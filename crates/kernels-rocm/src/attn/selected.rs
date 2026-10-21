@@ -79,6 +79,9 @@ fn selected(
             "a selection and a sliding window are two answers to which keys a row reads",
         ));
     }
+    if !crate::attn::kv::native_bf16(pool) {
+        return Err(refuse(op, "the selected walk reads bf16 pages"));
+    }
     let head_dim = count(op, "the head width this attention states", head_dim)?;
     if head_dim % 32 != 0 || head_dim / 32 > MAX_PER {
         return Err(refuse(

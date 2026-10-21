@@ -124,20 +124,35 @@ __global__ __launch_bounds__(BLOCK) void qkv_decode_qk_norm_rope_vnorm_write_kv(
     }
 }
 
-// A 64-, 128-, 256- or 512-wide head: one wavefront per head, a block of
-// blockDim / 64 wavefronts over consecutive heads of one row (grid: rows ×
-// head groups), heads ordered q then kv. The row's rotation (cos, sin of
-// each pair) is computed once a block into LDS rather than once a lane for
-// every head. Lane l holds elements E·l .. E·l + E − 1, read and written as
-// one 2E-byte access; a pair's partner `span` away is the lane span / E
-// across, one exchange. The packed heads sit at their own widths (q and k
-// `qk_width`, v `v_width`), landing HEAD_DIM wide, zero past their widths.
+// A 64-, 128-, 256- or 512-wide head: HEAD_DIM / E lanes per head (a
+// wavefront at E = HEAD_DIM / 64, a 16-byte run a lane at E = 8), a block
+// over consecutive heads of one row (grid: rows × head groups), heads
+// ordered q then kv. The row's rotation (cos, sin of each pair) is computed
+// once a block into LDS rather than once a lane for every head. Lane l of a
+// head holds elements E·l .. E·l + E − 1, read and written as one 2E-byte
+// access; a pair's partner `span` away is the lane span / E across, one
+// exchange. The packed heads sit at their own widths (q and k `qk_width`,
+// v `v_width`), landing HEAD_DIM wide, zero past their widths.
 template <int E>
 struct alignas(2 * E) BfRun {
     bf16 v[E];
 };
 
-template <int HEAD_DIM, bool USE_ROPE_TABLE>
+// A run's e4m3 codes (an e4m3 pool's pages), each from the bf16 the
+// unfused append would have read.
+template <int E>
+__device__ __forceinline__ void put_e4m3(bf16* pages, long long at, const BfRun<E>& x) {
+    float f[E < 4 ? 4 : E] = {};
+#pragma unroll
+    for (int i = 0; i < E; ++i) f[i] = to_f32(x.v[i]);
+    u64 c = 0;
+#pragma unroll
+    for (int i = 0; i < E; i += 4) c |= u64{attn::e4m3x4(f[i], f[i + 1], f[i + 2], f[i + 3])} << (8 * i);
+    using U = typename conditional<E == 8, u64, typename conditional<E == 4, u32, typename conditional<E == 2, u16, u8>::type>::type>::type;
+    *reinterpret_cast<U*>(reinterpret_cast<u8*>(pages) + at) = static_cast<U>(c);
+}
+
+template <int HEAD_DIM, bool USE_ROPE_TABLE, int E, bool FP8>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const bf16* __restrict__ packed, bf16* __restrict__ q_out, bf16* __restrict__ k_pages,
     bf16* __restrict__ v_pages, const bf16* __restrict__ q_weight, const bf16* __restrict__ k_weight,
@@ -147,8 +162,8 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const u32* __restrict__ w_off, const u8* __restrict__ row_valid, const u32* __restrict__ win,
     int num_q_heads, int num_kv_heads, int page_size, bool hnd_layout, float theta, float eps,
     bool v_norm, int rotary_dim, int span, bool qk_norm, float v_scale, int qk_width, int v_width) {
-    static_assert(kWave == 64 && HEAD_DIM % 64 == 0, "a lane holds whole elements of each half");
-    constexpr int E = HEAD_DIM / kWave;
+    constexpr int LPH = HEAD_DIM / E;
+    static_assert(HEAD_DIM % E == 0 && LPH <= kWave && kWave % LPH == 0, "a head's lanes share a wavefront");
     constexpr int kPairs = HEAD_DIM / 2;
     using Run = BfRun<E>;
     __shared__ float rot_c[kPairs], rot_s[kPairs];
@@ -157,9 +172,9 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const Window window{win};
     if (!window.live(r)) return;
     const long long row = window.plane(r);
-    const int ln = lane();
+    const int ln = static_cast<int>(threadIdx.x) % LPH;
     const int heads = num_q_heads + num_kv_heads;
-    const int head = static_cast<int>(blockIdx.y * (blockDim.x / kWave) + threadIdx.x / kWave);
+    const int head = static_cast<int>(blockIdx.y * (blockDim.x / LPH) + threadIdx.x / LPH);
     const bool is_q = head < num_q_heads;
     const bool live = head < heads && (is_q || row_valid == nullptr || row_valid[row] != 0);
     const int local = is_q ? head : head - num_q_heads;
@@ -203,8 +218,16 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         y[i] = to_f32(yr.v[i]);
         ss_v += y[i] * y[i];
     }
-    ss = wave_sum(ss);
-    ss_v = wave_sum(ss_v);
+    if constexpr (LPH == kWave) {
+        ss = wave_sum(ss);
+        ss_v = wave_sum(ss_v);
+    } else {
+#pragma unroll
+        for (int off = LPH / 2; off > 0; off >>= 1) {
+            ss += __shfl_xor(ss, off, kWave);
+            ss_v += __shfl_xor(ss_v, off, kWave);
+        }
+    }
 
     if (qk_norm) {
         const float inv_rms = rsqrtf(ss / static_cast<float>(HEAD_DIM) + eps);
@@ -233,6 +256,11 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         Run vq;
 #pragma unroll
         for (int i = 0; i < E; ++i) vq.v[i] = from_f32<bf16>(y[i] * inv_v * v_scale);
+        if constexpr (FP8) {
+            put_e4m3<E>(k_pages, at + ln * E, out);
+            put_e4m3<E>(v_pages, at + ln * E, vq);
+            return;
+        }
         reinterpret_cast<Run*>(v_pages + at)[ln] = vq;
     }
     reinterpret_cast<Run*>(dst)[ln] = out;
@@ -255,10 +283,16 @@ __global__ __launch_bounds__(WAVES* kWave) void q_gate_k_norm_rope_append(
     constexpr int PACKS = HEAD_DIM / 8;
     using P8 = Pack8<bf16>;
     __shared__ float normed[WAVES][HEAD_DIM];
+    __shared__ float rot_c[HEAD_DIM / 2], rot_s[HEAD_DIM / 2];
     const Window window{win};
     const int r = static_cast<int>(blockIdx.x);
     if (!window.live(r)) return;
     const long long row = window.plane(r);
+    // The row's rotation, once a block rather than once a lane a head.
+    const int pos = positions[row];
+    const int pairs = rotary_dim / 2;
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) elemwise::rotation(pos, p, span, theta, rot_c[p], rot_s[p]);
+    __syncthreads();
     const int wave = threadIdx.x / kWave, ln = lane();
     const int head = static_cast<int>(blockIdx.y) * WAVES + wave;
     if (head >= num_q_heads + num_kv_heads) return;
@@ -311,8 +345,6 @@ __global__ __launch_bounds__(WAVES* kWave) void q_gate_k_norm_rope_append(
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
     __builtin_amdgcn_wave_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-    const int pos = positions[row];
-    const int pairs = rotary_dim / 2;
     P8 o;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
@@ -321,8 +353,7 @@ __global__ __launch_bounds__(WAVES* kWave) void q_gate_k_norm_rope_append(
         const int i = e < span ? e : e - span;
         const bool lo = e < span;
         if (e < HEAD_DIM && i < pairs && (lo || e - span < pairs)) {
-            float c, s;
-            elemwise::rotation(pos, i, span, theta, c, s);
+            const float c = rot_c[i], s = rot_s[i];
             const float a = nr[i], b = nr[i + span];
             val = lo ? a * c - b * s : b * c + a * s;
         }

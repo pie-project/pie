@@ -92,6 +92,10 @@ pub struct KvPool {
     pub max_pages_per_request: i32,
 
     pub pages_in_batch: i32,
+
+    /// Where heads are zero-padded to `head_stride`: the widths a key head
+    /// and a value head carry (`[0, 0]`: the whole stride).
+    pub live: [u32; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

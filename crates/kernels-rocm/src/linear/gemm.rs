@@ -87,6 +87,41 @@ pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), 
     act_x_wt(ctx, "linear.lm_head", act, w, None, y)
 }
 
+/// [`lm_head`] over a body's padded readouts, `live` a device word holding
+/// how many of act's rows are live: past `kernel.gemm.live_from` padded rows
+/// only those are multiplied (the rest of y keeps what it held).
+pub fn lm_head_live(
+    ctx: &Ctx,
+    act: Tensor,
+    w: Tensor,
+    live: u64,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.lm_head";
+    #[cfg(feature = "rocm")]
+    {
+        let from = ctx.tuning().gemm_live_from;
+        if live != 0
+            && from > 0
+            && y.rows >= from
+            && act.dtype == Dtype::Bf16
+            && w.dtype == Dtype::Bf16
+            && y.dtype == Dtype::Bf16
+            && act.rows == y.rows
+            && w.rows == y.width
+            && w.width == act.width
+            && act.width.is_multiple_of(8)
+            && dense::act_x_wt_live(
+                ctx, OP, act.ptr, w.ptr, live, y.ptr, y.rows, y.width, act.width,
+            )?
+        {
+            return Ok(());
+        }
+    }
+    let _ = live;
+    act_x_wt(ctx, OP, act, w, None, y)
+}
+
 pub fn act_x_wt(
     ctx: &Ctx,
     op: &'static str,

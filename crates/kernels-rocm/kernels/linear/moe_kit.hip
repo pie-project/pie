@@ -603,11 +603,15 @@ struct GroupAffine {
 // begin + count) (count ≤ MT) of one expert, weight rows [blockIdx.y·32·
 // waves, +32·waves). Rounds once on the store, after the bias. SORTED bit 0:
 // the activation's rows are in expert order (ordered route i at row i, no
-// act_div); bit 1: the products land in that order too, not by route.
-template <class C, class T, int MT, int NBW = 2, int WAVES = kGroupWaves<MT>, int SORTED = 0>
+// act_div); bit 1: the products land in that order too, not by route. GLU
+// (1, or 2 clamped at `limit`) reads a packed [gate | up] bank of n rows: a
+// wave's first NBW / 2 blocks gate rows, the rest the matching up rows, and
+// lands silu(g)·u (g and u rounded first) in rows of n / 2.
+template <class C, class T, int MT, int NBW = 2, int WAVES = kGroupWaves<MT>, int SORTED = 0, int GLU = 0>
 __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
                                              int count, const typename C::Planes& p, const T* __restrict__ bias,
-                                             T* __restrict__ out, int act_div, int n, int k, int tile = -1) {
+                                             T* __restrict__ out, int act_div, int n, int k, int tile = -1,
+                                             float limit = 0.f) {
     static_assert(MT == 32 || MT == 64 || MT == 128, "a work item is 32, 64 or 128 routes");
     constexpr int CODES = C::kCodes, KU = MT == 32 || C::kKU == 1 ? C::kKU : C::kKU / 2;
     constexpr int KC = 4 * KU * CODES;  // codes a stage
@@ -625,7 +629,9 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     __shared__ __align__(16) T xt[MT * LD];
 
     const int tid = threadIdx.x, wave = tid / kWave, l = lane(), r16 = l % 16, g = l / 16;
-    const int row0 = (tile < 0 ? static_cast<int>(blockIdx.y) : tile) * TILE_N + wave * NB * 16;
+    static_assert(GLU == 0 || NB % 2 == 0, "a GLU wave pairs its gate and up blocks");
+    constexpr int GB = GLU != 0 ? NB / 2 : NB;  // output blocks a wave
+    const int row0 = (tile < 0 ? static_cast<int>(blockIdx.y) : tile) * (TILE_N / (GLU != 0 ? 2 : 1)) + wave * GB * 16;
     const int chunks = k / CODES;
     const int stages = (k + KC - 1) / KC;
 
@@ -646,7 +652,8 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     }
     long long wrow[NB];
 #pragma unroll
-    for (int nb = 0; nb < NB; ++nb) wrow[nb] = min(row0 + nb * 16 + r16, n - 1);
+    for (int nb = 0; nb < NB; ++nb)
+        wrow[nb] = min((nb >= GB ? n / 2 : 0) + row0 + (nb % GB) * 16 + r16, n - 1);
 
     typename C::Chunk wv[2][NB][KU];
     b128 av[NA];
@@ -729,6 +736,27 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     for (int mb = 0; mb < MB; ++mb) {
         const int m = mb * 16 + r16;
         if (m >= count) continue;
+        if constexpr (GLU != 0) {
+            T* o = out + static_cast<long long>((SORTED & 2) != 0 ? begin + m : order[begin + m]) * (n / 2);
+#pragma unroll
+            for (int nb = 0; nb < GB; ++nb) {
+                const int c = row0 + nb * 16 + 4 * g;
+                T v[4];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    float gv = to_f32(from_f32<T>(acc[nb][mb][t])), uv = to_f32(from_f32<T>(acc[nb + GB][mb][t]));
+                    if constexpr (GLU == 2) {
+                        gv = fminf(gv, limit);
+                        uv = fminf(fmaxf(uv, -limit), limit);
+                        v[t] = from_f32<T>(gv / (1.f + expf(-gv)) * uv);
+                    } else {
+                        v[t] = from_f32<T>(gv * (1.f / (1.f + __expf(-gv))) * uv);
+                    }
+                }
+                if (c + 3 < n / 2) *reinterpret_cast<moe_u2*>(o + c) = __builtin_bit_cast(moe_u2, v);
+            }
+            continue;
+        }
         T* o = out + static_cast<long long>((SORTED & 2) != 0 ? begin + m : order[begin + m]) * n;
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb) {

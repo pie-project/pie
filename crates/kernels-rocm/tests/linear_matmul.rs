@@ -216,6 +216,67 @@ fn the_batch_engine_projection() {
     }
 }
 
+/// The turned kernel (forced over every row count it covers): K of one to
+/// eight slices, one and two activation blocks, a ragged N, the f32 landing
+/// and the fused swiglu.
+#[test]
+fn the_turned_projection() {
+    let Some(gpu) = Gpu::open() else { return };
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.gemm_turn_from = 1;
+    t.gemm_turn_wide_until = 32;
+    t.gemm_turn_min_n = 0;
+    t.gemm_skinny_batch_min_n = 0;
+    let ctx = gpu.ctx().with_tuning(t);
+    for (m, n, k) in [
+        (1u32, 2056u32, 256u32),
+        (8, 4096, 2048),
+        (13, 24, 1280),
+        (24, 3000, 2048),
+        (32, 1024, 768),
+    ] {
+        let a: Vec<f32> = values((m * k) as usize, 31, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let w: Vec<f32> = values((n * k) as usize, 32, 0.05)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let at = gpu.tensor(&a, m, k, Dtype::Bf16);
+        let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
+        let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
+        let mut y = gpu.zeros(m, n, Dtype::Bf16);
+        gemm::matmul(&ctx, at, wt, &mut y).unwrap();
+        close_bf16(&format!("turned {m}x{n}x{k}"), &gpu.read(&y), &want, 2.0);
+        let mut yf = gpu.zeros(m, n, Dtype::F32);
+        gemm::matmul_f32(&ctx, at, wt, &mut yf).unwrap();
+        let got = gpu.read(&yf);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs() / w.abs().max(1.0))
+            .fold(0.0, f32::max);
+        assert!(worst < 1e-3, "turned f32 {m}x{n}x{k}: {worst}");
+        // The fused swiglu over the bank as [gate | up] lands its matmul's bits.
+        let i = n / 2;
+        let mut h = gpu.zeros(m, i, Dtype::Bf16);
+        assert!(
+            gemm::matmul_swiglu(&ctx, at, wt, &mut h).unwrap(),
+            "turned {m}x{i}x{k} fused"
+        );
+        let mut h2 = gpu.zeros(m, i, Dtype::Bf16);
+        kernels_rocm::linear::mlp::swiglu(&ctx, y, i, 1, &mut h2).unwrap();
+        let diff = gpu
+            .read(&h)
+            .iter()
+            .zip(&gpu.read(&h2))
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(diff, 0, "turned {m}x{i}x{k}: {diff} cells differ");
+    }
+}
+
 #[test]
 fn the_f32_projection_lands_unrounded() {
     let Some(gpu) = Gpu::open() else { return };
@@ -240,5 +301,45 @@ fn the_f32_projection_lands_unrounded() {
                 "matmul_f32 {m}x{n}x{k}[{i}] = {h}, want {w}"
             );
         }
+    }
+}
+
+/// The lm head over a body's padded readouts multiplies only the live rows
+/// (a device word), whichever of its three launches takes the count, and
+/// leaves the padding's rows as they were.
+#[test]
+fn the_live_lm_head_multiplies_the_live_rows() {
+    let Some(gpu) = Gpu::open() else { return };
+    if kernels_rocm::hip::lt_grouped::library(Dtype::Bf16).is_err() {
+        return;
+    }
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.gemm_live_from = 129;
+    let ctx = gpu.ctx().with_tuning(t);
+    let (m, n, k) = (192u32, 3000u32, 512u32);
+    let a: Vec<f32> = values((m * k) as usize, 31, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let w: Vec<f32> = values((n * k) as usize, 32, 0.05)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let (at, wt) = (
+        gpu.tensor(&a, m, k, Dtype::Bf16),
+        gpu.tensor(&w, n, k, Dtype::Bf16),
+    );
+    let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
+    for live in [7u32, 40, 150, 192] {
+        let count = gpu.upload(&[live], 1, 1, Dtype::I32);
+        let mut y = gpu.tensor(&vec![3.0; (m * n) as usize], m, n, Dtype::Bf16);
+        gemm::lm_head_live(&ctx, at, wt, count.ptr, &mut y).unwrap();
+        let got = gpu.read(&y);
+        let rows = (live * n) as usize;
+        close_bf16(&format!("live {live}"), &got[..rows], &want[..rows], 2.0);
+        assert!(
+            got[rows..].iter().all(|&v| v == 3.0),
+            "live {live}: a padding row was written"
+        );
     }
 }

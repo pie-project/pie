@@ -1,6 +1,6 @@
 //! The GPU's profile: the CUDA registry, the facts this engine measures, the
 //! checked-in profiles, and resolution for one load. A ROCm build reads the
-//! same registry against AMD's chips: `cc` is the gfx version there.
+//! same registry against AMD's chips, keyed by their gfx version.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -9,11 +9,16 @@ use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shel
 
 use crate::{Graphs, Recording};
 
+/// The fact a family file assumes: CUDA's compute capability as major * 10
+/// + minor (89 is sm_89), or AMD's gfx version the same way (94 is gfx94x).
+#[cfg(not(feature = "rocm"))]
+pub const ARCH: &str = "cc";
+#[cfg(feature = "rocm")]
+pub const ARCH: &str = "gfx";
+
 /// What this engine measures about its GPU.
 pub const FACTS: &[Var] = &[
-    // Compute capability as major * 10 + minor: 89 is sm_89 (on ROCm the gfx
-    // version: 94 is gfx94x).
-    Var::fixed("cc", Domain::COUNT),
+    Var::fixed(ARCH, Domain::COUNT),
     Var::fixed("sms", Domain::COUNT),
 ];
 
@@ -118,15 +123,21 @@ pub struct WalkFireRows(pub u32);
 #[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
 pub struct HostPlanes;
 
-/// Rows from which the default bucket lattice takes four buckets a doubling
-/// whatever `engine.lattice_steps` says (a prefill's GEMMs run its bucket's
-/// rows); 0 never. Past a GEMM's ridge, where its rows cost compute rather
-/// than the weights' read, every padded row costs as much as a real one; the
-/// ridge (peak flops over memory bandwidth) is some 150 to 450 rows on the
-/// cards CUDA serves, so the default starts there.
+/// Rows from which the default bucket lattice takes
+/// `engine.prefill_lattice_steps` buckets a doubling whatever
+/// `engine.lattice_steps` says (a prefill's GEMMs run its bucket's rows); 0
+/// never. Past a GEMM's ridge, where its rows cost compute rather than the
+/// weights' read, every padded row costs as much as a real one; the ridge
+/// (peak flops over memory bandwidth) is some 150 to 450 rows on the cards
+/// CUDA serves, so the default starts there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 256, tune = engine)]
 pub struct PrefillLatticeFrom(pub u32);
+
+/// Buckets a doubling the default lattice takes past `engine.prefill_lattice_from`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.prefill_lattice_steps", constant(set(4, 8)), default = 4, tune = engine)]
+pub struct PrefillLatticeSteps(pub u32);
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
@@ -144,7 +155,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<HostPlanes>()
-        .add::<PrefillLatticeFrom>();
+        .add::<PrefillLatticeFrom>()
+        .add::<PrefillLatticeSteps>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register(&mut r, 2);
@@ -160,45 +172,40 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
-/// The checked-in profiles' directory: AMD's chips have their own.
-#[cfg(not(feature = "rocm"))]
-macro_rules! profiles {
-    () => {
-        "profiles"
-    };
-}
-#[cfg(feature = "rocm")]
-macro_rules! profiles {
-    () => {
-        "profiles-rocm"
-    };
-}
-
-macro_rules! seeded {
-    ($($file:literal),* $(,)?) => {
-        pub const SEEDED: &[(&str, &str)] = &[
-            $(($file, include_str!(concat!("../", profiles!(), "/", $file)))),*
-        ];
+/// The checked-in profiles, CUDA's and AMD's side by side in `profiles/`:
+/// a build seeds its own, and the other's are the files beside them.
+macro_rules! shelved {
+    (cuda: [$($cuda:literal),* $(,)?], rocm: [$($rocm:literal),* $(,)?] $(,)?) => {
+        #[cfg(not(feature = "rocm"))]
+        pub const SEEDED: &[(&str, &str)] =
+            &[$(($cuda, include_str!(concat!("../profiles/", $cuda)))),*];
+        #[cfg(not(feature = "rocm"))]
+        const BESIDE: &[&str] = &[$($rocm),*];
+        #[cfg(feature = "rocm")]
+        pub const SEEDED: &[(&str, &str)] =
+            &[$(($rocm, include_str!(concat!("../profiles/", $rocm)))),*];
+        #[cfg(feature = "rocm")]
+        const BESIDE: &[&str] = &[$($cuda),*];
     };
 }
 
-#[cfg(feature = "rocm")]
-seeded!("gfx94.toml");
-#[cfg(not(feature = "rocm"))]
-seeded!(
-    "sm80.toml",
-    "sm80/nvidia-a100-80gb-pcie.toml",
-    "sm86.toml",
-    "sm87.toml",
-    "sm89.toml",
-    "sm89/nvidia-l40s.toml",
-    "sm90.toml",
-    "sm100.toml",
-    "sm100/nvidia-b200.toml",
-    "sm103.toml",
-    "sm110.toml",
-    "sm120.toml",
-    "sm121.toml",
+shelved!(
+    cuda: [
+        "sm80.toml",
+        "sm80/nvidia-a100-80gb-pcie.toml",
+        "sm86.toml",
+        "sm87.toml",
+        "sm89.toml",
+        "sm89/nvidia-l40s.toml",
+        "sm90.toml",
+        "sm100.toml",
+        "sm100/nvidia-b200.toml",
+        "sm103.toml",
+        "sm110.toml",
+        "sm120.toml",
+        "sm121.toml",
+    ],
+    rocm: ["gfx94.toml"],
 );
 
 pub static SHELF: Shelf = Shelf {
@@ -210,7 +217,7 @@ pub static SHELF: Shelf = Shelf {
 #[must_use]
 pub fn facts(major: u32, minor: u32, sms: u32) -> Facts {
     Facts::of(registry())
-        .int("cc", i64::from(major * 10 + minor))
+        .int(ARCH, i64::from(major * 10 + minor))
         .int("sms", i64::from(sms))
 }
 
@@ -231,6 +238,7 @@ pub struct Engine {
     pub walk_fire_rows: u32,
     pub host_planes: bool,
     pub prefill_lattice_from: u32,
+    pub prefill_lattice_steps: u32,
 }
 
 impl Engine {
@@ -261,6 +269,7 @@ impl Engine {
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
+            prefill_lattice_steps: profile.get::<PrefillLatticeSteps>().0,
         }
     }
 }
@@ -377,9 +386,9 @@ mod tests {
 
     #[test]
     fn the_checked_in_profiles_hold_together_and_each_family_names_its_tier() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(profiles!());
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
         SHELF
-            .check(registry(), &dir)
+            .check_beside(registry(), &dir, BESIDE)
             .unwrap_or_else(|e| panic!("{e}"));
         for (name, text) in SEEDED.iter().filter(|(n, _)| !n.contains('/')) {
             let file = registry()
@@ -389,7 +398,7 @@ mod tests {
                 .target
                 .assumes
                 .iter()
-                .find(|(i, _)| FACTS[*i].name == "cc")
+                .find(|(i, _)| FACTS[*i].name == ARCH)
                 .map(|(_, cc)| *cc)
                 .expect("a family file assumes its compute capability");
             let tier = if cfg!(feature = "rocm") {
@@ -688,6 +697,7 @@ mod tests {
                 walk_fire_rows: 0,
                 host_planes: false,
                 prefill_lattice_from: 256,
+                prefill_lattice_steps: 4,
             }
         );
         assert_eq!(
@@ -967,17 +977,27 @@ mod hip {
                 Engine {
                     forward_tokens: 10240,
                     prefill_lattice_from: 2048,
+                    prefill_lattice_steps: 8,
                     ..Engine::of(&registry().defaults())
                 }
             );
-            // The defaults, but for the routed MLP's paths the family measured.
+            // The defaults, but for the paths the family measured.
             let mut want = kernels_cuda::tuning::Tuning::of(&registry().defaults());
+            want.mla_absorb_q_until = 2048;
+            want.mla_absorb_out_from = 33;
+            want.mla_absorb_out_until = 1536;
+            want.fp8_decode_until = 32;
+            want.fp8_narrow_until = 128;
             want.moe_lt_grouped = true;
             want.moe_lt_mlp_from = 128;
             want.moe_lt_tile_deep = 256_192_064;
             want.moe_lt_tile_shallow = 128_288_032;
             want.moe_lt_deep_k = 2048;
-            want.moe_ordered_from = 256;
+            want.moe_ordered_from = 128;
+            want.gemm_live_from = 129;
+            want.gemm_turn_from = 3;
+            want.gemm_turn_wide_until = 32;
+            want.ssm_gdn_wide_from = 512;
             assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
         }
     }
@@ -1022,7 +1042,7 @@ mod device {
             return;
         };
         assert!(!name.is_empty(), "the driver names the GPU");
-        let cc = facts.get("cc").expect("probed");
+        let cc = facts.get(super::ARCH).expect("probed");
         #[cfg(not(feature = "rocm"))]
         assert!(
             cc >= 80,

@@ -396,3 +396,81 @@ pub(crate) fn skinny_planned(
         ],
     )
 }
+
+/// The turned kernel's LDS a wavefront: a 16 x 256 bf16 turn.
+const TURN_WAVE_LDS: u32 = 8 << 10;
+
+/// The turned kernel's walk of a bank of `rows` rows (2n for a packed
+/// `[gate | up]` one) over K `k`: wavefronts a block (`ks`, a 256-element
+/// slice of K each, up to four), slices a wavefront (`r`, up to two) and
+/// blocks (as many as the LDS keeps resident, at most a 16-row tile each).
+/// `None` past K 2048.
+pub(crate) fn turn_plan(m: u32, rows: u32, k: u32) -> Option<(u32, u32, u32)> {
+    if !(1..=32).contains(&m) || k == 0 || !k.is_multiple_of(256) || k > 2048 || rows == 0 {
+        return None;
+    }
+    let slices = k / 256;
+    let ks = slices.min(if m > 16 { 8 } else { 4 });
+    let r = slices.div_ceil(ks);
+    let resident = compute_units() * ((64 << 10) / (ks * TURN_WAVE_LDS));
+    Some((ks, r, rows.div_ceil(16).min(resident)))
+}
+
+/// `y[m, n] = act[m, k] · w[n, k]ᵀ` for 1 ≤ m ≤ 32 on the turned kernel
+/// (`skinnyt_bf16`), K up to 2048 in whole 256s. Refuses what it does not
+/// cover.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn skinnyt(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    epilogue: SkinnyEpilogue,
+) -> Result<(), Error> {
+    const OP: &str = "linear.skinnyt";
+    let glu = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
+    let plan = turn_plan(
+        m.unsigned_abs(),
+        n.unsigned_abs() * if glu { 2 } else { 1 },
+        k.unsigned_abs(),
+    );
+    let (Some((ks, r, grid)), true) = (plan, n > 0 && k > 0) else {
+        return Err(refuse(
+            OP,
+            format!("covers 1..=32 rows of K up to 2048 in whole 256s, not m={m} n={n} k={k}"),
+        ));
+    };
+    for (address, what) in [
+        (weight, "the weight"),
+        (act, "the activation"),
+        (out, "the output"),
+    ] {
+        if address == 0 || (what != "the output" && !aligned16(address)) {
+            return Err(refuse(OP, format!("{what} is null or not 16-byte aligned")));
+        }
+    }
+    let cap = match epilogue {
+        SkinnyEpilogue::Softcap(cap) => cap,
+        _ => 0.0,
+    };
+    let symbol = format!(
+        "::pie::linear::skinnyt_bf16<{m}, {r}, {ks}, {}>",
+        epilogue.code()
+    );
+    ctx.fire(
+        OP,
+        Fire::at("linear/gemv.hip", crate::jit::symbol(&symbol))
+            .apply(Launch::grid([grid, 1, 1], [64, ks, 1])),
+        &[
+            ArgValue::Ptr(weight),
+            ArgValue::Ptr(act),
+            ArgValue::Ptr(out),
+            ArgValue::I32(n),
+            ArgValue::I32(k),
+            ArgValue::F32(cap),
+        ],
+    )
+}

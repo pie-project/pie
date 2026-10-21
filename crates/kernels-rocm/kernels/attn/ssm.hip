@@ -712,6 +712,20 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
     const bf16* in_row = qkvz + row * QW;
     const int span = K - 1;
 
+    // This head's state, in flight under the conv and the ticket.
+    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
+    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
+    u32x4 sp[Q];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
+
+    // The gates, as `ssm_gdn_prep_ba_gates` lands them.
+    const float bb = to_f32(ba[row * 2 * V_h + h]);
+    const float za = to_f32(ba[row * 2 * V_h + V_h + h]) + to_f32(dt_bias[h]);
+    const float softplus = za > 20.f ? za : log1pf(__expf(za));
+    const float g_log = -__expf(a_log[h]) * softplus;
+    const float beta = 1.f / (1.f + __expf(-bb));
+
     // The conv over this block's channels: q and k of its key head, v of
     // its own; every read in flight before any is used.
     int ch[CPT];
@@ -774,19 +788,7 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
         }
     }
 
-    // The gates, as `ssm_gdn_prep_ba_gates` lands them.
-    const float bb = to_f32(ba[row * 2 * V_h + h]);
-    const float za = to_f32(ba[row * 2 * V_h + V_h + h]) + to_f32(dt_bias[h]);
-    const float softplus = za > 20.f ? za : log1pf(__expf(za));
-    const float g_log = -__expf(a_log[h]) * softplus;
-    const float beta = 1.f / (1.f + __expf(-bb));
-
     // The recurrence, as `ssm_gdn_decode_rows` walks it.
-    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
-    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
-    u32x4 sp[Q];
-#pragma unroll
-    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
     const bool fold = folds_uniform(write_state, mask, rl);
     float qi[Q], ki[Q], vv[VEC];
 #pragma unroll
@@ -1315,36 +1317,45 @@ __global__ __launch_bounds__(512) void ssm_gdn_chunk_wu(
     }
 }
 
-// Grid (lanes · V_h · BV/16), block 256: one 16-column slice of one head's
-// state through every chunk of one request (state columns evolve
+// Grid (lanes · V_h · BV/BVT), block 256: one BVT-column slice of one
+// head's state through every chunk of one request (state columns evolve
 // independently), in f32 registers in the matrix core's D layout:
-// wavefront w holds key rows [16w, 16w+16) and [16(w+4), 16(w+4)+16).
-// Records each chunk's entering state (hcT [s][V_h][BV][BK]) and V' (vnT
-// [s][V_h][BV][CH], zero past the chunk's rows). The next chunks' operands
-// are loaded while this one computes, in few enough reads that three
-// chunks' worth stay under the 63 the memory counter can wait on.
-template <int BK, int BV>
-__global__ __launch_bounds__(256) void ssm_gdn_chunk_h(
+// wavefront w holds key rows [16w, 16w+16) and [16(w+4), 16(w+4)+16) of
+// each 16-column tile. Records each chunk's entering state (hcT
+// [s][V_h][BV][BK]) and V' (vnT [s][V_h][BV][CH], zero past the chunk's
+// rows). The next chunk's operands are loaded while this one computes, two
+// wavefronts a SIMD (a deeper ring spills them). A wider slice reads a
+// chunk's W and k̂ᵀ for more columns; a narrower one fills the device at
+// fewer requests.
+template <int BK, int BV, int BVT>
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2, 2))) void ssm_gdn_chunk_h(
     const float* __restrict__ gcum, const bf16* __restrict__ kT, const bf16* __restrict__ w,
     const bf16* __restrict__ uT, bf16* __restrict__ vnT, bf16* __restrict__ hcT, bf16* __restrict__ state_base,
     const i32* __restrict__ slot_ids, const u32* __restrict__ indptr, long long slot_stride,
     const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
     const u8* __restrict__ mask, int lanes, int K_h, int V_h, const int* __restrict__ snap,
     const int* __restrict__ snap_rows, const i32* __restrict__ snap_slots, const u32* __restrict__ win) {
-    constexpr int CH = GDN_CH, BVT = 16, KT = BK / 16 / 4, KS = BK / 32, CS = CH / 32;
+    constexpr int CH = GDN_CH, NT = BVT / 16, KT = BK / 16 / 4, KS = BK / 32, CS = CH / 32;
     // LDS rows padded by 16 bytes against the 16-row reads' bank conflicts.
     constexpr int HP = BK + 8, VP = CH + 8;
     static_assert(BK % 64 == 0, "four wavefronts split the key rows evenly");
+    static_assert(BVT % 16 == 0 && BV % BVT == 0, "whole 16-column tiles");
     __shared__ alignas(16) bf16 hT[BVT * HP];
     __shared__ alignas(16) bf16 vnTs[BVT * VP];  // V'·exp(Γ_L − Γ), the update's operand
     __shared__ alignas(16) bf16 vnL[BVT * CH];   // V' as recorded
     __shared__ float sE[CH];
 
-    const int vt = static_cast<int>(blockIdx.x) % (BV / BVT);
-    const int h = (static_cast<int>(blockIdx.x) / (BV / BVT)) % V_h;
-    const int r = static_cast<int>(blockIdx.x) / ((BV / BVT) * V_h);
+    // Each XCD (block b runs on XCD b mod 8) takes a run of the live blocks
+    // (a captured grid's tail past the live lanes exits), so a head's
+    // slices, which read the same W and k̂ᵀ chunks, share its L2.
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
-    if (r >= lanes) return;
+    const int live = lanes * (BV / BVT) * V_h, b = blockIdx.x;
+    if (b >= live) return;
+    const int xcd = b % 8, q8 = live / 8, rem = live % 8;
+    const int at = xcd * q8 + min(xcd, rem) + b / 8;
+    const int vt = at % (BV / BVT);
+    const int h = (at / (BV / BVT)) % V_h;
+    const int r = at / ((BV / BVT) * V_h);
     const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, snap, win);
     if (ln.T <= 0 || ln.slot < 0) return;
     const int hk = h / (V_h / K_h);
@@ -1352,19 +1363,21 @@ __global__ __launch_bounds__(256) void ssm_gdn_chunk_h(
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
     bf16* state = state_base + static_cast<long long>(ln.slot) * slot_stride + static_cast<long long>(h) * BK * BV;
 
-    float hf[KT][4];
+    float hf[KT][NT][4];
 #pragma unroll
     for (int q = 0; q < KT; ++q)
-        mfma_each(mfma_zero(), [&](int i, int vv, float) {
-            hf[q][i % 4] = to_f32(state[static_cast<long long>((wave + 4 * q) * 16 + i) * BV + v0 + vv]);
-        });
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+            mfma_each(mfma_zero(), [&](int i, int vv, float) {
+                hf[q][n][i % 4] = to_f32(state[static_cast<long long>((wave + 4 * q) * 16 + i) * BV + v0 + 16 * n + vv]);
+            });
 
     // One chunk's operands for this lane: W's A fragments for the
     // wavefront's 16 rows, U at its D cells, k̂ᵀ's A fragments for its key
     // rows, and (wavefront 0) Γ at its row and at the chunk's last.
     struct Ops {
         mfma_ab2 wf[KS];
-        mfma_ab uv;
+        mfma_ab uv[NT];
         mfma_ab2 kf[KT][CS];
         float g, gl;
     };
@@ -1380,7 +1393,9 @@ __global__ __launch_bounds__(256) void ssm_gdn_chunk_h(
 #pragma unroll
         for (int st = 0; st < KS; ++st) o.wf[st] = load8(wr + st * 32);
         // Uᵀ: the lane's four rows of its column, adjacent.
-        o.uv = load4(uT + ((static_cast<long long>(sj) * V_h + h) * BV + v0 + l % 16) * CH + m0 + 4 * (l / 16));
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+            o.uv[n] = load4(uT + ((static_cast<long long>(sj) * V_h + h) * BV + v0 + 16 * n + l % 16) * CH + m0 + 4 * (l / 16));
         const bf16* kT_s = kT + (static_cast<long long>(sj) * K_h + hk) * BK * CH;
 #pragma unroll
         for (int q = 0; q < KT; ++q)
@@ -1394,7 +1409,7 @@ __global__ __launch_bounds__(256) void ssm_gdn_chunk_h(
     // while the DEPTH − 1 before it compute. Every step refills its slot
     // (past the last chunk, with the last chunk again) so each slot's loads
     // stay the oldest outstanding when the step that reads them comes round.
-    constexpr int DEPTH = 3;
+    constexpr int DEPTH = 2;
     Ops ring[DEPTH];
 #pragma unroll
     for (int d = 0; d < DEPTH; ++d) fetch(min(d, chunks - 1), ring[d]);
@@ -1405,62 +1420,76 @@ __global__ __launch_bounds__(256) void ssm_gdn_chunk_h(
 
 #pragma unroll
         for (int q = 0; q < KT; ++q)
-            mfma_each(mfma_zero(), [&](int i, int vv, float) { hT[vv * HP + (wave + 4 * q) * 16 + i] = from_f32<bf16>(hf[q][i % 4]); });
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+                mfma_each(mfma_zero(), [&](int i, int vv, float) {
+                    hT[(16 * n + vv) * HP + (wave + 4 * q) * 16 + i] = from_f32<bf16>(hf[q][n][i % 4]);
+                });
         if (wave == 0) sE[l] = l < L ? __expf(o.gl - o.g) : 0.f;
         lds_barrier();
 
         // The entering state, recorded as a contiguous slice.
         bf16* hcT_s = hcT + ((static_cast<long long>(sj) * V_h + h) * BV + v0) * BK;
-        static_assert(BVT * BK / 8 == 256, "a 16-byte piece per thread");
-        *reinterpret_cast<b128*>(hcT_s + (tid / 16) * BK + (tid % 16) * 8) =
-            *reinterpret_cast<const b128*>(hT + (tid / 16) * HP + (tid % 16) * 8);
+        static_assert(BVT * BK / 8 % 256 == 0, "whole 16-byte pieces a thread");
+#pragma unroll
+        for (int e = tid; e < BVT * BK / 8; e += 256)
+            *reinterpret_cast<b128*>(hcT_s + (e / 16) * BK + (e % 16) * 8) =
+                *reinterpret_cast<const b128*>(hT + (e / 16) * HP + (e % 16) * 8);
 
         // V' = U − W·S for the wavefront's 16 chunk rows.
         {
             const int m0 = wave * 16;
-            mfma_cd c = mfma_zero();
 #pragma unroll
-            for (int st = 0; st < KS; ++st) c = mfma16x2(o.wf[st], load8(hT + (l % 16) * HP + st * 32 + g8), c);
-            const bf16* uv = reinterpret_cast<const bf16*>(&o.uv);
-            float vn[4], vs[4];
+            for (int n = 0; n < NT; ++n) {
+                mfma_cd c = mfma_zero();
 #pragma unroll
-            for (int t = 0; t < 4; ++t) {
-                const int i = m0 + 4 * (l / 16) + t;
-                vn[t] = i < L ? to_f32(uv[t]) - c[t] : 0.f;
-                vs[t] = vn[t] * sE[i];
+                for (int st = 0; st < KS; ++st)
+                    c = mfma16x2(o.wf[st], load8(hT + (16 * n + l % 16) * HP + st * 32 + g8), c);
+                const bf16* uv = reinterpret_cast<const bf16*>(&o.uv[n]);
+                float vn[4], vs[4];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const int i = m0 + 4 * (l / 16) + t;
+                    vn[t] = i < L ? to_f32(uv[t]) - c[t] : 0.f;
+                    vs[t] = vn[t] * sE[i];
+                }
+                const int vv = 16 * n + l % 16, i0 = m0 + 4 * (l / 16);
+                *reinterpret_cast<mfma_ab*>(vnL + vv * CH + i0) = pack4(vn[0], vn[1], vn[2], vn[3]);
+                *reinterpret_cast<mfma_ab*>(vnTs + vv * VP + i0) = pack4(vs[0], vs[1], vs[2], vs[3]);
             }
-            const int vv = l % 16, i0 = m0 + 4 * (l / 16);
-            *reinterpret_cast<mfma_ab*>(vnL + vv * CH + i0) = pack4(vn[0], vn[1], vn[2], vn[3]);
-            *reinterpret_cast<mfma_ab*>(vnTs + vv * VP + i0) = pack4(vs[0], vs[1], vs[2], vs[3]);
         }
         lds_barrier();
 
         bf16* vnT_s = vnT + ((static_cast<long long>(sj) * V_h + h) * BV + v0) * CH;
-        static_assert(BVT * CH / 8 == 128, "a 16-byte piece per thread of the first half");
-        if (tid < BVT * CH / 8) reinterpret_cast<b128*>(vnT_s)[tid] = reinterpret_cast<const b128*>(vnL)[tid];
+        for (int e = tid; e < BVT * CH / 8; e += 256) reinterpret_cast<b128*>(vnT_s)[e] = reinterpret_cast<const b128*>(vnL)[e];
 
         // S ← exp(Γ_L)·S + K̂ᵀ·diag(exp(Γ_L − Γ))·V'.
         const float decay = __expf(o.gl);
 #pragma unroll
-        for (int q = 0; q < KT; ++q) {
-            mfma_cd c = mfma_zero();
+        for (int q = 0; q < KT; ++q)
 #pragma unroll
-            for (int st = 0; st < CS; ++st) c = mfma16x2(o.kf[q][st], load8(vnTs + (l % 16) * VP + st * 32 + g8), c);
+            for (int n = 0; n < NT; ++n) {
+                mfma_cd c = mfma_zero();
 #pragma unroll
-            for (int t = 0; t < 4; ++t) hf[q][t] = hf[q][t] * decay + c[t];
-        }
+                for (int st = 0; st < CS; ++st)
+                    c = mfma16x2(o.kf[q][st], load8(vnTs + (16 * n + l % 16) * VP + st * 32 + g8), c);
+#pragma unroll
+                for (int t = 0; t < 4; ++t) hf[q][n][t] = hf[q][n][t] * decay + c[t];
+            }
         // A snapshot lands the state as stored and the walk carries on from
         // it rounded, as a pass cut there reloads it.
         if (ck.snap >= 0) {
-            bf16* at = state_base + static_cast<long long>(snap_slots[ck.snap]) * slot_stride +
-                       static_cast<long long>(h) * BK * BV;
+            bf16* sat = state_base + static_cast<long long>(snap_slots[ck.snap]) * slot_stride +
+                        static_cast<long long>(h) * BK * BV;
 #pragma unroll
             for (int q = 0; q < KT; ++q)
-                mfma_each(mfma_zero(), [&](int i, int vv, float) {
-                    const bf16 x = from_f32<bf16>(hf[q][i % 4]);
-                    if (folding) at[static_cast<long long>((wave + 4 * q) * 16 + i) * BV + v0 + vv] = x;
-                    hf[q][i % 4] = to_f32(x);
-                });
+#pragma unroll
+                for (int n = 0; n < NT; ++n)
+                    mfma_each(mfma_zero(), [&](int i, int vv, float) {
+                        const bf16 x = from_f32<bf16>(hf[q][n][i % 4]);
+                        if (folding) sat[static_cast<long long>((wave + 4 * q) * 16 + i) * BV + v0 + 16 * n + vv] = x;
+                        hf[q][n][i % 4] = to_f32(x);
+                    });
         }
         fetch(min(jc + DEPTH, chunks - 1), o);
     };
@@ -1476,9 +1505,11 @@ __global__ __launch_bounds__(256) void ssm_gdn_chunk_h(
     if (!folds(write_state, mask, ln.rl)) return;
 #pragma unroll
     for (int q = 0; q < KT; ++q)
-        mfma_each(mfma_zero(), [&](int i, int vv, float) {
-            state[static_cast<long long>((wave + 4 * q) * 16 + i) * BV + v0 + vv] = from_f32<bf16>(hf[q][i % 4]);
-        });
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+            mfma_each(mfma_zero(), [&](int i, int vv, float) {
+                state[static_cast<long long>((wave + 4 * q) * 16 + i) * BV + v0 + 16 * n + vv] = from_f32<bf16>(hf[q][n][i % 4]);
+            });
 }
 
 // Grid (slots, V_h), block 256: the chunk's output rows, f32 [n][V_h][BV]
@@ -2409,6 +2440,124 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
 #pragma unroll
     for (int q = 0; q < KT; ++q)
         *reinterpret_cast<f32x4*>(state + key(q)) = f32x4{hf[q][0], hf[q][1], hf[q][2], hf[q][3]};
+}
+
+// ------------------------------------------------------------- Mamba-2 --
+
+// Mamba-2: a head's state S[p][n] (64 head dims by a 128-wide state) in f32
+// at slab + slot·stride + h·64·128, its operands off one convolved `xbc` row
+// (`x`, then each group's `B`, then its `C`), its decay exp(−exp(A_log)·dt)
+// one scalar a step. A token stores S = S·decay + dt·x·Bᵀ and lands
+// (S·C + D·x)·silu(z), the group norm after it. A block of four wavefronts
+// holds the state in registers: a half-wavefront a state row, lane c its
+// columns 4c..4c+3, eight rows a lane.
+constexpr int M2_P = 64, M2_N = 128, M2_Q = M2_P / 8;
+
+__device__ __forceinline__ float m2_dt(float raw, float bias) {
+    const float x = raw + bias;
+    return x > 20.f ? x : log1pf(__expf(x));
+}
+
+// The state row of the lane's q-th run, and the run's index among the head's.
+__device__ __forceinline__ int m2_row(int q) {
+    return static_cast<int>(threadIdx.x / kWave) * (2 * M2_Q) + 2 * q + (lane() >> 5);
+}
+__device__ __forceinline__ int m2_run(int q) { return m2_row(q) * (M2_N / 4) + (lane() & 31); }
+
+// One token through the lane's runs: `at` its xbc row, `zr` and `yr` its z
+// and output rows.
+__device__ __forceinline__ void m2_token(f32x4 (&s)[M2_Q], const bf16* at, const bf16* zr, bf16* yr, float step,
+                                         float decay, float skip, int h, int inner, int g, int G) {
+    const int c = 4 * (lane() & 31);
+    const bf16* bp = at + inner + g * M2_N + c;
+    const bf16* cp = at + inner + (G + g) * M2_N + c;
+    const f32x4 b = {to_f32(bp[0]), to_f32(bp[1]), to_f32(bp[2]), to_f32(bp[3])};
+    const f32x4 cc = {to_f32(cp[0]), to_f32(cp[1]), to_f32(cp[2]), to_f32(cp[3])};
+    float x[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) x[q] = to_f32(at[h * M2_P + m2_row(q)]);
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) {
+        s[q] = s[q] * decay + (step * x[q]) * b;
+        float acc = s[q].x * cc.x + s[q].y * cc.y + s[q].z * cc.z + s[q].w * cc.w;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, kWave);
+        if ((lane() & 31) == 0) {
+            const int o = h * M2_P + m2_row(q);
+            yr[o] = from_f32<bf16>((acc + skip * x[q]) * silu(to_f32(zr[o])));
+        }
+    }
+}
+
+// Decode: grid (rows, H), a block a (row, head).
+__global__ __launch_bounds__(256) void ssm_mamba2_step(
+    const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
+    float* __restrict__ state_base, const i32* __restrict__ slot_ids, long long slot_stride, bf16* __restrict__ y,
+    int H, int G, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
+    const int r = blockIdx.x, h = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const int inner = H * M2_P;
+    f32x4* st = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(slot) * slot_stride +
+                                         static_cast<long long>(h) * M2_P * M2_N);
+    f32x4 s[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
+    const float step = m2_dt(to_f32(dt[row * H + h]), dt_bias[h]);
+    m2_token(s, xbc + row * (inner + 2 * G * M2_N), z + row * inner, y + row * inner, step,
+             __expf(-__expf(a_log[h]) * step), D[h], h, inner, h / (H / G), G);
+    if (!folds(write_state, mask, rl)) return;
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+}
+
+// Prefill, token by token: grid (lanes, H), the head's state in registers
+// across the walk.
+__global__ __launch_bounds__(256) void ssm_mamba2_scan(
+    const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
+    float* __restrict__ state_base, const i32* __restrict__ slot_ids, const u32* __restrict__ indptr,
+    long long slot_stride, const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
+    const u8* __restrict__ mask, const int* __restrict__ snap, const int* __restrict__ snap_rows,
+    const i32* __restrict__ snap_slots, bf16* __restrict__ y, int H, int G, const u32* __restrict__ win) {
+    const int r = blockIdx.x, h = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[2])) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const Span sp = span_of(indptr, r, rl, commit_len, begin_at);
+    if (sp.n <= 0) return;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const long long head = static_cast<long long>(h) * M2_P * M2_N;
+    f32x4* st = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(slot) * slot_stride + head);
+    f32x4 s[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
+    const int inner = H * M2_P, g = h / (H / G);
+    const long long width = inner + 2 * G * M2_N;
+    const float neg_a = -__expf(a_log[h]), bias = dt_bias[h], skip = D[h];
+    const bool fold = folds(write_state, mask, rl);
+    Snaps sn = snaps_of(snap, rl);
+    for (int t = 0; t < sp.n; ++t) {
+        const long long row = sp.t0 + t + row0;
+        const float step = m2_dt(to_f32(dt[row * H + h]), bias);
+        m2_token(s, xbc + row * width, z + row * inner, y + row * inner, step, __expf(neg_a * step), skip, h, inner,
+                 g, G);
+        if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
+            f32x4* at = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride + head);
+            if (fold)
+#pragma unroll
+                for (int q = 0; q < M2_Q; ++q) at[m2_run(q)] = s[q];
+            ++sn.e0;
+        }
+    }
+    if (!fold) return;
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
 }
 
 }  // namespace pie::attn

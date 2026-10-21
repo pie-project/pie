@@ -257,12 +257,12 @@ pub const CODEGEN: &str = "cuda";
 pub const CODEGEN: &str = "hip";
 
 /// Powers of two from the floor up to `max_tokens`, with `steps - 1` more
-/// between each pair; from `fine_from` rows (0 never), at least
-/// `PREFILL_LATTICE_STEPS` a doubling. A prefill's GEMMs run its bucket's
+/// between each pair; from `fine_from` rows (0 never), at least `fine_steps`
+/// a doubling. A prefill's GEMMs run its bucket's
 /// rows, so a 2K prompt padded to 4096 costs a second prompt, while buckets
 /// this tall are few.
 #[must_use]
-pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32) -> Vec<u32> {
+pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32, fine_steps: u32) -> Vec<u32> {
     let steps = steps.max(1);
     let mut lattice: Vec<u32> = Vec::new();
     let push = |point: f64, lattice: &mut Vec<u32>| -> bool {
@@ -285,7 +285,7 @@ pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32) -> Ve
             return lattice;
         }
     }
-    let fine = steps.max(PREFILL_LATTICE_STEPS);
+    let fine = steps.max(fine_steps);
     for i in 0u32.. {
         let point = (f64::from(fine_from) * 2f64.powf(f64::from(i) / f64::from(fine))).ceil();
         if !push(point, &mut lattice) {
@@ -296,14 +296,18 @@ pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32) -> Ve
     lattice
 }
 
-const PREFILL_LATTICE_STEPS: u32 = 4;
-
 pub(crate) const LATTICE_FLOOR: u32 = 1;
 
 #[must_use]
-pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32, steps: u32, fine_from: u32) -> Vec<u32> {
+pub(crate) fn lattice(
+    stated: Vec<u32>,
+    max_tokens: u32,
+    steps: u32,
+    fine_from: u32,
+    fine_steps: u32,
+) -> Vec<u32> {
     if stated.is_empty() {
-        default_lattice(max_tokens, steps, fine_from)
+        default_lattice(max_tokens, steps, fine_from, fine_steps)
     } else {
         stated
     }

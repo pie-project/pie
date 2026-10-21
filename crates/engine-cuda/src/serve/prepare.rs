@@ -1476,6 +1476,7 @@ impl FrameShell for Shell {
                 });
         let readout_ceiling = last_rows.min(self.budget.max_lanes) + every_row;
         let bodied = bodied && readout_rows.len() <= readout_ceiling as usize;
+        let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
         }
@@ -1547,6 +1548,7 @@ impl FrameShell for Shell {
                 positions: &positions,
                 windows: &boundaries,
                 readout_rows: &readout_rows,
+                readout_live,
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,

@@ -935,15 +935,21 @@ namespace pie::linear {
 // offsets[num_experts + 1]. One block of 256 threads; dynamic LDS of
 // 2·(num_experts + 1) ints. A thread holds its first kOrderHeld routes in
 // registers across the two passes over them, and owns a run of the buckets
-// for the prefix, so the block meets at four barriers.
+// for the prefix, so the block meets at four barriers. Given `hist` (a
+// prefill's routes, `spans` blocks of moe_route_span_count having bucketed
+// kOrderSpan routes each), the counts are the spans' and in place of the
+// scatter each span's count becomes where its routes start, for
+// moe_route_span_scatter.
 constexpr int kOrderThreads = 1024;
 constexpr int kOrderHeld = 2;
+constexpr int kOrderSpan = 2048;
 
 __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __restrict__ routes,
                                                                  i32* __restrict__ order, i32* __restrict__ offsets,
                                                                  i32* __restrict__ work, int work_cap,
                                                                  int group_routes, int top_k, int route_count,
-                                                                 int num_experts, const u32* __restrict__ win) {
+                                                                 int num_experts, const u32* __restrict__ win,
+                                                                 i32* __restrict__ hist, int spans) {
     extern __shared__ i32 order_smem[];
     __shared__ i32 wave_totals[2][kOrderThreads / kWave];
     i32* counts = order_smem;
@@ -959,17 +965,23 @@ __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __re
 #pragma unroll
     for (int i = 0; i < kOrderHeld; ++i) {
         const int r = tid + i * kOrderThreads;
-        held[i] = r < live ? bucket(r) : -1;
+        held[i] = hist == nullptr && r < live ? bucket(r) : -1;
     }
     for (int e = tid; e <= num_experts; e += kOrderThreads) {
-        counts[e] = 0;
+        int c = 0;
+        if (hist != nullptr)
+            for (int b = 0; b < spans; ++b) c += hist[b * (num_experts + 1) + e];
+        counts[e] = c;
         fill[e] = 0;
     }
     __syncthreads();
+    if (hist == nullptr) {
 #pragma unroll
-    for (int i = 0; i < kOrderHeld; ++i)
-        if (held[i] >= 0) atomicAdd(counts + held[i], 1);
-    for (int r = tid + kOrderHeld * kOrderThreads; r < live; r += kOrderThreads) atomicAdd(counts + bucket(r), 1);
+        for (int i = 0; i < kOrderHeld; ++i)
+            if (held[i] >= 0) atomicAdd(counts + held[i], 1);
+        for (int r = tid + kOrderHeld * kOrderThreads; r < live; r += kOrderThreads)
+            atomicAdd(counts + bucket(r), 1);
+    }
     __syncthreads();
 
     // Thread t's buckets [t·per, +per): their routes and items, prefixed
@@ -1018,6 +1030,17 @@ __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __re
     }
     if (tid == 0) offsets[num_experts + 1] = min(total, work_cap);
     __syncthreads();
+    if (hist != nullptr) {
+        for (int e = tid; e <= num_experts; e += kOrderThreads) {
+            int at = counts[e];
+            for (int b = 0; b < spans; ++b) {
+                const int c = hist[b * (num_experts + 1) + e];
+                hist[b * (num_experts + 1) + e] = at;
+                at += c;
+            }
+        }
+        return;
+    }
 
 #pragma unroll
     for (int i = 0; i < kOrderHeld; ++i)
@@ -1025,6 +1048,45 @@ __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __re
     for (int r = tid + kOrderHeld * kOrderThreads; r < live; r += kOrderThreads) {
         const int e = bucket(r);
         order[counts[e] + atomicAdd(fill + e, 1)] = base + r;
+    }
+}
+
+// A prefill's routes bucketed a kOrderSpan span a block (256 threads,
+// dynamic LDS of num_experts + 1 ints): hist[span][e] counts the span's
+// routes of expert e (e = num_experts: no expert's).
+__global__ __launch_bounds__(256) void moe_route_span_count(const i32* __restrict__ routes, i32* __restrict__ hist,
+                                                           int top_k, int route_count, int num_experts,
+                                                           const u32* __restrict__ win) {
+    extern __shared__ i32 span_smem[];
+    const int tid = threadIdx.x;
+    const int live = win != nullptr ? min(static_cast<int>(win[0]) * top_k, route_count) : route_count;
+    const int base = win != nullptr ? static_cast<int>(win[1]) * top_k : 0;
+    for (int e = tid; e <= num_experts; e += 256) span_smem[e] = 0;
+    __syncthreads();
+    const int end = min(live, static_cast<int>(blockIdx.x + 1) * kOrderSpan);
+    for (int r = blockIdx.x * kOrderSpan + tid; r < end; r += 256) {
+        const int e = routes[base + r];
+        atomicAdd(span_smem + (e < 0 || e >= num_experts ? num_experts : e), 1);
+    }
+    __syncthreads();
+    for (int e = tid; e <= num_experts; e += 256) hist[blockIdx.x * (num_experts + 1) + e] = span_smem[e];
+}
+
+// The span's routes to where moe_route_order (over `hist`) started them.
+__global__ __launch_bounds__(256) void moe_route_span_scatter(const i32* __restrict__ routes,
+                                                             const i32* __restrict__ hist, i32* __restrict__ order,
+                                                             int top_k, int route_count, int num_experts,
+                                                             const u32* __restrict__ win) {
+    extern __shared__ i32 span_smem[];
+    const int tid = threadIdx.x;
+    const int live = win != nullptr ? min(static_cast<int>(win[0]) * top_k, route_count) : route_count;
+    const int base = win != nullptr ? static_cast<int>(win[1]) * top_k : 0;
+    for (int e = tid; e <= num_experts; e += 256) span_smem[e] = hist[blockIdx.x * (num_experts + 1) + e];
+    __syncthreads();
+    const int end = min(live, static_cast<int>(blockIdx.x + 1) * kOrderSpan);
+    for (int r = blockIdx.x * kOrderSpan + tid; r < end; r += 256) {
+        const int e = routes[base + r];
+        order[atomicAdd(span_smem + (e < 0 || e >= num_experts ? num_experts : e), 1)] = base + r;
     }
 }
 

@@ -132,6 +132,29 @@ pub struct GemmSkinnyDenseRows(pub u32);
 #[decision(id = "kernel.gemm.skinny_batch_min_n", constant(range(0..=4_194_304)), default = 65536, tune = search)]
 pub struct GemmSkinnyBatchMinN(pub u32);
 
+/// The rows a dense bf16 projection gives the turned kernel (whole 512-byte
+/// weight row runs turned through LDS into the matrix core's order), from
+/// and up to (at most 16); from 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_from", constant(range(0..=16)), default = 0, tune = search)]
+pub struct GemmTurnFrom(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_until", constant(range(0..=16)), default = 16, tune = search)]
+pub struct GemmTurnUntil(pub u32);
+
+/// The most rows the turned kernel takes over a bank at least
+/// `kernel.gemm.skinny_batch_min_n` wide (an lm head), up to 32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_wide_until", constant(range(0..=32)), default = 16, tune = search)]
+pub struct GemmTurnWideUntil(pub u32);
+
+/// The fewest output columns (a bank's rows) the turned kernel takes: a
+/// narrower bank's tiles leave the card idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_min_n", constant(range(0..=4_194_304)), default = 2048, tune = search)]
+pub struct GemmTurnMinN(pub u32);
+
 /// Routes an expert must average before bf16/f16 routed matmuls group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.group_at", constant(range(1..=4096)), default = 4, tune = search)]
@@ -192,6 +215,28 @@ pub struct MoeDenseBatchUntil(pub u32);
 #[decision(id = "kernel.moe.dense_wide_from", constant(range(0..=4096)), default = 26, tune = search)]
 pub struct MoeDenseWideFrom(pub u32);
 
+/// The padded rows from which an lm head over a body's readouts multiplies
+/// only the live ones (a device word): hipBLASLt's grouped kernels, M read
+/// on the device, one launch a range of live rows (0: never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct GemmLiveFrom(pub u32);
+
+/// The grouped tiles (`MT0·10⁶ + MT1·10³ + depth`) of the live lm head's
+/// three launches; each takes the live rows up to its MT1 the one before
+/// did not (the last, the rest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_tile_small", constant(range(0..=4_000_000_000)), default = 192_032_128, tune = search)]
+pub struct GemmLiveTileSmall(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_tile_mid", constant(range(0..=4_000_000_000)), default = 256_128_064, tune = search)]
+pub struct GemmLiveTileMid(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_tile_large", constant(range(0..=4_000_000_000)), default = 176_256_064, tune = search)]
+pub struct GemmLiveTileLarge(pub u32);
+
 /// The rows from which, and up to which, a bf16 projection (and the fused
 /// gate/up SwiGLU) takes the batch engine over hipBLASLt; until 0, never.
 /// On MI300X it wins by 1.2x only at a few rows over a wide bank (Qwen3.8's
@@ -212,6 +257,42 @@ pub struct DenseBatchWeightMi(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.dense.batch_weight_max_mi", constant(range(0..=65_536)), default = 192, tune = search)]
 pub struct DenseBatchWeightMaxMi(pub u32);
+
+/// The rows up to which MLA's query absorb (`q_nope · W_UK`, per head)
+/// takes the native kernel (`attn/mla.hip` `mla_absorb`) over rocBLAS's
+/// strided batch; 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.absorb_q_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MlaAbsorbQUntil(pub u32);
+
+/// The rows from which, and up to which, MLA's value absorb (`latent ·
+/// W_UVᵀ`, per head) takes the native kernel; until 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.absorb_out_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MlaAbsorbOutFrom(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.absorb_out_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MlaAbsorbOutUntil(pub u32);
+
+/// The rows up to which a dense `e4m3tile128` projection takes the FP8
+/// decode tile (`dense_fp8_mfma`, at most 64), past them the prefill tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.fp8.decode_until", constant(range(1..=64)), default = 64, tune = search)]
+pub struct Fp8DecodeUntil(pub u32);
+
+/// The rows up to which those prefill tiles are 64 x 128 (a wave a 16-row
+/// strip, three waves a SIMD) rather than 64 or 128 x 256; 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.fp8.narrow_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct Fp8NarrowUntil(pub u32);
+
+/// The fewest 16-column state slices (requests x value heads x v_dim / 16)
+/// from which the gated-delta chunk scan walks 32-column slices, a chunk's
+/// W and k̂ᵀ read for twice the columns; 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_wide_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SsmGdnWideFrom(pub u32);
 
 pub fn register(registry: &mut Registry) {
     registry
@@ -237,6 +318,10 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmSkinnyQuadFrom>()
         .add::<GemmSkinnyDenseRows>()
         .add::<GemmSkinnyBatchMinN>()
+        .add::<GemmTurnFrom>()
+        .add::<GemmTurnUntil>()
+        .add::<GemmTurnWideUntil>()
+        .add::<GemmTurnMinN>()
         .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
@@ -250,7 +335,17 @@ pub fn register(registry: &mut Registry) {
         .add::<DenseBatchFrom>()
         .add::<DenseBatchUntil>()
         .add::<DenseBatchWeightMi>()
-        .add::<DenseBatchWeightMaxMi>();
+        .add::<DenseBatchWeightMaxMi>()
+        .add::<MlaAbsorbQUntil>()
+        .add::<MlaAbsorbOutFrom>()
+        .add::<MlaAbsorbOutUntil>()
+        .add::<Fp8DecodeUntil>()
+        .add::<Fp8NarrowUntil>()
+        .add::<SsmGdnWideFrom>()
+        .add::<GemmLiveFrom>()
+        .add::<GemmLiveTileSmall>()
+        .add::<GemmLiveTileMid>()
+        .add::<GemmLiveTileLarge>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -278,6 +373,10 @@ pub struct Tuning {
     pub gemm_skinny_quad_from: u32,
     pub gemm_skinny_dense_rows: u32,
     pub gemm_skinny_batch_min_n: u32,
+    pub gemm_turn_from: u32,
+    pub gemm_turn_until: u32,
+    pub gemm_turn_wide_until: u32,
+    pub gemm_turn_min_n: u32,
     pub moe_group_at: u32,
     pub mxfp4_grouped_reuse: u32,
     pub affine_grouped: bool,
@@ -292,6 +391,14 @@ pub struct Tuning {
     pub dense_batch_until: u32,
     pub dense_batch_weight_mi: u32,
     pub dense_batch_weight_max_mi: u32,
+    pub mla_absorb_q_until: u32,
+    pub mla_absorb_out_from: u32,
+    pub mla_absorb_out_until: u32,
+    pub fp8_decode_until: u32,
+    pub fp8_narrow_until: u32,
+    pub ssm_gdn_wide_from: u32,
+    pub gemm_live_from: u32,
+    pub gemm_live_tiles: [u32; 3],
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
     /// never on ROCm.
     pub dsv4_prefill_from: u32,
@@ -323,6 +430,10 @@ impl Tuning {
         gemm_skinny_quad_from: 3,
         gemm_skinny_dense_rows: 4,
         gemm_skinny_batch_min_n: 65536,
+        gemm_turn_from: 0,
+        gemm_turn_until: 16,
+        gemm_turn_wide_until: 16,
+        gemm_turn_min_n: 2048,
         moe_group_at: 4,
         mxfp4_grouped_reuse: 2,
         affine_grouped: true,
@@ -337,6 +448,14 @@ impl Tuning {
         dense_batch_until: 16,
         dense_batch_weight_mi: 128,
         dense_batch_weight_max_mi: 192,
+        mla_absorb_q_until: 0,
+        mla_absorb_out_from: 0,
+        mla_absorb_out_until: 0,
+        fp8_decode_until: 64,
+        fp8_narrow_until: 0,
+        ssm_gdn_wide_from: 0,
+        gemm_live_from: 0,
+        gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
         dsv4_prefill_from: 0,
         dsv4_replay: false,
     };
@@ -366,6 +485,10 @@ impl Tuning {
             gemm_skinny_quad_from: profile.get::<GemmSkinnyQuadFrom>().0,
             gemm_skinny_dense_rows: profile.get::<GemmSkinnyDenseRows>().0,
             gemm_skinny_batch_min_n: profile.get::<GemmSkinnyBatchMinN>().0,
+            gemm_turn_from: profile.get::<GemmTurnFrom>().0,
+            gemm_turn_until: profile.get::<GemmTurnUntil>().0,
+            gemm_turn_wide_until: profile.get::<GemmTurnWideUntil>().0,
+            gemm_turn_min_n: profile.get::<GemmTurnMinN>().0,
             moe_group_at: profile.get::<MoeGroupAt>().0,
             mxfp4_grouped_reuse: profile.get::<MoeMxfp4GroupedReuse>().0,
             affine_grouped: profile.on::<MoeAffineGrouped>(&Anywhere),
@@ -380,6 +503,18 @@ impl Tuning {
             dense_batch_until: profile.get::<DenseBatchUntil>().0,
             dense_batch_weight_mi: profile.get::<DenseBatchWeightMi>().0,
             dense_batch_weight_max_mi: profile.get::<DenseBatchWeightMaxMi>().0,
+            mla_absorb_q_until: profile.get::<MlaAbsorbQUntil>().0,
+            mla_absorb_out_from: profile.get::<MlaAbsorbOutFrom>().0,
+            mla_absorb_out_until: profile.get::<MlaAbsorbOutUntil>().0,
+            fp8_decode_until: profile.get::<Fp8DecodeUntil>().0,
+            fp8_narrow_until: profile.get::<Fp8NarrowUntil>().0,
+            ssm_gdn_wide_from: profile.get::<SsmGdnWideFrom>().0,
+            gemm_live_from: profile.get::<GemmLiveFrom>().0,
+            gemm_live_tiles: [
+                profile.get::<GemmLiveTileSmall>().0,
+                profile.get::<GemmLiveTileMid>().0,
+                profile.get::<GemmLiveTileLarge>().0,
+            ],
             dsv4_prefill_from: 0,
             dsv4_replay: false,
         }

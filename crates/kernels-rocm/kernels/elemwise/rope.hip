@@ -176,7 +176,10 @@ __global__ void rope_partial(T* __restrict__ q, T* __restrict__ k,
 
 // The rotated part is the last rotary_dim entries of every head, its own
 // rotation at theta^(-2i/rotary_dim) (with YaRN's ramp when factor > 1);
-// `inverse` turns it back by the negated angle. One block per token row.
+// `inverse` turns it back by the negated angle. One block per token row. A
+// row of at most a block of pairs turns a pair a thread at its own angle;
+// a wider one takes its rotary_dim/2 angles once into LDS (cos then sin)
+// and turns eight entries a lane where the tail allows 16-byte runs.
 __global__ void rope_partial_last(bf16* __restrict__ q, bf16* __restrict__ k,
                                   const i32* __restrict__ positions, int num_q_heads,
                                   int num_kv_heads, int head_dim, int rotary_dim, float theta,
@@ -189,15 +192,68 @@ __global__ void rope_partial_last(bf16* __restrict__ q, bf16* __restrict__ k,
     const int half = rotary_dim / 2;
     const int offset = head_dim - rotary_dim;
     const int pos = inverse ? -positions[row] : positions[row];
-    for (int t = threadIdx.x; t < (num_q_heads + num_kv_heads) * half; t += blockDim.x) {
-        const int head = t / half;
-        const int i = t % half;
+    const int heads = num_q_heads + num_kv_heads;
+    auto angle = [&](int i, float& c, float& s) {
         float freq = frequency(theta, i, half);
         if (yarn_factor > 1.f) freq = yarn_frequency(freq, yarn_factor, yarn_low_dim, yarn_high_dim, i);
-        float c, s;
         turn(pos, freq, c, s);
-        rotate_any(head_at(q, k, row, head, num_q_heads, num_kv_heads, head_dim) + offset, i, half,
-                   interleaved, c, s);
+    };
+    auto tail = [&](int head) {
+        return head_at(q, k, row, head, num_q_heads, num_kv_heads, head_dim) + offset;
+    };
+    if (heads * half <= static_cast<int>(blockDim.x)) {
+        const int t = threadIdx.x;
+        if (t >= heads * half) return;
+        float c, s;
+        angle(t % half, c, s);
+        rotate_any(tail(t / half), t % half, half, interleaved, c, s);
+        return;
+    }
+    extern __shared__ float last_cs[];
+    for (int i = threadIdx.x; i < half; i += blockDim.x) angle(i, last_cs[i], last_cs[half + i]);
+    lds_barrier();
+    const bool packed = offset % 8 == 0 && head_dim % 8 == 0 && aligned16(q) && aligned16(k) &&
+                        (interleaved ? rotary_dim % 8 == 0 : half % 8 == 0);
+    if (!packed) {
+        for (int t = threadIdx.x; t < heads * half; t += blockDim.x) {
+            const int i = t % half;
+            rotate_any(tail(t / half), i, half, interleaved, last_cs[i], last_cs[half + i]);
+        }
+        return;
+    }
+    // A unit is one pack of four interleaved pairs, or a pack of eight
+    // split pairs and its mate `half` on.
+    const int units = interleaved ? rotary_dim / 8 : half / 8;
+    for (int t = threadIdx.x; t < heads * units; t += blockDim.x) {
+        const int u = t % units;
+        bf16* at = tail(t / units);
+        if (interleaved) {
+            Pack8<bf16>& p = *reinterpret_cast<Pack8<bf16>*>(at + 8 * u);
+            Pack8<bf16> o = p;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int i = 4 * u + j;
+                const float c = last_cs[i], sn = last_cs[half + i];
+                const float x = to_f32(o.v[2 * j]), y = to_f32(o.v[2 * j + 1]);
+                o.v[2 * j] = from_f32<bf16>(x * c - y * sn);
+                o.v[2 * j + 1] = from_f32<bf16>(y * c + x * sn);
+            }
+            p = o;
+        } else {
+            Pack8<bf16>& lo = *reinterpret_cast<Pack8<bf16>*>(at + 8 * u);
+            Pack8<bf16>& hi = *reinterpret_cast<Pack8<bf16>*>(at + half + 8 * u);
+            Pack8<bf16> a = lo, b = hi;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int i = 8 * u + j;
+                const float c = last_cs[i], sn = last_cs[half + i];
+                const float x = to_f32(a.v[j]), y = to_f32(b.v[j]);
+                a.v[j] = from_f32<bf16>(x * c - y * sn);
+                b.v[j] = from_f32<bf16>(y * c + x * sn);
+            }
+            lo = a;
+            hi = b;
+        }
     }
 }
 
