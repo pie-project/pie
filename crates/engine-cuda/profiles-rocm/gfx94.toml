@@ -70,3 +70,4 @@ ssm.gdn_wide_from = 512
 [engine]
 forward_tokens = 10240
 prefill_lattice_from = 2048
+prefill_lattice_steps = 8

@@ -99,6 +99,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.budget.max_tokens,
         engine.lattice_steps,
         engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
     );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
@@ -177,6 +178,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             tokens,
             engine.lattice_steps,
             engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
         );
         budget
     };
@@ -346,6 +348,7 @@ fn refit(
             tokens,
             engine.lattice_steps,
             engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
         );
         budget
     };
