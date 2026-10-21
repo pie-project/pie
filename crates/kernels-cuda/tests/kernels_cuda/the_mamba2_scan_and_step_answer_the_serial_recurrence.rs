@@ -142,6 +142,7 @@ fn the_mamba2_scan_and_step_answer_the_serial_recurrence() {
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
+        snapshots: kernels_cuda::Snapshots::NONE,
     };
     let at = |base: u64, row: usize, width: usize| base + (row * width * 2) as u64;
     let indptr: Vec<i32> = vec![0, LENS[0] as i32, prompt as i32];

@@ -60,4 +60,4 @@ pub use seat::{ENTRIES, EntryInfo, Lanes, Reads, Routes, Rows};
 #[doc(hidden)]
 pub use cudarc;
 
-pub use tensor::{KvPool, RaggedTensor, RecurrentPool, Tensor};
+pub use tensor::{KvPool, RaggedTensor, RecurrentPool, Snapshots, Tensor};

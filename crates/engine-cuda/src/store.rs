@@ -425,7 +425,6 @@ pub struct Seats {
     pub write_state_mask: Tensor,
     pub commit_len: Tensor,
     pub begin_at: Tensor,
-    #[cfg(feature = "rocm")]
     pub snapshots: kernels_cuda::Snapshots,
 }
 
@@ -444,7 +443,6 @@ impl Seats {
         self
     }
 
-    #[cfg(feature = "rocm")]
     #[must_use]
     pub fn snapshotting(mut self, snapshots: kernels_cuda::Snapshots) -> Seats {
         self.snapshots = snapshots;
@@ -1262,7 +1260,6 @@ impl Pools {
                     commit_len: seats.commit_len,
                     begin_at: seats.begin_at,
                     fused_decay: false,
-                    #[cfg(feature = "rocm")]
                     snapshots: seats.snapshots,
                     slab: Tensor::new(
                         planes.first().map_or(0, elastic::Arena::base),
