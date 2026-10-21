@@ -1,6 +1,6 @@
 //! The GPU's profile: the CUDA registry, the facts this engine measures, the
 //! checked-in profiles, and resolution for one load. A ROCm build reads the
-//! same registry against AMD's chips: `cc` is the gfx version there.
+//! same registry against AMD's chips, keyed by their gfx version.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -9,11 +9,16 @@ use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shel
 
 use crate::{Graphs, Recording};
 
+/// The fact a family file assumes: CUDA's compute capability as major * 10
+/// + minor (89 is sm_89), or AMD's gfx version the same way (94 is gfx94x).
+#[cfg(not(feature = "rocm"))]
+pub const ARCH: &str = "cc";
+#[cfg(feature = "rocm")]
+pub const ARCH: &str = "gfx";
+
 /// What this engine measures about its GPU.
 pub const FACTS: &[Var] = &[
-    // Compute capability as major * 10 + minor: 89 is sm_89 (on ROCm the gfx
-    // version: 94 is gfx94x).
-    Var::fixed("cc", Domain::COUNT),
+    Var::fixed(ARCH, Domain::COUNT),
     Var::fixed("sms", Domain::COUNT),
 ];
 
@@ -155,45 +160,40 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
-/// The checked-in profiles' directory: AMD's chips have their own.
-#[cfg(not(feature = "rocm"))]
-macro_rules! profiles {
-    () => {
-        "profiles"
-    };
-}
-#[cfg(feature = "rocm")]
-macro_rules! profiles {
-    () => {
-        "profiles-rocm"
-    };
-}
-
-macro_rules! seeded {
-    ($($file:literal),* $(,)?) => {
-        pub const SEEDED: &[(&str, &str)] = &[
-            $(($file, include_str!(concat!("../", profiles!(), "/", $file)))),*
-        ];
+/// The checked-in profiles, CUDA's and AMD's side by side in `profiles/`:
+/// a build seeds its own, and the other's are the files beside them.
+macro_rules! shelved {
+    (cuda: [$($cuda:literal),* $(,)?], rocm: [$($rocm:literal),* $(,)?] $(,)?) => {
+        #[cfg(not(feature = "rocm"))]
+        pub const SEEDED: &[(&str, &str)] =
+            &[$(($cuda, include_str!(concat!("../profiles/", $cuda)))),*];
+        #[cfg(not(feature = "rocm"))]
+        const BESIDE: &[&str] = &[$($rocm),*];
+        #[cfg(feature = "rocm")]
+        pub const SEEDED: &[(&str, &str)] =
+            &[$(($rocm, include_str!(concat!("../profiles/", $rocm)))),*];
+        #[cfg(feature = "rocm")]
+        const BESIDE: &[&str] = &[$($cuda),*];
     };
 }
 
-#[cfg(feature = "rocm")]
-seeded!("gfx94.toml");
-#[cfg(not(feature = "rocm"))]
-seeded!(
-    "sm80.toml",
-    "sm80/nvidia-a100-80gb-pcie.toml",
-    "sm86.toml",
-    "sm87.toml",
-    "sm89.toml",
-    "sm89/nvidia-l40s.toml",
-    "sm90.toml",
-    "sm100.toml",
-    "sm100/nvidia-b200.toml",
-    "sm103.toml",
-    "sm110.toml",
-    "sm120.toml",
-    "sm121.toml",
+shelved!(
+    cuda: [
+        "sm80.toml",
+        "sm80/nvidia-a100-80gb-pcie.toml",
+        "sm86.toml",
+        "sm87.toml",
+        "sm89.toml",
+        "sm89/nvidia-l40s.toml",
+        "sm90.toml",
+        "sm100.toml",
+        "sm100/nvidia-b200.toml",
+        "sm103.toml",
+        "sm110.toml",
+        "sm120.toml",
+        "sm121.toml",
+    ],
+    rocm: ["gfx94.toml"],
 );
 
 pub static SHELF: Shelf = Shelf {
@@ -205,7 +205,7 @@ pub static SHELF: Shelf = Shelf {
 #[must_use]
 pub fn facts(major: u32, minor: u32, sms: u32) -> Facts {
     Facts::of(registry())
-        .int("cc", i64::from(major * 10 + minor))
+        .int(ARCH, i64::from(major * 10 + minor))
         .int("sms", i64::from(sms))
 }
 
@@ -372,9 +372,9 @@ mod tests {
 
     #[test]
     fn the_checked_in_profiles_hold_together_and_each_family_names_its_tier() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(profiles!());
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
         SHELF
-            .check(registry(), &dir)
+            .check_beside(registry(), &dir, BESIDE)
             .unwrap_or_else(|e| panic!("{e}"));
         for (name, text) in SEEDED.iter().filter(|(n, _)| !n.contains('/')) {
             let file = registry()
@@ -384,7 +384,7 @@ mod tests {
                 .target
                 .assumes
                 .iter()
-                .find(|(i, _)| FACTS[*i].name == "cc")
+                .find(|(i, _)| FACTS[*i].name == ARCH)
                 .map(|(_, cc)| *cc)
                 .expect("a family file assumes its compute capability");
             let tier = if cfg!(feature = "rocm") {
@@ -1027,7 +1027,7 @@ mod device {
             return;
         };
         assert!(!name.is_empty(), "the driver names the GPU");
-        let cc = facts.get("cc").expect("probed");
+        let cc = facts.get(super::ARCH).expect("probed");
         #[cfg(not(feature = "rocm"))]
         assert!(
             cc >= 80,
