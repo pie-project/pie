@@ -1,6 +1,6 @@
 use kernels_metal::Tensor;
 use kernels_metal::attn::ple;
-use kernels_metal::linear::moe::{self, RoutedScratch};
+use kernels_metal::linear::moe::{self, RegisterRooms, RoutedScratch};
 use kernels_metal::linear::quant;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
@@ -76,6 +76,17 @@ struct Routed {
     sums: Room,
 }
 
+/// The rooms of a routed MLP on the register tile ([`RegisterRooms`]).
+#[derive(Clone, Copy, Debug)]
+struct Register {
+    tiles: Room,
+    rows: Room,
+    inv: Room,
+    table: Room,
+    hidden: Room,
+    y: Room,
+}
+
 #[derive(Debug)]
 pub struct Scratch {
     plane: Buffer,
@@ -83,6 +94,7 @@ pub struct Scratch {
     precast: Option<Room>,
     partials: Option<Room>,
     routed: Option<Routed>,
+    register: Option<Register>,
     index: Option<Room>,
     copy: Option<CopyRoom>,
 
@@ -151,6 +163,10 @@ impl Scratch {
         let mut dense: Vec<(u32, u32)> = Vec::new();
         let (mut act_rows, mut act_k) = (0u64, 0u64);
         let (mut sorted, mut pairs, mut routed_k, mut routed_n) = (0u64, 0u64, 0u64, 0u64);
+        // The register expert tiles: the most tiles and routes a fire of its
+        // tokens fills, and the widest input and output a pass of them takes.
+        let (mut register_tiles, mut register_routes, mut register_k, mut register_n) =
+            (0u64, 0u64, 0u64, 0u64);
         for node in &trace.nodes {
             for (act, w, y) in crate::legs::matmuls(&node.op) {
                 if !banked(w) {
@@ -178,6 +194,17 @@ impl Scratch {
                     let experts = routers.get(routes.0 as usize).copied().unwrap_or(0);
                     if experts == 0 {
                         continue;
+                    }
+                    if tuning.moe_register()
+                        && matches!(op, Linear::MoeMatmulSelectQuant { .. })
+                        && let Some(fan) = of(*routes).map(|r| r.width).filter(|w| *w > 0)
+                    {
+                        let tokens = moe::REGISTER_TOKENS;
+                        register_tiles = register_tiles
+                            .max(u64::from(moe::register_tiles(tokens, fan, experts, true)));
+                        register_routes = register_routes.max(u64::from(tokens * fan));
+                        register_k = register_k.max(u64::from(x.width));
+                        register_n = register_n.max(u64::from(y.width));
                     }
                     if moe::tile_rows(y.rows, experts, tuning) <= 1 {
                         continue;
@@ -235,6 +262,20 @@ impl Scratch {
             }
         });
 
+        let register = (register_tiles > 0).then(|| {
+            let mut at = 0u64;
+            let table = register_tiles
+                * moe::register_table_width(u32::try_from(register_k).unwrap_or(u32::MAX));
+            Register {
+                tiles: Room::lay(&mut at, 1, register_tiles + 1, Dtype::I32),
+                rows: Room::lay(&mut at, 1, register_tiles * 8, Dtype::I32),
+                inv: Room::lay(&mut at, 1, register_routes, Dtype::I32),
+                table: Room::lay(&mut at, 1, table, Dtype::Bf16),
+                hidden: Room::lay(&mut at, 1, table, Dtype::Bf16),
+                y: Room::lay(&mut at, register_tiles * 8, register_n, Dtype::Bf16),
+            }
+        });
+
         let index = trace
             .nodes
             .iter()
@@ -273,6 +314,7 @@ impl Scratch {
             .map_or(0, |r| r.at + r.bytes())
             .max(partials.map_or(0, |r| r.at + r.bytes()))
             .max(routed.map_or(0, |r| r.sums.at + r.sums.bytes()))
+            .max(register.map_or(0, |r| r.y.at + r.y.bytes()))
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
         let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
@@ -320,6 +362,7 @@ impl Scratch {
             precast,
             partials,
             routed,
+            register,
             index,
             copy,
             spatial,
@@ -442,6 +485,23 @@ impl Scratch {
                 x: r.x.bind(handles, &self.plane)?,
                 y: r.y.bind(handles, &self.plane)?,
                 sums: r.sums.bind(handles, &self.plane)?,
+            })
+        };
+        Some(mint())
+    }
+
+    /// The register expert tiles' rooms, where the load runs them; they
+    /// overlap the precast and routed rooms.
+    pub fn register(&self, handles: &Handles) -> Option<Result<RegisterRooms>> {
+        let r = self.register?;
+        let mint = || {
+            Ok(RegisterRooms {
+                tiles: r.tiles.bind(handles, &self.plane)?,
+                rows: r.rows.bind(handles, &self.plane)?,
+                inv: r.inv.bind(handles, &self.plane)?,
+                table: r.table.bind(handles, &self.plane)?,
+                hidden: r.hidden.bind(handles, &self.plane)?,
+                y: r.y.bind(handles, &self.plane)?,
             })
         };
         Some(mint())
