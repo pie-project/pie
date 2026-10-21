@@ -9,3 +9,11 @@ assumes = { cc = 89 }
 # 57% less GPU time than on the three wmma launches.
 [kernel]
 ssm.gdn_fused_scan = true
+
+# A prefill's fire on eight buckets a doubling from 256 rows: its GEMMs run
+# its bucket's rows, and a 556-row prompt padded to 1024 ran 84% more of
+# them (Qwen3.6-27B's prefill 30-35% faster on an H100, an A100 and an RTX
+# PRO 6000).
+[engine]
+prefill_lattice_from = 256
+prefill_lattice_steps = 8

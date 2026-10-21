@@ -462,7 +462,18 @@ mod tests {
                 "{gpu}"
             );
             assert!(report.untuned(), "{gpu}");
-            assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
+            // Ampere through Blackwell's consumer parts bucket a prefill
+            // eight a doubling from 256 rows; the rest keep the defaults.
+            let fine = matches!((major, minor), (8, 0 | 6 | 9) | (9, 0) | (12, 0));
+            assert_eq!(
+                Engine::of(&profile),
+                Engine {
+                    prefill_lattice_from: if fine { 256 } else { 0 },
+                    prefill_lattice_steps: if fine { 8 } else { 4 },
+                    ..Engine::of(&registry().defaults())
+                },
+                "{gpu}"
+            );
             let tuning = kernels_cuda::tuning::Tuning::of(&profile);
             // sm_100 alone runs the tcgen05 prefill and reads a wide
             // group's single-token rows through the prefill kernel; every
@@ -946,7 +957,14 @@ mod tests {
         assert_eq!(report.used, profile::Source::Seeded("sm89.toml".into()));
         assert!(report.untuned());
         for p in [&l40s, &rtx] {
-            assert_eq!(Engine::of(p), Engine::of(&registry().defaults()));
+            assert_eq!(
+                Engine::of(p),
+                Engine {
+                    prefill_lattice_from: 256,
+                    prefill_lattice_steps: 8,
+                    ..Engine::of(&registry().defaults())
+                }
+            );
             assert!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_fused_scan);
             assert_eq!(
                 kernels_cuda::tuning::Tuning {
@@ -957,7 +975,9 @@ mod tests {
                 "what an Ada GPU ran before its family file, past the gated delta scan"
             );
             for (spec, rungs, _) in p.entries() {
-                if spec.id == "kernel.ssm.gdn_fused_scan" {
+                if spec.id == "kernel.ssm.gdn_fused_scan"
+                    || spec.id.starts_with("engine.prefill_lattice_")
+                {
                     continue;
                 }
                 assert_eq!(
