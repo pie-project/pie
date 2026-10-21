@@ -143,6 +143,9 @@ fn check(
             Pass::Decode => dsv4::decode(
                 &ctx, qt, pos_t, req_t, floor_t, &win, 128, pooled, sink_t, 64, 512, s, turned, o,
             ),
+            // The prefill and window-only kernels are tcgen05's: elsewhere
+            // their passes have no kernel to answer.
+            Pass::Prefill(_) | Pass::Window if !kernels_cuda::linear::tc5::supported() => continue,
             Pass::Prefill(safe) => {
                 let takes = pre::takes(64, 512, Some(128), &win, &staged);
                 assert!(takes, "V4-Flash's shape");
@@ -201,6 +204,10 @@ fn deepseeks_attention_answers_the_reference() {
 /// it has grown to, landing what a fresh pass lands, bit for bit.
 #[test]
 fn a_recorded_pass_reads_the_page_tables_its_replay_states() {
+    // The pass is the tcgen05 prefill's.
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
     for fmts in [[Rows::Ds; 2], [Rows::Mx8, Rows::Nv4]] {
         let (mut gpu, mut lcg, n) = (Gpu::open(), Lcg::seeded(0x9a), 6usize);
         let (q_raw, _) = lcg.row(n * H * D);

@@ -3,7 +3,7 @@
 //! The paged attention launchers (`decode_lse`, FA2's and tcgen05's
 //! `prefill_lse` and their sinked forms) against the host softmax, one case a route.
 
-use crate::common::attn_ref::{attend, col, landed, near, pool, ten, tuned};
+use crate::common::attn_ref::{attend, col, near, pool, ten, tuned, wide};
 use crate::common::host::to_e4m3;
 use crate::common::tc5::e4m3;
 use crate::common::{Gpu, Lcg, from_bf16, host::upload_to};
@@ -224,13 +224,18 @@ fn check_live(
     );
     want_o[..ra * qw].fill(from_bf16(0x7f7f));
     want_o[rb * qw..].fill(from_bf16(0x7f7f));
-    // A padded head's values past their width are never written.
-    want_o
-        .iter_mut()
-        .enumerate()
-        .filter(|(i, _)| i % d as usize >= lv)
-        .for_each(|(_, o)| *o = from_bf16(0x7f7f));
-    landed(&gpu, o_at, &want_o, 2e-2, 1.0, &what);
+    // A padded head's values past their width are no one's: the live
+    // columns alone are compared (a split's fold may scale the tail).
+    gpu.sync();
+    let got_o = wide(&gpu.down::<u16>(o_at, want_o.len()));
+    let live_cols = |v: &[f32]| -> Vec<f32> {
+        v.iter()
+            .enumerate()
+            .filter(|(i, _)| (i % d as usize) < lv)
+            .map(|(_, &x)| x)
+            .collect()
+    };
+    near(&live_cols(&got_o), &live_cols(&want_o), 2e-2, 1.0, &what);
     let got_lse: Vec<f32> = gpu.down(lse_at, rows * qh as usize);
     let span = ra * qh as usize..rb * qh as usize;
     near(&got_lse[span.clone()], &want_lse[span], 1e-2, 1.0, &what);
@@ -276,14 +281,16 @@ fn the_paged_attention_answers_the_reference() {
     for (heads, reqs, window, flags, lanes, tuning) in cases {
         check(heads, reqs, window, flags, lanes, tuning);
     }
-    let tc5 = tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding) = (true, true));
+    // Where tcgen05 is absent, FA2 reads the live widths (`kernel.sdpa.fa2_live`).
+    let live = tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding, t.fa2_live) = (true, true, true));
     let none = [0, 0];
     #[rustfmt::skip]
     let cases = [
-        // MiMo's heads, 192-wide keys and 128-wide values padded to 256: the tcgen05 prefill reads
-        // the widths alone, whole and over a window.
-        ([64, 8, 256], long, None, own, pre, tc5, [192, 128], false),
-        ([64, 8, 256], long, w128, sunk, pre, tc5, [192, 128], false),
+        // MiMo's heads, 192-wide keys and 128-wide values padded to 256: the tcgen05 prefill (FA2
+        // below it) reads the widths alone, whole and over a window, and a decode's grouped rows.
+        ([64, 8, 256], long, None, own, pre, live, [192, 128], false),
+        ([64, 8, 256], long, w128, sunk, pre, live, [192, 128], false),
+        ([64, 8, 256], dec, w128, sunk, pre, live, [192, 128], false),
         // An e4m3 pool: FA2's decode and prefill read it as it is, the tensor-core decode widens it
         // (whole, split, over a cluster), the tcgen05 prefill reads a bf16 shadow of it.
         ([32, 2, 128], dec, None, own, all, read(false, false, 0, 0), none, true),

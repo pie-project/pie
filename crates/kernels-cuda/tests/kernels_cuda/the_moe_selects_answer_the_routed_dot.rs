@@ -182,6 +182,10 @@ fn the_routed_selects_answer_the_routed_dot() {
     let (gemv, fp32) = (Tuning { moe_grouped: false, ..d }, Tuning { mxfp4_wmma: false, ..d });
     #[rustfmt::skip]
     let mma = Tuning { mxfp4_mma_until: 65_536, mxfp4_mma_from: 1, ..d };
+    let lean = Tuning {
+        mxfp4_select_lean: true,
+        ..d
+    };
     #[rustfmt::skip]
     let bf16mma = Tuning { moe_grouped: false, bf16_mma_from: 1, bf16_mma_until: 65_536, ..d };
     #[rustfmt::skip]
@@ -224,6 +228,10 @@ fn the_routed_selects_answer_the_routed_dot() {
         // keeping the order for the select after; the e2m1 converts (a K
         // split at one token, scales and rows past f16's range); B200's.
         (K::Mx, d, [8, 3, 4, 96, 2240], t, None, 0),
+        // A100's lean per-route select: by token and by route, a bias, a
+        // partial row tile.
+        (K::Mx, lean, [8, 3, 4, 96, 2240], t, None, 0),
+        (K::MxBias, lean, [8, 2, 4, 200, 2880], f, None, 0),
         (K::MxBias, d, [8, 64, 4, 256, 256], t, None, 0),
         (K::MxBias, fp32, [8, 48, 4, 200, 160], t, None, 0),
         (K::MxBias, TC5, [8, 40, 4, 576, 2880], t, None, 0),
@@ -247,6 +255,7 @@ fn the_routed_selects_answer_the_routed_dot() {
         // NVFP4: by route, grouped, tcgen05, the register-dequant kernel and
         // its GLU.
         (K::Nv, d, [16, 3, 10, 640, 2560], t, None, 0),
+        (K::Nv, lean, [16, 3, 10, 640, 2560], t, None, 0),
         (K::Nv, d, [16, 48, 10, 200, 640], f, None, 0),
         (K::Nv, TC5, [16, 48, 10, 128, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 2, 10, 256, 640], f, None, 0),

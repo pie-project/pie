@@ -600,6 +600,28 @@ pub struct SsmConvVec4;
 #[decision(id = "kernel.ssm.gdn_out_bf16", flag, default = false, tune = search)]
 pub struct SsmGdnOutBf16;
 
+/// The most blocks an SM seats of the fused gated delta decode step: 4 but
+/// where a chip's profile says (A100's 3: its persistent warps stream the
+/// state 7% faster).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_step_blocks", constant(set(1, 2, 3, 4)), default = 4, tune = search)]
+pub struct SsmGdnStepBlocks(pub u32);
+
+/// Whether the per-route MXFP4 and NVFP4 selects (a decode's few routes an
+/// expert, and NVFP4's dense product) run lean: two-warp blocks, one code
+/// block a row in flight a lane, the codes widened by integer ops, no
+/// converts. Off but where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_select_lean", flag, default = false, tune = search)]
+pub struct MoeMxfp4SelectLean;
+
+/// Whether a strided grouped bf16 projection at one row (DeepSeek-V4.1's
+/// grouped output LoRA at decode) is one GEMV over every group's rows rather
+/// than batched cuBLAS. Off but where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
+pub struct GemmGroupedGemv;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -633,6 +655,14 @@ pub struct DecodeGroupedPrefillLse;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_window", flag, default = false, tune = search)]
 pub struct DecodeGroupedPrefillWindow;
+
+/// Whether the FA2 prefill kernel (a decode's grouped rows too) reads a
+/// pool's live widths out of its wider heads (MiMo's 192-wide keys and
+/// 128-wide values stored 256 wide), not the padding. Off but where a chip's
+/// profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.fa2_live", flag, default = false, tune = search)]
+pub struct Fa2Live;
 
 /// Whether a paged decode of a group of at most eight query heads reads its
 /// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
@@ -716,6 +746,9 @@ pub fn register(registry: &mut Registry) {
         .add::<ElemwiseHcMma>()
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
+        .add::<SsmGdnStepBlocks>()
+        .add::<MoeMxfp4SelectLean>()
+        .add::<GemmGroupedGemv>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -754,6 +787,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeGroupedPrefillWindow>()
+        .add::<Fa2Live>()
         .add::<DecodeXqa>()
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
@@ -841,6 +875,9 @@ tuning! {
     hc_mma: bool = false, on ElemwiseHcMma;
     ssm_conv_vec4: bool = false, on SsmConvVec4;
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
+    ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
+    mxfp4_select_lean: bool = false, on MoeMxfp4SelectLean;
+    grouped_gemv: bool = false, on GemmGroupedGemv;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
@@ -879,6 +916,7 @@ tuning! {
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
+    fa2_live: bool = false, on Fa2Live;
     decode_xqa: bool = false, on DecodeXqa;
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;

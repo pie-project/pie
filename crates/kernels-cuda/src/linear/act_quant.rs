@@ -330,24 +330,13 @@ pub fn read_back(
     Ok(Tensor::new(out, src.rows, src.x.width, Dtype::Bf16))
 }
 
-/// A 128x128-block FP8 projection (`n x k` e4m3 codes at `codes`, their
-/// ue8m0 exponents laid in atoms a row a 128 columns) at a decode's few rows
-/// as a GEMV (`linear/fp8_gemv.cuh`): the activations as they are, bf16, the
-/// codes streamed once. `Ok(false)` past `kernel.gemm.fp8_gemv_until` rows
-/// or for a shape it does not read (`k` a whole number of 512s, the rows'
-/// activations within its shared memory).
+/// A block-FP8 projection (`n x k` e4m3 codes at `codes`, their ue8m0
+/// exponents laid in atoms a row a `gran` columns, 128 or 32) at a decode's
+/// few rows as a GEMV (`linear/fp8_gemv.cuh`): the activations as they are,
+/// bf16, the codes streamed once. `Ok(false)` past `kernel.gemm.fp8_gemv_until` rows
+/// or for a shape it does not read (`k` a whole number of 128s: a warp's
+/// lanes past `k` on its last 512-code pass read nothing).
 pub fn fp8_block_gemv(
-    ctx: &Ctx,
-    act: Tensor,
-    codes: u64,
-    atoms: u64,
-    y: &mut Tensor,
-) -> Result<bool, Error> {
-    fp8_block_gemv_in(ctx, act, codes, atoms, 128, y)
-}
-
-/// [`fp8_block_gemv`] over blocks of `gran` (128, or MXFP8's 32) columns.
-pub fn fp8_block_gemv_in(
     ctx: &Ctx,
     act: Tensor,
     codes: u64,
@@ -364,12 +353,12 @@ pub fn fp8_block_gemv_in(
         || act.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
         || y.rows != m
+        || !matches!(gran, 32 | 128)
         || k == 0
-        || !k.is_multiple_of(512)
+        || !k.is_multiple_of(128)
         || n == 0
         || !codes.is_multiple_of(16)
         || !act.ptr.is_multiple_of(16)
-        || !matches!(gran, 32 | 128)
     {
         return Ok(false);
     }
@@ -386,7 +375,12 @@ pub fn fp8_block_gemv_in(
         Fire::at(
             "linear/fp8_gemv.cuh",
             symbol(&format!(
-                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}, {gran}>"
+                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}{}>",
+                if gran == 128 {
+                    String::new()
+                } else {
+                    format!(", {gran}")
+                }
             )),
         )
         .apply(

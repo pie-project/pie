@@ -306,4 +306,23 @@ __device__ __forceinline__ uint4 ld_stream(const void* p) {
     return v;
 }
 
+// Two e4m3 codes (the low byte first) as f32, exactly: sm_89's convert, or
+// below it each code laid into an f32 by integer ops (2^-120 times its
+// value, an e4m3 subnormal an f32 one) and taken back up.
+__device__ __forceinline__ void e4m3_pair_f32(unsigned short pair, float& lo, float& hi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    const unsigned b0 = pair & 0xFFu, b1 = static_cast<unsigned>(pair) >> 8;
+    lo = __uint_as_float(((b0 & 0x80u) << 24) | ((b0 & 0x7Fu) << 20)) * 0x1p120f;
+    hi = __uint_as_float(((b1 & 0x80u) << 24) | ((b1 & 0x7Fu) << 20)) * 0x1p120f;
+#else
+    asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
+        "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
+        "mov.b32 {l, h}, h2;\n\t"
+        "cvt.f32.f16 %0, l;\n\t"
+        "cvt.f32.f16 %1, h;\n\t}"
+        : "=f"(lo), "=f"(hi)
+        : "h"(pair));
+#endif
+}
+
 }
