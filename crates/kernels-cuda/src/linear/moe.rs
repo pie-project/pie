@@ -722,7 +722,7 @@ pub fn fp8_w8a8_capable() -> bool {
 /// Whether this device is Hopper (sm_90), whose arch-specific target has
 /// wgmma: the routed W8A8 select's tensor-core GEMM there.
 #[cfg(feature = "cuda")]
-fn hopper_wgmma() -> bool {
+pub(crate) fn hopper_wgmma() -> bool {
     crate::jit::cache::arch() == Some("sm_90")
 }
 

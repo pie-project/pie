@@ -1,18 +1,29 @@
 # How a Muse Glimmer checkpoint is laid out: transformers' names, the text
-# model under `model.language_model.`.
+# model under `model.language_model.`, and mlx_lm's, under `language_model.model.`.
 
-TRUNK = "model.language_model."
+LAYOUTS = {
+    "huggingface": struct(trunk = "model.language_model.", lm_head = "lm_head.weight"),
+    "mlx_lm": struct(trunk = "language_model.model.", lm_head = "language_model.lm_head.weight"),
+}
 
 def formats(m):
-    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+    return [safetensors_format(m, "huggingface"), safetensors_format(m, "mlx_lm")]
 
-def huggingface(m, reads):
-    at = lambda leaf: TRUNK + leaf
+def safetensors_format(m, name):
+    layout = LAYOUTS[name]
+    return format(
+        name,
+        recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight"),
+        read = lambda reads: safetensors(m, reads, layout),
+    )
+
+def safetensors(m, reads, layout):
+    at = lambda leaf: layout.trunk + leaf
     reads.read(m.embed, at("embed_tokens.weight"))
     reads.read(m.final_norm, at("norm.weight"))
-    reads.read(m.lm_head, "lm_head.weight")
+    reads.read(m.lm_head, layout.lm_head)
     for l, w in enumerate(m.layers):
-        n = lambda leaf: "{}layers.{}.{}".format(TRUNK, l, leaf)
+        n = lambda leaf: "{}layers.{}.{}".format(layout.trunk, l, leaf)
         reads.read(w.attn_norm, n("input_layernorm.weight"))
         reads.read(w.post_attn_norm, n("post_attention_layernorm.weight"))
         reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))

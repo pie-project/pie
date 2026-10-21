@@ -342,7 +342,8 @@ fn the_w8a16_projections_answer_the_dot() {
     #[rustfmt::skip]
     let cases = [(128, 1, 384, 1024), (128, 5, 200, 640), (128, 16, 512, 2048), (128, 23, 256, 768),
         (128, 64, 136, 512), (128, 100, 256, 1024), (32, 1, 256, 1024), (32, 37, 200, 512),
-        (32, 130, 200, 1024), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640)];
+        (32, 130, 200, 1024), (32, 64, 1280, 5120), (32, 50, 256, 1152), (32, 64, 520, 1536),
+        (128, 48, 384, 2048), (32, 24, 640, 1024), (128, 20, 384, 2048), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640)];
     for (gran, m, n, k) in cases {
         let mut b = Bench::new(0xa16 ^ (m * n + k) as u64);
         let (x, xv) = b.bf16(m * k);
@@ -478,6 +479,46 @@ fn an_mxfp8_release_laid_a_row_a_32_answers_the_dot() {
                 &dot([m, n, k], |r, i| a[r * k + i], w),
                 TOL,
                 &what("W8A8"),
+            );
+        }
+    }
+}
+
+/// The W8A16 product's rate at a batch's rows over DeepSeek-V4.1-Flash's
+/// dense planes (32-wide blocks).
+#[test]
+#[ignore = "a rate bench: cargo test ... -- --ignored w8a16_rate --nocapture"]
+fn w8a16_rate() {
+    use kernels_cuda::linear::w8a16;
+    for m in [17usize, 32, 64] {
+        for (n, k) in [
+            (5120usize, 8192usize),
+            (32768, 1280),
+            (4608, 5120),
+            (5120, 2304),
+            (1280, 5120),
+            (512, 5120),
+        ] {
+            let mut b = Bench::new(13);
+            let (x, _) = b.bf16(m * k);
+            let codes = b.up(&tab(n * k, |i| (i * 37 % 251) as u8 & 0xbf));
+            let atoms = b.up(&tab(atom_bytes(n, k, 32), |i| 120 + (i % 5) as u8));
+            let mut y = b.out(m, n);
+            let ctx = b.ctx();
+            let x = t(x, m, k, Bf16);
+            let fire = |y: &mut _| w8a16::matmul(&ctx, "test", x, codes, atoms, 32, y);
+            assert!(fire(&mut y).expect("fires"));
+            b.sync();
+            let reps = 50;
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                fire(&mut y).expect("fires");
+            }
+            b.sync();
+            let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+            eprintln!(
+                "w8a16 {m}x{n}x{k}: {us:.1} us, {:.0} GB/s of the codes",
+                (n * k) as f64 / us / 1e3
             );
         }
     }

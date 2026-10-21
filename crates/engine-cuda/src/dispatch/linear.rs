@@ -1742,6 +1742,16 @@ impl Run<'_> {
         {
             return Ok(());
         }
+        // A batch's rows (past the decode widths the W8A16 kernels take)
+        // quantized as the deployment says, on cuBLASLt's block-scaled FP8
+        // GEMM where there is an FP8 MMA (W8A8), else the mma.sync one.
+        if block == 128
+            && act.rows > linear::w8a16::MMA_UNTIL
+            && linear::moe::fp8_w8a8_capable()
+            && linear::lt_fp8::matmul(self.ctx(), op, act, codes.ptr, atoms.ptr, &mut out)?
+        {
+            return Ok(());
+        }
         if block == 128
             && linear::moe::FP8_W8A8_DENSE.contains(&act.rows)
             && linear::moe::fp8_w8a8_capable()

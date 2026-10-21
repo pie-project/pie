@@ -563,6 +563,12 @@ impl ChannelCell {
         Ok(())
     }
 
+    /// Cells the device has published that the host has not taken, as of
+    /// the last `read` or `take`.
+    pub fn unread_len(&self) -> usize {
+        self.produced.len()
+    }
+
     pub fn staged_len(&self) -> usize {
         self.staged.len()
     }

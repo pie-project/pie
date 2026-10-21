@@ -138,7 +138,8 @@ impl Context {
                     Some(comm) => match comm.peers() {
                         None => ctx.with_comm(comm.raw()),
                         Some(peers) => ctx.with_comm(comm.raw()).with_peers(peers),
-                    },
+                    }
+                    .with_rank(Some(comm.rank())),
                 };
                 let Some(device) = Device::probe(&ctx) else {
                     return Err(Fault::Unsupported(format!(
@@ -297,12 +298,14 @@ impl Context {
                 ctx: Ctx::on(stream)
                     .with_cublas(cublas)
                     .with_slabs(self.slabs)
-                    .with_tuning(self.ctx.tuning()),
+                    .with_tuning(self.ctx.tuning())
+                    .with_rank(self.ctx.rank()),
                 #[cfg(feature = "rocm")]
                 ctx: Ctx::on(stream)
                     .with_blas(cublas)
                     .with_slabs(self.slabs)
-                    .with_tuning(self.ctx.tuning()),
+                    .with_tuning(self.ctx.tuning())
+                    .with_rank(self.ctx.rank()),
             })
         }
     }

@@ -279,18 +279,29 @@ fn poll_channel(
             .as_ref()
             .is_some_and(|fires| !fires.lock().unwrap().is_empty())
     {
-        let ready = cell.lock().unwrap().read();
+        let (ready, unread) = {
+            let mut cell = cell.lock().unwrap();
+            let ready = cell.read();
+            (ready, cell.unread_len())
+        };
         match ready {
             Ok(_) => {
                 if pop_settled && let Some(op) = crate::pipeline::fire::pop_settled(fires.as_ref())
                 {
                     return Ok(ChannelPoll::Finalize(op));
                 }
+                let queue = fires
+                    .as_ref()
+                    .expect("the ready take has a pending fire queue");
                 // A visible channel may precede fire completion. Wait on that
-                // completion, not the already-ready channel, before taking it.
-                return Ok(ChannelPoll::AwaitCompletion(
-                    fires.expect("the ready take has a pending fire queue"),
-                ));
+                // completion, not the already-ready channel, before taking it,
+                // unless the front cell cannot be a pending fire's: then its
+                // fire is finalized already, by an earlier take or by a
+                // submit's drain, and holding it for the next completion would
+                // leave the lane that many tokens behind for good.
+                if unread <= queue.writers_of(&cell) {
+                    return Ok(ChannelPoll::AwaitCompletion(Arc::clone(queue)));
+                }
             }
             Err(ChannelError::Empty) => {}
             Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),

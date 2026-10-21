@@ -1130,6 +1130,7 @@ impl Shell {
             .collect();
         let exact = real_rows + ones.len() as u32;
         if !mixed
+            && exact >= pad.prefill_floor
             && buckets.contains(&exact)
             && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize
         {
@@ -1152,7 +1153,7 @@ impl Shell {
         if need > top {
             return None;
         }
-        let bucket = poem_exec::fire::rung_of(buckets, need);
+        let bucket = poem_exec::fire::rung_of(buckets, need.max(pad.prefill_floor));
         pads.push((bucket - real_rows - ones, by[host].1));
         if lanes.len() + pads.len() > self.budgets.tokens.max_lanes as usize {
             return None;

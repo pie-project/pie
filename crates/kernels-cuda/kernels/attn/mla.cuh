@@ -633,7 +633,11 @@ __device__ __forceinline__ void ld_b_v(std::uint32_t (&b)[2], const __nv_bfloat1
         : "r"(addr));
 }
 
-template <int KPE>
+// With `kFp8` the pool is vLLM's fp8 MLA rows (`mla_kv_append_fp8`): one u8
+// plane, a cell's latent and rotated e4m3 codes in one row under a scale of
+// 1, at `ckv_pages`; each staged chunk is widened to bf16 as it lands (the
+// tcgen05 sparse pass reads them otherwise).
+template <int KPE, bool kFp8 = false>
 __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_kernel(
     const __nv_bfloat16* __restrict__ q_nope,
     const __nv_bfloat16* __restrict__ q_pe,
@@ -773,7 +777,23 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
             const int d = (c % kChunksPerRow) * 8;
             const long long slot = s_slot[row];
             __nv_bfloat16* dst = dst_base + row * kLdD + d;
-            if (slot >= 0) {
+            if (slot >= 0 && kFp8) {
+                const uint2 codes = *reinterpret_cast<const uint2*>(
+                    reinterpret_cast<const std::uint8_t*>(ckv_pages) + slot * kD + d);
+                const unsigned short pairs[4] = {
+                    static_cast<unsigned short>(codes.x), static_cast<unsigned short>(codes.x >> 16),
+                    static_cast<unsigned short>(codes.y), static_cast<unsigned short>(codes.y >> 16)};
+                int4 v;
+                std::uint32_t* w = reinterpret_cast<std::uint32_t*>(&v);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float lo, hi;
+                    ::pie::e4m3_pair_f32(pairs[i], lo, hi);
+                    const __nv_bfloat162 b = __floats2bfloat162_rn(lo, hi);
+                    w[i] = *reinterpret_cast<const std::uint32_t*>(&b);
+                }
+                *reinterpret_cast<int4*>(dst) = v;
+            } else if (slot >= 0) {
                 const void* src =
                     (d < kCkv)
                         ? static_cast<const void*>(ckv_pages + slot * kCkv + d)

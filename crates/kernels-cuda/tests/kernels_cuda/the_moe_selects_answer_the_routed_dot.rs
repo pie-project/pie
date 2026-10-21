@@ -490,7 +490,9 @@ fn the_w8a16_selects_answer_the_routed_dot() {
 #[ignore]
 fn bf16_select_rate() {
     for (n, k) in [(1408usize, 2816usize), (2816, 704)] {
-        let (experts, tokens, top) = (128usize, 64usize, 8usize);
+        // `PIE_TOKENS`: the fire's tokens (64).
+        let tokens = std::env::var("PIE_TOKENS").map_or(64usize, |t| t.parse().expect("a count"));
+        let (experts, top) = (128usize, 8usize);
         let mut b = Bench::new(7);
         let (x, _) = b.bf16(tokens * k);
         let bank = b.up(&tab(experts * n * k, |i| 0x3c00u16 ^ (i % 97) as u16));
