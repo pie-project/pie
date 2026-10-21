@@ -4,7 +4,7 @@ api = 1
 # the decisions measured below.
 [target]
 tier    = "gfx94"
-assumes = { cc = 94 }
+assumes = { gfx = 94 }
 
 # The routed swiglu MLP of a prefill (MI300X, random bf16 weights).
 #
