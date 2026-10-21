@@ -451,6 +451,7 @@ fn qg_qknorm_rope_append() -> Rule {
             d,
             p.f32("theta"),
             Some(p.u32("span")),
+            None,
         );
         p.name("k_out", &k_out);
         let cache = p.cache("cache");
@@ -707,6 +708,7 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
                     d,
                     theta,
                     Some(p.u32("span")),
+                    None,
                 );
                 let cache = p.cache("cache");
                 let (write_page, write_offset) =
@@ -731,11 +733,11 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             };
             let (q, k) = match rope {
                 0 => (q, k),
-                1 => elemwise::rope_full(&q, &k, &positions, d, p.f32("theta"), false),
+                1 => elemwise::rope_full(&q, &k, &positions, d, p.f32("theta"), false, None),
                 _ => {
                     let span = Some(p.u32("span"));
                     let (rotary, theta) = (p.u32("rotary"), p.f32("theta"));
-                    elemwise::rope_partial(&q, &k, &positions, rotary, d, theta, span)
+                    elemwise::rope_partial(&q, &k, &positions, rotary, d, theta, span, None)
                 }
             };
             let cache = p.cache("cache");
@@ -1790,7 +1792,8 @@ fn rmsnorm_rope_partial_q() -> Rule {
             elemwise::rmsnorm_per_head(&p.rows("x", W), &p.weight("weight", [W]), d, p.f32("eps"));
         p.name("y", &y);
         let (rotary_dim, theta, span) = (p.u32("rotary_dim"), p.f32("theta"), p.u32("span"));
-        let q_out = elemwise::rope_partial_q(&y, &positions, rotary_dim, d, theta, Some(span));
+        let q_out =
+            elemwise::rope_partial_q(&y, &positions, rotary_dim, d, theta, Some(span), None);
         p.export("q_out", &q_out);
     });
     Rule::new("elementwise.rmsnorm_rope_partial_q", [pattern], |m| {
@@ -1914,6 +1917,7 @@ fn q_gate_k_norm_rope_append() -> Rule {
             d,
             p.f32("theta"),
             Some(p.u32("span")),
+            None,
         );
         p.export("q_out", &q_out);
         p.name("k_out", &k_out);

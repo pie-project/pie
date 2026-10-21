@@ -79,6 +79,7 @@ impl Run<'_> {
                 head_dim,
                 span,
                 theta,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } if *span == rotary_dim / 2 => elemwise::rope::partial(
@@ -97,6 +98,7 @@ impl Run<'_> {
                 head_dim,
                 span,
                 theta,
+                freqs: None,
                 q_out: _,
             } if *span == rotary_dim / 2 => elemwise::rope::partial_q(
                 self.ctx(),
@@ -115,6 +117,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => {

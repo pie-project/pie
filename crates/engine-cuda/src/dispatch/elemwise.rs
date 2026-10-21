@@ -372,6 +372,58 @@ impl Run<'_> {
         }
     }
 
+    /// A rotation at its own frequencies (a checkpoint's rope scaling): `k`
+    /// absent turns q alone; `pairs` is the head width, the pairs' span,
+    /// whether they interleave and an interleaved M-RoPE's sections.
+    #[cfg(not(feature = "rocm"))]
+    fn rope_table(
+        &self,
+        op: &'static str,
+        q: poem_ir::ValueId,
+        k: Option<poem_ir::ValueId>,
+        positions: poem_ir::ValueId,
+        pairs: (u32, u32, bool, Option<[u32; 3]>),
+        freqs: &poem_ir::RopeFreqs,
+    ) -> Result<(), kernels_cuda::Error> {
+        let (head_dim, span, interleaved, sections) = pairs;
+        let mut q = self.tensor(q);
+        let mut k = k.map_or_else(
+            || Tensor::new(q.ptr, q.rows, 0, q.dtype),
+            |k| self.tensor(k),
+        );
+        elemwise::rope_table::rope(
+            self.ctx(),
+            op,
+            &mut q,
+            &mut k,
+            self.tensor(positions),
+            elemwise::rope_table::Pairs {
+                head_dim,
+                span,
+                interleaved,
+                sections,
+            },
+            elemwise::rope_table::Freqs {
+                inv_freq: &freqs.inv_freq,
+                mscale: freqs.mscale,
+            },
+        )
+    }
+
+    /// ROCm turns no stated table yet.
+    #[cfg(feature = "rocm")]
+    fn rope_table(
+        &self,
+        op: &'static str,
+        _q: poem_ir::ValueId,
+        _k: Option<poem_ir::ValueId>,
+        _positions: poem_ir::ValueId,
+        _pairs: (u32, u32, bool, Option<[u32; 3]>),
+        _freqs: &poem_ir::RopeFreqs,
+    ) -> Result<(), kernels_cuda::Error> {
+        Err(kernels_cuda::Error::Unsupported { op })
+    }
+
     pub(super) fn elementwise(&self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
         match op {
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
@@ -574,8 +626,79 @@ impl Run<'_> {
                 k,
                 positions,
                 head_dim,
+                interleaved,
+                freqs: Some(freqs),
+                ..
+            } => self.rope_table(
+                "elementwise.rope_full",
+                *q,
+                Some(*k),
+                *positions,
+                (*head_dim, *head_dim / 2, *interleaved, None),
+                freqs,
+            ),
+            Elementwise::RopePartial {
+                q,
+                k,
+                positions,
+                head_dim,
+                span,
+                freqs: Some(freqs),
+                ..
+            } => self.rope_table(
+                "elementwise.rope_partial",
+                *q,
+                Some(*k),
+                *positions,
+                (*head_dim, *span, false, None),
+                freqs,
+            ),
+            Elementwise::RopePartialQ {
+                q,
+                positions,
+                head_dim,
+                span,
+                freqs: Some(freqs),
+                ..
+            } => self.rope_table(
+                "elementwise.rope_partial_q",
+                *q,
+                None,
+                *positions,
+                (*head_dim, *span, false, None),
+                freqs,
+            ),
+            Elementwise::RopeMrope {
+                q,
+                k,
+                positions,
+                sections,
+                form: MropeForm::Interleaved,
+                rotary_dim,
+                head_dim,
+                freqs: Some(freqs),
+                ..
+            } => self.rope_table(
+                "elementwise.rope_mrope",
+                *q,
+                Some(*k),
+                *positions,
+                (*head_dim, *rotary_dim / 2, false, Some(*sections)),
+                freqs,
+            ),
+            Elementwise::RopeMrope { freqs: Some(_), .. } => {
+                Err(kernels_cuda::Error::Unsupported {
+                    op: "elementwise.rope_mrope",
+                })
+            }
+            Elementwise::RopeFull {
+                q,
+                k,
+                positions,
+                head_dim,
                 theta,
                 interleaved,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope::full(
@@ -595,6 +718,7 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 span,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope::partial(
@@ -616,6 +740,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => (match form {
@@ -646,6 +771,7 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 span,
+                freqs: None,
                 q_out: _,
             } => elemwise::rope::partial_q(
                 self.ctx(),

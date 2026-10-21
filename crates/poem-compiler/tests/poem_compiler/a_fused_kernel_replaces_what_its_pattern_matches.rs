@@ -123,12 +123,16 @@ fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
 }
 
 fn qkv_write(p: &Pattern, q_eps: f32, k_eps: f32) {
+    qkv_write_scaled(p, q_eps, k_eps, None);
+}
+
+fn qkv_write_scaled(p: &Pattern, q_eps: f32, k_eps: f32, scaling: Option<poem::rope::RopeScaling>) {
     let positions = p.indices("positions");
     let (q, k, v) = layout::split_qkv(&p.rows("packed", 512), 256, 128);
     let v = elemwise::rmsnorm_no_scale(&v, 64, q_eps);
     let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, q_eps);
     let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [64]), 64, k_eps);
-    let (q, k) = elemwise::rope_full(&q, &k, &positions, 64, 10_000.0, false);
+    let (q, k) = elemwise::rope_full(&q, &k, &positions, 64, 10_000.0, false, scaling);
     attn::kv_append(
         &k,
         &v,
@@ -162,6 +166,23 @@ fn the_qkv_write_folds_when_its_norms_share_an_epsilon() {
         panic!("the first op is the fused write");
     };
     assert_eq!((*kv_heads, *head_dim, *rotary_dim), (2, 64, 64));
+}
+
+/// A rotation a rope scaling restates turns at its own frequencies, which
+/// the fused write does not carry: the chain stays apart rather than
+/// dropping them.
+#[test]
+fn a_scaled_rotation_keeps_the_qkv_write_apart() {
+    let scaling = poem::rope::RopeScaling::Linear { factor: 2.0 };
+    let fused = fuse(
+        trace(|p| qkv_write_scaled(p, 1e-6, 1e-6, Some(scaling))),
+        &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"],
+    );
+    assert!(
+        ops(&fused).contains(&"elementwise.rope_full"),
+        "{:?}",
+        ops(&fused)
+    );
 }
 
 /// Muse Spark's form folds too: scaleless q and k norms, v as it is, and a
@@ -207,7 +228,7 @@ fn the_unnormed_partly_turned_qkv_write_folds() {
                 };
                 let v = elemwise::mul_scalar(0.707, &v);
                 let positions = p.indices("positions");
-                let (q, k) = elemwise::rope_partial(&q, &k, &positions, 64, 256, 1e4, None);
+                let (q, k) = elemwise::rope_partial(&q, &k, &positions, 64, 256, 1e4, None, None);
                 let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
                 attn::kv_append(&k, &v, p.cache("kv"), &page, &offset);
                 elemwise::silu(&q);
@@ -537,7 +558,7 @@ fn qwens_attention_prologue_lands_as_one_fused_op() {
             1e-6,
         );
         let positions = p.indices("positions");
-        let (q, k) = elemwise::rope_partial(&q, &k, &positions, 16, d, 1e6, None);
+        let (q, k) = elemwise::rope_partial(&q, &k, &positions, 16, d, 1e6, None, None);
         let cache = p.cache("cache");
         attn::kv_append(
             &k,

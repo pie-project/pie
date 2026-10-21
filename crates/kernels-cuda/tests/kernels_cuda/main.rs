@@ -3,6 +3,7 @@
 
 mod a_body_captured_on_its_own_stream_takes_its_owners_tile;
 mod a_qkv_split_reaches_every_row_of_a_tall_fire;
+mod a_stated_rope_table_turns_each_pair_at_its_frequency;
 mod a_trimmed_pixel_shuffle_drops_its_anchor_frames;
 mod common;
 mod deepseeks_attention_answers_the_reference;
