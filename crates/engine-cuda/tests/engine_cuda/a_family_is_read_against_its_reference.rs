@@ -97,20 +97,9 @@ fn every_probe_is_dumped() {
                 .expect("PIE_PARITY_DEPLOYMENT names the row that reads the snapshot");
             let deployment = poem_compiler::catalog::deployment(&name)
                 .unwrap_or_else(|| panic!("no deployment {name}"));
-            let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
-                std::fs::read_dir(&snapshot)
-                    .expect("the snapshot lists")
-                    .filter_map(|e| {
-                        let path = e.ok()?.path();
-                        let name = path.file_name()?.to_str()?;
-                        (name.ends_with(".safetensors") || name.ends_with(".zt")).then_some(path)
-                    })
-                    .collect()
-            } else {
-                vec![snapshot.clone()]
-            };
-            shards.sort();
-            let source = ztensor_compat::index_all(&shards).expect("the snapshot opens");
+            // As an import opens it: its `config.json` rides along, which a
+            // format reads (an int4 export's `quantization_config`).
+            let source = checkpoint::file::snapshot::open(&snapshot).expect("the snapshot opens");
             let contract = deployment
                 .contract(&source, Platform::Cuda)
                 .unwrap_or_else(|why| panic!("{name}'s import reads the snapshot: {why}"));
