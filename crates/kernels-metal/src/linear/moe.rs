@@ -1139,14 +1139,17 @@ pub const REGISTER_TOKENS: u32 = 8;
 
 const REGISTER_FILE: &str = "linear/moe_sg.metal";
 
-/// How the register expert passes cut their columns: the intermediate's
+/// How the register expert passes cut their work: the intermediate's
 /// 8-column fragments a simdgroup of the gate-up takes (each with its gate
-/// and up columns), and the simdgroups a threadgroup of each pass holds.
+/// and up columns), the simdgroups a threadgroup of each pass holds, and the
+/// tile slots of their grids (0: one for every tile a fire may fill), each
+/// slot taking every slots-th live tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegisterCut {
     pub fragments: u32,
     pub glu_simdgroups: u32,
     pub down_simdgroups: u32,
+    pub slots: u32,
 }
 
 /// The cut the register expert passes run at.
@@ -1154,7 +1157,16 @@ pub const REGISTER_CUT: RegisterCut = RegisterCut {
     fragments: 1,
     glu_simdgroups: 4,
     down_simdgroups: 4,
+    slots: 0,
 };
+
+impl RegisterCut {
+    /// The tile slots of a pass over up to `tiles` tiles.
+    #[must_use]
+    pub fn slots(&self, tiles: u32) -> u32 {
+        if self.slots == 0 { tiles } else { self.slots.min(tiles) }
+    }
+}
 
 /// The scratch of a routed MLP on the register tile, as `moe_sg.metal` reads it.
 #[derive(Clone, Copy, Debug)]
@@ -1335,7 +1347,7 @@ pub fn register_glu(
         register_banks(ctx, gate_up, shared)?;
     ctx.fire(
         Fire::at(REGISTER_FILE, entry).apply(Grid::of(
-            [32 * simdgroups * (inter / columns), tiles, 1],
+            [32 * simdgroups * (inter / columns), cut.slots(tiles), 1],
             [32 * simdgroups, 1, 1],
         )),
         &[
@@ -1394,7 +1406,7 @@ pub fn register_down(
         register_banks(ctx, down, shared)?;
     ctx.fire(
         Fire::at(REGISTER_FILE, entry).apply(Grid::of(
-            [32 * simdgroups * (columns / span), tiles, 1],
+            [32 * simdgroups * (columns / span), cut.slots(tiles), 1],
             [32 * simdgroups, 1, 1],
         )),
         &[

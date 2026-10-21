@@ -290,7 +290,9 @@ fn the_register_routed_mlp_prices_its_tiles() {
             fragments,
             glu_simdgroups,
             down_simdgroups,
+            slots: 0,
         };
+        let slotted = |slots| moe::RegisterCut { slots, ..moe::REGISTER_CUT };
         let tiled = |s: &Sink, l: &[Bank; 4], shared: bool, cut: moe::RegisterCut| {
             let tiles = moe::register_tiles(tokens, TOP_K, EXPERTS, shared);
             let own = |b: Bank| shared.then_some(b);
@@ -342,7 +344,11 @@ fn the_register_routed_mlp_prices_its_tiles() {
                 time(&|s, l| tiled(s, l, true, c))
             );
         }
-        line += &format!(" | without it h1s4/s4 {:6.1} us a layer", time(&|s, l| tiled(s, l, false, cut(1, 4, 4))));
+        line += "\n  chain over tile slots";
+        for slots in [8, 12, 16, 24, 32] {
+            line += &format!(" {slots} {:6.1}", time(&|s, l| tiled(s, l, true, slotted(slots))));
+        }
+        line += &format!(" | without the shared tile {:6.1} us a layer", time(&|s, l| tiled(s, l, false, cut(1, 4, 4))));
         eprintln!("{line}");
     }
 }

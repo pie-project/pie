@@ -116,8 +116,8 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
     for tokens in [2u32, 5, 8] {
         for cut in [
             moe::REGISTER_CUT,
-            moe::RegisterCut { fragments: 2, glu_simdgroups: 8, down_simdgroups: 16 },
-            moe::RegisterCut { fragments: 1, glu_simdgroups: 16, down_simdgroups: 8 },
+            moe::RegisterCut { fragments: 2, glu_simdgroups: 8, down_simdgroups: 16, slots: 3 },
+            moe::RegisterCut { fragments: 1, glu_simdgroups: 16, down_simdgroups: 8, slots: 16 },
         ] {
             for shared in [false, true] {
                 let pairs = tokens * TOP_K;

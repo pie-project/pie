@@ -217,8 +217,10 @@ struct Shifted {
 // silu(gate) * up, both rounded to bf16 first as the packed rows would hold
 // them, straight into the down's input table of the tile; the threadgroup's
 // 8 HF SG columns are whole halves of 64-input groups, whose sums it adds as
-// `qmm_sg_table` does. A threadgroup of more simdgroups is fewer for the GPU
-// to dispatch, of which the tiles past the count are pure cost.
+// `qmm_sg_table` does. The grid's y extent is its tile slots: slot y takes
+// tiles y, y + slots, ... of the live count, so a grid of fewer slots than
+// tiles a fire may fill dispatches fewer threadgroups past the count, each
+// pure cost.
 template <int HF, int SG>
 [[kernel]] void affine_qmm_sg_glu_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
@@ -227,54 +229,57 @@ template <int HF, int SG>
     const device bfloat *tables [[buffer(6)]], device bfloat *hidden [[buffer(7)]],
     const device int *tiles [[buffer(8)]], constant int &width [[buffer(9)]],
     constant int &inter [[buffer(10)]], constant int &experts [[buffer(11)]],
-    uint2 position [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
+    uint2 position [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
+    uint lid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
   constexpr int NF = 2 * HF;
   constexpr uint COLUMNS = 8 * HF * SG, HALVES = COLUMNS / 32;
   static_assert(COLUMNS % 32 == 0, "a threadgroup's columns are whole halves of 64-input groups");
   threadgroup bfloat laid[8][COLUMNS];
-  const uint tile = position.y;
-  if (int(tile) >= tiles[0])
-    return;
-  const int expert = tiles[1 + tile];
-  const bool own = expert == experts;
-  const ulong first = own ? 0 : ulong(expert) * 2 * ulong(inter);
   const moe_sg::Lane l = moe_sg::lane_of(lane);
   const uint local = simd * 8 * HF + l.fm;
   const uint at = position.x * COLUMNS + local;
-  ulong column[NF];
-#pragma unroll
-  for (int f = 0; f < HF; ++f) {
-    column[f] = first + at + 8 * f;
-    column[HF + f] = first + inter + at + 8 * f;
-  }
   const ulong words = ulong(width) / 8, groups = ulong(width) / 64;
-  const device bfloat *table = tables + tile * moe_sg::table_width(width);
-  float2 acc[NF];
-  moe_sg::chains<NF>(acc, own ? shared_codes : codes, own ? shared_scales : scales,
-                     own ? shared_biases : biases, column, l.c, words, groups,
-                     reinterpret_cast<const device vec<bfloat, 16> *>(table) + l.fm * 4 + l.c,
-                     register_table::sums(const_cast<device bfloat *>(table), width), l.fn);
-  device bfloat *out = hidden + tile * moe_sg::table_width(inter);
+  const int count = tiles[0];
+  for (uint tile = position.y; int(tile) < count; tile += grid.y) {
+    const int expert = tiles[1 + tile];
+    const bool own = expert == experts;
+    const ulong first = own ? 0 : ulong(expert) * 2 * ulong(inter);
+    ulong column[NF];
 #pragma unroll
-  for (int f = 0; f < HF; ++f)
-#pragma unroll
-    for (uint i = 0; i < 2; ++i) {
-      const uint row = l.fn + i;
-      const float g = float(bfloat(acc[f][i]));
-      const float u = float(bfloat(acc[HF + f][i]));
-      const bfloat h = bfloat((g / (1.0f + metal::exp(-g))) * u);
-      out[register_table::slot(at + 8 * f, row)] = h;
-      laid[row][local + 8 * f] = h;
+    for (int f = 0; f < HF; ++f) {
+      column[f] = first + at + 8 * f;
+      column[HF + f] = first + inter + at + 8 * f;
     }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  // Rows x halves: a thread each.
-  if (lid < 8 * HALVES) {
-    const uint row = lid & 7, part = lid >> 3;
-    const uint n = position.x * HALVES + part; // the 32-input half of the down's input
-    const moe_sg::Shifted src{&laid[row][0], int(position.x * COLUMNS)};
-    register_table::sums(out, inter)[ulong(n) * 8 + row] =
-        register_table::half_sum(src, n >> 1, n & 1);
+    const device bfloat *table = tables + tile * moe_sg::table_width(width);
+    float2 acc[NF];
+    moe_sg::chains<NF>(acc, own ? shared_codes : codes, own ? shared_scales : scales,
+                       own ? shared_biases : biases, column, l.c, words, groups,
+                       reinterpret_cast<const device vec<bfloat, 16> *>(table) + l.fm * 4 + l.c,
+                       register_table::sums(const_cast<device bfloat *>(table), width), l.fn);
+    device bfloat *out = hidden + tile * moe_sg::table_width(inter);
+    // The last tile's sums are read out of `laid` before it is written again.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (int f = 0; f < HF; ++f)
+#pragma unroll
+      for (uint i = 0; i < 2; ++i) {
+        const uint row = l.fn + i;
+        const float g = float(bfloat(acc[f][i]));
+        const float u = float(bfloat(acc[HF + f][i]));
+        const bfloat h = bfloat((g / (1.0f + metal::exp(-g))) * u);
+        out[register_table::slot(at + 8 * f, row)] = h;
+        laid[row][local + 8 * f] = h;
+      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Rows x halves: a thread each.
+    if (lid < 8 * HALVES) {
+      const uint row = lid & 7, part = lid >> 3;
+      const uint n = position.x * HALVES + part; // the 32-input half of the down's input
+      const moe_sg::Shifted src{&laid[row][0], int(position.x * COLUMNS)};
+      register_table::sums(out, inter)[ulong(n) * 8 + row] =
+          register_table::half_sum(src, n >> 1, n & 1);
+    }
   }
 }
 
@@ -283,7 +288,8 @@ template <int HF, int SG>
   affine_qmm_sg_glu_routed<hf, sg>(                                                                \
       const device uint *, const device bfloat *, const device bfloat *, const device uint *,      \
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
-      const device int *, constant int &, constant int &, constant int &, uint2, uint, uint, uint);
+      const device int *, constant int &, constant int &, constant int &, uint2, uint2, uint,      \
+      uint, uint);
 PIE_MOE_SG_GLU(1, 4)
 PIE_MOE_SG_GLU(1, 8)
 PIE_MOE_SG_GLU(1, 16)
@@ -292,7 +298,8 @@ PIE_MOE_SG_GLU(2, 8)
 
 // A routed projection of each live tile's table by its expert's columns, SG
 // simdgroups of 16 a threadgroup, into the tile's eight rows of `out` (rows
-// past its routes are zero).
+// past its routes are zero); the grid's y extent is its tile slots, as the
+// gate-up's.
 template <int SG>
 [[kernel]] void affine_qmm_sg_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
@@ -301,34 +308,34 @@ template <int SG>
     const device bfloat *tables [[buffer(6)]], device bfloat *out [[buffer(7)]],
     const device int *tiles [[buffer(8)]], constant int &width [[buffer(9)]],
     constant int &columns [[buffer(10)]], constant int &experts [[buffer(11)]],
-    uint2 position [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]]) {
+    uint2 position [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
+    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
   constexpr int NF = 2;
-  const uint tile = position.y;
-  if (int(tile) >= tiles[0])
-    return;
-  const int expert = tiles[1 + tile];
-  const bool own = expert == experts;
-  const ulong first = own ? 0 : ulong(expert) * ulong(columns);
   const moe_sg::Lane l = moe_sg::lane_of(lane);
   const uint at = position.x * 8 * NF * SG + simd * 8 * NF + l.fm;
-  ulong column[NF];
-#pragma unroll
-  for (int f = 0; f < NF; ++f)
-    column[f] = first + at + 8 * f;
   const ulong words = ulong(width) / 8, groups = ulong(width) / 64;
-  const device bfloat *table = tables + tile * moe_sg::table_width(width);
-  float2 acc[NF];
-  moe_sg::chains<NF>(acc, own ? shared_codes : codes, own ? shared_scales : scales,
-                     own ? shared_biases : biases, column, l.c, words, groups,
-                     reinterpret_cast<const device vec<bfloat, 16> *>(table) + l.fm * 4 + l.c,
-                     register_table::sums(const_cast<device bfloat *>(table), width), l.fn);
-#pragma unroll
-  for (uint i = 0; i < 2; ++i) {
-    const ulong row = ulong(tile) * 8 + l.fn + i;
+  const int count = tiles[0];
+  for (uint tile = position.y; int(tile) < count; tile += grid.y) {
+    const int expert = tiles[1 + tile];
+    const bool own = expert == experts;
+    const ulong first = own ? 0 : ulong(expert) * ulong(columns);
+    ulong column[NF];
 #pragma unroll
     for (int f = 0; f < NF; ++f)
-      out[row * columns + at + 8 * f] = bfloat(acc[f][i]);
+      column[f] = first + at + 8 * f;
+    const device bfloat *table = tables + tile * moe_sg::table_width(width);
+    float2 acc[NF];
+    moe_sg::chains<NF>(acc, own ? shared_codes : codes, own ? shared_scales : scales,
+                       own ? shared_biases : biases, column, l.c, words, groups,
+                       reinterpret_cast<const device vec<bfloat, 16> *>(table) + l.fm * 4 + l.c,
+                       register_table::sums(const_cast<device bfloat *>(table), width), l.fn);
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const ulong row = ulong(tile) * 8 + l.fn + i;
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
+        out[row * columns + at + 8 * f] = bfloat(acc[f][i]);
+    }
   }
 }
 
@@ -336,7 +343,8 @@ template <int SG>
   template [[host_name("affine_qmm_sg_routed_s" #sg)]] [[kernel]] void affine_qmm_sg_routed<sg>(   \
       const device uint *, const device bfloat *, const device bfloat *, const device uint *,      \
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
-      const device int *, constant int &, constant int &, constant int &, uint2, uint, uint);
+      const device int *, constant int &, constant int &, constant int &, uint2, uint2, uint,      \
+      uint);
 PIE_MOE_SG_DOWN(4)
 PIE_MOE_SG_DOWN(8)
 PIE_MOE_SG_DOWN(16)
