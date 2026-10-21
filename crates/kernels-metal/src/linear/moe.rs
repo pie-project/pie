@@ -1137,6 +1137,13 @@ fn unsorted(op: &'static str, sorted: Sorted) -> Result<bool, Error> {
 /// of so many tokens fill one 8-row tile.
 pub const REGISTER_TOKENS: u32 = 8;
 
+/// The most experts the register tiles group: a thread each.
+pub const REGISTER_EXPERTS: u32 = ROUTER_MAX_EXPERTS;
+
+/// The widest fan-out the register tiles group: `moe_sg_group` stages
+/// [`REGISTER_TOKENS`] tokens' routes of it.
+pub const REGISTER_FAN_OUT: u32 = 16;
+
 const REGISTER_FILE: &str = "linear/moe_sg.metal";
 
 /// How the register expert passes cut their work: the intermediate's
@@ -1153,11 +1160,13 @@ pub struct RegisterCut {
 }
 
 /// The cut the register expert passes run at.
+/// On an M4 Pro over a 35B-A3B layer's eight verify rows, 24 slots take a
+/// fifth off the gate-up of 21 experts' tiles and add a twentieth to 59's.
 pub const REGISTER_CUT: RegisterCut = RegisterCut {
     fragments: 1,
     glu_simdgroups: 4,
     down_simdgroups: 4,
-    slots: 0,
+    slots: 24,
 };
 
 impl RegisterCut {
@@ -1238,12 +1247,17 @@ pub fn register_group(
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` walks i32 routes");
     let tokens = nonzero(OP, "the routed tokens", routes.rows)?;
     let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
-    if tokens > REGISTER_TOKENS || x.rows != tokens || !x.width.is_multiple_of(256) {
+    if tokens > REGISTER_TOKENS
+        || top_k > REGISTER_FAN_OUT
+        || x.rows != tokens
+        || !x.width.is_multiple_of(256)
+    {
         return Err(refuse(
             OP,
             format!(
                 "the register tile takes at most {REGISTER_TOKENS} tokens' rows of whole \
-                 256-input spans, not {} x {} over {tokens} tokens",
+                 256-input spans and {REGISTER_FAN_OUT} routes a token, not {} x {} over \
+                 {tokens} tokens of {top_k}",
                 x.rows, x.width
             ),
         ));
@@ -1271,13 +1285,9 @@ pub fn register_group(
             u32::from(shared).arg(),
         ],
     )?;
-    // A threadgroup a tile (of up to 32 groups): the tiles past the count cost
-    // a dispatch each.
-    let groups = x.width / 64;
-    let group = (1..=groups.min(32)).rev().find(|g| groups.is_multiple_of(*g)).unwrap_or(1);
     ctx.fire(
         Fire::at(REGISTER_FILE, "moe_sg_gather")
-            .apply(Grid::of([32, groups, tiles], [32, group, 1])),
+            .apply(Grid::of([32, x.width / 64, tiles], [32, 4, 1])),
         &[
             x.arg(),
             rooms.table.arg_mut(),

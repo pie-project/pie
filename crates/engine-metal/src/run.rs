@@ -617,6 +617,7 @@ impl<'c> Run<'c> {
         let (xt, rt) = (self.tensor(x), self.tensor(routes));
         if rt.rows < 2
             || rt.rows > moe::REGISTER_TOKENS
+            || rt.width > moe::REGISTER_FAN_OUT
             || xt.rows != rt.rows
             || self.windows.runs(self.place.region.get()) > 1
         {
@@ -666,8 +667,11 @@ impl<'c> Run<'c> {
         {
             return Ok(false);
         }
-        let shared = self.shared_tile(x, fold_at, fold, *folded, inter, columns);
         let experts = self.experts(routes);
+        if experts == 0 || experts > moe::REGISTER_EXPERTS {
+            return Ok(false);
+        }
+        let shared = self.shared_tile(x, fold_at, fold, *folded, inter, columns);
         let tiles = moe::register_tiles(rt.rows, rt.width, experts, shared.is_some());
         let Some(rooms) = self.register_rooms() else {
             return Ok(false);

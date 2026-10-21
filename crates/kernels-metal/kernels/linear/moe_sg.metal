@@ -124,9 +124,13 @@ struct Shifted {
 
 } // namespace moe_sg
 
-// Groups `tokens` x `top_k` routes by expert: one threadgroup, a thread per
-// expert (a multiple of 32 threads, at most 1024), the tiles in expert order,
-// after the shared expert's where `shared`, each expert's rows in route order.
+// The most routes a fire groups: eight tokens of a 16-wide fan-out.
+constant constexpr uint kGroupRoutes = 128;
+
+// Groups `tokens` x `top_k` routes (at most kGroupRoutes) by expert: one
+// threadgroup, a thread per expert (a multiple of 32 threads, at most 1024),
+// the tiles in expert order, after the shared expert's where `shared`, each
+// expert's rows in route order.
 [[kernel]] void moe_sg_group(const device int *routes [[buffer(0)]], device int *tiles [[buffer(1)]],
                              device int *rows [[buffer(2)]], device int *inv [[buffer(3)]],
                              constant uint &tokens [[buffer(4)]], constant uint &top_k [[buffer(5)]],
@@ -136,11 +140,15 @@ struct Shifted {
                              uint lane [[thread_index_in_simdgroup]],
                              uint simd [[simdgroup_index_in_threadgroup]]) {
   threadgroup uint before[32];
-  const uint n = tokens * top_k;
+  threadgroup int staged[kGroupRoutes];
+  const uint n = min(tokens * top_k, kGroupRoutes);
+  for (uint r = lid; r < n; r += lanes)
+    staged[r] = routes[r];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   uint count = 0;
   if (lid < experts)
     for (uint r = 0; r < n; ++r)
-      count += uint(routes[r] == int(lid));
+      count += uint(staged[r] == int(lid));
   const uint present = count > 0 ? 1u : 0u;
   const uint within = simd_prefix_exclusive_sum(present);
   if (lane == 31)
@@ -153,7 +161,7 @@ struct Shifted {
     tiles[1 + at] = int(lid);
     uint slot = 0;
     for (uint r = 0; r < n && slot < 8; ++r)
-      if (routes[r] == int(lid)) {
+      if (staged[r] == int(lid)) {
         rows[at * 8 + slot] = int(r / top_k);
         inv[r] = int(at * 8 + slot);
         ++slot;
