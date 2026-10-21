@@ -128,70 +128,96 @@ struct Shifted {
 // The most routes a fire groups: eight tokens of a 16-wide fan-out.
 constant constexpr uint kGroupRoutes = 128;
 
-// Groups `tokens` x `top_k` routes (at most kGroupRoutes) by expert: one
-// threadgroup, a thread per expert (a multiple of 32 threads, at most 1024),
-// the tiles in expert order, after the shared expert's where `shared`, each
-// expert's rows in route order.
-[[kernel]] void moe_sg_group(const device int *routes [[buffer(0)]], device int *tiles [[buffer(1)]],
-                             device int *rows [[buffer(2)]], device int *inv [[buffer(3)]],
-                             constant uint &tokens [[buffer(4)]], constant uint &top_k [[buffer(5)]],
-                             constant uint &experts [[buffer(6)]], constant uint &shared [[buffer(7)]],
-                             uint lid [[thread_position_in_threadgroup]],
-                             uint lanes [[threads_per_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]],
-                             uint simd [[simdgroup_index_in_threadgroup]]) {
-  threadgroup uint before[32];
+// The most experts a fire groups: a bit each in 32 words.
+constant constexpr uint kGroupExperts = 1024;
+
+// Groups `tokens` x `top_k` routes (at most kGroupRoutes, of at most
+// kGroupExperts experts) by expert and lays each live tile's input table from
+// its rows' tokens in `x`, in one pass: every threadgroup groups the routes
+// for itself (64 routes are cheaper to group again than to wait a launch for)
+// and takes its tile, the tiles in expert order after the shared expert's
+// where `shared`, each expert's rows in route order; the first of a tile's
+// threadgroups records its expert, rows and routes, the first of tile 0's the
+// live count. Then `qmm_sg_table` over the tile's rows: a simdgroup per
+// 64-input group (grid y) and tile (grid z), a lane per slot.
+[[kernel]] void moe_sg_group_gather(
+    const device bfloat *x [[buffer(0)]], const device int *routes [[buffer(1)]],
+    device bfloat *tables [[buffer(2)]], device int *tiles [[buffer(3)]], device int *rows [[buffer(4)]],
+    device int *inv [[buffer(5)]], constant uint &width [[buffer(6)]], constant uint &tokens [[buffer(7)]],
+    constant uint &top_k [[buffer(8)]], constant uint &experts [[buffer(9)]],
+    constant uint &shared [[buffer(10)]], uint3 at [[thread_position_in_grid]],
+    uint3 group [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
+    uint3 extent [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+  const uint threads = extent.x * extent.y * extent.z;
   threadgroup int staged[kGroupRoutes];
-  const uint n = min(tokens * top_k, kGroupRoutes);
-  for (uint r = lid; r < n; r += lanes)
+  threadgroup atomic_uint present[kGroupExperts / 32];
+  threadgroup int expert_of, count_of, token_of[8];
+  const uint n = min(tokens * top_k, kGroupRoutes), tile = at.z;
+  for (uint w = lid; w < kGroupExperts / 32; w += threads)
+    atomic_store_explicit(&present[w], 0u, memory_order_relaxed);
+  for (uint r = lid; r < n; r += threads)
     staged[r] = routes[r];
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint count = 0;
-  if (lid < experts)
-    for (uint r = 0; r < n; ++r)
-      count += uint(staged[r] == int(lid));
-  const uint present = count > 0 ? 1u : 0u;
-  const uint within = simd_prefix_exclusive_sum(present);
-  if (lane == 31)
-    before[simd] = within + present;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint at = shared + within;
-  for (uint s = 0; s < simd; ++s)
-    at += before[s];
-  if (present) {
-    tiles[1 + at] = int(lid);
-    uint slot = 0;
-    for (uint r = 0; r < n && slot < 8; ++r)
-      if (staged[r] == int(lid)) {
-        rows[at * 8 + slot] = int(r / top_k);
-        inv[r] = int(at * 8 + slot);
-        ++slot;
-      }
-    for (; slot < 8; ++slot)
-      rows[at * 8 + slot] = -1;
+  for (uint r = lid; r < n; r += threads) {
+    const uint e = uint(staged[r]);
+    if (e < min(experts, kGroupExperts))
+      atomic_fetch_or_explicit(&present[e >> 5], 1u << (e & 31), memory_order_relaxed);
   }
-  if (lid == lanes - 1)
-    tiles[0] = int(at + present);
-  if (shared != 0 && lid < 8)
-    rows[lid] = lid < tokens ? int(lid) : -1;
-  if (shared != 0 && lid == 0)
-    tiles[1] = int(experts);
-}
-
-// Each live tile's input table, from its rows' tokens in `x`: `qmm_sg_table`
-// over the tile's rows, a simdgroup per 64-input group (grid y) and tile
-// (grid z), a lane per slot.
-[[kernel]] void moe_sg_gather(const device bfloat *x [[buffer(0)]], device bfloat *tables [[buffer(1)]],
-                              const device int *tiles [[buffer(2)]], const device int *rows [[buffer(3)]],
-                              constant uint &width [[buffer(4)]],
-                              uint3 at [[thread_position_in_grid]]) {
-  const uint slot = at.x, h = at.y, tile = at.z;
-  if (int(tile) >= tiles[0])
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // The k-th expert present, in expert order: lane w holds word w's.
+  if (simd == 0) {
+    const uint word = atomic_load_explicit(&present[lane], memory_order_relaxed);
+    const uint held = popcount(word), before = simd_prefix_exclusive_sum(held);
+    const uint total = simd_sum(held);
+    const int k = int(tile) - int(shared);
+    if (lane == 0) {
+      count_of = int(shared + total);
+      expert_of = shared != 0 && tile == 0 ? int(experts) : -1;
+    }
+    if (k >= 0 && uint(k) >= before && uint(k) < before + held) {
+      uint left = word;
+      for (uint skip = uint(k) - before; skip > 0; --skip)
+        left &= left - 1;
+      expert_of = int(32 * lane + ctz(left));
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(tile) >= count_of)
     return;
+  const int expert = expert_of;
+  const bool first = group.y == 0;
+  if (lid == 0) {
+    uint slot = 0;
+    if (expert == int(experts)) {
+      for (; slot < tokens; ++slot)
+        token_of[slot] = int(slot);
+    } else {
+      for (uint r = 0; r < n && slot < 8; ++r)
+        if (staged[r] == expert) {
+          token_of[slot] = int(r / top_k);
+          if (first)
+            inv[r] = int(tile * 8 + slot);
+          ++slot;
+        }
+    }
+    for (; slot < 8; ++slot)
+      token_of[slot] = -1;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (first && lid < 8) {
+    rows[tile * 8 + lid] = token_of[lid];
+    if (lid == 0) {
+      tiles[1 + tile] = expert;
+      if (tile == 0)
+        tiles[0] = count_of;
+    }
+  }
+  const uint slot = at.x, h = at.y;
   device bfloat *table = tables + tile * moe_sg::table_width(width);
   const uint fm = slot >> 2, c = slot & 3;
   const uint cp = fm >> 1, i = fm & 1;
-  const int token[2] = {rows[tile * 8 + 2 * c], rows[tile * 8 + 2 * c + 1]};
+  const int token[2] = {token_of[2 * c], token_of[2 * c + 1]};
   vec<bfloat, 16> v;
   float sum[2] = {0.0f, 0.0f};
 #pragma unroll

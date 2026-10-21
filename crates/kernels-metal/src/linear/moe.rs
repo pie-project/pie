@@ -1140,7 +1140,7 @@ pub const REGISTER_TOKENS: u32 = 8;
 /// The most experts the register tiles group: a thread each.
 pub const REGISTER_EXPERTS: u32 = ROUTER_MAX_EXPERTS;
 
-/// The widest fan-out the register tiles group: `moe_sg_group` stages
+/// The widest fan-out the register tiles group: `moe_sg_group_gather` stages
 /// [`REGISTER_TOKENS`] tokens' routes of it.
 pub const REGISTER_FAN_OUT: u32 = 16;
 
@@ -1234,7 +1234,7 @@ pub fn register_cuts(inter: u32, columns: u32, cut: RegisterCut) -> bool {
 
 /// The routes of `routes` (at most [`REGISTER_TOKENS`] tokens) grouped into
 /// the register tile's expert tiles, after the shared expert's where `shared`,
-/// and each tile's input table laid from `x` ([`register_gather`]).
+/// and each tile's input table laid from `x`, in one launch.
 pub fn register_group(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -1270,36 +1270,27 @@ pub fn register_group(
             && u64::from(rooms.table.width) >= u64::from(tiles) * register_table_width(x.width),
         "`{OP}`'s register rooms hold every tile a fire may fill"
     );
+    if experts > REGISTER_EXPERTS {
+        return Err(refuse(
+            OP,
+            format!("{experts} experts are more than the {REGISTER_EXPERTS} the register tiles group"),
+        ));
+    }
     ctx.fire(
-        Fire::at(REGISTER_FILE, "moe_sg_group").apply(Grid::of(
-            [router_lanes(OP, experts)?, 1, 1],
-            [router_lanes(OP, experts)?, 1, 1],
-        )),
+        Fire::at(REGISTER_FILE, "moe_sg_group_gather")
+            .apply(Grid::of([32, x.width / 64, tiles], [32, 4, 1])),
         &[
+            x.arg(),
             routes.arg(),
+            rooms.table.arg_mut(),
             rooms.tiles.arg_mut(),
             rooms.rows.arg_mut(),
             rooms.inv.arg_mut(),
+            x.width.arg(),
             tokens.arg(),
             top_k.arg(),
             experts.arg(),
             u32::from(shared).arg(),
-        ],
-    )?;
-    register_gather(ctx, x, tiles, rooms)
-}
-
-/// Each of the up to `tiles` grouped tiles' input table, laid from `x`.
-pub fn register_gather(ctx: &Ctx<'_>, x: Tensor, tiles: u32, rooms: RegisterRooms) -> Result<(), Error> {
-    ctx.fire(
-        Fire::at(REGISTER_FILE, "moe_sg_gather")
-            .apply(Grid::of([32, x.width / 64, tiles], [32, 4, 1])),
-        &[
-            x.arg(),
-            rooms.table.arg_mut(),
-            rooms.tiles.arg(),
-            rooms.rows.arg(),
-            x.width.arg(),
         ],
     )
 }

@@ -308,12 +308,11 @@ fn the_register_routed_mlp_prices_its_tiles() {
         });
         let shared_dense = time(&|s, l| own(s, l));
         let group = time(&|s, _l| moe::register_group(s, xt, rt, EXPERTS, true, rooms).expect("group"));
-        let gather = time(&|s, _l| moe::register_gather(s, xt, tiles, rooms).expect("gather"));
         // Each pass over every tile a fire may fill, and over the live tiles alone, as an
         // indirect grid would launch them.
         let live = u32::try_from(unique).unwrap() + 1;
         let mut line = format!(
-            "rows={tokens} unique={unique:2}: per-route {per_route:6.1} + dense shared {shared_dense:5.1} = {:6.1} us | group+gather {group:5.1} us (gather {gather:5.1})\n  glu",
+            "rows={tokens} unique={unique:2}: per-route {per_route:6.1} + dense shared {shared_dense:5.1} = {:6.1} us | group+gather {group:5.1} us\n  glu",
             per_route + shared_dense
         );
         for (f, sg) in [(1, 4), (1, 8), (1, 16), (2, 4), (2, 8)] {
