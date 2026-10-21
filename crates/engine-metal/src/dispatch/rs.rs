@@ -272,9 +272,9 @@ impl Run<'_> {
     }
 
     /// Whether a split of `x` at `width` into `left` and `right` is left to
-    /// the verify conv that alone reads `left`, through the page table and
-    /// before anything reads `right`: it reads its own rows from `x` and
-    /// lands `right` itself.
+    /// the verify convs that alone read `left`, one an arm, through the page
+    /// table: each reads its rows from `x` and lands their `right` itself,
+    /// before the rest of its arm reads them (a gated-delta scan reads none).
     pub(crate) fn rs_split_into_conv(
         &self,
         x: ValueId,
@@ -285,33 +285,38 @@ impl Run<'_> {
         let Some(seat) = self.rs_seat() else {
             return false;
         };
-        let &[at] = self.readers(left) else {
-            return false;
+        let node = |at: u32| self.nodes().get(at as usize);
+        let convs = self.readers(left);
+        let convolves = |at: &u32| {
+            matches!(
+                node(*at).map(|node| &node.op),
+                Some(Operation::Attention(
+                    Attention::SsmCausalConv1d { x: input, conv_width, dilation, .. }
+                        | Attention::SsmCausalConv1dChunked { x: input, conv_width, dilation, .. }
+                )) if *input == left
+                    && attn::ssm::causal_conv1d_verify_fits(width, *conv_width, *dilation)
+            )
         };
-        let Some(Operation::Attention(
-            Attention::SsmCausalConv1d {
-                x: input,
-                conv_width,
-                dilation,
-                ..
-            }
-            | Attention::SsmCausalConv1dChunked {
-                x: input,
-                conv_width,
-                dilation,
-                ..
-            },
-        )) = self.nodes().get(at as usize).map(|node| &node.op)
-        else {
-            return false;
+        let after_its_conv = |at: &u32| {
+            let Some(reader) = node(*at) else {
+                return false;
+            };
+            matches!(
+                reader.op,
+                Operation::Attention(
+                    Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. }
+                )
+            ) || convs
+                .iter()
+                .any(|conv| conv < at && node(*conv).is_some_and(|conv| conv.guard == reader.guard))
         };
         let z = self.tensor(right).width;
-        let fits = *input == left
-            && attn::ssm::causal_conv1d_verify_fits(width, *conv_width, *dilation)
+        let fits = !convs.is_empty()
+            && convs.iter().all(convolves)
+            && self.readers(right).iter().all(after_its_conv)
             && z <= width
             && z.is_multiple_of(4)
-            && seat.paged(self.handles(), left).is_some()
-            && self.readers(right).iter().all(|&reader| reader > at);
+            && seat.paged(self.handles(), left).is_some();
         if fits {
             seat.split.borrow_mut().insert(left.0, (x, right));
         }
@@ -328,7 +333,7 @@ impl Run<'_> {
     ) -> Result<Tensor, Error> {
         const OP: &str = "attention.ssm_causal_conv1d_committed";
         let ext_y = self.rs_out(OP, seat, y)?;
-        let split = seat.split.borrow_mut().remove(&conv.x.0);
+        let split = seat.split.borrow().get(&conv.x.0).copied();
         // The verify conv lands the window's own rows itself, and through the
         // page table reads and lands the buffer's too, and the split's other
         // half where it reads the packed rows.
