@@ -300,40 +300,50 @@ impl<'c> Run<'c> {
     /// 64-group bank over at most eight rows, a whole number of the tile's
     /// 64 columns), the arrival counters the widest split one takes: the
     /// producer of `value` then lays the tile's input table with that many
-    /// zeroed, and the projections read it.
+    /// zeroed, and the projections read it. A fused MLP's gate-up is one.
     pub(crate) fn register_readers(&self, value: ValueId) -> Option<u32> {
-        use poem_ir::{Linear, Operation};
-        let x = self.tensor(value);
-        if !self.tuning.qmm_register()
-            || x.dtype != poem_ir::Dtype::Bf16
-            || x.rows == 0
-            || x.rows > 8
-            || !x.width.is_multiple_of(256)
-        {
-            return None;
-        }
+        use poem_ir::{Fused, Linear, Operation};
         self.readers_of(value)
             .iter()
             .filter_map(|&at| match &self.nodes.get(at as usize)?.op {
                 Operation::Linear(Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y })
                     if *act == value =>
                 {
-                    let bank = self.banked(*w)?;
-                    let columns = self.tensor(*y).width;
-                    let (Ok(cols), Ok(k)) = (i32::try_from(columns), i32::try_from(x.width)) else {
-                        return None;
-                    };
-                    let split =
-                        kernels_metal::linear::quant::register_split(cols, k, self.tuning.cores());
-                    (bank.bits == 4
-                        && bank.group == 64
-                        && bank.biases.is_some()
-                        && columns.is_multiple_of(64))
-                    .then_some(if split > 1 { columns / 64 } else { 0 })
+                    self.register_counters(value, *w, self.tensor(*y).width)
+                }
+                Operation::Fused(Fused::MlpSwiglu {
+                    act,
+                    gate_up,
+                    packed,
+                    ..
+                }) if *act == value => {
+                    self.register_counters(value, *gate_up, self.tensor(*packed).width)
                 }
                 _ => None,
             })
             .max()
+    }
+
+    /// When the projection of `act` by bank `w` into `columns` columns may
+    /// run on the register tile, the arrival counters its split takes.
+    pub(crate) fn register_counters(&self, act: ValueId, w: ValueId, columns: u32) -> Option<u32> {
+        let x = self.tensor(act);
+        if !self.tuning.qmm_register()
+            || x.dtype != poem_ir::Dtype::Bf16
+            || x.rows == 0
+            || x.rows > 8
+            || !x.width.is_multiple_of(256)
+            || !columns.is_multiple_of(64)
+        {
+            return None;
+        }
+        let bank = self.banked(w)?;
+        if bank.bits != 4 || bank.group != 64 || bank.biases.is_none() {
+            return None;
+        }
+        let (cols, k) = (i32::try_from(columns).ok()?, i32::try_from(x.width).ok()?);
+        let split = kernels_metal::linear::quant::register_split(cols, k, self.tuning.cores());
+        Some(if split > 1 { columns / 64 } else { 0 })
     }
 
     pub(crate) fn chain_clear(&self) {
@@ -1123,7 +1133,12 @@ impl<'c> Run<'c> {
     /// take zeroed), when a projection of it runs on the register tile:
     /// recorded as standing, so the projections read it.
     pub(crate) fn producer_table(&self, value: ValueId) -> Option<(Tensor, u32)> {
-        let counters = self.register_readers(value)?;
+        self.laid_table(value, self.register_readers(value)?)
+    }
+
+    /// [`Run::producer_table`] for a producer that knows its projection's
+    /// counters (a fused MLP's swiglu, whose down the same node runs).
+    pub(crate) fn laid_table(&self, value: ValueId, counters: u32) -> Option<(Tensor, u32)> {
         let width = self.tensor(value).width;
         let rows = (17 * width + 4 * counters).div_ceil(2 * width);
         let (table, _) = self.register_table(value, rows, width, counters)?;

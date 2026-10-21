@@ -44,11 +44,26 @@ impl Run<'_> {
                         w: *gate_up,
                         y: *packed,
                     })?;
-                    self.linear(&Linear::MlpSwiglu {
-                        packed: *packed,
-                        intermediate: *intermediate,
-                        y: *h,
-                    })?;
+                    // The down on the register tile reads its input table as
+                    // the swiglu lays it.
+                    let laid = self
+                        .register_counters(*h, *down, self.tensor(*y).width)
+                        .and_then(|counters| self.laid_table(*h, counters));
+                    match laid {
+                        Some((table, counters)) => linear::mlp::swiglu_table(
+                            self.ctx(),
+                            self.tensor(*packed),
+                            *intermediate,
+                            self.tensor(*h),
+                            table,
+                            counters,
+                        )?,
+                        None => self.linear(&Linear::MlpSwiglu {
+                            packed: *packed,
+                            intermediate: *intermediate,
+                            y: *h,
+                        })?,
+                    }
                     self.linear(&Linear::Matmul {
                         act: *h,
                         w: *down,
