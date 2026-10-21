@@ -16,6 +16,7 @@ fn every_model_is_spoken_through_a_format_the_runtime_ships() {
             tools: t.tools,
             xml_tools: t.xml_tools,
             generation_suffix: t.generation_suffix.clone(),
+            identity: t.identity.clone(),
             stop: t.stop.clone(),
             bos: t.bos.clone(),
             eos: t.eos.clone(),

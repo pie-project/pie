@@ -19,6 +19,7 @@ pub mod lines;
 pub mod llama;
 pub mod mimo;
 pub mod minimax;
+pub mod minimax2;
 pub mod raw;
 pub mod spec;
 

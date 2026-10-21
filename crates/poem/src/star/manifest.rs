@@ -29,6 +29,7 @@ pub struct Template {
     pub tools: bool,
     pub xml_tools: bool,
     pub generation_suffix: String,
+    pub identity: String,
     pub stop: Vec<String>,
     pub bos: Option<String>,
     pub eos: Option<String>,
@@ -374,7 +375,7 @@ pub fn precision_of(spelled: &str) -> Option<Precision> {
 pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
     /// The template `format` with the settings it reads: ChatML `thinking`,
     /// `preserve_thinking`, `reasoning_effort`, `tools`, `xml_tools`, `generation_suffix`, `stop`; `lines`
-    /// `stop`, `bos`, `eos`; `raw` `stop`.
+    /// `stop`, `bos`, `eos`; `raw` `stop`; `minimax2` `identity`.
     fn template(
         #[starlark(require = pos)] format: String,
         #[starlark(require = named, default = false)] thinking: bool,
@@ -383,6 +384,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] tools: bool,
         #[starlark(require = named, default = false)] xml_tools: bool,
         #[starlark(require = named, default = String::new())] generation_suffix: String,
+        #[starlark(require = named, default = String::new())] identity: String,
         #[starlark(require = named, default = UnpackList::default())] stop: UnpackList<String>,
         #[starlark(require = named, default = NoneOr::None)] bos: NoneOr<String>,
         #[starlark(require = named, default = NoneOr::None)] eos: NoneOr<String>,
@@ -395,6 +397,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
             tools,
             xml_tools,
             generation_suffix,
+            identity,
             stop: stop.items,
             bos: bos.into_option(),
             eos: eos.into_option(),

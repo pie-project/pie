@@ -40,6 +40,87 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     llama_opens_on_its_dated_system_turn_and_writes_its_calls_as_json();
     glm47_writes_its_turns_back_to_back_and_its_calls_in_xml();
     glm45_writes_a_newline_after_each_marker();
+    minimax2_opens_on_its_identity_and_cues_an_open_think_block();
+}
+
+/// MiniMax-M2.5's template: a system turn of the release's identity (or the
+/// caller's prompt, or the identity and the tools), a cue inside an open
+/// `<think>` block, calls as `<invoke>`s, results as `<response>`s.
+fn minimax2_opens_on_its_identity_and_cues_an_open_think_block() {
+    let Some(tokenizer) = snapshot(
+        "MiniMaxAI/MiniMax-M2.5",
+        "f710177d938eff80b684d42c5aa84b382612f21f",
+    ) else {
+        return;
+    };
+    let template = chat_template::minimax2::MiniMax2::new(
+        tokenizer,
+        "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax.",
+    );
+    let opening: Vec<u32> = vec![
+        200034, 200019, 28463, 10, 2985, 457, 258, 12473, 23413, 46, 5324, 1925, 355, 35353, 12973,
+        5145, 50, 46, 53, 306, 355, 6904, 531, 35353, 12973, 46, 200020, 10,
+    ];
+    let question: Vec<u32> = vec![
+        200019, 3995, 10, 3376, 355, 32, 1462, 3539, 32, 2019, 63, 200020, 10,
+    ];
+    let cue: Vec<u32> = vec![200019, 1361, 10, 200050, 10];
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.cue());
+    assert_eq!(
+        got,
+        [opening.clone(), question.clone(), cue.clone()].concat()
+    );
+
+    let mut got = template.system_user("You are terse.", MESSAGE);
+    got.extend(template.cue());
+    let terse: Vec<u32> = vec![
+        200034, 200019, 28463, 10, 2985, 457, 6000, 101, 46, 200020, 10,
+    ];
+    assert_eq!(got, [terse, question.clone(), cue.clone()].concat());
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.assistant("<think>\n17*23\n</think>\n\n391"));
+    got.extend(template.user("And 18 times 23?"));
+    got.extend(template.cue());
+    let want = [
+        opening,
+        question,
+        vec![
+            200019, 1361, 10, 42131, 200020, 10, 200019, 3995, 10, 3622, 32, 1081, 3539, 32, 2019,
+            63, 200020, 10,
+        ],
+        cue,
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let mut got = template.equip(&[GLM_TOOL.to_string()]);
+    got.extend(template.user("Weather in Paris?"));
+    got.extend(template.assistant(GLM_CALL));
+    got.extend(template.answer("get_weather", "{\"temp\": 21}"));
+    got.extend(template.cue());
+    let want: Vec<u32> = vec![
+        200034, 200019, 28463, 10, 2985, 457, 258, 12473, 23413, 46, 5324, 1925, 355, 35353, 12973,
+        5145, 50, 46, 53, 306, 355, 6904, 531, 35353, 12973, 634, 35, 31455, 10, 2985, 992, 1728,
+        841, 436, 812, 6629, 301, 7202, 418, 275, 3100, 9560, 320, 9806, 457, 275, 6629, 3136, 296,
+        19535, 19357, 6634, 3728, 60, 32650, 1100, 60, 45382, 62, 16673, 1906, 2803, 494, 848, 95,
+        51872, 1164, 494, 16944, 2803, 494, 66079, 1164, 494, 24344, 2803, 18396, 4467, 2803, 494,
+        7052, 1164, 494, 41187, 2803, 18396, 44044, 2803, 18396, 4467, 2803, 494, 3386, 150370,
+        21384, 45382, 1100, 1579, 32650, 6983, 4625, 3527, 3994, 9885, 44, 1223, 27190, 6634, 301,
+        48687, 6629, 306, 1916, 7729, 3728, 200052, 10, 60, 88638, 1925, 1139, 45382, 28145, 45,
+        49, 6143, 60, 24662, 1925, 1139, 2949, 38158, 45, 49, 3361, 2949, 27306, 45, 49, 1579,
+        24662, 1100, 60, 24662, 1925, 1139, 2949, 38158, 45, 50, 3361, 2949, 27306, 45, 50, 1579,
+        24662, 1100, 4563, 1579, 88638, 1100, 200053, 200020, 10, 200019, 3995, 10, 66079, 296,
+        8261, 63, 200020, 10, 200019, 1361, 367, 200052, 10, 60, 88638, 1925, 1139, 848, 95, 51872,
+        6143, 60, 24662, 1925, 1139, 44044, 3361, 44890, 1579, 24662, 1100, 60, 24662, 1925, 1139,
+        29525, 3361, 50, 1579, 24662, 1100, 1579, 88638, 1100, 200053, 200020, 10, 200019, 45382,
+        10, 60, 9679, 62, 16673, 40886, 2803, 32, 2254, 30085, 9679, 62, 200020, 10, 200019, 1361,
+        10, 200050, 10,
+    ];
+    assert_eq!(got, want);
+    assert_eq!(template.seal(), vec![200020]);
 }
 
 const GLM_TOOL: &str = r#"{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}"#;
