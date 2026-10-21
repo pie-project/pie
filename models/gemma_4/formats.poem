@@ -2,6 +2,7 @@
 # spellings, and DiffusionGemma's own.
 
 load("//lib/dflash/formats.poem", "bind_aux")
+load("//lib/modelopt/formats.poem", "nvfp4_bank")
 
 def product(xs):
     out = 1
@@ -120,7 +121,12 @@ def safetensors(m, reads, layout):
             reads.read(x.post_ffw_norm_2, n("post_feedforward_layernorm_2.weight"))
             fused = n("experts.gate_up_proj")
             fused_quantized = n("experts.gate_up_proj.weight")
-            if has(fused):
+            if has(n("experts.0.gate_proj.weight_scale")):
+                # modelopt's NVFP4 export: each expert apart, its legs NVFP4.
+                e = lambda i, leg: n("experts.{}.{}_proj".format(i, leg))
+                nvfp4_bank(reads, x.gate_up, [[e(i, "gate"), e(i, "up")] for i in range(x.experts)])
+                nvfp4_bank(reads, x.down, [[e(i, "down")] for i in range(x.experts)])
+            elif has(fused):
                 reads.read(x.gate_up, fused)
                 reads.read(x.down, n("experts.down_proj"))
             elif has(fused_quantized):

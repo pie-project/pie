@@ -102,6 +102,17 @@ DFLASH_26B_A4B = dflash_head(
     mask_token = 4,
 )
 
+def modelopt(d, weights):
+    """Whether `weights` is modelopt's NVFP4 export as nvidia ships it and
+    vLLM serves it: the routed experts (26B-A4B) or the MLP (31B) NVFP4, the
+    rest bf16. The experts take NVFP4 rows or bf16 ones; a dense MLP, bf16
+    ones (W4A16), there being no dense NVFP4 product against NVFP4 rows."""
+    if len(weights) != 2 or weights[0] != dtype.bf16:
+        return False
+    if d.moe != None:
+        return weights[1] in [dtype.nvfp4, dtype.nvfp4a4]
+    return weights[1] == dtype.nvfp4
+
 def layout(id, deploy):
     """`id`'s weights as `deploy` stores them: the trunk's at its first
     dtype, the experts' at the second if it has one, DiffusionGemma's
@@ -114,8 +125,8 @@ def layout(id, deploy):
     if self_cond:
         if len(weights) not in ([3] if "selfcond" in deploy.parts else [1, 2]):
             fail("{} does not ship {}".format(id, deploy))
-    elif len(weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, weights))
+    elif len(weights) != 1 and not modelopt(d, weights):
+        fail("{} stores its weights at one dtype, or as modelopt's NVFP4 export [bf16, nvfp4(a4)], not {}".format(id, weights))
     if vision and drafter != None:
         fail("{} does not ship {}".format(id, deploy))
     w = weights[0]
@@ -124,6 +135,8 @@ def layout(id, deploy):
     dense = compute(w)
     gate = dtype.u8g64 if w == dtype.u4g64 else w
     proj = dtype.u4g64tiled if w == dtype.u4g64 else w
+    # modelopt's 31B export stores its MLP NVFP4; the 26B-A4B's, bf16.
+    mlp_at = weights[1] if not self_cond and len(weights) == 2 and d.moe == None else proj
     hidden = d.hidden
     full_at = lambda l: l % d.full_every == d.full_every - 1
     shared_at = lambda l: d.shared_tail != None and l >= d.layers - d.shared_tail
@@ -196,9 +209,9 @@ def layout(id, deploy):
             pre_ffw_norm_eps = d.norm_eps,
             post_ffw_norm = norm("post_ffw_norm", hidden),
             post_ffw_norm_eps = d.norm_eps,
-            gate_up = weight(n("gate_up"), [2 * iw, hidden], proj).packed([iw, iw]),
+            gate_up = weight(n("gate_up"), [2 * iw, hidden], mlp_at).packed([iw, iw]),
             inter = iw,
-            down = weight(n("down"), [hidden, iw], proj).rows(),
+            down = weight(n("down"), [hidden, iw], mlp_at).rows(),
             scalar = weight(n("scalar"), [1], dense) if d.ple_dim == None else None,
             lora_a = lora_a,
             lora_b = lora_b,
