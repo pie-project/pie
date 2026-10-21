@@ -25,6 +25,16 @@ F8 = dtype.e4m3tile128a8
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.bf16),
+    # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
+    deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.e4m3),
+    # compressed-tensors per-channel FP8 (RedHatAI/Qwen3-*-FP8-dynamic): a
+    # factor a row against e4m3 activations in 1x128 blocks (finer than the
+    # release's per-token), keys and values e4m3 as vLLM serves it on B200.
+    deployment("qwen3-0.6b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-0.6b", weights = dtype.e4m3g128a8, kv = dtype.bf16),
+    deployment("qwen3-14b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = dtype.e4m3g128a8, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = F8, kv = dtype.bf16),
     deployment("qwen3-8b", weights = F8, kv = dtype.e4m3),
@@ -34,4 +44,6 @@ DEPLOYMENTS = [
     deployment("qwen3-32b", weights = F8, kv = dtype.e4m3),
     deployment("qwen3-32b", weights = dtype.nvfp4, kv = dtype.e4m3),
     deployment("qwen3-32b", weights = dtype.u4g64, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
 ]

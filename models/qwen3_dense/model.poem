@@ -27,9 +27,10 @@ DIMS = {
     "qwen3-32b": dims(hidden = 5120, layers = 64, q_heads = 64, kv_heads = 8, inter = 25600, tied = False),
 }
 
-# A release whose projections a deployment keeps as released (Qwen's FP8,
-# modelopt's NVFP4), its tables and norms bf16.
-RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4]
+# A release whose projections a deployment keeps as released (Qwen's block
+# FP8, compressed-tensors' per-channel FP8 as RedHatAI's *-FP8-dynamic store
+# it, modelopt's NVFP4), its tables and norms bf16.
+RELEASED = [dtype.e4m3tile128a8, dtype.e4m3g128, dtype.e4m3g128a8, dtype.nvfp4]
 
 def layout(id, deploy):
     if len(deploy.weights) != 1:

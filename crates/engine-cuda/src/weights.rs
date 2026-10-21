@@ -1590,7 +1590,7 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
             let gran = match trace.params[at].dtype {
                 Dtype::Nvfp4 => 16,
                 Dtype::Mxfp4 => 32,
-                Dtype::E4m3 | Dtype::E4m3tile128 => 128,
+                Dtype::E4m3 | Dtype::E4m3tile128 | Dtype::E4m3g128 => 128,
                 _ => continue,
             };
             banks.insert(at, gran);
@@ -1689,7 +1689,10 @@ fn lay_atoms(
         };
         // An MXFP4 plane is `[.., rows, blocks, 16]` bytes, an NVFP4 one its
         // logical `[.., rows, k]`.
-        if matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
+        if matches!(
+            trace.params[at].dtype,
+            Dtype::E4m3 | Dtype::E4m3tile128 | Dtype::E4m3g128
+        ) {
             continue;
         }
         let shape = &trace.params[at].shape;
@@ -1752,9 +1755,13 @@ fn lay_tile_banks(
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
     for (at, _) in act_quant_banks(trace) {
-        if !matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
-            continue;
-        }
+        // A factor a 128x128 block, or (`e4m3g128`, a per-channel release) a
+        // factor a 128 along each row.
+        let per: u64 = match trace.params[at].dtype {
+            Dtype::E4m3 | Dtype::E4m3tile128 => 128,
+            Dtype::E4m3g128 => 1,
+            _ => continue,
+        };
         let Some(Some(WeightRow::Planes {
             codes,
             scales,
@@ -1779,8 +1786,8 @@ fn lay_tile_banks(
         {
             continue;
         }
-        let (blocks_r, blocks_k) = (rows / 128, k / 128);
-        let exps = Buffer::zeroed(usize::try_from(blocks_r * blocks_k).unwrap_or(usize::MAX))?;
+        let blocks_k = k / 128;
+        let exps = Buffer::zeroed(usize::try_from(rows / per * blocks_k).unwrap_or(usize::MAX))?;
         let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, 128);
         let laid = Buffer::zeroed(bytes)?;
         let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
@@ -1794,7 +1801,7 @@ fn lay_tile_banks(
             exps.ptr(),
             to32(rows),
             to32(k),
-            128,
+            to32(per),
         )?;
         kernels_cuda::linear::act_quant::scales_to_atoms(
             &ctx,
@@ -1803,7 +1810,7 @@ fn lay_tile_banks(
             laid.ptr(),
             to32(rows),
             to32(blocks_k),
-            128,
+            to32(per),
         )?;
         *scales = Tensor::new(laid.ptr(), to32(rows), to32(blocks_k), Dtype::U8);
         *codes = Tensor::new(codes.ptr, codes.rows, codes.width, Dtype::E4m3);
