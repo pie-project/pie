@@ -85,8 +85,8 @@ __device__ __forceinline__ u32 e4m3fn_bits(float q) {
         bits = static_cast<u32>(rintf(a * 512.f));
     } else {
         const int e = static_cast<int>((__float_as_uint(a) >> 23) & 0xFFu) - 127;
-        const float step = __uint_as_float(static_cast<u32>(e - 3 + 127) << 23);
-        const u32 mant = static_cast<u32>(rintf(a / step));  // 8 .. 16
+        // a / 2^(e-3), as an exact product.
+        const u32 mant = static_cast<u32>(rintf(a * __uint_as_float(static_cast<u32>(127 + 3 - e) << 23)));  // 8 .. 16
         bits = mant == 16u ? static_cast<u32>(e + 8) << 3 : (static_cast<u32>(e + 7) << 3) | (mant - 8u);
     }
     return bits != 0u && q < 0.f ? bits | 0x80u : bits;
@@ -1130,12 +1130,13 @@ __global__ __launch_bounds__(256) void act_quant_e4m3_codes(const bf16* __restri
     constexpr int LANES = GRAN / 8;
     static_assert(LANES <= kWave && (LANES & (LANES - 1)) == 0, "a block's lanes are a power of two in a wavefront");
     const Window window{win};
-    const int per = k / 8;
-    const long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= static_cast<long long>(rows) * per) return;
-    const long long r = t / per;
+    // The launch's threads fit 32 bits (the launcher's check).
+    const u32 per = static_cast<u32>(k) / 8;
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= static_cast<u32>(rows) * per) return;
+    const u32 r = t / per;
     if (!window.live(r)) return;
-    const long long at = window.plane(r) * k + (t % per) * 8;
+    const long long at = window.plane(r) * k + (t - r * per) * 8;
     const Pack8<bf16> in = *reinterpret_cast<const Pack8<bf16>*>(x + at);
     float v[8];
     float amax = 0.f;
@@ -1147,14 +1148,20 @@ __global__ __launch_bounds__(256) void act_quant_e4m3_codes(const bf16* __restri
 #pragma unroll
     for (int off = LANES / 2; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, kWave));
     float sc = e4m3_block_scale(amax);
+    // v / sc, as an exact product where sc is a power of two.
+    float inv = 0.f;
     if constexpr (POW2) {
         const u32 bits = __float_as_uint(fmaxf(amax, 1e-4f) * (1.f / 448.f));
         const int e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
         sc = __uint_as_float(static_cast<u32>(e + 127) << 23);
+        inv = __uint_as_float(static_cast<u32>(127 - e) << 23);
     }
     u32 word[2] = {0u, 0u};
 #pragma unroll
-    for (int i = 0; i < 8; ++i) word[i / 4] |= e4m3fn_bits(fminf(fmaxf(v[i] / sc, -448.f), 448.f)) << (8 * (i % 4));
+    for (int i = 0; i < 8; ++i) {
+        const float q = POW2 ? v[i] * inv : v[i] / sc;
+        word[i / 4] |= e4m3fn_bits(fminf(fmaxf(q, -448.f), 448.f)) << (8 * (i % 4));
+    }
     *reinterpret_cast<uint2*>(codes + at) = uint2{word[0], word[1]};
     if (t % LANES == 0) scales[at / GRAN] = sc;
 }
