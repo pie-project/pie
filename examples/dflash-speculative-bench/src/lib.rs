@@ -14,6 +14,14 @@
 //! accumulation-order floor at a near-tie: a wide verify fire sums in a
 //! different order than a one-row one). `baseline` runs that decode over the
 //! same prompt, so the speedup is measured rather than argued.
+//!
+//! **ONE FRAME A ROUND.** The draft and the verify are submitted together:
+//! the draft's epilogue lays out the verify's tokens (`[anchor, d[..]]`) on a
+//! channel the verify embeds, so the verify runs on the device right behind
+//! the draft and the host reads the round once, after the verify. The verify
+//! also counts the agreeing prefix (`kept`), which the host would otherwise
+//! need the proposals for. `chain: false` reads the draft back before the
+//! verify instead, as does a round whose width the draft's margins choose.
 
 use inferlet::eta::prelude::*;
 use inferlet::{chat, monotonic_now_ns, session};
@@ -67,6 +75,10 @@ struct Input {
     ngram_n: u32,
     #[serde(default = "default_ngram_max")]
     ngram_max: u32,
+    /// Submit the draft and the verify as one frame, the verify embedding the
+    /// draft's picks on the device; off reads the draft back in between.
+    #[serde(default = "default_true")]
+    chain: bool,
 }
 
 fn default_drafter() -> String {
@@ -638,12 +650,35 @@ async fn main(input: Input) -> Result<Output> {
         let drafting = planned.is_some();
         let fold_len = Channel::from([survivors]).named("fold_len_v");
         let mut proposals_owned: Vec<i32> = Vec::new();
+        // The verify's answer when the draft and the verify ran as one frame:
+        // the target's picks, and how many proposals they agreed with.
+        let mut judged: Option<(Vec<i32>, usize)> = None;
+        let chained = input.chain && !input.margin_width && frame_size() >= 2;
         if !drafting {
             verify = 1;
             plain_fires += 1;
         } else if ngram {
             // No draft fire: the proposals are the lookup's.
             proposals_owned = ngram_props[..verify as usize - 1].to_vec();
+        } else if chained {
+            let started = monotonic_now_ns();
+            let (truth, kept) = chained_round(&ChainedRound {
+                pipe: &pipe,
+                ws: &ws,
+                anchor,
+                held,
+                block,
+                verify,
+                from: from as u32,
+                mask_token,
+                bind_mask,
+                fold_len: &fold_len,
+            })
+            .await?;
+            // The round is one price: the verify's bucket carries it whole.
+            prices.drafted(1);
+            prices.verified(verify, monotonic_now_ns().saturating_sub(started));
+            judged = Some((truth, kept));
         } else {
             let mut ids = vec![mask_token; block as usize];
             ids[0] = anchor;
@@ -719,57 +754,24 @@ async fn main(input: Input) -> Result<Output> {
         let proposals = proposals_owned.as_slice();
         widths.push(verify);
 
-        // ── the verify: ONE trunk fire over `[anchor, proposals]` ────────
-        let mut fed = vec![anchor];
-        fed.extend_from_slice(&proposals[..verify as usize - 1]);
-        let toks = Channel::from(fed.as_slice()).named("toks_v");
-        let indptr = Channel::from([0u32, verify]).named("embed_indptr_v");
-        let slots = Channel::from_iter(held..held + verify).named("slots_v");
-        let readout = Channel::from_iter(0..verify).named("readout_v");
-        let truth = Channel::new([verify], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("truth_v");
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&toks, &indptr)?;
-        fwd.readout(&readout)?;
-        fwd.state(
-            &[&ws],
-            StateGeometry {
-                slots: Some(&slots),
-                fold: if drafting {
-                    Fold::Count(&fold_len)
-                } else {
-                    Fold::All
-                },
-                ..StateGeometry::default()
-            },
-        )?;
-        {
-            let truth = truth.clone();
-            fwd.epilogue(move || {
-                truth.put(&reshape(reduce_argmax(intrinsics::logits()), [verify]));
-            });
-        }
-        let verified_at = monotonic_now_ns();
-        fwd.submit(&pipe).context("verify submit")?;
-        let truth = truth
-            .take_host::<Vec<i32>>()
-            .await
-            .context("verify readback")?;
-        // A plain fire is priced only with nothing buffered behind it, the baseline's geometry.
-        if drafting || survivors == 0 {
-            prices.verified(verify, monotonic_now_ns().saturating_sub(verified_at));
-        }
-
-        // ── what the target kept ────────────────────────────────────────
-        // Row `i` of the verify predicts position `held + i + 1`, which is
-        // what proposal `i` claims — so the prefix is read off one zip.
-        let kept = proposals[..verify as usize - 1]
-            .iter()
-            .zip(&truth)
-            .take_while(|(p, t)| p == t)
-            .count();
+        let (truth, kept) = match judged {
+            Some(judged) => judged,
+            None => {
+                verify_round(
+                    &pipe,
+                    &ws,
+                    anchor,
+                    proposals,
+                    verify,
+                    held,
+                    drafting,
+                    survivors,
+                    &fold_len,
+                    &mut prices,
+                )
+                .await?
+            }
+        };
         if drafting {
             rounds += 1;
             drafted += verify as usize - 1;
@@ -781,7 +783,8 @@ async fn main(input: Input) -> Result<Output> {
         // fire to fold; the rejected tail is written over.
         survivors = if drafting { kept as u32 + 1 } else { 0 };
         let round_ns = monotonic_now_ns();
-        for tok in proposals[..kept].iter() {
+        // The kept proposals are the target's own picks up to the break.
+        for tok in truth[..kept].iter() {
             generated.push(*tok as u32);
             emitted_ns.push(round_ns);
         }
@@ -790,7 +793,256 @@ async fn main(input: Input) -> Result<Output> {
         emitted_ns.push(round_ns);
         held += kept as u32 + 1;
     }
+    finish(Finish {
+        input: &input,
+        prompt: &prompt,
+        stop_tokens: &stop_tokens,
+        generated,
+        emitted_ns,
+        rounds,
+        drafted,
+        accepted,
+        block,
+        widths,
+        replayed,
+        plain_fires,
+        prices: &prices,
+    })
+}
 
+/// One trunk fire over `[anchor, proposals]` from the host: the target's
+/// pick per row, and the proposals it agreed with.
+#[allow(clippy::too_many_arguments)]
+async fn verify_round(
+    pipe: &Pipeline,
+    ws: &WorkingSet,
+    anchor: i32,
+    proposals: &[i32],
+    verify: u32,
+    held: u32,
+    drafting: bool,
+    survivors: u32,
+    fold_len: &Channel,
+    prices: &mut Prices,
+) -> Result<(Vec<i32>, usize)> {
+    // ── the verify: ONE trunk fire over `[anchor, proposals]` ────────
+    let mut fed = vec![anchor];
+    fed.extend_from_slice(&proposals[..verify as usize - 1]);
+    let toks = Channel::from(fed.as_slice()).named("toks_v");
+    let indptr = Channel::from([0u32, verify]).named("embed_indptr_v");
+    let slots = Channel::from_iter(held..held + verify).named("slots_v");
+    let readout = Channel::from_iter(0..verify).named("readout_v");
+    let truth = Channel::new([verify], dtype::i32)
+        .capacity(channel_capacity() as u32)
+        .named("truth_v");
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &indptr)?;
+    fwd.readout(&readout)?;
+    fwd.state(
+        &[ws],
+        StateGeometry {
+            slots: Some(&slots),
+            fold: if drafting {
+                Fold::Count(fold_len)
+            } else {
+                Fold::All
+            },
+            ..StateGeometry::default()
+        },
+    )?;
+    {
+        let truth = truth.clone();
+        fwd.epilogue(move || {
+            truth.put(&reshape(reduce_argmax(intrinsics::logits()), [verify]));
+        });
+    }
+    let verified_at = monotonic_now_ns();
+    fwd.submit(pipe).context("verify submit")?;
+    let truth = truth
+        .take_host::<Vec<i32>>()
+        .await
+        .context("verify readback")?;
+    // A plain fire is priced only with nothing buffered behind it, the baseline's geometry.
+    if drafting || survivors == 0 {
+        prices.verified(verify, monotonic_now_ns().saturating_sub(verified_at));
+    }
+
+    // ── what the target kept ────────────────────────────────────────
+    // Row `i` of the verify predicts position `held + i + 1`, which is
+    // what proposal `i` claims — so the prefix is read off one zip.
+    let kept = proposals[..verify as usize - 1]
+        .iter()
+        .zip(&truth)
+        .take_while(|(p, t)| p == t)
+        .count();
+    Ok((truth, kept))
+}
+
+/// What a chained round reads off the loop.
+struct ChainedRound<'a> {
+    pipe: &'a Pipeline,
+    ws: &'a WorkingSet,
+    anchor: i32,
+    held: u32,
+    block: u32,
+    verify: u32,
+    from: u32,
+    mask_token: i32,
+    bind_mask: bool,
+    fold_len: &'a Channel,
+}
+
+/// The draft and the verify as ONE frame. The draft's epilogue lays out the
+/// verify's window, `[anchor, d[from], .., d[from + verify - 2]]`, on a
+/// channel the verify embeds, so the device runs the verify right behind the
+/// draft; the verify's epilogue answers its picks and the length of the
+/// prefix the window's proposals agreed with, the one read of the round.
+async fn chained_round(round: &ChainedRound<'_>) -> Result<(Vec<i32>, usize)> {
+    let &ChainedRound {
+        pipe,
+        ws,
+        anchor,
+        held,
+        block,
+        verify,
+        from,
+        mask_token,
+        bind_mask,
+        fold_len,
+    } = round;
+
+    // ── the draft: `[anchor, MASK x block-1]`, as the unchained round ────
+    let mut ids = vec![mask_token; block as usize];
+    ids[0] = anchor;
+    let toks = Channel::from(ids.as_slice()).named("toks_d");
+    let indptr = Channel::from([0u32, block]).named("embed_indptr_d");
+    let slots = Channel::from_iter(held..held + block).named("slots_d");
+    let kv_len = Channel::from([held + block]).named("kv_len_d");
+    let visible = vec![true; (block * (held + block)) as usize];
+    let mask = Channel::from_shaped([block, held + block], visible).named("mask_d");
+    let readout = Channel::from_iter(0..block).named("readout_d");
+    let first = Channel::from([anchor]).named("anchor_d");
+    // The verify's window: put by the draft, embedded by the verify.
+    let window = Channel::new([verify], dtype::i32).named("window_v");
+
+    let draft = ForwardPass::new();
+    draft
+        .set_drafting_block(true)
+        .map_err(|why| format!("stating the draft block: {why}"))?;
+    draft.embed(&toks, &indptr)?;
+    draft.readout(&readout)?;
+    draft.state(
+        &[ws],
+        StateGeometry {
+            slots: Some(&slots),
+            kv_len: Some(&kv_len),
+            mask: if bind_mask { Some(&mask) } else { None },
+            ..StateGeometry::default()
+        },
+    )?;
+    draft.epilogue(move || {
+        let a = first.take(); // [1] i32
+        let picks = reshape(intrinsics::mtp_drafts(block), [block]); // [block] i32
+        let i = iota(verify);
+        let one = Tensor::constant(1u32);
+        // Row i > 0 of the window is proposal i - 1, the pick of block row
+        // from + i - 1.
+        let at = min_elem(
+            max_elem(&i, &one) - &one + Tensor::constant(from),
+            Tensor::constant(block - 1),
+        );
+        window.put(&select(
+            eq(&i, Tensor::constant(0u32)),
+            broadcast(&a, [verify]),
+            gather(&picks, &at),
+        ));
+    });
+
+    // ── the verify: ONE trunk fire over the window ───────────────────────
+    let indptr = Channel::from([0u32, verify]).named("embed_indptr_v");
+    let slots = Channel::from_iter(held..held + verify).named("slots_v");
+    let readout = Channel::from_iter(0..verify).named("readout_v");
+    // `[t[0..verify], kept]`: the target's picks, then the agreeing prefix.
+    let judged = Channel::new([verify + 1], dtype::i32)
+        .capacity(channel_capacity() as u32)
+        .named("judged_v");
+
+    let check = ForwardPass::new();
+    check.embed(&window, &indptr)?;
+    check.readout(&readout)?;
+    check.state(
+        &[ws],
+        StateGeometry {
+            slots: Some(&slots),
+            fold: Fold::Count(fold_len),
+            ..StateGeometry::default()
+        },
+    )?;
+    {
+        let judged = judged.clone();
+        check.epilogue(move || {
+            let window = window.take(); // [verify] i32
+            let truth = reshape(reduce_argmax(intrinsics::logits()), [verify]); // [verify] i32
+            let k = verify - 1;
+            let one = Tensor::constant(1u32);
+            // Row i of the verify predicts what proposal i (window row i + 1)
+            // claims.
+            let proposed = gather(&window, iota(k) + &one);
+            let said = gather(&truth, iota(k));
+            let hit = cast(eq(&proposed, &said), dtype::u32);
+            let kept = cast(reshape(reduce_sum(cumprod(&hit)), [1]), dtype::i32);
+            let i = iota(verify + 1);
+            let last = Tensor::constant(verify - 1);
+            judged.put(&select(
+                lt(&i, Tensor::constant(verify)),
+                gather(&truth, min_elem(&i, &last)),
+                broadcast(&kept, [verify + 1]),
+            ));
+        });
+    }
+    submit_frame(pipe, &[Some(&draft), Some(&check)]).context("draft and verify submit")?;
+    let mut truth = judged
+        .take_host::<Vec<i32>>()
+        .await
+        .context("verify readback")?;
+    let kept = truth.pop().map_or(0, |kept| kept.max(0) as usize);
+    Ok((truth, kept.min(verify as usize - 1)))
+}
+
+/// What the loop leaves for the answer.
+struct Finish<'a> {
+    input: &'a Input,
+    prompt: &'a [u32],
+    stop_tokens: &'a [u32],
+    generated: Vec<u32>,
+    emitted_ns: Vec<u64>,
+    rounds: usize,
+    drafted: usize,
+    accepted: usize,
+    block: u32,
+    widths: Vec<u32>,
+    replayed: usize,
+    plain_fires: usize,
+    prices: &'a Prices,
+}
+
+fn finish(done: Finish<'_>) -> Result<Output> {
+    let Finish {
+        input,
+        prompt,
+        stop_tokens,
+        mut generated,
+        mut emitted_ns,
+        rounds,
+        drafted,
+        accepted,
+        block,
+        widths,
+        replayed,
+        plain_fires,
+        prices,
+    } = done;
     // A stop token ends the text; anything the last block committed past it
     // is not the answer.
     if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
