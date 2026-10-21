@@ -224,6 +224,15 @@ pub enum MoePath {
 )]
 pub struct MoeTileRows(pub u32);
 
+/// Whether a routed MLP over a verify's few tokens (2 to 8) runs on the register
+/// tile, as Splash's Apple9 expert tiles do: the routes grouped into an 8-row
+/// tile an expert, each tile's codes streamed once for its rows, the gate-up
+/// landing its SwiGLU as the down's input table, and the shared expert, where
+/// one follows, riding along as one more tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.register", flag, default = false, tune = search)]
+pub struct MoeRegister;
+
 /// How prompt rows attend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.prefill", default = "tiled", tune = search)]
@@ -298,6 +307,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaSplit>()
         .add::<MoePath>()
         .add::<MoeTileRows>()
+        .add::<MoeRegister>()
         .add::<SdpaPrefill>()
         .add::<SdpaTileRowsPerRequest>()
         .add::<SdpaMma>()
@@ -414,6 +424,12 @@ impl Tuning {
             per_expert: i64::from(pairs / experts),
         };
         self.profile.pick::<MoeTileRows>(&at).0
+    }
+
+    /// Whether a routed MLP over 2 to 8 tokens runs on the register expert tiles.
+    #[must_use]
+    pub fn moe_register(&self) -> bool {
+        self.profile.on::<MoeRegister>(&profile::Anywhere)
     }
 
     #[must_use]
