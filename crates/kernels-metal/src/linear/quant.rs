@@ -798,7 +798,11 @@ fn act_x_wt_over(
                 }
             }
             Qmm::Register => {
-                if cols % REGISTER_COLUMNS == 0 && m <= 8 {
+                if cols % REGISTER_COLUMNS == 0
+                    && m <= 8
+                    && k % REGISTER_SPAN == 0
+                    && ld % REGISTER_SPAN == 0
+                {
                     // Without room for the partials it runs whole.
                     let split = register_split(cols, k, tuning.cores());
                     let partial = (split > 1)
@@ -810,15 +814,12 @@ fn act_x_wt_over(
                         })
                         .flatten();
                     let split = if partial.is_some() { split } else { 1 };
-                    // The rows' inputs as the lanes take them (8 x k bf16), their sums (k / 4
-                    // f32) and, split, one arrival counter per 64 columns, in 2k-byte rows.
                     let counters = if split > 1 {
                         cols / REGISTER_COLUMNS
                     } else {
                         0
                     };
-                    let bytes = 16 * k + k + 4 * counters;
-                    let table_rows = bytes.unsigned_abs().div_ceil(2 * k.unsigned_abs());
+                    let table_rows = register_table_rows(k, counters);
                     // A table another matmul of this activation laid is read as it stands.
                     let table = match scratch.table {
                         Some(kept) => kept(table_rows, contraction, counters.unsigned_abs()),
@@ -828,38 +829,18 @@ fn act_x_wt_over(
                         continue;
                     };
                     if !laid {
-                        ctx.fire(
-                            Fire::at(REGISTER_FILE, "qmm_sg_table")
-                                .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
-                            &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
-                        )?;
+                        register_table(ctx, act, table, m, k, counters)?;
                     }
-                    let entry = symbol(&format!("affine_qmm_sg_k{split}"));
-                    let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})"));
-                    return ctx.fire(
-                        Fire::at(REGISTER_FILE, entry).stamp(stamp).apply(Grid::of(
-                            [
-                                128 * (cols / REGISTER_COLUMNS).unsigned_abs(),
-                                split.unsigned_abs(),
-                                1,
-                            ],
-                            [128, 1, 1],
-                        )),
-                        &[
-                            w.codes.arg(),
-                            w.scales.arg(),
-                            biases.arg(),
-                            table.arg(),
-                            y.arg_mut(),
-                            k.arg(),
-                            n.arg(),
-                            match partial {
-                                Some(partial) => partial.arg_mut(),
-                                None => ctx.absent()?,
-                            },
-                            m.arg(),
-                            ld.arg(),
-                        ],
+                    return register_matmul(
+                        ctx,
+                        w,
+                        biases,
+                        table,
+                        y,
+                        (m, n, k, cols, ld),
+                        split,
+                        partial,
+                        REGISTER_WALK,
                     );
                 }
             }
@@ -1084,6 +1065,199 @@ pub fn register_split(cols: i32, k: i32, cores: Option<u32>) -> i32 {
         split *= 2;
     }
     split
+}
+
+/// The register tile's walk over a partition: `(U, V)`, the 64-code groups a
+/// step loads ahead and the groups a scale or bias load takes.
+pub const REGISTER_WALK: (u32, u32) = (2, 1);
+
+/// The rows of a `k`-wide room the register tile's input table takes: the
+/// rows' inputs as the lanes take them (8 x k bf16), their sums (k / 4 f32)
+/// and `counters` arrival counters, in 2k-byte rows.
+#[must_use]
+pub fn register_table_rows(k: i32, counters: i32) -> u32 {
+    (16 * k + k + 4 * counters)
+        .unsigned_abs()
+        .div_ceil(2 * k.unsigned_abs())
+}
+
+/// Lays the register tile's input table for the `m` rows of `act` (`k`
+/// wide) in `table`, with its first `counters` arrival counters zeroed.
+pub fn register_table(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    table: Tensor,
+    m: i32,
+    k: i32,
+    counters: i32,
+) -> Result<(), Error> {
+    ctx.fire(
+        Fire::at(REGISTER_FILE, "qmm_sg_table")
+            .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
+        &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
+    )
+}
+
+/// One register-tile matmul of a laid input `table` into `y`: `(m, n, k,
+/// cols, ld)` its rows, row stride, contraction, columns computed and the
+/// bank's row stride; `split` partitions of the contraction, whose sums go
+/// to `partial` when there are more than one.
+#[allow(clippy::too_many_arguments)]
+pub fn register_matmul(
+    ctx: &Ctx<'_>,
+    w: Bank,
+    biases: Tensor,
+    table: Tensor,
+    y: Tensor,
+    (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
+    split: i32,
+    partial: Option<Tensor>,
+    (u, v): (u32, u32),
+) -> Result<(), Error> {
+    let entry = symbol(&if (u, v) == REGISTER_WALK {
+        format!("affine_qmm_sg_k{split}")
+    } else {
+        format!("affine_qmm_sg_k{split}_u{u}_v{v}")
+    });
+    let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split},{u},{v})"));
+    ctx.fire(
+        Fire::at(REGISTER_FILE, entry).stamp(stamp).apply(Grid::of(
+            [
+                128 * (cols / REGISTER_COLUMNS).unsigned_abs(),
+                split.unsigned_abs(),
+                1,
+            ],
+            [128, 1, 1],
+        )),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            biases.arg(),
+            table.arg(),
+            y.arg_mut(),
+            k.arg(),
+            n.arg(),
+            match partial {
+                Some(partial) => partial.arg_mut(),
+                None => ctx.absent()?,
+            },
+            m.arg(),
+            ld.arg(),
+        ],
+    )
+}
+
+/// One projection of a register-tile segment launch: its bank, the output
+/// it lands whole (its width the row stride) and its contraction's
+/// partitions.
+#[derive(Clone, Copy, Debug)]
+pub struct Segment {
+    pub w: Bank,
+    pub y: Tensor,
+    pub split: i32,
+}
+
+/// The arrival counters and partial sums (f32) a segment launch takes: one
+/// counter per 64 columns and `split` rows of sums per row of every split
+/// segment.
+#[must_use]
+pub fn segments_scratch(segments: &[Segment], m: u32) -> (u32, u32) {
+    segments
+        .iter()
+        .filter(|s| s.split > 1)
+        .fold((0, 0), |(counters, floats), s| {
+            (
+                counters + s.y.width / REGISTER_COLUMNS.unsigned_abs(),
+                floats + s.split.unsigned_abs() * m * s.y.width,
+            )
+        })
+}
+
+/// Two or three register-tile matmuls of one laid input `table` (the `m`
+/// rows of a `k`-wide activation) in one launch, each segment summed as its
+/// own matmul sums it ([`register_matmul`] at its split), so its output is
+/// that matmul's to the bit. `partials` holds [`segments_scratch`]'s sums
+/// and the table its counters. Refused where a segment is no whole number of
+/// the tile's columns, or its bank no 4-bit, 64-group affine one the tile
+/// walks.
+pub fn register_segments(
+    ctx: &Ctx<'_>,
+    segments: &[Segment],
+    table: Tensor,
+    m: i32,
+    k: i32,
+    partials: Option<Tensor>,
+    (u, v): (u32, u32),
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_segments";
+    if !(2..=3).contains(&segments.len()) {
+        return Err(refuse(OP, "a segment launch takes two or three matmuls"));
+    }
+    if m <= 0 || m > 8 || k % REGISTER_SPAN != 0 {
+        return Err(refuse(
+            OP,
+            "the register tile takes up to 8 rows of whole 256-input units",
+        ));
+    }
+    let mut groups = 0u32;
+    let mut args = Vec::with_capacity(25);
+    for s in segments {
+        let Some(biases) = s.w.biases else {
+            return Err(refuse(OP, "a segment's bank holds no biases"));
+        };
+        let cols = stated(OP, s.y.width)?;
+        let ld = stated(OP, s.w.ld)?;
+        if s.w.bits != 4
+            || s.w.group != 64
+            || cols % REGISTER_COLUMNS != 0
+            || ld % REGISTER_SPAN != 0
+            || ld < k
+            || s.y.rows != m.unsigned_abs()
+            || !(1..=8).contains(&s.split)
+            || (s.split > 1 && partials.is_none())
+        {
+            return Err(refuse(OP, "a segment the register tile does not walk"));
+        }
+        groups += (cols / REGISTER_COLUMNS).unsigned_abs() * s.split.unsigned_abs();
+        args.extend([
+            s.w.codes.arg(),
+            s.w.scales.arg(),
+            biases.arg(),
+            s.y.arg_mut(),
+        ]);
+    }
+    for _ in segments.len()..3 {
+        let absent = ctx.absent()?;
+        args.extend([absent; 4]);
+    }
+    args.extend([
+        table.arg(),
+        match partials {
+            Some(partials) => partials.arg_mut(),
+            None => ctx.absent()?,
+        },
+        k.arg(),
+        m.arg(),
+    ]);
+    let at = |i: usize, of: &dyn Fn(&Segment) -> i32| segments.get(i).map_or(0, of);
+    for of in [
+        &(|s: &Segment| s.y.width.cast_signed()) as &dyn Fn(&Segment) -> i32,
+        &|s: &Segment| s.split,
+        &|s: &Segment| s.w.ld.cast_signed(),
+    ] {
+        for i in 0..3 {
+            args.push(at(i, of).arg());
+        }
+    }
+    let count = segments.len();
+    let entry = symbol(&format!("affine_qmm_sg_segments_s{count}_u{u}_v{v}"));
+    let stamp = symbol(&format!("PIE_SG_SEGMENTS(\"{entry}\",{count},{u},{v})"));
+    ctx.fire(
+        Fire::at(REGISTER_FILE, entry)
+            .stamp(stamp)
+            .apply(Grid::of([128 * groups, 1, 1], [128, 1, 1])),
+        &args,
+    )
 }
 
 const STAGED_SPLIT_WIDE: i32 = 8;
