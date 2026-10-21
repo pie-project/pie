@@ -1,7 +1,7 @@
-# The forward of Nemotron-3 Super: pre-norm layers, each one mixer added to
-# the residual: a Mamba-2 scan, a NoPE GQA attention, or a latent MoE whose
-# relu2 experts read the residual squeezed to the latent width beside a relu2
-# shared expert reading it whole.
+# The forward of Nemotron-3 Super and Nano: pre-norm layers, each one mixer
+# added to the residual: a Mamba-2 scan, a NoPE GQA attention, or an MoE
+# whose relu2 experts read the residual (Super's squeezed to the latent
+# width) beside a relu2 shared expert reading it whole.
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
@@ -100,8 +100,18 @@ def moe(x, m, f):
         True,
         m.scaling,
     )
-    z = ops.linear.matmul(x, f.down_latent)
-    hidden = ops.linear.mlp_relu2(ops.linear.moe_matmul_select_quant(z, f.up, routes, m.top_k))
-    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(hidden, f.down, routes, m.top_k), weights)
+
+    def select(act, bank):
+        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
+            return ops.linear.moe_matmul_select(act, bank, routes, m.top_k)
+        return ops.linear.moe_matmul_select_quant(act, bank, routes, m.top_k)
+
+    # Super's experts read the residual squeezed to the latent width; Nano's
+    # read it whole.
+    z = ops.linear.matmul(x, f.down_latent) if f.down_latent != None else x
+    hidden = ops.linear.mlp_relu2(select(z, f.up))
+    routed = ops.linear.moe_weighted_sum(select(hidden, f.down), weights)
     shared = ops.linear.matmul(ops.linear.mlp_relu2(ops.linear.matmul(x, f.shared_up)), f.shared_down)
-    return ops.elemwise.residual_add(ops.linear.matmul(routed, f.up_latent), shared)
+    if f.up_latent != None:
+        routed = ops.linear.matmul(routed, f.up_latent)
+    return ops.elemwise.residual_add(routed, shared)
