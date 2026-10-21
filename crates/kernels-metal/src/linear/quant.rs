@@ -474,6 +474,11 @@ pub(crate) fn symbol(name: &str) -> &'static str {
     leaked
 }
 
+/// The register tile's input table for a matmul's activation: given the
+/// table's rows, contraction and arrival counters, its room and whether it
+/// already stands there (see [`Scratch::table`]).
+pub type KeptTable<'a> = &'a dyn Fn(u32, u32, u32) -> Option<(Tensor, bool)>;
+
 pub struct Scratch<'a> {
     pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,
 
@@ -485,7 +490,7 @@ pub struct Scratch<'a> {
     /// for (`rows`, `contraction`), and whether it already holds the
     /// activation's rows with at least `counters` arrival counters zeroed, so
     /// the call skips its table pass. `None` lays the table every call.
-    pub table: Option<&'a dyn Fn(u32, u32, u32) -> Option<(Tensor, bool)>>,
+    pub table: Option<KeptTable<'a>>,
 }
 
 pub fn matmul(
