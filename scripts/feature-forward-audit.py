@@ -14,7 +14,6 @@ FORWARDS = [("runtime", "worker"), ("worker", "pie")]
 # `feature -> why it is not forwarded`; an entry that stops being true fails.
 EXCUSED = {
     ("worker", "pie"): {
-        "nixl": "transport's NIXL engine is a stub; forwarding it would put a flag on the CLI that turns on nothing",
         "net": "the CLI always links a gateway; `standalone`, which `pie` depends on, turns it on",
         "standalone": "`pie` depends on it unconditionally; it is no flag for the CLI to offer",
     },
