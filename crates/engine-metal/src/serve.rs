@@ -4437,12 +4437,14 @@ impl engine::frame::Shell for Shell {
         };
         fire_trace(|| "forward-encoded".to_string());
         if crate::diag::on().barrier_trace {
-            let (launches, barriers) = crate::device::ctx::barrier_census();
+            let (launches, barriers, switches) = crate::device::ctx::barrier_census();
             eprintln!(
-                "barriers: fire of {} row(s): {} barrier(s) over {} concurrent launch(es)",
+                "barriers: fire of {} row(s): {} barrier(s) over {} concurrent launch(es), \
+                 {} switch(es) of pass",
                 prepared.descriptor.rows,
                 barriers - census.1,
-                launches - census.0
+                launches - census.0,
+                switches - census.2
             );
         }
         let profile = crate::encode::kernel_profile();

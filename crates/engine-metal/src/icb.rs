@@ -409,7 +409,7 @@ impl Icb {
         // overlap; the barriers are the commands' own.
         let frame = device.concurrent_frame()?;
         {
-            let encoder = frame.encoder();
+            let encoder = frame.indirect();
             for slab in &self.residents {
                 let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**slab);
                 encoder

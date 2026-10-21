@@ -364,11 +364,12 @@ impl Context {
         self.open_frame(false)
     }
 
-    /// A frame whose compute passes run their dispatches concurrently: a
-    /// launch encoded through [`Frame::tracked`] waits only on the launches
-    /// whose bytes it shares (see [`crate::hazard`]), and one encoded
-    /// through [`Frame::encoder`] waits on, and is waited on by, all of
-    /// them. The `serial` diagnostic hands out a serial frame instead.
+    /// A frame whose launches encoded through [`Frame::tracked`] run in a
+    /// concurrent pass, each waiting only on the launches whose bytes it
+    /// shares (see [`crate::hazard`]); what is encoded through
+    /// [`Frame::encoder`] runs in a serial pass of its own, after all of
+    /// them and before any that follow. The `serial` diagnostic hands out a
+    /// serial frame instead.
     pub fn concurrent_frame(&self) -> Result<Frame> {
         self.open_frame(!crate::diag::on().serial)
     }
@@ -392,6 +393,7 @@ impl Context {
                 committed: RefCell::new(Vec::new()),
                 flushed: RefCell::new(Vec::new()),
                 concurrent,
+                parallel: std::cell::Cell::new(concurrent),
                 hazards: RefCell::new(crate::hazard::Hazards::new()),
             })
         }
@@ -417,14 +419,17 @@ fn compute_pass(
 
 static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SWITCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Launches encoded into concurrent passes, and the barriers placed ahead
-/// of them, since the process began.
+/// Since the process began: launches encoded into concurrent passes, the
+/// barriers placed ahead of them, and the passes a concurrent frame opened
+/// to switch between its concurrent and serial kinds.
 #[must_use]
-pub fn barrier_census() -> (u64, u64) {
+pub fn barrier_census() -> (u64, u64, u64) {
     (
         LAUNCHES.load(std::sync::atomic::Ordering::Relaxed),
         BARRIERS.load(std::sync::atomic::Ordering::Relaxed),
+        SWITCHES.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -454,11 +459,13 @@ pub struct Frame {
     /// the order the queue runs them.
     #[cfg(target_vendor = "apple")]
     flushed: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
-    /// Whether the compute passes this frame opens run their dispatches
-    /// concurrently, ordered only by the barriers [`Frame::tracked`] and
-    /// [`Frame::encoder`] place.
+    /// Whether this frame runs tracked launches in concurrent passes.
     #[cfg(target_vendor = "apple")]
     concurrent: bool,
+    /// Whether the open pass is a concurrent one, ordered only by the
+    /// barriers [`Frame::tracked`] places.
+    #[cfg(target_vendor = "apple")]
+    parallel: std::cell::Cell<bool>,
     /// What the launches since the open pass's last barrier touched.
     #[cfg(target_vendor = "apple")]
     hazards: RefCell<crate::hazard::Hazards>,
@@ -472,33 +479,57 @@ impl Frame {
     /// The open compute pass, retained: a fence may replace it while the
     /// caller still holds this one, so nothing borrows the cell for long.
     ///
-    /// On a concurrent frame the caller is taken to encode one launch whose
-    /// touches nobody listed: it waits for every launch before it, and the
-    /// next launch waits for it. A caller that encodes more than one launch
-    /// asks once per launch.
+    /// The pass is a serial one: what the caller encodes on it touches
+    /// bytes nobody listed, as many launches as it likes, so on a concurrent
+    /// frame an open concurrent pass ends here and a serial one opens. A
+    /// pass boundary orders everything on its two sides.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn encoder(&self) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
-        let encoder = self.pass();
-        if self.concurrent {
-            let owed = self.hazards.borrow_mut().opaque();
-            self.place(&encoder, owed);
+        if self.parallel.get() {
+            self.switch(false);
         }
-        encoder
+        self.pass()
     }
 
-    /// The open compute pass, for one launch touching exactly `accesses`;
-    /// on a concurrent frame a barrier goes ahead of it when one of them
-    /// meets bytes a launch since the last barrier wrote, or writes bytes
-    /// one read.
+    /// The open compute pass, for one launch touching exactly `accesses`.
+    /// On a concurrent frame the pass is a concurrent one, and a barrier
+    /// goes ahead of the launch when one of them meets bytes a launch since
+    /// the last barrier wrote, or writes bytes one read.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn tracked(
         &self,
         accesses: &[crate::hazard::Access],
     ) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
+        if !self.concurrent {
+            return self.pass();
+        }
+        if !self.parallel.get() {
+            self.switch(true);
+        }
         let encoder = self.pass();
-        if self.concurrent {
-            let owed = self.hazards.borrow_mut().admit(accesses);
-            self.place(&encoder, owed);
+        let owed = self.hazards.borrow_mut().admit(accesses);
+        LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if owed {
+            BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+        encoder
+    }
+
+    /// The open compute pass, concurrent on a concurrent frame, for one
+    /// indirect command buffer whose commands carry their own barriers;
+    /// the launch after it waits for all of them.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn indirect(&self) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
+        if !self.concurrent {
+            return self.pass();
+        }
+        if !self.parallel.get() {
+            self.switch(true);
+        }
+        let encoder = self.pass();
+        if self.hazards.borrow_mut().opaque() {
+            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }
         encoder
     }
@@ -526,24 +557,35 @@ impl Frame {
             .expect("the pass is open until `commit` closes it")
     }
 
+    /// Ends the open compute pass and opens one of the other kind on the
+    /// same buffer.
     #[cfg(target_vendor = "apple")]
-    fn place(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, owed: bool) {
-        LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if owed {
-            BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        }
+    fn switch(&self, parallel: bool) {
+        let ended = self
+            .encoder
+            .borrow_mut()
+            .take()
+            .expect("the pass is open until `commit` closes it");
+        ended.endEncoding();
+        SWITCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let opened = self
+            .open_pass(&self.buffer.borrow(), parallel)
+            .expect("the command buffer opens a compute pass");
+        *self.encoder.borrow_mut() = Some(opened);
     }
 
-    /// A fresh compute pass on `buffer`, of this frame's kind; nothing in a
+    /// A fresh compute pass on `buffer`, concurrent or serial; nothing in a
     /// pass before it overlaps it, so the hazard sets start empty.
     #[cfg(target_vendor = "apple")]
     fn open_pass(
         &self,
         buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        parallel: bool,
     ) -> Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> {
         self.hazards.borrow_mut().reset();
-        compute_pass(buffer, self.concurrent)
+        let parallel = parallel && self.concurrent;
+        self.parallel.set(parallel);
+        compute_pass(buffer, parallel)
     }
 
     /// Has `then` run once this frame's buffer is committed; a frame dropped
@@ -571,10 +613,12 @@ impl Frame {
         if let Some(encoder) = self.encoder.borrow_mut().take() {
             encoder.endEncoding();
         }
-        let encoder = self.open_pass(&tail).ok_or(Fault::Device {
-            call: "computeCommandEncoder",
-            why: "the command buffer would not open a compute pass".to_string(),
-        })?;
+        let encoder = self
+            .open_pass(&tail, self.parallel.get())
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoder",
+                why: "the command buffer would not open a compute pass".to_string(),
+            })?;
         head.commit();
         for then in self.committed.borrow_mut().drain(..) {
             then();
@@ -610,15 +654,11 @@ impl Frame {
     pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.end_pass();
         let buffer = self.buffer.get_mut().clone();
-        let encoder = self.open_pass(&buffer).ok_or(Fault::Device {
+        // A serial pass: the caller may encode on the pass it is handed.
+        let encoder = self.open_pass(&buffer, false).ok_or(Fault::Device {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a second compute pass".to_string(),
         })?;
-        if self.concurrent {
-            // The pass is handed out bare, so what the caller encodes on it
-            // is a launch nobody listed: the next tracked one waits for it.
-            let _ = self.hazards.get_mut().opaque();
-        }
         *self.encoder.get_mut() = Some(encoder);
         Ok(self.encoder.get_mut().as_deref().expect("just opened"))
     }
@@ -655,10 +695,12 @@ impl Frame {
         } else {
             current.encodeWaitForEvent_value(event, value);
         }
-        let reopened = self.open_pass(&self.buffer.borrow()).ok_or(Fault::Device {
-            call: "computeCommandEncoder",
-            why: "the command buffer would not reopen a compute pass after a fence".to_string(),
-        })?;
+        let reopened = self
+            .open_pass(&self.buffer.borrow(), self.parallel.get())
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoder",
+                why: "the command buffer would not reopen a compute pass after a fence".to_string(),
+            })?;
         *self.encoder.borrow_mut() = Some(reopened);
         Ok(())
     }
