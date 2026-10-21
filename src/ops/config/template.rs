@@ -116,10 +116,11 @@ activation_dtype = "bfloat16"
 # kv_page_size    = 32      # omit: the engine derives one
 # max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256,
 #                           # or what the chip profile states (B200: two a lane)
-# max_model_len   = 4096    # the most tokens one sequence may hold; omit for
-#                           # 4096. State it at what you serve: a decode body
-#                           # for n lanes is armed only when the pool holds
-#                           # n x max_model_len tokens
+# max_model_len   = 32768   # the most tokens one sequence may hold; omit for
+#                           # the context the model's config.json declares,
+#                           # shortened where one sequence at it would take
+#                           # more than half the pool (4096 if it declares
+#                           # none)
 "#;
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
