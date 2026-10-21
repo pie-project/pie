@@ -52,7 +52,10 @@ DEPLOYMENTS = [
     deployment("dsv4-flash-mini", weights = BF, kv = BF),
     deployment("dsv4-flash-mini", weights = [BF, FP4], kv = BF),
     deployment("dsv4-flash-mini", weights = W8A8, kv = BF),
-    deployment("dsv4-pro", weights = [BF, FP4], kv = BF),
+    # DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla), the kv vLLM serves V4 at.
+    deployment("dsv4-flash", weights = W8A8, kv = dtype.e4m3),
+    deployment("dsv4-flash-mini", weights = W8A8, kv = dtype.e4m3),
+    deployment("dsv4-pro",weights = [BF, FP4], kv = BF),
     deployment("dsv4-pro-mini", weights = [BF, FP4], kv = BF),
     deployment("dsv4-base", weights = BF, kv = BF),
     deployment("dsv4-flash", weights = BF, kv = BF),

@@ -40,4 +40,7 @@ DEPLOYMENTS = [
     deployment("hy4-preview", weights = BF, kv = BF),
     deployment("hy4-mini", weights = BF, kv = BF),
     deployment("hy4-mini", weights = [U4, U4], kv = BF),
+    # The latent rows as vLLM's standard fp8 rows, read by B200's sparse pass.
+    deployment("hy4-preview", weights = [U4, U2], kv = dtype.e4m3),
+    deployment("hy4-mini", weights = BF, kv = dtype.e4m3),
 ]
