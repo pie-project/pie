@@ -1,7 +1,7 @@
 //! What a ROCm load does to the planes it lands, past what the CUDA one
 //! does: e4m3 made canonical for the FP8 matrix core (it reads e4m3fnuz),
-//! and fp8b32 projections and mxfp4 expert banks put in the matrix core's
-//! order where they lie.
+//! and fp8b32 / fp8b128 projections and mxfp4 expert banks put in the
+//! matrix core's order where they lie.
 
 use std::collections::BTreeMap;
 
@@ -169,11 +169,12 @@ pub(super) fn group_row_factors(
     Ok(())
 }
 
-/// The fp8b32 projections that land in the FP8 matrix core's order: `[n,
-/// k]` e4m3 planes (n a multiple of 16, k of 128) beside ue8m0 exponents a
-/// 32x32 block, held on the device, that only W8A8 products of bf16 rows
-/// under e4m3 a 1x32 block read; with their exponents.
-fn fp8b32_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<usize> {
+/// The fp8b32 and fp8b128 projections that land in the FP8 matrix core's
+/// order: `[n, k]` e4m3 planes (n a multiple of 16, k of 128) beside ue8m0
+/// exponents a 32x32 (128x128) block, held on the device, that only W8A8
+/// products of bf16 rows under e4m3 a 1x32 (1x128) block read; with their
+/// exponents and block side.
+fn fp8b_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<(usize, usize, u64)> {
     use poem_ir::{ActQuant, Def, Linear, Operands, Operation, Ty};
     let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def)
     {
@@ -191,6 +192,7 @@ fn fp8b32_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<usiz
     };
     let mut reads = vec![0u32; trace.params.len()];
     let mut products = vec![0u32; trace.params.len()];
+    let mut exps_of = vec![(0usize, 0u64); trace.params.len()];
     let mut ins = Vec::new();
     for node in &trace.nodes {
         ins.clear();
@@ -203,7 +205,9 @@ fn fp8b32_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<usiz
         if let Operation::Linear(Linear::MatmulActQuant {
             act,
             w,
-            quant: ActQuant::E4m3 { gran: 32 },
+            quant: ActQuant::E4m3 {
+                gran: side @ (32 | 128),
+            },
             input_scales: None,
             scales: Some(scales),
             ..
@@ -212,14 +216,16 @@ fn fp8b32_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<usiz
             && bf16(*act)
         {
             let (param, exps) = (&trace.params[w], &trace.params[s]);
+            let side = u64::from(*side);
             if param.dtype == Dtype::E4m3
                 && exps.dtype == Dtype::E8m0
                 && param.shape.len() == 2
                 && param.shape[0] % 16 == 0
                 && param.shape[1] % 128 == 0
-                && exps.shape == [param.shape[0].div_ceil(32), param.shape[1] / 32]
+                && exps.shape == [param.shape[0].div_ceil(side), param.shape[1] / side]
             {
                 products[w] += 1;
+                exps_of[w] = (s, side);
             }
         }
     }
@@ -231,28 +237,71 @@ fn fp8b32_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<usiz
                     tier.handles(at).is_some() || tier.group_handles(at).is_some()
                 })
         })
+        .map(|at| (at, exps_of[at].0, exps_of[at].1))
         .collect()
 }
 
-/// Puts `fp8b32_planes` in the FP8 matrix core's order where they lie, made
+/// Puts `fp8b_planes` in the FP8 matrix core's order where they lie, made
 /// canonical (a NaN code refused), through one staging plane, and rebinds
-/// their rows as ordered.
-pub(super) fn order_fp8b32_planes(
+/// their rows as ordered; an fp8b128 plane's exponents rebind as the f32
+/// factors 2^(e − 127) the matrix core's 128-block products fold under
+/// (into `held`).
+pub(super) fn order_fp8b_planes(
     trace: &Trace,
     places: &[Place],
     store: &Buffer,
     tier: Option<&crate::experts::Tier>,
     table: &mut [Option<WeightRow>],
+    held: &mut Vec<Buffer>,
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
-    let planes = fp8b32_planes(trace, tier);
-    let Some(widest) = planes
+    let found = fp8b_planes(trace, tier);
+    let Some(widest) = found
         .iter()
-        .map(|&at| trace.params[at].shape.iter().product::<u64>())
+        .map(|&(at, _, _)| trace.params[at].shape.iter().product::<u64>())
         .max()
     else {
         return Ok(());
     };
+    for &(_, exps, side) in &found {
+        if side != 128 {
+            continue;
+        }
+        let Some(Some(WeightRow::Dense(t))) = table.get(exps).copied() else {
+            continue;
+        };
+        let mut bytes = vec![0u8; t.rows as usize * t.width as usize];
+        crate::device::ctx::sync(stream)?;
+        crate::device::copy_any(stream, bytes.as_mut_ptr() as u64, t.ptr, bytes.len())?;
+        crate::device::ctx::sync(stream)?;
+        // 2^(e − 127); e = 0 is 2^-127, an f32 denormal.
+        let factors: Vec<f32> = bytes
+            .iter()
+            .map(|&e| {
+                f32::from_bits(if e == 0 {
+                    0x40_0000
+                } else {
+                    u32::from(e) << 23
+                })
+            })
+            .collect();
+        let buffer = Buffer::zeroed(factors.len() * 4)?;
+        crate::device::copy_any(
+            stream,
+            buffer.ptr(),
+            factors.as_ptr() as u64,
+            factors.len() * 4,
+        )?;
+        crate::device::ctx::sync(stream)?;
+        table[exps] = Some(WeightRow::Dense(kernels_cuda::Tensor::new(
+            buffer.ptr(),
+            t.rows,
+            t.width,
+            Dtype::F32,
+        )));
+        held.push(buffer);
+    }
+    let planes: Vec<usize> = found.iter().map(|&(at, _, _)| at).collect();
     // SAFETY: `stream` is the load's stream, live for the load.
     let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
     let staging = Buffer::zeroed(usize::try_from(widest).unwrap_or(usize::MAX))?;
@@ -285,7 +334,7 @@ pub(super) fn order_fp8b32_planes(
     if u32::from_le_bytes(count) != 0 {
         return Err(Fault::Param {
             name: trace.params[planes[0]].name.clone(),
-            why: "is one of the fp8b32 planes, which together hold NaN codes (0x7f, 0xff); the FP8 \
+            why: "is one of the fp8b32 / fp8b128 planes, which together hold NaN codes (0x7f, 0xff); the FP8 \
                   matrix core reads e4m3fnuz, where they are numbers, so this load refuses them",
         });
     }

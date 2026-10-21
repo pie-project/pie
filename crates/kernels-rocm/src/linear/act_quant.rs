@@ -64,10 +64,7 @@ pub fn e4m3_values(
     if x.rows == 0 {
         return Ok(());
     }
-    let blocks = u64::from(x.rows) * u64::from(x.width / gran);
-    let per_wave = u64::from((WAVE / gran).max(1));
-    let waves = blocks.div_ceil(per_wave);
-    let threads = u32::try_from(waves * u64::from(WAVE))
+    let threads = u32::try_from(u64::from(x.rows) * u64::from(x.width / 8))
         .map_err(|_| refuse(op, "the quantizer's threads do not fit a 32-bit extent"))?;
     ctx.fire(
         op,
@@ -296,7 +293,7 @@ fn factor_rows(n: u32, rows: u32) -> Option<u32> {
 }
 
 /// `x`'s rows quantized as e4m3 codes under an f32 scale a `gran` (`amax /
-/// 448`): the OCP bytes (`[rows, k]`, negative zero as zero) and each
+/// 448`, or with `pow2` DeepSeek's power of two, as `e4m3_values`): the OCP bytes (`[rows, k]`, negative zero as zero) and each
 /// block's scale (`[rows, k / gran]`), in this fire's scratch, as the FP8
 /// matrix-core products read them (`linear/fp8.hip`).
 pub fn quantized_codes(
@@ -304,6 +301,7 @@ pub fn quantized_codes(
     op: &'static str,
     x: Tensor,
     gran: u32,
+    pow2: bool,
 ) -> Result<(Tensor, Tensor), Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     if gran != FP8_BLOCK || x.width == 0 || !x.width.is_multiple_of(gran) {
@@ -329,7 +327,7 @@ pub fn quantized_codes(
     )? as usize as u64;
     let codes = Tensor::new(at, x.rows, x.width, Dtype::U8);
     let scales = Tensor::new(sat, x.rows, blocks, Dtype::F32);
-    quantize_codes_into(ctx, op, x, gran, codes, scales)?;
+    quantize_codes_into(ctx, op, x, gran, pow2, codes, scales)?;
     Ok((codes, scales))
 }
 
@@ -338,20 +336,22 @@ fn quantize_codes_into(
     op: &'static str,
     x: Tensor,
     gran: u32,
+    pow2: bool,
     codes: Tensor,
     scales: Tensor,
 ) -> Result<(), Error> {
-    let blocks = x.width / gran;
     if x.rows == 0 {
         return Ok(());
     }
-    let threads = u32::try_from(u64::from(x.rows) * u64::from(blocks) * u64::from(WAVE))
+    let threads = u32::try_from(u64::from(x.rows) * u64::from(x.width / 8))
         .map_err(|_| refuse(op, "the quantizer's threads do not fit a 32-bit extent"))?;
     ctx.fire(
         op,
         Fire::at(
             "linear/fp8.hip",
-            symbol(&format!("::pie::linear::act_quant_e4m3_codes<{gran}>")),
+            symbol(&format!(
+                "::pie::linear::act_quant_e4m3_codes<{gran}, {pow2}>"
+            )),
         )
         .apply(Launch::flat(threads, BLOCK)),
         &[
@@ -396,7 +396,7 @@ pub fn matmul_fp8(
     if act.rows == 0 {
         return Ok(());
     }
-    let (q, act_scales) = quantized_codes(ctx, op, act, FP8_BLOCK)?;
+    let (q, act_scales) = quantized_codes(ctx, op, act, FP8_BLOCK, false)?;
     matmul_fp8_quantized(ctx, op, q, act_scales, codes, factors, y)
 }
 
@@ -434,9 +434,10 @@ pub fn quantized_codes_held(
     op: &'static str,
     x: Tensor,
     hold: usize,
+    pow2: bool,
 ) -> Result<(Tensor, Tensor), Error> {
     if x.rows > 64 {
-        return quantized_codes(ctx, op, x, FP8_BLOCK);
+        return quantized_codes(ctx, op, x, FP8_BLOCK, pow2);
     }
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     if x.width == 0 || !x.width.is_multiple_of(FP8_BLOCK) {
@@ -462,7 +463,7 @@ pub fn quantized_codes_held(
     )? as usize as u64;
     let codes = Tensor::new(at, x.rows, x.width, Dtype::U8);
     let scales = Tensor::new(sat, x.rows, blocks, Dtype::F32);
-    quantize_codes_into(ctx, op, x, FP8_BLOCK, codes, scales)?;
+    quantize_codes_into(ctx, op, x, FP8_BLOCK, pow2, codes, scales)?;
     Ok((codes, scales))
 }
 
@@ -586,8 +587,9 @@ pub fn matmul_fp8b32_lanes(
 /// `act_scales` against `codes` (in the matrix core's order) beside
 /// `factors`: SB 0 f32 scales a 1x128 block and factors a 128x128 one, SB 32
 /// ue8m0 exponents a 1x32 and a 32x32 block (the same bytes a 128-code
-/// stage). Up to 64 rows on the decode tile (`dense_fp8_mfma`), past them on
-/// the prefill tiles (`dense_fp8_tiles`).
+/// stage). Up to 64 rows (`kernel.fp8.decode_until` for `e4m3tile128`) on
+/// the decode tile (`dense_fp8_mfma`), past them on the prefill tiles
+/// (`dense_fp8_tiles`).
 #[allow(clippy::too_many_arguments)]
 fn fire_fp8_dense(
     ctx: &Ctx,
@@ -608,7 +610,12 @@ fn fire_fp8_dense(
     } else {
         FP8_BLOCK
     };
-    if act.rows > 64 {
+    let decode_until = if sb == 0 {
+        ctx.tuning().fp8_decode_until
+    } else {
+        64
+    };
+    if act.rows > decode_until {
         return fire_fp8_tiles(ctx, op, act, act_scales, codes, factors, y, sb, fr);
     }
     // The decode tile; K sliced while the tiles and items are short of two
@@ -696,8 +703,20 @@ impl PrefillTile {
 /// The prefill tile a product's shape takes (measured on MI300X): SB 32 64
 /// rows x 256 columns at four waves a SIMD (its every step's fold leaves the
 /// registers for no wider tile); SB 0 128 x 256 at two a SIMD, 64 x 256
-/// where those leave more than two fifths of a round of CUs idle.
+/// where those leave more than two fifths of a round of CUs idle; up to
+/// `kernel.fp8.narrow_until` rows 64 x 128 at three a SIMD, a wave a strip,
+/// so a short prefill's tiles fill the card.
 fn prefill_tile(ctx: &Ctx, sb: u32, rows: u32, n: u32) -> PrefillTile {
+    if sb == 0 && rows <= ctx.tuning().fp8_narrow_until {
+        return PrefillTile {
+            nb: 3,
+            wn: 8,
+            wm: 1,
+            ns: 1,
+            ms: 4,
+            occ: 3,
+        };
+    }
     if sb == 32 {
         return PrefillTile {
             nb: 2,

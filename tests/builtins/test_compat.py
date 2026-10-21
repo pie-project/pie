@@ -566,6 +566,52 @@ def test_completions(http: Http):
     assert status == 400 and json.loads(text)["error"]["param"] == "prompt", text
 
 
+SAMPLING_ARMS = [
+    {"temperature": 1.0},
+    {"temperature": 0.7},
+    {"temperature": 1.0, "min_p": 0.05},
+    {"temperature": 0.7, "top_p": 0.9},
+    {"temperature": 1.0, "top_k": 40},
+]
+
+
+def test_sampling_arms(http: Http):
+    """Every sampler arm samples: at temperature > 0 a fixed seed answers the
+    same each time, different seeds answer differently, nothing degenerates to
+    one repeated token (a draw over an unwritten row answers token 0 every
+    step: "!!!!" on Qwen), and the drawn tokens are ones the model finds
+    plausible. Without a cut, compat's draw is one fused scan of the logits;
+    each cut takes another arm, so each is covered."""
+    prompt = "Once upon a time"
+
+    def draw(seed: int, **knobs) -> str:
+        status, _, text = http.post(
+            "/v1/completions",
+            {"prompt": prompt, "max_tokens": 24, "seed": seed, "ignore_eos": True, **knobs},
+        )
+        assert status == 200, text
+        return json.loads(text)["choices"][0]["text"]
+
+    for knobs in SAMPLING_ARMS:
+        texts = [draw(seed, **knobs) for seed in range(4)]
+        assert draw(0, **knobs) == texts[0], f"{knobs}: seed 0 drew differently twice"
+        assert len(set(texts)) >= 3, f"{knobs}: four seeds drew {len(set(texts))} texts: {texts}"
+        for t in texts:
+            stripped = t.strip()
+            assert len(set(stripped)) > 3, f"{knobs}: a degenerate draw {t!r}"
+
+        # Logprobs ride a different epilogue; the draws must still be plausible
+        # under the model's own (raw) distribution.
+        status, _, text = http.post(
+            "/v1/completions",
+            {"prompt": prompt, "max_tokens": 24, "seed": 7, "logprobs": 1, **knobs},
+        )
+        assert status == 200, text
+        lps = json.loads(text)["choices"][0]["logprobs"]["token_logprobs"]
+        mean = sum(lps) / len(lps)
+        assert mean > -6.0, f"{knobs}: drawn tokens average logprob {mean:.2f}"
+
+
 def test_completions_streaming(http: Http):
     status, _, resp = http.post(
         "/v1/completions",
@@ -850,6 +896,7 @@ TESTS = [
     test_anthropic_bad_requests,
     test_official_anthropic_client,
     test_completions,
+    test_sampling_arms,
     test_completions_streaming,
     test_responses_non_streaming,
     test_responses_streaming,

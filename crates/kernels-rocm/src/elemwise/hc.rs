@@ -135,6 +135,9 @@ const PROJECT_ROWS: u32 = 16;
 const PROJECT_WAVES: u32 = 4;
 /// The most K slices it sums (`hc_project_sum` holds one a register).
 const PROJECT_SLICES: u32 = 64;
+/// The blocks a compute unit the slicing fills: one block leaves a SIMD a
+/// single wavefront, whose f32 MFMA chains and stream reads then stall it.
+const PROJECT_BLOCKS_PER_CU: u32 = 2;
 
 fn compute_units() -> u32 {
     #[cfg(feature = "rocm")]
@@ -149,8 +152,9 @@ fn compute_units() -> u32 {
 
 /// How the tiled projection cuts its rows and K: `nt` 16-row tiles a
 /// wavefront (two past one tile), `tiles` row blocks, and K in `slices`
-/// slices of `per`, sliced until the blocks cover the compute units once, a
-/// slice at least one step of every wavefront.
+/// slices of `per`, sliced until the blocks fill every compute unit
+/// `PROJECT_BLOCKS_PER_CU` deep, a slice at least one step of every
+/// wavefront.
 #[derive(Clone, Copy)]
 struct Slicing {
     nt: u32,
@@ -164,7 +168,7 @@ impl Slicing {
         let nt = if rows > PROJECT_ROWS { 2 } else { 1 };
         let tiles = rows.div_ceil(PROJECT_ROWS * nt);
         let grain = 64 * PROJECT_WAVES;
-        let want = compute_units()
+        let want = (compute_units() * PROJECT_BLOCKS_PER_CU)
             .div_ceil(tiles)
             .clamp(1, fan.div_ceil(grain).min(PROJECT_SLICES));
         let per = fan.div_ceil(want).div_ceil(grain) * grain;

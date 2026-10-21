@@ -29,49 +29,47 @@ __device__ __forceinline__ float e4m3fn_round(float v) {
         // Three mantissa bits under the binade's exponent.
         const int e = static_cast<int>((__float_as_uint(a) >> 23) & 0xFFu) - 127;
         const float step = __uint_as_float(static_cast<u32>(e - 3 + 127) << 23);
-        r = rintf(a / step) * step;
+        r = rintf(a * __uint_as_float(static_cast<u32>(127 + 3 - e) << 23)) * step;
     }
     r = fminf(r, 448.f);
     return v < 0.f ? -r : r;
 }
 
 // x's rows quantized as E4M3 in GRAN-wide blocks, landed as their bf16
-// values. One wavefront a block, GRAN / 64 elements a lane (GRAN ≥ 64), or
-// 64 / GRAN blocks a wavefront.
+// values. Eight elements a thread, GRAN / 8 threads a block.
 template <int GRAN>
 __global__ __launch_bounds__(256) void act_quant_e4m3_values(const bf16* __restrict__ x, bf16* __restrict__ y,
                                                              i32 rows, i32 k, const u32* __restrict__ win) {
-    static_assert(GRAN % 8 == 0 && (GRAN % kWave == 0 || kWave % GRAN == 0), "a block a lane run");
-    constexpr int EACH = GRAN >= kWave ? GRAN / kWave : 1;
-    constexpr int SPAN = GRAN >= kWave ? kWave : GRAN;  // lanes a block spans
+    constexpr int LANES = GRAN / 8;  // a thread eight elements
+    static_assert(GRAN % 8 == 0 && LANES <= kWave && (LANES & (LANES - 1)) == 0, "a block a lane run");
     const Window window{win};
-    const int blocks = k / GRAN;
-    const long long w = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) / kWave;
-    const int l = lane();
-    const long long slot = w * (kWave / SPAN) + l / SPAN;
-    if (slot >= static_cast<long long>(rows) * blocks) return;
-    const long long r = slot / blocks;
+    // The launch's threads fit 32 bits (the launcher's check).
+    const u32 per = static_cast<u32>(k) / 8;
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= static_cast<u32>(rows) * per) return;
+    const u32 r = t / per;
     if (!window.live(r)) return;
-    const long long row = window.plane(r);
-    const int b = static_cast<int>(slot % blocks);
-    const int sub = l % SPAN;
-    const long long at = row * k + static_cast<long long>(b) * GRAN + sub * EACH;
-    float v[EACH];
+    const long long at = window.plane(r) * k + (t - r * per) * 8;
+    const Pack8<bf16> in = *reinterpret_cast<const Pack8<bf16>*>(x + at);
+    float v[8];
     float amax = 0.f;
 #pragma unroll
-    for (int i = 0; i < EACH; ++i) {
-        v[i] = to_f32(x[at + i]);
+    for (int i = 0; i < 8; ++i) {
+        v[i] = to_f32(in.v[i]);
         amax = fmaxf(amax, fabsf(v[i]));
     }
 #pragma unroll
-    for (int off = SPAN / 2; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, kWave));
+    for (int off = LANES / 2; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, kWave));
     amax = fmaxf(amax, 1e-4f);
     // 2^ceil(log2(amax / 448)), from the bits of the quotient.
     const u32 bits = __float_as_uint(amax * (1.f / 448.f));
     const int e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
     const float s = __uint_as_float(static_cast<u32>(e + 127) << 23);
+    const float inv = __uint_as_float(static_cast<u32>(127 - e) << 23);  // 1 / s, exact
+    Pack8<bf16> out;
 #pragma unroll
-    for (int i = 0; i < EACH; ++i) y[at + i] = from_f32<bf16>(e4m3fn_round(fminf(fmaxf(v[i] / s, -448.f), 448.f)) * s);
+    for (int i = 0; i < 8; ++i) out.v[i] = from_f32<bf16>(e4m3fn_round(fminf(fmaxf(v[i] * inv, -448.f), 448.f)) * s);
+    *reinterpret_cast<Pack8<bf16>*>(y + at) = out;
 }
 
 // The scale of fp8b128 block (n / 128, kk / 128): 2^(e − 127), 2^-127 (an

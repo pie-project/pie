@@ -65,12 +65,8 @@ pub fn walk(
             ),
         ));
     }
-    let (keys, values) = if kv::native_bf16(pool) {
-        (pool.keys, pool.values)
-    } else {
-        (pool.bf16_keys, pool.bf16_values)
-    };
-    if keys.ptr == 0 || values.ptr == 0 || keys.ptr % 16 != 0 {
+    let (keys, values) = (pool.keys, pool.values);
+    if !kv::native_bf16(pool) || keys.ptr == 0 || values.ptr == 0 || keys.ptr % 16 != 0 {
         return Err(refuse(
             op,
             "the pool's bf16 pages are absent or not 16-byte aligned",

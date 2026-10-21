@@ -903,13 +903,42 @@ fn route_order(
     // route has one.
     let work_cap = fan.route_count.div_ceil(group) + experts.min(fan.route_count);
     let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
+    // Past a few spans of routes, the spans bucket their own routes across
+    // the card and the one block only prefixes their counts.
+    let spans = fan.route_count.div_ceil(ORDER_SPAN);
+    let spans = if spans >= ORDER_SPANS_FROM { spans } else { 0 };
+    let hist_at = (work_at + work_cap as usize).next_multiple_of(64);
     let order = ctx.scratch_stream(
         op,
         ROUTE_ORDER,
-        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
+        (hist_at + spans as usize * (experts as usize + 1)) * core::mem::size_of::<i32>(),
     )? as usize as u64;
     let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
     let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
+    let hist = if spans > 0 {
+        order + (hist_at * core::mem::size_of::<i32>()) as u64
+    } else {
+        0
+    };
+    let span = |entry: &str, order: Option<u64>| -> Result<(), Error> {
+        let mut args = vec![routes.arg(), ArgValue::Ptr(hist)];
+        args.extend(order.map(ArgValue::Ptr));
+        args.extend([
+            fan.top_k.arg(),
+            stated(op, fan.route_count)?.arg(),
+            stated(op, experts)?.arg(),
+            ctx.stage(),
+        ]);
+        ctx.fire(
+            op,
+            Fire::at("linear/quant.hip", symbol(entry))
+                .apply(Launch::grid([spans, 1, 1], [256, 1, 1]).smem((experts + 1) * 4)),
+            &args,
+        )
+    };
+    if spans > 0 {
+        span("::pie::linear::moe_route_span_count", None)?;
+    }
     ctx.fire(
         op,
         Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
@@ -925,8 +954,13 @@ fn route_order(
             stated(op, fan.route_count)?.arg(),
             stated(op, experts)?.arg(),
             ctx.stage(),
+            ArgValue::Ptr(hist),
+            spans.arg(),
         ],
     )?;
+    if spans > 0 {
+        span("::pie::linear::moe_route_span_scatter", Some(order))?;
+    }
     Ok(RouteOrder {
         order,
         offsets,
@@ -935,6 +969,11 @@ fn route_order(
         routes: group,
     })
 }
+
+/// Routes a span of the spread ordering buckets (`kOrderSpan`), and the
+/// spans from which it takes over from the one block.
+const ORDER_SPAN: u32 = 2048;
+const ORDER_SPANS_FROM: u32 = 8;
 
 /// The grouped dense leg: routes ordered by expert, then 32 or 128 of one expert's
 /// routes against 128 of its weight rows a block on the matrix core.
@@ -975,23 +1014,44 @@ fn select_grouped_launch(
     act_div: i32,
     sorted: u32,
 ) -> Result<(), Error> {
+    grouped_launch(ctx, op, x, bank, y, experts, ordered, act_div, sorted, None)
+}
+
+/// [`select_grouped_launch`]; with `glu` (the swiglu's clamp, if any) over a
+/// packed [gate | up] bank of 2·`y.width` rows on the tall block (which must
+/// take it), landing the swiglu's rows.
+#[allow(clippy::too_many_arguments)]
+fn grouped_launch(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    y: &mut Tensor,
+    experts: u32,
+    ordered: &RouteOrder,
+    act_div: i32,
+    sorted: u32,
+    glu: Option<Option<f32>>,
+) -> Result<(), Error> {
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let k = stated(op, x.width)?;
-    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    // 128-route items over a bank whose rows come in whole 512s take the
-    // tall block: 64 weight rows a wave, so each activation piece read from
-    // LDS feeds twice the products; narrower banks would idle its rows. Only
-    // over long K: a short one ran no faster in the serve.
-    let tall = ordered.routes == GROUP_ROUTES_WIDE
-        && y.width.is_multiple_of(TALL_ROWS)
-        && x.width >= TALL_MIN_K;
+    let rows =
+        nonzero(op, "N, the bank's output width", y.width)? * if glu.is_some() { 2 } else { 1 };
+    let n = stated(op, rows)?;
+    let tall = takes_tall(ordered, rows, x.width);
+    debug_assert!(tall || glu.is_none(), "a GLU launch takes the tall block");
+    let (glu_kind, limit) = match glu {
+        None => (0, 0.0),
+        Some(None) => (1, 0.0),
+        Some(Some(limit)) => (2, limit),
+    };
     let (entry, launch) = if tall {
         (
             format!(
-                "::pie::linear::moe_matmul_select_grouped_tall<{t}, ::pie::i32({}), ::pie::i32(4), ::pie::i32(8), ::pie::i32({sorted})>",
+                "::pie::linear::moe_matmul_select_grouped_tall<{t}, ::pie::i32({}), ::pie::i32(4), ::pie::i32(8), ::pie::i32({sorted}), ::pie::i32({glu_kind})>",
                 ordered.routes
             ),
-            Launch::grid([ordered.work_cap, y.width / TALL_ROWS, 1], [64 * 8, 1, 1]),
+            Launch::grid([ordered.work_cap, rows / TALL_ROWS, 1], [64 * 8, 1, 1]),
         )
     } else {
         (
@@ -1016,8 +1076,20 @@ fn select_grouped_launch(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
-        ],
+        ]
+        .into_iter()
+        .chain(tall.then(|| limit.arg()))
+        .collect::<Vec<_>>(),
     )
+}
+
+/// Whether a grouped launch over `rows` bank rows and a `k` contraction
+/// takes the tall block: 128-route items over rows in whole 512s (64 weight
+/// rows a wave, so each activation piece read from LDS feeds twice the
+/// products; narrower banks would idle its rows), and only over long K (a
+/// short one ran no faster in the serve).
+const fn takes_tall(ordered: &RouteOrder, rows: u32, k: u32) -> bool {
+    ordered.routes == GROUP_ROUTES_WIDE && rows.is_multiple_of(TALL_ROWS) && k >= TALL_MIN_K
 }
 
 /// The routed MLP with its routes kept in expert order between the two
@@ -1031,8 +1103,8 @@ fn select_grouped_launch(
 #[cfg(feature = "rocm")]
 mod ordered {
     use super::{
-        FILE, SORT_ACT, SORT_OUT, Selected, dense_experts, group_routes, grouped_worth,
-        route_order, select_grouped_launch, selected, weighted_sum,
+        FILE, SORT_ACT, SORT_OUT, Selected, dense_experts, group_routes, grouped_launch,
+        grouped_worth, route_order, select_grouped_launch, selected, takes_tall, weighted_sum,
     };
     use crate::error::Error;
     use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, stated, symbol};
@@ -1083,51 +1155,66 @@ mod ordered {
         let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
         let rows = fan.route_count as usize;
         let elem = 2usize;
-        let packed = ctx.scratch_stream(
-            op,
-            "linear.moe_ordered_packed",
-            rows * 2 * i as usize * elem,
-        )? as usize as u64;
         let h = ctx.scratch_stream(op, "linear.moe_ordered_h", rows * i as usize * elem)? as usize
             as u64;
         let ordered = route_order(ctx, op, p.routes, fan, experts, group_routes(fan, experts))?;
         let act_div = if fan.by_token { fan.top_k } else { 1 };
-        // Gate-up: the tokens' rows by route in, the products in expert order.
-        let mut packed_t = Tensor::new(packed, fan.route_count, 2 * i, x.dtype);
-        select_grouped_launch(
-            ctx,
-            op,
-            x,
-            p.gate_up,
-            &mut packed_t,
-            experts,
-            &ordered,
-            act_div,
-            SORT_OUT,
-        )?;
-        // The swiglu over the ordered rows.
-        let clamp = if p.limit.is_some() { "true" } else { "false" };
-        ctx.fire(
-            op,
-            Fire::at(
-                FILE,
-                symbol(&format!("::pie::linear::moe_swiglu_ordered<{t}, {clamp}>")),
-            )
-            .apply(Launch::grid(
-                [fan.route_count, i.div_ceil(8 * 256), 1],
-                [256, 1, 1],
-            )),
-            &[
-                ArgValue::Ptr(packed),
-                ArgValue::Ptr(h),
-                ArgValue::Ptr(ordered.offsets),
-                stated(op, experts)?.arg(),
-                stated(op, i)?.arg(),
-                p.limit.unwrap_or(f32::INFINITY).arg(),
-            ],
-        )?;
+        let mut h_t = Tensor::new(h, fan.route_count, i, x.dtype);
+        // Gate-up: the tokens' rows by route in, the products in expert
+        // order; on the tall block its swiglu lands them, else a pass does.
+        if takes_tall(&ordered, 2 * i, x.width) {
+            grouped_launch(
+                ctx,
+                op,
+                x,
+                p.gate_up,
+                &mut h_t,
+                experts,
+                &ordered,
+                act_div,
+                SORT_OUT,
+                Some(p.limit),
+            )?;
+        } else {
+            let packed = ctx.scratch_stream(
+                op,
+                "linear.moe_ordered_packed",
+                rows * 2 * i as usize * elem,
+            )? as usize as u64;
+            let mut packed_t = Tensor::new(packed, fan.route_count, 2 * i, x.dtype);
+            select_grouped_launch(
+                ctx,
+                op,
+                x,
+                p.gate_up,
+                &mut packed_t,
+                experts,
+                &ordered,
+                act_div,
+                SORT_OUT,
+            )?;
+            let clamp = if p.limit.is_some() { "true" } else { "false" };
+            ctx.fire(
+                op,
+                Fire::at(
+                    FILE,
+                    symbol(&format!("::pie::linear::moe_swiglu_ordered<{t}, {clamp}>")),
+                )
+                .apply(Launch::grid(
+                    [fan.route_count, i.div_ceil(8 * 256), 1],
+                    [256, 1, 1],
+                )),
+                &[
+                    ArgValue::Ptr(packed),
+                    ArgValue::Ptr(h),
+                    ArgValue::Ptr(ordered.offsets),
+                    stated(op, experts)?.arg(),
+                    stated(op, i)?.arg(),
+                    p.limit.unwrap_or(f32::INFINITY).arg(),
+                ],
+            )?;
+        }
         // Down: the ordered rows in, the products by route.
-        let h_t = Tensor::new(h, fan.route_count, i, x.dtype);
         let mut routed = p.routed;
         select_grouped_launch(
             ctx,
@@ -2157,7 +2244,7 @@ pub fn matmul_select_fp8_mfma(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128)?;
+    let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false)?;
     matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, seat)
 }
 
@@ -2475,10 +2562,22 @@ pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Res
         ));
     }
     let top_k = routed.rows / y.rows;
+    let vec = if y.width.is_multiple_of(8)
+        && [y.ptr, routed.ptr, shared.ptr]
+            .iter()
+            .all(|p| p.is_multiple_of(16))
+    {
+        8
+    } else {
+        1
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_sum_add<{t}>")))
-            .apply(elementwise_rows(OP, y.rows, y.width)?),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::moe_sum_add<{t}, {vec}>")),
+        )
+        .apply(elementwise_rows(OP, y.rows, y.width / vec)?),
         &[
             y.arg(),
             routed.arg(),
@@ -2798,13 +2897,14 @@ fn weighted_fold(
         weights.rows == y.rows && weights.width == top_k,
         "the weight plane is one weight per route"
     );
+    let vec = if y.width.is_multiple_of(8) { 8 } else { 1 };
     ctx.fire(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::linear::moe_weighted_sum<{t}>")),
+            symbol(&format!("::pie::linear::moe_weighted_sum<{t}, {vec}>")),
         )
-        .apply(elementwise_rows(OP, y.rows, y.width)?),
+        .apply(elementwise_rows(OP, y.rows, y.width / vec)?),
         &[
             shared.map_or(*y, |s| s.y).arg(),
             routed.arg(),

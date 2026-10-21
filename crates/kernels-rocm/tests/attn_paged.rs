@@ -1,12 +1,12 @@
 //! Paged attention against a host reference: decode and causal prefill,
-//! split and unsplit schedules, NHD and HND pages, with real plans staged
-//! through the schedulers the engine runs.
+//! split and unsplit schedules, NHD and HND pages, bf16 and e4m3 pools, with
+//! real plans staged through the schedulers the engine runs.
 
 #![cfg(feature = "rocm")]
 
 mod common;
 
-use common::{Gpu, KV, round_bf16, values};
+use common::{Gpu, KV, e4m3_code, e4m3_value, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::attn::{self, plan};
 use kernels_rocm::{KvPool, RaggedTensor};
@@ -17,6 +17,8 @@ struct Case {
     head_dim: u32,
     page_size: u32,
     hnd: bool,
+    /// The pool holds OCP e4m3 codes under a unit scale.
+    fp8: bool,
 }
 
 impl Case {
@@ -27,7 +29,12 @@ impl Case {
             head_dim,
             page_size,
             hnd,
+            fp8: false,
         }
+    }
+
+    const fn e4m3(self) -> Self {
+        Self { fp8: true, ..self }
     }
 }
 
@@ -101,9 +108,22 @@ fn cache(gpu: &Gpu, c: &Case, kv_lens: &[u32], seed: u64) -> Cache {
         vals.push(v);
     }
     let rows = (total_pages * ps) as u32;
+    let plane = |x: &[f32]| {
+        if c.fp8 {
+            let codes: Vec<u8> = x.iter().map(|&v| e4m3_code(v)).collect();
+            gpu.upload(&codes, rows, (h * d) as u32, Dtype::E4m3)
+        } else {
+            gpu.tensor(x, rows, (h * d) as u32, Dtype::Bf16)
+        }
+    };
+    if c.fp8 {
+        for x in keys.iter_mut().chain(vals.iter_mut()) {
+            x.iter_mut().for_each(|v| *v = e4m3_value(e4m3_code(*v)));
+        }
+    }
     let pool = KvPool {
-        keys: gpu.tensor(&kp, rows, (h * d) as u32, Dtype::Bf16),
-        values: gpu.tensor(&vp, rows, (h * d) as u32, Dtype::Bf16),
+        keys: plane(&kp),
+        values: plane(&vp),
         page_indices: gpu.column(&page_indices),
         page_indptr: gpu.column(&page_indptr),
         last_page_lens: gpu.column(&last),
@@ -113,6 +133,7 @@ fn cache(gpu: &Gpu, c: &Case, kv_lens: &[u32], seed: u64) -> Cache {
         layout: i32::from(c.hnd),
         max_pages_per_request: *pages_of.iter().max().unwrap() as i32,
         pages_in_batch: page_indices.len() as i32,
+        live: [0, 0],
         ..KV
     };
     Cache {
@@ -261,10 +282,11 @@ fn run_decode(gpu: &Gpu, c: &Case, kv_lens: &[u32], window: Option<u32>, max_gri
             window,
         );
         let tag = format!(
-            "decode d{} g{} hnd={} split={} req {r}",
+            "decode d{} g{} hnd={} fp8={} split={} req {r}",
             c.head_dim,
             c.q_heads / c.kv_heads,
             c.hnd,
+            c.fp8,
             built.info.split_kv
         );
         close(&tag, &got[r * row..(r + 1) * row], &want, 1.5e-2);
@@ -376,10 +398,11 @@ fn run_prefill_window(
                 window,
             );
             let tag = format!(
-                "prefill d{} g{} hnd={} split={} window={window:?} graph={graph} req {r} token {t}",
+                "prefill d{} g{} hnd={} fp8={} split={} window={window:?} graph={graph} req {r} token {t}",
                 c.head_dim,
                 c.q_heads / c.kv_heads,
                 c.hnd,
+                c.fp8,
                 built.info.split_kv
             );
             close(&tag, &got[at * row..(at + 1) * row], &want, 1.5e-2);
@@ -408,8 +431,8 @@ fn attn_paged() {
 }
 
 /// The head widths and groups past Qwen's: Gemma 4's global layers (512
-/// wide, group 8) and sliding ones (256 wide, group 2, a 1024 window), and
-/// DeepSeek-V4's single shared head (512 wide, group 64).
+/// wide, group 8) and sliding ones (256 wide, group 2, a 1024 window),
+/// DeepSeek-V4's single shared head (512 wide, group 64) and 64-wide heads.
 #[test]
 fn attn_paged_wide_heads() {
     let Some(gpu) = Gpu::open() else { return };
@@ -420,7 +443,9 @@ fn attn_paged_wide_heads() {
     run_decode(&gpu, &global, &[1, 37, 300, 1000], None, 1);
     // (DeepSeek-V4 decodes through its pool reader, not this one: only the
     // prefill takes its 64-head group.)
-    for c in [&global, &mqa] {
+    // Muse Spark's 64-wide heads walk the wide kernel too.
+    let narrow = Case::new(16, 2, 64, 16, false);
+    for c in [&global, &mqa, &narrow] {
         run_prefill(&gpu, c, &[1, 70, 200], &[0, 0, 0], 1);
         run_prefill(&gpu, c, &[33, 5, 130], &[100, 17, 900], 1);
     }
@@ -620,6 +645,78 @@ fn attn_paged_wide_groups() {
         run_decode(&gpu, &c, &[1, 37, 300, 1000], None, 4096);
         run_decode(&gpu, &c, &[1, 37, 300, 1000], None, 1);
         run_decode(&gpu, &c, &[5, 300, 2000], Some(128), 4096);
+    }
+}
+
+/// An e4m3 pool read as it is, by every decode and prefill walk: the
+/// matrix-core decode (and its matrix-core values at a group of eight),
+/// the column-split decode at 512-wide heads, the vector decode of a wide
+/// group, the tiled prefill and the wide one; and the append's codes.
+#[test]
+fn attn_paged_e4m3() {
+    let Some(gpu) = Gpu::open() else { return };
+    let narrow = Case::new(8, 2, 128, 16, false).e4m3();
+    let pvm = Case::new(16, 2, 128, 32, true).e4m3();
+    let global = Case::new(32, 4, 512, 16, false).e4m3();
+    let small = Case::new(8, 2, 64, 16, false).e4m3();
+    for c in [&narrow, &pvm, &global] {
+        run_decode(&gpu, c, &[1, 37, 300, 1000], None, 4096);
+        run_decode(&gpu, c, &[1, 37, 300, 1000], None, 1);
+    }
+    run_decode(
+        &gpu,
+        &Case::new(32, 1, 128, 16, false).e4m3(),
+        &[5, 300],
+        Some(64),
+        4096,
+    );
+    for c in [&narrow, &pvm, &global, &small] {
+        run_prefill(&gpu, c, &[1, 70, 200], &[0, 0, 0], 1);
+        run_prefill(&gpu, c, &[33, 5, 130], &[100, 17, 900], 3);
+    }
+
+    // The append: bf16 rows to their codes, ties to even, saturated, −0
+    // as 0x00, through explicit pages and slots.
+    let ctx = gpu.ctx();
+    let (rows, width) = (5u32, 2 * 64u32);
+    let mut x: Vec<f32> = values((rows * width) as usize, 9, 300.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    x[..6].copy_from_slice(&[-0.0, 1000.0, -1000.0, 0.0009765625, -0.001, 448.0]);
+    let pool = KvPool {
+        keys: gpu.upload(&vec![0x5au8; 64 * width as usize], 64, width, Dtype::E4m3),
+        values: gpu.upload(&vec![0x5au8; 64 * width as usize], 64, width, Dtype::E4m3),
+        page_size: 16,
+        seq_stride: i64::from(width),
+        head_stride: 64,
+        live: [0, 0],
+        ..KV
+    };
+    let slots = [(3u32, 1u32), (0, 15), (2, 0), (3, 2), (1, 7)];
+    let k = RaggedTensor {
+        data: gpu.tensor(&x, rows, width, Dtype::Bf16),
+        indptr: gpu.column(&[0, rows as i32]),
+    };
+    let page = gpu.upload(&slots.map(|s| s.0), rows, 1, Dtype::U32);
+    let offset = gpu.upload(&slots.map(|s| s.1), rows, 1, Dtype::U32);
+    attn::kv_append(&ctx, k, k.data, &pool, page, offset).unwrap();
+    let (kc, vc) = (
+        gpu.read_as::<u8>(&pool.keys),
+        gpu.read_as::<u8>(&pool.values),
+    );
+    for (r, &(pg, off)) in slots.iter().enumerate() {
+        let at = ((pg * 16 + off) * width) as usize;
+        let want: Vec<u8> = x[r * width as usize..(r + 1) * width as usize]
+            .iter()
+            .map(|&v| e4m3_code(v))
+            .collect();
+        assert_eq!(&kc[at..at + width as usize], &want[..], "row {r} key codes");
+        assert_eq!(
+            &vc[at..at + width as usize],
+            &want[..],
+            "row {r} value codes"
+        );
     }
 }
 
