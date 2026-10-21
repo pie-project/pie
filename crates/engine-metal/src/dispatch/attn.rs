@@ -951,16 +951,40 @@ impl Run<'_> {
                 taps,
                 group,
                 y,
-            } => attn::dynconv::block_dyn_conv(
-                self.ctx(),
-                self.ragged(*x),
-                self.tensor(*coeff),
-                self.tensor(*base),
-                *side,
-                *taps,
-                *group,
-                self.tensor(*y),
-            ),
+            } => {
+                // The convolved rows' projections on the register tile read
+                // their input table as the convolution lays it.
+                let (x, coeff, base, out) = (
+                    self.ragged(*x),
+                    self.tensor(*coeff),
+                    self.tensor(*base),
+                    self.tensor(*y),
+                );
+                match self.producer_table(*y) {
+                    Some((table, counters)) => attn::dynconv::block_dyn_conv_table(
+                        self.ctx(),
+                        x,
+                        coeff,
+                        base,
+                        *side,
+                        *taps,
+                        *group,
+                        out,
+                        table,
+                        counters,
+                    ),
+                    None => attn::dynconv::block_dyn_conv(
+                        self.ctx(),
+                        x,
+                        coeff,
+                        base,
+                        *side,
+                        *taps,
+                        *group,
+                        out,
+                    ),
+                }
+            }
             Attention::Ragged {
                 q,
                 k,
