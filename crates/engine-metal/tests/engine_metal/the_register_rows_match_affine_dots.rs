@@ -911,7 +911,7 @@ fn a_segment_launch_lands_each_matmuls_bits() {
             }
             frame.commit().expect("commit");
             let reference = read(&alone);
-            for walk in [quant::REGISTER_WALK, (2, 2, 0), (4, 4, 0), (2, 1, 1), (1, 1, 1)] {
+            for walk in [quant::REGISTER_WALK, (2, 2), (4, 4), (4, 2)] {
                 let (own, one) = (outputs(0x5a), outputs(0x3c));
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
