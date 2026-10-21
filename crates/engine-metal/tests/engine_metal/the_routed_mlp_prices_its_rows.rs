@@ -165,3 +165,190 @@ fn the_routed_mlp_prices_its_rows() {
         }
     }
 }
+
+/// A Qwen3.6-35B-A3B routed MLP (gate-up, SwiGLU, down, fold, and its shared
+/// expert) over a verify's rows: today's per-route path, its shared expert on the
+/// dense register tile, against the register expert tiles, the shared expert
+/// riding along as a tile or not. `LAYERS` layers' banks in turn, so no layer's
+/// codes sit in the cache from the last.
+/// Run: cargo test --release -p engine-metal --test engine_metal \
+///        the_register_routed_mlp_prices -- --ignored --nocapture
+#[test]
+#[ignore = "a microbenchmark"]
+fn the_register_routed_mlp_prices_its_tiles() {
+    use kernels_metal::linear::{mlp, quant};
+    const LAYERS: usize = 3;
+    const PASSES: usize = 12;
+    const HIDDEN: u32 = 2048;
+    const INTER: u32 = 512;
+    let Ok(device) = Context::bind() else { return };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let register = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]\n", false);
+    let upload = |bytes: &[u8]| {
+        let mut b = Buffer::zeroed(&device, bytes.len().max(4) as u64).expect("plane");
+        b.write(0, bytes).expect("upload");
+        b
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let mut held: Vec<Buffer> = Vec::new();
+    let mut bank = |k: u32, n: u32, seed: u64| {
+        let groups = k / 64;
+        let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) / 2).map(|a| noise(a ^ seed)).collect();
+        let scales: Vec<u8> = (0..n * groups).flat_map(|a| bf16(0.003 + (a % 7) as f32 * 1e-4)).collect();
+        let biases: Vec<u8> = (0..n * groups).flat_map(|a| bf16(((a % 9) as f32 - 4.0) / 64.0)).collect();
+        let (c, s, b) = (upload(&codes), upload(&scales), upload(&biases));
+        let bank = Bank {
+            mpp_codes: None,
+            codes: Tensor::new(bind(&c), n, k, Dtype::U4g64),
+            scales: Tensor::new(bind(&s), n, groups, Dtype::Bf16),
+            biases: Some(Tensor::new(bind(&b), n, groups, Dtype::Bf16)),
+            group: 64,
+            bits: 4,
+            ld: k,
+        };
+        held.extend([c, s, b]);
+        bank
+    };
+    // (gate-up, down, shared gate-up, shared down) a layer.
+    let layers: Vec<[Bank; 4]> = (0..LAYERS as u64)
+        .map(|l| {
+            [
+                bank(HIDDEN, EXPERTS * 2 * INTER, 4 * l + 1),
+                bank(INTER, EXPERTS * HIDDEN, 4 * l + 2),
+                bank(HIDDEN, 2 * INTER, 4 * l + 3),
+                bank(INTER, HIDDEN, 4 * l + 4),
+            ]
+        })
+        .collect();
+    let zeroed = |bytes: u64| Buffer::zeroed(&device, bytes.max(4)).expect("scratch");
+    for (tokens, share) in [(8u32, 0u32), (8, 2), (8, 4), (8, 6), (6, 4), (1, 0)] {
+        let pairs = tokens * TOP_K;
+        let r = routes(tokens, share, 11);
+        let unique = { let mut u = r.clone(); u.sort(); u.dedup(); u.len() };
+        let x: Vec<u8> = (0..tokens * HIDDEN).flat_map(|a| bf16((f32::from(noise(u64::from(a))) - 127.0) / 256.0)).collect();
+        let w: Vec<u8> = (0..pairs).flat_map(|a| (1.0f32 / TOP_K as f32 + a as f32 * 1e-4).to_le_bytes()).collect();
+        let (xb, rb, wb) = (upload(&x), upload(&r.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>()), upload(&w));
+        let xt = Tensor::new(bind(&xb), tokens, HIDDEN, Dtype::Bf16);
+        let rt = Tensor::new(bind(&rb), tokens, TOP_K, Dtype::I32);
+        let wt = Tensor::new(bind(&wb), tokens, TOP_K, Dtype::F32);
+        let plane = |rows: u32, width: u32, dtype: Dtype| {
+            let b = zeroed(u64::from(rows) * u64::from(width) * dtype.bytes_ceil());
+            let t = Tensor::new(bind(&b), rows, width, dtype);
+            (b, t)
+        };
+        let (_p, pt) = plane(pairs, 2 * INTER, Dtype::Bf16);
+        let (_h, ht) = plane(pairs, INTER, Dtype::Bf16);
+        let (_y, yt) = plane(pairs, HIDDEN, Dtype::Bf16);
+        let (_f, ft) = plane(tokens, HIDDEN, Dtype::Bf16);
+        let (_sp, spt) = plane(tokens, 2 * INTER, Dtype::Bf16);
+        let (_sh, sht) = plane(tokens, INTER, Dtype::Bf16);
+        let (_sy, syt) = plane(tokens, HIDDEN, Dtype::Bf16);
+        let (_t, table) = plane(64, HIDDEN, Dtype::F16);
+        let (_q, partial) = plane(8 * 8, HIDDEN, Dtype::F32);
+        let precast = |rows: u32, width: u32| (rows <= 64 && width <= HIDDEN).then(|| Tensor::new(table.buf, rows, width, Dtype::F16));
+        let partials = |rows: u32, width: u32| (rows <= 64 && width <= HIDDEN).then(|| Tensor::new(partial.buf, rows, width, Dtype::F32));
+        let scratch = || quant::Scratch { precast: &precast, partials: &partials, table: None };
+        let tiles = moe::register_tiles(tokens, TOP_K, EXPERTS, true);
+        let (_a, tiles_t) = plane(1, tiles + 1, Dtype::I32);
+        let (_b, rows_t) = plane(1, tiles * 8, Dtype::I32);
+        let (_c, inv_t) = plane(1, pairs, Dtype::I32);
+        let (_d, table_t) = plane(tiles, u32::try_from(moe::register_table_width(HIDDEN)).unwrap(), Dtype::Bf16);
+        let (_e, hidden_t) = plane(tiles, u32::try_from(moe::register_table_width(INTER)).unwrap(), Dtype::Bf16);
+        let (_g, y_t) = plane(tiles * 8, HIDDEN, Dtype::Bf16);
+        let rooms = moe::RegisterRooms { tiles: tiles_t, rows: rows_t, inv: inv_t, table: table_t, hidden: hidden_t, y: y_t };
+
+        let time = |f: &dyn Fn(&Sink, &[Bank; 4])| -> f64 {
+            let mut v = Vec::new();
+            for i in 0..(ITERS + 5) {
+                let frame = device.frame().expect("frame");
+                let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                for pass in 0..PASSES {
+                    f(&sink, &layers[pass % LAYERS]);
+                }
+                let s = frame.commit_timed().expect("commit");
+                if i >= 5 {
+                    v.push(s * 1e6 / PASSES as f64);
+                }
+            }
+            median(v)
+        };
+        let route_gate_up = |s: &Sink, l: &[Bank; 4]| {
+            moe::matmul_select_quant(s, xt, l[0], rt, pt).expect("gate-up");
+            mlp::swiglu(s, pt, INTER, ht).expect("swiglu");
+        };
+        let route_down = |s: &Sink, l: &[Bank; 4]| {
+            moe::matmul_select_quant(s, ht, l[1], rt, yt).expect("down");
+            moe::weighted_sum(s, yt, wt, ft).expect("fold");
+        };
+        let own = |s: &Sink, l: &[Bank; 4]| {
+            quant::matmul(s, &register, xt, l[2], spt, scratch(), 8).expect("shared gate-up");
+            mlp::swiglu(s, spt, INTER, sht).expect("shared swiglu");
+            quant::matmul(s, &register, sht, l[3], syt, scratch(), 8).expect("shared down");
+        };
+        let cut = |fragments, glu_simdgroups, down_simdgroups| moe::RegisterCut {
+            fragments,
+            glu_simdgroups,
+            down_simdgroups,
+            slots: 0,
+        };
+        let slotted = |slots| moe::RegisterCut { slots, ..moe::REGISTER_CUT };
+        let tiled = |s: &Sink, l: &[Bank; 4], shared: bool, cut: moe::RegisterCut| {
+            let tiles = moe::register_tiles(tokens, TOP_K, EXPERTS, shared);
+            let own = |b: Bank| shared.then_some(b);
+            moe::register_group(s, xt, rt, EXPERTS, shared, rooms).expect("group");
+            moe::register_glu(s, l[0], own(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, cut).expect("glu");
+            moe::register_down(s, l[1], own(l[3]), INTER, HIDDEN, tiles, EXPERTS, rooms, cut).expect("down");
+            let sorted = Tensor::new(rooms.y.buf, tiles * 8, HIDDEN, Dtype::Bf16);
+            moe::weighted_sum_sorted(s, sorted, rooms.inv, wt, TOP_K, ft).expect("fold");
+        };
+        let per_route = time(&|s, l| {
+            route_gate_up(s, l);
+            route_down(s, l);
+        });
+        let shared_dense = time(&|s, l| own(s, l));
+        let group = time(&|s, _l| moe::register_group(s, xt, rt, EXPERTS, true, rooms).expect("group"));
+        // Each pass over every tile a fire may fill, and over the live tiles alone, as an
+        // indirect grid would launch them.
+        let live = u32::try_from(unique).unwrap() + 1;
+        let mut line = format!(
+            "rows={tokens} unique={unique:2}: per-route {per_route:6.1} + dense shared {shared_dense:5.1} = {:6.1} us | group+gather {group:5.1} us\n  glu",
+            per_route + shared_dense
+        );
+        for (f, sg) in [(1, 4), (1, 8), (1, 16), (2, 4), (2, 8)] {
+            let at = |tiles| {
+                time(&|s, l| {
+                    moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, cut(f, sg, 4))
+                        .expect("glu");
+                })
+            };
+            line += &format!(" h{f}s{sg} {:6.1} ({:6.1} live)", at(tiles), at(live));
+        }
+        line += "\n  down";
+        for sg in [4, 8, 16] {
+            let at = |tiles| {
+                time(&|s, l| {
+                    moe::register_down(s, l[1], Some(l[3]), INTER, HIDDEN, tiles, EXPERTS, rooms, cut(1, 4, sg))
+                        .expect("down");
+                })
+            };
+            line += &format!(" s{sg} {:6.1} ({:6.1} live)", at(tiles), at(live));
+        }
+        line += "\n  chain with the shared tile";
+        for c in [cut(1, 4, 4), cut(1, 8, 8), cut(1, 16, 8), cut(1, 16, 16), cut(2, 8, 16)] {
+            line += &format!(
+                " h{}s{}/s{} {:6.1}",
+                c.fragments,
+                c.glu_simdgroups,
+                c.down_simdgroups,
+                time(&|s, l| tiled(s, l, true, c))
+            );
+        }
+        line += "\n  chain over tile slots";
+        for slots in [8, 12, 16, 24, 32] {
+            line += &format!(" {slots} {:6.1}", time(&|s, l| tiled(s, l, true, slotted(slots))));
+        }
+        line += &format!(" | without the shared tile {:6.1} us a layer", time(&|s, l| tiled(s, l, false, cut(1, 4, 4))));
+        eprintln!("{line}");
+    }
+}
