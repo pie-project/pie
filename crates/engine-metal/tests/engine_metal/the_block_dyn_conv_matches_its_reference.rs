@@ -201,3 +201,74 @@ fn the_convolution_matches_the_reference_on_both_sides() {
     );
     eprintln!("boundary: the second request's rows are unchanged by the first's last row");
 }
+
+/// The convolution that lays the register tile's input table lands the
+/// plain convolution's rows, and the table the tile lays over them, byte for
+/// byte, its arrival counters zeroed: a block of eight rows and two lanes of
+/// five, over a draft's 2048 channels.
+#[test]
+fn the_convolution_lays_the_table_its_projections_read() {
+    use kernels_metal::linear::quant;
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    const WIDE: u32 = 2048;
+    const COUNTERS: u32 = 80;
+    let groups = WIDE / GROUP;
+    let upload = |bytes: &[u8]| {
+        let mut b = Buffer::zeroed(&device, bytes.len().max(16) as u64).expect("a plane");
+        b.write(0, bytes).expect("write");
+        b
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("a handle");
+    for spans in [&[8u32][..], &[3, 2][..]] {
+        let rows: u32 = spans.iter().sum();
+        let mut indptr = vec![0i32];
+        for s in spans {
+            indptr.push(indptr.last().unwrap() + *s as i32);
+        }
+        let coeff_width = 2 * TAPS * groups;
+        let x: Vec<f32> = (0..u64::from(rows * WIDE)).map(|at| bf16_round(unit(at ^ 0x77))).collect();
+        let coeff: Vec<f32> =
+            (0..u64::from(rows * coeff_width)).map(|at| bf16_round(0.25 * unit(at ^ 0x5151))).collect();
+        let base: Vec<f32> =
+            (0..u64::from(2 * TAPS * WIDE)).map(|at| bf16_round(0.5 + 0.1 * unit(at ^ 0xA1A1))).collect();
+        let (x_b, coeff_b, base_b) = (upload(&bf16_bytes(&x)), upload(&bf16_bytes(&coeff)), upload(&bf16_bytes(&base)));
+        let indptr_b = upload(&indptr.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<_>>());
+        let (plain_b, laid_b) = (upload(&vec![0x11; (rows * WIDE * 2) as usize]), upload(&vec![0x11; (rows * WIDE * 2) as usize]));
+        let table_rows = quant::register_table_rows(WIDE as i32, COUNTERS as i32);
+        let own_b = upload(&vec![0xa5; (table_rows * WIDE * 2) as usize]);
+        let laid_table_b = upload(&vec![0xa5; (table_rows * WIDE * 2) as usize]);
+        let xt = RaggedTensor {
+            data: Tensor::new(bind(&x_b), rows, WIDE, Dtype::Bf16),
+            indptr: Tensor::new(bind(&indptr_b), indptr.len() as u32, 1, Dtype::I32),
+        };
+        let ct = Tensor::new(bind(&coeff_b), rows, coeff_width, Dtype::Bf16);
+        let bt = Tensor::new(bind(&base_b), 2 * TAPS, WIDE, Dtype::Bf16);
+        let (plain, laid) = (
+            Tensor::new(bind(&plain_b), rows, WIDE, Dtype::Bf16),
+            Tensor::new(bind(&laid_b), rows, WIDE, Dtype::Bf16),
+        );
+        let own = Tensor::new(bind(&own_b), table_rows, WIDE, Dtype::Bf16);
+        let table = Tensor::new(bind(&laid_table_b), table_rows, WIDE, Dtype::Bf16);
+        for side in 0..2u32 {
+            let frame = device.frame().expect("a frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            dynconv::block_dyn_conv(&sink, xt, ct, bt, side, TAPS, GROUP, plain).expect("the plain launch");
+            quant::register_table(&sink, plain, own, rows as i32, WIDE as i32, COUNTERS as i32).expect("the tile's table");
+            dynconv::block_dyn_conv_table(&sink, xt, ct, bt, side, TAPS, GROUP, laid, table, COUNTERS)
+                .expect("the table-laying launch");
+            frame.commit().expect("the commit");
+            let read = |b: &Buffer| handles.read(bind(b), b.bytes()).expect("read");
+            assert!(read(&plain_b) == read(&laid_b), "spans {spans:?} side {side}: the table-laying conv lands other rows");
+            let (mine, theirs) = (read(&laid_table_b), read(&own_b));
+            let end = (17 * WIDE + 4 * COUNTERS) as usize;
+            assert!(
+                mine[..end] == theirs[..end],
+                "spans {spans:?} side {side}: the conv's table is not the one the tile lays"
+            );
+        }
+    }
+}
