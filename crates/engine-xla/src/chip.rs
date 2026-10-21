@@ -171,6 +171,13 @@ pub struct MixedHostRung(pub u32);
 #[decision(id = "engine.pad.page_floor", constant(set(4, 8, 16, 32, 64)), default = 16, tune = search)]
 pub struct PageFloor(pub u32);
 
+/// The least row rung of a fire that prefills, so a prompt's tail behind
+/// its last whole page (where the runtime cuts a hybrid's prefill to keep
+/// its state) runs one program whatever its length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.pad.prefill_floor", constant(set(1, 8, 16, 32, 64)), default = 16, tune = search)]
+pub struct PrefillFloor(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("xla", FACTS, &["rows"]);
     kernels_xla::tuning::register(&mut r);
@@ -180,7 +187,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PadGrowth>()
         .add::<PadRoom>()
         .add::<MixedHostRung>()
-        .add::<PageFloor>();
+        .add::<PageFloor>()
+        .add::<PrefillFloor>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -214,6 +222,8 @@ pub struct Pad {
     pub room: u32,
     pub mixed_host_rung: u32,
     pub page_floor: u32,
+    /// The least rows a fire that prefills is padded to.
+    pub prefill_floor: u32,
 }
 
 impl Pad {
@@ -265,6 +275,7 @@ impl Engine {
                 room: profile.get::<PadRoom>().0,
                 mixed_host_rung: profile.get::<MixedHostRung>().0,
                 page_floor: profile.get::<PageFloor>().0,
+                prefill_floor: profile.get::<PrefillFloor>().0,
             },
         }
     }
@@ -328,6 +339,7 @@ mod tests {
                 room: 128,
                 mixed_host_rung: 16,
                 page_floor: 16,
+                prefill_floor: 16,
             }
         );
         assert_eq!(

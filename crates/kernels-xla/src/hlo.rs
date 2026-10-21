@@ -1474,6 +1474,26 @@ impl Func {
         self.reduce_window(x, fold, &window, &vec![1; r], &lo, &vec![0; r])
     }
 
+    /// `scan` as `ceil(log2 n)` shifted folds (Hillis-Steele), the same
+    /// prefix in another order. A TPU walks a reduce window a window at a
+    /// time: over a 128-row axis that is ~250 us where this is a handful.
+    pub fn scan_steps(&mut self, x: Val, axis: usize, fold: Fold) -> Built<Val> {
+        let d = self.dims(x).to_vec();
+        let (r, n) = (d.len(), d[axis]);
+        let init = self.fold_init(fold, self.elem(x));
+        let mut y = x;
+        let mut shift = 1;
+        while shift < n {
+            let kept = self.slice_axis(y, axis, 0, n - shift)?;
+            let mut lo = vec![0; r];
+            lo[axis] = shift;
+            let shifted = self.pad(kept, init, &lo, &vec![0; r], &vec![0; r])?;
+            y = self.fold_op(fold, y, shifted)?;
+            shift *= 2;
+        }
+        Ok(y)
+    }
+
     // ----------------------------------------------------------- gather/scatter
 
     pub fn gather(
