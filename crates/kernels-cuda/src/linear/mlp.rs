@@ -67,7 +67,7 @@ pub fn swiglu(
     {
         (
             "mlp_swiglu_vec8",
-            elementwise_rows(OP, y.rows, y.width / 8)?,
+            elementwise_rows(OP, y.rows, y.width / 8)?.programmatic(ctx.tuning().pdl),
         )
     } else {
         ("mlp_swiglu", launch)
@@ -102,7 +102,7 @@ pub fn swiglu_clamp(
             FILE,
             symbol(&format!("::pie::linear::mlp_swiglu_clamp<{t}>")),
         )
-        .apply(launch),
+        .apply(launch.programmatic(ctx.tuning().pdl)),
         &[
             packed.arg(),
             y.arg(),
@@ -423,7 +423,7 @@ pub fn geglu_tanh_packed(
     {
         (
             "mlp_geglu_tanh_packed_vec8",
-            elementwise_rows(OP, y.rows, y.width / 8)?,
+            elementwise_rows(OP, y.rows, y.width / 8)?.programmatic(ctx.tuning().pdl),
         )
     } else {
         ("mlp_geglu_tanh_packed", launch)

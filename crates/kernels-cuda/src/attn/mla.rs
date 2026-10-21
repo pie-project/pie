@@ -106,7 +106,7 @@ fn split_kv_a_norm(
             "attn/mla.cuh",
             crate::jit::symbol(&format!("::pie::attn::mla_latents<{t}, 256>")),
         )
-        .apply(rms(kv_a.rows)),
+        .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl)),
         &[
             kv_a.arg(),
             weight.arg(),
@@ -197,7 +197,7 @@ pub fn split_q_b(
                 "attn/mla.cuh",
                 crate::jit::symbol(&format!("::pie::attn::mla_split_q_b_vec8<{t}>")),
             )
-            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
             &[
                 q_b.arg(),
                 q_nope.arg(),
@@ -466,6 +466,9 @@ pub(crate) mod naive {
 
     pub const MMA_BM: i32 = 16;
 
+    /// `PIE_MLA_MMA_BK`: the keys an mma tile reads.
+    pub const MMA_BK: u32 = 64;
+
     pub const MMA_SMEM_BYTES: u32 = 100_032;
 
     #[must_use]
@@ -543,16 +546,33 @@ pub(crate) mod naive {
             && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads)
         {
             #[allow(clippy::cast_sign_loss)]
-            let launch = Launch::grid(
-                [
-                    (shape.num_heads / MMA_BM).max(0) as u32,
-                    shape.total_tokens.max(0) as u32,
-                    1,
-                ],
-                [MMA_THREADS, 1, 1],
-            )
-            .smem(MMA_SMEM_BYTES);
-            return ctx.fire(
+            let (blocks, rows, heads) = (
+                (shape.num_heads / MMA_BM).max(0) as u32,
+                shape.total_tokens.max(0) as u32,
+                shape.num_heads.max(0) as u32,
+            );
+            // Few rows (a decode) deal each row's key tiles over splits, so
+            // the multiprocessors fill: as many as fit them, at most 32 (the
+            // fold's lanes) and at most a split a tile of a selection.
+            let sms = ctx.multiprocessors().unwrap_or(132);
+            let mut splits = (sms / (blocks * rows).max(1)).clamp(1, 32);
+            if selected {
+                #[allow(clippy::cast_sign_loss)]
+                let tiles = (shape.top_k.max(1) as u32).div_ceil(MMA_BK);
+                splits = splits.min(tiles).max(1);
+            }
+            let (part_o, part_lse) = if splits > 1 {
+                let units = rows as usize * splits as usize * heads as usize;
+                (
+                    ctx.scratch_shared(op, "attn.mla_mma.part_o", units * 512 * 2)? as u64,
+                    ctx.scratch_shared(op, "attn.mla_mma.part_lse", units * 4)? as u64,
+                )
+            } else {
+                (0, 0)
+            };
+            let launch =
+                Launch::grid([blocks, rows, splits], [MMA_THREADS, 1, 1]).smem(MMA_SMEM_BYTES);
+            ctx.fire(
                 op,
                 Fire::at(
                     "attn/mla.cuh",
@@ -573,6 +593,8 @@ pub(crate) mod naive {
                     ArgValue::Ptr(ptrs.kv_last_page_lens),
                     ArgValue::Ptr(ptrs.o),
                     ArgValue::Ptr(ptrs.lse),
+                    ArgValue::Ptr(part_o),
+                    ArgValue::Ptr(part_lse),
                     ArgValue::Ptr(ptrs.selection),
                     shape.top_k.arg(),
                     i32::from(ctx.tuning().mla_dense_short).arg(),
@@ -581,6 +603,27 @@ pub(crate) mod naive {
                     shape.page_size.arg(),
                     shape.sm_scale.arg(),
                     shape.causal.arg(),
+                    ctx.stage(),
+                ],
+            )?;
+            if splits == 1 {
+                return Ok(());
+            }
+            return ctx.fire(
+                op,
+                Fire::at(
+                    "attn/mla.cuh",
+                    "::pie::attn::mla_naive::mma_detail::mla_mma_fold",
+                )
+                .apply(Launch::grid([rows, heads, 1], [128, 1, 1])),
+                &[
+                    ArgValue::Ptr(part_o),
+                    ArgValue::Ptr(part_lse),
+                    ArgValue::Ptr(ptrs.o),
+                    ArgValue::Ptr(ptrs.lse),
+                    #[allow(clippy::cast_possible_wrap)]
+                    (splits as i32).arg(),
+                    shape.num_heads.arg(),
                     ctx.stage(),
                 ],
             );

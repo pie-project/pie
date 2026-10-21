@@ -145,6 +145,10 @@ __global__ void __launch_bounds__(256) rmsnorm_runs(
     float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x;
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
@@ -505,6 +509,10 @@ __global__ void __launch_bounds__(256) residual_add_rmsnorm_reg(
     float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr int BLOCK = 256;
     const int row = blockIdx.x;
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
@@ -1158,6 +1166,10 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
     float eps1,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x;
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
@@ -1290,6 +1302,10 @@ __global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n
 // Eight bf16 lanes a thread, rows of whole 16-byte groups (`width8` a row).
 __global__ void residual_add_vec8(bf16* __restrict__ y, const bf16* __restrict__ x, usize n8,
                                   int width8, const u32* __restrict__ win) {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n8) return;
     if (win != nullptr && i >= static_cast<usize>(win[0]) * static_cast<usize>(width8)) return;
@@ -1342,6 +1358,10 @@ __global__ void silu_scaled(T* __restrict__ x, float s, usize n,
 template <class T>
 __global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n,
                       int width, const u32* __restrict__ win) {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
@@ -1701,6 +1721,10 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_by(
     int rows, int H, int D, float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const long long first = (static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5)) * kP;
     const int lane = threadIdx.x & 31;
     const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;

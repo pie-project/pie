@@ -231,6 +231,10 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     int rest_width,
     bf16* __restrict__ rest)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = HEAD_DIM / 32;
     static_assert(HEAD_DIM % 64 == 0);

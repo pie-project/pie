@@ -325,6 +325,10 @@ __global__ void __launch_bounds__(32) moe_topk_softmax_lane(
     const u32* __restrict__ win,
     const T* __restrict__ per_expert_scale)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int n = blockIdx.x;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int row_at = win != nullptr ? n + static_cast<int>(win[1]) : n;
@@ -595,6 +599,10 @@ __global__ void __launch_bounds__(32 * kRankedRows) moe_topk_ranked(
     float routed_scaling_factor,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int n = static_cast<int>(blockIdx.x) * kRankedRows + static_cast<int>(threadIdx.x >> 5);
     if (n >= rows) return;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
@@ -985,6 +993,10 @@ __global__ void moe_matmul_select_gemv_by_token(
     int route_count,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     moe_matmul_select_gemv_body<T, true, kRows>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
         expert_table, expert_hits, win, route_count);
@@ -1002,6 +1014,10 @@ __global__ void moe_matmul_select_gemv_by_route(
     int route_count,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     moe_matmul_select_gemv_body<T, false, kRows>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
         expert_table, expert_hits, win, route_count);
@@ -1389,6 +1405,10 @@ __global__ void moe_weighted_sum_vec8(
     int top_k, int hidden,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int n = blockIdx.x;
 
     if (win != nullptr && n >= static_cast<int>(win[0])) return;

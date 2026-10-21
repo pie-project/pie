@@ -300,6 +300,10 @@ __global__ void split_rows_vec8(
     int left_dim, int right_dim,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr int VEC = 8;
 
     const int n = blockIdx.x;

@@ -462,6 +462,12 @@ pub enum MlaPath {
 #[decision(id = "kernel.qmm.gemm_from", constant(range(1..=4096)), default = 16, tune = search)]
 pub struct QmmGemmFrom(pub u32);
 
+/// The rows from which a tiled four-bit decode point multiplies on the
+/// tensor cores (`gemv_affine_tiled_mma`); below, on the CUDA cores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.gemv_mma_from", constant(range(1..=17)), default = 2, tune = search)]
+pub struct QmmGemvMmaFrom(pub u32);
+
 /// The fewest rows the tiled quantised GEMM takes its long tile (64 x 128,
 /// 2 stages) for; fewer take the short one (32 x 128, 4 stages).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -554,6 +560,14 @@ pub struct SsmGdnFusedScan;
 #[decision(id = "kernel.ssm.gdn_tc5", flag, default = false, tune = search)]
 pub struct SsmGdnTc5;
 
+/// The fire rows up to which a gated delta fire runs the sequential scan
+/// (`ssm_gated_delta_chunked_batched_fla`) over the chunked walk: a verify's
+/// or a fold's handful of rows barely fill a chunk, and the scan reads each
+/// lane's state once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_scan_until", constant(range(0..=4096)), default = 32, tune = search)]
+pub struct SsmGdnScanUntil(pub u32);
+
 /// Whether the row kernels a prefill streams run their bandwidth-shaped
 /// forms: a 128- or 256-wide RMS norm a warp a row (per head or whole), a
 /// scale-free per-head norm of whole 256-element runs a warp a head, the
@@ -616,6 +630,28 @@ pub struct SsmConvVec4;
 #[decision(id = "kernel.ssm.gdn_out_bf16", flag, default = false, tune = search)]
 pub struct SsmGdnOutBf16;
 
+/// The most blocks an SM seats of the fused gated delta decode step: 4 but
+/// where a chip's profile says (A100's 3: its persistent warps stream the
+/// state 7% faster).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_step_blocks", constant(set(1, 2, 3, 4)), default = 4, tune = search)]
+pub struct SsmGdnStepBlocks(pub u32);
+
+/// Whether the per-route MXFP4 and NVFP4 selects (a decode's few routes an
+/// expert, and NVFP4's dense product) run lean: two-warp blocks, one code
+/// block a row in flight a lane, the codes widened by integer ops, no
+/// converts. Off but where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_select_lean", flag, default = false, tune = search)]
+pub struct MoeMxfp4SelectLean;
+
+/// Whether a strided grouped bf16 projection at one row (DeepSeek-V4.1's
+/// grouped output LoRA at decode) is one GEMV over every group's rows rather
+/// than batched cuBLAS. Off but where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
+pub struct GemmGroupedGemv;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -649,6 +685,14 @@ pub struct DecodeGroupedPrefillLse;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_window", flag, default = false, tune = search)]
 pub struct DecodeGroupedPrefillWindow;
+
+/// Whether the FA2 prefill kernel (a decode's grouped rows too) reads a
+/// pool's live widths out of its wider heads (MiMo's 192-wide keys and
+/// 128-wide values stored 256 wide), not the padding. Off but where a chip's
+/// profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.fa2_live", flag, default = false, tune = search)]
+pub struct Fa2Live;
 
 /// Whether a paged decode of a group of at most eight query heads reads its
 /// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
@@ -704,6 +748,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemvSplitkMaxN>()
         .add::<MlaPath>()
         .add::<QmmGemmFrom>()
+        .add::<QmmGemvMmaFrom>()
         .add::<QmmLongRows>()
         .add::<QmmSplitWarpsPerSm>()
         .add::<QmmSplitThinMax>()
@@ -725,6 +770,7 @@ pub fn register(registry: &mut Registry) {
         .add::<Dsv4DecodeUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
+        .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
         .add::<ElemwiseQNormRopeWarp>()
         .add::<ElemwiseSkipUnread>()
@@ -733,6 +779,9 @@ pub fn register(registry: &mut Registry) {
         .add::<ElemwiseHcMma>()
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
+        .add::<SsmGdnStepBlocks>()
+        .add::<MoeMxfp4SelectLean>()
+        .add::<GemmGroupedGemv>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -772,6 +821,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeGroupedPrefillWindow>()
+        .add::<Fa2Live>()
         .add::<DecodeXqa>()
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
@@ -831,6 +881,7 @@ tuning! {
     /// `kernel.mla.path = naive`.
     mla_naive: bool = false, is MlaPath::Naive;
     qmm_gemm_from: u32 = 16, get QmmGemmFrom;
+    qmm_gemv_mma_from: u32 = 2, get QmmGemvMmaFrom;
     qmm_long_rows: u32 = 512, get QmmLongRows;
     qmm_split_warps_per_sm: u32 = 58, get QmmSplitWarpsPerSm;
     qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
@@ -852,6 +903,7 @@ tuning! {
     dsv4_decode_until: u32 = 0, get Dsv4DecodeUntil;
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
+    ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
     q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
     skip_unread: bool = false, on ElemwiseSkipUnread;
@@ -860,6 +912,9 @@ tuning! {
     hc_mma: bool = false, on ElemwiseHcMma;
     ssm_conv_vec4: bool = false, on SsmConvVec4;
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
+    ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
+    mxfp4_select_lean: bool = false, on MoeMxfp4SelectLean;
+    grouped_gemv: bool = false, on GemmGroupedGemv;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
@@ -899,6 +954,7 @@ tuning! {
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
+    fa2_live: bool = false, on Fa2Live;
     decode_xqa: bool = false, on DecodeXqa;
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;

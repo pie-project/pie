@@ -26,6 +26,8 @@ use crate::prompt::Prompt;
 /// no truncation, no penalties.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sampling {
+    /// Draft with the model's block drafter where it pays (greedy, alone);
+    /// on unless the request turns it off.
     pub speculative: bool,
     pub temperature: f32,
     pub top_p: f32,
@@ -41,7 +43,7 @@ pub struct Sampling {
 impl Default for Sampling {
     fn default() -> Self {
         Self {
-            speculative: false,
+            speculative: true,
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
@@ -228,9 +230,11 @@ pub async fn generate(
         && matcher.is_none()
         && !prompt.is_empty()
         && images.is_empty()
+        // Beside other requests the run-ahead decode below batches with
+        // theirs; drafting would cost all of them.
+        && Pipeline::live() == 0
         && let Some(draft) = model::draft_block()
-        && !draft.bidirectional
-        && draft.proposals_from == 1
+        && draft.proposals_from <= 1
         && (2..=16).contains(&draft.rows)
     {
         return crate::speculative::generate(prompt, ends, max_tokens, draft, on_token).await;

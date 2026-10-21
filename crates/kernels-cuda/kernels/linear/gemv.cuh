@@ -4,21 +4,16 @@
 
 namespace pie::linear {
 
-template <int kWarps, int kUnrollP = 4>
-__global__ void gemv_bf16_kernel(
-    const bf16* __restrict__ weight,
-    const bf16* __restrict__ act,
-    const bf16* __restrict__ bias,
-    bf16* __restrict__ out,
-    int N, int K, float beta)
+// A warp's dot of weight row `row` (K wide) with the activation `act`,
+// folded to lane 0.
+template <int kUnroll>
+__device__ __forceinline__ float gemv_bf16_row(
+    const bf16* __restrict__ weight, const bf16* __restrict__ act, int row, int K)
 {
-    const int row = blockIdx.x * kWarps + threadIdx.y;
-    if (row >= N) return;
     const float4* w4 =
         reinterpret_cast<const float4*>(weight + (long long)row * K);
     const float4* x4 = reinterpret_cast<const float4*>(act);
     const int vectors = K / 8;
-    constexpr int kUnroll = kUnrollP;
     float acc = 0.f;
     int i = threadIdx.x;
     for (; i + 32 * (kUnroll - 1) < vectors; i += 32 * kUnroll) {
@@ -53,6 +48,24 @@ __global__ void gemv_bf16_kernel(
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
+    return acc;
+}
+
+template <int kWarps, int kUnrollP = 4>
+__global__ void gemv_bf16_kernel(
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ act,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int N, int K, float beta)
+{
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
+    const int row = blockIdx.x * kWarps + threadIdx.y;
+    if (row >= N) return;
+    float acc = gemv_bf16_row<kUnrollP>(weight, act, row, K);
     if (threadIdx.x == 0) {
         if (beta != 0.f) acc += beta * bf16_to_f32(out[row]);
 
@@ -62,6 +75,21 @@ __global__ void gemv_bf16_kernel(
         }
         out[row] = v;
     }
+}
+
+// `gemv_bf16_kernel` over a grouped plane at one row: weight row `row` is
+// group `row / group_n`'s, against that group's K-wide slice of the row.
+template <int kWarps>
+__global__ void gemv_bf16_grouped_kernel(
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ act,
+    bf16* __restrict__ out,
+    int N, int K, int group_n)
+{
+    const int row = blockIdx.x * kWarps + threadIdx.y;
+    if (row >= N) return;
+    const float acc = gemv_bf16_row<4>(weight, act + (long long)(row / group_n) * K, row, K);
+    if (threadIdx.x == 0) out[row] = f32_to_bf16(acc);
 }
 
 // `out[row][n] = act[row] . weight[n]` for a product a few columns wide
@@ -124,6 +152,10 @@ __global__ void gemv_splitk_bf16_kernel(
     bf16* __restrict__ out,
     int N, int K, float beta)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x;
     if (row >= N) return;
     const int warp = threadIdx.y;

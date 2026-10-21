@@ -481,7 +481,8 @@ pub fn split_rows(
             Launch::grid(
                 [left.rows, (x.width / VEC_WIDTH).div_ceil(BLOCK), 1],
                 [BLOCK, 1, 1],
-            ),
+            )
+            .programmatic(ctx.tuning().pdl),
         )
     } else {
         (

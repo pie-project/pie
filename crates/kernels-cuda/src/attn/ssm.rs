@@ -264,7 +264,8 @@ fn conv1d_update(
             Launch::grid(
                 [(channels / CONV_VEC).div_ceil(CONV_BLOCK), rows, 1],
                 [CONV_BLOCK, 1, 1],
-            ),
+            )
+            .programmatic(ctx.tuning().pdl),
         )
     } else {
         args.push(dil.arg());
@@ -766,23 +767,23 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> 
             .all(|&at| aligned16(at))
 }
 
-/// Warps per block of the fused step, and the most blocks each SM holds:
-/// the warps are persistent, so the grid is at most what the SMs seat at
-/// once.
+/// Warps per block of the fused step: the warps are persistent, so the
+/// grid is at most what the SMs seat at once (`kernel.ssm.gdn_step_blocks`
+/// blocks an SM at most).
 const FUSED_WARPS: u32 = 4;
-const FUSED_BLOCKS_PER_SM: u32 = 4;
 /// The bytes one warp's stage of the fused step streams: its state tile, the
 /// q and k rows, its value slice and the two gates.
 const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
 /// The fused step's shared memory a block, double-buffered.
 const FUSED_SMEM: u32 = FUSED_WARPS * 2 * FUSED_STAGE;
 
-/// The fused step's blocks one SM seats: four, or fewer where the SM's
+/// The fused step's blocks one SM seats: `most`, or fewer where the SM's
 /// shared memory (less the 1 KiB the runtime keeps a block) holds fewer.
-fn fused_blocks_per_sm(smem_per_sm: Option<u32>) -> u32 {
+fn fused_blocks_per_sm(smem_per_sm: Option<u32>, most: u32) -> u32 {
     const RESERVED: u32 = 1024;
-    smem_per_sm.map_or(FUSED_BLOCKS_PER_SM, |bytes| {
-        (bytes / (FUSED_SMEM + RESERVED)).clamp(1, FUSED_BLOCKS_PER_SM)
+    let most = most.max(1);
+    smem_per_sm.map_or(most, |bytes| {
+        (bytes / (FUSED_SMEM + RESERVED)).clamp(1, most)
     })
 }
 
@@ -810,7 +811,7 @@ impl Delta {
             })?;
         let blocks = tiles
             .div_ceil(FUSED_WARPS)
-            .min(sms * fused_blocks_per_sm(ctx.smem_per_sm()));
+            .min(sms * fused_blocks_per_sm(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks));
         ctx.fire(
             op,
             Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<4>")
@@ -1306,6 +1307,8 @@ pub fn gated_delta_chunked(
     let _ = z;
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    // A short fire (a verify, a fold) scans its rows in order instead.
+    let scan = y.rows <= ctx.tuning().ssm_gdn_scan_until;
     if y.dtype == Dtype::Bf16 {
         // Narrowed for its gated norm: the tcgen05 walk lands bf16 itself;
         // any other walk lands f32 in a plane, cast after.
@@ -1315,6 +1318,7 @@ pub fn gated_delta_chunked(
         if k_dim == 128
             && v_dim == 128
             && !SERIAL_SCAN.with(core::cell::Cell::get)
+            && !scan
             && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)?
         {
             return Ok(());
@@ -1341,7 +1345,8 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
-    let wide = k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get);
+    let wide =
+        k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) && !scan;
     #[cfg(feature = "cuda")]
     if wide && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)? {
         return Ok(());
@@ -1621,8 +1626,28 @@ impl Kda {
 
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>")
-                .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1])),
+            // A warp a head where the row is whole heads (a decode's row over
+            // the card), else a block a plane.
+            if self.head_dim > 0 && self.width.is_multiple_of(self.head_dim) {
+                Fire::at(
+                    FILE,
+                    "::pie::attn::ssm_kda_qkv_prep_heads<::pie::bf16, 128>",
+                )
+                .apply(
+                    Launch::grid(
+                        [
+                            self.n,
+                            PLANES,
+                            (self.width / self.head_dim).div_ceil(PREP_BLOCK / WARP),
+                        ],
+                        [PREP_BLOCK, 1, 1],
+                    )
+                    .programmatic(ctx.tuning().pdl),
+                )
+            } else {
+                Fire::at(FILE, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>")
+                    .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1]))
+            },
             &[
                 mixed.arg(),
                 ArgValue::Ptr(staged.q_norm),
@@ -1636,8 +1661,10 @@ impl Kda {
         )?;
         // A row a block, four channels a thread.
         let gates = if self.head_dim.is_multiple_of(4) {
-            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>")
-                .apply(Launch::grid([self.n, 1, 1], [256, 1, 1]))
+            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>").apply(
+                Launch::grid([self.n, self.width.div_ceil(1024), 1], [256, 1, 1])
+                    .programmatic(ctx.tuning().pdl),
+            )
         } else {
             Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta<::pie::bf16>").apply(Launch::grid(
                 [self.n, self.heads, 1],
@@ -1752,8 +1779,16 @@ pub fn kda_step(
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_step_batched").apply(
-            Launch::grid([shape.n, shape.heads, 1], [STEP_BLOCK, 1, 1])
-                .smem(kda_shmem(shape.head_dim)),
+            Launch::grid(
+                [
+                    shape.n,
+                    shape.heads,
+                    kda_step_splits(ctx, shape.n, shape.heads),
+                ],
+                [STEP_BLOCK, 1, 1],
+            )
+            .smem(kda_shmem(shape.head_dim))
+            .programmatic(ctx.tuning().pdl),
         ),
         &[
             ArgValue::Ptr(staged.q_norm),
@@ -1773,6 +1808,14 @@ pub fn kda_step(
             ctx.stage(),
         ],
     )
+}
+
+/// The blocks a decode step's head splits its value rows over: as many as
+/// keep two blocks a multiprocessor where the rows and heads alone do not, at
+/// most eight.
+fn kda_step_splits(ctx: &Ctx, n: u32, heads: u32) -> u32 {
+    let sms = ctx.multiprocessors().unwrap_or(132);
+    (2 * sms / (n * heads).max(1)).clamp(1, 8)
 }
 
 /// The raw decay and beta rows the tensor-core prep forms its gates from.
@@ -2132,14 +2175,16 @@ mod tests {
         assert!(scan_smem(128) > 101_376);
     }
 
-    /// Three blocks of the fused step where the SM holds them, as on a B200
-    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM.
+    /// Four blocks of the fused step where the SM holds them, as on a B200
+    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM; the profile's
+    /// fewer where it asks (A100's three).
     #[test]
     fn the_fused_step_seats_what_the_sm_holds() {
-        assert_eq!(fused_blocks_per_sm(Some(233_472)), 4);
-        assert_eq!(fused_blocks_per_sm(Some(167_936)), 4);
-        assert_eq!(fused_blocks_per_sm(Some(102_400)), 2);
-        assert_eq!(fused_blocks_per_sm(Some(16_384)), 1);
-        assert_eq!(fused_blocks_per_sm(None), 4);
+        assert_eq!(fused_blocks_per_sm(Some(233_472), 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(167_936), 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(102_400), 4), 2);
+        assert_eq!(fused_blocks_per_sm(Some(16_384), 4), 1);
+        assert_eq!(fused_blocks_per_sm(None, 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(167_936), 3), 3);
     }
 }

@@ -371,7 +371,7 @@ fn gates_norm_launch(
                 held.is_some()
             )),
         )
-        .apply(Launch::grid([y.rows, 2, 1], [threads, 1, 1])),
+        .apply(Launch::grid([y.rows, 2, 1], [threads, 1, 1]).programmatic(ctx.tuning().pdl)),
         &[
             mixes,
             gate.scale.arg(),
@@ -485,15 +485,17 @@ pub fn fold(
     }
     // Eight columns a thread where the rows are whole 16-byte runs: the same
     // sums in the same order.
-    let (entry, width) =
-        if ctx.tuning().hc_tile && whole_runs(x.width, &[x.ptr, streams.ptr, y.ptr]) {
-            (format!("::pie::elemwise::hc_fold_vec8<{t}>"), x.width / 8)
-        } else {
-            (format!("::pie::elemwise::hc_fold<{t}>"), x.width)
-        };
+    let vec8 = ctx.tuning().hc_tile && whole_runs(x.width, &[x.ptr, streams.ptr, y.ptr]);
+    let (entry, width) = if vec8 {
+        (format!("::pie::elemwise::hc_fold_vec8<{t}>"), x.width / 8)
+    } else {
+        (format!("::pie::elemwise::hc_fold<{t}>"), x.width)
+    };
+    // The vec8 fold waits on its producer in-kernel (`kernel.pdl`).
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry)).apply(elementwise_in(OP, y.rows, width)?),
+        Fire::at(FILE, symbol(&entry))
+            .apply(elementwise_in(OP, y.rows, width)?.programmatic(ctx.tuning().pdl && vec8)),
         &[
             x.arg(),
             streams.arg(),
@@ -822,10 +824,13 @@ fn prenorm_launch(
     );
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&entry)).apply(Launch {
-            smem,
-            ..Launch::grid([row_blocks, slices, 1], [threads, 1, 1])
-        }),
+        Fire::at(FILE, symbol(&entry)).apply(
+            Launch {
+                smem,
+                ..Launch::grid([row_blocks, slices, 1], [threads, 1, 1])
+            }
+            .programmatic(ctx.tuning().pdl),
+        ),
         &[
             streams.arg(),
             hc_fn.arg(),

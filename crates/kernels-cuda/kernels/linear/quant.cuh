@@ -638,7 +638,27 @@ __device__ __forceinline__ void moe_note_group(
     }
 }
 
-template <class T, int kRowsT>
+// Eight e2m1 codes of a word (code `i` its nibble `i`) dotted with `xv`
+// onto `acc`, the codes laid into bf16 by integer ops: each 2^-126 times its
+// value, exact, so `xv` comes 2^100 up and the caller's scale takes back the
+// 2^26 left. No f16 converts.
+__device__ __forceinline__ float e2m1x8_dot_lean(unsigned wd, const float (&xv)[8], float acc) {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        // Codes 3 - p and 7 - p at bits 12..15 and 28..31.
+        const unsigned t = wd << (4 * p);
+        const unsigned b2 = (t & 0x80008000u) | ((t >> 6) & 0x01C001C0u);
+        acc = fmaf(__uint_as_float(b2 << 16), xv[3 - p], acc);
+        acc = fmaf(__uint_as_float(b2 & 0xFFFF0000u), xv[7 - p], acc);
+    }
+    return acc;
+}
+
+// With kLean (A100's profile) one 32-code block a row in flight a lane, the
+// codes laid into bf16 by integer ops (2^-126 times their value, exact) and
+// the activations taken 2^100 up so the products stay normal, the block
+// scale taking back the 2^26 left: no f16 converts.
+template <class T, int kRowsT, bool kLean = false>
 __global__ void moe_matmul_select_mxfp4(
     const T* __restrict__ act,
     const i32* __restrict__ routes,
@@ -689,7 +709,7 @@ __global__ void moe_matmul_select_mxfp4(
 
     // One 16-byte load is a whole 32-code block of a row; a lane issues every
     // row's block for kU blocks before it computes, so the weights stream.
-    constexpr int kU = 2;
+    constexpr int kU = kLean ? 1 : 2;
     const uint4* wq = reinterpret_cast<const uint4*>(w);
     const uint4* x4 = reinterpret_cast<const uint4*>(x);
 
@@ -723,22 +743,29 @@ __global__ void moe_matmul_select_mxfp4(
                 const T* xe = reinterpret_cast<const T*>(&xq);
                 float xv[8];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) xv[j] = Elem<T>::to_f32(xe[j]);
+                for (int j = 0; j < 8; ++j) xv[j] = Elem<T>::to_f32(xe[j]) * (kLean ? 0x1p100f : 1.f);
 #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
-                    __half2 qd[4];
-                    mxfp4_unpack8((&ww[u][r].x)[q], qd);
+                    if constexpr (kLean) {
+                        part[r] = e2m1x8_dot_lean((&ww[u][r].x)[q], xv, part[r]);
+                    } else {
+                        __half2 qd[4];
+                        mxfp4_unpack8((&ww[u][r].x)[q], qd);
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float2 f = __half22float2(qd[j]);
-                        part[r] = fmaf(f.x, xv[2 * j], part[r]);
-                        part[r] = fmaf(f.y, xv[2 * j + 1], part[r]);
+                        for (int j = 0; j < 4; ++j) {
+                            const float2 f = __half22float2(qd[j]);
+                            part[r] = fmaf(f.x, xv[2 * j], part[r]);
+                            part[r] = fmaf(f.y, xv[2 * j + 1], part[r]);
+                        }
                     }
                 }
             }
 #pragma unroll
             for (int r = 0; r < kRows; ++r)
-                acc[r] = fmaf(part[r], mxfp4_block_scale(sc[u][r]), acc[r]);
+                acc[r] = fmaf(part[r],
+                              kLean ? __uint_as_float((static_cast<unsigned>(sc[u][r]) + 26u) << 23)
+                                    : mxfp4_block_scale(sc[u][r]),
+                              acc[r]);
         }
     }
 #pragma unroll

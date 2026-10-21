@@ -493,6 +493,172 @@ __global__ __launch_bounds__(32 * kBands * kSplit) void gemv_affine_tiled(
     }
 }
 
+// The decode point's tensor-core twin for a verify's or a few lanes' rows:
+// the same tile-order codes as the B fragment of one m16n8k16 a band, the
+// rows as its A fragment (up to 16; a lane loads its two rows' words, not
+// every row's), so the multiply-adds leave the CUDA cores and each
+// activation word is read once a warp.
+template <class T, int kBits, int kGroup, int kRowsT, int kBands, int kSplit>
+__global__ __launch_bounds__(32 * kBands * kSplit) void gemv_affine_tiled_mma(
+    const T* __restrict__ act,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const u8* __restrict__ biases,
+    T* __restrict__ out,
+    int m,
+    int n,
+    int k,
+    const u32* __restrict__ win)
+{
+    static_assert(is_same<T, bf16>::value, "this point is bf16 activations only");
+    static_assert(kBits == 4, "this point serves the four-bit code plane only");
+    static_assert(kGroup % kMmaK == 0, "a 16-wide k tile must sit inside one group");
+    static_assert(kRowsT == 8 || kRowsT == kMmaM,
+                  "the rows are one mma tile's: its top half alone, or all of it");
+    static_assert(kBands >= 1 && kSplit >= 1, "a block is at least one warp");
+
+    constexpr int kNSubs = kTiledBand / kMmaN;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int col_of = lane >> 2;
+    const int row_of = lane & 3;
+    const int slice = warp % kSplit;
+
+    int rows = m;
+    if (win != nullptr) {
+        const int staged = static_cast<int>(win[0]);
+        if (staged < rows) rows = staged;
+    }
+
+    const int bands = (n + kTiledBand - 1) / kTiledBand;
+    const int band = static_cast<int>(blockIdx.x) * kBands + (warp / kSplit);
+    const int steps = k / kTiledK;
+    const int groups = k / kGroup;
+
+    float acc[kNSubs][4];
+#pragma unroll
+    for (int ns = 0; ns < kNSubs; ++ns) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[ns][i] = 0.f;
+    }
+
+    if (band < bands && rows > 0) {
+        const uint4* wq = reinterpret_cast<const uint4*>(codes)
+            + static_cast<long long>(band) * steps * 32 + lane;
+        const bf16* sf = reinterpret_cast<const bf16*>(scales);
+        const bf16* bp = reinterpret_cast<const bf16*>(biases);
+
+        // This lane's two rows of the A fragment; a row past the fire reads zero.
+        const u32* xw = reinterpret_cast<const u32*>(act);
+        const bool lo_live = col_of < rows;
+        const bool hi_live = kRowsT > 8 && col_of + 8 < rows;
+        const u32* xlo = xw + static_cast<long long>(lo_live ? col_of : 0) * (k / 2);
+        const u32* xhi = xw + static_cast<long long>(hi_live ? col_of + 8 : 0) * (k / 2);
+
+        unsigned s2[kNSubs];
+        unsigned b2[kNSubs];
+#pragma unroll
+        for (int ns = 0; ns < kNSubs; ++ns) {
+            s2[ns] = 0u;
+            b2[ns] = 0u;
+        }
+        int held = -1;
+
+        for (int step = slice; step < steps; step += kSplit) {
+            const uint4 q4 = wq[static_cast<long long>(step) * 32];
+            const unsigned qs[kTiledQuad] = {q4.x, q4.y, q4.z, q4.w};
+#pragma unroll
+            for (int kk = 0; kk < kTiledQuad; ++kk) {
+                const int kt = step * kTiledQuad + kk;
+                const int g = (kt * kMmaK) / kGroup;
+                if (g != held) {
+                    held = g;
+                    const long long at =
+                        (static_cast<long long>(band) * groups + g) * kTiledBand + col_of;
+#pragma unroll
+                    for (int ns = 0; ns < kNSubs; ++ns) {
+                        s2[ns] = splat(sf[at + ns * 8]);
+                        b2[ns] = splat(bp[at + ns * 8]);
+                    }
+                }
+
+                const unsigned q = qs[kk];
+                unsigned frag[kNSubs][2];
+#pragma unroll
+                for (int ns = 0; ns < kNSubs; ++ns) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        frag[ns][h] = fold_post(
+                            dequant_u4_bf16x2(q >> (4 * (2 * ns + h))), s2[ns], b2[ns]);
+                    }
+                }
+
+                const long long xat = static_cast<long long>(kt) * 8 + row_of;
+                unsigned a[4];
+                a[0] = lo_live ? xlo[xat] : 0u;
+                a[1] = hi_live ? xhi[xat] : 0u;
+                a[2] = lo_live ? xlo[xat + 4] : 0u;
+                a[3] = hi_live ? xhi[xat + 4] : 0u;
+#pragma unroll
+                for (int ns = 0; ns < kNSubs; ++ns) {
+                    ::nvcuda::wmma::detail::mma_m16n8k16(acc[ns], a, frag[ns], acc[ns]);
+                }
+            }
+        }
+    }
+
+    // Accumulator element `i` of sub-tile `ns` is row `col_of + 8 * (i >> 1)`,
+    // column `ns * 8 + 2 * row_of + (i & 1)` of the band.
+    if constexpr (kSplit > 1) {
+        extern __shared__ __align__(16) unsigned char gemv_tiled_mma_smem[];
+        float* red = reinterpret_cast<float*>(gemv_tiled_mma_smem);
+#pragma unroll
+        for (int ns = 0; ns < kNSubs; ++ns) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = col_of + 8 * (i >> 1);
+                if (row < kRowsT) {
+                    const int col = ns * kMmaN + 2 * row_of + (i & 1);
+                    red[(warp * kRowsT + row) * kTiledBand + col] = acc[ns][i];
+                }
+            }
+        }
+        __syncthreads();
+        if (slice != 0) return;
+#pragma unroll
+        for (int ns = 0; ns < kNSubs; ++ns) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = col_of + 8 * (i >> 1);
+                if (row < kRowsT) {
+                    const int col = ns * kMmaN + 2 * row_of + (i & 1);
+                    float sum = 0.f;
+#pragma unroll
+                    for (int sl = 0; sl < kSplit; ++sl) {
+                        sum += red[((warp + sl) * kRowsT + row) * kTiledBand + col];
+                    }
+                    acc[ns][i] = sum;
+                }
+            }
+        }
+    }
+
+    if (band >= bands) return;
+#pragma unroll
+    for (int ns = 0; ns < kNSubs; ++ns) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = col_of + 8 * (i >> 1);
+            const int col = band * kTiledBand + ns * kMmaN + 2 * row_of + (i & 1);
+            if (row < rows && col < n) {
+                out[static_cast<long long>(row) * n + col] = Elem<T>::from_f32(acc[ns][i]);
+            }
+        }
+    }
+}
+
 template <int kBits>
 __global__ void repack_affine_tiled(
     const u8* __restrict__ codes,

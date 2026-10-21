@@ -137,13 +137,7 @@ __device__ __forceinline__ uint4 ds_load8(const std::uint8_t* data, const std::u
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         float lo, hi;
-        asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
-            "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-            "mov.b32 {l, h}, h2;\n\t"
-            "cvt.f32.f16 %0, l;\n\t"
-            "cvt.f32.f16 %1, h;\n\t}"
-            : "=f"(lo), "=f"(hi)
-            : "h"(c2[i]));
+        ::pie::e4m3_pair_f32(c2[i], lo, hi);
         const __nv_bfloat162 b = __floats2bfloat162_rn(lo * s, hi * s);
         o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
     }
@@ -301,13 +295,7 @@ __device__ __forceinline__ uint4 mx8_widen8(uint2 codes, float s) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         float lo, hi;
-        asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
-            "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-            "mov.b32 {l, h}, h2;\n\t"
-            "cvt.f32.f16 %0, l;\n\t"
-            "cvt.f32.f16 %1, h;\n\t}"
-            : "=f"(lo), "=f"(hi)
-            : "h"(c2[i]));
+        ::pie::e4m3_pair_f32(c2[i], lo, hi);
         const __nv_bfloat162 b = __floats2bfloat162_rn(lo * s, hi * s);
         o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
     }
