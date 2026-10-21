@@ -826,14 +826,72 @@ pub fn settle(cells: &[CellPtr], outcome: TerminalOutcomeCode) {
 }
 
 struct PendingFrame {
-    remaining: usize,
-    cells: Vec<CellPtr>,
+    /// Each step: its fires' terminal cells, the completions they are of,
+    /// and the waiters on what it puts; `None` once the step has settled
+    /// and published them.
+    steps: Vec<Option<LandingStep>>,
     frame_cell: CellPtr,
     wait_id: u64,
     epoch: u64,
-    wakes: Vec<u64>,
 }
 
+impl PendingFrame {
+    /// Publishes step `step` as it settled; `true` once every step has, and
+    /// the frame with them. A faulted step fails the steps still to come
+    /// and the frame.
+    fn settle_step(&mut self, step: usize, failed: bool, broker: &CompletionBroker) -> bool {
+        let code = if failed {
+            TERMINAL_OUTCOME_FAILED
+        } else {
+            TERMINAL_OUTCOME_SUCCESS
+        };
+        let to = if failed { self.steps.len() } else { step + 1 };
+        for at in step.min(self.steps.len())..to.min(self.steps.len()) {
+            if let Some(LandingStep {
+                cells,
+                completions,
+                wakes,
+            }) = self.steps[at].take()
+            {
+                settle(&cells, code);
+                // Each fire resolves as its step lands, so what waits on it
+                // goes on a step later rather than once the frame retires.
+                for completion in &completions {
+                    completion.mark_native_retired();
+                    if let Ok(WorkItemAttemptOutcome::Retry) = completion.resolve_from_terminal() {
+                        completion.reject(
+                            "engine published RETRY at step settle; retry is not a v14 \
+                             outcome (frame admission bounds every in-frame gate)",
+                        );
+                    }
+                }
+                for wait_id in &wakes {
+                    let outcome = waker::WakerTable::global().wake(*wait_id);
+                    tracing::debug!(wait_id, ?outcome, "published to a waiter");
+                }
+            }
+        }
+        if !failed && self.steps.iter().any(Option::is_some) {
+            return false;
+        }
+        settle(&[self.frame_cell], code);
+        broker.notify(self.wait_id, self.epoch);
+        true
+    }
+}
+
+/// A step still landing: its fires' terminal cells and completions, and the
+/// waiters on what it puts.
+#[derive(Default)]
+pub struct LandingStep {
+    pub cells: Vec<CellPtr>,
+    pub completions: Vec<WorkItemCompletion>,
+    pub wakes: Vec<u64>,
+}
+
+/// The frames on a lane whose steps are still landing: each step publishes
+/// what it settled as it lands, so a lane reads its step's values a step
+/// later, not a frame.
 #[derive(Default)]
 pub struct FrameSettlements {
     inner: Mutex<Book>,
@@ -842,7 +900,9 @@ pub struct FrameSettlements {
 #[derive(Default)]
 struct Book {
     frames: std::collections::HashMap<u64, PendingFrame>,
-    early: std::collections::HashMap<u64, (usize, bool)>,
+    /// Steps that landed before their frame was booked, and whether each
+    /// faulted.
+    early: std::collections::HashMap<u64, Vec<(usize, bool)>>,
 }
 
 impl FrameSettlements {
@@ -851,40 +911,36 @@ impl FrameSettlements {
         Arc::new(FrameSettlements::default())
     }
 
+    /// Books frame `frame`: each step's fires and the waiters on its puts,
+    /// step by step.
     pub fn expect(
         &self,
         frame: u64,
-        steps: usize,
-        cells: Vec<CellPtr>,
-        wakes: Vec<u64>,
+        steps: Vec<LandingStep>,
         completion: &SubmissionCompletion,
         broker: &CompletionBroker,
     ) {
         let Some(frame_cell) = completion.terminal_cell_ptr() else {
             return;
         };
-        let pending = PendingFrame {
-            remaining: steps.max(1),
-            cells,
+        let mut steps: Vec<_> = steps.into_iter().map(Some).collect();
+        if steps.is_empty() {
+            steps.push(Some(LandingStep::default()));
+        }
+        let mut pending = PendingFrame {
+            steps,
             frame_cell,
             wait_id: completion.wait_id(),
             epoch: completion.target_epoch(),
-            wakes,
         };
-        let resolved = {
-            let mut book = self.inner.lock().unwrap();
-            let (seen, failed) = book.early.remove(&frame).unwrap_or((0, false));
-            let mut pending = pending;
-            pending.remaining = pending.remaining.saturating_sub(seen);
-            if pending.remaining > 0 && !failed {
-                book.frames.insert(frame, pending);
-                None
-            } else {
-                Some((pending, failed))
-            }
-        };
-        if let Some((pending, failed)) = resolved {
-            publish(&pending, failed, broker);
+        let mut book = self.inner.lock().unwrap();
+        let early = book.early.remove(&frame).unwrap_or_default();
+        let mut done = false;
+        for (step, failed) in early {
+            done |= pending.settle_step(step, failed, broker);
+        }
+        if !done {
+            book.frames.insert(frame, pending);
         }
     }
 
@@ -894,35 +950,25 @@ impl FrameSettlements {
         book.early.remove(&frame);
     }
 
-    pub fn settled(&self, frame: u64, outcome: &engine::StepOutcome, broker: &CompletionBroker) {
+    /// Step `step` of frame `frame` landed, as `outcome` says.
+    pub fn settled(
+        &self,
+        frame: u64,
+        step: usize,
+        outcome: &engine::StepOutcome,
+        broker: &CompletionBroker,
+    ) {
         let failed = matches!(outcome, engine::StepOutcome::Faulted(_));
-        let pending = {
-            let mut book = self.inner.lock().unwrap();
-            let Some(pending) = book.frames.get_mut(&frame) else {
-                let seen = book.early.entry(frame).or_insert((0, false));
-                seen.0 += 1;
-                seen.1 |= failed;
-                tracing::debug!(
-                    frame,
-                    failed,
-                    early = seen.0,
-                    "settled before its frame was booked"
-                );
-                return;
-            };
-            pending.remaining = pending.remaining.saturating_sub(1);
-            if !failed && pending.remaining > 0 {
-                tracing::debug!(
-                    frame,
-                    remaining = pending.remaining,
-                    "step settled, frame still open"
-                );
-                return;
-            }
-            book.frames.remove(&frame).expect("present just above")
+        let mut book = self.inner.lock().unwrap();
+        let Some(pending) = book.frames.get_mut(&frame) else {
+            book.early.entry(frame).or_default().push((step, failed));
+            tracing::debug!(frame, step, failed, "settled before its frame was booked");
+            return;
         };
-        tracing::debug!(frame, failed, "frame settled; publishing");
-        publish(&pending, failed, broker);
+        if pending.settle_step(step, failed, broker) {
+            tracing::debug!(frame, failed, "frame settled");
+            book.frames.remove(&frame);
+        }
     }
 
     pub fn close_all(&self, broker: &CompletionBroker) {
@@ -931,23 +977,8 @@ impl FrameSettlements {
             book.early.clear();
             book.frames.drain().map(|(_, f)| f).collect()
         };
-        for pending in frames {
-            publish(&pending, true, broker);
+        for mut pending in frames {
+            pending.settle_step(0, true, broker);
         }
-    }
-}
-
-fn publish(pending: &PendingFrame, failed: bool, broker: &CompletionBroker) {
-    let code = if failed {
-        TERMINAL_OUTCOME_FAILED
-    } else {
-        TERMINAL_OUTCOME_SUCCESS
-    };
-    settle(&pending.cells, code);
-    settle(&[pending.frame_cell], code);
-    broker.notify(pending.wait_id, pending.epoch);
-    for wait_id in &pending.wakes {
-        let outcome = waker::WakerTable::global().wake(*wait_id);
-        tracing::debug!(wait_id, ?outcome, "published to a waiter");
     }
 }

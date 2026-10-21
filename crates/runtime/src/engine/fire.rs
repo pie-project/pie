@@ -80,6 +80,8 @@ impl FireRequest {
 pub struct StepFire {
     pub submission: Step,
     pub terminal_cells: Vec<CellPtr>,
+    /// The completions those cells are of, resolved once the step lands.
+    pub completions: Vec<crate::engine::WorkItemCompletion>,
     pub instances: Vec<u64>,
     pub logical_fire_ids: Vec<u64>,
 }

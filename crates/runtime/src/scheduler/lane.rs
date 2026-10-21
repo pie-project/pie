@@ -441,7 +441,7 @@ impl Lane {
                         }
                     }
                     tracing::debug!(frame, step, "channels pumped out after landing");
-                    settlements.settled(frame, &outcome, &broker);
+                    settlements.settled(frame, step as usize, &outcome, &broker);
                     if landed_instances
                         .get(&frame)
                         .is_some_and(|steps| step as usize + 1 >= steps.len())
@@ -567,10 +567,10 @@ impl Lane {
                     .collect(),
             );
         }
-        let mut wakes: Vec<u64> = Vec::new();
-        for step in &submitted.steps {
+        let mut wakes: Vec<Vec<u64>> = vec![Vec::new(); submitted.steps.len()];
+        for (step, woken) in submitted.steps.iter().zip(&mut wakes) {
             for attachment in &step.attachments {
-                let deferred = asynchronous.then_some(&mut wakes);
+                let deferred = asynchronous.then_some(&mut *woken);
                 if let Err(error) =
                     channels.pump_out_with(engine.as_mut(), attachment.instance, deferred)
                 {
@@ -587,15 +587,18 @@ impl Lane {
         }
 
         let completion = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
-        let cells: Vec<_> = frame.terminal_cells().collect();
-        settlements.expect(
-            ticket.id,
-            ticket.steps.len(),
-            cells,
-            wakes,
-            &completion,
-            broker,
-        );
+        // Each step publishes its own cells and waiters as it lands.
+        let steps = frame
+            .steps
+            .iter()
+            .zip(wakes)
+            .map(|(step, wakes)| completion::LandingStep {
+                cells: step.terminal_cells.clone(),
+                completions: step.completions.clone(),
+                wakes,
+            })
+            .collect();
+        settlements.expect(ticket.id, steps, &completion, broker);
         Ok(completion)
     }
 

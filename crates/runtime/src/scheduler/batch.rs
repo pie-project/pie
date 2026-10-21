@@ -16,6 +16,7 @@ pub(crate) struct StepBuild {
     pub(crate) boundary_programs: Vec<bool>,
     pub(crate) member_lane_indptr: Vec<u32>,
     pub(crate) terminal_cells: Vec<CellPtr>,
+    pub(crate) completions: Vec<crate::engine::WorkItemCompletion>,
     pub(crate) logical_fire_ids: Vec<u64>,
 }
 
@@ -164,6 +165,7 @@ pub(crate) fn build_batch_request(
         let mut instance_ids = Vec::with_capacity(requests.len());
         let mut boundary_programs = Vec::with_capacity(requests.len());
         let mut terminal_cells = Vec::with_capacity(requests.len());
+        let mut completions = Vec::with_capacity(requests.len());
         let mut logical_fire_ids = Vec::with_capacity(requests.len());
         let mut member_lane_indptr = Vec::with_capacity(requests.len() + 1);
         member_lane_indptr.push(0);
@@ -173,6 +175,7 @@ pub(crate) fn build_batch_request(
             boundary_programs.push(req.request.boundary_program);
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
+            completions.push(req.completion.clone());
             logical_fire_ids.push(req.logical_fire_id);
             let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
             lanes.extend(req.request.lanes.iter().cloned());
@@ -194,6 +197,7 @@ pub(crate) fn build_batch_request(
             boundary_programs,
             member_lane_indptr,
             terminal_cells,
+            completions,
             logical_fire_ids,
         }
     })
@@ -319,6 +323,7 @@ pub(crate) fn build_frame_submission(
                 voxels: build.voxels,
             },
             terminal_cells: build.terminal_cells,
+            completions: build.completions,
             instances,
             logical_fire_ids: build.logical_fire_ids,
         });

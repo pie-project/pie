@@ -2328,7 +2328,8 @@ impl BatchScheduler {
                     }
                     let requests = std::mem::take(&mut retired.requests);
                     let mut outcomes = Vec::with_capacity(requests.len());
-                    for request in &requests {
+                    // A fire its step resolved as it landed is resolved.
+                    for request in requests.iter().filter(|r| !r.completion.is_settled()) {
                         match request.completion.resolve_from_terminal() {
                             Ok(WorkItemAttemptOutcome::Committed) => {
                                 outcomes.push("committed");
@@ -2705,6 +2706,7 @@ mod tests {
                             voxels: Vec::new(),
                         },
                         terminal_cells: Vec::new(),
+                        completions: Vec::new(),
                         instances: vec![0],
                         logical_fire_ids: vec![token],
                     }],
@@ -2781,6 +2783,7 @@ mod tests {
                         voxels: Vec::new(),
                     },
                     terminal_cells: Vec::new(),
+                        completions: Vec::new(),
                     instances: vec![0],
                     logical_fire_ids: vec![42],
                 }],
