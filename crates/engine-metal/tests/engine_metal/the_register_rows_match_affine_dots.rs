@@ -594,11 +594,11 @@ fn own_table(
     handles.read(th, u64::from(17 * k)).expect("read")
 }
 
-/// The attention gate that lays the register tile's input table of its rows
-/// lands the rows the plain gate lands and the table the out projection lays
-/// over them, byte for byte, the counters zeroed.
+/// The attention gate and the gated RMS norm that lay the register tile's
+/// input table of their rows land the rows the plain ops land and the table
+/// the out projection lays over them, byte for byte, the counters zeroed.
 #[test]
-fn a_gate_lays_the_table_its_out_projection_reads() {
+fn a_gate_and_a_gated_norm_lay_the_table_their_out_projection_reads() {
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -666,10 +666,56 @@ fn a_gate_lays_the_table_its_out_projection_reads() {
             .expect("gate and table");
             frame.commit().expect("commit");
             check(plain, laid, th, "gate");
-            checked += 1;
+            // The gated norm over f32 rows of 128-wide heads.
+            let x: Vec<u8> = (0..m * k)
+                .flat_map(|at| {
+                    ((f32::from(noise(u64::from(at) ^ 0x71)) - 127.0) * 0.013).to_le_bytes()
+                })
+                .collect();
+            let w: Vec<u8> = (0..128u32)
+                .flat_map(|at| (0.6 + f32::from(noise(u64::from(at) ^ 0x72)) / 300.0).to_le_bytes())
+                .collect();
+            let x_t = Tensor::new(bind(&upload(&x)), m, k, Dtype::F32);
+            let w_t = Tensor::new(bind(&upload(&w)), 1, 128, Dtype::F32);
+            let z = Tensor::new(bind(&upload(&plane(0x73, 0.07))), m, k, Dtype::Bf16);
+            let plain = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let laid = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let th = bind(&upload(&vec![0xa5; (table_rows * k * 2) as usize]));
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            kernels_metal::elemwise::norm::rmsnorm_gated(
+                &sink, x_t, z, w_t, 128, 1e-6, false, plain,
+            )
+            .expect("gated norm");
+            kernels_metal::elemwise::norm::rmsnorm_gated_table(
+                &sink,
+                x_t,
+                z,
+                w_t,
+                128,
+                1e-6,
+                laid,
+                Tensor::new(th, table_rows, k, Dtype::F16),
+                counters,
+            )
+            .expect("gated norm and table");
+            frame.commit().expect("commit");
+            check(plain, laid, th, "gated norm");
+            checked += 2;
+
         }
     }
-    eprintln!("checked {checked} tables a gate laid");
+    eprintln!("checked {checked} tables a gate or a gated norm laid");
 }
 
 /// A plain RMS norm (scaled by its weight or by one plus it) that lays the
@@ -766,7 +812,7 @@ fn register_tables_on_this_gpu() {
     a_norm_lays_the_table_its_projections_read();
     a_plain_norm_lays_the_table_its_projections_read();
     a_swiglu_lays_the_table_its_down_reads();
-    a_gate_lays_the_table_its_out_projection_reads();
+    a_gate_and_a_gated_norm_lay_the_table_their_out_projection_reads();
     eprintln!("every register table producer matched qmm_sg_table on this GPU");
 }
 

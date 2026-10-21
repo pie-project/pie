@@ -355,6 +355,22 @@ impl<'c> Run<'c> {
             .reduce(|a, b| a + b)
     }
 
+    /// The merge of the arms `value` is one of, when the merge's rows here are
+    /// the very bytes `value` lands in: the merge's readers then read what the
+    /// arm writes, in place.
+    pub(crate) fn merged_into(&self, value: ValueId) -> Option<ValueId> {
+        let at = self.values.iter().position(|decl| {
+            matches!(&decl.def, poem_ir::Def::Merge(arms) if arms.iter().any(|(v, _)| *v == value))
+        })?;
+        let merged = ValueId(u32::try_from(at).ok()?);
+        let (arm, whole) = (self.tensor(value), self.tensor(merged));
+        (arm.rows == whole.rows
+            && arm.width == whole.width
+            && arm.dtype == whole.dtype
+            && self.address(arm.buf) == self.address(whole.buf))
+        .then_some(merged)
+    }
+
     /// When the projection of `act` by bank `w` into `columns` columns runs on
     /// the register tile, the arrival counters its split takes.
     pub(crate) fn register_counters(&self, act: ValueId, w: ValueId, columns: u32) -> Option<u32> {

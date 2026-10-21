@@ -401,16 +401,40 @@ impl Run<'_> {
                 eps,
                 act,
                 y,
-            } => elemwise::norm::rmsnorm_gated(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                matches!(act, poem_ir::GateActivation::Sigmoid),
-                self.tensor(*y),
-            ),
+            } => {
+                let sigmoid = matches!(act, poem_ir::GateActivation::Sigmoid);
+                // The out projection on the register tile reads its input
+                // table as the norm lays it: a GDN layer's projection reads
+                // the merge of its scan's arms, which this arm's rows land in.
+                let laid = (!sigmoid
+                    && self.tensor(*x).dtype == poem_ir::Dtype::F32
+                    && head_dim.is_multiple_of(32))
+                .then(|| self.producer_table(self.merged_into(*y).unwrap_or(*y)))
+                .flatten();
+                match laid {
+                    Some((table, counters)) => elemwise::norm::rmsnorm_gated_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*gate),
+                        self.tensor(*weight),
+                        *head_dim,
+                        *eps,
+                        self.tensor(*y),
+                        table,
+                        counters,
+                    ),
+                    None => elemwise::norm::rmsnorm_gated(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*gate),
+                        self.tensor(*weight),
+                        *head_dim,
+                        *eps,
+                        sigmoid,
+                        self.tensor(*y),
+                    ),
+                }
+            }
             Elementwise::RmsnormGatedBy {
                 x,
                 gate,
