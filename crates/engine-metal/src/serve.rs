@@ -3310,6 +3310,13 @@ impl Shell {
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
         let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
+        let rs_pages = if rs_active {
+            self.rs_buffers.as_ref().and_then(|buffers| {
+                crate::rs::page_table(&rs_plans, buffers.page_tokens(), buffers.page_count())
+            })
+        } else {
+            None
+        };
         if rs_active {
             let layout = self
                 .rs_layout
@@ -3573,6 +3580,7 @@ impl Shell {
                 rs_replay: rs_active.then_some(rs_replay.as_slice()),
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
                 rs_snaps: (!rs_snaps.is_empty()).then_some(rs_snaps.as_slice()),
+                rs_pages: rs_pages.as_deref(),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 spaces: &geometries,
@@ -3717,6 +3725,7 @@ impl Shell {
                     commit,
                     bound.slot_ids,
                     rows_ext,
+                    bound.rs_pages,
                 )?))
             } else {
                 None
@@ -4435,7 +4444,7 @@ impl engine::frame::Shell for Shell {
             for (name, ns, launches) in profile.iter().take(crate::diag::on().kernel_profile.rows())
             {
                 eprintln!(
-                    "  {:>9.1} ms  {:>5} launch(es)  {name}",
+                    "  {:>9.3} ms  {:>5} launch(es)  {name}",
                     *ns as f64 / 1e6,
                     launches
                 );

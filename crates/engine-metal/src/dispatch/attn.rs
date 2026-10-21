@@ -739,23 +739,15 @@ impl Run<'_> {
                 y,
                 ..
             } if self.rs_seat().is_some() => {
-                const OP: &str = "attention.ssm_causal_conv1d_committed";
                 let seat = self.rs_seat().expect("guarded");
-                let ext_x = self.rs_extend(OP, &seat, *x)?;
-                let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::causal_conv1d_committed_landing(
-                    self.ctx(),
-                    ext_x,
-                    self.qo_indptr(),
-                    &self.rs_committed(&seat),
-                    self.tensor(*weight),
-                    &self.recurrent(*state),
-                    *conv_width,
-                    *dilation,
-                    ext_y,
-                    self.rs_snapshots(),
-                )?;
-                self.rs_land(OP, &seat, ext_y, *y)
+                let conv = crate::rs::Convolved {
+                    x: *x,
+                    weight: self.tensor(*weight),
+                    state: *state,
+                    conv_width: *conv_width,
+                    dilation: *dilation,
+                };
+                self.rs_convolve(&seat, &conv, *y).map(|_| ())
             }
             Attention::SsmGdnPrep {
                 ba,
@@ -763,18 +755,15 @@ impl Run<'_> {
                 a_log,
                 gates,
             } if self.rs_seat().is_some() => {
-                const OP: &str = "attention.ssm_gdn_prep";
                 let seat = self.rs_seat().expect("guarded");
-                let ext_ba = self.rs_extend(OP, &seat, *ba)?;
-                let ext_gates = self.rs_out(OP, &seat, *gates)?;
-                attn::ssm::gdn_prep(
-                    self.ctx(),
-                    ext_ba,
-                    self.tensor(*dt_bias),
-                    self.tensor(*a_log),
-                    ext_gates,
-                )?;
-                self.rs_land(OP, &seat, ext_gates, *gates)
+                let prep = (*ba, self.tensor(*dt_bias), self.tensor(*a_log));
+                // The scan that alone reads the gates derives them as it
+                // stages its rows, and lands the window's own.
+                if self.read_only_by_scan(*gates) {
+                    seat.prepped.borrow_mut().insert(gates.0, prep);
+                    return Ok(());
+                }
+                self.rs_prep(&seat, prep, *gates)
             }
             Attention::SsmGatedDelta {
                 qkv,
@@ -801,6 +790,41 @@ impl Run<'_> {
                 const OP: &str = "attention.ssm_gated_delta_committed";
                 let seat = self.rs_seat().expect("guarded");
                 let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
+                let prepped = seat.prepped.borrow_mut().remove(&gates.0);
+                if let Some((ba, dt_bias, a_log)) = prepped
+                    && attn::ssm::gated_delta_verify_fits(*k_dim, *v_dim)
+                {
+                    let paged = seat.paged(self.handles(), ba);
+                    let ba = match paged {
+                        Some(_) => self.tensor(ba),
+                        None => self.rs_extend(OP, &seat, ba)?,
+                    };
+                    return attn::ssm::gated_delta_verify(
+                        self.ctx(),
+                        ext_qkv,
+                        self.qo_indptr(),
+                        &self.rs_committed(&seat),
+                        &attn::ssm::VerifyGates {
+                            ba,
+                            dt_bias,
+                            a_log,
+                            gates: self.tensor(*gates),
+                        },
+                        paged,
+                        &self.recurrent(*state),
+                        *k_heads,
+                        *v_heads,
+                        *k_dim,
+                        *v_dim,
+                        self.tensor(*y),
+                        self.rs_snapshots(),
+                    );
+                }
+                // Heads the verify scan does not stage take the gate prep
+                // the verify scan would have folded in.
+                if let Some(prep) = prepped {
+                    self.rs_prep(&seat, prep, *gates)?;
+                }
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 attn::ssm::gated_delta_committed_landing(

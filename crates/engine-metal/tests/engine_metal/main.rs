@@ -9,6 +9,7 @@ mod a_family_is_read_against_its_reference;
 mod a_fenced_frame_lands_both_sides;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
+mod a_verify_walk_is_the_committed_walk;
 mod a_tower_region_reads_the_patch_window;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;

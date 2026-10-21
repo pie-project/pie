@@ -119,6 +119,7 @@ pub struct Handles {
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
     pub rs_snaps: Option<Tensor>,
+    pub rs_pages: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub ports: Vec<Tensor>,
@@ -180,6 +181,7 @@ pub struct Fire<'a> {
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
     pub rs_snaps: Option<&'a [i32]>,
+    pub rs_pages: Option<&'a [i32]>,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
 }
@@ -240,6 +242,7 @@ pub struct Inputs {
     rs_replay: u64,
     rs_commit: u64,
     rs_snaps: u64,
+    rs_pages: u64,
 }
 
 /// The ints one fire's packed window boundaries can fill, at the ceiling.
@@ -394,6 +397,7 @@ impl Inputs {
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
         let rs_snaps = take(lanes * u64::from(SNAP_INTS) * 4);
+        let rs_pages = take(lanes * u64::from(crate::rs::PAGE_INTS) * 4);
         let total = at;
 
         let store = Buffer::zeroed(device, total)?;
@@ -427,6 +431,7 @@ impl Inputs {
             rs_replay,
             rs_commit,
             rs_snaps,
+            rs_pages,
         })
     }
 
@@ -541,6 +546,16 @@ impl Inputs {
                 });
             }
             self.store.write(self.rs_snaps, bytes_of(snaps))?;
+        }
+        if let Some(pages) = fire.rs_pages {
+            if pages.len() != lanes as usize * crate::rs::PAGE_INTS as usize {
+                return Err(Fault::Ceiling {
+                    what: "recurrent buffer page tables, one row per lane",
+                    need: pages.len() as u64,
+                    have: u64::from(lanes) * u64::from(crate::rs::PAGE_INTS),
+                });
+            }
+            self.store.write(self.rs_pages, bytes_of(pages))?;
         }
 
         let adapter_routes = match fire.adapter_routes {
@@ -986,6 +1001,15 @@ impl Inputs {
                     &self.store,
                     self.rs_snaps,
                     snaps.len() as u32,
+                )?),
+                None => None,
+            },
+            rs_pages: match fire.rs_pages {
+                Some(pages) => Some(i32s(
+                    handles,
+                    &self.store,
+                    self.rs_pages,
+                    pages.len() as u32,
                 )?),
                 None => None,
             },
