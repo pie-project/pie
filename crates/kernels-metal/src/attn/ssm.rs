@@ -1013,24 +1013,56 @@ pub fn gated_delta_committed_landing(
 
 /// The `(lanes a value row, simdgroups, value rows a lane)` of a verify
 /// scan's threadgroup.
-const GDN_VERIFY_GROUP: (u32, u32, u32) = (32, 4, 4);
+const GDN_VERIFY_GROUP: (i32, u32, u32) = (32, 4, 4);
 
 /// The key and value head width the verify scan stages.
 const GDN_VERIFY_DIM: u32 = 128;
 
-/// The verify scan stamped at `(lanes, simdgroups, value rows)`.
+/// The batched verify scan stamped at `(simdgroups, value rows, batches)`.
 #[must_use]
-pub fn gated_delta_verify_entry(lanes: u32, groups: u32, vrows: u32) -> Option<&'static str> {
+pub fn gated_delta_verify_batched_entry(
+    groups: u32,
+    vrows: u32,
+    batches: u32,
+) -> Option<&'static str> {
+    Some(match (groups, vrows, batches) {
+        (8, 4, 4) => "gated_delta_verify_batched_bfloat16_s_8_v_4_b_4",
+        (8, 2, 8) => "gated_delta_verify_batched_bfloat16_s_8_v_2_b_8",
+        (4, 4, 4) => "gated_delta_verify_batched_bfloat16_s_4_v_4_b_4",
+        (8, 4, 2) => "gated_delta_verify_batched_bfloat16_s_8_v_4_b_2",
+        (4, 4, 2) => "gated_delta_verify_batched_bfloat16_s_4_v_4_b_2",
+        (8, 2, 4) => "gated_delta_verify_batched_bfloat16_s_8_v_2_b_4",
+        _ => return None,
+    })
+}
+
+/// The launch of a batched verify scan over `heads` value heads of every
+/// lane.
+#[must_use]
+pub fn gated_delta_verify_batched_grid(groups: u32, vrows: u32, batches: u32, heads: u32) -> Grid {
+    let tiles = GDN_VERIFY_DIM / (groups * vrows * batches);
+    Grid::of(
+        [GDN_SCAN_LANES, groups * tiles, heads],
+        [GDN_SCAN_LANES, groups, 1],
+    )
+}
+
+/// The verify scan stamped at `(lanes, simdgroups, value rows)`, a lane's
+/// keys side by side; at negative lanes, every `-lanes`-th.
+#[must_use]
+pub fn gated_delta_verify_entry(lanes: i32, groups: u32, vrows: u32) -> Option<&'static str> {
     Some(match (lanes, groups, vrows) {
         (32, 4, 4) => "gated_delta_verify_bfloat16_l_32_s_4_v_4",
         (32, 8, 4) => "gated_delta_verify_bfloat16_l_32_s_8_v_4",
         (32, 8, 2) => "gated_delta_verify_bfloat16_l_32_s_8_v_2",
-        (32, 4, 8) => "gated_delta_verify_bfloat16_l_32_s_4_v_8",
         (8, 4, 1) => "gated_delta_verify_bfloat16_l_8_s_4_v_1",
         (8, 4, 2) => "gated_delta_verify_bfloat16_l_8_s_4_v_2",
-        (8, 8, 1) => "gated_delta_verify_bfloat16_l_8_s_8_v_1",
-        (16, 4, 2) => "gated_delta_verify_bfloat16_l_16_s_4_v_2",
-        (16, 4, 1) => "gated_delta_verify_bfloat16_l_16_s_4_v_1",
+        (-8, 4, 1) => "gated_delta_verify_bfloat16_l_8_s_4_v_1_strided",
+        (-8, 4, 2) => "gated_delta_verify_bfloat16_l_8_s_4_v_2_strided",
+        (-4, 4, 1) => "gated_delta_verify_bfloat16_l_4_s_4_v_1_strided",
+        (-4, 8, 1) => "gated_delta_verify_bfloat16_l_4_s_8_v_1_strided",
+        (-4, 4, 2) => "gated_delta_verify_bfloat16_l_4_s_4_v_2_strided",
+        (-16, 4, 1) => "gated_delta_verify_bfloat16_l_16_s_4_v_1_strided",
         _ => return None,
     })
 }
@@ -1038,8 +1070,8 @@ pub fn gated_delta_verify_entry(lanes: u32, groups: u32, vrows: u32) -> Option<&
 /// The launch of a verify scan at `(lanes, simdgroups, value rows)` over
 /// `heads` value heads of every lane.
 #[must_use]
-pub fn gated_delta_verify_grid(lanes: u32, groups: u32, vrows: u32, heads: u32) -> Grid {
-    let rows_a_simdgroup = (GDN_SCAN_LANES / lanes) * vrows;
+pub fn gated_delta_verify_grid(lanes: i32, groups: u32, vrows: u32, heads: u32) -> Grid {
+    let rows_a_simdgroup = (GDN_SCAN_LANES / lanes.unsigned_abs()) * vrows;
     Grid::of(
         [GDN_SCAN_LANES, GDN_VERIFY_DIM / rows_a_simdgroup, heads],
         [GDN_SCAN_LANES, groups, 1],
@@ -1105,7 +1137,7 @@ pub fn gated_delta_verify(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_verify_at(
     ctx: &Ctx<'_>,
-    (row_lanes, groups, vrows): (u32, u32, u32),
+    (row_lanes, groups, vrows): (i32, u32, u32),
     qkv: Tensor,
     indptr: Tensor,
     committed: &Committed,

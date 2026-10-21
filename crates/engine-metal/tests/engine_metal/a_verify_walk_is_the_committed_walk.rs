@@ -498,17 +498,26 @@ fn a_verify_walk_prices_against_the_committed_walk() {
     let Some(bench) = Bench::new() else {
         return;
     };
-    // A verify round of the 35B: eight rows behind five replayed, each of
-    // the 30 layers its own state, as cold as a round finds it.
+    // A verify round of the 35B, eight rows behind five replayed, and one
+    // row alone, the bank traffic's floor.
+    price_round(&bench, 8, 5);
+    price_round(&bench, 1, 0);
+}
+
+/// Each arm over `rows` rows behind `replay` replayed, the replayed rows
+/// committed, each of the 30 layers its own state, as cold as a round
+/// finds it.
+fn price_round(bench: &Bench, rows: i32, replay: i32) {
+    let bench = bench;
     let lanes = Lanes {
-        rows: vec![8],
-        replay: vec![5],
-        commit: vec![5],
+        rows: vec![rows],
+        replay: vec![replay],
+        commit: vec![replay.max(1)],
         old_slots: vec![0],
         new_slots: vec![0],
     };
     let ext = lanes.extended();
-    let x = inputs(&bench, ext);
+    let x = inputs(bench, ext);
     let indptr = bench.i32s(&lanes.indptr());
     let layers: Vec<Committed> = (0..LAYERS)
         .map(|l| Committed {
@@ -521,14 +530,14 @@ fn a_verify_walk_prices_against_the_committed_walk() {
     let ext_gates = bench.zeroed(ext, BA_WIDTH, Dtype::F32);
     let ext_y = bench.zeroed(ext, Y_WIDTH, Dtype::F32);
     let ext_conv = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
-    let land = bench.zeroed(8, QKV_WIDTH, Dtype::Bf16);
+    let land = bench.zeroed(rows as u32, QKV_WIDTH, Dtype::Bf16);
     let gates = VerifyGates {
         ba: x.ba,
         dt_bias: x.dt_bias,
         a_log: x.a_log,
-        gates: bench.zeroed(8, BA_WIDTH, Dtype::F32),
+        gates: bench.zeroed(rows as u32, BA_WIDTH, Dtype::F32),
     };
-    let own_y = bench.zeroed(8, Y_WIDTH, Dtype::F32);
+    let own_y = bench.zeroed(rows as u32, Y_WIDTH, Dtype::F32);
     let work = bench.zeroed(1, BANK_FLOATS as u32, Dtype::F32);
     let tuning = engine_metal::chip::tuning("", false);
     // A frame of the 30 layers, so the device runs at the clock a round
@@ -596,7 +605,7 @@ fn a_verify_walk_prices_against_the_committed_walk() {
         )
         .expect("the committed scan");
     };
-    let new_walk = |geometry: (u32, u32, u32)| {
+    let new_walk = |geometry: (i32, u32, u32)| {
         let gates = &gates;
         let x = &x;
         move |sink: &Sink, c: &Committed| {
@@ -620,17 +629,65 @@ fn a_verify_walk_prices_against_the_committed_walk() {
     };
     let geometries = [
         (32, 4, 4),
-        (32, 8, 4),
         (32, 8, 2),
-        (32, 4, 8),
-        (16, 4, 1),
-        (16, 4, 2),
         (8, 4, 1),
-        (8, 4, 2),
-        (8, 8, 1),
+        (-8, 4, 1),
+        (-8, 4, 2),
+        (-4, 4, 1),
+        (-4, 8, 1),
+        (-4, 4, 2),
+        (-16, 4, 1),
     ];
+    let batched = [
+        (8, 4, 4),
+        (8, 2, 8),
+        (4, 4, 4),
+        (8, 4, 2),
+        (4, 4, 2),
+        (8, 2, 4),
+    ];
+    let batched_walk = |(groups, vrows, batches): (u32, u32, u32)| {
+        let gates = &gates;
+        let x = &x;
+        move |sink: &Sink, c: &Committed| {
+            use kernels_metal::encode::{Arg, Encode, Fire};
+            sink.fire(
+                Fire::at(
+                    "attn/ssm_gdn_scan.metal",
+                    ssm::gated_delta_verify_batched_entry(groups, vrows, batches)
+                        .expect("a stamped entry"),
+                )
+                .apply(ssm::gated_delta_verify_batched_grid(
+                    groups, vrows, batches, V_HEADS,
+                )),
+                &[
+                    x.qkv.arg(),
+                    indptr.arg(),
+                    c.replay.arg(),
+                    c.commit.arg(),
+                    c.slots.arg(),
+                    0i32.arg(),
+                    gates.ba.arg(),
+                    gates.a_log.arg(),
+                    gates.dt_bias.arg(),
+                    x.state.arg_mut(),
+                    own_y.arg_mut(),
+                    gates.gates.arg_mut(),
+                    (K_HEADS as i32).arg(),
+                    (V_HEADS as i32).arg(),
+                    sink.absent().expect("an absent table"),
+                    (-1i32).arg(),
+                ],
+            )
+            .expect("the batched verify scan");
+        }
+    };
+    let mut batched_best = vec![f64::MAX; batched.len()];
     let mut best = vec![f64::MAX; geometries.len() + 3];
     for _ in 0..3 {
+        for (at, geometry) in batched.into_iter().enumerate() {
+            batched_best[at] = batched_best[at].min(price(&batched_walk(geometry)));
+        }
         best[0] = best[0].min(price(&old_conv));
         best[1] = best[1].min(price(&new_conv));
         best[2] = best[2].min(price(&old_walk));
@@ -639,15 +696,20 @@ fn a_verify_walk_prices_against_the_committed_walk() {
         }
     }
     eprintln!(
-        "one layer of 5 + 8 rows: conv committed {:.1} us, verify {:.1} us",
+        "one layer of {replay} + {rows} rows: conv committed {:.1} us, verify {:.1} us",
         best[0], best[1]
     );
     let mut line = format!(
-        "one layer of 5 + 8 rows: prep and committed scan {:.1} us; verify",
+        "one layer of {replay} + {rows} rows: prep and committed scan {:.1} us; verify",
         best[2]
     );
     for ((l, g, v), us) in geometries.iter().zip(&best[3..]) {
         line += &format!(" l{l}s{g}v{v} {us:.1}");
+    }
+    eprintln!("{line}");
+    let mut line = format!("one layer of {replay} + {rows} rows: batched verify");
+    for ((g, v, b), us) in batched.iter().zip(&batched_best) {
+        line += &format!(" s{g}v{v}b{b} {us:.1}");
     }
     eprintln!("{line}");
 }
