@@ -3,6 +3,32 @@
 # turns its rope dims in interleaved pairs: the reader moves each pair's
 # halves apart so the attention turns them as halves, and moves the indexer's
 # rope dims (the last of each head) first, where its kernels turn them.
+# Hy4-preview-FP8 (modelopt's MXFP8) stores its projections and experts e4m3
+# beside `*.weight_scale` (`*_scale` beside a stacked bank), one e8m0 a 1x32
+# block of each row; a row gather takes each row's exponents with it.
+
+load("//lib/mxfp8/formats.poem", "mx_proj", "mx_read", "mx_stacked_bank", "mx_widened")
+
+E4M3 = raw(dtype.e4m3)
+
+def proj(reads, w, names, rows = None):
+    """`w` from `names` joined along its rows, `rows` (if given) the rows it
+    keeps in order: as the release stores it where `w` keeps its MXFP8."""
+    if mx_proj(w):
+        mx_read(reads, w, names, rows)
+    elif rows != None:
+        reads.read_expr(w, src(names[0]).gather(0, rows))
+    elif len(names) == 1:
+        reads.read(w, names[0])
+    else:
+        reads.read_concat(w, names)
+
+def kept(reads, w, name):
+    """`w`, read at bf16 where the release stores `name` MXFP8: widened."""
+    if w.dtype == dtype.bf16 and stored(name) == E4M3:
+        reads.push(tensor(w.name, mx_widened(reads, name), raw(dtype.bf16)))
+    else:
+        reads.read(w, name)
 
 def halved(width):
     """The interleaved pairs of a `width`-wide rope part, as halves."""
@@ -54,8 +80,8 @@ def huggingface(m, reads):
         if f.routed:
             moe(reads, f, at)
         else:
-            reads.read_concat(f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
-            reads.read(f.down, at("mlp.down_proj.weight"))
+            proj(reads, f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
+            proj(reads, f.down, [at("mlp.down_proj.weight")])
 
     mtp = m.mtp
     if mtp == None:
@@ -72,21 +98,21 @@ def huggingface(m, reads):
     moe(reads, mtp.mlp, at)
 
 def attention(reads, a, at):
-    reads.read(a.q_a_proj, at("self_attn.q_a_proj.weight"))
+    proj(reads, a.q_a_proj, [at("self_attn.q_a_proj.weight")])
     reads.read(a.q_a_norm, at("self_attn.q_a_layernorm.weight"))
-    reads.read_expr(a.q_b_proj, src(at("self_attn.q_b_proj.weight")).gather(0, q_b_rows(a)))
-    reads.read_expr(a.kv_a_proj, src(at("self_attn.kv_a_proj_with_mqa.weight")).gather(0, kv_a_rows(a)))
+    proj(reads, a.q_b_proj, [at("self_attn.q_b_proj.weight")], q_b_rows(a))
+    proj(reads, a.kv_a_proj, [at("self_attn.kv_a_proj_with_mqa.weight")], kv_a_rows(a))
     reads.read(a.kv_a_norm, at("self_attn.kv_a_layernorm.weight"))
-    reads.read(a.kv_b_proj, at("self_attn.kv_b_proj.weight"))
+    kept(reads, a.kv_b_proj, at("self_attn.kv_b_proj.weight"))
     reads.read(a.gate, at("self_attn.linear_gate.weight"))
-    reads.read(a.o_proj, at("self_attn.o_proj.weight"))
+    proj(reads, a.o_proj, [at("self_attn.o_proj.weight")])
     reads.read(a.sink, at("self_attn.learnable_sink_param"))
     ix = a.indexer
     if ix == None:
         return
     one = rope_first(1, ix.head_dim, ix.rope_dim)
-    reads.read_expr(ix.wq_b, src(at("self_attn.indexer.wq_b.weight")).gather(0, rope_first(ix.heads, ix.head_dim, ix.rope_dim)))
-    reads.read_expr(ix.wk, src(at("self_attn.indexer.wk.weight")).gather(0, one))
+    proj(reads, ix.wq_b, [at("self_attn.indexer.wq_b.weight")], rope_first(ix.heads, ix.head_dim, ix.rope_dim))
+    proj(reads, ix.wk, [at("self_attn.indexer.wk.weight")], one)
     reads.read(ix.weights_proj, at("self_attn.indexer.weights_proj.weight"))
     reads.read_expr(ix.k_norm, src(at("self_attn.indexer.k_norm.weight")).gather(0, one))
     reads.read_expr(ix.k_norm_bias, src(at("self_attn.indexer.k_norm.bias")).gather(0, one))
@@ -94,10 +120,13 @@ def attention(reads, a, at):
 def moe(reads, f, at):
     reads.read(f.router, at("mlp.gate.weight"))
     reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
-    reads.read(f.gate_up, at("mlp.experts.gate_up_proj"))
-    reads.read(f.down, at("mlp.experts.down_proj"))
-    reads.read_concat(f.shared.gate_up, [
+    for w, name in [(f.gate_up, at("mlp.experts.gate_up_proj")), (f.down, at("mlp.experts.down_proj"))]:
+        if mx_proj(w):
+            mx_stacked_bank(reads, w, name)
+        else:
+            reads.read(w, name)
+    proj(reads, f.shared.gate_up, [
         at("mlp.shared_experts.gate_proj.weight"),
         at("mlp.shared_experts.up_proj.weight"),
     ])
-    reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+    proj(reads, f.shared.down, [at("mlp.shared_experts.down_proj.weight")])

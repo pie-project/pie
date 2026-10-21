@@ -584,6 +584,29 @@ def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
         cfg["mtp_config"]["local_layer_ids"] = []
 
 
+def _rewrite_minimax_m3(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    # Its MTP modules are dropped with the layers past the block.
+    tc["num_mtp_modules"] = 0
+    tc["num_nextn_predict_layers"] = 0
+    # Which layers are routed and which index their keys, one entry a layer.
+    if isinstance(tc.get("moe_layer_freq"), list):
+        tc["moe_layer_freq"] = _slice_list(tc["moe_layer_freq"], plan.src_layers)
+    sac = tc.get("sparse_attention_config")
+    if isinstance(sac, dict):
+        for key in ("sparse_disable_index_value", "sparse_attention_freq"):
+            if isinstance(sac.get(key), list):
+                sac[key] = _slice_list(sac[key], plan.src_layers)
+
+
+def _rewrite_hy_v4(cfg: dict, plan: Plan) -> None:
+    _rewrite_glm(cfg, plan)
+    # The miniature's indexer keeps sixteen keys, so the ranking is read at
+    # probe lengths (`hy4-mini`'s `index_top_k`).
+    cfg["index_topk"] = min(cfg.get("index_topk", 16), 16)
+
+
 def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # `layer_types` is what makes a layer sliding vs full attention.
@@ -1043,8 +1066,10 @@ def carry_quant_overrides(cfg: dict, pairs: list[tuple[str, str]]) -> dict[str, 
         table = cfg.get(key)
         if not isinstance(table, dict):
             continue
-        modules = {k: v for k, v in table.items() if isinstance(v, dict)}
-        rebuilt = {k: v for k, v in table.items() if not isinstance(v, dict)}
+        # modelopt nests its recipe under `quantization` (`quant_algo`, the
+        # excluded modules): a table of its own, not a module.
+        modules = {k: v for k, v in table.items() if isinstance(v, dict) and k != "quantization"}
+        rebuilt = {k: v for k, v in table.items() if k not in modules}
         for module, spec in modules.items():
             head = module + "."
             for out_name, src_name in pairs:
@@ -1492,6 +1517,45 @@ FAMILIES: dict[str, dict[str, Any]] = {
         globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
         default_layers="0-3",
         config_rewrite=_rewrite_common,
+    ),
+    # MiniMax-M3 (bf16, or the MXFP8 release: e4m3 planes beside
+    # `.weight_scale_inv` e8m0 bytes, kept as released): the text tower under
+    # `language_model.`, one name per expert, the vision tower kept whole.
+    # Layers 0-5 are its three dense layers and the first three sparse.
+    "minimax_m3_vl": dict(
+        layer_prefix="language_model.model.layers.",
+        expert_re=re.compile(r"\.block_sparse_moe\.experts\.(\d+)\."),
+        router_suffixes=("block_sparse_moe.gate.weight",
+                         "block_sparse_moe.e_score_correction_bias"),
+        globals_keep=("language_model.model.embed_tokens.weight",
+                      "language_model.model.norm.weight",
+                      "language_model.lm_head.weight"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_minimax_m3,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^multi_modal_projector\."),
+                  re.compile(r"^patch_merge_mlp\.")),
+    ),
+    # Hy4-preview (bf16, or the FP8 release, modelopt's MXFP8: e4m3 planes
+    # beside `.weight_scale` e8m0 bytes, kept as released): the routed bank
+    # stacked on dim 0 with its exponents, the MTP layer dropped. Layers 0-5
+    # are the dense layer, the ranking layers 0, 1 and 5 and the reading 2-4.
+    "hy_v4": dict(
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.gate.e_score_correction_bias",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.gate_up_proj_scale",
+            "mlp.experts.down_proj",
+            "mlp.experts.down_proj_scale",
+        ),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                      "model.hc_head.hc_head_fn", "model.hc_head.hc_head_scale",
+                      "model.hc_head.hc_head_base"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_hy_v4,
     ),
     "gpt_oss": dict(
         layer_prefix="model.layers.",

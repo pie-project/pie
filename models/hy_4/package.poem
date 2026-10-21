@@ -34,7 +34,15 @@ BF = dtype.bf16
 U4 = dtype.u4g64
 U2 = dtype.u2g64
 
+# Hy4-preview-FP8 as it ships (modelopt's MXFP8, whatever its name says):
+# projections and experts e4m3 under one e8m0 exponent a 1x32 block of each
+# row, against e4m3 activations in 1x32 blocks (W8A8; W8A16 where there are
+# no tcgen05 GEMMs); the tables, gates and latent up-projection bf16.
+MX8 = dtype.mxfp8a8g32
+
 DEPLOYMENTS = [
+    deployment("hy4-preview", weights = MX8, kv = BF),
+    deployment("hy4-preview", weights = [MX8, MX8, MX8], kv = BF, drafter = "mtp"),
     deployment("hy4-preview", weights = [U4, U2], kv = BF),
     deployment("hy4-preview", weights = [U4, U2, U4], kv = BF, drafter = "mtp"),
     deployment("hy4-preview", weights = BF, kv = BF),
@@ -43,4 +51,5 @@ DEPLOYMENTS = [
     # The latent rows as vLLM's standard fp8 rows, read by B200's sparse pass.
     deployment("hy4-preview", weights = [U4, U2], kv = dtype.e4m3),
     deployment("hy4-mini", weights = BF, kv = dtype.e4m3),
+    deployment("hy4-mini", weights = MX8, kv = BF),
 ]
