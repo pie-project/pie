@@ -39,7 +39,7 @@ use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
-use enqueue::{GuestBatch, reap_guest_fires};
+use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,8 +119,9 @@ pub struct Shell {
     /// Where taps tell what they read.
     tap_sink: Option<engine::TapSink>,
     airborne: crate::settle::Airborne,
-    owed: Option<GuestBatch>,
-    guest_landed: crate::device::graph::Event,
+    owed: Owed,
+    /// Landed events of reaped batches, for the next to record.
+    spare_events: Vec<crate::device::graph::Event>,
     /// Where a device-counted fold left each recurrent slot, ahead of the
     /// runtime's settled length until that fold settles.
     rs_ahead: std::collections::HashMap<u32, u32>,
@@ -529,19 +530,18 @@ impl Shell {
         self.reap_guests_at("shell.reap_guests")
     }
 
-    /// Settles the guest batch a step left owed once that step has landed:
-    /// its channels' cells reach their readers then, and not at the next
-    /// fire's enqueue, which a reader waiting on them may be what holds back.
+    /// Settles the guest batches whose steps have landed: their channels'
+    /// cells reach their readers then, and not at a later fire's enqueue,
+    /// which a reader waiting on them may be what holds back.
     pub fn reap_landed_guests(&mut self) -> Result<()> {
-        let Some(batch) = self.owed.as_ref() else {
-            return Ok(());
-        };
-        // The batch's own event is recorded behind its programs, so it says
-        // the batch has landed even before the step's settle is counted.
-        if self.airborne.settled_past(batch.seq) || self.guest_landed.done()? {
-            self.reap_guests_at("shell.reap_landed_guests")?;
-        }
-        Ok(())
+        reap_guest_fires(
+            &mut self.programs,
+            &mut self.owed,
+            &self.airborne,
+            &mut self.spare_events,
+            "shell.reap_landed_guests",
+            Reap::Landed,
+        )
     }
 
     pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
@@ -549,13 +549,22 @@ impl Shell {
             &mut self.programs,
             &mut self.owed,
             &self.airborne,
-            &self.guest_landed,
+            &mut self.spare_events,
             site,
+            Reap::All,
         )
     }
 
+    /// The compute stream fires run on.
+    #[must_use]
+    pub fn stream(&self) -> *mut core::ffi::c_void {
+        self.device.stream()
+    }
+
+    /// Instance `instance_id`, what has landed settled: a take reads only
+    /// cells settled fires put, and a publish is staged behind airborne fires.
     pub fn program_instance(&mut self, instance_id: u64) -> Result<Option<&mut ProgramSession>> {
-        self.reap_guests_at("shell.program_instance")?;
+        self.reap_landed_guests()?;
         Ok(self.programs.instance_mut(instance_id))
     }
 
@@ -565,7 +574,7 @@ impl Shell {
     }
 
     pub fn close_program_instance(&mut self, instance_id: u64) -> Result<()> {
-        self.reap_guests_at("shell.close_program_instance")?;
+        self.reap_landed_guests()?;
         self.programs.close_instance(instance_id)
     }
 

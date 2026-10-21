@@ -220,6 +220,7 @@ fn pool(raw: &Raw) -> KvPool {
         block_size: 0,
         max_pages_per_request: 5,
         pages_in_batch: PAGE_INDICES.len() as i32,
+        live: [0, 0],
     }
 }
 

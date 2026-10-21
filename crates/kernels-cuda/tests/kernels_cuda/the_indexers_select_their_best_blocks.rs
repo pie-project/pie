@@ -158,6 +158,8 @@ fn the_pooled_index_selects_its_best_blocks() {
         // A prefill's rows on tcgen05, pages back to front and 64-wide, turned and not.
         (64, big, 16, bf, 128, t(true, true, true)),
         (64, big, 64, turned, 128, t(true, true, true)),
+        // GLM-5.3's 32 heads, four rows a pass, a pass's rows split between requests.
+        (32, &[(301, 600), (299, 700)], 64, turned, 128, t(true, true, true)),
     ];
     for (heads, lens, page, keys, top_k, tuning) in cases {
         rank(heads, lens, page, keys, top_k, tuning);

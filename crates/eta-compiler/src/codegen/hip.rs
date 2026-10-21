@@ -7,7 +7,7 @@ use crate::plan::{CompiledStage, Region};
 use alloc::string::String;
 
 /// The HIP emitter shares the CUDA one's text and moves with it.
-pub const HIP_GENERATED_EMITTER_VERSION: u16 = 11;
+pub const HIP_GENERATED_EMITTER_VERSION: u16 = 12;
 
 /// How a lane's blocks meet on CDNA: the exchange words at device scope
 /// (each XCD's L2 written through and read past, never written back or
@@ -27,6 +27,7 @@ const HIP_LANE: &str = "
 pub const DIALECT: Dialect = Dialect {
     chunk: include_str!("../../runtime/hip/ptir_m1_chunk.hip"),
     lane: HIP_LANE,
+    cut_mark: "",
 };
 
 pub fn emit_region(

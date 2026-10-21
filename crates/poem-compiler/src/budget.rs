@@ -232,7 +232,8 @@ impl FamilyCosts {
                 | poem_ir::Fused::MatmulSplitRows { .. }
                 | poem_ir::Fused::MoeSelectGlu { .. }
                 | poem_ir::Fused::MoeExperts { .. } => self.linear,
-                poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom,
+                poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
+                | poem_ir::Fused::SplitQkvFused { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attention,
                 poem_ir::Fused::QGateNormRopeAppend { .. } => self.attention,
                 poem_ir::Fused::ResidualAddRmsnorm { .. }

@@ -3209,7 +3209,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
-    const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
+    // Narrower live widths read out of wider heads (pie): the output
+    // lands at the query's head stride, its tail past HEAD_DIM_VO unwritten.
+    const uint32_t o_stride_h = HEAD_DIM_QK == HEAD_DIM_VO ? HEAD_DIM_VO : q_stride_h;
+    const uint32_t o_stride_n = num_qo_heads * o_stride_h;
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;

@@ -27,6 +27,19 @@ inline constexpr int qmm_tgp() {
   return qmm_wm<BM>() * 2 * SIMD_SIZE;
 }
 
+// A routed tile of at most 16 rows multiplies in two simdgroups side by side, each all of
+// its rows, as MLX's gather_qmm does: the rows one expert's tile holds are few, and four
+// simdgroups of eight rows apiece reload each weight fragment twice as often.
+template <int BM>
+inline constexpr int routed_wm() {
+  return BM <= 16 ? 1 : 2;
+}
+
+template <int BM>
+inline constexpr int routed_tgp() {
+  return routed_wm<BM>() * 2 * SIMD_SIZE;
+}
+
 #include "../third_party/mlx_steel_prelude.metal"
 #include "../third_party/mlx_steel_transforms.metal"
 #include "../third_party/mlx_steel_mma.metal"
@@ -576,7 +589,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = BK + 16 / sizeof(half);
   using loader_w_t = typename AffineLoaderFor<
-      T, BN, BK, BK_padded, qmm_tgp<BM>(), group_size, bits, half>::type;
+      T, BN, BK, BK_padded, routed_tgp<BM>(), group_size, bits, half>::type;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -591,7 +604,8 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       (const device uint8_t*)w + w_bytes + size_t(y_col) * size_t(K_w),
       scales + g_off + size_t(y_col) * size_t(K_g),
       biases + g_off + size_t(y_col) * size_t(K_g), K, Ws, simd_gid, simd_lid);
-  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, false>(
+  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, false, false,
+                         routed_wm<BM>()>(
       x, y, (const device T*)nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid,
       loader_w);
 }
@@ -686,7 +700,7 @@ METAL_FUNC void mxfp4_qmm_t_routed_impl(
   if (e < 0) return;
 
   constexpr int BK_padded = BK + 16 / sizeof(half);
-  constexpr int tgp_size = qmm_tgp<BM>();
+  constexpr int tgp_size = routed_tgp<BM>();
   const int y_col = int(tid.x) * BN;
   const size_t expert_w = size_t(e) * size_t(N) * size_t(K) / 2;
   const size_t expert_s = size_t(e) * size_t(N) * size_t(K / 32);
@@ -695,7 +709,8 @@ METAL_FUNC void mxfp4_qmm_t_routed_impl(
 
   using loader_w_t = Mxfp4VecLoader<T, BN, BK, BK_padded, 1, tgp_size, half>;
   loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
-  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, WITH_BIAS>(
+  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, WITH_BIAS, false,
+                         routed_wm<BM>()>(
       x, y,
       WITH_BIAS ? bias + size_t(e) * size_t(N) + y_col : (const device T*)nullptr,
       Xs, Ws, K, N, tid, simd_gid, simd_lid, loader_w);

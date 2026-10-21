@@ -40,7 +40,9 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
         call: "cuDeviceGet",
         code: -1,
     })?;
-    let target = root.target(plain).ok_or_else(|| Fault::Compile {
+    static TCGEN05: OnceLock<bool> = OnceLock::new();
+    let tcgen05 = *TCGEN05.get_or_init(|| features().tcgen05);
+    let target = root.target(plain, tcgen05).ok_or_else(|| Fault::Compile {
         unit: root.name,
         log: format!(
             "`{}` compiles for an arch-specific target and {plain} has none: \

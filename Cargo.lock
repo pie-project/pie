@@ -605,6 +605,7 @@ dependencies = [
 name = "chat-template"
 version = "0.5.4"
 dependencies = [
+ "serde",
  "serde_json",
  "tokenizer",
 ]
@@ -1819,6 +1820,32 @@ dependencies = [
  "serde_json",
  "state",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "engine-cerebras"
+version = "0.5.4"
+dependencies = [
+ "blake3",
+ "checkpoint",
+ "engine",
+ "eta-compiler",
+ "eta-exec",
+ "kernels-cerebras",
+ "libc",
+ "libloading 0.9.0",
+ "pie-dtype",
+ "pie-eta-ir",
+ "pie-poem",
+ "pie-poem-compiler",
+ "pie-poem-exec",
+ "pie-poem-ir",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
+ "ztensor",
+ "ztensor-compat",
 ]
 
 [[package]]
@@ -3087,6 +3114,13 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kernels-cerebras"
+version = "0.5.4"
+dependencies = [
+ "pie-dtype",
 ]
 
 [[package]]
@@ -5153,6 +5187,7 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "engine",
+ "engine-cerebras",
  "engine-cuda",
  "engine-metal",
  "engine-vulkan",

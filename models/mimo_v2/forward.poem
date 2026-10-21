@@ -1,4 +1,4 @@
-# The forward of MiMo-V2.6: attention over heads read 256 wide, the first 64
+# The forward of MiMo-V2.6: attention over heads stored 256 wide, the first 64
 # of each rotated, full on its few layers and over a 128-token window with
 # sinks on the rest; then a dense SwiGLU MLP, or experts chosen by a biased
 # sigmoid router.
@@ -12,7 +12,7 @@ def caches(m, c):
     for w in m.layers:
         at = w.attn
         plane = at.kv_heads * m.head_dim
-        c.kv(spaces[at.reading], at.kv, [plane, plane], m.head_dim, heads = True)
+        c.kv(spaces[at.reading], at.kv, [plane, plane], m.head_dim, heads = True, live = [m.qk_head_dim, m.v_head_dim])
 
 def plans(m, input, plan):
     """`plan` over `input` for each reading, indexed by it."""

@@ -2,11 +2,12 @@
 //!
 //! The host fills roles (`inferlet::chat`) and tool turns (`inferlet::tools`)
 //! for whichever model is loaded, so this module only decides the order:
-//! leading system messages, then the tool manifest, then the conversation,
-//! then the generation cue. A user turn's pictures go just ahead of its text,
+//! the opening system turn (the system message, the tools and the reasoning
+//! effort, as the template combines them), then the conversation, then the
+//! generation cue. A user turn's pictures go just ahead of its text,
 //! each as the span its handle spells.
 
-use crate::request::{Message, Request, Role, Thinking};
+use crate::request::{Effort, Message, Request, Role, Thinking};
 use inferlet::pie::inferlet::tools;
 use inferlet::{chat, media, model};
 
@@ -27,25 +28,34 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         ends.push(tokens.len() as u32);
     } else {
         let messages = &req.messages;
+        // The template opens on one system turn: the first system message,
+        // the tools (described even under `tool_choice: none`, because the
+        // conversation may replay calls to them) and a thinking request's
+        // reasoning effort, in the order the template writes them.
         let lead = messages
             .iter()
             .take_while(|m| m.role == Role::System)
             .count();
-        for m in &messages[..lead] {
+        let system = messages
+            .first()
+            .filter(|_| lead > 0)
+            .map(|m| m.content.clone());
+        tokens.extend(chat::open(system.as_deref(), &req.tools, effort(req)));
+        if !tokens.is_empty() {
+            ends.push(tokens.len() as u32);
+        }
+        for m in messages.iter().take(lead).skip(1) {
             tokens.extend(chat::system(&m.content));
             ends.push(tokens.len() as u32);
         }
 
-        // Tools the model may not call (`tool_choice: none`) are still
-        // described, because the conversation may replay calls to them.
-        if !req.tools.is_empty() {
-            let equipped = tools::equip(&req.tools).map_err(|e| format!("equip tools: {e:?}"))?;
-            tokens.extend(equipped);
-            ends.push(tokens.len() as u32);
-        }
-
+        // Turns after the last user query are the current tool loop, which
+        // some templates replay with their reasoning.
+        let last_query = messages.iter().rposition(|m| m.role == Role::User);
         let mut seen_user = false;
-        for m in &messages[lead..] {
+        let mut at = lead;
+        while at < messages.len() {
+            let m = &messages[at];
             match m.role {
                 Role::System => tokens.extend(chat::system(&m.content)),
                 Role::User => {
@@ -54,24 +64,42 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
                     } else {
                         chat::first_user(&m.content)
                     };
-                    let at = text_at(&turn, &m.content);
-                    tokens.extend(&turn[..at]);
+                    let text_at = text_at(&turn, &m.content);
+                    tokens.extend(&turn[..text_at]);
                     for bytes in &m.images {
                         let image =
                             media::Image::from_bytes(bytes).map_err(|e| format!("image: {e:?}"))?;
                         images.push((tokens.len() as u32, image));
                         tokens.extend(images.last().unwrap().1.tokens());
                     }
-                    tokens.extend(&turn[at..]);
+                    tokens.extend(&turn[text_at..]);
                     seen_user = true;
                 }
-                Role::Assistant => tokens.extend(chat::assistant(&assistant_body(m))),
-                Role::Tool => tokens.extend(tools::answer(
-                    m.tool_name.as_deref().unwrap_or(""),
-                    &m.content,
-                )),
+                Role::Assistant => {
+                    let calls: Vec<tools::ToolCall> = m
+                        .tool_calls
+                        .iter()
+                        .map(|c| tools::ToolCall {
+                            name: c.name.clone(),
+                            arguments_json: c.arguments.clone(),
+                        })
+                        .collect();
+                    let current = last_query.is_some_and(|q| at > q);
+                    tokens.extend(tools::assistant_calls(&assistant_body(m), &calls, current));
+                }
+                Role::Tool => {
+                    // The template writes consecutive results in one turn.
+                    let run = messages[at..]
+                        .iter()
+                        .take_while(|m| m.role == Role::Tool)
+                        .map(|m| (m.tool_name.clone().unwrap_or_default(), m.content.clone()))
+                        .collect::<Vec<_>>();
+                    at += run.len() - 1;
+                    tokens.extend(tools::answers(&run));
+                }
             }
             ends.push(tokens.len() as u32);
+            at += 1;
         }
 
         tokens.extend(chat::cue_thinking(thinks(req)));
@@ -112,26 +140,22 @@ fn text_at(turn: &[u32], text: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// An assistant turn's replayed body: its text, then each tool call it made
-/// in the model's own call syntax, so the model sees its earlier calls the
-/// way it wrote them.
-///
-/// The call syntax is the ChatML one (`<tool_call>{…}</tool_call>`), which is
-/// what every tool-capable template in the host currently parses. A host
-/// filler for "an assistant turn that called tools" would make this exact
-/// for every template; until then, this is the one place it is spelled out.
+/// The reasoning effort the system turn states: none for a request the
+/// model answers without thinking.
+fn effort(req: &Request) -> Option<chat::ReasoningEffort> {
+    thinks(req).then_some(match req.effort {
+        Effort::Xhigh => chat::ReasoningEffort::Xhigh,
+        Effort::Medium => chat::ReasoningEffort::Medium,
+        Effort::Low => chat::ReasoningEffort::Low,
+    })
+}
+
+/// An assistant turn's text with the reasoning it carried in front, inside
+/// the thinking block the host's template splits it back out of.
 fn assistant_body(m: &Message) -> String {
-    let mut body = m.content.clone();
-    for call in &m.tool_calls {
-        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
-            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
-        let payload = serde_json::json!({"name": call.name, "arguments": arguments});
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        body.push_str("<tool_call>\n");
-        body.push_str(&payload.to_string());
-        body.push_str("\n</tool_call>");
+    if m.reasoning.trim().is_empty() {
+        m.content.clone()
+    } else {
+        format!("<think>\n{}\n</think>\n\n{}", m.reasoning.trim(), m.content)
     }
-    body
 }

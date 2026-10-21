@@ -24,10 +24,11 @@ fn dense(x: &[f64], w: &[f64], [m, n, k]: [usize; 3], bias: Option<&[f64]>) -> V
 fn the_few_rows_and_narrow_gemms_land_the_dot() {
     use kernels_cuda::linear::{gemm_narrow_bf16, gemm_rows_bf16};
     // (few rows, m, n, k, bias): the rows kernel at each K split (8, 4, 2,
-    // 1 warps a row), the narrow one at column counts of its template.
+    // 1 warps a row) and over a cluster (a router's few columns), the narrow
+    // one at column counts of its template.
     #[rustfmt::skip]
     let cases = [(true, 8, 512, 4096, false), (true, 5, 300, 96, true), (true, 2, 64, 48, true),
-        (true, 3, 7, 1032, false), (false, 64, 4, 10240, false), (false, 7, 1, 264, true)];
+        (true, 3, 7, 1032, false), (true, 8, 16, 8192, true), (false, 64, 4, 10240, false), (false, 7, 1, 264, true)];
     for (rows, m, n, k, bias) in cases {
         let mut b = Bench::new((m * 31 + n * 7 + k) as u64);
         let ((x, xv), (w, wv), (bias_at, bv)) = (b.bf16(m * k), b.bf16(n * k), b.bf16(n));
@@ -146,6 +147,16 @@ fn the_strided_grouped_projection_answers_each_group() {
     let w = |r: usize, c: usize, i: usize| wv[((r % groups) * n + c) * k + i];
     let want = dot([rows * groups, n, k], |r, i| xv[r * k + i], w);
     b.check(y.ptr, &want, TOL, "strided");
+    // A decode's one row on the grouped GEMV (`kernel.gemm.grouped_gemv`).
+    let mut y1 = b.out(1, groups * n);
+    let ctx = b.ctx().with_tuning(Tuning {
+        grouped_gemv: true,
+        ..Tuning::DEFAULT
+    });
+    let xt1 = t(x, 1, groups * k, Bf16);
+    matmul_grouped_strided(&ctx, xt1, wt, &mut y1, groups as u32).expect("fires");
+    let want1 = dot([groups, n, k], |r, i| xv[r * k + i], w);
+    b.check(y1.ptr, &want1, TOL, "strided, one row");
 }
 
 #[test]
@@ -183,17 +194,33 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
 #[test]
 fn the_fp8_block_projections_answer_the_dot() {
     use kernels_cuda::linear::moe::{dense_fp8_shape, matmul_grouped_fp8, matmul_grouped_fp8_with};
+    use kernels_cuda::linear::moe::{matmul_fp8_w8a8, select_fp8_w8a8};
     use kernels_cuda::linear::moe_route::group_routes;
     // (arm, rows, groups, n, k): 0, the mma.sync kernel in each CTA shape
     // the dense pick lands; 1, its grouped projection; 2, a row's groups as
     // its routes on the grouped tcgen05 GEMM; 3, the GEMV over bf16 rows (K
-    // split across warps, then rows padded to four).
+    // split across warps, then rows padded to four); 4, the W8A8 matmul
+    // (narrow planes K split, wide ones whole); 5, a row's groups as its
+    // routes on the W8A8 select; 6, cuBLASLt's block-scaled FP8 GEMM (rows
+    // padded to fours).
     #[rustfmt::skip]
     let cases = [(0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
         (0, 8, 1, 1024, 4096), (1, 3, 8, 256, 1024), (2, 37, 4, 256, 1024), (3, 1, 1, 640, 6144),
-        (3, 3, 1, 1024, 1536)];
+        (3, 3, 1, 1024, 1536), (4, 5, 1, 384, 512), (4, 13, 1, 256, 1024), (4, 30, 1, 128, 2048),
+        (4, 130, 1, 640, 1536), (4, 40, 1, 16384, 512), (4, 130, 1, 32768, 512),
+        (5, 37, 4, 256, 1024), (5, 9, 8, 128, 512), (6, 5, 1, 384, 512), (6, 64, 1, 640, 1536),
+        (6, 37, 1, 16384, 512), (6, 130, 1, 256, 2048)];
+    // The mma.sync fp8 kernels (arms 0, 1, 4 and 5) are sm_89's: an Ada's e4m3 MMA.
+    let fp8_mma = kernels_cuda::jit::cache::arch()
+        .and_then(|a| {
+            a.trim_start_matches("sm_")
+                .trim_end_matches(char::is_alphabetic)
+                .parse::<u32>()
+                .ok()
+        })
+        .is_some_and(|cc| cc >= 89);
     for (arm, rows, groups, n, k) in cases {
-        if !supported() && arm >= 2 {
+        if (!supported() && arm == 2) || (!fp8_mma && matches!(arm, 0 | 1 | 4 | 5 | 6)) {
             continue;
         }
         let mut b = Bench::new(0xf8 + rows as u64);
@@ -225,7 +252,16 @@ fn the_fp8_block_projections_answer_the_dot() {
                 let bank = act_quant::Bank { codes, atoms, experts, n: n32, k: k32, elem, gran, alpha_e: 0, alpha_from };
                 act_quant::select(&ctx, "test", fmt, xr, routes, None, bank, &mut yr)
             }
-            _ => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, &mut y).map(|took| assert!(took)),
+            3 => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, 128, &mut y).map(|took| assert!(took)),
+            4 => matmul_fp8_w8a8(&ctx, xt, codes, atoms, &mut y),
+            6 => kernels_cuda::linear::lt_fp8::matmul(&ctx, "test", xt, codes, atoms, &mut y)
+                .map(|took| assert!(took, "cuBLASLt takes {rows}x{n}x{k}")),
+            _ => {
+                let mut routes = t(b.zeros(rg * 4), rows, groups, I32);
+                group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");
+                let (xr, mut yr) = (t(x, rg, k, Bf16), t(y.ptr, rg, n, Bf16));
+                select_fp8_w8a8(&ctx, xr, codes, atoms, groups as u32, routes, &mut yr)
+            }
         }
         .expect("the fp8 projection fires");
         // The quantizing arms read e4m3 rows, the GEMV the bf16 ones.
@@ -289,5 +325,70 @@ fn the_quantizing_products_answer_the_read_back_dot() {
         let (held, again) = (b.read(held.ptr, m * n), b.read(again.ptr, m * n));
         let same = held == got && again == got;
         assert!(same, "{what}: the held and dependent products");
+    }
+}
+
+#[test]
+fn the_w8a16_projections_answer_the_dot() {
+    use kernels_cuda::linear::w8a16;
+    // (block, m, n, k): the mma.sync kernel at each CTA shape (16, 32 and 64
+    // rows, a part tile of each), and wider fires on the widened plane.
+    #[rustfmt::skip]
+    let cases = [(128, 1, 384, 1024), (128, 5, 200, 640), (128, 16, 512, 2048), (128, 23, 256, 768),
+        (128, 64, 136, 512), (128, 100, 256, 1024), (32, 1, 256, 1024), (32, 37, 200, 512),
+        (32, 130, 200, 1024), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640)];
+    for (gran, m, n, k) in cases {
+        let mut b = Bench::new(0xa16 ^ (m * n + k) as u64);
+        let (x, xv) = b.bf16(m * k);
+        let s = b.side(Elem::E4m3, Some(gran), n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let (mut y, ctx) = (b.out(m, n), b.ctx());
+        let took = w8a16::matmul(
+            &ctx,
+            "test",
+            t(x, m, k, Bf16),
+            codes,
+            atoms,
+            gran as u32,
+            &mut y,
+        )
+        .expect("the W8A16 product fires");
+        assert!(took, "{m}x{n}x{k} in {gran}s is a shape it reads");
+        let want = dot(
+            [m, n, k],
+            |r, i| xv[r * k + i],
+            |_, c, i| f64::from(s.value(c, k, i)),
+        );
+        b.check(y.ptr, &want, TOL, &format!("W8A16 in {gran}s, {m}x{n}x{k}"));
+    } // The GEMV over bf16 rows at a decode's few rows, in either block width.
+    for (gran, m, n, k) in [
+        (32, 1, 1280, 5120),
+        (32, 3, 512, 1024),
+        (128, 2, 640, 2048),
+        (32, 1, 4096, 1280),
+        (128, 2, 256, 640),
+    ] {
+        let mut b = Bench::new(0x6e3 ^ (m * n + k) as u64);
+        let (x, xv) = b.bf16(m * k);
+        let s = b.side(Elem::E4m3, Some(gran), n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let (mut y, ctx) = (b.out(m, n), b.ctx().with_tuning(GEMV));
+        let took =
+            act_quant::fp8_block_gemv(&ctx, t(x, m, k, Bf16), codes, atoms, gran as u32, &mut y)
+                .expect("the GEMV fires");
+        assert!(took, "{m}x{n}x{k} in {gran}s is a shape the GEMV reads");
+        let want = dot(
+            [m, n, k],
+            |r, i| xv[r * k + i],
+            |_, c, i| f64::from(s.value(c, k, i)),
+        );
+        b.check(
+            y.ptr,
+            &want,
+            TOL,
+            &format!("the GEMV in {gran}s, {m}x{n}x{k}"),
+        );
     }
 }

@@ -32,6 +32,8 @@ pub mod run;
 pub mod scores;
 pub mod serve;
 pub mod settle;
+#[cfg(feature = "rocm")]
+pub mod split_arm;
 pub mod staged_h2d;
 pub mod store;
 pub mod tap;
@@ -48,7 +50,8 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 /// rule it does not list (`linear.mlp_swiglu`, which Metal splits across
 /// engines) leaves its primitives alone here.
 #[cfg(not(feature = "rocm"))]
-pub const FUSED: [&str; 30] = [
+pub const FUSED: [&str; 31] = [
+    "custom_cuda.split_qkv_fused",
     "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
     "elementwise.rmsnorm_residual_add",
     "elementwise.embed_scale_add_select",

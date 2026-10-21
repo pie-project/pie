@@ -6,6 +6,8 @@ use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/qkv_fused.cuh";
 
+/// The packed row's qkv write; with `rest`, the row's columns past its qkv
+/// planes (a row split's second half) land there.
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_fused_qknorm_rope_vnorm_write(
     ctx: &Ctx,
@@ -26,6 +28,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     qk_norm: bool,
     v_scale: f32,
     widths: [u32; 2],
+    rest: Option<Tensor>,
     q: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
@@ -86,7 +89,22 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let head_dim = count(OP, "the head width this fused write states", head_dim)?;
     let kv_heads = count(OP, "the kv head count this fused write states", kv_heads)?;
 
-    let width = stated(OP, packed.width)?;
+    // The rest: whole 16-byte words after a whole number of them.
+    let rest_width = rest.map_or(0, |r| r.width);
+    if rest.is_some_and(|r| {
+        r.rows != packed.rows
+            || r.dtype != Dtype::Bf16
+            || rest_width >= packed.width
+            || !rest_width.is_multiple_of(8)
+            || !packed.width.is_multiple_of(8)
+    }) {
+        return Err(refuse(
+            OP,
+            "the rest of a row lands as whole 16-byte words past whole ones",
+        ));
+    }
+    let rest_arg = rest.map_or(ArgValue::ABSENT, |r| r.arg());
+    let width = stated(OP, packed.width - rest_width)?;
     let num_q_heads = (width - kv_heads * (qk_width + v_width)) / qk_width;
     if num_q_heads <= 0 {
         return Err(refuse(
@@ -103,23 +121,51 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let rows = count(OP, "rows", packed.rows)?;
 
     let hnd_layout = pool.layout != 0;
+    // The pages it writes: bf16, or e4m3 under a unit scale.
+    let pages = if crate::attn::kv::native_e4m3(pool) {
+        ", __nv_fp8_e4m3"
+    } else if crate::attn::kv::native_bf16(pool) {
+        ""
+    } else {
+        return Err(refuse(
+            OP,
+            "the fused write lands bf16 or e4m3 pages, not a scaled scheme's",
+        ));
+    };
     let rope_table = ArgValue::ABSENT;
     let window = ctx.stage();
 
     // A prefill's rows go a block a row: the row's rotation is computed once
     // for every head rather than once a head, and each head moves in whole
     // 16-byte words. A decode's few rows keep the warp a head.
+    // Under `rows_vec` (B200) a row of 16-byte words a lane (64-, 128- and
+    // 256-wide heads) lands in shared memory whole, by one bulk copy (sm_90's).
+    let stage = (word || head_dim == 256)
+        && ctx.tuning().rows_vec
+        && crate::jit::device::compute_capability_major().is_some_and(|major| major >= 9)
+        && packed.width * 2 + 16 <= 48 * 1024;
     let by_row = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
         let e = if word { 8 } else { head_dim / 32 };
-        format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e})>")
+        if stage {
+            let kv = if pages.is_empty() { "::pie::bf16" } else { "__nv_fp8_e4m3" };
+            format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}), {kv}, true>")
+        } else {
+            format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}){pages}>")
+        }
     });
+    let smem = if stage { packed.width * 2 + 16 } else { 0 };
+    let block = if stage {
+        128
+    } else if word {
+        64
+    } else {
+        ROW_BLOCK
+    };
     if let Some(instantiation) = by_row.filter(|_| packed.rows >= ctx.tuning().qkv_rows_from) {
         return ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&instantiation)).apply(Launch::grid(
-                [packed.rows, 1, 1],
-                [if word { 64 } else { ROW_BLOCK }, 1, 1],
-            )),
+            Fire::at(FILE, symbol(&instantiation))
+                .apply(Launch::grid([packed.rows, 1, 1], [block, 1, 1]).smem(smem)),
             &[
                 packed.arg(),
                 q.arg(),
@@ -148,30 +194,23 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 tail.2.arg(),
                 qk_width.arg(),
                 v_width.arg(),
+                stated(OP, rest_width)?.arg(),
+                rest_arg,
             ],
         );
     }
 
-    let warped = match head_dim {
-        64 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(64), false>",
-        ),
-        128 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(128), false>",
-        ),
-        256 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(256), false>",
-        ),
-        _ => None,
-    };
+    let warped = matches!(head_dim, 64 | 128 | 256).then(|| {
+        format!("::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false{pages}>")
+    });
     if let Some(instantiation) = warped {
         let units = packed.rows.saturating_mul(heads);
         return ctx.fire(
             OP,
-            Fire::at(FILE, instantiation).apply(Launch::grid(
-                [units.div_ceil(WARPS_PER_BLOCK), 1, 1],
-                [WARP_BLOCK, 1, 1],
-            )),
+            Fire::at(FILE, symbol(&instantiation)).apply(
+                Launch::grid([units.div_ceil(WARPS_PER_BLOCK), 1, 1], [WARP_BLOCK, 1, 1])
+                    .programmatic(ctx.tuning().pdl),
+            ),
             &[
                 packed.arg(),
                 q.arg(),
@@ -202,11 +241,15 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 tail.2.arg(),
                 qk_width.arg(),
                 v_width.arg(),
+                stated(OP, rest_width)?.arg(),
+                rest_arg,
             ],
         );
     }
-    // The block-a-head kernel turns Gemma's pairs under norms alone.
-    if 2 * span != head_dim.unsigned_abs()
+    // The block-a-head kernel turns Gemma's pairs under norms alone, and
+    // reads a row of qkv alone.
+    if rest.is_some()
+        || 2 * span != head_dim.unsigned_abs()
         || !qk_norm
         || v_scale != 1.0
         || widths != [head_dim.unsigned_abs(); 2]
@@ -220,7 +263,9 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         OP,
         Fire::at(
             FILE,
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false>",
+            symbol(&format!(
+                "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false{pages}>"
+            )),
         )
         .apply(Launch::grid([packed.rows, heads, 1], [DECODE_BLOCK, 1, 1])),
         &[

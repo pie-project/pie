@@ -595,6 +595,119 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+# The fixed points every engine is held to (`pie_baseline.py`,
+# `profile_points.py`): one prefill batch, three decode batches timed at 256
+# outputs and at 1 so a step is (t256 - t1) / 255, and one serving burst
+# offered all at once.
+FIXED_PREFILL = dict(batch=32, input_len=4096, output_len=1)
+FIXED_DECODE_BATCHES = (1, 8, 64)
+FIXED_DECODE_INPUT, FIXED_DECODE_OUTPUT = 512, 256
+FIXED_SERVE = dict(num_prompts=256, input_len=1024, output_len=256)
+
+
+def fixed_prompt_ids(rng: random.Random, vocab: int, batch: int, input_len: int) -> list[list[int]]:
+    """`batch` prompts of `input_len` random token ids, drawn as every
+    engine's baseline draws them, so a seeded `rng` gives each engine the
+    same ids."""
+    return [[rng.randrange(100, vocab - 100) for _ in range(input_len)] for _ in range(batch)]
+
+
+def tokenizer_vocab_size(snapshot: str) -> int:
+    """The base vocabulary of a checkpoint's `tokenizer.json` (added tokens
+    left out), which is what a Hugging Face tokenizer reports as
+    `vocab_size` and what the vLLM baseline draws prompt ids under. A
+    tiktoken checkpoint (Kimi's) has no `tokenizer.json`; its tokenizer
+    reports its ranks and reserved specials together, the configuration's
+    `vocab_size`."""
+    path = Path(snapshot)
+    if not (path / "tokenizer.json").exists() and (path / "tiktoken.model").exists():
+        with open(path / "config.json", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return int(cfg.get("text_config", cfg)["vocab_size"])
+    with open(path / "tokenizer.json", encoding="utf-8") as f:
+        return len(json.load(f)["model"]["vocab"])
+
+
+def _gpu_compute_apps() -> tuple[int, dict[int, int]]:
+    """Device memory in use (MiB) and every compute process's pid -> MiB."""
+    used = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=10).stdout.split()
+    procs = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=10).stdout.splitlines()
+    apps = {}
+    for line in procs:
+        if "," in line:
+            pid, mib = (x.strip() for x in line.split(",", 1))
+            apps[int(pid)] = int(mib) if mib.isdigit() else 0
+    return sum(int(u) for u in used), apps
+
+
+def _descends_from(pid: int, root: int) -> bool:
+    while pid > 1:
+        if pid == root:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+class MemSampler:
+    """nvidia-smi memory.used and utilization every `period` seconds, into
+    `path`, with every compute process's pid:MiB. A compute process that does
+    not descend from this one is a neighbour: `foreign` collects those seen
+    once `measuring()` was called (one during the weight load slows the load,
+    not a measured point), and a run with any is contended."""
+
+    def __init__(self, path: str, period: float = 1.0) -> None:
+        import threading
+
+        self.path, self.period = path, period
+        self.peak = 0
+        self.foreign: set[int] = set()
+        self._measuring = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        me = os.getpid()
+        with open(self.path, "w") as f:
+            f.write("t,memory_used_mib,util_pct,processes\n")
+            t0 = time.time()
+            while not self._stop.is_set():
+                try:
+                    used, util = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=10).stdout.split(",")[:2]
+                    _, apps = _gpu_compute_apps()
+                    if self._measuring.is_set():
+                        self.foreign |= {pid for pid in apps if not _descends_from(pid, me)}
+                    used = int(used)
+                    self.peak = max(self.peak, used)
+                    procs = " ".join(f"{pid}:{mib}" for pid, mib in apps.items())
+                    f.write(f"{time.time() - t0:.1f},{used},{util.strip()},{procs}\n")
+                    f.flush()
+                except Exception:
+                    pass
+                self._stop.wait(self.period)
+
+    def measuring(self) -> None:
+        """The engine is up: from here on a neighbour contends a measurement."""
+        self._measuring.set()
+
+    def __enter__(self) -> "MemSampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._thread.join()
+
+
 def gpu_clock_state() -> list[dict[str, Any]]:
     """Per-GPU SM clock and utilization, or [] when nvidia-smi is unavailable.
 

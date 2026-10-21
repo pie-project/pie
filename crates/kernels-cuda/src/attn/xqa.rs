@@ -16,13 +16,15 @@ use crate::tensor::{KvPool, Tensor};
 const FILE: &str = "attn/xqa.cuh";
 
 /// One head width's stamp: key tiles of `16 * mt` rows, `warps` warps a
-/// block, `stages` tiles in flight a warp.
+/// block, `stages` tiles in flight a warp, its key rows swizzled rather than
+/// padded (`swizzle`, a bf16 pool's alone).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     pub head_dim: u32,
     pub mt: u32,
     pub warps: u32,
     pub stages: u32,
+    pub swizzle: bool,
 }
 
 impl Stamp {
@@ -45,8 +47,20 @@ impl Stamp {
             mt,
             warps,
             stages,
+            swizzle: false,
         })
     }
+
+    /// The 64-wide stamp three tiles deep a warp, its key rows swizzled so
+    /// four blocks still share an SM: a decode's two or three tiles a warp
+    /// all in flight at once (`kernel.sdpa.decode.xqa_deep_64`).
+    pub const DEEP_64: Self = Self {
+        head_dim: 64,
+        mt: 1,
+        warps: 4,
+        stages: 3,
+        swizzle: true,
+    };
 
     /// The blocks a split decode aims for: as many as the SMs hold at once.
     #[must_use]
@@ -58,13 +72,26 @@ impl Stamp {
     /// The dynamic shared memory a block holds (`Shape::SMEM_BYTES`).
     #[must_use]
     pub const fn smem(self) -> u32 {
+        self.smem_over(false)
+    }
+
+    /// [`Stamp::smem`] over an e4m3 pool's pages, staged raw before they
+    /// widen.
+    #[must_use]
+    pub const fn smem_over(self, e4m3: bool) -> u32 {
         let head_dim = self.head_dim;
         let ld = head_dim + 8;
+        let kv_ld = if self.swizzle { head_dim } else { ld };
         let tile = 16 * self.mt;
-        let staged = self.warps * self.stages * 2 * tile * ld * 2;
+        let staged = self.warps * self.stages * 2 * tile * kv_ld * 2;
         let fold = self.warps * (8 * head_dim + 16) * 4;
         let region = if staged > fold { staged } else { fold };
-        region + (8 * ld + self.warps * tile * 8) * 2
+        let raw = if e4m3 {
+            self.warps * self.stages * 2 * tile * head_dim
+        } else {
+            0
+        };
+        region + (8 * ld + self.warps * tile * 8) * 2 + raw
     }
 }
 
@@ -79,6 +106,9 @@ pub struct Gate {
     /// The most blocks a cluster splits an unwindowed row across (0: the
     /// plan splits it).
     pub cluster: u32,
+    /// 64-wide heads over a bf16 pool take [`Stamp::DEEP_64`]
+    /// (`kernel.sdpa.decode.xqa_deep_64`).
+    pub deep_64: bool,
 }
 
 impl Gate {
@@ -89,6 +119,17 @@ impl Gate {
             from_64: tuning.decode_xqa_from_64,
             whole_window: tuning.decode_xqa_whole_window,
             cluster: tuning.decode_xqa_cluster,
+            deep_64: tuning.decode_xqa_deep_64,
+        }
+    }
+
+    /// The stamp a head width takes, over an e4m3 pool or a bf16 one.
+    #[must_use]
+    pub const fn stamp(self, head_dim: u32, e4m3: bool) -> Option<Stamp> {
+        if self.deep_64 && head_dim == 64 && !e4m3 {
+            Some(Stamp::DEEP_64)
+        } else {
+            Stamp::of(head_dim)
         }
     }
 
@@ -139,6 +180,10 @@ impl Gate {
         }
         let pairs = requests.saturating_mul(kv_heads).max(1);
         let mut ranks = self.cluster.min(8);
+        // Past 64 blocks, eight slices a row fold slower than four.
+        while ranks > 4 && pairs.saturating_mul(ranks) > 64 {
+            ranks /= 2;
+        }
         while ranks > 1 && pairs.saturating_mul(ranks) > grid {
             ranks /= 2;
         }
@@ -155,26 +200,31 @@ pub fn takes(ctx: &Ctx, plan: &DecodePlan, pool: &KvPool, rel: bool) -> bool {
         && !rel
         && plan.shape.num_kv_heads * group == plan.shape.num_q_heads
         && !plan.shape.hnd_layout
-        && pool.keys.dtype == Dtype::Bf16
-        && pool.values.dtype == Dtype::Bf16
-        && Stamp::of(head_dim).is_some_and(|stamp| {
-            ctx.smem_per_block_optin()
-                .is_some_and(|cap| cap >= stamp.smem())
-        })
+        && (pool.keys.dtype == Dtype::Bf16 && pool.values.dtype == Dtype::Bf16
+            || crate::attn::kv::native_e4m3(pool))
+        && Gate::of(ctx.tuning())
+            .stamp(head_dim, crate::attn::kv::native_e4m3(pool))
+            .is_some_and(|stamp| {
+                ctx.smem_per_block_optin()
+                    .is_some_and(|cap| cap >= stamp.smem_over(crate::attn::kv::native_e4m3(pool)))
+            })
 }
 
 /// Fires the tensor-core decode over `params` (the FA2 decode's, its output
 /// already the split's partial plane where the plan splits). With `sinks`
-/// and no split, the sinks scale the output in the same pass.
+/// and no split, the sinks scale the output in the same pass. `e4m3` reads
+/// the pages as an e4m3 pool's.
 pub fn decode(
     ctx: &Ctx,
     op: &'static str,
     plan: &DecodePlan,
     params: &DecodeParams,
     sinks: Option<Tensor>,
+    e4m3: bool,
 ) -> Result<(), Error> {
     let head_dim = plan.shape.head_dim;
-    let stamp = Stamp::of(head_dim).ok_or_else(|| {
+    let gate = Gate::of(ctx.tuning());
+    let stamp = gate.stamp(head_dim, e4m3).ok_or_else(|| {
         crate::jit::refuse(
             op,
             format!("no tensor-core decode at head width {head_dim}"),
@@ -189,24 +239,32 @@ pub fn decode(
     let launch = Launch::grid(
         [plan.shape.num_kv_heads * ranks, params.padded_batch_size, 1],
         [32 * stamp.warps, 1, 1],
-    );
+    )
+    .programmatic(ctx.tuning().pdl);
+    let smem = stamp.smem_over(e4m3);
     let launch = if ranks > 1 {
-        launch
-            .cluster(ranks)
-            .smem(stamp.smem() + (8 * head_dim + 8) * 4)
+        launch.cluster(ranks).smem(smem + (8 * head_dim + 8) * 4)
     } else {
-        launch.smem(stamp.smem())
+        launch.smem(smem)
+    };
+    // The defaulted parameters spelled out up to the last one set.
+    let pages = if e4m3 { ", ::pie::u8" } else { "" };
+    // The swizzled stamp (a bf16 pool's) has its own entry, its registers
+    // held to the four blocks its shared memory lets share an SM.
+    let entry = if stamp.swizzle {
+        format!(
+            "::pie::attn::xqa::decode_deep<{head_dim}, {}, {}, {}, 4, {sink_ty}>",
+            stamp.mt, stamp.warps, stamp.stages
+        )
+    } else {
+        format!(
+            "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}{pages}>",
+            stamp.mt, stamp.warps, stamp.stages
+        )
     };
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}>",
-                stamp.mt, stamp.warps, stamp.stages
-            )),
-        )
-        .apply(launch),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             ArgValue::Ptr(params.q),
             ArgValue::Ptr(kv.k_data),
@@ -257,6 +315,7 @@ mod tests {
             from_64: 16,
             whole_window: 128,
             cluster: 8,
+            deep_64: false,
         };
         assert!(gate.takes(256, 2, 1) && gate.takes(64, 8, 16));
         assert!(!gate.takes(64, 8, 15) && !gate.takes(256, 16, 64) && !gate.takes(512, 8, 64));
@@ -268,7 +327,7 @@ mod tests {
         // most eight; a 64-wide one under a long window too (Muse Spark's
         // 2048); a whole-read window, Gemma's 256-wide sliding row, or any
         // where it is off, none.
-        assert_eq!(gate.ranks(64, 8, 8, 8, -1, 740), 8);
+        assert_eq!(gate.ranks(64, 8, 8, 8, -1, 740), 4);
         assert_eq!(gate.ranks(64, 8, 16, 8, -1, 740), 4);
         assert_eq!(gate.ranks(64, 8, 64, 8, -1, 740), 1);
         assert_eq!(gate.ranks(64, 8, 8, 8, 127, 740), 0);
@@ -278,5 +337,17 @@ mod tests {
         assert_eq!(Gate { cluster: 0, ..gate }.ranks(64, 8, 8, 8, -1, 740), 0);
         assert!(gate.stamps(64, 8));
         assert!(!Gate::default().stamps(256, 2));
+        // The deep 64-wide stamp: four blocks still share a B200 SM, a bf16
+        // pool's alone; off, or past 64 wide, the stamps as they were.
+        let deep = Gate {
+            deep_64: true,
+            ..gate
+        };
+        let stamp = deep.stamp(64, false).expect("stamped");
+        assert_eq!(stamp, Stamp::DEEP_64);
+        assert!(4 * (stamp.smem() + (8 * 64 + 8) * 4 + 1024) <= 233_472);
+        assert_eq!(deep.stamp(64, true), Stamp::of(64));
+        assert_eq!(deep.stamp(256, false), Stamp::of(256));
+        assert_eq!(gate.stamp(64, false), Stamp::of(64));
     }
 }

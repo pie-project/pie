@@ -45,6 +45,46 @@ pub struct Layout {
     pub work_elems: u64,
 }
 
+/// The snapshot rows one lane lands in a fire (`Lane::rs_snapshots`):
+/// [`kernels_metal::attn::ssm::RS_SNAPSHOTS`] where every op that reads a
+/// state slot is a conv or gated-delta scan, whose prompt arms land them;
+/// else none, and a pass is cut at each.
+#[must_use]
+pub fn snapshots(trace: &Trace) -> u32 {
+    use poem_ir::Operands;
+    let state = |id: &ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|value| &value.def),
+            Some(Def::Cache(row))
+                if matches!(trace.caches.get(*row as usize), Some(poem_ir::CacheRow::State { .. }))
+        )
+    };
+    let mut reads = Vec::new();
+    let mut any = false;
+    let lands = trace.nodes.iter().all(|node| {
+        reads.clear();
+        node.op.inputs(&mut reads);
+        if !reads.iter().any(state) {
+            return true;
+        }
+        any = true;
+        matches!(
+            &node.op,
+            Operation::Attention(
+                Attention::SsmCausalConv1d { .. }
+                    | Attention::SsmCausalConv1dChunked { .. }
+                    | Attention::SsmGatedDelta { .. }
+                    | Attention::SsmGatedDeltaChunked { .. },
+            )
+        )
+    });
+    if lands && any {
+        kernels_metal::attn::ssm::RS_SNAPSHOTS
+    } else {
+        0
+    }
+}
+
 fn row_of(trace: &Trace, id: ValueId) -> Result<(u32, Dtype, u64)> {
     let decl = trace
         .values

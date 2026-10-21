@@ -371,6 +371,11 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
 
+  // pie: the staged lengths are read only once the producer is done
+  // (`kernel.pdl`).
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   const uint32_t staged = seq_len_ptr ? *seq_len_ptr : max_seq_len;
   const uint32_t seq_len = (win != nullptr && win[0] < staged) ? win[0] : staged;
   const uint32_t row_base = win != nullptr ? win[1] : 0;

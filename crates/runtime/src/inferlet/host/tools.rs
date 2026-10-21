@@ -31,6 +31,25 @@ impl pie::inferlet::tools::Host for ProcessCtx {
         Ok(crate::model::model().instruct().answer(&name, &value))
     }
 
+    async fn answers(&mut self, results: Vec<(String, String)>) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().answers(&results))
+    }
+
+    async fn assistant_calls(
+        &mut self,
+        message: String,
+        calls: Vec<pie::inferlet::tools::ToolCall>,
+        current: bool,
+    ) -> Result<Vec<u32>> {
+        let calls: Vec<(String, String)> = calls
+            .into_iter()
+            .map(|call| (call.name, call.arguments_json))
+            .collect();
+        Ok(crate::model::model()
+            .instruct()
+            .assistant_calls(&message, &calls, current))
+    }
+
     async fn format(
         &mut self,
         tools: Vec<String>,

@@ -152,12 +152,12 @@ impl Kind {
         }
     }
 
-    /// The 128-byte TMA boxes a tile row takes a stage: a swapped NVFP4
-    /// launch of one P tile (a decode's down leg streaming its weight) two,
-    /// 512 K.
+    /// The 128-byte TMA boxes a tile row takes a stage: a swapped
+    /// block-scaled launch of one P tile (a decode streaming its weight)
+    /// two, 512 K NVFP4 or 256 K mx.
     const fn boxes(self, swap: bool, pt: u32) -> u32 {
         match self {
-            Self::Nvf4 if swap && pt == 1 => 2,
+            Self::Nvf4 | Self::Mx if swap && pt == 1 => 2,
             _ => 1,
         }
     }
@@ -216,6 +216,7 @@ const fn smem_bytes(
     p_blocks: u32,
     lives: bool,
     quant: bool,
+    routes: u32,
 ) -> u32 {
     let Plan {
         swap,
@@ -250,9 +251,10 @@ const fn smem_bytes(
             (true, false) => 1024,
             (false, _) => 4 * 2 * 2048,
         };
-    // The routing a grouped launch holds is reserved for every launch; a
+    // The routing a grouped launch holds, `routes` entries (its experts and
+    // one, or the most a launch routes), is reserved for every launch; a
     // swapped contiguous one holds each expert's live rows too.
-    let routing = MAX_ROUTES * if lives { 12 } else { 8 };
+    let routing = routes * if lives { 12 } else { 8 };
     bar + (3 * stages + 16) * 8 + 8 + routing + 1024
 }
 
@@ -273,7 +275,8 @@ pub struct Plan {
 impl Plan {
     /// Rows of 64 or fewer put the weight on the 128-row side. Otherwise a CTA
     /// pair runs 256 x 256 tiles, unless lone 128 x 128 tiles fill the `sms`
-    /// sooner. Either splits K when its tiles leave SMs idle ([`Plan::splits_for`]).
+    /// sooner, or a short K's lone 128 x 256. Either splits K when its tiles
+    /// leave SMs idle ([`Plan::splits_for`]).
     #[must_use]
     pub fn choose(m: u32, n: u32, k: u32, sms: u32) -> Self {
         if m <= 64 {
@@ -296,9 +299,12 @@ impl Plan {
             f64::from(waves) * area * f64::from(steps.div_ceil(splits)) / rate * penalty
         };
         let pair = time(256, 2, 1.8) <= time(128, 1, 1.0);
+        // Over 1024 K or less the epilogue outruns the products: lone CTAs'
+        // 128 x 256 tiles drain twice the stores at once.
+        let lone = pair && k <= 1024;
         Self {
             swap: false,
-            pair,
+            pair: pair && !lone,
             bn: if pair { 256 } else { 128 },
             stages: 0,
             splits: 0,
@@ -328,6 +334,7 @@ impl Plan {
         p_blocks: u32,
         lives: bool,
         quant: bool,
+        routes: u32,
     ) -> Self {
         let mut stages = 8;
         while stages > 2
@@ -340,6 +347,7 @@ impl Plan {
                 p_blocks,
                 lives,
                 quant,
+                routes,
             ) > SMEM_CAP
         {
             stages -= 1;
@@ -404,6 +412,8 @@ pub enum Glu {
     /// under a cap (`cap > 0`), `u` else (`mlp_situ`; its tanh the fast
     /// one).
     Situ { beta: f32, cap: f32 },
+    /// `relu(g)^2`, of the weight's rows alone: no up rows (`mlp_relu2`).
+    Relu2,
 }
 
 /// Where the epilogue lands its `rows x n` result.
@@ -459,6 +469,11 @@ pub struct Epilogue {
     /// select's rows, the GLU's and the next select's quantizer would hold
     /// them apart.
     pub input_scales: u64,
+    /// Swapped: the weight, its scales, the group's offsets and live rows
+    /// were all landed before the launch this one depends on (a routed
+    /// down leg after its gate-up), so under PDL the first ring of weight
+    /// tiles loads before the wait and only the activations wait.
+    pub weights_ahead: bool,
 }
 
 impl Epilogue {
@@ -470,6 +485,7 @@ impl Epilogue {
         weight_scale: 0,
         live_rows: 0,
         input_scales: 0,
+        weights_ahead: false,
     };
 
     const fn glu_code(&self) -> u32 {
@@ -480,7 +496,13 @@ impl Epilogue {
             Some(Glu::SwigluClampAlpha { .. }) => 3,
             Some(Glu::GegluTanh) => 4,
             Some(Glu::Situ { .. }) => 5,
+            Some(Glu::Relu2) => 6,
         }
+    }
+
+    /// Whether the epilogue's activation reads gate and up rows.
+    const fn gated(&self) -> bool {
+        matches!(self.glu, Some(g) if !matches!(g, Glu::Relu2))
     }
 
     const fn out_code(&self) -> u32 {
@@ -501,13 +523,11 @@ impl Epilogue {
             }
             return Ok(plan);
         }
-        if plan.swap {
-            if plan.bn > 128 {
-                // Two accumulators of 128 fill a stage's TMEM: wider rows take
-                // more Q tiles.
-                plan.bn = 128;
-            }
-        } else {
+        if self.gated() && plan.swap {
+            // Two accumulators of 128 fill a stage's TMEM: wider rows take
+            // more Q tiles.
+            plan.bn = plan.bn.min(128);
+        } else if self.gated() {
             plan.bn = 256;
         }
         plan.splits = 1;
@@ -545,9 +565,12 @@ impl Epilogue {
             wscale: self.weight_scale,
             live: self.live_rows,
             in_scale: self.input_scales,
+            weights_ahead: i32::from(self.weights_ahead),
             raster: 8,
             slab: 0,
             tickets: 0,
+            even_waves: 0,
+            route_cap: 0,
         }
     }
 }
@@ -573,6 +596,9 @@ struct EpiArgs {
     raster: i32,
     slab: i64,
     tickets: u64,
+    weights_ahead: i32,
+    even_waves: i32,
+    route_cap: i32,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's columns, under a stated plan.
@@ -592,7 +618,7 @@ pub fn gemm_epi_with(
     }
     let plan = unpaired_if_mixed(act, w, epi.fit(swapped_if_mixed(act, w, plan, m >= 256))?);
     let kind = admit(act, w, n, k, plan)?;
-    let glu = epi.glu.is_some();
+    let glu = epi.gated();
     if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
         return Err(refuse(
             OP,
@@ -637,8 +663,9 @@ pub enum Groups {
     /// `y`, `rows x n`). `offsets` is a device `i32[experts + 1]`, every
     /// entry a multiple of [`GROUP_ALIGN`]; the pad rows between experts
     /// are computed and land, unread. Rows past `offsets[experts]` are not
-    /// touched.
-    Contiguous { offsets: u64, rows: u32 },
+    /// touched. `cap` is the most rows an expert holds, where the layout
+    /// knows it (a decode's distinct routes: its tokens), else 0.
+    Contiguous { offsets: u64, rows: u32, cap: u32 },
     /// The decode layout: expert e's rows at `[e * m_max, e * m_max +
     /// counts[e])` of an `experts * m_max`-row activation and of `y`.
     /// `counts` is a device `i32[experts]`, each at most `m_max <= 256`.
@@ -777,7 +804,7 @@ pub fn grouped_gemm_epi_with(
             Groups::Masked { .. } => plan,
         })?,
     );
-    let glu = epi.glu.is_some();
+    let glu = epi.gated();
     if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
         return Err(refuse(
             OP,
@@ -804,7 +831,7 @@ pub fn grouped_gemm_epi_with(
     let bank = g.experts * n_per;
     let q_step = if glu { 128 } else { plan.bn };
     let job = match g.groups {
-        Groups::Contiguous { offsets, rows } => {
+        Groups::Contiguous { offsets, rows, cap } => {
             let swap = plan.swap;
             if swap && !matches!(kind, Kind::Mixed(_) | Kind::Mx | Kind::Nvf4) {
                 return Err(refuse(
@@ -814,11 +841,21 @@ pub fn grouped_gemm_epi_with(
             }
             // A 32-row Q tile at an odd quarter of its rows' 128-row scale
             // atom (an expert's second) faults the block-scaled MMA, as an
-            // A-side one does.
-            if swap && act.scales.is_some() && plan.bn < 64 {
+            // A-side one does: one an expert (its rows `cap` or fewer) starts
+            // at an even one.
+            if swap && act.scales.is_some() && plan.bn < 64 && (cap == 0 || cap > plan.bn) {
                 return Err(refuse(
                     OP,
                     "a swapped contiguous group of scaled rows takes Q tiles of 64 rows or more",
+                ));
+            }
+            // A wider one at an expert's odd 64-row start reaches into the
+            // next 128-row scale atom its one mapped atom block does not
+            // hold (96 and 128 fault on B200).
+            if swap && act.scales.is_some() && plan.bn > GROUP_ALIGN {
+                return Err(refuse(
+                    OP,
+                    "a swapped contiguous group of scaled rows takes Q tiles of 64 rows or fewer",
                 ));
             }
             if rows == 0 {
@@ -1008,7 +1045,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         epi,
         ..
     } = job;
-    let glu = epi.glu.is_some();
+    let glu = epi.gated();
     // A GLU swapped reads two weight tiles a stage; unswapped, its Q tile
     // comes in two 128-row halves.
     let pt = if glu && job.plan.swap { 2 } else { 1 };
@@ -1024,10 +1061,27 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     };
     let lives = group.mode == 1 && job.plan.swap;
     let quant = job.plan.swap && matches!(epi.out, Out::Nvfp4 { .. });
+    // A grouped launch's routing for its bank's experts alone where the
+    // profile says (`kernel.moe.routes_sized`), the room going to the ring.
+    let routes = if group.mode != 0 && ctx.tuning().moe_routes_sized {
+        group.experts + 1
+    } else {
+        MAX_ROUTES
+    };
     let plan = job
         .plan
-        .staged(kind, gran(p), gran(q), pt, p_blocks, lives, quant);
-    let smem = smem_bytes(kind, gran(p), gran(q), plan, pt, p_blocks, lives, quant);
+        .staged(kind, gran(p), gran(q), pt, p_blocks, lives, quant, routes);
+    let smem = smem_bytes(
+        kind,
+        gran(p),
+        gran(q),
+        plan,
+        pt,
+        p_blocks,
+        lives,
+        quant,
+        routes,
+    );
     let ctas = if plan.pair { 2 } else { 1 };
     let [rows_p, rows_q] = job.rows;
 
@@ -1063,6 +1117,15 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     };
     let epi_args = EpiArgs {
         raster: i32::try_from(ctx.tuning().gemm_tc5_raster.max(1)).unwrap_or(8),
+        // A swapped grouped launch's units, dealt evenly from as many waves
+        // as the profile says (`kernel.moe.even_waves_from`).
+        even_waves: if group.mode != 0 && plan.swap {
+            i32::try_from(ctx.tuning().moe_even_waves_from).unwrap_or(0)
+        } else {
+            0
+        },
+        // The routing entries its shared memory holds, as reserved above.
+        route_cap: i32::try_from(routes).unwrap_or(i32::MAX),
         ..epi.args(n, job.pad, wsf, wzero)
     };
     let sms = ctx.multiprocessors().unwrap_or(148);
@@ -1459,9 +1522,9 @@ mod tests {
                     stages: 0,
                     splits: 0,
                 }
-                .staged(kind, g, g, 1, 1, false, false);
+                .staged(kind, g, g, 1, 1, false, false, MAX_ROUTES);
                 assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
-                assert!(smem_bytes(kind, g, g, plan, 1, 1, false, false) <= SMEM_CAP);
+                assert!(smem_bytes(kind, g, g, plan, 1, 1, false, false, MAX_ROUTES) <= SMEM_CAP);
             }
         }
     }

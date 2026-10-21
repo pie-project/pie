@@ -63,6 +63,9 @@ struct Params {
     // each q head's bf16 sink the row is scaled down by.
     float* lse;
     const u16* sinks;
+    // A head's stride in Q and O where wider than D and DV (heads padded
+    // past the widths read); 0 where they are the widths.
+    int head;
 };
 
 __host__ __device__ constexpr u32 smem_bytes(int d, int bkv, int stages, int dv = 0) {
@@ -211,7 +214,9 @@ __device__ __forceinline__ bool work_of(const Params& p, int bound, int block, W
 //
 // With PAIR a block's item is two tiles of 128 rows that read one K and V
 // stream, each its own softmax warpgroup (warps 0-3, 6-9), S buffers, O
-// and Q: every key tile loads once for 256 rows.
+// and Q: every key tile loads once for 256 rows. Without IO a block walks
+// several items (the host's grid an SM a block), each softmax warpgroup
+// taking its tile's Q in and O out.
 template <int D, int BKV, int ST, int DV = D, bool IO = false, bool PAIR = false>
 __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
     const __grid_constant__ tc5::TmaMap map_k, const __grid_constant__ tc5::TmaMap map_v,
@@ -242,19 +247,86 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
     static_assert(kColQ + kT * D / 2 <= kCols, "S twice, O and Q fit TMEM");
     static_assert(!(IO && PAIR), "a pair's warpgroups move their own Q and O");
     constexpr int kRows = 128 * kT;
+    // Without IO the softmax warps move each item's Q and O themselves.
+    constexpr bool kOwn = !IO;
     (void)kKA;
 
     // A block's items: a tile of a KV head's rows, numbered tile-major from
     // (x, y), the grid's size apart; `next_work` steps `i` past empty ones.
-    // With IO a block walks several (the host's grid an SM a block), the K
-    // and V ring, the S buffers and the P V products counting across them.
-    const int first = static_cast<int>(blockIdx.x * gridDim.y + blockIdx.y);
-    const int step = static_cast<int>(gridDim.x * gridDim.y);
+    // A block walks several (the host's grid an SM a block), the K and V
+    // ring, the S buffers and the P V products counting across them.
+    // Without IO `i` is instead the block's round: the requests' tiles ranked
+    // from each one's last (the longest causal ones first), a rank's every
+    // request and head in turn (past 16 KV heads, a head at a time, its keys
+    // kept in L2 while the blocks share them), dealt to the blocks back and
+    // forth so their sums even out. Up to 32 requests with rows a warp holds
+    // them a lane each, so a captured fire's empty lanes cost no rounds.
+    const int first = kOwn ? 0 : static_cast<int>(blockIdx.x * gridDim.y + blockIdx.y);
+    const int step = kOwn ? 1 : static_cast<int>(gridDim.x * gridDim.y);
     int h = 0;
+    int ranks = 0;
+    // The live requests (rows past 0), the n-th at lane n: its lane, first
+    // row, rows and tiles.
+    int nlive = 0, my_r = 0, my_qs = 0, my_ql = 0, my_tiles = 0;
+    if constexpr (kOwn) {
+        const int lane = static_cast<int>(threadIdx.x & 31);
+        for (int base = 0; base < p.live[1]; base += 32) {
+            const int r = p.live[0] + base + lane;
+            const bool in = base + lane < p.live[1];
+            const int qs = in ? p.qo_indptr[r] : 0;
+            const int ql = in ? p.qo_indptr[r + 1] - qs : 0;
+            const int tiles = (ql * p.group + kRows - 1) / kRows;
+            ranks = max(ranks, tiles);
+            const unsigned on = __ballot_sync(0xffffffffu, tiles > 0);
+            const int at = nlive + __popc(on & ((1u << lane) - 1u));
+            if (tiles > 0 && at < 32) {
+                my_r = r;
+                my_qs = qs;
+                my_ql = ql;
+                my_tiles = tiles;
+            }
+            nlive += __popc(on);
+        }
+        ranks = __reduce_max_sync(0xffffffffu, ranks);
+    }
     auto next_work = [&](int& i, Work& x) {
+        if constexpr (kOwn) {
+            const bool held = nlive <= 32;
+            const int lanes = held ? nlive : p.live[1];
+            const int nb = static_cast<int>(gridDim.x);
+            const int b = static_cast<int>(blockIdx.x);
+            for (;; ++i) {
+                const int item = i * nb + ((i & 1) ? nb - 1 - b : b);
+                if (item >= ranks * lanes * p.kv_heads) return false;
+                const bool by_head = p.kv_heads > 16;
+                h = by_head ? item / (ranks * lanes) : item % p.kv_heads;
+                const int q = by_head ? item % (ranks * lanes) : item / p.kv_heads;
+                int r, qs, ql, tiles;
+                if (held) {
+                    r = __shfl_sync(0xffffffffu, my_r, q % lanes);
+                    qs = __shfl_sync(0xffffffffu, my_qs, q % lanes);
+                    ql = __shfl_sync(0xffffffffu, my_ql, q % lanes);
+                    tiles = __shfl_sync(0xffffffffu, my_tiles, q % lanes);
+                } else {
+                    r = p.live[0] + q % lanes;
+                    qs = p.qo_indptr[r];
+                    ql = p.qo_indptr[r + 1] - qs;
+                    tiles = (ql * p.group + kRows - 1) / kRows;
+                }
+                if (q / lanes >= tiles) continue;
+                x.r = r;
+                x.row0 = (tiles - 1 - q / lanes) * kRows;
+                x.qo_start = qs;
+                x.qo_len = ql;
+                x.kv_page0 = p.kv_indptr[r];
+                const int pages = p.kv_indptr[r + 1] - x.kv_page0;
+                x.kv_len = pages > 0 ? (pages - 1) * p.page + p.last_page_len[r] : 0;
+                return true;
+            }
+        }
         for (; i < bound * p.kv_heads; i += step) {
-            h = IO ? i % p.kv_heads : static_cast<int>(blockIdx.y);
-            const int t = IO ? i / p.kv_heads : static_cast<int>(blockIdx.x);
+            h = i % p.kv_heads;
+            const int t = i / p.kv_heads;
             if (work_of(p, bound, t, x, kRows)) return true;
         }
         return false;
@@ -320,7 +392,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         bar_init(v_fixed, 128);
         bar_init(q_free, 1);
         bar_init(o_ready, 128);
-        bar_init(o_free, 128);
+        bar_init(o_free, kRows);
         bar_init_fence();
     }
     if (warp == 5) {
@@ -346,7 +418,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         const bool live = prow < x.qo_len * p.group;
         const u16* src =
             p.q + static_cast<long long>(x.qo_start + (live ? prow / p.group : 0)) * p.q_stride +
-            static_cast<long long>(h * p.group + prow % p.group) * D;
+            static_cast<long long>(h * p.group + prow % p.group) * (p.head > 0 ? p.head : D);
         // Every load in flight at once, 32 bytes each, then the stores.
         u32 qv[D / 2];
 #pragma unroll
@@ -375,12 +447,12 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
     };
     // A tile's O out at `inv`, its rows' scale. Whole-warp TMEM loads: a
     // dead row still joins its warp's, and stores nothing.
-    auto store_o = [&](const Work& w, int nt, float inv) {
+    auto store_o = [&](const Work& w, int nt, float inv, int wh) {
         const int prow = w.row0 + irow;
         const bool live = prow < w.qo_len * p.group;
         const long long o_row = w.qo_start + (live ? prow / p.group : 0);
-        const int qh = h * p.group + prow % p.group;
-        u16* dst = p.o + o_row * p.o_stride + static_cast<long long>(qh) * DV;
+        const int qh = wh * p.group + prow % p.group;
+        u16* dst = p.o + o_row * p.o_stride + static_cast<long long>(qh) * (p.head > 0 ? p.head : DV);
 #pragma unroll 1
         for (u32 c = 0; c < DV; c += 32) {
             u32 v[32];
@@ -505,7 +577,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         const u32 idesc_s = idesc_dense(kF16Bf16, kF16Bf16, 128, kBKV);
         const u32 idesc_o = idesc_dense(kF16Bf16, kF16Bf16, 128, DV) | (1u << 16);
         int g = 0, tile = 0, keyed = 0;
-        // Lane 0 issues a tile's products.
+        // The whole warp walks a tile's products; the elected lane issues.
         auto issue = [&](const Work& w) {
             int jb = 0;
             const int nt = tiles_of(w, jb);
@@ -513,15 +585,16 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             for (u32 x = 0; x < kT; ++x) bar_wait(&q_ready[x], tile & 1);
             // The last tile's O out before this one's first product lands.
             if (nt == 0) {
-                if (IO && tile > 0) bar_wait(o_free, (tile - 1) & 1);
-                if (IO) tc_commit(q_free);
+                if (tile > 0) bar_wait(o_free, (tile - 1) & 1);
+                __syncwarp();
+                if (elect_one()) tc_commit(q_free);
                 ++tile;
                 return;
             }
             auto pv = [&](int i) {
                 const int gi = g + i;
                 const u32 st = gi % ST;
-                if (IO && i == 0 && tile > 0) bar_wait(o_free, (tile - 1) & 1);
+                if (i == 0 && tile > 0) bar_wait(o_free, (tile - 1) & 1);
                 bar_wait(&v_full[st], (gi / ST) & 1);
                 if (i == nt - 1) bar_wait(v_fixed, keyed & 1);
                 const u32 vb = sbase + kOffV + st * kTileV;
@@ -531,14 +604,18 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                     bar_wait(&p_full[sb], (gi >> 1) & 1);
                     tc_fence_after();
                     const u32 pa = tmem + kColS + sb * kBKV;
+                    __syncwarp();
+                    if (elect_one()) {
 #pragma unroll
-                    for (u32 s = 0; s < kBKV / 16; ++s) {
-                        const u64 b = sdesc_sw128_mn(vb + s * 2048, kAtomKV);
-                        mma_f16_ts(tmem + kColO + x * DV, pa + s * 8, b, idesc_o, i > 0 || s > 0);
+                        for (u32 s = 0; s < kBKV / 16; ++s) {
+                            const u64 b = sdesc_sw128_mn(vb + s * 2048, kAtomKV);
+                            mma_f16_ts(tmem + kColO + x * DV, pa + s * 8, b, idesc_o,
+                                       i > 0 || s > 0);
+                        }
+                        tc_commit(&pv_done[sb]);
+                        if (x == kT - 1) tc_commit(&v_empty[st]);
                     }
-                    tc_commit(&pv_done[sb]);
                 }
-                tc_commit(&v_empty[st]);
             };
             for (int j = 0; j < nt; ++j) {
                 const int gj = g + j;
@@ -552,16 +629,21 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                     // product has read it. Only it can have landed yet.
                     if (gj >= 2) bar_wait(&pv_done[sb], ((gj - 2) >> 1) & 1);
                     tc_fence_after();
+                    __syncwarp();
+                    if (elect_one()) {
 #pragma unroll
-                    for (u32 s = 0; s < D / 16; ++s) {
-                        const u64 b = sdesc_sw128(kb + (s / 4) * kAtomKV) + 2 * (s % 4);
-                        mma_f16_ts(tmem + kColS + sb * kBKV, tmem + kColQ + x * (D / 2) + s * 8, b,
-                                   idesc_s, s > 0);
+                        for (u32 s = 0; s < D / 16; ++s) {
+                            const u64 b = sdesc_sw128(kb + (s / 4) * kAtomKV) + 2 * (s % 4);
+                            mma_f16_ts(tmem + kColS + sb * kBKV,
+                                       tmem + kColQ + x * (D / 2) + s * 8, b, idesc_s, s > 0);
+                        }
+                        tc_commit(&s_full[sb]);
+                        if (x == kT - 1) {
+                            tc_commit(&k_empty[st]);
+                            if (j == nt - 1) tc_commit(q_free);
+                        }
                     }
-                    tc_commit(&s_full[sb]);
                 }
-                tc_commit(&k_empty[st]);
-                if (IO && j == nt - 1) tc_commit(q_free);
                 if (j > 0) pv(j - 1);
             }
             pv(nt - 1);
@@ -569,15 +651,10 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             ++keyed;
             ++tile;
         };
-        // With IO the whole warp finds each tile, its lanes scanning the
-        // requests. (A loop of one tile issues slower: 47 -> 51 us.)
-        if (IO) {
-            Work w = w0;
-            for (int t = t0, more = 1; more; t += step, more = next_work(t, w)) {
-                if (lane == 0) issue(w);
-            }
-        } else if (lane == 0) {
-            issue(w0);
+        // The whole warp finds each tile, its lanes scanning the requests.
+        Work w = w0;
+        for (int t = t0, more = 1; more; t += step, more = next_work(t, w)) {
+            issue(w);
         }
     } else if (warp < 4 || (PAIR && warp >= 6)) {
         // The softmax warpgroup (with PAIR, tile xt's).
@@ -586,7 +663,9 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         for (int t = t0, more = 1; more; t += step, more = next_work(t, w)) {
             int jb = 0;
             const int nt = tiles_of(w, jb);
-            if (!IO) load_q(w);
+            // Each item's Q after the first went in under the last one's end.
+            if (kOwn && tile == 0) load_q(w);
+            const int wh = h;
             const int prow = w.row0 + irow;
             const bool live = prow < w.qo_len * p.group;
             const int tok = prow / p.group;
@@ -638,7 +717,8 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 const float alpha = grow ? ex2(m_used - m_new) : 1.f;
                 const float base = m_new == neg_inf() ? 0.f : m_new;
                 // Two f32 lanes an instruction (the scale's FMA, the sums); an
-                // eighth of the exponentials on the FMA pipe beside the rest's.
+                // eighth of the exponentials on the FMA pipe beside the rest's
+                // (a pair's 64-wide heads, a quarter).
                 u64 s2[4] = {0, 0, 0, 0};
                 const u64 sc2 = f32x2(p.scale_log2, p.scale_log2);
                 const u64 nb2 = f32x2(-base, -base);
@@ -647,7 +727,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 for (int c = 0; c < kBKV; c += 2) {
                     float x0, x1;
                     f32x2_split(fma_f32x2(f32x2(s[c], s[c + 1]), sc2, nb2), x0, x1);
-                    const bool fma_pipe = (c & 15) == 14;
+                    const bool fma_pipe = PAIR ? (c & 7) == 6 : (c & 15) == 14;
                     const float e0 = fma_pipe ? ex2_fma(x0) : ex2(x0);
                     const float e1 = fma_pipe ? ex2_fma(x1) : ex2(x1);
                     s2[(c >> 1) & 3] = add_f32x2(s2[(c >> 1) & 3], f32x2(e0, e1));
@@ -712,6 +792,17 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 tc_fence_before();
                 bar_arrive(&p_full[st]);
             }
+            if (kOwn) {
+                // The next item's Q, once this one's last S has read this Q,
+                // under this one's last products.
+                Work wn;
+                int tn = t + step;
+                if (next_work(tn, wn)) {
+                    bar_wait(q_free, tile & 1);
+                    tc_fence_after();
+                    load_q(wn);
+                }
+            }
             if (nt > 0) {
                 const int gl = g + nt - 1;
                 if (nt >= 2) bar_wait(&pv_done[2 * xt + ((gl - 1) & 1)], ((gl - 1) >> 1) & 1);
@@ -725,11 +816,12 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 o_inv[row] = inv;
             } else {
                 tc_fence_after();
-                store_o(w, nt, inv);
+                store_o(w, nt, inv, wh);
                 tmem_wait_ld();
             }
             tc_fence_before();
             if (IO) bar_arrive(o_ready);
+            if (kOwn) bar_arrive(o_free);
             ++tile;
             g += nt;
         }
@@ -752,7 +844,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             }
             bar_wait(o_ready, tile & 1);
             tc_fence_after();
-            store_o(w, nt, o_inv[row]);
+            store_o(w, nt, o_inv[row], h);
             tmem_wait_ld();
             tc_fence_before();
             bar_arrive(o_free);

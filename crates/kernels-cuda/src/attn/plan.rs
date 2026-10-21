@@ -338,7 +338,7 @@ pub fn plan_decode(
 
     // The tensor-core decode's block holds a whole stamp of key tiles; its
     // split fills the SMs once, not the FA2 kernel's occupancy.
-    let max_grid_size = match crate::attn::xqa::Stamp::of(shape.head_dim) {
+    let max_grid_size = match toggles.xqa.stamp(shape.head_dim, false) {
         Some(stamp)
             if toggles
                 .xqa
@@ -350,7 +350,7 @@ pub fn plan_decode(
     };
     // A cluster folds through distributed shared memory, sm_90 on; it fills
     // the SMs once with the stamp's blocks.
-    let ranks = match crate::attn::xqa::Stamp::of(shape.head_dim) {
+    let ranks = match toggles.xqa.stamp(shape.head_dim, false) {
         Some(stamp) if device.cc_major >= 9 => toggles.xqa.ranks(
             shape.head_dim,
             shape.group_size(),
@@ -556,10 +556,15 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
     {
         use cudarc::runtime::sys as rt;
 
+        // From pageable memory the copy holds the host until the stream
+        // reaches it (the fire before's kernels), so a plan the next fire
+        // stages ahead would wait out the card; a pinned slot leaves it
+        // queued.
+        let from = pinned::stage(op, bytes)?;
         let code = unsafe {
             rt::cudaMemcpyAsync(
                 int_ptr as usize as *mut core::ffi::c_void,
-                bytes.as_ptr().cast(),
+                from.cast(),
                 bytes.len(),
                 rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
                 ctx.stream().cast(),
@@ -574,7 +579,7 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
                 ),
             ));
         }
-        Ok(())
+        pinned::sent(op, ctx.stream().cast())
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -645,4 +650,101 @@ pub struct MlaPlanInfo {
     pub work_indptr_offset: Option<u32>,
     pub partial_o_offset: Option<u32>,
     pub partial_lse_offset: Option<u32>,
+}
+
+/// A ring of page-locked slots the plans' uploads stage through, each
+/// reused once the copy that read it has run.
+#[cfg(feature = "cuda")]
+mod pinned {
+    use super::{Error, refuse};
+    use core::cell::RefCell;
+    use cudarc::runtime::sys as rt;
+
+    const SLOTS: usize = 8;
+
+    struct Slot {
+        host: *mut u8,
+        bytes: usize,
+        read: rt::cudaEvent_t,
+    }
+
+    struct Ring {
+        slots: Vec<Slot>,
+        next: usize,
+    }
+
+    thread_local! {
+        static RING: RefCell<Ring> = const { RefCell::new(Ring { slots: Vec::new(), next: 0 }) };
+    }
+
+    fn check(op: &'static str, what: &str, code: rt::cudaError_t) -> Result<(), Error> {
+        if code == rt::cudaError::cudaSuccess {
+            Ok(())
+        } else {
+            Err(refuse(
+                op,
+                format!("`{what}` answered {} staging the plan", code as i32),
+            ))
+        }
+    }
+
+    /// `bytes` copied into the ring's next slot, waiting out the copy that
+    /// last read it; the slot's address.
+    pub(super) fn stage(op: &'static str, bytes: &[u8]) -> Result<*const u8, Error> {
+        RING.with(|ring| {
+            let mut ring = ring.borrow_mut();
+            let at = ring.next;
+            if ring.slots.len() <= at {
+                let mut read: rt::cudaEvent_t = core::ptr::null_mut();
+                // SAFETY: an out-pointer for a new event.
+                check(op, "cudaEventCreateWithFlags", unsafe {
+                    rt::cudaEventCreateWithFlags(&raw mut read, rt::cudaEventDisableTiming)
+                })?;
+                ring.slots.push(Slot {
+                    host: core::ptr::null_mut(),
+                    bytes: 0,
+                    read,
+                });
+            } else {
+                // SAFETY: an event this ring created.
+                check(op, "cudaEventSynchronize", unsafe {
+                    rt::cudaEventSynchronize(ring.slots[at].read)
+                })?;
+            }
+            let slot = &mut ring.slots[at];
+            if slot.bytes < bytes.len() {
+                if !slot.host.is_null() {
+                    // SAFETY: a page-locked allocation this slot owns, its
+                    // last copy run (the event above).
+                    unsafe { rt::cudaFreeHost(slot.host.cast()) };
+                    slot.host = core::ptr::null_mut();
+                    slot.bytes = 0;
+                }
+                let size = bytes.len().next_power_of_two();
+                let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
+                // SAFETY: an out-pointer for a new page-locked allocation.
+                check(op, "cudaMallocHost", unsafe {
+                    rt::cudaMallocHost(&raw mut host, size)
+                })?;
+                slot.host = host.cast();
+                slot.bytes = size;
+            }
+            // SAFETY: the slot holds at least `bytes.len()` and no copy reads it.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.host, bytes.len()) };
+            Ok(slot.host.cast_const())
+        })
+    }
+
+    /// The slot `stage` handed out is read once `stream` runs to here.
+    pub(super) fn sent(op: &'static str, stream: rt::cudaStream_t) -> Result<(), Error> {
+        RING.with(|ring| {
+            let mut ring = ring.borrow_mut();
+            let at = ring.next;
+            ring.next = (at + 1) % SLOTS;
+            // SAFETY: an event this ring created, on the caller's stream.
+            check(op, "cudaEventRecord", unsafe {
+                rt::cudaEventRecord(ring.slots[at].read, stream)
+            })
+        })
+    }
 }

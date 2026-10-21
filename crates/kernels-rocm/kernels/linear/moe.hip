@@ -22,39 +22,73 @@ struct Ranked {
     u32 out;                   // slots out of the running: picked, or past the row
 };
 
-// (v, i) beats (bv, bi): a present candidate over none, a larger value, an
-// equal value at a lower index.
-__device__ __forceinline__ bool router_beats(float v, int i, float bv, int bi) {
-    return i >= 0 && (bi < 0 || v > bv || (v == bv && i < bi));
+// A candidate as one key whose max is the pick: a larger score, an equal
+// one at a lower index, any over none (0). The score's bits made monotone
+// (-0 as +0) above the complement of its index.
+__device__ __forceinline__ unsigned long long router_key(float v, int i) {
+    u32 b = __builtin_bit_cast(u32, v);
+    b = b == 0x80000000u ? 0u : b;
+    b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    return (static_cast<unsigned long long>(b) << 32) | (0xFFFFFFFFu - static_cast<u32>(i));
+}
+
+// max(x, x of the lane DPP control CTRL names), rows outside ROWS keeping x.
+template <int CTRL, int ROWS>
+__device__ __forceinline__ unsigned long long dpp_max_key(unsigned long long x) {
+    const int hi = static_cast<int>(x >> 32), lo = static_cast<int>(x);
+    const unsigned long long o =
+        (static_cast<unsigned long long>(static_cast<u32>(__builtin_amdgcn_update_dpp(hi, hi, CTRL, ROWS, 0xf, false)))
+         << 32) |
+        static_cast<u32>(__builtin_amdgcn_update_dpp(lo, lo, CTRL, ROWS, 0xf, false));
+    return o > x ? o : x;
+}
+
+// The wavefront's largest key, every lane: a butterfly over quads, rows'
+// halves and rows by DPP, rows' maxima carried up to lane 63.
+__device__ __forceinline__ unsigned long long wave_max_key(unsigned long long x) {
+    if constexpr (kWave == 64) {
+        x = dpp_max_key<0xB1, 0xf>(x);   // quad_perm [1, 0, 3, 2]
+        x = dpp_max_key<0x4E, 0xf>(x);   // quad_perm [2, 3, 0, 1]
+        x = dpp_max_key<0x141, 0xf>(x);  // row_half_mirror
+        x = dpp_max_key<0x140, 0xf>(x);  // row_mirror
+        x = dpp_max_key<0x142, 0xa>(x);  // row_bcast:15
+        x = dpp_max_key<0x143, 0xc>(x);  // row_bcast:31
+        const u32 hi = __builtin_amdgcn_readlane(static_cast<int>(x >> 32), 63);
+        const u32 lo = __builtin_amdgcn_readlane(static_cast<int>(x), 63);
+        return (static_cast<unsigned long long>(hi) << 32) | lo;
+    } else {
+#pragma unroll
+        for (int off = kWave / 2; off > 0; off >>= 1) {
+            const unsigned long long o = __shfl_xor(x, off, kWave);
+            x = o > x ? o : x;
+        }
+        return x;
+    }
 }
 
 // The best score still running, its weight, and takes it out of the running;
 // -1 once none is left.
 __device__ __forceinline__ int router_pick(Ranked& s, float& weight) {
     const int l = lane();
-    float bv = 0.f, bw = 0.f;
-    int bi = -1;
+    unsigned long long best = 0;
 #pragma unroll
     for (int t = 0; t < kRouterSlots; ++t) {
-        const int i = (s.out >> t) & 1u ? -1 : l + kWave * t;
-        if (router_beats(s.rank[t], i, bv, bi)) {
-            bv = s.rank[t];
-            bw = s.keep[t];
-            bi = i;
-        }
+        if ((s.out >> t) & 1u) continue;
+        const unsigned long long key = router_key(s.rank[t], l + kWave * t);
+        best = key > best ? key : best;
     }
+    best = wave_max_key(best);
+    if (best == 0) {
+        weight = 0.f;
+        return -1;
+    }
+    const int bi = static_cast<int>(0xFFFFFFFFu - static_cast<u32>(best));
+    const int owner = bi % kWave, slot = bi / kWave;
+    float kw = 0.f;
 #pragma unroll
-    for (int off = kWave / 2; off > 0; off >>= 1) {
-        const float ov = __shfl_xor(bv, off, kWave), ow = __shfl_xor(bw, off, kWave);
-        const int oi = __shfl_xor(bi, off, kWave);
-        if (router_beats(ov, oi, bv, bi)) {
-            bv = ov;
-            bw = ow;
-            bi = oi;
-        }
-    }
-    if (bi >= 0 && bi % kWave == l) s.out |= 1u << (bi / kWave);
-    weight = bw;
+    for (int t = 0; t < kRouterSlots; ++t) kw = t == slot ? s.keep[t] : kw;
+    weight = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, kw), owner));
+    if (l == owner) s.out |= 1u << slot;
     return bi;
 }
 
@@ -262,10 +296,13 @@ __global__ __launch_bounds__(64) void moe_topk_sigmoid_sink(const T* __restrict_
 
 // ---------------------------------------------------------------- folds --
 
-// y[n][h] = Σ_k weights[n][k] · routed[n·top_k + k][h], in rank order.
+// y[n][h] = Σ_k weights[n][k] · routed[n·top_k + k][h], in rank order;
+// given `shared`, rounded and then shared[n][h]·sigmoid(gate[n·gate_stride])
+// added, as `moe_sigmoid_gate_add` would.
 template <class T>
 __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src, const float* __restrict__ weights,
-                                 int top_k, int hidden, const u32* __restrict__ win) {
+                                 int top_k, int hidden, const T* __restrict__ shared, const T* __restrict__ gate,
+                                 int gate_stride, const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long n = window.plane(blockIdx.x);
@@ -274,6 +311,10 @@ __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src,
     const long long base = n * top_k;
     float acc = 0.f;
     for (int k = 0; k < top_k; ++k) acc += weights[base + k] * to_f32(src[(base + k) * hidden + h]);
+    if (shared != nullptr) {
+        const float s = 1.f / (1.f + __expf(-to_f32(gate[n * gate_stride])));
+        acc = to_f32(from_f32<T>(acc)) + to_f32(shared[n * hidden + h]) * s;
+    }
     out[n * hidden + h] = from_f32<T>(acc);
 }
 
@@ -478,6 +519,150 @@ __global__ __launch_bounds__(256) void moe_matmul_select_gemv_by_route(
                           rows_per_wave, win);
 }
 
+// A one-token fire's routed MLP in two launches, a wave a row: each lane
+// holds CH 16-byte chunks of its row (K = 512·CH) and the activation's
+// matching chunks, so a row is one dot and one wave sum. Grid (routes or
+// tokens, ⌈rows / (4·RPW)⌉), 256 threads.
+constexpr int kDecodeWaves = 4;
+
+// A dword's two 16-bit elements as f32.
+template <class T>
+__device__ __forceinline__ void halves(u32 v, float& lo, float& hi) {
+    if constexpr (is_same<T, bf16>::value) {
+        lo = __builtin_bit_cast(float, v << 16);
+        hi = __builtin_bit_cast(float, v & 0xffff0000u);
+    } else {
+        lo = to_f32(__builtin_bit_cast(T, static_cast<unsigned short>(v)));
+        hi = to_f32(__builtin_bit_cast(T, static_cast<unsigned short>(v >> 16)));
+    }
+}
+
+template <class T>
+__device__ __forceinline__ float dot8(moe_u4 w, b128 x) {
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float a0, a1, b0, b1;
+        halves<T>(w[i], a0, a1);
+        halves<T>(x.w[i], b0, b1);
+        s = fmaf(a0, b0, s);
+        s = fmaf(a1, b1, s);
+    }
+    return s;
+}
+
+template <int CH, class T>
+__device__ __forceinline__ void decode_row(const T* row, moe_u4* w) {
+    const moe_u4* p = reinterpret_cast<const moe_u4*>(row) + lane();
+#pragma unroll
+    for (int c = 0; c < CH; ++c) w[c] = __builtin_nontemporal_load(p + c * kWave);
+}
+
+// h[route][i] = silu(G·x)·(U·x), G row i and U row I + i of the route's
+// packed [gate | up] expert; a dead route lands zeros.
+template <class T, int CH, int RPW>
+__global__ __launch_bounds__(kDecodeWaves* kWave) void moe_decode_glu(
+    const i32* __restrict__ topk_idx, const T* __restrict__ act, const T* __restrict__ bank, T* __restrict__ h,
+    int top_k, int I, long long expert_stride, const u32* __restrict__ win) {
+    constexpr int K = 512 * CH;
+    const int route = blockIdx.x;
+    if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
+    const long long plane_route = win != nullptr ? route + static_cast<long long>(win[1]) * top_k : route;
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / kWave);
+    const int row0 = (blockIdx.y * kDecodeWaves + wave) * RPW;
+    if (row0 >= I) return;
+    const int l = lane();
+    const int expert = topk_idx[plane_route];
+    T* y = h + plane_route * I;
+    if (expert < 0) {
+        if (l < RPW && row0 + l < I) y[row0 + l] = from_f32<T>(0.f);
+        return;
+    }
+    // The activation's reads issue first: a wait for them waits out no weight.
+    const b128* x = reinterpret_cast<const b128*>(act + (plane_route / top_k) * K) + l;
+    b128 xs[CH];
+#pragma unroll
+    for (int c = 0; c < CH; ++c) xs[c] = x[c * kWave];
+    const T* w = bank + expert * expert_stride;
+    moe_u4 g[RPW][CH], u[RPW][CH];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        const long long row = min(row0 + r, I - 1);
+        decode_row<CH>(w + row * K, g[r]);
+        decode_row<CH>(w + (I + row) * K, u[r]);
+    }
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        float a = 0.f, b = 0.f;
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+            a += dot8<T>(g[r][c], xs[c]);
+            b += dot8<T>(u[r][c], xs[c]);
+        }
+        a = wave_sum(a);
+        b = wave_sum(b);
+        if (l == 0 && row0 + r < I) y[row0 + r] = from_f32<T>(a / (1.f + __expf(-a)) * b);
+    }
+}
+
+// y[token][j] = Σ_k w_k · (D[e_k] row j)·h[route k], plus shared[token][j]·
+// sigmoid(gate[token·gate_stride]) where `shared` is given; a dead route
+// adds nothing.
+template <class T, int CH, int TOPK, int RPW>
+__global__ __launch_bounds__(kDecodeWaves* kWave) void moe_decode_down(
+    const i32* __restrict__ topk_idx, const float* __restrict__ weights, const T* __restrict__ h,
+    const T* __restrict__ bank, T* __restrict__ out, const T* __restrict__ shared, const T* __restrict__ gate,
+    int gate_stride, int H, long long expert_stride, const u32* __restrict__ win) {
+    constexpr int K = 512 * CH;
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long token = window.plane(blockIdx.x);
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / kWave);
+    const int row0 = (blockIdx.y * kDecodeWaves + wave) * RPW;
+    if (row0 >= H) return;
+    const int l = lane();
+    int expert[TOPK];
+    float wk[TOPK];
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) {
+        expert[k] = topk_idx[token * TOPK + k];
+        wk[k] = weights[token * TOPK + k];
+    }
+    b128 hs[TOPK][CH];
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) {
+        const b128* x = reinterpret_cast<const b128*>(h + (token * TOPK + k) * K) + l;
+#pragma unroll
+        for (int c = 0; c < CH; ++c) hs[k][c] = x[c * kWave];
+    }
+    moe_u4 dv[RPW][TOPK][CH];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        const long long row = min(row0 + r, H - 1);
+#pragma unroll
+        for (int k = 0; k < TOPK; ++k)
+            decode_row<CH>(bank + max(expert[k], 0) * expert_stride + row * K, dv[r][k]);
+    }
+    const float s = shared != nullptr ? 1.f / (1.f + __expf(-to_f32(gate[token * gate_stride]))) : 0.f;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < TOPK; ++k) {
+            float d = 0.f;
+#pragma unroll
+            for (int c = 0; c < CH; ++c) d += dot8<T>(dv[r][k][c], hs[k][c]);
+            acc = expert[k] < 0 ? acc : fmaf(wk[k], d, acc);
+        }
+        acc = wave_sum(acc);
+        const int row = row0 + r;
+        if (l == 0 && row < H) {
+            if (shared != nullptr) acc = fmaf(to_f32(shared[token * H + row]), s, acc);
+            out[token * H + row] = from_f32<T>(acc);
+        }
+    }
+}
+
 constexpr int kDenseXcds = 8;
 
 // The grouped dense leg: routes ordered by expert (moe_route_order in
@@ -537,6 +722,21 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
                                                   k, blockIdx.y);
 }
 
+
+// The gate-up leg's batch with its swiglu: h[route] = silu(G·x)·(U·x) over
+// a packed [gate | up] bank of 2n rows, a wave 16 gate rows and their up
+// rows (grid (work cap, ⌈n / 64⌉), 256 threads).
+template <class T, int MT>
+__global__ __launch_bounds__(256) void moe_matmul_select_dense_batch_swiglu(
+    const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ h, int act_div, int n, int k,
+    int num_experts) {
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, MT, item)) return;
+    const T* w = bank + static_cast<long long>(item.expert) * 2 * n * k;
+    batch_tile<BatchDense<T, MT >= 32 ? 128 : 256>, T, MT, 2, 3, true>(act, order, item.begin, item.count, {w}, nullptr,
+                                                                     h, act_div, n, k, blockIdx.y);
+}
 
 // The wide dense leg (wide decode batches): one work item of up to 4·MW
 // routes a block, NT weight rows, KC elements a stage; k a multiple of KC and the activation

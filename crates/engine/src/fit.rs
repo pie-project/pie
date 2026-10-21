@@ -142,6 +142,35 @@ pub fn state_slots_within(
     least_state_slots(u32::try_from(seats).unwrap_or(u32::MAX))
 }
 
+/// The state slots a hybrid's pool keeps beside its kv pages: the asked
+/// count where the pages that fit beside its slabs (`pages_at`) seat as many
+/// sequences at the declared context (`one_slot` pages each), else the most
+/// slots that still do, so slots and pages seat alike; and never under
+/// `floor` (`state_slots_within`'s, where a context so long that seating
+/// alike would leave a lane or two keeps half the room for the slabs).
+#[must_use]
+pub fn balanced_state_slots(
+    asked: u32,
+    floor: u32,
+    one_slot: u64,
+    pages_at: impl Fn(u32) -> u64,
+) -> u32 {
+    let seats = |slots: u32| pages_at(slots) / one_slot.max(1) >= u64::from(slots);
+    if seats(asked) {
+        return asked;
+    }
+    let (mut fits, mut over) = (0u32, asked);
+    while over - fits > 1 {
+        let probe = fits + (over - fits) / 2;
+        if seats(probe) {
+            fits = probe;
+        } else {
+            over = probe;
+        }
+    }
+    fits.max(floor).min(asked)
+}
+
 /// The pages and state slots a pool of `room` bytes seats at or under the
 /// asked counts, for an engine that declares its whole pool at load: every
 /// page that fits beside the asked slots, or, when that is under one
@@ -156,14 +185,16 @@ pub fn pool_within(
     room: u64,
     bytes_at: impl Fn(u64, u32) -> u64,
 ) -> Option<(u64, u32)> {
-    let fit = pages_within(pages, room, |pages| bytes_at(pages, slots));
-    if fit >= one_slot {
+    let pages_at = |slots| pages_within(pages, room, |pages| bytes_at(pages, slots));
+    let fit = pages_at(slots);
+    if fit / one_slot.max(1) >= u64::from(slots) {
         return Some((fit, slots));
     }
-    let slots = state_slots_within(slots, room, bytes_at(one_slot, 0), |slots| {
+    let floor = state_slots_within(slots, room, bytes_at(one_slot, 0), |slots| {
         bytes_at(0, slots)
     })
     .min(slots);
+    let slots = balanced_state_slots(slots, floor, one_slot, pages_at);
     let fit = pages_within(pages, room, |pages| bytes_at(pages, slots));
     (fit >= one_slot).then_some((fit, slots))
 }
@@ -185,7 +216,7 @@ pub fn pool_for(
 
 #[cfg(test)]
 mod tests {
-    use super::{Short, pages_for, pool_for, pool_within};
+    use super::{Short, balanced_state_slots, pages_for, pool_for, pool_within};
 
     #[test]
     fn a_budget_buys_its_pages_and_none_fills_the_room() {
@@ -236,13 +267,42 @@ mod tests {
             pool_within(1024, 16, 256, u64::MAX, bytes_at),
             Some((1024, 16))
         );
+        // 16 slots leave pages for 4 sequences: cut to the half-room floor,
+        // past where slots and pages seat alike (6).
         assert_eq!(
             pool_within(65536, 16, 256, 2048 * PAGE, bytes_at),
-            Some((1024, 16))
+            Some((1152, 14))
         );
         let (pages, slots) = pool_within(65536, 256, 256, 2048 * PAGE, bytes_at).unwrap();
         assert!(slots < 256 && pages >= 256 && bytes_at(pages, slots) <= 2048 * PAGE);
         assert_eq!(pool_within(65536, 3, 256, 255 * PAGE, bytes_at), None);
+    }
+
+    #[test]
+    fn a_heavy_slab_gives_slots_back_until_slots_and_pages_seat_alike() {
+        // Nemotron-3 Super on a B200: 163 MiB of Mamba state a slot, 64 KiB a
+        // page, an 8192-token context's 512 pages a sequence; the room seats
+        // the asked 256 slots beside one sequence.
+        const PAGE: u64 = 64 << 10;
+        const SLOT: u64 = 163 << 20;
+        let room = 256 * SLOT + 512 * PAGE;
+        let pages_at = |slots: u32| (room - u64::from(slots) * SLOT) / PAGE;
+        let slots = balanced_state_slots(256, 3, 512, pages_at);
+        assert!(pages_at(slots) / 512 >= u64::from(slots), "{slots} seated");
+        assert!(
+            pages_at(slots + 1) / 512 < u64::from(slots + 1),
+            "the most that are"
+        );
+        assert_eq!(
+            balanced_state_slots(256, 240, 512, pages_at),
+            240,
+            "held at the floor"
+        );
+        assert_eq!(
+            balanced_state_slots(256, 3, 512, |_| u64::MAX),
+            256,
+            "slots the pages seat are kept"
+        );
     }
 
     #[test]

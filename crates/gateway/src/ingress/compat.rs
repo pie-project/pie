@@ -171,6 +171,31 @@ fn error_body(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// What the runtime says when one request's sequence can never fit: past
+/// the context one sequence holds, or more KV pages than the pool has.
+const OVERFLOW: &[&str] = &[
+    "one sequence holds on this engine",
+    "KV pool exhausted by this process alone",
+    "can never fit",
+];
+
+/// A turn that failed because its prompt and budget do not fit is the
+/// client's to shorten: a 400, as the OpenAI servers answer it.
+fn overflow(message: &str) -> Option<Response> {
+    OVERFLOW.iter().any(|m| message.contains(m)).then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {
+                "message": format!("the prompt and max_tokens do not fit this model's context: {message}"),
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": "context_length_exceeded",
+            }})),
+        )
+            .into_response()
+    })
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -242,6 +267,9 @@ async fn relay(
         match rx.recv().await {
             Some(Tokens::Chunk(ServerMessage::Response { ok, result, .. })) => {
                 if !ok {
+                    if let Some(response) = overflow(&result) {
+                        return response;
+                    }
                     let status = if result.contains("not installed")
                         || result.contains("no program named")
                     {
@@ -297,6 +325,9 @@ fn error_response(value: &str) -> Response {
         && let Some(body) = v.get("body")
     {
         return (status, Json(body.clone())).into_response();
+    }
+    if let Some(response) = overflow(value) {
+        return response;
     }
     error_body(StatusCode::INTERNAL_SERVER_ERROR, value)
 }
@@ -429,6 +460,20 @@ mod tests {
         let _ = frame(&raw);
         let _ = frame("not json");
         let _ = frame(&json!({"event": "a\nb", "data": "x\r\ny"}).to_string());
+    }
+
+    #[test]
+    fn a_sequence_that_cannot_fit_is_the_clients_400() {
+        let hog = "prefill submit @0: KV pool exhausted by this process alone: it holds 3 pages and asks 9000 more of a 4096-page pool";
+        assert_eq!(error_response(hog).status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_response("pipeline: this fire would grow its sequence to 9 KV page(s) (up to 144 tokens), past the 128 tokens (8 page(s)) one sequence holds on this engine").status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            error_response("something else").status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

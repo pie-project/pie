@@ -1,6 +1,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef PIE_RS_SNAPSHOTS
+#define PIE_RS_SNAPSHOTS 4
+#endif
+
 
 inline float causal_conv1d_silu(float z) {
   return z / (1.0f + metal::exp(-z));
@@ -57,6 +61,8 @@ template <typename T>
     const constant int& conv_width [[buffer(8)]],
     const constant int& dilation   [[buffer(9)]],
     const constant int& run_rows   [[buffer(10)]],
+    const device int* snaps        [[buffer(11)]],
+    const constant int& snap_lane0 [[buffer(12)]],
     uint3 pos [[thread_position_in_grid]]) {
   // One thread a channel, a lane and a run of at least `run_rows` rows. Only
   // a run that starts before the history ends reads the carried state, and
@@ -103,6 +109,21 @@ template <typename T>
     return;
   }
 
+  // The state as of each snapshot row lands in a slot of its own, read
+  // before the lane's own slot takes its state past the last row.
+  if (snap_lane0 >= 0) {
+    const device int* snap = snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS;
+    for (int i = 0; i < PIE_RS_SNAPSHOTS && snap[i] > 0; ++i) {
+      const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
+      for (int s = 0; s < hist; ++s) {
+        const int src = snap[i] - hist + s;
+        new_conv_state[into + size_t(s) * chans + col] = (src < 0)
+            ? conv_state[slab + size_t(hist + src) * chans + col]
+            : float(x[size_t(begin + src) * chans + col]);
+      }
+    }
+  }
+
   for (int s = 0; s < hist; ++s) {
     const int src = span - hist + s;
     new_conv_state[slab + size_t(s) * chans + col] = (src < 0)
@@ -110,6 +131,108 @@ template <typename T>
         : float(x[size_t(begin + src) * chans + col]);
   }
 }
+
+// `causal_conv1d_chunked` with four adjacent channels a thread, each its
+// own arithmetic: the loads are vectors and the taps stay in registers.
+// Holds widths of at most `PIE_CONV_X4_TAPS`.
+#define PIE_CONV_X4_TAPS 8
+
+// Four channels' tap at row `src` of a lane, the carried window's before it.
+template <typename T>
+inline float4 causal_conv1d_x4_tap(
+    const device T* x, const device float* conv_state, size_t slab, size_t chans, size_t col,
+    int begin, int hist, int src) {
+  return (src < 0)
+      ? *reinterpret_cast<const device float4*>(conv_state + slab + size_t(hist + src) * chans + col)
+      : float4(*reinterpret_cast<const device vec<T, 4>*>(x + size_t(begin + src) * chans + col));
+}
+
+template <typename T>
+[[kernel]] void causal_conv1d_chunked_x4(
+    const device T* x              [[buffer(0)]],
+    const device int* indptr       [[buffer(1)]],
+    const device T* weight         [[buffer(2)]],
+    const device float* conv_state [[buffer(3)]],
+    device float* new_conv_state   [[buffer(4)]],
+    const device uint* slots       [[buffer(5)]],
+    device T* y                    [[buffer(6)]],
+    const constant int& channels   [[buffer(7)]],
+    const constant int& conv_width [[buffer(8)]],
+    const constant int& dilation   [[buffer(9)]],
+    const constant int& run_rows   [[buffer(10)]],
+    const device int* snaps        [[buffer(11)]],
+    const constant int& snap_lane0 [[buffer(12)]],
+    uint3 pos [[thread_position_in_grid]]) {
+  const int c = int(pos.x) * 4;
+  const int r = int(pos.y);
+  const int begin = indptr[r];
+  const int end = indptr[r + 1];
+  if (end <= begin || c >= channels) {
+    return;
+  }
+  const int span = end - begin;
+  const int width = conv_width;
+  const int dil = dilation;
+  const int hist = (width - 1) * dil + 1;
+  const size_t chans = size_t(channels);
+  const size_t col = size_t(c);
+  const size_t slab = size_t(slots[begin]) * size_t(hist) * chans;
+  const int run = max(run_rows, hist);
+  const int first = int(pos.z) * run;
+  if (first >= span) {
+    return;
+  }
+  const int last = min(span, first + run);
+
+  float4 w[PIE_CONV_X4_TAPS];
+  for (int k = 0; k < width; ++k) {
+    w[k] = float4(float(weight[(col + 0) * size_t(width) + size_t(k)]),
+                  float(weight[(col + 1) * size_t(width) + size_t(k)]),
+                  float(weight[(col + 2) * size_t(width) + size_t(k)]),
+                  float(weight[(col + 3) * size_t(width) + size_t(k)]));
+  }
+  for (int t = first; t < last; ++t) {
+    float4 acc = 0.0f;
+    for (int k = 0; k < width; ++k) {
+      const float4 tap = causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist, t - (width - 1 - k) * dil);
+      acc.x += tap.x * w[k].x;
+      acc.y += tap.y * w[k].y;
+      acc.z += tap.z * w[k].z;
+      acc.w += tap.w * w[k].w;
+    }
+    *reinterpret_cast<device vec<T, 4>*>(y + size_t(begin + t) * chans + col) =
+        vec<T, 4>(T(causal_conv1d_silu(acc.x)), T(causal_conv1d_silu(acc.y)),
+                  T(causal_conv1d_silu(acc.z)), T(causal_conv1d_silu(acc.w)));
+  }
+  if (first != 0) {
+    return;
+  }
+  if (snap_lane0 >= 0) {
+    const device int* snap = snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS;
+    for (int i = 0; i < PIE_RS_SNAPSHOTS && snap[i] > 0; ++i) {
+      const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
+      for (int s = 0; s < hist; ++s) {
+        *reinterpret_cast<device float4*>(new_conv_state + into + size_t(s) * chans + col) =
+            causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist, snap[i] - hist + s);
+      }
+    }
+  }
+  for (int s = 0; s < hist; ++s) {
+    *reinterpret_cast<device float4*>(new_conv_state + slab + size_t(s) * chans + col) =
+        causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist, span - hist + s);
+  }
+}
+
+#define instantiate_causal_conv1d_chunked_x4(name, itype)               \
+  template [[host_name("causal_conv1d_chunked_x4_" #name)]]             \
+  [[kernel]] void causal_conv1d_chunked_x4<itype>(                      \
+      const device itype*, const device int*, const device itype*,      \
+      const device float*, device float*, const device uint*,           \
+      device itype*, const constant int&, const constant int&,          \
+      const constant int&, const constant int&, const device int*,      \
+      const constant int&, uint3);
+
+instantiate_causal_conv1d_chunked_x4(bfloat16, bfloat)
 
 #define instantiate_causal_conv1d(name, itype)                          \
   template [[host_name("causal_conv1d_" #name)]]                        \
@@ -125,7 +248,8 @@ template <typename T>
       const device itype*, const device int*, const device itype*,      \
       const device float*, device float*, const device uint*,           \
       device itype*, const constant int&, const constant int&,          \
-      const constant int&, const constant int&, uint3);
+      const constant int&, const constant int&, const device int*,      \
+      const constant int&, uint3);
 
 instantiate_causal_conv1d(bfloat16, bfloat)
 
@@ -146,6 +270,8 @@ template <typename T>
     const constant int& channels   [[buffer(10)]],
     const constant int& conv_width [[buffer(11)]],
     const constant int& dilation   [[buffer(12)]],
+    const device int* snaps        [[buffer(13)]],
+    const constant int& snap_lane0 [[buffer(14)]],
     uint2 pos [[thread_position_in_grid]]) {
   const int c = int(pos.x);
   const int r = int(pos.y);
@@ -184,6 +310,20 @@ template <typename T>
     y[size_t(begin + t) * chans + col] = T(causal_conv1d_silu(acc));
   }
 
+  // A lane that snapshots folds its own rows, none replayed.
+  if (snap_lane0 >= 0) {
+    const device int* snap = snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS;
+    for (int i = 0; i < PIE_RS_SNAPSHOTS && snap[i] > 0; ++i) {
+      const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
+      for (int s = 0; s < hist; ++s) {
+        const int src = snap[i] - hist + s;
+        new_conv_state[into + size_t(s) * chans + col] = (src < 0)
+            ? conv_state[slab + size_t(hist + src) * chans + col]
+            : float(x[size_t(begin + src) * chans + col]);
+      }
+    }
+  }
+
   int keep = commit[lane0 + r];
   if (keep > span) {
     keep = span;
@@ -211,6 +351,7 @@ template <typename T>
       const device int*, const device int*, const constant int&,        \
       const device itype*, const device float*, device float*,          \
       device itype*, const constant int&, const constant int&,          \
-      const constant int&, uint2);
+      const constant int&, const device int*, const constant int&,      \
+      uint2);
 
 instantiate_causal_conv1d_committed(bfloat16, bfloat)

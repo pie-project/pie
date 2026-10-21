@@ -49,6 +49,9 @@ pub struct WeightTable(
     /// A dense row requantized in place at load to fp8b128 (codes,
     /// atom-laid exponents; `kernel.gemm.fp8_o_down`): its bf16 is gone.
     pub std::collections::BTreeMap<usize, (Tensor, Tensor)>,
+    /// A block-FP8 dense row's bf16 copy widened at load beside its codes
+    /// (`kernel.gemm.fp8_shadow`), which a batch's rows read on cuBLAS.
+    pub std::collections::BTreeMap<usize, Tensor>,
 );
 
 #[derive(Clone, Debug, Default)]
@@ -823,6 +826,23 @@ impl<'c> Run<'c> {
             .skip(lane0)
             .take(lanes)
             .any(|reads| !reads.is_empty())
+    }
+
+    /// Whether every lane of this window folds its rows whole: none of them
+    /// buffers, so a commit length the fire carries for another class's
+    /// lanes says nothing about these, and a one-token arm (which has no
+    /// seat for one) can run them.
+    fn rs_window_folds_whole(&self) -> bool {
+        let Some(seat) = self.rs.as_ref() else {
+            return false;
+        };
+        let lane0 = self.window().span().lane_offset as usize;
+        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        seat.lanes
+            .iter()
+            .skip(lane0)
+            .take(lanes)
+            .all(|lane| *lane == RsMove::None)
     }
 
     fn rs_ext_layout(&self, seat: &RsSeat<'_>) -> (Vec<(u32, u32, u32)>, Vec<i32>) {
@@ -1718,6 +1738,15 @@ impl<'c> Run<'c> {
         self.weights.1.get(&(*w as usize)).copied()
     }
 
+    /// The bf16 copy a block-FP8 dense plane keeps (`kernel.gemm.fp8_shadow`).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fp8_shadow(&self, id: ValueId) -> Option<Tensor> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.2.get(&(*w as usize)).copied()
+    }
+
     pub(crate) fn maybe_tiled_planes(
         &self,
         id: ValueId,
@@ -2004,7 +2033,11 @@ impl<'c> Run<'c> {
                 RecurrentPool {
                     slot_ids: lanes(pool.slot_ids),
                     write_state_mask: lanes(pool.write_state_mask),
-                    commit_len: lanes(pool.commit_len),
+                    commit_len: if self.rs_window_folds_whole() {
+                        Tensor::ABSENT
+                    } else {
+                        lanes(pool.commit_len)
+                    },
                     begin_at: lanes(pool.begin_at),
                     #[cfg(feature = "rocm")]
                     snapshots: kernels_cuda::Snapshots {

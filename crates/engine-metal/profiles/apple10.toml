@@ -12,5 +12,11 @@ qmm = [
   { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 160 },
 ]
 moe.path        = "mpp"
+moe.tile_rows   = [
+  { when = "per_expert < 2", value = 1 },
+  { when = "per_expert >= 64", value = 64 },
+  { when = "per_expert >= 32", value = 32 },
+  { value = 16 },
+]
 sdpa.prefill    = "mpp"
 gdn.scan        = { use = "staged", min_rows = 32 }

@@ -94,7 +94,7 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
     #[rustfmt::skip]
     let groups = match lay {
         Lay::D(_) => None,
-        Lay::C(_) => Some(Groups::Contiguous { offsets: b.up(&offs), rows: rows as u32 }),
+        Lay::C(_) => Some(Groups::Contiguous { offsets: b.up(&offs), rows: rows as u32, cap: 0 }),
         Lay::M(..) => Some(Groups::Masked { counts: b.up(&counts), m_max: mm as u32 }),
     };
     let wrows = n << u8::from(f.is_some());
@@ -258,6 +258,9 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
         (NV, NV, Lay::C(3), [640, 640], no, f, None, 0),
         (NV, NV, Lay::C(3), [640, 768], no, f, p(f, f, 128, 3), 2),
         (NV, NV, Lay::C(8), [256, 512], no, f, p(t, f, 64, 1), 0),
+        // A decode's swapped NVFP4 down leg split along K, repeated and replayed.
+        (NV, NV, Lay::C(8), [256, 4096], no, f, p(t, f, 64, 2), 4),
+        (NV, NV, Lay::C(8), [256, 4096], no, f, p(t, f, 64, 4), 4),
         (DS, W4, Lay::C(6), [512, 1024], no, f, p(f, t, 256, 0), 0),
         (BF, BF, Lay::M(6, 1), [384, 4104], no, f, None, 0),
         (NV, NV, Lay::M(12, 40), [256, 2048], no, f, p(t, f, 64, 4), 2),
@@ -270,6 +273,38 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
         (BF, u64_, Lay::M(5, 72), [128, 512], sw, f, p(t, f, 96, 0), 0),
     ];
     cases.iter().for_each(|&case| run(case));
+}
+
+#[test]
+fn a_swapped_contiguous_group_of_scaled_rows_refuses_a_q_tile_past_64() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    // An expert's rows start on a 64-row boundary; a wider Q tile reads
+    // the next 128-row scale atom unmapped (96 and 128 faulted on B200).
+    let b = Bench::new(0x64);
+    let nv = Operand::scaled(0, NV.0, 0, 16);
+    #[rustfmt::skip]
+    let g = Grouped { experts: 8, groups: Groups::Contiguous { offsets: 0, rows: 0, cap: 0 }, alpha_e: 0 };
+    let fire = |bn| {
+        grouped_gemm_epi_with(
+            &b.ctx(),
+            nv,
+            nv,
+            0,
+            g,
+            [256, 512],
+            1.0,
+            Epilogue::STORE,
+            p(true, false, bn, 1).expect("a plan"),
+        )
+    };
+    for bn in [96, 128, 256] {
+        assert!(fire(bn).is_err(), "a {bn}-row Q tile is admitted");
+    }
+    // 64 is admitted (no rows, so nothing launches).
+    fire(64).expect("a 64-row Q tile is admitted");
 }
 
 #[test]

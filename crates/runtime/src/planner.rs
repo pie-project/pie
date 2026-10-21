@@ -1034,6 +1034,10 @@ pub struct ResidencyPlanner {
     /// `PoolFacts::seated_first`: a seated lane's growth before a prompt
     /// waiting to be seated, which waits for a lane to finish.
     seated_first: bool,
+    /// Held while an uncontended claim reads the rings' free room, weighs it
+    /// against the seated lanes' growth and takes its grant, so prompts seated
+    /// at once each see the others' pages gone.
+    seating: parking_lot::Mutex<()>,
 }
 
 struct WaitRegistration<'a> {
@@ -1072,6 +1076,7 @@ impl ResidencyPlanner {
             port,
             stats: PlannerStats::default(),
             seated_first: false,
+            seating: parking_lot::Mutex::new(()),
         }
     }
 
@@ -1632,6 +1637,11 @@ impl ResidencyPlanner {
             return None;
         }
         if uncontended {
+            // The room read, the growth held back and the grant taken as one
+            // step: a burst of prompts read apart from their grants would each
+            // see the room the others are about to take, and seat lanes their
+            // first page boundary finds short.
+            let _seating = self.seating.lock();
             if !demand.rs.is_zero() {
                 let (rs_free, rs_total) = self.port.rs_stats();
                 let reserve =
@@ -4446,6 +4456,133 @@ mod starvation_race_tests {
         assert_eq!(
             victims.members.iter().map(|v| v.pid).collect::<Vec<_>>(),
             [younger]
+        );
+    }
+
+    /// A window ring alone, its room read a moment before it is handed back,
+    /// as a busy pool's is.
+    struct RingPool {
+        free: AtomicU32,
+        total: u32,
+    }
+
+    impl PoolPort for RingPool {
+        fn device_stats(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        fn host_stats(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        fn disk_stats(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        fn rs_stats(&self) -> (RsUnits, RsUnits) {
+            let free = self.free.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_micros(200));
+            (
+                RsUnits {
+                    slots: 0,
+                    pages: free,
+                },
+                RsUnits {
+                    slots: 0,
+                    pages: self.total,
+                },
+            )
+        }
+        fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
+            Default::default()
+        }
+        fn reclaim_idle(&self) -> u32 {
+            0
+        }
+        fn reclaimable_idle(&self) -> u32 {
+            0
+        }
+        fn suspend_capable(&self) -> bool {
+            false
+        }
+        fn locus(&self) -> (usize, usize) {
+            (0, 0)
+        }
+        fn rs_growth(&self) -> RsUnits {
+            RsUnits { slots: 0, pages: 2 }
+        }
+        fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
+            Some(Vec::new())
+        }
+        fn reserve_device_up_to(&self, _count: u32) -> Vec<PhysicalKvPageId> {
+            Vec::new()
+        }
+        fn release_device(&self, _pages: Vec<PhysicalKvPageId>) {}
+        fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
+            self.free
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |free| {
+                    free.checked_sub(need.pages)
+                })
+                .ok()
+                .map(|_| Default::default())
+        }
+        fn release_rs(&self, _grant: crate::store::rs::RsGrant) {}
+        fn yield_checkpoints(&self, _working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+            0
+        }
+        fn prepare_sweep(
+            &self,
+            _keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
+            _room: usize,
+        ) -> Option<crate::store::kv::KvResidencyTxn> {
+            None
+        }
+        fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+            None
+        }
+    }
+
+    /// Prompts seated at once each see the others' pages gone: the ring keeps
+    /// the seated lanes' growth however many arrive together.
+    #[test]
+    fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
+        const PROMPT: u32 = 64;
+        const RING: u32 = 6400;
+        let pool = Arc::new(RingPool {
+            free: AtomicU32::new(RING),
+            total: RING,
+        });
+        let planner =
+            Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>).seated_first(true));
+        let pids: Vec<ProcessId> = (0..120).map(|_| ProcessId::new_v4()).collect();
+        for &pid in &pids {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        let demand = Demand {
+            kv_pages: 0,
+            rs: RsUnits {
+                slots: 0,
+                pages: PROMPT,
+            },
+        };
+        let start = std::sync::Barrier::new(pids.len());
+        let grants = parking_lot::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for &pid in &pids {
+                let (planner, start, grants) = (&planner, &start, &grants);
+                scope.spawn(move || {
+                    start.wait();
+                    if let Some(grant) = planner.grant_now(pid, demand) {
+                        grants.lock().push(grant);
+                    }
+                });
+            }
+        });
+        let seated = u32::try_from(grants.lock().len()).expect("a few lanes");
+        let free = pool.free.load(Ordering::SeqCst);
+        let held_back = (2 * seated.saturating_sub(1)).min(RING / RESERVE_SHARE);
+        assert!(seated > 0, "the ring seats prompts");
+        assert!(
+            free >= held_back,
+            "{seated} prompts seated left {free} pages for the lanes' growth, short of {held_back}"
         );
     }
 }

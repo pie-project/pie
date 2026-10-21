@@ -84,6 +84,7 @@ impl Gpu {
                 pdl: true,
                 gemm_tc5_split_tickets: 65_536,
                 gemm_rows_m: 8,
+                ssm_kda_chunked: true,
                 ..tuning
             })
         } else {
@@ -316,6 +317,10 @@ pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     mxfp4_cvt_ksplit_until: 6,
     mxfp4_a8_until: 48,
     moe_w4a4_fused_from: 1,
+    moe_w4a4_fused_layout: true,
+    moe_even_waves_from: 3,
+    moe_routes_sized: true,
+    moe_gather_ahead_until: 128,
     moe_w4a8_fused_from: 512,
     attn_res_fused_norm: true,
     mla_expanded_from: 256,

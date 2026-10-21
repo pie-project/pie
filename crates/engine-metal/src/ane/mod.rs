@@ -57,6 +57,9 @@ impl Ane {
     pub fn prefill_rows(&self) -> u32 {
         match *self {}
     }
+    pub fn head_rows(&self, _: u32) -> u32 {
+        match *self {}
+    }
     pub fn plan(&self, _: poem_ir::ValueId, _: u32) -> Option<Plan> {
         match *self {}
     }

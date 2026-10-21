@@ -1,0 +1,107 @@
+api = 1
+
+[target]
+device = "NVIDIA A100 80GB PCIe"
+
+# Each line's measured win is in the commit that set it.
+# cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV, row kernels 16
+# bytes a lane, a split attention's partials folded a warp a row;
+# a block-FP8 projection's two rows or fewer on the GEMV over bf16 rows;
+# MXFP4 selects of 17 routes or more on the register-dequant MMA (fewer stay
+# on the per-route kernel, which streams a decode's bank faster); Qwen3.5's
+# gated delta on the fused scan; DeepSeek-V4.1's bounded replay, as B200's.
+[kernel]
+gemm.fp8_gemv_until = 2
+gemm.skinny_rows = 0
+gemv.bf16 = "narrow"
+gemm.narrow_n = 8
+gemm.fp8_shadow = true
+gemm.grouped_gemv = true
+elemwise.rows_vec = true
+sdpa.merge_warp = true
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
+sdpa.index_mma = true
+sdpa.index_radix = true
+sdpa.pool_mma = true
+sdpa.selected_mma = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.qg_prologue_until = 64
+elemwise.norm_emit = true
+sdpa.dsv4_decode_until = 64
+gemm.bias_epilogue = true
+gemm.rows_m = 8
+mla.expanded_from = 256
+attn_res.fused_norm = true
+moe.mxfp4_mma_from = 17
+moe.mxfp4_mma_until = 16777216
+moe.mxfp4_select_lean = true
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+sdpa.dsv4_replay = true
+ssm.gdn_fused_scan = true
+ssm.conv_vec4 = true
+ssm.gdn_out_bf16 = true
+ssm.kda_chunked = true
+ssm.kda_step_fused = true
+ssm.gdn_step_blocks = 3
+
+# A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
+# its bucket's rows), and a bucket between powers of two below.
+[engine]
+prefill_lattice_from = 256
+lattice_steps = 2
+
+# Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
+# DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged; a join's branches on them too.
+[compiler]
+dag_streams = true
+branches = true
+
+[provenance]
+source = "end to end on MiMo-V2.6-Flash and Qwen3.6-27B miniatures and checkpoints, by hand"
+measured = [
+  "kernel.gemm.fp8_gemv_until",
+  "kernel.gemm.skinny_rows",
+  "kernel.gemv.bf16",
+  "kernel.gemm.narrow_n",
+  "kernel.gemm.fp8_shadow",
+  "kernel.gemm.grouped_gemv",
+  "kernel.elemwise.rows_vec",
+  "kernel.sdpa.merge_warp",
+  "kernel.sdpa.decode.grouped_prefill_from",
+  "kernel.sdpa.decode.grouped_prefill_lse",
+  "kernel.sdpa.decode.grouped_prefill_window",
+  "kernel.sdpa.fa2_live",
+  "kernel.sdpa.index_mma",
+  "kernel.sdpa.index_radix",
+  "kernel.sdpa.pool_mma",
+  "kernel.sdpa.selected_mma",
+  "kernel.moe.mxfp4_mma_from",
+  "kernel.moe.mxfp4_mma_until",
+  "kernel.moe.mxfp4_select_lean",
+  "kernel.moe.nvfp4_mma_from",
+  "kernel.moe.nvfp4_mma_until",
+  "kernel.ssm.gdn_fused_scan",
+  "kernel.ssm.gdn_step_blocks",
+  "kernel.ssm.conv_vec4",
+  "kernel.ssm.gdn_out_bf16",
+  "kernel.ssm.kda_chunked",
+  "kernel.ssm.kda_step_fused",
+  "engine.prefill_lattice_from",
+  "engine.lattice_steps",
+  "compiler.dag_streams",
+  "kernel.elemwise.hc_tile",
+  "kernel.elemwise.hc_mma",
+  "kernel.elemwise.qg_prologue_until",
+  "kernel.elemwise.norm_emit",
+  "kernel.sdpa.dsv4_decode_until",
+  "kernel.gemm.bias_epilogue",
+  "kernel.gemm.rows_m",
+  "kernel.mla.expanded_from",
+  "kernel.attn_res.fused_norm",
+  "compiler.branches",
+]

@@ -31,8 +31,9 @@ __global__ void mlp_geglu_tanh(
     y[at] = Elem<T>::from_f32(gelu * u);
 }
 
-template <class T>
-__global__ void mlp_gelu_tanh(
+// `gelu_tanh(x)` (`RELU2` false) or `relu(x)^2`, element for element.
+template <class T, bool RELU2>
+__global__ void mlp_act(
     const T* __restrict__ x,
     T* __restrict__ y,
     i32 n,
@@ -52,8 +53,13 @@ __global__ void mlp_gelu_tanh(
 
     constexpr float c = 0.7978845608028654f;
     const float g = Elem<T>::to_f32(x[at]);
-    y[at] = Elem<T>::from_f32(
-        0.5f * g * (1.f + tanhf(c * (g + 0.044715f * g * g * g))));
+    if constexpr (RELU2) {
+        const float r = fmaxf(g, 0.f);
+        y[at] = Elem<T>::from_f32(r * r);
+    } else {
+        y[at] = Elem<T>::from_f32(
+            0.5f * g * (1.f + tanhf(c * (g + 0.044715f * g * g * g))));
+    }
 }
 
 template <class T>
@@ -180,6 +186,10 @@ __global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 
 template <class T>
 __global__ void mlp_swiglu_vec8(const T* __restrict__ packed, T* __restrict__ y, i32 I,
                                 i32 fan, const u32* __restrict__ win) {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const i32 n = blockIdx.x;
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
@@ -280,6 +290,10 @@ __global__ void mlp_geglu_tanh_packed_vec8(
     const T* __restrict__ packed, T* __restrict__ y, i32 I,
     i32 fan, const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const i32 n = blockIdx.x;
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
@@ -313,6 +327,10 @@ __global__ void mlp_swiglu_clamp(
     i32 fan,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const i32 n = blockIdx.x;
 
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;

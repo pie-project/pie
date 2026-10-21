@@ -1331,7 +1331,7 @@ __device__ void ptir_lane_sample(
     m1_u8* token,
     m1_u32 rows,
     m1_u32 len) {
-  __shared__ M1CutShared cut;
+  M1_CUT_STATE(cut);
   float* tree_work = cut.before;
   __shared__ M1Range block_range[32];
   __shared__ M1ArgmaxCandidate block_best[32];
@@ -1508,7 +1508,7 @@ __device__ void ptir_lane_cut(
     const m1_u8* threshold,
     const M1ValueDesc threshold_desc,
     m1_u8* output) {
-  __shared__ M1CutShared cut;
+  M1_CUT_STATE(cut);
   const m1_u32 len = input_desc.last;
   const m1_u32 rows = input_desc.rows;
   const m1_u32 dtype = input_desc.dtype;

@@ -100,7 +100,8 @@ pub fn skinny_bf16(
                 [(n / cols(epilogue) as i32) as u32, 1, 1],
                 [32 * WARPS, 1, 1],
             )
-            .smem(SMEM_BYTES),
+            .smem(SMEM_BYTES)
+            .programmatic(ctx.tuning().pdl),
         ),
         &values,
     )

@@ -42,11 +42,28 @@ __global__ void argmax_rows(
 
     float best = neg_inf();
     unsigned best_i = TOPK_NONE;
-    for (unsigned c = threadIdx.x; c < static_cast<unsigned>(width); c += blockDim.x) {
-        const float v = topk_load(src[c]);
+    auto take = [&](float v, unsigned c) {
         if (!isnan(v) && (best_i == TOPK_NONE || topk_beats(v, c, best, best_i))) {
             best = v;
             best_i = c;
+        }
+    };
+    // A row of 16-byte runs is read a run at a time, four in flight: one
+    // block walks a whole vocabulary row, so scalar loads left it latency-bound.
+    constexpr unsigned kRun = 16 / sizeof(T);
+    if (width % kRun == 0 && (reinterpret_cast<unsigned long long>(src) & 15ull) == 0) {
+        const uint4* runs = reinterpret_cast<const uint4*>(src);
+        const unsigned count = static_cast<unsigned>(width) / kRun;
+#pragma unroll 4
+        for (unsigned r = threadIdx.x; r < count; r += blockDim.x) {
+            const uint4 q = runs[r];
+            const T* e = reinterpret_cast<const T*>(&q);
+#pragma unroll
+            for (unsigned j = 0; j < kRun; ++j) take(topk_load(e[j]), r * kRun + j);
+        }
+    } else {
+        for (unsigned c = threadIdx.x; c < static_cast<unsigned>(width); c += blockDim.x) {
+            take(topk_load(src[c]), c);
         }
     }
 

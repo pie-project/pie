@@ -114,6 +114,11 @@ pub enum Linear {
         x: ValueId,
         y: ValueId,
     },
+    /// `relu(x)^2` (Nemotron-H's ungated experts).
+    MlpRelu2 {
+        x: ValueId,
+        y: ValueId,
+    },
     MlpGegluTanhPacked {
         packed: ValueId,
         intermediate: u32,
@@ -305,7 +310,7 @@ impl Operands for Linear {
                 packed, weights, ..
             } => sink.extend([*packed, *weights]),
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
-            Self::MlpGeluTanh { x, .. } => sink.push(*x),
+            Self::MlpGeluTanh { x, .. } | Self::MlpRelu2 { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
@@ -413,7 +418,7 @@ impl Operands for Linear {
             Self::MlpSwigluClampSplitRouted { y, .. } => sink.push(*y),
             Self::MlpSwigluClampRouted { y, .. } => sink.push(*y),
             Self::MlpGegluTanh { y, .. } => sink.push(*y),
-            Self::MlpGeluTanh { y, .. } => sink.push(*y),
+            Self::MlpGeluTanh { y, .. } | Self::MlpRelu2 { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
             Self::MlpSitu { y, .. } => sink.push(*y),
             Self::MoeTopkSoftmax {
@@ -465,6 +470,7 @@ impl Operands for Linear {
             | Self::MlpSwigluClampRouted { .. }
             | Self::MlpGegluTanh { .. }
             | Self::MlpGeluTanh { .. }
+            | Self::MlpRelu2 { .. }
             | Self::MlpGegluTanhPacked { .. }
             | Self::MlpSitu { .. }
             | Self::MoeTopkSoftmax { .. }
@@ -500,6 +506,7 @@ impl Operands for Linear {
             Self::MlpSwigluClampRouted { .. } => "linear.mlp_swiglu_clamp_routed",
             Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
             Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
+            Self::MlpRelu2 { .. } => "linear.mlp_relu2",
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
             Self::MlpSitu { .. } => "linear.mlp_situ",
             Self::MoeTopkSoftmax { .. } => "linear.moe_topk_softmax",

@@ -197,6 +197,7 @@ pub fn pool(keys: Tensor, pages: Tensor, indptr: Tensor, page: usize) -> KvPool 
         block_size: 0,
         max_pages_per_request: pages.rows as i32,
         pages_in_batch: pages.rows as i32,
+        live: [0, 0],
     }
 }
 

@@ -52,6 +52,8 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
         (256, 35, 6, 2, 3, 3, 65),
         (256, 64, 8, 4, 2, 4, 65),
         (256, 600, 2, 1, 3, 10, 65),
+        (64, 35, 8, 1, 3, 3, 65),
+        (64, 600, 8, 1, 1, 21, 65),
     ] {
         let page = 32usize;
         let slots = np * requests * page;
@@ -103,6 +105,7 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
             };
             let scale = 1. / (d as f32).sqrt();
             let mut reference = vec![0f64; q.len()];
+            let mut reference_lse = vec![0f64; m * qh];
             for row in 0..m {
                 for head in 0..qh {
                     let last = if mode == 2 {
@@ -128,6 +131,7 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
                     }
                     let max = scores.iter().map(|x| x.0).fold(f64::NEG_INFINITY, f64::max);
                     let sum = scores.iter().map(|x| (x.0 - max).exp()).sum::<f64>();
+                    reference_lse[row * qh + head] = (max + sum.ln()) / std::f64::consts::LN_2;
                     for (s, offset) in scores {
                         let p = (s - max).exp() / sum;
                         for j in 0..d {
@@ -136,26 +140,64 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
                     }
                 }
             }
+            // A 64-wide head also publishes its log-sum-exp, which a sink folds in after.
+            let lse_plane = upload(&vec![0u8; m * qh * 4]);
             let frame = dev.frame().unwrap();
-            attn::arbiter::masked(
-                &Sink::new(&dev, &frame, &pipes, &handles),
-                RaggedTensor {
-                    data: tensor(&qb, m, qh * d, Dtype::Bf16),
-                    indptr: tensor(&qp, 2, 1, Dtype::I32),
-                },
-                &plan,
-                plan.mask,
-                &pool,
-                window,
-                true,
-                d as u32,
-                scale,
-                tensor(&y, m, qh * d, Dtype::Bf16),
-                requests as u32,
-                &tuning,
-            )
-            .unwrap();
+            if d == 64 {
+                attn::arbiter::masked_lse(
+                    &Sink::new(&dev, &frame, &pipes, &handles),
+                    RaggedTensor {
+                        data: tensor(&qb, m, qh * d, Dtype::Bf16),
+                        indptr: tensor(&qp, 2, 1, Dtype::I32),
+                    },
+                    &plan,
+                    plan.mask,
+                    &pool,
+                    window,
+                    true,
+                    d as u32,
+                    scale,
+                    tensor(&y, m, qh * d, Dtype::Bf16),
+                    tensor(&lse_plane, m, qh, Dtype::F32),
+                    requests as u32,
+                    &tuning,
+                )
+                .unwrap();
+            } else {
+                attn::arbiter::masked(
+                    &Sink::new(&dev, &frame, &pipes, &handles),
+                    RaggedTensor {
+                        data: tensor(&qb, m, qh * d, Dtype::Bf16),
+                        indptr: tensor(&qp, 2, 1, Dtype::I32),
+                    },
+                    &plan,
+                    plan.mask,
+                    &pool,
+                    window,
+                    true,
+                    d as u32,
+                    scale,
+                    tensor(&y, m, qh * d, Dtype::Bf16),
+                    requests as u32,
+                    &tuning,
+                )
+                .unwrap();
+            }
             frame.commit().unwrap();
+            if d == 64 {
+                let raw = handles.read(bind(&lse_plane), lse_plane.bytes()).unwrap();
+                for (at, want) in reference_lse
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, want)| want.is_finite())
+                {
+                    let got = f32::from_le_bytes(raw[at * 4..at * 4 + 4].try_into().unwrap());
+                    assert!(
+                        (f64::from(got) - want).abs() < 0.02,
+                        "d={d} rows={m} window={window:?} mode={mode} at {at}: lse {got} vs {want}"
+                    );
+                }
+            }
             let raw = handles.read(bind(&y), y.bytes()).unwrap();
             assert!(
                 raw[q.len() * 2..].iter().all(|x| *x == 0xa5),

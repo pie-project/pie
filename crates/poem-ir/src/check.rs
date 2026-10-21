@@ -695,6 +695,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(3), CACHE)]
             }
             Attention::SsmKdaStep { .. } | Attention::SsmKdaChunked { .. } => &[(In(5), CACHE)],
+            Attention::SsmMamba2 { .. } => &[(In(7), CACHE)],
             Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
             Attention::IndexTopk { .. } => &[(In(1), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
@@ -778,6 +779,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MoeSumAdd { .. }
             | Linear::MlpGegluTanh { .. }
             | Linear::MlpGeluTanh { .. }
+            | Linear::MlpRelu2 { .. }
             | Linear::MlpGegluTanhPacked { .. }
             | Linear::MlpSitu { .. }
             | Linear::MoeSigmoidGateAdd { .. } => &[],
@@ -911,7 +913,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
             }
             Fused::EmbedScaleAdd { .. } | Fused::EmbedScaleAddSelect { .. } => &[(In(0), I32)],
-            Fused::QkvFusedQknormRopeVnormWrite { .. } => {
+            Fused::QkvFusedQknormRopeVnormWrite { .. } | Fused::SplitQkvFused { .. } => {
                 &[(In(1), CACHE), (In(2), I32), (In(3), I32)]
             }
             Fused::RopeYarnAppend { .. } => {

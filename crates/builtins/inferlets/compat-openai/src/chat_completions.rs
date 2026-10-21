@@ -13,15 +13,18 @@
 //! `max_tokens`/`max_completion_tokens`, `ignore_eos`, `stop`, `seed`,
 //! `presence_penalty`, `frequency_penalty`, `repetition_penalty`, vLLM's
 //! `min_tokens`,
-//! `reasoning_effort: "none"` and `chat_template_kwargs.enable_thinking` to
-//! switch thinking off or on.
+//! `reasoning_effort` (`none` switches thinking off; `low`, `medium` and
+//! `high`/`xhigh` set the effort a template states, Qwen3.8's) and
+//! `chat_template_kwargs.enable_thinking` to switch thinking off or on, and
+//! an assistant message's `reasoning_content` replayed where the template
+//! replays reasoning.
 //!
 //! Refused with 400: `n > 1`, `logprobs`, and non-text content parts. Every
 //! other unknown field is ignored, as OpenAI does.
 
 use compat::{
-    ApiError, Envelope, Event, Finish, Message, Request, ResponseFormat, Role, Thinking, ToolCall,
-    ToolChoice, emit,
+    ApiError, Effort, Envelope, Event, Finish, Message, Request, ResponseFormat, Role, Thinking,
+    ToolCall, ToolChoice, emit,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,6 +69,9 @@ struct StreamOptions {
 struct Msg {
     role: String,
     content: Option<Value>,
+    /// An earlier answer's reasoning, as the open servers return it.
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
     tool_calls: Option<Vec<WireToolCall>>,
     tool_call_id: Option<String>,
     name: Option<String>,
@@ -190,6 +196,9 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
         }
         let mut message = Message::text(role, content);
         message.images = images;
+        if role == Role::Assistant {
+            message.reasoning = m.reasoning_content.or(m.reasoning).unwrap_or_default();
+        }
         if role == Role::Assistant {
             for (j, call) in m.tool_calls.unwrap_or_default().into_iter().enumerate() {
                 let id = call.id.unwrap_or_else(|| format!("call_{i}_{j}"));
@@ -325,14 +334,23 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
     req.min_tokens = body.min_tokens;
     req.ignore_eos = body.ignore_eos;
     req.stop = stop_sequences(body.stop)?;
-    req.thinking = match body.reasoning_effort.as_deref() {
+    let kwargs = body.chat_template_kwargs.as_ref();
+    let effort = body.reasoning_effort.as_deref().or_else(|| {
+        kwargs
+            .and_then(|k| k.get("reasoning_effort"))
+            .and_then(Value::as_str)
+    });
+    req.thinking = match effort {
         Some("none") => Thinking::Disabled,
         Some(_) => Thinking::Enabled,
         None => Thinking::ModelDefault,
     };
-    if let Some(enable) = body
-        .chat_template_kwargs
-        .as_ref()
+    req.effort = match effort {
+        Some("low" | "minimal") => Effort::Low,
+        Some("medium") => Effort::Medium,
+        _ => Effort::Xhigh,
+    };
+    if let Some(enable) = kwargs
         .and_then(|k| k.get("enable_thinking"))
         .and_then(Value::as_bool)
     {

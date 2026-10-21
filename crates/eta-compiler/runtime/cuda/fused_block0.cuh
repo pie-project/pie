@@ -598,6 +598,17 @@ struct alignas(16) M1CutShared {
   float mass;
 };
 
+// Where a function's cut state lives: the launch's dynamic shared memory
+// where the dialect says so (CUDA's), else a static array.
+#if defined(M1_CUT_DYNAMIC)
+static_assert(sizeof(M1CutShared) <= M1_CUT_STATE_BYTES, "the cut's state fits what the launcher gives it");
+#define M1_CUT_STATE(name)                                              \
+  extern __shared__ __align__(16) unsigned char m1_cut_state[];         \
+  M1CutShared& name = *reinterpret_cast<M1CutShared*>(m1_cut_state)
+#else
+#define M1_CUT_STATE(name) __shared__ M1CutShared name
+#endif
+
 __device__ __forceinline__ float m1_cut_value(m1_u32 key) {
   const m1_u32 ascending = ~key;
   return m1_bits_f32((ascending & 0x80000000u) ? (ascending & 0x7FFFFFFFu)
@@ -1400,7 +1411,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
     m1_u8* output,
     const M1ValueDesc input_desc,
     const M1ValueDesc threshold_desc) {
-  __shared__ M1CutShared cut;
+  M1_CUT_STATE(cut);
   const m1_u32 len = input_desc.last;
   const m1_u32 rows = input_desc.rows;
   const m1_u32 dtype = input_desc.dtype;

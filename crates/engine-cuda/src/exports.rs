@@ -658,6 +658,43 @@ fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> po
     classes
 }
 
+/// For each value, whether it is a schedule read only in regions every class
+/// of which is `decoding` (one query row a lane): a grouped decode read
+/// through the prefill kernel, whose fires carry at most a row a lane.
+#[must_use]
+pub(crate) fn read_only_by_decoders(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    decoding: &poem_ir::ClassSet,
+) -> Vec<bool> {
+    // None: unread; Some(true): every reading region decodes.
+    let mut read: Vec<Option<bool>> = vec![None; trace.values.len()];
+    let mut inputs: Vec<ValueId> = Vec::new();
+    for region in compiled.template() {
+        let decodes = !region.mask.is_empty() && region.mask.iter().all(|c| decoding.contains(c));
+        for node in region.nodes.clone() {
+            let Some(node) = trace.nodes.get(node as usize) else {
+                continue;
+            };
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            for id in &inputs {
+                let at = id.0 as usize;
+                if !trace
+                    .values
+                    .get(at)
+                    .is_some_and(|decl| matches!(decl.ty, poem_ir::Ty::Struct(_)))
+                {
+                    continue;
+                }
+                let seen = read[at].get_or_insert(true);
+                *seen &= decodes;
+            }
+        }
+    }
+    read.into_iter().map(|seen| seen == Some(true)).collect()
+}
+
 #[must_use]
 pub(crate) fn schedule_streams(trace: &Trace, compiled: &CompiledModel) -> Vec<Option<u32>> {
     let mut streams: Vec<Option<Vec<u32>>> = vec![None; trace.values.len()];
