@@ -794,6 +794,26 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
             .expect("the verify scan");
         }
     };
+    // The bank traffic alone: a layer's bank read and written elsewhere.
+    let copy = |sink: &Sink, c: &Committed| {
+        let slot = |at: u32| {
+            let bytes = BANK_FLOATS * 4;
+            let handle = bench
+                .handles
+                .cut(x.state.buf, u64::from(at % SLOTS) * bytes, bytes)
+                .expect("a bank");
+            Tensor::new(handle, 1, 1, Dtype::U32)
+        };
+        let at = layers
+            .iter()
+            .position(|l| l.slots.buf == c.slots.buf)
+            .unwrap_or(0) as u32;
+        kernels_metal::layout::copy_words(sink, slot(at), slot(at + LAYERS / 2), BANK_FLOATS * 4)
+            .expect("a bank copy");
+    };
+    if rows == 1 {
+        eprintln!("one layer's bank copied: {:.1} us", price(&copy));
+    }
     let geometries = [(8, 2), (4, 4), (8, 4)];
     let mut best = vec![f64::MAX; geometries.len() + 3];
     for _ in 0..3 {
