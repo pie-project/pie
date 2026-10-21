@@ -91,8 +91,10 @@ pub fn block_dyn_conv(
         y.rows == x.data.rows && y.width == x.data.width,
         "the convolution lands the rows it convolves"
     );
+    // A thread per channel and row, so a lane's rows convolve side by side.
+    let rows = nonzero(OP, "the rows the convolution walks", x.data.rows)?;
     ctx.fire(
-        Fire::at(FILE, entry).apply(Grid::of([channels, lanes, 1], [channels.min(GROUP), 1, 1])),
+        Fire::at(FILE, entry).apply(Grid::of([channels, rows, 1], [channels.min(GROUP), 1, 1])),
         &[
             x.data.arg(),
             x.indptr.arg(),
@@ -103,6 +105,7 @@ pub fn block_dyn_conv(
             stated(OP, side)?.arg(),
             stated(OP, taps_n)?.arg(),
             stated(OP, group_n)?.arg(),
+            stated(OP, lanes)?.arg(),
         ],
     )
 }
