@@ -275,7 +275,7 @@ impl Model {
     }
 
     /// The name a deployment of this model is served under:
-    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-tp{n}]`, its parts in
+    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tp{n}]`, its parts in
     /// the order the model states them.
     #[must_use]
     pub fn name(&self, deploy: &Deploy) -> String {
@@ -294,6 +294,9 @@ impl Model {
         }
         name.push_str("-kv-");
         name.push_str(&word(deploy.kv));
+        if let Some(factor) = deploy.yarn {
+            name.push_str(&format!("-yarn{factor}"));
+        }
         if deploy.tp > 1 {
             name.push_str(&format!("-tp{}", deploy.tp));
         }
@@ -325,6 +328,14 @@ impl Model {
             weights.push(precision_of(word)?);
         }
         let kv = dtype_of(words.next()?)?;
+        let yarn = match words.peek().and_then(|w| w.strip_prefix("yarn")) {
+            Some(factor) => {
+                let factor = factor.parse().ok().filter(|f| *f > 1)?;
+                words.next();
+                Some(factor)
+            }
+            None => None,
+        };
         let tp = match words.next() {
             None => 1,
             Some(word) => word.strip_prefix("tp")?.parse().ok().filter(|tp| *tp > 1)?,
@@ -338,6 +349,7 @@ impl Model {
             tp,
             parts,
             drafter,
+            yarn,
         })
     }
 }
@@ -484,6 +496,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
                 tp: 1,
                 parts: parts.items,
                 drafter: drafter.into_option(),
+                yarn: None,
             },
         })
     }

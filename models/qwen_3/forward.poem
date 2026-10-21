@@ -48,10 +48,10 @@ def positions(inputs, vision):
     """The positions a trunk's attention rotates by: multimodal with a tower."""
     return inputs.mrope_positions() if vision else inputs.positions()
 
-def rope(q, k, positions, vision, rotary_dim, head_dim, theta):
+def rope(q, k, positions, vision, rotary_dim, head_dim, theta, scaling = None):
     if not vision:
-        return ops.elemwise.rope_partial(q, k, positions, rotary_dim, head_dim, theta)
-    return ops.elemwise.rope_mrope(q, k, positions, MROPE_SECTIONS, "interleaved", rotary_dim, head_dim, theta)
+        return ops.elemwise.rope_partial(q, k, positions, rotary_dim, head_dim, theta, scaling = scaling)
+    return ops.elemwise.rope_mrope(q, k, positions, MROPE_SECTIONS, "interleaved", rotary_dim, head_dim, theta, scaling = scaling)
 
 def tower(inputs, t):
     """The tower's merged rows for the request's patches."""
@@ -222,7 +222,7 @@ def draft(m, inputs, x, logits, head):
 
 def rotate(q, k, inputs, m, a):
     vision = m.tower != None
-    return rope(q, k, positions(inputs, vision), vision, a.rotary_dim, m.head_dim, a.theta)
+    return rope(q, k, positions(inputs, vision), vision, a.rotary_dim, m.head_dim, a.theta, rope_scaling(m.rope))
 
 def attn_mixer(x, inputs, m, plans, mask, a):
     pages = inputs.kv(a.kv)

@@ -4,6 +4,7 @@
 # Each layer also has the LoRA banks the host registers.
 
 load("//lib/adapters/model.poem", "banks")
+load("//lib/rope.poem", "yarn")
 
 def dims(hidden, layers, q_heads, kv_heads, inter, tied):
     return struct(
@@ -62,6 +63,9 @@ def layout(id, deploy):
         inter = d.inter,
         theta = d.theta,
         eps = d.norm_eps,
+        # Qwen3's native context, which YaRN stretches (its card: factor 4
+        # over 32768 tokens).
+        rope = yarn(deploy, 32768),
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight("embed", [d.vocab, hidden], w),

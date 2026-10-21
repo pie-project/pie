@@ -14,7 +14,9 @@ with only the builtins of its stage:
 Any other `.poem` file is a helper the stages may `load()`; `lib/` holds
 the helpers every package may load, as `//lib/…`.
 
-A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-tp{n}]`.
+A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tp{n}]`; `yarn{f}` stretches the
+model's native context `f` times by YaRN, in a package that turns it
+(`deploy.yarn`, read into `rope_scaling(...)`).
 Each of its weights is a dtype or a precision: a stored dtype whose products
 quantize their activations, spelled with what they quantize to (`nvfp4a4`,
 NVFP4 codes against NVFP4 activations; `mxfp4a8`, MXFP4 codes against e4m3

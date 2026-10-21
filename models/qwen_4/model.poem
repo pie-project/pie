@@ -5,6 +5,7 @@
 # n-gram embedding (PLE) enriches the stream at one layer.
 
 load("//lib/media.poem", "smart_resize")
+load("//lib/rope.poem", "yarn")
 
 def gated_attn(n, d, w, kv):
     """Gated attention over `d`'s heads, its projections at `w`, caching in `kv`."""
@@ -327,27 +328,29 @@ def layout(id, deploy):
     if deploy.weights in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4]]:
         nvfp4 = nvfp4_mix(deploy.weights[1])
     refused = "{} does not ship {}".format(id, deploy)
+    # The native 262144 tokens a deployment's YaRN stretches.
+    rope = yarn(deploy, 262144)
     if id == "qwen38-flash-next-micro":
         if len(deploy.weights) != 1:
             fail(refused)
-        return build(mix_of(deploy.weights[0]), deploy.kv, MICRO, HASHES["micro"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, rope, MICRO, HASHES["micro"], False, False)
     if id == "qwen38-flash-next-mini":
         if mixed:
-            return build(MIXED_2BIT, deploy.kv, MINI, HASHES["mini"], False, False)
+            return build(MIXED_2BIT, deploy.kv, rope, MINI, HASHES["mini"], False, False)
         if nvfp4 != None:
-            return build(nvfp4, deploy.kv, MINI, HASHES["mini"], False, False)
+            return build(nvfp4, deploy.kv, rope, MINI, HASHES["mini"], False, False)
         if len(deploy.weights) != 1:
             fail(refused)
-        return build(mix_of(deploy.weights[0]), deploy.kv, MINI, HASHES["mini"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, rope, MINI, HASHES["mini"], False, False)
     if len(deploy.weights) == 1 and not vision and deploy.drafter == None:
-        return build(mix_of(deploy.weights[0]), deploy.kv, FLASH, HASHES["flash"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, rope, FLASH, HASHES["flash"], False, False)
     if mixed and (mtp or deploy.drafter == None):
-        return build(MIXED_2BIT, deploy.kv, FLASH, HASHES["flash"], mtp, vision)
+        return build(MIXED_2BIT, deploy.kv, rope, FLASH, HASHES["flash"], mtp, vision)
     if nvfp4 != None and not vision and deploy.drafter == None:
-        return build(nvfp4, deploy.kv, FLASH, HASHES["flash"], False, False)
+        return build(nvfp4, deploy.kv, rope, FLASH, HASHES["flash"], False, False)
     fail(refused)
 
-def build(mix, kv, d, hashes, draft, vision):
+def build(mix, kv, rope, d, hashes, draft, vision):
     dense = compute(mix.proj)
     proj = mix.proj
     hidden = d.hidden
@@ -448,6 +451,7 @@ def build(mix, kv, d, hashes, draft, vision):
         head_dim = d.head_dim,
         streams = d.streams,
         kv = kv,
+        rope = rope,
         embed = weight("embed", [d.vocab, hidden], mix.embed),
         head = weight("lm_head", [d.vocab, hidden], mix.head),
         layers = [layer(l) for l in range(d.layers)],
