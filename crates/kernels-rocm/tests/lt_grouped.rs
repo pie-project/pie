@@ -171,6 +171,33 @@ fn the_sorted_routed_mlp_answers_the_steps() {
     }
 }
 
+/// The native expert-ordered MLP, its swiglu in the gate-up's tall block
+/// (long contraction, 128-route items), clamped or not, its 16K routes
+/// ordered in spans.
+#[test]
+fn the_ordered_routed_mlp_answers_the_steps() {
+    let Some(gpu) = Gpu::open() else { return };
+    let dt = Dtype::Bf16;
+    let (tokens, hidden) = (2048usize, 2048usize);
+    for limit in [None, Some(0.5f32)] {
+        let mut m = mlp(&gpu, dt, tokens, 8, 64, hidden, 256, 7);
+        m.p.limit = limit;
+        let mut want = m.y;
+        let mut have = gpu.zeros(tokens as u32, hidden as u32, dt);
+        moe::mlp_swiglu(&gpu.ctx().with_tuning(tuning(0, 0, None)), &m.p, &mut want).unwrap();
+        moe::mlp_swiglu(&gpu.ctx().with_tuning(tuning(0, 1, None)), &m.p, &mut have).unwrap();
+        let (want, have) = (gpu.read(&want), gpu.read(&have));
+        for (i, (&h, &w)) in have.iter().zip(&want).enumerate() {
+            assert!(
+                (h - w).abs() <= w.abs() / 64.0 + 0.01,
+                "{limit:?}: y[{}][{}] = {h}, steps {w}",
+                i / hidden,
+                i % hidden
+            );
+        }
+    }
+}
+
 #[test]
 fn the_decode_routed_mlp_answers_the_steps() {
     let Some(gpu) = Gpu::open() else { return };

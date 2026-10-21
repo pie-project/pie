@@ -85,8 +85,8 @@ __device__ __forceinline__ u32 e4m3fn_bits(float q) {
         bits = static_cast<u32>(rintf(a * 512.f));
     } else {
         const int e = static_cast<int>((__float_as_uint(a) >> 23) & 0xFFu) - 127;
-        const float step = __uint_as_float(static_cast<u32>(e - 3 + 127) << 23);
-        const u32 mant = static_cast<u32>(rintf(a / step));  // 8 .. 16
+        // a / 2^(e-3), as an exact product.
+        const u32 mant = static_cast<u32>(rintf(a * __uint_as_float(static_cast<u32>(127 + 3 - e) << 23)));  // 8 .. 16
         bits = mant == 16u ? static_cast<u32>(e + 8) << 3 : (static_cast<u32>(e + 7) << 3) | (mant - 8u);
     }
     return bits != 0u && q < 0.f ? bits | 0x80u : bits;
@@ -1119,47 +1119,51 @@ __global__ __launch_bounds__(256) void act_quant_e4m3_e8m0(const bf16* __restric
     if (t % 4 == 0) exps[at / 32] = static_cast<u8>(e + 127);
 }
 
-template <int GRAN>
+// x's rows as e4m3 codes under an f32 scale a GRAN-wide block: amax / 448,
+// or (POW2, DeepSeek's recipe as `act_quant_e4m3_values` keeps it)
+// 2^ceil(log2(max(amax, 1e-4) / 448)). A thread eight elements, GRAN / 8
+// threads a block.
+template <int GRAN, bool POW2>
 __global__ __launch_bounds__(256) void act_quant_e4m3_codes(const bf16* __restrict__ x, u8* __restrict__ codes,
                                                             float* __restrict__ scales, i32 rows, i32 k,
                                                             const u32* __restrict__ win) {
-    static_assert(GRAN % kWave == 0, "a block spans the wavefront");
-    constexpr int EACH = GRAN / kWave;
+    constexpr int LANES = GRAN / 8;
+    static_assert(LANES <= kWave && (LANES & (LANES - 1)) == 0, "a block's lanes are a power of two in a wavefront");
     const Window window{win};
-    const int blocks = k / GRAN;
-    const long long slot = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) / kWave;
-    if (slot >= static_cast<long long>(rows) * blocks) return;
-    const long long r = slot / blocks;
+    // The launch's threads fit 32 bits (the launcher's check).
+    const u32 per = static_cast<u32>(k) / 8;
+    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= static_cast<u32>(rows) * per) return;
+    const u32 r = t / per;
     if (!window.live(r)) return;
-    const long long row = window.plane(r);
-    const int b = static_cast<int>(slot % blocks);
-    const int l = lane();
-    const long long at = row * k + static_cast<long long>(b) * GRAN + l * EACH;
-    float v[EACH];
+    const long long at = window.plane(r) * k + (t - r * per) * 8;
+    const Pack8<bf16> in = *reinterpret_cast<const Pack8<bf16>*>(x + at);
+    float v[8];
     float amax = 0.f;
 #pragma unroll
-    for (int i = 0; i < EACH; ++i) {
-        v[i] = to_f32(x[at + i]);
+    for (int i = 0; i < 8; ++i) {
+        v[i] = to_f32(in.v[i]);
         amax = fmaxf(amax, fabsf(v[i]));
     }
 #pragma unroll
-    for (int off = kWave / 2; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, kWave));
-    const float sc = e4m3_block_scale(amax);
-    u32 word = 0;
-#pragma unroll
-    for (int i = 0; i < EACH; ++i) {
-        const u32 bits = e4m3fn_bits(fminf(fmaxf(v[i] / sc, -448.f), 448.f));
-        word |= bits << (8 * (i % 4));
-        if (i % 4 == 3) {
-            *reinterpret_cast<u32*>(codes + at + i - 3) = word;
-            word = 0;
-        }
+    for (int off = LANES / 2; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, kWave));
+    float sc = e4m3_block_scale(amax);
+    // v / sc, as an exact product where sc is a power of two.
+    float inv = 0.f;
+    if constexpr (POW2) {
+        const u32 bits = __float_as_uint(fmaxf(amax, 1e-4f) * (1.f / 448.f));
+        const int e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+        sc = __uint_as_float(static_cast<u32>(e + 127) << 23);
+        inv = __uint_as_float(static_cast<u32>(127 - e) << 23);
     }
-    if constexpr (EACH % 4 != 0) {
+    u32 word[2] = {0u, 0u};
 #pragma unroll
-        for (int i = EACH - EACH % 4; i < EACH; ++i) codes[at + i] = static_cast<u8>(word >> (8 * (i % 4)));
+    for (int i = 0; i < 8; ++i) {
+        const float q = POW2 ? v[i] * inv : v[i] / sc;
+        word[i / 4] |= e4m3fn_bits(fminf(fmaxf(q, -448.f), 448.f)) << (8 * (i % 4));
     }
-    if (l == 0) scales[row * blocks + b] = sc;
+    *reinterpret_cast<uint2*>(codes + at) = uint2{word[0], word[1]};
+    if (t % LANES == 0) scales[at / GRAN] = sc;
 }
 
 // The slices' f32 partials of `dense_fp8_mfma` summed in slice order and

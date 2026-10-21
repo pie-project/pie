@@ -85,6 +85,10 @@ fn elemwise_norm() {
     norm::rmsnorm_per_head_plus_one(&ctx, x, w, hd, 1e-6, &mut y).unwrap();
     let want = rows(&xs, hd as usize, |h| rms(h, Some(&ws), true, 1e-6));
     close_bf16("rmsnorm_per_head_plus_one", &gpu.read(&y), &want, 1.0);
+    let mut y = gpu.zeros(r, heads * hd, Dtype::Bf16);
+    norm::rmsnorm_no_scale(&ctx, x, 512, 1e-6, &mut y).unwrap();
+    let want = rows(&xs, 512, |h| rms(h, None, false, 1e-6));
+    close_bf16("rmsnorm_no_scale per head", &gpu.read(&y), &want, 1.0);
 
     // Gated (GDN output): f32 x and w, bf16 gate, silu and sigmoid.
     let (r, heads, hd) = (3u32, 4u32, 128u32);

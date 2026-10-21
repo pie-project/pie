@@ -384,6 +384,7 @@ fn attend_pool(
             op,
             super::mla::latent::RANK,
             0,
+            false,
             rows,
             latent::Gather {
                 q_nope: read.q.ptr,

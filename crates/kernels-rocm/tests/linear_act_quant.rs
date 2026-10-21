@@ -154,15 +154,42 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
             k,
         );
         assert_eq!(nans, 0);
-        act_quant::matmul_fp8b32_lanes(
-            &ctx,
-            "linear.matmul_act_quant",
-            gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
-            wt,
-            gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
-            &mut y,
-        )
-        .unwrap();
+        if side == 128 {
+            // fp8b128: the exponents as the f32 factors a load lands, the
+            // rows under DeepSeek's power-of-two scales.
+            let factors: Vec<f32> = exps
+                .iter()
+                .map(|&e| 2f32.powi(i32::from(e) - 127))
+                .collect();
+            let (q, s) = act_quant::quantized_codes(
+                &ctx,
+                "linear.matmul_act_quant",
+                gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
+                128,
+                true,
+            )
+            .unwrap();
+            act_quant::matmul_fp8_quantized(
+                &ctx,
+                "linear.matmul_act_quant",
+                q,
+                s,
+                wt,
+                gpu.tensor(&factors, nb as u32, kb as u32, Dtype::F32),
+                &mut y,
+            )
+            .unwrap();
+        } else {
+            act_quant::matmul_fp8b32_lanes(
+                &ctx,
+                "linear.matmul_act_quant",
+                gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
+                wt,
+                gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
+                &mut y,
+            )
+            .unwrap();
+        }
         for (i, (g, w)) in gpu.read(&y).iter().zip(&want).enumerate() {
             assert!(
                 (g - w).abs() <= w.abs() * 2f32.powi(-8) + 1e-5 * big,
@@ -200,6 +227,10 @@ fn an_fp8b128_projection_answers_the_quantized_dot() {
     run_fp8b128(13, 256, 512, true);
     run_fp8b128(100, 320, 768, true);
     run_fp8b128(40, 200, 256, false);
+    // In the FP8 matrix core's order: the decode tile and the prefill tiles.
+    for m in [1, 100, 300] {
+        run_fp8b_on(m, 384, 1024, true, 128, true);
+    }
 }
 
 #[test]
@@ -318,8 +349,19 @@ fn run_fp8_mfma(m: usize, n: usize, k: usize, edge_codes: bool) {
 
 /// `run_fp8_mfma` under factors a `tall` x 128 block (at 64: `e4m3g128` per-row factors folded at load).
 fn run_fp8_mfma_rows(m: usize, n: usize, k: usize, edge_codes: bool, tall: usize) {
+    run_fp8_mfma_tuned(m, n, k, edge_codes, tall, false);
+}
+
+/// `run_fp8_mfma_rows`, `narrow`: past 16 rows on the 64 x 128 prefill tile.
+fn run_fp8_mfma_tuned(m: usize, n: usize, k: usize, edge_codes: bool, tall: usize, narrow: bool) {
     let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
+    let mut ctx = gpu.ctx();
+    if narrow {
+        let mut tuning = ctx.tuning();
+        tuning.fp8_decode_until = 16;
+        tuning.fp8_narrow_until = u32::MAX;
+        ctx.set_tuning(tuning);
+    }
     let (nb, kb) = (n.div_ceil(tall), k / 128);
     let (mut codes, factors) = tile_planes(n * k, nb * kb, (m * 37 + n) as u32);
     if edge_codes {
@@ -378,6 +420,11 @@ fn an_fp8_projection_on_the_matrix_core_folds_each_block() {
     run_fp8_mfma(150, 320, 512, true);
     run_fp8_mfma(300, 320, 768, true);
     run_fp8_mfma(1100, 1040, 1536, false);
+    // The narrow tile: one tile of rows, then rows past several, whole
+    // tiles and sliced.
+    run_fp8_mfma_tuned(40, 384, 1024, true, 128, true);
+    run_fp8_mfma_tuned(300, 1040, 1536, false, 128, true);
+    run_fp8_mfma_tuned(150, 320, 768, true, 64, true);
 }
 
 #[test]

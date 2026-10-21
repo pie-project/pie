@@ -99,6 +99,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.budget.max_tokens,
         engine.lattice_steps,
         engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
     );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
@@ -177,6 +178,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             tokens,
             engine.lattice_steps,
             engine.prefill_lattice_from,
+            engine.prefill_lattice_steps,
         );
         budget
     };
@@ -346,6 +348,7 @@ fn refit(
             tokens,
             engine.lattice_steps,
             engine.prefill_lattice_from,
+            engine.prefill_lattice_steps,
         );
         budget
     };
@@ -1321,8 +1324,12 @@ fn decoded_weight_planes(
             // to bf16 for a prefill's GEMM like a split-plane one; on CUDA
             // without tcgen05 so is its W8A16 product past
             // `w8a16::GEMM_UNTIL` rows.
+            #[cfg(feature = "rocm")]
+            let decoded = true;
+            #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+            let decoded = !kernels_cuda::linear::tc5::supported();
             #[cfg(any(feature = "rocm", feature = "cuda"))]
-            if (cfg!(feature = "rocm") || !kernels_cuda::linear::tc5::supported())
+            if decoded
                 && let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
                     w,
                     scales: Some(_),

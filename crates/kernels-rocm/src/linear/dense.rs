@@ -11,7 +11,9 @@ use crate::hip::{lt, sys};
 use crate::jit::{Ctx, refuse};
 
 use super::dense_batch::dense_batch_bf16;
-use super::gemv::{gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16};
+use super::gemv::{
+    SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_plan,
+};
 
 /// Up to eight rows the skinny kernels always take a small weight.
 const SKINNY_SMALL: i32 = 8;
@@ -26,6 +28,8 @@ const SKINNY_QUAD_ROWS: i32 = super::gemv::QUAD_MIN_ROWS as i32;
 /// so the two land the same bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
+    /// The turned kernel (`kernel.gemm.turn_*`; past 16 rows, an lm head).
+    Turn,
     /// The skinny kernels (`linear/gemv.hip`).
     Skinny,
     /// The decode-batch engine (`kernel.dense.batch_*`, or up to eight rows
@@ -37,6 +41,18 @@ enum Route {
 
 fn route(ctx: &Ctx, m: i32, rows: i32, k: i32) -> Route {
     let t = ctx.tuning();
+    let until = if rows.unsigned_abs() >= t.gemm_skinny_batch_min_n {
+        t.gemm_turn_wide_until
+    } else {
+        t.gemm_turn_until.min(16)
+    };
+    if t.gemm_turn_from > 0
+        && (t.gemm_turn_from as i32..=until as i32).contains(&m)
+        && rows.unsigned_abs() >= t.gemm_turn_min_n
+        && turn_plan(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs()).is_some()
+    {
+        return Route::Turn;
+    }
     if m <= SKINNY_SMALL && i64::from(rows) * i64::from(k) <= SKINNY_SMALL_WEIGHT {
         return Route::Skinny;
     }
@@ -76,6 +92,12 @@ pub(crate) fn act_x_wt(
         return Ok(false);
     }
     let way = route(ctx, m, n, k);
+    if bias == 0
+        && way == Route::Turn
+        && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store).is_ok()
+    {
+        return Ok(false);
+    }
     if bias == 0 && way == Route::Skinny && skinny_bf16(ctx, w, act, y, m, n, k).is_ok() {
         return Ok(false);
     }
@@ -138,7 +160,11 @@ pub(crate) fn act_x_wt_f32(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    if route(ctx, m, n, k) == Route::Skinny && skinny_f32(ctx, w, act, y, m, n, k).is_ok() {
+    let way = route(ctx, m, n, k);
+    if way == Route::Turn && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::F32).is_ok() {
+        return Ok(());
+    }
+    if way == Route::Skinny && skinny_f32(ctx, w, act, y, m, n, k).is_ok() {
         return Ok(());
     }
     let shape = lt::Shape {
@@ -192,6 +218,21 @@ pub(crate) fn act_x_wt_swiglu(
         return Ok(false);
     }
     let way = route(ctx, m, 2 * intermediate, k);
+    if way == Route::Turn
+        && skinnyt(
+            ctx,
+            gate_up,
+            act,
+            h,
+            m,
+            intermediate,
+            k,
+            SkinnyEpilogue::Swiglu,
+        )
+        .is_ok()
+    {
+        return Ok(true);
+    }
     if way == Route::Skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok()
     {
         return Ok(true);
@@ -210,4 +251,73 @@ fn batch_on(ctx: &Ctx, m: i32, n: i32, k: i32) -> bool {
     (t.dense_batch_from as i32..=t.dense_batch_until as i32).contains(&m)
         && (i64::from(t.dense_batch_weight_mi) << 20..=i64::from(t.dense_batch_weight_max_mi) << 20)
             .contains(&weight)
+}
+
+/// `y = act · wᵀ` over the first `*live` of act's `m` rows (`live` a device
+/// word), the rest of y left as it was: hipBLASLt's grouped kernels with M
+/// read on the device, a launch for each range of live rows
+/// (`kernel.gemm.live_tile_*`). `Ok(false)` where the library or a tile is
+/// missing.
+pub(crate) fn act_x_wt_live(
+    ctx: &Ctx,
+    op: &'static str,
+    act: u64,
+    w: u64,
+    live: u64,
+    y: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<bool, Error> {
+    use crate::hip::lt_grouped::{USER_ARGS_BYTES, library};
+    use crate::jit::{ArgValue, Fire, Launch, symbol};
+    let Ok(lib) = library(dtype::Dtype::Bf16) else {
+        return Ok(false);
+    };
+    let tiles = ctx.tuning().gemm_live_tiles;
+    let Some(at) = tiles
+        .iter()
+        .map(|&t| lib.pick(t))
+        .collect::<Option<Vec<usize>>>()
+    else {
+        return Ok(false);
+    };
+    // Launch r takes live rows up to its tile's MT1 (the last, up to m).
+    let bound = |r: usize| {
+        if r == 2 {
+            m
+        } else {
+            lib.solutions[at[r]].mt[1].min(m)
+        }
+    };
+    let args = ctx.scratch(op, "linear.live_args", 6 * USER_ARGS_BYTES)? as u64;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe.hip",
+            symbol("::pie::linear::dense_lt_live_args<::pie::bf16>"),
+        )
+        .apply(Launch::grid([1, 1, 1], [64, 1, 1])),
+        &[
+            ArgValue::Ptr(live),
+            ArgValue::Ptr(args),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(act),
+            ArgValue::Ptr(y),
+            ArgValue::I32(n as i32),
+            ArgValue::I32(k as i32),
+            ArgValue::I32(m as i32),
+            ArgValue::I32(bound(0) as i32),
+            ArgValue::I32(bound(1) as i32),
+        ],
+    )?;
+    for (r, &solution) in at.iter().enumerate() {
+        let grid = lib.solutions[solution].worst_grid(n, bound(r), 1);
+        let record = args + (2 * r * USER_ARGS_BYTES) as u64;
+        // SAFETY: the records were written on this stream, naming act, w and
+        // y, live device planes of [m, k], [n, k] and [m, n] bf16.
+        unsafe { lib.launch(solution, 2, record, grid, ctx.stream()) }
+            .map_err(|why| refuse(op, why))?;
+    }
+    Ok(true)
 }

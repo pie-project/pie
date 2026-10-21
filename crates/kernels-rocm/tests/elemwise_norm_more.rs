@@ -485,3 +485,89 @@ fn res_blend() {
     );
     untouched("windowed res_blend", &got, hd, 1..2);
 }
+
+/// Muse Spark's norm and residual gate (`norm::norm_gate`), both norms, on
+/// rows of whole eights (the packed walk) and a ragged one, one row a token
+/// and two (a routed plane).
+#[test]
+fn norm_gate() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (eps, temp) = (1e-6f32, 0.7f32);
+    for (rows, n, fan, gated) in [
+        (3u32, 4096u32, 1u32, true),
+        (4, 8192, 2, false),
+        (2, 100, 1, true),
+    ] {
+        let len = (rows * n) as usize;
+        let xs = bf16s(len, 11, 2.0);
+        let ss = bf16s(n as usize, 12, 1.0);
+        let rs = bf16s(len, 13, 1.0);
+        let gs = values(n as usize, 14, 2.0);
+        let nw = bf16s(n as usize, 15, 0.5);
+        let x = gpu.tensor(&xs, rows, n, Dtype::Bf16);
+        let scale = gpu.tensor(&ss, 1, n, Dtype::Bf16);
+        let res = gpu.tensor(&rs, rows, n, Dtype::Bf16);
+        let gate = gpu.tensor(&gs, 1, n, Dtype::F32);
+        let mut y = gpu.zeros(rows, n, Dtype::Bf16);
+        let z = gpu.zeros(rows, n, Dtype::Bf16);
+        let next = norm::Next {
+            weight: gpu.tensor(&nw, 1, n, Dtype::Bf16),
+            eps,
+            plus_one: true,
+            y: z,
+        };
+        let (res_t, gate_t) = if gated {
+            (Some(res), Some(gate))
+        } else {
+            (None, None)
+        };
+        norm::norm_gate(
+            &ctx,
+            x,
+            Some(scale),
+            res_t,
+            gate_t,
+            eps,
+            temp,
+            fan,
+            Some(next),
+            &mut y,
+        )
+        .unwrap();
+        let (mut want_y, mut want_z) = (Vec::new(), Vec::new());
+        for r in 0..rows as usize {
+            let row = &xs[r * n as usize..(r + 1) * n as usize];
+            let u: Vec<f32> = row
+                .iter()
+                .zip(&ss)
+                .map(|(v, s)| round_bf16(v * s))
+                .collect();
+            let inv = inv_rms(&u, eps);
+            let out: Vec<f32> = u
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let o = v * inv;
+                    round_bf16(if gated {
+                        let w = gs[i] / temp;
+                        let beta = sigmoid(w);
+                        let alpha = (sigmoid(-w) * (1.0 + beta)).max(1e-3).sqrt();
+                        alpha * rs[r * n as usize + i] + beta * round_bf16(o)
+                    } else {
+                        o
+                    })
+                })
+                .collect();
+            let inv2 = inv_rms(&out, eps);
+            want_z.extend(
+                out.iter()
+                    .zip(&nw)
+                    .map(|(o, w)| round_bf16(o * inv2 * (w + 1.0))),
+            );
+            want_y.extend(out);
+        }
+        close_bf16(&format!("norm_gate {n} y"), &gpu.read(&y), &want_y, 2.0);
+        close_bf16(&format!("norm_gate {n} z"), &gpu.read(&z), &want_z, 2.0);
+    }
+}

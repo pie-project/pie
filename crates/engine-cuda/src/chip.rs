@@ -111,12 +111,17 @@ pub struct WalkFireRows(pub u32);
 #[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
 pub struct HostPlanes;
 
-/// Rows from which the default bucket lattice takes four buckets a doubling
-/// whatever `engine.lattice_steps` says (a prefill's GEMMs run its bucket's
-/// rows); 0 never.
+/// Rows from which the default bucket lattice takes
+/// `engine.prefill_lattice_steps` buckets a doubling whatever
+/// `engine.lattice_steps` says (a prefill's GEMMs run its bucket's rows); 0 never.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct PrefillLatticeFrom(pub u32);
+
+/// Buckets a doubling the default lattice takes past `engine.prefill_lattice_from`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.prefill_lattice_steps", constant(set(4, 8)), default = 4, tune = engine)]
+pub struct PrefillLatticeSteps(pub u32);
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
@@ -133,7 +138,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<HostPlanes>()
-        .add::<PrefillLatticeFrom>();
+        .add::<PrefillLatticeFrom>()
+        .add::<PrefillLatticeSteps>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register(&mut r, 2);
@@ -219,6 +225,7 @@ pub struct Engine {
     pub walk_fire_rows: u32,
     pub host_planes: bool,
     pub prefill_lattice_from: u32,
+    pub prefill_lattice_steps: u32,
 }
 
 impl Engine {
@@ -248,6 +255,7 @@ impl Engine {
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
+            prefill_lattice_steps: profile.get::<PrefillLatticeSteps>().0,
         }
     }
 }
@@ -688,6 +696,7 @@ mod tests {
                 walk_fire_rows: 0,
                 host_planes: false,
                 prefill_lattice_from: 0,
+                prefill_lattice_steps: 4,
             }
         );
         assert_eq!(
@@ -969,17 +978,27 @@ mod hip {
                 Engine {
                     forward_tokens: 10240,
                     prefill_lattice_from: 2048,
+                    prefill_lattice_steps: 8,
                     ..Engine::of(&registry().defaults())
                 }
             );
-            // The defaults, but for the routed MLP's paths the family measured.
+            // The defaults, but for the paths the family measured.
             let mut want = kernels_cuda::tuning::Tuning::of(&registry().defaults());
+            want.mla_absorb_q_until = 2048;
+            want.mla_absorb_out_from = 33;
+            want.mla_absorb_out_until = 1536;
+            want.fp8_decode_until = 32;
+            want.fp8_narrow_until = 128;
             want.moe_lt_grouped = true;
             want.moe_lt_mlp_from = 128;
             want.moe_lt_tile_deep = 256_192_064;
             want.moe_lt_tile_shallow = 128_288_032;
             want.moe_lt_deep_k = 2048;
-            want.moe_ordered_from = 256;
+            want.moe_ordered_from = 128;
+            want.gemm_live_from = 129;
+            want.gemm_turn_from = 3;
+            want.gemm_turn_wide_until = 32;
+            want.ssm_gdn_wide_from = 512;
             assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
         }
     }
