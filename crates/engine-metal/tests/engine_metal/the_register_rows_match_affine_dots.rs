@@ -117,6 +117,7 @@ fn every_register_row_answers_an_affine_reference() {
                     quant::Scratch {
                         precast: &precast,
                         partials: &partials,
+                        table: None,
                     },
                     cap,
                 )
@@ -166,4 +167,142 @@ fn every_register_row_answers_an_affine_reference() {
         }
     }
     eprintln!("checked {checked} register outputs against exact and random affine dots");
+}
+
+/// A 4-bit, 64-group bank of `n` rows of `k` codes, its planes seeded by `seed`.
+fn bank_of(device: &Context, handles: &Handles, k: u32, n: u32, seed: u64) -> (Bank, [Buffer; 3]) {
+    let groups = k / 64;
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) / 2)
+        .map(|at| noise(at ^ seed))
+        .collect();
+    let factor = |at: u32, salt: u64, base: f32, step: f32| {
+        bf16(base + f32::from(noise(u64::from(at) ^ seed ^ salt)) * step)
+    };
+    let scales: Vec<u8> = (0..n * groups)
+        .flat_map(|at| factor(at, 0x11, 0.0031, 0.000173))
+        .collect();
+    let biases: Vec<u8> = (0..n * groups)
+        .flat_map(|at| factor(at, 0x5678, -0.2, 0.00157))
+        .collect();
+    let planes = [upload(&codes), upload(&scales), upload(&biases)];
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let bank = Bank {
+        mpp_codes: None,
+        codes: Tensor::new(bind(&planes[0]), n, k, Dtype::U4g64),
+        scales: Tensor::new(bind(&planes[1]), n, groups, Dtype::Bf16),
+        biases: Some(Tensor::new(bind(&planes[2]), n, groups, Dtype::Bf16)),
+        group: 64,
+        bits: 4,
+        ld: k,
+    };
+    (bank, planes)
+}
+
+/// The matmuls of one activation share the register tile's input table: the
+/// second reads the table the first laid (its split's arrival counters put
+/// back to zero by the first's last partitions) and lands the very bits it
+/// lands over a table of its own, whether it splits wider or narrower.
+#[test]
+fn a_table_one_matmul_laid_feeds_the_next() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]", false);
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    // (k, the first's columns, the second's): a layer's in-projection and its
+    // gates, a query and a key, and the narrow one first.
+    let cases = [
+        (2048u32, 12288u32, 64u32),
+        (2048, 8192, 512),
+        (2048, 64, 12288),
+        (4096, 2048, 1024),
+    ];
+    let mut checked = 0;
+    for &(k, first_n, second_n) in &cases {
+        let (first, _first_planes) = bank_of(&device, &handles, k, first_n, 0x1);
+        let (second, _second_planes) = bank_of(&device, &handles, k, second_n, 0x2);
+        for m in [1u32, 6, 8] {
+            let cap = 8;
+            let inputs: Vec<u8> = (0..cap * k)
+                .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0xabcd)) - 127.0) * 0.0197))
+                .collect();
+            let act_b = upload(&inputs);
+            let act = Tensor::new(bind(&act_b), m, k, Dtype::Bf16);
+            let widest = first_n.max(second_n);
+            let table_rows = 16 + (4 * widest / 64).div_ceil(2 * k);
+            let table_b = upload(&vec![0xa5; (table_rows * k * 2) as usize]);
+            let th = bind(&table_b);
+            let partial_b = upload(&vec![0xa5; (cap * 8 * widest * 4) as usize]);
+            let ph = bind(&partial_b);
+            let precast = |rows: u32, width: u32| {
+                (rows <= table_rows && width == k).then(|| Tensor::new(th, rows, width, Dtype::F16))
+            };
+            let partials = |rows: u32, width: u32| {
+                (rows <= cap * 8 && width <= widest)
+                    .then(|| Tensor::new(ph, rows, width, Dtype::F32))
+            };
+            // Laid by the first call, with the counters it zeroed; read by the second when
+            // those cover its own.
+            let laid = std::cell::Cell::new(None::<u32>);
+            let kept = |rows: u32, width: u32, counters: u32| {
+                let table = precast(rows, width)?;
+                let standing = laid.get().is_some_and(|zeroed| zeroed >= counters);
+                if !standing {
+                    laid.set(Some(counters));
+                }
+                Some((table, standing))
+            };
+            let run =
+                |bank: Bank,
+                 n: u32,
+                 out: u32,
+                 table: Option<&dyn Fn(u32, u32, u32) -> Option<(Tensor, bool)>>| {
+                    let frame = device.frame().expect("frame");
+                    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                    quant::matmul(
+                        &sink,
+                        &tuning,
+                        act,
+                        bank,
+                        Tensor::new(out, m, n, Dtype::Bf16),
+                        quant::Scratch {
+                            precast: &precast,
+                            partials: &partials,
+                            table,
+                        },
+                        cap,
+                    )
+                    .expect("register");
+                    frame.commit().expect("commit");
+                };
+            let alone_b = upload(&vec![0x5a; (m * second_n * 2) as usize]);
+            let first_b = upload(&vec![0x5a; (m * first_n * 2) as usize]);
+            let shared_b = upload(&vec![0x5a; (m * second_n * 2) as usize]);
+            let (alone, first_out, shared) = (bind(&alone_b), bind(&first_b), bind(&shared_b));
+            run(second, second_n, alone, None);
+            run(first, first_n, first_out, Some(&kept));
+            run(second, second_n, shared, Some(&kept));
+            let bytes = u64::from(m * second_n * 2);
+            let want = handles.read(alone, bytes).expect("read");
+            let got = handles.read(shared, bytes).expect("read");
+            assert!(
+                want == got,
+                "k={k}, {first_n} then {second_n} columns, M={m}: the shared table lands other bits"
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("checked {checked} matmuls reading a table another laid");
 }

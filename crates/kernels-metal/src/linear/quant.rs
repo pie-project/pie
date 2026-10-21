@@ -478,6 +478,14 @@ pub struct Scratch<'a> {
     pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,
 
     pub partials: &'a dyn Fn(u32, u32) -> Option<Tensor>,
+
+    /// The register tile's input table for this call's activation, when the
+    /// caller keeps one across the matmuls that read the same activation (a
+    /// layer's projections of one normed row): the room `precast` would mint
+    /// for (`rows`, `contraction`), and whether it already holds the
+    /// activation's rows with at least `counters` arrival counters zeroed, so
+    /// the call skips its table pass. `None` lays the table every call.
+    pub table: Option<&'a dyn Fn(u32, u32, u32) -> Option<(Tensor, bool)>>,
 }
 
 pub fn matmul(
@@ -805,18 +813,22 @@ fn act_x_wt_over(
                         0
                     };
                     let bytes = 16 * k + k + 4 * counters;
-                    let table = (scratch.precast)(
-                        bytes.unsigned_abs().div_ceil(2 * k.unsigned_abs()),
-                        contraction,
-                    );
-                    let Some(table) = table else {
+                    let table_rows = bytes.unsigned_abs().div_ceil(2 * k.unsigned_abs());
+                    // A table another matmul of this activation laid is read as it stands.
+                    let table = match scratch.table {
+                        Some(kept) => kept(table_rows, contraction, counters.unsigned_abs()),
+                        None => (scratch.precast)(table_rows, contraction).map(|t| (t, false)),
+                    };
+                    let Some((table, laid)) = table else {
                         continue;
                     };
-                    ctx.fire(
-                        Fire::at(REGISTER_FILE, "qmm_sg_table")
-                            .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
-                        &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
-                    )?;
+                    if !laid {
+                        ctx.fire(
+                            Fire::at(REGISTER_FILE, "qmm_sg_table")
+                                .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
+                            &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
+                        )?;
+                    }
                     let entry = symbol(&format!("affine_qmm_sg_k{split}"));
                     let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})"));
                     return ctx.fire(

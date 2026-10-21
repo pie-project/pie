@@ -1090,6 +1090,7 @@ fn measure(
                         quant::Scratch {
                             precast: &precast,
                             partials: &partials,
+                            table: None,
                         },
                         cap,
                     )
