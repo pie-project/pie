@@ -1,6 +1,9 @@
-# Qwen 3, dense and text-only (Qwen/Qwen3-0.6B ... -14B): full attention in
+# Qwen 3, dense and text-only (Qwen/Qwen3-0.6B ... -32B): full attention in
 # every layer, its q and k RMS-normed per head and rotated in full, and a
-# SwiGLU MLP. Qwen 3.5 and later, with gated-delta layers, are `qwen_3`.
+# SwiGLU MLP; as released, as Qwen releases it in FP8 (128-square blocks
+# against e4m3 activations) and as modelopt exports it in NVFP4 (against bf16
+# activations). Qwen 3.5 and later, with gated-delta layers, are `qwen_3`;
+# Qwen 3's mixtures of experts are `qwen3_moe`.
 
 load("//lib/spoken.poem", "QWEN_STOP")
 
@@ -12,10 +15,23 @@ def qwen3(id, layers):
 
 MODELS = [
     qwen3("qwen3-0.6b", layers = 28),
+    qwen3("qwen3-8b", layers = 36),
     qwen3("qwen3-14b", layers = 40),
+    qwen3("qwen3-32b", layers = 64),
 ]
+
+F8 = dtype.e4m3tile128a8
 
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = F8, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen3-8b", weights = dtype.nvfp4, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-32b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.nvfp4, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.u4g64, kv = dtype.bf16),
 ]

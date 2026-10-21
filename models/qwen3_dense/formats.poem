@@ -1,5 +1,9 @@
 # How a Qwen 3 (dense) checkpoint is read: transformers' safetensors, under
-# `model.`, recognized by its per-head q norm and checked against its config.
+# `model.`, as released (bf16), as Qwen releases it in FP8 (e4m3 codes beside
+# 128-square block factors) or as modelopt exports it in NVFP4; recognized by
+# its per-head q norm and checked against its config.
+
+load("//lib/blockfp8/formats.poem", "fp8_proj", "fp8_read")
 
 def configured(m):
     return [
@@ -17,10 +21,24 @@ def configured(m):
 def formats(m):
     return [format(
         "transformers",
-        recognizes = lambda checkpoint: has("model.embed_tokens.weight") and has("model.layers.0.self_attn.q_norm.weight"),
+        recognizes = lambda checkpoint: has("model.embed_tokens.weight") and has("model.layers.0.self_attn.q_norm.weight") and not has("model.layers.0.mlp.experts.0.down_proj.weight"),
         read = lambda reads: read(m, reads),
         states = configured(m),
     )]
+
+def unscaled(w, name):
+    """Refuses to read `name`'s e4m3 codes as `w`'s dtype: without their
+    scales the codes are not the weight."""
+    if stored(name) == raw(dtype.e4m3):
+        fail("`{}`: `{}` is stored FP8 and this deployment reads it as {}; import the deployment that keeps the release's FP8".format(w.name, name, w.dtype))
+
+def proj(reads, w, name):
+    """`w` from `name`: the release's FP8 kept, or read as stored."""
+    if fp8_proj(w):
+        fp8_read(reads, w, [name])
+    else:
+        unscaled(w, name)
+        reads.read(w, name)
 
 def read(m, reads):
     reads.read(m.embed, "model.embed_tokens.weight")
@@ -30,12 +48,16 @@ def read(m, reads):
     for l, w in enumerate(m.layers):
         n = lambda s: "model.layers.{}.{}".format(l, s)
         reads.read(w.attn_norm, n("input_layernorm.weight"))
-        reads.read(w.q, n("self_attn.q_proj.weight"))
-        reads.read(w.k, n("self_attn.k_proj.weight"))
-        reads.read(w.v, n("self_attn.v_proj.weight"))
-        reads.read(w.o, n("self_attn.o_proj.weight"))
+        proj(reads, w.q, n("self_attn.q_proj.weight"))
+        proj(reads, w.k, n("self_attn.k_proj.weight"))
+        proj(reads, w.v, n("self_attn.v_proj.weight"))
+        proj(reads, w.o, n("self_attn.o_proj.weight"))
         reads.read(w.q_norm, n("self_attn.q_norm.weight"))
         reads.read(w.k_norm, n("self_attn.k_norm.weight"))
         reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
-        reads.read(w.down, n("mlp.down_proj.weight"))
+        if fp8_proj(w.gate_up):
+            fp8_read(reads, w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        else:
+            unscaled(w.gate_up, n("mlp.gate_proj.weight"))
+            reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        proj(reads, w.down, n("mlp.down_proj.weight"))

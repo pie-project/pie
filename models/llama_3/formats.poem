@@ -29,12 +29,21 @@ def formats(m):
         states = configured(m),
     )]
 
+def unscaled(w, name):
+    """Refuses to read `name`'s e4m3 codes as `w`'s dtype: without their
+    scales the codes are not the weight."""
+    if stored(name) == raw(dtype.e4m3):
+        fail("`{}`: `{}` is stored FP8 and this deployment reads it as {}; import the deployment that keeps the release's FP8".format(w.name, name, w.dtype))
+
 def proj(reads, w, names):
     """`w` from its legs `names`: modelopt's FP8 kept as block FP8, or read
     as stored (bf16, or modelopt's NVFP4 joined leg by leg)."""
     if fp8_proj(w):
         fp8_read(reads, w, names)
-    elif len(names) == 1:
+        return
+    for name in names:
+        unscaled(w, name)
+    if len(names) == 1:
         reads.read(w, names[0])
     else:
         reads.read_concat(w, names)

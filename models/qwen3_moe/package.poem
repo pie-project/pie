@@ -1,0 +1,60 @@
+# Qwen 3 MoE (Qwen/Qwen3-30B-A3B, -235B-A22B, their 2507 releases, and
+# Qwen3-Coder-480B-A35B / -30B-A3B): full attention in every layer, its q and
+# k RMS-normed per head, and a routed MLP of softmax-picked experts with no
+# shared expert. As released (bf16), as Qwen releases it in FP8 (128-square
+# blocks), as NVIDIA's modelopt exports it in NVFP4, and miniatures that read
+# the first layers and experts of the whole models' checkpoints at full width.
+# The original releases rotate at theta 1e6 and the 2507 ones at their own,
+# so each is its own model.
+
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP])
+
+def qwen3(id, layers, mini = False):
+    return model(id, mini = mini, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3_moe", layers = layers, vocab = 151936)
+
+MODELS = [
+    qwen3("qwen3-30b-a3b", layers = 48),
+    qwen3("qwen3-30b-a3b-2507", layers = 48),
+    qwen3("qwen3-30b-a3b-mini", layers = 4, mini = True),
+    qwen3("qwen3-235b-a22b", layers = 94),
+    qwen3("qwen3-235b-a22b-2507", layers = 94),
+    qwen3("qwen3-235b-a22b-2507-mini", layers = 4, mini = True),
+    qwen3("qwen3-coder-480b-a35b", layers = 62),
+    qwen3("qwen3-coder-480b-a35b-mini", layers = 4, mini = True),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+F8 = dtype.e4m3tile128a8
+NV4 = dtype.nvfp4a4
+NV4W = dtype.nvfp4
+
+def rows(id, mini = False):
+    """A model's rows: as released, Qwen's FP8, quantized to u4 at import,
+    and modelopt's NVFP4 (projections against bf16 activations, experts
+    against NVFP4 ones, or bf16 where no GEMM quantizes them)."""
+    out = [
+        deployment(id, weights = BF, kv = BF),
+        deployment(id, weights = F8, kv = BF),
+        deployment(id, weights = F8, kv = dtype.e4m3),
+        deployment(id, weights = [NV4W, NV4], kv = BF),
+        deployment(id, weights = [NV4W, NV4], kv = dtype.e4m3),
+        deployment(id, weights = [NV4W, NV4W], kv = BF),
+    ]
+    if not mini:
+        out.append(deployment(id, weights = U4, kv = BF))
+    return out
+
+DEPLOYMENTS = (
+    rows("qwen3-30b-a3b") +
+    rows("qwen3-30b-a3b-2507") +
+    rows("qwen3-30b-a3b-mini", mini = True) +
+    rows("qwen3-235b-a22b") +
+    rows("qwen3-235b-a22b-2507") +
+    rows("qwen3-235b-a22b-2507-mini", mini = True) +
+    rows("qwen3-coder-480b-a35b") +
+    rows("qwen3-coder-480b-a35b-mini", mini = True)
+)
