@@ -159,8 +159,15 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
+    // The routed banks as a checkpoint's experts land: an expert a row.
+    let expert_rows = |bank: Bank, columns: u32| Bank {
+        codes: Tensor::new(bank.codes.buf, EXPERTS, columns * bank.codes.width, bank.codes.dtype),
+        ld: columns * bank.codes.width,
+        ..bank
+    };
     let (gate_up, _g, gate_up_host) = bank_of(&device, &handles, HIDDEN, EXPERTS * 2 * INTER, 0x1);
     let (down, _d, down_host) = bank_of(&device, &handles, INTER, EXPERTS * HIDDEN, 0x2);
+    let (gate_up, down) = (expert_rows(gate_up, 2 * INTER), expert_rows(down, HIDDEN));
     let (shared_gate_up, _sg, shared_gate_up_host) = bank_of(&device, &handles, HIDDEN, 2 * INTER, 0x3);
     let (shared_down, _sd, shared_down_host) = bank_of(&device, &handles, INTER, HIDDEN, 0x4);
     // Each path's largest spread from the f64 reference.

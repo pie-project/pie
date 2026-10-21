@@ -1211,14 +1211,15 @@ pub fn register_table_width(width: u32) -> u64 {
 
 /// Whether a bank multiplies on the register tile: 4-bit, 64-group affine
 /// with bf16 factors, each expert `columns` whole 64-column tiles over a
-/// whole number of 256-input spans, its rows packed.
+/// whole number of 256-input spans, its rows packed (laid as rows of `width`
+/// codes, or an expert a row).
 #[must_use]
 pub fn register_bank(bank: Bank, width: u32, columns: u32) -> bool {
     bank.affine()
         && bank.bits == 4
         && bank.group == 64
         && bank.scales.dtype == Dtype::Bf16
-        && bank.ld == width
+        && (bank.ld == width || u64::from(bank.ld) == u64::from(columns) * u64::from(width))
         && width.is_multiple_of(256)
         && columns.is_multiple_of(64)
 }
