@@ -526,6 +526,11 @@ mod tests {
                 );
                 assert_eq!(tuning.decode_xqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.decode_xqa_deep_64, b200, "{gpu}");
+                // B200 alone runs Gemma 4's q norm a warp a head and its
+                // norm-and-fold 128 threads a row, skipping unread rows.
+                assert_eq!(tuning.q_norm_rope_warp, b200, "{gpu}");
+                assert_eq!(tuning.skip_unread, b200, "{gpu}");
+                assert_eq!(tuning.norm_fold_block, if b200 { 128 } else { 0 }, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -589,6 +594,9 @@ mod tests {
                         index_tc5: false,
                         norm_emit: false,
                         qkv_rows_from: defaults.qkv_rows_from,
+                        q_norm_rope_warp: false,
+                        skip_unread: false,
+                        norm_fold_block: 0,
                         ..tuning
                     },
                     defaults,
