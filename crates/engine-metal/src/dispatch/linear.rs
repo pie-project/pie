@@ -637,7 +637,7 @@ impl Run<'_> {
                 y,
             } => {
                 const OP: &str = "linear.moe_matmul_select_bias";
-                if let Some(scratch) = self.routed_scratch() {
+                if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
                         self.ctx(),
@@ -652,6 +652,9 @@ impl Run<'_> {
                         self.tuning(),
                         sorted,
                     )? {
+                        // The batched pass ran over the routed rooms, which
+                        // the precast room overlaps.
+                        self.knock_table();
                         return Ok(());
                     }
                     debug_assert!(
@@ -671,7 +674,7 @@ impl Run<'_> {
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
-                if let Some(scratch) = self.routed_scratch() {
+                if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
                         self.ctx(),
@@ -686,6 +689,9 @@ impl Run<'_> {
                         self.tuning(),
                         sorted,
                     )? {
+                        // The batched pass ran over the routed rooms, which
+                        // the precast room overlaps.
+                        self.knock_table();
                         return Ok(());
                     }
                     debug_assert!(
