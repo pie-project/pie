@@ -55,6 +55,14 @@ moe.bf16_mma_until = 65536
 # ahead of the W8A16 mma.sync kernel (GLM-5.3-Flash's dense layers).
 gemm.fp8_gemv_until = 4
 
+# A prefill's fire on eight buckets a doubling from 256 rows: its GEMMs run
+# its bucket's rows, and a 556-row prompt padded to 1024 ran 84% more of
+# them (Qwen3.6-27B's prefill 30-35% faster on an H100, an A100 and an RTX
+# PRO 6000).
+[engine]
+prefill_lattice_from = 256
+prefill_lattice_steps = 8
+
 [compiler]
 # A taken conditional node costs about 12 us on an H100, past the launches it
 # skips at decode: priced out, every region launches (DeepSeek-V4.1-Flash's
