@@ -9,6 +9,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/common/mpp.metal")),
     ),
     (
+        "common/register_mma.metal",
+        include_str!(concat!(source_root!(), "/common/register_mma.metal")),
+    ),
+    (
         "common/register_table.metal",
         include_str!(concat!(source_root!(), "/common/register_table.metal")),
     ),
@@ -327,6 +331,10 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "linear/quant_qmm_staged.metal",
         include_str!(concat!(source_root!(), "/linear/quant_qmm_staged.metal")),
+    ),
+    (
+        "linear/moe_sg.metal",
+        include_str!(concat!(source_root!(), "/linear/moe_sg.metal")),
     ),
     (
         "linear/quant_qmm_sg.metal",

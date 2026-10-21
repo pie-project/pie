@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "../common/register_mma.metal"
 using namespace metal;
 
 // Up to eight rows of a 4-bit, 64-group affine matmul on the 8x8 simdgroup
@@ -25,23 +26,6 @@ using namespace metal;
 // column tile to arrive.
 
 namespace qmm_sg {
-
-template <typename T>
-__attribute__((always_inline)) inline thread vec<T, 2> &te(thread simdgroup_matrix<T, 8, 8> &m) {
-  return reinterpret_cast<thread vec<T, 2> &>(m.thread_elements());
-}
-
-// c += a x b on operands held in plain registers: lane (fm, fn) holds
-// M[fm][fn] and M[fm][fn + 1] of each.
-__attribute__((always_inline)) inline void mma(thread float2 &c, bfloat2 a, bfloat2 b) {
-  simdgroup_matrix<bfloat, 8, 8> A, B;
-  simdgroup_matrix<float, 8, 8> C, D;
-  te(A) = a;
-  te(B) = b;
-  te(C) = c;
-  simdgroup_multiply_accumulate(D, A, B, C);
-  c = te(D);
-}
 
 constant constexpr int kSpan = 256;
 constant constexpr int NF = 2; // 8-column fragments a simdgroup holds
