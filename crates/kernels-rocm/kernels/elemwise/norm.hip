@@ -92,6 +92,44 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_no_scale(const T* __restrict__ 
     rmsnorm_rows<T, BLOCK, false>(x, nullptr, y, hidden, hidden, hidden, eps, heads, win);
 }
 
+// The per-head norms over contiguous heads of 8·LPH elements: LPH lanes a
+// head row, eight elements a lane, the sum of squares across them by
+// shuffles; 256 / LPH head rows a block, `total` (rows x heads) in all.
+// `w` (one head wide) null scales by one. Planes 16-byte aligned.
+template <class T, int LPH, bool PLUS_ONE>
+__global__ __launch_bounds__(256) void rmsnorm_lanes(const T* __restrict__ x,
+                                                     const T* __restrict__ w,
+                                                     T* __restrict__ y, long long total,
+                                                     float eps, int heads,
+                                                     const u32* __restrict__ win) {
+    constexpr int HD = 8 * LPH;
+    const long long hr = static_cast<long long>(blockIdx.x) * (256 / LPH) + threadIdx.x / LPH;
+    const Window window{win};
+    if (hr >= total || !window.live(hr, heads)) return;
+    const long long row = window.plane(hr, heads) * HD;
+    const int c = (threadIdx.x % LPH) * 8;
+    const Pack8<T> p = *reinterpret_cast<const Pack8<T>*>(x + row + c);
+    float local = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float v = to_f32(p.v[e]);
+        local += v * v;
+    }
+#pragma unroll
+    for (int off = LPH / 2; off > 0; off >>= 1) local += __shfl_xor(local, off, kWave);
+    const float inv = rsqrtf(local / static_cast<float>(HD) + eps);
+    Pack8<T> ws;
+    if (w != nullptr) ws = *reinterpret_cast<const Pack8<T>*>(w + c);
+    Pack8<T> q;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        float sc = w == nullptr ? 1.f : to_f32(ws.v[e]);
+        if constexpr (PLUS_ONE) sc += 1.f;
+        q.v[e] = from_f32<T>(to_f32(p.v[e]) * inv * sc);
+    }
+    *reinterpret_cast<Pack8<T>*>(y + row + c) = q;
+}
+
 // y += x (the residual stream, rounded once), then out = rmsnorm(y) · (w [+ 1]).
 template <class T, int BLOCK, bool PLUS_ONE>
 __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restrict__ x,

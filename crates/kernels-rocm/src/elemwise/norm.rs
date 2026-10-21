@@ -47,6 +47,34 @@ const fn per_head_split(width: u32, head_dim: u32) -> u32 {
     if head_dim == 0 { 1 } else { width / head_dim }
 }
 
+/// A per-head norm on its own lanes: a head of 8 to 512 elements (a power
+/// of two) in planes that allow 16-byte reads, eight elements a lane. The
+/// lanes a head, the launch and the head rows in all.
+fn head_lanes(
+    op: &'static str,
+    y: &Tensor,
+    head_dim: u32,
+    planes: &[u64],
+) -> Result<Option<(u32, Launch, i64)>, Error> {
+    let lph = head_dim / VEC_WIDTH;
+    if head_dim == 0
+        || !head_dim.is_multiple_of(VEC_WIDTH)
+        || !lph.is_power_of_two()
+        || lph > WARP
+        || !planes.iter().all(|p| p.is_multiple_of(16))
+    {
+        return Ok(None);
+    }
+    let total = u64::from(y.rows) * u64::from(y.width / head_dim);
+    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK / lph)))
+        .map_err(|_| refuse(op, format!("the grid will not launch: {total} head rows")))?;
+    Ok(Some((
+        lph,
+        Launch::per_row(blocks, BLOCK),
+        i64::try_from(total).unwrap_or(i64::MAX),
+    )))
+}
+
 fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     let n = t.elements();
     let lanes = u32::try_from(n).map_err(|_| {
@@ -110,6 +138,28 @@ fn rms_row(
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
     let heads = stated(op, per_head_split(y.width, per_head_dim))?;
+    if let Some((lph, lanes, total)) =
+        head_lanes(op, y, per_head_dim, &[x.ptr, weight.ptr, y.ptr])?
+    {
+        let plus = template == OFFSET_BANK;
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::elemwise::rmsnorm_lanes<{t}, {lph}, {plus}>")),
+            )
+            .apply(lanes),
+            &[
+                x.arg(),
+                weight.arg(),
+                y.arg(),
+                total.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(
@@ -228,6 +278,25 @@ pub fn rmsnorm_no_scale(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    if let Some((lph, lanes, total)) = head_lanes(OP, y, head_dim, &[x.ptr, y.ptr])? {
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::elemwise::rmsnorm_lanes<{t}, {lph}, false>")),
+            )
+            .apply(lanes),
+            &[
+                x.arg(),
+                ArgValue::ABSENT,
+                y.arg(),
+                total.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -274,30 +343,25 @@ pub fn rmsnorm_gated(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
-    // A head of 8 to 512 (a power of two) on its own lanes, eight elements
-    // a lane, where every plane allows 16-byte reads.
-    let lph = head_dim / 8;
-    let aligned = [x.ptr, gate.ptr, y.ptr, weight.map_or(0, |w| w.ptr)]
-        .iter()
-        .all(|p| p.is_multiple_of(16));
-    if head_dim.is_multiple_of(8) && lph.is_power_of_two() && lph <= WARP && aligned {
-        let total = u64::from(y.rows) * u64::from(y.width / head_dim);
-        let per = u64::from(BLOCK / lph);
-        let blocks = u32::try_from(total.div_ceil(per))
-            .map_err(|_| refuse(OP, format!("the grid will not launch: {total} head rows")))?;
+    if let Some((lph, lanes, total)) = head_lanes(
+        OP,
+        y,
+        head_dim,
+        &[x.ptr, gate.ptr, y.ptr, weight.map_or(0, |w| w.ptr)],
+    )? {
         return ctx.fire(
             OP,
             Fire::at(
                 FILE,
                 symbol(&format!("::pie::elemwise::rmsnorm_gated_f32_lanes<{t}, {lph}>")),
             )
-            .apply(Launch::per_row(blocks, BLOCK)),
+            .apply(lanes),
             &[
                 x.arg(),
                 gate.arg(),
                 weight.map_or(ArgValue::ABSENT, |w| w.arg()),
                 y.arg(),
-                i64::try_from(total).unwrap_or(i64::MAX).arg(),
+                total.arg(),
                 eps.arg(),
                 i32::from(sigmoid_gate).arg(),
                 heads.arg(),
