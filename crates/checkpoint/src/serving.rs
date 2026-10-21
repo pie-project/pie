@@ -106,6 +106,15 @@ fn without_kv(name: &str) -> String {
         Some(at) => {
             let rest = &name[at + "-kv-".len()..];
             let tail = rest.find('-').map_or("", |end| &rest[end..]);
+            // Nor does a YaRN stretch (`-yarn{f}`): it turns the rotation, no
+            // plane.
+            let tail = match tail.strip_prefix("-yarn") {
+                Some(after) => {
+                    let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+                    if digits > 0 { &after[digits..] } else { tail }
+                }
+                None => tail,
+            };
             format!("{}{tail}", &name[..at])
         }
         None => name.to_string(),
@@ -681,4 +690,23 @@ fn required_uint(attributes: &Value, field: Field) -> Result<u64, Error> {
 
 fn gcd_of(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd_of(b, a % b) }
+}
+
+#[cfg(test)]
+mod deployment_words {
+    use super::without_kv;
+
+    /// The kv dtype and a YaRN stretch are a config's to choose: an artifact
+    /// stamped without them serves a deployment with them.
+    #[test]
+    fn the_kv_and_a_yarn_stretch_leave_the_planes_alone() {
+        let base = without_kv("qwen3-0.6b-bf16-kv-bf16");
+        assert_eq!(without_kv("qwen3-0.6b-bf16-kv-e4m3"), base);
+        assert_eq!(without_kv("qwen3-0.6b-bf16-kv-bf16-yarn4"), base);
+        assert_eq!(
+            without_kv("qwen3-0.6b-bf16-kv-bf16-yarn4-tp2"),
+            without_kv("qwen3-0.6b-bf16-kv-bf16-tp2")
+        );
+        assert_ne!(without_kv("qwen3-0.6b-bf16-kv-bf16-tp2"), base);
+    }
 }

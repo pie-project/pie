@@ -453,6 +453,45 @@ fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+/// `[model] rope_scaling`: the YaRN a deployment stretches its model's
+/// native context by.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RopeScalingConfig {
+    #[serde(alias = "type")]
+    pub rope_type: String,
+    pub factor: f64,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<u32>,
+}
+
+impl RopeScalingConfig {
+    /// The whole YaRN factor this states.
+    ///
+    /// # Errors
+    ///
+    /// A type other than YaRN, or a factor not a whole number past one.
+    pub fn yarn(&self) -> Result<u32> {
+        ensure!(
+            self.rope_type == "yarn",
+            "model.rope_scaling: pie stretches a served context by YaRN, not {:?}; other \
+             scalings are what a model's own package states",
+            self.rope_type
+        );
+        ensure!(
+            self.factor > 1.0 && self.factor.fract() == 0.0 && self.factor < 1024.0,
+            "model.rope_scaling.factor is a whole number past 1, not {}",
+            self.factor
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "checked whole and in range above"
+        )]
+        Ok(self.factor as u32)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
@@ -482,6 +521,14 @@ pub struct ModelConfig {
     /// carries.
     #[serde(default)]
     pub drafter: Option<String>,
+    /// A rope scaling to serve the model past its native context, as
+    /// config.json (or vLLM's `--hf-overrides`) spells one: `{ rope_type =
+    /// "yarn", factor = 4 }`, the factor whole, its
+    /// `original_max_position_embeddings` the package's native context.
+    /// Unstated, a YaRN the checkpoint's config.json states is served where
+    /// the model's package does not turn one on its own.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
     /// Which backend runs the model, on what devices.
     pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
@@ -786,6 +833,15 @@ impl ModelConfig {
             off,
             drafter,
             tp: None,
+            yarn: self
+                .rope_scaling
+                .as_ref()
+                .map(RopeScalingConfig::yarn)
+                .transpose()?,
+            yarn_original: self
+                .rope_scaling
+                .as_ref()
+                .and_then(|r| r.original_max_position_embeddings),
         })
     }
 

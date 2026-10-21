@@ -52,6 +52,66 @@ pub struct Overrides {
     /// `Some(None)` serves without the checkpoint's drafter.
     pub drafter: Option<Option<String>>,
     pub tp: Option<u32>,
+    /// A YaRN factor to stretch the model's native context by, where its
+    /// package turns one; unstated, the factor the checkpoint's config.json
+    /// states, where its package does not already scale its rotation.
+    pub yarn: Option<u32>,
+    /// The native context `yarn` stretches, where the config states it; else
+    /// the length the checkpoint's config.json declares.
+    pub yarn_original: Option<u32>,
+}
+
+/// The YaRN factor the config.json `config` states (`rope_scaling` or
+/// `rope_parameters`, whole), if it states one that stretches.
+#[must_use]
+pub fn yarn_of(config: &[u8]) -> Option<u32> {
+    let config: serde_json::Value = serde_json::from_slice(config).ok()?;
+    let text = config
+        .get("text_config")
+        .filter(|t| t.is_object())
+        .unwrap_or(&config);
+    let rope = ["rope_scaling", "rope_parameters"]
+        .iter()
+        .find_map(|key| text.get(*key).or_else(|| config.get(*key)))?;
+    let kind = rope
+        .get("rope_type")
+        .or_else(|| rope.get("type"))
+        .and_then(serde_json::Value::as_str)?;
+    let factor = rope.get("factor").and_then(serde_json::Value::as_f64)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a whole factor past one, checked below"
+    )]
+    (kind == "yarn" && factor > 1.0 && factor.fract() == 0.0 && factor < 1024.0)
+        .then_some(factor as u32)
+}
+
+/// Whether some rotation of `trace` is scaled already: at stated
+/// frequencies, or by a package's own YaRN.
+fn scales_its_rotation(trace: &Trace) -> bool {
+    use poem_ir::{Elementwise, Operation};
+    trace.nodes.iter().any(|node| {
+        matches!(
+            &node.op,
+            Operation::Elementwise(
+                Elementwise::RopeFull { freqs: Some(_), .. }
+                    | Elementwise::RopePartial { freqs: Some(_), .. }
+                    | Elementwise::RopePartialQ { freqs: Some(_), .. }
+                    | Elementwise::RopeMrope { freqs: Some(_), .. }
+                    | Elementwise::RopeYarn { .. }
+                    | Elementwise::RopePartialLast { yarn: Some(_), .. }
+            )
+        )
+    })
+}
+
+/// The config.json an artifact carries, if any.
+fn carried_config(artifact: &Path) -> Option<Vec<u8>> {
+    let metadata = parse_metadata(artifact).ok()?;
+    checkpoint::file::read::read_meta(&metadata, "model/config")
+        .ok()
+        .flatten()
 }
 
 /// The deployment `base` becomes under `overrides`, checked on `platform`.
@@ -105,6 +165,9 @@ fn composed(
     }
     if let Some(tp) = overrides.tp {
         deploy.tp = tp;
+    }
+    if let Some(factor) = overrides.yarn {
+        deploy.yarn = Some(factor);
     }
     Ok(deploy)
 }
@@ -442,7 +505,35 @@ pub fn request(
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
     let trace = if stamp_of(checkpoint)?.is_some() {
-        let (name, _, trace) = packaged(checkpoint, overrides, platform)?;
+        let (mut name, _, mut trace) = packaged(checkpoint, overrides, platform)?;
+        // A YaRN the checkpoint's config.json states and its package does
+        // not turn on its own is served as the deployment's stretch, where
+        // the package takes one; never twice.
+        if overrides.yarn.is_none()
+            && let Some(factor) = carried_config(checkpoint).as_deref().and_then(yarn_of)
+            && !scales_its_rotation(&trace)
+        {
+            let stretched = Overrides {
+                yarn: Some(factor),
+                ..overrides.clone()
+            };
+            match packaged(checkpoint, &stretched, platform) {
+                Ok((n, _, t)) => {
+                    tracing::info!(
+                        deployment = n,
+                        factor,
+                        "the checkpoint's config.json stretches its context by YaRN"
+                    );
+                    (name, trace) = (n, t);
+                }
+                Err(why) => tracing::warn!(
+                    deployment = name,
+                    factor,
+                    "the checkpoint's config.json states a YaRN this package does not turn \
+                     ({why:#}); serving its native rotation"
+                ),
+            }
+        }
         tracing::info!(deployment = name, ?checkpoint, "serving its package");
         trace
     } else {

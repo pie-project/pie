@@ -67,11 +67,13 @@ impl Model {
 /// The context the checkpoint's config declares, as vLLM derives its
 /// default `max_model_len`: the least of the length keys the (text) config
 /// states, stretched by a rope scaling's factor where the scaling leaves the
-/// stated length unscaled (linear, dynamic); `stretch`, a yarn factor the
-/// deployment turns at on top of the config, stretches it too. `None` where
+/// stated length unscaled (linear, dynamic), a YaRN reaching at least its
+/// original length times its factor; `stretch`, a YaRN factor and the native
+/// length it stretches (the stated one unless given) the deployment turns at
+/// instead of the config's, gives the stretched length. `None` where
 /// the config states no length.
 #[must_use]
-pub fn declared_context(config: &[u8], stretch: Option<f64>) -> Option<u32> {
+pub fn declared_context(config: &[u8], stretch: Option<(f64, Option<f64>)>) -> Option<u32> {
     const KEYS: [&str; 9] = [
         "max_position_embeddings",
         "n_positions",
@@ -101,7 +103,11 @@ pub fn declared_context(config: &[u8], stretch: Option<f64>) -> Option<u32> {
             .filter_map(|key| c.get(*key).and_then(serde_json::Value::as_f64))
             .reduce(f64::min)
     };
-    let mut context = length(text).or_else(|| length(&config))?;
+    let stated = length(text).or_else(|| length(&config))?;
+    if let Some((factor, original)) = stretch {
+        return whole(original.unwrap_or(stated) * factor);
+    }
+    let mut context = stated;
     let scalings = ["rope_scaling", "rope_parameters"]
         .iter()
         .filter_map(|key| text.get(*key).or_else(|| config.get(*key)))
@@ -143,10 +149,24 @@ pub fn declared_context(config: &[u8], stretch: Option<f64>) -> Option<u32> {
             context *= factor;
             break;
         }
+        // A YaRN reaches its original length times its factor, which a
+        // config that added the scaling by hand leaves its length short of.
+        for rope in &each {
+            if rope.get("rope_type").or_else(|| rope.get("type")) == Some(&"yarn".into())
+                && let (Some(factor), Some(original)) = (
+                    rope.get("factor").and_then(serde_json::Value::as_f64),
+                    rope.get("original_max_position_embeddings")
+                        .and_then(serde_json::Value::as_f64),
+                )
+            {
+                context = context.max(original * factor);
+            }
+        }
     }
-    if let Some(stretch) = stretch {
-        context *= stretch;
-    }
+    whole(context)
+}
+
+fn whole(context: f64) -> Option<u32> {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -482,7 +502,14 @@ mod tests {
     fn a_config_declares_its_context() {
         let qwen3 = br#"{"max_position_embeddings": 40960, "rope_scaling": null}"#;
         assert_eq!(declared_context(qwen3, None), Some(40960));
-        assert_eq!(declared_context(qwen3, Some(4.0)), Some(163_840));
+        assert_eq!(declared_context(qwen3, Some((4.0, None))), Some(163_840));
+        assert_eq!(
+            declared_context(qwen3, Some((4.0, Some(32768.0)))),
+            Some(131_072)
+        );
+        let added = br#"{"max_position_embeddings": 40960, "rope_scaling":
+            {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}}"#;
+        assert_eq!(declared_context(added, None), Some(131_072));
         let gptoss = br#"{"max_position_embeddings": 131072, "rope_scaling":
             {"rope_type": "yarn", "factor": 32.0, "original_max_position_embeddings": 4096}}"#;
         assert_eq!(declared_context(gptoss, None), Some(131_072));

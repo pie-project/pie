@@ -256,9 +256,14 @@ fn declared_context(
     snapshot_dir: &Path,
     overrides: &runtime::engine::load::Overrides,
 ) -> Option<u32> {
-    let _ = overrides;
     let config = crate::weights::config_of(snapshot_dir).ok()?;
-    crate::weights::declared_context(&config, None)
+    let stretch = overrides.yarn.map(|factor| {
+        (
+            f64::from(factor),
+            overrides.yarn_original.map(f64::from),
+        )
+    });
+    crate::weights::declared_context(&config, stretch)
 }
 
 fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
