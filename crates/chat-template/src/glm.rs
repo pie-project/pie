@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::decode::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
-use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, special, specials};
+use crate::{
+    ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, special, specials,
+};
 
 pub const STOP_TOKENS: &[&str] = &["<|user|>", "<|observation|>", "<|endoftext|>"];
 const THINK_OPEN: &str = "<think>";
@@ -262,15 +264,35 @@ impl Instruct for Glm {
         tokens
     }
 
-    fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
-        if self.style == Style::Glm5 {
+    fn answer(&self, name: &str, value: &str) -> Vec<u32> {
+        self.answers(&[(name.to_string(), value.to_string())])
+    }
+
+    /// Consecutive results under one observation marker.
+    fn answers(&self, results: &[(String, String)]) -> Vec<u32> {
+        if self.style == Style::Glm5 || results.is_empty() {
             return Vec::new();
         }
         let nl = self.gap();
         let mut tokens = vec![self.observation];
-        tokens.extend(self.tokenizer.encode(&format!(
-            "{nl}<tool_response>{nl}{value}{nl}</tool_response>"
-        )));
+        for (_, value) in results {
+            tokens.extend(self.tokenizer.encode(&format!(
+                "{nl}<tool_response>{nl}{value}{nl}</tool_response>"
+            )));
+        }
+        tokens
+    }
+
+    /// The opening: the tools' system turn, then the system message's, as
+    /// the template writes them.
+    fn open(&self, system: Option<&str>, tools: &[String], _effort: Option<Effort>) -> Vec<u32> {
+        if self.style == Style::Glm5 || tools.is_empty() {
+            return system.map(|msg| self.system(msg)).unwrap_or_default();
+        }
+        let mut tokens = self.equip(tools);
+        if let Some(msg) = system {
+            tokens.extend(self.turn(self.system_marker, msg));
+        }
         tokens
     }
 

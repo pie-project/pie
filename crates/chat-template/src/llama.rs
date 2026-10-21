@@ -10,7 +10,8 @@ use tokenizer::{Tokenizer, TokenizerDecoder};
 use crate::chatml::{JSON_GRAMMAR, tool_names};
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder};
 use crate::{
-    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special, specials,
+    ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special,
+    specials,
 };
 
 pub const STOP_TOKENS: &[&str] = &["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"];
@@ -152,6 +153,16 @@ impl Instruct for Llama {
     /// The tools open the conversation in a system turn of their own, as the
     /// reference writes it with no system message.
     fn equip(&self, tools: &[String]) -> Vec<u32> {
+        self.open(None, tools, None)
+    }
+
+    /// One opening system turn: under tools, `Environment: ipython`, the
+    /// dates, the tools and then the system message, as the reference writes
+    /// them (`tools_in_user_message: false`).
+    fn open(&self, system: Option<&str>, tools: &[String], _effort: Option<Effort>) -> Vec<u32> {
+        if tools.is_empty() {
+            return system.map(|msg| self.system(msg)).unwrap_or_default();
+        }
         let mut body = String::from(TOOLS);
         for tool in tools {
             let pretty = serde_json::from_str::<serde_json::Value>(tool)
@@ -161,6 +172,7 @@ impl Instruct for Llama {
             body.push_str(&pretty);
             body.push_str("\n\n");
         }
+        body.push_str(system.map(str::trim).unwrap_or_default());
         let mut tokens = vec![self.bos];
         tokens.extend(self.turn("system", &format!("Environment: ipython\n{DATES}{body}")));
         tokens

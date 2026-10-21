@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokenizer::Tokenizer;
 
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder};
-use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
+use crate::{ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
 
 pub const STOP_TOKENS: &[&str] = &["<|im_end|>", "<|endoftext|>"];
 
@@ -180,11 +180,30 @@ impl Instruct for Qwen3Coder {
         self.turn("system", &format!("{IDENTITY}{}", tools_section(tools)))
     }
 
-    fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
-        self.turn(
-            "user",
-            &format!("<tool_response>\n{value}\n</tool_response>\n"),
-        )
+    fn answer(&self, name: &str, value: &str) -> Vec<u32> {
+        self.answers(&[(name.to_string(), value.to_string())])
+    }
+
+    /// Consecutive results in one user turn.
+    fn answers(&self, results: &[(String, String)]) -> Vec<u32> {
+        if results.is_empty() {
+            return Vec::new();
+        }
+        let body: String = results
+            .iter()
+            .map(|(_, value)| format!("<tool_response>\n{value}\n</tool_response>\n"))
+            .collect();
+        self.turn("user", &body)
+    }
+
+    /// One opening system turn: the system message (or the coder's
+    /// identity) and the tools.
+    fn open(&self, system: Option<&str>, tools: &[String], _effort: Option<Effort>) -> Vec<u32> {
+        if tools.is_empty() {
+            return system.map(|msg| self.system(msg)).unwrap_or_default();
+        }
+        let first = system.unwrap_or(IDENTITY);
+        self.turn("system", &format!("{first}{}", tools_section(tools)))
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {

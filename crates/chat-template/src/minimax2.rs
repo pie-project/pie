@@ -13,7 +13,9 @@ use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::decode::{GenericChatDecoder, ThinkingDecoder};
 use crate::minimax::{lift_calls, py_json};
-use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, special, specials};
+use crate::{
+    ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, special, specials,
+};
 
 pub const STOP_TOKENS: &[&str] = &[EOS];
 
@@ -158,8 +160,33 @@ impl Instruct for MiniMax2 {
         ))
     }
 
-    fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
-        self.encode(&turn("tool", &format!("<response>{value}</response>")))
+    fn answer(&self, name: &str, value: &str) -> Vec<u32> {
+        self.answers(&[(name.to_string(), value.to_string())])
+    }
+
+    /// Consecutive results in one `tool` turn.
+    fn answers(&self, results: &[(String, String)]) -> Vec<u32> {
+        if results.is_empty() {
+            return Vec::new();
+        }
+        let body: Vec<String> = results
+            .iter()
+            .map(|(_, value)| format!("<response>{value}</response>"))
+            .collect();
+        self.encode(&turn("tool", &body.join("\n")))
+    }
+
+    /// One opening system turn: the system message (or the identity) and
+    /// the tools.
+    fn open(&self, system: Option<&str>, tools: &[String], _effort: Option<Effort>) -> Vec<u32> {
+        if tools.is_empty() {
+            return system.map(|msg| self.system(msg)).unwrap_or_default();
+        }
+        let first = system.unwrap_or(&self.identity);
+        self.encode(&format!(
+            "{BOD}{}",
+            turn("system", &format!("{first}{}", tools_section(tools)))
+        ))
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
