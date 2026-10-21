@@ -18,6 +18,20 @@ pub use root::{Features, Headers, Root, Toolchain, specific_of};
 
 use crate::error::Error;
 
+/// The current device's compute capability major, or `None` where the crate
+/// builds without CUDA (a kernel choice keyed on it then takes its default).
+#[must_use]
+pub(crate) fn cc_major() -> Option<u32> {
+    #[cfg(feature = "cuda")]
+    {
+        device::compute_capability_major()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
 #[must_use]
 pub const fn aligned16(addr: u64) -> bool {
     addr & 15 == 0
