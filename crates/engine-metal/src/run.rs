@@ -182,6 +182,23 @@ pub struct Run<'c> {
 
     /// Per value, the nodes that read it, made on first ask.
     readers: std::cell::OnceCell<Vec<Vec<u32>>>,
+
+    /// The register tile's input table the precast room holds, if one does.
+    table: std::cell::Cell<Option<Laid>>,
+}
+
+/// A register-tile input table standing in the precast room: `act`'s rows as
+/// the tile's lanes take them, laid in this walk's region, run and pass, with
+/// `counters` arrival counters zeroed. Another matmul of `act` there reads it
+/// rather than laying it again; anything else that takes a scratch room the
+/// precast room overlaps knocks it down, and a value is written once a walk
+/// of its region, so `act` itself cannot change under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Laid {
+    act: ValueId,
+    place: (u32, u32, bool),
+    contraction: u32,
+    counters: u32,
 }
 
 /// Where a routed MLP that keeps its rows sorted, as Splash's does, has got
@@ -245,6 +262,7 @@ impl<'c> Run<'c> {
             tuning,
             chain: std::cell::Cell::new(None),
             readers: std::cell::OnceCell::new(),
+            table: std::cell::Cell::new(None),
         }
     }
 
@@ -568,6 +586,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn copy_room(&self, offset: u64, bytes: u64) -> Option<u32> {
+        self.table.set(None);
         Some(
             self.scratch
                 .copy(self.handles, offset, bytes)?
@@ -943,12 +962,14 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn routed_scratch(&self) -> Option<RoutedScratch> {
+        self.table.set(None);
         Some(self.scratch.routed(self.handles)?.unwrap_or_else(|fault| {
             panic!("the routed scratch this load reserved does not mint: {fault}")
         }))
     }
 
     pub(crate) fn index_scores(&self) -> Option<Tensor> {
+        self.table.set(None);
         Some(
             self.scratch
                 .index_scores(self.handles)?
@@ -990,6 +1011,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Option<Tensor> {
+        self.table.set(None);
         Some(
             self.scratch
                 .precast(self.handles, rows, contraction)?
@@ -1000,6 +1022,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Option<(Tensor, Tensor)> {
+        self.table.set(None);
         Some(
             self.scratch
                 .spatial_moments(self.handles, clips, groups)?
@@ -1009,7 +1032,51 @@ impl<'c> Run<'c> {
         )
     }
 
+    /// The register tile's input table for `act` in the precast room, and
+    /// whether it already stands there, laid by another matmul of `act` in
+    /// this region, run and pass with at least `counters` arrival counters
+    /// zeroed (each split matmul's last partition puts its counters back to
+    /// zero, so the next reader finds them so). A table laid now is
+    /// remembered as standing: the caller lays it before anything else runs.
+    pub(crate) fn register_table(
+        &self,
+        act: ValueId,
+        rows: u32,
+        contraction: u32,
+        counters: u32,
+    ) -> Option<(Tensor, bool)> {
+        let room = self
+            .scratch
+            .precast(self.handles, rows, contraction)?
+            .unwrap_or_else(|fault| {
+                panic!("the precast plane this load reserved does not mint: {fault}")
+            });
+        let place = (
+            self.place.region.get(),
+            self.place.run.get(),
+            self.place.tail.get(),
+        );
+        let standing = self.table.get().is_some_and(|laid| {
+            laid.act == act
+                && laid.place == place
+                && laid.contraction == contraction
+                && laid.counters >= counters
+        });
+        if !standing {
+            self.table.set(Some(Laid {
+                act,
+                place,
+                contraction,
+                counters,
+            }));
+        }
+        Some((room, standing))
+    }
+
     pub(crate) fn partials(&self, rows: u32, width: u32) -> Option<Tensor> {
+        if !self.scratch.partials_clear_of_precast() {
+            self.table.set(None);
+        }
         Some(
             self.scratch
                 .partials(self.handles, rows, width)?

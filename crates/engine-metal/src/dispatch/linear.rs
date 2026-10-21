@@ -112,6 +112,7 @@ impl Run<'_> {
             linear::quant::Scratch {
                 precast: &|rows, contraction| self.precast(rows, contraction),
                 partials: &|rows, width| self.partials(rows, width),
+                table: None,
             },
             self.capacity(act).min(self.capacity(y)),
         )?;
@@ -146,6 +147,7 @@ impl Run<'_> {
         let scratch = || linear::quant::Scratch {
             precast: &precast,
             partials: &partials,
+            table: None,
         };
         let (x, gate, hidden, out) = (at(act), at(packed), at(h), at(y));
         linear::quant::matmul(
@@ -210,6 +212,7 @@ impl Run<'_> {
         let scratch = || linear::quant::Scratch {
             precast: &precast,
             partials: &partials,
+            table: None,
         };
         let rows = self.capacity(act);
         linear::quant::matmul(
@@ -270,6 +273,8 @@ impl Run<'_> {
                     {
                         return self.matmul_split(ane, &plan, *act, *y);
                     }
+                    // The matmuls of one activation (a layer's projections of
+                    // its normed rows) share the register tile's input table.
                     linear::quant::matmul(
                         self.ctx(),
                         self.tuning(),
@@ -279,6 +284,9 @@ impl Run<'_> {
                         linear::quant::Scratch {
                             precast: &|rows, contraction| self.precast(rows, contraction),
                             partials: &|rows, width| self.partials(rows, width),
+                            table: Some(&|rows, contraction, counters| {
+                                self.register_table(*act, rows, contraction, counters)
+                            }),
                         },
                         self.capacity(*act).min(self.capacity(*y)),
                     )
@@ -300,6 +308,7 @@ impl Run<'_> {
                     linear::quant::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
                         partials: &|rows, width| self.partials(rows, width),
+                        table: None,
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
