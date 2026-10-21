@@ -584,6 +584,7 @@ impl Run<'_> {
                 span,
                 q_out,
                 k_out,
+                freqs: None,
             },
         )?;
         DispatchAttention::dispatch(
