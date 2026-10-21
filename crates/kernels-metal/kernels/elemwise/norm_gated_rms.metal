@@ -130,3 +130,80 @@ instantiate_gated_rms(bfloat16, bfloat, bfloat)
 instantiate_gated_rms(f32_bfloat16, float, bfloat)
 
 instantiate_gated_rms_sigmoid(f32_bfloat16, float, bfloat)
+
+// One 32-input half (`q` of 64-input group `h`) of row `row` of the register
+// tile's input table (`qmm_sg_table` in linear/quant_qmm_sg.metal), from that
+// row's inputs at `src` (indexed by input): each input at its lane slot, the
+// 32 summed in the order `qmm_sg_table` adds them. A row past the rows the
+// matmul reads is laid as zeros (`live` false).
+METAL_FUNC void lay_register_half(
+    const device bfloat* src, bool live, device bfloat* table, uint width, uint row,
+    uint h, uint q) {
+  // The sums add in `qmm_sg_table`'s order, not one the compiler picks.
+#pragma clang fp reassociate(off)
+  const uint c = row >> 1, r = row & 1;
+  float part[2][2];
+  for (uint cl = 0; cl < 2; ++cl) {
+    const uint cp = 2 * q + cl;
+    for (uint i = 0; i < 2; ++i) {
+      const uint fm = 2 * cp + i;
+      float sum = 0.0f;
+      for (uint j = 0; j < 2; ++j)
+        for (uint p = 0; p < 4; ++p) {
+          const uint k = 64 * h + 8 * (2 * cp + j) + p + 4 * i;
+          const bfloat v = live ? src[k] : bfloat(0.0f);
+          table[(ulong(h) * 32 + fm * 4 + c) * 16 + 8 * j + 2 * p + r] = v;
+          sum += float(v);
+        }
+      part[cl][i] = sum;
+    }
+  }
+  device float* sums = reinterpret_cast<device float*>(table + 8 * ulong(width));
+  sums[(2 * ulong(h) + q) * 8 + row] = (part[0][0] + part[0][1]) + (part[1][0] + part[1][1]);
+}
+
+// gated_rms (f32 rows, bf16 gate and output, SiLU gate) that also lays the
+// register tile's input table of the rows it writes, so the out projection
+// runs no table pass: a threadgroup per head and row lays its head's columns
+// once the row's values are written, the first row's threadgroups lay the
+// rows past `rows` as zeros, and the first threadgroup zeroes the split
+// tile's `counters` arrival counters. Bit for bit `qmm_sg_table`'s table.
+[[kernel]] void gated_rms_table_f32_bfloat16(
+    const device float* x      [[buffer(0)]],
+    const device bfloat* z     [[buffer(1)]],
+    const device float* w      [[buffer(2)]],
+    device bfloat* out         [[buffer(3)]],
+    const constant float& eps  [[buffer(4)]],
+    const constant uint& vd    [[buffer(5)]],
+    device bfloat* table       [[buffer(6)]],
+    const constant uint& rows  [[buffer(7)]],
+    const constant uint& counters [[buffer(8)]],
+    uint3 tgpos       [[threadgroup_position_in_grid]],
+    uint3 tpg         [[threadgroups_per_grid]],
+    uint3 lid3        [[thread_position_in_threadgroup]],
+    uint  simd_lane   [[thread_index_in_simdgroup]],
+    uint  simd_group  [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  const uint lid = lid3.x;
+  const size_t idx =
+      size_t(tgpos.z * tpg.y + tgpos.y) * vd + lid;
+  gated_rms_body<float, bfloat, true>(
+      x, z, w, out, eps, vd, idx, lid,
+      inv_rms, partials, simd_lane, simd_group);
+  // The head's writes, seen by every thread of its threadgroup.
+  threadgroup_barrier(mem_flags::mem_device);
+  const uint width = tpg.y * vd, row = tgpos.z;
+  const device bfloat* src = out + size_t(row) * width;
+  for (uint t = lid; t < vd / 32; t += vd) {
+    const uint at = tgpos.y * vd + 32 * t;
+    lay_register_half(src, true, table, width, row, at / 64, (at / 32) & 1);
+    if (row == 0)
+      for (uint gone = rows; gone < 8; ++gone)
+        lay_register_half(src, false, table, width, gone, at / 64, (at / 32) & 1);
+  }
+  if (row == 0 && tgpos.y == 0) {
+    device uint* count = reinterpret_cast<device uint*>(table + 8 * ulong(width)) + width / 4;
+    for (uint n = lid; n < counters; n += vd)
+      count[n] = 0;
+  }
+}

@@ -24,13 +24,7 @@ impl Run<'_> {
             } => {
                 // The normed rows' projections on the register tile read
                 // their input table as this norm lays it.
-                let width = self.tensor(*out).width;
-                let laid = self.register_readers(*out).and_then(|counters| {
-                    let rows = (17 * width + 4 * counters).div_ceil(2 * width);
-                    let (table, _) = self.register_table(*out, rows, width, counters)?;
-                    Some((table, counters))
-                });
-                if let Some((table, counters)) = laid {
+                if let Some((table, counters)) = self.producer_table(*out) {
                     return elemwise::norm::residual_add_rmsnorm_table(
                         self.ctx(),
                         self.tensor(*x),
@@ -370,16 +364,39 @@ impl Run<'_> {
                 eps,
                 act,
                 y,
-            } => elemwise::norm::rmsnorm_gated(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                matches!(act, poem_ir::GateActivation::Sigmoid),
-                self.tensor(*y),
-            ),
+            } => {
+                let sigmoid = matches!(act, poem_ir::GateActivation::Sigmoid);
+                // The out projection on the register tile reads its input
+                // table as the norm lays it.
+                let laid = (!sigmoid
+                    && self.tensor(*x).dtype == poem_ir::Dtype::F32
+                    && head_dim.is_multiple_of(32))
+                .then(|| self.producer_table(*y))
+                .flatten();
+                match laid {
+                    Some((table, counters)) => elemwise::norm::rmsnorm_gated_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*gate),
+                        self.tensor(*weight),
+                        *head_dim,
+                        *eps,
+                        self.tensor(*y),
+                        table,
+                        counters,
+                    ),
+                    None => elemwise::norm::rmsnorm_gated(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*gate),
+                        self.tensor(*weight),
+                        *head_dim,
+                        *eps,
+                        sigmoid,
+                        self.tensor(*y),
+                    ),
+                }
+            }
             Elementwise::RmsnormGatedBy {
                 x,
                 gate,
@@ -646,8 +663,21 @@ impl Run<'_> {
                 *interleaved,
             ),
 
-            Elementwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
+            Elementwise::GateSigmoidMul { x, gate, x_out } => {
+                // The gated rows' projection on the register tile reads its
+                // input table as the gate lays it.
+                match self.producer_table(*x_out) {
+                    Some((table, counters)) => elemwise::gate::sigmoid_mul_table(
+                        self.ctx(),
+                        self.tensor(*gate),
+                        self.tensor(*x),
+                        table,
+                        counters,
+                    ),
+                    None => {
+                        elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
+                    }
+                }
             }
 
             Elementwise::HcExpand { x, streams, y } => {

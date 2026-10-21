@@ -63,30 +63,39 @@ instantiate_packed_swiglu(bfloat16, bfloat)
   const uint c = row >> 1, r = row & 1;
   const bool live = row < rows;
   const size_t at = size_t(row) * size_t(width);
-  float part[2][2];
-  for (uint cl = 0; cl < 2; ++cl) {
-    const uint cp = 2 * q + cl;
-    for (uint i = 0; i < 2; ++i) {
-      const uint fm = 2 * cp + i;
-      float sum = 0.0f;
-      for (uint j = 0; j < 2; ++j)
-        for (uint p = 0; p < 4; ++p) {
-          const uint k = 64 * h + 8 * (2 * cp + j) + p + 4 * i;
-          bfloat v = bfloat(0.0f);
-          if (live) {
-            const float g = float(packed[at * 2 + k]);
-            const float u = float(packed[at * 2 + width + k]);
-            v = static_cast<bfloat>((g / (1.0f + metal::exp(-g))) * u);
-            out[at + k] = v;
-          }
-          table[(ulong(h) * 32 + fm * 4 + c) * 16 + 8 * j + 2 * p + r] = v;
-          sum += float(v);
-        }
-      part[cl][i] = sum;
+  // The 32 inputs in the tile's (cl, i, j, p) order, written as packed_swiglu writes them.
+  bfloat v[32];
+  for (uint n = 0; n < 32; ++n) {
+    const uint cl = n >> 4, i = (n >> 3) & 1, j = (n >> 2) & 1, p = n & 3;
+    const uint k = 64 * h + 8 * (2 * (2 * q + cl) + j) + p + 4 * i;
+    v[n] = bfloat(0.0f);
+    if (live) {
+      const float g = float(packed[at * 2 + k]);
+      const float u = float(packed[at * 2 + width + k]);
+      v[n] = static_cast<bfloat>((g / (1.0f + metal::exp(-g))) * u);
+      out[at + k] = v[n];
     }
   }
+  float part[2][2];
+  {
+    // The sums add in `qmm_sg_table`'s order, not one the compiler picks.
+#pragma clang fp reassociate(off)
+    for (uint cl = 0; cl < 2; ++cl)
+      for (uint i = 0; i < 2; ++i) {
+        const uint fm = 2 * (2 * q + cl) + i;
+        float sum = 0.0f;
+        for (uint j = 0; j < 2; ++j)
+          for (uint p = 0; p < 4; ++p) {
+            const bfloat x = v[16 * cl + 8 * i + 4 * j + p];
+            table[(ulong(h) * 32 + fm * 4 + c) * 16 + 8 * j + 2 * p + r] = x;
+            sum += float(x);
+          }
+        part[cl][i] = sum;
+      }
+    device float* sums = reinterpret_cast<device float*>(table + 8 * ulong(width));
+    sums[(2 * ulong(h) + q) * 8 + row] = (part[0][0] + part[0][1]) + (part[1][0] + part[1][1]);
+  }
   device float* sums = reinterpret_cast<device float*>(table + 8 * ulong(width));
-  sums[(2 * ulong(h) + q) * 8 + row] = (part[0][0] + part[0][1]) + (part[1][0] + part[1][1]);
   device uint* count = reinterpret_cast<device uint*>(sums) + width / 4;
   for (uint n = gid.y * grid.x + gid.x; n < counters; n += grid.x * grid.y)
     count[n] = 0;

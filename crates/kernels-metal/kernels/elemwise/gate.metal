@@ -85,3 +85,61 @@ template <typename T>
       const constant uint&, const constant float&, uint2);
 
 instantiate_gate_sigmoid_mul_heads(bfloat16, bfloat)
+
+// One 32-input half (`q` of 64-input group `h`) of row `row` of the register
+// tile's input table (`qmm_sg_table` in linear/quant_qmm_sg.metal), from that
+// row's inputs at `src` (indexed by input): each input at its lane slot, the
+// 32 summed in the order `qmm_sg_table` adds them. A row past the rows the
+// matmul reads is laid as zeros (`live` false).
+METAL_FUNC void lay_register_half(
+    const device bfloat* src, bool live, device bfloat* table, uint width, uint row,
+    uint h, uint q) {
+  // The sums add in `qmm_sg_table`'s order, not one the compiler picks.
+#pragma clang fp reassociate(off)
+  const uint c = row >> 1, r = row & 1;
+  float part[2][2];
+  for (uint cl = 0; cl < 2; ++cl) {
+    const uint cp = 2 * q + cl;
+    for (uint i = 0; i < 2; ++i) {
+      const uint fm = 2 * cp + i;
+      float sum = 0.0f;
+      for (uint j = 0; j < 2; ++j)
+        for (uint p = 0; p < 4; ++p) {
+          const uint k = 64 * h + 8 * (2 * cp + j) + p + 4 * i;
+          const bfloat v = live ? src[k] : bfloat(0.0f);
+          table[(ulong(h) * 32 + fm * 4 + c) * 16 + 8 * j + 2 * p + r] = v;
+          sum += float(v);
+        }
+      part[cl][i] = sum;
+    }
+  }
+  device float* sums = reinterpret_cast<device float*>(table + 8 * ulong(width));
+  sums[(2 * ulong(h) + q) * 8 + row] = (part[0][0] + part[0][1]) + (part[1][0] + part[1][1]);
+}
+
+// attn_gate over at most eight rows that also lays the register tile's input
+// table of the gated rows, so the out projection runs no table pass: a thread
+// per 32 inputs of a row (x: 64-input group x / 2, half x % 2; y: the row, of
+// the table's eight), rows past `rows` laid as zeros, the split tile's
+// `counters` arrival counters zeroed. Bit for bit `qmm_sg_table`'s table.
+[[kernel]] void gate_table_bfloat16(
+    device bfloat* attn         [[buffer(0)]],
+    const device bfloat* gate   [[buffer(1)]],
+    const constant int& width   [[buffer(2)]],
+    device bfloat* table        [[buffer(3)]],
+    const constant uint& rows   [[buffer(4)]],
+    const constant uint& counters [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]],
+    uint2 grid [[threads_per_grid]]) {
+  const uint row = tid.y, h = tid.x >> 1, q = tid.x & 1;
+  const bool live = row < rows;
+  device bfloat* x = attn + size_t(row) * size_t(width);
+  const device bfloat* g = gate + size_t(row) * size_t(width);
+  if (live)
+    for (uint k = 32 * tid.x; k < 32 * tid.x + 32; ++k)
+      x[k] = x[k] * sigmoid_mlx(g[k]);
+  lay_register_half(x, live, table, uint(width), row, h, q);
+  device uint* count = reinterpret_cast<device uint*>(table + 8 * ulong(width)) + width / 4;
+  for (uint n = tid.y * grid.x + tid.x; n < counters; n += grid.x * grid.y)
+    count[n] = 0;
+}
