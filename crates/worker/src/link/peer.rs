@@ -215,13 +215,7 @@ impl Peer for PeerServer {
             request.tokens,
             request.from_page,
             request.home,
-            match request.delivery {
-                worker_api::peer::Delivery::Fetched => runtime::offload::prefill::Delivery::Fetched,
-                worker_api::peer::Delivery::InPlace => runtime::offload::prefill::Delivery::InPlace,
-                worker_api::peer::Delivery::Streamed => {
-                    runtime::offload::prefill::Delivery::Streamed
-                }
-            },
+            from_wire(request.delivery),
         )
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -291,10 +285,41 @@ pub async fn serve(listen: &str, hello: Hello) -> Result<std::net::SocketAddr> {
 
 struct Dialed {
     client: PeerClient,
+    /// The peer's worker id, as it greeted.
+    worker: WorkerId,
     /// This worker's bulk-bytes address, for the peer to fetch prefixes from.
     home: Option<String>,
     /// The key this worker reads the peer's kv in place by, if it can.
     kv: Option<u64>,
+    /// A call on the link failed: the peer is dialed afresh next time.
+    broken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Dialed {
+    fn broken(&self) -> bool {
+        self.broken.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The wire's name for how a pass's pages come back.
+fn to_wire(delivery: runtime::offload::prefill::Delivery) -> worker_api::peer::Delivery {
+    use runtime::offload::prefill::Delivery as Here;
+    use worker_api::peer::Delivery as Wire;
+    match delivery {
+        Here::Fetched => Wire::Fetched,
+        Here::InPlace => Wire::InPlace,
+        Here::Streamed => Wire::Streamed,
+    }
+}
+
+fn from_wire(delivery: worker_api::peer::Delivery) -> runtime::offload::prefill::Delivery {
+    use runtime::offload::prefill::Delivery as Here;
+    use worker_api::peer::Delivery as Wire;
+    match delivery {
+        Wire::Fetched => Here::Fetched,
+        Wire::InPlace => Here::InPlace,
+        Wire::Streamed => Here::Streamed,
+    }
 }
 
 impl runtime::offload::prefill::PrefillPeer for Dialed {
@@ -311,10 +336,12 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
 
     fn release(&self, lease: u64) -> BoxFuture<'static, Result<()>> {
         let client = self.client.clone();
+        let broken = self.broken.clone();
         Box::pin(async move {
             client
                 .release(tarpc::context::current(), lease)
                 .await
+                .inspect_err(|_| broken.store(true, std::sync::atomic::Ordering::Relaxed))
                 .context("the peer link")?
                 .map_err(|why| anyhow::anyhow!("the peer refused the release: {why}"))
         })
@@ -328,6 +355,7 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
     ) -> BoxFuture<'static, Result<runtime::offload::prefill::RemotePages>> {
         let client = self.client.clone();
         let home = self.home.clone();
+        let broken = self.broken.clone();
         Box::pin(async move {
             let mut ctx = tarpc::context::current();
             ctx.deadline = Instant::now() + PREFILL_DEADLINE;
@@ -339,20 +367,11 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
                         tokens,
                         from_page,
                         home,
-                        delivery: match delivery {
-                            runtime::offload::prefill::Delivery::Fetched => {
-                                worker_api::peer::Delivery::Fetched
-                            }
-                            runtime::offload::prefill::Delivery::InPlace => {
-                                worker_api::peer::Delivery::InPlace
-                            }
-                            runtime::offload::prefill::Delivery::Streamed => {
-                                worker_api::peer::Delivery::Streamed
-                            }
-                        },
+                        delivery: to_wire(delivery),
                     },
                 )
                 .await
+                .inspect_err(|_| broken.store(true, std::sync::atomic::Ordering::Relaxed))
                 .context("the peer link")?
                 .map_err(|why| anyhow::anyhow!("the peer refused: {why}"))?;
             tracing::debug!(target: "pie::offload", ms = t0.elapsed().as_millis() as u64, "the peer answered");
@@ -376,6 +395,7 @@ pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()
     let dialed = greet(addr, ours, listen).await?;
     tracing::info!(
         peer = %addr,
+        worker = %dialed.worker,
         in_place = dialed.kv.is_some(),
         "prefilling passes on a peer"
     );
@@ -415,8 +435,10 @@ async fn greet(addr: &str, ours: &Hello, listen: Option<String>) -> Result<Diale
     };
     Ok(Dialed {
         client,
+        worker: theirs.worker,
         home: listen,
         kv,
+        broken: Arc::default(),
     })
 }
 
@@ -428,21 +450,24 @@ pub fn set_hello(hello: Hello) {
 }
 
 /// Reaches the workers the cluster names by id: their links' addresses
-/// from the gateway's directory, each greeted once and kept while it stays
-/// where it was.
+/// from the gateway's directory (the link this worker reports on now), each
+/// greeted once and kept while it stays where it was and its calls succeed.
 struct GatewayDialer {
-    gateway: worker_api::GatewayInboundClient,
-    dialed: Mutex<HashMap<String, (String, Arc<Dialed>)>>,
+    gateway: Mutex<worker_api::GatewayInboundClient>,
+    dialed: Arc<Mutex<Reached>>,
 }
+
+/// The workers reached so far, by id: where each was, and its link.
+type Reached = HashMap<String, (String, Arc<Dialed>)>;
 
 impl runtime::offload::executors::Dialer for GatewayDialer {
     fn dial(
         &self,
         worker: String,
     ) -> BoxFuture<'static, Result<Arc<dyn runtime::offload::prefill::PrefillPeer>>> {
-        let gateway = self.gateway.clone();
+        let gateway = self.gateway.lock().unwrap().clone();
         let kept = self.dialed.lock().unwrap().get(&worker).cloned();
-        let dialer = DIALER.get().cloned();
+        let cache = self.dialed.clone();
         Box::pin(async move {
             let id: u64 = worker.parse().context("a worker id")?;
             let addr = gateway
@@ -452,6 +477,7 @@ impl runtime::offload::executors::Dialer for GatewayDialer {
                 .ok_or_else(|| anyhow::anyhow!("worker {worker} has no peer link"))?;
             if let Some((at, dialed)) = kept
                 && at == addr
+                && !dialed.broken()
             {
                 return Ok(dialed as Arc<dyn runtime::offload::prefill::PrefillPeer>);
             }
@@ -459,13 +485,10 @@ impl runtime::offload::executors::Dialer for GatewayDialer {
                 .get()
                 .ok_or_else(|| anyhow::anyhow!("this worker greets no peer"))?;
             let dialed = Arc::new(greet(&addr, hello, listen()).await?);
-            if let Some(dialer) = dialer {
-                dialer
-                    .dialed
-                    .lock()
-                    .unwrap()
-                    .insert(worker.clone(), (addr.clone(), dialed.clone()));
-            }
+            cache
+                .lock()
+                .unwrap()
+                .insert(worker.clone(), (addr.clone(), dialed.clone()));
             tracing::info!(%worker, peer = %addr, "an executor reached");
             Ok(dialed as Arc<dyn runtime::offload::prefill::PrefillPeer>)
         })
@@ -514,11 +537,13 @@ pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: Wor
     let dialer = DIALER
         .get_or_init(|| {
             Arc::new(GatewayDialer {
-                gateway: gateway.clone(),
-                dialed: Mutex::default(),
+                gateway: Mutex::new(gateway.clone()),
+                dialed: Arc::default(),
             })
         })
         .clone();
+    // A later link (the gateway restarted, or another one) is the one asked.
+    *dialer.gateway.lock().unwrap() = gateway.clone();
     runtime::offload::executors::set_dialer(Some(dialer));
     let peer = listen();
     let mut said: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();

@@ -79,7 +79,17 @@ impl Store for Dir {
 
     fn get(&self, keys: &[Key]) -> Vec<Option<Vec<u8>>> {
         keys.iter()
-            .map(|key| std::fs::read(self.dir.join(hex(key))).ok())
+            .map(|key| {
+                let path = self.dir.join(hex(key));
+                match std::fs::read(&path) {
+                    Ok(blob) => Some(blob),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "a kept page not read");
+                        None
+                    }
+                }
+            })
             .collect()
     }
 
@@ -223,11 +233,12 @@ mod objects {
                 .filter_map(|(name, len)| Some((name.as_str(), (*len)?)))
                 .collect();
             // One batch; if any of it is gone from the store, all of it is
-            // a miss.
+            // a miss, and what is gone is no longer told as kept.
             let mut got = match self.objects.get(&held) {
                 Ok(blobs) => blobs.into_iter(),
                 Err(error) => {
-                    tracing::debug!(%error, "pages not read from the object store");
+                    tracing::warn!(%error, "pages not read from the object store");
+                    self.forget_missing(keys, &names);
                     return vec![None; keys.len()];
                 }
             };
@@ -238,6 +249,27 @@ mod objects {
 
         fn keys(&self) -> Vec<Key> {
             self.log.lock().unwrap().lens.keys().copied().collect()
+        }
+    }
+
+    impl Objects {
+        /// Drops from the log's lengths the keys among `keys` whose objects
+        /// (`names`, one each) the store no longer has.
+        fn forget_missing(&self, keys: &[Key], names: &[String]) {
+            let asked: Vec<&str> = names.iter().map(String::as_str).collect();
+            match self.objects.exists(&asked) {
+                Ok(present) => {
+                    let mut log = self.log.lock().unwrap();
+                    for (key, present) in keys.iter().zip(present) {
+                        if !present {
+                            log.lens.remove(key);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "the object store would not say what it holds");
+                }
+            }
         }
     }
 

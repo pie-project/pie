@@ -19,8 +19,11 @@ pub struct Directory {
 #[derive(Default)]
 struct Inner {
     held: HashMap<WorkerId, HashSet<Key>>,
+    /// Where each worker serves its pages' bytes (the bulk link).
     peers: HashMap<WorkerId, String>,
-    /// Where each worker's peer link listens.
+    /// Where each worker's peer link listens, which takes others' passes.
+    /// Kept apart from `peers`: a pool serves bytes and no passes, and how
+    /// far apart a worker puts the two is its own affair.
     links: HashMap<WorkerId, String>,
     /// Runs workers keep whole from token 0, by their last key: the groups
     /// a cluster policy places.
@@ -175,6 +178,7 @@ impl Directory {
         self.inner.lock().unwrap().peers.get(&worker).cloned()
     }
 
+    /// `worker`'s peer link listens at `link`.
     pub fn report_link(&self, worker: WorkerId, link: String) {
         self.inner.lock().unwrap().links.insert(worker, link);
     }

@@ -146,7 +146,7 @@ impl Pool {
                 .put(&blobs)
                 .map_err(|e| format!("keeping pages in the pool's store: {e}"))?;
         }
-        let meta = Arc::new(pages.meta.clone());
+        let meta = Arc::new(pages.meta);
         let mut inner = self.inner.lock().unwrap();
         for (at, (key, bytes)) in keys
             .iter()

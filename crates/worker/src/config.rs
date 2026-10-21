@@ -24,23 +24,23 @@ pub use units::{ByteSize, Duration};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Client-facing listener.
-    /// OpenTelemetry export. Off by default.
-    /// Batching and timeout policy. Every field has a measured default; the
-    /// frame knobs are part of the guest contract.
-    /// The box an inferlet runs in: what it may reach, and how big it may get.
-    /// Distributed-cluster topology (controller + role + gateways). Absent, or
-    /// `controller` unset ⇒ single-node (gateway-free local inference).
-    /// Other workers' part in this one's passes, and its in theirs.
     #[serde(default)]
     pub server: ServerConfig,
+    /// OpenTelemetry export. Off by default.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Batching and timeout policy. Every field has a measured default; the
+    /// frame knobs are part of the guest contract.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// The box an inferlet runs in: what it may reach, and how big it may get.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Distributed-cluster topology (controller + role + gateways). Absent, or
+    /// `controller` unset ⇒ single-node (gateway-free local inference).
     #[serde(default)]
     pub cluster: ClusterConfig,
+    /// Other workers' part in this one's passes, and its in theirs.
     #[serde(default)]
     pub offload: OffloadConfig,
     /// The single `[model]` table. Pie serves exactly one model.
@@ -67,7 +67,7 @@ impl Config {
         })?;
         let reshaped = crate::config::layout::reshape(file)?;
         refuse_retired_keys(&reshaped)?;
-        refuse_retired_sections(&reshaped)?;
+        refuse_retired_config_keys(&reshaped)?;
         let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
         let cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
@@ -119,6 +119,7 @@ impl Config {
         self.runtime.validate()?;
         self.sandbox.validate()?;
         self.cluster.validate()?;
+        self.offload.validate()?;
         Ok(())
     }
 }
@@ -155,6 +156,17 @@ impl Default for OffloadConfig {
             peers: Vec::new(),
             pools: Vec::new(),
         }
+    }
+}
+
+impl OffloadConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            cfg!(feature = "nixl") || self.transfer != OffloadTransfer::Nixl,
+            "[offload] transfer = \"nixl\" needs a build with the `nixl` feature; \"auto\" \
+             reads in place where the build can"
+        );
+        Ok(())
     }
 }
 
@@ -536,9 +548,9 @@ const RETIRED: &[(&str, &str)] = &[
     ("total_pages", "[model] device_kv_budget, in bytes"),
 ];
 
-/// Keys of the remote executor and partner links, which are gone: a worker
-/// of any role runs a runtime, and peers' passes ride the peer link.
-const RETIRED_KEYS: &[(&str, &str)] = &[
+/// Config keys that are gone (dotted, from the file's top), each refused with
+/// what replaced it.
+const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
         "server.policy",
         "`[server] policies` lists the cluster policies, each granted its own writes",
@@ -557,8 +569,8 @@ const RETIRED_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-fn refuse_retired_sections(config: &toml::Table) -> Result<()> {
-    for (key, why) in RETIRED_KEYS {
+fn refuse_retired_config_keys(config: &toml::Table) -> Result<()> {
+    for (key, why) in RETIRED_CONFIG_KEYS {
         let mut at = Some(config);
         let mut parts = key.split('.').peekable();
         while let Some(part) = parts.next() {

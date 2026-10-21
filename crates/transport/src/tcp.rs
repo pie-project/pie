@@ -45,6 +45,11 @@ const PUT: &[u8; 4] = b"PIEP";
 const VERSION: u32 = 5;
 /// More keys than one sequence could hold is not a request.
 const MAX_KEYS: u32 = 1 << 20;
+/// More groups, spans a group or slots a page than a model's layers and
+/// planes could need is not an answer.
+const MAX_GROUPS: u32 = 1 << 16;
+const MAX_SPANS: u32 = 1 << 16;
+const MAX_SLOTS_PER_PAGE: u32 = 1 << 16;
 const SOCKET_BUFFER: usize = 16 << 20;
 /// What the asker reads into before handing a chunk on.
 const RECV_CHUNK_BYTES: usize = 32 << 20;
@@ -292,13 +297,21 @@ pub trait Source: Send + Sync + 'static {
     }
 }
 
-/// The slots as the link carries them: per page, then the hashes.
-fn put_slots(out: &mut Vec<u8>, slots: &[Key], count: usize) {
+/// The slots as the link carries them: per page, then the hashes. Each of
+/// `count` pages names as many.
+fn put_slots(out: &mut Vec<u8>, slots: &[Key], count: usize) -> Result<(), String> {
     let per_page = slots.len().checked_div(count).unwrap_or(0);
+    if per_page * count != slots.len() {
+        return Err(format!(
+            "{} slots do not divide among {count} pages",
+            slots.len()
+        ));
+    }
     out.extend_from_slice(&(per_page as u32).to_le_bytes());
     for slot in slots {
         out.extend_from_slice(slot);
     }
+    Ok(())
 }
 
 fn put_groups(out: &mut Vec<u8>, groups: &Groups) {
@@ -314,13 +327,13 @@ fn put_groups(out: &mut Vec<u8>, groups: &Groups) {
 
 async fn read_groups(stream: &mut TcpStream) -> std::io::Result<Groups> {
     let count = stream.read_u32_le().await?;
-    if count > 1 << 16 {
+    if count > MAX_GROUPS {
         return Err(std::io::Error::other("too many groups"));
     }
     let mut groups = Groups::with_capacity(count as usize);
     for _ in 0..count {
         let spans = stream.read_u32_le().await?;
-        if spans > 1 << 16 {
+        if spans > MAX_SPANS {
             return Err(std::io::Error::other("too many spans a group"));
         }
         let mut group = Vec::with_capacity(spans as usize);
@@ -333,9 +346,14 @@ async fn read_groups(stream: &mut TcpStream) -> std::io::Result<Groups> {
 }
 
 async fn read_slots(stream: &mut TcpStream, count: usize) -> std::io::Result<Vec<Key>> {
-    let per_page = stream.read_u32_le().await? as usize;
-    if per_page > 1 << 16 {
+    let per_page = stream.read_u32_le().await?;
+    if per_page > MAX_SLOTS_PER_PAGE {
         return Err(std::io::Error::other("too many slots a page"));
+    }
+    let per_page = per_page as usize;
+    // As many as one sequence's keys, whatever the header says.
+    if per_page.saturating_mul(count) > MAX_KEYS as usize {
+        return Err(std::io::Error::other("more slots than a sequence holds"));
     }
     let mut slots = vec![[0u8; 32]; per_page * count];
     for slot in &mut slots {
@@ -432,7 +450,7 @@ async fn answer(mut stream: TcpStream, source: &dyn Source) -> std::io::Result<(
                 head.extend_from_slice(&(answer.page_bytes as u64).to_le_bytes());
                 head.extend_from_slice(&(answer.meta.len() as u32).to_le_bytes());
                 head.extend_from_slice(&answer.meta);
-                put_slots(&mut head, &answer.slots, answer.count);
+                put_slots(&mut head, &answer.slots, answer.count).map_err(std::io::Error::other)?;
                 put_groups(&mut head, &answer.groups);
                 stream.write_all(&head).await?;
                 // A grouped answer's parts carry their heads; the asker
@@ -582,7 +600,7 @@ pub async fn put(addr: &str, keys: &[Key], pages: &Pages) -> Result<(), String> 
     head.extend_from_slice(&(pages.page_bytes() as u64).to_le_bytes());
     head.extend_from_slice(&(pages.meta.len() as u32).to_le_bytes());
     head.extend_from_slice(&pages.meta);
-    put_slots(&mut head, &pages.slots, pages.count);
+    put_slots(&mut head, &pages.slots, pages.count)?;
     stream.write_all(&head).await.map_err(io)?;
     stream.write_all(&pages.data).await.map_err(io)?;
     if stream.read_u8().await.map_err(io)? == 0 {

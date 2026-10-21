@@ -19,14 +19,11 @@ const LINK_HEAL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_DEADLINE: Duration = Duration::from_secs(300);
 const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
-fn restart_after_lost_registration(kind: &str) -> ! {
+fn restart_after_lost_registration() -> ! {
     #[cfg(test)]
-    panic!("controller requested {kind} re-registration");
+    panic!("controller requested worker re-registration");
     #[cfg(not(test))]
-    {
-        let _ = kind;
-        std::process::abort();
-    }
+    std::process::abort();
 }
 
 pub trait ControlLink: Clone + Send + Sync + 'static {
@@ -316,7 +313,7 @@ pub fn spawn_control_tasks<C: ControlLink>(
                             granted = %id,
                             "the controller gave this worker another id; restarting worker"
                         );
-                        restart_after_lost_registration("worker");
+                        restart_after_lost_registration();
                     }
                     Err(e) => tracing::warn!(
                         worker = %worker_id,

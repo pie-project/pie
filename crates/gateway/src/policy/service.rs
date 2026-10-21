@@ -673,9 +673,9 @@ struct Registry {
     replication: Vec<wit::Replicate>,
     /// Replications asked for, by (group, worker), and when.
     asked: HashMap<(String, String), std::time::Instant>,
-    /// The directory was heard since the table was last enacted.
+    /// The directory was heard since `replicate` last ran.
     ticked: bool,
-    /// The table was replaced since it was last enacted.
+    /// The replication table was replaced since `replicate` last ran.
     replaced: bool,
     /// What each worker's policy published about it, by name.
     published: HashMap<String, HashMap<String, serde_json::Value>>,

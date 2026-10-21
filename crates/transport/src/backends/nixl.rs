@@ -24,7 +24,7 @@ fn err(ctx: &str, st: nixl_capi_status_t) -> TransportError {
 
 /// The NIXL segment a domain's memory registers as, and its device id: host
 /// memory as DRAM, a CUDA or ROCm device's as VRAM. The rest (Metal, Vulkan,
-/// wgpu, XLA memory, a slot file) NIXL cannot reach.
+/// wgpu, XLA, Cerebras memory, a slot file) NIXL cannot reach.
 fn segment(domain: MemoryDomain) -> Result<(nixl_capi_mem_type_t, u64)> {
     match domain {
         MemoryDomain::HostPinned => Ok((nixl_capi_mem_type_t_NIXL_CAPI_MEM_DRAM, 0)),
@@ -36,6 +36,7 @@ fn segment(domain: MemoryDomain) -> Result<(nixl_capi_mem_type_t, u64)> {
         | MemoryDomain::VulkanDevice(_)
         | MemoryDomain::WgpuDevice(_)
         | MemoryDomain::XlaDevice(_)
+        | MemoryDomain::CerebrasDevice(_)
         | MemoryDomain::LocalDisk => Err(TransportError::Unsupported(
             "NIXL reaches host memory and CUDA or ROCm device memory only",
         )),
@@ -402,11 +403,12 @@ mod tests {
         }
     }
 
-    fn host(bytes: &[u8]) -> KvHandle {
+    /// A host region at `base`, `len` bytes: NIXL reads or writes it.
+    fn host(base: *mut u8, len: usize) -> KvHandle {
         KvHandle {
             regions: vec![KvRegion {
-                base: bytes.as_ptr() as u64,
-                len: bytes.len() as u64,
+                base: base as u64,
+                len: len as u64,
                 page_stride: STRIDE,
                 domain: MemoryDomain::HostPinned,
             }],
@@ -416,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_read_brings_the_peers_pages_into_the_named_slots() {
-        let theirs: Vec<u8> = (0..PAGES * STRIDE)
+        let mut theirs: Vec<u8> = (0..PAGES * STRIDE)
             .map(|i| (i / STRIDE) as u8 + 1)
             .collect();
         let mut ours = vec![0u8; (PAGES * STRIDE) as usize];
@@ -424,11 +426,14 @@ mod tests {
             NixlBackend::new("home").unwrap(),
             NixlBackend::new("peer").unwrap(),
         );
-        let mine = a.register(WorkerId(1), host(&ours)).unwrap();
-        b.register(WorkerId(2), host(&theirs)).unwrap();
+        let ours_at = (ours.as_mut_ptr(), ours.len());
+        let theirs_at = (theirs.as_mut_ptr(), theirs.len());
+        let mine = a.register(WorkerId(1), host(ours_at.0, ours_at.1)).unwrap();
+        b.register(WorkerId(2), host(theirs_at.0, theirs_at.1))
+            .unwrap();
         a.connect(&PeerConn {
             worker: WorkerId(2),
-            handle: host(&theirs),
+            handle: host(theirs_at.0, theirs_at.1),
             metadata: b.local_metadata().unwrap(),
         })
         .unwrap();
@@ -452,6 +457,7 @@ mod tests {
         assert!(page(0).iter().all(|&b| b == 4), "slot 0 holds their page 3");
         assert!(page(5).iter().all(|&b| b == 7), "slot 5 holds their page 6");
         assert!(page(1).iter().all(|&b| b == 0), "slot 1 was not asked for");
-        ours.clear();
+        // The peer's region stays alive until the read is checked.
+        drop(theirs);
     }
 }

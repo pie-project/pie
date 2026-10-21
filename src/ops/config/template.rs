@@ -50,6 +50,8 @@ telemetry = false
 # service_name    = "pie"
 # worker_threads  = 16        # derived from visible CPUs, capped at 64
 # max_upload      = "256MiB"
+# policies        = []        # cluster policies: built-in names or .wasm paths,
+#                             # no two granted the same write
 
 "#;
 
@@ -98,6 +100,15 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # gateways = ["tcp://10.0.0.2:8081"]
 # transfer = "auto"               # peers' kv read in place where the build has NIXL
 # prefill_min_suffix_tokens = 0
+
+# [offload]
+# Other workers' part in this one's passes, and its in theirs. Omit to serve
+# and send none.
+# listen = "10.0.0.1:7100"     # where this worker serves peers' passes; their
+#                              # pages' bytes ride one port above
+# peers  = ["10.0.0.2:7100"]   # workers to prefill this worker's passes on
+# pools  = ["10.0.0.3:7201"]   # pool workers (`pie-pool`) to keep its runs on,
+#                              # by their bulk address
 "#;
 
 #[cfg(any(feature = "engine-cuda", test))]
