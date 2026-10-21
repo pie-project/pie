@@ -1233,7 +1233,7 @@ pub fn register_cuts(inter: u32, columns: u32, cut: RegisterCut) -> bool {
 
 /// The routes of `routes` (at most [`REGISTER_TOKENS`] tokens) grouped into
 /// the register tile's expert tiles, after the shared expert's where `shared`,
-/// and each tile's input table laid from `x`.
+/// and each tile's input table laid from `x` ([`register_gather`]).
 pub fn register_group(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -1285,6 +1285,11 @@ pub fn register_group(
             u32::from(shared).arg(),
         ],
     )?;
+    register_gather(ctx, x, tiles, rooms)
+}
+
+/// Each of the up to `tiles` grouped tiles' input table, laid from `x`.
+pub fn register_gather(ctx: &Ctx<'_>, x: Tensor, tiles: u32, rooms: RegisterRooms) -> Result<(), Error> {
     ctx.fire(
         Fire::at(REGISTER_FILE, "moe_sg_gather")
             .apply(Grid::of([32, x.width / 64, tiles], [32, 4, 1])),
