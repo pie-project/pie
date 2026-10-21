@@ -94,7 +94,10 @@ fn qwen_3_5_and_later_stretch_their_partial_rotation() {
         let table = turned[0];
         assert!(turned.iter().all(|other| *other == table), "{stretched}");
         assert_eq!(table.inv_freq.len(), 32, "{stretched}");
-        assert!((table.mscale - (0.1 * 4f32.ln() + 1.0)).abs() < 1e-6, "{stretched}");
+        assert!(
+            (table.mscale - (0.1 * 4f32.ln() + 1.0)).abs() < 1e-6,
+            "{stretched}"
+        );
         assert!((table.inv_freq[0] - 1.0).abs() < 1e-7, "{stretched}");
         assert!(
             (f64::from(table.inv_freq[31]) - slowest).abs() < 1e-6 * slowest,

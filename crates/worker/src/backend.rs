@@ -257,12 +257,9 @@ fn declared_context(
     overrides: &runtime::engine::load::Overrides,
 ) -> Option<u32> {
     let config = crate::weights::config_of(snapshot_dir).ok()?;
-    let stretch = overrides.yarn.map(|factor| {
-        (
-            f64::from(factor),
-            overrides.yarn_original.map(f64::from),
-        )
-    });
+    let stretch = overrides
+        .yarn
+        .map(|factor| (f64::from(factor), overrides.yarn_original.map(f64::from)));
     crate::weights::declared_context(&config, stretch)
 }
 
