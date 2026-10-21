@@ -335,8 +335,8 @@ impl<'c> Run<'c> {
             .max()
     }
 
-    /// When the projection of `act` by bank `w` into `columns` columns may
-    /// run on the register tile, the arrival counters its split takes.
+    /// When the projection of `act` by bank `w` into `columns` columns runs on
+    /// the register tile, the arrival counters its split takes.
     pub(crate) fn register_counters(&self, act: ValueId, w: ValueId, columns: u32) -> Option<u32> {
         let x = self.tensor(act);
         if !self.tuning.qmm_register()
@@ -350,6 +350,14 @@ impl<'c> Run<'c> {
         }
         let bank = self.banked(w)?;
         if bank.bits != 4 || bank.group != 64 || bank.biases.is_none() {
+            return None;
+        }
+        // Only where the profile runs the register tile first (not one row's
+        // decode, which runs the qmv): a table nothing reads is work for none.
+        let at = self
+            .tuning
+            .qmm_at(x.rows, columns, x.width, bank.bits, bank.group);
+        if self.tuning.qmm(&at).first() != Some(&kernels_metal::tuning::Qmm::Register) {
             return None;
         }
         let (cols, k) = (i32::try_from(columns).ok()?, i32::try_from(x.width).ok()?);
