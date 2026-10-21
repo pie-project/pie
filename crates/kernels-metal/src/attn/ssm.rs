@@ -1016,33 +1016,31 @@ pub fn gated_delta_committed_landing(
 pub const RS_PAGE_INTS: u32 = 8;
 
 /// A recurrent buffer's plane as a verify arm reads it through the fire's
-/// page table: each lane's row of `pages` names the in-page token of its
-/// first extended row, then the slots of the pages its rows touch.
+/// page table: `slab` from the plane's first row in the buffer's first
+/// slot, and each lane's row of `pages` the in-page token of its first
+/// extended row, then the slots of the pages its rows touch.
 #[derive(Clone, Copy, Debug)]
 pub struct Paged {
     pub slab: Tensor,
     pub pages: Tensor,
     pub page_tokens: u32,
     pub page_bytes: u32,
-    pub plane_at: u32,
     pub row_bytes: u32,
 }
 
-fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::ArgValue; 7], Error> {
+fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::ArgValue; 6], Error> {
     Ok(match paged {
         Some(paged) => [
             paged.slab.arg_mut(),
             paged.pages.arg(),
             paged.page_tokens.arg(),
             paged.page_bytes.arg(),
-            paged.plane_at.arg(),
             paged.row_bytes.arg(),
             1i32.arg(),
         ],
         None => [
             ctx.absent()?,
             ctx.absent()?,
-            0u32.arg(),
             0u32.arg(),
             0u32.arg(),
             0u32.arg(),
@@ -1241,15 +1239,7 @@ pub fn gated_delta_verify_at(
         .ok_or_else(|| refuse(OP, "no verify scan is stamped at this geometry"))?;
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
-    let [
-        slab,
-        pages,
-        page_tokens,
-        page_bytes,
-        plane_at,
-        row_bytes,
-        is_paged,
-    ] = paged_args(ctx, paged)?;
+    let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
@@ -1276,7 +1266,6 @@ pub fn gated_delta_verify_at(
             pages,
             page_tokens,
             page_bytes,
-            plane_at,
             row_bytes,
             is_paged,
         ],
@@ -1345,15 +1334,7 @@ pub fn causal_conv1d_verify(
     }
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
-    let [
-        slab,
-        pages,
-        page_tokens,
-        page_bytes,
-        plane_at,
-        row_bytes,
-        is_paged,
-    ] = paged_args(ctx, paged)?;
+    let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
     ctx.fire(
         Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
             [channels / 4, CONV_VERIFY_ROWS, lanes],
@@ -1380,7 +1361,6 @@ pub fn causal_conv1d_verify(
             pages,
             page_tokens,
             page_bytes,
-            plane_at,
             row_bytes,
             is_paged,
         ],

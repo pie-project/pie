@@ -745,7 +745,7 @@ impl Run<'_> {
                 // The verify conv lands the window's own rows itself, and
                 // through the page table reads and lands the buffer's too.
                 if attn::ssm::causal_conv1d_verify_fits(ext_y.width, *conv_width, *dilation) {
-                    let paged = seat.paged(*x);
+                    let paged = seat.paged(self.handles(), *x);
                     let source = match paged {
                         Some(_) => self.tensor(*x),
                         None => self.rs_extend(OP, &seat, *x)?,
@@ -823,7 +823,7 @@ impl Run<'_> {
                 if let Some((ba, dt_bias, a_log)) = prepped
                     && attn::ssm::gated_delta_verify_fits(*k_dim, *v_dim)
                 {
-                    let paged = seat.paged(ba);
+                    let paged = seat.paged(self.handles(), ba);
                     let ba = match paged {
                         Some(_) => self.tensor(ba),
                         None => self.rs_extend(OP, &seat, ba)?,

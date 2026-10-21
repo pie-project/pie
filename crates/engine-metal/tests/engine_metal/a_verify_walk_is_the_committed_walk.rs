@@ -272,13 +272,21 @@ fn buffered(bench: &Bench, lanes: &Lanes, ext: Tensor) -> Buffered {
         window.extend(bench.rows(ext, from, rows));
     }
     let own = lanes.own();
+    let whole = bench.upload(&slab, slots as u32, page_bytes as u32, Dtype::U8);
+    let plane = bench
+        .handles
+        .cut(
+            whole.buf,
+            u64::from(PLANE_AT),
+            slab.len() as u64 - u64::from(PLANE_AT),
+        )
+        .expect("the plane's view");
     Buffered {
         paged: Paged {
-            slab: bench.upload(&slab, slots as u32, page_bytes as u32, Dtype::U8),
+            slab: Tensor::new(plane, 1, 1, Dtype::U8),
             pages: bench.i32s(&table),
             page_tokens: PAGE,
             page_bytes: page_bytes as u32,
-            plane_at: PLANE_AT,
             row_bytes: row as u32,
         },
         window: bench.upload(&window, own, ext.width, ext.dtype),
@@ -301,7 +309,6 @@ impl Buffered {
                     let token = 2 + rep + i;
                     let slot = (r + 1) * pages_a_lane - 1 - token / PAGE as usize;
                     let offset = slot as u64 * u64::from(self.paged.page_bytes)
-                        + u64::from(self.paged.plane_at)
                         + (token % PAGE as usize) as u64 * row;
                     bench.read(self.paged.slab, offset, row) == bench.rows(self.window, at + i, 1)
                 })
