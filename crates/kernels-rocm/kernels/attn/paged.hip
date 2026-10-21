@@ -246,7 +246,10 @@ template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8>
 __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     using KV = Kv<FP8>;
     constexpr int SUB = 16, KT = SUB / 16, KP = D / 32;
-    constexpr int LPK = D / 8;           // lanes a key's value row spans
+    // Elements a value read takes: sixteen e4m3 codes (16 bytes) where the
+    // values stage through LDS, else eight (a lane's accumulator columns).
+    constexpr int RE = PVM && FP8 ? 16 : 8;
+    constexpr int LPK = D / RE;          // lanes a key's value row spans
     constexpr int KPI = kWave / LPK;     // keys one value read covers
     constexpr int VR = SUB / KPI;        // value reads a round
     static_assert(G <= 16 && D % 32 == 0 && kWave % LPK == 0, "a group within one column tile");
@@ -328,7 +331,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     mfma_cd ot[PVM ? D / 16 : 1];
 #pragma unroll
     for (int mt = 0; mt < (PVM ? D / 16 : 1); ++mt) ot[mt] = mfma_zero();
-    const int col = 8 * (l % LPK), parity = l / LPK;
+    const int col = RE * (l % LPK), parity = l / LPK;
 
     const i32* pages = p.page_indices + p.page_indptr[req];
     const int ps_ = p.page_size;
@@ -366,8 +369,13 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
         read_keys(0);
         // The value reads ride ahead of the scores, except at 512-wide heads,
         // which read them in halves after the weights (registers again).
-        auto value_at = [&](int i) { return KV::raw(p.v, at(min(t0 + i * KPI + parity, wend - 1), col)); };
-        typename KV::Raw vr[HALVES ? 1 : VR];
+        using VRaw = typename conditional<RE == 16, Pack8<bf16>, typename KV::Raw>::type;
+        auto value_at = [&](int i) -> VRaw {
+            const long long v = at(min(t0 + i * KPI + parity, wend - 1), col);
+            if constexpr (RE == 16) return *reinterpret_cast<const VRaw*>(reinterpret_cast<const u8*>(p.v) + v);
+            else return KV::raw(p.v, v);
+        };
+        VRaw vr[HALVES ? 1 : VR];
         if constexpr (!HALVES) {
 #pragma unroll
             for (int i = 0; i < VR; ++i) vr[i] = value_at(i);
@@ -410,8 +418,16 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
             // The round's value rows into this wavefront's LDS rows.
             bf16* vs = vbuf + wave * SUB * VLD;
 #pragma unroll
-            for (int i = 0; i < VR; ++i)
-                *reinterpret_cast<Pack8<bf16>*>(vs + (i * KPI + parity) * VLD + col) = KV::wide(vr[i]);
+            for (int i = 0; i < VR; ++i) {
+                bf16* row = vs + (i * KPI + parity) * VLD + col;
+                if constexpr (RE == 16) {
+                    const auto w = __builtin_bit_cast(mfma_ab2, vr[i]);
+                    *reinterpret_cast<mfma_ab2*>(row) = e4m3x8_bf16(__builtin_bit_cast(u64, w.lo));
+                    *reinterpret_cast<mfma_ab2*>(row + 8) = e4m3x8_bf16(__builtin_bit_cast(u64, w.hi));
+                } else {
+                    *reinterpret_cast<Pack8<bf16>*>(row) = KV::wide(vr[i]);
+                }
+            }
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
@@ -443,7 +459,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
 #pragma unroll
             for (int c = 0; c < 8; ++c) acc[h][c] *= a;
         }
-        auto weigh = [&](int i, const typename KV::Raw& raw) {
+        auto weigh = [&](int i, const auto& raw) {
             const Pack8<bf16> v = KV::wide(raw);
             const int kl = i * KPI + parity;
             float pv[G];
@@ -456,11 +472,12 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
                 for (int h = 0; h < G; ++h) acc[h][c] += pv[h] * vf;
             }
         };
-        if constexpr (HALVES) {
+        if constexpr (PVM) {
+        } else if constexpr (HALVES) {
             constexpr int VH = VR / 2;
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                typename KV::Raw vh[VH];
+                VRaw vh[VH];
 #pragma unroll
                 for (int i = 0; i < VH; ++i) vh[i] = value_at(half * VH + i);
 #pragma unroll
