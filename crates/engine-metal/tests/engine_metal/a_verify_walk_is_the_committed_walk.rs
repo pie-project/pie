@@ -90,13 +90,11 @@ impl Lanes {
 
     /// Each lane's `(extended row, window row, own rows)`.
     fn spans(&self) -> Vec<(usize, usize, usize)> {
-        let indptr = self.indptr();
         let mut begin = 0usize;
         let mut spans = Vec::new();
-        for r in 0..self.rows.len() {
-            let rep = self.replay[r] as usize;
-            let rows = self.rows[r] as usize;
-            spans.push((begin + rep, indptr[r] as usize, rows));
+        for ((&rows, &rep), at) in self.rows.iter().zip(&self.replay).zip(self.indptr()) {
+            let (rows, rep) = (rows as usize, rep as usize);
+            spans.push((begin + rep, at as usize, rows));
             begin += rep + rows;
         }
         spans
@@ -572,7 +570,10 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
 
 /// Lanes whose old and new walks start from the same slot contents: every
 /// slot of the inputs holds the same bank.
-fn cases() -> Vec<(Lanes, Option<(Vec<i32>, Vec<i32>)>)> {
+/// A case's lanes, and its old and new snapshot tables.
+type Case = (Lanes, Option<(Vec<i32>, Vec<i32>)>);
+
+fn cases() -> Vec<Case> {
     let s = RS_SNAPSHOTS as usize;
     let mut old = vec![0i32; 2 * s];
     let mut new = vec![0i32; 2 * s];
@@ -666,7 +667,6 @@ fn a_verify_walk_prices_against_the_committed_walk() {
 /// committed, each of the 30 layers its own state, as cold as a round
 /// finds it.
 fn price_round(bench: &Bench, rows: i32, replay: i32) {
-    let bench = bench;
     let lanes = Lanes {
         rows: vec![rows],
         replay: vec![replay],
