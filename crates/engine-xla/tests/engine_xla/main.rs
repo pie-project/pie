@@ -11,6 +11,7 @@ mod a_device_geometry_beam_answers_the_host_path;
 mod a_double_block_fires_two_streams_through_the_engine;
 mod a_model_speaks_on_the_device;
 mod a_picture_is_seen_by_the_trunk;
+mod a_prompt_length_reuses_its_programs;
 mod a_recurrent_verb_replays_what_a_plain_walk_folds;
 mod a_stated_position_rotates_and_the_row_bounds;
 mod a_windowed_pool_answers_what_full_pages_do;
