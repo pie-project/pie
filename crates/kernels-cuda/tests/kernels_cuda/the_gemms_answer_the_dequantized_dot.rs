@@ -398,3 +398,87 @@ fn the_w8a16_projections_answer_the_dot() {
         );
     }
 }
+
+#[test]
+fn an_mxfp8_release_laid_a_row_a_32_answers_the_dot() {
+    use kernels_cuda::linear::act_quant::{Bank, read_back, scales_to_atoms, select};
+    use kernels_cuda::linear::moe::select_fp8_w8a16;
+    use kernels_cuda::linear::w8a16;
+    // (m, experts, n, k): an MXFP8 release's plane as it ships, e4m3 codes
+    // beside one e8m0 exponent a 1x32 block of each row (`[rows, k / 32]`),
+    // its exponents laid into atoms a row a row (as the load lays them); a
+    // projection (one expert) and a bank, each W8A8 against e4m3 in 1x32
+    // blocks and W8A16, under the default tuning and B200's.
+    #[rustfmt::skip]
+    let cases = [(1, 1, 384, 1024), (37, 1, 256, 6144), (130, 1, 200, 2048), (3, 4, 256, 512),
+        (64, 8, 128, 1024)];
+    for (m, ex, n, k) in cases {
+        for tuning in [Tuning::DEFAULT, SM100] {
+            let mut b = Bench::new(0x3c8 ^ (m * n + k + ex) as u64);
+            let rows = ex * n;
+            let s = b.side(Elem::E4m3, Some(32), rows, k);
+            let host = &s.scales.as_ref().expect("scaled").0;
+            let (codes, plane) = (b.up(&s.bytes), b.up(&s.codes));
+            let atoms = b.zeros(atom_bytes(rows, k, 32));
+            let ctx = b.ctx().with_tuning(tuning);
+            let (r32, k32, n32) = (rows as u32, k as u32, n as u32);
+            scales_to_atoms(&ctx, "test", plane, atoms, r32, k32 / 32, 1).expect("lays");
+            b.sync();
+            let laid: Vec<u8> = b.down(atoms, host.len());
+            assert!(
+                laid == *host,
+                "{rows}x{k}: the exponents land where the GEMM reads them"
+            );
+            let what = |arm: &str| format!("{arm} {m}x{ex}x{n}x{k}, sm100 {}", tuning.moe_tc5);
+            // Each row routed to its own expert, in turn.
+            let routes = tab(m, |r| (r % ex) as i32);
+            let r = t(b.up(&routes), m, 1, I32);
+            let w =
+                |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
+            let (x, xv) = b.bf16(m * k);
+            let x = t(x, m, k, Bf16);
+            // W8A16: the bf16 rows against the codes widened in registers.
+            let mut y = b.out(m, n);
+            if ex == 1 {
+                let took = w8a16::matmul(&ctx, "test", x, codes, atoms, 32, &mut y).expect("fires");
+                assert!(took, "{}", what("W8A16"));
+            } else {
+                select_fp8_w8a16(
+                    &ctx, "test", x, codes, atoms, ex as u32, 32, r, &mut y, None,
+                )
+                .expect("the W8A16 select fires");
+            }
+            b.check(
+                y.ptr,
+                &dot([m, n, k], |r, i| xv[r * k + i], w),
+                TOL,
+                &what("W8A16"),
+            );
+            if !supported() {
+                continue;
+            }
+            // W8A8: the rows quantized to e4m3 in 1x32 blocks (read back),
+            // against the laid atoms on the tcgen05 GEMM.
+            let (fmt, src) = (Format::E4m3 { gran: 32 }, Source::rows(x, None));
+            let back = b.zeros(m * k * 2);
+            read_back(&ctx, "test", fmt, src, back).expect("the read-back fires");
+            let mut y = b.out(m, n);
+            if ex == 1 {
+                #[rustfmt::skip]
+                let weight = Weight { codes, scales: atoms, n: n32, k: k32, elem: Elem::E4m3, gran: 32, laid: true };
+                act_quant::matmul(&ctx, "test", fmt, src, weight, &mut y, 1.0).expect("fires");
+            } else {
+                #[rustfmt::skip]
+                let bank = Bank { codes, atoms, experts: ex as u32, n: n32, k: k32, elem: Elem::E4m3, gran: 32, alpha_e: 0, alpha_from: None };
+                select(&ctx, "test", fmt, x, r, None, bank, &mut y).expect("the W8A8 select fires");
+            }
+            let a = b.read(back, m * k);
+            b.check(
+                y.ptr,
+                &dot([m, n, k], |r, i| a[r * k + i], w),
+                TOL,
+                &what("W8A8"),
+            );
+        }
+    }
+}
