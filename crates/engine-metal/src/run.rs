@@ -186,16 +186,20 @@ pub struct Run<'c> {
     /// The register tile's input table the precast room holds, if one does.
     table: std::cell::Cell<Option<Laid>>,
 
-    /// The outputs a segment launch landed ahead of their own matmuls.
+    /// The outputs a segment launch landed ahead of the nodes that write them.
     landed: std::cell::Cell<Option<Landed>>,
+
+    /// The compiled regions the walk's place indexes, when the encode names
+    /// them: a segment launch takes only nodes of the region it runs in.
+    regions: Option<&'c [poem_compiler::Region]>,
 }
 
-/// The outputs of the matmuls after a segment launch's first (at most two),
-/// which the launch landed at `rows` of region `region`: each of those
-/// matmuls, reached at the same place, has nothing left to do.
+/// The values a segment launch landed at `rows` of region `region` ahead of
+/// the nodes that write them (a later matmul's output, a split's left half):
+/// each of those nodes, reached at the same place, has nothing left to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Landed {
-    ys: [Option<ValueId>; 2],
+    ys: [Option<ValueId>; 3],
     region: u32,
     rows: Rows,
 }
@@ -288,6 +292,7 @@ impl<'c> Run<'c> {
             readers: std::cell::OnceCell::new(),
             table: std::cell::Cell::new(None),
             landed: std::cell::Cell::new(None),
+            regions: None,
         }
     }
 
@@ -556,6 +561,25 @@ impl<'c> Run<'c> {
     pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>) -> Self {
         self.ane = ane;
         self
+    }
+
+    /// The compiled regions the walk's place indexes.
+    #[must_use]
+    pub(crate) fn with_regions(mut self, regions: &'c [poem_compiler::Region]) -> Self {
+        self.regions = Some(regions);
+        self
+    }
+
+    /// The nodes of the region the walk is in, and whether its rows run in one
+    /// pass over one window (no gathered copy, no tail cut), so every node of
+    /// it reads the same rows: `None` where the encode names no regions.
+    pub(crate) fn region_nodes(&self) -> Option<(std::ops::Range<u32>, bool)> {
+        let region = self.regions?.get(self.place.region.get() as usize)?;
+        let window = self.window();
+        Some((
+            region.nodes.clone(),
+            window.gathered.is_none() && window.passes <= 1,
+        ))
     }
 
     pub(crate) fn ane(&self) -> Option<&'c crate::ane::Ane> {
@@ -1188,9 +1212,9 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// Records that a segment launch here landed `ys`, the outputs of the
-    /// matmuls that follow its first.
-    pub(crate) fn land_ahead(&self, ys: [Option<ValueId>; 2]) {
+    /// Records that a segment launch here landed `ys` ahead of the nodes that
+    /// write them.
+    pub(crate) fn land_ahead(&self, ys: [Option<ValueId>; 3]) {
         self.landed.set(Some(Landed {
             ys,
             region: self.place.region.get(),
@@ -1199,8 +1223,8 @@ impl<'c> Run<'c> {
     }
 
     /// Whether a segment launch at this place already landed `y`; it is then
-    /// struck off, and the matmul writing it has nothing to do. Anywhere
-    /// else the matmul runs again, which lands the same values.
+    /// struck off, and the node writing it has nothing to do. Anywhere else
+    /// a matmul runs again, which lands the same values.
     pub(crate) fn landed_ahead(&self, y: ValueId) -> bool {
         let Some(mut landed) = self.landed.get() else {
             return false;

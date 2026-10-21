@@ -774,7 +774,8 @@ fn register_tables_on_this_gpu() {
 /// launch lands them: a GDN in-projection and its gates, a query, key and
 /// value, and segments of other contractions, at five to eight rows, each at
 /// its own split (one, two, four or eight partitions side by side), over one
-/// table; and every walk of the tile lands the default walk's bits.
+/// table; a projection's two halves as two segments of its bank land its
+/// columns; and every walk of the tile lands the default walk's bits.
 #[test]
 fn a_segment_launch_lands_each_matmuls_bits() {
     use kernels_metal::linear::quant::Segment;
@@ -810,7 +811,10 @@ fn a_segment_launch_lands_each_matmuls_bits() {
             let x_b = upload(&x);
             let act = Tensor::new(bind(&x_b), m, k, Dtype::Bf16);
             let outputs = |fill: u8| -> Vec<Buffer> {
-                widths.iter().map(|&n| upload(&vec![fill; (m * n * 2) as usize])).collect()
+                widths
+                    .iter()
+                    .map(|&n| upload(&vec![fill; (m * n * 2) as usize]))
+                    .collect()
             };
             let segments = |ys: &[Buffer]| -> Vec<Segment> {
                 banks
@@ -819,13 +823,17 @@ fn a_segment_launch_lands_each_matmuls_bits() {
                     .zip(widths)
                     .map(|(((bank, _), y), &n)| Segment {
                         w: *bank,
+                        first: 0,
                         y: Tensor::new(bind(y), m, n, Dtype::Bf16),
                         split: quant::register_split(n as i32, k as i32, Some(20)),
                     })
                     .collect()
             };
             let (counters, floats) = quant::segments_scratch(&segments(&outputs(0)), m);
-            assert!(floats <= 2 << 20, "the test's partials hold the segments' sums");
+            assert!(
+                floats <= 2 << 20,
+                "the test's partials hold the segments' sums"
+            );
             let rows = quant::register_table_rows(k as i32, counters as i32);
             let table_b = upload(&vec![0xa5; (rows * k * 2) as usize]);
             let table = Tensor::new(bind(&table_b), rows, k, Dtype::Bf16);
@@ -906,6 +914,98 @@ fn a_segment_launch_lands_each_matmuls_bits() {
                 "K={k} {widths:?} M={m}: a segment launch left an arrival counter standing"
             );
         }
+    }
+    // A projection's rows split in two halves as two segments of its bank at the projection's
+    // own split, beside its gates: each half the whole projection's columns, to the bit.
+    let (k, n, cut) = (2048u32, 12288u32, 8192u32);
+    let (whole, _whole_planes) = bank_of(&device, &handles, k, n, 0x77);
+    let (gates, _gates_planes) = bank_of(&device, &handles, k, 64, 0x78);
+    for m in [5u32, 8] {
+        let x: Vec<u8> = (0..m * k)
+            .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x1357)) - 127.0) * 0.021))
+            .collect();
+        let x_b = upload(&x);
+        let act = Tensor::new(bind(&x_b), m, k, Dtype::Bf16);
+        let split = quant::register_split(n as i32, k as i32, Some(20));
+        let out = |width: u32| {
+            let b = upload(&vec![0x3c; (m * width * 2) as usize]);
+            let t = Tensor::new(bind(&b), m, width, Dtype::Bf16);
+            (b, t)
+        };
+        let ((whole_b, whole_y), (gate_b, gate_y)) = (out(n), out(64));
+        let ((left_b, left_y), (right_b, right_y), (gate2_b, gate2_y)) =
+            (out(cut), out(n - cut), out(64));
+        let segments = [
+            Segment {
+                w: whole,
+                first: 0,
+                y: left_y,
+                split,
+            },
+            Segment {
+                w: whole,
+                first: cut,
+                y: right_y,
+                split,
+            },
+            Segment {
+                w: gates,
+                first: 0,
+                y: gate2_y,
+                split: quant::register_split(64, k as i32, Some(20)),
+            },
+        ];
+        let (counters, _) = quant::segments_scratch(&segments, m);
+        let rows = quant::register_table_rows(k as i32, counters as i32);
+        let table_b = upload(&vec![0xa5; (rows * k * 2) as usize]);
+        let table = Tensor::new(bind(&table_b), rows, k, Dtype::Bf16);
+        let frame = device.frame().expect("frame");
+        let sink = Sink::new(&device, &frame, &pipelines, &handles);
+        quant::register_table(&sink, act, table, m as i32, k as i32, counters as i32)
+            .expect("table");
+        for (w, y, split) in [(whole, whole_y, split), (gates, gate_y, segments[2].split)] {
+            let width = y.width as i32;
+            quant::register_matmul(
+                &sink,
+                w,
+                w.biases.expect("biases"),
+                table,
+                y,
+                (m as i32, width, k as i32, width, k as i32),
+                split,
+                (split > 1).then_some(partials),
+                quant::REGISTER_WALK,
+            )
+            .expect("matmul");
+        }
+        quant::register_segments(
+            &sink,
+            &segments,
+            table,
+            m as i32,
+            k as i32,
+            Some(partials),
+            quant::REGISTER_WALK,
+        )
+        .expect("segments");
+        frame.commit().expect("commit");
+        let read = |b: &Buffer| handles.read(bind(b), b.bytes()).expect("read");
+        let (whole_bits, left_bits, right_bits) = (read(&whole_b), read(&left_b), read(&right_b));
+        for r in 0..m as usize {
+            let row = &whole_bits[r * n as usize * 2..(r + 1) * n as usize * 2];
+            assert!(
+                row[..cut as usize * 2]
+                    == left_bits[r * cut as usize * 2..(r + 1) * cut as usize * 2]
+                    && row[cut as usize * 2..]
+                        == right_bits[r * (n - cut) as usize * 2..(r + 1) * (n - cut) as usize * 2],
+                "M={m} row {r}: a half lands other bits than the whole projection's columns"
+            );
+        }
+        assert!(
+            read(&gate_b) == read(&gate2_b),
+            "M={m}: the gates beside the halves land other bits"
+        );
+        checked += 1;
     }
     eprintln!("checked {checked} segment launches against their matmuls' own");
 }

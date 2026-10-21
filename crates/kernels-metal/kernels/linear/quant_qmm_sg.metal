@@ -303,13 +303,13 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
       constant int &, uint2, uint, uint);
 
 // Up to three matmuls of one table in one launch (a layer's projections of its normed rows: a
-// GDN in-projection and its gates; a query, key and value), each segment s its own bank, output
-// (rows of `columns[s]` = c0, c1, c2; its bank's row stride `strides[s]` = d0, d1, d2) and
-// partitions `splits[s]` = p0, p1, p2, each
-// summed as that matmul alone sums it. The grid is one row of threadgroups: segment s takes
-// columns[s] / 64 x splits[s] of them, partition-major, after the segments before it; a split
-// segment's partials follow those of the split segments before it in `partials`, and its tiles'
-// arrival counters theirs in the table.
+// GDN in-projection and its gates; a query, key and value), each segment s the columns of its own
+// bank from column `offsets[s]` (o0, o1, o2; the bank's row stride `strides[s]`, d0, d1, d2) into
+// its own output, rows of `columns[s]` (c0, c1, c2), in `splits[s]` partitions (p0, p1, p2): each
+// column summed as its bank's own matmul at that split sums it. The grid is one row of
+// threadgroups: segment s takes columns[s] / 64 x splits[s] of them, partition-major, after the
+// segments before it; a split segment's partials follow those of the split segments before it in
+// `partials`, and its tiles' arrival counters theirs in the table.
 template <int S, int U, int V>
 [[kernel]] void
 affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat *s0 [[buffer(1)]],
@@ -324,11 +324,14 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
                        constant int &c2 [[buffer(18)]], constant int &p0 [[buffer(19)]],
                        constant int &p1 [[buffer(20)]], constant int &p2 [[buffer(21)]],
                        constant int &d0 [[buffer(22)]], constant int &d1 [[buffer(23)]],
-                       constant int &d2 [[buffer(24)]], uint position [[threadgroup_position_in_grid]],
+                       constant int &d2 [[buffer(24)]], constant int &o0 [[buffer(25)]],
+                       constant int &o1 [[buffer(26)]], constant int &o2 [[buffer(27)]],
+                       uint position [[threadgroup_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]],
                        uint simd [[simdgroup_index_in_threadgroup]]) {
   using namespace qmm_sg;
   const int columns[3] = {c0, c1, c2}, splits[3] = {p0, p1, p2}, strides[3] = {d0, d1, d2};
+  const int offsets[3] = {o0, o1, o2};
   // The segment this threadgroup falls in, and the threadgroups, counters and partials before it.
   int s = 0;
   uint first = 0, tiles_before = 0;
@@ -356,7 +359,8 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
   const uint column = tile * 32 * NF + simd * 8 * NF + l.fm;
   const int2 span = partition(width, split, int(part));
   float2 acc[NF];
-  walk<U, V>(weights, scales, biases, table, width, strides[s], column, l, span.x, span.y, acc);
+  walk<U, V>(weights, scales, biases, table, width, strides[s], uint(offsets[s]) + column, l, span.x,
+             span.y, acc);
   threadgroup uint arrival;
   land(acc, output, n, rows, column, l, split, part, partials + floats_before,
        counters(table, width) + tiles_before + tile, simd * 32 + lane, arrival);
@@ -369,4 +373,5 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
       const device uint *, const device bfloat *, const device bfloat *, device bfloat *,          \
       const device bfloat *, device float *, constant int &, constant int &, constant int &,       \
       constant int &, constant int &, constant int &, constant int &, constant int &,              \
-      constant int &, constant int &, constant int &, uint, uint, uint);
+      constant int &, constant int &, constant int &, constant int &, constant int &,              \
+      constant int &, uint, uint, uint);

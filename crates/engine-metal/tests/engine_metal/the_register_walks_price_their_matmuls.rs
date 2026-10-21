@@ -251,6 +251,7 @@ fn the_register_walks_price_their_matmuls() {
                     .zip(ys)
                     .map(|(w, y)| Segment {
                         w: *w,
+                        first: 0,
                         y: *y,
                         split: quant::register_split(y.width as i32, k as i32, Some(CORES)),
                     })

@@ -1147,12 +1147,13 @@ pub fn register_matmul(
     )
 }
 
-/// One projection of a register-tile segment launch: its bank, the output
-/// it lands whole (its width the row stride) and its contraction's
-/// partitions.
+/// One projection of a register-tile segment launch: the columns of bank
+/// `w` from its row `first`, the output it lands them in whole (its width
+/// the row stride and the columns' count) and its contraction's partitions.
 #[derive(Clone, Copy, Debug)]
 pub struct Segment {
     pub w: Bank,
+    pub first: u32,
     pub y: Tensor,
     pub split: i32,
 }
@@ -1174,9 +1175,9 @@ pub fn segments_scratch(segments: &[Segment], m: u32) -> (u32, u32) {
 }
 
 /// Two or three register-tile matmuls of one laid input `table` (the `m`
-/// rows of a `k`-wide activation) in one launch, each segment summed as its
-/// own matmul sums it ([`register_matmul`] at its split), so its output is
-/// that matmul's to the bit. `partials` holds [`segments_scratch`]'s sums
+/// rows of a `k`-wide activation) in one launch, each segment's columns
+/// summed as its bank's own matmul sums them ([`register_matmul`] at the
+/// segment's split), so they land that matmul's bits. `partials` holds [`segments_scratch`]'s sums
 /// and the table its counters. Refused where a segment is no whole number of
 /// the tile's columns, or its bank no 4-bit, 64-group affine one the tile
 /// walks.
@@ -1210,6 +1211,8 @@ pub fn register_segments(
         if s.w.bits != 4
             || s.w.group != 64
             || cols % REGISTER_COLUMNS != 0
+            || s.first % REGISTER_COLUMNS.unsigned_abs() != 0
+            || s.first + s.y.width > s.w.codes.rows
             || ld % REGISTER_SPAN != 0
             || ld < k
             || s.y.rows != m.unsigned_abs()
@@ -1244,6 +1247,7 @@ pub fn register_segments(
         &(|s: &Segment| s.y.width.cast_signed()) as &dyn Fn(&Segment) -> i32,
         &|s: &Segment| s.split,
         &|s: &Segment| s.w.ld.cast_signed(),
+        &|s: &Segment| s.first.cast_signed(),
     ] {
         for i in 0..3 {
             args.push(at(i, of).arg());

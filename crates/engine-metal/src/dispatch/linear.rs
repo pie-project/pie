@@ -268,9 +268,13 @@ impl Run<'_> {
     /// `y` (a GDN layer's in-projection then its gates; a query, key and
     /// value, the query's split into query and gate between the query's and
     /// the key's) in one register-tile launch with it, when every one of them
-    /// runs on the register tile and their outputs stand clear of each other
-    /// and of `act`: each lands as its own launch would land it, bit for bit,
-    /// and the later ones' nodes find it done ([`Run::landed_ahead`]).
+    /// runs on the register tile, all in the region the walk is in, and their
+    /// outputs stand clear of each other and of `act`: each lands as its own
+    /// launch would land it, bit for bit, and the later ones' nodes find it
+    /// done ([`Run::landed_ahead`]). A projection whose only reader is a split
+    /// of its rows in two (the GDN in-projection's convolved half and its
+    /// gate) lands its halves where the split would copy them, as two
+    /// segments of its bank at its own split, and the split finds them done.
     /// False where they run as their own launches.
     fn matmul_segments(
         &self,
@@ -280,26 +284,38 @@ impl Run<'_> {
     ) -> Result<bool, kernels_metal::Error> {
         use linear::quant::{Segment, register_split};
         use poem_ir::Operation;
-        let readers = self.readers_of(act);
-        let matmul = |at: u32| match self.nodes().get(at as usize).map(|n| &n.op) {
+        let Some((nodes, one_pass)) = self.region_nodes() else {
+            return Ok(false);
+        };
+        let op = |at: u32| self.nodes().get(at as usize).map(|n| &n.op);
+        let matmul = |at: u32| match op(at) {
             Some(Operation::Linear(Linear::Matmul { act: a, w, y })) if *a == act => Some((*w, *y)),
             _ => None,
         };
-        let Some(&first) = readers.iter().find(|&&at| matmul(at) == Some((w, y))) else {
+        let Some(first) = self
+            .readers_of(act)
+            .iter()
+            .copied()
+            .find(|&at| matmul(at) == Some((w, y)))
+        else {
             return Ok(false);
         };
         let mut members = vec![(w, y)];
-        // The values a node between the matmuls touches: a query's split into
-        // query and gate, between the query's projection and the key's.
+        // What a node between the matmuls writes: a query's split into query
+        // and gate, between the query's projection and the key's.
         let mut between: Vec<poem_ir::ValueId> = Vec::new();
-        let mut at = first + 1;
-        while members.len() < 3 {
+        let (mut at, mut last) = (first + 1, first);
+        while members.len() < 3 && nodes.contains(&at) {
             if let Some(next) = matmul(at) {
                 members.push(next);
+                last = at;
             } else {
-                match self.nodes().get(at as usize).map(|n| &n.op) {
+                match op(at) {
                     Some(Operation::Layout(poem_ir::Layout::SplitQGate {
-                        packed, q, gate, ..
+                        packed,
+                        q,
+                        gate,
+                        ..
                     })) if between.is_empty() && members.iter().any(|m| m.1 == *packed) => {
                         between.extend([*q, *gate]);
                     }
@@ -308,20 +324,19 @@ impl Run<'_> {
             }
             at += 1;
         }
-        if members.len() < 2 {
+        if members.len() < 2 || !nodes.contains(&first) {
             return Ok(false);
         }
         let x = self.tensor(act);
         let (m, k) = (x.rows, x.width);
-        let mut segments = Vec::with_capacity(members.len());
-        for &(w, y) in &members {
+        let mut segments = Vec::with_capacity(3);
+        // The left half of the split whose halves a segment pair lands.
+        let mut halves = None;
+        for (i, &(w, y)) in members.iter().enumerate() {
             let out = self.tensor(y);
             let fits = self.register_counters(act, w, out.width).is_some()
                 && out.rows == m
-                && self
-                    .ane()
-                    .and_then(|ane| ane.plan_columns(w, m))
-                    .is_none();
+                && self.ane().and_then(|ane| ane.plan_columns(w, m)).is_none();
             let Some(bank) = self.banked(w).filter(|b| fits && b.ld % 256 == 0) else {
                 return Ok(false);
             };
@@ -330,27 +345,85 @@ impl Run<'_> {
                 i32::try_from(k).unwrap_or(0),
                 self.tuning().cores(),
             );
-            segments.push(Segment { w: bank, y: out, split });
+            // The split of this output's rows, its only reader, in this
+            // region after the matmuls, into halves of whole column tiles.
+            let split_rows = self
+                .readers_of(y)
+                .iter()
+                .copied()
+                .find_map(|at| match op(at) {
+                    Some(Operation::Layout(poem_ir::Layout::SplitRows {
+                        x,
+                        width,
+                        left,
+                        right,
+                    })) if *x == y
+                        && self.readers_of(y).len() == 1
+                        && nodes.contains(&at)
+                        && at > last
+                        && width % 64 == 0
+                        && *width < out.width =>
+                    {
+                        Some((*width, *left, *right))
+                    }
+                    _ => None,
+                });
+            match split_rows {
+                Some((width, left, right))
+                    if one_pass && halves.is_none() && members.len() + 1 <= 3 && i == 0 =>
+                {
+                    let (l, r) = (self.tensor(left), self.tensor(right));
+                    if l.width != width
+                        || r.width != out.width - width
+                        || l.rows != m
+                        || r.rows != m
+                    {
+                        return Ok(false);
+                    }
+                    segments.push(Segment {
+                        w: bank,
+                        first: 0,
+                        y: l,
+                        split,
+                    });
+                    segments.push(Segment {
+                        w: bank,
+                        first: width,
+                        y: r,
+                        split,
+                    });
+                    halves = Some(left);
+                }
+                _ => segments.push(Segment {
+                    w: bank,
+                    first: 0,
+                    y: out,
+                    split,
+                }),
+            }
+        }
+        if segments.len() > 3 {
+            return Ok(false);
         }
         // Every output its own bytes, apart from each other and the activation.
         let span = |t: kernels_metal::Tensor| {
-            self.address(t.buf).map(|(slab, at)| {
-                (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2)
-            })
+            self.address(t.buf)
+                .map(|(slab, at)| (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2))
         };
         let mut spans = vec![span(x)];
         spans.extend(segments.iter().map(|s| span(s.y)));
         let Some(spans) = spans.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(false);
         };
-        let apart = |a: &(u64, u64, u64), b: &(u64, u64, u64)| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1;
+        let apart =
+            |a: &(u64, u64, u64), b: &(u64, u64, u64)| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1;
         for (i, a) in spans.iter().enumerate() {
             if spans[i + 1..].iter().any(|b| !apart(a, b)) {
                 return Ok(false);
             }
         }
         // ... and from what a node between them writes, which runs after the
-        // launch landed them.
+        // launch landed them (the first segment's output it reads).
         for &v in &between {
             let Some(b) = span(self.tensor(v)) else {
                 return Ok(false);
@@ -391,7 +464,11 @@ impl Run<'_> {
             partials,
             linear::quant::REGISTER_WALK,
         )?;
-        self.land_ahead([members.get(1).map(|s| s.1), members.get(2).map(|s| s.1)]);
+        self.land_ahead([
+            members.get(1).map(|s| s.1),
+            members.get(2).map(|s| s.1),
+            halves,
+        ]);
         Ok(true)
     }
 
