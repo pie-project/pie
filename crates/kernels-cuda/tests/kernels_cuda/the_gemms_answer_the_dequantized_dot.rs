@@ -219,8 +219,14 @@ fn the_fp8_block_projections_answer_the_dot() {
                 .ok()
         })
         .is_some_and(|cc| cc >= 89);
+    // cuBLASLt's 128x128-block float-scaled FP8 GEMM (arm 6) is Hopper's: a
+    // Blackwell's cuBLASLt scales FP8 in 32-wide UE8M0 vectors instead.
+    let hopper = kernels_cuda::jit::cache::arch().is_some_and(|a| a.starts_with("sm_90"));
     for (arm, rows, groups, n, k) in cases {
-        if (!supported() && arm == 2) || (!fp8_mma && matches!(arm, 0 | 1 | 4 | 5 | 6)) {
+        if (!supported() && arm == 2)
+            || (!fp8_mma && matches!(arm, 0 | 1 | 4 | 5))
+            || (!hopper && arm == 6)
+        {
             continue;
         }
         let mut b = Bench::new(0xf8 + rows as u64);
