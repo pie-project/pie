@@ -2244,7 +2244,7 @@ pub fn matmul_select_fp8_mfma(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false)?;
+    let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false, 1)?;
     matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, seat)
 }
 

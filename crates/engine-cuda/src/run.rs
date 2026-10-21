@@ -651,6 +651,13 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// Forget the rows quantized so far: the next pass quantizes its own.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn forget_fp8_rows(&mut self) {
+        self.fp8_rows.clear();
+        self.fp8_holds.clear();
+    }
+
     /// Whether `y`, a routed GLU's rows, lands as its e4m3 1x128 read-back: its one
     /// reader, the routed down select, reads it back ([`Run::reading_back`]).
     #[cfg(feature = "cuda")]

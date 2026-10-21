@@ -374,8 +374,9 @@ impl Run<'_> {
                         })
                     }
                     poem_ir::ActQuant::E4m3 { gran } => {
-                        let x =
-                            linear::act_quant::quantized(self.ctx(), OP, self.tensor(*x), gran)?;
+                        let x = self.tensor(*x);
+                        let fan = self.plane_fan(x.rows);
+                        let x = linear::act_quant::quantized(self.ctx(), OP, x, gran, fan)?;
                         self.select_quant(x, *bank, *routes, *y)
                     }
                     poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
@@ -816,7 +817,8 @@ impl Run<'_> {
                 0
             }
         } % linear::act_quant::FP8_HOLDS;
-        let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold, pow2)?;
+        let fan = self.plane_fan(x.rows);
+        let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold, pow2, fan)?;
         // The hold's earlier rows are gone; past a decode batch nothing is
         // held (the stream's slab).
         self.fp8_rows

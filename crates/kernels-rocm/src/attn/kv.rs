@@ -217,6 +217,7 @@ pub(crate) fn write_mla_to_pages(
             pool.page_size.arg(),
             kv_lora_rank.arg(),
             rope_dim.arg(),
+            ctx.stage(),
         ],
     )
 }

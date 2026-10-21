@@ -1125,7 +1125,7 @@ __global__ __launch_bounds__(256) void act_quant_e4m3_e8m0(const bf16* __restric
 // threads a block.
 template <int GRAN, bool POW2>
 __global__ __launch_bounds__(256) void act_quant_e4m3_codes(const bf16* __restrict__ x, u8* __restrict__ codes,
-                                                            float* __restrict__ scales, i32 rows, i32 k,
+                                                            float* __restrict__ scales, i32 rows, i32 k, i32 fan,
                                                             const u32* __restrict__ win) {
     constexpr int LANES = GRAN / 8;
     static_assert(LANES <= kWave && (LANES & (LANES - 1)) == 0, "a block's lanes are a power of two in a wavefront");
@@ -1135,8 +1135,8 @@ __global__ __launch_bounds__(256) void act_quant_e4m3_codes(const bf16* __restri
     const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= static_cast<u32>(rows) * per) return;
     const u32 r = t / per;
-    if (!window.live(r)) return;
-    const long long at = window.plane(r) * k + (t - r * per) * 8;
+    if (!window.live(r, fan)) return;
+    const long long at = window.plane(r, fan) * k + (t - r * per) * 8;
     const Pack8<bf16> in = *reinterpret_cast<const Pack8<bf16>*>(x + at);
     float v[8];
     float amax = 0.f;
