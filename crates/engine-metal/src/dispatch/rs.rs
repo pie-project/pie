@@ -271,58 +271,6 @@ impl Run<'_> {
         self.rs_land(OP, seat, ext_gates, gates)
     }
 
-    /// Whether a split of `x` at `width` into `left` and `right` is left to
-    /// the verify convs that alone read `left`, one an arm, through the page
-    /// table: each reads its rows from `x` and lands their `right` itself,
-    /// before the rest of its arm reads them (a gated-delta scan reads none).
-    pub(crate) fn rs_split_into_conv(
-        &self,
-        x: ValueId,
-        width: u32,
-        left: ValueId,
-        right: ValueId,
-    ) -> bool {
-        let Some(seat) = self.rs_seat() else {
-            return false;
-        };
-        let node = |at: u32| self.nodes().get(at as usize);
-        let convs = self.readers(left);
-        let convolves = |at: &u32| {
-            matches!(
-                node(*at).map(|node| &node.op),
-                Some(Operation::Attention(
-                    Attention::SsmCausalConv1d { x: input, conv_width, dilation, .. }
-                        | Attention::SsmCausalConv1dChunked { x: input, conv_width, dilation, .. }
-                )) if *input == left
-                    && attn::ssm::causal_conv1d_verify_fits(width, *conv_width, *dilation)
-            )
-        };
-        let after_its_conv = |at: &u32| {
-            let Some(reader) = node(*at) else {
-                return false;
-            };
-            matches!(
-                reader.op,
-                Operation::Attention(
-                    Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. }
-                )
-            ) || convs
-                .iter()
-                .any(|conv| conv < at && node(*conv).is_some_and(|conv| conv.guard == reader.guard))
-        };
-        let z = self.tensor(right).width;
-        let fits = !convs.is_empty()
-            && convs.iter().all(convolves)
-            && self.readers(right).iter().all(after_its_conv)
-            && z <= width
-            && z.is_multiple_of(4)
-            && seat.paged(self.handles(), left).is_some();
-        if fits {
-            seat.split.borrow_mut().insert(left.0, (x, right));
-        }
-        fits
-    }
-
     /// Runs the window's conv into the extended plane, landing the window's
     /// own rows in `y`, and returns the extended plane.
     pub(crate) fn rs_convolve(
@@ -333,43 +281,11 @@ impl Run<'_> {
     ) -> Result<Tensor, Error> {
         const OP: &str = "attention.ssm_causal_conv1d_committed";
         let ext_y = self.rs_out(OP, seat, y)?;
-        let split = seat.split.borrow().get(&conv.x.0).copied();
         // The verify conv lands the window's own rows itself, and through the
-        // page table reads and lands the buffer's too, and the split's other
-        // half where it reads the packed rows.
+        // page table reads and lands the buffer's too.
         let paged = seat.paged(self.handles(), conv.x);
         let fits =
             attn::ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
-        if let (Some((packed, right)), Some(_), true) = (split, paged, fits) {
-            return attn::ssm::causal_conv1d_verify(
-                self.ctx(),
-                self.tensor(packed),
-                paged,
-                Some(attn::ssm::VerifySplit {
-                    z: self.tensor(right),
-                }),
-                self.qo_indptr(),
-                &self.rs_committed(seat),
-                conv.weight,
-                &self.recurrent(conv.state),
-                conv.conv_width,
-                conv.dilation,
-                ext_y,
-                self.tensor(y),
-                self.rs_snapshots(),
-            )
-            .map(|()| ext_y);
-        }
-        // A split left to a conv that cannot take it is cut here.
-        if let Some((packed, right)) = split {
-            layout::split_rows(
-                self.ctx(),
-                self.tensor(packed),
-                ext_y.width,
-                self.tensor(conv.x),
-                self.tensor(right),
-            )?;
-        }
         if fits {
             let source = match paged {
                 Some(_) => self.tensor(conv.x),
@@ -379,7 +295,6 @@ impl Run<'_> {
                 self.ctx(),
                 source,
                 paged,
-                None,
                 self.qo_indptr(),
                 &self.rs_committed(seat),
                 conv.weight,

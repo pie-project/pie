@@ -1254,26 +1254,16 @@ pub fn causal_conv1d_verify_fits(channels: u32, conv_width: u32, dilation: u32) 
         && conv_history("", conv_width, dilation).is_ok_and(|hist| hist <= CONV_VERIFY_HIST)
 }
 
-/// The window's split a verify conv makes as it reads its own rows: `x` is
-/// the packed `[x | z]` projection, and the window's own rows' `z` land in
-/// `z`.
-#[derive(Clone, Copy, Debug)]
-pub struct VerifySplit {
-    pub z: Tensor,
-}
-
 /// [`causal_conv1d_committed_landing`] with a thread a row: every row lands
 /// in the extended plane `y`, and a row of the window's own in `land`, the
 /// window's own rows. Through `paged`, `x` is the window's own rows: the
 /// replayed rows are read from the lane's buffer, and the window's own land
-/// there; with `split`, `x` is the packed projection the window's split
-/// would have cut, its conv input the leading `y.width` of each row.
+/// there.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d_verify(
     ctx: &Ctx<'_>,
     x: Tensor,
     paged: Option<Paged>,
-    split: Option<VerifySplit>,
     indptr: Tensor,
     committed: &Committed,
     weight: Tensor,
@@ -1292,26 +1282,6 @@ pub fn causal_conv1d_verify(
         land.width == y.width && land.dtype == x.dtype,
         "the window's own rows land as the conv's row"
     );
-    let z_width = match split {
-        Some(split) => {
-            if paged.is_none()
-                || u64::from(x.width) != u64::from(channels) + u64::from(split.z.width)
-                || split.z.width > channels
-                || !split.z.width.is_multiple_of(4)
-            {
-                return Err(refuse(
-                    OP,
-                    format!(
-                        "a split of {} columns into {channels} and {} the verify conv lands \
-                         only through a page table, its second half no wider than its first",
-                        x.width, split.z.width
-                    ),
-                ));
-            }
-            split.z.width
-        }
-        None => 0,
-    };
     let taps = stated(
         OP,
         nonzero(OP, "the conv width this statement states", conv_width)?,
@@ -1357,12 +1327,6 @@ pub fn causal_conv1d_verify(
             page_bytes,
             row_bytes,
             is_paged,
-            stated(OP, x.width)?.arg(),
-            match split {
-                Some(split) => split.z.arg_mut(),
-                None => ctx.absent()?,
-            },
-            stated(OP, z_width)?.arg(),
         ],
     )
 }

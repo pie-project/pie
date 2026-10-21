@@ -23,7 +23,7 @@ const QKV_WIDTH: u32 = 2 * K_HEADS * DIM + V_HEADS * DIM;
 const Y_WIDTH: u32 = V_HEADS * DIM;
 const BA_WIDTH: u32 = 2 * V_HEADS;
 const BANK_FLOATS: u64 = V_HEADS as u64 * DIM as u64 * DIM as u64;
-const SLOTS: u32 = 60;
+const SLOTS: u32 = 40;
 /// The slot of a lane's paged walk past its unpaged one.
 const PAGED_SLOTS: i32 = 20;
 /// Tokens a page of the test's buffer, so a lane's rows cross pages.
@@ -500,7 +500,6 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             sink,
             x.x,
             None,
-            None,
             indptr,
             &new,
             x.weight,
@@ -525,7 +524,6 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             sink,
             xs.window,
             Some(xs.paged),
-            None,
             indptr,
             &paged,
             x.weight,
@@ -542,60 +540,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         xs.landed(bench, lanes),
         "the paged verify conv left the window's own rows out of the buffer"
     );
-    // And reading the packed `[x | z]` rows a split would have cut, landing
-    // `z` itself.
-    const Z_WIDTH: u32 = V_HEADS * DIM;
-    let packs = buffered(bench, lanes, x.x);
-    let z = bench.upload(
-        &bf16s(u64::from(own * Z_WIDTH), |at| unit(at ^ 0x6666)),
-        own,
-        Z_WIDTH,
-        Dtype::Bf16,
-    );
-    let packed: Vec<u8> = (0..own as usize)
-        .flat_map(|i| {
-            let mut row = bench.rows(packs.window, i, 1);
-            row.extend(bench.rows(z, i, 1));
-            row
-        })
-        .collect();
-    let packed = bench.upload(&packed, own, QKV_WIDTH + Z_WIDTH, Dtype::Bf16);
-    let split_slots = shifted(&paged_slots);
-    let split = committed(&split_slots);
-    let split_y = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
-    let split_land = bench.zeroed(own, QKV_WIDTH, Dtype::Bf16);
-    let split_z = bench.zeroed(own, Z_WIDTH, Dtype::Bf16);
-    bench.run(&|sink| {
-        ssm::causal_conv1d_verify(
-            sink,
-            packed,
-            Some(packs.paged),
-            Some(ssm::VerifySplit { z: split_z }),
-            indptr,
-            &split,
-            x.weight,
-            &pool(&x, split.slots),
-            TAPS,
-            1,
-            split_y,
-            split_land,
-            None,
-        )
-        .expect("the splitting verify conv");
-    });
     let window = |slot: i32| bench.read(x.conv, slot as u64 * CONV_FLOATS * 4, CONV_FLOATS * 4);
-    assert!(
-        packs.landed(bench, lanes)
-            && bench.rows(split_z, 0, own as usize) == bench.rows(z, 0, own as usize)
-            && bench.rows(split_land, 0, own as usize) == bench.rows(paged_land, 0, own as usize)
-            && bench.rows(split_y, 0, ext as usize) == bench.rows(old_y, 0, ext as usize)
-            && lanes
-                .old_slots
-                .iter()
-                .zip(&split_slots)
-                .all(|(&o, &n)| window(o) == window(n)),
-        "the verify conv reading the packed rows landed other bits"
-    );
     assert!(
         bench.rows(old_y, 0, ext as usize) == bench.rows(new_y, 0, ext as usize)
             && bench.rows(old_y, 0, ext as usize) == bench.rows(paged_y, 0, ext as usize),
@@ -794,7 +739,6 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
         ssm::causal_conv1d_verify(
             sink,
             x.x,
-            None,
             None,
             indptr,
             c,

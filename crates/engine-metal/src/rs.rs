@@ -443,9 +443,6 @@ pub struct Seat {
     /// rows, by the gates value: the `[b | a]` projection, `dt_bias` and
     /// `a_log`.
     pub prepped: RefCell<HashMap<u32, (ValueId, Tensor, Tensor)>>,
-    /// The splits whose packed rows the verify conv reads in place, by the
-    /// conv's input: the packed value and the split's other half.
-    pub split: RefCell<HashMap<u32, (ValueId, ValueId)>>,
 }
 
 /// A buffered window's conv, as its op states it.
@@ -543,7 +540,6 @@ impl Seat {
             pages,
             ext: RefCell::new(HashMap::new()),
             prepped: RefCell::new(HashMap::new()),
-            split: RefCell::new(HashMap::new()),
         })
     }
 
