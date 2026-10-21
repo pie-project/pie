@@ -43,18 +43,34 @@ fn the_verify_rows_price_their_matmuls() {
     // the M4 Pro's split-k, under each 5-to-8-row choice
     let splitk = "qmm_splitk = { use = \"fill\", fill_tg = 896, max = 8 }\n";
     // Apple9's own rungs, with the 5-to-8-row rung swapped for each candidate
-    let rest = |packs: u32| format!(
-        "{{ when = \"rows >= 5 and (bits == 2 or format == fp16)\", use = \"tiled\", crossover_tg = 96 }}, \
+    let rest = |packs: u32| {
+        format!(
+            "{{ when = \"rows >= 5 and (bits == 2 or format == fp16)\", use = \"tiled\", crossover_tg = 96 }}, \
          {{ when = \"rows >= 12\", use = \"tiled\", crossover_tg = 96 }}, \
-         {{ use = \"qmv\", rows_max = 8, packs = {packs}, crossover_tg = 96 }}");
+         {{ use = \"qmv\", rows_max = 8, packs = {packs}, crossover_tg = 96 }}"
+        )
+    };
     let paths: [(&str, String); 4] = [
-        ("register", format!("[kernel]\n{splitk}qmm = [{{ when = \"rows >= 5 and rows <= 8\", use = \"register\" }}, {}]\n", rest(1))),
+        (
+            "register",
+            format!(
+                "[kernel]\n{splitk}qmm = [{{ when = \"rows >= 5 and rows <= 8\", use = \"register\" }}, {}]\n",
+                rest(1)
+            ),
+        ),
         ("qmv p1", format!("[kernel]\n{splitk}qmm = [{}]\n", rest(1))),
         ("qmv p2", format!("[kernel]\n{splitk}qmm = [{}]\n", rest(2))),
-        ("tiled", format!("[kernel]\n{splitk}qmm = [{{ when = \"rows >= 5\", use = \"tiled\", crossover_tg = 96 }}, {{ use = \"qmv\", rows_max = 8, packs = 1, crossover_tg = 96 }}]\n")),
+        (
+            "tiled",
+            format!(
+                "[kernel]\n{splitk}qmm = [{{ when = \"rows >= 5\", use = \"tiled\", crossover_tg = 96 }}, {{ use = \"qmv\", rows_max = 8, packs = 1, crossover_tg = 96 }}]\n"
+            ),
+        ),
     ];
-    let tunings: Vec<(&str, kernels_metal::Tuning)> =
-        paths.iter().map(|(n, t)| (*n, engine_metal::chip::tuning(t, false))).collect();
+    let tunings: Vec<(&str, kernels_metal::Tuning)> = paths
+        .iter()
+        .map(|(n, t)| (*n, engine_metal::chip::tuning(t, false)))
+        .collect();
     let keep: RefCell<Vec<Buffer>> = RefCell::new(Vec::new());
     let plane = |rows: u32, width: u32, dtype: Dtype| -> Option<Tensor> {
         let bytes = (u64::from(rows) * u64::from(width) * dtype.bits() / 8).max(16384);
@@ -80,11 +96,20 @@ fn the_verify_rows_price_their_matmuls() {
     ] {
         let groups = k / 64;
         let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) / 2).map(noise).collect();
-        let scales: Vec<u8> = (0..n * groups).flat_map(|a| bf16(0.003 + (a % 7) as f32 * 1e-4)).collect();
-        let biases: Vec<u8> = (0..n * groups).flat_map(|a| bf16(((a % 9) as f32 - 4.0) / 64.0)).collect();
+        let scales: Vec<u8> = (0..n * groups)
+            .flat_map(|a| bf16(0.003 + (a % 7) as f32 * 1e-4))
+            .collect();
+        let biases: Vec<u8> = (0..n * groups)
+            .flat_map(|a| bf16(((a % 9) as f32 - 4.0) / 64.0))
+            .collect();
         let (cb, sb, bb) = (upload(&codes), upload(&scales), upload(&biases));
         let t = |b: &Buffer, rows: u32, width: u32, dtype: Dtype| {
-            Tensor::new(handles.bind(b, 0, b.bytes()).expect("bind"), rows, width, dtype)
+            Tensor::new(
+                handles.bind(b, 0, b.bytes()).expect("bind"),
+                rows,
+                width,
+                dtype,
+            )
         };
         let bank = Bank {
             mpp_codes: None,
@@ -95,22 +120,31 @@ fn the_verify_rows_price_their_matmuls() {
             bits: 4,
             ld: k,
         };
-        let mut line = format!("{what:15} K={k:5} N={n:6} MB={:6.1}", f64::from(k) * f64::from(n) * 0.5625 / 1e6);
+        let mut line = format!(
+            "{what:15} K={k:5} N={n:6} MB={:6.1}",
+            f64::from(k) * f64::from(n) * 0.5625 / 1e6
+        );
         for (col, (name, tuning)) in tunings.iter().enumerate() {
             for rows in [1u32, 8] {
                 if rows == 1 && col > 0 {
                     continue; // one row takes the qmv whatever the 5-to-8-row rule says
                 }
-                let x: Vec<u8> = (0..rows * k).flat_map(|a| bf16((f32::from(noise(u64::from(a))) - 127.0) / 256.0)).collect();
+                let x: Vec<u8> = (0..rows * k)
+                    .flat_map(|a| bf16((f32::from(noise(u64::from(a))) - 127.0) / 256.0))
+                    .collect();
                 let xb = upload(&x);
-                let yb = Buffer::zeroed(&device, (u64::from(rows) * u64::from(n) * 2).max(16384)).expect("y");
+                let yb = Buffer::zeroed(&device, (u64::from(rows) * u64::from(n) * 2).max(16384))
+                    .expect("y");
                 let (xt, yt) = (t(&xb, rows, k, Dtype::Bf16), t(&yb, rows, n, Dtype::Bf16));
                 let mut v = Vec::new();
                 let mut ok = true;
                 for i in 0..(ITERS + WARM) {
                     let frame = device.frame().expect("frame");
                     let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                    let scratch = quant::Scratch { precast: &|r, c| plane(r, c, Dtype::F16), partials: &|r, w| plane(r, w, Dtype::F32) };
+                    let scratch = quant::Scratch {
+                        precast: &|r, c| plane(r, c, Dtype::F16),
+                        partials: &|r, w| plane(r, w, Dtype::F32),
+                    };
                     if quant::matmul(&sink, tuning, xt, bank, yt, scratch, 32).is_err() {
                         ok = false;
                         break;
