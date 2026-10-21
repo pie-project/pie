@@ -173,6 +173,11 @@ pub struct Ctx {
     owner: *mut c_void,
     blas: *mut c_void,
     comm: *mut c_void,
+    /// This rank's place in its tensor-parallel group, for the launches
+    /// that only need to know it (a vocab-sharded embed): a side stream's
+    /// context carries it but no communicator, so collectives stay on the
+    /// main stream.
+    rank: Option<u32>,
     peers: Option<crate::collective::Peers>,
     slabs: Slabs,
 
@@ -196,6 +201,7 @@ impl Ctx {
             owner: stream,
             blas: core::ptr::null_mut(),
             comm: core::ptr::null_mut(),
+            rank: None,
             peers: None,
             slabs: Slabs::PROCESS,
             pad: core::cell::Cell::new(Pad { rows: 0, bucket: 0 }),
@@ -262,6 +268,17 @@ impl Ctx {
     pub const unsafe fn with_peers(mut self, peers: crate::collective::Peers) -> Self {
         self.peers = Some(peers);
         self
+    }
+
+    #[must_use]
+    pub const fn with_rank(mut self, rank: Option<u32>) -> Self {
+        self.rank = rank;
+        self
+    }
+
+    #[must_use]
+    pub const fn rank(&self) -> Option<u32> {
+        self.rank
     }
 
     #[must_use]

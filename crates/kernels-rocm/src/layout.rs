@@ -107,6 +107,9 @@ pub fn embed_vocab_shard(
 }
 
 pub(crate) fn comm_rank(ctx: &Ctx, op: &'static str) -> Result<u32, Error> {
+    if let Some(rank) = ctx.rank() {
+        return Ok(rank);
+    }
     let comm = ctx.comm(op)?;
     #[cfg(feature = "rocm")]
     {

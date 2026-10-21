@@ -37,6 +37,10 @@ impl Peers {
         Some(match (reduce, self.world) {
             (true, 2) => "::pie::collective::all_reduce_peers<__nv_bfloat16, 2>",
             (false, 2) => "::pie::collective::all_gather_peers<__nv_bfloat16, 2>",
+            (true, 4) => "::pie::collective::all_reduce_peers<__nv_bfloat16, 4>",
+            (false, 4) => "::pie::collective::all_gather_peers<__nv_bfloat16, 4>",
+            (true, 8) => "::pie::collective::all_reduce_peers<__nv_bfloat16, 8>",
+            (false, 8) => "::pie::collective::all_gather_peers<__nv_bfloat16, 8>",
             _ => return None,
         })
     }

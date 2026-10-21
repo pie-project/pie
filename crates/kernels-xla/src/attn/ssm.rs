@@ -233,11 +233,33 @@ pub(crate) fn slot_rows(
     ))
 }
 
+/// The most lanes `take_slots` slices out of a one-row-per-slot bank row by
+/// row. A TPU gathers rows as wide as a GDN state (a megabyte) by cutting the
+/// whole bank into column blocks first: a copy of every slot, per layer, per
+/// fire.
+const SLICED_LANES: i64 = 8;
+
 /// Each slot's state as one row, `[L, per · width]`, from a bank of `per`
 /// rows per slot; out-of-range slots clamp (they read garbage, harmlessly).
 pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<Val> {
     if per == 1 {
-        return f.take_rows(slab, slot);
+        let l = f.dims(slot)[0];
+        if l > SLICED_LANES {
+            return f.take_rows(slab, slot);
+        }
+        let width = f.dims(slab)[1];
+        let zero = ci(f, 0);
+        let mut rows = Vec::with_capacity(l as usize);
+        for i in 0..l {
+            let at = f.slice_axis(slot, 0, i, i + 1)?;
+            let at = f.reshape(at, &[])?;
+            rows.push(f.dynamic_slice(slab, &[at, zero], &[1, width])?);
+        }
+        return if l == 1 {
+            Ok(rows[0])
+        } else {
+            f.concat(&rows, 0)
+        };
     }
     let (rows, width) = (f.dims(slab)[0], f.dims(slab)[1]);
     let l = f.dims(slot)[0];
@@ -1105,7 +1127,7 @@ fn delta_chunked(
     let beta = blank(f, h.beta, &[nc, c], &[0, 2, 1])?;
 
     // Cumulative decay inside each chunk.
-    let gcum = f.scan(g, 2, Fold::Sum)?;
+    let gcum = f.scan_steps(g, 2, Fold::Sum)?;
     let glast = f.slice_axis(gcum, 2, c - 1, c)?;
     let glast = f.reshape(glast, &[nc, hh, gd])?;
     let e = f.exp(gcum);

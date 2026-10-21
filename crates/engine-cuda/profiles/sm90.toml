@@ -36,6 +36,9 @@ sdpa.dsv4_decode_until = 64
 gemm.bias_epilogue = true
 # Bf16 products of 2 to 8 rows may time the few-rows kernel.
 gemm.rows_m = 8
+# cuBLAS, not the fused skinny GEMM, for Gemma's GEGLU and soft-capped
+# head (Gemma 4 26B-A4B +4% at one request, +2% at 64).
+gemm.skinny_rows = 0
 # AttnRes's blend and its row's norm in one pass.
 attn_res.fused_norm = true
 # MXFP4 selects on the register-dequant mma.sync from 28 to 1024 routes,
@@ -51,3 +54,9 @@ moe.bf16_mma_until = 65536
 # A block-FP8 projection's decode rows (to 4) on the GEMV over bf16 rows,
 # ahead of the W8A16 mma.sync kernel (GLM-5.3-Flash's dense layers).
 gemm.fp8_gemv_until = 4
+
+[compiler]
+# A taken conditional node costs about 12 us on an H100, past the launches it
+# skips at decode: priced out, every region launches (DeepSeek-V4.1-Flash's
+# miniature +5% at one request, MiMo-V2.6-Flash's +7% at 64, six others even).
+cond_fixed_us = 1000000

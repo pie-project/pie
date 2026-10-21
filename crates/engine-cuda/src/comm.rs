@@ -202,9 +202,35 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
     let off = |why: String| Fault::program("comm::open_peers", why);
     let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
     // Past two ranks every rank reads several peers at once; over PCIe that
-    // loses to NCCL at every size, where any pair alone wins (#777).
-    if world != 2 {
+    // loses to NCCL at every size, where any pair alone wins (#777). Over
+    // NVLink (every pair with native peer atomics, which PCIe does not carry)
+    // the one-stage reduce wins at four and eight as vLLM's does.
+    if !matches!(world, 2 | 4 | 8) {
         return Err(off(format!("no peer path for a group of {world}")));
+    }
+    let nvlink = world == 2 || {
+        let mut all = true;
+        for &a in ordinals {
+            for &b in ordinals.iter().filter(|&&b| b != a) {
+                let mut atomic = 0;
+                // SAFETY: a live out-parameter and two ordinals the runtime counts.
+                let asked = unsafe {
+                    rt::cudaDeviceGetP2PAttribute(
+                        &raw mut atomic,
+                        rt::cudaDeviceP2PAttr::cudaDevP2PAttrNativeAtomicSupported,
+                        a,
+                        b,
+                    )
+                };
+                all &= asked == rt::cudaError::cudaSuccess && atomic != 0;
+            }
+        }
+        all
+    };
+    if !nvlink {
+        return Err(off(format!(
+            "no peer path for a group of {world}: its pairs are not all NVLink"
+        )));
     }
     for &a in ordinals {
         let mut vmm = 0;
