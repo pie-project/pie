@@ -101,6 +101,12 @@ impl Run<'_> {
                 width,
                 left,
                 right,
+            } if self.rs_split_into_conv(*x, *width, *left, *right) => Ok(()),
+            Layout::SplitRows {
+                x,
+                width,
+                left,
+                right,
             } => layout::split_rows(
                 self.ctx(),
                 self.tensor(*x),
