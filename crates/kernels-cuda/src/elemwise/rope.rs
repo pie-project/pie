@@ -224,6 +224,49 @@ pub fn rmsnorm_rope_partial_q(
     if y.rows == 0 || heads == 0 {
         return Ok(());
     }
+    // a warp a (row, head) over whole 16-byte runs, heads up to 1024 wide
+    let runs = (head_dim / 8).div_ceil(32);
+    if ctx.tuning().q_norm_rope_warp
+        && head_dim.is_multiple_of(8)
+        && matches!(runs, 1 | 2 | 4)
+        && [x.ptr, weight.ptr, y.ptr].iter().all(|p| aligned16(*p))
+    {
+        // eight warps a block, as many blocks as the card seats at once, each
+        // warp striding over the (row, head) items
+        const WARPS: u64 = 8;
+        let items = u64::from(y.rows) * u64::from(heads);
+        let resident = u64::from(ctx.multiprocessors().unwrap_or(148)) * 8;
+        let blocks = u32::try_from(items.div_ceil(WARPS).min(resident)).map_err(|_| {
+            refuse(
+                OP,
+                format!("{items} (row, head) items do not fit a 32-bit launch extent"),
+            )
+        })?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::q_rmsnorm_rope_partial_warp<{WARPS}, {runs}>"
+                )),
+            )
+            .apply(Launch::grid([blocks, 1, 1], [WARPS as u32 * 32, 1, 1])),
+            &[
+                x.arg(),
+                weight.arg(),
+                positions.arg(),
+                y.arg(),
+                stated(OP, y.rows)?.arg(),
+                stated(OP, head_dim)?.arg(),
+                stated(OP, heads)?.arg(),
+                stated(OP, rotary_dim)?.arg(),
+                stated(OP, span)?.arg(),
+                theta.arg(),
+                eps.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::elemwise::q_rmsnorm_rope_partial<128>")

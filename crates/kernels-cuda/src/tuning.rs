@@ -557,6 +557,28 @@ pub struct SsmGdnTc5;
 #[decision(id = "kernel.elemwise.rows_vec", flag, default = false, tune = search)]
 pub struct ElemwiseRowsVec;
 
+/// Whether q's fused per-head RMS norm and partial rotation (Gemma 4's global
+/// layers) runs a warp a (row, head) over 16-byte runs staged in shared memory
+/// rather than a 128-thread block a (row, head) an element a thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.q_norm_rope_warp", flag, default = false, tune = search)]
+pub struct ElemwiseQNormRopeWarp;
+
+/// Whether a fused norm-and-fold leaves unwritten the rows nothing reads past
+/// it (Gemma 4's normed sublayer outputs, and a stream its layer scalar
+/// rescales into a new row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.skip_unread", flag, default = false, tune = search)]
+pub struct ElemwiseSkipUnread;
+
+/// The threads a block of the 16-byte fused norm-and-fold takes a row with
+/// in a fire of 1024 rows or more: 0 is the row's runs rounded up to a power
+/// of two (at most 512), as always and as in every narrower fire; a smaller
+/// block takes the row in several runs a thread and seats more rows an SM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.norm_fold_block", constant(set(0, 32, 64, 128, 256)), default = 0, tune = search)]
+pub struct ElemwiseNormFoldBlock(pub u32);
+
 /// Whether the hyper-connection kernels run their tiled and 16-byte forms:
 /// the mix projection a block 64 rows of every column over shared-memory
 /// tiles, the fold and the gates' pre-mix eight columns a thread, and a
@@ -696,6 +718,9 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<ElemwiseRowsVec>()
+        .add::<ElemwiseQNormRopeWarp>()
+        .add::<ElemwiseSkipUnread>()
+        .add::<ElemwiseNormFoldBlock>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
         .add::<SsmConvVec4>()
@@ -819,6 +844,9 @@ tuning! {
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
     rows_vec: bool = false, on ElemwiseRowsVec;
+    q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
+    skip_unread: bool = false, on ElemwiseSkipUnread;
+    norm_fold_block: u32 = 0, get ElemwiseNormFoldBlock;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
     ssm_conv_vec4: bool = false, on SsmConvVec4;

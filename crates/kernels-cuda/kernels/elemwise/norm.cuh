@@ -1140,7 +1140,10 @@ __global__ void rmsnorm_residual_add(
     }
 }
 
-template <int BLOCK, int CHUNKS, bool SCALE, bool POST, bool POST_PLUS_ONE>
+// KEEP_T / KEEP_Y off: the normed row t, or the stream y it folds into (in
+// place), has no reader past the chain and is not written back.
+template <int BLOCK, int CHUNKS, bool SCALE, bool POST, bool POST_PLUS_ONE, bool KEEP_T = true,
+          bool KEEP_Y = true>
 __global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
     const bf16* __restrict__ x,
     const bf16* __restrict__ w0,
@@ -1236,8 +1239,8 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
                 last[c][2 * j + 1] = fin.y;
                 local2 += fin.x * fin.x + fin.y * fin.y;
             }
-            tr[i] = tq;
-            yr[i] = yq;
+            if constexpr (KEEP_T) tr[i] = tq;
+            if constexpr (KEEP_Y) yr[i] = yq;
             if constexpr (SCALE) sr[i] = sq;
         }
     }

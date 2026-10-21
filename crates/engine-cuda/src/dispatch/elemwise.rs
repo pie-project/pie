@@ -91,33 +91,67 @@ impl Run<'_> {
                 eps,
                 t,
                 y,
-                y_out: _,
+                y_out,
                 scale,
                 post,
             } => {
                 let mut scaled = scale.map(|(_, scaled)| self.tensor(scaled));
                 let mut out = post.as_ref().map(|post| self.tensor(post.out));
-                elemwise::norm::rmsnorm_residual_add(
+                // Under `kernel.elemwise.skip_unread` a row nothing reads past
+                // the chain goes unwritten: the normed row folded straight into
+                // the stream, and the stream itself where only its rescaled
+                // copy and the next norm go on.
+                #[cfg(feature = "cuda")]
+                let keep = if self.ctx().tuning().skip_unread {
+                    elemwise::norm::Keep {
+                        t: !self.is_unread(*t),
+                        y: !self.is_unread(*y_out),
+                    }
+                } else {
+                    elemwise::norm::Keep::ALL
+                };
+                #[cfg(not(feature = "cuda"))]
+                let _ = y_out;
+                let mut t = self.tensor(*t);
+                let mut y = self.tensor(*y);
+                let scale = match (scale, scaled.as_mut()) {
+                    (Some((s, _)), Some(scaled)) => Some((self.tensor(*s), scaled)),
+                    _ => None,
+                };
+                let post = match (post, out.as_mut()) {
+                    (Some(post), Some(out)) => Some(elemwise::norm::PostNorm {
+                        weight: self.tensor(post.weight),
+                        plus_one: post.plus_one,
+                        eps: post.eps,
+                        out,
+                    }),
+                    _ => None,
+                };
+                let (x, weight) = (self.tensor(*x), self.tensor(*weight));
+                #[cfg(feature = "cuda")]
+                let landed = elemwise::norm::rmsnorm_residual_add_keeping(
                     self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*weight),
+                    x,
+                    weight,
                     *eps,
-                    &mut self.tensor(*t),
-                    &mut self.tensor(*y),
-                    match (scale, scaled.as_mut()) {
-                        (Some((s, _)), Some(scaled)) => Some((self.tensor(*s), scaled)),
-                        _ => None,
-                    },
-                    match (post, out.as_mut()) {
-                        (Some(post), Some(out)) => Some(elemwise::norm::PostNorm {
-                            weight: self.tensor(post.weight),
-                            plus_one: post.plus_one,
-                            eps: post.eps,
-                            out,
-                        }),
-                        _ => None,
-                    },
-                )
+                    &mut t,
+                    &mut y,
+                    scale,
+                    post,
+                    keep,
+                );
+                #[cfg(not(feature = "cuda"))]
+                let landed = elemwise::norm::rmsnorm_residual_add(
+                    self.ctx(),
+                    x,
+                    weight,
+                    *eps,
+                    &mut t,
+                    &mut y,
+                    scale,
+                    post,
+                );
+                landed
             }
             Fused::EmbedScaleAdd {
                 ids,

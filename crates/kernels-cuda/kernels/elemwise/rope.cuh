@@ -894,6 +894,119 @@ __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     }
 }
 
+// `q_rmsnorm_rope_partial` a warp a (row, head): the head lands in shared
+// memory 16 bytes a lane, the warp folds its square sum, and each lane writes
+// its own 8-element runs, normed, scaled and (where a run holds a rotary pair's
+// half) turned against its mate read back from the staged head. The pairs'
+// frequencies are tabled once a block, each warp striding over the (row, head)
+// items. The same arithmetic as the block-a-head form, element for element; a
+// head is read whole before any of it is written, so y may be x. Heads are a
+// whole number of 8-element runs and at most 8 * 32 * RUNS wide.
+template <int WARPS, int RUNS>
+__global__ __launch_bounds__(WARPS * 32) void q_rmsnorm_rope_partial_warp(
+    const bf16* x,
+    const bf16* __restrict__ weight,
+    const i32* __restrict__ positions,
+    bf16* y,
+    int rows,
+    int head_dim,
+    int heads,
+    int rotary_dim,
+    int span,
+    float theta,
+    float eps,
+    const u32* __restrict__ win)
+{
+    __shared__ __align__(16) uint4 staged[WARPS][32 * RUNS];
+    __shared__ float freqs[128 * RUNS];
+    const int pairs = rotary_dim / 2;
+    for (int p = threadIdx.x; p < pairs; p += WARPS * 32) {
+        freqs[p] = powf(theta, -static_cast<float>(p) / static_cast<float>(span));
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int live = win != nullptr ? min(rows, static_cast<int>(win[0])) : rows;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const long long items = static_cast<long long>(live) * heads;
+    const uint4* wr = reinterpret_cast<const uint4*>(weight);
+    uint4* mine = staged[warp];
+    const bf16* head_x = reinterpret_cast<const bf16*>(mine);
+    const int runs = head_dim >> 3;
+
+    for (long long item = static_cast<long long>(blockIdx.x) * WARPS + warp; item < items;
+         item += static_cast<long long>(gridDim.x) * WARPS) {
+        const int n = static_cast<int>(item / heads);
+        const int head = static_cast<int>(item - static_cast<long long>(n) * heads);
+        const int row = n + base;
+        const long long at = (static_cast<long long>(row) * heads + head) * head_dim;
+        const uint4* xr = reinterpret_cast<const uint4*>(x + at);
+        uint4* yr = reinterpret_cast<uint4*>(y + at);
+
+        float local = 0.f;
+#pragma unroll
+        for (int k = 0; k < RUNS; ++k) {
+            const int c = lane + 32 * k;
+            if (c < runs) {
+                const uint4 v = xr[c];
+                mine[c] = v;
+                const bf16* e = reinterpret_cast<const bf16*>(&v);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const float f = bf16_to_f32(e[u]);
+                    local += f * f;
+                }
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            local += __shfl_xor_sync(0xffffffffu, local, off);
+        }
+        __syncwarp();
+        const float inv_rms = rsqrtf(local / static_cast<float>(head_dim) + eps);
+        const float pos = static_cast<float>(positions[row]);
+
+#pragma unroll
+        for (int k = 0; k < RUNS; ++k) {
+            const int c = lane + 32 * k;
+            if (c >= runs) continue;
+            const uint4 v = mine[c];
+            const uint4 wv = wr[c];
+            const bf16* e = reinterpret_cast<const bf16*>(&v);
+            const bf16* we = reinterpret_cast<const bf16*>(&wv);
+            uint4 packed;
+            bf16* out = reinterpret_cast<bf16*>(&packed);
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int i = c * 8 + u;
+                const float self = bf16_to_f32(e[u]) * inv_rms * bf16_to_f32(we[u]);
+                float o = self;
+                int pair = -1;
+                int mate = 0;
+                if (i < pairs) {
+                    pair = i;
+                    mate = i + span;
+                } else if (i >= span && i < span + pairs) {
+                    pair = i - span;
+                    mate = pair;
+                }
+                if (pair >= 0) {
+                    const float other =
+                        bf16_to_f32(head_x[mate]) * inv_rms * bf16_to_f32(weight[mate]);
+                    float cos_v, sin_v;
+                    __sincosf(pos * freqs[pair], &sin_v, &cos_v);
+                    o = i == pair ? self * cos_v - other * sin_v : self * cos_v + other * sin_v;
+                }
+                out[u] = f32_to_bf16(o);
+            }
+            yr[c] = packed;
+        }
+        // the next item restages this warp's head
+        __syncwarp();
+    }
+}
+
 template <class T>
 __global__ void rope_partial(
     T* __restrict__ q,

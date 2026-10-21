@@ -31,6 +31,7 @@ mod the_mla_prefill_ada_arm_answers_the_reference;
 mod the_mla_scores_land_their_log_sum_exp;
 mod the_modulate_forms_answer_the_broadcast_and_the_per_token_reference;
 mod the_moe_selects_answer_the_routed_dot;
+mod the_norm_fold_lands_only_what_it_keeps;
 mod the_norms_and_rotations_answer_the_host;
 mod the_paged_attention_answers_the_reference;
 mod the_partial_rope_turns_only_the_rotary_pairs;
