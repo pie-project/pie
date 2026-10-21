@@ -266,7 +266,8 @@ impl Run<'_> {
 
     /// The matmuls of `act` the trace places right after the one by `w` into
     /// `y` (a GDN layer's in-projection then its gates; a query, key and
-    /// value) in one register-tile launch with it, when every one of them
+    /// value, the query's split into query and gate between the query's and
+    /// the key's) in one register-tile launch with it, when every one of them
     /// runs on the register tile and their outputs stand clear of each other
     /// and of `act`: each lands as its own launch would land it, bit for bit,
     /// and the later ones' nodes find it done ([`Run::landed_ahead`]).
@@ -288,12 +289,24 @@ impl Run<'_> {
             return Ok(false);
         };
         let mut members = vec![(w, y)];
+        // The values a node between the matmuls touches: a query's split into
+        // query and gate, between the query's projection and the key's.
+        let mut between: Vec<poem_ir::ValueId> = Vec::new();
+        let mut at = first + 1;
         while members.len() < 3 {
-            let at = first + members.len() as u32;
-            match matmul(at).filter(|_| readers.contains(&at)) {
-                Some(next) => members.push(next),
-                None => break,
+            if let Some(next) = matmul(at) {
+                members.push(next);
+            } else {
+                match self.nodes().get(at as usize).map(|n| &n.op) {
+                    Some(Operation::Layout(poem_ir::Layout::SplitQGate {
+                        packed, q, gate, ..
+                    })) if between.is_empty() && members.iter().any(|m| m.1 == *packed) => {
+                        between.extend([*q, *gate]);
+                    }
+                    _ => break,
+                }
             }
+            at += 1;
         }
         if members.len() < 2 {
             return Ok(false);
@@ -330,11 +343,20 @@ impl Run<'_> {
         let Some(spans) = spans.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(false);
         };
+        let apart = |a: &(u64, u64, u64), b: &(u64, u64, u64)| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1;
         for (i, a) in spans.iter().enumerate() {
-            for b in &spans[i + 1..] {
-                if a.0 == b.0 && a.1 < b.2 && b.1 < a.2 {
-                    return Ok(false);
-                }
+            if spans[i + 1..].iter().any(|b| !apart(a, b)) {
+                return Ok(false);
+            }
+        }
+        // ... and from what a node between them writes, which runs after the
+        // launch landed them.
+        for &v in &between {
+            let Some(b) = span(self.tensor(v)) else {
+                return Ok(false);
+            };
+            if spans[2..].iter().any(|a| !apart(a, &b)) {
+                return Ok(false);
             }
         }
         let (counters, floats) = linear::quant::segments_scratch(&segments, m);
