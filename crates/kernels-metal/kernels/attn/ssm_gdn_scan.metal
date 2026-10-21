@@ -455,6 +455,58 @@ inline device uchar* gdn_buffered_row(
          size_t(at % page_tokens) * row_bytes;
 }
 
+// `gdn_row_sum<32>` of each of `V` values, with fewer shuffles: each xor step
+// of the first `log2(V)` halves the values a lane carries, keeping the half
+// its lane bit names and taking its partner's of that half, so a lane ends
+// with one value's sum after the steps every value's tree took. Each sum is
+// the tree's, operand for operand. Lane `l` holds value `gdn_rows_index`'s.
+template <int V>
+inline float gdn_rows_sum(thread float (&x)[V], uint lane) {
+  float a[V];
+  for (int v = 0; v < V; ++v) {
+    a[v] = x[v];
+  }
+  int count = V;
+  ushort mask = 1;
+  for (; count > 1; count /= 2, mask *= 2) {
+    const bool upper = (lane & mask) != 0;
+    const int split = count / 2;
+    for (int i = 0; i < split; ++i) {
+      const float keep = upper ? a[split + i] : a[i];
+      const float send = upper ? a[i] : a[split + i];
+      a[i] = keep + simd_shuffle_xor(send, mask);
+    }
+  }
+  float sum = a[0];
+  for (; mask < 32; mask *= 2) {
+    sum += simd_shuffle_xor(sum, mask);
+  }
+  return sum;
+}
+
+// The value whose sum lane `lane` holds after `gdn_rows_sum<V>`, and a lane
+// holding value `v`'s.
+template <int V>
+inline int gdn_rows_index(uint lane) {
+  int index = 0;
+  for (int split = V / 2, bit = 1; split > 0; split /= 2, bit *= 2) {
+    index += (lane & uint(bit)) != 0 ? split : 0;
+  }
+  return index;
+}
+
+template <int V>
+inline ushort gdn_rows_lane(int v) {
+  ushort lane = 0;
+  for (int split = V / 2, bit = 1; split > 0; split /= 2, bit *= 2) {
+    if (v >= split) {
+      lane |= ushort(bit);
+      v -= split;
+    }
+  }
+  return lane;
+}
+
 // A row's `[b | a]` gates of head `hv`, as `qwen_gdn_ba_gates` derives them:
 // `ba` the extended rows, or through a page table the window's own rows,
 // the replayed rows read from the lane's buffer and the window's own landed
@@ -660,8 +712,16 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
       }
       const float beta = beta_s[j];
       gdn_scan_memory<LANES, VROWS, PER>(st, k, decay_s[j], mem);
-      for (int v = 0; v < VROWS; ++v) {
-        mem[v] = gdn_row_sum<LANES>(mem[v]);
+      constexpr bool TRANSPOSED = LANES == 32 && VROWS > 1;
+      if constexpr (TRANSPOSED) {
+        const float sum = gdn_rows_sum<VROWS>(mem, lane_u);
+        for (int v = 0; v < VROWS; ++v) {
+          mem[v] = simd_shuffle(sum, gdn_rows_lane<VROWS>(v));
+        }
+      } else {
+        for (int v = 0; v < VROWS; ++v) {
+          mem[v] = gdn_row_sum<LANES>(mem[v]);
+        }
       }
       if (t < rep) {
         for (int v = 0; v < VROWS; ++v) {
@@ -674,10 +734,17 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
         float out[VROWS];
         gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
         const size_t row_out = (size_t(own + t) * size_t(v_heads) + size_t(hv)) * D;
-        for (int v = 0; v < VROWS; ++v) {
-          out[v] = gdn_row_sum<LANES>(out[v]);
-          if (lane == 0) {
-            y[row_out + size_t(dv_base + v)] = out[v];
+        if constexpr (TRANSPOSED) {
+          const float sum = gdn_rows_sum<VROWS>(out, lane_u);
+          if (lane_u < uint(VROWS)) {
+            y[row_out + size_t(dv_base + gdn_rows_index<VROWS>(lane_u))] = sum;
+          }
+        } else {
+          for (int v = 0; v < VROWS; ++v) {
+            out[v] = gdn_row_sum<LANES>(out[v]);
+            if (lane == 0) {
+              y[row_out + size_t(dv_base + v)] = out[v];
+            }
           }
         }
       }
