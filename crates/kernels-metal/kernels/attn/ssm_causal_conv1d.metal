@@ -468,11 +468,21 @@ template <typename T>
 
   if (live) {
     float4 w[PIE_CONV_X4_TAPS];
-    for (int k = 0; k < width; ++k) {
-      w[k] = float4(float(weight[(col + 0) * size_t(width) + size_t(k)]),
-                    float(weight[(col + 1) * size_t(width) + size_t(k)]),
-                    float(weight[(col + 2) * size_t(width) + size_t(k)]),
-                    float(weight[(col + 3) * size_t(width) + size_t(k)]));
+    if (width == 4) {
+      // The four channels' taps side by side: four loads of a channel's.
+      const device vec<T, 4>* taps = reinterpret_cast<const device vec<T, 4>*>(weight + col * 4);
+      const float4 c0 = float4(taps[0]), c1 = float4(taps[1]), c2 = float4(taps[2]),
+                   c3 = float4(taps[3]);
+      for (int k = 0; k < 4; ++k) {
+        w[k] = float4(c0[k], c1[k], c2[k], c3[k]);
+      }
+    } else {
+      for (int k = 0; k < width; ++k) {
+        w[k] = float4(float(weight[(col + 0) * size_t(width) + size_t(k)]),
+                      float(weight[(col + 1) * size_t(width) + size_t(k)]),
+                      float(weight[(col + 2) * size_t(width) + size_t(k)]),
+                      float(weight[(col + 3) * size_t(width) + size_t(k)]));
+      }
     }
     for (int t = first; t < span; t += rows) {
       float4 acc = 0.0f;
