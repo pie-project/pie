@@ -409,8 +409,8 @@ fn attn_paged() {
 }
 
 /// The head widths and groups past Qwen's: Gemma 4's global layers (512
-/// wide, group 8) and sliding ones (256 wide, group 2, a 1024 window), and
-/// DeepSeek-V4's single shared head (512 wide, group 64).
+/// wide, group 8) and sliding ones (256 wide, group 2, a 1024 window),
+/// DeepSeek-V4's single shared head (512 wide, group 64) and 64-wide heads.
 #[test]
 fn attn_paged_wide_heads() {
     let Some(gpu) = Gpu::open() else { return };
@@ -421,7 +421,9 @@ fn attn_paged_wide_heads() {
     run_decode(&gpu, &global, &[1, 37, 300, 1000], None, 1);
     // (DeepSeek-V4 decodes through its pool reader, not this one: only the
     // prefill takes its 64-head group.)
-    for c in [&global, &mqa] {
+    // Muse Spark's 64-wide heads walk the wide kernel too.
+    let narrow = Case::new(16, 2, 64, 16, false);
+    for c in [&global, &mqa, &narrow] {
         run_prefill(&gpu, c, &[1, 70, 200], &[0, 0, 0], 1);
         run_prefill(&gpu, c, &[33, 5, 130], &[100, 17, 900], 1);
     }

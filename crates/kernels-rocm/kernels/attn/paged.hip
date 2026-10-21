@@ -761,9 +761,10 @@ __device__ __forceinline__ void prefill_item(bool causal, int& bx, int& kv_head)
 template <int D, bool HND, bool CAUSAL>
 __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     constexpr int BC = prefill_bc<D>();
-    constexpr int KS = D / 16;   // k steps over the head for Sᵀ, d tiles for Oᵀ
+    constexpr int KS = D / 16;   // d tiles for Oᵀ
+    constexpr int KP = D / 32;   // paired k steps over the head for Sᵀ
     constexpr int KT = BC / 16;  // key tiles per kv tile
-    constexpr int KPAD = D + 16, VPAD = BC + 4;
+    constexpr int KPAD = D + 8, VPAD = BC + 4;
     constexpr int THREADS = 512, RD = BC * D / 8 / THREADS;  // 16-byte reads a thread a tile
     static_assert(RD * 8 * THREADS == BC * D && THREADS % BC == 0, "the tile splits evenly");
     __shared__ alignas(16) bf16 ks[BC][KPAD];
@@ -801,13 +802,13 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     // Whether any of the wavefront's rows is a query (its first row is).
     const bool wave_live = (qo_tile * kPrefillTileQ + wave * 16) / G < qo_len;
 
-    // Qᵀ as B operands: column = this lane's query row, k = 4·quad + t.
-    mfma_ab qf[KS];
+    // Qᵀ as B operands, k paired 8·quad: column = this lane's query row.
+    mfma_ab2 qf[KP];
     {
-        const bf16* qrow = p.q + static_cast<long long>(q_first + token) * p.q_stride_n +
-                           static_cast<long long>(head) * p.q_stride_h;
+        const bf16* qrow = p.q + static_cast<long long>(q_first + min(token, qo_len - 1)) * p.q_stride_n +
+                           static_cast<long long>(head) * p.q_stride_h + 8 * quad;
 #pragma unroll
-        for (int s = 0; s < KS; ++s) qf[s] = row_live ? load4(qrow + s * 16 + 4 * quad) : mfma_ab{0, 0, 0, 0};
+        for (int s = 0; s < KP; ++s) qf[s] = load8(qrow + s * 32);
     }
 
     mfma_cd o[KS];
@@ -823,17 +824,32 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     // (key c % BC, columns 8·(c / BC)), a wavefront 16 keys of four columns.
     // Every read is issued (a key past the chunk reads the chunk's last,
     // and lands as zeros at the store), so no read waits on another.
+    // With an even RD a thread's V reads pair up: keys 2·(c % (BC/2)) and
+    // +1 of columns 8·(c / (BC/2)), landed in Vᵀ four bytes a write.
+    constexpr bool PAIRS = RD % 2 == 0;
     Pack8<bf16> kr[RD], vr[RD];
+    auto v_at = [&](int r, int& vkey, int& vj) {
+        if constexpr (PAIRS) {
+            const int c = threadIdx.x + (r / 2) * THREADS;
+            vkey = 2 * (c % (BC / 2)) + r % 2;
+            vj = (c / (BC / 2)) * 8;
+        } else {
+            const int c = threadIdx.x + r * THREADS;
+            vkey = c % BC;
+            vj = (c / BC) * 8;
+        }
+    };
     auto fetch = [&](int kv0) {
 #pragma unroll
         for (int r = 0; r < RD; ++r) {
             const int c = threadIdx.x + r * THREADS;
             const int kkey = kv0 + c / (D / 8), kj = (c % (D / 8)) * 8;
-            const int vkey = kv0 + c % BC, vj = (c / BC) * 8;
+            int vkey, vj;
+            v_at(r, vkey, vj);
             kr[r] = *reinterpret_cast<const Pack8<bf16>*>(
                 p.k + kv_token<HND, D>(p, req, min(kkey, chunk_end - 1), kv_head, kj));
             vr[r] = *reinterpret_cast<const Pack8<bf16>*>(
-                p.v + kv_token<HND, D>(p, req, min(vkey, chunk_end - 1), kv_head, vj));
+                p.v + kv_token<HND, D>(p, req, min(kv0 + vkey, chunk_end - 1), kv_head, vj));
         }
     };
     auto stage = [&](int kv0) {
@@ -841,18 +857,31 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
         for (int r = 0; r < RD; ++r) {
             const int c = threadIdx.x + r * THREADS;
             const Pack8<bf16> k8 = kv0 + c / (D / 8) < chunk_end ? kr[r] : Pack8<bf16>{};
-            const Pack8<bf16> v8 = kv0 + c % BC < chunk_end ? vr[r] : Pack8<bf16>{};
             *reinterpret_cast<Pack8<bf16>*>(&ks[c / (D / 8)][(c % (D / 8)) * 8]) = k8;
-            const int vkey = c % BC, vj = (c / BC) * 8;
+        }
 #pragma unroll
-            for (int e = 0; e < 8; ++e) vt[vj + e][vkey] = v8.v[e];
+        for (int r = 0; r < RD; r += PAIRS ? 2 : 1) {
+            int vkey, vj;
+            v_at(r, vkey, vj);
+            const Pack8<bf16> v0 = kv0 + vkey < chunk_end ? vr[r] : Pack8<bf16>{};
+            if constexpr (PAIRS) {
+                const Pack8<bf16> v1 = kv0 + vkey + 1 < chunk_end ? vr[r + 1] : Pack8<bf16>{};
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const bf16 pair[2] = {v0.v[e], v1.v[e]};
+                    *reinterpret_cast<u32*>(&vt[vj + e][vkey]) = *reinterpret_cast<const u32*>(pair);
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) vt[vj + e][vkey] = v0.v[e];
+            }
         }
     };
     if (chunk_start < chunk_end) fetch(chunk_start);
 
     for (int kv0 = chunk_start; kv0 < chunk_end; kv0 += BC) {
         stage(kv0);
-        __syncthreads();
+        lds_barrier();
         if (kv0 + BC < chunk_end) fetch(kv0 + BC);
         if (wave_live) {
             // Sᵀ: lane holds keys 4·quad + t of each 16-key tile, for its row;
@@ -861,14 +890,11 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
             mfma_cd s[KT];
 #pragma unroll
             for (int kt = 0; kt < KT; ++kt) {
-                mfma_cd s2 = mfma_cd{0.f, 0.f, 0.f, 0.f};
-                s[kt] = mfma_cd{0.f, 0.f, 0.f, 0.f};
+                mfma_cd c[2] = {mfma_zero(), mfma_zero()};
 #pragma unroll
-                for (int st = 0; st < KS; st += 2) {
-                    s[kt] = mfma16(load4(&ks[kt * 16 + ln % 16][st * 16 + 4 * quad]), qf[st], s[kt]);
-                    s2 = mfma16(load4(&ks[kt * 16 + ln % 16][(st + 1) * 16 + 4 * quad]), qf[st + 1], s2);
-                }
-                s[kt] += s2;
+                for (int st = 0; st < KP; ++st)
+                    c[st % 2] = mfma16x2(load8(&ks[kt * 16 + ln % 16][st * 32 + 8 * quad]), qf[st], c[st % 2]);
+                s[kt] = c[0] + c[1];
             }
             float tile_max = neg_inf();
 #pragma unroll
@@ -905,7 +931,7 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
                 for (int kt = 0; kt < KT; ++kt) o[dt] = mfma16(load4(&vt[dt * 16 + ln % 16][kt * 16 + 4 * quad]), pt[kt], o[dt]);
             }
         }
-        __syncthreads();
+        lds_barrier();
     }
 
     // Each lane summed only its own keys of the row; the row's four lanes
