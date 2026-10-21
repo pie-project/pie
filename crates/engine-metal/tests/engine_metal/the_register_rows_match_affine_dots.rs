@@ -799,3 +799,16 @@ fn a_plain_norm_lays_the_table_its_projections_read() {
         }
     }
 }
+
+/// Every table producer's check on the GPU at hand, run by name with
+/// `--ignored` (as the microbenchmarks are) to read them on another chip.
+#[test]
+#[ignore = "the table producers' checks, run on demand on a named GPU"]
+fn register_tables_on_this_gpu() {
+    a_table_one_matmul_laid_feeds_the_next();
+    a_norm_lays_the_table_its_projections_read();
+    a_plain_norm_lays_the_table_its_projections_read();
+    a_swiglu_lays_the_table_its_down_reads();
+    a_gate_and_a_gated_norm_lay_the_table_their_out_projection_reads();
+    eprintln!("every register table producer matched qmm_sg_table on this GPU");
+}
