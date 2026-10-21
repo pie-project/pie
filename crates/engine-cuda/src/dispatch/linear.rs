@@ -1778,8 +1778,10 @@ impl Run<'_> {
         if block == 128 {
             // A decode's few rows on the mma.sync fp8 kernel, its rows quantized
             // in the same launch, where it leads (`kernel.gemm.fp8_mma_gemv_until`,
-            // `moe::dense_fp8_shape`).
-            if act.rows <= self.ctx().tuning().gemm_fp8_mma_gemv_until
+            // up to `kernel.gemm.fp8_mma_k_until` of K, `moe::dense_fp8_shape`).
+            let tuning = self.ctx().tuning();
+            if act.rows <= tuning.gemm_fp8_mma_gemv_until
+                && (tuning.gemm_fp8_mma_k_until == 0 || k <= tuning.gemm_fp8_mma_k_until)
                 && let Some(shape) = linear::moe::dense_fp8_shape(act.rows, n, k)
             {
                 return linear::moe::matmul_grouped_fp8_with(

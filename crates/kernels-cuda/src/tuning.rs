@@ -206,6 +206,14 @@ pub struct GemmFp8Shadow;
 #[decision(id = "kernel.gemm.fp8_mma_gemv_until", constant(range(0..=8)), default = 0, tune = search)]
 pub struct GemmFp8MmaGemvUntil(pub u32);
 
+/// The widest K a dense fp8b128 projection takes the mma.sync fp8 kernel at
+/// (`kernel.gemm.fp8_mma_gemv_until`); wider, its few CTAs each walk K too
+/// long and the tcgen05 GEMM leads (GLM-5.3's 6144-wide q_a, kv_a and indexer
+/// key at bs8, 12 us each). 0: any K.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_mma_k_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct GemmFp8MmaKUntil(pub u32);
+
 /// Whether AttnRes's blend and the RMS norm of its row run as one pass
 /// (`res_blend_norm`, 512 threads a row, the row in registers). Off but
 /// where a chip's profile turns it on (B200's).
@@ -742,6 +750,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
         .add::<GemmFp8MmaGemvUntil>()
+        .add::<GemmFp8MmaKUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
         .add::<MoeW4a4FusedLayout>()
@@ -868,6 +877,7 @@ tuning! {
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
+    gemm_fp8_mma_k_until: u32 = 0, get GemmFp8MmaKUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
     moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;
