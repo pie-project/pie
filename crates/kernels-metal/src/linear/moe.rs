@@ -1375,8 +1375,8 @@ pub fn register_glu(
 }
 
 /// A routed down (each expert's `columns` rows over `inter` inputs) on the
-/// register tile, over the tables [`register_glu`] landed: each tile's eight
-/// rows into `rooms.y`, route `at`'s at row `rooms.inv[at]`.
+/// register tile, over the tables [`register_glu`] landed: each tile's rows
+/// that hold a route into `rooms.y`, route `at`'s at row `rooms.inv[at]`.
 #[allow(clippy::too_many_arguments)]
 pub fn register_down(
     ctx: &Ctx<'_>,
@@ -1429,6 +1429,7 @@ pub fn register_down(
             stated(OP, inter)?.arg(),
             stated(OP, columns)?.arg(),
             stated(OP, experts)?.arg(),
+            rooms.rows.arg(),
         ],
     )
 }

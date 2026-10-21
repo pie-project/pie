@@ -332,9 +332,9 @@ PIE_MOE_SG_GLU(2, 4)
 PIE_MOE_SG_GLU(2, 8)
 
 // A routed projection of each live tile's table by its expert's columns, SG
-// simdgroups of 16 a threadgroup, into the tile's eight rows of `out` (rows
-// past its routes are zero); the grid's y extent is its tile slots, as the
-// gate-up's.
+// simdgroups of 16 a threadgroup, into the tile's rows of `out` that hold a
+// route (the rest are left as they were, read by nothing); the grid's y
+// extent is its tile slots, as the gate-up's.
 template <int SG>
 [[kernel]] void affine_qmm_sg_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
@@ -343,8 +343,9 @@ template <int SG>
     const device bfloat *tables [[buffer(6)]], device bfloat *out [[buffer(7)]],
     const device int *tiles [[buffer(8)]], constant int &width [[buffer(9)]],
     constant int &columns [[buffer(10)]], constant int &experts [[buffer(11)]],
-    uint2 position [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
-    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
+    const device int *rows [[buffer(12)]], uint2 position [[threadgroup_position_in_grid]],
+    uint2 grid [[threadgroups_per_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
   constexpr int NF = 2;
   const moe_sg::Lane l = moe_sg::lane_of(lane);
   const uint at = position.x * 8 * NF * SG + simd * 8 * NF + l.fm;
@@ -367,6 +368,8 @@ template <int SG>
 #pragma unroll
     for (uint i = 0; i < 2; ++i) {
       const ulong row = ulong(tile) * 8 + l.fn + i;
+      if (rows[row] < 0)
+        continue;
 #pragma unroll
       for (int f = 0; f < NF; ++f)
         out[row * columns + at + 8 * f] = bfloat(acc[f][i]);
@@ -378,8 +381,8 @@ template <int SG>
   template [[host_name("affine_qmm_sg_routed_s" #sg)]] [[kernel]] void affine_qmm_sg_routed<sg>(   \
       const device uint *, const device bfloat *, const device bfloat *, const device uint *,      \
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
-      const device int *, constant int &, constant int &, constant int &, uint2, uint2, uint,      \
-      uint);
+      const device int *, constant int &, constant int &, constant int &, const device int *,      \
+      uint2, uint2, uint, uint);
 PIE_MOE_SG_DOWN(4)
 PIE_MOE_SG_DOWN(8)
 PIE_MOE_SG_DOWN(16)
