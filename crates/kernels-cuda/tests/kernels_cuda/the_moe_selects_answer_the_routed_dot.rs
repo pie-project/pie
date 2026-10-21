@@ -246,6 +246,9 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [4, 200, 2, 384, 1024], f, None, 0),
         (K::MxBias, mma, [8, 80, 4, 192, 2880], t, alpha, 2),
         (K::Mx, mma, [8, 120, 4, 256, 512], t, None, 1),
+        // Hopper's wgmma slice below the staged kernel's 32 routes an expert.
+        (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
+        (K::MxBias, mma, [8, 32, 4, 192, 2048], t, alpha, 0),
         (K::Mx, cvt, [8, 1, 4, 200, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 40, 4, 576, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 3, 4, 576, 2880], f, None, 2),
@@ -531,6 +534,63 @@ fn bf16_select_rate() {
 /// The NVFP4 W4A16 select's rate at GLM-5.3-mini's decode shapes (eight
 /// experts, each of a C64 step's tokens on all eight): the GLU gate-up and
 /// the down projection.
+#[test]
+#[ignore = "a rate bench: cargo test ... -- --ignored mxfp4_select_rate --nocapture"]
+fn mxfp4_select_rate() {
+    // DeepSeek-V4-Flash's miniature at a 64-row decode: 16 experts, top 6.
+    let (experts, top) = (16usize, 6usize);
+    // `PIE_TOKENS`: the decode's rows (64 by default).
+    let tokens: usize = std::env::var("PIE_TOKENS").map_or(64, |v| v.parse().expect("a count"));
+    for (n, k, glu) in [(2048usize, 4096usize, true), (4096, 2048, false)] {
+        let rows = if glu { 2 * n } else { n };
+        let mut b = Bench::new(9);
+        let (x, _) = b.bf16(tokens * k);
+        let codes = b.up(&tab(experts * rows * k / 2, |i| (i * 37 % 251) as u8));
+        let scales = b.up(&tab(experts * rows * k / 32, |i| 120 + (i % 7) as u8));
+        let routes = b.up(&tab(tokens * top, |i| {
+            ((i / top * 5 + i % top * 3) % experts) as i32
+        }));
+        let (xt, rt) = (t(x, tokens, k, Bf16), t(routes, tokens, top, I32));
+        let mut y = b.out(tokens * top, n);
+        // sm90's span of the register-dequant select.
+        let tuning = Tuning {
+            mxfp4_mma_from: 28,
+            mxfp4_mma_until: 1024,
+            ..b.ctx().tuning()
+        };
+        let ctx = b.ctx().with_tuning(tuning);
+        let (c, s) = (
+            t(codes, experts, rows * k / 2, U8),
+            t(scales, experts, rows * k / 32, U8),
+        );
+        let fire = |y: &mut _| {
+            if glu {
+                let bank = GluBank::Mxfp4 {
+                    codes: c,
+                    scales: s,
+                    bias: None,
+                };
+                moe::select_glu(&ctx, xt, bank, rt, y, Glu::Swiglu, RES).map(|_| ())
+            } else {
+                moe::matmul_select_quant(&ctx, xt, c, s, None, rt, y, SEAT)
+            }
+        };
+        fire(&mut y).expect("fires");
+        b.sync();
+        let reps = 50;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        eprintln!(
+            "mxfp4 select {n}x{k} glu={glu}: {us:.1} us a fire, {:.0} GB/s of the bank",
+            (experts * rows * k / 2) as f64 / us / 1e3
+        );
+    }
+}
+
 #[test]
 #[ignore = "a rate, not an answer"]
 fn nvfp4_select_rate() {
