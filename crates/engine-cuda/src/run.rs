@@ -1993,7 +1993,6 @@ impl<'c> Run<'c> {
         Some(RecurrentPool {
             write_state: false,
             commit_len: Tensor::ABSENT,
-            #[cfg(feature = "rocm")]
             snapshots: kernels_cuda::Snapshots::NONE,
             ..cut
         })
@@ -2027,7 +2026,6 @@ impl<'c> Run<'c> {
                         lanes(pool.commit_len)
                     },
                     begin_at: lanes(pool.begin_at),
-                    #[cfg(feature = "rocm")]
                     snapshots: kernels_cuda::Snapshots {
                         indptr: lanes(pool.snapshots.indptr),
                         ..pool.snapshots

@@ -7,3 +7,7 @@ assumes = { cc = 120 }
 [kernel]
 gemv.bf16 = "narrow"
 mla.path  = "naive"
+# The gated delta rule's prefill on the two-launch scan, a quarter head a
+# block in its 99 KiB: Qwen3.5-0.8B's prefill fire 36% less GPU time than on
+# the three wmma launches.
+ssm.gdn_fused_scan = true

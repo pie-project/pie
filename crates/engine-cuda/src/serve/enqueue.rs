@@ -563,7 +563,6 @@ impl FireCtx<'_> {
                 commit_len,
             )
             .splitting(commit_len);
-        #[cfg(feature = "rocm")]
         let seats = seats.snapshotting(
             self.predicate
                 .snapshots(self.device.stream(), &p.rs.snapshots)?,

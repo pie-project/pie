@@ -1651,7 +1651,6 @@ impl FrameShell for Shell {
                 order: rs_order,
                 reads: rs_reads,
                 rows_ext: rs_rows_ext,
-                #[cfg(feature = "rocm")]
                 snapshots,
             },
         })
