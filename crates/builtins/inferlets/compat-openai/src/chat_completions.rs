@@ -112,7 +112,7 @@ fn content_parts(content: Option<Value>, param: &str) -> Result<(String, Vec<Vec
                             .and_then(|u| u.get("url").or(Some(u)))
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        images.push(data_url(url).map_err(|e| invalid(e, Some(param)))?);
+                        images.push(compat::image::data_url(url).map_err(|e| invalid(e, Some(param)))?);
                     }
                     Some(other) => {
                         return Err(invalid(
@@ -132,36 +132,6 @@ fn content_parts(content: Option<Value>, param: &str) -> Result<(String, Vec<Vec
             Some(param),
         )),
     }
-}
-
-/// The bytes of a base64 `data:` URL; the program cannot fetch remote ones.
-fn data_url(url: &str) -> Result<Vec<u8>, String> {
-    let Some((head, body)) = url.strip_prefix("data:").and_then(|u| u.split_once(',')) else {
-        return Err("an image must be a `data:` URL".into());
-    };
-    if !head.ends_with(";base64") {
-        return Err("an image `data:` URL must be base64".into());
-    }
-    let mut out = Vec::with_capacity(body.len() * 3 / 4);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for c in body.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' | b'\n' | b'\r' => continue,
-            _ => return Err("an image `data:` URL is not valid base64".into()),
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Ok(out)
 }
 
 /// The normalized request, whether a streamed reply ends with a usage

@@ -7,13 +7,14 @@
 //! `message_stop`) with `stream: true`. Reasoning is a `thinking` block.
 //!
 //! Supported: `system` (string or text blocks), `messages` with `text`,
-//! `tool_use` and `tool_result` blocks, `tools` (custom tools with
+//! `tool_use` and `tool_result` blocks and a user's `image` blocks (a
+//! `base64` source), `tools` (custom tools with
 //! `input_schema`), `tool_choice` (`auto`/`any`/`tool`/`none`), `thinking`
 //! (`enabled`/`disabled`; off when absent, as the API says),
 //! `stop_sequences`, `temperature`, `top_p`, `top_k`, `max_tokens`
 //! (required), `stream`.
 //!
-//! Refused with 400: image and document blocks, built-in tool types, and
+//! Refused with 400: an image by `url` source, document blocks, built-in tool types, and
 //! more than one candidate. `anthropic-version` and `metadata` are ignored.
 
 use compat::{
@@ -52,6 +53,24 @@ fn invalid(message: impl Into<String>) -> ApiError {
 }
 
 /// Text blocks (or a bare string) joined.
+/// The bytes of an `image` block: a `base64` source, its payload beside its
+/// `media_type`. A `url` source would have this server fetch it, which it
+/// cannot.
+fn image_of(block: &Value, what: &str) -> Result<Vec<u8>, ApiError> {
+    let source = block.get("source").unwrap_or(&Value::Null);
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let data = source.get("data").and_then(Value::as_str).unwrap_or("");
+            compat::image::base64(data)
+                .map_err(|_| invalid(format!("{what}: the image's `data` is not valid base64")))
+        }
+        Some(other) => Err(invalid(format!(
+            "{what}: an image source of type `{other}` is not supported; send its bytes as a `base64` source"
+        ))),
+        None => Err(invalid(format!("{what}: an image block needs a `source`"))),
+    }
+}
+
 fn text_of(value: &Value, what: &str) -> Result<String, ApiError> {
     match value {
         Value::String(s) => Ok(s.clone()),
@@ -108,6 +127,7 @@ fn parse(body: Value) -> Result<Request, ApiError> {
                 Value::String(s) => messages.push(Message::text(Role::User, s.clone())),
                 Value::Array(blocks) => {
                     let mut text = String::new();
+                    let mut images = Vec::new();
                     for block in blocks {
                         match block.get("type").and_then(Value::as_str) {
                             Some("text") => {
@@ -115,6 +135,7 @@ fn parse(body: Value) -> Result<Request, ApiError> {
                                     block.get("text").and_then(Value::as_str).unwrap_or(""),
                                 );
                             }
+                            Some("image") => images.push(image_of(block, &what)?),
                             Some("tool_result") => {
                                 let id = block
                                     .get("tool_use_id")
@@ -133,14 +154,16 @@ fn parse(body: Value) -> Result<Request, ApiError> {
                             }
                             Some(other) => {
                                 return Err(invalid(format!(
-                                    "{what}: block type `{other}` is not supported; only `text` and `tool_result` are"
+                                    "{what}: block type `{other}` is not supported; only `text`, `image` and `tool_result` are"
                                 )));
                             }
                             None => return Err(invalid(format!("{what}: block has no `type`"))),
                         }
                     }
-                    if !text.is_empty() {
-                        messages.push(Message::text(Role::User, text));
+                    if !text.is_empty() || !images.is_empty() {
+                        let mut message = Message::text(Role::User, text);
+                        message.images = images;
+                        messages.push(message);
                     }
                 }
                 _ => {
@@ -447,4 +470,42 @@ async fn main(input: String) -> Result<String, String> {
         "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
     })
     .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(content: Value) -> Result<Request, ApiError> {
+        parse(json!({"max_tokens": 8, "messages": [{"role": "user", "content": content}]}))
+    }
+
+    #[test]
+    fn a_base64_image_block_lands_its_bytes_on_the_user_turn() {
+        let req = turn(json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+            {"type": "text", "text": "What is this?"},
+        ]))
+        .expect("an image block parses");
+        let user = req.messages.last().expect("a user turn");
+        assert_eq!(user.content, "What is this?");
+        assert_eq!(user.images, vec![b"hello".to_vec()]);
+
+        let alone = turn(json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+        ]))
+        .expect("an image alone is a turn");
+        assert_eq!(alone.messages.last().unwrap().images, vec![b"hi".to_vec()]);
+    }
+
+    #[test]
+    fn an_image_the_server_would_fetch_is_refused() {
+        let why = turn(json!([
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+        ]))
+        .err()
+        .expect("a url source is refused");
+        assert_eq!(why.status, 400);
+        assert!(why.body.to_string().contains("base64"), "{}", why.body);
+    }
 }

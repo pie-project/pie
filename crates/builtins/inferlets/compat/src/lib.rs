@@ -25,6 +25,7 @@ pub mod envelope;
 pub mod error;
 pub mod generate;
 pub mod holdback;
+pub mod image;
 pub mod prompt;
 pub mod request;
 pub mod resume;
