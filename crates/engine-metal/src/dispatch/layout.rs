@@ -96,6 +96,8 @@ impl Run<'_> {
                 self.tensor(*q),
                 self.tensor(*gate),
             ),
+            // A segment launch of the projection it splits landed both halves.
+            Layout::SplitRows { left, .. } if self.landed_ahead(*left) => Ok(()),
             Layout::SplitRows {
                 x,
                 width,
