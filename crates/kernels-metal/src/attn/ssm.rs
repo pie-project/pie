@@ -1010,3 +1010,111 @@ pub fn gated_delta_committed_landing(
         ],
     )
 }
+
+/// The `(lanes a value row, simdgroups, value rows a lane)` of a verify
+/// scan's threadgroup.
+const GDN_VERIFY_GROUP: (u32, u32, u32) = (32, 4, 4);
+
+/// The key and value head width the verify scan stages.
+const GDN_VERIFY_DIM: u32 = 128;
+
+/// The verify scan stamped at `(lanes, simdgroups, value rows)`.
+#[must_use]
+pub fn gated_delta_verify_entry(lanes: u32, groups: u32, vrows: u32) -> Option<&'static str> {
+    Some(match (lanes, groups, vrows) {
+        (32, 4, 4) => "gated_delta_verify_bfloat16_l_32_s_4_v_4",
+        (32, 8, 4) => "gated_delta_verify_bfloat16_l_32_s_8_v_4",
+        (32, 8, 2) => "gated_delta_verify_bfloat16_l_32_s_8_v_2",
+        (32, 4, 8) => "gated_delta_verify_bfloat16_l_32_s_4_v_8",
+        (8, 4, 1) => "gated_delta_verify_bfloat16_l_8_s_4_v_1",
+        (8, 4, 2) => "gated_delta_verify_bfloat16_l_8_s_4_v_2",
+        (8, 8, 1) => "gated_delta_verify_bfloat16_l_8_s_8_v_1",
+        (16, 4, 2) => "gated_delta_verify_bfloat16_l_16_s_4_v_2",
+        (16, 4, 1) => "gated_delta_verify_bfloat16_l_16_s_4_v_1",
+        _ => return None,
+    })
+}
+
+/// The launch of a verify scan at `(lanes, simdgroups, value rows)` over
+/// `heads` value heads of every lane.
+#[must_use]
+pub fn gated_delta_verify_grid(lanes: u32, groups: u32, vrows: u32, heads: u32) -> Grid {
+    let rows_a_simdgroup = (GDN_SCAN_LANES / lanes) * vrows;
+    Grid::of(
+        [GDN_SCAN_LANES, GDN_VERIFY_DIM / rows_a_simdgroup, heads],
+        [GDN_SCAN_LANES, groups, 1],
+    )
+}
+
+/// Whether [`gated_delta_verify`] walks these heads.
+#[must_use]
+pub fn gated_delta_verify_fits(k_dim: u32, v_dim: u32) -> bool {
+    k_dim == GDN_VERIFY_DIM && v_dim == GDN_VERIFY_DIM
+}
+
+/// [`gated_delta_committed_landing`] over 128-wide heads, a threadgroup's
+/// rows staged before it walks them. A replayed row only folds in; a row of
+/// the window's own lands its readout in `y`, the window's own rows, where
+/// the committed scan landed every row in the extended plane.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_verify(
+    ctx: &Ctx<'_>,
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ssm_gated_delta_committed";
+    let _ = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_verify_bfloat16" });
+    debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
+    nonzero(OP, "the key heads this statement states", k_heads)?;
+    nonzero(OP, "the value heads this statement states", v_heads)?;
+    if !v_heads.is_multiple_of(k_heads) {
+        return Err(refuse(
+            OP,
+            format!("the {v_heads} value heads are not a whole number of the {k_heads} key heads"),
+        ));
+    }
+    if !gated_delta_verify_fits(k_dim, v_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the verify scan stages {GDN_VERIFY_DIM}-wide heads, and these are {k_dim} by {v_dim}"
+            ),
+        ));
+    }
+    let lanes = committed_lanes(OP, indptr)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
+    let (row_lanes, groups, vrows) = GDN_VERIFY_GROUP;
+    let entry = gated_delta_verify_entry(row_lanes, groups, vrows)
+        .ok_or_else(|| refuse(OP, "no verify scan is stamped at this geometry"))?;
+    let z = v_heads
+        .checked_mul(lanes)
+        .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
+    ctx.fire(
+        Fire::at(GDN_SCAN_FILE, entry).apply(gated_delta_verify_grid(row_lanes, groups, vrows, z)),
+        &[
+            qkv.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            gates.arg(),
+            state.state.arg_mut(),
+            y.arg_mut(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            snaps,
+            lane0,
+        ],
+    )
+}

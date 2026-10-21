@@ -435,3 +435,190 @@ template <typename T, int LANES, int VROWS, int PER>
       const device float*, device float*, device float*,                       \
       const constant int&, const constant int&, const constant int&,           \
       const constant int&, const device int*, const constant int&, uint3);
+
+// The rows of a committed scan one pass stages in threadgroup memory.
+constant constexpr int kVerifyChunk = 16;
+
+// A committed scan over 128-wide heads whose threadgroup holds `SG` simdgroups
+// of `32 / LANES` value-row groups, `VROWS` rows each. Each pass stages up to
+// `kVerifyChunk` rows' normed q and k, the group's value rows, decay and beta
+// in threadgroup memory, every row's loads issued side by side, so a row of
+// the walk reads no device memory; `gated_delta_scan_committed` loaded each
+// row's inputs behind the row before, and a verify walk of a dozen rows
+// spent most of its time waiting on them. A replayed row only folds into the
+// state: its readout was landed the fire that first ran it. A row of this
+// fire's own lands its readout in `y` at its own row, where the window reads
+// it. At 32 lanes the arithmetic is `gdn_scan_token`'s, so the bits are the
+// committed scan's.
+template <typename T, int LANES, int SG, int VROWS>
+[[kernel]] void gated_delta_verify(
+    const device T* qkv         [[buffer(0)]],
+    const device int* indptr    [[buffer(1)]],
+    const device int* replay    [[buffer(2)]],
+    const device int* commit    [[buffer(3)]],
+    const device int* slots     [[buffer(4)]],
+    const constant int& lane0   [[buffer(5)]],
+    const device float* gates   [[buffer(6)]],
+    device float* rstate        [[buffer(7)]],
+    device float* y             [[buffer(8)]],
+    const constant int& k_heads [[buffer(9)]],
+    const constant int& v_heads [[buffer(10)]],
+    const device int* snaps     [[buffer(11)]],
+    const constant int& snap_lane0 [[buffer(12)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane_u [[thread_index_in_simdgroup]],
+    uint sg_u [[simdgroup_index_in_threadgroup]]) {
+  constexpr int D = 128;
+  constexpr int PER = D / LANES;
+  // The normed q and k are staged 4 columns a lane, as the 32-lane scan
+  // holds them.
+  constexpr int NORM_PER = 4;
+  constexpr int SUBS = 32 / LANES;
+  constexpr int GROUP_ROWS = SG * SUBS * VROWS;
+  const int tid = int(sg_u) * 32 + int(lane_u);
+  const int lane = int(lane_u) % LANES;
+  const int hv = int(group.z) % v_heads;
+  const int r = int(group.z) / v_heads;
+  const int group_base = int(group.y) * GROUP_ROWS;
+  const int my_rows = (int(sg_u) * SUBS + int(lane_u) / LANES) * VROWS;
+  const int dv_base = group_base + my_rows;
+
+  threadgroup float q_s[kVerifyChunk][D];
+  threadgroup float k_s[kVerifyChunk][D];
+  threadgroup float v_s[kVerifyChunk][GROUP_ROWS];
+  threadgroup float decay_s[kVerifyChunk];
+  threadgroup float beta_s[kVerifyChunk];
+
+  int begin = indptr[r];
+  for (int j = 0; j < r; ++j) {
+    begin += replay[lane0 + j];
+  }
+  const int rep = replay[lane0 + r];
+  const int span = (indptr[r + 1] - indptr[r]) + rep;
+  const int slot = slots[lane0 + r];
+  // Uniform over the threadgroup, so its barriers below are too.
+  if (span <= 0 || slot < 0) {
+    return;
+  }
+  const int own = indptr[r] - rep;
+  const int keep = min(commit[lane0 + r], span);
+  const int hk = hv / (v_heads / k_heads);
+  const size_t keys = size_t(k_heads) * D;
+  const size_t pitch = 2 * keys + size_t(v_heads) * D;
+  const float scale = 1.0f / metal::sqrt(float(D));
+
+  device float* cells = gdn_cells<VROWS, PER>(rstate, slot, hv, v_heads, dv_base, D, D);
+  float st[VROWS][PER];
+  gdn_load<VROWS, PER>(st, cells, lane, D);
+  const device int* snap =
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+  int snapped = 0;
+  int snap_at = snap != nullptr ? snap[0] : 0;
+
+  for (int c0 = 0; c0 < span; c0 += kVerifyChunk) {
+    const int rows = min(kVerifyChunk, span - c0);
+    // One simdgroup a row: its q and k, normed as `gdn_scan_row` norms them.
+    for (int j = int(sg_u); j < rows; j += SG) {
+      const size_t row = size_t(begin + c0 + j) * pitch;
+      const size_t qbase = row + size_t(hk) * D;
+      const size_t kbase = qbase + keys;
+      float q[NORM_PER], k[NORM_PER];
+      float qs = 0.0f;
+      float ks = 0.0f;
+      for (int i = 0; i < NORM_PER; ++i) {
+        const int d = NORM_PER * int(lane_u) + i;
+        const float qv = float(qkv[qbase + size_t(d)]);
+        const float kv = float(qkv[kbase + size_t(d)]);
+        q[i] = qv;
+        k[i] = kv;
+        qs += qv * qv;
+        ks += kv * kv;
+      }
+      const float qinv = metal::rsqrt(gdn_row_sum<32>(qs) + 1e-6f) * scale;
+      const float kinv = metal::rsqrt(gdn_row_sum<32>(ks) + 1e-6f);
+      for (int i = 0; i < NORM_PER; ++i) {
+        q_s[j][NORM_PER * int(lane_u) + i] = q[i] * qinv;
+        k_s[j][NORM_PER * int(lane_u) + i] = k[i] * kinv;
+      }
+    }
+    for (int at = tid; at < rows * GROUP_ROWS; at += SG * 32) {
+      const int j = at / GROUP_ROWS;
+      const int v = at % GROUP_ROWS;
+      const size_t vbase = size_t(begin + c0 + j) * pitch + 2 * keys + size_t(hv) * D;
+      v_s[j][v] = float(qkv[vbase + size_t(group_base + v)]);
+    }
+    if (tid < rows) {
+      const size_t fused = size_t(begin + c0 + tid) * 2 * size_t(v_heads) + size_t(hv);
+      decay_s[tid] = metal::exp(gates[fused]);
+      beta_s[tid] = gates[fused + size_t(v_heads)];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < rows; ++j) {
+      const int t = c0 + j;
+      float q[PER], k[PER], vals[VROWS], mem[VROWS];
+      for (int i = 0; i < PER; ++i) {
+        q[i] = q_s[j][PER * lane + i];
+        k[i] = k_s[j][PER * lane + i];
+      }
+      for (int v = 0; v < VROWS; ++v) {
+        vals[v] = v_s[j][my_rows + v];
+      }
+      const float beta = beta_s[j];
+      gdn_scan_memory<LANES, VROWS, PER>(st, k, decay_s[j], mem);
+      for (int v = 0; v < VROWS; ++v) {
+        mem[v] = gdn_row_sum<LANES>(mem[v]);
+      }
+      if (t < rep) {
+        for (int v = 0; v < VROWS; ++v) {
+          const float delta = (vals[v] - mem[v]) * beta;
+          for (int i = 0; i < PER; ++i) {
+            st[v][i] += k[i] * delta;
+          }
+        }
+      } else {
+        float out[VROWS];
+        gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
+        const size_t row_out = (size_t(own + t) * size_t(v_heads) + size_t(hv)) * D;
+        for (int v = 0; v < VROWS; ++v) {
+          out[v] = gdn_row_sum<LANES>(out[v]);
+          if (lane == 0) {
+            y[row_out + size_t(dv_base + v)] = out[v];
+          }
+        }
+      }
+      if (t + 1 == keep) {
+        gdn_store<VROWS, PER>(cells, st, lane, D);
+      }
+      if (t + 1 == snap_at) {
+        gdn_store<VROWS, PER>(
+            gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+                                  D, D),
+            st, lane, D);
+        ++snapped;
+        snap_at = snapped < PIE_RS_SNAPSHOTS ? snap[snapped] : 0;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+#define PIE_GDN_VERIFY(lanes, sg, vrows)                                       \
+  template [[host_name("gated_delta_verify_bfloat16_l_" #lanes "_s_" #sg       \
+                       "_v_" #vrows)]]                                         \
+  [[kernel]] void gated_delta_verify<bfloat, lanes, sg, vrows>(                \
+      const device bfloat*, const device int*, const device int*,              \
+      const device int*, const device int*, const constant int&,               \
+      const device float*, device float*, device float*,                       \
+      const constant int&, const constant int&, const device int*,             \
+      const constant int&, uint3, uint, uint);
+
+PIE_GDN_VERIFY(32, 4, 4)
+PIE_GDN_VERIFY(32, 8, 4)
+PIE_GDN_VERIFY(32, 8, 2)
+PIE_GDN_VERIFY(32, 4, 8)
+PIE_GDN_VERIFY(8, 4, 1)
+PIE_GDN_VERIFY(8, 4, 2)
+PIE_GDN_VERIFY(8, 8, 1)
+PIE_GDN_VERIFY(16, 4, 2)
+PIE_GDN_VERIFY(16, 4, 1)
