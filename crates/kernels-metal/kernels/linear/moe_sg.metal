@@ -14,9 +14,10 @@ using namespace metal;
 //
 // `tiles` holds the live tile count, then each tile's expert (`experts` for
 // the shared one); `rows` each tile row's token, -1 past its routes; `inv`
-// each route's tile row. A pass launches every tile a fire could fill and
-// the tiles past the count return. A tile's table is `moe_sg::table_width`
-// bf16 wide: its rows' inputs and their sums as `qmm_sg_table` lays them.
+// each route's tile row. A pass's grid holds tile slots, each taking every
+// slots-th live tile, as no grid can be sized by the live count it reads. A
+// tile's table is `moe_sg::table_width` bf16 wide: its rows' inputs and their
+// sums as `qmm_sg_table` lays them.
 
 namespace moe_sg {
 
@@ -114,8 +115,8 @@ inline Lane lane_of(uint lane) {
   return {fm, fn, fn >> 1};
 }
 
-// Row `k - by` of a threadgroup row, for `register_table::half_sum` over a
-// row that holds one half of a 64-input group.
+// Input `k` of a threadgroup row that holds the inputs from `by` on, for
+// `register_table::half_sum`, which indexes a row from its first input.
 struct Shifted {
   const threadgroup bfloat *at;
   int by;
