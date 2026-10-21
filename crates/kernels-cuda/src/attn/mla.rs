@@ -827,7 +827,8 @@ mod sparse {
     /// strides its rows), or, a pass short of 64 heads, copies them into
     /// 64-head rows and its output back out. A head's attention reads no
     /// other head's, so a padded head's rows (left as they are) touch nothing
-    /// kept. The log-sum-exp plane, 64 a row in the kernel, is not split.
+    /// kept. Each pass's log-sum-exps (64 a row in the kernel) are copied to
+    /// their heads likewise.
     fn by_sixty_four(
         ctx: &Ctx,
         op: &'static str,
@@ -836,8 +837,7 @@ mod sparse {
     ) -> Result<(), Error> {
         let heads = u32::try_from(s.heads).unwrap_or(0);
         let rope = u32::try_from(s.rope).unwrap_or(u32::MAX);
-        if s.lse != 0
-            || s.kv_lora_rank != 512
+        if s.kv_lora_rank != 512
             || !(rope == 0 || rope == 64)
             || s.q.width != heads * 512
             || o.width != heads * 512
@@ -847,12 +847,8 @@ mod sparse {
                 op,
                 format!(
                     "fp8 latent rows are read 64 heads a pass, over 512 latent and 64 or no \
-                     rotated dims without a log-sum-exp plane, and this read is {} heads of \
-                     {} latent and {} rotated dims{}",
-                    s.heads,
-                    s.kv_lora_rank,
-                    s.rope,
-                    if s.lse != 0 { " with one" } else { "" }
+                     rotated dims, and this read is {} heads of {} latent and {} rotated dims",
+                    s.heads, s.kv_lora_rank, s.rope
                 ),
             ));
         }
@@ -861,6 +857,21 @@ mod sparse {
             return Ok(());
         }
         let at = |ptr: u64, head: u32, width: u32| ptr + u64::from(head) * u64::from(width) * 2;
+        // The kernel lands 64 log-sum-exps a row: a pass's land in a plane of
+        // their own and are copied out (an f32 is two bf16s wide).
+        let lse = if s.lse == 0 {
+            0
+        } else {
+            ctx.scratch_shared(op, "attn.mla_sparse.pad_lse", rows as usize * 64 * 4)? as usize
+                as u64
+        };
+        let lse_out = |first: u32, held: u32| -> Result<(), Error> {
+            if lse == 0 {
+                return Ok(());
+            }
+            let to = at(s.lse, first, 2);
+            copy_rows(ctx, op, to, heads * 2, lse, 64 * 2, held * 2, rows)
+        };
         for first in (0..heads).step_by(64) {
             let held = (heads - first).min(64);
             if held == 64 {
@@ -881,9 +892,11 @@ mod sparse {
                     q,
                     q_pe,
                     heads: 64,
+                    lse,
                     ..*s
                 };
                 passed(ctx, op, &pass, &mut out)?;
+                lse_out(first, held)?;
                 continue;
             }
             let wide = |name, width: u32| -> Result<Tensor, Error> {
@@ -892,12 +905,13 @@ mod sparse {
                 Ok(Tensor::new(ptr, rows, 64 * width, Dtype::Bf16))
             };
             let q = wide("attn.mla_sparse.pad_q", 512)?;
+            let from = at(s.q.ptr, first, 512);
             copy_rows(
                 ctx,
                 op,
                 q.ptr,
                 64 * 512,
-                at(s.q.ptr, first, 512),
+                from,
                 heads * 512,
                 held * 512,
                 rows,
@@ -924,19 +938,22 @@ mod sparse {
                 q,
                 q_pe,
                 heads: 64,
+                lse,
                 ..*s
             };
             passed(ctx, op, &pass, &mut out)?;
+            let to = at(o.ptr, first, 512);
             copy_rows(
                 ctx,
                 op,
-                at(o.ptr, first, 512),
+                to,
                 heads * 512,
                 out.ptr,
                 64 * 512,
                 held * 512,
                 rows,
             )?;
+            lse_out(first, held)?;
         }
         Ok(())
     }

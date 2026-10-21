@@ -563,10 +563,10 @@ fn e4m3(b: u8) -> f32 {
 /// same values as standard fp8 rows (512 latent and `rope` rotated e4m3
 /// codes, scale 1). The bf16 rows hold each code's value.
 fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> Vec<u16> {
-    decode_heads(HEADS, reqs, kv, rope, fp8, dense)
+    decode_heads(HEADS, reqs, kv, rope, fp8, dense, false).0
 }
 
-/// [`decode_short`] over `heads` heads.
+/// [`decode_short`] over `heads` heads, and its log-sum-exps where `lse`.
 fn decode_heads(
     heads: usize,
     reqs: usize,
@@ -574,7 +574,8 @@ fn decode_heads(
     rope: usize,
     fp8: bool,
     dense: bool,
-) -> Vec<u16> {
+    lse: bool,
+) -> (Vec<u16>, Vec<f32>) {
     const PG: usize = 64;
     let row = RANK + rope;
     let pages_per = kv.div_ceil(PG);
@@ -682,6 +683,7 @@ fn decode_heads(
     let qo_at = gpu.up(&qo);
     let sel_at = gpu.up(&sel);
     let out = gpu.zeros(reqs * heads * RANK * 2);
+    let lse_at = gpu.zeros(reqs * heads * 4);
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_sparse: true,
         mla_dense_short: dense,
@@ -702,13 +704,21 @@ fn decode_heads(
             RANK as u32,
             0.04,
             &mut Tensor::new(out, reqs as u32, (heads * RANK) as u32, Dtype::Bf16),
-            None,
+            lse.then_some(&mut Tensor::new(
+                lse_at,
+                reqs as u32,
+                heads as u32,
+                Dtype::F32,
+            )),
         )
         .expect("the decode's selected attention fires");
     };
     fire();
     gpu.sync();
-    gpu.down(out, reqs * heads * RANK)
+    (
+        gpu.down(out, reqs * heads * RANK),
+        gpu.down(lse_at, reqs * heads),
+    )
 }
 
 /// The fp8 rows on e4m3 tensor cores (Q and P in e4m3 too) against the same
@@ -773,8 +783,16 @@ fn fp8_rows_read_any_head_count_sixty_four_a_pass() {
         (128, 4, 1000, 64),
         (96, 4, 300, 64),
     ] {
-        let want = decode_heads(heads, rows, kv, rope, false, false);
-        let got = decode_heads(heads, rows, kv, rope, true, false);
+        let (want, want_lse) = decode_heads(heads, rows, kv, rope, false, false, true);
+        let (got, got_lse) = decode_heads(heads, rows, kv, rope, true, false, true);
+        for (i, (&g, &w)) in got_lse.iter().zip(&want_lse).enumerate() {
+            assert!(
+                (g - w).abs() <= 0.05 * w.abs().max(1.0),
+                "{heads} heads, row {} head {}: log-sum-exp {g} against {w}",
+                i / heads,
+                i % heads
+            );
+        }
         let (mut err, mut norm) = (0f64, 0f64);
         for (&g, &w) in got.iter().zip(&want) {
             let (g, w) = (f64::from(from_bf16(g)), f64::from(from_bf16(w)));
