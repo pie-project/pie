@@ -47,6 +47,34 @@ const fn per_head_split(width: u32, head_dim: u32) -> u32 {
     if head_dim == 0 { 1 } else { width / head_dim }
 }
 
+/// A per-head norm on its own lanes: a head of 8 to 512 elements (a power
+/// of two) in planes that allow 16-byte reads, eight elements a lane. The
+/// lanes a head, the launch and the head rows in all.
+fn head_lanes(
+    op: &'static str,
+    y: &Tensor,
+    head_dim: u32,
+    planes: &[u64],
+) -> Result<Option<(u32, Launch, i64)>, Error> {
+    let lph = head_dim / VEC_WIDTH;
+    if head_dim == 0
+        || !head_dim.is_multiple_of(VEC_WIDTH)
+        || !lph.is_power_of_two()
+        || lph > WARP
+        || !planes.iter().all(|p| p.is_multiple_of(16))
+    {
+        return Ok(None);
+    }
+    let total = u64::from(y.rows) * u64::from(y.width / head_dim);
+    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK / lph)))
+        .map_err(|_| refuse(op, format!("the grid will not launch: {total} head rows")))?;
+    Ok(Some((
+        lph,
+        Launch::per_row(blocks, BLOCK),
+        i64::try_from(total).unwrap_or(i64::MAX),
+    )))
+}
+
 fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     let n = t.elements();
     let lanes = u32::try_from(n).map_err(|_| {
@@ -110,6 +138,29 @@ fn rms_row(
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
     let heads = stated(op, per_head_split(y.width, per_head_dim))?;
+    if let Some((lph, lanes, total)) = head_lanes(op, y, per_head_dim, &[x.ptr, weight.ptr, y.ptr])?
+    {
+        let plus = template == OFFSET_BANK;
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_lanes<{t}, {lph}, {plus}>"
+                )),
+            )
+            .apply(lanes),
+            &[
+                x.arg(),
+                weight.arg(),
+                y.arg(),
+                total.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(
@@ -228,6 +279,27 @@ pub fn rmsnorm_no_scale(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    if let Some((lph, lanes, total)) = head_lanes(OP, y, head_dim, &[x.ptr, y.ptr])? {
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_lanes<{t}, {lph}, false>"
+                )),
+            )
+            .apply(lanes),
+            &[
+                x.arg(),
+                ArgValue::ABSENT,
+                y.arg(),
+                total.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -274,6 +346,34 @@ pub fn rmsnorm_gated(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    if let Some((lph, lanes, total)) = head_lanes(
+        OP,
+        y,
+        head_dim,
+        &[x.ptr, gate.ptr, y.ptr, weight.map_or(0, |w| w.ptr)],
+    )? {
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_gated_f32_lanes<{t}, {lph}>"
+                )),
+            )
+            .apply(lanes),
+            &[
+                x.arg(),
+                gate.arg(),
+                weight.map_or(ArgValue::ABSENT, |w| w.arg()),
+                y.arg(),
+                total.arg(),
+                eps.arg(),
+                i32::from(sigmoid_gate).arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -303,12 +403,36 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let group = nonzero(OP, "the group width", group)?;
+    rmsnorm_grouped(
+        ctx,
+        "elementwise.rmsnorm_grouped_plus_one",
+        x,
+        weight,
+        group,
+        eps,
+        true,
+        y,
+    )
+}
+
+/// Each `group`-wide run of `x`'s rows RMS-normed into `y` and scaled by
+/// its own `weight`s (`1 + weight` under `plus_one`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rmsnorm_grouped(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Tensor,
+    group: u32,
+    eps: f32,
+    plus_one: bool,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let group = nonzero(op, "the group width", group)?;
     if y.width == 0 || !y.width.is_multiple_of(group) {
         return Err(refuse(
-            OP,
+            op,
             format!(
                 "the {}-wide row is not a whole number of {group}-wide groups",
                 y.width
@@ -321,13 +445,13 @@ pub fn rmsnorm_grouped_plus_one(
         "the weight spans the row's full width"
     );
     let groups = y.width / group;
-    let launch = rows_per_head(OP, y.rows, y.width, group)?;
+    let launch = rows_per_head(op, y.rows, y.width, group)?;
     ctx.fire(
-        OP,
+        op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::rmsnorm_grouped_plus_one<{t}, 256>"
+                "::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"
             )),
         )
         .apply(launch),
@@ -335,8 +459,8 @@ pub fn rmsnorm_grouped_plus_one(
             x.arg(),
             weight.arg(),
             y.arg(),
-            stated(OP, group)?.arg(),
-            stated(OP, groups)?.arg(),
+            stated(op, group)?.arg(),
+            stated(op, groups)?.arg(),
             eps.arg(),
             ctx.stage(),
         ],
@@ -714,13 +838,29 @@ pub fn norm_gate(
     let rows = nonzero(OP, "rows", y.rows)?;
     let absent = |t: Option<&Tensor>| t.map_or(ArgValue::ABSENT, Tensor::arg);
     let tail = next.is_some();
+    // A row of whole eights in aligned planes moves in 16-byte packs, held
+    // in registers (up to eight a thread) through both norms.
+    let chunks = (y.width / VEC_WIDTH).div_ceil(BLOCK);
+    let aligned = [
+        Some(x),
+        scale,
+        res,
+        gate,
+        Some(*y),
+        next.as_ref().map(|n| n.weight),
+        next.as_ref().map(|n| n.y),
+    ]
+    .iter()
+    .flatten()
+    .all(|t| t.ptr.is_multiple_of(16));
+    let entry = if y.width.is_multiple_of(VEC_WIDTH) && chunks <= 8 && aligned {
+        format!("::pie::elemwise::norm_gate_vec8<{t}, {BLOCK}, {tail}, {chunks}>")
+    } else {
+        format!("::pie::elemwise::norm_gate<{t}, {BLOCK}, {tail}>")
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::elemwise::norm_gate<{t}, {BLOCK}, {tail}>")),
-        )
-        .apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(FILE, symbol(&entry)).apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
             absent(scale.as_ref()),

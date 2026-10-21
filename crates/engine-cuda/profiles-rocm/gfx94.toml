@@ -10,20 +10,64 @@ assumes = { cc = 94 }
 #
 # hipBLASLt's grouped GEMM keeps the rows by expert from the gate-up to the
 # fold from `lt_mlp_from` routes an expert, both contractions at least
-# `lt_deep_k` (it loses over Qwen3.8-Flash-Next's 640-deep down projection).
-# Below that, the native legs keep expert order from `ordered_from` routes an
-# expert. Tiles: MT256x192x64 over the deep contractions, MT128x288x32 below.
+# `lt_deep_k` (it loses over Qwen3.8-Flash-Next's 640-deep down projection,
+# and is no faster than the native legs over Qwen3.6's 512-deep one). Below
+# that, the native legs keep expert order from `ordered_from` routes an
+# expert, the swiglu in the gate-up's epilogue (Qwen3.6, 4K tokens: -13%).
+# Tiles: MT256x192x64 over the deep contractions, MT128x288x32 below.
 [kernel]
 moe.lt_grouped = true
 moe.lt_mlp_from = 128
 moe.lt_tile_deep = 256_192_064
 moe.lt_tile_shallow = 128_288_032
 moe.lt_deep_k = 2048
-moe.ordered_from = 256
+moe.ordered_from = 128
+
+# MLA's per-head absorbs (DeepSeek, GLM-5.3, Kimi K3 heads: 64 x 192 / 512 x
+# 256) on the native kernel where rocBLAS's strided batch picks a slow
+# solution: the query's up to 2048 rows (1.4-3x), the value's 33-1536 (it
+# keeps rocBLAS's few-row and 2048-row solutions).
+mla.absorb_q_until = 2048
+mla.absorb_out_from = 33
+mla.absorb_out_until = 1536
+
+# A dense e4m3tile128 projection past 32 rows leaves the FP8 decode tile for
+# the prefill tiles, 64 x 128 up to 128 rows (GLM-5.3's shapes at 48-128
+# rows: 12-44% faster than the decode tile or the 256-wide tiles).
+fp8.decode_until = 32
+fp8.narrow_until = 128
+
+# An lm head over a body's readouts padded past 128 rows (a mixed fire's
+# ceiling, 7-9 of 256 live on GLM-5.3) multiplies only the live ones on
+# hipBLASLt's grouped kernels: 154880 x 6144 at 9 live 483 us against the
+# padded GEMM's 1018; up to 128 rows the dense GEMM stays (the grouped tiles
+# trail it by ~4% at full count).
+gemm.live_from = 129
+
+# A dense bf16 projection of 3-16 rows over a bank at least 2048 wide and K
+# up to 2048 takes the turned kernel: whole 512-byte weight row runs turned
+# through LDS into the matrix core's order (Qwen3.6 at 8 rows, cold weights:
+# 12288 x 2048 18.5 us vs hipBLASLt's 23.6, 9216 x 2048 14.6 vs 16.2,
+# 2048 x 512 3.1 vs 4.2; 4 rows 16.7 vs the skinny kernel's 20.5). An lm head
+# keeps it to 32 rows (248320 x 2048: 24-32 rows 260-265 us vs hipBLASLt's
+# 346-358); a narrower bank past 16 loses to hipBLASLt.
+gemm.turn_from = 3
+gemm.turn_until = 16
+gemm.turn_wide_until = 32
+gemm.turn_min_n = 2048
+
+# The gated-delta chunk scan walks 32-column state slices from 512 slices
+# of 16 (two Qwen3.6 requests): the slices of a head read the same chunk
+# operands, and at 14K rows the 16-column walk is 1.4x the time (one
+# request keeps it: 64 vs 82 us).
+ssm.gdn_wide_from = 512
 
 # A fire of 10240 rows where `max_forward_tokens` is unstated: 8192 left the
 # first prompts' decodes waiting out a second prefill fire, 12K and up made
-# queued prompts wait. Past 2048 rows, four buckets a doubling.
+# queued prompts wait. Past 2048 rows, eight buckets a doubling: a prefill's
+# GEMMs run its bucket's rows (Gemma4 31B, 32 prompts: 4416 rows took 4871,
+# 10% of the frame, at four).
 [engine]
 forward_tokens = 10240
 prefill_lattice_from = 2048
+prefill_lattice_steps = 8

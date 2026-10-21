@@ -5,33 +5,156 @@
 // values' shared part) beside its rotated half (`rope` wide, keys only),
 // held in two page planes; the query arrives absorbed into the latent space,
 // so every head scores q_nope·latent + q_pe·rope and reads the latent back.
+// An e4m3 kv deployment keeps vLLM's standard fp8 rows instead: one u8
+// plane, the latent's then the rope's e4m3 codes a row under a unit scale,
+// read as attn/kv.hip reads an e4m3 pool (`FP8`).
 //
 // Scores live in the log2 domain (s = q·k · sm_scale · log2 e); a log-sum-
 // exp is m + log2 Σ 2^(s − m), the convention every lse plane here carries.
 
 #include "prelude/device.hip"
 #include "prelude/mfma.hip"
+#include "attn/kv.hip"
 
 namespace pie::attn {
 
 // ---------------------------------------------------------------- feed --
 
-// q_b's per-head [nope | rope] rows split into the two planes.
-template <class T>
+// q_b's per-head [nope | rope] rows split into the two planes, V elements a
+// thread (V divides both widths).
+template <class T, int V>
 __global__ void mla_split_q_b(const T* __restrict__ q_b, T* __restrict__ q_nope, T* __restrict__ q_pe,
                               int total, int heads, int nope, int rope, const u32* __restrict__ win) {
+    struct alignas(sizeof(T) * V) P {
+        T v[V];
+    };
     const Window window{win};
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     const int per = nope + rope;
-    const int d = i % per;
-    const int h = (i / per) % heads;
-    const int n = i / (heads * per);
+    const long long e = static_cast<long long>(i) * V;
+    const int d = static_cast<int>(e % per);
+    const int h = static_cast<int>(e / per % heads);
+    const long long n = e / (static_cast<long long>(heads) * per);
     if (!window.live(n)) return;
     const long long row = window.plane(n) * heads + h;
-    const T v = q_b[row * per + d];
-    if (d < nope) q_nope[row * nope + d] = v;
-    else q_pe[row * rope + (d - nope)] = v;
+    const P v = *reinterpret_cast<const P*>(q_b + row * per + d);
+    if (d < nope) *reinterpret_cast<P*>(q_nope + row * nope + d) = v;
+    else *reinterpret_cast<P*>(q_pe + row * rope + (d - nope)) = v;
+}
+
+// The absorbs: y[t, h, :] = x[t, h, :] · W_h, every head's own K x N
+// matrix (`wstride` elements apart), KN: W_h row-major [K][N] (the up
+// projection's key half, read for the query), else [N][K] (its value half,
+// read back out of the latent). A block 64 of a head's N columns over
+// WT·16·MS tokens, its four waves WN along N by WT along the tokens; a stage
+// 64 of K, the weight through LDS as [n][k] (KN transposed on the way in),
+// each wave's tokens straight to its registers.
+template <bool KN, int WT, int MS>
+__global__ __launch_bounds__(256) void mla_absorb(const bf16* __restrict__ x, const bf16* __restrict__ w,
+                                                  bf16* __restrict__ y, int tokens, int n, int k, int ldx, int ldy,
+                                                  long long wstride, const u32* __restrict__ win) {
+    constexpr int NT = 64, KC = 64, PITCH = KC + 8, WL = NT * KC / 8 / 256, H2 = KC / 32;
+    constexpr int WN = 4 / WT, NB = 4 / WN, TT = WT * 16 * MS;
+    static_assert(WN * WT == 4, "four waves");
+    __shared__ __align__(16) bf16 wl[2][NT * PITCH];
+    const Window window{win};
+    const int live = window.w == nullptr ? tokens : min(tokens, static_cast<int>(win[0]));
+    const long long first = window.plane(0);
+    const int h = blockIdx.y, n0 = blockIdx.x * NT, t0 = blockIdx.z * TT;
+    if (t0 >= live) return;
+    const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16, wave = tid / kWave;
+    const int wn = wave % WN, wt = wave / WN, tw = t0 + wt * 16 * MS;
+    const bf16* wh = w + h * wstride;
+    const int stages = k / KC;
+
+    // A thread's 16-byte pieces of a weight stage, piece p = tid + 256 i: KN
+    // row p / 8 of the stage, columns 8 (p % 8) ..; else row n = p / 8, k
+    // 8 (p % 8) ...
+    auto wload = [&](int s, Pack8<bf16> (&v)[WL]) {
+#pragma unroll
+        for (int i = 0; i < WL; ++i) {
+            const int p = tid + 256 * i, r = KN ? p / 8 : p / (KC / 8), c = KN ? 8 * (p % 8) : 8 * (p % (KC / 8));
+            if constexpr (KN)
+                v[i] = *reinterpret_cast<const Pack8<bf16>*>(wh + static_cast<long long>(s * KC + r) * n + n0 + c);
+            else
+                v[i] = *reinterpret_cast<const Pack8<bf16>*>(wh + static_cast<long long>(n0 + r) * k + s * KC + c);
+        }
+    };
+    auto wstore = [&](const Pack8<bf16> (&v)[WL], int b) {
+#pragma unroll
+        for (int i = 0; i < WL; ++i) {
+            const int p = tid + 256 * i, r = KN ? p / 8 : p / (KC / 8), c = KN ? 8 * (p % 8) : 8 * (p % (KC / 8));
+            if constexpr (KN) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) wl[b][(c + j) * PITCH + r] = v[i].v[j];
+            } else {
+                *reinterpret_cast<Pack8<bf16>*>(&wl[b][r * PITCH + c]) = v[i];
+            }
+        }
+    };
+    const bf16* xr[MS];
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms)
+        xr[ms] = x + (first + min(tw + 16 * ms + r16, live - 1)) * ldx + static_cast<long long>(h) * k + 8 * g;
+
+    mfma_cd acc[NB][MS];
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+        for (int ms = 0; ms < MS; ++ms) acc[nb][ms] = mfma_zero();
+    mfma_ab2 xb[MS][H2];
+    Pack8<bf16> wv[WL];
+    wload(0, wv);
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms)
+#pragma unroll
+        for (int h2 = 0; h2 < H2; ++h2) xb[ms][h2] = load8(xr[ms] + 32 * h2);
+    wstore(wv, 0);
+    lds_barrier();
+    for (int s = 0; s < stages; ++s) {
+        const int b = s & 1;
+        mfma_ab2 xn[MS][H2];
+        if (s + 1 < stages) {
+            wload(s + 1, wv);
+#pragma unroll
+            for (int ms = 0; ms < MS; ++ms)
+#pragma unroll
+                for (int h2 = 0; h2 < H2; ++h2) xn[ms][h2] = load8(xr[ms] + (s + 1) * KC + 32 * h2);
+        }
+#pragma unroll
+        for (int h2 = 0; h2 < H2; ++h2)
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                const mfma_ab2 a = *reinterpret_cast<const mfma_ab2*>(
+                    &wl[b][(16 * (wn * NB + nb) + r16) * PITCH + 32 * h2 + 8 * g]);
+#pragma unroll
+                for (int ms = 0; ms < MS; ++ms) acc[nb][ms] = mfma16x2(a, xb[ms][h2], acc[nb][ms]);
+            }
+        if (s + 1 < stages) {
+            wstore(wv, b ^ 1);
+#pragma unroll
+            for (int ms = 0; ms < MS; ++ms)
+#pragma unroll
+                for (int h2 = 0; h2 < H2; ++h2) xb[ms][h2] = xn[ms][h2];
+        }
+        lds_barrier();
+    }
+    // D: column (token) l % 16, rows (n) 4g .. 4g + 3 of each 16.
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms) {
+        const int t = tw + 16 * ms + r16;
+        if (t >= live) continue;
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb) {
+            const int c = n0 + 16 * (wn * NB + nb) + 4 * g;
+            bf16 v[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) v[i] = from_f32<bf16>(acc[nb][ms][i]);
+            *reinterpret_cast<uint2*>(y + (first + t) * ldy + static_cast<long long>(h) * n + c) =
+                __builtin_bit_cast(uint2, v);
+        }
+    }
 }
 
 // kv_a's [latent | rope] row: the latent RMS-normed into kv_c, the rope
@@ -87,7 +210,9 @@ __device__ __forceinline__ void copy_row(const T* __restrict__ src, T* __restric
 
 // The step's new latent (and rope) rows into their cache slots: row t of
 // request r lands at kv position (kv_len_r − new_r) + (t − qo_lo_r). One
-// block per row; `kpe` null appends the latent plane alone.
+// block per row; `kpe` null appends the latent plane alone. FP8 lands both
+// as one fp8 row of `ckv_pages` (eight codes a thread).
+template <bool FP8>
 __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restrict__ kpe,
                               bf16* __restrict__ ckv_pages, bf16* __restrict__ kpe_pages,
                               const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices,
@@ -103,6 +228,19 @@ __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restri
     if (pos < 0) return;
     const long long slot =
         static_cast<long long>(page_indices[page_indptr[r] + pos / page_size]) * page_size + pos % page_size;
+    if constexpr (FP8) {
+        const int w = rank + (kpe != nullptr ? rope : 0);
+        u8* dst = reinterpret_cast<u8*>(ckv_pages) + slot * w;
+        for (int i = 8 * threadIdx.x; i < w; i += 8 * blockDim.x) {
+            const bf16* src = i < rank ? ckv + static_cast<long long>(t) * rank + i
+                                       : kpe + static_cast<long long>(t) * rope + (i - rank);
+            const Pack8<bf16> x = *reinterpret_cast<const Pack8<bf16>*>(src);
+            *reinterpret_cast<u64*>(dst + i) =
+                u64{e4m3x4(to_f32(x.v[0]), to_f32(x.v[1]), to_f32(x.v[2]), to_f32(x.v[3]))} |
+                u64{e4m3x4(to_f32(x.v[4]), to_f32(x.v[5]), to_f32(x.v[6]), to_f32(x.v[7]))} << 32;
+        }
+        return;
+    }
     copy_row(ckv + static_cast<long long>(t) * rank, ckv_pages + slot * rank, rank);
     if (kpe != nullptr && rope > 0)
         copy_row(kpe + static_cast<long long>(t) * rope, kpe_pages + slot * rope, rope);
@@ -325,17 +463,25 @@ struct Staged {
     chunk rp;
 };
 
+// An fp8 row's tile in registers: two 16-code latent chunks and one 8-code
+// rope run a thread.
+struct Staged8 {
+    chunk lat[2];
+    u64 rp;
+};
+
 // The block's 64 query rows: `qn(r)`/`qp(r)` their latent and rope query
 // rows, `limit(r)` the last key position row r sees (−1: a dead row), and
 // `put(r, j, v)` / `put_lse(r, lse)` land 4 output columns from j / the lse.
 // `attend` walks the keys and lands every live row: every column of the
 // scores, and the 512 output columns from `voff` (a 1024 latent's output
 // is two blocks' halves, each scoring the whole row).
-template <int R, class Rows, int RK = kRank, int BK = kBK>
+template <int R, class Rows, int RK = kRank, int BK = kBK, bool FP8 = false>
 __device__ void attend(Smem<R, RK, BK>& sm, const Rows& rows, const LatentKeys& keys,
                        const bf16* __restrict__ ckv, const bf16* __restrict__ kpe, float scale_log2,
                        int voff = 0) {
     using SM = Smem<R, RK, BK>;
+    using Buf = typename conditional<FP8, Staged8, Staged>::type;
     constexpr int ST = SM::W / 32;       // 32-wide k pairs over the key row
     constexpr int SH = ST / 2;           // a wavefront's half
     constexpr int KT = BK / 16;          // 16-key halves a tile
@@ -375,19 +521,36 @@ __device__ void attend(Smem<R, RK, BK>& sm, const Rows& rows, const LatentKeys& 
         }
     };
     const int key = threadIdx.x / TPK, part = threadIdx.x % TPK;
-    auto issue = [&](Staged& s, int tile) {
+    auto issue = [&](Buf& s, int tile) {
         tile = min(tile, tiles - 1);  // past the walk: the last tile again, from L2
         const long long slot = sm.slot[(tile / kTableTiles) % 2][(tile % kTableTiles) * BK + key];
-        const bf16* src = ckv + slot * RK;
+        if constexpr (FP8) {
+            const u8* src = reinterpret_cast<const u8*>(ckv) + slot * SM::W;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) s.lat[i] = *reinterpret_cast<const chunk*>(src + 8 * (part + TPK * i));
-        if constexpr (R > 0) s.rp = *reinterpret_cast<const chunk*>(kpe + slot * R + 8 * (part % 8));
+            for (int i = 0; i < 2; ++i) s.lat[i] = *reinterpret_cast<const chunk*>(src + 16 * (part + TPK * i));
+            if constexpr (R > 0) s.rp = *reinterpret_cast<const u64*>(src + RK + 8 * (part % 8));
+        } else {
+            const bf16* src = ckv + slot * RK;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) s.lat[i] = *reinterpret_cast<const chunk*>(src + 8 * (part + TPK * i));
+            if constexpr (R > 0) s.rp = *reinterpret_cast<const chunk*>(kpe + slot * R + 8 * (part % 8));
+        }
     };
-    auto store = [&](const Staged& s) {
+    auto store = [&](const Buf& s) {
         bf16* dst = &sm.kv[key][0];
+        if constexpr (FP8) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) *reinterpret_cast<chunk*>(dst + 8 * (part + TPK * j)) = s.lat[j];
-        if constexpr (R > 0) *reinterpret_cast<chunk*>(dst + RK + 8 * (part % 8)) = s.rp;
+            for (int i = 0; i < 2; ++i) {
+                const u64 lo = (u64{s.lat[i].y} << 32) | s.lat[i].x, hi = (u64{s.lat[i].w} << 32) | s.lat[i].z;
+                *reinterpret_cast<mfma_ab2*>(dst + 16 * (part + TPK * i)) = e4m3x8_bf16(lo);
+                *reinterpret_cast<mfma_ab2*>(dst + 16 * (part + TPK * i) + 8) = e4m3x8_bf16(hi);
+            }
+            if constexpr (R > 0) *reinterpret_cast<mfma_ab2*>(dst + RK + 8 * (part % 8)) = e4m3x8_bf16(s.rp);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) *reinterpret_cast<chunk*>(dst + 8 * (part + TPK * j)) = s.lat[j];
+            if constexpr (R > 0) *reinterpret_cast<chunk*>(dst + RK + 8 * (part % 8)) = s.rp;
+        }
     };
 
     float m_run = neg_inf(), l_run = 0.f;
@@ -397,7 +560,7 @@ __device__ void attend(Smem<R, RK, BK>& sm, const Rows& rows, const LatentKeys& 
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) acc[mt][nt] = mfma_zero();
 
-    auto step = [&](Staged& buf, int i) {
+    auto step = [&](Buf& buf, int i) {
         lds_barrier();
         store(buf);
         const int ahead = i + 2;
@@ -490,7 +653,7 @@ __device__ void attend(Smem<R, RK, BK>& sm, const Rows& rows, const LatentKeys& 
     };
 
     if (tiles > 0) {
-        Staged a, b;
+        Buf a, b;
         fill(0);
         lds_barrier();
         issue(a, 0);
@@ -518,7 +681,7 @@ __device__ void attend(Smem<R, RK, BK>& sm, const Rows& rows, const LatentKeys& 
     for (int nt = 0; nt < 4; ++nt) {
         const int row = 16 * nt + c;
         const float sum = sm.rl[row];
-        const float inv = sum > 0.f ? 1.f / sum : 0.f;
+        const float inv = sum > 0.f ? Kv<FP8>::unit / sum : 0.f;
 #pragma unroll
         for (int mt = 0; mt < 4; ++mt) {
             const float v[4] = {acc[mt][nt][0] * inv, acc[mt][nt][1] * inv, acc[mt][nt][2] * inv,
@@ -604,7 +767,7 @@ struct PlanRows {
     }
 };
 
-template <int R>
+template <int R, bool FP8>
 __global__ __launch_bounds__(kThreads) void mla_paged(const Work p) {
     __shared__ Smem<R> sm;
     const int heads = p.num_heads;
@@ -631,7 +794,7 @@ __global__ __launch_bounds__(kThreads) void mla_paged(const Work p) {
                          p.causal != 0};
         const LatentKeys keys{nullptr, p.kv_indices + p.kv_indptr[item], p.page_size, 1,
                               kv_start, max(kv_end, kv_start), max(kv_end, kv_start) - 1};
-        attend<R>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2);
+        attend<R, PlanRows<R>, kRank, kBK, FP8>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2);
     }
 }
 
@@ -828,7 +991,7 @@ struct GatherRows {
     }
 };
 
-template <int R, int RK = kRank>
+template <int R, int RK, bool FP8>
 __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
     constexpr int BK = RK > kRank ? 16 : kBK;
     constexpr int HALVES = RK / kRank;  // blocks that split a row's output columns
@@ -883,7 +1046,7 @@ __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
                           first + n0, first + min(count, n0 + share), limit, floor};
     const GatherRows<R, RK> rows{p.q_nope, p.q_pe, p.o, p.lse, p.part_o, p.part_lse, t_row, t,
                                  p.num_heads, static_cast<int>(blockIdx.x) * kBM, limit, p.splits, split};
-    attend<R, GatherRows<R, RK>, RK, BK>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2, voff);
+    attend<R, GatherRows<R, RK>, RK, BK, FP8>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2, voff);
 }
 
 // The splits of row (t, h) folded into o (and lse). One wavefront a row,

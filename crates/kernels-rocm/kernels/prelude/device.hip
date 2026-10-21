@@ -41,6 +41,15 @@ struct is_same<A, A> {
     static constexpr bool value = true;
 };
 
+template <bool B, class T, class F>
+struct conditional {
+    using type = T;
+};
+template <class T, class F>
+struct conditional<false, T, F> {
+    using type = F;
+};
+
 // Lanes per wavefront: 64 on CDNA (gfx9), 32 on RDNA.
 #if defined(__GFX9__)
 constexpr int kWave = 64;

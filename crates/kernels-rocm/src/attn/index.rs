@@ -14,6 +14,12 @@ const POOL_BLOCK: u32 = 256;
 /// Keys a scoring block ranks.
 const SCORE_KEYS: u32 = 256;
 
+/// Rows a prefill's scoring block takes over its keys, and the blocks a row
+/// tile's key blocks deal across (each walks every SCORE_LANES-th one until
+/// its rows have none left: no block launches over keys no row reaches).
+const SCORE_ROWS: u32 = 16;
+const SCORE_LANES: u32 = 4;
+
 const SELECT_BLOCK: u32 = 1024;
 
 /// Keys a collecting block filters.
@@ -299,7 +305,37 @@ pub fn topk(
         v
     };
     let launch = Launch::grid([score_blocks, rows, 1], [SCORE_KEYS, 1, 1]);
-    if mfma {
+    if mfma && lists.count == 0 {
+        // A prefill's rows, SCORE_ROWS a block over the same keys.
+        let entry = symbol(&format!(
+            "::pie::attn::index_score_rows<{head_dim}, {tiles}, {SCORE_ROWS}>"
+        ));
+        ctx.fire(
+            OP,
+            Fire::at(FILE, entry).apply(Launch::grid(
+                [score_blocks.min(SCORE_LANES), rows.div_ceil(SCORE_ROWS), 1],
+                [SCORE_KEYS, 1, 1],
+            )),
+            &[
+                q.data.arg(),
+                weights,
+                keys.keys.arg(),
+                q.indptr.arg(),
+                keys.page_indices.arg(),
+                keys.page_indptr.arg(),
+                keys.last_page_lens.arg(),
+                scores,
+                stated(OP, rows)?.arg(),
+                num_requests.arg(),
+                heads.arg(),
+                keys.page_size.arg(),
+                max_kv.arg(),
+                ratio.arg(),
+                i32::from(compact).arg(),
+                ctx.stage(),
+            ],
+        )?;
+    } else if mfma {
         let entry = symbol(&format!(
             "::pie::attn::index_score_paged<{head_dim}, {tiles}>"
         ));

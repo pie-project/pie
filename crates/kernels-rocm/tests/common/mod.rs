@@ -213,6 +213,7 @@ pub const KV: KvPool = KvPool {
     block_size: 0,
     max_pages_per_request: 0,
     pages_in_batch: 0,
+    live: [0, 0],
 };
 
 /// A recurrent pool writing every lane's state, nothing else seated.
@@ -324,6 +325,24 @@ pub fn e4m3_value(code: u8) -> f32 {
         (1.0 + m / 8.0) * ((e - 7) as f32).exp2()
     };
     if code & 0x80 != 0 { -a } else { a }
+}
+
+/// The nearest finite e4m3 code, a tie to the even code, saturating at 448
+/// (no −0: zero is 0x00).
+pub fn e4m3_code(x: f32) -> u8 {
+    let a = x.abs();
+    let mut best = 0u8;
+    for c in 1..=0x7eu8 {
+        let (dc, db) = ((e4m3_value(c) - a).abs(), (e4m3_value(best) - a).abs());
+        if dc < db || (dc == db && c % 2 == 0) {
+            best = c;
+        }
+    }
+    if x < 0.0 && best != 0 {
+        best | 0x80
+    } else {
+        best
+    }
 }
 
 /// Every `have[i]` is within `ulps` bf16 steps of `want[i]`.

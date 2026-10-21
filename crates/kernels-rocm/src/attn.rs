@@ -46,24 +46,17 @@ const fn elementwise(n: u32) -> Launch {
     Launch::flat(n, BLOCK)
 }
 
+/// A per-head elementwise pass over `rows` rows of `heads` heads: the
+/// elements a thread (eight where the head width allows) and its launch,
+/// a row's threads over grid y.
 #[must_use]
-const fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> Launch {
-    #[must_use]
-    const fn head_dim_block(head_dim: u32) -> u32 {
-        const SINK_BLOCK_MAX: u32 = 128;
-
-        const SINK_BLOCK_MIN: u32 = 32;
-
-        if head_dim < SINK_BLOCK_MIN {
-            SINK_BLOCK_MIN
-        } else if head_dim > SINK_BLOCK_MAX {
-            SINK_BLOCK_MAX
-        } else {
-            head_dim
-        }
-    }
-
-    Launch::grid([rows, heads, 1], [head_dim_block(head_dim), 1, 1])
+const fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> (u32, Launch) {
+    let vec = if head_dim % 8 == 0 { 8 } else { 1 };
+    let threads = heads * head_dim / vec;
+    (
+        vec,
+        Launch::grid([rows, threads.div_ceil(BLOCK), 1], [BLOCK, 1, 1]),
+    )
 }
 
 fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
@@ -129,14 +122,6 @@ fn fa2_decode(
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
-
-    let _ = kv::dequant_active(
-        ctx,
-        op,
-        pool,
-        stated(op, plan.shape.num_kv_heads)?,
-        stated(op, head_dim)?,
-    );
 
     if let Some(rel) = rel {
         if lse.is_some() {
@@ -209,14 +194,6 @@ fn fa2_prefill(
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
-
-    let _ = kv::dequant_active(
-        ctx,
-        op,
-        pool,
-        stated(op, plan.shape.num_kv_heads)?,
-        stated(op, head_dim)?,
-    );
 
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
     if let Some(rel) = rel {
@@ -633,13 +610,14 @@ pub fn sink(
     let heads = row_heads(OP, o.width, head_dim)?;
     lse_plane(OP, &lse, o.rows, heads);
     let rows = count(OP, "rows", o.rows)?;
+    let (vec, launch) = per_head_elementwise(o.rows, heads, head_dim);
     ctx.fire(
         OP,
         Fire::at(
             "attn/attention.hip",
-            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}>")),
+            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}, {vec}>")),
         )
-        .apply(per_head_elementwise(o.rows, heads, head_dim)),
+        .apply(launch),
         &[
             o.arg(),
             lse.arg(),
@@ -666,34 +644,22 @@ pub fn merge_lse(
 ) -> Result<(), Error> {
     const OP: &str = "attention.merge_lse";
 
-    const COMBINE_BLOCK_MIN: u32 = 32;
-
-    const COMBINE_BLOCK_MAX: u32 = 256;
-
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
         o1.rows == o.rows && o2.rows == o.rows,
         "the merged outputs are one row per query row"
     );
     lse_plane(OP, lse, o.rows, heads);
+    let (vec, launch) = per_head_elementwise(o.rows, heads, head_dim);
     let heads = count(OP, "the head count this merge states", heads)?;
     let head_dim = count(OP, "the head width this merge states", head_dim)?;
     ctx.fire(
         OP,
         Fire::at(
             "attn/attention.hip",
-            symbol(&format!("::pie::attn::merge_lse_combine<{t}>")),
+            symbol(&format!("::pie::attn::merge_lse_combine<{t}, {vec}>")),
         )
-        .apply(Launch::grid(
-            [o.rows, heads.unsigned_abs(), 1],
-            [
-                head_dim
-                    .unsigned_abs()
-                    .clamp(COMBINE_BLOCK_MIN, COMBINE_BLOCK_MAX),
-                1,
-                1,
-            ],
-        )),
+        .apply(launch),
         &[
             o1.arg(),
             lse1.arg(),

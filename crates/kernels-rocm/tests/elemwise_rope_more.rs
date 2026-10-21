@@ -225,12 +225,15 @@ fn rope_partial_last() {
         beta_slow: 1.0,
         original_max_position: 4096,
     };
-    // DeepSeek's 64-wide rotated tail of a 192-wide head (interleaved, YaRN),
-    // a whole head turned back, and a plain tail.
+    // DeepSeek's 64-wide rotated tail of a 192-wide head (interleaved, YaRN)
+    // past a block of pairs and within one, a whole head turned back, a plain
+    // tail, and a tail of no whole packs.
     for (rows, heads, hd, rot_dim, interleaved, inverse, scaled) in [
-        (5usize, 3usize, 192usize, 64usize, true, false, true),
-        (3, 2, 128, 128, false, true, false),
+        (5usize, 16usize, 192usize, 64usize, true, false, true),
+        (5, 3, 192, 64, true, false, true),
+        (3, 6, 128, 128, false, true, false),
         (4, 1, 96, 32, false, false, false),
+        (2, 16, 100, 36, true, false, false),
     ] {
         let qs = bf16s(rows * heads * hd, 10);
         let pos = positions(rows, 11);

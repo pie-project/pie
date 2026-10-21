@@ -95,13 +95,16 @@ const fn at(base: u64, offset: Option<u32>) -> u64 {
     }
 }
 
-fn scale_log2(sm_scale: f32, head_dim: u32) -> f32 {
+/// The scores' scale in the log2 domain, with an e4m3 pool's unit folded
+/// in (its keys read as half their value: `attn/kv.hip`'s `kE4m3Unit`).
+fn scale_log2(sm_scale: f32, head_dim: u32, pool: &KvPool) -> f32 {
     let scale = if sm_scale > 0.0 {
         sm_scale
     } else {
         1.0 / (head_dim as f32).sqrt()
     };
-    scale * core::f32::consts::LOG2_E
+    let unit = if kv::native_e4m3(pool) { 2.0 } else { 1.0 };
+    scale * unit * core::f32::consts::LOG2_E
 }
 
 fn head_dim_built(op: &'static str, head_dim: u32) -> Result<(), Error> {
@@ -117,23 +120,20 @@ fn head_dim_built(op: &'static str, head_dim: u32) -> Result<(), Error> {
 }
 
 fn pool_args(
+    op: &'static str,
     q: RaggedTensor,
     pool: &KvPool,
     num_qo_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
-) -> Args {
-    // A quantized pool is read through its bf16 shadow, which the fire
-    // refreshed (`kv::dequant_active`) before this one.
-    let (k, v) = if kv::native_bf16(pool) {
-        (pool.keys.ptr, pool.values.ptr)
-    } else {
-        (pool.bf16_keys.ptr, pool.bf16_values.ptr)
-    };
-    Args {
+) -> Result<Args, Error> {
+    if !kv::native_bf16(pool) && !kv::native_e4m3(pool) {
+        return Err(refuse(op, "the paged attention reads bf16 or e4m3 pages"));
+    }
+    Ok(Args {
         q: q.data.ptr,
-        k,
-        v,
+        k: pool.keys.ptr,
+        v: pool.values.ptr,
         page_indices: pool.page_indices.ptr,
         page_indptr: pool.page_indptr.ptr,
         last_page_len: pool.last_page_lens.ptr,
@@ -144,7 +144,7 @@ fn pool_args(
         q_stride_n: (num_qo_heads * head_dim) as i32,
         q_stride_h: head_dim as i32,
         ..Args::default()
-    }
+    })
 }
 
 /// The partials a split plan wrote, and where they fold to.
@@ -203,17 +203,18 @@ pub fn decode(
     let int = plan.workspace.int_ptr;
     let float = plan.workspace.float_ptr;
     let mut args = pool_args(
+        op,
         q,
         pool,
         shape.num_q_heads,
         shape.num_kv_heads,
         shape.head_dim,
-    );
+    )?;
     args.request_indices = at(int, info.request_indices_offset);
     args.kv_tile_indices = at(int, info.kv_tile_indices_offset);
     args.kv_chunk_size = at(int, info.kv_chunk_size_ptr_offset);
     args.window_left = window_left;
-    args.scale_log2 = scale_log2(sm_scale, shape.head_dim);
+    args.scale_log2 = scale_log2(sm_scale, shape.head_dim, pool);
     args.partition = i32::from(info.split_kv);
     args.rel(rel);
     let split = info.split_kv.then(|| Partials {
@@ -240,6 +241,7 @@ pub fn decode(
         }
     }
     let hnd = if shape.hnd_layout { "true" } else { "false" };
+    let fp8 = kv::native_e4m3(pool);
     // The matrix-core decode takes a group within one 16-column tile; a
     // wider group takes the vector decode.
     let blocks = (info.padded_batch_size as u32).saturating_mul(shape.num_kv_heads);
@@ -249,7 +251,7 @@ pub fn decode(
         // (and their reads) in flight.
         (
             symbol(&format!(
-                "::pie::attn::paged_decode_cols<{}, {group}, {hnd}>",
+                "::pie::attn::paged_decode_cols<{}, {group}, {hnd}, {fp8}>",
                 shape.head_dim
             )),
             256,
@@ -271,7 +273,7 @@ pub fn decode(
         };
         (
             symbol(&format!(
-                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}, {pvm}>",
+                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}, {pvm}, {fp8}>",
                 shape.head_dim,
                 shape.head_dim < 512
             )),
@@ -281,7 +283,7 @@ pub fn decode(
         let waves = decode_waves(group, shape.head_dim);
         (
             symbol(&format!(
-                "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}>",
+                "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}, {fp8}>",
                 shape.head_dim
             )),
             64 * waves,
@@ -395,19 +397,20 @@ fn prefill_walk(
     let int = plan.workspace.int_ptr;
     let float = plan.workspace.float_ptr;
     let mut args = pool_args(
+        op,
         q,
         pool,
         shape.num_q_heads,
         shape.num_kv_heads,
         shape.head_dim,
-    );
+    )?;
     args.o_indptr = at(int, info.o_indptr_offset);
     args.request_indices = at(int, info.request_indices_offset);
     args.qo_tile_indices = at(int, info.qo_tile_indices_offset);
     args.kv_tile_indices = at(int, info.kv_tile_indices_offset);
     args.kv_chunk_size = at(int, info.kv_chunk_size_ptr_offset);
     args.window_left = window_left;
-    args.scale_log2 = scale_log2(sm_scale, shape.head_dim);
+    args.scale_log2 = scale_log2(sm_scale, shape.head_dim, pool);
     args.partition = i32::from(info.split_kv);
     if rel.is_some() && !rel_walks(shape.group_size(), shape.head_dim) {
         return Err(refuse(op, "a relative bias rides the tiled prefill only"));
@@ -443,11 +446,12 @@ fn prefill_walk(
         [info.padded_batch_size as u32, shape.num_kv_heads, 1],
         [512, 1, 1],
     );
+    let fp8 = kv::native_e4m3(pool);
     if let Some(sel) = sel {
-        if !matches!(shape.head_dim, 128 | 256) || !plan.causal {
+        if !matches!(shape.head_dim, 128 | 256) || !plan.causal || fp8 {
             return Err(refuse(
                 op,
-                "the selected prefill walks causal 128- or 256-wide heads only",
+                "the selected prefill walks causal 128- or 256-wide heads of bf16 pages only",
             ));
         }
         let entry = symbol(&format!(
@@ -472,7 +476,7 @@ fn prefill_walk(
             "paged_prefill_wide"
         };
         let entry = symbol(&format!(
-            "::pie::attn::{kernel}<{}, {hnd}, {causal}>",
+            "::pie::attn::{kernel}<{}, {hnd}, {causal}, {fp8}>",
             shape.head_dim
         ));
         ctx.fire(op, Fire::at(FILE, entry).apply(launch), &[by_value(&args)])?;

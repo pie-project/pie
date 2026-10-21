@@ -181,6 +181,13 @@ fn linear_glu_flat() {
             "gelu f32[{i}] = {h}, want {want}"
         );
     }
+
+    // relu(x)², the same walk.
+    let mut y = gpu.zeros(3, 1000, Dtype::F32);
+    mlp::relu2(&ctx, x, 1, &mut y).unwrap();
+    for (i, (&h, &v)) in gpu.read(&y).iter().zip(&xs).enumerate() {
+        assert_eq!(h, v.max(0.0) * v.max(0.0), "relu2 f32[{i}]");
+    }
 }
 
 /// The decode projection with its epilogue fused: GEGLU over a packed

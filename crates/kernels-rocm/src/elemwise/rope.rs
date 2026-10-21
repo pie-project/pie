@@ -293,10 +293,16 @@ pub fn partial_last(
         ));
     }
     let num_q_heads = q_heads(OP, q.width, head_dim)?;
+    if rotary_dim / 2 > MAX_CACHED_PAIRS {
+        return Err(refuse(
+            OP,
+            format!("caches at most {MAX_CACHED_PAIRS} angles a row, and {rotary_dim} rotate"),
+        ));
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::elemwise::rope_partial_last")
-            .apply(Launch::per_row(q.rows, ROTATE_BLOCK)),
+            .apply(Launch::per_row(q.rows, ROTATE_BLOCK).smem(8 * (rotary_dim / 2))),
         &[
             q.arg(),
             q.arg(),
