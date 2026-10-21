@@ -624,6 +624,38 @@ pub fn matmul_select_bias(
     )
 }
 
+/// The expert-major routed GEMV for a fire of several tokens: each expert's codes are streamed once for every
+/// route to it (up to `group` routes a pass), where the per-route kernel streams them once a route. `None` when
+/// the bank has no expert-major instantiation (affine u4 in groups of 64 has).
+fn expert_major_point(bank: Bank, biased: bool, group: u32) -> Option<&'static str> {
+    match (bank.affine(), bank.group, bank.bits, biased, group) {
+        (true, 64, 4, false, 16) => Some("affine_qmv_routed_em_bfloat16_gs_64_b_4"),
+        (true, 64, 4, true, 16) => Some("affine_qmv_routed_em_bias_bfloat16_gs_64_b_4"),
+        (true, 64, 4, false, 8) => Some("affine_qmv_routed_em_m8_bfloat16_gs_64_b_4"),
+        _ => None,
+    }
+}
+
+/// The routed GEMV with its kernel named: `group` 0 is the per-route kernel, 8 or 16 the expert-major one
+/// gathering that many routes an expert. For measuring the two against each other.
+pub fn matmul_select_quant_as(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    bank: Bank,
+    routes: Tensor,
+    y: Tensor,
+    group: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_matmul_select_quant";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    let entry = match group {
+        0 => routed_point(OP, bank, false)?,
+        g => expert_major_point(bank, false, g)
+            .ok_or_else(|| refuse(OP, format!("no expert-major kernel gathers {g} routes for this bank")))?,
+    };
+    routed_select(ctx, OP, entry, x, bank, routes, y)
+}
+
 pub fn matmul_select_quant(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -633,12 +665,28 @@ pub fn matmul_select_quant(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    let entry = routed_point(OP, bank, false)?;
-    let fan = selected(OP, x, routes, y)?;
-    routed_bank(OP, x, bank)?;
+    // several tokens route to shared experts: read each expert once for all of them
+    let entry = match expert_major_point(bank, false, 16) {
+        Some(em) if routes.rows > 1 && std::env::var_os("PIE_MOE_EXPERT_MAJOR").is_some() => em,
+        _ => routed_point(OP, bank, false)?,
+    };
+    routed_select(ctx, OP, entry, x, bank, routes, y)
+}
+
+fn routed_select(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    entry: &'static str,
+    x: Tensor,
+    bank: Bank,
+    routes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    let fan = selected(op, x, routes, y)?;
+    routed_bank(op, x, bank)?;
     ctx.fire(
         Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
-            routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
+            routed_qmv_grid(op, fan.tokens, y.width, fan.top_k)?,
             QMV_GROUP,
         )),
         &[
@@ -647,13 +695,13 @@ pub fn matmul_select_quant(
             zero_points(ctx, bank)?,
             x.arg(),
             y.arg_mut(),
-            stated(OP, x.width)?.arg(),
-            stated(OP, y.width)?.arg(),
+            stated(op, x.width)?.arg(),
+            stated(op, y.width)?.arg(),
             ctx.absent()?,
             routes.arg(),
-            stated(OP, fan.x_slot_stride)?.arg(),
-            stated(OP, fan.x_row_stride)?.arg(),
-            stated(OP, fan.top_k)?.arg(),
+            stated(op, fan.x_slot_stride)?.arg(),
+            stated(op, fan.x_row_stride)?.arg(),
+            stated(op, fan.top_k)?.arg(),
         ],
     )
 }

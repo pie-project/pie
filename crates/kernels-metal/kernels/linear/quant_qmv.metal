@@ -449,6 +449,161 @@ METAL_FUNC void qmv_gptoss_impl(
   }
 }
 
+// A routed GEMV that reads each expert's weights once per fire, not once per route. A fire of several tokens
+// (a speculative verify: 8 or 9 rows, 8 routes each) sends many routes to one expert; the per-route kernel
+// above streams that expert's rows once for every route. Here the threadgroup holding an expert's first
+// route (and every MAXM-th after it) gathers up to MAXM routes to that expert and walks the expert's rows
+// once, dotting each block of codes against every gathered route's activation while the block is hot;
+// the other threadgroups return at once. Same grid, buffers and output layout as qmv_gptoss_impl.
+template <typename T, typename Codec, bool BIASED, int PPT, int MAXM>
+METAL_FUNC void qmv_expert_major_impl(
+    const device uint32_t* w,
+    const device typename Codec::scale_t* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const device int* expert_ids,
+    int in_vec_size,
+    int out_vec_size,
+    int x_slot_stride,
+    int x_row_stride,
+    int slots_per_row,
+    uint3 tid,
+    uint3 tgs,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int bits = Codec::bits;
+  constexpr int group_size = Codec::group_size;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * PPT;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  typedef float U;
+
+  const int routes = int(tgs.x) * slots_per_row;
+  const int sel = int(tid.x) * slots_per_row + int(tid.z);
+  const int e = expert_ids[sel];
+  if (e < 0) {
+    return;
+  }
+  // this route's rank among the routes to its expert: only every MAXM-th one leads a group
+  int rank = 0;
+  for (int q = 0; q < sel; q++) {
+    rank += expert_ids[q] == e;
+  }
+  if (rank % MAXM != 0) {
+    return;
+  }
+  int members[MAXM];
+  int m = 0;
+  for (int q = sel; q < routes && m < MAXM; q++) {
+    if (expert_ids[q] == e) {
+      members[m++] = q;
+    }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_w);
+  const device typename Codec::scale_t* sc = scales + size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g);
+  const device T* bi = Codec::zero_point ? biases + size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g) : biases;
+  const device uint8_t* ws_row = ws + out_row * in_vec_size_w;
+  const device typename Codec::scale_t* sc_row = sc + out_row * in_vec_size_g;
+  const device T* bi_row = Codec::zero_point ? bi + out_row * in_vec_size_g : bi;
+
+  thread U x_thread[values_per_thread];
+  thread U result[MAXM][results_per_simdgroup];
+  for (int j = 0; j < MAXM; j++) {
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result[j][r] = 0;
+    }
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int base = k + int(simd_lid) * values_per_thread;
+    if (base + values_per_thread > in_vec_size) {
+      continue;
+    }
+    const device uint8_t* wl = ws_row + size_t(base) * size_t(bytes_per_pack) / size_t(pack_factor);
+    const int g = base / group_size;
+    U s[results_per_simdgroup];
+    U b[results_per_simdgroup];
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      s[r] = Codec::scale_of(sc_row[r * in_vec_size_g + g]);
+      b[r] = Codec::zero_point ? U(bi_row[r * in_vec_size_g + g]) : U(0);
+    }
+    for (int j = 0; j < m; j++) {
+      const int q = members[j];
+      const device T* x_row = x + (q / slots_per_row) * x_row_stride + (q % slots_per_row) * x_slot_stride;
+      U sum = Codec::template prepare<U, values_per_thread>(x_row + base, x_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        result[j][r] += Codec::template dot<U, values_per_thread>(wl + r * in_vec_size_w, x_thread, s[r], b[r], sum);
+      }
+    }
+  }
+
+  const device T* bias_row = BIASED ? bias + size_t(e) * size_t(out_vec_size) : bias;
+  for (int j = 0; j < m; j++) {
+    device T* y_row = y + members[j] * out_vec_size + out_row;
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      U v = simd_sum(result[j][r]);
+      if (simd_lid == 0 && out_row + r < out_vec_size) {
+        if (BIASED) v += U(bias_row[out_row + r]);
+        y_row[r] = static_cast<T>(v);
+      }
+    }
+  }
+}
+
+#define expert_major_qmv_kernel(name, BIASED, PPT, MAXM)                          \
+  template <typename T, template <typename> class Codec>                       \
+  [[kernel]] void name(                                                        \
+      const device uint32_t* w   [[buffer(0)]],                                \
+      const device typename Codec<T>::scale_t* scales [[buffer(1)]],           \
+      const device T* biases     [[buffer(2)]],                                \
+      const device T* x          [[buffer(3)]],                                \
+      device T* y                [[buffer(4)]],                                \
+      const constant int& in_vec_size  [[buffer(5)]],                          \
+      const constant int& out_vec_size [[buffer(6)]],                          \
+      const device T* bias       [[buffer(7)]],                                \
+      const device int* expert_ids [[buffer(8)]],                              \
+      const constant int& x_slot_stride [[buffer(9)]],                         \
+      const constant int& x_row_stride  [[buffer(10)]],                        \
+      const constant int& slots_per_row [[buffer(11)]],                        \
+      uint3 tid       [[threadgroup_position_in_grid]],                        \
+      uint3 tgs       [[threadgroups_per_grid]],                               \
+      uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
+    qmv_expert_major_impl<T, Codec<T>, BIASED, PPT, MAXM>(                       \
+        w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
+        x_slot_stride, x_row_stride, slots_per_row, tid, tgs, simd_gid, simd_lid); \
+  }
+
+expert_major_qmv_kernel(qmv_routed_em_p2, false, 2, 16)
+expert_major_qmv_kernel(qmv_routed_em_bias_p2, true, 2, 16)
+expert_major_qmv_kernel(qmv_routed_em_p2_m8, false, 2, 8)
+
+#define instantiate_expert_major_qmv(host, fn, codec, name, itype, gs, b)       \
+  template [[host_name(#host "_" #name "_gs_" #gs "_b_" #b)]]                 \
+  [[kernel]] void fn<itype, codec>(                                           \
+      const device uint32_t*, const device codec<itype>::scale_t*,            \
+      const device itype*,                                                    \
+      const device itype*, device itype*, const constant int&,                \
+      const constant int&, const device itype*, const device int*,            \
+      const constant int&, const constant int&, const constant int&,          \
+      uint3, uint3, uint, uint);
+
+instantiate_expert_major_qmv(affine_qmv_routed_em, qmv_routed_em_p2, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_expert_major_qmv(affine_qmv_routed_em_bias, qmv_routed_em_bias_p2, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_expert_major_qmv(affine_qmv_routed_em_m8, qmv_routed_em_p2_m8, AffineU4, bfloat16, bfloat, 64, 4)
+
 #define gptoss_qmv_kernel(name, BIASED, ROUTED, PPT)                                \
   template <typename T, template <typename> class Codec>                       \
   [[kernel]] void name(                                                        \
