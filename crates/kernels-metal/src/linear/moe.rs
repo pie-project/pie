@@ -650,12 +650,8 @@ pub fn matmul_select_quant_as(
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let entry = match group {
         0 => routed_point(OP, bank, false)?,
-        g => expert_major_point(bank, false, g).ok_or_else(|| {
-            refuse(
-                OP,
-                format!("no expert-major kernel gathers {g} routes for this bank"),
-            )
-        })?,
+        g => expert_major_point(bank, false, g)
+            .ok_or_else(|| refuse(OP, format!("no expert-major kernel gathers {g} routes for this bank")))?,
     };
     routed_select(ctx, OP, entry, x, bank, routes, y)
 }

@@ -9,8 +9,8 @@ mod a_family_is_read_against_its_reference;
 mod a_fenced_frame_lands_both_sides;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
-mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
+mod a_tower_region_reads_the_patch_window;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
 mod mma_attention_matches_fp64;
@@ -43,12 +43,12 @@ mod the_q8_kv_roundtrip;
 mod the_ragged_attention_answers_its_host_reference;
 mod the_register_rows_match_affine_dots;
 mod the_rotated_packed_kv_serves;
-mod the_routed_mlp_prices_its_rows;
 mod the_selector_reads_out_the_reference_walk;
 mod the_split_mlp_matches_the_gpu_alone;
+mod the_routed_mlp_prices_its_rows;
 mod the_staged_rows_match_affine_dots;
-mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_verify_rows_price_their_matmuls;
+mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
 
 /// The bytes a pool takes that holds `slots` sequences at `context`, the
