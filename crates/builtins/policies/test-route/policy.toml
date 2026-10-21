@@ -18,3 +18,7 @@ doc = "Terminate it while it waits, for this reason."
 [props.stop]
 type = "boolean"
 doc = "Terminate it once it runs."
+
+[props.scale-workers]
+type = "int"
+doc = "Install a scale table of this many workers, which this policy is not granted."

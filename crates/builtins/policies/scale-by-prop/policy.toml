@@ -1,0 +1,21 @@
+# Keeps the cluster at the worker counts launches ask for: a launch whose
+# `scale-workers` prop is set asks for that many workers of the shape its
+# `scale-engine` (and `scale-model`, none for workers that load no model)
+# props name. The last ask of a shape stands; a shape never asked for
+# keeps what it has. The controller's actuator converges (`cluster.scale`).
+plane = "cluster"
+subscribe = ["arrived"]
+grants = ["scale"]
+uses = ["cluster.scale"]
+
+[props.scale-workers]
+type = "int"
+doc = "How many workers of the shape the cluster should run."
+
+[props.scale-engine]
+type = "text"
+doc = "The shape's engine kind, as a worker's config spells it (`cuda_native`)."
+
+[props.scale-model]
+type = "text"
+doc = "The shape's model, as workers serve it (`[model] name`); unset, workers that load no model."
