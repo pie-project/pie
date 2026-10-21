@@ -451,7 +451,7 @@ constant constexpr int kVerifyChunk = 16;
 // fire's own lands its readout in `y` at its own row, where the window reads
 // it. At 32 lanes the arithmetic is `gdn_scan_token`'s, so the bits are the
 // committed scan's.
-template <typename T, int LANES, int SG, int VROWS>
+template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
 [[kernel]] void gated_delta_verify(
     const device T* qkv         [[buffer(0)]],
     const device int* indptr    [[buffer(1)]],
@@ -511,9 +511,26 @@ template <typename T, int LANES, int SG, int VROWS>
   const size_t pitch = 2 * keys + size_t(v_heads) * D;
   const float scale = 1.0f / metal::sqrt(float(D));
 
+  // A lane's keys: `PER` side by side, or every `LANES`-th, whose reads of
+  // the staged rows are a bank apart.
+  auto key = [&](int i) { return STRIDED ? i * LANES + lane : PER * lane + i; };
+  auto load = [&](thread float (&st)[VROWS][PER], const device float* cells) {
+    for (int v = 0; v < VROWS; ++v) {
+      for (int i = 0; i < PER; ++i) {
+        st[v][i] = cells[size_t(v) * D + size_t(key(i))];
+      }
+    }
+  };
+  auto store = [&](device float* cells, thread const float (&st)[VROWS][PER]) {
+    for (int v = 0; v < VROWS; ++v) {
+      for (int i = 0; i < PER; ++i) {
+        cells[size_t(v) * D + size_t(key(i))] = st[v][i];
+      }
+    }
+  };
   device float* cells = gdn_cells<VROWS, PER>(rstate, slot, hv, v_heads, dv_base, D, D);
   float st[VROWS][PER];
-  gdn_load<VROWS, PER>(st, cells, lane, D);
+  load(st, cells);
   const device int* snap =
       snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
   int snapped = 0;
@@ -577,14 +594,216 @@ template <typename T, int LANES, int SG, int VROWS>
       const int t = c0 + j;
       float q[PER], k[PER], vals[VROWS], mem[VROWS];
       for (int i = 0; i < PER; ++i) {
-        q[i] = q_s[j][PER * lane + i];
-        k[i] = k_s[j][PER * lane + i];
+        q[i] = q_s[j][key(i)];
+        k[i] = k_s[j][key(i)];
       }
       for (int v = 0; v < VROWS; ++v) {
         vals[v] = v_s[j][my_rows + v];
       }
       const float beta = beta_s[j];
       gdn_scan_memory<LANES, VROWS, PER>(st, k, decay_s[j], mem);
+      for (int v = 0; v < VROWS; ++v) {
+        mem[v] = gdn_row_sum<LANES>(mem[v]);
+      }
+      if (t < rep) {
+        for (int v = 0; v < VROWS; ++v) {
+          const float delta = (vals[v] - mem[v]) * beta;
+          for (int i = 0; i < PER; ++i) {
+            st[v][i] += k[i] * delta;
+          }
+        }
+      } else {
+        float out[VROWS];
+        gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
+        const size_t row_out = (size_t(own + t) * size_t(v_heads) + size_t(hv)) * D;
+        for (int v = 0; v < VROWS; ++v) {
+          out[v] = gdn_row_sum<LANES>(out[v]);
+          if (lane == 0) {
+            y[row_out + size_t(dv_base + v)] = out[v];
+          }
+        }
+      }
+      if (t + 1 == keep) {
+        store(cells, st);
+      }
+      if (t + 1 == snap_at) {
+        store(gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads,
+                                    dv_base, D, D),
+              st);
+        ++snapped;
+        snap_at = snapped < PIE_RS_SNAPSHOTS ? snap[snapped] : 0;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+#define PIE_GDN_VERIFY(lanes, sg, vrows, strided, name)                        \
+  template [[host_name("gated_delta_verify_bfloat16_l_" #lanes "_s_" #sg       \
+                       "_v_" #vrows name)]]                                    \
+  [[kernel]] void gated_delta_verify<bfloat, lanes, sg, vrows, strided>(       \
+      const device bfloat*, const device int*, const device int*,              \
+      const device int*, const device int*, const constant int&,               \
+      const device bfloat*, const device float*, const device bfloat*,         \
+      device float*, device float*, device float*,                             \
+      const constant int&, const constant int&, const device int*,             \
+      const constant int&, uint3, uint, uint);
+
+PIE_GDN_VERIFY(32, 4, 4, false, "")
+PIE_GDN_VERIFY(32, 8, 4, false, "")
+PIE_GDN_VERIFY(32, 8, 2, false, "")
+PIE_GDN_VERIFY(8, 4, 1, false, "")
+PIE_GDN_VERIFY(8, 4, 2, false, "")
+PIE_GDN_VERIFY(8, 4, 1, true, "_strided")
+PIE_GDN_VERIFY(8, 4, 2, true, "_strided")
+PIE_GDN_VERIFY(4, 4, 1, true, "_strided")
+PIE_GDN_VERIFY(4, 8, 1, true, "_strided")
+PIE_GDN_VERIFY(4, 4, 2, true, "_strided")
+PIE_GDN_VERIFY(16, 4, 1, true, "_strided")
+
+// `gated_delta_verify` for a walk of at most `kVerifyChunk` rows, whose
+// simdgroups each walk `BATCHES` batches of `VROWS` value rows in turn,
+// loading the next batch's state before walking the current one: a
+// threadgroup a few value rows wide loaded its state, walked and stored it,
+// and with every group resident at once the device read the banks, then
+// walked, then wrote them, the bank traffic beside none of the walk. The
+// arithmetic is the 32-lane scan's, so the bits are the committed scan's.
+template <typename T, int SG, int VROWS, int BATCHES>
+[[kernel]] void gated_delta_verify_batched(
+    const device T* qkv         [[buffer(0)]],
+    const device int* indptr    [[buffer(1)]],
+    const device int* replay    [[buffer(2)]],
+    const device int* commit    [[buffer(3)]],
+    const device int* slots     [[buffer(4)]],
+    const constant int& lane0   [[buffer(5)]],
+    const device T* ba          [[buffer(6)]],
+    const device float* a_log   [[buffer(7)]],
+    const device T* dt_bias     [[buffer(8)]],
+    device float* rstate        [[buffer(9)]],
+    device float* y             [[buffer(10)]],
+    device float* gates         [[buffer(11)]],
+    const constant int& k_heads [[buffer(12)]],
+    const constant int& v_heads [[buffer(13)]],
+    const device int* snaps     [[buffer(14)]],
+    const constant int& snap_lane0 [[buffer(15)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane_u [[thread_index_in_simdgroup]],
+    uint sg_u [[simdgroup_index_in_threadgroup]]) {
+  constexpr int LANES = 32;
+  constexpr int D = 128;
+  constexpr int PER = D / LANES;
+  constexpr int GROUP_ROWS = SG * VROWS * BATCHES;
+  const int lane = int(lane_u);
+  const int sg = int(sg_u);
+  const int tid = sg * LANES + lane;
+  const int hv = int(group.z) % v_heads;
+  const int r = int(group.z) / v_heads;
+  const int group_base = int(group.y) * GROUP_ROWS;
+
+  threadgroup float q_s[kVerifyChunk][D];
+  threadgroup float k_s[kVerifyChunk][D];
+  threadgroup float v_s[kVerifyChunk][GROUP_ROWS];
+  threadgroup float decay_s[kVerifyChunk];
+  threadgroup float beta_s[kVerifyChunk];
+
+  int begin = indptr[r];
+  for (int j = 0; j < r; ++j) {
+    begin += replay[lane0 + j];
+  }
+  const int rep = replay[lane0 + r];
+  const int span = min((indptr[r + 1] - indptr[r]) + rep, kVerifyChunk);
+  const int slot = slots[lane0 + r];
+  // Uniform over the threadgroup, so its barrier below is too.
+  if (span <= 0 || slot < 0) {
+    return;
+  }
+  const int own = indptr[r] - rep;
+  const int keep = min(commit[lane0 + r], span);
+  const int hk = hv / (v_heads / k_heads);
+  const size_t keys = size_t(k_heads) * D;
+  const size_t pitch = 2 * keys + size_t(v_heads) * D;
+  const float scale = 1.0f / metal::sqrt(float(D));
+
+  // The first batch's state loads beside the staging.
+  device float* cells =
+      gdn_cells<VROWS, PER>(rstate, slot, hv, v_heads, group_base + sg * VROWS, D, D);
+  float st[VROWS][PER];
+  gdn_load<VROWS, PER>(st, cells, lane, D);
+
+  // One simdgroup a row: its q and k, normed as `gdn_scan_row` norms them.
+  for (int j = sg; j < span; j += SG) {
+    const size_t row = size_t(begin + j) * pitch;
+    const size_t qbase = row + size_t(hk) * D;
+    const size_t kbase = qbase + keys;
+    float q[PER], k[PER];
+    float qs = 0.0f;
+    float ks = 0.0f;
+    for (int i = 0; i < PER; ++i) {
+      const int d = PER * lane + i;
+      const float qv = float(qkv[qbase + size_t(d)]);
+      const float kv = float(qkv[kbase + size_t(d)]);
+      q[i] = qv;
+      k[i] = kv;
+      qs += qv * qv;
+      ks += kv * kv;
+    }
+    const float qinv = metal::rsqrt(gdn_row_sum<LANES>(qs) + 1e-6f) * scale;
+    const float kinv = metal::rsqrt(gdn_row_sum<LANES>(ks) + 1e-6f);
+    for (int i = 0; i < PER; ++i) {
+      q_s[j][PER * lane + i] = q[i] * qinv;
+      k_s[j][PER * lane + i] = k[i] * kinv;
+    }
+  }
+  for (int at = tid; at < span * GROUP_ROWS; at += SG * LANES) {
+    const int j = at / GROUP_ROWS;
+    const int v = at % GROUP_ROWS;
+    const size_t vbase = size_t(begin + j) * pitch + 2 * keys + size_t(hv) * D;
+    v_s[j][v] = float(qkv[vbase + size_t(group_base + v)]);
+  }
+  // The row's gates, as `qwen_gdn_ba_gates` derives them; the first group
+  // of the head lands a row of the window's own in `gates`.
+  if (tid < span) {
+    const int t = tid;
+    const size_t vh = size_t(v_heads);
+    const size_t fused = size_t(begin + t) * 2 * vh;
+    const float bv = float(ba[fused + size_t(hv)]);
+    const float av = float(ba[fused + vh + size_t(hv)]);
+    const float z = av + float(dt_bias[hv]);
+    const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
+    const float g_log = -metal::fast::exp(a_log[hv]) * sp;
+    const float beta = 1.0f / (1.0f + metal::fast::exp(-bv));
+    decay_s[t] = metal::exp(g_log);
+    beta_s[t] = beta;
+    if (group.y == 0 && t >= rep) {
+      const size_t at = size_t(own + t) * 2 * vh + size_t(hv);
+      gates[at] = g_log;
+      gates[at + vh] = beta;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const device int* snap =
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+  for (int b = 0; b < BATCHES; ++b) {
+    const int local = (b * SG + sg) * VROWS;
+    const int dv_base = group_base + local;
+    float upcoming[VROWS][PER];
+    if (b + 1 < BATCHES) {
+      gdn_load<VROWS, PER>(upcoming, cells + size_t(SG * VROWS) * D, lane, D);
+    }
+    int snapped = 0;
+    int snap_at = snap != nullptr ? snap[0] : 0;
+    for (int t = 0; t < span; ++t) {
+      float q[PER], k[PER], vals[VROWS], mem[VROWS];
+      for (int i = 0; i < PER; ++i) {
+        q[i] = q_s[t][PER * lane + i];
+        k[i] = k_s[t][PER * lane + i];
+      }
+      for (int v = 0; v < VROWS; ++v) {
+        vals[v] = v_s[t][local + v];
+      }
+      const float beta = beta_s[t];
+      gdn_scan_memory<LANES, VROWS, PER>(st, k, decay_s[t], mem);
       for (int v = 0; v < VROWS; ++v) {
         mem[v] = gdn_row_sum<LANES>(mem[v]);
       }
@@ -618,14 +837,21 @@ template <typename T, int LANES, int SG, int VROWS>
         snap_at = snapped < PIE_RS_SNAPSHOTS ? snap[snapped] : 0;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (b + 1 < BATCHES) {
+      cells += size_t(SG * VROWS) * D;
+      for (int v = 0; v < VROWS; ++v) {
+        for (int i = 0; i < PER; ++i) {
+          st[v][i] = upcoming[v][i];
+        }
+      }
+    }
   }
 }
 
-#define PIE_GDN_VERIFY(lanes, sg, vrows)                                       \
-  template [[host_name("gated_delta_verify_bfloat16_l_" #lanes "_s_" #sg       \
-                       "_v_" #vrows)]]                                         \
-  [[kernel]] void gated_delta_verify<bfloat, lanes, sg, vrows>(                \
+#define PIE_GDN_VERIFY_BATCHED(sg, vrows, batches)                             \
+  template [[host_name("gated_delta_verify_batched_bfloat16_s_" #sg "_v_"     \
+                       #vrows "_b_" #batches)]]                                \
+  [[kernel]] void gated_delta_verify_batched<bfloat, sg, vrows, batches>(      \
       const device bfloat*, const device int*, const device int*,              \
       const device int*, const device int*, const constant int&,               \
       const device bfloat*, const device float*, const device bfloat*,         \
@@ -633,12 +859,9 @@ template <typename T, int LANES, int SG, int VROWS>
       const constant int&, const constant int&, const device int*,             \
       const constant int&, uint3, uint, uint);
 
-PIE_GDN_VERIFY(32, 4, 4)
-PIE_GDN_VERIFY(32, 8, 4)
-PIE_GDN_VERIFY(32, 8, 2)
-PIE_GDN_VERIFY(32, 4, 8)
-PIE_GDN_VERIFY(8, 4, 1)
-PIE_GDN_VERIFY(8, 4, 2)
-PIE_GDN_VERIFY(8, 8, 1)
-PIE_GDN_VERIFY(16, 4, 2)
-PIE_GDN_VERIFY(16, 4, 1)
+PIE_GDN_VERIFY_BATCHED(8, 4, 4)
+PIE_GDN_VERIFY_BATCHED(8, 2, 8)
+PIE_GDN_VERIFY_BATCHED(4, 4, 4)
+PIE_GDN_VERIFY_BATCHED(8, 4, 2)
+PIE_GDN_VERIFY_BATCHED(4, 4, 2)
+PIE_GDN_VERIFY_BATCHED(8, 2, 4)
