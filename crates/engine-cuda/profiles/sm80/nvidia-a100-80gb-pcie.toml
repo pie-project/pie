@@ -4,7 +4,8 @@ api = 1
 device = "NVIDIA A100 80GB PCIe"
 
 # Each line's measured win is in the commit that set it.
-# cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV, row kernels 16
+# cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV split across warps
+# at every width (Nemotron-3 Ultra's decode +3.7%), row kernels 16
 # bytes a lane, a split attention's partials folded a warp a row;
 # a block-FP8 projection's two rows or fewer on the GEMV over bf16 rows;
 # MXFP4 selects of 17 routes or more on the register-dequant MMA (fewer stay
@@ -14,6 +15,7 @@ device = "NVIDIA A100 80GB PCIe"
 gemm.fp8_gemv_until = 2
 gemm.skinny_rows = 0
 gemv.bf16 = "narrow"
+gemv.splitk_max_n = 1048576
 gemm.narrow_n = 8
 gemm.fp8_shadow = true
 gemm.grouped_gemv = true
@@ -67,6 +69,7 @@ measured = [
   "kernel.gemm.fp8_gemv_until",
   "kernel.gemm.skinny_rows",
   "kernel.gemv.bf16",
+  "kernel.gemv.splitk_max_n",
   "kernel.gemm.narrow_n",
   "kernel.gemm.fp8_shadow",
   "kernel.gemm.grouped_gemv",
