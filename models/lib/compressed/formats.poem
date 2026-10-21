@@ -33,6 +33,10 @@ def factors(reads, name, cols):
     rows, spans = shape(name)[0], (cols + 127) // 128
     wide = scale + ".f32"
     spread = src(scale).gather(1, [0] * spans)
+    # An f32 scale's spread lowers to byte runs, which a bank's join takes;
+    # a bf16 one is widened into a tensor of its own first.
+    if stored(scale) == F32:
+        return spread
     reads.push(tensor(wide, spread.cast(F32), F32, shape = [rows, spans], internal = True))
     return out(wide)
 
