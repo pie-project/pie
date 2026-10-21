@@ -301,6 +301,54 @@ pub fn rmsnorm_per_head_plus_one(
     )
 }
 
+/// Two [`rmsnorm_per_head_plus_one`]s of one head width and epsilon in one
+/// launch (a layer's query and key heads), each landing its own launch's bits.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_per_head_plus_one_pair(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    y: Tensor,
+    x2: Tensor,
+    weight2: Tensor,
+    y2: Tensor,
+    head_dim: u32,
+    eps: f32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_per_head_plus_one";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    if x2.dtype != x.dtype || y.dtype != x.dtype || y2.dtype != x.dtype {
+        return Err(refuse(OP, "a norm pair runs over bf16 rows alone"));
+    }
+    let threads = rms_threads(OP, head_dim)?;
+    let groups = |t: Tensor| -> Result<u32, Error> {
+        nonzero(OP, "rows", t.rows)?;
+        if t.width % head_dim != 0 {
+            return Err(refuse(OP, format!("the {}-wide row holds no whole {head_dim}-wide heads", t.width)));
+        }
+        Ok(t.width / head_dim * t.rows)
+    };
+    let (first, second) = (groups(x)?, groups(x2)?);
+    ctx.fire(
+        Fire::at("elemwise/norm_rms.metal", "rms_single_row_pair_bfloat16")
+            .apply(Grid::of([threads * (first + second), 1, 1], [threads, 1, 1])),
+        &[
+            x.arg(),
+            weight.arg(),
+            y.arg_mut(),
+            x2.arg(),
+            weight2.arg(),
+            y2.arg_mut(),
+            first.arg(),
+            eps.arg(),
+            head_dim.arg(),
+            DENSE_BANK.arg(),
+            OFFSET_BANK.arg(),
+            UNIT_GAIN.arg(),
+        ],
+    )
+}
+
 pub fn rmsnorm_grouped_plus_one(
     ctx: &Ctx<'_>,
     x: Tensor,

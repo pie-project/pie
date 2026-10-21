@@ -118,20 +118,39 @@ impl Run<'_> {
                     ),
                 }
             }
+            // The pair launch of the norm before it landed these rows.
+            Elementwise::RmsnormPerHeadPlusOne { y, .. } if self.landed_ahead(*y) => Ok(()),
             Elementwise::RmsnormPerHeadPlusOne {
                 x,
                 weight,
                 head_dim,
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_per_head_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => match self.norm_pair(*x, *y, *head_dim, *eps) {
+                Some((x2, weight2, y2)) => {
+                    elemwise::norm::rmsnorm_per_head_plus_one_pair(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        self.tensor(*y),
+                        self.tensor(x2),
+                        self.tensor(weight2),
+                        self.tensor(y2),
+                        *head_dim,
+                        *eps,
+                    )?;
+                    self.land_ahead([Some(y2), None, None]);
+                    Ok(())
+                }
+                None => elemwise::norm::rmsnorm_per_head_plus_one(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*weight),
+                    *head_dim,
+                    *eps,
+                    self.tensor(*y),
+                ),
+            },
             // Muse Spark's post-norm gate is served on CUDA.
             Elementwise::NormGate { .. } => Err(kernels_metal::Error::Unsupported {
                 op: "elementwise.norm_gate",
