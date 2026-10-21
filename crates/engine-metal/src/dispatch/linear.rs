@@ -308,7 +308,9 @@ impl Run<'_> {
                     linear::quant::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
                         partials: &|rows, width| self.partials(rows, width),
-                        table: None,
+                        table: Some(&|rows, contraction, counters| {
+                            self.register_table(*act, rows, contraction, counters)
+                        }),
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),

@@ -53,13 +53,31 @@ impl Run<'_> {
 
     fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_metal::Error> {
         match op {
-            Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            Elementwise::Rmsnorm { x, weight, eps, y } => {
+                // The normed rows' projections on the register tile read
+                // their input table as this norm lays it.
+                match (self.tensor(*x).width == self.tensor(*y).width)
+                    .then(|| self.producer_table(*y))
+                    .flatten()
+                {
+                    Some((table, counters)) => elemwise::norm::rmsnorm_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        *eps,
+                        self.tensor(*y),
+                        table,
+                        counters,
+                    ),
+                    None => elemwise::norm::rmsnorm(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        *eps,
+                        self.tensor(*y),
+                    ),
+                }
+            }
             Elementwise::RmsnormPerHead {
                 x,
                 weight,

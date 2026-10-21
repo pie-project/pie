@@ -496,3 +496,32 @@ template <typename T, int N_READS>
       const device itype*, uint, uint, uint, uint, uint);
 
 instantiate_rms_residual(bfloat16, bfloat, 4)
+
+// `rms_single_row` over whole rows that also lays the register tile's input
+// table of the normed rows (at most eight), so the projections that read them
+// run no table pass of their own.
+[[kernel]] void rms_table_bfloat16(
+    const device bfloat* x     [[buffer(0)]],
+    const device bfloat* w     [[buffer(1)]],
+    device bfloat* out         [[buffer(2)]],
+    const constant float& eps  [[buffer(3)]],
+    const constant uint& axis_size [[buffer(4)]],
+    const constant uint& w_stride  [[buffer(5)]],
+    const constant uint& plus_one  [[buffer(6)]],
+    const constant float& gain     [[buffer(7)]],
+    device bfloat* table       [[buffer(8)]],
+    const constant uint& rows  [[buffer(9)]],
+    const constant uint& counters [[buffer(10)]],
+    uint gid                   [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_position_in_threadgroup]],
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  rms_row_body<bfloat, 4>(
+      x, w, out, eps, axis_size, w_stride, plus_one, gain,
+      size_t(gid) * axis_size,
+      inv_rms, partials, lid, simd_lane, simd_group, tg_size);
+  rms_lay_register_table(
+      out + size_t(gid) * axis_size, table, axis_size, gid, rows, counters, lid, tg_size);
+}
