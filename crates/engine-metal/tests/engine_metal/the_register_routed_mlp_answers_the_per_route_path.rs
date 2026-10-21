@@ -33,8 +33,59 @@ fn floats(raw: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn bf16_value(v: f32) -> f32 {
+    f32::from_bits(v.to_bits() & 0xffff_0000)
+}
+
+/// Rounds to the nearest bf16, ties to even, as the GPU lands a bf16.
+fn to_bf16(v: f64) -> f64 {
+    let bits = (v as f32).to_bits();
+    f64::from(f32::from_bits(((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) << 16))
+}
+
+/// A bank's planes on the host: row `row`'s dot with `x` in f64.
+struct Host {
+    k: usize,
+    codes: Vec<u8>,
+    scales: Vec<f32>,
+    biases: Vec<f32>,
+}
+
+impl Host {
+    fn dot(&self, row: usize, x: &[f64]) -> f64 {
+        let groups = self.k / 64;
+        (0..self.k)
+            .map(|at| {
+                let code = row * self.k + at;
+                let q = f64::from((self.codes[code / 2] >> ((code % 2) * 4)) & 15);
+                let g = row * groups + at / 64;
+                x[at] * (q * f64::from(self.scales[g]) + f64::from(self.biases[g]))
+            })
+            .sum()
+    }
+}
+
+/// A route's (or the shared expert's) down row in f64 from token row `x`: the
+/// gate-up and its SwiGLU landed in bf16, as both paths land them.
+fn reference(gate_up: &Host, down: &Host, expert: usize, inter: usize, width: usize, x: &[f64]) -> Vec<f64> {
+    let hidden: Vec<f64> = (0..inter)
+        .map(|c| {
+            let g = to_bf16(gate_up.dot(expert * 2 * inter + c, x));
+            let u = to_bf16(gate_up.dot(expert * 2 * inter + inter + c, x));
+            to_bf16(g / (1.0 + (-g).exp()) * u)
+        })
+        .collect();
+    (0..width).map(|c| down.dot(expert * width + c, &hidden)).collect()
+}
+
+/// The largest difference of `got` from the f64 `want`, relative to `want`'s largest magnitude.
+fn spread64(want: &[f64], got: &[f32]) -> f64 {
+    let scale = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1e-9);
+    want.iter().zip(got).fold(0f64, |m, (a, b)| m.max((a - f64::from(*b)).abs())) / scale
+}
+
 /// A 4-bit, 64-group affine bank of `n` rows of `k` codes, seeded by `seed`.
-fn bank_of(device: &Context, handles: &Handles, k: u32, n: u32, seed: u64) -> (Bank, [Buffer; 3]) {
+fn bank_of(device: &Context, handles: &Handles, k: u32, n: u32, seed: u64) -> (Bank, [Buffer; 3], Host) {
     let groups = k / 64;
     let upload = |bytes: &[u8]| {
         let mut buffer = Buffer::zeroed(device, bytes.len() as u64).expect("a plane");
@@ -54,6 +105,13 @@ fn bank_of(device: &Context, handles: &Handles, k: u32, n: u32, seed: u64) -> (B
         .flat_map(|at| factor(at, 0x5678, -0.2, 0.00157))
         .collect();
     let planes = [upload(&codes), upload(&scales), upload(&biases)];
+    let values = |bytes: &[u8]| -> Vec<f32> { floats(bytes).into_iter().map(bf16_value).collect() };
+    let host = Host {
+        k: k as usize,
+        scales: values(&scales),
+        biases: values(&biases),
+        codes,
+    };
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let bank = Bank {
         mpp_codes: None,
@@ -64,7 +122,7 @@ fn bank_of(device: &Context, handles: &Handles, k: u32, n: u32, seed: u64) -> (B
         bits: 4,
         ld: k,
     };
-    (bank, planes)
+    (bank, planes, host)
 }
 
 /// `tokens` rows of `TOP_K` distinct experts, consecutive rows sharing half.
@@ -101,10 +159,12 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    let (gate_up, _g) = bank_of(&device, &handles, HIDDEN, EXPERTS * 2 * INTER, 0x1);
-    let (down, _d) = bank_of(&device, &handles, INTER, EXPERTS * HIDDEN, 0x2);
-    let (shared_gate_up, _sg) = bank_of(&device, &handles, HIDDEN, 2 * INTER, 0x3);
-    let (shared_down, _sd) = bank_of(&device, &handles, INTER, HIDDEN, 0x4);
+    let (gate_up, _g, gate_up_host) = bank_of(&device, &handles, HIDDEN, EXPERTS * 2 * INTER, 0x1);
+    let (down, _d, down_host) = bank_of(&device, &handles, INTER, EXPERTS * HIDDEN, 0x2);
+    let (shared_gate_up, _sg, shared_gate_up_host) = bank_of(&device, &handles, HIDDEN, 2 * INTER, 0x3);
+    let (shared_down, _sd, shared_down_host) = bank_of(&device, &handles, INTER, HIDDEN, 0x4);
+    // Each path's largest spread from the f64 reference.
+    let (mut route_off, mut tile_off) = (0f64, 0f64);
     let plane = |bytes: u64| Buffer::zeroed(&device, bytes.max(4)).expect("a plane");
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let upload = |bytes: &[u8]| {
@@ -239,6 +299,23 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                     );
                     checked += 1;
                 }
+                // Against f64, for a few routes and the shared rows: the register path is
+                // no further off than the per-route path.
+                let token_row = |t: usize| -> Vec<f64> {
+                    floats(&x[t * width * 2..(t + 1) * width * 2]).into_iter().map(f64::from).collect()
+                };
+                for (route, &row) in inv.iter().enumerate().step_by(9) {
+                    let x = token_row(route / TOP_K as usize);
+                    let exact = reference(&gate_up_host, &down_host, r[route] as usize, INTER as usize, width, &x);
+                    route_off = route_off.max(spread64(&exact, &want[route * width..(route + 1) * width]));
+                    tile_off = tile_off.max(spread64(&exact, &got[row * width..(row + 1) * width]));
+                }
+                if shared {
+                    for t in [0usize, tokens as usize - 1] {
+                        let exact = reference(&shared_gate_up_host, &shared_down_host, 0, INTER as usize, width, &token_row(t));
+                        tile_off = tile_off.max(spread64(&exact, &got[t * width..(t + 1) * width]));
+                    }
+                }
                 let fold_want = read(&folded, u64::from(tokens) * u64::from(HIDDEN) * 2);
                 let fold_got = read(&sorted_fold, u64::from(tokens) * u64::from(HIDDEN) * 2);
                 let off = spread(&fold_want, &fold_got);
@@ -254,5 +331,12 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
             }
         }
     }
-    eprintln!("checked {checked} register routes against the per-route path");
+    eprintln!(
+        "checked {checked} register routes against the per-route path; against f64 the per-route \
+         path is {route_off:.2e} off and the register tiles {tile_off:.2e}"
+    );
+    assert!(
+        tile_off <= 1.5 * route_off.max(2e-3),
+        "the register tiles are {tile_off:.2e} off f64, the per-route path {route_off:.2e}"
+    );
 }
