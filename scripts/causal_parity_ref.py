@@ -36,7 +36,8 @@ PROMPTS = [
 
 def logits_of(model, ids, device):
     with torch.no_grad():
-        return model(input_ids=torch.tensor([ids], device=device)).logits[0].float().cpu().numpy()
+        # No cache: a model of recurrent layers alone has none to size.
+        return model(input_ids=torch.tensor([ids], device=device), use_cache=False).logits[0].float().cpu().numpy()
 
 
 def main():

@@ -557,6 +557,16 @@ def _rewrite_muse_glimmer(cfg: dict, plan: Plan) -> None:
             tc[key] = _slice_list(tc[key], plan.src_layers)
 
 
+def _rewrite_nemotron_h(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # `hybrid_override_pattern` names each layer's mixer by position (`M`
+    # Mamba-2, `*` attention, `E` MoE); the cut keeps the kept layers' letters.
+    tc = _text_cfg(cfg, plan)
+    pattern = tc.get("hybrid_override_pattern")
+    if isinstance(pattern, str):
+        tc["hybrid_override_pattern"] = "".join(pattern[i] for i in plan.src_layers)
+
+
 def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     tc = _text_cfg(cfg, plan)
@@ -1432,6 +1442,55 @@ FAMILIES: dict[str, dict[str, Any]] = {
         router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
         globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
         default_layers="0-4",
+        config_rewrite=_rewrite_common,
+    ),
+    # modelopt's export of a Qwen3.5/3.6 MoE (nvidia/Qwen3.6-35B-A3B-NVFP4):
+    # the same trunk, each expert apart. Its prefix is the upstream one, so
+    # it is picked by `--family qwen3_5_moe_modelopt`.
+    "qwen3_5_moe_modelopt": dict(
+        model_type="qwen3_5_moe",
+        layer_prefix="model.language_model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight",),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight",
+                      "lm_head.weight", "lm_head.weight_scale",
+                      "lm_head.weight_scale_2", "lm_head.input_scale"),
+        default_layers="0-7",
+        config_rewrite=_rewrite_qwen3_5_moe,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.visual\."),),
+    ),
+    # Nemotron-3 (Nano): Mamba-2, attention and MoE mixers named by
+    # `hybrid_override_pattern`, each expert apart; the router and its score
+    # bias slice with the bank. Six layers hold every mixer kind.
+    "nemotron_h": dict(
+        layer_prefix="backbone.layers.",
+        expert_re=re.compile(r"\.mixer\.experts\.(\d+)\."),
+        router_suffixes=("mixer.gate.weight", "mixer.gate.e_score_correction_bias"),
+        globals_keep=("backbone.embeddings.weight", "backbone.norm_f.weight", "lm_head.weight"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_nemotron_h,
+    ),
+    # Qwen3-Next: GDN and gated attention at 3:1, every layer routed, each
+    # expert apart beside a gated shared expert. Eight layers are two
+    # periods.
+    "qwen3_next": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight",),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-7",
+        config_rewrite=_rewrite_common,
+    ),
+    # MiniMax-M2.x: every layer routed, each expert apart (`w1`/`w2`/`w3`),
+    # the router and its score bias slicing with the bank.
+    "minimax_m2": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.block_sparse_moe\.experts\.(\d+)\."),
+        router_suffixes=("block_sparse_moe.gate.weight", "block_sparse_moe.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-3",
         config_rewrite=_rewrite_common,
     ),
     "gpt_oss": dict(
