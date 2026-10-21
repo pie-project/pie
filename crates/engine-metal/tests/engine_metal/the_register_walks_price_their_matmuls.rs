@@ -154,7 +154,7 @@ fn the_register_walks_price_their_matmuls() {
         16 << 20,
         Dtype::F32,
     );
-    let walks: [(u32, u32); 4] = [quant::REGISTER_WALK, (2, 2), (4, 4), (4, 2)];
+    let walks: [(u32, u32, u32); 5] = [quant::REGISTER_WALK, (2, 2, 0), (2, 1, 1), (2, 2, 1), (1, 1, 1)];
     // (what, K, N, layers): the verify's and draft's single projections
     for (what, k, n, layers) in [
         ("gdn/attn out", 4096u32, 2048u32, 40u32),
@@ -215,7 +215,7 @@ fn the_register_walks_price_their_matmuls() {
                     same,
                     "{what}: walk {walk:?} at split {split} differs from the default walk's bits"
                 );
-                line += &format!("  s{split} u{}v{} {us:7.1}", walk.0, walk.1);
+                line += &format!("  s{split} u{}v{}l{} {us:7.1}", walk.0, walk.1, walk.2);
             }
         }
         eprintln!("{line}");
@@ -306,9 +306,10 @@ fn the_register_walks_price_their_matmuls() {
                     ),
                 }
                 line += &format!(
-                    "  u{}v{} {} {us:7.1}",
+                    "  u{}v{}l{} {} {us:7.1}",
                     walk.0,
                     walk.1,
+                    walk.2,
                     if fused { "one" } else { "own" }
                 );
             }
