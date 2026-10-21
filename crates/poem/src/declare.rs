@@ -339,6 +339,34 @@ impl Weight {
             ],
             // Its codes and its block exponents are planes of their own, raw
             // e4m3 and e8m0, which a W8A8 product reads beside each other.
+            // An MXFP8 bank (a release's experts, each row's exponents its
+            // own): e4m3 codes `[.., n, k]` beside e8m0 `[.., n, k / 32]`.
+            Dtype::Mxfp8 if self.shape.len() > 2 => {
+                let (&k, lead) = self
+                    .shape
+                    .split_last()
+                    .expect("an mxfp8 bank's logical shape ends in its contracted axis");
+                assert!(
+                    k % 32 == 0,
+                    "`{}` is an mxfp8 bank contracting over {k}, which is not a whole \
+                     number of 32-code blocks",
+                    self.name,
+                );
+                let mut exps = lead.to_vec();
+                exps.push(k / 32);
+                vec![
+                    BankPlane {
+                        suffix: "",
+                        shape: self.shape.clone(),
+                        dtype: Dtype::E4m3,
+                    },
+                    BankPlane {
+                        suffix: SCALES,
+                        shape: exps,
+                        dtype: Dtype::E8m0,
+                    },
+                ]
+            }
             Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 => {
                 let (br, bc) = self.dtype.fp8_blocks().unwrap_or((128, 128));
                 let (br, bc) = (u64::from(br), u64::from(bc));
@@ -558,7 +586,7 @@ impl Precision {
     /// The stored dtypes that quantize their activations, by deployment-name
     /// word: NVFP4 against NVFP4 (W4A4), and MXFP4 (W4A8) and DeepSeek's
     /// 128x128-block FP8 (W8A8) against e4m3 in 1x128 blocks.
-    pub const ACTED: [Precision; 7] = [
+    pub const ACTED: [Precision; 8] = [
         Precision {
             dtype: Dtype::Nvfp4,
             act: Some(ActQuant::Nvfp4),
@@ -589,6 +617,13 @@ impl Precision {
         },
         Precision {
             dtype: Dtype::Mxfp4,
+            act: Some(ActQuant::E4m3 { gran: 32 }),
+        },
+        // An MXFP8 release (MiniMax-M3's, Hy4's): e4m3 codes under one ue8m0
+        // exponent a 1x32 block of each row, projections and experts alike,
+        // against e4m3 in 1x32 blocks (W8A8, OCP MXFP8 on both sides).
+        Precision {
+            dtype: Dtype::Mxfp8,
             act: Some(ActQuant::E4m3 { gran: 32 }),
         },
     ];
