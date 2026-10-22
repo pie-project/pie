@@ -294,6 +294,7 @@ pub struct Shell {
     inflight: VecDeque<Flight>,
     /// Fires' host and device times, under the `fire-timeline` diagnostic.
     timeline: crate::timeline::Timeline,
+    staged: u64,
     grafted: Option<Pending>,
     landed: BTreeMap<u64, Vec<Vec<f32>>>,
     host_rows: bool,
@@ -1097,6 +1098,7 @@ impl PreparedLoad<'_> {
             airborne: Airborne::new(),
             inflight: VecDeque::new(),
             timeline: crate::timeline::Timeline::default(),
+            staged: 0,
             grafted: None,
             landed: BTreeMap::new(),
             host_rows: crate::diag::on().host_rows,
@@ -1824,13 +1826,13 @@ impl Shell {
         if (true || crate::diag::on().fire_timeline)
             && waited.is_ok()
             && let Some(lines) = self.timeline.land(
-                (flight.rows, flight.dispatches),
+                (flight.variant, flight.rows, flight.dispatches),
                 &flight.pending.timeline(),
                 crate::device::ctx::host_seconds(),
             )
         {
             for line in lines {
-                eprintln!("{line}");
+                println!("{line}");
             }
         }
         fire_trace(|| {
@@ -3747,7 +3749,10 @@ impl Shell {
             },
         };
 
+        self.staged += 1;
+        let variant = u8::from((self.staged / 20) % 2 == 1);
         Ok(Prepared {
+            variant,
             lanes,
             self_cond_feeds,
             port_feeds,
@@ -3981,7 +3986,8 @@ impl Shell {
                 #[cfg(target_vendor = "apple")]
                 let sink = sink
                     .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                    .flushing_after(HEAD_LAUNCHES);
+                    .flushing_after(HEAD_LAUNCHES)
+                    .flushing_every(Self::flush_every(p.variant));
                 Encoded::Live(sink)
             }
             Mode::Record | Mode::Replay => {
@@ -4322,6 +4328,7 @@ pub struct Clips<'a> {
 }
 
 pub struct Prepared<'a> {
+    variant: u8,
     lanes: &'a [Seated<'a>],
     self_cond_feeds: Vec<(u64, u64, u64, u64)>,
     port_feeds: Vec<PortFeedPlan>,
@@ -4357,6 +4364,7 @@ pub struct Enqueued<'a> {
     launches: u32,
     rows: u32,
     dispatches: u32,
+    variant: u8,
     attached: Vec<u64>,
     step: PhantomData<&'a ()>,
 }
@@ -4382,6 +4390,12 @@ pub struct Landed {
 #[cfg(target_vendor = "apple")]
 const HEAD_LAUNCHES: u32 = 64;
 
+impl Shell {
+    fn flush_every(variant: u8) -> u32 {
+        if variant == 1 { 128 } else { 0 }
+    }
+}
+
 fn fire_trace(line: impl FnOnce() -> String) {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -4399,6 +4413,7 @@ struct Flight {
     lanes: usize,
     rows: u32,
     dispatches: u32,
+    variant: u8,
     pending: Pending,
     attached: Vec<u64>,
 }
@@ -4638,6 +4653,7 @@ impl engine::frame::Shell for Shell {
             launches: walked.launches,
             rows: prepared.descriptor.rows,
             dispatches: walked.dispatches,
+            variant: prepared.variant,
             attached,
             step: PhantomData,
         })
@@ -4655,6 +4671,7 @@ impl engine::frame::Shell for Shell {
             launches,
             rows,
             dispatches,
+            variant,
             attached,
             step: _,
         } = enqueued;
@@ -4666,6 +4683,7 @@ impl engine::frame::Shell for Shell {
             lanes,
             rows,
             dispatches,
+            variant,
             pending,
             attached,
         });
