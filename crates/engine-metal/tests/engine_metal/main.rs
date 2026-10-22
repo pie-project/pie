@@ -13,6 +13,7 @@ mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
+mod every_unit_compiles;
 mod mma_attention_matches_fp64;
 mod mpp_attention_over_a_bf16_pool_matches_fp64;
 mod the_block_drafter_loads_and_leaves_the_trunk_alone;
