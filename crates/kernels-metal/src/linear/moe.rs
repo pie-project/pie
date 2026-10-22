@@ -633,8 +633,11 @@ pub fn matmul_select_quant(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    let entry = routed_point(OP, bank, false)?;
+    let mut entry = routed_point(OP, bank, false)?;
     let fan = selected(OP, x, routes, y)?;
+    if entry == "affine_qmv_routed_bfloat16_gs_64_b_4" && fan.tokens > 1 {
+        entry = "affine_qmv_routed_grouped_bfloat16_gs_64_b_4";
+    }
     routed_bank(OP, x, bank)?;
     ctx.fire(
         Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
