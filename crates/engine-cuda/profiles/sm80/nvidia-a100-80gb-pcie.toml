@@ -56,10 +56,11 @@ ssm.kda_chunked = true
 ssm.kda_step_fused = true
 ssm.gdn_step_blocks = 3
 
-# A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
+# A prefill's fire on eight buckets a doubling from 256 rows (its GEMMs run
 # its bucket's rows), and a bucket between powers of two below.
 [engine]
 prefill_lattice_from = 256
+prefill_lattice_steps = 8
 lattice_steps = 2
 
 # Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,

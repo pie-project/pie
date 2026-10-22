@@ -50,6 +50,10 @@ telemetry = false
 # service_name    = "pie"
 # worker_threads  = 16        # derived from visible CPUs, capped at 64
 # max_upload      = "256MiB"
+# policies        = []        # cluster policies: built-in names or .wasm paths,
+#                             # no two granted the same write (`publish`
+#                             # excepted: each writes under its own name)
+#                             # SIGHUP reloads this and `[runtime] policy`
 
 "#;
 
@@ -94,13 +98,20 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # [cluster]
 # Distributed serving only. A single-node config omits this section entirely.
 # controller = "tcp://10.0.0.1:9102"
-# role = "decode"
+# role = "decode"                # or "prefill": takes peers' passes, no client turns
 # gateways = ["tcp://10.0.0.2:8081"]
-# max_clients = 4
-# offload = true
-# transfer = "auto"
-# prefill_min_suffix_tokens = 0
-# max_outstanding_per_partner = 4
+
+# [offload]
+# Other workers' part in this one's passes, and its in theirs. Omit to serve
+# and send none.
+# listen = "10.0.0.1:7100"     # where this worker serves peers' passes; their
+#                              # pages' bytes ride one port above
+# peers  = ["10.0.0.2:7100"]   # workers to prefill this worker's passes on
+# pools  = ["10.0.0.3:7201"]   # pool workers (`pie-pool`) to keep its runs on,
+#                              # by their bulk address
+# transfer = "auto"            # peers' kv read in place where the build has NIXL
+# prefill_min_suffix_tokens = 0  # shortest uncached suffix worth a peer's
+#                                # prefill; 0: 2048 tokens
 "#;
 
 #[cfg(any(feature = "engine-cuda", test))]

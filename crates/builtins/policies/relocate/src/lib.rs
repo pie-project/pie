@@ -1,7 +1,8 @@
 //! Places a launch by its `worker` prop, and moves it to `move-to` once it
-//! has run `move-after-ms`.
+//! has run `move-after-ms`. The gateway moves a turn only while it has sent
+//! no output; one it refuses stays where it runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use policy::{Id, Placement, Subject, SubjectKind, candidates, cluster, prop, set_alarm};
 
@@ -10,6 +11,8 @@ struct Relocate {
     /// When each process arrived: stamped by the call that heard it, whose
     /// clock is `plan`'s.
     arrived: HashMap<Id, u64>,
+    /// Moves the gateway refused, for the turn had sent output.
+    refused: HashSet<Id>,
 }
 
 fn worker(of: &Subject, name: &str) -> Option<String> {
@@ -21,8 +24,13 @@ fn worker(of: &Subject, name: &str) -> Option<String> {
 }
 
 impl cluster::Policy for Relocate {
+    fn on_migration_failed(&mut self, process: &Id) {
+        self.refused.insert(process.clone());
+    }
+
     fn on_exited(&mut self, exit: &policy::Exit) {
         self.arrived.remove(&exit.process);
+        self.refused.remove(&exit.process);
     }
 
     fn plan(&mut self, now_ms: u64) {
@@ -33,9 +41,11 @@ impl cluster::Policy for Relocate {
                 let of = Subject::Process(process.clone());
                 let arrived = *self.arrived.entry(process.clone()).or_insert(now_ms);
                 let mut at = worker(&of, "worker");
-                if let (Some(to), Some(after)) =
-                    (worker(&of, "move-to"), prop(&of, "move-after-ms").int())
-                {
+                if let (false, Some(to), Some(after)) = (
+                    self.refused.contains(&process),
+                    worker(&of, "move-to"),
+                    prop(&of, "move-after-ms").int(),
+                ) {
                     let due = arrived + after.max(0) as u64;
                     if now_ms >= due {
                         at = Some(to);

@@ -2363,7 +2363,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .collect();
             req.media = crate::pipeline::media::lane_media(&matched, &lane_rows, &lane_base);
         }
-        crate::offload::try_encode(&mut req).await;
         let kv_clock = crate::scheduler::probe::ProbeClock::start();
         let groups = lane_groups(&pass_lanes.kv.iter().map(|ws| ws.id).collect::<Vec<_>>());
         let group_sets: Vec<KvWorkingSet> = groups
@@ -2478,6 +2477,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 slots,
             )
             .await;
+            // A pass that computes a run a peer streams taps its fires.
+            crate::offload::stream::bind(pid, &stores, ws.id, u64::from(lane.kv.held), slots);
         }
         // Pages below the device come back up first; the run stays held
         // until it is mapped in just below.
@@ -2612,7 +2613,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // the pieces of concurrent prompts seal together.
         let piece_frames = {
             let pipeline = ctx.resources().get(&this)?;
-            piece_frames(frame, cuts.len(), || pipeline.next_frame_seq())
+            piece_frames(
+                frame,
+                cuts.len(),
+                crate::scheduler::configured_frame_size(),
+                || pipeline.next_frame_seq(),
+            )
         };
         let mut settles = Vec::new();
         for (at, piece) in cuts.iter().enumerate() {
@@ -2770,6 +2776,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if let Err(refusal) = map_lane_pages(&mut req, &stores, &groups) {
                 return Ok(Err(refusal));
             }
+            crate::offload::stream::tap(pid, &stores, &mut req);
             rs_prepared.apply_to(&mut req);
             checkpoints_here.extend(
                 rs_prepared
@@ -2840,13 +2847,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     cells: cells.clone(),
                     failure: pipeline_failure.clone(),
                 }));
-            if !last {
-                // The next fire reads the KV this one writes.
-                drain_pipeline_fires(ctx, &pipe_fires).await?;
-                if let Some(error) = pipeline_failed(&pipeline_failure) {
-                    return Ok(Err(error));
-                }
-            }
+            // The next piece reads the KV this one writes: they run in
+            // order on the device, so it is submitted now, as a decode's
+            // next pass is, rather than once this one retires.
         }
         advance_cursors(&pass_lanes, Some(&landings), &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
@@ -2856,31 +2859,38 @@ pub async fn submit_pass_stamped<C: FireContext>(
 }
 
 /// The frame each of a pass's `pieces` fires carries, the pass's frame
-/// `frame`. A piece is submitted once the one before it has retired (it
-/// reads the KV and state that one writes), so a pass alone in its frame
-/// runs each piece as a frame of its own: the first takes `frame`'s sequence
-/// and each later one the next the pipeline hands out (`next_seq`). A lane's
-/// pieces queue in their order, one frame each, and the pieces of concurrent
-/// lanes seal together rather than one launch at a time. A pass sharing its
-/// frame keeps that frame for its last piece, its earlier pieces unframed.
+/// `frame`, in frames of `k` steps. A piece reads the KV and state the one
+/// before it writes, so a pass alone in its frame runs its pieces in order,
+/// one a step, `k` to a frame: the first frame takes `frame`'s sequence and
+/// each later one the next the pipeline hands out (`next_seq`). A lane's
+/// pieces queue in their order and the pieces of concurrent lanes seal
+/// together rather than one launch at a time. A pass sharing its frame keeps
+/// that frame for its last piece, its earlier pieces unframed.
 pub(crate) fn piece_frames(
     frame: Option<crate::scheduler::FrameStamp>,
     pieces: usize,
+    k: usize,
     mut next_seq: impl FnMut() -> u64,
 ) -> Vec<Option<crate::scheduler::FrameStamp>> {
+    let k = k.max(1);
     match frame {
-        Some(stamp) if stamp.fires == 1 => (0..pieces)
-            .map(|at| {
-                Some(if at == 0 {
-                    stamp
-                } else {
-                    crate::scheduler::FrameStamp {
-                        seq: next_seq(),
-                        ..stamp
+        Some(stamp) if stamp.fires == 1 => {
+            let mut seq = stamp.seq;
+            (0..pieces)
+                .map(|at| {
+                    if at > 0 && at % k == 0 {
+                        seq = next_seq();
                     }
+                    let first = at - at % k;
+                    Some(crate::scheduler::FrameStamp {
+                        seq,
+                        slot: (at % k) as u32,
+                        fires: (pieces - first).min(k) as u32,
+                        ..stamp
+                    })
                 })
-            })
-            .collect(),
+                .collect()
+        }
         frame => (0..pieces)
             .map(|at| if at + 1 == pieces { frame } else { None })
             .collect(),

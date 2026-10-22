@@ -36,6 +36,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "disaggregate"
+version = "0.1.0"
+dependencies = [
+ "policy",
+]
+
+[[package]]
 name = "drain-migrate"
 version = "0.1.0"
 dependencies = [
@@ -221,6 +228,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "replicate"
+version = "0.1.0"
+dependencies = [
+ "policy",
+]
+
+[[package]]
+name = "scale-by-prop"
+version = "0.1.0"
+dependencies = [
+ "policy",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -288,6 +309,13 @@ dependencies = [
 
 [[package]]
 name = "test-route"
+version = "0.1.0"
+dependencies = [
+ "policy",
+]
+
+[[package]]
+name = "test-share"
 version = "0.1.0"
 dependencies = [
  "policy",

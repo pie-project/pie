@@ -210,7 +210,7 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     // Tiles in flight: six of quantized rows (five below sm_90, as
     // `dsv4_decode.cuh` lays them) and the one they widen into, four of
     // bf16. A raw key holds the wider format's data and scales.
-    let stages = if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
+    let stages = if crate::jit::compute_capability_major().is_some_and(|major| major < 9) {
         5
     } else {
         6

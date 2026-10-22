@@ -386,6 +386,7 @@ mod tests {
             props: Props::new(),
             session: Some("conv-1".into()),
             cluster_props: Props::new(),
+            executors: Vec::new(),
         };
         for bytes in [
             rmp_serde::to_vec(&bare).unwrap(),

@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "../common/register_table.metal"
 using namespace metal;
 
 template <typename T>
@@ -85,3 +86,40 @@ template <typename T>
       const constant uint&, const constant float&, uint2);
 
 instantiate_gate_sigmoid_mul_heads(bfloat16, bfloat)
+
+
+// attn_gate over at most eight rows that also lays the register tile's input
+// table of the gated rows, so the out projection runs no table pass: a
+// threadgroup per row of the table's eight, the rows past `rows` laid as
+// zeros, the first zeroing the split tile's `counters` arrival counters.
+[[kernel]] void gate_table_bfloat16(
+    device bfloat* attn         [[buffer(0)]],
+    const device bfloat* gate   [[buffer(1)]],
+    const constant int& width   [[buffer(2)]],
+    device bfloat* table        [[buffer(3)]],
+    const constant uint& rows   [[buffer(4)]],
+    const constant uint& counters [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 lid2 [[thread_position_in_threadgroup]],
+    uint2 threads2 [[threads_per_threadgroup]]) {
+  threadgroup bfloat values[8192];
+  const uint lid = lid2.x, threads = threads2.x;
+  const uint n = uint(width), row = group.y;
+  const bool live = row < rows;
+  device bfloat* x = attn + size_t(row) * size_t(n);
+  const device bfloat* g = gate + size_t(row) * size_t(n);
+  for (uint k = lid; k < n; k += threads) {
+    bfloat v = bfloat(0.0f);
+    if (live) {
+      v = x[k] * sigmoid_mlx(g[k]);
+      x[k] = v;
+    }
+    table[register_table::slot(k, row)] = v;
+    values[k] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const threadgroup bfloat* laid = values;
+  register_table::lay_sums(laid, table, n, row, lid, threads);
+  if (row == 0)
+    register_table::lay_rest(table, n, 8, counters, lid, threads);
+}

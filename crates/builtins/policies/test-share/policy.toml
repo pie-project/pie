@@ -1,0 +1,3 @@
+plane = "cluster"
+subscribe = ["placement-changed"]
+grants = ["publish"]

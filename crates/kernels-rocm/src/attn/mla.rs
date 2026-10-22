@@ -405,7 +405,7 @@ fn absorb_native(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     let heads_i = count(op, "the head count this absorb states", heads)?;
-    if k % 64 != 0 || n % 64 != 0 || k == 0 || n == 0 {
+    if !k.is_multiple_of(64) || !n.is_multiple_of(64) || k == 0 || n == 0 {
         return Err(refuse(
             op,
             format!("the absorb takes K and N multiples of 64, not {k} and {n}"),

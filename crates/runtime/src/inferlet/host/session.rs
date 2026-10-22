@@ -58,6 +58,15 @@ async fn stream_out(ctx: &mut ProcessCtx, bytes: Vec<u8>, name: String) -> Resul
     Ok(())
 }
 
+/// `event` to process `process_id`'s client, if it has one.
+async fn deliver(process_id: process::ProcessId, event: &ProcessEvent, what: &str) {
+    if let Ok(Some(client_id)) = process::get_client_id(process_id).await
+        && let Err(err) = server::send_event(client_id, process_id, event)
+    {
+        tracing::warn!(client_id, process_id = %process_id, error = %err, "{what} delivery failed");
+    }
+}
+
 impl pie::inferlet::session::Host for ProcessCtx {
     async fn set_props(&mut self, props: String) -> Result<Result<(), String>> {
         let changes: client_api::Props = match serde_json::from_str(&props) {
@@ -108,18 +117,7 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
     async fn send(&mut self, message: String) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        let process_id = self.id();
-        if let Ok(Some(client_id)) = process::get_client_id(process_id).await
-            && let Err(err) =
-                server::send_event(client_id, process_id, &ProcessEvent::Message(message))
-        {
-            tracing::warn!(
-                client_id,
-                process_id = %process_id,
-                error = %err,
-                "session.send delivery failed"
-            );
-        }
+        deliver(self.id(), &ProcessEvent::Message(message), "session.send").await;
         Ok(())
     }
 

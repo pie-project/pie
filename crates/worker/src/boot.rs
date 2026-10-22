@@ -12,30 +12,17 @@ use crate::weights;
 pub(crate) struct LoadedModelEngines {
     pub(crate) model: String,
     pub(crate) caps: EngineCapabilities,
-    pub(crate) full_identity: crate::executor::ModelIdentity,
-    pub(crate) encode_identity: crate::executor::ModelIdentity,
     pub(crate) kv_handle: Option<engine::KvHandle>,
     pub(crate) engines: ModelEngines,
     pub(crate) metadata: runtime::model::ModelMetadata,
 }
 
-#[cfg_attr(not(feature = "net"), allow(dead_code))]
-pub(crate) struct LoadedPartnerMetadata {
-    pub(crate) full_identity: crate::executor::ModelIdentity,
-    pub(crate) encode_identity: crate::executor::ModelIdentity,
-    pub(crate) kv_handle: Option<engine::KvHandle>,
-    pub(crate) page_size: u32,
-    pub(crate) supports_media_encode: bool,
-    pub(crate) hidden_size: u32,
-}
-
 pub(crate) fn load_model_engines(
     user_cfg: &config::Config,
     home: &Path,
-    component: crate::executor::ModelComponent,
     mut opened: Option<runtime::engine::EngineBox>,
 ) -> Result<LoadedModelEngines> {
-    let (engine_groups, snapshot_dir, metadata) = {
+    let (engine_groups, metadata) = {
         let m = &user_cfg.model;
         let flavor = crate::backend::flavor::resolve(m.engine.kind, &m.name)?;
 
@@ -84,6 +71,10 @@ pub(crate) fn load_model_engines(
                 .runtime
                 .max_concurrent_processes
                 .and_then(|n| u32::try_from(n).ok());
+            // Other workers read this one's kv in place where the build
+            // hosts NIXL and the configuration does not keep transfers inline.
+            residency.kv_export = cfg!(feature = "nixl")
+                && user_cfg.offload.transfer != crate::config::OffloadTransfer::Inline;
             group_engines.push(create_engine_group(
                 m,
                 residency,
@@ -94,7 +85,6 @@ pub(crate) fn load_model_engines(
                 &snapshot_dir,
                 home,
                 tp_degree,
-                component,
                 u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
                 opened.take(),
             )?);
@@ -103,7 +93,6 @@ pub(crate) fn load_model_engines(
             ModelEngines {
                 groups: group_engines,
             },
-            snapshot_dir,
             lifted,
         )
     };
@@ -117,26 +106,9 @@ pub(crate) fn load_model_engines(
         .groups
         .first()
         .and_then(|group| group.backend.export_kv_handle());
-    let artifact_digest = if user_cfg.cluster.controller.is_some() || user_cfg.offload.enabled {
-        weights::model_artifact_digest(&snapshot_dir)?
-    } else {
-        *blake3::hash(user_cfg.model.model.as_bytes()).as_bytes()
-    };
     Ok(LoadedModelEngines {
         metadata,
         model: user_cfg.model.name.clone(),
-        full_identity: weights::model_identity(
-            user_cfg,
-            &caps,
-            &artifact_digest,
-            crate::executor::ModelComponent::Full,
-        )?,
-        encode_identity: weights::model_identity(
-            user_cfg,
-            &caps,
-            &artifact_digest,
-            crate::executor::ModelComponent::Encode,
-        )?,
         caps,
         kv_handle,
         engines: engine_groups,
@@ -196,8 +168,9 @@ impl Embedded {
 pub struct Loaded {
     #[cfg_attr(not(feature = "net"), allow(dead_code))]
     pub(crate) model: String,
+    /// The kv the engine exported, for peers to read in place.
     #[cfg_attr(not(feature = "net"), allow(dead_code))]
-    pub(crate) partner: Option<LoadedPartnerMetadata>,
+    pub(crate) kv_handle: Option<engine::KvHandle>,
     summary: Summary,
     config: runtime::bootstrap::Config,
 }
@@ -233,22 +206,10 @@ fn load(
     let LoadedModelEngines {
         model,
         caps,
-        full_identity,
-        encode_identity,
         kv_handle,
         engines,
         metadata,
-    } = load_model_engines(
-        user_cfg,
-        home,
-        crate::executor::ModelComponent::Full,
-        opened,
-    )?;
-    let hidden_size: u32 = serde_json::from_slice::<serde_json::Value>(&metadata.config)
-        .ok()
-        .and_then(|config| config.get("hidden_size")?.as_u64())
-        .and_then(|size| u32::try_from(size).ok())
-        .unwrap_or(0);
+    } = load_model_engines(user_cfg, home, opened)?;
     let group = &engines.groups[0];
     let summary = Summary {
         model: artifact_name(&group.snapshot_dir),
@@ -264,14 +225,7 @@ fn load(
         .context("translating to bootstrap::Config")?;
     Ok(Loaded {
         model,
-        partner: Some(LoadedPartnerMetadata {
-            full_identity,
-            encode_identity,
-            kv_handle,
-            page_size: caps.pools.kv_page_size,
-            supports_media_encode: caps.media_encode,
-            hidden_size,
-        }),
+        kv_handle,
         summary,
         config,
     })
@@ -302,7 +256,7 @@ fn load_without_engine(
             .context("translating to bootstrap::Config")?;
     Ok(Loaded {
         model: m.name.clone(),
-        partner: None,
+        kv_handle: None,
         summary: Summary {
             model: artifact_name(&artifact),
             deployment: deployment.clone(),
@@ -347,7 +301,6 @@ fn create_engine_group(
     snapshot_dir: &Path,
     home: &Path,
     tp_degree: usize,
-    component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
@@ -361,7 +314,6 @@ fn create_engine_group(
                 home,
                 m.adapter_mount().as_deref(),
                 group_idx,
-                component,
                 frames_in_flight,
                 &m.adapters,
                 residency.clone(),
@@ -396,7 +348,6 @@ fn create_engine_group(
         home,
         m.adapter_mount().as_deref(),
         group_idx,
-        component,
         frames_in_flight,
         &m.adapters,
         residency,

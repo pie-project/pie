@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 pub use ids::{GatewayId, NodeId, WorkerId};
 
+/// The environment variable a worker the controller launched finds its
+/// launch token in ([`WorkerInfo::launch`]).
+pub const LAUNCH_ENV: &str = "PIE_LAUNCH";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -49,7 +53,15 @@ pub enum Health {
 pub struct WorkerInfo {
     pub role: Role,
     pub model: String,
+    /// The engine kind it serves on, as its config spells it (`[engine]
+    /// type`): with the model, the shape a scale table counts it under.
+    #[serde(default)]
+    pub engine: String,
     pub addr: String,
+    /// The token the controller's actuator launched it with
+    /// (`PIE_LAUNCH`), so the controller knows which of its launches it is.
+    #[serde(default)]
+    pub launch: Option<String>,
     /// The id this worker had, registering again (a controller restarted,
     /// or one that timed it out): granted back if no one holds it, so the
     /// worker keeps its links and its turns.
@@ -91,22 +103,15 @@ pub enum Ack {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NeighborPeer {
-    pub id: WorkerId,
-    pub addr: String,
-    pub role: Role,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayEndpoint {
     pub id: GatewayId,
     pub addr: String,
 }
 
+/// What a worker hears from the controller: the gateways to link to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Neighbors {
     pub epoch: u64,
-    pub peers: Vec<NeighborPeer>,
     pub gateways: Vec<GatewayEndpoint>,
 }
 
@@ -116,6 +121,8 @@ pub struct RoutableWorker {
     pub addr: String,
     pub role: Role,
     pub model: String,
+    #[serde(default)]
+    pub engine: String,
     pub health: Health,
     pub coarse_load: WorkerStatus,
 }
@@ -124,6 +131,37 @@ pub struct RoutableWorker {
 pub struct RoutingTable {
     pub epoch: u64,
     pub workers: Vec<RoutableWorker>,
+    /// The controller launches and stops workers to meet a scale table: it
+    /// has slots to launch into (`cluster.scale`).
+    #[serde(default)]
+    pub scales: bool,
+}
+
+/// A shape of worker, and how many of it the cluster should run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScaleEntry {
+    /// The model as workers serve it (`[model] name`); None: workers that
+    /// load no model.
+    pub model: Option<String>,
+    pub engine: String,
+    pub workers: u32,
+}
+
+/// Where a shape a scale table names stands, for whoever converges on it:
+/// the controller's own actuator, or an operator in its place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleStatus {
+    pub model: Option<String>,
+    pub engine: String,
+    pub desired: u32,
+    /// Registered and taking turns.
+    pub serving: u32,
+    /// Launched by the actuator and not registered yet.
+    pub launching: u32,
+    /// Stopped by the actuator and still draining.
+    pub stopping: u32,
+    /// Slots of the shape the actuator has free to launch into.
+    pub free: u32,
 }
 
 #[tarpc::service]
@@ -139,6 +177,13 @@ pub trait Control {
     async fn watch_worker(id: WorkerId, since: u64) -> Neighbors;
 
     async fn watch_gateway(since: u64) -> RoutingTable;
+
+    /// The scale table a cluster policy installed: level-triggered, the
+    /// whole table each time; a shape it does not name keeps what it has.
+    async fn desire_scale(entries: Vec<ScaleEntry>);
+
+    /// Each shape the scale table names, desired against current.
+    async fn scale_status() -> Vec<ScaleStatus>;
 }
 
 #[cfg(test)]
@@ -170,11 +215,13 @@ mod tests {
     fn routing_table_serde_round_trip() {
         let table = RoutingTable {
             epoch: 7,
+            scales: false,
             workers: vec![RoutableWorker {
                 id: WorkerId(3),
                 addr: "10.0.0.4:7000".into(),
                 role: Role::Decode,
                 model: "llama3-8b".into(),
+                engine: "cuda_native".into(),
                 health: Health::Healthy,
                 coarse_load: WorkerStatus {
                     kv_pressure_bucket: 42,

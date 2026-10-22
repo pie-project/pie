@@ -8,7 +8,7 @@ use ::engine::{ChannelRegistration, ProgramRegistration, StateCopy};
 
 use crate::engine::{
     BoundInstance, ChannelJoin, EngineBox, EngineId, InstanceBindingPlan, RegisteredChannel,
-    SchedulerLimits, SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
+    SchedulerLimits, SubmissionCompletion, WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
@@ -292,6 +292,8 @@ pub(crate) enum HostKvOp {
     /// A copy of device pages into host slots, then a read of those slots:
     /// one item on the lane, with no completion to settle between.
     CopyRead(::engine::KvCopy, Vec<u32>),
+    /// The engine's tap groups (`Engine::tap_groups`), as JSON.
+    TapGroups,
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
@@ -2296,7 +2298,7 @@ impl BatchScheduler {
                 }
                 _ => None,
             };
-            let mut retired = in_flight_launches.pop_front().expect("front batch exists");
+            let retired = in_flight_launches.pop_front().expect("front batch exists");
             if wave_trace() {
                 wave_trace_emit(format!(
                     "[wave-trace] t={}us retire lanes={}",
@@ -2324,35 +2326,14 @@ impl BatchScheduler {
                     for request in &retired.requests {
                         request.completion.mark_native_retired();
                     }
-                    let requests = std::mem::take(&mut retired.requests);
-                    let mut outcomes = Vec::with_capacity(requests.len());
-                    for request in &requests {
-                        match request.completion.resolve_from_terminal() {
-                            Ok(WorkItemAttemptOutcome::Committed) => {
-                                outcomes.push("committed");
-                            }
-                            Ok(WorkItemAttemptOutcome::Failed) => {
-                                outcomes.push("failed");
-                            }
-                            Ok(WorkItemAttemptOutcome::Retry) => {
-                                outcomes.push("retry");
-                                request.completion.reject(
-                                    "engine published RETRY at frame settle; \
-                                     retry is not a v14 outcome (frame admission \
-                                     bounds every in-frame gate)",
-                                );
-                            }
-                            Err(err) => {
-                                outcomes.push("settlement_error");
-                                tracing::warn!(
-                                    instance_id = request.instance_id,
-                                    ?err,
-                                    "direct launch terminal settlement failed"
-                                );
-                            }
-                        }
+                    // A fire its step resolved as it landed is resolved.
+                    for request in retired
+                        .requests
+                        .iter()
+                        .filter(|r| !r.completion.is_settled())
+                    {
+                        request.completion.resolve_landed("frame settle");
                     }
-                    drop(requests);
                     stats::record_fire_stats(
                         stats,
                         retired.started.elapsed(),
@@ -2703,6 +2684,7 @@ mod tests {
                             voxels: Vec::new(),
                         },
                         terminal_cells: Vec::new(),
+                        completions: Vec::new(),
                         instances: vec![0],
                         logical_fire_ids: vec![token],
                     }],
@@ -2779,6 +2761,7 @@ mod tests {
                         voxels: Vec::new(),
                     },
                     terminal_cells: Vec::new(),
+                    completions: Vec::new(),
                     instances: vec![0],
                     logical_fire_ids: vec![42],
                 }],

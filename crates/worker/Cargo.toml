@@ -39,7 +39,7 @@ vulkan = ["runtime/vulkan"]
 wgpu = ["runtime/wgpu"]
 xla = ["runtime/xla"]
 cerebras = ["runtime/cerebras"]
-nixl = ["dep:transport", "transport/nixl"]
+nixl = ["dep:transport", "transport/nixl", "engine-cpu?/nixl"]
 
 profile-fire = ["runtime/profile-fire"]
 

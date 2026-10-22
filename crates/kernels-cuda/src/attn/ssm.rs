@@ -464,8 +464,18 @@ fn conv1d_chunked(
         ],
     )?;
     if !row_tiled || !state.write_state {
+        if state.snapshots.count > 0 && !row_tiled {
+            return Err(refuse(
+                op,
+                format!(
+                    "this fire lands state snapshots and a conv reaching {reach} rows folds its \
+                     window inline, with no seat for them"
+                ),
+            ));
+        }
         return Ok(());
     }
+    let [snap, snap_rows, snap_slots] = state.snapshots.args();
     ctx.fire(
         op,
         Fire::at(
@@ -488,6 +498,9 @@ fn conv1d_chunked(
             state.write_state_mask.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
+            snap,
+            snap_rows,
+            snap_slots,
             ctx.stage(),
             stated(op, lanes)?.arg(),
         ],
@@ -844,23 +857,39 @@ impl Delta {
 /// cannot follow the batch.
 const SCAN_BV: u32 = 64;
 
+/// A quarter head a block, where a block cannot hold half a head's scan
+/// (99 KiB: an RTX 30/40/50, an A40, an L4, a DGX Spark).
+const SCAN_BV_NARROW: u32 = 32;
+
 /// The shared memory one block of the chunked scan holds at key width
-/// `k_dim`: its prep is smaller.
-const fn scan_smem(k_dim: u32) -> u32 {
+/// `k_dim` and `bv` value columns: its prep is smaller.
+const fn scan_smem_at(k_dim: u32, bv: u32) -> u32 {
     const CH: u32 = 64;
     const LD: u32 = 136;
     const LDC: u32 = 72;
-    let ldv = SCAN_BV + 8;
+    let ldv = bv + 8;
     (3 * CH * LD + CH * ldv + CH * LDC + k_dim * ldv + 2 * CH * ldv) * 2 + 2 * CH * FLOAT
 }
 
-/// Whether a 128-wide prefill takes the two-launch scan: the profile turns
-/// it on, and this device's blocks can opt into its shared memory.
-fn fused_scan(ctx: &Ctx, k_dim: u32) -> bool {
-    ctx.tuning().ssm_gdn_fused_scan
-        && ctx
-            .smem_per_block_optin()
-            .is_some_and(|cap| cap >= scan_smem(k_dim))
+/// The value columns a 128-wide prefill's two-launch scan takes a block,
+/// where the profile turns the scan on and this device's blocks can opt
+/// into its shared memory at half a head, else a quarter.
+fn fused_scan(ctx: &Ctx, k_dim: u32) -> Option<u32> {
+    if !ctx.tuning().ssm_gdn_fused_scan {
+        return None;
+    }
+    let cap = ctx.smem_per_block_optin()?;
+    [SCAN_BV, SCAN_BV_NARROW]
+        .into_iter()
+        .find(|&bv| cap >= scan_smem_at(k_dim, bv))
+}
+
+/// Whether a prefill of the gated delta rule at key width `k_dim` lands its
+/// state snapshots on this device: the two-launch scan and the serial walk
+/// seat them, the wmma launches and the tcgen05 walk do not.
+#[must_use]
+pub fn gdn_lands_snapshots(ctx: &Ctx, k_dim: u32) -> bool {
+    k_dim == 128 && fused_scan(ctx, k_dim).is_some()
 }
 
 /// `pie::attn::gdn::Params`, field for field.
@@ -911,7 +940,8 @@ fn gated_delta_chunked_tc5(
         && (shape.conv_dim * 2).is_multiple_of(16)
         && aligned16(qkv.data.ptr)
         && aligned16(y.ptr)
-        && state.slot_stride_elems > 0)
+        && state.slot_stride_elems > 0
+        && state.snapshots.count == 0)
     {
         return Ok(false);
     }
@@ -994,6 +1024,7 @@ fn gated_delta_chunked_fla(
     gates: Tensor,
     state: &RecurrentPool,
     y: &mut Tensor,
+    bv: u32,
 ) -> Result<(), Error> {
     const CH: u32 = 64;
     const BLOCK: u32 = 128;
@@ -1003,7 +1034,9 @@ fn gated_delta_chunked_fla(
     let lanes = requests(op, qkv)?;
     seated(op, state, "ssm_gdn_chunk", true, true, true)?;
     let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
-    let slots = shape.n.div_ceil(CH) + lanes;
+    // A snapshot cuts a lane's chunk where it lands: one more chunk slot each.
+    let slots = shape.n.div_ceil(CH) + lanes + state.snapshots.count;
+    let [snap, snap_rows, snap_slots] = state.snapshots.args();
     let padded = Delta {
         n: shape.n + CH,
         ..*shape
@@ -1065,18 +1098,21 @@ fn gated_delta_chunked_fla(
             stated(op, v_heads)?.arg(),
             stated(op, shape.conv_dim)?.arg(),
             q_scale.arg(),
+            snap,
+            snap_rows,
             ctx.stage(),
         ],
     )?;
-    let scan_smem = scan_smem(k_dim);
+    let scan_smem = scan_smem_at(k_dim, bv);
+    let entry = if bv == SCAN_BV {
+        "::pie::attn::ssm_chunk_scan<64>"
+    } else {
+        "::pie::attn::ssm_chunk_scan<32>"
+    };
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::ssm_chunk_scan<64>").apply(
-            Launch::grid(
-                [lanes * v_heads * (v_dim / SCAN_BV), 1, 1],
-                [2 * BLOCK, 1, 1],
-            )
-            .smem(scan_smem),
+        Fire::at(FILE, entry).apply(
+            Launch::grid([lanes * v_heads * (v_dim / bv), 1, 1], [2 * BLOCK, 1, 1]).smem(scan_smem),
         ),
         &[
             ArgValue::Ptr(gcum),
@@ -1097,6 +1133,9 @@ fn gated_delta_chunked_fla(
             stated(op, lanes)?.arg(),
             stated(op, k_heads)?.arg(),
             stated(op, v_heads)?.arg(),
+            snap,
+            snap_rows,
+            snap_slots,
             ctx.stage(),
         ],
     )
@@ -1121,6 +1160,12 @@ fn gated_delta_chunked_split(
     const BLOCK: u32 = 256;
     let lanes = requests(op, qkv)?;
     seated(op, state, "ssm_gdn_chunk", true, true, true)?;
+    if state.snapshots.count > 0 {
+        return Err(refuse(
+            op,
+            "this fire lands state snapshots and the three wmma launches have no seat for them",
+        ));
+    }
     let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
     let slots = shape.n.div_ceil(CH) + lanes;
     let padded = Delta {
@@ -1351,8 +1396,9 @@ pub fn gated_delta_chunked(
     if wide && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)? {
         return Ok(());
     }
-    let fused = wide && fused_scan(ctx, k_dim);
-    if fused
+    let scan_bv = if wide { fused_scan(ctx, k_dim) } else { None };
+    let fused = scan_bv.is_some();
+    if let Some(bv) = scan_bv
         && shape.conv_dim.is_multiple_of(8)
         && (k_heads * k_dim).is_multiple_of(8)
         && state.slot_stride_elems % 8 == 0
@@ -1360,9 +1406,10 @@ pub fn gated_delta_chunked(
             .iter()
             .all(|&at| aligned16(at))
     {
-        return gated_delta_chunked_fla(ctx, OP, &shape, qkv, gates, state, y);
+        return gated_delta_chunked_fla(ctx, OP, &shape, qkv, gates, state, y, bv);
     }
     let staged = shape.stage(ctx, OP, qkv.data, gates, StagePlanes::Chunk)?;
+    let [snap, snap_rows, snap_slots] = state.snapshots.args();
     if wide && !fused {
         return gated_delta_chunked_split(ctx, OP, &shape, &staged, qkv, state, y);
     }
@@ -1405,9 +1452,18 @@ pub fn gated_delta_chunked(
                 state.write_state_mask.arg(),
                 state.begin_at.arg(),
                 state.fused_decay.arg(),
+                snap,
+                snap_rows,
+                snap_slots,
                 ctx.stage(),
             ],
         );
+    }
+    if state.snapshots.count > 0 {
+        return Err(refuse(
+            OP,
+            "this fire lands state snapshots and the warp-tiled scan has no seat for them",
+        ));
     }
 
     if k_dim <= WARP_TILED_K_MAX {
@@ -2170,9 +2226,10 @@ mod tests {
     /// RTX 30/40/50 or a DGX Spark into 99 KiB, short of the scan.
     #[test]
     fn the_scan_fits_a_datacenter_block_and_not_a_99_kib_one() {
-        assert!(scan_smem(128) <= 232_448);
-        assert!(scan_smem(128) <= 166_912);
-        assert!(scan_smem(128) > 101_376);
+        assert!(scan_smem_at(128, SCAN_BV) <= 232_448);
+        assert!(scan_smem_at(128, SCAN_BV) <= 166_912);
+        assert!(scan_smem_at(128, SCAN_BV) > 101_376);
+        assert!(scan_smem_at(128, SCAN_BV_NARROW) <= 101_376);
     }
 
     /// Four blocks of the fused step where the SM holds them, as on a B200

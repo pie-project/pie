@@ -8,6 +8,23 @@ interface reads {
     candidates: func(kind: subject-kind) -> list<id>;
 
     /// A value the host measured or authenticated. Trusted.
+    ///
+    /// On the cluster plane, what the programs' calls have committed is
+    /// read here too, read-only, as of the last call that returned:
+    /// - a process's `placement/worker` (text), `placement/executors` (a
+    ///   JSON array of worker ids, best first) and `placement/props/<name>`;
+    /// - a group's `replication/sites` (a JSON array of the worker ids its
+    ///   replication table asks for);
+    /// - any subject's `published/<program>/<name>`, what that program
+    ///   published (`cluster-writes.publish`). On a worker subject, a
+    ///   worker policy's own `published/<name>` shares the prefix; where a
+    ///   name reads as both, the cluster program's value is the one read.
+    ///
+    /// A launch's gate holds it until every program has heard it and the
+    /// edges their calls' changes carry have reached the others, so a
+    /// program that reads another's placement reads the one made for it.
+    /// Programs that keep answering each other's change hold it to the
+    /// gate's bound.
     attr: func(of: subject, name: string) -> option<value>;
 
     /// A value supplied from outside the host: by the client, or by the
@@ -59,7 +76,7 @@ interface worker-writes {
 
 /// The cluster plane's process tables.
 interface cluster-writes {
-    use types.{id, key, placement, scale};
+    use types.{id, key, placement, scale, subject, value};
 
     /// The gateway's queue: released in key order, held below `floor`.
     install-schedule: func(entries: list<tuple<id, key>>, floor: option<key>);
@@ -68,6 +85,15 @@ interface cluster-writes {
 
     /// The cluster's size, per shape.
     install-scale: func(entries: list<scale>);
+
+    /// A value for the other cluster programs to read, as attr
+    /// `published/<this program's name>/<name>` of `of`: a word between
+    /// programs of one plane, not a decision. Level-triggered; `none`
+    /// withdraws it. Committed with the call, like every write; a value
+    /// that changed reaches the others as edge `published` on their next
+    /// call. Granted by `publish`, which every program may hold: each
+    /// writes only under its own name.
+    publish: func(of: subject, name: string, val: option<value>);
 }
 
 /// The cluster plane's state tables and verb. Their subjects are groups,

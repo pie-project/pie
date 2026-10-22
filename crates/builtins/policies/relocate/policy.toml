@@ -1,8 +1,9 @@
 # Places a launch on the worker its `worker` prop names, then, once it has
-# run `move-after-ms`, moves it to `move-to`: a running turn changes worker
-# and its stream goes on. For benchmarks and tests of migration.
+# run `move-after-ms`, moves it to `move-to`, where it runs again from the
+# start. The gateway moves a turn only while it has sent no output; one it
+# refuses stays where it runs. For tests of migration.
 plane = "cluster"
-subscribe = ["arrived", "dispatched", "exited", "migrated"]
+subscribe = ["arrived", "dispatched", "exited", "migrated", "migration-failed"]
 grants = ["placement"]
 uses = ["placement.migrate"]
 gate-ms = 20

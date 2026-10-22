@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use runtime::model::ModelMetadata;
 
-use crate::backend::EngineCapabilities;
-use crate::config;
 use checkpoint::file::read::{parse_metadata, read_meta};
 
 pub const CONFIG_OBJECT: &str = "model/config";
@@ -269,30 +267,6 @@ fn looks_like_path(value: &str) -> bool {
                 .iter()
                 .any(|known| ext.eq_ignore_ascii_case(known))
         })
-}
-
-pub(crate) fn model_identity(
-    user_cfg: &config::Config,
-    caps: &EngineCapabilities,
-    artifact_digest: &[u8; 32],
-    component: crate::executor::ModelComponent,
-) -> Result<crate::executor::ModelIdentity> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(user_cfg.model.name.as_bytes());
-    hasher.update(artifact_digest);
-    hasher.update(caps.device.backend.as_bytes());
-    hasher.update(&caps.profile.vocab.to_le_bytes());
-    hasher.update(&caps.profile.num_layers.to_le_bytes());
-    hasher.update(&caps.limits.max_context.to_le_bytes());
-    hasher.update(caps.profile.activation_name().as_bytes());
-    hasher.update(&caps.pools.kv_page_size.to_le_bytes());
-    hasher.update(format!("{:?}", user_cfg.model.engine.kind).as_bytes());
-    hasher.update(user_cfg.model.engine.activation_dtype.as_bytes());
-    hasher.update(user_cfg.model.weight_dtype.as_bytes());
-    Ok(crate::executor::ModelIdentity {
-        hash: *hasher.finalize().as_bytes(),
-        component,
-    })
 }
 
 pub(crate) fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {

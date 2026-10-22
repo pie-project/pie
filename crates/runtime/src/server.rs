@@ -321,9 +321,8 @@ impl Session {
         event: &str,
         value: String,
     ) {
-        let uuid_str = process_id.to_string();
         self.send(WireServerMessage::ProcessEvent {
-            process_id: uuid_str,
+            process_id: process_id.to_string(),
             event: event.to_string(),
             value,
         })
@@ -386,6 +385,7 @@ impl Session {
                 props,
                 session,
                 cluster_props,
+                executors,
             } => {
                 self.handle_launch_process(
                     corr_id,
@@ -395,6 +395,7 @@ impl Session {
                     props,
                     session,
                     cluster_props,
+                    executors,
                 )
                 .await
             }

@@ -1010,3 +1010,323 @@ pub fn gated_delta_committed_landing(
         ],
     )
 }
+
+/// The ints of one lane's row in a recurrent buffer's page table
+/// (`PIE_RS_PAGE_INTS`).
+pub const RS_PAGE_INTS: u32 = 8;
+
+/// A recurrent buffer's plane as a verify arm reads it through the fire's
+/// page table: `slab` from the plane's first row in the buffer's first
+/// slot, and each lane's row of `pages` the in-page token of its first
+/// extended row, then the slots of the pages its rows touch.
+#[derive(Clone, Copy, Debug)]
+pub struct Paged {
+    pub slab: Tensor,
+    pub pages: Tensor,
+    pub page_tokens: u32,
+    pub page_bytes: u32,
+    pub row_bytes: u32,
+}
+
+fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::ArgValue; 6], Error> {
+    Ok(match paged {
+        Some(paged) => [
+            paged.slab.arg_mut(),
+            paged.pages.arg(),
+            paged.page_tokens.arg(),
+            paged.page_bytes.arg(),
+            paged.row_bytes.arg(),
+            1i32.arg(),
+        ],
+        None => [
+            ctx.absent()?,
+            ctx.absent()?,
+            0u32.arg(),
+            0u32.arg(),
+            0u32.arg(),
+            0i32.arg(),
+        ],
+    })
+}
+
+/// The `(simdgroups, value rows a simdgroup)` of a verify scan's
+/// threadgroup. On the M4 Pro a verify round's layer (5 replayed rows and 8
+/// of its own) walks in 36.6 us at (8, 2), 40.7 us at (4, 4) and 54.8 us
+/// in the gate prep and the committed scan, against a floor of 25 us for
+/// one row: the bank's read and write.
+const GDN_VERIFY_GROUP: (u32, u32) = (8, 2);
+
+/// The key and value head width the verify scan stages.
+const GDN_VERIFY_DIM: u32 = 128;
+
+/// The verify scan stamped at `(simdgroups, value rows)`.
+#[must_use]
+pub fn gated_delta_verify_entry(groups: u32, vrows: u32) -> Option<&'static str> {
+    Some(match (groups, vrows) {
+        (8, 2) => "gated_delta_verify_bfloat16_l_32_s_8_v_2",
+        (4, 4) => "gated_delta_verify_bfloat16_l_32_s_4_v_4",
+        (8, 4) => "gated_delta_verify_bfloat16_l_32_s_8_v_4",
+        _ => return None,
+    })
+}
+
+/// The launch of a verify scan at `(simdgroups, value rows)` over `heads`
+/// value heads of every lane.
+#[must_use]
+pub fn gated_delta_verify_grid(groups: u32, vrows: u32, heads: u32) -> Grid {
+    Grid::of(
+        [GDN_SCAN_LANES, GDN_VERIFY_DIM / vrows, heads],
+        [GDN_SCAN_LANES, groups, 1],
+    )
+}
+
+/// Whether [`gated_delta_verify`] walks these heads.
+#[must_use]
+pub fn gated_delta_verify_fits(k_dim: u32, v_dim: u32) -> bool {
+    k_dim == GDN_VERIFY_DIM && v_dim == GDN_VERIFY_DIM
+}
+
+/// The `[b | a]` projection a verify scan derives its gates from, as
+/// [`gdn_prep`] does: the extended rows, and the window's own rows' gates
+/// it lands.
+#[derive(Clone, Copy, Debug)]
+pub struct VerifyGates {
+    pub ba: Tensor,
+    pub dt_bias: Tensor,
+    pub a_log: Tensor,
+    pub gates: Tensor,
+}
+
+/// [`gated_delta_committed_landing`] over 128-wide heads, a threadgroup's
+/// rows staged before it walks them, the gates [`gdn_prep`] derives
+/// derived as they stage. A replayed row only folds in; a row of the
+/// window's own lands its readout in `y` and its gates in `gates.gates`,
+/// the window's own rows, where the committed scan landed every row in the
+/// extended plane. Through `paged`, `gates.ba` is the window's own rows:
+/// the replayed rows' are read from the lane's buffer, and the window's own
+/// land there.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_verify(
+    ctx: &Ctx<'_>,
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: &VerifyGates,
+    paged: Option<Paged>,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    gated_delta_verify_at(
+        ctx,
+        GDN_VERIFY_GROUP,
+        qkv,
+        indptr,
+        committed,
+        gates,
+        paged,
+        state,
+        k_heads,
+        v_heads,
+        k_dim,
+        v_dim,
+        y,
+        snapshots,
+    )
+}
+
+/// [`gated_delta_verify`] at a stated `(lanes, simdgroups, value rows)`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_verify_at(
+    ctx: &Ctx<'_>,
+    (groups, vrows): (u32, u32),
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: &VerifyGates,
+    paged: Option<Paged>,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ssm_gated_delta_committed";
+    let _ = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_verify_bfloat16" });
+    debug_assert_eq!(
+        gates.ba.dtype, qkv.dtype,
+        "`{OP}` reads a `[b | a]` row as its qkv"
+    );
+    debug_assert_eq!(
+        gates.a_log.dtype,
+        Dtype::F32,
+        "`{OP}` reads an f32 decay bank"
+    );
+    debug_assert_eq!(
+        gates.gates.dtype,
+        Dtype::F32,
+        "`{OP}` lands an f32 decay row"
+    );
+    debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
+    nonzero(OP, "the key heads this statement states", k_heads)?;
+    nonzero(OP, "the value heads this statement states", v_heads)?;
+    if !v_heads.is_multiple_of(k_heads) {
+        return Err(refuse(
+            OP,
+            format!("the {v_heads} value heads are not a whole number of the {k_heads} key heads"),
+        ));
+    }
+    if gates.ba.width != 2 * v_heads {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide `[b | a]` projection is not two entries of each of the {v_heads} value heads",
+                gates.ba.width
+            ),
+        ));
+    }
+    if !gated_delta_verify_fits(k_dim, v_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the verify scan stages {GDN_VERIFY_DIM}-wide heads, and these are {k_dim} by {v_dim}"
+            ),
+        ));
+    }
+    let entry = gated_delta_verify_entry(groups, vrows)
+        .ok_or_else(|| refuse(OP, "no verify scan is stamped at this geometry"))?;
+    let lanes = committed_lanes(OP, indptr)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
+    let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
+    let z = v_heads
+        .checked_mul(lanes)
+        .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
+    ctx.fire(
+        Fire::at(GDN_SCAN_FILE, entry).apply(gated_delta_verify_grid(groups, vrows, z)),
+        &[
+            qkv.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            gates.ba.arg(),
+            gates.a_log.arg(),
+            gates.dt_bias.arg(),
+            state.state.arg_mut(),
+            y.arg_mut(),
+            gates.gates.arg_mut(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            snaps,
+            lane0,
+            slab,
+            pages,
+            page_tokens,
+            page_bytes,
+            row_bytes,
+            is_paged,
+        ],
+    )
+}
+
+/// The rows of a lane one threadgroup of the verify conv runs side by side,
+/// and the threads of four channels beside them.
+const CONV_VERIFY_ROWS: u32 = 4;
+const CONV_VERIFY_CHANNELS: u32 = 32;
+
+/// The history the verify conv commits, at most: a thread holds
+/// `kConvVerifyHeld` rows of it, four.
+const CONV_VERIFY_HIST: u32 = 4 * CONV_VERIFY_ROWS;
+
+/// Whether [`causal_conv1d_verify`] holds a conv this wide over this many
+/// channels: four a thread, as the prompt's four-channel conv.
+#[must_use]
+pub fn causal_conv1d_verify_fits(channels: u32, conv_width: u32, dilation: u32) -> bool {
+    channels.is_multiple_of(4)
+        && conv_width <= CONV_X4_TAPS
+        && conv_history("", conv_width, dilation).is_ok_and(|hist| hist <= CONV_VERIFY_HIST)
+}
+
+/// [`causal_conv1d_committed_landing`] with a thread a row: every row lands
+/// in the extended plane `y`, and a row of the window's own in `land`, the
+/// window's own rows. Through `paged`, `x` is the window's own rows: the
+/// replayed rows are read from the lane's buffer, and the window's own land
+/// there.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_verify(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    paged: Option<Paged>,
+    indptr: Tensor,
+    committed: &Committed,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    land: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ssm_causal_conv1d_committed";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_verify_bfloat16" });
+    let channels = nonzero(OP, "the conv's channel count", y.width)?;
+    nonzero(OP, "extended rows", y.rows)?;
+    debug_assert!(
+        land.width == y.width && land.dtype == x.dtype,
+        "the window's own rows land as the conv's row"
+    );
+    let taps = stated(
+        OP,
+        nonzero(OP, "the conv width this statement states", conv_width)?,
+    )?;
+    if !causal_conv1d_verify_fits(channels, conv_width, dilation) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the verify conv runs four of a multiple of four channels, at most \
+                 {CONV_X4_TAPS} taps and {CONV_VERIFY_HIST} rows of history; this one is \
+                 {channels} channels, {conv_width} taps at dilation {dilation}"
+            ),
+        ));
+    }
+    let lanes = committed_lanes(OP, indptr)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
+    let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
+    ctx.fire(
+        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
+            [channels / 4, CONV_VERIFY_ROWS, lanes],
+            [CONV_VERIFY_CHANNELS, CONV_VERIFY_ROWS, 1],
+        )),
+        &[
+            x.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            weight.arg(),
+            state.conv_state.arg(),
+            state.new_conv_state.arg_mut(),
+            y.arg_mut(),
+            land.arg_mut(),
+            stated(OP, channels)?.arg(),
+            taps.arg(),
+            stated(OP, dilation)?.arg(),
+            snaps,
+            lane0,
+            slab,
+            pages,
+            page_tokens,
+            page_bytes,
+            row_bytes,
+            is_paged,
+        ],
+    )
+}

@@ -48,6 +48,12 @@ impl FrameShell for Shell {
         } = step;
         let arming = self.arming;
         let copies = self.copies;
+        let tapped = lanes.iter().any(|seated| seated.tap.is_some());
+        if tapped && (arming || !self.taps_kv()) {
+            return Err(Fault::Unsupported(
+                "a lane asks for a tap, and this load reads no layer out as it goes".to_string(),
+            ));
+        }
 
         for (index, attached) in attachments.iter().enumerate() {
             if attached.lane as usize >= lanes.len() {
@@ -758,6 +764,11 @@ impl FrameShell for Shell {
             indptr: vec![0],
             ..Default::default()
         };
+        let scoring = lanes.iter().any(|seated| seated.captures_scores);
+        let seated_scores = self.scores.as_ref().map_or(0, crate::scores::Scores::seats);
+        let mut score_seats: Vec<i32> = Vec::new();
+        let mut score_seat_of: Vec<Option<u32>> = vec![None; lanes.len()];
+        let mut next_seat = 0u32;
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
@@ -857,6 +868,24 @@ impl FrameShell for Shell {
                 bidirectional: seated.bidirectional,
             });
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
+            if scoring {
+                // Capturing lanes take the slab's seats in the order the
+                // fire lays its lanes out.
+                if seated.captures_scores {
+                    if next_seat >= seated_scores {
+                        return Err(Fault::Ceiling {
+                            what: "capturing lanes the score slab seats",
+                            need: u64::from(next_seat) + 1,
+                            have: u64::from(seated_scores),
+                        });
+                    }
+                    score_seat_of[source] = Some(next_seat);
+                    score_seats.push(next_seat as i32);
+                    next_seat += 1;
+                } else {
+                    score_seats.push(-1);
+                }
+            }
             if !seated.rs_snapshots.is_empty() && row.rows as usize != lane.tokens.len() {
                 return Err(Fault::program(
                     "serve::rs",
@@ -1241,6 +1270,8 @@ impl FrameShell for Shell {
             .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        self.pools
+            .fence_swaps(self.device.stream(), &kv_ranges, &window_pages)?;
         super::btrace::mark("commit_frame");
 
         let indptr_host = kv::indptr(&seats)?;
@@ -1418,7 +1449,10 @@ impl FrameShell for Shell {
             (Vec::new().into(), true)
         };
         super::btrace::mark("segmentation");
+        // A tapped fire is walked, so the walk can mark where each layer
+        // ends on the stream.
         let bodied = records_bodies
+            && !tapped
             && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
             && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
             && Self::keyable_units(&self.compiled)
@@ -1525,6 +1559,7 @@ impl FrameShell for Shell {
                 lane_reach: lane_carve,
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
+                score_seats: &score_seats,
                 packings: &packing_fires,
                 class_table: class_table
                     .as_ref()
@@ -1601,6 +1636,7 @@ impl FrameShell for Shell {
             patch_ladder,
             towered: self.towered,
             lanes,
+            score_seat_of,
             attachments,
             composition,
             readout_rows,
@@ -1651,7 +1687,6 @@ impl FrameShell for Shell {
                 order: rs_order,
                 reads: rs_reads,
                 rows_ext: rs_rows_ext,
-                #[cfg(feature = "rocm")]
                 snapshots,
             },
         })

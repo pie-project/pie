@@ -4,13 +4,13 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 use client_api::{ClientMessage, Props};
-use controller_api::{Health, Role, RoutableWorker, RoutingTable};
+use controller_api::{Health, Role, RoutableWorker, RoutingTable, ScaleEntry};
 use ids::{ReqId, WorkerId};
 use tokio::sync::{Notify, mpsc, watch};
 use worker_api::Request;
@@ -21,13 +21,17 @@ use crate::admission::{AdmissionDecision, RejectReason};
 use crate::route::RoutingHandle;
 use crate::session::AdmitReject;
 
+/// What this host carries whatever its controller can do. `cluster.scale`
+/// is not among them: it is there only while the controller has an actuator
+/// to meet a scale table, so a policy `uses` it and reads it at run time.
 fn capability(name: &str) -> bool {
-    // Runs replicate to pools, and a GPU worker takes them as a pass needs
-    // them; a running turn of a built-in API moves by ending where it runs
-    // and resuming where it goes, after what its client was sent.
+    // Runs replicate to pools and to serving workers' host tiers; a running
+    // turn that has sent no output moves by ending where it runs and running
+    // again where it goes; the workers a placement names run its process's
+    // passes.
     matches!(
         name,
-        "cluster.hold" | "state.replicate" | "placement.migrate"
+        "cluster.hold" | "state.replicate" | "placement.migrate" | "placement.executors"
     )
 }
 
@@ -45,10 +49,16 @@ fn hex(key: &[u8; 32]) -> String {
 struct Tables {
     schedule: Option<Table>,
     placement: HashMap<String, wit::Placement>,
+    /// Each process's executors, best first.
+    executors: HashMap<String, Vec<String>>,
 }
 
 struct Shared {
     tables: RwLock<Tables>,
+    /// The scale table, for the controller to converge on: none until a
+    /// program granted `scale` writes one, so a gateway whose programs hold
+    /// no such grant never speaks for the cluster's size.
+    scale: watch::Sender<Option<Vec<ScaleEntry>>>,
     waiting: Mutex<BTreeMap<u64, String>>,
     refused: Mutex<HashMap<String, Option<String>>>,
     cancels: mpsc::UnboundedSender<ReqId>,
@@ -62,7 +72,9 @@ struct Shared {
 pub struct Cluster {
     events: Sender<Event>,
     shared: Arc<Shared>,
-    gate: Duration,
+    /// How long a launch waits for the slowest program to hear it, in ms;
+    /// a reload sets it anew.
+    gate_ms: AtomicU64,
     next_seq: AtomicU64,
     dead: Arc<AtomicBool>,
 }
@@ -101,6 +113,12 @@ enum Event {
         worker: Option<String>,
         why: String,
     },
+    /// Swap every program for these (name, component), loaded whole first:
+    /// the answer is the new set's gate, or why it did not load.
+    Reload {
+        programs: Vec<(String, Vec<u8>)>,
+        answer: tokio::sync::oneshot::Sender<Result<u64, LoadError>>,
+    },
     /// The directory's groups and pools, and what worker policies
     /// published, as of now.
     State(
@@ -119,17 +137,26 @@ pub type Started = (
 );
 
 impl Cluster {
+    /// Starts the cluster policies `programs` names, (name, component), on
+    /// one thread: each call goes to every one, and each writes what its
+    /// manifest grants it, which no other may.
     pub fn start(
-        name: &str,
-        component: &[u8],
+        programs: Vec<(String, Vec<u8>)>,
         routing: watch::Receiver<RoutingTable>,
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
         fleet: crate::worker::WorkerRegistry,
     ) -> Result<Started, LoadError> {
+        // A program is named by its built-in name, or by its file's stem: the
+        // name keys what it publishes, so it holds no `/`.
+        let programs: Vec<(String, Vec<u8>)> = programs
+            .into_iter()
+            .map(|(spec, component)| (program_name(&spec), component))
+            .collect();
         let (cancels, cancelled) = mpsc::unbounded_channel();
         let (migrations, moves) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             tables: RwLock::default(),
+            scale: watch::Sender::new(None),
             waiting: Mutex::default(),
             refused: Mutex::default(),
             cancels,
@@ -139,12 +166,13 @@ impl Cluster {
         });
         let (events, rx) = channel();
         let dead = Arc::new(AtomicBool::new(false));
-        let manifest = program::spawn(name, component, capability, "pie-cluster-policy", {
+        let names: Vec<String> = programs.iter().map(|(name, _)| name.clone()).collect();
+        let manifests = program::spawn(programs, capability, "pie-cluster-policy", {
             let (shared, dead) = (shared.clone(), dead.clone());
             let (fleet, handle) = (fleet.clone(), tokio::runtime::Handle::current());
-            move |program| run(program, rx, shared, routing, dead, fleet, handle)
+            move |programs| run(programs, rx, shared, routing, dead, fleet, handle)
         })?;
-        let gate = Duration::from_millis(manifest.gate_ms);
+        let gate_ms = gate_of(manifests.iter());
 
         let workers = events.clone();
         tokio::spawn(async move {
@@ -181,12 +209,12 @@ impl Cluster {
                 }
             }
         });
-        tracing::info!(policy = name, "cluster policy started");
+        tracing::info!(policies = ?names, "cluster policies started");
         Ok((
             Arc::new(Self {
                 events,
                 shared,
-                gate,
+                gate_ms: AtomicU64::new(gate_ms),
                 next_seq: AtomicU64::new(0),
                 dead,
             }),
@@ -197,6 +225,42 @@ impl Cluster {
 
     fn send(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+
+    /// Swaps every running program for `programs` (spec, component), as a
+    /// SIGHUP asks. The new set loads whole before anything changes; on an
+    /// error the old one runs on. The old programs stop as a dead one does:
+    /// their tables and what they published are withdrawn, and the others
+    /// hear it. The new ones start with no state of their own, a program
+    /// in both sets too, and read the cluster as it stands.
+    pub async fn reload(&self, programs: Vec<(String, Vec<u8>)>) -> Result<(), LoadError> {
+        if programs.is_empty() {
+            return Err(LoadError::Instantiate(
+                "a reload names at least one cluster policy; a gateway with none starts without \
+                 them"
+                    .into(),
+            ));
+        }
+        let programs = programs
+            .into_iter()
+            .map(|(spec, component)| (program_name(&spec), component))
+            .collect();
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        self.events
+            .send(Event::Reload { programs, answer })
+            .map_err(|_| LoadError::Instantiate("the policy thread has ended".into()))?;
+        let gate_ms = answered
+            .await
+            .map_err(|_| LoadError::Instantiate("the policy thread has ended".into()))??;
+        self.gate_ms.store(gate_ms, Ordering::Release);
+        Ok(())
+    }
+
+    /// The scale table the policies installed (`install-scale`), whole;
+    /// none while no program granted `scale` has written one.
+    #[must_use]
+    pub fn scale_watch(&self) -> watch::Receiver<Option<Vec<ScaleEntry>>> {
+        self.shared.scale.subscribe()
     }
 
     pub async fn admit(&self, req: &Request, routing: &RoutingHandle) -> Result<(), AdmitReject> {
@@ -239,10 +303,11 @@ impl Cluster {
         routing: &RoutingHandle,
     ) -> Result<(), AdmitReject> {
         let (id, seq) = (waiting.id, waiting.seq);
-        if !self.gate.is_zero() && !self.dead.load(Ordering::Acquire) {
+        let gate = Duration::from_millis(self.gate_ms.load(Ordering::Acquire));
+        if !gate.is_zero() && !self.dead.load(Ordering::Acquire) {
             // Unanswered, the launch goes by the gateway's default.
             let mut heard = self.shared.heard.subscribe();
-            let _ = tokio::time::timeout(self.gate, heard.wait_for(|&h| h >= seq)).await;
+            let _ = tokio::time::timeout(gate, heard.wait_for(|&h| h >= seq)).await;
         }
 
         {
@@ -297,10 +362,20 @@ impl Cluster {
             .is_some_and(|(s, _)| *s == seq)
     }
 
-    pub fn placement(&self, req: &Request) -> (Option<WorkerId>, Props) {
+    /// Where the placement table puts `req`: its worker, its props, and the
+    /// workers its passes may run on, best first.
+    pub fn placement(&self, req: &Request) -> (Option<WorkerId>, Props, Vec<WorkerId>) {
         let tables = self.shared.tables.read().unwrap();
-        let Some(placement) = tables.placement.get(&req.req_id.0.to_string()) else {
-            return (None, Props::new());
+        let id = req.req_id.0.to_string();
+        let executors = tables
+            .executors
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.parse().ok().map(WorkerId))
+            .collect();
+        let Some(placement) = tables.placement.get(&id) else {
+            return (None, Props::new(), executors);
         };
         let worker = placement
             .worker
@@ -312,7 +387,7 @@ impl Cluster {
             .iter()
             .filter_map(|(name, value)| Some((name.clone(), json(value)?)))
             .collect();
-        (worker, props)
+        (worker, props, executors)
     }
 
     pub fn dispatched(&self, req: &Request, worker: WorkerId) {
@@ -390,7 +465,7 @@ impl Drop for Waiting<'_> {
 }
 
 fn run(
-    mut program: Program,
+    mut programs: Vec<Program>,
     events: Receiver<Event>,
     shared: Arc<Shared>,
     routing: watch::Receiver<RoutingTable>,
@@ -399,33 +474,77 @@ fn run(
     handle: tokio::runtime::Handle,
 ) {
     let mut registry = Registry::default();
+    // The last arrival heard, owed to the gate until the rounds its calls'
+    // changes carry to the others have run too.
+    let mut owed: Option<u64> = None;
+    // The last arrival seen at all: what a set coming back to life has heard.
+    let mut last_seq = 0u64;
     loop {
-        let first = match program.alarm() {
-            Some(at_ms) => {
-                let wait = at_ms.saturating_sub(now_ms());
-                match events.recv_timeout(Duration::from_millis(wait)) {
-                    Ok(event) => Some(event),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            None => match events.recv() {
+        // What the last round's calls changed reaches the others now.
+        let carried = std::mem::take(&mut registry.carried);
+        let first = if !carried.is_empty() {
+            match events.try_recv() {
                 Ok(event) => Some(event),
-                Err(_) => return,
-            },
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        } else {
+            match programs.iter().filter_map(Program::alarm).min() {
+                Some(at_ms) => {
+                    let wait = at_ms.saturating_sub(now_ms());
+                    match events.recv_timeout(Duration::from_millis(wait)) {
+                        Ok(event) => Some(event),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                None => match events.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => return,
+                },
+            }
         };
         let mut edges = Vec::new();
         let mut heard = None;
-        registry.exited.clear();
+        let mut reloads = Vec::new();
+        registry.forget_exited();
         for event in first.into_iter().chain(events.try_iter()) {
-            if let Event::Arrived { seq, .. } = &event {
-                heard = heard.max(Some(*seq));
+            match event {
+                Event::Reload { programs, answer } => reloads.push((programs, answer)),
+                event => {
+                    if let Event::Arrived { seq, .. } = &event {
+                        heard = heard.max(Some(*seq));
+                        last_seq = last_seq.max(*seq);
+                    }
+                    registry.apply(event, &mut edges);
+                }
             }
-            registry.apply(event, &mut edges);
         }
-        let now = now_ms();
-        if program.alarm().is_some_and(|at_ms| at_ms <= now) {
-            edges.push(Edge::Timer);
+        for (next, answer) in reloads {
+            match program::load_all(&next, capability) {
+                Ok(next) => {
+                    let (old, new): (Vec<&str>, Vec<&str>) = (
+                        programs.iter().map(Program::name).collect(),
+                        next.iter().map(Program::name).collect(),
+                    );
+                    tracing::info!(?old, ?new, "cluster policies reloaded");
+                    // The old ones stop as a dead one does.
+                    for program in &programs {
+                        withdraw(&shared, &mut registry, program.name(), program.manifest());
+                    }
+                    let gate_ms = gate_of(next.iter().map(Program::manifest));
+                    programs = next;
+                    if dead.swap(false, Ordering::AcqRel) {
+                        // The launches let through while none ran stay heard.
+                        shared.heard.send_replace(last_seq);
+                    }
+                    let _ = answer.send(Ok(gate_ms));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "cluster policies not reloaded; the running ones go on");
+                    let _ = answer.send(Err(error));
+                }
+            }
         }
         // A worker the controller now grades degraded is draining.
         let degraded: BTreeSet<String> = routing
@@ -440,9 +559,24 @@ fn run(
         }
         registry.draining = degraded;
 
-        if !edges.is_empty() {
+        let now = now_ms();
+        let mut withdrawn = Vec::new();
+        for (at, program) in programs.iter_mut().enumerate() {
+            let mut edges = edges.clone();
+            edges.extend(
+                carried
+                    .iter()
+                    .filter(|(author, _)| author != program.name())
+                    .map(|(_, edge)| edge.clone()),
+            );
+            if program.alarm().is_some_and(|at_ms| at_ms <= now) {
+                edges.push(Edge::Timer);
+            }
+            if edges.is_empty() {
+                continue;
+            }
             tracing::debug!(policy = program.name(), ?edges, "cluster policy edges");
-            let plane = registry.snapshot(&routing.borrow());
+            let plane = registry.snapshot(&routing.borrow(), &shared.tables.read().unwrap());
             match program.react(Box::new(plane), edges, now) {
                 Ok(commit) => {
                     tracing::debug!(
@@ -450,35 +584,111 @@ fn run(
                         schedule = commit.schedule.as_ref().map(|t| t.keys.len()),
                         floor = commit.schedule.as_ref().and_then(|t| t.floor),
                         placement = commit.placement.as_ref().map(|t| t.len()),
+                        executors = commit.executors.as_ref().map(|t| t.len()),
+                        published = commit.publish.len(),
                         "cluster policy call"
                     );
-                    enact(&shared, &mut registry, commit);
-                    replicate(&mut registry, &fleet, &handle);
+                    let author = program.name().to_string();
+                    enact(&shared, &mut registry, commit, &author);
                 }
                 Err(Fault::Dead(error)) => {
                     tracing::error!(policy = program.name(), %error, "cluster policy is dead; its tables are withdrawn");
-                    dead.store(true, Ordering::Release);
-                    *shared.tables.write().unwrap() = Tables::default();
-                    shared.heard.send_replace(u64::MAX);
-                    shared.changed.notify_waiters();
-                    return;
+                    withdraw(&shared, &mut registry, program.name(), program.manifest());
+                    withdrawn.push(at);
                 }
                 Err(fault) => {
                     tracing::warn!(policy = program.name(), %fault, "cluster policy call discarded");
                 }
             }
         }
+        for at in withdrawn.into_iter().rev() {
+            programs.remove(at);
+        }
+        // With none left, launches go by the gateway's default until a
+        // reload starts a set again.
+        if programs.is_empty() {
+            if !dead.swap(true, Ordering::AcqRel) {
+                shared.heard.send_replace(u64::MAX);
+                shared.changed.notify_waiters();
+            }
+            continue;
+        }
         // A replication table stands until replaced: what it asks for and
         // is not yet so is asked for again.
-        if registry.ticked {
+        if registry.ticked || registry.replaced {
             registry.ticked = false;
+            registry.replaced = false;
             replicate(&mut registry, &fleet, &handle);
         }
-        // Whether or not a call ran, the gate has nothing more to wait for.
-        if let Some(seq) = heard {
+        // A launch's gate opens once every program has heard it and what
+        // their calls about it changed has reached the others: a program
+        // reading another's placement then reads the one made for it.
+        owed = owed.max(heard);
+        if registry.carried.is_empty()
+            && let Some(seq) = owed.take()
+        {
             shared.heard.send_modify(|h| *h = (*h).max(seq));
         }
     }
+}
+
+/// A dead program's tables revert to empty, and what it published is
+/// withdrawn; the others' stand.
+fn withdraw(
+    shared: &Shared,
+    registry: &mut Registry,
+    author: &str,
+    manifest: &super::manifest::Manifest,
+) {
+    {
+        let mut tables = shared.tables.write().unwrap();
+        if manifest.grants("schedule") {
+            tables.schedule = None;
+        }
+        let (placement, executors) = (manifest.grants("placement"), manifest.grants("executors"));
+        if placement || executors {
+            registry.replace_placement(&mut tables, author, |tables| {
+                if placement {
+                    tables.placement.clear();
+                }
+                if executors {
+                    tables.executors.clear();
+                }
+            });
+        }
+    }
+    if manifest.grants("scale") {
+        // No shape named: each keeps what it has.
+        shared.scale.send_replace(Some(Vec::new()));
+    }
+    if manifest.grants("replication") {
+        registry.replace_replication(author, Vec::new());
+    }
+    let prefix = format!("{author}/");
+    let gone: Vec<(Subject, String, Option<Value>)> = registry
+        .said
+        .values()
+        .flat_map(|(subject, said)| {
+            said.keys()
+                .filter_map(|key| key.strip_prefix(&prefix))
+                .map(|name| (subject.clone(), name.to_string(), None))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    registry.say(author, gone);
+    shared.changed.notify_waiters();
+}
+
+/// How long a launch waits for the slowest of `manifests` to hear it.
+fn gate_of<'a>(manifests: impl Iterator<Item = &'a super::manifest::Manifest>) -> u64 {
+    manifests.map(|m| m.gate_ms).max().unwrap_or(0)
+}
+
+fn program_name(spec: &str) -> String {
+    std::path::Path::new(spec)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map_or_else(|| spec.to_string(), str::to_string)
 }
 
 /// Asks each site the replication table names, and that does not hold its
@@ -534,10 +744,26 @@ fn replicate(
     }
 }
 
-fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
-    if let Some(replication) = commit.state.replication {
-        registry.replication = replication;
+fn enact(shared: &Shared, registry: &mut Registry, commit: Commit, author: &str) {
+    if let Some(scale) = commit.scale {
+        let entries: Vec<ScaleEntry> = scale
+            .into_iter()
+            .map(|s| ScaleEntry {
+                model: s.model,
+                engine: s.engine,
+                workers: s.workers,
+            })
+            .collect();
+        shared.scale.send_if_modified(|table| {
+            let changed = table.as_ref() != Some(&entries);
+            *table = Some(entries);
+            changed
+        });
     }
+    if let Some(replication) = commit.state.replication {
+        registry.replace_replication(author, replication);
+    }
+    registry.say(author, commit.publish);
     let mut changed = false;
     {
         let mut tables = shared.tables.write().unwrap();
@@ -545,25 +771,30 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
             tables.schedule = Some(schedule);
             changed = true;
         }
-        if let Some(placement) = commit.placement {
-            // A running process given another worker moves there.
-            for (id, entry) in &placement {
-                let Some(target) = entry.worker.as_deref() else {
-                    continue;
-                };
-                let Some(proc) = registry.procs.get(id) else {
-                    continue;
-                };
-                let Some(at) = proc.worker.as_deref() else {
-                    continue;
-                };
-                if at != target
-                    && let (Ok(req), Ok(worker)) = (id.parse::<u64>(), target.parse::<u64>())
-                {
-                    let _ = shared.migrations.send((ReqId(req), WorkerId(worker)));
-                }
+        // A running process given another worker moves there.
+        for (id, entry) in commit.placement.iter().flatten() {
+            let Some(target) = entry.worker.as_deref() else {
+                continue;
+            };
+            let Some(at) = registry.procs.get(id).and_then(|p| p.worker.as_deref()) else {
+                continue;
+            };
+            if at != target
+                && let (Ok(req), Ok(worker)) = (id.parse::<u64>(), target.parse::<u64>())
+            {
+                let _ = shared.migrations.send((ReqId(req), WorkerId(worker)));
             }
-            tables.placement = placement;
+        }
+        if commit.placement.is_some() || commit.executors.is_some() {
+            let (placement, executors) = (commit.placement, commit.executors);
+            registry.replace_placement(&mut tables, author, |tables| {
+                if let Some(executors) = executors {
+                    tables.executors = executors;
+                }
+                if let Some(placement) = placement {
+                    tables.placement = placement;
+                }
+            });
         }
     }
     for (id, reason) in commit.terminate {
@@ -581,6 +812,78 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
     }
     if changed {
         shared.changed.notify_waiters();
+    }
+}
+
+/// A process's committed placement as another program reads it: its
+/// worker, its executors and its props.
+type Placed = (Option<String>, Vec<String>, Vec<(String, ValueKey)>);
+
+/// A value as it compares: its kind and its payload, a float by its bits,
+/// so a value is changed exactly when what a reader would read changed.
+type ValueKey = (u8, String);
+
+fn value_key(value: &Value) -> ValueKey {
+    match value {
+        Value::Boolean(b) => (0, b.to_string()),
+        Value::Int(i) => (1, i.to_string()),
+        Value::Float(f) => (2, f.to_bits().to_string()),
+        Value::Text(text) => (3, text.clone()),
+        Value::Json(text) => (4, text.clone()),
+    }
+}
+
+fn placed_all(tables: &Tables) -> HashMap<String, Placed> {
+    let ids: BTreeSet<&String> = tables
+        .placement
+        .keys()
+        .chain(tables.executors.keys())
+        .collect();
+    ids.into_iter()
+        .map(|id| {
+            let placement = tables.placement.get(id);
+            let placed = (
+                placement.and_then(|p| p.worker.clone()),
+                tables.executors.get(id).cloned().unwrap_or_default(),
+                placement
+                    .map(|p| {
+                        p.props
+                            .iter()
+                            .map(|(n, v)| (n.clone(), value_key(v)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+            (id.clone(), placed)
+        })
+        .collect()
+}
+
+/// The workers each group's replication table asks for.
+fn replicated(table: &[wit::Replicate]) -> BTreeMap<String, Vec<String>> {
+    let mut sites: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in table {
+        sites
+            .entry(entry.group.clone())
+            .or_default()
+            .extend(entry.at.iter().map(|site| site.worker.clone()));
+    }
+    for workers in sites.values_mut() {
+        workers.sort_unstable();
+        workers.dedup();
+    }
+    sites
+}
+
+/// Where a subject's publications are kept.
+fn subject_key(subject: &Subject) -> String {
+    match subject {
+        Subject::Session(id) => format!("session:{id}"),
+        Subject::Process(id) => format!("process:{id}"),
+        Subject::WorkingSet(id) => format!("working-set:{id}"),
+        Subject::Worker(id) => format!("worker:{id}"),
+        Subject::Group(id) => format!("group:{id}"),
+        Subject::Link(id) => format!("link:{id}"),
     }
 }
 
@@ -621,12 +924,19 @@ struct Registry {
     replication: Vec<wit::Replicate>,
     /// Replications asked for, by (group, worker), and when.
     asked: HashMap<(String, String), std::time::Instant>,
-    /// The directory was heard since the table was last enacted.
+    /// The directory was heard since `replicate` last ran.
     ticked: bool,
+    /// The replication table was replaced since `replicate` last ran.
+    replaced: bool,
     /// What each worker's policy published about it, by name.
     published: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Workers draining, as of the routing table last heard.
     draining: BTreeSet<String>,
+    /// What cluster programs published, by subject: each value under
+    /// `<program>/<name>`.
+    said: HashMap<String, (Subject, BTreeMap<String, Value>)>,
+    /// Edges a call caused, for every program but its author's next call.
+    carried: Vec<(String, Edge)>,
 }
 
 /// The prompt blocks the router counts a worker as holding: about 4M tokens
@@ -652,6 +962,13 @@ impl Registry {
                         }
                     }
                 }
+            }
+            // The policy thread swaps programs before a round applies its
+            // events; one here has no set to swap.
+            Event::Reload { answer, .. } => {
+                let _ = answer.send(Err(LoadError::Instantiate(
+                    "a reload reached the registry, not the policy thread".into(),
+                )));
             }
             Event::State(groups, pools, published) => {
                 self.published = published;
@@ -774,6 +1091,8 @@ impl Registry {
             }
             Event::SessionClosed { id } => {
                 self.sessions.remove(&id);
+                self.said
+                    .remove(&subject_key(&Subject::Session(id.clone())));
                 edges.push(Edge::Closed(id));
             }
             Event::Workers(now) => {
@@ -786,8 +1105,109 @@ impl Registry {
         }
     }
 
-    fn snapshot(&self, routing: &RoutingTable) -> Snapshot {
+    /// The processes the last round's calls read as exited are gone, and
+    /// what programs published about them with them, without an edge.
+    fn forget_exited(&mut self) {
+        for id in std::mem::take(&mut self.exited).into_keys() {
+            self.said.remove(&subject_key(&Subject::Process(id)));
+        }
+    }
+
+    /// Changes the committed placement by `f`, and carries
+    /// `placement-changed`, caused by `author`, for each process whose
+    /// placement differs.
+    fn replace_placement(
+        &mut self,
+        tables: &mut Tables,
+        author: &str,
+        f: impl FnOnce(&mut Tables),
+    ) {
+        let before = placed_all(tables);
+        f(tables);
+        let after = placed_all(tables);
+        self.carry_placements(author, &before, &after);
+    }
+
+    /// Replaces the replication table, and carries `replication-changed`,
+    /// caused by `author`, for each group whose sites differ.
+    fn replace_replication(&mut self, author: &str, table: Vec<wit::Replicate>) {
+        let before = replicated(&self.replication);
+        self.replication = table;
+        self.replaced = true;
+        self.carry_replications(author, &before);
+    }
+
+    /// `placement-changed` for each process whose committed placement
+    /// differs, caused by `author`.
+    fn carry_placements(
+        &mut self,
+        author: &str,
+        before: &HashMap<String, Placed>,
+        after: &HashMap<String, Placed>,
+    ) {
+        let ids: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+        for id in ids {
+            if before.get(id) != after.get(id) {
+                self.carried
+                    .push((author.to_string(), Edge::PlacementChanged(id.clone())));
+            }
+        }
+    }
+
+    /// `replication-changed` for each group whose committed sites differ
+    /// from `before`, caused by `author`.
+    fn carry_replications(&mut self, author: &str, before: &BTreeMap<String, Vec<String>>) {
+        let after = replicated(&self.replication);
+        let groups: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+        for group in groups {
+            if before.get(group) != after.get(group) {
+                self.carried
+                    .push((author.to_string(), Edge::ReplicationChanged(group.clone())));
+            }
+        }
+    }
+
+    /// `author`'s publications, in order; `published` for each subject one
+    /// of them changed.
+    fn say(&mut self, author: &str, said: Vec<(Subject, String, Option<Value>)>) {
+        let mut changed: Vec<(String, Subject)> = Vec::new();
+        for (subject, name, value) in said {
+            let key = subject_key(&subject);
+            let full = format!("{author}/{name}");
+            let entry = self
+                .said
+                .entry(key.clone())
+                .or_insert_with(|| (subject.clone(), BTreeMap::new()));
+            if entry.1.get(&full).map(value_key) == value.as_ref().map(value_key) {
+                continue;
+            }
+            match value {
+                Some(value) => entry.1.insert(full, value),
+                None => entry.1.remove(&full),
+            };
+            if entry.1.is_empty() {
+                self.said.remove(&key);
+            }
+            if !changed.iter().any(|(k, _)| *k == key) {
+                changed.push((key, subject));
+            }
+        }
+        for (_, subject) in changed {
+            self.carried
+                .push((author.to_string(), Edge::Published(subject)));
+        }
+    }
+
+    fn snapshot(&self, routing: &RoutingTable, tables: &Tables) -> Snapshot {
         Snapshot {
+            placement: tables.placement.clone(),
+            executors: tables.executors.clone(),
+            replication: replicated(&self.replication),
+            said: self
+                .said
+                .iter()
+                .map(|(key, (_, said))| (key.clone(), said.clone()))
+                .collect(),
             groups: self.groups.clone(),
             pools: self.pools.clone(),
             published: self.published.clone(),
@@ -801,6 +1221,7 @@ impl Registry {
                 .filter(|w| self.workers.contains(&w.id.0.to_string()))
                 .map(|w| (w.id.0.to_string(), w.clone()))
                 .collect(),
+            scales: routing.scales,
         }
     }
 }
@@ -832,6 +1253,11 @@ fn json(value: &Value) -> Option<serde_json::Value> {
 }
 
 struct Snapshot {
+    /// What the programs' calls have committed, read-only.
+    placement: HashMap<String, wit::Placement>,
+    executors: HashMap<String, Vec<String>>,
+    replication: BTreeMap<String, Vec<String>>,
+    said: HashMap<String, BTreeMap<String, Value>>,
     groups: HashMap<String, crate::directory::Group>,
     pools: Vec<String>,
     published: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -840,6 +1266,8 @@ struct Snapshot {
     sessions: HashMap<String, Props>,
     held: HashMap<String, Arc<PromptIndex>>,
     workers: BTreeMap<String, RoutableWorker>,
+    /// The controller has an actuator to meet a scale table.
+    scales: bool,
 }
 
 fn text(value: impl Into<String>) -> Option<Value> {
@@ -875,7 +1303,32 @@ impl Plane for Snapshot {
     }
 
     fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
+        // What a cluster program published, under its name.
+        if let Some(said) = name
+            .strip_prefix("published/")
+            .and_then(|key| self.said.get(&subject_key(of))?.get(key))
+        {
+            return Some(said.clone());
+        }
         match of {
+            Subject::Process(id) if name.starts_with("placement/") => match name {
+                "placement/worker" => self.placement.get(id)?.worker.clone().and_then(text),
+                "placement/executors" => Some(Value::Json(
+                    serde_json::to_string(self.executors.get(id)?).unwrap_or_default(),
+                )),
+                _ => {
+                    let prop = name.strip_prefix("placement/props/")?;
+                    let placement = self.placement.get(id)?;
+                    placement
+                        .props
+                        .iter()
+                        .find(|(n, _)| n == prop)
+                        .map(|(_, value)| value.clone())
+                }
+            },
+            Subject::Group(id) if name == "replication/sites" => Some(Value::Json(
+                serde_json::to_string(self.replication.get(id)?).unwrap_or_default(),
+            )),
             Subject::Process(id) => {
                 let (proc, live) = match (self.procs.get(id), self.exited.get(id)) {
                     (Some(proc), _) => (proc, true),
@@ -974,6 +1427,14 @@ impl Plane for Snapshot {
                         Role::Encode => "encode",
                     }),
                     "model" => text(worker.model.clone()),
+                    // The machine it serves from: workers sharing one share
+                    // a node's links.
+                    "host" => worker
+                        .addr
+                        .rsplit_once(':')
+                        .map(|(host, _)| host.trim_start_matches("tcp://"))
+                        .and_then(text),
+                    "engine" if !worker.engine.is_empty() => text(worker.engine.clone()),
                     "draining" => Some(Value::Boolean(worker.health != Health::Healthy)),
                     "pie/kv-pressure" => {
                         Some(Value::Int(i64::from(worker.coarse_load.kv_pressure_bucket)))
@@ -1013,7 +1474,10 @@ impl Plane for Snapshot {
     }
 
     fn capability(&self, name: &str) -> bool {
-        capability(name)
+        match name {
+            "cluster.scale" => self.scales,
+            name => capability(name),
+        }
     }
 
     fn terminable(&self, process: &str) -> bool {
@@ -1034,11 +1498,13 @@ mod tests {
     fn table(kv: u8) -> RoutingTable {
         RoutingTable {
             epoch: 1,
+            scales: false,
             workers: vec![RoutableWorker {
                 id: WorkerId(1),
                 addr: "w1".into(),
                 role: Role::Decode,
                 model: "m".into(),
+                engine: String::new(),
                 health: Health::Healthy,
                 coarse_load: WorkerStatus {
                     kv_pressure_bucket: kv,
@@ -1068,8 +1534,10 @@ mod tests {
                 props: serde_json::from_value(props).unwrap(),
                 session: None,
                 cluster_props: Props::new(),
+                executors: Vec::new(),
             },
             cluster_props: Props::new(),
+            executors: Vec::new(),
         }
     }
 
@@ -1104,7 +1572,7 @@ mod tests {
         ] {
             registry.apply(event, &mut edges);
         }
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         let int = |n| format!("{:?}", Some(Value::Int(n)));
         assert_eq!(of("1", "generated-tokens"), int(30));
@@ -1124,7 +1592,7 @@ mod tests {
         assert_eq!(worker("used-tokens"), int(250));
 
         registry.exited.clear();
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         assert!(
             plane
                 .attr(&Subject::Process("1".into()), "worker")
@@ -1151,7 +1619,7 @@ mod tests {
             },
             &mut edges,
         );
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |name| format!("{:?}", plane.attr(&Subject::Process("1".into()), name));
         assert_eq!(of("prompt-tokens"), format!("{:?}", Some(Value::Int(160))));
         assert_eq!(of("max-tokens"), format!("{:?}", Some(Value::Int(64))));
@@ -1185,7 +1653,7 @@ mod tests {
         ] {
             registry.apply(event, &mut edges);
         }
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         // 1000 bytes: fifteen whole 64-byte blocks, at a guessed 16 tokens each.
         assert_eq!(
@@ -1211,7 +1679,7 @@ mod tests {
             &mut edges,
         );
         assert!(matches!(&edges[..], [Edge::PropChanged(c)] if c.names == ["tool-eta-ms"]));
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         assert_eq!(plane.candidates(SubjectKind::Session), ["default/s"]);
         assert!(matches!(
             plane.prop(&Subject::Session("default/s".into()), "tool-eta-ms"),
@@ -1225,7 +1693,7 @@ mod tests {
             &mut edges,
         );
         assert!(matches!(&edges[..], [Edge::Closed(s)] if s == "default/s"));
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         assert!(
             plane
                 .prop(&Subject::Session("default/s".into()), "tool-eta-ms")
@@ -1241,14 +1709,28 @@ mod tests {
         _connected: watch::Sender<Arc<HashSet<WorkerId>>>,
     }
 
+    fn programs(names: &[&str]) -> Vec<(String, Vec<u8>)> {
+        names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    builtins::policy(name).unwrap().component.to_vec(),
+                )
+            })
+            .collect()
+    }
+
     fn rig(kv: u8) -> Rig {
+        rig_of(kv, &["test-route"])
+    }
+
+    fn rig_of(kv: u8, names: &[&str]) -> Rig {
         let (table, table_rx) = watch::channel(table(kv));
         let (connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
-        let component = builtins::policy("test-route").unwrap().component;
         let (router, cancelled, _moves) = Cluster::start(
-            "test-route",
-            component,
+            programs(names),
             table_rx,
             connected_rx,
             crate::worker::WorkerRegistry::new(),
@@ -1264,9 +1746,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_swaps_the_programs_and_withdraws_the_old_ones_tables() {
+        let rig = rig(0);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+        // Below test-route's floor, a launch waits.
+        let held = launch(2, serde_json::json!({"key": 0}));
+        let waiting = {
+            let (router, routing) = (rig.router.clone(), rig.routing.clone());
+            tokio::spawn(async move { router.admit(&held, &routing).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "held below the floor");
+
+        rig.router.reload(programs(&["replicate"])).await.unwrap();
+        // test-route's schedule and placement are withdrawn with it: the
+        // held launch leaves, and nothing places the first any more.
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("let through once the floor is withdrawn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rig.router.placement(&placed).0, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_that_does_not_load_leaves_the_running_set() {
+        let rig = rig(0);
+        let mut broken = programs(&["replicate"]);
+        broken.push(("garbled".to_string(), vec![0, 1, 2, 3]));
+        assert!(matches!(
+            rig.router.reload(broken).await,
+            Err(LoadError::Of(name, _)) if name == "garbled"
+        ));
+        assert!(matches!(
+            rig.router
+                .reload(programs(&["test-route", "cache-aware"]))
+                .await,
+            Err(LoadError::Shared { .. })
+        ));
+        // test-route still places.
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_tells_the_new_programs_what_the_old_ones_withdrew() {
+        // test-share publishes the placement test-route made; test-route
+        // names it as the process's executors.
+        let rig = rig_of(0, &["test-share", "test-route"]);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        let until = |want: &[WorkerId]| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (router, want) = (rig.router.clone(), want.to_vec());
+            let placed = placed.clone();
+            async move {
+                loop {
+                    let (worker, _, executors) = router.placement(&placed);
+                    if executors == want && worker == Some(WorkerId(1)) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "executors {executors:?}, wanted {want:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        until(&[WorkerId(1)]).await;
+        // Without test-share, its value is withdrawn; the new test-route,
+        // told so, places the process again and names no executors.
+        rig.router.reload(programs(&["test-route"])).await.unwrap();
+        until(&[]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_launch_is_held_below_the_floor_and_placed_where_its_policy_says() {
         let rig = rig(0);
-        let held = launch(1, serde_json::json!({"key": 0, "worker": "1"}));
+        let held = launch(
+            1,
+            serde_json::json!({"key": 0, "worker": "1", "executors": "3,2"}),
+        );
         let free = launch(2, serde_json::json!({}));
 
         let waiting = tokio::spawn({
@@ -1277,11 +1841,135 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!waiting.is_finished(), "key 0 is below the floor of 1");
 
-        let (worker, props) = rig.router.placement(&held);
+        let (worker, props, executors) = rig.router.placement(&held);
         assert_eq!(worker, Some(WorkerId(1)));
         assert_eq!(props["from"], serde_json::json!("1"));
+        assert_eq!(
+            executors,
+            [WorkerId(3), WorkerId(2)],
+            "its passes' workers, best first"
+        );
         assert_eq!(rig.router.placement(&free).0, None, "the router's default");
         waiting.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_policy_beside_another_places_what_it_places() {
+        let rig = rig_of(0, &["replicate", "test-route"]);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scale_table_comes_only_from_the_policy_granted_it() {
+        let ask = serde_json::json!({
+            "key": 1,
+            "scale-workers": 2,
+            "scale-engine": "cuda_native",
+            "scale-model": "m",
+        });
+        let granted = rig_of(0, &["scale-by-prop", "test-route"]);
+        let mut scale = granted.router.scale_watch();
+        granted
+            .router
+            .admit(&launch(1, ask.clone()), &granted.routing)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), scale.wait_for(Option::is_some))
+            .await
+            .expect("the scale table is installed")
+            .unwrap();
+        assert_eq!(
+            scale.borrow().as_deref(),
+            Some(
+                &[ScaleEntry {
+                    model: Some("m".into()),
+                    engine: "cuda_native".into(),
+                    workers: 2,
+                }][..]
+            )
+        );
+
+        // test-route installs one too, and holds no `scale` grant.
+        let ungranted = rig_of(0, &["test-route"]);
+        let scale = ungranted.router.scale_watch();
+        ungranted
+            .router
+            .admit(&launch(1, ask), &ungranted.routing)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            scale.borrow().is_none(),
+            "refused, and a gateway granted no `scale` speaks for no size"
+        );
+    }
+
+    #[test]
+    fn cluster_scale_is_there_while_the_controller_can_act() {
+        let registry = Registry::default();
+        let tables = Tables::default();
+        let mut routing = table(0);
+        assert!(
+            !registry
+                .snapshot(&routing, &tables)
+                .capability("cluster.scale")
+        );
+        routing.scales = true;
+        assert!(
+            registry
+                .snapshot(&routing, &tables)
+                .capability("cluster.scale")
+        );
+        assert!(
+            registry
+                .snapshot(&routing, &tables)
+                .capability("placement.migrate"),
+            "the rest as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placement_s_parts_have_an_author_each() {
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
+        assert!(
+            Cluster::start(
+                programs(&["cache-aware", "disaggregate"]),
+                table_rx,
+                connected_rx,
+                crate::worker::WorkerRegistry::new(),
+            )
+            .is_ok(),
+            "one places processes, the other names their executors"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_policies_granted_the_same_write_do_not_load() {
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
+        let started = Cluster::start(
+            programs(&["test-route", "cache-aware"]),
+            table_rx,
+            connected_rx,
+            crate::worker::WorkerRegistry::new(),
+        );
+        match started {
+            Err(LoadError::Shared {
+                grant,
+                first,
+                second,
+            }) => {
+                assert_eq!(
+                    (grant.as_str(), first.as_str(), second.as_str()),
+                    ("placement", "test-route", "cache-aware")
+                );
+            }
+            Err(other) => panic!("refused for sharing a write, got {other}"),
+            Ok(_) => panic!("refused for sharing a write, but it loaded"),
+        }
     }
 
     // One thread, so each records its release as it is released.
@@ -1326,5 +2014,200 @@ mod tests {
             .await
             .expect("the gateway is told to cancel it");
         assert_eq!(cancelled, Some(ReqId(2)));
+    }
+
+    fn placed(worker: &str, props: &[(&str, &str)]) -> wit::Placement {
+        wit::Placement {
+            process: String::new(),
+            worker: Some(worker.into()),
+            executors: Vec::new(),
+            props: props
+                .iter()
+                .map(|(n, v)| (n.to_string(), Value::Text(v.to_string())))
+                .collect(),
+        }
+    }
+
+    fn carried_kinds(registry: &mut Registry) -> Vec<(String, String)> {
+        std::mem::take(&mut registry.carried)
+            .into_iter()
+            .map(|(author, edge)| {
+                let what = match edge {
+                    Edge::PlacementChanged(id) => format!("placement {id}"),
+                    Edge::ReplicationChanged(id) => format!("replication {id}"),
+                    Edge::Published(subject) => format!("published {}", subject_key(&subject)),
+                    other => format!("{other:?}"),
+                };
+                (author, what)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_committed_placement_reads_as_attrs_and_its_change_is_carried_once() {
+        let mut registry = Registry::default();
+        let mut tables = Tables::default();
+        let before = placed_all(&tables);
+        tables
+            .placement
+            .insert("7".into(), placed("3", &[("tier", "gold")]));
+        tables
+            .executors
+            .insert("7".into(), vec!["5".into(), "4".into()]);
+        registry.carry_placements("a", &before, &placed_all(&tables));
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("a".to_string(), "placement 7".to_string())],
+            "one edge for the one process that changed, carried by its author"
+        );
+
+        let plane = registry.snapshot(&table(0), &tables);
+        let process = Subject::Process("7".into());
+        assert!(
+            matches!(plane.attr(&process, "placement/worker"), Some(Value::Text(w)) if w == "3")
+        );
+        assert!(
+            matches!(plane.attr(&process, "placement/executors"), Some(Value::Json(j)) if j == r#"["5","4"]"#)
+        );
+        assert!(
+            matches!(plane.attr(&process, "placement/props/tier"), Some(Value::Text(v)) if v == "gold")
+        );
+        assert!(plane.attr(&process, "placement/props/none").is_none());
+
+        // The same table again is no change.
+        let before = placed_all(&tables);
+        registry.carry_placements("b", &before, &placed_all(&tables));
+        assert!(carried_kinds(&mut registry).is_empty());
+    }
+
+    #[test]
+    fn a_published_value_reads_under_its_author_s_name_and_is_carried_only_when_it_changes() {
+        let mut registry = Registry::default();
+        let worker = Subject::Worker("1".into());
+        registry.published.insert(
+            "1".into(),
+            HashMap::from([("mark".to_string(), serde_json::json!("own"))]),
+        );
+        registry.say(
+            "a",
+            vec![(worker.clone(), "mark".into(), Some(Value::Int(3)))],
+        );
+        registry.say(
+            "b",
+            vec![(worker.clone(), "mark".into(), Some(Value::Int(4)))],
+        );
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [
+                ("a".to_string(), "published worker:1".to_string()),
+                ("b".to_string(), "published worker:1".to_string()),
+            ]
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(matches!(
+            plane.attr(&worker, "published/a/mark"),
+            Some(Value::Int(3))
+        ));
+        assert!(matches!(
+            plane.attr(&worker, "published/b/mark"),
+            Some(Value::Int(4))
+        ));
+        assert!(
+            matches!(plane.attr(&worker, "published/mark"), Some(Value::Text(t)) if t == "own"),
+            "the worker's own policy's value stands beside the programs'"
+        );
+
+        registry.say(
+            "a",
+            vec![(worker.clone(), "mark".into(), Some(Value::Int(3)))],
+        );
+        assert!(
+            carried_kinds(&mut registry).is_empty(),
+            "the same value again is no change"
+        );
+
+        registry.say("a", vec![(worker.clone(), "mark".into(), None)]);
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("a".to_string(), "published worker:1".to_string())]
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            plane.attr(&worker, "published/a/mark").is_none(),
+            "withdrawn"
+        );
+        assert!(matches!(
+            plane.attr(&worker, "published/b/mark"),
+            Some(Value::Int(4))
+        ));
+    }
+
+    #[test]
+    fn a_group_s_committed_replication_reads_as_its_sites() {
+        let mut registry = Registry::default();
+        let before = replicated(&registry.replication);
+        registry.replication = vec![wit::Replicate {
+            group: "g".into(),
+            upto: None,
+            at: vec![
+                wit::Site {
+                    worker: "2".into(),
+                    tier: wit::Tier::Host,
+                },
+                wit::Site {
+                    worker: "1".into(),
+                    tier: wit::Tier::Device,
+                },
+            ],
+        }];
+        registry.carry_replications("r", &before);
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("r".to_string(), "replication g".to_string())]
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            matches!(plane.attr(&Subject::Group("g".into()), "replication/sites"), Some(Value::Json(j)) if j == r#"["1","2"]"#)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_program_answers_another_s_placement_and_that_one_acts_on_the_answer() {
+        // test-route places the process on worker 1; test-share, told the
+        // placement changed, publishes it; test-route, told of that, names
+        // what it read as the process's executors.
+        let rig = rig_of(0, &["test-share", "test-route"]);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (worker, _, executors) = rig.router.placement(&placed);
+            if executors == [WorkerId(1)] {
+                assert_eq!(worker, Some(WorkerId(1)));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "executors never followed the published placement: {executors:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn any_number_of_programs_may_publish() {
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
+        let share = builtins::policy("test-share").unwrap().component.to_vec();
+        assert!(
+            Cluster::start(
+                vec![("one".into(), share.clone()), ("two".into(), share)],
+                table_rx,
+                connected_rx,
+                crate::worker::WorkerRegistry::new(),
+            )
+            .is_ok(),
+            "each publishes under its own name"
+        );
     }
 }

@@ -181,6 +181,7 @@ fn build_model(
                     max_context: g.caps.limits.max_context as usize,
                     prefill_rows: g.caps.limits.prefill_rows as usize,
                     max_readouts: g.caps.limits.max_readouts as usize,
+                    max_scoring_lanes: g.caps.limits.max_scoring_lanes as usize,
                 },
                 engine_backend: g.backend,
             }
