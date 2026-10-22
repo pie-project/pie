@@ -449,31 +449,58 @@ pub fn set_hello(hello: Hello) {
     let _ = HELLO.set(hello);
 }
 
+/// What this worker asks the controller's directory, behind whichever
+/// [`crate::ControlLink`] it runs with.
+pub(crate) trait Lookup: Send + Sync {
+    fn locate(
+        &self,
+        asker: WorkerId,
+        keys: Vec<[u8; 32]>,
+    ) -> BoxFuture<'static, Result<Vec<(WorkerId, String, u32)>>>;
+    fn link(&self, worker: WorkerId) -> BoxFuture<'static, Result<Option<String>>>;
+}
+
+impl<C: crate::ControlLink> Lookup for C {
+    fn locate(
+        &self,
+        asker: WorkerId,
+        keys: Vec<[u8; 32]>,
+    ) -> BoxFuture<'static, Result<Vec<(WorkerId, String, u32)>>> {
+        let control = self.clone();
+        Box::pin(async move { crate::ControlLink::locate(&control, asker, keys).await })
+    }
+
+    fn link(&self, worker: WorkerId) -> BoxFuture<'static, Result<Option<String>>> {
+        let control = self.clone();
+        Box::pin(async move { crate::ControlLink::link(&control, worker).await })
+    }
+}
+
 /// Reaches the workers the cluster names by id: their links' addresses
-/// from the gateway's directory (the link this worker reports on now), each
-/// greeted once and kept while it stays where it was and its calls succeed.
-struct GatewayDialer {
-    gateway: Mutex<worker_api::GatewayInboundClient>,
+/// from the controller's directory, each greeted once and kept while it
+/// stays where it was and its calls succeed.
+struct ControlDialer {
+    lookup: Arc<dyn Lookup>,
     dialed: Arc<Mutex<Reached>>,
 }
 
 /// The workers reached so far, by id: where each was, and its link.
 type Reached = HashMap<String, (String, Arc<Dialed>)>;
 
-impl runtime::offload::executors::Dialer for GatewayDialer {
+impl runtime::offload::executors::Dialer for ControlDialer {
     fn dial(
         &self,
         worker: String,
     ) -> BoxFuture<'static, Result<Arc<dyn runtime::offload::prefill::PrefillPeer>>> {
-        let gateway = self.gateway.lock().unwrap().clone();
+        let lookup = self.lookup.clone();
         let kept = self.dialed.lock().unwrap().get(&worker).cloned();
         let cache = self.dialed.clone();
         Box::pin(async move {
             let id: u64 = worker.parse().context("a worker id")?;
-            let addr = gateway
-                .link(tarpc::context::current(), WorkerId(id))
+            let addr = lookup
+                .link(WorkerId(id))
                 .await
-                .context("asking the gateway's directory")?
+                .context("asking the controller's directory")?
                 .ok_or_else(|| anyhow::anyhow!("worker {worker} has no peer link"))?;
             if let Some((at, dialed)) = kept
                 && at == addr
@@ -495,25 +522,23 @@ impl runtime::offload::executors::Dialer for GatewayDialer {
     }
 }
 
-static DIALER: std::sync::OnceLock<Arc<GatewayDialer>> = std::sync::OnceLock::new();
-
-/// The gateway's directory, asked by this worker.
-struct GatewayDirectory {
-    gateway: worker_api::GatewayInboundClient,
+/// The controller's directory, asked by this worker.
+struct ControlDirectory {
+    lookup: Arc<dyn Lookup>,
     worker: WorkerId,
 }
 
-impl runtime::offload::directory::Directory for GatewayDirectory {
+impl runtime::offload::directory::Directory for ControlDirectory {
     fn locate(
         &self,
         keys: Vec<[u8; 32]>,
     ) -> BoxFuture<'static, Result<Vec<runtime::offload::directory::Holder>>> {
-        let (gateway, worker) = (self.gateway.clone(), self.worker);
+        let (lookup, worker) = (self.lookup.clone(), self.worker);
         Box::pin(async move {
-            let found = gateway
-                .locate(tarpc::context::current(), worker, keys)
+            let found = lookup
+                .locate(worker, keys)
                 .await
-                .context("asking the gateway's directory")?;
+                .context("asking the controller's directory")?;
             Ok(found
                 .into_iter()
                 .map(|(_, addr, pages)| runtime::offload::directory::Holder { addr, pages })
@@ -522,37 +547,42 @@ impl runtime::offload::directory::Directory for GatewayDirectory {
     }
 }
 
-/// How often this worker tells the gateway what it holds.
+/// How often this worker tells the controller what it holds.
 const REPORT_EVERY: Duration = Duration::from_secs(1);
 
-/// Tells `gateway` what sealed pages this worker holds, all of it first and
-/// then what changed, for as long as the link lives; and makes it the
-/// runtime's directory.
-pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: WorkerId) {
+/// Tells the controller's directory what sealed pages this worker holds,
+/// all of it first and then what changed, for as long as the worker lives
+/// (all of it again after a report that did not arrive); and makes that
+/// directory the runtime's.
+pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
     clients();
-    runtime::offload::directory::set_directory(Some(Arc::new(GatewayDirectory {
-        gateway: gateway.clone(),
+    let lookup: Arc<dyn Lookup> = Arc::new(control.clone());
+    runtime::offload::directory::set_directory(Some(Arc::new(ControlDirectory {
+        lookup: lookup.clone(),
         worker,
     })));
-    let dialer = DIALER
-        .get_or_init(|| {
-            Arc::new(GatewayDialer {
-                gateway: Mutex::new(gateway.clone()),
-                dialed: Arc::default(),
-            })
-        })
-        .clone();
-    // A later link (the gateway restarted, or another one) is the one asked.
-    *dialer.gateway.lock().unwrap() = gateway.clone();
-    runtime::offload::executors::set_dialer(Some(dialer));
+    runtime::offload::executors::set_dialer(Some(Arc::new(ControlDialer {
+        lookup,
+        dialed: Arc::default(),
+    })));
     let peer = listen();
+    let mut generation = control.generation();
     let mut said: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut said_runs: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> =
         std::collections::HashMap::new();
     let mut full = true;
     let mut said_published = Vec::new();
+    let mut said_disk: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut said_hints = Vec::new();
     loop {
+        // A controller dialed again has heard none of it.
+        if control.generation() != generation {
+            generation = control.generation();
+            full = true;
+        }
         let now = runtime::offload::directory::sealed_keys();
+        let disk = runtime::offload::directory::persisted_keys();
+        let hints = runtime::offload::directory::persist_hints();
         let published: Vec<(String, String, String)> = runtime::policy::published()
             .into_iter()
             .map(|(of, name, value)| (of, name, value.to_string()))
@@ -592,25 +622,30 @@ pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: Wor
             pool: false,
             published: (full || published != said_published).then(|| published.clone()),
             link: link(),
+            disk_added: if full {
+                disk.iter().copied().collect()
+            } else {
+                disk.difference(&said_disk).copied().collect()
+            },
+            disk_removed: if full {
+                Vec::new()
+            } else {
+                said_disk.difference(&disk).copied().collect()
+            },
+            persist_hints: (full || hints != said_hints).then(|| hints.clone()),
+            disk_tier: full.then(runtime::offload::directory::disk_tier).flatten(),
         };
-        // Sent even when nothing changed: it is also how a link finds its
-        // gateway gone, and ends so the link is dialed again.
-        match gateway
-            .state(tarpc::context::current(), worker, report)
-            .await
-        {
+        match control.report_state(worker, report).await {
             Ok(()) => {
                 said = now;
                 said_runs = runs;
                 said_published = published;
+                said_disk = disk;
+                said_hints = hints;
                 full = false;
             }
-            Err(tarpc::client::RpcError::Shutdown) => {
-                tracing::info!("the gateway link is down; ending it");
-                return;
-            }
             Err(error) => {
-                tracing::debug!(%error, "state report not delivered; resending whole");
+                tracing::debug!(error = %format!("{error:#}"), "state report not delivered; resending whole");
                 full = true;
             }
         }

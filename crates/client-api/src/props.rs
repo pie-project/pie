@@ -36,6 +36,33 @@ pub const MAX_TOKENS: &str = "max-tokens";
 
 pub const MAX_PROMPT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Keep this many of the process's leading tokens on its worker's
+/// persistent disk tier (`disk_kv_persistent`), for later processes and
+/// restarts.
+pub const PERSIST_PREFIX_TOKENS: &str = "persist-prefix-tokens";
+
+/// Keep the process's system turn so: as many tokens as `system-tokens`.
+pub const PERSIST_SYSTEM: &str = "persist-system";
+
+/// How many tokens the system turn takes, as the inferlet that rendered it
+/// counts them (the compat inferlet sets it).
+pub const SYSTEM_TOKENS: &str = "system-tokens";
+
+/// How many leading tokens `props` ask to be kept on disk: `persist-prefix-
+/// tokens`, else `system-tokens` under `persist-system`.
+#[must_use]
+pub fn persist_tokens(props: &Props) -> Option<u64> {
+    let int = |name: &str| props.0.get(name).and_then(Value::as_u64);
+    int(PERSIST_PREFIX_TOKENS).or_else(|| {
+        props
+            .0
+            .get(PERSIST_SYSTEM)
+            .and_then(Value::as_bool)
+            .filter(|&asked| asked)
+            .and_then(|_| int(SYSTEM_TOKENS))
+    })
+}
+
 pub const PROMPT_BLOCK_BYTES: usize = 64;
 
 /// Chained FNV-1a hashes of whole blocks: texts sharing a prefix share its
@@ -260,6 +287,30 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect()
+    }
+
+    #[test]
+    fn a_prefix_to_persist_is_named_outright_or_as_the_system_turn() {
+        assert_eq!(
+            persist_tokens(&props(json!({"persist-prefix-tokens": 96}))),
+            Some(96)
+        );
+        assert_eq!(
+            persist_tokens(&props(json!({"persist-system": true, "system-tokens": 40}))),
+            Some(40)
+        );
+        assert_eq!(
+            persist_tokens(&props(json!({"persist-system": true}))),
+            None,
+            "the system turn not counted yet"
+        );
+        assert_eq!(
+            persist_tokens(&props(
+                json!({"persist-system": false, "system-tokens": 40})
+            )),
+            None
+        );
+        assert_eq!(persist_tokens(&props(json!({"system-tokens": 40}))), None);
     }
 
     #[test]

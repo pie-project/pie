@@ -55,26 +55,3 @@ pub enum Control {
     Continue,
     Abort,
 }
-
-/// What a worker holds, as it tells its gateway's directory: the sealed
-/// pages it gained and lost by key since its last report (all of them when
-/// `full`), the runs it keeps whole from token 0 (gained in full, lost by
-/// their last key), and where it serves its pages' bytes.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StateReport {
-    pub peer: Option<String>,
-    /// Where this worker's peer link listens: other workers send it passes
-    /// there.
-    #[serde(default)]
-    pub link: Option<String>,
-    pub added: Vec<[u8; 32]>,
-    pub removed: Vec<[u8; 32]>,
-    pub full: bool,
-    pub runs_added: Vec<Vec<[u8; 32]>>,
-    pub runs_removed: Vec<[u8; 32]>,
-    /// A pool: it loads no model and keeps what it is sent.
-    pub pool: bool,
-    /// What the worker policy published for the cluster plane, as
-    /// `(subject, name, JSON value)`; all of it, whenever any changes.
-    pub published: Option<Vec<(String, String, String)>>,
-}

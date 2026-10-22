@@ -113,6 +113,13 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
     // The worker's policy sees the prompt while this process still waits.
     let prompt_tokens = prompt.tokens.len() as u32;
     inferlet::session::set_tokens(prompt_tokens, 0);
+    // How long the system turn is, which only this process counts: a client
+    // that asks it kept on disk (`persist-system`) names it so.
+    if let Some(system) = prompt.system {
+        let props = inferlet::serde_json::json!({ "system-tokens": system }).to_string();
+        // Refused, it costs only the persisting.
+        let _ = inferlet::session::set_props(&props);
+    }
     // A turn continued here goes on after what the client was sent.
     let continued = crate::continuation::get()
         .map(|c| c.tokens)

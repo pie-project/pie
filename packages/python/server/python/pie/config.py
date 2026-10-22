@@ -89,6 +89,9 @@ class ModelConfig:
     # and vulkan); omit for the engine's default, "0B" for off.
     disk_kv_budget: Optional[str] = None
     disk_kv_path: Optional[str] = None
+    # Keep the disk tier for the next run (cuda): a restart takes back the
+    # sealed pages it holds as cache.
+    disk_kv_persistent: Optional[bool] = None
     engine: EngineConfig = field(default_factory=EngineConfig)
 
 
@@ -123,7 +126,7 @@ class Config:
         model: dict = {"name": m.name, "model": m.hf_repo}
         for name in ("precision", "kv", "drafter", "weight_dtype", "device_weight_budget", "host_weight_budget",
                      "device_kv_budget", "device_memory_share", "host_kv_budget", "disk_kv_budget",
-                     "disk_kv_path"):
+                     "disk_kv_path", "disk_kv_persistent"):
             put(model, name, getattr(m, name))
         if m.off:
             model["off"] = list(m.off)

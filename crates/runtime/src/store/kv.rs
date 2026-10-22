@@ -1,4 +1,5 @@
 pub mod hash;
+pub mod journal;
 pub mod page_table;
 pub mod working_set;
 pub mod write;
@@ -119,6 +120,130 @@ pub struct KvStore {
     seq: u64,
     outstanding: BTreeSet<u64>,
     moved: Arc<tokio::sync::Notify>,
+    /// A persistent disk tier's journal, and the slots it names.
+    persisted: Option<Persisted>,
+    /// How many leading tokens each owner's props ask to keep on disk
+    /// (`persist-prefix-tokens`, `persist-system`): told to the cluster with
+    /// the runs it leaves, until it owns none.
+    hints: HashMap<ProcessId, u64>,
+}
+
+/// A persistent disk tier: a copy on disk of sealed pages, by key. A page
+/// is immutable once sealed, so a copy serves every place its key is found.
+/// A copy beside a page held on the device or the host costs nothing there;
+/// a page settled on disk is backed by its copy.
+struct Persisted {
+    journal: journal::Journal,
+    /// Each copy's page, by its slot.
+    slots: HashMap<DiskKvSlotId, Hash256>,
+    by_key: HashMap<Hash256, DiskKvSlotId>,
+    /// The copies pages are backed by now, with how many places each backs.
+    backing: HashMap<DiskKvSlotId, u32>,
+    /// The cluster retention key each copy is kept under: swap takes the
+    /// lowest first.
+    retention: HashMap<DiskKvSlotId, i64>,
+}
+
+impl Persisted {
+    fn back(&mut self, slot: DiskKvSlotId) {
+        *self.backing.entry(slot).or_insert(0) += 1;
+    }
+
+    /// A place backed by `slot` lets it go: true when `slot` is a copy, which
+    /// stays.
+    fn let_go(&mut self, slot: DiskKvSlotId) -> bool {
+        if !self.slots.contains_key(&slot) {
+            return false;
+        }
+        if let Some(count) = self.backing.get_mut(&slot) {
+            *count -= 1;
+            if *count == 0 {
+                self.backing.remove(&slot);
+            }
+        }
+        true
+    }
+}
+
+/// Persisting a run: its resident pages, each copied to a fresh disk slot
+/// while it stays where it is.
+#[derive(Debug)]
+pub struct KvPersistTxn {
+    pages: Vec<(
+        TriePageLocation,
+        PhysicalKvPageId,
+        DiskKvSlotId,
+        journal::PageRecord,
+    )>,
+    pinned: NodeId,
+}
+
+impl KvPersistTxn {
+    /// The device pages to copy, and the disk slots they go to.
+    pub fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
+        self.pages
+            .iter()
+            .map(|(_, gpu, slot, _)| (gpu.0, slot.0))
+            .unzip()
+    }
+}
+
+type HeldPage = (DiskKvSlotId, journal::PageRecord);
+
+/// The pages a journal names, as runs to import in order, each after the
+/// keys of the pages before it (from token 0); and the slots of pages that
+/// follow on from no page held, or do not span a page, which nothing can
+/// take back.
+#[allow(clippy::type_complexity)]
+fn runs(
+    mut held: HashMap<Hash256, HeldPage>,
+    page_size: usize,
+) -> (Vec<(Vec<Hash256>, Vec<HeldPage>)>, Vec<DiskKvSlotId>) {
+    let mut orphans: Vec<DiskKvSlotId> = Vec::new();
+    held.retain(|_, (slot, record)| {
+        let whole = record.tokens.len() == page_size;
+        if !whole {
+            orphans.push(*slot);
+        }
+        whole
+    });
+    let mut children: HashMap<Option<Hash256>, Vec<Hash256>> = HashMap::new();
+    for (page, (_, record)) in &held {
+        children.entry(record.parent).or_default().push(*page);
+    }
+    for pages in children.values_mut() {
+        pages.sort_unstable();
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<(Vec<Hash256>, Hash256)> = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|&page| (Vec::new(), page))
+        .collect();
+    while let Some((prefix, first)) = stack.pop() {
+        let mut run = Vec::new();
+        let mut at = first;
+        while let Some(page) = held.remove(&at) {
+            run.push(page);
+            match children.get(&Some(at)).map(Vec::as_slice) {
+                Some([only]) => at = *only,
+                Some(next) => {
+                    let mut keys = prefix.clone();
+                    keys.extend(run.iter().map(|(_, record)| record.page));
+                    stack.extend(next.iter().rev().map(|&page| (keys.clone(), page)));
+                    break;
+                }
+                None => break,
+            }
+        }
+        if !run.is_empty() {
+            out.push((prefix, run));
+        }
+    }
+    orphans.extend(held.into_values().map(|(slot, _)| slot));
+    (out, orphans)
 }
 
 #[derive(Debug)]
@@ -175,6 +300,8 @@ impl KvStore {
             seq: 0,
             outstanding: BTreeSet::new(),
             moved: Arc::new(tokio::sync::Notify::new()),
+            persisted: None,
+            hints: HashMap::new(),
         }
     }
 
@@ -360,6 +487,7 @@ impl KvStore {
             *count -= 1;
             if *count == 0 {
                 self.owners.remove(&owner);
+                self.hints.remove(&owner);
                 crate::policy::report(Event::CacheEmptied(owner, by));
             }
         }
@@ -413,21 +541,82 @@ impl KvStore {
                 freed += self.release_entry(entry, epoch);
             }
         }
+        self.forget_lost_copies();
         freed
     }
 
     /// Only what no live working set reads, lowest key first, then least
     /// recently used.
+    /// Pages the disk tier keeps a copy of settle there instead, at no cost,
+    /// and their entries stay.
     pub fn reclaim_cache(&mut self, epoch: u64, keys: impl Keys) -> usize {
         self.split_at_steps(&keys);
+        self.split_persisted();
         let mut freed = 0;
-        for (_, ids) in self.reclaim_order(&keys) {
-            freed += self.drop_entries(ids, By::Host, epoch);
+        for (key, ids) in self.reclaim_order(&keys) {
+            freed += self.settle_on_disk(&ids, key, &keys, epoch);
+            if freed == 0 {
+                let ids = ids
+                    .into_iter()
+                    .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
+                    .collect();
+                freed += self.drop_entries(ids, By::Host, epoch);
+            }
             if freed > 0 {
                 break;
             }
         }
         tracing::debug!(target: "pie::kv", freed, "reclaimed");
+        freed
+    }
+
+    /// The terminals of entries whose key is above `key`: what they cover
+    /// stays with them.
+    fn above(&self, key: i64, keys: &impl Keys) -> Vec<NodeId> {
+        self.cache
+            .values()
+            .filter(|entry| keys.key_at(entry.owner, self.key_token(entry.path.pages)) > key)
+            .map(|entry| entry.path.terminal)
+            .collect()
+    }
+
+    /// Moves the device pages only `ids` read, that the disk tier keeps a
+    /// copy of, onto their copies: no copy is made. Answers the device
+    /// pages freed.
+    fn settle_on_disk(&mut self, ids: &[u64], key: i64, keys: &impl Keys, epoch: u64) -> usize {
+        if self.persisted.as_ref().is_none_or(|p| p.by_key.is_empty()) {
+            return 0;
+        }
+        let above = self.above(key, keys);
+        let moves: Vec<(TriePageLocation, PhysicalKvPageId, DiskKvSlotId)> = self
+            .table
+            .cache_only_pages(&self.roots(ids), &above)
+            .into_iter()
+            .filter_map(|(location, gpu)| Some((location, gpu, self.copy_of(&location)?)))
+            .collect();
+        if moves.is_empty() {
+            return 0;
+        }
+        let replacements: Vec<_> = moves
+            .iter()
+            .map(|&(location, gpu, slot)| {
+                (
+                    location,
+                    KvPageBacking::Resident(gpu),
+                    KvPageBacking::OnDisk(slot),
+                )
+            })
+            .collect();
+        if self.table.replace_backings(&replacements).is_err() {
+            return 0;
+        }
+        if let Some(persisted) = &mut self.persisted {
+            moves.iter().for_each(|&(_, _, slot)| persisted.back(slot));
+        }
+        let freed = moves.len();
+        self.pool
+            .recycle_after_epoch(moves.into_iter().map(|(_, gpu, _)| gpu).collect(), epoch);
+        tracing::debug!(target: "pie::kv", pages = freed, "settled on disk");
         freed
     }
 
@@ -461,6 +650,38 @@ impl KvStore {
                 }
             }
         }
+        self.keep_heads(heads);
+    }
+
+    /// Keeps the head of each entry whose first pages the disk tier keeps a
+    /// copy of, as an entry of its own, so that the tail can go alone while
+    /// the head settles on disk.
+    fn split_persisted(&mut self) {
+        let Some(persisted) = &self.persisted else {
+            return;
+        };
+        if persisted.by_key.is_empty() || !self.keeps {
+            return;
+        }
+        let mut heads = Vec::new();
+        for (&id, entry) in &self.cache {
+            let Some(keys) = self.table.path_keys(entry.path.terminal) else {
+                continue;
+            };
+            let pages = keys
+                .iter()
+                .take(entry.path.pages as usize)
+                .take_while(|key| persisted.by_key.contains_key(*key))
+                .count() as u64;
+            if pages > 0 && pages < entry.path.pages && !self.splits.contains(&(id, pages)) {
+                heads.push((id, *entry, pages));
+            }
+        }
+        self.keep_heads(heads);
+    }
+
+    /// Keeps each entry's first `pages` as an entry of its own.
+    fn keep_heads(&mut self, heads: Vec<(u64, KeptEntry, u64)>) {
         for (id, entry, pages) in heads {
             self.splits.insert((id, pages));
             let path = self.table.keep_prefix_of(entry.path, pages);
@@ -524,15 +745,14 @@ impl KvStore {
             return Ok(None);
         }
         self.split_at_steps(&keys);
+        self.split_persisted();
         for (key, ids) in self.reclaim_order(&keys) {
             // What a higher key also covers stays with it.
-            let above: Vec<NodeId> = self
-                .cache
-                .values()
-                .filter(|entry| keys.key_at(entry.owner, self.key_token(entry.path.pages)) > key)
-                .map(|entry| entry.path.terminal)
-                .collect();
+            let above = self.above(key, &keys);
             let mut pages = self.table.cache_only_pages(&self.roots(&ids), &above);
+            // A page with a copy on disk settles there when its room is
+            // wanted, at no cost: host room is for the rest.
+            pages.retain(|(location, _)| self.copy_of(location).is_none());
             if pages.is_empty() {
                 continue;
             }
@@ -655,7 +875,7 @@ impl KvStore {
         }
         self.pool.release_reserved(device);
         self.host_pool.release_reserved(host);
-        self.disk_pool.release_reserved(disk);
+        self.release_disk(disk);
     }
 
     pub fn free_host_slots(&mut self, slots: Vec<HostKvSlotId>) {
@@ -845,6 +1065,13 @@ impl KvStore {
     pub fn release_working_set(&mut self, ws: WorkingSetId, epoch: u64) {
         if self.keeps {
             self.keep_sealed_prefix(ws);
+        }
+        // A hint is for what its owner leaves in the cache: one that left
+        // nothing needs none.
+        if let Some(owner) = self.owner_of(ws)
+            && !self.owners.contains_key(&owner)
+        {
+            self.hints.remove(&owner);
         }
         let freed = self.table.release_working_set_backings(ws);
         self.recycle_backings(freed, epoch);
@@ -1065,7 +1292,187 @@ impl KvStore {
             }
         }
         self.host_pool.release_reserved(host);
-        self.disk_pool.release_reserved(disk);
+        self.release_disk(disk);
+    }
+
+    /// Gives disk slots back; a persistent tier's copies stay, for the pages
+    /// they hold (given up by [`Self::forget_lost_copies`] once no page is).
+    fn release_disk(&mut self, slots: Vec<DiskKvSlotId>) {
+        let slots = match &mut self.persisted {
+            Some(persisted) => slots
+                .into_iter()
+                .filter(|&slot| !persisted.let_go(slot))
+                .collect(),
+            None => slots,
+        };
+        self.disk_pool.release_reserved(slots);
+    }
+
+    /// Gives up copies no page is backed by, in the journal, durably, then
+    /// gives their slots back.
+    fn give_up_copies(&mut self, slots: Vec<DiskKvSlotId>) {
+        let Some(persisted) = &mut self.persisted else {
+            return;
+        };
+        let slots: Vec<DiskKvSlotId> = slots
+            .into_iter()
+            .filter(|slot| !persisted.backing.contains_key(slot))
+            .filter(|slot| match persisted.slots.remove(slot) {
+                Some(key) => {
+                    persisted.by_key.remove(&key);
+                    persisted.retention.remove(slot);
+                    true
+                }
+                None => false,
+            })
+            .collect();
+        if slots.is_empty() {
+            return;
+        }
+        let named: Vec<u32> = slots.iter().map(|slot| slot.0).collect();
+        if let Err(error) = persisted.journal.give_up(&named) {
+            tracing::error!(target: "pie::kv", %error, "disk kv journal not written; the tier is kept no longer");
+            self.abandon_persisted();
+        }
+        self.disk_pool.release_reserved(slots);
+    }
+
+    /// Gives up the copies of pages no longer held anywhere here.
+    fn forget_lost_copies(&mut self) {
+        let Some(persisted) = &self.persisted else {
+            return;
+        };
+        if persisted.slots.is_empty() {
+            return;
+        }
+        let live = self.table.sealed_keys();
+        let lost: Vec<DiskKvSlotId> = persisted
+            .slots
+            .iter()
+            .filter(|(_, key)| !live.contains(*key))
+            .map(|(&slot, _)| slot)
+            .collect();
+        self.give_up_copies(lost);
+    }
+
+    /// Stops keeping the disk tier, and removes its journal so that the
+    /// next run trusts none of its slots. Copies no page is backed by are
+    /// free again; the rest go back as their pages let them go.
+    fn abandon_persisted(&mut self) {
+        let Some(persisted) = self.persisted.take() else {
+            return;
+        };
+        let spare: Vec<DiskKvSlotId> = persisted
+            .slots
+            .keys()
+            .filter(|slot| !persisted.backing.contains_key(slot))
+            .copied()
+            .collect();
+        if let Err(error) = persisted.journal.abandon() {
+            tracing::error!(target: "pie::kv", %error, "disk kv journal not removed");
+        }
+        self.disk_pool.release_reserved(spare);
+    }
+
+    /// The copy of the page at `location`, if the disk tier keeps one.
+    fn copy_of(&self, location: &TriePageLocation) -> Option<DiskKvSlotId> {
+        let persisted = self.persisted.as_ref()?;
+        persisted
+            .by_key
+            .get(&self.table.page_key_at(location)?)
+            .copied()
+    }
+
+    /// Whether every page of `entry` has a copy on disk.
+    fn persisted_whole(&self, entry: &KeptEntry) -> bool {
+        let Some(persisted) = &self.persisted else {
+            return false;
+        };
+        let pages = entry.path.pages as usize;
+        pages > 0
+            && !persisted.by_key.is_empty()
+            && self
+                .table
+                .path_keys(entry.path.terminal)
+                .is_some_and(|keys| {
+                    keys.len() >= pages
+                        && keys[..pages]
+                            .iter()
+                            .all(|key| persisted.by_key.contains_key(key))
+                })
+    }
+
+    /// Keeps the disk tier for the next run, its journal at `path`, and
+    /// takes back what the last run left there, as ownerless cache entries
+    /// whose pages are on disk: a hit promotes them as it would pages this
+    /// run demoted. `kept`: the engine found its slot files as it left
+    /// them. Answers the pages taken back.
+    pub fn keep_disk(&mut self, path: &std::path::Path, kept: bool) -> std::io::Result<usize> {
+        if !self.keeps {
+            tracing::warn!(target: "pie::kv", "a model with recurrent state or a window resumes from kv alone nowhere; the disk tier is not kept");
+            return Ok(0);
+        }
+        let header = journal::Header {
+            domain: self.domain,
+            page_size: self.page_size,
+            slots: self.disk_pool.capacity(),
+        };
+        let (mut journal, held) = journal::Journal::open(path, header, kept)?;
+        let mut pages: HashMap<Hash256, HeldPage> = HashMap::new();
+        let mut doubled = Vec::new();
+        for (slot, record) in held {
+            let slot = DiskKvSlotId(slot);
+            if pages.contains_key(&record.page) || !self.disk_pool.take(slot) {
+                doubled.push(slot.0);
+            } else {
+                pages.insert(record.page, (slot, record));
+            }
+        }
+        if !doubled.is_empty() {
+            journal.give_up(&doubled)?;
+        }
+        let mut persisted = Persisted {
+            journal,
+            slots: HashMap::new(),
+            by_key: HashMap::new(),
+            backing: HashMap::new(),
+            retention: HashMap::new(),
+        };
+        for (key, (slot, record)) in &pages {
+            persisted.slots.insert(*slot, *key);
+            persisted.by_key.insert(*key, *slot);
+            persisted.retention.insert(*slot, record.retention);
+        }
+        self.persisted = Some(persisted);
+        let (runs, _) = runs(pages, self.page_size as usize);
+        let mut taken = 0;
+        for (prefix, run) in runs {
+            let (mut tokens, mut keys, mut backings) = (Vec::new(), Vec::new(), Vec::new());
+            for (slot, record) in run {
+                keys.push(record.page);
+                tokens.push(record.tokens);
+                backings.push(KvPageBacking::OnDisk(slot));
+            }
+            let slots: Vec<DiskKvSlotId> = backings
+                .iter()
+                .map(|backing| match backing {
+                    KvPageBacking::OnDisk(slot) => *slot,
+                    _ => unreachable!("taken back on disk"),
+                })
+                .collect();
+            if let Some(persisted) = &mut self.persisted {
+                slots.iter().for_each(|&slot| persisted.back(slot));
+            }
+            let len = keys.len();
+            if self.import_cached_at(&prefix, tokens, keys, backings) {
+                taken += len;
+            }
+        }
+        // Pages that followed on from nothing, or did not take: no page
+        // holds their copies.
+        self.forget_lost_copies();
+        tracing::info!(target: "pie::kv", pages = taken, "disk kv tier kept; pages taken back");
+        Ok(taken)
     }
 
     pub fn write_demand(
@@ -1323,7 +1730,7 @@ impl KvStore {
         if pages.is_empty() {
             return Ok(None);
         }
-        let available = self.swap_available();
+        let available = self.make_swap_room(pages.len());
         if available < pages.len() {
             return Err(KvStoreError::HostSwapFull {
                 requested: pages.len(),
@@ -1345,7 +1752,8 @@ impl KvStore {
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.stranded_pages(keep);
         }
-        pages.truncate(room.min(self.swap_available()));
+        let available = self.make_swap_room(pages.len().min(room));
+        pages.truncate(room.min(available));
         if pages.is_empty() {
             return Ok(None);
         }
@@ -1356,7 +1764,283 @@ impl KvStore {
     }
 
     fn swap_available(&self) -> usize {
+        self.host_pool.available() + self.disk_swap_available()
+    }
+
+    /// Frees swap slots for `wanted` pages, giving up the disk tier's copies
+    /// if it must: suspended kv cannot be computed again, so it wins. Answers
+    /// the slots free.
+    fn make_swap_room(&mut self, wanted: usize) -> usize {
+        let free = self.host_pool.available() + self.disk_pool.available();
+        if free < wanted {
+            self.yield_disk(wanted - free);
+        }
         self.host_pool.available() + self.disk_pool.available()
+    }
+
+    /// Copies whose pages are held on the device or the host, lowest
+    /// retention key first; and the unused entries kept only on disk, at
+    /// the lowest key among their pages, then least recently used.
+    fn disk_yield_plan(&self) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
+        let Some(persisted) = &self.persisted else {
+            return (Vec::new(), Vec::new());
+        };
+        let key = |slot: &DiskKvSlotId| persisted.retention.get(slot).copied().unwrap_or(0);
+        let mut spare: Vec<DiskKvSlotId> = persisted
+            .slots
+            .keys()
+            .filter(|slot| !persisted.backing.contains_key(slot))
+            .copied()
+            .collect();
+        spare.sort_unstable_by_key(|slot| (key(slot), slot.0));
+        if persisted.backing.is_empty() {
+            return (spare, Vec::new());
+        }
+        let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
+        // An entry goes at the lowest key among its pages' copies.
+        let lowest = |entry: &KeptEntry| {
+            self.table
+                .path_keys(entry.path.terminal)
+                .into_iter()
+                .flatten()
+                .take(entry.path.pages as usize)
+                .filter_map(|page| persisted.by_key.get(&page))
+                .map(key)
+                .min()
+                .unwrap_or(0)
+        };
+        let mut whole: Vec<(i64, Instant, u64)> = self
+            .cache
+            .iter()
+            .filter(|(_, entry)| {
+                let root = entry.path.terminal;
+                unused.contains(&root)
+                    && !self.table.holds_resident(root)
+                    && !self.table.in_move_at(root)
+                    && self.persisted_whole(entry)
+            })
+            .map(|(&id, entry)| (lowest(entry), entry.last_use, id))
+            .collect();
+        whole.sort_unstable();
+        (
+            spare,
+            whole.into_iter().map(|(_, at, id)| (at, id)).collect(),
+        )
+    }
+
+    /// Gives up the disk tier's copies until `wanted` slots are free:
+    /// [`Self::disk_yield_plan`] in order.
+    fn yield_disk(&mut self, wanted: usize) {
+        let (spare, whole) = self.disk_yield_plan();
+        let start = self.disk_pool.available();
+        let freed = |store: &Self| store.disk_pool.available().saturating_sub(start);
+        let spare: Vec<DiskKvSlotId> = spare.into_iter().take(wanted).collect();
+        self.give_up_copies(spare);
+        for (_, id) in whole {
+            if freed(self) >= wanted {
+                break;
+            }
+            self.drop_entries(vec![id], By::Host, self.current_epoch());
+        }
+        tracing::debug!(target: "pie::kv", wanted, freed = freed(self), "disk copies given up for swap");
+    }
+
+    /// Persists the sealed run `keys` (from token 0) as far as its pages
+    /// are found here, in a row, held on the device or copied already: a
+    /// copy of each resident page goes to a fresh disk slot while the page
+    /// stays where it is. `None` when nothing is left to copy, or the disk
+    /// tier is not kept or full; never at swap's cost.
+    pub fn prepare_persist(&mut self, keys: &[Hash256], retention: i64) -> Option<KvPersistTxn> {
+        let run = self.table.sealed_run(keys, false);
+        self.raise_retention(keys, &run, retention);
+        let persisted = self.persisted.as_ref()?;
+        let mut wanted = Vec::new();
+        for (i, location) in run.iter().enumerate() {
+            if persisted.by_key.contains_key(&keys[i]) {
+                continue;
+            }
+            match self.table.backing_at(location) {
+                Ok(KvPageBacking::Resident(gpu)) if !self.table.page_location_pinned(*location) => {
+                    let tokens = self.table.token_hashes_at(location)?.to_vec();
+                    wanted.push((
+                        *location,
+                        gpu,
+                        journal::PageRecord {
+                            page: keys[i],
+                            parent: i.checked_sub(1).map(|p| keys[p]),
+                            tokens,
+                            retention,
+                        },
+                    ));
+                }
+                // A copy is made from the device: the run ends at a page
+                // that is not there.
+                _ => break,
+            }
+        }
+        wanted.truncate(self.disk_pool.available());
+        if wanted.is_empty() {
+            return None;
+        }
+        let slots = self.disk_pool.try_alloc_n(wanted.len())?;
+        // The last page's node holds the whole run while it is copied.
+        let pinned = wanted.last()?.0.node;
+        self.table.pin(pinned);
+        self.table
+            .pin_swap_locations(wanted.iter().map(|(location, ..)| *location));
+        Some(KvPersistTxn {
+            pages: wanted
+                .into_iter()
+                .zip(slots)
+                .map(|((location, gpu, record), slot)| (location, gpu, slot, record))
+                .collect(),
+            pinned,
+        })
+    }
+
+    /// Keeps the copies `run` already has under `retention` where that is
+    /// higher than the key they were kept under, in the journal too.
+    fn raise_retention(&mut self, keys: &[Hash256], run: &[TriePageLocation], retention: i64) {
+        let Some(persisted) = &mut self.persisted else {
+            return;
+        };
+        let mut raised = Vec::new();
+        for (i, location) in run.iter().enumerate() {
+            let Some(&slot) = persisted.by_key.get(&keys[i]) else {
+                continue;
+            };
+            if persisted
+                .retention
+                .get(&slot)
+                .is_some_and(|&kept| kept >= retention)
+            {
+                continue;
+            }
+            let Some(tokens) = self.table.token_hashes_at(location) else {
+                continue;
+            };
+            persisted.retention.insert(slot, retention);
+            raised.push((
+                slot,
+                journal::PageRecord {
+                    page: keys[i],
+                    parent: i.checked_sub(1).map(|p| keys[p]),
+                    tokens: tokens.to_vec(),
+                    retention,
+                },
+            ));
+        }
+        if raised.is_empty() {
+            return;
+        }
+        let written = raised
+            .iter()
+            .try_for_each(|(slot, record)| persisted.journal.put(slot.0, record))
+            .and_then(|()| persisted.journal.sync());
+        if let Err(error) = written {
+            tracing::error!(target: "pie::kv", %error, "disk kv journal not written; the tier is kept no longer");
+            self.abandon_persisted();
+        }
+    }
+
+    /// The copies landed: the journal names them, durably. Answers the pages
+    /// persisted.
+    pub fn commit_persist(&mut self, txn: KvPersistTxn) -> usize {
+        self.unpin_persist(&txn);
+        let Some(persisted) = &mut self.persisted else {
+            self.disk_pool
+                .release_reserved(txn.pages.into_iter().map(|(.., slot, _)| slot).collect());
+            return 0;
+        };
+        let written = txn
+            .pages
+            .iter()
+            .try_for_each(|(_, _, slot, record)| persisted.journal.put(slot.0, record))
+            .and_then(|()| persisted.journal.sync());
+        if let Err(error) = written {
+            tracing::error!(target: "pie::kv", %error, "disk kv journal not written; the tier is kept no longer");
+            self.disk_pool
+                .release_reserved(txn.pages.into_iter().map(|(.., slot, _)| slot).collect());
+            self.abandon_persisted();
+            return 0;
+        }
+        let count = txn.pages.len();
+        for (_, _, slot, record) in txn.pages {
+            persisted.slots.insert(slot, record.page);
+            persisted.by_key.insert(record.page, slot);
+            persisted.retention.insert(slot, record.retention);
+        }
+        // A page dropped while it was copied leaves its copy to no one.
+        self.forget_lost_copies();
+        // The prefix persisted is a run of its own: the cluster sees it as a
+        // group on disk.
+        self.split_persisted();
+        tracing::debug!(target: "pie::kv", pages = count, "persisted");
+        count
+    }
+
+    /// The copies did not land: their slots go back.
+    pub fn abort_persist(&mut self, txn: KvPersistTxn) {
+        self.unpin_persist(&txn);
+        self.disk_pool
+            .release_reserved(txn.pages.into_iter().map(|(.., slot, _)| slot).collect());
+    }
+
+    fn unpin_persist(&mut self, txn: &KvPersistTxn) {
+        let mut freed = self.table.unpin(txn.pinned);
+        freed.extend(
+            self.table
+                .unpin_swap_locations(txn.pages.iter().map(|(location, ..)| *location)),
+        );
+        self.end_move(freed);
+    }
+
+    /// `owner`'s props ask `tokens` leading tokens kept on disk, or none.
+    pub fn set_persist_hint(&mut self, owner: ProcessId, tokens: Option<u64>) {
+        match tokens {
+            Some(tokens) if tokens > 0 => {
+                self.hints.insert(owner, tokens);
+            }
+            _ => {
+                self.hints.remove(&owner);
+            }
+        }
+    }
+
+    /// The runs whose owner asked a prefix of them kept on disk, by the
+    /// run's last key, with the tokens asked.
+    pub fn persist_hints(&self) -> Vec<(Hash256, u64)> {
+        if self.hints.is_empty() {
+            return Vec::new();
+        }
+        self.cache
+            .values()
+            .filter_map(|entry| {
+                let tokens = *self.hints.get(&entry.owner?)?;
+                let keys = self.table.path_keys(entry.path.terminal)?;
+                let last = *keys.get(usize::try_from(entry.path.pages).ok()?.checked_sub(1)?)?;
+                Some((last, tokens))
+            })
+            .collect()
+    }
+
+    /// The pages the disk tier keeps a copy of, by key.
+    pub fn persisted_keys(&self) -> Vec<Hash256> {
+        self.persisted
+            .as_ref()
+            .map(|p| p.by_key.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the disk tier is kept across runs.
+    pub fn disk_persistent(&self) -> bool {
+        self.persisted.is_some()
+    }
+
+    /// Pages the disk tier keeps a copy of.
+    #[cfg(test)]
+    pub fn persisted_pages(&self) -> usize {
+        self.persisted.as_ref().map_or(0, |p| p.slots.len())
     }
 
     /// No lookup hits them, and no one will bring them back.
@@ -1368,6 +2052,7 @@ impl KvStore {
             .filter(|(_, entry)| {
                 unused.contains(&entry.path.terminal)
                     && !self.table.settled_on_device(entry.path.terminal)
+                    && !self.persisted_whole(entry)
             })
             .map(|(&key, _)| key)
             .collect();
@@ -1584,8 +2269,28 @@ impl KvStore {
         self.host_pool.capacity()
     }
 
+    /// Free disk slots, and those the disk tier's copies would give up for
+    /// swap.
     pub fn disk_swap_available(&self) -> usize {
-        self.disk_pool.available()
+        let (spare, whole) = self.disk_yield_plan();
+        let mut backing: HashSet<DiskKvSlotId> = HashSet::new();
+        if let Some(persisted) = &self.persisted {
+            for (_, id) in &whole {
+                let Some(entry) = self.cache.get(id) else {
+                    continue;
+                };
+                let keys = self
+                    .table
+                    .path_keys(entry.path.terminal)
+                    .unwrap_or_default();
+                backing.extend(
+                    keys.iter()
+                        .take(entry.path.pages as usize)
+                        .filter_map(|key| persisted.by_key.get(key)),
+                );
+            }
+        }
+        self.disk_pool.available() + spare.len() + backing.len()
     }
 
     pub fn disk_swap_capacity(&self) -> u32 {

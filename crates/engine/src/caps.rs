@@ -82,6 +82,13 @@ pub struct PoolFacts {
     pub host_buffer_pages: u32,
     #[serde(default)]
     pub disk_kv_pages: u32,
+    /// The slot files are kept across runs (`disk_kv_persistent`).
+    #[serde(default)]
+    pub disk_kv_persistent: bool,
+    /// And what they held when the last run left is there still: they were
+    /// found with the meta this load would write.
+    #[serde(default)]
+    pub disk_kv_kept: bool,
     /// The engine would rather post one frame a lane than seat fewer lanes
     /// than it batches when its state slots are short: the runtime then
     /// dispatches one frame deep, so a lane holds one slot. False keeps the
@@ -106,6 +113,8 @@ impl PoolFacts {
             self.host_state_slots = self.host_state_slots.min(rank.host_state_slots);
             self.host_buffer_pages = self.host_buffer_pages.min(rank.host_buffer_pages);
             self.disk_kv_pages = self.disk_kv_pages.min(rank.disk_kv_pages);
+            self.disk_kv_persistent &= rank.disk_kv_persistent;
+            self.disk_kv_kept &= rank.disk_kv_kept;
         }
     }
 }

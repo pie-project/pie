@@ -1747,14 +1747,34 @@ impl Pools {
     }
 
     /// Opens `dir`'s slot file for this rank with `budget` bytes of kv pages;
-    /// a budget short of one page seats none.
-    pub fn seat_disk(&mut self, dir: &std::path::Path, rank: u32, budget: u64) -> Result<()> {
-        let file = engine::disk::SlotFile::open(
-            dir,
-            &format!("r{rank}.kv"),
-            self.paged_page_bytes(),
-            budget,
-        )
+    /// a budget short of one page seats none. `keep` names the load when the
+    /// file is kept for the next run ([`engine::disk::SlotFile::open_kept`]):
+    /// with the page's planes, the layout its slots are read back by.
+    pub fn seat_disk(
+        &mut self,
+        dir: &std::path::Path,
+        rank: u32,
+        budget: u64,
+        keep: Option<&str>,
+    ) -> Result<()> {
+        let name = format!("r{rank}.kv");
+        let file = match keep {
+            None => engine::disk::SlotFile::open(dir, &name, self.paged_page_bytes(), budget),
+            Some(load) => {
+                let planes: Vec<u64> = self.paged_planes().iter().map(|&(_, b)| b).collect();
+                let layout = format!(
+                    "cuda {load} page {} planes {planes:?}",
+                    self.paging.page_size
+                );
+                engine::disk::SlotFile::open_kept(
+                    dir,
+                    &name,
+                    self.paged_page_bytes(),
+                    budget,
+                    &layout,
+                )
+            }
+        }
         .map_err(slot_file)?;
         self.disk = file
             .map(|file| {
@@ -1775,6 +1795,12 @@ impl Pools {
     #[must_use]
     pub fn disk_pages(&self) -> u32 {
         self.disk.as_ref().map_or(0, |disk| disk.file.slots())
+    }
+
+    /// The slot file is kept, and holds what the last run left.
+    #[must_use]
+    pub fn disk_kept(&self) -> bool {
+        self.disk.as_ref().is_some_and(|disk| disk.file.kept())
     }
 
     /// Copies whole kv pages between the device pool and the slot file,

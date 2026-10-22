@@ -1726,6 +1726,14 @@ impl KvPageTable {
         }
     }
 
+    /// The key of the sealed page at `location`.
+    pub fn page_key_at(&self, location: &TriePageLocation) -> Option<Hash256> {
+        match &self.nodes.get(location.node)?.pages {
+            Pages::Owned { page_hashes, .. } => *page_hashes.get(location.local as usize)?,
+            Pages::ParentSelection { .. } => None,
+        }
+    }
+
     pub fn backing_at(&self, location: &TriePageLocation) -> Result<KvPageBacking, KvTableError> {
         let node = self
             .nodes

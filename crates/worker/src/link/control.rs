@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use controller_api::{Ack, ControlClient, Neighbors, WorkerInfo, WorkerStatus};
+use controller_api::{Ack, ControlClient, Neighbors, StateReport, WorkerInfo, WorkerStatus};
 use ids::{NodeId, WorkerId};
 use tarpc::serde_transport::tcp;
 #[cfg(unix)]
@@ -38,6 +38,31 @@ pub trait ControlLink: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<()>> + Send;
 
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors>;
+
+    /// What this worker holds, gained and lost since its last report: the
+    /// controller's directory.
+    fn report_state(
+        &self,
+        id: WorkerId,
+        report: StateReport,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// The workers other than `asker` that hold a run of `keys` from the
+    /// first: id, bulk address and run length, longest first.
+    fn locate(
+        &self,
+        asker: WorkerId,
+        keys: Vec<[u8; 32]>,
+    ) -> impl Future<Output = Result<Vec<(WorkerId, String, u32)>>> + Send;
+
+    /// Where `worker`'s peer link listens.
+    fn link(&self, worker: WorkerId) -> impl Future<Output = Result<Option<String>>> + Send;
+
+    /// Which controller this link reaches: a new one after it was dialed
+    /// again, which has heard none of this worker's reports.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 impl ControlLink for ControlClient {
@@ -66,6 +91,28 @@ impl ControlLink for ControlClient {
         });
         tokio::spawn(watch_neighbors_loop(self.clone(), id, tx));
         rx
+    }
+
+    async fn report_state(&self, id: WorkerId, report: StateReport) -> Result<()> {
+        ControlClient::report_state(self, tarpc::context::current(), id, report)
+            .await
+            .context("report_state rpc")
+    }
+
+    async fn locate(
+        &self,
+        asker: WorkerId,
+        keys: Vec<[u8; 32]>,
+    ) -> Result<Vec<(WorkerId, String, u32)>> {
+        ControlClient::locate(self, tarpc::context::current(), asker, keys)
+            .await
+            .context("locate rpc")
+    }
+
+    async fn link(&self, worker: WorkerId) -> Result<Option<String>> {
+        ControlClient::link(self, tarpc::context::current(), worker)
+            .await
+            .context("link rpc")
     }
 }
 
@@ -153,6 +200,50 @@ impl ControlLink for Controller {
                 Err(e).context("report_worker rpc")
             }
         }
+    }
+
+    async fn report_state(&self, id: WorkerId, report: StateReport) -> Result<()> {
+        let (client, seen) = self.client();
+        match client
+            .report_state(tarpc::context::current(), id, report)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("report_state rpc")
+            }
+        }
+    }
+
+    async fn locate(
+        &self,
+        asker: WorkerId,
+        keys: Vec<[u8; 32]>,
+    ) -> Result<Vec<(WorkerId, String, u32)>> {
+        let (client, seen) = self.client();
+        match client.locate(tarpc::context::current(), asker, keys).await {
+            Ok(found) => Ok(found),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("locate rpc")
+            }
+        }
+    }
+
+    async fn link(&self, worker: WorkerId) -> Result<Option<String>> {
+        let (client, seen) = self.client();
+        match client.link(tarpc::context::current(), worker).await {
+            Ok(link) => Ok(link),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("link rpc")
+            }
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.client().1
     }
 
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
@@ -286,6 +377,7 @@ pub fn spawn_control_tasks<C: ControlLink>(
     info: WorkerInfo,
     mut gateways: GatewayLinkManager,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    let state_task = tokio::spawn(crate::link::peer::report_state(ctrl.clone(), worker_id));
     let heartbeat_ctrl = ctrl.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -411,5 +503,5 @@ pub fn spawn_control_tasks<C: ControlLink>(
         }
     });
 
-    vec![heartbeat_task, report_task, watch_task]
+    vec![state_task, heartbeat_task, report_task, watch_task]
 }

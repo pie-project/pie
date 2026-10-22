@@ -11,7 +11,8 @@ use ids::{ReqId, SessionId, TenantId, WorkerId};
 use tokio::sync::{mpsc, watch};
 use worker_api::{BlobRef, Priority, Request, Tokens};
 
-use crate::policy::wit::{By, Outcome};
+use crate::policy::By;
+use controller_api::Outcome;
 
 const DEFAULT_PIPE_CAP: usize = 256;
 

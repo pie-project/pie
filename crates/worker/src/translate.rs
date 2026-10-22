@@ -140,8 +140,10 @@ fn build_model(
     let engines = engines
         .groups
         .into_iter()
-        .map(|g| {
+        .enumerate()
+        .map(|(group, g)| {
             let backend_kind = g.backend.kind().to_string();
+            let disk_kept = kept_disk(m, group, &g);
             runtime::bootstrap::EngineConfig {
                 total_pages: g.caps.pools.kv_pages as usize,
                 window_pages: g.caps.pools.window_pages,
@@ -149,6 +151,7 @@ fn build_model(
                 cpu_pages: g.caps.pools.host_kv_pages as usize,
                 cpu_window_pages: g.caps.pools.host_window_pages,
                 disk_pages: g.caps.pools.disk_kv_pages,
+                disk_kept,
                 kv_copy: g.caps.kv_copy,
                 backend_kind,
                 rs_cache_required: g.caps.pools.state_slots != 0,
@@ -197,4 +200,30 @@ fn build_model(
         engines,
         scheduler: scheduler(runtime),
     })
+}
+
+/// The disk tier `g` keeps for the next run, its journal beside its slot
+/// files, when `disk_kv_persistent` asked for one and the engine kept it.
+fn kept_disk(
+    m: &config::ModelConfig,
+    group: usize,
+    g: &crate::backend::GroupEngine,
+) -> Option<runtime::bootstrap::KeptDisk> {
+    let pools = &g.caps.pools;
+    match (&g.disk_kv_dir, pools.disk_kv_persistent) {
+        (Some(dir), true) => Some(runtime::bootstrap::KeptDisk {
+            journal: dir.join(format!("g{group}.journal")),
+            kept: pools.disk_kv_kept,
+        }),
+        _ => {
+            if m.disk_kv_persistent {
+                tracing::warn!(
+                    engine = %g.backend.kind(),
+                    disk_pages = pools.disk_kv_pages,
+                    "disk_kv_persistent: this engine keeps no disk tier across runs; it is scratch"
+                );
+            }
+            None
+        }
+    }
 }

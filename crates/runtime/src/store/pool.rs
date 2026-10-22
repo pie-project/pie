@@ -35,6 +35,18 @@ impl<I: PoolId> Pool<I> {
         Some(self.free.split_off(at))
     }
 
+    /// Takes `id` out of the free list, as a reservation; false when it is
+    /// not free.
+    pub fn take(&mut self, id: I) -> bool {
+        match self.free.iter().position(|free| free.index() == id.index()) {
+            Some(at) => {
+                self.free.swap_remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn recycle_after_epoch(&mut self, ids: Vec<I>, epoch: u64) {
         if !ids.is_empty() {
             self.pending.push((epoch, ids));

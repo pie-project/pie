@@ -521,3 +521,91 @@ async fn restore(
     planner.report_restored(pid);
     crate::scheduler::nudge(engine);
 }
+
+/// Persists the sealed run `keys` (from token 0) on the disk tier of
+/// `engine`: each resident page not on disk yet is copied to a fresh slot
+/// and stays where it is, then the journal names it. Answers the pages
+/// persisted; none when the tier is not kept, is full, or the run is not
+/// held here.
+pub(super) async fn persist(
+    model: usize,
+    engine: usize,
+    keys: Vec<crate::store::kv::hash::Hash256>,
+    retention: i64,
+) -> Result<usize, String> {
+    let stores = crate::store::registry::get(model, engine);
+    let Some(txn) = crate::store::registry::with_kv_lock(&stores.kv, "persist", |kv| {
+        kv.prepare_persist(&keys, retention)
+    }) else {
+        return Ok(0);
+    };
+    let (device, slots) = txn.copy_plan();
+    let copy = TierMove {
+        kind: TierKind::Kv,
+        tier: MemoryDomain::LocalDisk,
+        out: true,
+        device,
+        slots,
+    };
+    let mut guard = PersistGuard {
+        model,
+        engine,
+        txn: Some(txn),
+        in_flight: None,
+    };
+    let started = Instant::now();
+    let completion = crate::scheduler::copy_tier_tracked(engine, &copy)
+        .map_err(|error| format!("{} submit: {error:#}", copy.label()))?;
+    guard.in_flight = Some(completion.clone());
+    let copied = completion.wait().await;
+    guard.in_flight = None;
+    if let Some(planner) = crate::planner::planner_for(model, engine) {
+        planner.record_tier_copy(&copy, started.elapsed());
+    }
+    copied.map_err(|error| format!("{} copy: {error}", copy.label()))?;
+    let txn = guard.txn.take().expect("persist present");
+    Ok(crate::store::registry::with_kv_lock(
+        &stores.kv,
+        "persist",
+        |kv| kv.commit_persist(txn),
+    ))
+}
+
+/// Gives back a persist's slots when it is dropped before it commits,
+/// after any copy in flight.
+struct PersistGuard {
+    model: usize,
+    engine: usize,
+    txn: Option<crate::store::kv::KvPersistTxn>,
+    in_flight: Option<crate::scheduler::ControlCompletion>,
+}
+
+impl Drop for PersistGuard {
+    fn drop(&mut self) {
+        let Some(txn) = self.txn.take() else {
+            return;
+        };
+        let (model, engine) = (self.model, self.engine);
+        let abort = move || {
+            let stores = crate::store::registry::get(model, engine);
+            crate::store::registry::with_kv_lock(&stores.kv, "persist-abort", |kv| {
+                kv.abort_persist(txn)
+            });
+        };
+        match self.in_flight.take() {
+            None => abort(),
+            Some(completion) if crate::rt::has_runtime() => {
+                crate::rt::spawn(async move {
+                    let _ = completion.wait().await;
+                    abort();
+                });
+            }
+            Some(_) => tracing::error!(
+                model,
+                engine,
+                "persist dropped with an engine copy in flight and no runtime; \
+                 keeping its slots to avoid reuse during the copy"
+            ),
+        }
+    }
+}

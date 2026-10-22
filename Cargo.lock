@@ -839,16 +839,23 @@ name = "controller"
 version = "0.5.4"
 dependencies = [
  "anyhow",
+ "builtins",
  "controller-api",
  "futures",
  "ids",
+ "pie-client-api",
  "rustix",
  "serde",
+ "serde_json",
  "tarpc",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "toml",
  "tracing",
+ "wasmparser 0.259.0",
+ "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]
@@ -2357,6 +2364,7 @@ dependencies = [
  "blake3",
  "builtins",
  "bytes",
+ "controller",
  "controller-api",
  "futures",
  "ids",
@@ -2365,14 +2373,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tarpc",
- "thiserror 2.0.21",
  "tokio",
  "toml",
  "tower",
  "tracing",
- "wasmparser 0.259.0",
- "wasmtime",
- "wasmtime-wasi",
  "worker-api",
 ]
 

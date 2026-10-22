@@ -84,6 +84,12 @@ pub struct Residency {
     pub disk_kv_budget: Option<u64>,
     #[serde(default)]
     pub disk_kv_dir: Option<PathBuf>,
+    /// Keeps the slot files under `disk_kv_dir` for the next run, beside a
+    /// meta naming the layout they were written in, instead of unlinking
+    /// them: a persistent tier. Which slots mean anything is the runtime's
+    /// to remember.
+    #[serde(default)]
+    pub disk_kv_persistent: bool,
     /// Hands the kv planes to other workers to read in place
     /// ([`crate::Engine::export_kv_handle`]): the engine commits them whole
     /// at load and keeps them mapped for its life.
@@ -126,6 +132,7 @@ impl Residency {
             kv_seats: None,
             disk_kv_budget: Some(0),
             disk_kv_dir: None,
+            disk_kv_persistent: false,
             kv_export: false,
         }
     }

@@ -26,13 +26,13 @@ const TURN_QUEUE_DEPTH: usize = 64;
 
 pub struct GatewayLink {
     serve_task: tokio::task::JoinHandle<()>,
-    state_task: tokio::task::JoinHandle<()>,
+    alive_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for GatewayLink {
     fn drop(&mut self) {
         self.serve_task.abort();
-        self.state_task.abort();
+        self.alive_task.abort();
     }
 }
 
@@ -74,7 +74,7 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         .with_context(|| format!("registering worker with gateway at {addr}"))?;
     tracing::info!(%worker_id, gateway = %addr, "worker registered with gateway (dial-in)");
 
-    let state_task = tokio::spawn(crate::link::peer::report_state(gateway.clone(), worker_id));
+    let alive_task = tokio::spawn(keep_alive(gateway.clone(), worker_id));
     let server = WorkerControlServer {
         worker_id,
         gateway,
@@ -90,8 +90,26 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
 
     Ok(GatewayLink {
         serve_task,
-        state_task,
+        alive_task,
     })
+}
+
+/// How often a link to a gateway is checked.
+const ALIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Calls the gateway each [`ALIVE_EVERY`] until its link is down, so the
+/// link is reaped and dialed again.
+async fn keep_alive(gateway: GatewayInboundClient, worker_id: WorkerId) {
+    loop {
+        if let Err(tarpc::client::RpcError::Shutdown) = gateway
+            .report(tarpc::context::current(), worker_id, Default::default())
+            .await
+        {
+            tracing::info!("the gateway link is down; ending it");
+            return;
+        }
+        tokio::time::sleep(ALIVE_EVERY).await;
+    }
 }
 
 pub struct GatewayLinkManager {
@@ -177,7 +195,7 @@ impl GatewayLinkManager {
         let dead: Vec<String> = self
             .links
             .iter()
-            .filter(|(_, link)| link.serve_task.is_finished() || link.state_task.is_finished())
+            .filter(|(_, link)| link.serve_task.is_finished() || link.alive_task.is_finished())
             .map(|(addr, _)| addr.clone())
             .collect();
         for addr in &dead {
@@ -263,8 +281,14 @@ impl WorkerControl for WorkerControlServer {
         _: tarpc::context::Context,
         keys: Vec<[u8; 32]>,
         from: String,
-        _: i64,
+        retention: i64,
+        disk: bool,
     ) -> Result<u32, String> {
+        if disk {
+            let pages = runtime::planner::persist_run(keys, retention).await?;
+            tracing::info!(target: "pie::offload", pages, "kept a run on the persistent disk tier");
+            return Ok(u32::try_from(pages).unwrap_or(u32::MAX));
+        }
         let pages = runtime::offload::prefill::replicate(keys, from.clone())
             .await
             .map_err(|e| format!("{e:#}"))?;

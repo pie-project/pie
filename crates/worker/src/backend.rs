@@ -183,7 +183,7 @@ fn land(
     platform: poem_ir::Platform,
     frames_in_flight: u8,
     overrides: &runtime::engine::load::Overrides,
-) -> Result<(engine::Loaded, String)> {
+) -> Result<(engine::Loaded, String, Option<PathBuf>)> {
     let mut request = runtime::engine::load::request(
         overrides,
         snapshot_dir,
@@ -204,8 +204,9 @@ fn land(
         }
     }
     let deployment = request.trace.name.clone();
+    let disk_kv_dir = request.residency.disk_kv_dir.clone();
     let loaded = backend.load(request).map_err(anyhow::Error::from)?;
-    Ok((loaded, deployment))
+    Ok((loaded, deployment, disk_kv_dir))
 }
 
 fn register_operator_adapters(
@@ -325,7 +326,7 @@ pub(crate) fn create_engine_backend_group(
     let EngineOptions::CudaNative(opts) = &rank_options[0] else {
         unreachable!("validated cuda options above");
     };
-    let (loaded, deployment) = land(
+    let (loaded, deployment, disk_kv_dir) = land(
         &mut backend,
         snapshot_dir,
         cache_dir,
@@ -348,6 +349,7 @@ pub(crate) fn create_engine_backend_group(
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
+        disk_kv_dir,
         backend,
     })
 }
@@ -638,7 +640,7 @@ pub(crate) fn create_engine_backend(
             reason = "`EngineOptions` has no variants in this build"
         )
     )]
-    let (loaded, deployment) = land(
+    let (loaded, deployment, disk_kv_dir) = land(
         &mut backend,
         snapshot_dir,
         cache_dir,
@@ -656,6 +658,7 @@ pub(crate) fn create_engine_backend(
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
+        disk_kv_dir,
         backend,
     })
 }
@@ -740,6 +743,8 @@ pub struct GroupEngine {
     pub caps: EngineCapabilities,
     pub facts: engine::LoadFacts,
     pub snapshot_dir: PathBuf,
+    /// Where the disk tier's slot files are, when it has one.
+    pub disk_kv_dir: Option<PathBuf>,
     pub backend: runtime::engine::EngineBox,
 }
 

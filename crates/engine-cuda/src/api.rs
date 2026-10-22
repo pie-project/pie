@@ -607,6 +607,7 @@ impl Engine for Cuda {
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
+                residency.disk_kv_persistent,
                 self.boot.world,
             )
             .map_err(fault)?;
@@ -660,6 +661,8 @@ impl Engine for Cuda {
                 host_state_slots: shell.host_state_slots(),
                 host_buffer_pages: shell.host_buffer_pages(),
                 disk_kv_pages,
+                disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
+                disk_kv_kept: shell.disk_kv_kept(),
                 one_frame_when_short: shell.one_frame_when_short(),
                 seated_first: shell.seated_first(),
             },

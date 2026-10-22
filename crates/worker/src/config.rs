@@ -544,7 +544,8 @@ pub struct ModelConfig {
     /// How many disk bytes suspended kv may spill into once host swap is
     /// full (`"200GiB"`), shared by the ranks, each in its own slot file
     /// under `disk_kv_path` (default `$PIE_HOME/cache/kv/<checkpoint
-    /// digest>`), unlinked once open so it never outlives the server. Metal
+    /// digest>`), unlinked once open so it never outlives the server unless
+    /// `disk_kv_persistent`. Metal
     /// and Vulkan keep no host tier, so there it is the only one, and
     /// suspended rs slots go to it too. Omit for four host tiers' worth on
     /// cuda, or every seat at full context elsewhere, within a quarter of
@@ -554,6 +555,13 @@ pub struct ModelConfig {
     pub disk_kv_budget: Option<ByteSize>,
     #[serde(default)]
     pub disk_kv_path: Option<std::path::PathBuf>,
+    /// Keeps the disk tier for the next run: its slot files stay under
+    /// `disk_kv_path` with a journal of the sealed pages they hold, and a
+    /// restart takes those pages back as cache. Swap and cache share
+    /// `disk_kv_budget`, suspended kv first. Off by default; cuda only, and
+    /// not for a model with recurrent state or a window.
+    #[serde(default)]
+    pub disk_kv_persistent: bool,
     /// **MAY A WARM BOOT DEFER THE PINNED TIER?** On (the default) T1's
     /// planes are verified where they lie in the artifact and served from
     /// there while a background thread builds the page-locked copy, so the
@@ -783,6 +791,7 @@ impl ModelConfig {
             kv_seats: None,
             disk_kv_budget: self.disk_kv_budget.map(|b| b.as_bytes()),
             disk_kv_dir: self.disk_kv_path.clone(),
+            disk_kv_persistent: self.disk_kv_persistent,
             kv_export: false,
         }
     }

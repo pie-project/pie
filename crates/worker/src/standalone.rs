@@ -4,7 +4,9 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use anyhow::{Context, Result};
-use controller_api::{Ack, GatewayInfo, Neighbors, RoutingTable, WorkerInfo, WorkerStatus};
+use controller_api::{
+    Ack, DirectoryView, GatewayInfo, Neighbors, RoutingTable, StateReport, WorkerInfo, WorkerStatus,
+};
 use ids::{GatewayId, NodeId, WorkerId};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -32,6 +34,23 @@ impl ControlLink for EmbeddedControl {
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
         self.0.worker_watch(id)
     }
+
+    async fn report_state(&self, id: WorkerId, report: StateReport) -> Result<()> {
+        self.0.report_state(id, report);
+        Ok(())
+    }
+
+    async fn locate(
+        &self,
+        asker: WorkerId,
+        keys: Vec<[u8; 32]>,
+    ) -> Result<Vec<(WorkerId, String, u32)>> {
+        Ok(self.0.locate(asker, &keys))
+    }
+
+    async fn link(&self, worker: WorkerId) -> Result<Option<String>> {
+        Ok(self.0.link(worker))
+    }
 }
 
 impl gateway::GatewayControl for EmbeddedControl {
@@ -47,12 +66,33 @@ impl gateway::GatewayControl for EmbeddedControl {
         self.0.gateway_watch()
     }
 
-    async fn desire_scale(
+    async fn cluster_events(
         &self,
         gateway: GatewayId,
-        entries: Vec<controller_api::ScaleEntry>,
+        events: Vec<controller_api::ProcessEvent>,
     ) -> Result<()> {
-        self.0.desire_scale(gateway, entries).await;
+        self.0.cluster_events(gateway, events);
+        Ok(())
+    }
+
+    fn decisions_watch(
+        &self,
+        gateway: GatewayId,
+    ) -> watch::Receiver<controller_api::GatewayDecisions> {
+        self.0.decisions_watch(gateway)
+    }
+
+    fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
+        self.0.directory_watch()
+    }
+
+    async fn report_state(&self, worker: WorkerId, report: StateReport) -> Result<()> {
+        self.0.report_state(worker, report);
+        Ok(())
+    }
+
+    async fn forget_state(&self, worker: WorkerId) -> Result<()> {
+        self.0.forget_state(worker);
         Ok(())
     }
 }
@@ -60,19 +100,17 @@ impl gateway::GatewayControl for EmbeddedControl {
 /// Swaps both planes' policies of a `pie serve` process.
 #[derive(Clone)]
 pub struct PolicyReload {
-    policies: Option<std::sync::Arc<gateway::policy::Cluster>>,
+    controller: controller::Handle,
 }
 
 impl PolicyReload {
-    /// For those `config` names: the in-proc gateway's `[server] policies`,
-    /// where it started with any, and the worker's `[runtime] policy`.
+    /// For those `config` names: the in-proc controller's cluster policies
+    /// (`[server] policies`) and the worker's `[runtime] policy`.
     pub async fn reload(&self, config: &crate::Config) -> Result<()> {
-        match &self.policies {
-            Some(policies) => gateway::reload_policies(policies, &config.server.policies).await?,
-            None if !config.server.policies.is_empty() => {
-                tracing::warn!("no cluster policies to reload: this server started with none");
-            }
-            None => {}
+        if !config.server.policies.is_empty() {
+            self.controller
+                .reload_policies(&config.server.policies)
+                .await?;
         }
         crate::reload_policy(config).await
     }
@@ -81,8 +119,7 @@ impl PolicyReload {
 pub struct StandaloneHandle {
     pub listen_addr: SocketAddr,
     pub worker_addr: SocketAddr,
-    policies: Option<std::sync::Arc<gateway::policy::Cluster>>,
-    _controller: controller::Handle,
+    controller: controller::Handle,
     worker: crate::WorkerHandle,
     gateway: JoinHandle<()>,
 }
@@ -92,7 +129,7 @@ impl StandaloneHandle {
     #[must_use]
     pub fn policy_reload(&self) -> PolicyReload {
         PolicyReload {
-            policies: self.policies.clone(),
+            controller: self.controller.clone(),
         }
     }
 
@@ -133,7 +170,6 @@ pub async fn run_standalone(
         .context("bind in-proc gateway")?;
     let listen_addr = gw.listen_addr;
     let worker_addr = gw.worker_addr;
-    let policies = gw.state.router.clone();
 
     let worker = crate::run_with(
         worker,
@@ -154,8 +190,7 @@ pub async fn run_standalone(
     Ok(StandaloneHandle {
         listen_addr,
         worker_addr,
-        policies,
-        _controller: handle,
+        controller: handle,
         worker,
         gateway,
     })
@@ -167,8 +202,8 @@ pub fn derive_standalone(
     combined: &str,
 ) -> Result<(controller::Config, gateway::Config, crate::Config)> {
     let worker = crate::Config::parse(combined).context("parsing config")?;
-    let controller = controller::Config::parse("").context("controller defaults")?;
-    let mut gateway = gateway::Config::parse("").context("gateway defaults")?;
-    gateway.policies = worker.server.policies.clone();
+    let mut controller = controller::Config::parse("").context("controller defaults")?;
+    controller.policies = worker.server.policies.clone();
+    let gateway = gateway::Config::parse("").context("gateway defaults")?;
     Ok((controller, gateway, worker))
 }

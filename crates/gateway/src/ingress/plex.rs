@@ -22,9 +22,7 @@ pub async fn session_props(
     }
     let id = format!("{}/{session}", tenant(&headers));
     let text = serde_json::to_string(&changes).unwrap_or_default();
-    if let Some(router) = &state.router {
-        router.session_props(id.clone(), changes);
-    }
+    state.router.session_props(id.clone(), changes);
     fan_out(&state, id, Some(text)).await;
     Json(json!({"ok": true})).into_response()
 }
@@ -38,9 +36,7 @@ pub async fn session_close(
         return refused(why);
     }
     let id = format!("{}/{session}", tenant(&headers));
-    if let Some(router) = &state.router {
-        router.session_closed(id.clone());
-    }
+    state.router.session_closed(id.clone());
     fan_out(&state, id, None).await;
     Json(json!({"ok": true})).into_response()
 }

@@ -1,139 +1,124 @@
-//! The cluster policy on its own thread, with its own record of processes built
-//! from the same events as its edges.
+//! The cluster policies' client: this gateway's processes, told to the
+//! controller in order, and the controller's decisions about them, applied.
+//! The gate, the order launches leave in, and where each goes stay here, on
+//! the request path; what decides them runs once, in the controller.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 use client_api::{ClientMessage, Props};
-use controller_api::{Health, Role, RoutableWorker, RoutingTable, ScaleEntry};
+use controller_api::{GatewayDecisions, Outcome, PlacementView, ProcessEvent, ReplicateOrder};
 use ids::{GatewayId, ReqId, WorkerId};
 use tokio::sync::{Notify, mpsc, watch};
 use worker_api::Request;
 
-use super::program::{self, Commit, Fault, LoadError, Plane, Program, Table};
-use super::wit::{self, Edge, Outcome, Subject, SubjectKind, Value};
 use crate::admission::{AdmissionDecision, RejectReason};
+use crate::controller::GatewayControl;
 use crate::route::RoutingHandle;
 use crate::session::AdmitReject;
 
-/// What this host carries whatever its controller can do. `cluster.scale`
-/// is not among them: it is there only while the controller has an actuator
-/// to meet a scale table, so a policy `uses` it and reads it at run time.
-fn capability(name: &str) -> bool {
-    // Runs replicate to pools and to serving workers' host tiers; a group
-    // retained above key 0 keeps a copy in a pool; a running turn that has
-    // sent no output moves by ending where it runs and running again where
-    // it goes; the workers a placement names run its process's passes.
-    matches!(
-        name,
-        "cluster.hold"
-            | "state.replicate"
-            | "state.retain"
-            | "placement.migrate"
-            | "placement.executors"
-    )
+/// Who caused a process's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum By {
+    Policy,
+    Host,
+    Client,
 }
 
-/// How often the policy hears what the directory holds, and its replication
-/// and retention tables are enacted again.
-const STATE_TICK: Duration = Duration::from_secs(1);
-/// A copy asked for and not yet seen done is asked again after this.
+/// A copy asked of a worker and not yet seen done is asked again after this.
 const REPLICATE_RETRY: Duration = Duration::from_secs(30);
 
-fn hex(key: &[u8; 32]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
+/// The controller's decisions about this gateway's processes, as last heard.
+#[derive(Default)]
+struct Decided {
+    active: bool,
+    schedule: Option<(HashMap<u64, i64>, Option<i64>)>,
+    placements: HashMap<u64, PlacementView>,
 }
 
+/// What this gateway did about the decisions, so each acts once.
 #[derive(Default)]
-struct Tables {
-    schedule: Option<Table>,
-    placement: HashMap<String, wit::Placement>,
-    /// Each process's executors, best first.
-    executors: HashMap<String, Vec<String>>,
+struct Acted {
+    /// Where each of its processes runs.
+    running: HashMap<u64, WorkerId>,
+    cancelled: HashSet<u64>,
+    /// Moves asked of the sessions: (process, target).
+    moves: HashSet<(u64, WorkerId)>,
+    /// Copies asked of workers, and when.
+    asked: HashMap<(String, WorkerId, bool), Instant>,
 }
 
 struct Shared {
-    tables: RwLock<Tables>,
-    /// The scale table, for the controller to converge on: none until a
-    /// program granted `scale` writes one, so a gateway whose programs hold
-    /// no such grant never speaks for the cluster's size.
-    scale: watch::Sender<Option<Vec<ScaleEntry>>>,
-    waiting: Mutex<BTreeMap<u64, String>>,
-    refused: Mutex<HashMap<String, Option<String>>>,
+    decided: RwLock<Decided>,
+    /// Launches past the gate, by arrival: their request ids.
+    waiting: Mutex<BTreeMap<u64, u64>>,
+    /// Launches at the gate: the reason one was refused.
+    refused: Mutex<HashMap<u64, Option<String>>>,
     cancels: mpsc::UnboundedSender<ReqId>,
-    /// Running processes the placement table moved, and where to.
+    /// Running processes the placement moved, and where to.
     migrations: mpsc::UnboundedSender<(ReqId, WorkerId)>,
-    /// The last arrival a call has heard, or would have had it listened.
+    /// The highest arrival every program has heard.
     heard: watch::Sender<u64>,
+    gate_ms: AtomicU64,
+    acted: Mutex<Acted>,
     changed: Notify,
+    /// What a controller new to this gateway is told first: each live
+    /// process's arrival, and each session's props.
+    told: Mutex<Told>,
+}
+
+#[derive(Default)]
+struct Told {
+    workers: Vec<WorkerId>,
+    arrived: BTreeMap<u64, ProcessEvent>,
+    sessions: HashMap<String, Props>,
+}
+
+impl Shared {
+    /// The events that bring a new controller up to date: the workers
+    /// linked here, each live process's arrival, then where it runs, then
+    /// each session's props.
+    fn retell(&self) -> Vec<ProcessEvent> {
+        let told = self.told.lock().unwrap();
+        let running = self.acted.lock().unwrap().running.clone();
+        let mut events = vec![ProcessEvent::Workers(told.workers.clone())];
+        events.extend(told.arrived.values().cloned());
+        events.extend(told.arrived.keys().filter_map(|req| {
+            Some(ProcessEvent::Dispatched {
+                req: *req,
+                worker: *running.get(req)?,
+            })
+        }));
+        events.extend(
+            told.sessions
+                .iter()
+                .map(|(id, props)| ProcessEvent::SessionProps {
+                    id: id.clone(),
+                    changes: json_props(props),
+                }),
+        );
+        events
+    }
+}
+
+fn json_props(props: &Props) -> Vec<(String, String)> {
+    props
+        .iter()
+        .map(|(name, value)| (name.clone(), value.to_string()))
+        .collect()
 }
 
 pub struct Cluster {
-    events: Sender<Event>,
+    events: mpsc::UnboundedSender<ProcessEvent>,
     shared: Arc<Shared>,
-    /// How long a launch waits for the slowest program to hear it, in ms;
-    /// a reload sets it anew.
-    gate_ms: AtomicU64,
     next_seq: AtomicU64,
-    dead: Arc<AtomicBool>,
 }
 
-enum Event {
-    Arrived {
-        id: String,
-        seq: u64,
-        tenant: String,
-        session: Option<String>,
-        props: Props,
-    },
-    Dispatched {
-        id: String,
-        worker: String,
-    },
-    Counted {
-        id: String,
-        prompt: u64,
-        generated: u64,
-    },
-    Exited {
-        id: String,
-        outcome: Outcome,
-    },
-    Workers(BTreeSet<String>),
-    SessionProps {
-        id: String,
-        changes: Props,
-    },
-    SessionClosed {
-        id: String,
-    },
-    Moved {
-        id: String,
-        worker: Option<String>,
-        why: String,
-    },
-    /// Swap every program for these (name, component), loaded whole first:
-    /// the answer is the new set's gate, or why it did not load.
-    Reload {
-        programs: Vec<(String, Vec<u8>)>,
-        answer: tokio::sync::oneshot::Sender<Result<u64, LoadError>>,
-    },
-    /// The directory's groups and pools, and what worker policies
-    /// published, as of now.
-    State(
-        HashMap<String, crate::directory::Group>,
-        Vec<String>,
-        HashMap<String, HashMap<String, serde_json::Value>>,
-    ),
-}
-
-/// A started cluster policy, the launches it cancelled, and the moves it
-/// asked for: (process, the worker it is to run on).
+/// A started client, the launches the policies cancelled, and the moves
+/// they asked for: (process, the worker it is to run on).
 pub type Started = (
     Arc<Cluster>,
     mpsc::UnboundedReceiver<ReqId>,
@@ -141,165 +126,172 @@ pub type Started = (
 );
 
 impl Cluster {
-    /// Starts the cluster policies `programs` names, (name, component), on
-    /// one thread: each call goes to every one, and each writes what its
-    /// manifest grants it, which no other may.
-    ///
-    /// `me` is this gateway's id once registered: while the routing table
-    /// names it the author, it enacts the cluster-wide tables (replication,
-    /// retention; scale goes by the heartbeat loop). Otherwise its programs
-    /// run all the same and their tables are taken, but not enacted.
-    pub fn start(
-        programs: Vec<(String, Vec<u8>)>,
-        routing: watch::Receiver<RoutingTable>,
-        me: watch::Receiver<Option<GatewayId>>,
+    /// Takes part in the cluster policies through `control`, once this
+    /// gateway has an id (`me`): tells them of its processes and the workers
+    /// linked to it (`connected`), and applies their decisions; as the
+    /// routing table's author, it carries their copies to workers
+    /// (`fleet`).
+    pub fn start<C: GatewayControl>(
+        control: C,
+        mut me: watch::Receiver<Option<GatewayId>>,
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
         fleet: crate::worker::WorkerRegistry,
-    ) -> Result<Started, LoadError> {
-        // A program is named by its built-in name, or by its file's stem: the
-        // name keys what it publishes, so it holds no `/`.
-        let programs: Vec<(String, Vec<u8>)> = programs
-            .into_iter()
-            .map(|(spec, component)| (program_name(&spec), component))
-            .collect();
+    ) -> Started {
         let (cancels, cancelled) = mpsc::unbounded_channel();
         let (migrations, moves) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
-            tables: RwLock::default(),
-            scale: watch::Sender::new(None),
+            decided: RwLock::default(),
             waiting: Mutex::default(),
             refused: Mutex::default(),
             cancels,
             migrations,
             heard: watch::Sender::new(0),
+            gate_ms: AtomicU64::new(0),
+            acted: Mutex::default(),
             changed: Notify::new(),
+            told: Mutex::default(),
         });
-        let (events, rx) = channel();
-        let dead = Arc::new(AtomicBool::new(false));
-        let names: Vec<String> = programs.iter().map(|(name, _)| name.clone()).collect();
-        let manifests = program::spawn(programs, capability, "pie-cluster-policy", {
-            let (shared, dead) = (shared.clone(), dead.clone());
-            let (fleet, handle) = (fleet.clone(), tokio::runtime::Handle::current());
-            move |programs| run(programs, rx, shared, routing, me, dead, fleet, handle)
-        })?;
-        let gate_ms = gate_of(manifests.iter());
-
+        let (events, mut rx) = mpsc::unbounded_channel::<ProcessEvent>();
         let workers = events.clone();
+        let decisions_shared = shared.clone();
+        let events_shared = shared.clone();
+        let workers_shared = shared.clone();
         tokio::spawn(async move {
+            let Ok(gateway) = me
+                .wait_for(Option::is_some)
+                .await
+                .map(|id| id.expect("some"))
+            else {
+                return;
+            };
+            // The decisions.
+            let mut decisions = control.decisions_watch(gateway);
+            let shared = decisions_shared;
+            tokio::spawn(async move {
+                loop {
+                    let view = decisions.borrow_and_update().clone();
+                    apply(&shared, view, &fleet);
+                    if decisions.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+            // The workers linked here.
+            let told = workers_shared;
+            tokio::spawn(async move {
+                loop {
+                    let now: Vec<WorkerId> =
+                        connected.borrow_and_update().iter().copied().collect();
+                    told.told.lock().unwrap().workers = now.clone();
+                    if workers.send(ProcessEvent::Workers(now)).is_err()
+                        || connected.changed().await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            // The events, one batch at a time, in order; a controller new to
+            // this gateway hears first what the last one had.
+            let mut batch = Vec::new();
+            let mut generation = control.generation();
+            // A quiet gateway still finds a new controller out.
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
-                let ids = connected
-                    .borrow_and_update()
-                    .iter()
-                    .map(|w| w.0.to_string())
-                    .collect();
-                if workers.send(Event::Workers(ids)).is_err() || connected.changed().await.is_err()
-                {
-                    return;
+                tokio::select! {
+                    got = rx.recv_many(&mut batch, 1024) => if got == 0 {
+                        return;
+                    },
+                    _ = tick.tick() => {}
+                }
+                let mut events = std::mem::take(&mut batch);
+                if control.generation() != generation {
+                    generation = control.generation();
+                    let mut retold = events_shared.retell();
+                    tracing::info!(
+                        processes = retold.len(),
+                        "telling a new controller this gateway's processes"
+                    );
+                    retold.append(&mut events);
+                    events = retold;
+                }
+                if events.is_empty() {
+                    continue;
+                }
+                if let Err(error) = control.cluster_events(gateway, events).await {
+                    tracing::warn!(error = %format!("{error:#}"), "cluster policy events not delivered");
                 }
             }
         });
-        let ticks = events.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(STATE_TICK).await;
-                let directory = fleet.directory();
-                let groups = directory
-                    .groups()
-                    .into_iter()
-                    .map(|(last, group)| (hex(&last), group))
-                    .collect();
-                let pools = directory.pools().iter().map(|w| w.0.to_string()).collect();
-                let published = directory
-                    .published_by_workers()
-                    .into_iter()
-                    .map(|(w, map)| (w.0.to_string(), map))
-                    .collect();
-                if ticks.send(Event::State(groups, pools, published)).is_err() {
-                    return;
-                }
-            }
-        });
-        tracing::info!(policies = ?names, "cluster policies started");
-        Ok((
+        (
             Arc::new(Self {
                 events,
                 shared,
-                gate_ms: AtomicU64::new(gate_ms),
                 next_seq: AtomicU64::new(0),
-                dead,
             }),
             cancelled,
             moves,
-        ))
+        )
     }
 
-    fn send(&self, event: Event) {
-        let _ = self.events.send(event);
+    /// Whether cluster policies run: only then does this gateway's gate and
+    /// placement follow them.
+    pub fn active(&self) -> bool {
+        self.shared.decided.read().unwrap().active
     }
 
-    /// Swaps every running program for `programs` (spec, component), as a
-    /// SIGHUP asks. The new set loads whole before anything changes; on an
-    /// error the old one runs on. The old programs stop as a dead one does:
-    /// their tables and what they published are withdrawn, and the others
-    /// hear it. The new ones start with no state of their own, a program
-    /// in both sets too, and read the cluster as it stands.
-    pub async fn reload(&self, programs: Vec<(String, Vec<u8>)>) -> Result<(), LoadError> {
-        if programs.is_empty() {
-            return Err(LoadError::Instantiate(
-                "a reload names at least one cluster policy; a gateway with none starts without \
-                 them"
-                    .into(),
-            ));
+    /// Tells the policies of `event`, while any run.
+    fn send(&self, event: ProcessEvent) {
+        if self.active() {
+            let _ = self.events.send(event);
         }
-        let programs = programs
-            .into_iter()
-            .map(|(spec, component)| (program_name(&spec), component))
-            .collect();
-        let (answer, answered) = tokio::sync::oneshot::channel();
-        self.events
-            .send(Event::Reload { programs, answer })
-            .map_err(|_| LoadError::Instantiate("the policy thread has ended".into()))?;
-        let gate_ms = answered
-            .await
-            .map_err(|_| LoadError::Instantiate("the policy thread has ended".into()))??;
-        self.gate_ms.store(gate_ms, Ordering::Release);
-        Ok(())
-    }
-
-    /// The scale table the policies installed (`install-scale`), whole;
-    /// none while no program granted `scale` has written one.
-    #[must_use]
-    pub fn scale_watch(&self) -> watch::Receiver<Option<Vec<ScaleEntry>>> {
-        self.shared.scale.subscribe()
     }
 
     pub async fn admit(&self, req: &Request, routing: &RoutingHandle) -> Result<(), AdmitReject> {
-        let id = req.req_id.0.to_string();
+        let id = req.req_id.0;
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let (props, session) = match &req.message {
             ClientMessage::LaunchProcess { props, session, .. } => (props.clone(), session.clone()),
             _ => Default::default(),
         };
-        self.shared.refused.lock().unwrap().insert(id.clone(), None);
-        self.send(Event::Arrived {
-            id: id.clone(),
+        // The prompt goes as the blocks its text hashes to.
+        let prompt =
+            client_api::props::prompt_of(props.iter()).map(client_api::props::prompt_blocks);
+        let props = props
+            .iter()
+            .filter(|(name, _)| name.as_str() != client_api::props::PROMPT)
+            .map(|(name, value)| (name.clone(), value.to_string()))
+            .collect();
+        self.shared.refused.lock().unwrap().insert(id, None);
+        let arrived = ProcessEvent::Arrived {
+            req: id,
             seq,
             tenant: req.tenant.0.clone(),
             session,
             props,
-        });
+            prompt,
+        };
+        if self.active() {
+            self.shared
+                .told
+                .lock()
+                .unwrap()
+                .arrived
+                .insert(id, arrived.clone());
+        }
+        self.send(arrived);
         let admitted = {
             let mut waiting = Waiting {
                 router: self,
                 seq,
-                id: &id,
+                id,
                 left: false,
             };
             self.pass(&mut waiting, req, routing).await
         };
         if admitted.is_err() {
-            self.send(Event::Exited {
-                id,
+            self.shared.told.lock().unwrap().arrived.remove(&id);
+            self.send(ProcessEvent::Exited {
+                req: id,
                 outcome: Outcome::Cancelled,
             });
         }
@@ -313,8 +305,8 @@ impl Cluster {
         routing: &RoutingHandle,
     ) -> Result<(), AdmitReject> {
         let (id, seq) = (waiting.id, waiting.seq);
-        let gate = Duration::from_millis(self.gate_ms.load(Ordering::Acquire));
-        if !gate.is_zero() && !self.dead.load(Ordering::Acquire) {
+        let gate = Duration::from_millis(self.shared.gate_ms.load(Ordering::Acquire));
+        if !gate.is_zero() {
             // Unanswered, the launch goes by the gateway's default.
             let mut heard = self.shared.heard.subscribe();
             let _ = tokio::time::timeout(gate, heard.wait_for(|&h| h >= seq)).await;
@@ -326,14 +318,14 @@ impl Cluster {
                 drop(queue);
                 return waiting.leave(Err(AdmitReject::Full(RejectReason::QueueFull.to_string())));
             }
-            queue.insert(seq, id.to_string());
+            queue.insert(seq, id);
         }
         let mut table = routing.table_watch();
         loop {
             let changed = self.shared.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if matches!(self.shared.refused.lock().unwrap().get(id), Some(Some(_))) {
+            if matches!(self.shared.refused.lock().unwrap().get(&id), Some(Some(_))) {
                 return waiting.leave(Ok(()));
             }
             if self.next(seq) {
@@ -358,84 +350,200 @@ impl Cluster {
 
     /// The highest key the schedule does not hold, the earliest among equals.
     fn next(&self, seq: u64) -> bool {
-        let tables = self.shared.tables.read().unwrap();
-        let schedule = tables.schedule.as_ref();
-        let key = |id: &str| schedule.map_or(0, |table| table.key(id));
-        let held = |id: &str| schedule.is_some_and(|t| t.floor.is_some_and(|f| t.key(id) < f));
+        let decided = self.shared.decided.read().unwrap();
+        let schedule = decided.schedule.as_ref();
+        let key = |id: u64| schedule.map_or(0, |(keys, _)| keys.get(&id).copied().unwrap_or(0));
+        let held = |id: u64| schedule.is_some_and(|(_, floor)| floor.is_some_and(|f| key(id) < f));
         self.shared
             .waiting
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, id)| !held(id))
-            .max_by_key(|(s, id)| (key(id), Reverse(**s)))
+            .filter(|(_, id)| !held(**id))
+            .max_by_key(|(s, id)| (key(**id), Reverse(**s)))
             .is_some_and(|(s, _)| *s == seq)
     }
 
-    /// Where the placement table puts `req`: its worker, its props, and the
+    /// Where the placement puts `req`: its worker, its props, and the
     /// workers its passes may run on, best first.
     pub fn placement(&self, req: &Request) -> (Option<WorkerId>, Props, Vec<WorkerId>) {
-        let tables = self.shared.tables.read().unwrap();
-        let id = req.req_id.0.to_string();
-        let executors = tables
-            .executors
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| id.parse().ok().map(WorkerId))
-            .collect();
-        let Some(placement) = tables.placement.get(&id) else {
-            return (None, Props::new(), executors);
+        let decided = self.shared.decided.read().unwrap();
+        let Some(placement) = decided.placements.get(&req.req_id.0) else {
+            return (None, Props::new(), Vec::new());
         };
-        let worker = placement
-            .worker
-            .as_deref()
-            .and_then(|w| w.parse().ok())
-            .map(WorkerId);
         let props = placement
             .props
             .iter()
-            .filter_map(|(name, value)| Some((name.clone(), json(value)?)))
+            .filter_map(|(name, json)| Some((name.clone(), serde_json::from_str(json).ok()?)))
             .collect();
-        (worker, props, executors)
+        (placement.worker, props, placement.executors.clone())
     }
 
     pub fn dispatched(&self, req: &Request, worker: WorkerId) {
-        self.send(Event::Dispatched {
-            id: req.req_id.0.to_string(),
-            worker: worker.0.to_string(),
+        self.shared
+            .acted
+            .lock()
+            .unwrap()
+            .running
+            .insert(req.req_id.0, worker);
+        move_misplaced(&self.shared);
+        self.send(ProcessEvent::Dispatched {
+            req: req.req_id.0,
+            worker,
         });
     }
 
     pub fn counted(&self, req: &Request, prompt: u64, generated: u64) {
-        self.send(Event::Counted {
-            id: req.req_id.0.to_string(),
+        self.send(ProcessEvent::Counted {
+            req: req.req_id.0,
             prompt,
             generated,
         });
     }
 
     pub fn session_props(&self, id: String, changes: Props) {
-        self.send(Event::SessionProps { id, changes });
+        if self.active() {
+            let mut told = self.shared.told.lock().unwrap();
+            let current = told.sessions.remove(&id).unwrap_or_default();
+            if let Ok((merged, _)) = client_api::props::merge(&current, changes.clone())
+                && !merged.is_empty()
+            {
+                told.sessions.insert(id.clone(), merged);
+            }
+        }
+        self.send(ProcessEvent::SessionProps {
+            id,
+            changes: json_props(&changes),
+        });
     }
 
     pub fn session_closed(&self, id: String) {
-        self.send(Event::SessionClosed { id });
+        self.shared.told.lock().unwrap().sessions.remove(&id);
+        self.send(ProcessEvent::SessionClosed { id });
     }
 
     /// A running process moved to `worker`, or (`None`) could not move.
     pub fn moved(&self, req: &Request, worker: Option<WorkerId>, why: &str) {
-        self.send(Event::Moved {
-            id: req.req_id.0.to_string(),
-            worker: worker.map(|w| w.0.to_string()),
+        if let Some(worker) = worker {
+            self.shared
+                .acted
+                .lock()
+                .unwrap()
+                .running
+                .insert(req.req_id.0, worker);
+            move_misplaced(&self.shared);
+        }
+        self.send(ProcessEvent::Moved {
+            req: req.req_id.0,
+            worker,
             why: why.to_string(),
         });
     }
 
     pub fn exited(&self, req: &Request, outcome: Outcome) {
-        self.send(Event::Exited {
-            id: req.req_id.0.to_string(),
-            outcome,
+        let id = req.req_id.0;
+        {
+            let mut acted = self.shared.acted.lock().unwrap();
+            acted.running.remove(&id);
+            acted.cancelled.remove(&id);
+            acted.moves.retain(|(of, _)| *of != id);
+        }
+        self.shared.told.lock().unwrap().arrived.remove(&id);
+        self.send(ProcessEvent::Exited { req: id, outcome });
+    }
+}
+
+/// Applies the controller's view: the gate and the placement as it says;
+/// a process it ended refused at the gate or cancelled once admitted; a
+/// running process it placed elsewhere moved, once per target; and, for the
+/// gateway that carries them, its copies asked of workers.
+fn apply(shared: &Shared, view: GatewayDecisions, fleet: &crate::worker::WorkerRegistry) {
+    shared.gate_ms.store(view.gate_ms, Ordering::Release);
+    {
+        let mut decided = shared.decided.write().unwrap();
+        decided.active = view.active;
+        decided.schedule = view
+            .schedule
+            .map(|schedule| (schedule.keys.into_iter().collect(), schedule.floor));
+        decided.placements = view.placements.into_iter().collect();
+    }
+    let mut acted = shared.acted.lock().unwrap();
+    {
+        let mut refused = shared.refused.lock().unwrap();
+        for (id, reason) in view.terminated {
+            if let Some(at_gate) = refused.get_mut(&id) {
+                at_gate.get_or_insert(reason);
+            } else if acted.cancelled.insert(id) {
+                let _ = shared.cancels.send(ReqId(id));
+            }
+        }
+    }
+    carry(&mut acted.asked, view.replicate, fleet);
+    drop(acted);
+    move_misplaced(shared);
+    shared.heard.send_replace(view.heard);
+    shared.changed.notify_waiters();
+}
+
+/// Moves each running process its placement names another worker for,
+/// once per target: whenever the placement or where it runs changes.
+fn move_misplaced(shared: &Shared) {
+    let decided = shared.decided.read().unwrap();
+    let mut acted = shared.acted.lock().unwrap();
+    let moves: Vec<(u64, WorkerId)> = acted
+        .running
+        .iter()
+        .filter_map(|(id, at)| {
+            let target = decided.placements.get(id)?.worker?;
+            (target != *at).then_some((*id, target))
+        })
+        .collect();
+    for (id, target) in moves {
+        if acted.moves.insert((id, target)) {
+            let _ = shared.migrations.send((ReqId(id), target));
+        }
+    }
+}
+
+/// Asks each worker for the copies `orders` names, again after
+/// [`REPLICATE_RETRY`] while the order stands.
+fn carry(
+    asked: &mut HashMap<(String, WorkerId, bool), Instant>,
+    orders: Vec<ReplicateOrder>,
+    fleet: &crate::worker::WorkerRegistry,
+) {
+    let now = Instant::now();
+    asked.retain(|_, at| now.duration_since(*at) < REPLICATE_RETRY);
+    for order in orders {
+        let key = (order.group.clone(), order.worker, order.disk);
+        if asked.contains_key(&key) {
+            continue;
+        }
+        let Some(client) = fleet.client(order.worker) else {
+            continue;
+        };
+        asked.insert(key, now);
+        tokio::spawn(async move {
+            let mut ctx = tarpc::context::current();
+            ctx.deadline = Instant::now() + Duration::from_secs(120);
+            let ReplicateOrder {
+                group,
+                worker,
+                keys,
+                from,
+                retention,
+                disk,
+                table,
+            } = order;
+            match client.replicate(ctx, keys, from, retention, disk).await {
+                Ok(Ok(pages)) => tracing::info!(%group, %worker, table, pages, disk, "replicated"),
+                Ok(Err(why)) => {
+                    tracing::warn!(%group, %worker, table, %why, disk, "replication refused")
+                }
+                Err(error) => {
+                    tracing::warn!(%group, %worker, table, %error, disk, "replication not delivered")
+                }
+            }
         });
     }
 }
@@ -443,7 +551,7 @@ impl Cluster {
 struct Waiting<'a> {
     router: &'a Cluster,
     seq: u64,
-    id: &'a str,
+    id: u64,
     left: bool,
 }
 
@@ -454,7 +562,7 @@ impl Waiting<'_> {
         let refused = {
             let mut waiting = shared.waiting.lock().unwrap();
             waiting.remove(&self.seq);
-            shared.refused.lock().unwrap().remove(self.id).flatten()
+            shared.refused.lock().unwrap().remove(&self.id).flatten()
         };
         shared.changed.notify_waiters();
         refused.map_or(outcome, |reason| Err(AdmitReject::Refused(reason)))
@@ -467,1148 +575,30 @@ impl Drop for Waiting<'_> {
             return;
         }
         let _ = self.leave(Ok(()));
-        self.router.send(Event::Exited {
-            id: self.id.to_string(),
+        self.router
+            .shared
+            .told
+            .lock()
+            .unwrap()
+            .arrived
+            .remove(&self.id);
+        self.router.send(ProcessEvent::Exited {
+            req: self.id,
             outcome: Outcome::Cancelled,
         });
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    mut programs: Vec<Program>,
-    events: Receiver<Event>,
-    shared: Arc<Shared>,
-    routing: watch::Receiver<RoutingTable>,
-    me: watch::Receiver<Option<GatewayId>>,
-    dead: Arc<AtomicBool>,
-    fleet: crate::worker::WorkerRegistry,
-    handle: tokio::runtime::Handle,
-) {
-    let mut registry = Registry::default();
-    // The last arrival heard, owed to the gate until the rounds its calls'
-    // changes carry to the others have run too.
-    let mut owed: Option<u64> = None;
-    // The last arrival seen at all: what a set coming back to life has heard.
-    let mut last_seq = 0u64;
-    loop {
-        // What the last round's calls changed reaches the others now.
-        let carried = std::mem::take(&mut registry.carried);
-        let first = if !carried.is_empty() {
-            match events.try_recv() {
-                Ok(event) => Some(event),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => return,
-            }
-        } else {
-            match programs.iter().filter_map(Program::alarm).min() {
-                Some(at_ms) => {
-                    let wait = at_ms.saturating_sub(now_ms());
-                    match events.recv_timeout(Duration::from_millis(wait)) {
-                        Ok(event) => Some(event),
-                        Err(RecvTimeoutError::Timeout) => None,
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-                None => match events.recv() {
-                    Ok(event) => Some(event),
-                    Err(_) => return,
-                },
-            }
-        };
-        let mut edges = Vec::new();
-        let mut heard = None;
-        let mut reloads = Vec::new();
-        registry.forget_exited();
-        for event in first.into_iter().chain(events.try_iter()) {
-            match event {
-                Event::Reload { programs, answer } => reloads.push((programs, answer)),
-                event => {
-                    if let Event::Arrived { seq, .. } = &event {
-                        heard = heard.max(Some(*seq));
-                        last_seq = last_seq.max(*seq);
-                    }
-                    registry.apply(event, &mut edges);
-                }
-            }
-        }
-        for (next, answer) in reloads {
-            match program::load_all(&next, capability) {
-                Ok(next) => {
-                    let (old, new): (Vec<&str>, Vec<&str>) = (
-                        programs.iter().map(Program::name).collect(),
-                        next.iter().map(Program::name).collect(),
-                    );
-                    tracing::info!(?old, ?new, "cluster policies reloaded");
-                    // The old ones stop as a dead one does.
-                    for program in &programs {
-                        withdraw(&shared, &mut registry, program.name(), program.manifest());
-                    }
-                    let gate_ms = gate_of(next.iter().map(Program::manifest));
-                    programs = next;
-                    if dead.swap(false, Ordering::AcqRel) {
-                        // The launches let through while none ran stay heard.
-                        shared.heard.send_replace(last_seq);
-                    }
-                    let _ = answer.send(Ok(gate_ms));
-                }
-                Err(error) => {
-                    tracing::error!(%error, "cluster policies not reloaded; the running ones go on");
-                    let _ = answer.send(Err(error));
-                }
-            }
-        }
-        // A worker the controller now grades degraded is draining.
-        let degraded: BTreeSet<String> = routing
-            .borrow()
-            .workers
-            .iter()
-            .filter(|w| w.health == Health::Degraded)
-            .map(|w| w.id.0.to_string())
-            .collect();
-        for worker in degraded.difference(&registry.draining) {
-            edges.push(Edge::WorkerDraining(worker.clone()));
-        }
-        registry.draining = degraded;
-
-        let now = now_ms();
-        let mut withdrawn = Vec::new();
-        for (at, program) in programs.iter_mut().enumerate() {
-            let mut edges = edges.clone();
-            edges.extend(
-                carried
-                    .iter()
-                    .filter(|(author, _)| author != program.name())
-                    .map(|(_, edge)| edge.clone()),
-            );
-            if program.alarm().is_some_and(|at_ms| at_ms <= now) {
-                edges.push(Edge::Timer);
-            }
-            if edges.is_empty() {
-                continue;
-            }
-            tracing::debug!(policy = program.name(), ?edges, "cluster policy edges");
-            let plane = registry.snapshot(&routing.borrow(), &shared.tables.read().unwrap());
-            match program.react(Box::new(plane), edges, now) {
-                Ok(commit) => {
-                    tracing::debug!(
-                        policy = program.name(),
-                        schedule = commit.schedule.as_ref().map(|t| t.keys.len()),
-                        floor = commit.schedule.as_ref().and_then(|t| t.floor),
-                        placement = commit.placement.as_ref().map(|t| t.len()),
-                        executors = commit.executors.as_ref().map(|t| t.len()),
-                        published = commit.publish.len(),
-                        "cluster policy call"
-                    );
-                    let author = program.name().to_string();
-                    enact(&shared, &mut registry, commit, &author);
-                }
-                Err(Fault::Dead(error)) => {
-                    tracing::error!(policy = program.name(), %error, "cluster policy is dead; its tables are withdrawn");
-                    withdraw(&shared, &mut registry, program.name(), program.manifest());
-                    withdrawn.push(at);
-                }
-                Err(fault) => {
-                    tracing::warn!(policy = program.name(), %fault, "cluster policy call discarded");
-                }
-            }
-        }
-        for at in withdrawn.into_iter().rev() {
-            programs.remove(at);
-        }
-        // With none left, launches go by the gateway's default until a
-        // reload starts a set again.
-        if programs.is_empty() {
-            if !dead.swap(true, Ordering::AcqRel) {
-                shared.heard.send_replace(u64::MAX);
-                shared.changed.notify_waiters();
-            }
-            continue;
-        }
-        // A replication or retention table stands until replaced: what it
-        // asks for and is not yet so is asked for again, by the author.
-        registry.author = crate::controller::authors(&routing.borrow(), *me.borrow());
-        if registry.ticked || registry.replaced {
-            registry.ticked = false;
-            registry.replaced = false;
-            replicate(&mut registry, &fleet, &handle);
-        }
-        // A launch's gate opens once every program has heard it and what
-        // their calls about it changed has reached the others: a program
-        // reading another's placement then reads the one made for it.
-        owed = owed.max(heard);
-        if registry.carried.is_empty()
-            && let Some(seq) = owed.take()
-        {
-            shared.heard.send_modify(|h| *h = (*h).max(seq));
-        }
-    }
-}
-
-/// A dead program's tables revert to empty, and what it published is
-/// withdrawn; the others' stand.
-fn withdraw(
-    shared: &Shared,
-    registry: &mut Registry,
-    author: &str,
-    manifest: &super::manifest::Manifest,
-) {
-    {
-        let mut tables = shared.tables.write().unwrap();
-        if manifest.grants("schedule") {
-            tables.schedule = None;
-        }
-        let (placement, executors) = (manifest.grants("placement"), manifest.grants("executors"));
-        if placement || executors {
-            registry.replace_placement(&mut tables, author, |tables| {
-                if placement {
-                    tables.placement.clear();
-                }
-                if executors {
-                    tables.executors.clear();
-                }
-            });
-        }
-    }
-    if manifest.grants("scale") {
-        // No shape named: each keeps what it has.
-        shared.scale.send_replace(Some(Vec::new()));
-    }
-    if manifest.grants("replication") {
-        registry.replace_replication(author, Vec::new());
-    }
-    if manifest.grants("retention") {
-        registry.replace_retention(author, Table::default());
-    }
-    let prefix = format!("{author}/");
-    let gone: Vec<(Subject, String, Option<Value>)> = registry
-        .said
-        .values()
-        .flat_map(|(subject, said)| {
-            said.keys()
-                .filter_map(|key| key.strip_prefix(&prefix))
-                .map(|name| (subject.clone(), name.to_string(), None))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    registry.say(author, gone);
-    shared.changed.notify_waiters();
-}
-
-/// How long a launch waits for the slowest of `manifests` to hear it.
-fn gate_of<'a>(manifests: impl Iterator<Item = &'a super::manifest::Manifest>) -> u64 {
-    manifests.map(|m| m.gate_ms).max().unwrap_or(0)
-}
-
-fn program_name(spec: &str) -> String {
-    std::path::Path::new(spec)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map_or_else(|| spec.to_string(), str::to_string)
-}
-
-/// The copies the state tables want and the directory does not show: for
-/// each site the replication table names that does not hold its group, and
-/// for each group retained above key 0 that no pool holds, a pool (the one
-/// a hash of the group picks), highest key first. Each is asked to take the
-/// group from a site that holds it, told the group's retention key. That a
-/// pool holds a group is what the pool reports, as a worker does: the group
-/// stays in the directory, with the pool its site, after every worker lets
-/// it go, and comes back when the pool restarts.
-fn replicate(
-    registry: &mut Registry,
-    fleet: &crate::worker::WorkerRegistry,
-    handle: &tokio::runtime::Handle,
-) {
-    let now = std::time::Instant::now();
-    registry
-        .asked
-        .retain(|_, at| now.duration_since(*at) < REPLICATE_RETRY);
-    let directory = fleet.directory();
-    for (group_id, target, table) in registry.wanted() {
-        let Some(group) = registry.groups.get(&group_id) else {
-            continue;
-        };
-        let key = (group_id.clone(), target.0.to_string());
-        if registry.asked.contains_key(&key) {
-            continue;
-        }
-        let Some(from) = group
-            .sites
-            .iter()
-            .find_map(|holder| directory.peer(*holder))
-        else {
-            continue;
-        };
-        let Some(client) = fleet.client(target) else {
-            continue;
-        };
-        registry.asked.insert(key, now);
-        let keys = group.keys.as_ref().clone();
-        let retention = registry.retention.key(&group_id);
-        handle.spawn(async move {
-            let mut ctx = tarpc::context::current();
-            ctx.deadline = std::time::Instant::now() + Duration::from_secs(120);
-            match client.replicate(ctx, keys, from, retention).await {
-                Ok(Ok(pages)) => tracing::info!(group = %group_id, worker = %target, table, pages, "replicated"),
-                Ok(Err(why)) => tracing::warn!(group = %group_id, worker = %target, table, %why, "replication refused"),
-                Err(error) => tracing::warn!(group = %group_id, worker = %target, table, %error, "replication not delivered"),
-            }
-        });
-    }
-}
-
-fn enact(shared: &Shared, registry: &mut Registry, commit: Commit, author: &str) {
-    if let Some(scale) = commit.scale {
-        let entries: Vec<ScaleEntry> = scale
-            .into_iter()
-            .map(|s| ScaleEntry {
-                model: s.model,
-                engine: s.engine,
-                workers: s.workers,
-            })
-            .collect();
-        shared.scale.send_if_modified(|table| {
-            let changed = table.as_ref() != Some(&entries);
-            *table = Some(entries);
-            changed
-        });
-    }
-    if let Some(replication) = commit.state.replication {
-        registry.replace_replication(author, replication);
-    }
-    if let Some(retention) = commit.state.retention {
-        registry.replace_retention(author, retention);
-    }
-    registry.say(author, commit.publish);
-    let mut changed = false;
-    {
-        let mut tables = shared.tables.write().unwrap();
-        if let Some(schedule) = commit.schedule {
-            tables.schedule = Some(schedule);
-            changed = true;
-        }
-        // A running process given another worker moves there.
-        for (id, entry) in commit.placement.iter().flatten() {
-            let Some(target) = entry.worker.as_deref() else {
-                continue;
-            };
-            let Some(at) = registry.procs.get(id).and_then(|p| p.worker.as_deref()) else {
-                continue;
-            };
-            if at != target
-                && let (Ok(req), Ok(worker)) = (id.parse::<u64>(), target.parse::<u64>())
-            {
-                let _ = shared.migrations.send((ReqId(req), WorkerId(worker)));
-            }
-        }
-        if commit.placement.is_some() || commit.executors.is_some() {
-            let (placement, executors) = (commit.placement, commit.executors);
-            registry.replace_placement(&mut tables, author, |tables| {
-                if let Some(executors) = executors {
-                    tables.executors = executors;
-                }
-                if let Some(placement) = placement {
-                    tables.placement = placement;
-                }
-            });
-        }
-    }
-    for (id, reason) in commit.terminate {
-        if !registry.procs.contains_key(&id) {
-            continue;
-        }
-        // Not yet admitted, it is refused; admitted, the gateway cancels it.
-        if let Some(refused) = shared.refused.lock().unwrap().get_mut(&id) {
-            *refused = Some(reason);
-            changed = true;
-        } else if let Ok(req) = id.parse() {
-            registry.terminated.insert(id);
-            let _ = shared.cancels.send(ReqId(req));
-        }
-    }
-    if changed {
-        shared.changed.notify_waiters();
-    }
-}
-
-/// A process's committed placement as another program reads it: its
-/// worker, its executors and its props.
-type Placed = (Option<String>, Vec<String>, Vec<(String, ValueKey)>);
-
-/// A value as it compares: its kind and its payload, a float by its bits,
-/// so a value is changed exactly when what a reader would read changed.
-type ValueKey = (u8, String);
-
-fn value_key(value: &Value) -> ValueKey {
-    match value {
-        Value::Boolean(b) => (0, b.to_string()),
-        Value::Int(i) => (1, i.to_string()),
-        Value::Float(f) => (2, f.to_bits().to_string()),
-        Value::Text(text) => (3, text.clone()),
-        Value::Json(text) => (4, text.clone()),
-    }
-}
-
-fn placed_all(tables: &Tables) -> HashMap<String, Placed> {
-    let ids: BTreeSet<&String> = tables
-        .placement
-        .keys()
-        .chain(tables.executors.keys())
-        .collect();
-    ids.into_iter()
-        .map(|id| {
-            let placement = tables.placement.get(id);
-            let placed = (
-                placement.and_then(|p| p.worker.clone()),
-                tables.executors.get(id).cloned().unwrap_or_default(),
-                placement
-                    .map(|p| {
-                        p.props
-                            .iter()
-                            .map(|(n, v)| (n.clone(), value_key(v)))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            );
-            (id.clone(), placed)
-        })
-        .collect()
-}
-
-/// The workers each group's replication table asks for.
-fn replicated(table: &[wit::Replicate]) -> BTreeMap<String, Vec<String>> {
-    let mut sites: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for entry in table {
-        sites
-            .entry(entry.group.clone())
-            .or_default()
-            .extend(entry.at.iter().map(|site| site.worker.clone()));
-    }
-    for workers in sites.values_mut() {
-        workers.sort_unstable();
-        workers.dedup();
-    }
-    sites
-}
-
-/// Where a subject's publications are kept.
-fn subject_key(subject: &Subject) -> String {
-    match subject {
-        Subject::Session(id) => format!("session:{id}"),
-        Subject::Process(id) => format!("process:{id}"),
-        Subject::WorkingSet(id) => format!("working-set:{id}"),
-        Subject::Worker(id) => format!("worker:{id}"),
-        Subject::Group(id) => format!("group:{id}"),
-        Subject::Link(id) => format!("link:{id}"),
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-#[derive(Debug, Clone)]
-struct Proc {
-    arrival_ms: u64,
-    tenant: String,
-    /// Scoped by tenant.
-    session: Option<String>,
-    /// Shared with every call's view: a `prompt` can be long.
-    props: Arc<HashMap<String, Value>>,
-    prompt: Option<Arc<[u64]>>,
-    worker: Option<String>,
-    counted: Option<(u64, u64)>,
-}
-
-#[derive(Default)]
-struct Registry {
-    /// Ordered, so `candidates` is stable.
-    procs: BTreeMap<String, Proc>,
-    /// Exited in the events a call is about: it can still read them.
-    exited: BTreeMap<String, Proc>,
-    workers: BTreeSet<String>,
-    sessions: HashMap<String, Props>,
-    terminated: HashSet<String>,
-    /// As far as the router can tell: no worker reports its evictions.
-    held: HashMap<String, Arc<PromptIndex>>,
-    /// The directory's groups, by their last key's hex, and its pools.
-    groups: HashMap<String, crate::directory::Group>,
-    pools: Vec<String>,
-    /// The replication table the policy installed.
-    replication: Vec<wit::Replicate>,
-    /// The retention table the policy installed: a key per group.
-    retention: Table,
-    /// Copies asked for, by (group, worker), and when.
-    asked: HashMap<(String, String), std::time::Instant>,
-    /// The directory was heard since `replicate` last ran.
-    ticked: bool,
-    /// A replication or retention table was replaced since `replicate`
-    /// last ran.
-    replaced: bool,
-    /// This gateway is the author the routing table names, as of this
-    /// round: only then are the replication and retention tables enacted.
-    author: bool,
-    /// What each worker's policy published about it, by name.
-    published: HashMap<String, HashMap<String, serde_json::Value>>,
-    /// Workers draining, as of the routing table last heard.
-    draining: BTreeSet<String>,
-    /// What cluster programs published, by subject: each value under
-    /// `<program>/<name>`.
-    said: HashMap<String, (Subject, BTreeMap<String, Value>)>,
-    /// Edges a call caused, for every program but its author's next call.
-    carried: Vec<(String, Edge)>,
-}
-
-/// The prompt blocks the router counts a worker as holding: about 4M tokens
-/// of text.
-const HELD_BLOCKS: usize = 1 << 18;
-
-impl Registry {
-    fn apply(&mut self, event: Event, edges: &mut Vec<Edge>) {
-        match event {
-            Event::Moved { id, worker, why } => {
-                if let Some(proc) = self.procs.get_mut(&id) {
-                    match worker {
-                        Some(worker) => {
-                            proc.worker = Some(worker.clone());
-                            edges.push(Edge::Migrated(wit::Dispatch {
-                                process: id,
-                                worker,
-                            }));
-                        }
-                        None => {
-                            tracing::info!(process = %id, %why, "cluster policy: a move no worker took");
-                            edges.push(Edge::MigrationFailed(id));
-                        }
-                    }
-                }
-            }
-            // The policy thread swaps programs before a round applies its
-            // events; one here has no set to swap.
-            Event::Reload { answer, .. } => {
-                let _ = answer.send(Err(LoadError::Instantiate(
-                    "a reload reached the registry, not the policy thread".into(),
-                )));
-            }
-            Event::State(groups, pools, published) => {
-                self.published = published;
-                let tier = |pools: &[String], worker: &str| {
-                    if pools.iter().any(|p| p == worker) {
-                        wit::Tier::Pool
-                    } else {
-                        wit::Tier::Host
-                    }
-                };
-                for (id, group) in &groups {
-                    let before = self
-                        .groups
-                        .get(id)
-                        .map(|g| g.sites.as_slice())
-                        .unwrap_or(&[]);
-                    for site in group.sites.iter().filter(|s| !before.contains(s)) {
-                        edges.push(Edge::Copied(wit::Residency {
-                            group: id.clone(),
-                            site: wit::Site {
-                                worker: site.0.to_string(),
-                                tier: tier(&pools, &site.0.to_string()),
-                            },
-                        }));
-                    }
-                }
-                for (id, group) in &self.groups {
-                    let after = groups.get(id).map(|g| g.sites.as_slice()).unwrap_or(&[]);
-                    for site in group.sites.iter().filter(|s| !after.contains(s)) {
-                        edges.push(Edge::Dropped(wit::Residency {
-                            group: id.clone(),
-                            site: wit::Site {
-                                worker: site.0.to_string(),
-                                tier: tier(&self.pools, &site.0.to_string()),
-                            },
-                        }));
-                    }
-                }
-                self.groups = groups;
-                self.pools = pools;
-                self.ticked = true;
-            }
-            Event::Arrived {
-                id,
-                tenant,
-                session,
-                props,
-                ..
-            } => {
-                let prompt = client_api::props::prompt_of(props.iter())
-                    .map(|text| client_api::props::prompt_blocks(text).into());
-                self.procs.insert(
-                    id.clone(),
-                    Proc {
-                        arrival_ms: now_ms(),
-                        session: session.map(|session| format!("{tenant}/{session}")),
-                        tenant,
-                        props: Arc::new(props.into_iter().filter_map(prop_value).collect()),
-                        prompt,
-                        worker: None,
-                        counted: None,
-                    },
-                );
-                edges.push(Edge::Arrived(id));
-            }
-            Event::Dispatched { id, worker } => {
-                if let Some(proc) = self.procs.get_mut(&id) {
-                    proc.worker = Some(worker.clone());
-                    // What it prefills there, the worker holds after it:
-                    // the router counts it so, as a cache-aware router does.
-                    if let Some(prompt) = &proc.prompt {
-                        let held = Arc::make_mut(self.held.entry(worker.clone()).or_default());
-                        held.put(&id, prompt, TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64);
-                        held.trim(HELD_BLOCKS);
-                    }
-                    edges.push(Edge::Dispatched(wit::Dispatch {
-                        process: id,
-                        worker,
-                    }));
-                }
-            }
-            Event::Counted {
-                id,
-                prompt,
-                generated,
-            } => {
-                tracing::debug!(process = %id, prompt, generated, "cluster policy: a process counted its tokens");
-                if let Some(proc) = self.procs.get_mut(&id) {
-                    proc.counted = Some((prompt, generated));
-                }
-            }
-            Event::Exited { id, outcome } => {
-                self.terminated.remove(&id);
-                if let Some(proc) = self.procs.remove(&id) {
-                    self.exited.insert(id.clone(), proc);
-                    edges.push(Edge::Exited(wit::Exit {
-                        process: id,
-                        outcome,
-                    }));
-                }
-            }
-            Event::SessionProps { id, changes } => {
-                let current = self.sessions.remove(&id).unwrap_or_default();
-                let (merged, names) = match client_api::props::merge(&current, changes) {
-                    Ok(merged) => merged,
-                    Err(why) => {
-                        tracing::warn!(session = %id, %why, "cluster policy: session props refused");
-                        (current, Vec::new())
-                    }
-                };
-                if !merged.is_empty() {
-                    self.sessions.insert(id.clone(), merged);
-                }
-                if !names.is_empty() {
-                    edges.push(Edge::PropChanged(wit::Change {
-                        subject: Subject::Session(id),
-                        names,
-                    }));
-                }
-            }
-            Event::SessionClosed { id } => {
-                self.sessions.remove(&id);
-                self.said
-                    .remove(&subject_key(&Subject::Session(id.clone())));
-                edges.push(Edge::Closed(id));
-            }
-            Event::Workers(now) => {
-                for removed in self.workers.difference(&now) {
-                    edges.push(Edge::WorkerRemoved(removed.clone()));
-                    self.held.remove(removed);
-                }
-                self.workers = now;
-            }
-        }
-    }
-
-    /// The processes the last round's calls read as exited are gone, and
-    /// what programs published about them with them, without an edge.
-    fn forget_exited(&mut self) {
-        for id in std::mem::take(&mut self.exited).into_keys() {
-            self.said.remove(&subject_key(&Subject::Process(id)));
-        }
-    }
-
-    /// Changes the committed placement by `f`, and carries
-    /// `placement-changed`, caused by `author`, for each process whose
-    /// placement differs.
-    fn replace_placement(
-        &mut self,
-        tables: &mut Tables,
-        author: &str,
-        f: impl FnOnce(&mut Tables),
-    ) {
-        let before = placed_all(tables);
-        f(tables);
-        let after = placed_all(tables);
-        self.carry_placements(author, &before, &after);
-    }
-
-    /// Replaces the replication table, and carries `replication-changed`,
-    /// caused by `author`, for each group whose sites differ.
-    fn replace_replication(&mut self, author: &str, table: Vec<wit::Replicate>) {
-        let before = replicated(&self.replication);
-        self.replication = table;
-        self.replaced = true;
-        self.carry_replications(author, &before);
-    }
-
-    /// Replaces the retention table, and carries `retention-changed`,
-    /// caused by `author`, for each group whose key differs (one no entry
-    /// names is at 0).
-    fn replace_retention(&mut self, author: &str, table: Table) {
-        let before = std::mem::replace(&mut self.retention, table);
-        self.replaced = true;
-        let groups: BTreeSet<&String> = before
-            .keys
-            .keys()
-            .chain(self.retention.keys.keys())
-            .collect();
-        let mut changed = false;
-        for group in groups {
-            if before.key(group) != self.retention.key(group) {
-                changed = true;
-                self.carried
-                    .push((author.to_string(), Edge::RetentionChanged(group.clone())));
-            }
-        }
-        if changed && self.pools.is_empty() && self.retention.keys.values().any(|&key| key > 0) {
-            tracing::info!(
-                policy = author,
-                "retention table taken; no pool is known to keep a copy in, so none is kept"
-            );
-        }
-    }
-
-    /// The copies to ask for, (group, worker, the table that wants it): none
-    /// unless this gateway is the author, whose tables alone are enacted.
-    fn wanted(&self) -> Vec<(String, WorkerId, &'static str)> {
-        if !self.author {
-            return Vec::new();
-        }
-        let mut wanted = Vec::new();
-        for entry in &self.replication {
-            let Some(group) = self.groups.get(&entry.group) else {
-                continue;
-            };
-            for site in &entry.at {
-                let Ok(target) = site.worker.parse::<u64>().map(WorkerId) else {
-                    continue;
-                };
-                if !group.sites.contains(&target) {
-                    wanted.push((entry.group.clone(), target, "replication"));
-                }
-            }
-        }
-        wanted.extend(
-            self.retained()
-                .into_iter()
-                .map(|(group, pool)| (group, pool, "retention")),
-        );
-        wanted
-    }
-
-    /// For each group the directory shows, retained above key 0 and held by
-    /// no pool, the pool to take a copy: the one a hash of the group picks.
-    /// Highest key first.
-    fn retained(&self) -> Vec<(String, WorkerId)> {
-        let pools: Vec<WorkerId> = self
-            .pools
-            .iter()
-            .filter_map(|pool| pool.parse().ok().map(WorkerId))
-            .collect();
-        if pools.is_empty() {
-            return Vec::new();
-        }
-        let mut retained: Vec<(&String, i64)> = self
-            .retention
-            .keys
-            .iter()
-            .filter(|(_, key)| **key > 0)
-            .map(|(group, key)| (group, *key))
-            .collect();
-        retained.sort_by_key(|(group, key)| (Reverse(*key), *group));
-        retained
-            .into_iter()
-            .filter_map(|(id, _)| {
-                let group = self.groups.get(id)?;
-                if group.sites.iter().any(|site| pools.contains(site)) {
-                    return None;
-                }
-                let mut hasher = std::hash::DefaultHasher::new();
-                std::hash::Hash::hash(id, &mut hasher);
-                let at = std::hash::Hasher::finish(&hasher) % pools.len() as u64;
-                Some((id.clone(), pools[at as usize]))
-            })
-            .collect()
-    }
-
-    /// `placement-changed` for each process whose committed placement
-    /// differs, caused by `author`.
-    fn carry_placements(
-        &mut self,
-        author: &str,
-        before: &HashMap<String, Placed>,
-        after: &HashMap<String, Placed>,
-    ) {
-        let ids: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
-        for id in ids {
-            if before.get(id) != after.get(id) {
-                self.carried
-                    .push((author.to_string(), Edge::PlacementChanged(id.clone())));
-            }
-        }
-    }
-
-    /// `replication-changed` for each group whose committed sites differ
-    /// from `before`, caused by `author`.
-    fn carry_replications(&mut self, author: &str, before: &BTreeMap<String, Vec<String>>) {
-        let after = replicated(&self.replication);
-        let groups: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
-        for group in groups {
-            if before.get(group) != after.get(group) {
-                self.carried
-                    .push((author.to_string(), Edge::ReplicationChanged(group.clone())));
-            }
-        }
-    }
-
-    /// `author`'s publications, in order; `published` for each subject one
-    /// of them changed.
-    fn say(&mut self, author: &str, said: Vec<(Subject, String, Option<Value>)>) {
-        let mut changed: Vec<(String, Subject)> = Vec::new();
-        for (subject, name, value) in said {
-            let key = subject_key(&subject);
-            let full = format!("{author}/{name}");
-            let entry = self
-                .said
-                .entry(key.clone())
-                .or_insert_with(|| (subject.clone(), BTreeMap::new()));
-            if entry.1.get(&full).map(value_key) == value.as_ref().map(value_key) {
-                continue;
-            }
-            match value {
-                Some(value) => entry.1.insert(full, value),
-                None => entry.1.remove(&full),
-            };
-            if entry.1.is_empty() {
-                self.said.remove(&key);
-            }
-            if !changed.iter().any(|(k, _)| *k == key) {
-                changed.push((key, subject));
-            }
-        }
-        for (_, subject) in changed {
-            self.carried
-                .push((author.to_string(), Edge::Published(subject)));
-        }
-    }
-
-    fn snapshot(&self, routing: &RoutingTable, tables: &Tables) -> Snapshot {
-        Snapshot {
-            placement: tables.placement.clone(),
-            executors: tables.executors.clone(),
-            replication: replicated(&self.replication),
-            retention: self.retention.keys.clone(),
-            said: self
-                .said
-                .iter()
-                .map(|(key, (_, said))| (key.clone(), said.clone()))
-                .collect(),
-            groups: self.groups.clone(),
-            pools: self.pools.clone(),
-            published: self.published.clone(),
-            procs: self.procs.clone(),
-            exited: self.exited.clone(),
-            sessions: self.sessions.clone(),
-            held: self.held.clone(),
-            workers: routing
-                .workers
-                .iter()
-                .filter(|w| self.workers.contains(&w.id.0.to_string()))
-                .map(|w| (w.id.0.to_string(), w.clone()))
-                .collect(),
-            scales: routing.scales,
-        }
-    }
-}
-
-fn prop_value((name, value): (String, serde_json::Value)) -> Option<(String, Value)> {
-    use serde_json::Value as Json;
-    let value = match value {
-        Json::Null => return None,
-        Json::Bool(b) => Value::Boolean(b),
-        Json::Number(n) => match n.as_i64() {
-            Some(i) => Value::Int(i),
-            None => Value::Float(n.as_f64()?),
-        },
-        Json::String(s) => Value::Text(s),
-        json @ (Json::Array(_) | Json::Object(_)) => Value::Json(json.to_string()),
-    };
-    Some((name, value))
-}
-
-fn json(value: &Value) -> Option<serde_json::Value> {
-    use serde_json::Value as Json;
-    Some(match value {
-        Value::Boolean(b) => Json::Bool(*b),
-        Value::Int(i) => Json::from(*i),
-        Value::Float(f) => serde_json::Number::from_f64(*f).map(Json::Number)?,
-        Value::Text(s) => Json::String(s.clone()),
-        Value::Json(text) => serde_json::from_str(text).ok()?,
-    })
-}
-
-struct Snapshot {
-    /// What the programs' calls have committed, read-only.
-    placement: HashMap<String, wit::Placement>,
-    executors: HashMap<String, Vec<String>>,
-    replication: BTreeMap<String, Vec<String>>,
-    retention: HashMap<String, i64>,
-    said: HashMap<String, BTreeMap<String, Value>>,
-    groups: HashMap<String, crate::directory::Group>,
-    pools: Vec<String>,
-    published: HashMap<String, HashMap<String, serde_json::Value>>,
-    procs: BTreeMap<String, Proc>,
-    exited: BTreeMap<String, Proc>,
-    sessions: HashMap<String, Props>,
-    held: HashMap<String, Arc<PromptIndex>>,
-    workers: BTreeMap<String, RoutableWorker>,
-    /// The controller has an actuator to meet a scale table.
-    scales: bool,
-}
-
-fn text(value: impl Into<String>) -> Option<Value> {
-    Some(Value::Text(value.into()))
-}
-
-impl Plane for Snapshot {
-    fn candidates(&self, kind: SubjectKind) -> Vec<String> {
-        match kind {
-            SubjectKind::Process => self.procs.keys().cloned().collect(),
-            SubjectKind::Session => {
-                let sessions: BTreeSet<&String> = self
-                    .procs
-                    .values()
-                    .filter_map(|p| p.session.as_ref())
-                    .chain(self.sessions.keys())
-                    .collect();
-                sessions.into_iter().cloned().collect()
-            }
-            SubjectKind::Worker => self
-                .workers
-                .keys()
-                .cloned()
-                .chain(self.pools.iter().cloned())
-                .collect(),
-            SubjectKind::Group => {
-                let mut ids: Vec<String> = self.groups.keys().cloned().collect();
-                ids.sort_unstable();
-                ids
-            }
-            SubjectKind::WorkingSet | SubjectKind::Link => Vec::new(),
-        }
-    }
-
-    fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
-        // What a cluster program published, under its name.
-        if let Some(said) = name
-            .strip_prefix("published/")
-            .and_then(|key| self.said.get(&subject_key(of))?.get(key))
-        {
-            return Some(said.clone());
-        }
-        match of {
-            Subject::Process(id) if name.starts_with("placement/") => match name {
-                "placement/worker" => self.placement.get(id)?.worker.clone().and_then(text),
-                "placement/executors" => Some(Value::Json(
-                    serde_json::to_string(self.executors.get(id)?).unwrap_or_default(),
-                )),
-                _ => {
-                    let prop = name.strip_prefix("placement/props/")?;
-                    let placement = self.placement.get(id)?;
-                    placement
-                        .props
-                        .iter()
-                        .find(|(n, _)| n == prop)
-                        .map(|(_, value)| value.clone())
-                }
-            },
-            Subject::Group(id) if name == "replication/sites" => Some(Value::Json(
-                serde_json::to_string(self.replication.get(id)?).unwrap_or_default(),
-            )),
-            Subject::Group(id) if name == "retention/key" => {
-                self.retention.get(id).map(|key| Value::Int(*key))
-            }
-            Subject::Process(id) => {
-                let (proc, live) = match (self.procs.get(id), self.exited.get(id)) {
-                    (Some(proc), _) => (proc, true),
-                    (None, Some(proc)) => (proc, false),
-                    (None, None) => return None,
-                };
-                let int = |n: Option<u64>| n.map(|n| Value::Int(n as i64));
-                match name {
-                    "state" if !live => None,
-                    "state" if proc.worker.is_some() => text("running"),
-                    "state" => text("pending"),
-                    // An exited process has told the router its counts; before
-                    // that its prompt is estimated from its text.
-                    "prompt-tokens" => int(proc.counted.map(|(prompt, _)| prompt).or_else(|| {
-                        proc.prompt.as_ref().map(|blocks| {
-                            (blocks.len() as f64 * PROMPT_BLOCK_BYTES as f64 * TOKENS_PER_BYTE)
-                                as u64
-                        })
-                    })),
-                    "max-tokens" => match proc.props.get(client_api::props::MAX_TOKENS) {
-                        Some(Value::Int(n)) if *n >= 0 => Some(Value::Int(*n)),
-                        _ => None,
-                    },
-                    "generated-tokens" => int(proc.counted.map(|(_, generated)| generated)),
-                    "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
-                    "tenant" => text(proc.tenant.clone()),
-                    "session" => proc.session.clone().and_then(text),
-                    "worker" => proc.worker.clone().and_then(text),
-                    _ => {
-                        // What the worker holds of its prompt, estimated
-                        // from its text: there are no tokens here.
-                        let worker = name.strip_prefix("cached-tokens/")?;
-                        let prompt = proc.prompt.as_ref()?;
-                        self.workers.get(worker)?;
-                        let held = self
-                            .held
-                            .get(worker)
-                            .map_or(0, |held| held.held_tokens(prompt));
-                        Some(Value::Int(held as i64))
-                    }
-                }
-            }
-            Subject::Session(id) => {
-                let mut procs = self
-                    .procs
-                    .iter()
-                    .filter(|(_, p)| p.session.as_deref() == Some(id.as_str()))
-                    .peekable();
-                let tenant = match procs.peek() {
-                    Some((_, first)) => first.tenant.clone(),
-                    None if self.sessions.contains_key(id) => id
-                        .split_once('/')
-                        .map_or(id.as_str(), |(t, _)| t)
-                        .to_string(),
-                    None => return None,
-                };
-                match name {
-                    "tenant" => text(tenant),
-                    _ => None,
-                }
-            }
-            Subject::Worker(id) if name.starts_with("published/") => self
-                .published
-                .get(id)
-                .and_then(|map| map.get(&name["published/".len()..]))
-                .and_then(|value| prop_value((String::new(), value.clone())))
-                .map(|(_, value)| value),
-            Subject::Worker(id) if self.pools.contains(id) => match name {
-                "pool" => Some(Value::Boolean(true)),
-                _ => None,
-            },
-            Subject::Group(id) => {
-                let group = self.groups.get(id)?;
-                match name {
-                    "pages" => Some(Value::Int(group.keys.len() as i64)),
-                    // The workers holding a copy, as a JSON array of ids.
-                    "sites" => Some(Value::Json(
-                        serde_json::to_string(
-                            &group
-                                .sites
-                                .iter()
-                                .map(|w| w.0.to_string())
-                                .collect::<Vec<_>>(),
-                        )
-                        .unwrap_or_default(),
-                    )),
-                    _ => None,
-                }
-            }
-            Subject::Worker(id) => {
-                let worker = self.workers.get(id)?;
-                match name {
-                    "role" => text(match worker.role {
-                        Role::Prefill => "prefill",
-                        Role::Decode => "decode",
-                        Role::Encode => "encode",
-                    }),
-                    "model" => text(worker.model.clone()),
-                    // The machine it serves from: workers sharing one share
-                    // a node's links.
-                    "host" => worker
-                        .addr
-                        .rsplit_once(':')
-                        .map(|(host, _)| host.trim_start_matches("tcp://"))
-                        .and_then(text),
-                    "engine" if !worker.engine.is_empty() => text(worker.engine.clone()),
-                    "draining" => Some(Value::Boolean(worker.health != Health::Healthy)),
-                    "pie/kv-pressure" => {
-                        Some(Value::Int(i64::from(worker.coarse_load.kv_pressure_bucket)))
-                    }
-                    "pie/inflight" => Some(Value::Int(i64::from(worker.coarse_load.inflight))),
-                    // As of the worker's last report to the controller.
-                    "running" => Some(Value::Int(i64::from(worker.coarse_load.running))),
-                    "waiting" => Some(Value::Int(i64::from(worker.coarse_load.waiting))),
-                    "capacity-tokens" | "used-tokens"
-                        if worker.coarse_load.capacity_tokens == 0 =>
-                    {
-                        None
-                    }
-                    "capacity-tokens" => {
-                        Some(Value::Int(worker.coarse_load.capacity_tokens as i64))
-                    }
-                    "used-tokens" => Some(Value::Int(worker.coarse_load.used_tokens as i64)),
-                    _ => None,
-                }
-            }
-            Subject::WorkingSet(_) | Subject::Link(_) => None,
-        }
-    }
-
-    fn prop(&self, of: &Subject, name: &str) -> Option<Value> {
-        match of {
-            Subject::Process(id) => {
-                let proc = self.procs.get(id).or_else(|| self.exited.get(id))?;
-                proc.props.get(name).cloned()
-            }
-            Subject::Session(id) => {
-                let value = self.sessions.get(id)?.get(name)?;
-                prop_value((name.to_string(), value.clone())).map(|(_, value)| value)
-            }
-            _ => None,
-        }
-    }
-
-    fn capability(&self, name: &str) -> bool {
-        match name {
-            "cluster.scale" => self.scales,
-            name => capability(name),
-        }
-    }
-
-    fn terminable(&self, process: &str) -> bool {
-        self.procs.contains_key(process)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::collections::HashSet;
 
-    use controller_api::WorkerStatus;
-    use ids::{SessionId, TenantId};
+    use controller::cluster::{Host, LoadError};
+    use controller_api::{
+        Ack, DirectoryView, GatewayInfo, Health, Role, RoutableWorker, RoutingTable, ScaleEntry,
+        StateReport, WorkerStatus,
+    };
+    use ids::{NodeId, SessionId, TenantId};
     use worker_api::Priority;
 
     use super::*;
@@ -1660,172 +650,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_exited_process_is_read_with_its_counts_by_the_call_about_its_exit() {
-        let mut registry = Registry::default();
-        let mut edges = Vec::new();
-        let arrived = |id: &str| Event::Arrived {
-            id: id.into(),
-            seq: 0,
-            tenant: "t".into(),
-            session: None,
-            props: Props::new(),
-        };
-        for event in [
-            arrived("1"),
-            arrived("2"),
-            Event::Dispatched {
-                id: "1".into(),
-                worker: "7".into(),
-            },
-            Event::Counted {
-                id: "1".into(),
-                prompt: 120,
-                generated: 30,
-            },
-            Event::Exited {
-                id: "1".into(),
-                outcome: Outcome::Completed,
-            },
-            Event::Workers(BTreeSet::from(["1".to_string()])),
-        ] {
-            registry.apply(event, &mut edges);
+    /// A controller of the cluster policies alone, in process.
+    #[derive(Clone)]
+    struct HostControl(Arc<controller::cluster::Host>);
+
+    impl GatewayControl for HostControl {
+        async fn register_gateway(&self, _info: GatewayInfo) -> anyhow::Result<GatewayId> {
+            Ok(GatewayId(0))
         }
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
-        let int = |n| format!("{:?}", Some(Value::Int(n)));
-        assert_eq!(of("1", "generated-tokens"), int(30));
-        assert_eq!(of("1", "prompt-tokens"), int(120));
-        assert_eq!(of("1", "worker"), format!("{:?}", text("7")));
-        assert_eq!(of("1", "state"), "None");
-        assert_eq!(
-            of("2", "prompt-tokens"),
-            "None",
-            "the router never sees a live process's counts"
-        );
-        assert_eq!(plane.candidates(SubjectKind::Process), ["2"]);
-        let worker = |name| format!("{:?}", plane.attr(&Subject::Worker("1".into()), name));
-        assert_eq!(worker("waiting"), int(5));
-        assert_eq!(worker("running"), int(2));
-        assert_eq!(worker("capacity-tokens"), int(1000));
-        assert_eq!(worker("used-tokens"), int(250));
 
-        registry.exited.clear();
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(
-            plane
-                .attr(&Subject::Process("1".into()), "worker")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_pending_process_is_sized_from_its_prompt_text_and_its_limit() {
-        let mut registry = Registry::default();
-        let mut edges = Vec::new();
-        let props = serde_json::from_value(serde_json::json!({
-            "prompt": "x".repeat(640),
-            "max-tokens": 64,
-        }))
-        .unwrap();
-        registry.apply(
-            Event::Arrived {
-                id: "1".into(),
-                seq: 0,
-                tenant: "t".into(),
-                session: None,
-                props,
-            },
-            &mut edges,
-        );
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        let of = |name| format!("{:?}", plane.attr(&Subject::Process("1".into()), name));
-        assert_eq!(of("prompt-tokens"), format!("{:?}", Some(Value::Int(160))));
-        assert_eq!(of("max-tokens"), format!("{:?}", Some(Value::Int(64))));
-    }
-
-    #[test]
-    fn a_worker_holds_the_prompts_dispatched_to_it() {
-        let mut registry = Registry::default();
-        let mut edges = Vec::new();
-        let text = "word ".repeat(200);
-        let arrived = |id: &str, prompt: Option<String>| Event::Arrived {
-            id: id.into(),
-            seq: 0,
-            tenant: "t".into(),
-            session: None,
-            props: prompt
-                .map(|prompt| {
-                    serde_json::from_value(serde_json::json!({ "prompt": prompt })).unwrap()
-                })
-                .unwrap_or_default(),
-        };
-        for event in [
-            arrived("1", Some(text.clone())),
-            Event::Dispatched {
-                id: "1".into(),
-                worker: "1".into(),
-            },
-            arrived("2", Some(format!("{text}and more"))),
-            arrived("3", None),
-            Event::Workers(BTreeSet::from(["1".to_string()])),
-        ] {
-            registry.apply(event, &mut edges);
+        async fn heartbeat(&self, _id: NodeId) -> anyhow::Result<Ack> {
+            Ok(Ack::Ok)
         }
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
-        // 1000 bytes: fifteen whole 64-byte blocks, at a guessed 16 tokens each.
-        assert_eq!(
-            of("2", "cached-tokens/1"),
-            format!("{:?}", Some(Value::Int(240)))
-        );
-        assert_eq!(of("2", "cached-tokens/9"), "None", "no such worker");
-        assert_eq!(of("3", "cached-tokens/1"), "None", "no prompt");
-        assert_eq!(of("2", "cached-tokens"), "None");
-    }
 
-    #[test]
-    fn a_session_s_props_reach_the_cluster_program_between_launches() {
-        let mut registry = Registry::default();
-        let mut edges = Vec::new();
-        let changes: Props =
-            serde_json::from_value(serde_json::json!({"tool-eta-ms": 900})).unwrap();
-        registry.apply(
-            Event::SessionProps {
-                id: "default/s".into(),
-                changes,
-            },
-            &mut edges,
-        );
-        assert!(matches!(&edges[..], [Edge::PropChanged(c)] if c.names == ["tool-eta-ms"]));
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert_eq!(plane.candidates(SubjectKind::Session), ["default/s"]);
-        assert!(matches!(
-            plane.prop(&Subject::Session("default/s".into()), "tool-eta-ms"),
-            Some(Value::Int(900))
-        ));
-        edges.clear();
-        registry.apply(
-            Event::SessionClosed {
-                id: "default/s".into(),
-            },
-            &mut edges,
-        );
-        assert!(matches!(&edges[..], [Edge::Closed(s)] if s == "default/s"));
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(
-            plane
-                .prop(&Subject::Session("default/s".into()), "tool-eta-ms")
-                .is_none()
-        );
+        fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
+            watch::channel(table(0)).1
+        }
+
+        fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
+            watch::channel(DirectoryView::default()).1
+        }
+
+        async fn report_state(
+            &self,
+            _worker: WorkerId,
+            _report: StateReport,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn forget_state(&self, _worker: WorkerId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cluster_events(
+            &self,
+            gateway: GatewayId,
+            events: Vec<ProcessEvent>,
+        ) -> anyhow::Result<()> {
+            self.0.events(gateway, events);
+            Ok(())
+        }
+
+        fn decisions_watch(&self, gateway: GatewayId) -> watch::Receiver<GatewayDecisions> {
+            self.0.decisions(gateway)
+        }
     }
 
     struct Rig {
         router: Arc<Cluster>,
+        host: Arc<Host>,
         routing: RoutingHandle,
         table: watch::Sender<RoutingTable>,
         cancelled: mpsc::UnboundedReceiver<ReqId>,
+        moves: mpsc::UnboundedReceiver<(ReqId, WorkerId)>,
         _connected: watch::Sender<Arc<HashSet<WorkerId>>>,
+        _me: watch::Sender<Option<GatewayId>>,
     }
 
     fn programs(names: &[&str]) -> Vec<(String, Vec<u8>)> {
@@ -1840,34 +720,52 @@ mod tests {
             .collect()
     }
 
-    fn rig(kv: u8) -> Rig {
-        rig_of(kv, &["test-route"])
+    async fn rig(kv: u8) -> Rig {
+        rig_of(kv, &["test-route"]).await
     }
 
-    fn rig_of(kv: u8, names: &[&str]) -> Rig {
+    /// A gateway, its policies `names` running in a controller beside it,
+    /// once the gateway has heard they run.
+    async fn rig_of(kv: u8, names: &[&str]) -> Rig {
         let (table, table_rx) = watch::channel(table(kv));
         let (connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
-        let (router, cancelled, _moves) = Cluster::start(
+        let host = Host::start(
             programs(names),
             table_rx,
-            watch::channel(None).1,
-            connected_rx,
-            crate::worker::WorkerRegistry::new(),
+            watch::channel(DirectoryView::default()).1,
         )
         .unwrap();
+        let (me, me_rx) = watch::channel(Some(GatewayId(0)));
+        let (router, cancelled, moves) = Cluster::start(
+            HostControl(host.clone()),
+            me_rx,
+            connected_rx,
+            crate::worker::WorkerRegistry::new(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !router.active() {
+            assert!(
+                Instant::now() < deadline,
+                "the gateway never heard the policies run"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         Rig {
             router,
+            host,
             routing,
             table,
             cancelled,
+            moves,
             _connected: connected,
+            _me: me,
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reload_swaps_the_programs_and_withdraws_the_old_ones_tables() {
-        let rig = rig(0);
+        let rig = rig(0).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
@@ -1880,7 +778,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!waiting.is_finished(), "held below the floor");
 
-        rig.router.reload(programs(&["replicate"])).await.unwrap();
+        rig.host.reload(programs(&["replicate"])).await.unwrap();
         // test-route's schedule and placement are withdrawn with it: the
         // held launch leaves, and nothing places the first any more.
         tokio::time::timeout(Duration::from_secs(5), waiting)
@@ -1893,15 +791,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reload_that_does_not_load_leaves_the_running_set() {
-        let rig = rig(0);
+        let rig = rig(0).await;
         let mut broken = programs(&["replicate"]);
         broken.push(("garbled".to_string(), vec![0, 1, 2, 3]));
         assert!(matches!(
-            rig.router.reload(broken).await,
+            rig.host.reload(broken).await,
             Err(LoadError::Of(name, _)) if name == "garbled"
         ));
         assert!(matches!(
-            rig.router
+            rig.host
                 .reload(programs(&["test-route", "cache-aware"]))
                 .await,
             Err(LoadError::Shared { .. })
@@ -1916,7 +814,7 @@ mod tests {
     async fn a_reload_tells_the_new_programs_what_the_old_ones_withdrew() {
         // test-share publishes the placement test-route made; test-route
         // names it as the process's executors.
-        let rig = rig_of(0, &["test-share", "test-route"]);
+        let rig = rig_of(0, &["test-share", "test-route"]).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         let until = |want: &[WorkerId]| {
@@ -1940,13 +838,13 @@ mod tests {
         until(&[WorkerId(1)]).await;
         // Without test-share, its value is withdrawn; the new test-route,
         // told so, places the process again and names no executors.
-        rig.router.reload(programs(&["test-route"])).await.unwrap();
+        rig.host.reload(programs(&["test-route"])).await.unwrap();
         until(&[]).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_launch_is_held_below_the_floor_and_placed_where_its_policy_says() {
-        let rig = rig(0);
+        let rig = rig(0).await;
         let held = launch(
             1,
             serde_json::json!({"key": 0, "worker": "1", "executors": "3,2"}),
@@ -1963,7 +861,11 @@ mod tests {
 
         let (worker, props, executors) = rig.router.placement(&held);
         assert_eq!(worker, Some(WorkerId(1)));
-        assert_eq!(props["from"], serde_json::json!("1"));
+        assert_eq!(
+            props["from"],
+            serde_json::json!("0.1"),
+            "the policies name it by its gateway and its request"
+        );
         assert_eq!(
             executors,
             [WorkerId(3), WorkerId(2)],
@@ -1975,7 +877,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_policy_beside_another_places_what_it_places() {
-        let rig = rig_of(0, &["replicate", "test-route"]);
+        let rig = rig_of(0, &["replicate", "test-route"]).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
@@ -1989,8 +891,8 @@ mod tests {
             "scale-engine": "cuda_native",
             "scale-model": "m",
         });
-        let granted = rig_of(0, &["scale-by-prop", "test-route"]);
-        let mut scale = granted.router.scale_watch();
+        let granted = rig_of(0, &["scale-by-prop", "test-route"]).await;
+        let mut scale = granted.host.scale_watch();
         granted
             .router
             .admit(&launch(1, ask.clone()), &granted.routing)
@@ -2012,8 +914,8 @@ mod tests {
         );
 
         // test-route installs one too, and holds no `scale` grant.
-        let ungranted = rig_of(0, &["test-route"]);
-        let scale = ungranted.router.scale_watch();
+        let ungranted = rig_of(0, &["test-route"]).await;
+        let scale = ungranted.host.scale_watch();
         ungranted
             .router
             .admit(&launch(1, ask), &ungranted.routing)
@@ -2022,82 +924,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             scale.borrow().is_none(),
-            "refused, and a gateway granted no `scale` speaks for no size"
+            "refused: a program granted no `scale` speaks for no size"
         );
     }
 
-    #[test]
-    fn cluster_scale_is_there_while_the_controller_can_act() {
-        let registry = Registry::default();
-        let tables = Tables::default();
-        let mut routing = table(0);
-        assert!(
-            !registry
-                .snapshot(&routing, &tables)
-                .capability("cluster.scale")
-        );
-        routing.scales = true;
-        assert!(
-            registry
-                .snapshot(&routing, &tables)
-                .capability("cluster.scale")
-        );
-        assert!(
-            registry
-                .snapshot(&routing, &tables)
-                .capability("placement.migrate"),
-            "the rest as before"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_placement_s_parts_have_an_author_each() {
-        let (_table, table_rx) = watch::channel(table(0));
-        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
-        assert!(
-            Cluster::start(
-                programs(&["cache-aware", "disaggregate"]),
-                table_rx,
-                watch::channel(None).1,
-                connected_rx,
-                crate::worker::WorkerRegistry::new(),
-            )
-            .is_ok(),
-            "one places processes, the other names their executors"
-        );
-    }
-
-    #[tokio::test]
-    async fn two_policies_granted_the_same_write_do_not_load() {
-        let (_table, table_rx) = watch::channel(table(0));
-        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
-        let started = Cluster::start(
-            programs(&["test-route", "cache-aware"]),
-            table_rx,
-            watch::channel(None).1,
-            connected_rx,
-            crate::worker::WorkerRegistry::new(),
-        );
-        match started {
-            Err(LoadError::Shared {
-                grant,
-                first,
-                second,
-            }) => {
-                assert_eq!(
-                    (grant.as_str(), first.as_str(), second.as_str()),
-                    ("placement", "test-route", "cache-aware")
-                );
-            }
-            Err(other) => panic!("refused for sharing a write, got {other}"),
-            Ok(_) => panic!("refused for sharing a write, but it loaded"),
-        }
-    }
-
-    // One thread, so each records its release as it is released.
     #[tokio::test]
     async fn waiting_launches_leave_in_key_order_when_room_opens() {
-        let rig = rig(255);
+        let rig = rig(255).await;
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut waits = Vec::new();
         for (req, key) in [(1, 1), (2, 5), (3, 3)] {
@@ -2122,7 +955,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_terminated_launch_is_refused_while_it_waits_and_cancelled_once_it_runs() {
-        let mut rig = rig(0);
+        let mut rig = rig(0).await;
         let refused = launch(1, serde_json::json!({"refuse": "not today"}));
         match rig.router.admit(&refused, &rig.routing).await {
             Err(AdmitReject::Refused(why)) => assert_eq!(why, "not today"),
@@ -2138,386 +971,12 @@ mod tests {
         assert_eq!(cancelled, Some(ReqId(2)));
     }
 
-    fn placed(worker: &str, props: &[(&str, &str)]) -> wit::Placement {
-        wit::Placement {
-            process: String::new(),
-            worker: Some(worker.into()),
-            executors: Vec::new(),
-            props: props
-                .iter()
-                .map(|(n, v)| (n.to_string(), Value::Text(v.to_string())))
-                .collect(),
-        }
-    }
-
-    fn carried_kinds(registry: &mut Registry) -> Vec<(String, String)> {
-        std::mem::take(&mut registry.carried)
-            .into_iter()
-            .map(|(author, edge)| {
-                let what = match edge {
-                    Edge::PlacementChanged(id) => format!("placement {id}"),
-                    Edge::ReplicationChanged(id) => format!("replication {id}"),
-                    Edge::RetentionChanged(id) => format!("retention {id}"),
-                    Edge::Published(subject) => format!("published {}", subject_key(&subject)),
-                    other => format!("{other:?}"),
-                };
-                (author, what)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_committed_placement_reads_as_attrs_and_its_change_is_carried_once() {
-        let mut registry = Registry::default();
-        let mut tables = Tables::default();
-        let before = placed_all(&tables);
-        tables
-            .placement
-            .insert("7".into(), placed("3", &[("tier", "gold")]));
-        tables
-            .executors
-            .insert("7".into(), vec!["5".into(), "4".into()]);
-        registry.carry_placements("a", &before, &placed_all(&tables));
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [("a".to_string(), "placement 7".to_string())],
-            "one edge for the one process that changed, carried by its author"
-        );
-
-        let plane = registry.snapshot(&table(0), &tables);
-        let process = Subject::Process("7".into());
-        assert!(
-            matches!(plane.attr(&process, "placement/worker"), Some(Value::Text(w)) if w == "3")
-        );
-        assert!(
-            matches!(plane.attr(&process, "placement/executors"), Some(Value::Json(j)) if j == r#"["5","4"]"#)
-        );
-        assert!(
-            matches!(plane.attr(&process, "placement/props/tier"), Some(Value::Text(v)) if v == "gold")
-        );
-        assert!(plane.attr(&process, "placement/props/none").is_none());
-
-        // The same table again is no change.
-        let before = placed_all(&tables);
-        registry.carry_placements("b", &before, &placed_all(&tables));
-        assert!(carried_kinds(&mut registry).is_empty());
-    }
-
-    #[test]
-    fn a_published_value_reads_under_its_author_s_name_and_is_carried_only_when_it_changes() {
-        let mut registry = Registry::default();
-        let worker = Subject::Worker("1".into());
-        registry.published.insert(
-            "1".into(),
-            HashMap::from([("mark".to_string(), serde_json::json!("own"))]),
-        );
-        registry.say(
-            "a",
-            vec![(worker.clone(), "mark".into(), Some(Value::Int(3)))],
-        );
-        registry.say(
-            "b",
-            vec![(worker.clone(), "mark".into(), Some(Value::Int(4)))],
-        );
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [
-                ("a".to_string(), "published worker:1".to_string()),
-                ("b".to_string(), "published worker:1".to_string()),
-            ]
-        );
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(matches!(
-            plane.attr(&worker, "published/a/mark"),
-            Some(Value::Int(3))
-        ));
-        assert!(matches!(
-            plane.attr(&worker, "published/b/mark"),
-            Some(Value::Int(4))
-        ));
-        assert!(
-            matches!(plane.attr(&worker, "published/mark"), Some(Value::Text(t)) if t == "own"),
-            "the worker's own policy's value stands beside the programs'"
-        );
-
-        registry.say(
-            "a",
-            vec![(worker.clone(), "mark".into(), Some(Value::Int(3)))],
-        );
-        assert!(
-            carried_kinds(&mut registry).is_empty(),
-            "the same value again is no change"
-        );
-
-        registry.say("a", vec![(worker.clone(), "mark".into(), None)]);
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [("a".to_string(), "published worker:1".to_string())]
-        );
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(
-            plane.attr(&worker, "published/a/mark").is_none(),
-            "withdrawn"
-        );
-        assert!(matches!(
-            plane.attr(&worker, "published/b/mark"),
-            Some(Value::Int(4))
-        ));
-    }
-
-    #[test]
-    fn a_group_s_committed_replication_reads_as_its_sites() {
-        let mut registry = Registry::default();
-        let before = replicated(&registry.replication);
-        registry.replication = vec![wit::Replicate {
-            group: "g".into(),
-            upto: None,
-            at: vec![
-                wit::Site {
-                    worker: "2".into(),
-                    tier: wit::Tier::Host,
-                },
-                wit::Site {
-                    worker: "1".into(),
-                    tier: wit::Tier::Device,
-                },
-            ],
-        }];
-        registry.carry_replications("r", &before);
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [("r".to_string(), "replication g".to_string())]
-        );
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(
-            matches!(plane.attr(&Subject::Group("g".into()), "replication/sites"), Some(Value::Json(j)) if j == r#"["1","2"]"#)
-        );
-    }
-
-    fn group(sites: &[u64]) -> crate::directory::Group {
-        crate::directory::Group {
-            keys: Arc::new(vec![[7; 32]]),
-            sites: sites.iter().copied().map(WorkerId).collect(),
-        }
-    }
-
-    fn retention(entries: &[(&str, i64)]) -> Table {
-        Table {
-            keys: entries.iter().map(|(g, k)| (g.to_string(), *k)).collect(),
-            floor: None,
-        }
-    }
-
-    #[test]
-    fn a_group_s_committed_retention_reads_as_its_key_and_only_a_changed_key_is_carried() {
-        let mut registry = Registry::default();
-        registry.replace_retention("r", retention(&[("g", 2), ("h", 0)]));
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [("r".to_string(), "retention g".to_string())],
-            "h at 0 is where a group no entry names already is"
-        );
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        let key = |id: &str| plane.attr(&Subject::Group(id.into()), "retention/key");
-        assert!(matches!(key("g"), Some(Value::Int(2))));
-        assert!(matches!(key("h"), Some(Value::Int(0))));
-        assert!(key("other").is_none());
-
-        registry.replace_retention("r", retention(&[("g", 2)]));
-        assert!(carried_kinds(&mut registry).is_empty(), "no key changed");
-        registry.replace_retention("r", retention(&[("g", 3)]));
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [("r".to_string(), "retention g".to_string())]
-        );
-    }
-
-    #[test]
-    fn a_retained_group_no_pool_holds_is_asked_of_a_pool_highest_key_first() {
-        let mut registry = Registry {
-            groups: HashMap::from([
-                ("a".to_string(), group(&[1])),
-                ("b".to_string(), group(&[1])),
-                ("held".to_string(), group(&[1, 9])),
-                ("zero".to_string(), group(&[1])),
-            ]),
-            retention: retention(&[("a", 1), ("b", 5), ("held", 3), ("zero", 0), ("gone", 9)]),
-            ..Default::default()
-        };
-        assert!(
-            registry.retained().is_empty(),
-            "with no pool, the table is taken and nothing is asked"
-        );
-        registry.pools = vec!["9".into()];
-        assert_eq!(
-            registry.retained(),
-            [
-                ("b".to_string(), WorkerId(9)),
-                ("a".to_string(), WorkerId(9))
-            ],
-            "a pool already holds `held`, `zero` is at 0, `gone` is in no directory"
-        );
-    }
-
-    #[test]
-    fn a_gateway_that_is_not_the_author_takes_its_state_tables_and_does_not_enact_them() {
-        let shared = shared();
-        let mut registry = Registry {
-            groups: HashMap::from([("g".to_string(), group(&[1]))]),
-            pools: vec!["9".into()],
-            ..Default::default()
-        };
-        let commit = Commit {
-            state: super::super::StateCommit {
-                replication: Some(vec![wit::Replicate {
-                    group: "g".into(),
-                    upto: None,
-                    at: vec![wit::Site {
-                        worker: "2".into(),
-                        tier: wit::Tier::Host,
-                    }],
-                }]),
-                retention: Some(retention(&[("g", 4)])),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        enact(&shared, &mut registry, commit, "keeper");
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(
-            matches!(
-                plane.attr(&Subject::Group("g".into()), "retention/key"),
-                Some(Value::Int(4))
-            ),
-            "taken: the programs read it"
-        );
-        assert!(
-            registry.wanted().is_empty(),
-            "not the author: nothing asked"
-        );
-        registry.author = true;
-        assert_eq!(
-            registry.wanted(),
-            [
-                ("g".to_string(), WorkerId(2), "replication"),
-                ("g".to_string(), WorkerId(9), "retention")
-            ],
-            "the author asks for what both tables want"
-        );
-
-        // The author is the gateway the routing table names.
-        let mut routing = table(0);
-        assert!(!crate::controller::authors(&routing, Some(GatewayId(1))));
-        routing.author = Some(GatewayId(1));
-        assert!(crate::controller::authors(&routing, Some(GatewayId(1))));
-        assert!(!crate::controller::authors(&routing, Some(GatewayId(2))));
-        assert!(!crate::controller::authors(&routing, None));
-    }
-
-    #[test]
-    fn a_group_only_a_pool_holds_is_listed_with_the_pool_its_site_and_not_asked_again() {
-        let directory = crate::directory::Directory::default();
-        let run = vec![[1; 32], [2; 32]];
-        directory.report(WorkerId(9), Some("p:9".into()), run.clone(), vec![], true);
-        directory.report_runs(WorkerId(9), vec![run], vec![], true, true);
-        let id = hex(&[2; 32]);
-        let registry = Registry {
-            groups: directory
-                .groups()
-                .into_iter()
-                .map(|(last, group)| (hex(&last), group))
-                .collect(),
-            pools: vec!["9".into()],
-            retention: retention(&[(&id, 1)]),
-            ..Default::default()
-        };
-        assert!(registry.retained().is_empty(), "the pool holds it");
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(
-            matches!(plane.attr(&Subject::Group(id.clone()), "sites"), Some(Value::Json(j)) if j == r#"["9"]"#)
-        );
-        assert!(matches!(
-            plane.attr(&Subject::Group(id), "retention/key"),
-            Some(Value::Int(1))
-        ));
-    }
-
-    fn shared() -> Shared {
-        Shared {
-            tables: RwLock::default(),
-            scale: watch::Sender::new(None),
-            waiting: Mutex::default(),
-            refused: Mutex::default(),
-            cancels: mpsc::unbounded_channel().0,
-            migrations: mpsc::unbounded_channel().0,
-            heard: watch::Sender::new(0),
-            changed: Notify::new(),
-        }
-    }
-
-    #[test]
-    fn a_retention_table_is_committed_with_its_call_and_withdrawn_with_its_program() {
-        let shared = shared();
-        let mut registry = Registry {
-            groups: HashMap::from([("g".to_string(), group(&[1]))]),
-            pools: vec!["9".into()],
-            ..Default::default()
-        };
-        let commit = Commit {
-            state: super::super::StateCommit {
-                retention: Some(retention(&[("g", 4)])),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        enact(&shared, &mut registry, commit, "keeper");
-        assert!(registry.replaced, "enacted on the next round");
-        assert_eq!(registry.retained(), [("g".to_string(), WorkerId(9))]);
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [("keeper".to_string(), "retention g".to_string())]
-        );
-
-        // A call that installs no retention table leaves the one standing.
-        enact(&shared, &mut registry, Commit::default(), "keeper");
-        assert_eq!(registry.retention.key("g"), 4);
-
-        // Its death, or a reload, withdraws it, and the others hear it.
-        let manifest: super::super::Manifest =
-            toml::from_str("plane = \"cluster\"\ngrants = [\"retention\"]").unwrap();
-        withdraw(&shared, &mut registry, "keeper", &manifest);
-        assert!(registry.retained().is_empty());
-        assert_eq!(
-            carried_kinds(&mut registry),
-            [("keeper".to_string(), "retention g".to_string())]
-        );
-        let plane = registry.snapshot(&table(0), &Tables::default());
-        assert!(
-            plane
-                .attr(&Subject::Group("g".into()), "retention/key")
-                .is_none()
-        );
-
-        // A program not granted retention leaves the table when it goes.
-        registry.replace_retention("keeper", retention(&[("g", 4)]));
-        let other: super::super::Manifest =
-            toml::from_str("plane = \"cluster\"\ngrants = [\"replication\"]").unwrap();
-        withdraw(&shared, &mut registry, "other", &other);
-        assert_eq!(registry.retention.key("g"), 4);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn retain_all_runs_beside_a_replicating_program_and_its_grant_is_enacted() {
-        assert!(capability("state.retain"));
-        let _rig = rig_of(0, &["retain-all", "replicate"]);
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn a_program_answers_another_s_placement_and_that_one_acts_on_the_answer() {
         // test-route places the process on worker 1; test-share, told the
         // placement changed, publishes it; test-route, told of that, names
         // what it read as the process's executors.
-        let rig = rig_of(0, &["test-share", "test-route"]);
+        let rig = rig_of(0, &["test-share", "test-route"]).await;
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2535,21 +994,318 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn any_number_of_programs_may_publish() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_process_placed_elsewhere_moves_there_once() {
+        let mut rig = rig_of(0, &["relocate"]).await;
+        let placed = launch(
+            1,
+            serde_json::json!({"worker": 1, "move-to": 2, "move-after-ms": 0}),
+        );
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        rig.router.dispatched(&placed, WorkerId(1));
+        let moved = tokio::time::timeout(Duration::from_secs(5), rig.moves.recv())
+            .await
+            .expect("the gateway is told to move it");
+        assert_eq!(moved, Some((ReqId(1), WorkerId(2))));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rig.moves.recv())
+                .await
+                .is_err(),
+            "asked once while the placement stands"
+        );
+        rig.router.moved(&placed, Some(WorkerId(2)), "");
+        rig.router.exited(&placed, Outcome::Completed);
+    }
+
+    /// A controller that records what it hears, and can be swapped for a
+    /// new one.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        heard: Arc<Mutex<Vec<ProcessEvent>>>,
+        generation: Arc<AtomicU64>,
+    }
+
+    impl GatewayControl for Recorder {
+        async fn register_gateway(&self, _info: GatewayInfo) -> anyhow::Result<GatewayId> {
+            Ok(GatewayId(0))
+        }
+        async fn heartbeat(&self, _id: NodeId) -> anyhow::Result<Ack> {
+            Ok(Ack::Ok)
+        }
+        fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
+            watch::channel(table(0)).1
+        }
+        fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
+            watch::channel(DirectoryView::default()).1
+        }
+        async fn report_state(&self, _w: WorkerId, _r: StateReport) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn forget_state(&self, _w: WorkerId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn cluster_events(&self, _g: GatewayId, e: Vec<ProcessEvent>) -> anyhow::Result<()> {
+            self.heard.lock().unwrap().extend(e);
+            Ok(())
+        }
+        fn decisions_watch(&self, _g: GatewayId) -> watch::Receiver<GatewayDecisions> {
+            watch::channel(GatewayDecisions {
+                epoch: 1,
+                active: true,
+                heard: u64::MAX,
+                ..GatewayDecisions::default()
+            })
+            .1
+        }
+        fn generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_controller_hears_the_live_processes_and_sessions_first() {
+        let recorder = Recorder::default();
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
+        let routing = RoutingHandle::new(table_rx, connected_rx.clone());
+        let (_me, me_rx) = watch::channel(Some(GatewayId(0)));
+        let (router, _, _) = Cluster::start(
+            recorder.clone(),
+            me_rx,
+            connected_rx,
+            crate::worker::WorkerRegistry::new(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !router.active() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (live, gone) = (
+            launch(1, serde_json::json!({"key": 1})),
+            launch(2, serde_json::json!({})),
+        );
+        router.admit(&live, &routing).await.unwrap();
+        router.dispatched(&live, WorkerId(1));
+        router.admit(&gone, &routing).await.unwrap();
+        router.exited(&gone, Outcome::Completed);
+        let changes: Props = serde_json::from_value(serde_json::json!({"eta": 9})).unwrap();
+        router.session_props("t/s".into(), changes);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        recorder.heard.lock().unwrap().clear();
+
+        // The controller is dialed again: a new one.
+        recorder.generation.fetch_add(1, Ordering::AcqRel);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let heard = std::mem::take(&mut *recorder.heard.lock().unwrap());
+        let kinds: Vec<String> = heard
+            .iter()
+            .filter(|event| !matches!(event, ProcessEvent::Workers(_)))
+            .map(|event| match event {
+                ProcessEvent::Arrived { req, .. } => format!("arrived {req}"),
+                ProcessEvent::Dispatched { req, worker } => format!("dispatched {req} {worker}"),
+                ProcessEvent::SessionProps { id, .. } => format!("session {id}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["arrived 1", "dispatched 1 worker#1", "session t/s"],
+            "the live process, where it runs, and the session; not the one that exited"
+        );
+    }
+
+    /// A controller that can die and be replaced: while down, nothing it is
+    /// told is heard and it decides nothing; each one up is new, dialed
+    /// afresh.
+    #[derive(Clone, Default)]
+    struct Replaced {
+        up: Arc<Mutex<Option<Arc<Host>>>>,
+        generation: Arc<AtomicU64>,
+    }
+
+    impl Replaced {
+        fn down(&self) {
+            *self.up.lock().unwrap() = None;
+        }
+
+        fn up(&self, host: Arc<Host>) {
+            *self.up.lock().unwrap() = Some(host);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl GatewayControl for Replaced {
+        async fn register_gateway(&self, _info: GatewayInfo) -> anyhow::Result<GatewayId> {
+            Ok(GatewayId(0))
+        }
+        async fn heartbeat(&self, _id: NodeId) -> anyhow::Result<Ack> {
+            Ok(Ack::Ok)
+        }
+        fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
+            watch::channel(table(0)).1
+        }
+        fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
+            watch::channel(DirectoryView::default()).1
+        }
+        async fn report_state(&self, _w: WorkerId, _r: StateReport) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn forget_state(&self, _w: WorkerId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn cluster_events(&self, g: GatewayId, e: Vec<ProcessEvent>) -> anyhow::Result<()> {
+            let host = self.up.lock().unwrap().clone();
+            let host = host.ok_or_else(|| anyhow::anyhow!("no controller"))?;
+            host.events(g, e);
+            Ok(())
+        }
+        /// Follows whichever controller is up, as the healing client does.
+        fn decisions_watch(&self, g: GatewayId) -> watch::Receiver<GatewayDecisions> {
+            let (tx, rx) = watch::channel(GatewayDecisions::default());
+            let this = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    let generation = this.generation();
+                    let host = this.up.lock().unwrap().clone();
+                    let Some(host) = host else {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        continue;
+                    };
+                    let mut decisions = host.decisions(g);
+                    decisions.mark_changed();
+                    while this.generation() == generation && this.up.lock().unwrap().is_some() {
+                        if decisions.has_changed().unwrap_or(false)
+                            && tx.send(decisions.borrow_and_update().clone()).is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            });
+            rx
+        }
+        fn generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_controller_that_replaces_a_dead_one_takes_up_its_running_processes() {
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
+        let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
+        let start = || {
+            Host::start(
+                programs(&["relocate"]),
+                table_rx.clone(),
+                watch::channel(DirectoryView::default()).1,
+            )
+            .unwrap()
+        };
+        let control = Replaced::default();
+        control.up(start());
+        let (_me, me_rx) = watch::channel(Some(GatewayId(0)));
+        let (router, _, mut moves) = Cluster::start(
+            control.clone(),
+            me_rx,
+            connected_rx,
+            crate::worker::WorkerRegistry::new(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !router.active() {
+            assert!(
+                Instant::now() < deadline,
+                "the gateway never heard the policies run"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let placed = launch(
+            1,
+            serde_json::json!({"worker": 1, "move-to": 2, "move-after-ms": 600}),
+        );
+        rig_admit(&router, &placed, &routing).await;
+        router.dispatched(&placed, WorkerId(1));
+        assert_eq!(router.placement(&placed).0, Some(WorkerId(1)));
+
+        // The controller dies before the move is due, and stays down past it.
+        control.down();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(900), moves.recv())
+                .await
+                .is_err(),
+            "no controller, no move"
+        );
+        // While it is down, the gateway keeps to what it last heard.
+        assert!(router.active());
+        assert_eq!(router.placement(&placed).0, Some(WorkerId(1)));
+
+        // A new one hears the process from the gateway and, its time come
+        // again, moves it.
+        control.up(start());
+        let moved = tokio::time::timeout(Duration::from_secs(5), moves.recv())
+            .await
+            .expect("the new controller moves it");
+        assert_eq!(moved, Some((ReqId(1), WorkerId(2))));
+        router.moved(&placed, Some(WorkerId(2)), "");
+        router.exited(&placed, Outcome::Completed);
+    }
+
+    async fn rig_admit(router: &Cluster, req: &Request, routing: &RoutingHandle) {
+        tokio::time::timeout(Duration::from_secs(5), router.admit(req, routing))
+            .await
+            .expect("admitted in time")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_no_policy_running_the_gateway_goes_by_its_defaults() {
         let (_table, table_rx) = watch::channel(table(0));
         let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
-        let share = builtins::policy("test-share").unwrap().component.to_vec();
-        assert!(
-            Cluster::start(
-                vec![("one".into(), share.clone()), ("two".into(), share)],
-                table_rx,
-                watch::channel(None).1,
-                connected_rx,
-                crate::worker::WorkerRegistry::new(),
-            )
-            .is_ok(),
-            "each publishes under its own name"
+        let controller = controller::embed(controller::Config::default());
+        let (_me, me_rx) = watch::channel(Some(GatewayId(0)));
+        #[derive(Clone)]
+        struct Idle(controller::Handle);
+        impl GatewayControl for Idle {
+            async fn register_gateway(&self, _info: GatewayInfo) -> anyhow::Result<GatewayId> {
+                Ok(GatewayId(0))
+            }
+            async fn heartbeat(&self, _id: NodeId) -> anyhow::Result<Ack> {
+                Ok(Ack::Ok)
+            }
+            fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
+                watch::channel(table(0)).1
+            }
+            fn directory_watch(&self) -> watch::Receiver<DirectoryView> {
+                self.0.directory_watch()
+            }
+            async fn report_state(&self, _w: WorkerId, _r: StateReport) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn forget_state(&self, _w: WorkerId) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn cluster_events(
+                &self,
+                g: GatewayId,
+                e: Vec<ProcessEvent>,
+            ) -> anyhow::Result<()> {
+                self.0.cluster_events(g, e);
+                Ok(())
+            }
+            fn decisions_watch(&self, g: GatewayId) -> watch::Receiver<GatewayDecisions> {
+                self.0.decisions_watch(g)
+            }
+        }
+        let (router, _, _) = Cluster::start(
+            Idle(controller.clone()),
+            me_rx,
+            connected_rx,
+            crate::worker::WorkerRegistry::new(),
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!router.active(), "nothing to tell, nothing to follow");
+        let _ = table_rx;
+        controller.shutdown().await;
     }
 }

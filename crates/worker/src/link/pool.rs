@@ -34,6 +34,9 @@ impl WorkerControl for NoTurns {
         keys: Vec<[u8; 32]>,
         from: String,
         retention: i64,
+        // A pool keeps what it takes in its own store, on disk or not, as
+        // its configuration says.
+        _disk: bool,
     ) -> Result<u32, String> {
         let pages = transport::tcp::fetch(&from, &keys, 0).await?;
         let count = pages.count as u32;

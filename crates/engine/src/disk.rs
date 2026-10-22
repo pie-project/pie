@@ -1,5 +1,5 @@
-//! Slot files below host memory, one per rank and kind, unlinked once open so
-//! they never outlive the process.
+//! Slot files below host memory, one per rank and kind: unlinked once open so
+//! they never outlive the process, or kept, for a persistent tier.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -15,6 +15,7 @@ pub struct SlotFile {
     file: File,
     stride: usize,
     slots: u32,
+    kept: bool,
 }
 
 impl SlotFile {
@@ -25,6 +26,68 @@ impl SlotFile {
     /// lock covers the moment before the unlink, so two servers never share
     /// one file.
     pub fn open(dir: &Path, name: &str, slot_bytes: u64, budget: u64) -> io::Result<Option<Self>> {
+        let Some((file, stride, slots)) = Self::locked(dir, name, slot_bytes, budget)? else {
+            return Ok(None);
+        };
+        std::fs::remove_file(dir.join(name))?;
+        Self::reserve(&file, slots, stride)?;
+        Ok(Some(Self {
+            file,
+            stride,
+            slots,
+            kept: false,
+        }))
+    }
+
+    /// [`Self::open`], but the path stays for the next run: `dir/<name>`
+    /// and beside it `<name>.meta`, which names the file's slots and the
+    /// `layout` its engine wrote them in. When the meta found matches,
+    /// [`Self::kept`] is true and the slots hold what the last run left
+    /// there; otherwise the file is taken afresh. Which slots mean anything
+    /// is the caller's to remember.
+    pub fn open_kept(
+        dir: &Path,
+        name: &str,
+        slot_bytes: u64,
+        budget: u64,
+        layout: &str,
+    ) -> io::Result<Option<Self>> {
+        let Some((file, stride, slots)) = Self::locked(dir, name, slot_bytes, budget)? else {
+            return Ok(None);
+        };
+        let meta_path = dir.join(format!("{name}.meta"));
+        let meta = format!("{layout}\n{stride}\n{slots}\n");
+        let len = u64::from(slots) * stride as u64;
+        let kept = std::fs::read_to_string(&meta_path).is_ok_and(|found| found == meta)
+            && file.metadata()?.len() == len;
+        if !kept {
+            // No meta while the file is taken afresh: a run that dies here
+            // leaves nothing that reads as kept.
+            match std::fs::remove_file(&meta_path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+            file.set_len(0)?;
+            Self::reserve(&file, slots, stride)?;
+            file.sync_all()?;
+            write_synced(&meta_path, meta.as_bytes())?;
+        }
+        Ok(Some(Self {
+            file,
+            stride,
+            slots,
+            kept,
+        }))
+    }
+
+    /// The file at `dir/<name>`, open and locked, with the slots `budget`
+    /// holds; `None` when that is none.
+    fn locked(
+        dir: &Path,
+        name: &str,
+        slot_bytes: u64,
+        budget: u64,
+    ) -> io::Result<Option<(File, usize, u32)>> {
         let stride = usize::try_from(slot_bytes)
             .map_err(io::Error::other)?
             .next_multiple_of(ALIGN);
@@ -42,29 +105,39 @@ impl SlotFile {
                 path.display()
             ))
         })?;
-        std::fs::remove_file(&path)?;
+        Ok(Some((file, stride, slots)))
+    }
+
+    fn reserve(file: &File, slots: u32, stride: usize) -> io::Result<()> {
         let len = u64::from(slots) * stride as u64;
         file.set_len(len)?;
         // APFS copies on write: a page written lands in new blocks and the
         // preallocated ones stay reserved, so preallocating there doubles
         // the file's footprint instead of guaranteeing it.
         #[cfg(all(unix, not(target_vendor = "apple")))]
-        if let Err(error) =
-            rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, len)
+        if let Err(error) = rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, len)
             && error != rustix::io::Errno::OPNOTSUPP
         {
             return Err(error.into());
         }
-        Ok(Some(Self {
-            file,
-            stride,
-            slots,
-        }))
+        Ok(())
     }
 
     #[must_use]
     pub fn slots(&self) -> u32 {
         self.slots
+    }
+
+    /// Whether the slots hold what the last run left: a kept file whose
+    /// meta matched.
+    #[must_use]
+    pub fn kept(&self) -> bool {
+        self.kept
+    }
+
+    /// Makes every slot written so far durable.
+    pub fn sync(&self) -> io::Result<()> {
+        self.file.sync_data()
     }
 
     /// The bytes one slot takes in the file and in a page's stage.
@@ -100,6 +173,20 @@ impl SlotFile {
         }
         Ok(u64::from(slot) * self.stride as u64)
     }
+}
+
+/// The bytes a kept slot file `dir/<name>` already takes: room a
+/// persistent tier counts as its own when it sizes itself again.
+#[must_use]
+pub fn kept_bytes(dir: &Path, name: &str) -> u64 {
+    std::fs::metadata(dir.join(name)).map_or(0, |meta| meta.len())
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Zero when the filesystem does not say.
@@ -262,6 +349,49 @@ mod tests {
         assert_eq!(back.as_slice(), stage.as_slice());
         assert!(file.read(4, back.as_mut_slice()).is_err());
         drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_kept_file_holds_its_slots_across_opens_until_its_layout_or_size_changes() {
+        let dir = std::env::temp_dir().join(format!("pie-slot-kept-{}", std::process::id()));
+        let mut stage = Aligned::zeroed(8192);
+        stage.as_mut_slice().fill(7);
+        {
+            let file = SlotFile::open_kept(&dir, "r0.kv", 8192, 4 * 8192, "a")
+                .unwrap()
+                .unwrap();
+            assert!(!file.kept(), "a new file holds nothing");
+            file.write(2, stage.as_slice()).unwrap();
+            file.sync().unwrap();
+            assert!(
+                SlotFile::open_kept(&dir, "r0.kv", 8192, 4 * 8192, "a").is_err(),
+                "two servers share one file"
+            );
+        }
+        assert_eq!(kept_bytes(&dir, "r0.kv"), 4 * 8192);
+        {
+            let file = SlotFile::open_kept(&dir, "r0.kv", 8192, 4 * 8192, "a")
+                .unwrap()
+                .unwrap();
+            assert!(file.kept());
+            let mut back = Aligned::zeroed(8192);
+            file.read(2, back.as_mut_slice()).unwrap();
+            assert_eq!(back.as_slice(), stage.as_slice());
+        }
+        let other_layout = SlotFile::open_kept(&dir, "r0.kv", 8192, 4 * 8192, "b")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !other_layout.kept(),
+            "another layout's slots read as this one's"
+        );
+        drop(other_layout);
+        let other_size = SlotFile::open_kept(&dir, "r0.kv", 8192, 8 * 8192, "b")
+            .unwrap()
+            .unwrap();
+        assert!(!other_size.kept(), "slots of another count read as kept");
+        drop(other_size);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

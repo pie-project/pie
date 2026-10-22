@@ -5,7 +5,8 @@ mod data;
 mod link;
 pub mod peer;
 
-pub use data::{Accepted, BlobRef, Control, Priority, Request, StateReport, Tokens};
+pub use controller_api::StateReport;
+pub use data::{Accepted, BlobRef, Control, Priority, Request, Tokens};
 pub use link::{
     ChannelOrIoError, TwoWayMessage, accept_gateway_link, connect_gateway_link, dispatch_codec,
     spawn_twoway,
@@ -24,15 +25,10 @@ pub trait GatewayInbound {
 
     async fn redirect(req_id: ReqId);
 
-    /// What this worker holds, since its last report.
+    /// What a worker that links to no controller (a pool) holds, since its
+    /// last report: passed on to the controller's directory. A worker with
+    /// a controller reports there itself.
     async fn state(worker_id: WorkerId, report: StateReport);
-
-    /// The workers, not `worker_id`, that hold a run of `keys` from token 0:
-    /// each one's bulk address and how many pages of the run, longest first.
-    async fn locate(worker_id: WorkerId, keys: Vec<[u8; 32]>) -> Vec<(WorkerId, String, u32)>;
-
-    /// Where worker `worker`'s peer link listens, as it last said.
-    async fn link(worker: WorkerId) -> Option<String>;
 }
 
 #[tarpc::service]
@@ -54,8 +50,14 @@ pub trait WorkerControl {
     /// Take the run `keys` (from token 0) from the worker whose bulk address
     /// is `from`, and keep it: the cluster policy's replication. `retention`
     /// is the group's cluster retention key (0 when none names it): a pool
-    /// lets lower keys go first. Answers how many pages came.
-    async fn replicate(keys: Vec<[u8; 32]>, from: String, retention: i64) -> Result<u32, String>;
+    /// lets lower keys go first. `disk`: keep it on this worker's persistent
+    /// disk tier, from the run it holds itself. Answers how many pages came.
+    async fn replicate(
+        keys: Vec<[u8; 32]>,
+        from: String,
+        retention: i64,
+        disk: bool,
+    ) -> Result<u32, String>;
 
     /// `changes` is a JSON object whose `null`s remove names; none closes the
     /// session.
