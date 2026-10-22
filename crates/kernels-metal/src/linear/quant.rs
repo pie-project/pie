@@ -1297,46 +1297,14 @@ fn staged(
     let tiles = cols / 64;
     if cols >= COOP_LEAST_COLUMNS && k % COOP_SPAN == 0 {
         // Wide enough to fill the device from its columns alone, it runs whole; narrower, the
-        // contraction is cut in four so a 5120-column projection is not 160 simdgroups.
+        // contraction is cut in four, within each column tile's threadgroup, so a 5120-column
+        // projection is not 160 simdgroups.
         let split = if cols >= COOP_WHOLE_COLUMNS || (k / COOP_SPAN) % COOP_SPLIT != 0 {
             1
         } else {
             COOP_SPLIT
         };
-        let partial = if split > 1 {
-            (scratch.partials)(m.unsigned_abs() * split.unsigned_abs(), n.unsigned_abs())
-        } else {
-            None
-        };
-        if split == 1 || partial.is_some() {
-            let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
-            let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
-            ctx.fire(
-                Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
-                    [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
-                    [64, 1, 1],
-                )),
-                &[
-                    w.codes.arg(),
-                    w.scales.arg(),
-                    biases.arg(),
-                    act.arg(),
-                    y.arg_mut(),
-                    k.arg(),
-                    n.arg(),
-                    match partial {
-                        Some(partial) => partial.arg_mut(),
-                        None => ctx.absent()?,
-                    },
-                    m.arg(),
-                    ld.arg(),
-                ],
-            )?;
-            return match partial {
-                Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
-                None => Ok(()),
-            };
-        }
+        return coop_matmul(ctx, act, w, biases, y, (m, n, k, cols, ld), split);
     }
     let mut split = if k >= STAGED_DEEP || tiles < STAGED_FEW_TILES {
         STAGED_SPLIT_WIDE
@@ -1381,6 +1349,43 @@ fn staged(
         Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
         None => Ok(()),
     }
+}
+
+/// One register-fed (Apple10 cooperative) tile matmul of `act` into `y`: `(m, n, k, cols, ld)`
+/// its rows, row stride, contraction, columns computed and the bank's row stride; `split`
+/// partitions of the contraction, each a pair of simdgroups of the column tile's threadgroup,
+/// which sums them in place.
+#[allow(clippy::too_many_arguments)]
+pub fn coop_matmul(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    w: Bank,
+    biases: Tensor,
+    y: Tensor,
+    (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
+    split: i32,
+) -> Result<(), Error> {
+    let tiles = (cols / 64).unsigned_abs();
+    let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
+    let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
+    let threads = 64 * split.unsigned_abs();
+    ctx.fire(
+        Fire::at(STAGED_FILE, entry)
+            .stamp(stamp)
+            .apply(Grid::of([threads * tiles, 1, 1], [threads, 1, 1])),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            biases.arg(),
+            act.arg(),
+            y.arg_mut(),
+            k.arg(),
+            n.arg(),
+            ctx.absent()?,
+            m.arg(),
+            ld.arg(),
+        ],
+    )
 }
 
 /// Folds the `split` stacked f32 partials of an `m x n` product into `y`, over `cols` columns.
