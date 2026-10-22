@@ -234,22 +234,26 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 x_out: _,
-            } => elemwise::rope_axes::rope_axes(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope_axes::rope_axes(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *dims,
                 *thetas,
                 match form {
-                    poem_ir::RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
-                    poem_ir::RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
-                    poem_ir::RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
-                    poem_ir::RopeForm::SplitLadder => elemwise::rope_axes::RopeForm::SplitLadder,
+                    poem_ir::RopeForm::Interleaved => {
+                        kernels_slang::elemwise::rope_axes::RopeForm::Interleaved
+                    }
+                    poem_ir::RopeForm::Neox => kernels_slang::elemwise::rope_axes::RopeForm::Neox,
+                    poem_ir::RopeForm::Split => kernels_slang::elemwise::rope_axes::RopeForm::Split,
+                    poem_ir::RopeForm::SplitLadder => {
+                        kernels_slang::elemwise::rope_axes::RopeForm::SplitLadder
+                    }
                 },
                 *rotary_dim,
                 *head_dim,
-                self.tensor(*x),
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RelativeBucketBias { .. }
             | Elemwise::Gelu { .. }
             | Elemwise::Hadamard { .. }

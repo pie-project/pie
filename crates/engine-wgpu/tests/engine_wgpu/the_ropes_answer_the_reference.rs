@@ -457,3 +457,160 @@ fn the_mropes_answer_the_reference() {
         }
     }
 }
+
+/// Rotary over position axes, as the IR states it: per pair its axis, its
+/// frequency and its two channels, by `form` (0 interleaved, 1 neox, 2 split,
+/// 3 the split ladder).
+#[allow(clippy::too_many_arguments)]
+fn axes_reference(
+    x: &[f32],
+    heads: usize,
+    head_dim: usize,
+    dims: &[usize],
+    thetas: &[f64],
+    form: u8,
+    rotary: usize,
+    positions: &[f32],
+) -> Vec<f64> {
+    let mut out: Vec<f64> = x.iter().map(|v| f64::from(*v)).collect();
+    let angles = rotary / 2;
+    let axes = dims.len();
+    let span: usize = dims.iter().sum();
+    for row in 0..ROWS {
+        let pos = &positions[row * axes..][..axes];
+        for idx in 0..heads * angles {
+            let (head, angle) = (idx / angles, idx % angles);
+            let (lo, hi, t) = if form == 3 {
+                let pad = (heads * rotary - span) / 2;
+                let t = if idx >= pad {
+                    let slot = idx - pad;
+                    let (axis, f) = (slot % axes, slot / axes);
+                    let ladder = dims[axis] / 2;
+                    let e = if ladder > 1 {
+                        f as f64 / (ladder - 1) as f64
+                    } else {
+                        0.0
+                    };
+                    f64::from(pos[axis]) * thetas[axis].powf(e)
+                } else {
+                    0.0
+                };
+                (angle, angle + angles, t)
+            } else {
+                let (mut axis, mut first_angle, mut first_channel) = (0, 0, 0);
+                while angle >= first_angle + dims[axis] / 2 {
+                    first_angle += dims[axis] / 2;
+                    first_channel += dims[axis];
+                    axis += 1;
+                }
+                let within = angle - first_angle;
+                let t = f64::from(pos[axis])
+                    * thetas[axis].powf(-2.0 * within as f64 / dims[axis] as f64);
+                match form {
+                    0 => (
+                        first_channel + 2 * within,
+                        first_channel + 2 * within + 1,
+                        t,
+                    ),
+                    1 => (angle, angle + angles, t),
+                    _ => (
+                        first_channel + within,
+                        first_channel + dims[axis] / 2 + within,
+                        t,
+                    ),
+                }
+            };
+            let base = (row * heads + head) * head_dim;
+            let (a, b) = (out[base + lo], out[base + hi]);
+            out[base + lo] = a * t.cos() - b * t.sin();
+            out[base + hi] = b * t.cos() + a * t.sin();
+        }
+    }
+    out
+}
+
+#[test]
+fn the_axis_ropes_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    let heads = 4usize;
+    for (form, dims, rotary, head_dim) in [
+        (0u8, vec![16usize, 24, 24], 64usize, 80usize),
+        (1, vec![32, 32], 64, 64),
+        (2, vec![22, 20, 22], 64, 64),
+        (3, vec![40, 40], 32, 48),
+    ] {
+        let width = heads * head_dim;
+        let n = ROWS * width;
+        let axes = dims.len();
+        let posv: Vec<f32> = (0..ROWS * axes)
+            .map(|i| (i * 37 % 101) as f32 * 0.5)
+            .collect();
+        let pos = gpu.up_f32(&posv);
+        let pt = Tensor::new(pos, ROWS as u32, axes as u32, Dtype::F32);
+        let mut d4 = [0u32; 4];
+        let mut thetas = [0f32; 4];
+        for (a, d) in dims.iter().enumerate() {
+            d4[a] = *d as u32;
+            // The ladder raises its base to a growing power: a base under one
+            // keeps the angle where an f32 holds it.
+            thetas[a] = if form == 3 {
+                [0.001, 0.05, 0.2, 1.0][a]
+            } else {
+                [10_000.0, 500.0, 20_000.0, 1.0][a]
+            };
+        }
+        let (dims_u, th64): (Vec<usize>, Vec<f64>) =
+            (dims.clone(), thetas.iter().map(|t| f64::from(*t)).collect());
+        let xv = noise(head_dim as u64 + u64::from(form), n);
+        let (_, xr) = gpu.up(&xv);
+        let want = axes_reference(&xr, heads, head_dim, &dims_u, &th64, form, rotary, &posv);
+        let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+        let (rd, hd, dims) = (rotary as u32, head_dim as u32, d4);
+        let shape = format!("form {form}, dims {dims_u:?}, rotary {rotary}, head {head_dim}");
+
+        let sf = match form {
+            0 => kernels_slang::elemwise::rope_axes::RopeForm::Interleaved,
+            1 => kernels_slang::elemwise::rope_axes::RopeForm::Neox,
+            2 => kernels_slang::elemwise::rope_axes::RopeForm::Split,
+            _ => kernels_slang::elemwise::rope_axes::RopeForm::SplitLadder,
+        };
+        let (y, _) = gpu.up(&xv);
+        gpu.run_slang(|c| {
+            kernels_slang::elemwise::rope_axes::rope_axes(
+                c,
+                st(t(y)),
+                st(pt),
+                dims,
+                thetas,
+                sf,
+                rd,
+                hd,
+            )
+        });
+        close(&gpu.down(y, n), &want, &format!("slang rope axes {shape}"));
+        let y = gpu.up_f32(&xv);
+        let ft = Tensor::new(y, ROWS as u32, width as u32, Dtype::F32);
+        gpu.run_slang(|c| {
+            kernels_slang::elemwise::rope_axes::rope_axes(
+                c,
+                st(ft),
+                st(pt),
+                dims,
+                thetas,
+                sf,
+                rd,
+                hd,
+            )
+        });
+        let want = axes_reference(&xv, heads, head_dim, &dims_u, &th64, form, rotary, &posv);
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("slang rope axes f32 {shape}"),
+        );
+    }
+}

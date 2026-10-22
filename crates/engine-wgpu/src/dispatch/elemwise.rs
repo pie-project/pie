@@ -173,6 +173,36 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
+            Elemwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form,
+                rotary_dim,
+                head_dim,
+                x_out: _,
+            } => kernels_slang::elemwise::rope_axes::rope_axes(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
+                *dims,
+                *thetas,
+                match form {
+                    poem_ir::RopeForm::Interleaved => {
+                        kernels_slang::elemwise::rope_axes::RopeForm::Interleaved
+                    }
+                    poem_ir::RopeForm::Neox => kernels_slang::elemwise::rope_axes::RopeForm::Neox,
+                    poem_ir::RopeForm::Split => kernels_slang::elemwise::rope_axes::RopeForm::Split,
+                    poem_ir::RopeForm::SplitLadder => {
+                        kernels_slang::elemwise::rope_axes::RopeForm::SplitLadder
+                    }
+                },
+                *rotary_dim,
+                *head_dim,
+            )
+            .map_err(crate::encode::from_slang),
+
             Elemwise::Modulate { .. }
             | Elemwise::GatedResidualAdd { .. }
             | Elemwise::Sinusoid { .. }
@@ -180,7 +210,6 @@ impl Run<'_> {
             | Elemwise::Gelu { .. }
             | Elemwise::Hadamard { .. }
             | Elemwise::Mul { .. }
-            | Elemwise::RopeAxes { .. }
             | Elemwise::GateSigmoidMulHeads { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
