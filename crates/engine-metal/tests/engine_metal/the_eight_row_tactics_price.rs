@@ -504,3 +504,87 @@ fn the_eight_row_segments_price() {
         );
     }
 }
+
+/// The shared expert as a ninth route of each token (one expert every token
+/// takes) in the routed vector launch, against the eight routes alone.
+#[test]
+#[ignore = "a microbenchmark"]
+fn the_eight_row_shared_route_prices() {
+    use kernels_metal::linear::moe;
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let (experts, tokens, layers) = (257u32, 8u32, 40u32);
+    for &(k, n, per_pair) in &[(2048u32, 1024u32, false), (512, 2048, true)] {
+        let groups = k / 64;
+        let columns = experts * n;
+        let bank_bytes = u64::from(k) * u64::from(columns) / 2;
+        let codes: Vec<u8> = (0..bank_bytes).map(noise).collect();
+        let scales: Vec<u8> = (0..columns * groups)
+            .flat_map(|at| bf16(0.0031 + f32::from(noise(u64::from(at) ^ 0x11)) * 0.000173))
+            .collect();
+        let biases: Vec<u8> = (0..columns * groups)
+            .flat_map(|at| bf16(-0.2 + f32::from(noise(u64::from(at) ^ 0x5678)) * 0.00157))
+            .collect();
+        let p = [upload(&codes), upload(&scales), upload(&biases)];
+        let bank = Bank {
+            mpp_codes: None,
+            codes: Tensor::new(bind(&p[0]), columns, k, Dtype::U4g64),
+            scales: Tensor::new(bind(&p[1]), columns, groups, Dtype::Bf16),
+            biases: Some(Tensor::new(bind(&p[2]), columns, groups, Dtype::Bf16)),
+            group: 64,
+            bits: 4,
+            ld: k,
+        };
+        for slots in [8u32, 9] {
+            let pairs = tokens * slots;
+            let x_rows = if per_pair { pairs } else { tokens };
+            let inputs: Vec<u8> = (0..x_rows * k)
+                .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0xabcd)) - 127.0) * 0.0197))
+                .collect();
+            let x_b = upload(&inputs);
+            let x = Tensor::new(bind(&x_b), x_rows, k, Dtype::Bf16);
+            let y_b = upload(&vec![0u8; (pairs * n * 2) as usize]);
+            let y = Tensor::new(bind(&y_b), pairs, n, Dtype::Bf16);
+            let route_b: Vec<Buffer> = (0..layers)
+                .map(|l| {
+                    let routes: Vec<u8> = (0..tokens)
+                        .flat_map(|t| {
+                            (0..slots).flat_map(move |s| {
+                                let e = if s == 8 { 256 } else { (l * 61 + t * 5 + s * 29) % 256 };
+                                (e as i32).to_le_bytes()
+                            })
+                        })
+                        .collect();
+                    upload(&routes)
+                })
+                .collect();
+            let routes: Vec<Tensor> = route_b
+                .iter()
+                .map(|b| Tensor::new(bind(b), tokens, slots, Dtype::I32))
+                .collect();
+            let mut times = Vec::new();
+            for i in 0..12 {
+                let frame = device.frame().expect("frame");
+                let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                for r in &routes {
+                    moe::matmul_select_quant(&sink, x, bank, *r, y).expect("routed");
+                }
+                let s = frame.commit_timed().expect("commit");
+                if i >= 2 {
+                    times.push(s * 1e6 / f64::from(layers));
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!("K={k:>4} N={n:>4} {slots} routes a token: {:.1}us", times[times.len() / 2]);
+        }
+    }
+}
