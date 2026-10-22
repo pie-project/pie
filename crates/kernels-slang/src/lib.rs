@@ -7,10 +7,11 @@
 pub mod elemwise;
 pub mod encode;
 pub mod error;
+pub mod gather;
 pub mod sources;
 pub mod tensor;
 
 pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid};
 pub use error::Error;
 pub use sources::{CENSUS, SPIRV, WGSL, spirv, wgsl};
-pub use tensor::Tensor;
+pub use tensor::{Bank, Tensor};

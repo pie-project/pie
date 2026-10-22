@@ -1,4 +1,4 @@
-use kernels_wgpu::{Error, Tensor, elemwise};
+use kernels_wgpu::{Error, Tensor};
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, MropeForm, Operands};
 use poem_ir::{NormAxis, NormWeight};
@@ -203,10 +203,68 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Elemwise::Modulate { .. }
-            | Elemwise::GatedResidualAdd { .. }
-            | Elemwise::Sinusoid { .. }
-            | Elemwise::RelativeBucketBias { .. }
+            Elemwise::Modulate {
+                x,
+                m,
+                lane_of_row,
+                form,
+                y,
+            } => kernels_slang::elemwise::modulate::modulate(
+                &self.slang(),
+                match form {
+                    poem_ir::ModulateForm::ScaleShift => {
+                        kernels_slang::elemwise::modulate::Form::ScaleShift
+                    }
+                    poem_ir::ModulateForm::Scale => kernels_slang::elemwise::modulate::Form::Scale,
+                    poem_ir::ModulateForm::TanhGate => {
+                        kernels_slang::elemwise::modulate::Form::TanhGate
+                    }
+                },
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(match lane_of_row {
+                    Some(_) => self.uncut(*m),
+                    None => self.tensor(*m),
+                }),
+                lane_of_row.map(|lanes| crate::encode::slang_tensor(self.tensor(lanes))),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::GatedResidualAdd {
+                r,
+                g,
+                y,
+                lane_of_row,
+                r_out: _,
+            } => kernels_slang::elemwise::modulate::gated_residual_add(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*r)),
+                crate::encode::slang_tensor(match lane_of_row {
+                    Some(_) => self.uncut(*g),
+                    None => self.tensor(*g),
+                }),
+                crate::encode::slang_tensor(self.tensor(*y)),
+                lane_of_row.map(|lanes| crate::encode::slang_tensor(self.tensor(lanes))),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Sinusoid {
+                t,
+                dim,
+                max_period,
+                flip_sin_cos,
+                scale,
+                y,
+            } => kernels_slang::elemwise::posenc::sinusoid(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*t)),
+                *dim,
+                *max_period,
+                *flip_sin_cos,
+                *scale,
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+
+            Elemwise::RelativeBucketBias { .. }
             | Elemwise::Gelu { .. }
             | Elemwise::Hadamard { .. }
             | Elemwise::Mul { .. }
@@ -242,40 +300,43 @@ impl Run<'_> {
                 normed,
                 streams,
                 y,
-            } => elemwise::hc::mix(
-                self.ctx(),
-                self.tensor(*gates),
-                self.tensor(*normed),
+            } => kernels_slang::elemwise::hc::mix(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*gates)),
+                crate::encode::slang_tensor(self.tensor(*normed)),
                 *streams,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::HcInject {
                 o,
                 gates,
                 streams,
                 hyper,
                 hyper_out: _,
-            } => elemwise::hc::inject(
-                self.ctx(),
-                self.tensor(*o),
-                self.tensor(*gates),
+            } => kernels_slang::elemwise::hc::inject(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*o)),
+                crate::encode::slang_tensor(self.tensor(*gates)),
                 *streams,
-                self.tensor(*hyper),
-            ),
+                crate::encode::slang_tensor(self.tensor(*hyper)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::PleGate {
                 key,
                 query,
                 value,
                 streams,
                 y,
-            } => elemwise::hc::ple_gate(
-                self.ctx(),
-                self.tensor(*key),
-                self.tensor(*query),
-                self.tensor(*value),
+            } => kernels_slang::elemwise::hc::ple_gate(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*key)),
+                crate::encode::slang_tensor(self.tensor(*query)),
+                crate::encode::slang_tensor(self.tensor(*value)),
                 *streams,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             // A scaleless gated norm runs on CUDA alone (Muse Spark's).
             Elemwise::RmsnormGated { weight: None, .. } => {
@@ -586,24 +647,33 @@ impl Run<'_> {
                 .map_err(crate::encode::from_slang)
             }
 
-            Elemwise::HcExpand { x, streams, y } => {
-                elemwise::hc::expand(self.ctx(), self.tensor(*x), *streams, self.tensor(*y))
-            }
-            Elemwise::HcRmsnormF32 { streams, eps, y } => {
-                elemwise::hc::rmsnorm_f32(self.ctx(), self.tensor(*streams), *eps, self.tensor(*y))
-            }
+            Elemwise::HcExpand { x, streams, y } => kernels_slang::elemwise::hc::expand(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                *streams,
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::HcRmsnormF32 { streams, eps, y } => kernels_slang::elemwise::hc::rmsnorm_f32(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*streams)),
+                *eps,
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::HcProject {
                 normed,
                 weight,
                 stream_count,
                 mixes,
-            } => elemwise::hc::project(
-                self.ctx(),
-                self.tensor(*normed),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::hc_project::project(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*normed)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *stream_count,
-                self.tensor(*mixes),
-            ),
+                crate::encode::slang_tensor(self.tensor(*mixes)),
+            )
+            .map_err(crate::encode::from_slang),
             // The independent form (no combine) is landed on CUDA alone.
             Elemwise::HcGates { comb: false, .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
@@ -621,20 +691,21 @@ impl Run<'_> {
                 x,
                 post_mix,
                 comb_mix,
-            } => elemwise::hc::gates(
-                self.ctx(),
-                self.tensor(*normed),
-                self.tensor(*streams),
-                self.tensor(*scale),
-                self.tensor(*base),
+            } => kernels_slang::elemwise::hc::gates(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*normed)),
+                crate::encode::slang_tensor(self.tensor(*streams)),
+                crate::encode::slang_tensor(self.tensor(*scale)),
+                crate::encode::slang_tensor(self.tensor(*base)),
                 *stream_count,
                 *gate_eps,
                 *alpha,
                 *sinkhorn,
-                self.tensor(*x),
-                self.tensor(*post_mix),
-                self.tensor(*comb_mix),
-            ),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*post_mix)),
+                crate::encode::slang_tensor(self.tensor(*comb_mix)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::HcCollapse {
                 mixes,
                 streams,
@@ -643,30 +714,32 @@ impl Run<'_> {
                 stream_count,
                 hc_eps,
                 y,
-            } => elemwise::hc::collapse(
-                self.ctx(),
-                self.tensor(*mixes),
-                self.tensor(*streams),
-                self.tensor(*scale),
-                self.tensor(*base),
+            } => kernels_slang::elemwise::hc::collapse(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*mixes)),
+                crate::encode::slang_tensor(self.tensor(*streams)),
+                crate::encode::slang_tensor(self.tensor(*scale)),
+                crate::encode::slang_tensor(self.tensor(*base)),
                 *stream_count,
                 *hc_eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::HcFold {
                 x,
                 streams,
                 post_mix,
                 comb_mix,
                 y,
-            } => elemwise::hc::fold(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*streams),
-                self.tensor(*post_mix),
-                self.tensor(*comb_mix),
-                self.tensor(*y),
-            ),
+            } => kernels_slang::elemwise::hc::fold(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*streams)),
+                crate::encode::slang_tensor(self.tensor(*post_mix)),
+                crate::encode::slang_tensor(self.tensor(*comb_mix)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             // A weight and axis no builder pairs.
             Elemwise::Rmsnorm { .. } | Elemwise::Layernorm { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
