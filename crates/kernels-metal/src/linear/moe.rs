@@ -631,30 +631,64 @@ pub fn matmul_select_quant(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
+    matmul_select_quant_shared(ctx, x, bank, routes, y, None)
+}
+
+/// [`matmul_select_quant`], landing as well the shared expert `(bank, x, y)`
+/// of the fire's tokens, an expert of `bank`'s shape, as one more route of
+/// every token: the routes' kernel then reads each expert's codes once for
+/// every route to it, in each route's own order of the per-route kernel.
+pub fn matmul_select_quant_shared(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    bank: Bank,
+    routes: Tensor,
+    y: Tensor,
+    shared: Option<(Bank, Tensor, Tensor)>,
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let entry = routed_point(OP, bank, false)?;
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
+    let mut grid = routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?;
+    let mut args = vec![
+        bank.codes.arg(),
+        bank.scales.arg(),
+        zero_points(ctx, bank)?,
+        x.arg(),
+        y.arg_mut(),
+        stated(OP, x.width)?.arg(),
+        stated(OP, y.width)?.arg(),
+        ctx.absent()?,
+        routes.arg(),
+        stated(OP, fan.x_slot_stride)?.arg(),
+        stated(OP, fan.x_row_stride)?.arg(),
+        stated(OP, fan.top_k)?.arg(),
+    ];
+    let entry = match shared {
+        None if entry == "affine_qmv_routed_bfloat16_gs_64_b_4" && fan.x_slot_stride == 0 && fan.tokens > 1 => {
+            let absent = ctx.absent()?;
+            args.extend([absent, absent, absent, absent, absent, 0u32.arg()]);
+            "affine_qmv_routed_grouped_bfloat16_gs_64_b_4"
+        }
+        Some((sbank, sx, sy)) if entry == "affine_qmv_routed_bfloat16_gs_64_b_4" => {
+            grid[2] += 1;
+            args.extend([
+                sbank.codes.arg(),
+                sbank.scales.arg(),
+                zero_points(ctx, sbank)?,
+                sx.arg(),
+                sy.arg_mut(),
+                stated(OP, sx.width)?.arg(),
+            ]);
+            "affine_qmv_routed_grouped_bfloat16_gs_64_b_4"
+        }
+        _ => entry,
+    };
     ctx.fire(
-        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
-            routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
-            QMV_GROUP,
-        )),
-        &[
-            bank.codes.arg(),
-            bank.scales.arg(),
-            zero_points(ctx, bank)?,
-            x.arg(),
-            y.arg_mut(),
-            stated(OP, x.width)?.arg(),
-            stated(OP, y.width)?.arg(),
-            ctx.absent()?,
-            routes.arg(),
-            stated(OP, fan.x_slot_stride)?.arg(),
-            stated(OP, fan.x_row_stride)?.arg(),
-            stated(OP, fan.top_k)?.arg(),
-        ],
+        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(grid, QMV_GROUP)),
+        &args,
     )
 }
 
