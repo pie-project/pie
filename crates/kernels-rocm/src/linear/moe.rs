@@ -449,6 +449,12 @@ pub fn matmul_select(
             mt,
             nbw,
             None,
+            &[
+                ArgValue::Ptr(0),
+                ArgValue::Ptr(0),
+                ArgValue::Ptr(0),
+                0i32.arg(),
+            ],
         );
     }
     if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
@@ -652,6 +658,7 @@ fn select_batch(
     mt: u32,
     nbw: u32,
     seat: Option<GroupSeat>,
+    tail: &[ArgValue],
 ) -> Result<(), Error> {
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
@@ -674,6 +681,7 @@ fn select_batch(
     if let Some(seat) = seat {
         args.extend([ArgValue::Ptr(seat.cell), ArgValue::Ptr(seat.hits)]);
     }
+    args.extend_from_slice(tail);
     ctx.fire(
         op,
         Fire::at(file, symbol(entry)).apply(Launch::grid(
@@ -1938,6 +1946,7 @@ fn matmul_select_mxfp4(
             mt,
             BATCH_NBW,
             Some(seat),
+            &[],
         );
     }
     if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
@@ -2448,6 +2457,7 @@ fn matmul_select_mlxu4(
             mt,
             BATCH_NBW,
             Some(seat),
+            &[],
         );
     }
     let tuning = ctx.tuning();
@@ -2611,12 +2621,79 @@ pub struct RoutedMlp {
 }
 
 /// A shared expert's gated add after the routed fold: `y = routed +
-/// shared · sigmoid(gate)`, `gate` one logit a row.
+/// shared · sigmoid(gate)`, `gate` one logit a row. Given `banks`, `shared`
+/// is not landed yet: the routed legs land it, the shared expert's swiglu
+/// MLP over the routed one's x as items of their own. Given `gate_w` (one
+/// row), neither is `gate`: the fold takes x · gate_w itself.
 #[derive(Clone, Copy, Debug)]
 pub struct SharedGate {
     pub shared: Tensor,
     pub gate: Tensor,
     pub y: Tensor,
+    pub banks: Option<SharedBanks>,
+    pub gate_w: Option<Tensor>,
+}
+
+/// A shared expert's packed `[gate | up]` and down banks.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedBanks {
+    pub gate_up: Tensor,
+    pub down: Tensor,
+}
+
+/// The fan and expert count of a fire [`decode_mlp`] covers, if it does.
+fn decode_fan(
+    ctx: &Ctx,
+    p: &RoutedMlp,
+    shared: Option<SharedGate>,
+    hidden: u32,
+) -> Result<Option<(Selected, u32)>, Error> {
+    const OP: &str = "linear.moe_decode_mlp";
+    let (x, i) = (p.x, p.intermediate);
+    let fan = selected(OP, x, p.routes, &p.packed)?;
+    let (Some(count), Some(_)) = (
+        dense_experts(x, p.gate_up, &p.packed, p.gate_up_experts),
+        dense_experts(p.h, p.down, &p.routed, p.down_experts),
+    ) else {
+        return Ok(None);
+    };
+    let covered = fan.by_token
+        && ctx.tuning().moe_batch
+        && p.limit.is_none()
+        && p.packed.width == 2 * i
+        && shared.is_none_or(|s| {
+            s.shared.dtype == x.dtype
+                && s.gate.dtype == x.dtype
+                && s.shared.width == hidden
+                && s.y.width == hidden
+                && s.gate.width > 0
+                && s.banks.is_none_or(|b| {
+                    b.gate_up.dtype == x.dtype
+                        && b.down.dtype == x.dtype
+                        && b.gate_up.rows == 2 * i
+                        && b.gate_up.width == x.width
+                        && b.down.rows == hidden
+                        && b.down.width == i
+                        && s.shared.rows == x.rows
+                })
+                && s.gate_w.is_none_or(|w| {
+                    w.dtype == x.dtype
+                        && w.rows == 1
+                        && w.width == x.width
+                        && x.width.is_multiple_of(8)
+                })
+        });
+    Ok(covered.then_some((fan, count)))
+}
+
+/// Whether [`decode_mlp`] lands what `shared` holds back (its banks, its
+/// gate's weight) itself: its batch legs take the fire. A caller that holds
+/// them back for it decides here, before the legs.
+pub fn absorbs_shared(ctx: &Ctx, p: &RoutedMlp, shared: SharedGate, hidden: u32) -> bool {
+    (shared.banks.is_some() || shared.gate_w.is_some())
+        && p.x.rows >= ctx.tuning().moe_batch_from
+        && matches!(decode_fan(ctx, p, Some(shared), hidden), Ok(Some((fan, count)))
+            if batch_plan(ctx, p, &fan, count).is_some())
 }
 
 /// Rows a decode wave takes in [`decode_mlp`].
@@ -2637,30 +2714,15 @@ pub fn decode_mlp(
     const OP: &str = "linear.moe_decode_mlp";
     let (x, i, hidden) = (p.x, p.intermediate, y.width);
     let t = ctx.tuning();
-    let fan = selected(OP, x, p.routes, &p.packed)?;
-    let top_k = fan.top_k.unsigned_abs();
-    let (Some(count), Some(_)) = (
-        dense_experts(x, p.gate_up, &p.packed, p.gate_up_experts),
-        dense_experts(p.h, p.down, &p.routed, p.down_experts),
-    ) else {
+    let Some((fan, count)) = decode_fan(ctx, p, shared, hidden)? else {
         return Ok(false);
     };
-    let covered = fan.by_token
-        && t.moe_batch
-        && p.limit.is_none()
-        && p.packed.width == 2 * i
-        && shared.is_none_or(|s| {
-            s.shared.dtype == x.dtype
-                && s.gate.dtype == x.dtype
-                && s.shared.width == hidden
-                && s.y.width == hidden
-                && s.gate.width > 0
-        });
-    if !covered {
-        return Ok(false);
-    }
+    let top_k = fan.top_k.unsigned_abs();
     if x.rows >= t.moe_batch_from {
         return batch_mlp(ctx, p, &fan, count, shared, y);
+    }
+    if shared.is_some_and(|s| s.banks.is_some() || s.gate_w.is_some()) {
+        return Ok(false);
     }
     let fits = |k: u32, most: u32| k.is_multiple_of(512) && (1..=most).contains(&(k / 512));
     if !fits(x.width, 8) || !fits(i, 4) || !(1..=16).contains(&top_k) {
@@ -2726,6 +2788,30 @@ pub fn decode_mlp(
     Ok(true)
 }
 
+/// The items [`batch_mlp`] takes, if it takes the fire.
+fn batch_plan(ctx: &Ctx, p: &RoutedMlp, fan: &Selected, count: u32) -> Option<u32> {
+    let (x, i) = (p.x, p.intermediate);
+    let until = ctx.tuning().moe_dense_batch_until;
+    let down_fan = Selected {
+        by_token: false,
+        ..*fan
+    };
+    let tiled = x.dtype == Dtype::Bf16
+        && x.width.is_multiple_of(64)
+        && count <= ORDER_EXPERT_CAP
+        && (65..=until).contains(&fan.route_count.div_ceil(count));
+    let mt = batch_items(ctx, fan, count, 64, until)?;
+    if tiled
+        || !x.width.is_multiple_of(8)
+        || !i.is_multiple_of(8)
+        || wide_items(ctx, fan, count, x).is_some()
+        || wide_items(ctx, &down_fan, count, p.h).is_some()
+    {
+        return None;
+    }
+    Some(mt)
+}
+
 /// [`decode_mlp`]'s batch: where `matmul_select` would take the batch leg
 /// for both matmuls, one route ordering for both, the swiglu in the gate-up
 /// leg's epilogue, and the fold with the gated add.
@@ -2739,26 +2825,9 @@ fn batch_mlp(
 ) -> Result<bool, Error> {
     const OP: &str = "linear.moe_decode_mlp";
     let (x, i, hidden) = (p.x, p.intermediate, y.width);
-    let until = ctx.tuning().moe_dense_batch_until;
-    let down_fan = Selected {
-        by_token: false,
-        ..*fan
-    };
-    let tiled = x.dtype == Dtype::Bf16
-        && x.width.is_multiple_of(64)
-        && count <= ORDER_EXPERT_CAP
-        && (65..=until).contains(&fan.route_count.div_ceil(count));
-    let Some(mt) = batch_items(ctx, fan, count, 64, until) else {
+    let Some(mt) = batch_plan(ctx, p, fan, count) else {
         return Ok(false);
     };
-    if tiled
-        || !x.width.is_multiple_of(8)
-        || !i.is_multiple_of(8)
-        || wide_items(ctx, fan, count, x).is_some()
-        || wide_items(ctx, &down_fan, count, p.h).is_some()
-    {
-        return Ok(false);
-    }
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let ordered = route_order(ctx, OP, p.routes, fan, count, mt)?;
     let order = [
@@ -2767,6 +2836,16 @@ fn batch_mlp(
         ArgValue::Ptr(ordered.work),
     ];
     let experts = stated(OP, count)?;
+    // The shared expert's items lead both legs, its h in a slab of its own.
+    let banks = shared.and_then(|s| s.banks);
+    let shared_items = banks.map_or(0, |_| x.rows.div_ceil(mt));
+    let shared_h = match banks {
+        Some(_) => {
+            ctx.scratch_stream(OP, "linear.moe_shared_h", x.rows as usize * i as usize * 2)? as u64
+        }
+        None => 0,
+    };
+    let shared_rows = stated(OP, if banks.is_some() { x.rows } else { 0 })?;
     ctx.fire(
         OP,
         Fire::at(
@@ -2776,7 +2855,7 @@ fn batch_mlp(
             )),
         )
         .apply(Launch::grid(
-            [ordered.work_cap, i.div_ceil(64), 1],
+            [shared_items + ordered.work_cap, i.div_ceil(64), 1],
             [GROUP_BLOCK, 1, 1],
         )),
         &[
@@ -2789,6 +2868,9 @@ fn batch_mlp(
                 stated(OP, i)?.arg(),
                 stated(OP, x.width)?.arg(),
                 experts.arg(),
+                ArgValue::Ptr(banks.map_or(0, |b| b.gate_up.ptr)),
+                ArgValue::Ptr(shared_h),
+                shared_rows.arg(),
             ],
         ]
         .concat(),
@@ -2803,7 +2885,7 @@ fn batch_mlp(
             )),
         )
         .apply(Launch::grid(
-            [ordered.work_cap, hidden.div_ceil(64 * nbw), 1],
+            [shared_items + ordered.work_cap, hidden.div_ceil(64 * nbw), 1],
             [GROUP_BLOCK, 1, 1],
         )),
         &[
@@ -2816,11 +2898,18 @@ fn batch_mlp(
                 stated(OP, hidden)?.arg(),
                 stated(OP, i)?.arg(),
                 experts.arg(),
+                ArgValue::Ptr(banks.map_or(0, |b| b.down.ptr)),
+                ArgValue::Ptr(shared_h),
+                ArgValue::Ptr(match (banks, shared) {
+                    (Some(_), Some(s)) => s.shared.ptr,
+                    _ => 0,
+                }),
+                shared_rows.arg(),
             ],
         ]
         .concat(),
     )?;
-    weighted_fold(ctx, p.routed, p.weights, shared, y)?;
+    weighted_fold(ctx, p.routed, p.weights, shared, x, y)?;
     Ok(true)
 }
 
@@ -2862,15 +2951,17 @@ pub fn weighted_sum(
     weights: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    weighted_fold(ctx, routed, weights, None, y)
+    weighted_fold(ctx, routed, weights, None, routed, y)
 }
 
-/// [`weighted_sum`], and given `shared` its gated add, into `shared.y`.
+/// [`weighted_sum`], and given `shared` its gated add, into `shared.y` (the
+/// gate x · `shared.gate_w` where given).
 fn weighted_fold(
     ctx: &Ctx,
     routed: Tensor,
     weights: Tensor,
     shared: Option<SharedGate>,
+    x: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_weighted_sum";
@@ -2913,6 +3004,9 @@ fn weighted_fold(
             ArgValue::Ptr(shared.map_or(0, |s| s.gate.ptr)),
             stated(OP, shared.map_or(0, |s| s.gate.width))?.arg(),
             ctx.stage(),
+            ArgValue::Ptr(shared.and_then(|s| s.gate_w).map_or(0, |w| w.ptr)),
+            x.arg(),
+            stated(OP, x.width)?.arg(),
         ],
     )
 }

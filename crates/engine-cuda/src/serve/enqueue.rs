@@ -730,6 +730,7 @@ impl FireCtx<'_> {
             shifted: self.shifted,
             admits: p.admits.as_ref(),
             readers: self.schedule_readers,
+            regions: self.compiled.template(),
             carve: p.bodied.then(|| record::Carve {
                 per_axis: poem_ir::PerAxis::new([
                     Some(record::AxisCarve {
