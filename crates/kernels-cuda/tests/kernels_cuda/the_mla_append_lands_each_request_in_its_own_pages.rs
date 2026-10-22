@@ -154,3 +154,111 @@ fn the_mla_append_lands_each_request_in_its_own_pages() {
         }
     }
 }
+
+/// The pool's bytes after one append of `rows` rows from `at` of the plane,
+/// over `qo`, under `stage` where one is armed.
+#[allow(clippy::too_many_arguments)]
+fn appended(
+    fp8: bool,
+    ckv: &[u16],
+    kpe: &[u16],
+    at: usize,
+    rows: usize,
+    qo: &[i32],
+    row_valid: Option<&[u8]>,
+    stage: Option<[u32; 4]>,
+) -> (Vec<u8>, Vec<u8>) {
+    let cells_n = PAGES.len() * PAGE;
+    let mut gpu = Gpu::open();
+    let ckv_at = gpu.up(&ckv[at * RANK..]);
+    let kpe_at = gpu.up(&kpe[at * ROPE..]);
+    let qo_at = gpu.up(qo);
+    let (keys, values, keys_at, values_at, key_bytes, value_bytes) = if fp8 {
+        let k = gpu.zeros(cells_n * ROW);
+        let t = Tensor::new(k, cells_n as u32, ROW as u32, Dtype::U8);
+        (t, t, k, k, cells_n * ROW, 0)
+    } else {
+        let k = gpu.zeros(cells_n * RANK * 2);
+        let v = gpu.zeros(cells_n * ROPE * 2);
+        (
+            Tensor::new(k, cells_n as u32, RANK as u32, Dtype::Bf16),
+            Tensor::new(v, cells_n as u32, ROPE as u32, Dtype::Bf16),
+            k,
+            v,
+            cells_n * RANK * 2,
+            cells_n * ROPE * 2,
+        )
+    };
+    let mut pool = pool(keys, values, &mut gpu);
+    if let Some(valid) = row_valid {
+        pool.row_valid = Tensor::new(gpu.up(valid), valid.len() as u32, 1, Dtype::U8);
+    }
+    let ctx = gpu.ctx();
+    if let Some(window) = stage {
+        ctx.arm_stage(gpu.up(&window));
+    }
+    mla::kv_append(
+        &ctx,
+        RaggedTensor {
+            data: Tensor::new(ckv_at, rows as u32, RANK as u32, Dtype::Bf16),
+            indptr: Tensor::new(qo_at, qo.len() as u32, 1, Dtype::I32),
+        },
+        Tensor::new(kpe_at, rows as u32, ROPE as u32, Dtype::Bf16),
+        &pool,
+        Tensor::ABSENT,
+        Tensor::ABSENT,
+    )
+    .expect("the append fires");
+    gpu.sync();
+    (
+        gpu.down(keys_at, key_bytes),
+        if value_bytes > 0 {
+            gpu.down(values_at, value_bytes)
+        } else {
+            Vec::new()
+        },
+    )
+}
+
+/// A body replays the append over a plane whose window starts past row 0
+/// and holds fewer rows and requests than the body's ceiling: the rows
+/// before it are another window's, the ceiling's trailing rows another's
+/// still (valid ones), and the indptr past the live requests is stale and
+/// climbing. Under the staged window (`[live rows, first row, live lanes,
+/// first lane]`) the pool lands what the window's own rows land alone.
+#[test]
+fn a_staged_window_appends_only_its_own_rows() {
+    const BASE: usize = 2;
+    const LIVE: usize = 6;
+    const CEILING: usize = 9;
+    let plane = BASE + CEILING;
+    let ckv: Vec<u16> = (0..plane * RANK)
+        .map(|i| to_bf16(((i / RANK) as f32 + 1.0) * (1.0 + (i % 7) as f32 / 8.0)))
+        .collect();
+    let kpe: Vec<u16> = (0..plane * ROPE)
+        .map(|i| to_bf16(-((i / ROPE) as f32 + 1.0) - (i % ROPE) as f32 / 64.0))
+        .collect();
+    let stale: [i32; 9] = [0, 2, 3, 6, 7, 8, 9, 10, 11];
+    let valid = vec![1u8; plane];
+    for fp8 in [false, true] {
+        let alone = appended(fp8, &ckv, &kpe, BASE, LIVE, &QO, None, None);
+        let windowed = appended(
+            fp8,
+            &ckv,
+            &kpe,
+            0,
+            CEILING,
+            &stale,
+            Some(&valid),
+            Some([LIVE as u32, BASE as u32, 3, 0]),
+        );
+        assert!(
+            alone.0.iter().any(|&b| b != 0),
+            "fp8 {fp8}: the window's own rows land"
+        );
+        assert!(
+            alone == windowed,
+            "fp8 {fp8}: the windowed append lands what the window's rows land alone"
+        );
+    }
+}

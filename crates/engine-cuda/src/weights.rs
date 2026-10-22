@@ -728,8 +728,8 @@ fn pairings<'a>(
         );
     }
     // A block-FP8 bank stored as released: raw e4m3 codes beside raw f32
-    // block factors (`<name>.scales`), paired by name, the factors read at
-    // load (`lay_tile_banks`).
+    // block factors or (MXFP8) raw e8m0 exponents a 1x32 block
+    // (`<name>.scales`), paired by name, read at load (`lay_tile_banks`).
     let decls: BTreeMap<&str, &checkpoint::types::TensorDecl> = landing
         .tensors
         .iter()
@@ -750,7 +750,9 @@ fn pairings<'a>(
         else {
             continue;
         };
-        if beside.encoding == raw(checkpoint::types::DType::F32) {
+        if beside.encoding == raw(checkpoint::types::DType::F32)
+            || beside.encoding == raw(checkpoint::types::DType::E8m0)
+        {
             out.insert(
                 decl.name.as_str(),
                 Pairing {
@@ -1598,13 +1600,27 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
             let gran = match trace.params[at].dtype {
                 Dtype::Nvfp4 => 16,
                 Dtype::Mxfp4 => 32,
-                Dtype::E4m3 | Dtype::E4m3tile128 => 128,
+                Dtype::E4m3 | Dtype::E4m3tile128 => fp8_bank_gran(trace, at),
+                Dtype::E4m3g128 => 128,
                 _ => continue,
             };
             banks.insert(at, gran);
         }
     }
     banks
+}
+
+/// The K one scale of the block-FP8 bank `at` covers: 32 where its scales
+/// are e8m0 exponents (an MXFP8 bank, one a 1x32 block of each row), else
+/// 128 (a release's f32 factors, one a 128x128 block).
+#[cfg(feature = "cuda")]
+fn fp8_bank_gran(trace: &Trace, at: usize) -> u32 {
+    let scales = poem::scales_name(&trace.params[at].name);
+    let mx = trace
+        .params
+        .iter()
+        .any(|p| p.name == scales && p.dtype == Dtype::E8m0);
+    if mx { 32 } else { 128 }
 }
 
 /// Each NVFP4 activation-quantizing bank's input scales set to their largest,
@@ -1697,7 +1713,10 @@ fn lay_atoms(
         };
         // An MXFP4 plane is `[.., rows, blocks, 16]` bytes, an NVFP4 one its
         // logical `[.., rows, k]`.
-        if matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
+        if matches!(
+            trace.params[at].dtype,
+            Dtype::E4m3 | Dtype::E4m3tile128 | Dtype::E4m3g128
+        ) {
             continue;
         }
         let shape = &trace.params[at].shape;
@@ -1751,7 +1770,8 @@ fn lay_atoms(
 
 /// Each released 128x128-block FP8 expert bank's f32 factors requantized in place
 /// to ue8m0 exponents (as vLLM's DeepGEMM path on Blackwell), spread into tcgen05
-/// atoms a weight row an atom row, in a buffer bound in the factors' place.
+/// atoms a weight row an atom row, in a buffer bound in the factors' place; an
+/// MXFP8 bank's e8m0 exponents (one a 1x32 block of each row) spread as they are.
 #[cfg(feature = "cuda")]
 fn lay_tile_banks(
     trace: &Trace,
@@ -1759,10 +1779,15 @@ fn lay_tile_banks(
     held: &mut Vec<Buffer>,
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
-    for (at, _) in act_quant_banks(trace) {
-        if !matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
-            continue;
-        }
+    for (at, gran) in act_quant_banks(trace) {
+        // A factor a 128x128 block, or (`e4m3g128`, a per-channel release) a
+        // factor a 128 along each row; an MXFP8 bank's exponents (`gran` 32)
+        // one a 1x32 block of each row.
+        let per: u64 = match trace.params[at].dtype {
+            Dtype::E4m3 | Dtype::E4m3tile128 => 128,
+            Dtype::E4m3g128 => 1,
+            _ => continue,
+        };
         let Some(Some(WeightRow::Planes {
             codes,
             scales,
@@ -1776,7 +1801,8 @@ fn lay_tile_banks(
         let shape = &trace.params[at].shape;
         let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
         let rows: u64 = lead.iter().product();
-        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(512) {
+        let gran = u64::from(gran);
+        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {
             continue;
         }
         // The factors plane is bound as bytes; its param states it f32.
@@ -1787,13 +1813,30 @@ fn lay_tile_banks(
         {
             continue;
         }
-        let (blocks_r, blocks_k) = (rows / 128, k / 128);
-        let exps = Buffer::zeroed(usize::try_from(blocks_r * blocks_k).unwrap_or(usize::MAX))?;
-        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, 128);
-        let laid = Buffer::zeroed(bytes)?;
         let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, gran as usize);
+        let laid = Buffer::zeroed(bytes)?;
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        if gran == 32 {
+            kernels_cuda::linear::act_quant::scales_to_atoms(
+                &ctx,
+                "linear.act_quant",
+                scales.ptr,
+                laid.ptr(),
+                to32(rows),
+                to32(k / 32),
+                1,
+            )?;
+            *scales = Tensor::new(laid.ptr(), to32(rows), to32(k / 32), Dtype::U8);
+            *codes = Tensor::new(codes.ptr, codes.rows, codes.width, Dtype::E4m3);
+            *atoms = true;
+            crate::device::ctx::sync(stream)?;
+            held.push(laid);
+            continue;
+        }
+        let blocks_k = k / 128;
+        let exps = Buffer::zeroed(usize::try_from(rows / per * blocks_k).unwrap_or(usize::MAX))?;
         kernels_cuda::linear::act_quant::fp8_tile_requant(
             &ctx,
             "linear.act_quant",
@@ -1802,7 +1845,7 @@ fn lay_tile_banks(
             exps.ptr(),
             to32(rows),
             to32(k),
-            128,
+            to32(per),
         )?;
         kernels_cuda::linear::act_quant::scales_to_atoms(
             &ctx,
@@ -1811,7 +1854,7 @@ fn lay_tile_banks(
             laid.ptr(),
             to32(rows),
             to32(blocks_k),
-            128,
+            to32(per),
         )?;
         *scales = Tensor::new(laid.ptr(), to32(rows), to32(blocks_k), Dtype::U8);
         *codes = Tensor::new(codes.ptr, codes.rows, codes.width, Dtype::E4m3);
@@ -1823,8 +1866,9 @@ fn lay_tile_banks(
 }
 
 /// The block an `[n, k]` projection's scale plane `shape` scales, its K
-/// and the rows a scale covers: one a 128x128 block, a 32x32 block, or (f32
-/// factors, `e4m3g128`) a 128 along each row.
+/// and the rows a scale covers: one a 128x128 block, a 32x32 block, (f32
+/// factors, `e4m3g128`) a 128 along each row, or (e8m0, `mxfp8`) a 32
+/// along each row.
 #[cfg(feature = "cuda")]
 fn fp8_block_of(n: u64, k: u64, shape: &[u64], factors: bool) -> Option<(u64, u64)> {
     [128, 32]
@@ -1832,6 +1876,7 @@ fn fp8_block_of(n: u64, k: u64, shape: &[u64], factors: bool) -> Option<(u64, u6
         .find(|&b| shape == [n.div_ceil(b), k.div_ceil(b)])
         .map(|b| (b, b))
         .or((factors && shape == [n, k.div_ceil(128)]).then_some((128, 1)))
+        .or((!factors && shape == [n, k.div_ceil(32)]).then_some((32, 1)))
 }
 
 /// Each block-FP8 projection's block exponents spread into tcgen05 atoms, a row a
@@ -1869,8 +1914,9 @@ fn lay_block_atoms(
         let [n, k] = trace.params[codes].shape[..] else {
             continue;
         };
-        // The block the exponents scale: 128x128 (V4's fp8b128) or 32x32
-        // (V4.1's fp8b32), read off the exponent plane's own shape.
+        // The block the exponents scale: 128x128 (V4's fp8b128), 32x32
+        // (V4.1's fp8b32) or 1x32 (mxfp8), read off the exponent plane's own
+        // shape.
         let factors = trace.params[at].dtype == Dtype::F32;
         let Some((block, per)) = fp8_block_of(n, k, &trace.params[at].shape, factors) else {
             continue;
@@ -1935,6 +1981,17 @@ mod tests {
     use poem::Platform;
 
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_block_fp8_plane_is_read_by_the_block_its_exponents_count() {
+        assert_eq!(fp8_block_of(512, 6144, &[4, 48], false), Some((128, 128)));
+        assert_eq!(fp8_block_of(512, 6144, &[16, 192], false), Some((32, 32)));
+        assert_eq!(fp8_block_of(512, 6144, &[512, 48], true), Some((128, 1)));
+        // An MXFP8 plane: one e8m0 exponent a 32 of each row.
+        assert_eq!(fp8_block_of(512, 6144, &[512, 192], false), Some((32, 1)));
+        assert_eq!(fp8_block_of(512, 6144, &[512, 192], true), None);
+    }
 
     #[test]
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {

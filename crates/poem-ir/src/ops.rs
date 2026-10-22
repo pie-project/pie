@@ -13,7 +13,9 @@ pub mod spatial;
 
 pub use attn::{Attention, IndexScore, RaggedMask};
 pub use collective::Collective;
-pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, NormNext, RopeForm};
+pub use elemwise::{
+    Elementwise, GateActivation, ModulateForm, MropeForm, NormNext, RopeForm, RopeFreqs,
+};
 pub use fused::{Fused, NormKind};
 pub use layout::{Layout, PixelOrder, TapKind};
 pub use linear::{ActQuant, Linear};

@@ -2,8 +2,11 @@
 
 //! q's RMS norm and its (partial) rotation in one pass answer the host:
 //! every element normed and scaled, the first `rotary_dim / 2` pairs
-//! turned, each `span` apart, on the staged window's rows alone.
+//! turned, each `span` apart, on the staged window's rows alone, in the
+//! block-a-head form and the warp-a-head one
+//! (`kernel.elemwise.q_norm_rope_warp`) alike.
 
+use crate::common::attn_ref::tuned;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::rope;
@@ -15,6 +18,7 @@ fn check(
     rotary_dim: usize,
     span: usize,
     window: Option<(u32, u32, u32)>,
+    warp: bool,
 ) {
     let (rows, live, base) = window.unwrap_or((6, 6, 0));
     let planes = (base + rows) as usize;
@@ -31,7 +35,7 @@ fn check(
     let w_at = gpu.up(&w_raw);
     let p_at = gpu.up(&positions);
     let y_at = gpu.up(&y_raw);
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(tuned(|t| t.q_norm_rope_warp = warp));
     if window.is_some() {
         let win_at = gpu.up(&[live, base, 0u32, 0u32]);
         ctx.arm_stage(win_at);
@@ -83,7 +87,7 @@ fn check(
                 let g = from_bf16(got[at + i]);
                 assert!(
                     (g - want).abs() <= want.abs() * (1.0 / 64.0) + 1.5e-2,
-                    "head_dim {head_dim} rotary {rotary_dim} window {window:?}: y[{r}][{h}][{i}] = {g}, want {want}"
+                    "warp {warp} head_dim {head_dim} rotary {rotary_dim} window {window:?}: y[{r}][{h}][{i}] = {g}, want {want}"
                 );
             }
         }
@@ -95,7 +99,15 @@ fn the_fused_q_norm_rope_lands_the_pair_every_case() {
     // A full rotary head; a partial one on a window, the rest left normed;
     // Gemma 4 31B's proportional head (a quarter turning, each pair half a
     // head apart).
-    check(256, 4, 256, 128, None);
-    check(128, 2, 64, 32, Some((6, 4, 1)));
-    check(512, 4, 128, 256, None);
+    // Then a 1024-wide head (four runs a lane) and three heads, whose
+    // (row, head) items leave the last block of eight warps part-filled, and a
+    // window of 16,000 items, more than the warp form seats at once.
+    for warp in [false, true] {
+        check(256, 4, 256, 128, None, warp);
+        check(128, 2, 64, 32, Some((6, 4, 1)), warp);
+        check(512, 4, 128, 256, None, warp);
+        check(1024, 2, 256, 512, None, warp);
+        check(512, 3, 128, 256, Some((5, 3, 2)), warp);
+        check(256, 8, 256, 128, Some((2003, 2000, 3)), warp);
+    }
 }

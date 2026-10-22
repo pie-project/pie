@@ -4,17 +4,19 @@
 //! Supported: `prompt` (one string, or a one-element array), `max_tokens`
 //! (default 16), `temperature`, `top_p`, `top_k`, `stop`, `seed`, `echo`,
 //! the penalties, `stream`, `stream_options.include_usage`, `ignore_eos`
-//! (vLLM's and SGLang's extension) and vLLM's `min_tokens`.
+//! (vLLM's and SGLang's extension), vLLM's `min_tokens` and `min_p`, `n`,
+//! and `logprobs` (an integer, up to 20: the legacy `tokens`,
+//! `token_logprobs`, `top_logprobs`, `text_offset` lists).
 //!
-//! Refused with 400: more than one prompt, token-array prompts, `suffix`,
-//! `logprobs`, and `n > 1`. Anything a thinking model emits as a thinking
-//! block is returned as text: this API has no other place for it.
+//! Refused with 400: more than one prompt, token-array prompts and
+//! `suffix`. Anything a thinking model emits as a thinking block is returned
+//! as text: this API has no other place for it.
 
 use compat::{ApiError, Envelope, Event, Finish, Request, emit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{invalid, stop_sequences, usage};
+use crate::{choice_request, choices, invalid, stop_sequences, token_text, usage};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -30,6 +32,7 @@ struct Body {
     seed: Option<i64>,
     n: Option<u32>,
     logprobs: Option<Value>,
+    min_p: Option<f32>,
     echo: bool,
     suffix: Option<String>,
     stream: bool,
@@ -50,6 +53,7 @@ struct Parsed {
     prompt: String,
     echo: bool,
     include_usage: bool,
+    n: u32,
 }
 
 fn parse(body: Value) -> Result<Parsed, ApiError> {
@@ -76,12 +80,15 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
         },
         Some(_) => return Err(invalid("`prompt` must be a string", Some("prompt"))),
     };
-    if body.n.is_some_and(|n| n != 1) {
-        return Err(invalid("`n` other than 1 is not supported", Some("n")));
-    }
-    if body.logprobs.as_ref().is_some_and(|v| !v.is_null()) {
-        return Err(invalid("`logprobs` is not supported", Some("logprobs")));
-    }
+    let n = choices(body.n)?;
+    let logprobs = match body.logprobs {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|k| u32::try_from(k).ok())
+                .ok_or_else(|| invalid("`logprobs` must be an integer", Some("logprobs")))?,
+        ),
+    };
     if body.suffix.is_some() {
         return Err(invalid("`suffix` is not supported", Some("suffix")));
     }
@@ -112,6 +119,10 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
     if let Some(p) = body.repetition_penalty {
         req.sampling.repetition_penalty = p;
     }
+    if let Some(p) = body.min_p {
+        req.sampling.min_p = p;
+    }
+    req.sampling.logprobs = logprobs;
     if let Some(seed) = body.seed {
         req.sampling.set_seed(seed);
     }
@@ -122,6 +133,7 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
         prompt,
         echo: body.echo,
         include_usage: body.stream_options.is_some_and(|o| o.include_usage),
+        n,
     })
 }
 
@@ -139,15 +151,90 @@ struct Ids {
 }
 
 impl Ids {
-    fn chunk(&self, text: &str, finish: Option<&str>) -> Value {
+    fn chunk(&self, index: u32, text: &str, finish: Option<&str>, logprobs: Value) -> Value {
         json!({
             "id": self.id,
             "object": "text_completion",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish}],
+            "choices": [{"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish}],
         })
     }
+}
+
+/// Legacy logprobs over `steps`, the first token's text starting at
+/// `offset`: each token, its logprob, its alternatives (the sampled token
+/// among them, as vLLM lists it) and where its text starts.
+fn legacy_logprobs(steps: &[(u32, compat::Logprob)], offset: usize) -> Value {
+    let (mut tokens, mut values, mut tops, mut offsets) = (vec![], vec![], vec![], vec![]);
+    let mut at = offset;
+    for (token, lp) in steps {
+        let text = token_text(*token);
+        let mut top = serde_json::Map::new();
+        let alternatives = std::iter::once((*token, lp.logprob))
+            .chain(lp.top.iter().copied().filter(|&(t, _)| t != *token))
+            .take(lp.top.len());
+        for (alt, alt_lp) in alternatives {
+            top.entry(token_text(alt)).or_insert(json!(alt_lp));
+        }
+        offsets.push(at);
+        at += text.len();
+        tokens.push(text);
+        values.push(lp.logprob);
+        tops.push(Value::Object(top));
+    }
+    json!({"tokens": tokens, "token_logprobs": values, "top_logprobs": tops, "text_offset": offsets})
+}
+
+/// One choice's generation, its chunks streamed under `index`.
+async fn choice(
+    parsed: &Parsed,
+    req: &Request,
+    index: u32,
+    ids: &Ids,
+) -> Result<(compat::Outcome, String), String> {
+    let stream = req.stream;
+    let asked = req.sampling.logprobs.is_some();
+    if stream && parsed.echo {
+        emit::send(&ids.chunk(index, &parsed.prompt, None, Value::Null));
+    }
+    let mut text = String::new();
+    let mut offset = if parsed.echo { parsed.prompt.len() } else { 0 };
+    let mut pending: Vec<(u32, compat::Logprob)> = Vec::new();
+    let outcome = compat::run(req, |event| {
+        let piece = match event {
+            Event::Text(t) | Event::Reasoning(t) => t,
+            Event::ReasoningEnd => return,
+            Event::ToolCall(call) => call.arguments,
+            Event::Logprobs(steps) => {
+                pending.extend(steps);
+                return;
+            }
+        };
+        if stream {
+            let logprobs = if asked {
+                let lp = legacy_logprobs(&pending, offset);
+                pending.clear();
+                lp
+            } else {
+                Value::Null
+            };
+            offset += piece.len();
+            emit::send(&ids.chunk(index, &piece, None, logprobs));
+        } else {
+            text.push_str(&piece);
+        }
+    })
+    .await?;
+    if stream {
+        let logprobs = if asked {
+            legacy_logprobs(&pending, offset)
+        } else {
+            Value::Null
+        };
+        emit::send(&ids.chunk(index, "", Some(finish_reason(outcome.finish)), logprobs));
+    }
+    Ok((outcome, text))
 }
 
 pub async fn serve(envelope: Envelope) -> Result<String, String> {
@@ -158,47 +245,67 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         model: inferlet::model::name(),
     };
     let stream = parsed.req.stream;
-    if stream && parsed.echo {
-        emit::send(&ids.chunk(&parsed.prompt, None));
-    }
-    let mut text = String::new();
-    let outcome = compat::run(&parsed.req, |event| {
-        let piece = match event {
-            Event::Text(t) | Event::Reasoning(t) => t,
-            Event::ReasoningEnd => return,
-            Event::ToolCall(call) => call.arguments,
-        };
-        if stream {
-            emit::send(&ids.chunk(&piece, None));
-        } else {
-            text.push_str(&piece);
-        }
-    })
-    .await?;
+    let asked = parsed.req.sampling.logprobs.is_some();
+    let requests: Vec<Request> = (0..parsed.n)
+        .map(|i| choice_request(&parsed.req, i))
+        .collect();
+    let outcomes: Vec<(compat::Outcome, String)> = if parsed.n == 1 {
+        vec![choice(&parsed, &parsed.req, 0, &ids).await?]
+    } else {
+        compat::join_all(
+            requests
+                .iter()
+                .zip(0u32..)
+                .map(|(req, i)| {
+                    Box::pin(choice(&parsed, req, i, &ids))
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = _>>>
+                })
+                .collect(),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?
+    };
+    let mut total = usage(&outcomes[0].0);
+    let completion: usize = outcomes.iter().map(|(o, _)| o.completion_tokens).sum();
+    total["completion_tokens"] = json!(completion);
+    total["total_tokens"] = json!(outcomes[0].0.prompt_tokens + completion);
 
     if stream {
-        emit::send(&ids.chunk("", Some(finish_reason(outcome.finish))));
         if parsed.include_usage {
             emit::send(&json!({
                 "id": ids.id, "object": "text_completion", "created": ids.created, "model": ids.model,
-                "choices": [], "usage": usage(&outcome),
+                "choices": [], "usage": total,
             }));
         }
         emit::send_raw("[DONE]");
         return Ok(String::new());
     }
-    let text = if parsed.echo {
-        format!("{}{text}", parsed.prompt)
-    } else {
-        text
-    };
+    let choices: Vec<Value> = outcomes
+        .into_iter()
+        .zip(0u32..)
+        .map(|((outcome, text), index)| {
+            let text = if parsed.echo {
+                format!("{}{text}", parsed.prompt)
+            } else {
+                text
+            };
+            let offset = if parsed.echo { parsed.prompt.len() } else { 0 };
+            let logprobs = if asked {
+                legacy_logprobs(&outcome.logprobs, offset)
+            } else {
+                Value::Null
+            };
+            json!({"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish_reason(outcome.finish)})
+        })
+        .collect();
     Ok(json!({
         "id": ids.id,
         "object": "text_completion",
         "created": ids.created,
         "model": ids.model,
-        "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason(outcome.finish)}],
-        "usage": usage(&outcome),
+        "choices": choices,
+        "usage": total,
     })
     .to_string())
 }

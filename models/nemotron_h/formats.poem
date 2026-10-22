@@ -17,6 +17,12 @@ def formats(m):
         "transformers",
         recognizes = lambda checkpoint: has("backbone.embeddings.weight"),
         read = lambda reads: read(m, reads),
+        states = [
+            config("hidden_size", m.hidden),
+            config("num_hidden_layers", len(m.layers)),
+            config("n_routed_experts", m.experts),
+            config("mamba_num_heads", m.mamba_heads),
+        ],
     )]
 
 def proj(reads, w, name):
@@ -24,6 +30,8 @@ def proj(reads, w, name):
     from the export's NVFP4."""
     if fp8_proj(w):
         fp8_read(reads, w, [name])
+    elif w.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
+        reads.read(w, name)
     elif stored(name) == BF:
         reads.read(w, name)
     else:
@@ -82,8 +90,9 @@ def read(m, reads):
             f = w.moe
             reads.read(f.router, mixer("gate.weight"))
             reads.read(f.bias, mixer("gate.e_score_correction_bias"))
-            proj(reads, f.down_latent, mixer("fc1_latent_proj.weight"))
-            proj(reads, f.up_latent, mixer("fc2_latent_proj.weight"))
+            if f.down_latent != None:
+                proj(reads, f.down_latent, mixer("fc1_latent_proj.weight"))
+                proj(reads, f.up_latent, mixer("fc2_latent_proj.weight"))
             expert = lambda e, leaf: mixer("experts.{}.{}".format(e, leaf))
             bank(reads, f.up, [expert(e, "up_proj") for e in range(m.experts)])
             bank(reads, f.down, [expert(e, "down_proj") for e in range(m.experts)])

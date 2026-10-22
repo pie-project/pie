@@ -367,6 +367,7 @@ impl Rig {
                     max_adapters: 0,
                     page_size: 16,
                     max_context: 64,
+                    context_declared: false,
                     slots: 4,
                     max_patches: None,
                     max_images: None,

@@ -647,6 +647,14 @@ def _rewrite_minimax_m3(cfg: dict, plan: Plan) -> None:
     # The draft modules are not shipped; nothing may claim them.
     if "num_mtp_modules" in tc:
         tc["num_mtp_modules"] = 0
+    tc["num_nextn_predict_layers"] = 0
+
+
+def _rewrite_hy_v4(cfg: dict, plan: Plan) -> None:
+    _rewrite_glm(cfg, plan)
+    # The miniature's indexer keeps sixteen keys, so the ranking is read at
+    # probe lengths (`hy4-mini`'s `index_top_k`).
+    cfg["index_topk"] = min(cfg.get("index_topk", 16), 16)
 
 
 def _rewrite_nemotron_h(cfg: dict, plan: Plan) -> None:
@@ -1123,8 +1131,10 @@ def carry_quant_overrides(cfg: dict, pairs: list[tuple[str, str]]) -> dict[str, 
         table = cfg.get(key)
         if not isinstance(table, dict):
             continue
-        modules = {k: v for k, v in table.items() if isinstance(v, dict)}
-        rebuilt = {k: v for k, v in table.items() if not isinstance(v, dict)}
+        # modelopt nests its recipe under `quantization` (`quant_algo`, the
+        # excluded modules): a table of its own, not a module.
+        modules = {k: v for k, v in table.items() if isinstance(v, dict) and k != "quantization"}
+        rebuilt = {k: v for k, v in table.items() if k not in modules}
         for module, spec in modules.items():
             head = module + "."
             for out_name, src_name in pairs:
@@ -1493,6 +1503,79 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # the miniature loads unmodified as `InklingForConditionalGeneration`.
         keep_res=(re.compile(r"^model\.visual\."), re.compile(r"^model\.audio\.")),
     ),
+    # Dense, one layer kind: the first layers at the whole model's width.
+    "llama": dict(
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=(),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-3",
+        config_rewrite=_rewrite_common,
+    ),
+    # Every layer routed, each expert apart, no shared expert: the router's
+    # rows slice with the bank.
+    "qwen3_moe": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight",),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-3",
+        config_rewrite=_rewrite_common,
+    ),
+    # GLM-4.5 / 4.6 / 4.7: dense first layers (three, the Air's one), then
+    # routed experts each apart beside a shared expert; the router and its
+    # score bias slice with the bank. The draft layer after the last is
+    # dropped with the depth.
+    "glm4_moe": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-4",
+        config_rewrite=_rewrite_common,
+    ),
+    # modelopt's export of a Qwen3.5/3.6 MoE (nvidia/Qwen3.6-35B-A3B-NVFP4):
+    # the same trunk, each expert apart. Its prefix is the upstream one, so
+    # it is picked by `--family qwen3_5_moe_modelopt`.
+    "qwen3_5_moe_modelopt": dict(
+        model_type="qwen3_5_moe",
+        layer_prefix="model.language_model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight",),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight",
+                      "lm_head.weight", "lm_head.weight_scale",
+                      "lm_head.weight_scale_2", "lm_head.input_scale"),
+        default_layers="0-7",
+        config_rewrite=_rewrite_qwen3_5_moe,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.visual\."),),
+    ),
+    # Qwen3-Next: GDN and gated attention at 3:1, every layer routed, each
+    # expert apart beside a gated shared expert. Eight layers are two
+    # periods.
+    "qwen3_next": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight",),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-7",
+        config_rewrite=_rewrite_common,
+    ),
+    # MiniMax-M2.x: every layer routed, each expert apart (`w1`/`w2`/`w3`),
+    # the router and its score bias slicing with the bank.
+    "minimax_m2": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.block_sparse_moe\.experts\.(\d+)\."),
+        router_suffixes=("block_sparse_moe.gate.weight", "block_sparse_moe.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-3",
+        config_rewrite=_rewrite_common,
+    ),
+    # MiniMax-M3 (bf16, or the MXFP8 release: e4m3 planes beside
+    # `.weight_scale_inv` e8m0 bytes, kept as released): the text tower under
+    # `language_model.`, one name per expert, the vision tower kept whole.
+    # Layers 0-5 are its three dense layers and the first three sparse.
     "minimax_m3_vl": dict(
         layer_prefix="language_model.model.layers.",
         expert_re=re.compile(r"\.block_sparse_moe\.experts\.(\d+)\."),
@@ -1517,10 +1600,32 @@ FAMILIES: dict[str, dict[str, Any]] = {
         expert_re=re.compile(r"\.mixer\.experts\.(\d+)\."),
         router_suffixes=("mixer.gate.weight", "mixer.gate.e_score_correction_bias"),
         globals_keep=("backbone.embeddings.weight", "backbone.norm_f.weight", "lm_head.weight"),
-        # MEMEMEM*E: four Mamba-2 mixers, four routed MoE layers and one
-        # attention, every kind the model has.
+        # Super's MEMEMEM*E: four Mamba-2 mixers, four routed MoE layers and
+        # one attention, every kind the model has (Nano's six-layer
+        # miniature: `--layers 0-5`).
         default_layers="0-8",
         config_rewrite=_rewrite_nemotron_h,
+    ),
+    # Hy4-preview (bf16, or the FP8 release, modelopt's MXFP8: e4m3 planes
+    # beside `.weight_scale` e8m0 bytes, kept as released): the routed bank
+    # stacked on dim 0 with its exponents, the MTP layer dropped. Layers 0-5
+    # are the dense layer, the ranking layers 0, 1 and 5 and the reading 2-4.
+    "hy_v4": dict(
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.gate.e_score_correction_bias",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.gate_up_proj_scale",
+            "mlp.experts.down_proj",
+            "mlp.experts.down_proj_scale",
+        ),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                      "model.hc_head.hc_head_fn", "model.hc_head.hc_head_scale",
+                      "model.hc_head.hc_head_base"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_hy_v4,
     ),
     "gpt_oss": dict(
         layer_prefix="model.layers.",

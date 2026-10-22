@@ -1,9 +1,12 @@
 # The weights of Qwen 3 (dense): per layer an RMS norm, q, k, v and o
 # projections with per-head q and k norms, an RMS norm and a SwiGLU MLP; the
 # token embedding, which the 0.6B also reads out through (tied), a final norm.
-# Each layer also has the LoRA banks the host registers.
+# Each layer also has the LoRA banks the host registers. A deployment's dtype
+# is its projections'; the embedding and head stay at its compute dtype, as
+# an AWQ or GPTQ export keeps them.
 
 load("//lib/adapters/model.poem", "banks")
+load("//lib/rope.poem", "yarn")
 
 def dims(hidden, layers, q_heads, kv_heads, inter, tied):
     return struct(
@@ -21,15 +24,23 @@ def dims(hidden, layers, q_heads, kv_heads, inter, tied):
 
 DIMS = {
     "qwen3-0.6b": dims(hidden = 1024, layers = 28, q_heads = 16, kv_heads = 8, inter = 3072, tied = True),
+    "qwen3-8b": dims(hidden = 4096, layers = 36, q_heads = 32, kv_heads = 8, inter = 12288, tied = False),
     "qwen3-14b": dims(hidden = 5120, layers = 40, q_heads = 40, kv_heads = 8, inter = 17408, tied = False),
+    "qwen3-32b": dims(hidden = 5120, layers = 64, q_heads = 64, kv_heads = 8, inter = 25600, tied = False),
 }
+
+# A release whose projections a deployment keeps as released (Qwen's block
+# FP8, compressed-tensors' per-channel FP8 as RedHatAI's *-FP8-dynamic store
+# it, modelopt's NVFP4), its tables and norms bf16.
+RELEASED = [dtype.e4m3tile128a8, dtype.e4m3g128, dtype.e4m3g128a8, dtype.nvfp4]
 
 def layout(id, deploy):
     if len(deploy.weights) != 1:
         fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
     if deploy.drafter != None or deploy.parts:
         fail("{} ships no drafter and no parts".format(id))
-    w = deploy.weights[0]
+    proj = deploy.weights[0]
+    w = dtype.bf16 if proj in RELEASED else proj
     d = DIMS[id]
     dense = compute(w)
     hidden, hd = d.hidden, d.head_dim
@@ -39,15 +50,15 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight(n("attn_norm"), [hidden], dense),
-            q = weight(n("q"), [d.q_heads * hd, hidden], w).columns(),
-            k = weight(n("k"), [d.kv_heads * hd, hidden], w).columns(heads = d.kv_heads),
-            v = weight(n("v"), [d.kv_heads * hd, hidden], w).columns(heads = d.kv_heads),
-            o = weight(n("o"), [hidden, d.q_heads * hd], w).rows(),
+            q = weight(n("q"), [d.q_heads * hd, hidden], proj).columns(),
+            k = weight(n("k"), [d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
+            v = weight(n("v"), [d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
+            o = weight(n("o"), [hidden, d.q_heads * hd], proj).rows(),
             q_norm = weight(n("q_norm"), [hd], dense),
             k_norm = weight(n("k_norm"), [hd], dense),
             mlp_norm = weight(n("mlp_norm"), [hidden], dense),
-            gate_up = weight(n("gate_up"), [2 * d.inter, hidden], w).packed([d.inter, d.inter]),
-            down = weight(n("down"), [hidden, d.inter], w).rows(),
+            gate_up = weight(n("gate_up"), [2 * d.inter, hidden], proj).packed([d.inter, d.inter]),
+            down = weight(n("down"), [hidden, d.inter], proj).rows(),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -62,10 +73,13 @@ def layout(id, deploy):
         inter = d.inter,
         theta = d.theta,
         eps = d.norm_eps,
+        # Qwen3's native context, which YaRN stretches (its card: factor 4
+        # over 32768 tokens).
+        rope = yarn(deploy, 32768),
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, hidden], w),
-        head = None if d.tied else weight("lm_head", [d.vocab, hidden], w).columns(),
+        embed = weight("embed", [d.vocab, hidden], dense),
+        head = None if d.tied else weight("lm_head", [d.vocab, hidden], dense).columns(),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], dense),
     )

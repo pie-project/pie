@@ -43,6 +43,7 @@ PARAMS = {
     "TapKind": ("TapKind", "{}"),
     "ModulateForm": ("ModulateForm", "{}"),
     "Option<Yarn>": ("Option<Yarn>", "{}"),
+    "Option<RopeScaling>": ("Option<RopeScaling>", "{}"),
     "Conv": ("Conv", "{}"),
     "VoxelSegment": ("VoxelSegment", "{}"),
     "RaggedMask": ("RaggedMask", "{}"),

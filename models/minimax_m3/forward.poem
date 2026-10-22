@@ -9,8 +9,9 @@ def caches(m, c):
     for w in m.layers:
         c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
         if w.indexer != None:
-            # One raw indexer key a token.
-            index = c.kv_space(m.kv)
+            # One raw indexer key a token, bf16 at any kv, as the
+            # indexer's kernels read them.
+            index = c.kv_space(dtype.bf16)
             c.kv(index, w.indexer.keys, [w.indexer.head_dim], w.indexer.head_dim)
 
 def classes():

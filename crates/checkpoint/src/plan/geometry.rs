@@ -15,7 +15,13 @@ pub(super) fn repack_stage_bytes(spec: RepackSpec) -> Result<u64> {
             Ok(elems.div_ceil(2))
         }
         RepackLayout::MarlinMxfp4Scale => Ok(0),
-        RepackLayout::TiledAffineU4Weight | RepackLayout::TiledAffineFactor => Ok(0),
+        RepackLayout::TiledAffineU4Weight
+        | RepackLayout::TiledAffineFactor
+        | RepackLayout::AwqU4Codes
+        | RepackLayout::AwqU4Zeros
+        | RepackLayout::GptqU4Codes
+        | RepackLayout::GptqU4Zeros
+        | RepackLayout::Transposed => Ok(0),
     }
 }
 

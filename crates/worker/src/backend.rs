@@ -97,11 +97,15 @@ fn cuda_budgets(
     adapter_seats: u32,
     patch_ceilings: (Option<u32>, Option<u32>),
     voxel_ceilings: (Option<u32>, Option<u32>),
+    declared: Option<u32>,
 ) -> engine::Budgets {
     let page_size = opts.kv_page_size.unwrap_or(16).max(1);
-    let max_context = opts
-        .max_model_len
-        .filter(|&len| len > 0)
+    let stated = opts.max_model_len.filter(|&len| len > 0);
+    // Unstated: the context the model declares (the engine shortens it to
+    // what the card holds), 4096 where it declares none.
+    let context_declared = stated.is_none() && declared.is_some();
+    let max_context = stated
+        .or(declared)
         .unwrap_or_else(|| engine::Budgets::default().max_context)
         .max(page_size);
     engine::Budgets {
@@ -113,6 +117,7 @@ fn cuda_budgets(
         max_adapters: adapter_seats,
         page_size,
         max_context,
+        context_declared,
         // Unstated, 0: the engine sizes the slab from its chip's profile
         // (`engine.state_slots_per_lane`), 256 where the profile says nothing.
         slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
@@ -237,6 +242,20 @@ fn register_operator_adapters(
     Ok(())
 }
 
+#[cfg(feature = "engine-cuda")]
+/// The context the model at `snapshot_dir` declares, stretched by the yarn
+/// factor a deployment turns at past the config.
+fn declared_context(
+    snapshot_dir: &Path,
+    overrides: &runtime::engine::load::Overrides,
+) -> Option<u32> {
+    let config = crate::weights::config_of(snapshot_dir).ok()?;
+    let stretch = overrides
+        .yarn
+        .map(|factor| (f64::from(factor), overrides.yarn_original.map(f64::from)));
+    crate::weights::declared_context(&config, stretch)
+}
+
 fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
     if snapshot_dir.is_dir()
         || (crate::weights::is_file(snapshot_dir) && crate::weights::is_artifact_path(snapshot_dir))
@@ -310,7 +329,13 @@ pub(crate) fn create_engine_backend_group(
         &mut backend,
         snapshot_dir,
         cache_dir,
-        cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
+        cuda_budgets(
+            opts,
+            adapters.seats(),
+            patch_ceilings,
+            voxel_ceilings,
+            declared_context(snapshot_dir, overrides),
+        ),
         residency,
         poem_ir::Platform::Cuda,
         frames_in_flight,
@@ -378,7 +403,13 @@ pub(crate) fn create_engine_backend(
             let backend = runtime::engine::backend::open::cuda(boot)?;
             (
                 backend,
-                cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
+                cuda_budgets(
+                    opts,
+                    adapters.seats(),
+                    patch_ceilings,
+                    voxel_ceilings,
+                    declared_context(snapshot_dir, overrides),
+                ),
                 poem_ir::Platform::Cuda,
             )
         }
@@ -419,6 +450,7 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size,
                     max_context,
+                    context_declared: false,
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
@@ -459,6 +491,7 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: opts.max_model_len.unwrap_or(defaults.max_context),
+                    context_declared: false,
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
@@ -508,6 +541,7 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: opts.max_model_len.unwrap_or(defaults.max_context),
+                    context_declared: false,
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
@@ -549,6 +583,7 @@ pub(crate) fn create_engine_backend(
                         .filter(|&len| len > 0)
                         .unwrap_or(defaults.max_context)
                         .max(defaults.page_size),
+                    context_declared: false,
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
@@ -585,6 +620,7 @@ pub(crate) fn create_engine_backend(
                         .filter(|&len| len > 0)
                         .unwrap_or(defaults.max_context)
                         .max(defaults.page_size),
+                    context_declared: false,
                     slots: opts.max_state_slots.unwrap_or(4).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
@@ -637,11 +673,11 @@ mod tests {
 
     fn the_voxel_ceilings_a_deployment_states_reach_the_budget() {
         let opts = CudaNativeEngineOptions::default();
-        let derived = cuda_budgets(&opts, 0, (None, None), (None, None));
+        let derived = cuda_budgets(&opts, 0, (None, None), (None, None), None);
         assert_eq!(derived.max_voxels, None, "unstated derives a ladder");
         assert_eq!(derived.max_clips, None);
 
-        let stated = cuda_budgets(&opts, 0, (None, None), (Some(65_536), Some(4)));
+        let stated = cuda_budgets(&opts, 0, (None, None), (Some(65_536), Some(4)), None);
         assert_eq!(
             stated.max_voxels,
             Some(65_536),
@@ -655,7 +691,7 @@ mod tests {
             kv_page_size: Some(16),
             ..Default::default()
         };
-        let budgets = cuda_budgets(&opts, 0, (None, None), (None, None));
+        let budgets = cuda_budgets(&opts, 0, (None, None), (None, None), None);
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
         assert_eq!(
@@ -664,10 +700,16 @@ mod tests {
         );
 
         opts.max_state_slots = Some(4);
-        assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 4);
+        assert_eq!(
+            cuda_budgets(&opts, 0, (None, None), (None, None), None).slots,
+            4
+        );
 
         opts.max_state_slots = Some(0);
-        assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 1);
+        assert_eq!(
+            cuda_budgets(&opts, 0, (None, None), (None, None), None).slots,
+            1
+        );
     }
 
     fn an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else() {

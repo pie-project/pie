@@ -259,6 +259,47 @@ pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> 
     })
 }
 
+/// A model's declared context shortened to what the card holds: the
+/// longest whole number of pages, at most `declared`, at which one sequence
+/// takes no more than half of what `utilization` of the card, less what others
+/// already hold, leaves past the weight tier: the activations and a second
+/// sequence have the other half.
+/// Never under one page.
+pub fn declared_context_that_fits(
+    trace: &Trace,
+    page_size: u32,
+    declared: u32,
+    max_tokens: u32,
+    utilization: f64,
+    weights: u64,
+) -> Result<u32> {
+    let page_size = page_size.max(1);
+    let window = window_of(trace)?;
+    let one = |pages: u32| -> Result<u64> {
+        let paging = Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?
+            .windowed(window, max_tokens);
+        one_slot_bytes(trace, paging)
+    };
+    let (free, total) = device_memory()?;
+    let room = elastic::budget_bytes(free, total, utilization)
+        .saturating_sub(weight_tier_bytes(trace, weights, 0)?)
+        / 2;
+    let most = declared.div_ceil(page_size).max(1);
+    if one(most)? <= room {
+        return Ok(declared);
+    }
+    let (mut fits, mut over) = (1u32, most);
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if one(mid)? <= room {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    Ok(fits.saturating_mul(page_size))
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {

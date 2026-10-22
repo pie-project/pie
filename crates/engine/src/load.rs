@@ -12,6 +12,11 @@ pub struct Budgets {
     pub max_adapters: u32,
     pub page_size: u32,
     pub max_context: u32,
+    /// `max_context` is the model's own declared context, not one the
+    /// operator stated: an engine that cannot seat one sequence at it
+    /// shortens it to what the card holds rather than refusing the load.
+    #[serde(default)]
+    pub context_declared: bool,
     pub slots: u32,
     #[serde(default)]
     pub max_patches: Option<u32>,
@@ -32,6 +37,7 @@ impl Default for Budgets {
             max_adapters: 0,
             page_size: 16,
             max_context: 4096,
+            context_declared: false,
             slots: 256,
             max_patches: None,
             max_images: None,

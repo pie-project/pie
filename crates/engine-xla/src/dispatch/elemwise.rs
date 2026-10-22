@@ -80,6 +80,14 @@ impl Run<'_> {
             Elementwise::NormGate { .. } => Err(kernels_xla::Error::Unsupported {
                 op: "elementwise.norm_gate",
             }),
+            // A rotation at its own frequencies (a checkpoint's rope scaling) is
+            // served on CUDA.
+            Elementwise::RopeFull { freqs: Some(_), .. }
+            | Elementwise::RopePartial { freqs: Some(_), .. }
+            | Elementwise::RopePartialQ { freqs: Some(_), .. }
+            | Elementwise::RopeMrope { freqs: Some(_), .. } => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
             Elementwise::RmsnormNoScale {
                 x,
                 head_dim,
@@ -425,6 +433,7 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 interleaved,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope::full(
@@ -444,6 +453,7 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 span,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope::partial(
@@ -465,6 +475,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope_mrope::interleaved(
@@ -487,6 +498,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope_mrope::split(
@@ -509,6 +521,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                freqs: None,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope_mrope::blocked(
@@ -528,6 +541,7 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 span,
+                freqs: None,
                 q_out: _,
             } => elemwise::rope::partial_q(
                 self.ctx(),

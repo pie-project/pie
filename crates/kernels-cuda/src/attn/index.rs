@@ -17,6 +17,18 @@ fn q_rope_block(n_heads: i32) -> u32 {
 }
 
 fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
+    // A row of bf16 keys written into a narrower plane would spill into the
+    // next cell's; an index's keys stay bf16 at any kv.
+    if pool.keys.dtype != Dtype::Bf16 {
+        return Err(refuse(
+            op,
+            format!(
+                "an index's key rows are bf16, and this pool holds {:?} ones; declare the \
+                 index's kv space bf16",
+                pool.keys.dtype
+            ),
+        ));
+    }
     if pool.layout != 0 {
         return Err(refuse(
             op,

@@ -9,9 +9,12 @@ assumes = { cc = 100 }
 gemv.bf16 = "narrow"
 # A latent prefill from 256 rows runs expanded, as vLLM's MLA prefill does.
 mla.expanded_from = 256
-# Block-FP8 projections: a GEMV up to 4 rows, mma.sync up to 8.
+# Block-FP8 projections: a GEMV up to 4 rows, mma.sync up to 8 at K up to
+# 5120 (GLM-5.3's 6144-wide q_a, kv_a and indexer key lead on tcgen05: FP8
+# bs8 1.67-1.78 -> 1.55-1.58 ms; DeepSeek-V4/V4.1 and GLM-5.3-Flash keep it).
 gemm.fp8_gemv_until = 4
 gemm.fp8_mma_gemv_until = 8
+gemm.fp8_mma_k_until = 5120
 # DeepSeek-V4's attention: pool on mma.sync, prefill from 512 rows and
 # decode up to 64 in one launch, V4.1's bounded replay, its FP4 pass from 32.
 sdpa.pool_mma = true
@@ -38,6 +41,12 @@ ssm.conv_vec4 = true
 elemwise.rows_vec = true
 elemwise.hc_tile = true
 elemwise.hc_mma = true
+# Gemma 4's q norm and rotation on its kv-shared layers a warp a (row, head).
+elemwise.q_norm_rope_warp = true
+# A fused norm-and-fold leaves unwritten the rows nothing reads past it.
+elemwise.skip_unread = true
+# A prefill's fused norm-and-fold 128 threads a row.
+elemwise.norm_fold_block = 128
 # Qwen3.5's attention prologue in one launch up to 64 rows.
 elemwise.qg_prologue_until = 64
 # A wide decode's split partials fold a warp a row.

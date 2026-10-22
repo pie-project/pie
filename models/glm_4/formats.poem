@@ -1,0 +1,130 @@
+# How a GLM-4.5 / 4.6 / 4.7 checkpoint is read: transformers' safetensors
+# under `model.`, each expert apart, as released (bf16), as Z.ai releases it
+# in FP8 (compressed-tensors: e4m3 codes and a scale a row; biases, norms,
+# router and score bias unquantized) or as modelopt exports it in NVFP4
+# (attention bf16; every MLP's legs codes, e4m3 scales a 16, a tensor and an
+# input scale); recognized by its biased q and its router's score bias, and
+# checked against its config. The draft layer stored after the last is not
+# read.
+
+load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read", "released_fp8")
+load("//lib/compressed/formats.poem", "channel_fp8", "channel_fp8_bank", "channel_fp8_read", "channel_kept")
+load("//lib/modelopt/formats.poem", "nvfp4_bank")
+
+def configured(m):
+    return [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("head_dim", m.head_dim),
+        config("num_hidden_layers", len(m.layers)),
+        config("n_routed_experts", m.experts),
+        config("partial_rotary_factor", 0.5),
+        config("rms_norm_eps", m.eps),
+        config("rope_theta", m.theta),
+        config("max_position_embeddings", m.max_position),
+    ]
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.q_proj.bias") and has("model.layers.{}.mlp.gate.e_score_correction_bias".format(len(m.layers) - 1)),
+        read = lambda reads: read(m, reads),
+        states = configured(m),
+    )]
+
+def unscaled(w, name):
+    """Refuses to read `name`'s e4m3 codes as `w`'s dtype: without their
+    scales the codes are not the weight."""
+    if stored(name) == raw(dtype.e4m3):
+        fail("`{}`: `{}` is stored FP8 and this deployment reads it as {}; import the deployment that keeps the release's FP8".format(w.name, name, w.dtype))
+
+def proj(reads, w, names):
+    """`w` from its legs `names`: the release's FP8 kept, or read as stored."""
+    if fp8_proj(w):
+        fp8_read(reads, w, names)
+        return
+    if channel_kept(w):
+        channel_fp8_read(reads, w, names)
+        return
+    if w.dtype == dtype.bf16 and len(names) == 1 and channel_fp8(names[0]):
+        reads.push(tensor(w.name, widened(reads, names[0]), BF))
+        return
+    for name in names:
+        unscaled(w, name)
+    if len(names) == 1:
+        reads.read(w, names[0])
+    else:
+        reads.read_concat(w, names)
+
+BF = raw(dtype.bf16)
+
+F32 = raw(dtype.f32)
+
+def widened(reads, name):
+    """The per-channel FP8 projection `name` as bf16: its e4m3 codes widened
+    to f32, each row times its scale, rounded once."""
+    rows = shape(name)[0]
+    scale = name[:-len(".weight")] + ".weight_scale"
+    reads.extend([
+        tensor(name + ".rows", src(scale) if stored(scale) == F32 else src(scale).cast(F32), F32, shape = [rows, 1], internal = True),
+        tensor(name + ".f32", src(name).cast(F32), F32, internal = True),
+        tensor(name + ".scaled", out(name + ".f32").scale_by(out(name + ".rows")), F32, internal = True),
+    ])
+    return out(name + ".scaled").cast(BF)
+
+def stack(reads, w, legs):
+    """The routed bank `w` from each expert's bf16 legs `legs[e]`, joined
+    along the rows and stacked on the leading axis, encoded to its dtype."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    for names in legs:
+        for name in names:
+            unscaled(w, name)
+    joined = lambda names: src(names[0]) if len(names) == 1 else concat(0, [src(name) for name in names])
+    value = concat(0, [joined(names).transmute([1, rows, cols], BF) for names in legs])
+    if w.dtype == dtype.bf16:
+        reads.push(tensor(w.name, value, BF))
+    else:
+        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
+
+def read(m, reads):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda s: "model.layers.{}.{}".format(l, s)
+        a = lambda s: n("self_attn.{}".format(s))
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        proj(reads, w.qkv, [a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight")])
+        reads.read_concat(w.qkv_bias, [a("q_proj.bias"), a("k_proj.bias"), a("v_proj.bias")])
+        proj(reads, w.o, [a("o_proj.weight")])
+        if w.q_norm != None:
+            reads.read(w.q_norm, a("q_norm.weight"))
+            reads.read(w.k_norm, a("k_norm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        f = w.mlp
+        if not f.routed:
+            proj(reads, f.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            proj(reads, f.down, [n("mlp.down_proj.weight")])
+            continue
+        reads.read(f.router, n("mlp.gate.weight"))
+        reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
+        proj(reads, f.shared.gate_up, [n("mlp.shared_experts.gate_proj.weight"), n("mlp.shared_experts.up_proj.weight")])
+        proj(reads, f.shared.down, [n("mlp.shared_experts.down_proj.weight")])
+        e = lambda i, leg: n("mlp.experts.{}.{}.weight".format(i, leg))
+        gate_up = [[e(i, "gate_proj"), e(i, "up_proj")] for i in range(f.experts)]
+        down = [[e(i, "down_proj")] for i in range(f.experts)]
+        if f.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
+            stem = lambda i, leg: n("mlp.experts.{}.{}".format(i, leg))
+            nvfp4_bank(reads, f.gate_up, [[stem(i, "gate_proj"), stem(i, "up_proj")] for i in range(f.experts)])
+            nvfp4_bank(reads, f.down, [[stem(i, "down_proj")] for i in range(f.experts)])
+        elif channel_kept(f.gate_up):
+            channel_fp8_bank(reads, f.gate_up, gate_up)
+            channel_fp8_bank(reads, f.down, down)
+        elif released_fp8(f.gate_up):
+            fp8_bank(reads, f.gate_up, gate_up)
+            fp8_bank(reads, f.down, down)
+        else:
+            stack(reads, f.gate_up, gate_up)
+            stack(reads, f.down, down)

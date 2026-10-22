@@ -800,8 +800,14 @@ mod sparse {
         o: &mut Tensor,
     ) -> Option<Result<(), Error>> {
         let pool = s.pool;
-        let cells = pool.keys.rows;
         let fp8 = fp8_rows(pool);
+        // Where the tcgen05 pass serves, fp8 rows at any head count are read
+        // 64 heads a pass (a rank's share under tensor parallelism, or more
+        // than 64); elsewhere they take the path any other shape takes.
+        if fp8 && s.heads != 64 && s.heads > 0 && ctx.tuning().mla_sparse && supported() {
+            return Some(by_sixty_four(ctx, op, s, o));
+        }
+        let cells = pool.keys.rows;
         let fits = ctx.tuning().mla_sparse
             && supported()
             && s.heads == 64
@@ -827,6 +833,212 @@ mod sparse {
             return None;
         }
         Some(launch(ctx, op, s, o))
+    }
+
+    /// An fp8 pool's pass over a head count other than 64, 64 heads a pass:
+    /// each pass reads its heads where they lie in the rows (the kernel
+    /// strides its rows), or, a pass short of 64 heads, copies them into
+    /// 64-head rows and its output back out. A head's attention reads no
+    /// other head's, so a padded head's rows (left as they are) touch nothing
+    /// kept. Each pass's log-sum-exps (64 a row in the kernel) are copied to
+    /// their heads likewise.
+    fn by_sixty_four(
+        ctx: &Ctx,
+        op: &'static str,
+        s: &Shape<'_>,
+        o: &mut Tensor,
+    ) -> Result<(), Error> {
+        let heads = u32::try_from(s.heads).unwrap_or(0);
+        let rope = u32::try_from(s.rope).unwrap_or(u32::MAX);
+        if s.kv_lora_rank != 512
+            || !(rope == 0 || rope == 64)
+            || s.q.width != heads * 512
+            || o.width != heads * 512
+            || (rope > 0 && s.q_pe.width != heads * rope)
+        {
+            return Err(crate::jit::refuse(
+                op,
+                format!(
+                    "fp8 latent rows are read 64 heads a pass, over 512 latent and 64 or no \
+                     rotated dims, and this read is {} heads of {} latent and {} rotated dims",
+                    s.heads, s.kv_lora_rank, s.rope
+                ),
+            ));
+        }
+        let rows = o.rows;
+        if rows == 0 {
+            return Ok(());
+        }
+        let at = |ptr: u64, head: u32, width: u32| ptr + u64::from(head) * u64::from(width) * 2;
+        // The kernel lands 64 log-sum-exps a row: a pass's land in a plane of
+        // their own and are copied out (an f32 is two bf16s wide).
+        let lse = if s.lse == 0 {
+            0
+        } else {
+            ctx.scratch_shared(op, "attn.mla_sparse.pad_lse", rows as usize * 64 * 4)? as usize
+                as u64
+        };
+        let lse_out = |first: u32, held: u32| -> Result<(), Error> {
+            if lse == 0 {
+                return Ok(());
+            }
+            let to = at(s.lse, first, 2);
+            copy_rows(ctx, op, to, heads * 2, lse, 64 * 2, held * 2, rows)
+        };
+        for first in (0..heads).step_by(64) {
+            let held = (heads - first).min(64);
+            if held == 64 {
+                // A whole pass reads its heads in place, at the rows' own pitch.
+                let q = Tensor {
+                    ptr: at(s.q.ptr, first, 512),
+                    ..s.q
+                };
+                let q_pe = Tensor {
+                    ptr: at(s.q_pe.ptr, first, rope),
+                    ..s.q_pe
+                };
+                let mut out = Tensor {
+                    ptr: at(o.ptr, first, 512),
+                    ..*o
+                };
+                let pass = Shape {
+                    q,
+                    q_pe,
+                    heads: 64,
+                    lse,
+                    ..*s
+                };
+                passed(ctx, op, &pass, &mut out)?;
+                lse_out(first, held)?;
+                continue;
+            }
+            let wide = |name, width: u32| -> Result<Tensor, Error> {
+                let bytes = rows as usize * 64 * width as usize * 2;
+                let ptr = ctx.scratch_shared(op, name, bytes)? as usize as u64;
+                Ok(Tensor::new(ptr, rows, 64 * width, Dtype::Bf16))
+            };
+            let q = wide("attn.mla_sparse.pad_q", 512)?;
+            let from = at(s.q.ptr, first, 512);
+            copy_rows(
+                ctx,
+                op,
+                q.ptr,
+                64 * 512,
+                from,
+                heads * 512,
+                held * 512,
+                rows,
+            )?;
+            let q_pe = if rope > 0 {
+                let q_pe = wide("attn.mla_sparse.pad_q_pe", rope)?;
+                let from = at(s.q_pe.ptr, first, rope);
+                copy_rows(
+                    ctx,
+                    op,
+                    q_pe.ptr,
+                    64 * rope,
+                    from,
+                    heads * rope,
+                    held * rope,
+                    rows,
+                )?;
+                q_pe
+            } else {
+                s.q_pe
+            };
+            let mut out = wide("attn.mla_sparse.pad_o", 512)?;
+            let pass = Shape {
+                q,
+                q_pe,
+                heads: 64,
+                lse,
+                ..*s
+            };
+            passed(ctx, op, &pass, &mut out)?;
+            let to = at(o.ptr, first, 512);
+            copy_rows(
+                ctx,
+                op,
+                to,
+                heads * 512,
+                out.ptr,
+                64 * 512,
+                held * 512,
+                rows,
+            )?;
+            lse_out(first, held)?;
+        }
+        Ok(())
+    }
+
+    /// One 64-head pass, refused where the pass would not serve.
+    fn passed(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<(), Error> {
+        let pool = s.pool;
+        let fits = ctx.tuning().mla_sparse
+            && supported()
+            && pool.page_size > 0
+            && pool.keys.rows > 0
+            && s.selection.width > 0
+            && s.q.dtype == Dtype::Bf16
+            && [
+                s.q.ptr,
+                o.ptr,
+                pool.keys.ptr,
+                u64::from(s.q.width) * 2,
+                u64::from(o.width) * 2,
+            ]
+            .iter()
+            .all(|&at| aligned16(at))
+            && u32::try_from(s.rope).is_ok_and(|rope| pool.keys.width == 512 + rope)
+            && (s.rope == 0 || (aligned16(s.q_pe.ptr) && aligned16(u64::from(s.q_pe.width) * 2)));
+        if !fits {
+            return Err(crate::jit::refuse(
+                op,
+                "fp8 latent rows are read by the tcgen05 sparse pass alone, and this \
+                 shape or device is not one it serves",
+            ));
+        }
+        launch(ctx, op, s, o)
+    }
+
+    /// `rows` rows of `width` bf16s from `src` (a row every `src_pitch`) to
+    /// `dst` (a row every `dst_pitch`), on the fire's stream.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_rows(
+        ctx: &Ctx,
+        op: &'static str,
+        dst: u64,
+        dst_pitch: u32,
+        src: u64,
+        src_pitch: u32,
+        width: u32,
+        rows: u32,
+    ) -> Result<(), Error> {
+        use cudarc::runtime::sys as rt;
+        // SAFETY: both spans are live device memory the fire owns, `rows`
+        // rows of their pitches, on its stream.
+        let code = unsafe {
+            rt::cudaMemcpy2DAsync(
+                dst as usize as *mut core::ffi::c_void,
+                dst_pitch as usize * 2,
+                src as usize as *const core::ffi::c_void,
+                src_pitch as usize * 2,
+                width as usize * 2,
+                rows as usize,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                ctx.stream().cast(),
+            )
+        };
+        if code != rt::cudaError::cudaSuccess {
+            return Err(crate::jit::refuse(
+                op,
+                format!(
+                    "`cudaMemcpy2DAsync` answered {} laying a pass's heads",
+                    code as i32
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) use super::fp8_rows;

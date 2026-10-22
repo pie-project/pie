@@ -8,13 +8,15 @@
 //! `response.completed`).
 //!
 //! Supported: `input` as a string or as message / `function_call` /
-//! `function_call_output` items, `instructions`, function `tools`,
+//! `function_call_output` items (a user message's `input_image` parts as
+//! base64 `data:` URLs), `instructions`, function `tools`,
 //! `tool_choice`, `text.format` (`text`/`json_object`/`json_schema`),
 //! `reasoning.effort` (`none` switches thinking off), `max_output_tokens`,
 //! `temperature`, `top_p`, `top_k`, `stream`.
 //!
 //! Refused with 400: `previous_response_id` (this server keeps no
-//! conversation state), non-text input parts, and built-in tool types.
+//! conversation state), input parts other than text and images, an image by
+//! `file_id` or remote URL, and built-in tool types.
 
 use compat::{
     ApiError, Envelope, Event, Finish, Message, Request, ResponseFormat, Role, Thinking, ToolCall,
@@ -42,20 +44,42 @@ struct Body {
     previous_response_id: Option<String>,
 }
 
-fn content_text(content: &Value, what: &str) -> Result<String, ApiError> {
+/// The text of a message's `content`, and the pictures its `input_image`
+/// parts carry.
+fn content_parts(content: &Value, what: &str) -> Result<(String, Vec<Vec<u8>>), ApiError> {
     match content {
-        Value::String(s) => Ok(s.clone()),
+        Value::String(s) => Ok((s.clone(), Vec::new())),
         Value::Array(parts) => {
             let mut text = String::new();
+            let mut images = Vec::new();
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("input_text") | Some("output_text") | Some("text") => {
                         text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
                     }
+                    Some("input_image") => {
+                        if part.get("file_id").is_some_and(|f| !f.is_null()) {
+                            return Err(invalid(
+                                format!(
+                                    "{what}: an `input_image` by `file_id` is not supported; send its bytes as a `data:` URL in `image_url`"
+                                ),
+                                Some("input"),
+                            ));
+                        }
+                        let url = part
+                            .get("image_url")
+                            .and_then(|u| u.get("url").or(Some(u)))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        images.push(
+                            compat::image::data_url(url)
+                                .map_err(|e| invalid(format!("{what}: {e}"), Some("input")))?,
+                        );
+                    }
                     Some(other) => {
                         return Err(invalid(
                             format!(
-                                "{what}: part type `{other}` is not supported; only text parts are"
+                                "{what}: part type `{other}` is not supported; only text and `input_image` parts are"
                             ),
                             Some("input"),
                         ));
@@ -68,9 +92,9 @@ fn content_text(content: &Value, what: &str) -> Result<String, ApiError> {
                     }
                 }
             }
-            Ok(text)
+            Ok((text, images))
         }
-        Value::Null => Ok(String::new()),
+        Value::Null => Ok((String::new(), Vec::new())),
         _ => Err(invalid(
             format!("{what}: content must be a string or parts"),
             Some("input"),
@@ -116,9 +140,17 @@ fn parse(body: Value) -> Result<Request, ApiError> {
                                 ));
                             }
                         };
-                        let text =
-                            content_text(item.get("content").unwrap_or(&Value::Null), &what)?;
-                        messages.push(Message::text(role, text));
+                        let (text, images) =
+                            content_parts(item.get("content").unwrap_or(&Value::Null), &what)?;
+                        if !images.is_empty() && role != Role::User {
+                            return Err(invalid(
+                                format!("{what}: only user messages may carry images"),
+                                Some("input"),
+                            ));
+                        }
+                        let mut message = Message::text(role, text);
+                        message.images = images;
+                        messages.push(message);
                     }
                     Some("function_call") => {
                         let call_id = item
@@ -452,6 +484,7 @@ impl Stream {
                 self.event("response.reasoning_text.delta", json!({"item_id": id, "output_index": self.index, "content_index": 0, "delta": delta}));
             }
             Event::ReasoningEnd => self.close(),
+            Event::Logprobs(_) => {}
             Event::Text(delta) => {
                 self.ensure(Item::Message);
                 self.text.push_str(&delta);
@@ -564,4 +597,46 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     Ok(shell
         .response(status, output, Some(usage), Some(outcome.finish))
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(role: &str, content: Value) -> Result<Request, ApiError> {
+        parse(json!({"input": [{"type": "message", "role": role, "content": content}]}))
+    }
+
+    #[test]
+    fn an_input_image_lands_its_bytes_on_the_user_turn() {
+        let req = turn(
+            "user",
+            json!([
+                {"type": "input_text", "text": "What is this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8=", "detail": "auto"},
+            ]),
+        )
+        .expect("an input_image parses");
+        let user = req.messages.last().expect("a user turn");
+        assert_eq!(user.content, "What is this?");
+        assert_eq!(user.images, vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn an_image_by_file_id_or_url_or_off_a_user_turn_is_refused() {
+        for (role, part) in [
+            ("user", json!({"type": "input_image", "file_id": "file-1"})),
+            (
+                "user",
+                json!({"type": "input_image", "image_url": "https://example.com/a.png"}),
+            ),
+            (
+                "assistant",
+                json!({"type": "input_image", "image_url": "data:image/png;base64,aGk="}),
+            ),
+        ] {
+            let why = turn(role, json!([part])).err().expect("refused");
+            assert_eq!(why.status, 400, "{}", why.body);
+        }
+    }
 }

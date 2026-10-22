@@ -2,6 +2,8 @@ use super::*;
 
 pub use poem_ir::ops::elemwise::Yarn;
 
+pub use crate::rope::RopeScaling;
+
 use crate::Recorder;
 
 pub fn rmsnorm(x: &Value, weight: &Weight, eps: f32) -> Value {
@@ -314,6 +316,8 @@ pub fn res_blend(
     y
 }
 
+/// `scaling`, if any, turns each pair at its own frequency (a checkpoint's
+/// `rope_scaling`), the rest of the op as stated.
 pub fn rope_full(
     q: &Value,
     k: &Value,
@@ -321,7 +325,9 @@ pub fn rope_full(
     head_dim: u32,
     theta: f32,
     interleaved: bool,
+    scaling: Option<RopeScaling>,
 ) -> (Value, Value) {
+    let freqs = scaled(scaling.as_ref(), theta, head_dim / 2, head_dim / 2);
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
@@ -335,10 +341,24 @@ pub fn rope_full(
             interleaved,
             q_out: q_out.id(),
             k_out: k_out.id(),
+            freqs,
         },
         &[q, k, positions],
     );
     (q_out, k_out)
+}
+
+/// The frequencies `scaling` turns `pairs` pairs `span` apart at.
+fn scaled(
+    scaling: Option<&RopeScaling>,
+    theta: f32,
+    pairs: u32,
+    span: u32,
+) -> Option<poem_ir::RopeFreqs> {
+    scaling.map(|s| {
+        s.freqs(theta, pairs, span)
+            .unwrap_or_else(|why| panic!("{why}"))
+    })
 }
 
 /// A pair sits `span` apart, half the rotary width unless stated.
@@ -350,7 +370,10 @@ pub fn rope_partial(
     head_dim: u32,
     theta: f32,
     span: Option<u32>,
+    scaling: Option<RopeScaling>,
 ) -> (Value, Value) {
+    let span = span.unwrap_or(rotary_dim / 2);
+    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, span);
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
@@ -362,9 +385,10 @@ pub fn rope_partial(
             rotary_dim,
             head_dim,
             theta,
-            span: span.unwrap_or(rotary_dim / 2),
+            span,
             q_out: q_out.id(),
             k_out: k_out.id(),
+            freqs,
         },
         &[q, k, positions],
     );
@@ -379,7 +403,10 @@ pub fn rope_partial_q(
     head_dim: u32,
     theta: f32,
     span: Option<u32>,
+    scaling: Option<RopeScaling>,
 ) -> Value {
+    let span = span.unwrap_or(rotary_dim / 2);
+    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, span);
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     r.push(
@@ -389,8 +416,9 @@ pub fn rope_partial_q(
             rotary_dim,
             head_dim,
             theta,
-            span: span.unwrap_or(rotary_dim / 2),
+            span,
             q_out: q_out.id(),
+            freqs,
         },
         &[q, positions],
     );
@@ -780,7 +808,13 @@ pub fn rope_mrope(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    scaling: Option<RopeScaling>,
 ) -> (Value, Value) {
+    assert!(
+        scaling.is_none() || form == MropeForm::Interleaved,
+        "a {form:?} M-RoPE turns a still's grid, which no rope scaling stretches"
+    );
+    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, rotary_dim / 2);
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
@@ -796,6 +830,7 @@ pub fn rope_mrope(
             theta,
             q_out: q_out.id(),
             k_out: k_out.id(),
+            freqs,
         },
         &[q, k, positions],
     );

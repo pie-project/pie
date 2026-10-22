@@ -525,6 +525,31 @@ impl Engine for Cuda {
             width_free(&trace.name),
         )?;
         let (contract, plan) = self.settle(&trace, &path, &residency)?;
+        let mut budgets = budgets;
+        if budgets.context_declared && residency.device_kv_budget.is_none() {
+            let fits = crate::store::declared_context_that_fits(
+                &trace,
+                budgets.page_size,
+                budgets.max_context,
+                if budgets.max_tokens == 0 {
+                    16_384
+                } else {
+                    budgets.max_tokens
+                },
+                residency.device_memory_share,
+                plan.device_demand(),
+            )
+            .map_err(fault)?;
+            if fits < budgets.max_context {
+                eprintln!(
+                    "engine-cuda: the model declares a {}-token context and one sequence at it \
+                     takes more than half of what `[model] device_memory_share` leaves past the \
+                     weights; serving {fits} tokens. State `[engine] max_model_len` to choose.",
+                    budgets.max_context
+                );
+                budgets.max_context = fits;
+            }
+        }
 
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);

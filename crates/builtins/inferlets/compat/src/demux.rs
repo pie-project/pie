@@ -19,7 +19,7 @@ use inferlet::pie::inferlet::{reasoning, tools};
 use crate::holdback::HoldBack;
 use crate::request::ToolCall;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// A chunk of the model's reasoning.
     Reasoning(String),
@@ -29,6 +29,9 @@ pub enum Event {
     Text(String),
     /// A complete tool call.
     ToolCall(ToolCall),
+    /// The logprobs of tokens just sampled, ahead of whatever text they
+    /// make (streamed requests that ask for logprobs only).
+    Logprobs(Vec<(u32, crate::generate::Logprob)>),
 }
 
 pub(crate) struct Demux {
@@ -72,6 +75,13 @@ impl Demux {
             reasoning_text: String::new(),
             tool_calls: Vec::new(),
         }
+    }
+
+    /// Keep whitespace where a stream starts: a raw completion continues its
+    /// prompt verbatim, its leading space part of the text.
+    pub fn verbatim(&mut self) {
+        self.strip_leading = false;
+        self.reasoning_strip_leading = false;
     }
 
     /// Classify one token. Stop tokens must not be fed: the caller ends the

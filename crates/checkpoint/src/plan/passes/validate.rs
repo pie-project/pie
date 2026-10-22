@@ -141,7 +141,13 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                     && transform.repack.is_some_and(|repack| {
                         matches!(
                             repack.layout,
-                            RepackLayout::TiledAffineU4Weight | RepackLayout::TiledAffineFactor
+                            RepackLayout::TiledAffineU4Weight
+                                | RepackLayout::TiledAffineFactor
+                                | RepackLayout::AwqU4Codes
+                                | RepackLayout::AwqU4Zeros
+                                | RepackLayout::GptqU4Codes
+                                | RepackLayout::GptqU4Zeros
+                                | RepackLayout::Transposed
                         )
                     })));
         if !supported {

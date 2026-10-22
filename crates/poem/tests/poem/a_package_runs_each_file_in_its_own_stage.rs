@@ -25,6 +25,7 @@ fn deploy() -> Deploy {
         tp: 1,
         parts: vec![],
         drafter: None,
+        yarn: None,
     }
 }
 

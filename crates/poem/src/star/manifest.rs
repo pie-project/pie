@@ -29,6 +29,7 @@ pub struct Template {
     pub tools: bool,
     pub xml_tools: bool,
     pub generation_suffix: String,
+    pub identity: String,
     pub stop: Vec<String>,
     pub bos: Option<String>,
     pub eos: Option<String>,
@@ -275,7 +276,7 @@ impl Model {
     }
 
     /// The name a deployment of this model is served under:
-    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-tp{n}]`, its parts in
+    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tp{n}]`, its parts in
     /// the order the model states them.
     #[must_use]
     pub fn name(&self, deploy: &Deploy) -> String {
@@ -294,6 +295,9 @@ impl Model {
         }
         name.push_str("-kv-");
         name.push_str(&word(deploy.kv));
+        if let Some(factor) = deploy.yarn {
+            name.push_str(&format!("-yarn{factor}"));
+        }
         if deploy.tp > 1 {
             name.push_str(&format!("-tp{}", deploy.tp));
         }
@@ -325,6 +329,14 @@ impl Model {
             weights.push(precision_of(word)?);
         }
         let kv = dtype_of(words.next()?)?;
+        let yarn = match words.peek().and_then(|w| w.strip_prefix("yarn")) {
+            Some(factor) => {
+                let factor = factor.parse().ok().filter(|f| *f > 1)?;
+                words.next();
+                Some(factor)
+            }
+            None => None,
+        };
         let tp = match words.next() {
             None => 1,
             Some(word) => word.strip_prefix("tp")?.parse().ok().filter(|tp| *tp > 1)?,
@@ -338,6 +350,7 @@ impl Model {
             tp,
             parts,
             drafter,
+            yarn,
         })
     }
 }
@@ -362,7 +375,7 @@ pub fn precision_of(spelled: &str) -> Option<Precision> {
 pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
     /// The template `format` with the settings it reads: ChatML `thinking`,
     /// `preserve_thinking`, `reasoning_effort`, `tools`, `xml_tools`, `generation_suffix`, `stop`; `lines`
-    /// `stop`, `bos`, `eos`; `raw` `stop`.
+    /// `stop`, `bos`, `eos`; `raw` `stop`; `minimax2` `identity`.
     fn template(
         #[starlark(require = pos)] format: String,
         #[starlark(require = named, default = false)] thinking: bool,
@@ -371,6 +384,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] tools: bool,
         #[starlark(require = named, default = false)] xml_tools: bool,
         #[starlark(require = named, default = String::new())] generation_suffix: String,
+        #[starlark(require = named, default = String::new())] identity: String,
         #[starlark(require = named, default = UnpackList::default())] stop: UnpackList<String>,
         #[starlark(require = named, default = NoneOr::None)] bos: NoneOr<String>,
         #[starlark(require = named, default = NoneOr::None)] eos: NoneOr<String>,
@@ -383,6 +397,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
             tools,
             xml_tools,
             generation_suffix,
+            identity,
             stop: stop.items,
             bos: bos.into_option(),
             eos: eos.into_option(),
@@ -484,6 +499,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
                 tp: 1,
                 parts: parts.items,
                 drafter: drafter.into_option(),
+                yarn: None,
             },
         })
     }

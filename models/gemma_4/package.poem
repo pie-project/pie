@@ -45,6 +45,22 @@ DEPLOYMENTS = [
     deployment("gemma4-e4b-mini-l24", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l30", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l36", weights = BF, kv = BF),
+    # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
+    deployment("gemma4-26b-a4b", weights = U4, kv = dtype.e4m3),
+    deployment("gemma4-26b-a4b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = U4, kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-12b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-e4b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-e2b", weights = BF, kv = dtype.e4m3),
+    # nvidia's modelopt exports as vLLM serves them: the 26B-A4B's experts
+    # NVFP4 against NVFP4 rows (or bf16 ones), the 31B's MLP NVFP4 against
+    # bf16 rows, the rest bf16; keys and values e4m3.
+    deployment("gemma4-26b-a4b", weights = [BF, dtype.nvfp4a4], kv = dtype.e4m3),
+    deployment("gemma4-26b-a4b", weights = [BF, dtype.nvfp4a4], kv = BF),
+    deployment("gemma4-26b-a4b", weights = [BF, dtype.nvfp4], kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = [BF, dtype.nvfp4], kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = [BF, dtype.nvfp4], kv = BF),
     deployment("gemma4-e4b", weights = BF, kv = BF, parts = ["vision"]),
     deployment("gemma4-26b-a4b", weights = U4, kv = BF, parts = ["vision"]),
     deployment("gemma4-31b", weights = U4, kv = BF, parts = ["vision"]),

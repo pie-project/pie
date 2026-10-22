@@ -1,0 +1,16 @@
+# The rope scalings a deployment stretches its model's context by, spelled
+# as config.json spells them: a forward reads one with
+# `rope_scaling(dict)` and passes it to its rotations as `scaling`.
+
+def yarn(deploy, native):
+    """The YaRN a deployment's `yarn` factor stretches the model's `native`
+    context by (`-yarn{f}` in its name), as vLLM turns
+    `{"rope_type": "yarn", "factor": f, "original_max_position_embeddings":
+    native}`; None where the deployment stretches nothing."""
+    if deploy.yarn == None:
+        return None
+    return {
+        "rope_type": "yarn",
+        "factor": float(deploy.yarn),
+        "original_max_position_embeddings": native,
+    }

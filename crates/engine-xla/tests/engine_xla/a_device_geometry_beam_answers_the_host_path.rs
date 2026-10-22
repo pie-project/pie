@@ -53,7 +53,7 @@ impl ForwardHybrid for Tiny {
         let k = ops::linear::matmul(&x, &w("k", HEAD_DIM, WIDTH));
         let v = ops::linear::matmul(&x, &w("v", HEAD_DIM, WIDTH));
         let (q, k) =
-            ops::elemwise::rope_full(&q, &k, &inputs.positions(), HEAD_DIM, 10_000.0, false);
+            ops::elemwise::rope_full(&q, &k, &inputs.positions(), HEAD_DIM, 10_000.0, false, None);
         let pages = inputs.kv(KV_ROW);
         ops::attn::kv_append(
             &k,

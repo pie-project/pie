@@ -10,8 +10,26 @@ use crate::Instruct;
 use crate::chatml::{ChatML, ChatMLInstruct};
 
 pub const FORMATS: &[&str] = &[
-    "chatml", "harmony", "gemma", "deepseek", "dots", "glm", "kimi", "kimi3", "inkling", "atem",
-    "mimo", "minimax", "hy", "lines", "raw",
+    "chatml",
+    "harmony",
+    "gemma",
+    "deepseek",
+    "dots",
+    "glm",
+    "glm47",
+    "glm45",
+    "kimi",
+    "kimi3",
+    "inkling",
+    "atem",
+    "mimo",
+    "minimax",
+    "minimax2",
+    "hy",
+    "llama",
+    "qwen3_coder",
+    "lines",
+    "raw",
 ];
 
 /// A format and its settings; a setting the format does not read is refused.
@@ -25,6 +43,8 @@ pub struct Spec {
     pub tools: bool,
     pub xml_tools: bool,
     pub generation_suffix: String,
+    /// MiniMax-M2: the identity its default system turn states.
+    pub identity: String,
     /// ChatML, lines, raw.
     pub stop: Vec<String>,
     /// Lines.
@@ -61,6 +81,9 @@ impl Spec {
         if !self.generation_suffix.is_empty() {
             set.push("generation_suffix");
         }
+        if !self.identity.is_empty() {
+            set.push("identity");
+        }
         if !self.stop.is_empty() {
             set.push("stop");
         }
@@ -86,9 +109,10 @@ impl Spec {
             ],
             "gemma" | "hy" => &["thinking"],
             "lines" => &["stop", "bos", "eos"],
+            "minimax2" => &["identity"],
             "raw" => &["stop"],
-            "harmony" | "deepseek" | "dots" | "glm" | "kimi" | "kimi3" | "inkling" | "atem"
-            | "mimo" | "minimax" => &[],
+            "harmony" | "deepseek" | "dots" | "glm" | "glm47" | "glm45" | "kimi" | "kimi3"
+            | "inkling" | "atem" | "mimo" | "minimax" | "llama" | "qwen3_coder" => &[],
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
@@ -107,6 +131,9 @@ impl Spec {
                 "the `{}` format needs its stop tokens",
                 self.format
             )),
+            "minimax2" if self.identity.is_empty() => {
+                Err("the `minimax2` format needs the identity its system turn states".to_string())
+            }
             "lines" if self.stop.is_empty() || self.bos.is_none() || self.eos.is_none() => {
                 Err("the `lines` format needs its stop tokens, its bos and its eos".to_string())
             }
@@ -135,13 +162,24 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "deepseek" => Arc::new(crate::deepseek::DeepSeek::new(tokenizer)),
         "dots" => Arc::new(crate::dots::Dots::new(tokenizer)),
         "glm" => Arc::new(crate::glm::Glm::new(tokenizer)),
+        "glm47" => Arc::new(crate::glm::Glm::with_style(
+            tokenizer,
+            crate::glm::Style::Glm47,
+        )),
+        "glm45" => Arc::new(crate::glm::Glm::with_style(
+            tokenizer,
+            crate::glm::Style::Glm45,
+        )),
         "kimi" => Arc::new(crate::kimi::Kimi::new(tokenizer)),
         "kimi3" => Arc::new(crate::kimi3::Kimi3::new(tokenizer)),
         "inkling" => Arc::new(crate::inkling::Inkling::new(tokenizer)),
         "atem" => Arc::new(crate::atem::Atem::new(tokenizer)),
         "mimo" => Arc::new(crate::mimo::Mimo::new(tokenizer)),
         "minimax" => Arc::new(crate::minimax::MiniMax::new(tokenizer)),
+        "minimax2" => Arc::new(crate::minimax2::MiniMax2::new(tokenizer, &spec.identity)),
         "hy" => Arc::new(crate::hy::Hy::new(tokenizer, spec.thinking)),
+        "llama" => Arc::new(crate::llama::Llama::new(tokenizer)),
+        "qwen3_coder" => Arc::new(crate::qwen3_coder::Qwen3Coder::new(tokenizer)),
         "lines" => Arc::new(crate::lines::Lines::new(
             tokenizer,
             spec.bos.as_deref().unwrap_or_default(),

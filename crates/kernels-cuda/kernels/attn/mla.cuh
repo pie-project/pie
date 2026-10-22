@@ -176,6 +176,9 @@ __device__ __forceinline__ void mla_resolve_dst(
     actual_page = static_cast<int>(kv_page_indices[pages_first + page_in_req]);
 }
 
+// Under a staged window `win` a block walks only the window's live rows: its
+// source and validity rows sit `win[1]` into the plane, and its requests are
+// the window's first `win[2]` lanes.
 __global__ void mla_kv_append(
     const bf16* __restrict__ ckv_curr,
     const bf16* __restrict__ kpe_curr,
@@ -189,17 +192,24 @@ __global__ void mla_kv_append(
     int R,
     int page_size,
     int kv_lora_rank,
-    int qk_rope_head_dim)
+    int qk_rope_head_dim,
+    const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    if (row_valid != nullptr && row_valid[t] == 0) return;
+
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
+    if (row_valid != nullptr && row_valid[t_row] == 0) return;
     int actual_page = 0;
     int offset_in_page = 0;
     mla_resolve_dst(qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, R, page_size, t, actual_page,
                     offset_in_page);
 
-    const long long ckv_src = static_cast<long long>(t) * kv_lora_rank;
+    const long long ckv_src = static_cast<long long>(t_row) * kv_lora_rank;
     const long long ckv_dst =
         (static_cast<long long>(actual_page) * page_size + offset_in_page) *
         kv_lora_rank;
@@ -207,7 +217,7 @@ __global__ void mla_kv_append(
         ckv_pages[ckv_dst + i] = ckv_curr[ckv_src + i];
     }
 
-    const long long kpe_src = static_cast<long long>(t) * qk_rope_head_dim;
+    const long long kpe_src = static_cast<long long>(t_row) * qk_rope_head_dim;
     const long long kpe_dst =
         (static_cast<long long>(actual_page) * page_size + offset_in_page) *
         qk_rope_head_dim;
@@ -232,10 +242,17 @@ __global__ __launch_bounds__(160) void mla_kv_append_fp8(
     const u8* __restrict__ row_valid,
     int R,
     int page_size,
-    int rope)
+    int rope,
+    const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    if (row_valid != nullptr && row_valid[t] == 0) return;
+
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
+    if (row_valid != nullptr && row_valid[t_row] == 0) return;
     int actual_page = 0;
     int offset_in_page = 0;
     mla_resolve_dst(qo_indptr, kv_page_indices, kv_page_indptr,
@@ -245,8 +262,8 @@ __global__ __launch_bounds__(160) void mla_kv_append_fp8(
     u8* row = rows + (static_cast<long long>(actual_page) * page_size + offset_in_page) * width;
     const int i = static_cast<int>(threadIdx.x);
     if (i >= width / 4) return;
-    const bf16* src = i < 128 ? ckv_curr + static_cast<long long>(t) * 512 + 4 * i
-                              : kpe_curr + static_cast<long long>(t) * rope + 4 * (i - 128);
+    const bf16* src = i < 128 ? ckv_curr + static_cast<long long>(t_row) * 512 + 4 * i
+                              : kpe_curr + static_cast<long long>(t_row) * rope + 4 * (i - 128);
     std::uint32_t packed = 0;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {

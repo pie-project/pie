@@ -62,6 +62,129 @@ impl Model {
     }
 }
 
+/// The context the checkpoint's config declares, as vLLM derives its
+/// default `max_model_len`: the least of the length keys the (text) config
+/// states, stretched by a rope scaling's factor where the scaling leaves the
+/// stated length unscaled (linear, dynamic), a YaRN reaching at least its
+/// original length times its factor; `stretch`, a YaRN factor and the native
+/// length it stretches (the stated one unless given) the deployment turns at
+/// instead of the config's, gives the stretched length. `None` where
+/// the config states no length.
+#[must_use]
+pub fn declared_context(config: &[u8], stretch: Option<(f64, Option<f64>)>) -> Option<u32> {
+    const KEYS: [&str; 9] = [
+        "max_position_embeddings",
+        "n_positions",
+        "max_seq_len",
+        "seq_length",
+        "model_max_length",
+        "max_target_positions",
+        "max_sequence_length",
+        "max_seq_length",
+        "seq_len",
+    ];
+    let config: serde_json::Value = serde_json::from_slice(config).ok()?;
+    let text = config
+        .get("text_config")
+        .or_else(|| config.get("llm_config"))
+        .or_else(|| config.get("language_config"))
+        .filter(|text| text.is_object())
+        .unwrap_or(&config);
+    let length = |c: &serde_json::Value| {
+        if let Some(stated) = c
+            .get("model_max_length")
+            .and_then(serde_json::Value::as_f64)
+        {
+            return Some(stated);
+        }
+        KEYS.iter()
+            .filter_map(|key| c.get(*key).and_then(serde_json::Value::as_f64))
+            .reduce(f64::min)
+    };
+    let stated = length(text).or_else(|| length(&config))?;
+    if let Some((factor, original)) = stretch {
+        return whole(original.unwrap_or(stated) * factor);
+    }
+    let mut context = stated;
+    let scalings = ["rope_scaling", "rope_parameters"]
+        .iter()
+        .filter_map(|key| text.get(*key).or_else(|| config.get(*key)))
+        .filter(|rope| !rope.is_null());
+    for rope in scalings {
+        // `rope_parameters` may be per layer type: `{ "full_attention": {...} }`.
+        let each: Vec<&serde_json::Value> = if rope.get("rope_type").is_some()
+            || rope.get("type").is_some()
+            || rope.get("factor").is_some()
+        {
+            vec![rope]
+        } else {
+            rope.as_object()
+                .map(|layers| layers.values().filter(|v| v.is_object()).collect())
+                .unwrap_or_default()
+        };
+        let factor = each
+            .iter()
+            .filter(|rope| {
+                let kind = rope
+                    .get("rope_type")
+                    .or_else(|| rope.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("default");
+                !matches!(
+                    kind,
+                    "su" | "longrope"
+                        | "llama3"
+                        | "yarn"
+                        | "deepseek_yarn"
+                        | "deepseek_llama_scaling"
+                )
+            })
+            .filter_map(|rope| rope.get("factor").and_then(serde_json::Value::as_f64))
+            .next_back();
+        if let Some(factor) = factor
+            && config.get("model_type").and_then(serde_json::Value::as_str) != Some("gemma3")
+        {
+            context *= factor;
+            break;
+        }
+        // A YaRN reaches its original length times its factor, which a
+        // config that added the scaling by hand leaves its length short of.
+        for rope in &each {
+            if rope.get("rope_type").or_else(|| rope.get("type")) == Some(&"yarn".into())
+                && let (Some(factor), Some(original)) = (
+                    rope.get("factor").and_then(serde_json::Value::as_f64),
+                    rope.get("original_max_position_embeddings")
+                        .and_then(serde_json::Value::as_f64),
+                )
+            {
+                context = context.max(original * factor);
+            }
+        }
+    }
+    whole(context)
+}
+
+fn whole(context: f64) -> Option<u32> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a context is a positive token count well inside u32"
+    )]
+    (context.is_finite() && context >= 1.0).then(|| context.min(f64::from(u32::MAX)) as u32)
+}
+
+/// The config.json a model at `path` (an artifact, or a snapshot directory
+/// or file) carries.
+pub fn config_of(path: &Path) -> Result<Vec<u8>> {
+    if is_file(path) && is_artifact_path(path) {
+        Model::Artifact(path.to_path_buf())
+            .metadata()
+            .map(|m| m.config)
+    } else {
+        lift_snapshot_config(path)
+    }
+}
+
 fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
     let dir = if path.is_dir() {
         path
@@ -344,6 +467,39 @@ mod tests {
     use super::*;
     use checkpoint::file::write::Writer;
     use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
+
+    /// vLLM's default `max_model_len`: the least length key, a linear or
+    /// dynamic factor stretching it, YaRN's and llama3's left as stated
+    /// (their configs state the stretched length), a text config read
+    /// before the outer one.
+    #[test]
+    fn a_config_declares_its_context() {
+        let qwen3 = br#"{"max_position_embeddings": 40960, "rope_scaling": null}"#;
+        assert_eq!(declared_context(qwen3, None), Some(40960));
+        assert_eq!(declared_context(qwen3, Some((4.0, None))), Some(163_840));
+        assert_eq!(
+            declared_context(qwen3, Some((4.0, Some(32768.0)))),
+            Some(131_072)
+        );
+        let added = br#"{"max_position_embeddings": 40960, "rope_scaling":
+            {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}}"#;
+        assert_eq!(declared_context(added, None), Some(131_072));
+        let gptoss = br#"{"max_position_embeddings": 131072, "rope_scaling":
+            {"rope_type": "yarn", "factor": 32.0, "original_max_position_embeddings": 4096}}"#;
+        assert_eq!(declared_context(gptoss, None), Some(131_072));
+        let linear = br#"{"max_position_embeddings": 4096, "rope_scaling":
+            {"type": "linear", "factor": 2.0}}"#;
+        assert_eq!(declared_context(linear, None), Some(8192));
+        let vl = br#"{"text_config": {"max_position_embeddings": 262144,
+            "rope_parameters": {"rope_type": "default", "mrope_section": [11, 11, 10]}},
+            "vision_config": {"max_position_embeddings": 1024}}"#;
+        assert_eq!(declared_context(vl, None), Some(262_144));
+        let gemma = br#"{"text_config": {"max_position_embeddings": 262144, "rope_parameters":
+            {"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25},
+             "sliding_attention": {"rope_type": "default"}}}}"#;
+        assert_eq!(declared_context(gemma, None), Some(262_144));
+        assert_eq!(declared_context(br#"{"hidden_size": 8}"#, None), None);
+    }
 
     #[test]
     fn weights_every_case() {

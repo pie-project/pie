@@ -221,6 +221,7 @@ impl Shell {
             scores: self.scores.as_ref(),
             shifted: &self.shifted,
             schedule_readers: &self.schedule_readers,
+            unread: &self.unread,
             decoding: &self.decoding,
             tiers: &self.tiers,
             decoded_tiles: &self.decoded_tiles,
@@ -282,6 +283,7 @@ struct FireCtx<'a> {
     scores: Option<&'a Scores>,
     shifted: &'a [bool],
     schedule_readers: &'a [Option<u32>],
+    unread: &'a [bool],
     decoding: &'a poem_ir::ClassSet,
     tiers: &'a record::Tiers,
     decoded_tiles: &'a [u64],
@@ -826,6 +828,7 @@ impl FireCtx<'_> {
         .across(&side_ctx, &stream)
         .ceilings(ceilings)
         .decoded_tiles(self.decoded_tiles)
+        .unread(self.unread)
         .tapping(self.tapping);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);

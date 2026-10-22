@@ -169,6 +169,41 @@ pub enum RepackLayout {
     MarlinMxfp4Scale,
     TiledAffineU4Weight,
     TiledAffineFactor,
+    /// AWQ's `qweight`: `[rows, cols / 8]` 32-bit words, each eight
+    /// neighbours along its row in the nibble order 0, 2, 4, 6, 1, 3, 5, 7,
+    /// landed transposed as `[cols, rows]` 4-bit codes, two a byte, the low
+    /// nibble first.
+    AwqU4Codes,
+    /// AWQ's `qzeros`, its words as `qweight`'s, landed transposed as
+    /// `[cols, rows]` bytes, one zero a byte.
+    AwqU4Zeros,
+    /// GPTQ's `qweight`: `[rows / 8, cols]` 32-bit words, each eight
+    /// neighbours down its column, the low nibble first, landed transposed as
+    /// `[cols, rows]` 4-bit codes, two a byte.
+    GptqU4Codes,
+    /// GPTQ's `qzeros`: `[rows, cols / 8]` words, each eight neighbours along
+    /// its row, the low nibble first, landed transposed as `[cols, rows]`
+    /// bytes.
+    GptqU4Zeros,
+    /// `[rows, cols]` landed as `[cols, rows]`, element by element.
+    Transposed,
+}
+
+impl RepackLayout {
+    /// The rectangle a transposing layout reads its `[a, b]` operand as,
+    /// codes counted one by one; `None` for a layout that keeps its rows.
+    #[must_use]
+    pub fn transposes(self, a: i64, b: i64) -> Option<(i64, i64)> {
+        match self {
+            Self::AwqU4Codes | Self::AwqU4Zeros | Self::GptqU4Zeros => Some((a, b * 8)),
+            Self::GptqU4Codes => Some((a * 8, b)),
+            Self::Transposed => Some((a, b)),
+            Self::MarlinMxfp4Weight
+            | Self::MarlinMxfp4Scale
+            | Self::TiledAffineU4Weight
+            | Self::TiledAffineFactor => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

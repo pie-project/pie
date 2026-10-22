@@ -206,6 +206,14 @@ pub struct GemmFp8Shadow;
 #[decision(id = "kernel.gemm.fp8_mma_gemv_until", constant(range(0..=8)), default = 0, tune = search)]
 pub struct GemmFp8MmaGemvUntil(pub u32);
 
+/// The widest K a dense fp8b128 projection takes the mma.sync fp8 kernel at
+/// (`kernel.gemm.fp8_mma_gemv_until`); wider, its few CTAs each walk K too
+/// long and the tcgen05 GEMM leads (GLM-5.3's 6144-wide q_a, kv_a and indexer
+/// key at bs8, 12 us each). 0: any K.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_mma_k_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct GemmFp8MmaKUntil(pub u32);
+
 /// Whether AttnRes's blend and the RMS norm of its row run as one pass
 /// (`res_blend_norm`, 512 threads a row, the row in registers). Off but
 /// where a chip's profile turns it on (B200's).
@@ -578,6 +586,28 @@ pub struct SsmGdnScanUntil(pub u32);
 #[decision(id = "kernel.elemwise.rows_vec", flag, default = false, tune = search)]
 pub struct ElemwiseRowsVec;
 
+/// Whether q's fused per-head RMS norm and partial rotation (Gemma 4's global
+/// layers) runs a warp a (row, head) over 16-byte runs staged in shared memory
+/// rather than a 128-thread block a (row, head) an element a thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.q_norm_rope_warp", flag, default = false, tune = search)]
+pub struct ElemwiseQNormRopeWarp;
+
+/// Whether a fused norm-and-fold leaves unwritten the rows nothing reads past
+/// it (Gemma 4's normed sublayer outputs, and a stream its layer scalar
+/// rescales into a new row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.skip_unread", flag, default = false, tune = search)]
+pub struct ElemwiseSkipUnread;
+
+/// The threads a block of the 16-byte fused norm-and-fold takes a row with
+/// in a fire of 1024 rows or more: 0 is the row's runs rounded up to a power
+/// of two (at most 512), as always and as in every narrower fire; a smaller
+/// block takes the row in several runs a thread and seats more rows an SM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.norm_fold_block", constant(set(0, 32, 64, 128, 256)), default = 0, tune = search)]
+pub struct ElemwiseNormFoldBlock(pub u32);
+
 /// Whether the hyper-connection kernels run their tiled and 16-byte forms:
 /// the mix projection a block 64 rows of every column over shared-memory
 /// tiles, the fold and the gates' pre-mix eight columns a thread, and a
@@ -757,6 +787,9 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnTc5>()
         .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
+        .add::<ElemwiseQNormRopeWarp>()
+        .add::<ElemwiseSkipUnread>()
+        .add::<ElemwiseNormFoldBlock>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
         .add::<SsmConvVec4>()
@@ -783,6 +816,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
         .add::<GemmFp8MmaGemvUntil>()
+        .add::<GemmFp8MmaKUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
         .add::<MoeW4a4FusedLayout>()
@@ -888,6 +922,9 @@ tuning! {
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
+    q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
+    skip_unread: bool = false, on ElemwiseSkipUnread;
+    norm_fold_block: u32 = 0, get ElemwiseNormFoldBlock;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
     ssm_conv_vec4: bool = false, on SsmConvVec4;
@@ -914,6 +951,7 @@ tuning! {
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
+    gemm_fp8_mma_k_until: u32 = 0, get GemmFp8MmaKUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
     moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;

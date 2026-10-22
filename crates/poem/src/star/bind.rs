@@ -22,7 +22,7 @@ use spelled::*;
 
 /// The types an op's parameters are spelled in.
 pub(crate) mod spelled {
-    pub(crate) use crate::ops::elemwise::Yarn;
+    pub(crate) use crate::ops::elemwise::{RopeScaling, Yarn};
     pub(crate) use crate::ops::spatial::Conv;
     pub(crate) use crate::{
         Dtype, GateActivation, IndexScore, Input, ModulateForm, MropeForm, PixelOrder, RaggedMask,
@@ -344,6 +344,7 @@ pub(crate) struct Whole(#[allocative(skip)] pub(crate) Held);
 pub(crate) enum Held {
     Conv(Conv),
     Yarn(Yarn),
+    Scaling(RopeScaling),
     Mask(RaggedMask),
     Segment(VoxelSegment),
 }
@@ -375,6 +376,7 @@ macro_rules! whole {
 
 whole!(Conv, Conv, "a conv");
 whole!(Yarn, Yarn, "a yarn scaling");
+whole!(RopeScaling, Scaling, "a rope scaling");
 whole!(RaggedMask, Mask, "a ragged mask");
 whole!(VoxelSegment, Segment, "a voxel segment");
 
@@ -645,6 +647,31 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         })))
     }
 
+    /// The rope scaling a checkpoint's `rope_scaling` (or
+    /// `rope_parameters`) dict states, as `config.json` spells it;
+    /// `max_position` is its `max_position_embeddings`, which dynamic NTK and
+    /// LongRoPE also read. None where the dict scales nothing (no type,
+    /// `"default"`, `"proportional"`).
+    fn rope_scaling<'v>(
+        #[starlark(require = pos)] scaling: Star<'v>,
+        #[starlark(require = named, default = starlark::values::none::NoneOr::None)]
+        max_position: starlark::values::none::NoneOr<u32>,
+    ) -> anyhow::Result<starlark::values::none::NoneOr<Whole>> {
+        if scaling.is_none() {
+            return Ok(starlark::values::none::NoneOr::None);
+        }
+        let dict = starlark::values::dict::DictRef::from_value(scaling).ok_or_else(|| {
+            anyhow::anyhow!("a rope scaling is a dict, as config.json states it, not {scaling}")
+        })?;
+        let read = Scalings(&dict);
+        Ok(
+            match crate::rope::RopeScaling::of(&read, max_position.into_option())? {
+                Some(s) => starlark::values::none::NoneOr::Other(Whole(Held::Scaling(s))),
+                None => starlark::values::none::NoneOr::None,
+            },
+        )
+    }
+
     /// The voxels an attention reads: the whole clip, or runs of `frames`.
     fn segment(
         #[starlark(require = named, default = starlark::values::none::NoneOr::None)]
@@ -654,6 +681,66 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
             None => VoxelSegment::Clip,
             Some(n) => VoxelSegment::Frames(n),
         })))
+    }
+}
+
+/// A rope scaling's dict, read by key.
+struct Scalings<'a, 'v>(&'a starlark::values::dict::DictRef<'v>);
+
+impl<'v> Scalings<'_, 'v> {
+    fn get(&self, key: &str) -> Option<Star<'v>> {
+        self.0
+            .iter()
+            .find(|(k, _)| k.unpack_str() == Some(key))
+            .map(|(_, v)| v)
+            .filter(|v| !v.is_none())
+    }
+}
+
+fn number(key: &str, v: Star<'_>) -> anyhow::Result<f64> {
+    if let Some(n) = v.unpack_i32() {
+        return Ok(f64::from(n));
+    }
+    match v.downcast_ref::<starlark::values::float::StarlarkFloat>() {
+        Some(f) => Ok(f.0),
+        None => anyhow::bail!("rope scaling's `{key}` is a number, not {v}"),
+    }
+}
+
+impl crate::rope::Entries for Scalings<'_, '_> {
+    fn number(&self, key: &str) -> anyhow::Result<Option<f64>> {
+        self.get(key).map(|v| number(key, v)).transpose()
+    }
+
+    fn numbers(&self, key: &str) -> anyhow::Result<Option<Vec<f64>>> {
+        let Some(v) = self.get(key) else {
+            return Ok(None);
+        };
+        let list = starlark::values::list::ListRef::from_value(v)
+            .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a list, not {v}"))?;
+        list.iter()
+            .map(|n| number(key, n))
+            .collect::<anyhow::Result<_>>()
+            .map(Some)
+    }
+
+    fn text(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.get(key)
+            .map(|v| {
+                v.unpack_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a string, not {v}"))
+            })
+            .transpose()
+    }
+
+    fn flag(&self, key: &str) -> anyhow::Result<Option<bool>> {
+        self.get(key)
+            .map(|v| {
+                v.unpack_bool()
+                    .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a bool, not {v}"))
+            })
+            .transpose()
     }
 }
 

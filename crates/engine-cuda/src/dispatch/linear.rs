@@ -1462,11 +1462,14 @@ impl Run<'_> {
             ),
             // A 128x128-block FP8 bank (a block-FP8 release's experts, its
             // factors requantized to ue8m0 at load and spread a row an atom
-            // row) against e4m3 activations in 1x128 blocks (W8A8).
-            (Dtype::E4m3, ActQuant::E4m3 { gran: 128 }) => (
-                act_quant::Format::E4m3 { gran: 128 },
+            // row) against e4m3 activations in 1x128 blocks (W8A8); an MXFP8
+            // bank (its e8m0 exponents a 1x32 block of each row, laid as they
+            // are) against e4m3 in 1x32 blocks. The laid atoms count the K a
+            // scale covers.
+            (Dtype::E4m3, ActQuant::E4m3 { gran }) if fp8_bank_gran(scales, k) == Some(gran) => (
+                act_quant::Format::E4m3 { gran },
                 linear::tc5::Elem::E4m3,
-                128,
+                gran,
                 0,
                 None,
             ),
@@ -1532,7 +1535,7 @@ impl Run<'_> {
                 n,
                 k,
                 elem,
-                gran: gran as u32,
+                gran,
                 alpha_e,
                 alpha_from,
             },
@@ -1638,11 +1641,15 @@ impl Run<'_> {
                 self.select_quant(x, bank, routes, y)
             }
             // A block-FP8 release's experts, their factors laid as ue8m0
-            // exponents a weight row a 128 at load (`lay_tile_banks`).
+            // exponents a weight row a 128 at load (`lay_tile_banks`), or an
+            // MXFP8 bank's exponents a weight row a 32.
             Dtype::E4m3 => {
                 if !self.scales_in_atoms(bank) {
                     return Err(unlaid(op));
                 }
+                let Some(gran) = fp8_bank_gran(scales, self.tensor(x).width) else {
+                    return Err(unlaid(op));
+                };
                 if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
                     return Err(kernels_cuda::Error::Backend {
                         op,
@@ -1676,7 +1683,7 @@ impl Run<'_> {
                     codes.ptr,
                     scales.ptr,
                     codes.rows,
-                    128,
+                    gran,
                     routes,
                     &mut self.tensor(y),
                     None,
@@ -1811,8 +1818,10 @@ impl Run<'_> {
         if block == 128 {
             // A decode's few rows on the mma.sync fp8 kernel, its rows quantized
             // in the same launch, where it leads (`kernel.gemm.fp8_mma_gemv_until`,
-            // `moe::dense_fp8_shape`).
-            if act.rows <= self.ctx().tuning().gemm_fp8_mma_gemv_until
+            // up to `kernel.gemm.fp8_mma_k_until` of K, `moe::dense_fp8_shape`).
+            let tuning = self.ctx().tuning();
+            if act.rows <= tuning.gemm_fp8_mma_gemv_until
+                && (tuning.gemm_fp8_mma_k_until == 0 || k <= tuning.gemm_fp8_mma_k_until)
                 && let Some(shape) = linear::moe::dense_fp8_shape(act.rows, n, k)
             {
                 return linear::moe::matmul_grouped_fp8_with(
@@ -1979,6 +1988,15 @@ impl Run<'_> {
             },
         }
     }
+}
+
+/// The K one scale of a block-FP8 bank covers, read off its laid atoms (one
+/// a block of K a row): 128 or 32.
+#[cfg(feature = "cuda")]
+fn fp8_bank_gran(atoms: Tensor, k: u32) -> Option<u32> {
+    (atoms.width > 0 && k.is_multiple_of(atoms.width))
+        .then(|| k / atoms.width)
+        .filter(|gran| matches!(gran, 32 | 128))
 }
 
 /// A per-tensor e4m3 plane is a gathered table's, which no product reads.

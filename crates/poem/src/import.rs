@@ -1,4 +1,5 @@
 pub mod format;
+mod int4;
 
 use crate::{Dtype, Platform, Shard, Weight};
 use checkpoint::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
@@ -734,6 +735,9 @@ fn planes(
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
+    if int4::stored_int4(src, &from) {
+        return int4::int4_planes(src, w, &[from]);
+    }
     if w.dtype.fp8_blocks().is_some() {
         return fp8_block_planes(src, w, vec![from]);
     }
@@ -783,6 +787,9 @@ fn planes_fused(
     parts: impl IntoIterator<Item = String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
+    if parts.iter().all(|part| int4::stored_int4(src, part)) {
+        return int4::int4_planes(src, w, &parts);
+    }
     if w.dtype.fp8_blocks().is_some() {
         return fp8_block_planes(src, w, parts);
     }

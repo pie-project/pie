@@ -1,0 +1,94 @@
+# How a Qwen 3 MoE checkpoint is read: transformers' safetensors under
+# `model.`, each expert apart, as released (bf16), as Qwen releases it in FP8
+# (e4m3 codes beside 128-square block factors), or as modelopt exports it in
+# NVFP4 (codes, e4m3 scales a 16, a tensor scale and an input scale a leg);
+# recognized by its per-head q norm and its first expert, and checked against
+# its config.
+
+load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read", "released_fp8")
+load("//lib/modelopt/formats.poem", "nvfp4_bank")
+
+def configured(m):
+    return [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("head_dim", m.head_dim),
+        config("num_hidden_layers", len(m.layers)),
+        config("moe_intermediate_size", m.inter),
+        config("num_experts", m.experts),
+        config("num_experts_per_tok", m.top_k),
+        config("rms_norm_eps", m.eps),
+        config("rope_theta", m.theta),
+    ]
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.q_norm.weight") and has("model.layers.0.mlp.experts.0.down_proj.weight"),
+        read = lambda reads: read(m, reads),
+        states = configured(m),
+    )]
+
+def unscaled(w, name):
+    """Refuses to read `name`'s e4m3 codes as `w`'s dtype: without their
+    scales the codes are not the weight."""
+    if stored(name) == raw(dtype.e4m3):
+        fail("`{}`: `{}` is stored FP8 and this deployment reads it as {}; import the deployment that keeps the release's FP8".format(w.name, name, w.dtype))
+
+def proj(reads, w, names):
+    """`w` from its legs `names`: the release's FP8 kept, or read as stored
+    (bf16, or modelopt's NVFP4 joined leg by leg)."""
+    if fp8_proj(w):
+        fp8_read(reads, w, names)
+        return
+    for name in names:
+        unscaled(w, name)
+    if len(names) == 1:
+        reads.read(w, names[0])
+    else:
+        reads.read_concat(w, names)
+
+BF = raw(dtype.bf16)
+
+def stack(reads, w, legs):
+    """The routed bank `w` from each expert's bf16 legs `legs[e]`, joined
+    along the rows and stacked on the leading axis, encoded to its dtype."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    for names in legs:
+        for name in names:
+            unscaled(w, name)
+    joined = lambda names: src(names[0]) if len(names) == 1 else concat(0, [src(name) for name in names])
+    value = concat(0, [joined(names).transmute([1, rows, cols], BF) for names in legs])
+    if w.dtype == dtype.bf16:
+        reads.push(tensor(w.name, value, BF))
+    else:
+        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
+
+def read(m, reads):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda s: "model.layers.{}.{}".format(l, s)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        proj(reads, w.qkv, [n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")])
+        proj(reads, w.o, [n("self_attn.o_proj.weight")])
+        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
+        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        reads.read(w.router, n("mlp.gate.weight"))
+        stem = lambda e, leg: n("mlp.experts.{}.{}".format(e, leg))
+        gate_up = [[stem(e, "gate_proj"), stem(e, "up_proj")] for e in range(m.experts)]
+        down = [[stem(e, "down_proj")] for e in range(m.experts)]
+        weights = lambda legs: [[leg + ".weight" for leg in expert] for expert in legs]
+        if w.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
+            nvfp4_bank(reads, w.gate_up, gate_up)
+            nvfp4_bank(reads, w.down, down)
+        elif released_fp8(w.gate_up):
+            fp8_bank(reads, w.gate_up, weights(gate_up))
+            fp8_bank(reads, w.down, weights(down))
+        else:
+            stack(reads, w.gate_up, weights(gate_up))
+            stack(reads, w.down, weights(down))

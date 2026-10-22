@@ -15,9 +15,16 @@ MODELS = [
 BF = dtype.bf16
 U4 = dtype.u4g64
 
+# MiniMax-M3-MXFP8 as it ships: every projection and expert e4m3 under one
+# e8m0 exponent a 1x32 block of each row, against e4m3 activations in 1x32
+# blocks (W8A8; W8A16 where there are no tcgen05 GEMMs).
+MX8 = dtype.mxfp8a8g32
+
 DEPLOYMENTS = [
+    deployment("minimax-m3", weights = MX8, kv = BF),
     deployment("minimax-m3", weights = U4, kv = BF),
     deployment("minimax-m3", weights = BF, kv = BF),
     deployment("minimax-m3-mini", weights = BF, kv = BF),
     deployment("minimax-m3-mini", weights = U4, kv = BF),
+    deployment("minimax-m3-mini", weights = MX8, kv = BF),
 ]
