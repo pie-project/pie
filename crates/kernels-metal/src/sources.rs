@@ -197,10 +197,6 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/gather/pixels.metal")),
     ),
     (
-        "gather/ple_combine.metal",
-        include_str!(concat!(source_root!(), "/gather/ple_combine.metal")),
-    ),
-    (
         "gather/rows.metal",
         include_str!(concat!(source_root!(), "/gather/rows.metal")),
     ),
@@ -273,16 +269,8 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/quant_qmv_rows.metal")),
     ),
     (
-        "linear/quant_transcode.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_transcode.metal")),
-    ),
-    (
         "linear/register_table.h",
         include_str!(concat!(source_root!(), "/linear/register_table.h")),
-    ),
-    (
-        "prim/mpp.h",
-        include_str!(concat!(source_root!(), "/prim/mpp.h")),
     ),
     (
         "prim/gemm_loader.h",
@@ -301,6 +289,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/prim/gemm_transforms.h")),
     ),
     (
+        "prim/mpp.h",
+        include_str!(concat!(source_root!(), "/prim/mpp.h")),
+    ),
+    (
         "runtime/blit.metal",
         include_str!(concat!(source_root!(), "/runtime/blit.metal")),
     ),
@@ -315,10 +307,6 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "runtime/rebind.metal",
         include_str!(concat!(source_root!(), "/runtime/rebind.metal")),
-    ),
-    (
-        "sampling/argmax_logits.metal",
-        include_str!(concat!(source_root!(), "/sampling/argmax_logits.metal")),
     ),
     (
         "sampling/argmax_rows.metal",

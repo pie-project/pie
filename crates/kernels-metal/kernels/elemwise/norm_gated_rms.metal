@@ -79,39 +79,6 @@ template <typename X, typename T, bool SILU>
       inv_rms, partials, simd_lane, simd_group);
 }
 
-template <typename X, typename T>
-[[kernel]] void gated_rms_strided(
-    const device X* x        [[buffer(0)]],
-    const device T* z        [[buffer(1)]],
-    const device X* w        [[buffer(2)]],
-    device T* out            [[buffer(3)]],
-    const constant float& eps  [[buffer(4)]],
-    const constant uint& vd    [[buffer(5)]],
-    const constant int& row_pitch [[buffer(6)]],
-    uint3 tgpos       [[threadgroup_position_in_grid]],
-    uint3 tpg         [[threadgroups_per_grid]],
-    uint3 lid3        [[thread_position_in_threadgroup]],
-    uint  simd_lane   [[thread_index_in_simdgroup]],
-    uint  simd_group  [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float inv_rms[1], partials[32];
-  const uint lid = lid3.x;
-  const size_t idx =
-      size_t(tgpos.z) * size_t(row_pitch) + size_t(tgpos.y) * vd + lid;
-  (void)tpg;
-  gated_rms_body<X, T, true>(
-      x, z, w, out, eps, vd, idx, lid,
-      inv_rms, partials, simd_lane, simd_group);
-}
-
-#define instantiate_gated_rms_strided(name, xtype, itype)         \
-  template [[host_name("gated_rms_strided_" #name)]] [[kernel]] void \
-  gated_rms_strided<xtype, itype>(                                \
-      const device xtype*, const device itype*, const device xtype*, \
-      device itype*, const constant float&, const constant uint&,    \
-      const constant int&, uint3, uint3, uint3, uint, uint);
-
-instantiate_gated_rms_strided(bfloat16, bfloat, bfloat)
-
 #define instantiate_gated_rms(name, xtype, itype)                 \
   template [[host_name("gated_rms_" #name)]]                      \
   [[kernel]] void gated_rms<xtype, itype, true>(                  \
@@ -125,8 +92,6 @@ instantiate_gated_rms_strided(bfloat16, bfloat, bfloat)
       const device xtype*, const device itype*, const device xtype*, \
       device itype*, const constant float&, const constant uint&,    \
       uint3, uint3, uint3, uint, uint);
-
-instantiate_gated_rms(bfloat16, bfloat, bfloat)
 
 instantiate_gated_rms(f32_bfloat16, float, bfloat)
 

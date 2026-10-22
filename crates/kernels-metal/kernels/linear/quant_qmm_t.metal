@@ -1019,16 +1019,6 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       tid, simd_gid, simd_lid);
 }
 
-[[kernel]] void cast_qmm_input_strided_bfloat16_to_float16(
-    const device bfloat* x [[buffer(3)]],
-    const constant int& K [[buffer(5)]],
-    const constant int& row_stride [[buffer(8)]],
-    device half* y [[buffer(12)]],
-    uint2 gid [[thread_position_in_grid]]) {
-  y[size_t(gid.y) * row_stride + gid.x] =
-      half(x[size_t(gid.y) * row_stride + gid.x]);
-}
-
 template <int group_size, int bits, int BM, int BK, int BN, bool WITH_RESIDUAL>
 METAL_FUNC void qmm_t_strided_fp16_precast_impl(
     const device uint32_t* w,
@@ -1397,10 +1387,6 @@ instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 64)
 instantiate_qmm_t_splitk_fp16_precast(bfloat16, bfloat, 8)
 instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 8)
 
-template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
-qmm_splitk_reduce<bfloat, bfloat>(
-    device bfloat*, const constant int&, const device bfloat*,
-    const constant int&, const constant int&, uint2);
 template [[host_name("qmm_splitk_reduce_f32_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, float>(
     device bfloat*, const constant int&, const device float*,
