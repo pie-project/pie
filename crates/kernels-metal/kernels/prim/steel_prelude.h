@@ -1,18 +1,13 @@
-// Vendored from MLX, MIT licensed. type traits, defines, integral_constant
+// Type traits, defines, integral_constant
 //
 // Upstream: steel/utils/type_traits.h, steel/defines.h, steel/utils/integral_constant.h
 //
-// Kept verbatim so the math matches by construction. It lives here rather than
-// pasted into the kernel that uses it because the driver's shader reader
-// (`read_metal_source_at`) splices a quoted include, so a shared definition
-// costs a line rather than a copy — which is what
-// `quantized_qmm_t.metal` predated and why it grew to 2,970 lines.
-//
-// Do not edit to fit a caller. A caller that needs different behaviour wraps
-// this; that is the difference between vendoring and forking.
+// Derived from MLX (https://github.com/ml-explore/mlx), MIT License,
+// Copyright (c) 2023 Apple Inc.; see NOTICE. Pie owns it now: the names are
+// Pie's, and a change lands here as in any other kernel.
 
-#ifndef PIE_MLX_STEEL_PRELUDE_METAL
-#define PIE_MLX_STEEL_PRELUDE_METAL
+#ifndef PIE_PRIM_STEEL_PRELUDE_H
+#define PIE_PRIM_STEEL_PRELUDE_H
 
 
 // -- steel/utils/type_traits.h --
@@ -87,7 +82,7 @@ using pointer_element_t = typename pointer_element<remove_cv_t<T>>::type;
 
 #pragma METAL internals : enable
 
-namespace mlx {
+namespace pie {
 namespace steel {
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -205,7 +200,7 @@ METAL_FUNC constexpr auto sum(T x, Us... us) {
 }
 
 } // namespace steel
-} // namespace mlx
+} // namespace pie
 
 #pragma METAL internals : disable
 

@@ -2,8 +2,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define MLX_MTL_CONST static constant constexpr const
-MLX_MTL_CONST int SIMD_SIZE = 32;
+#define STEEL_CONST static constant constexpr const
+STEEL_CONST int SIMD_SIZE = 32;
 
 template <int bits, int wsize = 8>
 inline constexpr short get_pack_factor() {
@@ -18,7 +18,7 @@ inline constexpr short get_bytes_per_pack() {
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector(const device T* x, thread U* x_thread) {
   static_assert(bits == 2 || bits == 4 || bits == 8,
-                "port covers the widths mlx affine ships this box");
+                "port covers the affine widths this box ships");
   U sum = 0;
   if (bits == 2) {
 
@@ -59,7 +59,7 @@ inline U qdot(
     U bias,
     U sum) {
   static_assert(bits == 2 || bits == 4 || bits == 8,
-                "port covers the widths mlx affine ships this box");
+                "port covers the affine widths this box ships");
   U accum = 0;
   if (bits == 2) {
 
@@ -309,10 +309,10 @@ inline float mxfp4_block_scale(uint8_t code) {
 template <typename T, int BITS, int GROUP = 64>
 struct AffineQ {
   typedef T scale_t;
-  MLX_MTL_CONST int bits = BITS;
+  STEEL_CONST int bits = BITS;
 
-  MLX_MTL_CONST int group_size = GROUP;
-  MLX_MTL_CONST bool zero_point = true;
+  STEEL_CONST int group_size = GROUP;
+  STEEL_CONST bool zero_point = true;
   static METAL_FUNC float scale_of(scale_t s) { return float(s); }
   template <typename U, int VPT>
   static METAL_FUNC U prepare(const device T* x, thread U* x_thread) {
@@ -335,9 +335,9 @@ template <typename T> using AffineU2_gs128 = AffineQ<T, 2, 128>;
 template <typename T>
 struct Mxfp4 {
   typedef uint8_t scale_t;
-  MLX_MTL_CONST int bits = 4;
-  MLX_MTL_CONST int group_size = 32;
-  MLX_MTL_CONST bool zero_point = false;
+  STEEL_CONST int bits = 4;
+  STEEL_CONST int group_size = 32;
+  STEEL_CONST bool zero_point = false;
   static METAL_FUNC float scale_of(scale_t s) { return mxfp4_block_scale(s); }
   template <typename U, int VPT>
   static METAL_FUNC U prepare(const device T* x, thread U* x_thread) {

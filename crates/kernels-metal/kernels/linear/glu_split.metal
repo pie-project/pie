@@ -3,7 +3,7 @@
 using namespace metal;
 
 template <typename T>
-inline T sigmoid_mlx(T x) {
+inline T sigmoid_stable(T x) {
   float xf = float(x);
   float y = 1.0f / (1.0f + metal::exp(-metal::fabs(xf)));
   float s = (xf < 0.0f) ? (1.0f - y) : y;
@@ -17,7 +17,7 @@ template <typename T>
     device T* out        [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
   T g   = gate[tid];
-  T sg  = sigmoid_mlx(g);
+  T sg  = sigmoid_stable(g);
   T sil = T(float(g) * float(sg));
   out[tid] = T(float(sil) * float(up[tid]));
 }
@@ -31,7 +31,7 @@ template <typename T>
     uint2 tid [[thread_position_in_grid]]) {
   const size_t i = size_t(tid.y) * size_t(row_pitch) + size_t(tid.x);
   T g   = gate[i];
-  T sg  = sigmoid_mlx(g);
+  T sg  = sigmoid_stable(g);
   T sil = T(float(g) * float(sg));
   out[i] = T(float(sil) * float(up[i]));
 }

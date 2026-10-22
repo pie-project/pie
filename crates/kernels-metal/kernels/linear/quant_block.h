@@ -1,18 +1,13 @@
-// Vendored from MLX, MIT licensed. the affine dequantize and QuantizedBlockLoader
+// The affine dequantize and QuantizedBlockLoader
 //
 // Upstream: mlx/backend/metal/kernels/quantized.h
 //
-// Kept verbatim so the math matches by construction. It lives here rather than
-// pasted into the kernel that uses it because the driver's shader reader
-// (`read_metal_source_at`) splices a quoted include, so a shared definition
-// costs a line rather than a copy — which is what
-// `quantized_qmm_t.metal` predated and why it grew to 2,970 lines.
-//
-// Do not edit to fit a caller. A caller that needs different behaviour wraps
-// this; that is the difference between vendoring and forking.
+// Derived from MLX (https://github.com/ml-explore/mlx), MIT License,
+// Copyright (c) 2023 Apple Inc.; see NOTICE. Pie owns it now: the names are
+// Pie's, and a change lands here as in any other kernel.
 
-#ifndef PIE_MLX_QUANTIZED_BLOCK_METAL
-#define PIE_MLX_QUANTIZED_BLOCK_METAL
+#ifndef PIE_LINEAR_QUANT_BLOCK_H
+#define PIE_LINEAR_QUANT_BLOCK_H
 
 // ── quantized.h helpers ──
 
@@ -143,12 +138,12 @@ struct QuantizedBlockLoader {
           bits == 8,
       "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
 
-  MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
-  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
+  STEEL_CONST short pack_factor = get_pack_factor<bits, 8>();
+  STEEL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
+  STEEL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  STEEL_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+  STEEL_CONST short group_steps = group_size / BCOLS;
 
   const int src_ld;
   const int tile_stride;

@@ -5,8 +5,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define MLX_MTL_CONST static constant constexpr const
-MLX_MTL_CONST int SIMD_SIZE = 32;
+#define STEEL_CONST static constant constexpr const
+STEEL_CONST int SIMD_SIZE = 32;
 
 template <int bits, int wsize = 8>
 inline constexpr short get_pack_factor() {
@@ -21,7 +21,7 @@ inline constexpr short get_bytes_per_pack() {
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector(const device T* x, thread U* x_thread) {
   static_assert(bits == 2 || bits == 4 || bits == 8,
-                "port covers the widths mlx affine ships this box");
+                "port covers the affine widths this box ships");
   U sum = 0;
   if (bits == 2) {
 
@@ -62,7 +62,7 @@ inline U qdot_staged(
     U bias,
     U sum) {
   static_assert(bits == 2 || bits == 4 || bits == 8,
-                "port covers the widths mlx affine ships this box");
+                "port covers the affine widths this box ships");
   U accum = 0;
   if (bits == 2) {
 

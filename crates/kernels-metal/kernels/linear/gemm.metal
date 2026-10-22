@@ -4,8 +4,8 @@
 
 using namespace metal;
 
-#define MLX_MTL_CONST static constant constexpr const
-MLX_MTL_CONST int SIMD_SIZE = 32;
+#define STEEL_CONST static constant constexpr const
+STEEL_CONST int SIMD_SIZE = 32;
 
 constant float kMxfp4Lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -35,9 +35,9 @@ template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BK_padded = BK + 16 / sizeof(T);
   constexpr int tgp_size = WM * WN * SIMD_SIZE;
-  using loader_a_t = mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, tgp_size>;
-  using loader_b_t = mlx::steel::BlockLoader<T, BN, BK, BK_padded, 1, tgp_size>;
-  using mma_t = mlx::steel::
+  using loader_a_t = pie::steel::BlockLoader<T, BM, BK, BK_padded, 1, tgp_size>;
+  using loader_b_t = pie::steel::BlockLoader<T, BN, BK, BK_padded, 1, tgp_size>;
+  using mma_t = pie::steel::
       BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
 
   threadgroup T As[BM * BK_padded];
@@ -170,8 +170,8 @@ template <typename T>
 
 instantiate_dense_gemv_t(bfloat16, bfloat)
 
-MLX_MTL_CONST int KSPLIT_GROUP = 128;
-MLX_MTL_CONST int KSPLIT_SIMDGROUPS = KSPLIT_GROUP / SIMD_SIZE;
+STEEL_CONST int KSPLIT_GROUP = 128;
+STEEL_CONST int KSPLIT_SIMDGROUPS = KSPLIT_GROUP / SIMD_SIZE;
 
 template <typename T>
 [[kernel]] void dense_gemv_t_ksplit(

@@ -13,8 +13,8 @@ inline float mxfp4_block_scale(uint8_t code) {
 
 using namespace metal;
 
-#define MLX_MTL_CONST static constant constexpr const
-MLX_MTL_CONST int SIMD_SIZE = 32;
+#define STEEL_CONST static constant constexpr const
+STEEL_CONST int SIMD_SIZE = 32;
 
 template <int BM>
 inline constexpr int qmm_wm() {
@@ -57,13 +57,13 @@ template <
 struct AffineVec4Loader {
   static_assert(BCOLS <= group_size, "The group size should be larger than the columns");
   static_assert(group_size % BCOLS == 0, "The group size should be divisible by the columns");
-  MLX_MTL_CONST short pack_factor = 2;
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
+  STEEL_CONST short pack_factor = 2;
+  STEEL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  STEEL_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
+  STEEL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
   static_assert(VEC == 2 || VEC == 4, "a thread reads two or four bytes");
-  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+  STEEL_CONST short group_steps = group_size / BCOLS;
 
   const int src_ld;
   const int tile_stride;
@@ -161,10 +161,10 @@ METAL_FUNC void qmm_t_loaded_impl(
     uint simd_lid,
     thread LoaderW& loader_w) {
   constexpr int BK_padded = BK + 16 / sizeof(T);
-  using mma_t = mlx::steel::
+  using mma_t = pie::steel::
       BlockMMA<T, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
-      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+      pie::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
 
   const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN;
@@ -220,9 +220,9 @@ METAL_FUNC void qmm_t_cast_loaded_impl(
     uint simd_lid,
     thread LoaderW& loader_w) {
   constexpr int BK_padded = BK + 16 / sizeof(half);
-  using loader_x_t = mlx::steel::
+  using loader_x_t = pie::steel::
       BlockLoaderCast<T, half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  using mma_t = mlx::steel::
+  using mma_t = pie::steel::
       BlockMMA<half, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
 
   const int y_row = int(tid.y) * BM;
@@ -620,12 +620,12 @@ template <
     typename D = T>
 struct Mxfp4VecLoader {
   static_assert(BCOLS == 32, "MXFP4 blocks are exactly 32 values");
-  MLX_MTL_CONST short pack_factor = 2;
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
+  STEEL_CONST short pack_factor = 2;
+  STEEL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  STEEL_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
 
-  MLX_MTL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
+  STEEL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
   static_assert(VEC == 2 || VEC == 4, "a thread reads two or four bytes");
 
   const int src_ld;

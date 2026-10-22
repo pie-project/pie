@@ -1,18 +1,13 @@
-// Vendored from MLX, MIT licensed. BlockLoader, the tile stager
+// BlockLoader, the tile stager
 //
 // Upstream: steel/gemm/loader.h
 //
-// Kept verbatim so the math matches by construction. It lives here rather than
-// pasted into the kernel that uses it because the driver's shader reader
-// (`read_metal_source_at`) splices a quoted include, so a shared definition
-// costs a line rather than a copy — which is what
-// `quantized_qmm_t.metal` predated and why it grew to 2,970 lines.
-//
-// Do not edit to fit a caller. A caller that needs different behaviour wraps
-// this; that is the difference between vendoring and forking.
+// Derived from MLX (https://github.com/ml-explore/mlx), MIT License,
+// Copyright (c) 2023 Apple Inc.; see NOTICE. Pie owns it now: the names are
+// Pie's, and a change lands here as in any other kernel.
 
-#ifndef PIE_MLX_STEEL_LOADER_METAL
-#define PIE_MLX_STEEL_LOADER_METAL
+#ifndef PIE_PRIM_STEEL_LOADER_H
+#define PIE_PRIM_STEEL_LOADER_H
 
 // ── steel/gemm/loader.h ──
 
@@ -23,7 +18,7 @@
 // Loading helper
 ///////////////////////////////////////////////////////////////////////////////
 
-namespace mlx {
+namespace pie {
 namespace steel {
 
 template <
@@ -215,6 +210,6 @@ struct BlockLoaderCast {
 };
 
 } // namespace steel
-} // namespace mlx
+} // namespace pie
 
 #endif

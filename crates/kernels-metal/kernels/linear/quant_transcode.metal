@@ -29,7 +29,7 @@ kernel void mxfp4_dequant_bf16(
     }
 }
 
-inline float2 mlx_affine_params(float w_min, float w_max) {
+inline float2 affine_params(float w_min, float w_max) {
     const bool mask = abs(w_min) > abs(w_max);
     float scale = max((w_max - w_min) / 15.0f, 1e-7f);
     if (!mask) scale = -scale;
@@ -63,7 +63,7 @@ inline void encode_affine_group(
         w_min = min(w_min, value);
         w_max = max(w_max, value);
     }
-    const float2 params = mlx_affine_params(w_min, w_max);
+    const float2 params = affine_params(w_min, w_max);
     scales[gid] = bfloat(params.x);
     biases[gid] = bfloat(params.y);
 
