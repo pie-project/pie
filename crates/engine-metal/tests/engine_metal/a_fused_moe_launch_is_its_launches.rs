@@ -208,12 +208,12 @@ fn a_fused_moe_launch_prices() {
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    let mut keep = Vec::new();
-    let mut bind = |bytes: &[u8]| {
+    let keep = std::cell::RefCell::new(Vec::new());
+    let bind = |bytes: &[u8]| {
         let mut b = Buffer::zeroed(&device, bytes.len().max(16) as u64).expect("a plane");
         b.write(0, bytes).expect("write");
         let h = handles.bind(&b, 0, b.bytes()).expect("a handle");
-        keep.push(b);
+        keep.borrow_mut().push(b);
         h
     };
     let (experts, top_k, k, inter, banks) = (256u32, 8u32, 2048u32, 512u32, 4u32);
@@ -283,7 +283,7 @@ fn a_fused_moe_launch_prices() {
             .flat_map(|at| (at as f32 / 997.0).to_le_bytes())
             .collect();
         let w = Tensor::new(bind(&weights), tokens, top_k, Dtype::F32);
-        let mut row = |salt| {
+        let row = |salt| {
             Tensor::new(
                 bind(&plane(u64::from(tokens * k), salt, 0.05)),
                 tokens,
@@ -297,6 +297,68 @@ fn a_fused_moe_launch_prices() {
             tokens,
             1,
             Dtype::Bf16,
+        );
+        // Each fused launch lands its unfused launches' bytes here too, the add over
+        // the routed rows' own as the planner lays it.
+        let routed_copy = Tensor::new(
+            bind(&plane(u64::from(pairs * k), 0x44, 0.05)),
+            pairs,
+            k,
+            Dtype::Bf16,
+        );
+        let (packed_one, hidden_one) = (
+            Tensor::new(
+                bind(&vec![0; (pairs * n * 2) as usize]),
+                pairs,
+                n,
+                Dtype::Bf16,
+            ),
+            Tensor::new(
+                bind(&vec![0; (pairs * inter * 2) as usize]),
+                pairs,
+                inter,
+                Dtype::Bf16,
+            ),
+        );
+        let (folded_one, out_one) = (row(0x99), row(0xaa));
+        let frame = device.frame().expect("frame");
+        let sink = Sink::new(&device, &frame, &pipelines, &handles);
+        moe::matmul_select_quant(&sink, x, bank[0], routes, packed).expect("gate-up");
+        mlp::swiglu(&sink, packed, inter, hidden).expect("swiglu");
+        moe::matmul_select_swiglu(&sink, x, bank[0], routes, packed_one, hidden_one)
+            .expect("fused");
+        moe::weighted_sum(&sink, routed, w, folded).expect("fold");
+        moe::sigmoid_gate_add(&sink, folded, shared, gate, out).expect("add");
+        moe::weighted_sum_gate_add(&sink, routed, w, folded_one, shared, gate, out_one)
+            .expect("fused");
+        let over = Tensor::new(routed_copy.buf, tokens, k, Dtype::Bf16);
+        moe::weighted_sum_gate_add(&sink, routed_copy, w, folded_one, shared, gate, over)
+            .expect("fused in place");
+        frame.commit().expect("commit");
+        let read = |t: Tensor| {
+            handles
+                .read(t.buf, u64::from(t.rows) * u64::from(t.width) * 2)
+                .expect("read")
+        };
+        assert!(
+            read(packed) == read(packed_one),
+            "{tokens} row(s): other gate-up rows"
+        );
+        assert!(
+            read(hidden) == read(hidden_one),
+            "{tokens} row(s): other swiglu rows"
+        );
+        assert!(
+            read(folded) == read(folded_one),
+            "{tokens} row(s): other fold rows"
+        );
+        assert!(
+            read(out) == read(out_one),
+            "{tokens} row(s): other add rows"
+        );
+        assert!(
+            read(out) == read(over),
+            "{tokens} row(s): other add rows in place"
         );
         let time = |body: &dyn Fn(&Sink<'_>)| {
             let mut v = Vec::new();

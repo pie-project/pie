@@ -737,10 +737,10 @@ constant constexpr uint kMaxExperts = 1024;
 // expert_combine and shared_expert_combine in one launch: a row's routes
 // summed under their weights and rounded into `folded` as expert_combine lands
 // them, then the shared expert under its sigmoid gate added as
-// shared_expert_combine adds it. A threadgroup holds every row of its columns
-// and stores only once all of them have read, so `out` may be the routed
-// rows' own bytes from their first: row r lands on route row r of the same
-// columns.
+// shared_expert_combine adds it. A threadgroup holds every row of its 32
+// columns, stages what each thread lands in threadgroup memory, and stores
+// only once every thread has staged, so `out` may be the routed rows' own
+// bytes from their first: row r lands on route row r of the same columns.
 [[kernel]] void expert_shared_combine(
     const device bfloat* y             [[buffer(0)]],
     const device float* expert_weights [[buffer(1)]],
@@ -750,30 +750,32 @@ constant constexpr uint kMaxExperts = 1024;
     device bfloat* out                 [[buffer(5)]],
     const constant uint& width             [[buffer(6)]],
     const constant uint& experts_per_token [[buffer(7)]],
-    uint2 gid                          [[thread_position_in_grid]]) {
+    uint2 gid                          [[thread_position_in_grid]],
+    uint2 lid                          [[thread_position_in_threadgroup]]) {
+  threadgroup bfloat staged_fold[1024];
+  threadgroup bfloat staged_out[1024];
   const uint c = gid.x;
   const uint row = gid.y;
+  const uint slot = lid.y * 32u + lid.x;
   const bool live = c < width;
   const uint k = experts_per_token;
   const size_t base = size_t(row) * size_t(k);
   const uint at = row * width + c;
-  bfloat routed = bfloat(0.0f);
-  float g = 0.0f;
-  float s = 0.0f;
   if (live) {
     float acc = 0.0f;
     for (uint e = 0; e < k; ++e) {
       const size_t r = base + size_t(e);
       acc += expert_weights[r] * float(y[r * size_t(width) + size_t(c)]);
     }
-    routed = static_cast<bfloat>(acc);
-    g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
-    s = float(shared[at]);
+    const bfloat routed = static_cast<bfloat>(acc);
+    const float g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
+    staged_fold[slot] = routed;
+    staged_out[slot] = static_cast<bfloat>(float(routed) + g * float(shared[at]));
   }
-  threadgroup_barrier(mem_flags::mem_device);
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
   if (live) {
-    folded[at] = routed;
-    out[at] = static_cast<bfloat>(float(routed) + g * s);
+    folded[at] = staged_fold[slot];
+    out[at] = staged_out[slot];
   }
 }
 
