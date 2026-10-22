@@ -169,9 +169,13 @@ impl ControllerHandle {
         let _ = self.cmd.send(Command::ReportWorker { id, status }).await;
     }
 
-    /// The scale table to converge on, whole (`cluster.scale`).
-    pub async fn desire_scale(&self, entries: Vec<ScaleEntry>) {
-        let _ = self.cmd.send(Command::DesireScale { entries }).await;
+    /// The scale table to converge on, whole (`cluster.scale`), from
+    /// `gateway`: taken only while it is the author.
+    pub async fn desire_scale(&self, gateway: GatewayId, entries: Vec<ScaleEntry>) {
+        let _ = self
+            .cmd
+            .send(Command::DesireScale { gateway, entries })
+            .await;
     }
 
     /// Each shape the scale table names, desired against current; none
@@ -250,7 +254,7 @@ pub fn embed(config: Config) -> ControllerHandle {
         ActorConfig {
             heartbeat_timeout: config.heartbeat_timeout,
         },
-        actuator::Actuator::new(config.slots.clone()),
+        actuator::Actuator::new(config.slots.clone(), config.heartbeat_timeout),
     );
     let actor_token = shutdown.clone();
     let actor_task = tokio::spawn(async move {

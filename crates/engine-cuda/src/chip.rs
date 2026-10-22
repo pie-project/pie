@@ -543,6 +543,11 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(
+                    tuning.gemm_fp8_mma_k_until,
+                    if major == 10 && minor == 0 { 5120 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(
                     tuning.mxfp4_cvt_ksplit_until,
                     if major == 10 && minor == 0 { 6 } else { 0 },
                     "{gpu}"
@@ -559,6 +564,11 @@ mod tests {
                 );
                 assert_eq!(tuning.decode_xqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.decode_xqa_deep_64, b200, "{gpu}");
+                // B200 alone runs Gemma 4's q norm a warp a head and its
+                // norm-and-fold 128 threads a row, skipping unread rows.
+                assert_eq!(tuning.q_norm_rope_warp, b200, "{gpu}");
+                assert_eq!(tuning.skip_unread, b200, "{gpu}");
+                assert_eq!(tuning.norm_fold_block, if b200 { 128 } else { 0 }, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -617,11 +627,15 @@ mod tests {
                         mxfp4_a8_from: 0,
                         fp8_o_down: false,
                         gemm_fp8_mma_gemv_until: 0,
+                        gemm_fp8_mma_k_until: 0,
                         mxfp4_cvt_ksplit_until: 0,
                         hc_mma: false,
                         index_tc5: false,
                         norm_emit: false,
                         qkv_rows_from: defaults.qkv_rows_from,
+                        q_norm_rope_warp: false,
+                        skip_unread: false,
+                        norm_fold_block: 0,
                         ..tuning
                     },
                     defaults,
@@ -785,9 +799,11 @@ mod tests {
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
         assert_eq!(Engine::of(&b200).lattice_steps, 2);
+        assert_eq!(Engine::of(&b200).prefill_lattice_from, 4096);
         assert_eq!(
             Engine {
                 lattice_steps: 1,
+                prefill_lattice_from: Engine::of(&family).prefill_lattice_from,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,

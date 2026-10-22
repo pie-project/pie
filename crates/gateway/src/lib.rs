@@ -327,6 +327,10 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 
     let workers = WorkerRegistry::new();
     let routing = RoutingHandle::new(routing_rx, workers.connected_watch());
+    // This gateway's id, once registered: with the routing table's author,
+    // whether it enacts the cluster-wide tables.
+    let (me, me_rx) = watch::channel(None);
+    let authorship = routing.table_watch();
     let router = if config.policies.is_empty() {
         None
     } else {
@@ -334,6 +338,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         let (router, cancelled, moves) = policy::Cluster::start(
             programs,
             routing.table_watch(),
+            me_rx,
             workers.connected_watch(),
             workers.clone(),
         )
@@ -392,7 +397,9 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         .await
         .context("register gateway with controller")?;
     tracing::info!(%gateway_id, %worker_addr, "gateway registered with controller");
-    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info, scale));
+    tokio::spawn(controller::heartbeat_loop(
+        control, gateway_id, info, scale, me, authorship,
+    ));
 
     let app = Router::new()
         .merge(ingress::router(state.clone()))

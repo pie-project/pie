@@ -109,7 +109,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # peers  = ["10.0.0.2:7100"]   # workers to prefill this worker's passes on
 # pools  = ["10.0.0.3:7201"]   # pool workers (`pie-pool`) to keep its runs on,
 #                              # by their bulk address
-# transfer = "auto"            # peers' kv read in place where the build has NIXL
+# transfer = "auto"            # the bulk link; "nixl" reads peers' kv in place
 # prefill_min_suffix_tokens = 0  # shortest uncached suffix worth a peer's
 #                                # prefill; 0: 2048 tokens
 "#;
@@ -127,10 +127,11 @@ activation_dtype = "bfloat16"
 # kv_page_size    = 32      # omit: the engine derives one
 # max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256,
 #                           # or what the chip profile states (B200: two a lane)
-# max_model_len   = 4096    # the most tokens one sequence may hold; omit for
-#                           # 4096. State it at what you serve: a decode body
-#                           # for n lanes is armed only when the pool holds
-#                           # n x max_model_len tokens
+# max_model_len   = 32768   # the most tokens one sequence may hold; omit for
+#                           # the context the model's config.json declares,
+#                           # shortened where one sequence at it would take
+#                           # more than half the pool (4096 if it declares
+#                           # none)
 "#;
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]

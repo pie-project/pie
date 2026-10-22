@@ -4,6 +4,7 @@
 # rotation signs; and the small geometries the engines' tests serve.
 
 load("//lib/media.poem", "smart_resize")
+load("//lib/rope.poem", "yarn")
 
 load("//lib/adapters/model.poem", "banks")
 load("//lib/dflash/model.poem", dflash_declare = "declare", dflash_head = "head", "markov", "selector")
@@ -232,6 +233,21 @@ def a17b(**over):
     d.update(over)
     return d
 
+def a10b(**over):
+    """Qwen3.5-122B-A10B."""
+    d = dims(hidden = 3072, layers = 48, attn_every = 4, q_heads = 32, kv_heads = 2, head_dim = 256,
+             rotary_dim = 64, k_heads = 16, v_heads = 64, k_dim = 128, v_dim = 128,
+             mlp = moe(256, 8, 1024, 1024), vocab = 248320, tied = False)
+    d.update(over)
+    return d
+
+def next80b(**over):
+    """Qwen3-Next-80B-A3B: Qwen3.5-35B-A3B's mixer geometry, deeper, twice
+    the experts, ten a token, and Qwen 3's vocabulary."""
+    d = a3b(layers = 48, mlp = moe(512, 10, 512, 512), vocab = 151936)
+    d.update(over)
+    return d
+
 def a95b(**over):
     """Qwen3.8 Max (2.4T-A95B), text only."""
     d = dims(hidden = 8192, layers = 92, attn_every = 4, q_heads = 64, kv_heads = 4, head_dim = 256,
@@ -266,6 +282,10 @@ FIXED = {
     "qwen36-35b-a3b-mini": a3b(layers = 5, mlp = moe(16, 8, 512, 512)),
     "qwen36-35b-a3b-mini64": a3b(layers = 5, mlp = moe(64, 8, 512, 512)),
     "ornith15-397b-mini": a17b(layers = 5, mlp = moe(16, 10, 1024, 1024)),
+    "qwen35-122b-a10b": a10b(),
+    "qwen35-122b-a10b-mini": a10b(layers = 8, mlp = moe(16, 8, 1024, 1024)),
+    "qwen3-next-80b-a3b": next80b(),
+    "qwen3-next-80b-a3b-mini": next80b(layers = 8, mlp = moe(16, 10, 512, 512)),
     "qwen38-max": a95b(),
     "qwen38-max-mini": a95b(layers = 5, mlp = moe(16, 10, 2048, 2048)),
     "qwen3-a3b-micro": dims(hidden = 512, layers = 4, attn_every = 1, q_heads = 8, kv_heads = 2,
@@ -309,7 +329,7 @@ def drafted(id, deploy):
         refuse()
     if id == "qwen35-d0.8b":
         return d0_8b(tower = SMALL if vision else None, draft = drafter)
-    if id == "ornith15-397b" and drafter == None:
+    if id in ["ornith15-397b", "qwen35-397b-a17b"] and drafter == None:
         return a17b(tower = LARGE if vision else None)
     if vision:
         refuse()
@@ -345,11 +365,26 @@ def dense_mlp(w, hidden, inter, prefix):
         inter = inter,
     )
 
+def modelopt_mix(weights):
+    """modelopt's mixed export (nvidia/Qwen3.6-*-NVFP4) as vLLM serves it:
+    experts, shared expert, dense MLP and head NVFP4 against bf16 rows
+    (`W4A16_NVFP4`), or the experts against NVFP4 rows; attention and GDN
+    projections e4m3 under one scale, read as 128-square blocks against e4m3
+    rows; the rest bf16. `None` for any other list."""
+    if len(weights) != 3 or weights[0] != dtype.bf16 or weights[2] != dtype.e4m3tile128a8:
+        return None
+    if weights[1] not in [dtype.nvfp4, dtype.nvfp4a4]:
+        return None
+    return struct(experts = weights[1], mlp = dtype.nvfp4, proj = weights[2])
+
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
+    mix = modelopt_mix(deploy.weights)
+    if len(deploy.weights) != 1 and mix == None:
+        fail("{} stores its weights at one dtype, or as modelopt's mix [bf16, nvfp4, e4m3tile128a8], not {}".format(id, deploy.weights))
     w = deploy.weights[0]
     d = struct(**drafted(id, deploy))
+    if mix != None and d.draft != None:
+        fail("{}: modelopt's export ships no draft head".format(id))
     bonsai = id == "qwen36-27b-bonsai"
     dense = compute(w)
     # The release's FP8 (Qwen3.6-35B-A3B-FP8) as vLLM serves it: projections
@@ -359,6 +394,14 @@ def layout(id, deploy):
     table = dtype.bf16 if fp8 else w
     gate = dtype.u8g64 if w == dtype.u4g64 else table
     proj = dtype.u4g64tiled if w == dtype.u4g64 else w
+    experts = w
+    mlp_at = proj
+    head_at = proj if table == w else table
+    if mix != None:
+        proj = mix.proj
+        experts = mix.experts
+        mlp_at = mix.mlp
+        head_at = mix.mlp
     hidden = d.hidden
     attn_at = lambda l: l % d.attn_every == d.attn_every - 1
 
@@ -374,12 +417,12 @@ def layout(id, deploy):
             # Ternary-Bonsai stores the GDN beta/alpha projections in bf16,
             # not ternary: they are served as stored.
             # The FP8 release keeps them unquantized, as does its router.
-            ba = dense if bonsai or fp8 else proj
+            ba = dense if bonsai or fp8 or mix != None else proj
             delta = gdn(n, d, proj, ba, dense, "conv.{}".format(l), "delta.{}".format(l))
         if d.mlp.routed:
-            mlp = routed(n, hidden, d.mlp, w, proj, gate)
+            mlp = routed(n, hidden, d.mlp, experts, mlp_at, gate)
         else:
-            mlp = dense_mlp(proj, hidden, d.mlp.inter, "layer.{}".format(l))
+            mlp = dense_mlp(mlp_at, hidden, d.mlp.inter, "layer.{}".format(l))
         return struct(
             attn = attn,
             gdn = delta,
@@ -427,7 +470,7 @@ def layout(id, deploy):
     embed = weight("embed", [d.vocab, hidden], dense if bonsai else table)
     head = None
     if not d.tied:
-        head = weight("lm_head", [d.vocab, hidden], proj if table == w else table).columns()
+        head = weight("lm_head", [d.vocab, hidden], head_at).columns()
     signs = None
     if bonsai:
         sign = lambda width: weight(sign_name(width), [1, width], dense)
@@ -444,6 +487,9 @@ def layout(id, deploy):
         head_dim = d.head_dim,
         rotate_kv = d.rotate_kv,
         kv = deploy.kv,
+        # The native 262144 tokens a deployment's YaRN stretches (the cards:
+        # factor 4 toward a million).
+        rope = yarn(deploy, 262144),
         embed = embed,
         head = head,
         layers = [layer(l) for l in range(d.layers)],

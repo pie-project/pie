@@ -71,10 +71,9 @@ pub(crate) fn load_model_engines(
                 .runtime
                 .max_concurrent_processes
                 .and_then(|n| u32::try_from(n).ok());
-            // Other workers read this one's kv in place where the build
-            // hosts NIXL and the configuration does not keep transfers inline.
-            residency.kv_export = cfg!(feature = "nixl")
-                && user_cfg.offload.transfer != crate::config::OffloadTransfer::Inline;
+            // Other workers read this one's kv in place where the
+            // configuration asks for NIXL (a build without it refuses that).
+            residency.kv_export = user_cfg.offload.transfer == crate::config::OffloadTransfer::Nixl;
             group_engines.push(create_engine_group(
                 m,
                 residency,

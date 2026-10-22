@@ -567,6 +567,7 @@ pub(crate) fn write_mla_fp8_rows(
             num_requests.arg(),
             pool.page_size.arg(),
             i32::try_from(rope).unwrap_or(0).arg(),
+            ctx.stage(),
         ],
     )
 }
@@ -604,6 +605,7 @@ pub(crate) fn write_mla_to_pages(
             pool.page_size.arg(),
             kv_lora_rank.arg(),
             rope_dim.arg(),
+            ctx.stage(),
         ],
     )
 }

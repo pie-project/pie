@@ -620,7 +620,9 @@ pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: Wor
 
 /// Sends every run this worker keeps to `pools`, each from the first page a
 /// pool has not been sent, for as long as the process lives: a cache that
-/// outlives this worker's, for any worker to fetch from.
+/// outlives this worker's, for any worker to fetch from. Each goes named
+/// whole from token 0, so a pool keeps it as a run, at retention key 0, and
+/// reports it as its group.
 pub async fn push_to_pools(pools: Vec<String>) {
     let mut sent: std::collections::HashMap<String, std::collections::HashSet<[u8; 32]>> =
         std::collections::HashMap::new();
@@ -654,7 +656,7 @@ async fn push(pool: &str, run: &[[u8; 32]], from: usize) -> Result<usize> {
         .await
         .map_err(|why| anyhow::anyhow!(why))?;
     let count = pages.count;
-    transport::tcp::put(pool, &run[from..], &pages)
+    transport::tcp::put(pool, run, from as u32, &pages)
         .await
         .map_err(|why| anyhow::anyhow!(why))?;
     Ok(count)

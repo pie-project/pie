@@ -1,11 +1,37 @@
-# The weights of Nemotron-3 Super and Ultra: per layer an RMS norm and one
-# mixer, a Mamba-2 (`M`), a NoPE GQA attention (`*`) or a latent MoE (`E`) of
-# relu2 experts beside a relu2 shared expert; the token embedding, a final
-# norm and the head.
+# The weights of Nemotron-3 Super, Ultra and Nano: per layer an RMS norm and
+# one mixer, a Mamba-2 (`M`), a NoPE GQA attention (`*`) or an MoE (`E`) of
+# relu2 experts beside a relu2 shared expert (Super's and Ultra's reading the
+# residual squeezed to a latent width, Nano's reading it whole); the token
+# embedding, a final norm and the head.
 
-# Super's `hybrid_override_pattern`; Ultra's `layers_block_type`, one letter a layer.
+# Super's and Nano's `hybrid_override_pattern`; Ultra's `layers_block_type`,
+# one letter a layer.
 SUPER = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
 ULTRA = "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+NANO = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+
+def nano(layers, experts):
+    return struct(
+        pattern = NANO,
+        layers = layers,
+        hidden = 2688,
+        vocab = 131072,
+        heads = 32,
+        kv_heads = 2,
+        head_dim = 128,
+        mamba_heads = 64,
+        mamba_head_dim = 64,
+        groups = 8,
+        state_dim = 128,
+        conv_kernel = 4,
+        experts = experts,
+        top_k = 6,
+        latent = None,
+        moe_inter = 1856,
+        shared_inter = 3712,
+        scaling = 2.5,
+        eps = 1e-5,
+    )
 
 def dims(layers, pattern = SUPER, wide = 1, experts = 512):
     """Super's widths, or Ultra's (`wide = 2`): twice the residual, heads,
@@ -40,6 +66,9 @@ DIMS = {
     # Ultra's first nine layers at 64 of its experts: a 512-expert bank is
     # 21 GiB a layer in bf16, past one 80 GB card four times over.
     "nemotron3-ultra-mini": dims(9, ULTRA, 2, experts = 64),
+    "nemotron3-nano": nano(52, 128),
+    # Its first six layers: every mixer kind, the attention last.
+    "nemotron3-nano-mini": nano(6, 16),
 }
 
 # The release's own precision a projection, as modelopt chose it layer by
@@ -59,6 +88,8 @@ FP8_AT = {
 }
 
 def layout(id, deploy):
+    if DIMS[id].latent == None:
+        return nano_layout(id, deploy)
     d = DIMS[id]
     if deploy.drafter != None or deploy.parts:
         fail("{} has no draft head or parts here; not {}".format(id, deploy))
@@ -147,6 +178,97 @@ def layout(id, deploy):
         kv = deploy.kv,
         embed = weight("embed", [d.vocab, hidden], w),
         head = weight("lm_head", [d.vocab, hidden], w),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight("final_norm", [hidden], norms),
+    )
+
+def nano_layout(id, deploy):
+    """Nemotron-3 Nano: experts on the residual itself. Its modelopt exports
+    (NVFP4) keep every attention and the Mamba-2 ahead of it bf16; the
+    deployment's first dtype stores the other projections and the shared
+    expert, its second (or the first) the routed experts."""
+    ws = deploy.weights
+    if deploy.drafter != None or deploy.parts or len(ws) not in [1, 2]:
+        fail("{} stores its weights at one dtype, or its projections and experts at a dtype each; not {}".format(id, deploy))
+    proj = ws[0]
+    experts = ws[-1]
+    d = DIMS[id]
+    norms = compute(dtype.bf16)
+    hidden = d.hidden
+    inner = d.mamba_heads * d.mamba_head_dim
+    conv_dim = inner + 2 * d.groups * d.state_dim
+    pattern = d.pattern
+    kept = lambda l: pattern[l] == "*" or (l + 1 < len(pattern) and pattern[l + 1] == "*")
+    at = lambda l: dtype.bf16 if kept(l) else proj
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        kind = pattern[l]
+        mamba = None
+        attn = None
+        moe = None
+        if kind == "M":
+            mamba = struct(
+                in_proj = weight(n("in_proj"), [inner + conv_dim + d.mamba_heads, hidden], at(l)),
+                conv = weight(n("conv"), [conv_dim, d.conv_kernel], norms),
+                conv_bias = weight(n("conv_bias"), [conv_dim], norms),
+                a_log = weight(n("a_log"), [d.mamba_heads], dtype.f32),
+                dt_bias = weight(n("dt_bias"), [d.mamba_heads], dtype.f32),
+                d = weight(n("d"), [d.mamba_heads], dtype.f32),
+                norm = weight(n("ssm_norm"), [inner], norms),
+                out_proj = weight(n("out_proj"), [hidden, inner], at(l)),
+                conv_state = "conv.{}".format(l),
+                ssm_state = "ssm.{}".format(l),
+            )
+        elif kind == "*":
+            hd = d.head_dim
+            attn = struct(
+                q = weight(n("q"), [d.heads * hd, hidden], dtype.bf16),
+                k = weight(n("k"), [d.kv_heads * hd, hidden], dtype.bf16),
+                v = weight(n("v"), [d.kv_heads * hd, hidden], dtype.bf16),
+                o = weight(n("o"), [hidden, d.heads * hd], dtype.bf16),
+                kv = "kv.{}".format(l),
+            )
+        else:
+            moe = struct(
+                router = weight(n("router"), [d.experts, hidden], norms),
+                bias = weight(n("router_bias"), [d.experts], dtype.f32),
+                down_latent = None,
+                up_latent = None,
+                up = weight(n("experts_up"), [d.experts, d.moe_inter, hidden], experts),
+                down = weight(n("experts_down"), [d.experts, hidden, d.moe_inter], experts),
+                shared_up = weight(n("shared_up"), [d.shared_inter, hidden], proj),
+                shared_down = weight(n("shared_down"), [hidden, d.shared_inter], proj),
+            )
+        return struct(
+            kind = kind,
+            norm = weight(n("norm"), [hidden], norms),
+            mamba = mamba,
+            attn = attn,
+            moe = moe,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = d.heads,
+        kv_heads = d.kv_heads,
+        head_dim = d.head_dim,
+        sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+        mamba_heads = d.mamba_heads,
+        mamba_head_dim = d.mamba_head_dim,
+        groups = d.groups,
+        state_dim = d.state_dim,
+        conv_kernel = d.conv_kernel,
+        inner = inner,
+        conv_dim = conv_dim,
+        experts = d.experts,
+        top_k = d.top_k,
+        scaling = d.scaling,
+        eps = d.eps,
+        kv = deploy.kv,
+        embed = weight("embed", [d.vocab, hidden], norms),
+        head = weight("lm_head", [d.vocab, hidden], norms),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], norms),
     )

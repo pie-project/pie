@@ -120,7 +120,7 @@ fn tools_section(tools: &[String]) -> String {
 
 /// `value` as Python's `json.dumps(ensure_ascii=False)` writes it: keys in
 /// their order, `, ` and `: ` between items.
-fn py_json(value: &Value, out: &mut String) {
+pub(crate) fn py_json(value: &Value, out: &mut String) {
     match value {
         Value::Object(map) => {
             out.push('{');
@@ -194,7 +194,7 @@ fn invoke(name: &str, arguments: &Value, out: &mut String) {
 
 /// A replayed turn's ChatML calls (`<tool_call>{"name", "arguments"}</tool_call>`),
 /// lifted out of its text; a turn already in the namespaced form is kept whole.
-fn lift_calls(msg: &str) -> (String, Vec<(String, Value)>) {
+pub(crate) fn lift_calls(msg: &str) -> (String, Vec<(String, Value)>) {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
     let mut calls = Vec::new();

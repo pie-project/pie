@@ -51,4 +51,9 @@ DEPLOYMENTS = [
     # ... with the dense MLP the export's FP8, on mma.sync (Hopper).
     deployment("glm53", weights = [BF, NV4W, F8], kv = BF),
     deployment("glm53-mini", weights = [BF, NV4W, F8], kv = BF),
+    # The latent rows as vLLM's standard fp8 rows (B200's sparse pass reads
+    # them, at any rank's share of the heads), as nvidia's export states.
+    deployment("glm53", weights = [BF, NV4, F8], kv = dtype.e4m3),
+    deployment("glm53-mini", weights = [BF, NV4, F8], kv = dtype.e4m3),
+    deployment("glm53", weights = F8, kv = dtype.e4m3),
 ]

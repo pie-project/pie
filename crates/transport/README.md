@@ -5,10 +5,14 @@ How kv pages move between workers.
 - `tcp`: a page run's bytes over a plain TCP stream (the bulk link). Every
   build has it; it is what peers without a shared backend use.
 - `nixl` (feature): a worker's kv read in place, page to page, through
-  NIXL. A worker whose engine exports its kv (`offload.transfer` not
-  `inline`) registers it with one NIXL agent; a peer of the same layout
-  reads it device to device. UCX picks the path: CUDA IPC or shared memory
-  on one host, RDMA across hosts.
+  NIXL. A worker whose engine exports its kv (`offload.transfer = "nixl"`)
+  registers it with one NIXL agent; a peer of the same layout reads it
+  device to device, one descriptor per run of pages per plane. UCX picks
+  the path: RDMA across hosts, CUDA IPC where the device memory exports a
+  handle UCX opens. The CUDA engine's kv is VMM memory, which UCX's CUDA
+  IPC opens only by a fabric handle (NVLink); on PCIe cards without an RDMA
+  device UCX copies it through host memory over TCP, slower than the bulk
+  link's stream, so `"auto"` takes the bulk link.
 - `Objects` (`nixl`): named objects in a store a NIXL storage plugin fronts
   (`OBJ` for S3 and what speaks it). A pool worker keeps its pages there
   (`pie-pool --objects OBJ`), the cluster's external tier.

@@ -20,6 +20,8 @@ pub mod rope_axes;
 
 pub mod rope_mrope;
 
+pub mod rope_table;
+
 pub mod relative_bucket_bias;
 
 pub mod sinusoid;

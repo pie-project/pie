@@ -392,7 +392,7 @@ async fn main(input: String) -> Result<String, String> {
         }
         let part = match event {
             Event::Reasoning(text) if include_thoughts => json!({"text": text, "thought": true}),
-            Event::Reasoning(_) | Event::ReasoningEnd => return,
+            Event::Reasoning(_) | Event::ReasoningEnd | Event::Logprobs(_) => return,
             Event::Text(text) => json!({"text": text}),
             Event::ToolCall(call) => function_call_part(&call),
         };

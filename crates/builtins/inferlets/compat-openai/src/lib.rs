@@ -33,6 +33,59 @@ fn usage(outcome: &compat::Outcome) -> Value {
     })
 }
 
+/// A token's text as vLLM reports it beside a logprob: the token decoded on
+/// its own, empty where it is part of a character it does not finish.
+fn token_text(token: u32) -> String {
+    let text = inferlet::model::decode(&[token]).unwrap_or_default();
+    if text.contains('\u{fffd}') {
+        String::new()
+    } else {
+        text
+    }
+}
+
+/// One chat-completions logprob entry: the sampled token and its
+/// alternatives, each with its text's UTF-8 bytes. The alternatives are
+/// listed as vLLM lists them: the sampled token first, then the likeliest
+/// others, as many as were asked.
+fn chat_logprob(token: u32, logprob: &compat::Logprob) -> Value {
+    let entry = |token: u32, logprob: f32| {
+        let text = token_text(token);
+        let bytes: Vec<u8> = text.as_bytes().to_vec();
+        json!({"token": text, "logprob": logprob.max(-9999.0), "bytes": bytes})
+    };
+    let mut out = entry(token, logprob.logprob);
+    let asked = logprob.top.len();
+    out["top_logprobs"] = Value::Array(
+        std::iter::once((token, logprob.logprob))
+            .chain(logprob.top.iter().copied().filter(|&(t, _)| t != token))
+            .take(asked)
+            .map(|(token, logprob)| entry(token, logprob))
+            .collect(),
+    );
+    out
+}
+
+/// The `n` field: how many choices, at least one.
+fn choices(n: Option<u32>) -> Result<u32, ApiError> {
+    match n {
+        None => Ok(1),
+        Some(0) => Err(invalid("`n` must be at least 1", Some("n"))),
+        Some(n) if n > 128 => Err(invalid("`n` must be at most 128", Some("n"))),
+        Some(n) => Ok(n),
+    }
+}
+
+/// The request of the `index`-th of `n` choices: its own random stream.
+fn choice_request(req: &compat::Request, index: u32) -> compat::Request {
+    let mut req = req.clone();
+    req.sampling.seed = req
+        .sampling
+        .seed
+        .wrapping_add(index.wrapping_mul(0x9e37_79b9));
+    req
+}
+
 /// The `stop` field: absent, one string, or an array of them.
 fn stop_sequences(stop: Option<Value>) -> Result<Vec<String>, ApiError> {
     match stop {

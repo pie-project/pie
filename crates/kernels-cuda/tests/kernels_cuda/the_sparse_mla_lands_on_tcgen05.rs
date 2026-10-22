@@ -563,6 +563,19 @@ fn e4m3(b: u8) -> f32 {
 /// same values as standard fp8 rows (512 latent and `rope` rotated e4m3
 /// codes, scale 1). The bf16 rows hold each code's value.
 fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> Vec<u16> {
+    decode_heads(HEADS, reqs, kv, rope, fp8, dense, false).0
+}
+
+/// [`decode_short`] over `heads` heads, and its log-sum-exps where `lse`.
+fn decode_heads(
+    heads: usize,
+    reqs: usize,
+    kv: usize,
+    rope: usize,
+    fp8: bool,
+    dense: bool,
+    lse: bool,
+) -> (Vec<u16>, Vec<f32>) {
     const PG: usize = 64;
     let row = RANK + rope;
     let pages_per = kv.div_ceil(PG);
@@ -572,8 +585,8 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
     let last = vec![((kv - 1) % PG + 1) as i32; reqs];
     let slots = total * PG;
     let mut rng = Lcg::seeded(0x5407);
-    let (q_raw, _) = rng.row(reqs * HEADS * RANK);
-    let (qpe_raw, _) = rng.row(reqs * HEADS * rope.max(1));
+    let (q_raw, _) = rng.row(reqs * heads * RANK);
+    let (qpe_raw, _) = rng.row(reqs * heads * rope.max(1));
     let mut rows = vec![0u8; slots * row];
     let mut ckv = vec![0u16; slots * RANK];
     let mut kpe_raw = vec![0u16; slots * rope.max(1)];
@@ -621,7 +634,7 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
             row_offset: 0,
             rows: reqs as u32,
         },
-        HEADS as u32,
+        heads as u32,
         RANK as u32,
         false,
         &device,
@@ -669,7 +682,8 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
     let qpe_at = gpu.up(&qpe_raw);
     let qo_at = gpu.up(&qo);
     let sel_at = gpu.up(&sel);
-    let out = gpu.zeros(reqs * HEADS * RANK * 2);
+    let out = gpu.zeros(reqs * heads * RANK * 2);
+    let lse_at = gpu.zeros(reqs * heads * 4);
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_sparse: true,
         mla_dense_short: dense,
@@ -679,24 +693,32 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
         mla::attention_decode_selected(
             &ctx,
             RaggedTensor {
-                data: Tensor::new(q_at, reqs as u32, (HEADS * RANK) as u32, Dtype::Bf16),
+                data: Tensor::new(q_at, reqs as u32, (heads * RANK) as u32, Dtype::Bf16),
                 indptr: Tensor::new(qo_at, (reqs + 1) as u32, 1, Dtype::I32),
             },
             &plan,
-            Tensor::new(qpe_at, reqs as u32, (HEADS * rope) as u32, Dtype::Bf16),
+            Tensor::new(qpe_at, reqs as u32, (heads * rope) as u32, Dtype::Bf16),
             Tensor::new(sel_at, reqs as u32, 2048, Dtype::I32),
             &pool,
-            HEADS as u32,
+            heads as u32,
             RANK as u32,
             0.04,
-            &mut Tensor::new(out, reqs as u32, (HEADS * RANK) as u32, Dtype::Bf16),
-            None,
+            &mut Tensor::new(out, reqs as u32, (heads * RANK) as u32, Dtype::Bf16),
+            lse.then_some(&mut Tensor::new(
+                lse_at,
+                reqs as u32,
+                heads as u32,
+                Dtype::F32,
+            )),
         )
         .expect("the decode's selected attention fires");
     };
     fire();
     gpu.sync();
-    gpu.down(out, reqs * HEADS * RANK)
+    (
+        gpu.down(out, reqs * heads * RANK),
+        gpu.down(lse_at, reqs * heads),
+    )
 }
 
 /// The fp8 rows on e4m3 tensor cores (Q and P in e4m3 too) against the same
@@ -759,6 +781,46 @@ fn glm_reads_a_short_selection_dense() {
             i / (HEADS * RANK),
             (i / RANK) % HEADS,
             i % RANK
+        );
+    }
+}
+
+/// Fp8 rows at a head count other than 64 (a rank's share of 64 under
+/// tensor parallelism, or more than 64) read 64 heads a pass, against the
+/// same values in bf16 on the naive kernel.
+#[test]
+fn fp8_rows_read_any_head_count_sixty_four_a_pass() {
+    // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
+    for (heads, rows, kv, rope) in [
+        (32, 4, 300, 64),
+        (16, 4, 1000, 0),
+        (8, 160, 300, 64),
+        (128, 4, 1000, 64),
+        (96, 4, 300, 64),
+    ] {
+        let (want, want_lse) = decode_heads(heads, rows, kv, rope, false, false, true);
+        let (got, got_lse) = decode_heads(heads, rows, kv, rope, true, false, true);
+        for (i, (&g, &w)) in got_lse.iter().zip(&want_lse).enumerate() {
+            assert!(
+                (g - w).abs() <= 0.05 * w.abs().max(1.0),
+                "{heads} heads, row {} head {}: log-sum-exp {g} against {w}",
+                i / heads,
+                i % heads
+            );
+        }
+        let (mut err, mut norm) = (0f64, 0f64);
+        for (&g, &w) in got.iter().zip(&want) {
+            let (g, w) = (f64::from(from_bf16(g)), f64::from(from_bf16(w)));
+            err += (g - w) * (g - w);
+            norm += w * w;
+        }
+        let rel = (err / norm).sqrt();
+        assert!(
+            rel < 0.05,
+            "{heads} heads, {rows} rows of {kv} keys, rope {rope}: relative error {rel}"
         );
     }
 }

@@ -1,0 +1,43 @@
+# Llama 3.1 and 3.3 (meta-llama/Llama-3.1-8B-Instruct, Llama-3.3-70B-Instruct):
+# full grouped-query attention in every layer over llama3-scaled rope, and a
+# SwiGLU MLP; as released (bf16), as NVIDIA's modelopt exports them (FP8 a
+# tensor, run as 128-square blocks against e4m3 activations; NVFP4), and the
+# 70B's four-layer miniature, which reads the first four layers of the whole
+# model's checkpoint at its full width.
+
+LLAMA = template("llama")
+TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
+
+def llama(id, layers, mini = False):
+    return model(id, mini = mini, template = LLAMA, tokenizer = TOKENIZER, arch = "llama", layers = layers, vocab = 128256)
+
+MODELS = [
+    llama("llama31-8b", layers = 32),
+    llama("llama33-70b", layers = 80),
+    llama("llama33-70b-mini-l4", layers = 4, mini = True),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+F8 = dtype.e4m3tile128a8
+NV4W = dtype.nvfp4
+E4M3 = dtype.e4m3
+
+DEPLOYMENTS = [
+    deployment("llama31-8b", weights = BF, kv = BF),
+    deployment("llama31-8b", weights = BF, kv = E4M3),
+    # modelopt's FP8 export (`nvidia/Llama-3.1-8B-Instruct-FP8`), its one
+    # scale a projection as every 128-square block's factor, against e4m3
+    # activations, with the e4m3 cache vLLM serves it with.
+    deployment("llama31-8b", weights = F8, kv = E4M3),
+    deployment("llama31-8b", weights = F8, kv = BF),
+    # modelopt's NVFP4 export against bf16 activations.
+    deployment("llama31-8b", weights = NV4W, kv = E4M3),
+    deployment("llama31-8b", weights = U4, kv = BF),
+    deployment("llama33-70b", weights = BF, kv = BF),
+    deployment("llama33-70b", weights = F8, kv = E4M3),
+    deployment("llama33-70b", weights = NV4W, kv = E4M3),
+    deployment("llama33-70b", weights = U4, kv = BF),
+    deployment("llama33-70b-mini-l4", weights = BF, kv = BF),
+    deployment("llama33-70b-mini-l4", weights = F8, kv = E4M3),
+]

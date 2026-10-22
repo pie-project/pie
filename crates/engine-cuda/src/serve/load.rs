@@ -689,6 +689,7 @@ impl Shell {
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let staging = crate::exports::regions_staging(&boot.trace, &compiled);
         let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
+        let unread = crate::exports::unread(&boot.trace);
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
         if boot.knobs.diagnostics.arm_trace {
@@ -915,6 +916,7 @@ impl Shell {
             lane_shifted,
             staging,
             schedule_readers,
+            unread,
             adapters: crate::blob::Adapters::new(adapter_seats),
             scores,
             held: vec![0; boot.slots as usize],

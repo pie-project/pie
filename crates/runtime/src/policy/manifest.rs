@@ -7,7 +7,7 @@ use super::CAPABILITIES;
 pub const SECTION: &str = "plex.manifest";
 
 const DEFAULT_DEADLINE_MS: u64 = 50;
-const MAX_DEADLINE_MS: u64 = 1000;
+pub(crate) const MAX_DEADLINE_MS: u64 = 1000;
 
 /// `timer` is delivered whether or not it is listed.
 const EDGES: &[&str] = &[

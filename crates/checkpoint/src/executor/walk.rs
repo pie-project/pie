@@ -185,6 +185,66 @@ struct Walk<'a, 'p> {
     consume: Option<&'p SourceLedger>,
 }
 
+/// AWQ's nibble order: the `j`th nibble of a word, from the low end, holds
+/// the code at column `AWQ_ORDER[j]` of its eight.
+const AWQ_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+
+/// Int4 words of a `[rows, cols]` rectangle of codes (counted one by one),
+/// landed as `[cols, rows]`: 4-bit codes two a byte along `rows`, the low
+/// nibble first, or (zeros) one a byte.
+fn int4_transposed(
+    bytes: &[u8],
+    layout: RepackLayout,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u8>, Error> {
+    let down = layout == RepackLayout::GptqU4Codes;
+    let shaped = if down {
+        rows.is_multiple_of(8)
+    } else {
+        cols.is_multiple_of(8)
+    };
+    if !shaped || !rows.is_multiple_of(2) || bytes.len() != rows * cols / 2 {
+        return Err(invalid(format!(
+            "{layout:?} Repack reads {rows} x {cols} 4-bit codes from a {}-byte operand",
+            bytes.len()
+        )));
+    }
+    let word = |at: usize| {
+        let at = at * 4;
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    };
+    let mut nibble_of = [0usize; 8];
+    for (j, &column) in AWQ_ORDER.iter().enumerate() {
+        nibble_of[column] = j;
+    }
+    let awq = matches!(layout, RepackLayout::AwqU4Codes | RepackLayout::AwqU4Zeros);
+    let code = |r: usize, c: usize| -> u8 {
+        let (w, nibble) = if down {
+            (word((r / 8) * cols + c), r % 8)
+        } else if awq {
+            (word(r * (cols / 8) + c / 8), nibble_of[c % 8])
+        } else {
+            (word(r * (cols / 8) + c / 8), c % 8)
+        };
+        ((w >> (4 * nibble)) & 0xF) as u8
+    };
+    let wide = matches!(layout, RepackLayout::AwqU4Zeros | RepackLayout::GptqU4Zeros);
+    let mut out = vec![0u8; if wide { rows * cols } else { rows * cols / 2 }];
+    for r in 0..rows {
+        for c in 0..cols {
+            let q = code(r, c);
+            let at = c * rows + r;
+            if wide {
+                out[at] = q;
+            } else {
+                out[at / 2] |= q << (4 * (at % 2));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
     let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     for i in 0..16 {
@@ -1224,6 +1284,30 @@ impl Walk<'_, '_> {
                     if row < rows {
                         let from = (row * cols + g) * FACTOR;
                         slot.copy_from_slice(&bytes[from..from + FACTOR]);
+                    }
+                }
+                Ok(out)
+            }
+            RepackLayout::AwqU4Codes
+            | RepackLayout::AwqU4Zeros
+            | RepackLayout::GptqU4Codes
+            | RepackLayout::GptqU4Zeros => int4_transposed(bytes, spec.layout, rows, cols),
+            RepackLayout::Transposed => {
+                let count = rows * cols;
+                if count == 0 || !bytes.len().is_multiple_of(count) {
+                    return Err(invalid(format!(
+                        "Transposed Repack reads {rows} x {cols} elements from a {}-byte \
+                         operand",
+                        bytes.len()
+                    )));
+                }
+                let width = bytes.len() / count;
+                let mut out = vec![0u8; bytes.len()];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let from = (r * cols + c) * width;
+                        let to = (c * rows + r) * width;
+                        out[to..to + width].copy_from_slice(&bytes[from..from + width]);
                     }
                 }
                 Ok(out)

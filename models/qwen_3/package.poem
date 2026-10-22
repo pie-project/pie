@@ -1,6 +1,7 @@
-# Qwen 3.5 / 3.6 / 3.8, Qwen3.8 Max and Ornith-1.5: GDN layers with gated
-# attention every few, dense or routed MLPs, a vision tower, and their
-# drafters. Ternary-Bonsai 27B and the test geometries are unlisted models of
+# Qwen 3.5 / 3.6 / 3.8, Qwen3.8 Max, Ornith-1.5 and Qwen3-Next: GDN layers
+# with gated attention every few, dense or routed MLPs, a vision tower, and
+# their drafters. Qwen3.5-397B-A17B's configuration is Ornith-1.5's, so an
+# import reads either as Qwen3.5 unless told `--deployment ornith15-397b-...`. Ternary-Bonsai 27B and the test geometries are unlisted models of
 # it that tests trace and import by id.
 
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
@@ -11,6 +12,9 @@ CHATML = template("chatml", thinking = True, tools = True, xml_tools = True, gen
 CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 # Qwen3.8's template opens a thinking request's system turn with its reasoning-effort instruction.
 CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, xml_tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
+# Qwen3-Next's Instruct and Thinking releases share one configuration; its
+# Instruct template's cue opens no thinking block.
+CHATML_NEXT = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
@@ -30,6 +34,11 @@ MODELS = [
     qwen("qwen35-a3b", layers = 40),
     qwen("qwen35-d9b", drafters = ["dflash"], layers = 32),
     qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash", "dflash2"], layers = 40),
+    qwen("qwen35-397b-a17b", parts = ["vision"], layers = 60),
+    qwen("qwen35-122b-a10b", layers = 48),
+    qwen("qwen35-122b-a10b-mini", mini = True, layers = 8),
+    qwen("qwen3-next-80b-a3b", template = CHATML_NEXT, layers = 48, vocab = 151936),
+    qwen("qwen3-next-80b-a3b-mini", mini = True, template = CHATML_NEXT, layers = 8, vocab = 151936),
     qwen("ornith15-397b", template = CHATML_INTERLEAVED, parts = ["vision"], layers = 60),
     qwen("ornith15-397b-mini", mini = True, template = CHATML_INTERLEAVED, layers = 5),
     qwen("qwen38-max", template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, layers = 92),
@@ -53,8 +62,27 @@ U4 = dtype.u4g64
 BF = dtype.bf16
 U8 = dtype.u8g64
 F8 = dtype.e4m3tile128a8
+MODELOPT = [BF, dtype.nvfp4, F8]
+MODELOPT_A4 = [BF, dtype.nvfp4a4, F8]
 
 DEPLOYMENTS = [
+    deployment("qwen35-397b-a17b", weights = U4, kv = BF),
+    deployment("qwen35-397b-a17b", weights = BF, kv = BF),
+    deployment("qwen35-397b-a17b", weights = F8, kv = BF),
+    deployment("qwen35-397b-a17b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("qwen35-122b-a10b", weights = BF, kv = BF),
+    deployment("qwen35-122b-a10b", weights = F8, kv = BF),
+    deployment("qwen35-122b-a10b", weights = U4, kv = BF),
+    deployment("qwen35-122b-a10b-mini", weights = BF, kv = BF),
+    deployment("qwen35-122b-a10b-mini", weights = F8, kv = BF),
+    deployment("qwen3-next-80b-a3b", weights = BF, kv = BF),
+    deployment("qwen3-next-80b-a3b", weights = U4, kv = BF),
+    # Qwen3-Next-80B-A3B-FP8 as released (one B200 holds it): projections
+    # and experts as stored, 128-square blocks against e4m3 activations.
+    deployment("qwen3-next-80b-a3b", weights = F8, kv = BF),
+    deployment("qwen3-next-80b-a3b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen3-next-80b-a3b-mini", weights = BF, kv = BF),
+    deployment("qwen3-next-80b-a3b-mini", weights = F8, kv = dtype.e4m3),
     deployment("qwen36-27b", weights = U4, kv = BF, drafter = "mtp"),
     deployment("qwen36-27b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen36-27b", weights = U4, kv = BF),
@@ -91,6 +119,32 @@ DEPLOYMENTS = [
     # Qwen3.6-35B-A3B-FP8 as released: its projections and experts as stored
     # (128-square blocks, activations e4m3 in 1x128), the rest bf16.
     deployment("qwen36-35b-a3b", weights = F8, kv = BF),
+    # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV); the GDN
+    # states stay bf16.
+    deployment("qwen36-27b", weights = U4, kv = dtype.e4m3),
+    deployment("qwen36-27b", weights = BF, kv = dtype.e4m3),
+    deployment("qwen38-27b", weights = U4, kv = dtype.e4m3),
+    deployment("qwen38-27b", weights = BF, kv = dtype.e4m3),
+    deployment("qwen36-35b-a3b", weights = U4, kv = dtype.e4m3),
+    deployment("qwen36-35b-a3b", weights = BF, kv = dtype.e4m3),
+    deployment("qwen36-35b-a3b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen35-d0.8b", weights = BF, kv = dtype.e4m3),
+    deployment("ornith15-397b", weights = U4, kv = dtype.e4m3),
+    deployment("ornith15-397b-mini", weights = BF, kv = dtype.e4m3),
+    deployment("qwen38-max", weights = U4, kv = dtype.e4m3),
+    deployment("qwen38-max-mini", weights = BF, kv = dtype.e4m3),
+    # nvidia/Qwen3.6-*-NVFP4 as modelopt exports them and vLLM serves them:
+    # experts, MLP and head NVFP4 against bf16 rows, attention and GDN
+    # projections e4m3 under one scale, keys and values e4m3; or the experts
+    # against NVFP4 rows.
+    deployment("qwen36-35b-a3b", weights = MODELOPT, kv = dtype.e4m3),
+    deployment("qwen36-35b-a3b", weights = MODELOPT, kv = BF),
+    deployment("qwen36-35b-a3b", weights = MODELOPT_A4, kv = dtype.e4m3),
+    deployment("qwen36-35b-a3b-mini", weights = MODELOPT, kv = dtype.e4m3),
+    deployment("qwen36-35b-a3b-mini", weights = MODELOPT, kv = BF),
+    deployment("qwen36-35b-a3b-mini", weights = MODELOPT_A4, kv = dtype.e4m3),
+    deployment("qwen36-27b", weights = MODELOPT, kv = dtype.e4m3),
+    deployment("qwen36-27b", weights = MODELOPT, kv = BF),
     deployment("qwen35-d3b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("qwen35-d0.8b", weights = BF, kv = BF),

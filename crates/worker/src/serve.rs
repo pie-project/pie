@@ -359,6 +359,9 @@ async fn assemble_distributed<C: ControlLink>(
         addr,
         // Launched by the controller's actuator, the token it was given.
         launch: std::env::var(controller_api::LAUNCH_ENV).ok(),
+        // So a controller restarted after the one that launched it can
+        // signal it.
+        pid: Some(std::process::id()),
         prior: None,
     };
     let worker_id = ControlLink::register_worker(&control, info.clone())

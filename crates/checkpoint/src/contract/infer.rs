@@ -677,9 +677,24 @@ pub(crate) fn repack_spec(
     layout: RepackLayout,
     to: &TensorType,
 ) -> Result<RepackSpec, Error> {
+    if ty.rank() == 2
+        && let Some((rows, cols)) = layout.transposes(ty.shape[0], ty.shape[1])
+    {
+        return transposed_spec(ty, layout, to, rows, cols);
+    }
     let to_rank: usize = match layout {
         RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale => 3,
         RepackLayout::TiledAffineU4Weight | RepackLayout::TiledAffineFactor => 2,
+        RepackLayout::AwqU4Codes
+        | RepackLayout::AwqU4Zeros
+        | RepackLayout::GptqU4Codes
+        | RepackLayout::GptqU4Zeros
+        | RepackLayout::Transposed => {
+            return Err(Error::Contract(format!(
+                "{layout:?} Repack operand must be [rows, cols], got {:?}",
+                ty.shape
+            )));
+        }
     };
     let (want_rank, cols) = match layout {
         RepackLayout::MarlinMxfp4Weight => {
@@ -725,6 +740,11 @@ pub(crate) fn repack_spec(
             }
             (2, ty.shape[1])
         }
+        RepackLayout::AwqU4Codes
+        | RepackLayout::AwqU4Zeros
+        | RepackLayout::GptqU4Codes
+        | RepackLayout::GptqU4Zeros
+        | RepackLayout::Transposed => unreachable!("a transposing layout returned above"),
     };
     debug_assert_eq!(ty.rank(), want_rank);
     if to.rank() != to_rank {
@@ -808,6 +828,47 @@ fn row_bits(trailing: &[i64], encoding: &Encoding, what: &str) -> Result<u64, Er
             .ok_or_else(|| Error::Contract(format!("{what} row size overflow")))?;
     }
     Ok(total)
+}
+
+/// A layout that lands its `[rows, cols]` operand (codes counted one by one)
+/// as `[cols, rows]`: int4 words unpacked, or elements moved whole.
+fn transposed_spec(
+    ty: &TensorType,
+    layout: RepackLayout,
+    to: &TensorType,
+    rows: i64,
+    cols: i64,
+) -> Result<RepackSpec, Error> {
+    if to.shape != [cols, rows] {
+        return Err(Error::Contract(format!(
+            "{layout:?} Repack of {:?} lands [{cols}, {rows}] and declares {:?}",
+            ty.shape, to.shape
+        )));
+    }
+    let (from, into) = (element_bits(&ty.encoding), element_bits(&to.encoding));
+    let fits = match layout {
+        RepackLayout::AwqU4Codes | RepackLayout::GptqU4Codes => from == Some(32) && into == Some(4),
+        RepackLayout::AwqU4Zeros | RepackLayout::GptqU4Zeros => {
+            from == Some(32) && to.encoding == Encoding::Raw(DType::U8)
+        }
+        _ => from == into && from.is_some_and(|bits| bits % 8 == 0),
+    };
+    if !fits {
+        return Err(Error::Contract(format!(
+            "{layout:?} Repack reads {:?} and declares {:?}; it unpacks 32-bit words of \
+             4-bit codes (to 4-bit codes, or zeros to bytes), or moves whole elements as \
+             they are",
+            ty.encoding, to.encoding
+        )));
+    }
+    Ok(RepackSpec {
+        layout,
+        batch: 1,
+        source_rows: dim_u32(rows, "Repack source rows")?,
+        target_rows: dim_u32(cols, "Repack target rows")?,
+        source_cols: dim_u32(cols, "Repack source columns")?,
+        target_cols: dim_u32(rows, "Repack target columns")?,
+    })
 }
 
 fn dim_u32(value: i64, what: &str) -> Result<u32, Error> {

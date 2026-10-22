@@ -12,6 +12,7 @@ mod z_image_dims;
 
 mod a_banded_head_gathers_the_logits_it_holds_a_band_of;
 mod a_dag_schedule_orders_every_wait_after_its_close;
+mod a_deployment_stretched_by_yarn_turns_at_the_scaled_frequencies;
 mod a_fused_kernel_replaces_what_its_pattern_matches;
 mod a_kv_head_is_held_by_a_group_of_ranks;
 mod a_ptq1_0_trunk_traces_and_places;

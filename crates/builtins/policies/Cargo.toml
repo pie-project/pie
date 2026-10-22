@@ -18,6 +18,7 @@ members = [
     "drain-migrate",
     "relocate",
     "pool-replicate",
+    "retain-all",
     "replicate",
     "disaggregate",
     "scale-by-prop",

@@ -22,8 +22,22 @@ def collapse(streams, head, hy):
     mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
     return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
 
-def cache(c, space, a):
+# An e4m3 kv deployment keeps the latent rows as vLLM's standard fp8 rows, as
+# GLM-5's does: the 512 latent and 64 rotated dims e4m3 under one scale of 1,
+# 576 bytes a position in a u8 plane, read by the tcgen05 sparse pass alone.
+# The index keys stay at bf16.
+FP8_ROW = 576
+
+def fp8_rows(m):
+    return m.kv == dtype.e4m3
+
+def cache(c, space, a, fp8 = False):
     """`a`'s latent rows in the kv `space`."""
+    if fp8:
+        if a.kv_lora_rank != 512 or a.qk_rope_head_dim != 64:
+            fail("fp8 latent rows hold 512 latent and 64 rotated dims, and this attention's are {} and {}".format(a.kv_lora_rank, a.qk_rope_head_dim))
+        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim)
+        return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
 def plans(inputs, heads, kv_lora_rank):
@@ -142,15 +156,16 @@ def mlp(x, f):
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def caches(m, c):
-    kv = c.kv_space(m.kv)
-    index = c.kv_space(m.kv)
+    fp8 = fp8_rows(m)
+    kv = c.kv_space(dtype.u8 if fp8 else m.kv)
+    index = c.kv_space(dtype.bf16 if fp8 else m.kv)
     for w in m.layers:
-        cache(c, kv, w.attn)
+        cache(c, kv, w.attn, fp8)
         if w.attn.indexer != None:
             c.kv(index, w.attn.indexer.keys, [w.attn.indexer.head_dim], w.attn.indexer.head_dim)
     if m.mtp != None:
         a = m.mtp.attn
-        cache(c, kv, a)
+        cache(c, kv, a, fp8)
         c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):

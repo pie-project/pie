@@ -4,7 +4,8 @@
 # 64 experts). Super is served as modelopt exports it and vLLM serves it:
 # routed experts NVFP4 against NVFP4 activations, the projections the export
 # keeps FP8 at FP8, the rest bf16. Ultra is served as released, every weight
-# bf16.
+# bf16. Nemotron-3 Nano: the same mixers, its experts on the residual itself,
+# and its six-layer miniature.
 
 STOP = ["<|im_end|>"]
 CHATML = template("chatml", thinking = True, tools = True, generation_suffix = "<think>\n", stop = STOP)
@@ -15,16 +16,27 @@ MODELS = [
     model("nemotron3-ultra", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 108, vocab = 131072),
     model("nemotron3-super-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 9, vocab = 131072),
     model("nemotron3-ultra-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 9, vocab = 131072),
+    model("nemotron3-nano", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 52, vocab = 131072),
+    model("nemotron3-nano-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 6, vocab = 131072),
 ]
 
 RELEASE = [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]
 
-# Keys and values cached e4m3, as vLLM serves the export (its scales are
-# one); the miniature also bf16.
 DEPLOYMENTS = [
+    # Super's keys and values cached e4m3, as vLLM serves the export (its
+    # scales are one); the miniature also bf16. Ultra as released.
     deployment("nemotron3-super", weights = RELEASE, kv = dtype.e4m3),
     deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.e4m3),
     deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.bf16),
     deployment("nemotron3-ultra", weights = dtype.bf16, kv = dtype.bf16),
     deployment("nemotron3-ultra-mini", weights = dtype.bf16, kv = dtype.bf16),
+    # Nano as released (bf16), and modelopt's NVFP4 export (attention and the
+    # Mamba-2 ahead of it bf16, the rest NVFP4 against bf16 activations: the
+    # experts' 1856 rows are no whole number of the 128-row blocks the
+    # NVFP4-activation product takes).
+    deployment("nemotron3-nano", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("nemotron3-nano", weights = dtype.bf16, kv = dtype.e4m3),
+    deployment("nemotron3-nano", weights = [dtype.nvfp4, dtype.nvfp4], kv = dtype.e4m3),
+    deployment("nemotron3-nano-mini", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("nemotron3-nano-mini", weights = [dtype.nvfp4, dtype.nvfp4], kv = dtype.e4m3),
 ]

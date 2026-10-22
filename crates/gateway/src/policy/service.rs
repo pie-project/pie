@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 use client_api::{ClientMessage, Props};
 use controller_api::{Health, Role, RoutableWorker, RoutingTable, ScaleEntry};
-use ids::{ReqId, WorkerId};
+use ids::{GatewayId, ReqId, WorkerId};
 use tokio::sync::{Notify, mpsc, watch};
 use worker_api::Request;
 
@@ -25,20 +25,24 @@ use crate::session::AdmitReject;
 /// is not among them: it is there only while the controller has an actuator
 /// to meet a scale table, so a policy `uses` it and reads it at run time.
 fn capability(name: &str) -> bool {
-    // Runs replicate to pools and to serving workers' host tiers; a running
-    // turn that has sent no output moves by ending where it runs and running
-    // again where it goes; the workers a placement names run its process's
-    // passes.
+    // Runs replicate to pools and to serving workers' host tiers; a group
+    // retained above key 0 keeps a copy in a pool; a running turn that has
+    // sent no output moves by ending where it runs and running again where
+    // it goes; the workers a placement names run its process's passes.
     matches!(
         name,
-        "cluster.hold" | "state.replicate" | "placement.migrate" | "placement.executors"
+        "cluster.hold"
+            | "state.replicate"
+            | "state.retain"
+            | "placement.migrate"
+            | "placement.executors"
     )
 }
 
 /// How often the policy hears what the directory holds, and its replication
-/// table is enacted again.
+/// and retention tables are enacted again.
 const STATE_TICK: Duration = Duration::from_secs(1);
-/// A replication asked for and not yet seen done is asked again after this.
+/// A copy asked for and not yet seen done is asked again after this.
 const REPLICATE_RETRY: Duration = Duration::from_secs(30);
 
 fn hex(key: &[u8; 32]) -> String {
@@ -140,9 +144,15 @@ impl Cluster {
     /// Starts the cluster policies `programs` names, (name, component), on
     /// one thread: each call goes to every one, and each writes what its
     /// manifest grants it, which no other may.
+    ///
+    /// `me` is this gateway's id once registered: while the routing table
+    /// names it the author, it enacts the cluster-wide tables (replication,
+    /// retention; scale goes by the heartbeat loop). Otherwise its programs
+    /// run all the same and their tables are taken, but not enacted.
     pub fn start(
         programs: Vec<(String, Vec<u8>)>,
         routing: watch::Receiver<RoutingTable>,
+        me: watch::Receiver<Option<GatewayId>>,
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
         fleet: crate::worker::WorkerRegistry,
     ) -> Result<Started, LoadError> {
@@ -170,7 +180,7 @@ impl Cluster {
         let manifests = program::spawn(programs, capability, "pie-cluster-policy", {
             let (shared, dead) = (shared.clone(), dead.clone());
             let (fleet, handle) = (fleet.clone(), tokio::runtime::Handle::current());
-            move |programs| run(programs, rx, shared, routing, dead, fleet, handle)
+            move |programs| run(programs, rx, shared, routing, me, dead, fleet, handle)
         })?;
         let gate_ms = gate_of(manifests.iter());
 
@@ -464,11 +474,13 @@ impl Drop for Waiting<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut programs: Vec<Program>,
     events: Receiver<Event>,
     shared: Arc<Shared>,
     routing: watch::Receiver<RoutingTable>,
+    me: watch::Receiver<Option<GatewayId>>,
     dead: Arc<AtomicBool>,
     fleet: crate::worker::WorkerRegistry,
     handle: tokio::runtime::Handle,
@@ -613,8 +625,9 @@ fn run(
             }
             continue;
         }
-        // A replication table stands until replaced: what it asks for and
-        // is not yet so is asked for again.
+        // A replication or retention table stands until replaced: what it
+        // asks for and is not yet so is asked for again, by the author.
+        registry.author = crate::controller::authors(&routing.borrow(), *me.borrow());
         if registry.ticked || registry.replaced {
             registry.ticked = false;
             registry.replaced = false;
@@ -664,6 +677,9 @@ fn withdraw(
     if manifest.grants("replication") {
         registry.replace_replication(author, Vec::new());
     }
+    if manifest.grants("retention") {
+        registry.replace_retention(author, Table::default());
+    }
     let prefix = format!("{author}/");
     let gone: Vec<(Subject, String, Option<Value>)> = registry
         .said
@@ -691,8 +707,14 @@ fn program_name(spec: &str) -> String {
         .map_or_else(|| spec.to_string(), str::to_string)
 }
 
-/// Asks each site the replication table names, and that does not hold its
-/// group, to take the group from a site that does.
+/// The copies the state tables want and the directory does not show: for
+/// each site the replication table names that does not hold its group, and
+/// for each group retained above key 0 that no pool holds, a pool (the one
+/// a hash of the group picks), highest key first. Each is asked to take the
+/// group from a site that holds it, told the group's retention key. That a
+/// pool holds a group is what the pool reports, as a worker does: the group
+/// stays in the directory, with the pool its site, after every worker lets
+/// it go, and comes back when the pool restarts.
 fn replicate(
     registry: &mut Registry,
     fleet: &crate::worker::WorkerRegistry,
@@ -703,44 +725,36 @@ fn replicate(
         .asked
         .retain(|_, at| now.duration_since(*at) < REPLICATE_RETRY);
     let directory = fleet.directory();
-    for entry in &registry.replication {
-        let Some(group) = registry.groups.get(&entry.group) else {
+    for (group_id, target, table) in registry.wanted() {
+        let Some(group) = registry.groups.get(&group_id) else {
             continue;
         };
-        for site in &entry.at {
-            let Ok(target) = site.worker.parse::<u64>().map(WorkerId) else {
-                continue;
-            };
-            if group.sites.contains(&target) {
-                continue;
-            }
-            let key = (entry.group.clone(), site.worker.clone());
-            if registry.asked.contains_key(&key) {
-                continue;
-            }
-            let Some(from) = group
-                .sites
-                .iter()
-                .find_map(|holder| directory.peer(*holder))
-            else {
-                continue;
-            };
-            let Some(client) = fleet.client(target) else {
-                continue;
-            };
-            registry.asked.insert(key, now);
-            let keys = group.keys.as_ref().clone();
-            let group_id = entry.group.clone();
-            handle.spawn(async move {
-                let mut ctx = tarpc::context::current();
-                ctx.deadline = std::time::Instant::now() + Duration::from_secs(120);
-                match client.replicate(ctx, keys, from).await {
-                    Ok(Ok(pages)) => tracing::info!(group = %group_id, worker = %target, pages, "replicated"),
-                    Ok(Err(why)) => tracing::warn!(group = %group_id, worker = %target, %why, "replication refused"),
-                    Err(error) => tracing::warn!(group = %group_id, worker = %target, %error, "replication not delivered"),
-                }
-            });
+        let key = (group_id.clone(), target.0.to_string());
+        if registry.asked.contains_key(&key) {
+            continue;
         }
+        let Some(from) = group
+            .sites
+            .iter()
+            .find_map(|holder| directory.peer(*holder))
+        else {
+            continue;
+        };
+        let Some(client) = fleet.client(target) else {
+            continue;
+        };
+        registry.asked.insert(key, now);
+        let keys = group.keys.as_ref().clone();
+        let retention = registry.retention.key(&group_id);
+        handle.spawn(async move {
+            let mut ctx = tarpc::context::current();
+            ctx.deadline = std::time::Instant::now() + Duration::from_secs(120);
+            match client.replicate(ctx, keys, from, retention).await {
+                Ok(Ok(pages)) => tracing::info!(group = %group_id, worker = %target, table, pages, "replicated"),
+                Ok(Err(why)) => tracing::warn!(group = %group_id, worker = %target, table, %why, "replication refused"),
+                Err(error) => tracing::warn!(group = %group_id, worker = %target, table, %error, "replication not delivered"),
+            }
+        });
     }
 }
 
@@ -762,6 +776,9 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit, author: &str)
     }
     if let Some(replication) = commit.state.replication {
         registry.replace_replication(author, replication);
+    }
+    if let Some(retention) = commit.state.retention {
+        registry.replace_retention(author, retention);
     }
     registry.say(author, commit.publish);
     let mut changed = false;
@@ -922,12 +939,18 @@ struct Registry {
     pools: Vec<String>,
     /// The replication table the policy installed.
     replication: Vec<wit::Replicate>,
-    /// Replications asked for, by (group, worker), and when.
+    /// The retention table the policy installed: a key per group.
+    retention: Table,
+    /// Copies asked for, by (group, worker), and when.
     asked: HashMap<(String, String), std::time::Instant>,
     /// The directory was heard since `replicate` last ran.
     ticked: bool,
-    /// The replication table was replaced since `replicate` last ran.
+    /// A replication or retention table was replaced since `replicate`
+    /// last ran.
     replaced: bool,
+    /// This gateway is the author the routing table names, as of this
+    /// round: only then are the replication and retention tables enacted.
+    author: bool,
     /// What each worker's policy published about it, by name.
     published: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Workers draining, as of the routing table last heard.
@@ -1137,6 +1160,96 @@ impl Registry {
         self.carry_replications(author, &before);
     }
 
+    /// Replaces the retention table, and carries `retention-changed`,
+    /// caused by `author`, for each group whose key differs (one no entry
+    /// names is at 0).
+    fn replace_retention(&mut self, author: &str, table: Table) {
+        let before = std::mem::replace(&mut self.retention, table);
+        self.replaced = true;
+        let groups: BTreeSet<&String> = before
+            .keys
+            .keys()
+            .chain(self.retention.keys.keys())
+            .collect();
+        let mut changed = false;
+        for group in groups {
+            if before.key(group) != self.retention.key(group) {
+                changed = true;
+                self.carried
+                    .push((author.to_string(), Edge::RetentionChanged(group.clone())));
+            }
+        }
+        if changed && self.pools.is_empty() && self.retention.keys.values().any(|&key| key > 0) {
+            tracing::info!(
+                policy = author,
+                "retention table taken; no pool is known to keep a copy in, so none is kept"
+            );
+        }
+    }
+
+    /// The copies to ask for, (group, worker, the table that wants it): none
+    /// unless this gateway is the author, whose tables alone are enacted.
+    fn wanted(&self) -> Vec<(String, WorkerId, &'static str)> {
+        if !self.author {
+            return Vec::new();
+        }
+        let mut wanted = Vec::new();
+        for entry in &self.replication {
+            let Some(group) = self.groups.get(&entry.group) else {
+                continue;
+            };
+            for site in &entry.at {
+                let Ok(target) = site.worker.parse::<u64>().map(WorkerId) else {
+                    continue;
+                };
+                if !group.sites.contains(&target) {
+                    wanted.push((entry.group.clone(), target, "replication"));
+                }
+            }
+        }
+        wanted.extend(
+            self.retained()
+                .into_iter()
+                .map(|(group, pool)| (group, pool, "retention")),
+        );
+        wanted
+    }
+
+    /// For each group the directory shows, retained above key 0 and held by
+    /// no pool, the pool to take a copy: the one a hash of the group picks.
+    /// Highest key first.
+    fn retained(&self) -> Vec<(String, WorkerId)> {
+        let pools: Vec<WorkerId> = self
+            .pools
+            .iter()
+            .filter_map(|pool| pool.parse().ok().map(WorkerId))
+            .collect();
+        if pools.is_empty() {
+            return Vec::new();
+        }
+        let mut retained: Vec<(&String, i64)> = self
+            .retention
+            .keys
+            .iter()
+            .filter(|(_, key)| **key > 0)
+            .map(|(group, key)| (group, *key))
+            .collect();
+        retained.sort_by_key(|(group, key)| (Reverse(*key), *group));
+        retained
+            .into_iter()
+            .filter_map(|(id, _)| {
+                let group = self.groups.get(id)?;
+                if group.sites.iter().any(|site| pools.contains(site)) {
+                    return None;
+                }
+                let mut hasher = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(id, &mut hasher);
+                let at = std::hash::Hasher::finish(&hasher) % pools.len() as u64;
+                Some((id.clone(), pools[at as usize]))
+            })
+            .collect()
+    }
+
     /// `placement-changed` for each process whose committed placement
     /// differs, caused by `author`.
     fn carry_placements(
@@ -1203,6 +1316,7 @@ impl Registry {
             placement: tables.placement.clone(),
             executors: tables.executors.clone(),
             replication: replicated(&self.replication),
+            retention: self.retention.keys.clone(),
             said: self
                 .said
                 .iter()
@@ -1257,6 +1371,7 @@ struct Snapshot {
     placement: HashMap<String, wit::Placement>,
     executors: HashMap<String, Vec<String>>,
     replication: BTreeMap<String, Vec<String>>,
+    retention: HashMap<String, i64>,
     said: HashMap<String, BTreeMap<String, Value>>,
     groups: HashMap<String, crate::directory::Group>,
     pools: Vec<String>,
@@ -1329,6 +1444,9 @@ impl Plane for Snapshot {
             Subject::Group(id) if name == "replication/sites" => Some(Value::Json(
                 serde_json::to_string(self.replication.get(id)?).unwrap_or_default(),
             )),
+            Subject::Group(id) if name == "retention/key" => {
+                self.retention.get(id).map(|key| Value::Int(*key))
+            }
             Subject::Process(id) => {
                 let (proc, live) = match (self.procs.get(id), self.exited.get(id)) {
                     (Some(proc), _) => (proc, true),
@@ -1499,6 +1617,7 @@ mod tests {
         RoutingTable {
             epoch: 1,
             scales: false,
+            author: None,
             workers: vec![RoutableWorker {
                 id: WorkerId(1),
                 addr: "w1".into(),
@@ -1732,6 +1851,7 @@ mod tests {
         let (router, cancelled, _moves) = Cluster::start(
             programs(names),
             table_rx,
+            watch::channel(None).1,
             connected_rx,
             crate::worker::WorkerRegistry::new(),
         )
@@ -1938,6 +2058,7 @@ mod tests {
             Cluster::start(
                 programs(&["cache-aware", "disaggregate"]),
                 table_rx,
+                watch::channel(None).1,
                 connected_rx,
                 crate::worker::WorkerRegistry::new(),
             )
@@ -1953,6 +2074,7 @@ mod tests {
         let started = Cluster::start(
             programs(&["test-route", "cache-aware"]),
             table_rx,
+            watch::channel(None).1,
             connected_rx,
             crate::worker::WorkerRegistry::new(),
         );
@@ -2035,6 +2157,7 @@ mod tests {
                 let what = match edge {
                     Edge::PlacementChanged(id) => format!("placement {id}"),
                     Edge::ReplicationChanged(id) => format!("replication {id}"),
+                    Edge::RetentionChanged(id) => format!("retention {id}"),
                     Edge::Published(subject) => format!("published {}", subject_key(&subject)),
                     other => format!("{other:?}"),
                 };
@@ -2171,6 +2294,224 @@ mod tests {
         );
     }
 
+    fn group(sites: &[u64]) -> crate::directory::Group {
+        crate::directory::Group {
+            keys: Arc::new(vec![[7; 32]]),
+            sites: sites.iter().copied().map(WorkerId).collect(),
+        }
+    }
+
+    fn retention(entries: &[(&str, i64)]) -> Table {
+        Table {
+            keys: entries.iter().map(|(g, k)| (g.to_string(), *k)).collect(),
+            floor: None,
+        }
+    }
+
+    #[test]
+    fn a_group_s_committed_retention_reads_as_its_key_and_only_a_changed_key_is_carried() {
+        let mut registry = Registry::default();
+        registry.replace_retention("r", retention(&[("g", 2), ("h", 0)]));
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("r".to_string(), "retention g".to_string())],
+            "h at 0 is where a group no entry names already is"
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        let key = |id: &str| plane.attr(&Subject::Group(id.into()), "retention/key");
+        assert!(matches!(key("g"), Some(Value::Int(2))));
+        assert!(matches!(key("h"), Some(Value::Int(0))));
+        assert!(key("other").is_none());
+
+        registry.replace_retention("r", retention(&[("g", 2)]));
+        assert!(carried_kinds(&mut registry).is_empty(), "no key changed");
+        registry.replace_retention("r", retention(&[("g", 3)]));
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("r".to_string(), "retention g".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_retained_group_no_pool_holds_is_asked_of_a_pool_highest_key_first() {
+        let mut registry = Registry {
+            groups: HashMap::from([
+                ("a".to_string(), group(&[1])),
+                ("b".to_string(), group(&[1])),
+                ("held".to_string(), group(&[1, 9])),
+                ("zero".to_string(), group(&[1])),
+            ]),
+            retention: retention(&[("a", 1), ("b", 5), ("held", 3), ("zero", 0), ("gone", 9)]),
+            ..Default::default()
+        };
+        assert!(
+            registry.retained().is_empty(),
+            "with no pool, the table is taken and nothing is asked"
+        );
+        registry.pools = vec!["9".into()];
+        assert_eq!(
+            registry.retained(),
+            [
+                ("b".to_string(), WorkerId(9)),
+                ("a".to_string(), WorkerId(9))
+            ],
+            "a pool already holds `held`, `zero` is at 0, `gone` is in no directory"
+        );
+    }
+
+    #[test]
+    fn a_gateway_that_is_not_the_author_takes_its_state_tables_and_does_not_enact_them() {
+        let shared = shared();
+        let mut registry = Registry {
+            groups: HashMap::from([("g".to_string(), group(&[1]))]),
+            pools: vec!["9".into()],
+            ..Default::default()
+        };
+        let commit = Commit {
+            state: super::super::StateCommit {
+                replication: Some(vec![wit::Replicate {
+                    group: "g".into(),
+                    upto: None,
+                    at: vec![wit::Site {
+                        worker: "2".into(),
+                        tier: wit::Tier::Host,
+                    }],
+                }]),
+                retention: Some(retention(&[("g", 4)])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enact(&shared, &mut registry, commit, "keeper");
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            matches!(
+                plane.attr(&Subject::Group("g".into()), "retention/key"),
+                Some(Value::Int(4))
+            ),
+            "taken: the programs read it"
+        );
+        assert!(
+            registry.wanted().is_empty(),
+            "not the author: nothing asked"
+        );
+        registry.author = true;
+        assert_eq!(
+            registry.wanted(),
+            [
+                ("g".to_string(), WorkerId(2), "replication"),
+                ("g".to_string(), WorkerId(9), "retention")
+            ],
+            "the author asks for what both tables want"
+        );
+
+        // The author is the gateway the routing table names.
+        let mut routing = table(0);
+        assert!(!crate::controller::authors(&routing, Some(GatewayId(1))));
+        routing.author = Some(GatewayId(1));
+        assert!(crate::controller::authors(&routing, Some(GatewayId(1))));
+        assert!(!crate::controller::authors(&routing, Some(GatewayId(2))));
+        assert!(!crate::controller::authors(&routing, None));
+    }
+
+    #[test]
+    fn a_group_only_a_pool_holds_is_listed_with_the_pool_its_site_and_not_asked_again() {
+        let directory = crate::directory::Directory::default();
+        let run = vec![[1; 32], [2; 32]];
+        directory.report(WorkerId(9), Some("p:9".into()), run.clone(), vec![], true);
+        directory.report_runs(WorkerId(9), vec![run], vec![], true, true);
+        let id = hex(&[2; 32]);
+        let registry = Registry {
+            groups: directory
+                .groups()
+                .into_iter()
+                .map(|(last, group)| (hex(&last), group))
+                .collect(),
+            pools: vec!["9".into()],
+            retention: retention(&[(&id, 1)]),
+            ..Default::default()
+        };
+        assert!(registry.retained().is_empty(), "the pool holds it");
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            matches!(plane.attr(&Subject::Group(id.clone()), "sites"), Some(Value::Json(j)) if j == r#"["9"]"#)
+        );
+        assert!(matches!(
+            plane.attr(&Subject::Group(id), "retention/key"),
+            Some(Value::Int(1))
+        ));
+    }
+
+    fn shared() -> Shared {
+        Shared {
+            tables: RwLock::default(),
+            scale: watch::Sender::new(None),
+            waiting: Mutex::default(),
+            refused: Mutex::default(),
+            cancels: mpsc::unbounded_channel().0,
+            migrations: mpsc::unbounded_channel().0,
+            heard: watch::Sender::new(0),
+            changed: Notify::new(),
+        }
+    }
+
+    #[test]
+    fn a_retention_table_is_committed_with_its_call_and_withdrawn_with_its_program() {
+        let shared = shared();
+        let mut registry = Registry {
+            groups: HashMap::from([("g".to_string(), group(&[1]))]),
+            pools: vec!["9".into()],
+            ..Default::default()
+        };
+        let commit = Commit {
+            state: super::super::StateCommit {
+                retention: Some(retention(&[("g", 4)])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enact(&shared, &mut registry, commit, "keeper");
+        assert!(registry.replaced, "enacted on the next round");
+        assert_eq!(registry.retained(), [("g".to_string(), WorkerId(9))]);
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("keeper".to_string(), "retention g".to_string())]
+        );
+
+        // A call that installs no retention table leaves the one standing.
+        enact(&shared, &mut registry, Commit::default(), "keeper");
+        assert_eq!(registry.retention.key("g"), 4);
+
+        // Its death, or a reload, withdraws it, and the others hear it.
+        let manifest: super::super::Manifest =
+            toml::from_str("plane = \"cluster\"\ngrants = [\"retention\"]").unwrap();
+        withdraw(&shared, &mut registry, "keeper", &manifest);
+        assert!(registry.retained().is_empty());
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("keeper".to_string(), "retention g".to_string())]
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            plane
+                .attr(&Subject::Group("g".into()), "retention/key")
+                .is_none()
+        );
+
+        // A program not granted retention leaves the table when it goes.
+        registry.replace_retention("keeper", retention(&[("g", 4)]));
+        let other: super::super::Manifest =
+            toml::from_str("plane = \"cluster\"\ngrants = [\"replication\"]").unwrap();
+        withdraw(&shared, &mut registry, "other", &other);
+        assert_eq!(registry.retention.key("g"), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retain_all_runs_beside_a_replicating_program_and_its_grant_is_enacted() {
+        assert!(capability("state.retain"));
+        let _rig = rig_of(0, &["retain-all", "replicate"]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_program_answers_another_s_placement_and_that_one_acts_on_the_answer() {
         // test-route places the process on worker 1; test-share, told the
@@ -2203,6 +2544,7 @@ mod tests {
             Cluster::start(
                 vec![("one".into(), share.clone()), ("two".into(), share)],
                 table_rx,
+                watch::channel(None).1,
                 connected_rx,
                 crate::worker::WorkerRegistry::new(),
             )

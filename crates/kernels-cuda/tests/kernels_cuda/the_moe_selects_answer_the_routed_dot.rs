@@ -375,6 +375,13 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         (8, 64, [512, 256, 64, 6], clamp, Some(true), None, 0.25),
         (16, 160, [512, 256, 16, 4], sw, None, None, 0.1),
         (16, 8, [512, 256, 8, 8], sw, None, None, 0.1),
+        // Qwen3-30B-A3B's FP8 experts: the down leg's K (768) six 128-blocks,
+        // its atoms' last four-column group half filled.
+        (16, 64, [2048, 768, 16, 8], sw, None, None, 0.1),
+        (16, 8, [2048, 768, 16, 8], sw, None, None, 0.1),
+        // GLM-4.5-Air's: K 1408, eleven 128-blocks.
+        (16, 1, [4096, 1408, 16, 8], sw, None, None, 0.1),
+        (16, 64, [4096, 1408, 16, 8], sw, None, None, 0.1),
     ];
     for (a, tokens, [hidden, inter, ex, top], g, gate, window, tol) in cases {
         let what = format!("{a} {tokens}x{top} over {ex}, gate {gate:?}, window {window:?}");

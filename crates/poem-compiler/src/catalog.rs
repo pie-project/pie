@@ -470,6 +470,7 @@ pub fn one_rank(w: Dtype, kv: Dtype) -> Deploy {
         tp: 1,
         parts: Vec::new(),
         drafter: None,
+        yarn: None,
     }
 }
 

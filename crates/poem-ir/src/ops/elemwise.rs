@@ -11,6 +11,17 @@ pub struct Yarn {
     pub original_max_position: u32,
 }
 
+/// A rotation's frequencies stated outright (a `rope_scaling` the model
+/// declares: linear, dynamic NTK, YaRN, llama3, longrope): one inverse
+/// frequency a turned pair, `inv_freq[i]` turning pair `i` where the plain
+/// rotation would turn it at `theta^(-i/span)`, and the scale both its cos
+/// and sin carry. Absent, a rotation turns at `theta` as it states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RopeFreqs {
+    pub inv_freq: Vec<f32>,
+    pub mscale: f32,
+}
+
 /// The norm a [`Elementwise::NormGate`] also lands over its output: `y =
 /// rmsnorm(out) * weight` (`1 + weight` where `plus_one`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -167,6 +178,8 @@ pub enum Elementwise {
         interleaved: bool,
         q_out: ValueId,
         k_out: ValueId,
+        #[serde(default)]
+        freqs: Option<RopeFreqs>,
     },
     /// The first `rotary_dim/2` pairs of each head turn, pair `i` being
     /// `(i, i + span)` at `theta^(-i/span)`: `span` is `rotary_dim/2` for a
@@ -182,6 +195,8 @@ pub enum Elementwise {
         span: u32,
         q_out: ValueId,
         k_out: ValueId,
+        #[serde(default)]
+        freqs: Option<RopeFreqs>,
     },
     RopeMrope {
         q: ValueId,
@@ -194,6 +209,8 @@ pub enum Elementwise {
         theta: f32,
         q_out: ValueId,
         k_out: ValueId,
+        #[serde(default)]
+        freqs: Option<RopeFreqs>,
     },
     RopePartialQ {
         q: ValueId,
@@ -203,6 +220,8 @@ pub enum Elementwise {
         theta: f32,
         span: u32,
         q_out: ValueId,
+        #[serde(default)]
+        freqs: Option<RopeFreqs>,
     },
     RopePartialLast {
         q: ValueId,

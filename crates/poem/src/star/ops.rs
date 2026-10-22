@@ -2183,7 +2183,15 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "elemwise",
         name: "rope_full",
-        params: &["q", "k", "positions", "head_dim", "theta", "interleaved"],
+        params: &[
+            "q",
+            "k",
+            "positions",
+            "head_dim",
+            "theta",
+            "interleaved",
+            "scaling",
+        ],
         call: |a, heap| {
             let q: Value = a.next()?;
             let k: Value = a.next()?;
@@ -2191,10 +2199,19 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
             let interleaved: bool = a.next()?;
+            let scaling: Option<RopeScaling> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_full", || {
-                    ops::elemwise::rope_full(&q, &k, &positions, head_dim, theta, interleaved)
+                    ops::elemwise::rope_full(
+                        &q,
+                        &k,
+                        &positions,
+                        head_dim,
+                        theta,
+                        interleaved,
+                        scaling,
+                    )
                 })?,
             )
         },
@@ -2210,6 +2227,7 @@ pub(crate) static OPS: &[Op] = &[
             "head_dim",
             "theta",
             "span",
+            "scaling",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -2219,11 +2237,12 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
             let span: Option<u32> = a.next()?;
+            let scaling: Option<RopeScaling> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_partial", || {
                     ops::elemwise::rope_partial(
-                        &q, &k, &positions, rotary_dim, head_dim, theta, span,
+                        &q, &k, &positions, rotary_dim, head_dim, theta, span, scaling,
                     )
                 })?,
             )
@@ -2232,7 +2251,15 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "elemwise",
         name: "rope_partial_q",
-        params: &["q", "positions", "rotary_dim", "head_dim", "theta", "span"],
+        params: &[
+            "q",
+            "positions",
+            "rotary_dim",
+            "head_dim",
+            "theta",
+            "span",
+            "scaling",
+        ],
         call: |a, heap| {
             let q: Value = a.next()?;
             let positions: Value = a.next()?;
@@ -2240,10 +2267,13 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
             let span: Option<u32> = a.next()?;
+            let scaling: Option<RopeScaling> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_partial_q", || {
-                    ops::elemwise::rope_partial_q(&q, &positions, rotary_dim, head_dim, theta, span)
+                    ops::elemwise::rope_partial_q(
+                        &q, &positions, rotary_dim, head_dim, theta, span, scaling,
+                    )
                 })?,
             )
         },
@@ -2633,6 +2663,7 @@ pub(crate) static OPS: &[Op] = &[
             "rotary_dim",
             "head_dim",
             "theta",
+            "scaling",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -2643,11 +2674,12 @@ pub(crate) static OPS: &[Op] = &[
             let rotary_dim: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
+            let scaling: Option<RopeScaling> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_mrope", || {
                     ops::elemwise::rope_mrope(
-                        &q, &k, &positions, sections, form, rotary_dim, head_dim, theta,
+                        &q, &k, &positions, sections, form, rotary_dim, head_dim, theta, scaling,
                     )
                 })?,
             )

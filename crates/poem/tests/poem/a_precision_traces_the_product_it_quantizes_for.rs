@@ -51,6 +51,7 @@ fn a_precision_traces_the_product_it_quantizes_for_every_case() {
     a_plain_dtype_reads_its_activations_as_they_are();
     an_fp8_block_weight_lands_raw_codes_beside_its_block_exponents();
     an_mxfp8_weight_lands_one_exponent_a_32_square_block();
+    an_ocp_mxfp8_weight_lands_one_exponent_a_32_of_each_row();
     an_fp8_tile_weight_lands_raw_codes_beside_its_f32_factors();
     the_words_name_each_precision();
 }
@@ -153,6 +154,36 @@ fn an_mxfp8_weight_lands_one_exponent_a_32_square_block() {
     );
 }
 
+fn an_ocp_mxfp8_weight_lands_one_exponent_a_32_of_each_row() {
+    let w8a8 = Precision::ACTED
+        .into_iter()
+        .find(|p| p.dtype == Dtype::Mxfp8)
+        .expect("mxfp8 is read at a W8A8 precision");
+    let trace = traced(w8a8);
+    let Linear::MatmulActQuant {
+        w,
+        quant,
+        input_scales,
+        scales: Some(scales),
+        ..
+    } = product(&trace)
+    else {
+        panic!("an mxfp8a8g32 product names its block exponents")
+    };
+    assert_eq!(*quant, ActQuant::E4m3 { gran: 32 });
+    assert_eq!(*input_scales, None);
+    let (codes, exps) = (param_of(&trace, *w), param_of(&trace, *scales));
+    assert_eq!(
+        (codes.dtype, codes.shape.as_slice()),
+        (Dtype::E4m3, &[384, HIDDEN][..])
+    );
+    assert_eq!(
+        (exps.dtype, exps.shape.as_slice()),
+        (Dtype::E8m0, &[384, 8][..]),
+        "one exponent a 1x32 block"
+    );
+}
+
 fn the_words_name_each_precision() {
     let words: Vec<String> = Precision::ACTED
         .into_iter()
@@ -167,7 +198,8 @@ fn the_words_name_each_precision() {
             "e4m3tile128a8",
             "e4m3g128a8",
             "fp8b32a8g32",
-            "mxfp4a8g32"
+            "mxfp4a8g32",
+            "mxfp8a8g32"
         ]
     );
     for word in &words {

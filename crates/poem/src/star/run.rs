@@ -69,6 +69,9 @@ pub struct Deploy {
     pub tp: u32,
     pub parts: Vec<String>,
     pub drafter: Option<String>,
+    /// The YaRN factor the deployment stretches the model's native context
+    /// by, past what its package states (`-yarn{factor}` in its name).
+    pub yarn: Option<u32>,
 }
 
 impl Deploy {
@@ -87,6 +90,13 @@ impl Deploy {
                 "drafter",
                 match &self.drafter {
                     Some(d) => heap.alloc(d.as_str()),
+                    None => Star::new_none(),
+                },
+            ),
+            (
+                "yarn",
+                match self.yarn {
+                    Some(factor) => heap.alloc(factor),
                     None => Star::new_none(),
                 },
             ),
@@ -273,14 +283,39 @@ impl Package {
             if let Some(why) = model.failed.borrow_mut().take() {
                 return Err(why);
             }
-            traced.map_err(|panic| {
+            let trace = traced.map_err(|panic| {
                 anyhow::anyhow!(
                     "`{name}` does not trace: {}",
                     crate::star::forward::panic_message(&*panic)
                 )
-            })
+            })?;
+            if let Some(factor) = deploy.yarn
+                && !stretched(&trace)
+            {
+                anyhow::bail!(
+                    "`{name}` stretches its context {factor} times by YaRN, and `{id}`'s package \
+                     turns no rotation at a scaling"
+                );
+            }
+            Ok(trace)
         })
     }
+}
+
+/// Whether some rotation of `trace` turns at stated frequencies.
+fn stretched(trace: &Trace) -> bool {
+    use poem_ir::{Elementwise, Operation};
+    trace.nodes.iter().any(|node| {
+        matches!(
+            &node.op,
+            Operation::Elementwise(
+                Elementwise::RopeFull { freqs: Some(_), .. }
+                    | Elementwise::RopePartial { freqs: Some(_), .. }
+                    | Elementwise::RopePartialQ { freqs: Some(_), .. }
+                    | Elementwise::RopeMrope { freqs: Some(_), .. }
+            )
+        )
+    })
 }
 
 /// A package's forward, as the DSL traces a model.

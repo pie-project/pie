@@ -164,7 +164,7 @@ impl OffloadConfig {
         ensure!(
             cfg!(feature = "nixl") || self.transfer != OffloadTransfer::Nixl,
             "[offload] transfer = \"nixl\" needs a build with the `nixl` feature; \"auto\" \
-             reads in place where the build can"
+             takes the bulk link"
         );
         Ok(())
     }
@@ -172,10 +172,14 @@ impl OffloadConfig {
 
 /// How KV pages cross between workers.
 ///
-/// `Nixl` and `Auto` read a peer's kv in place, device to device, where the
-/// build has the `nixl` feature (built against `NIXL_PREFIX`) and both
-/// workers export kv of one layout; otherwise, and with `Inline`, the pages'
-/// bytes ride the bulk link. A build without the feature refuses `Nixl`.
+/// `Nixl` reads a peer's kv in place, device to device, where both workers
+/// export kv of one layout; a build without the `nixl` feature (built
+/// against `NIXL_PREFIX`) refuses it. Otherwise the pages' bytes ride the
+/// bulk link, a peer's prefill streamed back a layer at a time as it is
+/// computed. `Auto` takes the bulk link: the stream overlaps the transfer
+/// with the prefill, a read in place starts only once it is done, and only
+/// the operator knows whether NIXL reaches the peer's device memory directly
+/// (RDMA, NVLink) or copies it through host memory over TCP.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OffloadTransfer {
@@ -412,6 +416,45 @@ fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+/// `[model] rope_scaling`: the YaRN a deployment stretches its model's
+/// native context by.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RopeScalingConfig {
+    #[serde(alias = "type")]
+    pub rope_type: String,
+    pub factor: f64,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<u32>,
+}
+
+impl RopeScalingConfig {
+    /// The whole YaRN factor this states.
+    ///
+    /// # Errors
+    ///
+    /// A type other than YaRN, or a factor not a whole number past one.
+    pub fn yarn(&self) -> Result<u32> {
+        ensure!(
+            self.rope_type == "yarn",
+            "model.rope_scaling: pie stretches a served context by YaRN, not {:?}; other \
+             scalings are what a model's own package states",
+            self.rope_type
+        );
+        ensure!(
+            self.factor > 1.0 && self.factor.fract() == 0.0 && self.factor < 1024.0,
+            "model.rope_scaling.factor is a whole number past 1, not {}",
+            self.factor
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "checked whole and in range above"
+        )]
+        Ok(self.factor as u32)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
@@ -441,6 +484,14 @@ pub struct ModelConfig {
     /// carries.
     #[serde(default)]
     pub drafter: Option<String>,
+    /// A rope scaling to serve the model past its native context, as
+    /// config.json (or vLLM's `--hf-overrides`) spells one: `{ rope_type =
+    /// "yarn", factor = 4 }`, the factor whole, its
+    /// `original_max_position_embeddings` the package's native context.
+    /// Unstated, a YaRN the checkpoint's config.json states is served where
+    /// the model's package does not turn one on its own.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
     /// Which backend runs the model, on what devices.
     pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
@@ -480,9 +531,11 @@ pub struct ModelConfig {
     /// How many pinned host bytes a preempted process's kv pages and
     /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
     /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
-    /// Omit for every seat at full context, and at least one device pool,
-    /// up to half the host memory the load leaves free (so workers sharing
-    /// a host each find room); a stated budget is capped by all of it. The
+    /// Omit for every seat at full context, at least one device pool and at
+    /// most four (cuda), up to half the host memory the load leaves free (so
+    /// workers sharing a host each find room); a stated budget is capped by
+    /// all of it. Pinned memory is slow to give back: a worker that dies
+    /// holds its host's other GPU processes ~0.2 s a GiB of it. The
     /// container's cgroup limit (v1 or v2) counts as the host's. pie cannot
     /// compute kv again, so this is where memory contention goes: it cannot
     /// be turned off.
@@ -787,6 +840,15 @@ impl ModelConfig {
             off,
             drafter,
             tp: None,
+            yarn: self
+                .rope_scaling
+                .as_ref()
+                .map(RopeScalingConfig::yarn)
+                .transpose()?,
+            yarn_original: self
+                .rope_scaling
+                .as_ref()
+                .and_then(|r| r.original_max_position_embeddings),
         })
     }
 

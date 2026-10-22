@@ -1,0 +1,98 @@
+# The weights of Qwen 3 MoE: per layer an RMS norm, q, k and v packed into
+# one projection with per-head q and k norms, the output projection, an RMS
+# norm, the router and the routed experts' banks (gate and up packed); the
+# token embedding, a final norm and the head. The deployment's first dtype
+# stores the projections, its second (or the first) the expert banks; the
+# norms, the router, the embedding and the head stay bf16 under a release's
+# FP8 or NVFP4. Each layer also has the LoRA banks the host registers.
+
+load("//lib/adapters/model.poem", "banks")
+
+def dims(hidden, layers, q_heads, kv_heads, experts, inter, theta):
+    return struct(
+        hidden = hidden,
+        layers = layers,
+        q_heads = q_heads,
+        kv_heads = kv_heads,
+        head_dim = 128,
+        experts = experts,
+        top_k = 8,
+        inter = inter,
+        vocab = 151936,
+        theta = theta,
+        norm_eps = 1e-6,
+    )
+
+A3B = dict(hidden = 2048, q_heads = 32, kv_heads = 4, inter = 768)
+A22B = dict(hidden = 4096, q_heads = 64, kv_heads = 4, inter = 1536)
+A35B = dict(hidden = 6144, q_heads = 96, kv_heads = 8, inter = 2560)
+
+DIMS = {
+    "qwen3-30b-a3b": dims(layers = 48, experts = 128, theta = 1000000.0, **A3B),
+    "qwen3-30b-a3b-2507": dims(layers = 48, experts = 128, theta = 10000000.0, **A3B),
+    "qwen3-30b-a3b-mini": dims(layers = 4, experts = 16, theta = 1000000.0, **A3B),
+    "qwen3-235b-a22b": dims(layers = 94, experts = 128, theta = 1000000.0, **A22B),
+    "qwen3-235b-a22b-2507": dims(layers = 94, experts = 128, theta = 5000000.0, **A22B),
+    "qwen3-235b-a22b-2507-mini": dims(layers = 4, experts = 16, theta = 5000000.0, **A22B),
+    "qwen3-coder-30b-a3b": dims(layers = 48, experts = 128, theta = 10000000.0, **A3B),
+    "qwen3-coder-480b-a35b": dims(layers = 62, experts = 160, theta = 10000000.0, **A35B),
+    "qwen3-coder-480b-a35b-mini": dims(layers = 4, experts = 16, theta = 10000000.0, **A35B),
+}
+
+# A release whose planes a deployment keeps as released, its tables bf16.
+RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4, dtype.nvfp4a4]
+
+def layout(id, deploy):
+    ws = deploy.weights
+    if len(ws) == 1:
+        proj, experts = ws[0], ws[0]
+    elif len(ws) == 2:
+        proj, experts = ws
+    else:
+        fail("{} stores its weights at one dtype, or its projections and experts at a dtype each; not {}".format(id, ws))
+    if deploy.drafter != None or deploy.parts:
+        fail("{} ships no drafter and no parts".format(id))
+    table = dtype.bf16 if proj in RELEASED else proj
+    dense = compute(table)
+    d = DIMS[id]
+    hidden, hd = d.hidden, d.head_dim
+    q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        return struct(
+            attn_norm = weight(n("attn_norm"), [hidden], dense),
+            qkv = weight(n("qkv"), [q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            o = weight(n("o"), [hidden, q_width], proj).rows(),
+            q_norm = weight(n("q_norm"), [hd], dense),
+            k_norm = weight(n("k_norm"), [hd], dense),
+            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
+            router = weight(n("router"), [d.experts, hidden], dense),
+            gate_up = weight(n("experts_gate_up"), [d.experts, 2 * d.inter, hidden], experts).bank([d.inter, d.inter]),
+            down = weight(n("experts_down"), [d.experts, hidden, d.inter], experts).rows(),
+            kv = "kv.{}".format(l),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        q_width = q_width,
+        kv_width = kv_width,
+        experts = d.experts,
+        top_k = d.top_k,
+        inter = d.inter,
+        theta = d.theta,
+        eps = d.norm_eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        kv = deploy.kv,
+        embed = weight("embed", [d.vocab, hidden], table),
+        head = weight("lm_head", [d.vocab, hidden], table).columns(),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight("final_norm", [hidden], dense),
+    )

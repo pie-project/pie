@@ -1,0 +1,41 @@
+# MiniMax-M2.5 and M2.7 (MiniMaxAI/MiniMax-M2.5, -M2.7): full grouped-query
+# attention, its q and k RMS-normed across all their heads, a quarter of each
+# head rotated; every layer routed experts picked by a biased sigmoid, no
+# shared expert. As released (FP8, 128-square blocks), as NVIDIA's modelopt
+# exports them in NVFP4 (attention bf16), and a miniature that reads the
+# first layers and experts of the whole model's checkpoint at full width.
+# The two releases differ in the identity their template states and the
+# context their configuration does.
+
+def spoken(name):
+    return template("minimax2", identity = "You are a helpful assistant. Your name is {} and is built by MiniMax.".format(name))
+
+TOKENIZER = tokenizer(markers = [["[e~["], ["]~!b[", "]~b]", "<think>", "</think>", "<minimax:tool_call>", "</minimax:tool_call>"]])
+
+def minimax(id, layers, name, mini = False):
+    return model(id, mini = mini, template = spoken(name), tokenizer = TOKENIZER, arch = "minimax_m2", layers = layers, vocab = 200064)
+
+MODELS = [
+    minimax("minimax-m25", layers = 62, name = "MiniMax-M2.5"),
+    minimax("minimax-m25-mini", layers = 4, name = "MiniMax-M2.5", mini = True),
+    minimax("minimax-m27", layers = 62, name = "MiniMax-M2.7"),
+]
+
+BF = dtype.bf16
+F8 = dtype.e4m3tile128a8
+NV4 = dtype.nvfp4a4
+NV4W = dtype.nvfp4
+
+def rows(id):
+    """A model's rows: the release's FP8 as released (projections and
+    experts against e4m3 activations), and modelopt's NVFP4 (attention bf16,
+    the experts against NVFP4 activations, or bf16 ones)."""
+    return [
+        deployment(id, weights = F8, kv = dtype.e4m3),
+        deployment(id, weights = F8, kv = BF),
+        deployment(id, weights = [BF, NV4], kv = dtype.e4m3),
+        deployment(id, weights = [BF, NV4], kv = BF),
+        deployment(id, weights = [BF, NV4W], kv = BF),
+    ]
+
+DEPLOYMENTS = rows("minimax-m25") + rows("minimax-m27") + rows("minimax-m25-mini")
