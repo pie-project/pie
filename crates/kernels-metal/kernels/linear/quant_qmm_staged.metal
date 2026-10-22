@@ -178,7 +178,7 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
   constexpr auto descriptor = matmul2d_descriptor(16, N, 32, false, true, false,
                                                   matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroup> multiply;
-  threadgroup float parts[INNER > 1 ? (INNER - 1) * 8 * 2 * N : GLU ? 8 * N : 1];
+  threadgroup float parts[INNER > 1 ? (INNER - 1) * 8 * N : GLU ? 8 * N : 1];
   auto a = multiply.get_left_input_cooperative_tensor<bfloat, half, float>();
   auto b = multiply.get_right_input_cooperative_tensor<bfloat, half, float>();
   auto total = multiply.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
@@ -193,12 +193,12 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
   const ushort q = (lane & 1) + 2 * ((lane >> 3) & 1);
   const ushort sub = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
   // INNER > 1 cuts the contraction across the threadgroup's simdgroups instead of the grid:
-  // simdgroup `simd` takes half simd % 2 of the 64 columns and part simd / 2 of k.
+  // the threadgroup takes 32 columns, and simdgroup `simd` part `simd` of k.
   // GLU: simdgroup 0 takes the gate's 32 columns of `columns` and 1 the up's, packed past them.
   const uint column = GLU ? simd * columns + position.x * N
-                          : position.x * 2 * N + (INNER > 1 ? simd % 2 : simd) * N;
+                          : INNER > 1 ? position.x * N : position.x * 2 * N + simd * N;
   const int spans = width / 256 / SPLIT / INNER;
-  const int first = (INNER > 1 ? int(simd / 2) : int(position.y)) * spans, last = first + spans;
+  const int first = (INNER > 1 ? int(simd) : int(position.y)) * spans, last = first + spans;
   const ulong words = ulong(stride) / 32, groups = ulong(stride) / 64;
   const bool live = int(sub) < rows;
   const device uint4 *codes =
@@ -221,8 +221,8 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
       if (simd == 1)
         parts[row * N + at[0]] = total[i];
     } else if constexpr (INNER > 1) {
-      if (simd >= 2)
-        parts[(simd / 2 - 1) * 8 * 2 * N + row * 2 * N + (simd % 2) * N + at[0]] = total[i];
+      if (simd >= 1)
+        parts[(simd - 1) * 8 * N + row * N + at[0]] = total[i];
     } else if constexpr (SPLIT > 1)
       partials[ulong(position.y) * rows * columns + o] = total[i];
     else
@@ -249,7 +249,7 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
   if constexpr (INNER > 1) {
     // The parts summed in k order from zero, as qmm_splitk_reduce sums a grid's.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd >= 2)
+    if (simd >= 1)
       return;
 #pragma unroll
     for (ushort i = 0; i < total.get_capacity(); ++i) {
@@ -262,7 +262,7 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
       float acc = 0.0f;
       acc += total[i];
       for (int part = 0; part < INNER - 1; ++part)
-        acc += parts[part * 8 * 2 * N + row * 2 * N + simd * N + at[0]];
+        acc += parts[part * 8 * N + row * N + at[0]];
       output[ulong(row) * columns + column + at[0]] = bfloat(acc);
     }
   }
@@ -292,11 +292,12 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
     }
     return;
   }
-  // An inner cut runs whole on the first two simdgroups here.
-  if (INNER > 1 && simd >= 2)
+  // An inner cut runs whole on the first simdgroup here, as the half its 32 columns are.
+  if (INNER > 1 && simd >= 1)
     return;
   staged_tile<8, SPLIT>(weights, scales, biases, input, output, width, columns, partials, rows,
-                        stride, position, lane, simd, stages, pairs);
+                        stride, INNER > 1 ? uint2(position.x / 2, 0) : position, lane,
+                        INNER > 1 ? position.x % 2 : simd, stages, pairs);
 #endif
 }
 

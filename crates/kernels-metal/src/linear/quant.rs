@@ -1388,7 +1388,7 @@ fn staged(
             return ctx.fire(
                 Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
                     [64 * split.unsigned_abs() * tiles.unsigned_abs(), 1, 1],
-                    [64 * split.unsigned_abs(), 1, 1],
+                    [32 * split.unsigned_abs(), 1, 1],
                 )),
                 &[
                     w.codes.arg(),
