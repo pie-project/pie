@@ -1818,6 +1818,18 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_END: AtomicU64 = AtomicU64::new(0);
+            let (start, end) = flight.pending.gpu_span_us();
+            let last = LAST_END.swap(end, Ordering::Relaxed);
+            let span = end.saturating_sub(start) as f64 / 1e3;
+            let gap = if last == 0 { 0.0 } else { start.saturating_sub(last) as f64 / 1e3 };
+            let draft = if span < 15.0 { " selector" } else { "" };
+            eprintln!("kernels: fire of {} row(s), {span:.3} ms on the device:", flight.lanes.max(8));
+            eprintln!("  {span:>9.3} ms      1 launch(es)  device_span{draft}");
+            eprintln!("  {gap:>9.3} ms      1 launch(es)  device_gap_before{draft}");
+        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(
