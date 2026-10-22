@@ -970,6 +970,20 @@ async def run(args: argparse.Namespace):
                             ),
                             process_id=str(proc.process_id),
                             prologue_us=obj.get("prologue_us") or None,
+                            speculation=(
+                                {
+                                    "rounds": obj.get("rounds"),
+                                    "drafted": obj.get("drafted"),
+                                    "accepted": obj.get("accepted"),
+                                    "plain_fires": obj.get("plain_fires"),
+                                    "verify": obj.get("verify"),
+                                    "prices_ms": obj.get("prices_ms"),
+                                    "budget_model": obj.get("budget_model"),
+                                    "budget_expected": obj.get("budget_expected"),
+                                }
+                                if "rounds" in obj
+                                else None
+                            ),
                             output_text=(
                                 obj.get("text", "") if args.dump_all_texts else None
                             ),
