@@ -9,8 +9,10 @@
 mod common;
 
 use common::Gpu;
-use kernels_rocm::channel::{self, BumpLane, MAX_RING, PublishLane, PullLane, SettleLane, Ticket};
 use kernels_rocm::hip::{self, rt};
+use kernels_rocm::runtime::channel::{
+    self, BumpLane, MAX_RING, PublishLane, PullLane, SettleLane, Ticket,
+};
 
 /// Host memory the device maps, as the engine's endpoints hold their words
 /// and mirrors.

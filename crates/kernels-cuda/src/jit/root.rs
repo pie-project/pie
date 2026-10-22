@@ -87,7 +87,7 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
         Toolchain::ANY,
     ),
     (
-        "collective/all_reduce.cuh",
+        "collective/all_reduce.cu",
         &[],
         Headers::LibraryAndUpstream,
         Toolchain::ANY,

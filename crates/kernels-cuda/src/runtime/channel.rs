@@ -2,7 +2,7 @@ use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Launch};
 
-const FILE: &str = "channel/channels.cuh";
+const FILE: &str = "runtime/channel.cu";
 
 pub type DevicePtr = u64;
 
@@ -54,11 +54,11 @@ impl Ticket {
 
 const _: () = assert!(
     core::mem::size_of::<Ticket>() == 64,
-    "channel::Ticket: sizeof disagrees with `channel/channels.cuh`'s Ticket",
+    "channel::Ticket: sizeof disagrees with `runtime/channel.cu`'s Ticket",
 );
 const _: () = assert!(
     core::mem::align_of::<Ticket>() == 8,
-    "channel::Ticket: alignof disagrees with `channel/channels.cuh`'s Ticket",
+    "channel::Ticket: alignof disagrees with `runtime/channel.cu`'s Ticket",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub struct PullLane {
 
 const _: () = assert!(
     core::mem::size_of::<PullLane>() == 32,
-    "channel::PullLane: sizeof disagrees with `channel/channels.cuh`'s PullLane",
+    "channel::PullLane: sizeof disagrees with `runtime/channel.cu`'s PullLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub struct BumpLane {
 
 const _: () = assert!(
     core::mem::size_of::<BumpLane>() == 72,
-    "channel::BumpLane: sizeof disagrees with `channel/channels.cuh`'s BumpLane",
+    "channel::BumpLane: sizeof disagrees with `runtime/channel.cu`'s BumpLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -106,7 +106,7 @@ pub struct PublishLane {
 
 const _: () = assert!(
     core::mem::size_of::<PublishLane>() == 16,
-    "channel::PublishLane: sizeof disagrees with `channel/channels.cuh`'s PublishLane",
+    "channel::PublishLane: sizeof disagrees with `runtime/channel.cu`'s PublishLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,7 +119,7 @@ pub struct SettleLane {
 
 const _: () = assert!(
     core::mem::size_of::<SettleLane>() == 16,
-    "channel::SettleLane: sizeof disagrees with `channel/channels.cuh`'s SettleLane",
+    "channel::SettleLane: sizeof disagrees with `runtime/channel.cu`'s SettleLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,7 +213,7 @@ pub fn gather_words(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::channel::gather_words")
+        Fire::at(FILE, "::pie::runtime::channel::gather_words")
             .apply(Launch::grid([run_count, 1, 1], [GATHER_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(runs),
@@ -235,7 +235,7 @@ pub fn pull_validate(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::channel::pull_validate")
+        Fire::at(FILE, "::pie::runtime::channel::pull_validate")
             .apply(Launch::grid([lane_count, 1, 1], [PULL_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(tickets),
@@ -252,7 +252,7 @@ pub fn commit_bump(ctx: &Ctx, lanes: DevicePtr, lane_count: u32) -> Result<(), E
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::channel::commit_bump")
+        Fire::at(FILE, "::pie::runtime::channel::commit_bump")
             .apply(Launch::grid([lane_count, 1, 1], [BUMP_BLOCK, 1, 1])),
         &[ArgValue::Ptr(lanes), ArgValue::U32(lane_count)],
     )
@@ -270,7 +270,7 @@ pub fn scatter_publish(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::channel::scatter_publish")
+        Fire::at(FILE, "::pie::runtime::channel::scatter_publish")
             .apply(Launch::grid([lane_count, 1, 1], [PULL_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(tickets),
@@ -292,7 +292,7 @@ pub fn settle(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::channel::settle")
+        Fire::at(FILE, "::pie::runtime::channel::settle")
             .apply(Launch::grid([lane_count, 1, 1], [SETTLE_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(tickets),
@@ -315,7 +315,7 @@ pub fn mask_from_commit(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::channel::mask_from_commit")
+        Fire::at(FILE, "::pie::runtime::channel::mask_from_commit")
             .apply(Launch::grid([lane_count, 1, 1], [MASK_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(commits),

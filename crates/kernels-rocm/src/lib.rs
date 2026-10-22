@@ -37,7 +37,6 @@ mod layout_concat_cols;
 #[path = "layout/pixels.rs"]
 mod layout_pixels;
 
-pub mod channel;
 pub mod collective;
 pub mod conv;
 pub mod custom;
@@ -45,12 +44,12 @@ pub mod disk;
 pub mod elemwise;
 pub mod error;
 pub mod gather;
-pub mod graph;
 #[cfg(feature = "rocm")]
 pub mod hip;
 pub mod jit;
 mod layout;
 pub mod linear;
+pub mod runtime;
 pub mod sampling;
 pub mod seat;
 pub mod source;

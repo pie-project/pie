@@ -5,7 +5,7 @@ use eta_exec::{ExecPlan, Extents};
 use eta_ir::container::HostRole;
 use eta_ir::registry::{GeometryClass, Port};
 use eta_ir::validate::Direction;
-use kernels_cuda::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
+use kernels_cuda::runtime::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
 use crate::device::Pinned;
 use crate::error::{Fault, Result};

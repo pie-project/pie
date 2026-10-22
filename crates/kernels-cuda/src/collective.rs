@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
 use crate::tensor::Tensor;
 
-const FILE: &str = "collective/all_reduce.cuh";
+const FILE: &str = "collective/all_reduce.cu";
 
 const THREADS: u32 = 512;
 

@@ -622,13 +622,13 @@ impl Shell {
             if wants_if {
                 warmed(
                     "conditional setter",
-                    kernels_cuda::graph::set_conditional(
+                    kernels_cuda::runtime::graph::set_conditional(
                         device.ctx(),
                         0,
                         0,
                         0,
                         false,
-                        kernels_cuda::graph::Arm::Warm,
+                        kernels_cuda::runtime::graph::Arm::Warm,
                         0,
                     ),
                 )?;
@@ -636,13 +636,13 @@ impl Shell {
             if wants_switch {
                 warmed(
                     "switch setter",
-                    kernels_cuda::graph::set_switch(
+                    kernels_cuda::runtime::graph::set_switch(
                         device.ctx(),
                         0,
                         0,
                         0,
                         0,
-                        kernels_cuda::graph::Arm::Warm,
+                        kernels_cuda::runtime::graph::Arm::Warm,
                         0,
                     ),
                 )?;

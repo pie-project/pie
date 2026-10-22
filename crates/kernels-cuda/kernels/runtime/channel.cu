@@ -1,9 +1,6 @@
-#pragma once
-
-
 #include "prim/device.cuh"
 
-namespace pie::channel {
+namespace pie::runtime::channel {
 
 constexpr u32 MAX_RING = 64;
 

@@ -1,10 +1,8 @@
-#pragma once
-
 extern "C" __device__ void cudaGraphSetConditional(
     unsigned long long handle,
     unsigned int value);
 
-namespace pie::graph {
+namespace pie::runtime::graph {
 
 __global__ void set_conditional(
     unsigned long long handle,
@@ -41,7 +39,7 @@ __global__ void set_conditional_byte(
 
 }
 
-namespace pie::graph {
+namespace pie::runtime::graph {
 
 __global__ void set_switch(
     unsigned long long handle,

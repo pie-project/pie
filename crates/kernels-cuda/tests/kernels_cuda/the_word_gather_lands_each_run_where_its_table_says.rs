@@ -1,7 +1,7 @@
 #![cfg(feature = "cuda")]
 
 use crate::common::Gpu;
-use kernels_cuda::channel::{WordRun, gather_words};
+use kernels_cuda::runtime::channel::{WordRun, gather_words};
 
 /// 300 runs of one to three words land one after another, five words in.
 #[test]

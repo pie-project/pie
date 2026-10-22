@@ -1174,13 +1174,13 @@ impl Sink for Cursor<'_> {
             match kind {
                 Kind::If => {
                     let (indptr, lanes, absent, win) = self.count_of(cond, region);
-                    kernels_cuda::graph::set_conditional(
+                    kernels_cuda::runtime::graph::set_conditional(
                         cond.setter,
                         handle,
                         indptr,
                         lanes,
                         absent,
-                        kernels_cuda::graph::Arm::Set,
+                        kernels_cuda::runtime::graph::Arm::Set,
                         win,
                     )
                     .map_err(|why| Fault::Unbound {
@@ -1195,13 +1195,13 @@ impl Sink for Cursor<'_> {
                         if absent {
                             return Err(unlowered(lowering));
                         }
-                        kernels_cuda::graph::set_switch(
+                        kernels_cuda::runtime::graph::set_switch(
                             cond.setter,
                             handle,
                             arm,
                             indptr,
                             lanes,
-                            kernels_cuda::graph::Arm::Set,
+                            kernels_cuda::runtime::graph::Arm::Set,
                             win,
                         )
                         .map_err(|why| Fault::Unbound {

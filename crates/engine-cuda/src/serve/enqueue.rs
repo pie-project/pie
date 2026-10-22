@@ -353,7 +353,7 @@ impl FireCtx<'_> {
             self.predicate
                 .write(self.device.stream(), &commits, &p.rs.lens)?;
             if p.rs.predicated {
-                kernels_cuda::channel::mask_from_commit(
+                kernels_cuda::runtime::channel::mask_from_commit(
                     self.device.ctx(),
                     self.predicate.commits(),
                     self.predicate.indptr(),
