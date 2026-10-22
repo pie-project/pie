@@ -31,9 +31,12 @@ fn answered(call: &'static str, status: LtStatus) -> Result<(), Refused> {
     }
 }
 
-/// The workspace a plan may ask for; the heuristic only offers algorithms
-/// that fit it.
-pub const WORKSPACE: usize = 32 << 20;
+/// The workspace a plan may ask for. On gfx950 (MI350) hipBLASLt's
+/// heuristic still offers its best algorithm when that one needs more than
+/// the cap, reporting a workspace of 0, and the launch then answers 6: a
+/// bf16 prefill projection (M=1024 N=2560 K=10240) wants 40-63 MiB there,
+/// so a 32 MiB cap refused every gemma-4 and Qwen3.6 prefill on the MI350X.
+pub const WORKSPACE: usize = 128 << 20;
 
 /// Row-major `y[m, n] = x[m, k] · w[n, k]ᵀ (+ bias[n])`; with `groups` > 1,
 /// that for each group g of a row: `y[m, g·n..][n] = x[m, g·k..][k] ·
