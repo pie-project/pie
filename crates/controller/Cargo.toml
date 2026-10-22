@@ -30,5 +30,8 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [lints]
 workspace = true

@@ -1,8 +1,8 @@
-# How a Nemotron-3 Super checkpoint is laid out: transformers' names under
-# `backbone.`, as modelopt's mixed-precision export stores them: routed
+# How a Nemotron-3 checkpoint is laid out: transformers' names under
+# `backbone.`. Super as modelopt's mixed-precision export stores it: routed
 # experts NVFP4 an expert a tensor, the projections it quantized e4m3 under
 # one scale, one shared expert's down projection NVFP4 (widened here), the
-# rest bf16.
+# rest bf16. Ultra's release: every plane bf16, an expert a tensor.
 
 load("//lib/modelopt/formats.poem", "nvfp4_bank")
 
@@ -42,6 +42,16 @@ def nvfp4_widened(reads, name):
     ])
     return out(name + ".blocked").scale_by(out(name + ".tensor"))
 
+def bank(reads, w, stems):
+    """A routed bank: NVFP4 legs as the export stores them, or bf16 planes
+    stacked on the leading axis."""
+    if w.dtype != dtype.bf16:
+        nvfp4_bank(reads, w, [[s] for s in stems])
+        return
+    dims = list(w.shape)
+    dims[w.cut_axis] = -1
+    reads.read_expr(w, concat(0, [src(s + ".weight") for s in stems]).transmute(dims, BF))
+
 def read(m, reads):
     reads.read(m.embed, "backbone.embeddings.weight")
     reads.read(m.final_norm, "backbone.norm_f.weight")
@@ -73,7 +83,7 @@ def read(m, reads):
             proj(reads, f.down_latent, mixer("fc1_latent_proj.weight"))
             proj(reads, f.up_latent, mixer("fc2_latent_proj.weight"))
             expert = lambda e, leaf: mixer("experts.{}.{}".format(e, leaf))
-            nvfp4_bank(reads, f.up, [[expert(e, "up_proj")] for e in range(m.experts)])
-            nvfp4_bank(reads, f.down, [[expert(e, "down_proj")] for e in range(m.experts)])
+            bank(reads, f.up, [expert(e, "up_proj") for e in range(m.experts)])
+            bank(reads, f.down, [expert(e, "down_proj") for e in range(m.experts)])
             proj(reads, f.shared_up, mixer("shared_experts.up_proj.weight"))
             proj(reads, f.shared_down, mixer("shared_experts.down_proj.weight"))

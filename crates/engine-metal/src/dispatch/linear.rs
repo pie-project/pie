@@ -44,11 +44,26 @@ impl Run<'_> {
                         w: *gate_up,
                         y: *packed,
                     })?;
-                    self.linear(&Linear::MlpSwiglu {
-                        packed: *packed,
-                        intermediate: *intermediate,
-                        y: *h,
-                    })?;
+                    // The down on the register tile reads its input table as
+                    // the swiglu lays it.
+                    let laid = self
+                        .register_counters(*h, *down, self.tensor(*y).width)
+                        .and_then(|counters| self.laid_table(*h, counters));
+                    match laid {
+                        Some((table, counters)) => linear::mlp::swiglu_table(
+                            self.ctx(),
+                            self.tensor(*packed),
+                            *intermediate,
+                            self.tensor(*h),
+                            table,
+                            counters,
+                        )?,
+                        None => self.linear(&Linear::MlpSwiglu {
+                            packed: *packed,
+                            intermediate: *intermediate,
+                            y: *h,
+                        })?,
+                    }
                     self.linear(&Linear::Matmul {
                         act: *h,
                         w: *down,
@@ -112,6 +127,7 @@ impl Run<'_> {
             linear::quant::Scratch {
                 precast: &|rows, contraction| self.precast(rows, contraction),
                 partials: &|rows, width| self.partials(rows, width),
+                table: None,
             },
             self.capacity(act).min(self.capacity(y)),
         )?;
@@ -146,6 +162,7 @@ impl Run<'_> {
         let scratch = || linear::quant::Scratch {
             precast: &precast,
             partials: &partials,
+            table: None,
         };
         let (x, gate, hidden, out) = (at(act), at(packed), at(h), at(y));
         linear::quant::matmul(
@@ -210,6 +227,7 @@ impl Run<'_> {
         let scratch = || linear::quant::Scratch {
             precast: &precast,
             partials: &partials,
+            table: None,
         };
         let rows = self.capacity(act);
         linear::quant::matmul(
@@ -270,6 +288,8 @@ impl Run<'_> {
                     {
                         return self.matmul_split(ane, &plan, *act, *y);
                     }
+                    // The matmuls of one activation (a layer's projections of
+                    // its normed rows) share the register tile's input table.
                     linear::quant::matmul(
                         self.ctx(),
                         self.tuning(),
@@ -279,6 +299,9 @@ impl Run<'_> {
                         linear::quant::Scratch {
                             precast: &|rows, contraction| self.precast(rows, contraction),
                             partials: &|rows, width| self.partials(rows, width),
+                            table: Some(&|rows, contraction, counters| {
+                                self.register_table(*act, rows, contraction, counters)
+                            }),
                         },
                         self.capacity(*act).min(self.capacity(*y)),
                     )
@@ -300,6 +323,9 @@ impl Run<'_> {
                     linear::quant::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
                         partials: &|rows, width| self.partials(rows, width),
+                        table: Some(&|rows, contraction, counters| {
+                            self.register_table(*act, rows, contraction, counters)
+                        }),
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
@@ -325,12 +351,26 @@ impl Run<'_> {
                     perm,
                     sorted_h,
                 ),
-                None => linear::mlp::swiglu(
-                    self.ctx(),
-                    self.tensor(*packed),
-                    *intermediate,
-                    self.tensor(*y),
-                ),
+                None => {
+                    // The down projection on the register tile reads its
+                    // input table as the activation lays it.
+                    match self.producer_table(*y) {
+                        Some((table, counters)) => linear::mlp::swiglu_table(
+                            self.ctx(),
+                            self.tensor(*packed),
+                            *intermediate,
+                            self.tensor(*y),
+                            table,
+                            counters,
+                        ),
+                        None => linear::mlp::swiglu(
+                            self.ctx(),
+                            self.tensor(*packed),
+                            *intermediate,
+                            self.tensor(*y),
+                        ),
+                    }
+                }
             },
             Linear::MlpSwigluClamp {
                 packed,
@@ -597,7 +637,7 @@ impl Run<'_> {
                 y,
             } => {
                 const OP: &str = "linear.moe_matmul_select_bias";
-                if let Some(scratch) = self.routed_scratch() {
+                if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
                         self.ctx(),
@@ -612,6 +652,9 @@ impl Run<'_> {
                         self.tuning(),
                         sorted,
                     )? {
+                        // The batched pass ran over the routed rooms, which
+                        // the precast room overlaps.
+                        self.knock_table();
                         return Ok(());
                     }
                     debug_assert!(
@@ -631,7 +674,7 @@ impl Run<'_> {
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
-                if let Some(scratch) = self.routed_scratch() {
+                if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
                         self.ctx(),
@@ -646,6 +689,9 @@ impl Run<'_> {
                         self.tuning(),
                         sorted,
                     )? {
+                        // The batched pass ran over the routed rooms, which
+                        // the precast room overlaps.
+                        self.knock_table();
                         return Ok(());
                     }
                     debug_assert!(

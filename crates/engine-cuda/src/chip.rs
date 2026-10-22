@@ -71,6 +71,13 @@ pub struct Grouped;
 #[decision(id = "engine.working_set_percent", constant(range(10..=90)), default = 50, tune = engine)]
 pub struct WorkingSetPercent(pub u32);
 
+/// The lanes of one fire that may capture attention scores: the score slab
+/// seats this many lanes' planes, each the whole model's heads by the kv
+/// ceiling, and the scheduler holds a fire's capturing lanes to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.scoring_lanes", constant(range(1..=256)), default = 8, tune = engine)]
+pub struct ScoringLanes(pub u32);
+
 /// Row buckets per doubling of the default lattice: 1 is powers of two, 2
 /// adds a bucket between each, which pads less and records more bodies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -118,9 +125,13 @@ pub struct HostPlanes;
 
 /// Rows from which the default bucket lattice takes
 /// `engine.prefill_lattice_steps` buckets a doubling whatever
-/// `engine.lattice_steps` says (a prefill's GEMMs run its bucket's rows); 0 never.
+/// `engine.lattice_steps` says (a prefill's GEMMs run its bucket's rows); 0
+/// never. Past a GEMM's ridge, where its rows cost compute rather than the
+/// weights' read, every padded row costs as much as a real one; the ridge
+/// (peak flops over memory bandwidth) is some 150 to 450 rows on the cards
+/// CUDA serves, so the default starts there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 0, tune = engine)]
+#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 256, tune = engine)]
 pub struct PrefillLatticeFrom(pub u32);
 
 /// Buckets a doubling the default lattice takes past `engine.prefill_lattice_from`.
@@ -136,6 +147,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
+        .add::<ScoringLanes>()
         .add::<LatticeSteps>()
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
@@ -217,6 +229,7 @@ pub struct Engine {
     pub copies: bool,
     pub grouped: bool,
     pub working_set_percent: u32,
+    pub scoring_lanes: u32,
     pub lattice_steps: u32,
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
@@ -247,6 +260,7 @@ impl Engine {
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
+            scoring_lanes: profile.get::<ScoringLanes>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
@@ -475,7 +489,7 @@ mod tests {
                 assert_eq!(tuning.moe_tc5, b200, "{gpu}");
                 assert_eq!(
                     tuning.ssm_gdn_fused_scan,
-                    major == 10 && minor == 0,
+                    (major, minor) == (10, 0) || (major, minor) == (12, 0),
                     "{gpu}"
                 );
                 assert_eq!(tuning.ssm_gdn_tc5, b200, "{gpu}");
@@ -642,7 +656,17 @@ mod tests {
                 assert_eq!((tuning.mxfp4_mma_from, tuning.mxfp4_mma_until), (28, 1024));
                 assert_eq!((tuning.bf16_mma_from, tuning.bf16_mma_until), (16, 65536));
             } else {
-                assert_eq!(tuning, defaults, "{gpu}");
+                // The 99 KiB and A100 families take the two-launch gated
+                // delta scan alone; Orin keeps the three wmma launches.
+                assert_eq!(
+                    kernels_cuda::tuning::Tuning {
+                        ssm_gdn_fused_scan: false,
+                        ..tuning
+                    },
+                    defaults,
+                    "{gpu}"
+                );
+                assert_eq!(tuning.ssm_gdn_fused_scan, minor != 7, "{gpu}");
             }
         }
     }
@@ -674,6 +698,7 @@ mod tests {
                 copies: true,
                 grouped: true,
                 working_set_percent: 50,
+                scoring_lanes: 8,
                 lattice_steps: 1,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
@@ -681,7 +706,7 @@ mod tests {
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 host_planes: false,
-                prefill_lattice_from: 0,
+                prefill_lattice_from: 256,
                 prefill_lattice_steps: 4,
             }
         );
@@ -759,15 +784,20 @@ mod tests {
         assert_eq!(Engine::of(&family).lattice_steps, 1);
     }
 
-    /// The two-launch gated delta scan is a Hopper and sm_100 family decision;
+    /// The two-launch gated delta scan is a decision of the A100, the 99 KiB
+    /// cards (a quarter head a block there), Hopper and the sm_100 family;
     /// every other family keeps the three wmma launches it ran before.
     #[cfg(not(feature = "rocm"))]
     #[test]
-    fn only_hopper_and_the_sm100_family_run_the_two_launch_gated_delta_scan() {
+    fn the_gated_delta_scan_runs_where_its_family_measured_it() {
         for (name, major, minor, sms) in [
             ("NVIDIA B200", 10, 0, 148),
             ("NVIDIA GB200", 10, 0, 152),
             ("NVIDIA H100 80GB HBM3", 9, 0, 132),
+            ("NVIDIA A100-SXM4-80GB", 8, 0, 108),
+            ("NVIDIA GeForce RTX 3090", 8, 6, 82),
+            ("NVIDIA L40S", 8, 9, 142),
+            ("NVIDIA GeForce RTX 5090", 12, 0, 170),
         ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
             assert!(
@@ -776,13 +806,9 @@ mod tests {
             );
         }
         for (name, major, minor, sms) in [
-            ("NVIDIA A100-SXM4-80GB", 8, 0, 108),
-            ("NVIDIA GeForce RTX 3090", 8, 6, 82),
             ("NVIDIA Jetson AGX Orin", 8, 7, 16),
-            ("NVIDIA L40S", 8, 9, 142),
             ("NVIDIA B300", 10, 3, 148),
             ("NVIDIA Thor", 11, 0, 20),
-            ("NVIDIA GeForce RTX 5090", 12, 0, 170),
             ("NVIDIA GB10", 12, 1, 48),
         ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
@@ -921,12 +947,19 @@ mod tests {
         assert!(report.untuned());
         for p in [&l40s, &rtx] {
             assert_eq!(Engine::of(p), Engine::of(&registry().defaults()));
+            assert!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_fused_scan);
             assert_eq!(
-                kernels_cuda::tuning::Tuning::of(p),
+                kernels_cuda::tuning::Tuning {
+                    ssm_gdn_fused_scan: false,
+                    ..kernels_cuda::tuning::Tuning::of(p)
+                },
                 kernels_cuda::tuning::Tuning::of(&registry().defaults()),
-                "what an Ada GPU ran before its family file"
+                "what an Ada GPU ran before its family file, past the gated delta scan"
             );
             for (spec, rungs, _) in p.entries() {
+                if spec.id == "kernel.ssm.gdn_fused_scan" {
+                    continue;
+                }
                 assert_eq!(
                     rungs,
                     registry()

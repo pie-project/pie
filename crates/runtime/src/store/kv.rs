@@ -643,6 +643,21 @@ impl KvStore {
         self.host_pool.try_alloc_n(n)
     }
 
+    /// Gives reserved backings back to the pools they came from.
+    fn release_backings(&mut self, backings: Vec<KvPageBacking>) {
+        let (mut device, mut host, mut disk) = (Vec::new(), Vec::new(), Vec::new());
+        for backing in backings {
+            match backing {
+                KvPageBacking::Resident(page) => device.push(page),
+                KvPageBacking::Swapped(slot) => host.push(slot),
+                KvPageBacking::OnDisk(slot) => disk.push(slot),
+            }
+        }
+        self.pool.release_reserved(device);
+        self.host_pool.release_reserved(host);
+        self.disk_pool.release_reserved(disk);
+    }
+
     pub fn free_host_slots(&mut self, slots: Vec<HostKvSlotId>) {
         self.host_pool.release_reserved(slots);
     }
@@ -659,10 +674,27 @@ impl KvStore {
         page_hashes: Vec<Hash256>,
         slots: Vec<HostKvSlotId>,
     ) -> bool {
-        debug_assert_eq!(token_hashes.len(), slots.len());
-        debug_assert_eq!(page_hashes.len(), slots.len());
-        let pages = slots.len() as u64;
-        if pages == 0 {
+        self.import_cached_at(
+            prefix,
+            token_hashes,
+            page_hashes,
+            slots.into_iter().map(KvPageBacking::Swapped).collect(),
+        )
+    }
+
+    /// [`Self::import_cached`] for pages that sit anywhere: host slots, or
+    /// device pages another worker's were read into. The backings are the
+    /// caller's reservations, given back if the prefix went.
+    pub fn import_cached_at(
+        &mut self,
+        prefix: &[Hash256],
+        token_hashes: Vec<Vec<Option<Hash256>>>,
+        page_hashes: Vec<Hash256>,
+        backings: Vec<KvPageBacking>,
+    ) -> bool {
+        debug_assert_eq!(token_hashes.len(), backings.len());
+        debug_assert_eq!(page_hashes.len(), backings.len());
+        if backings.is_empty() {
             return true;
         }
         let after = if prefix.is_empty() {
@@ -670,17 +702,14 @@ impl KvStore {
         } else {
             let run = self.table.sealed_run(prefix, false);
             if run.len() != prefix.len() {
-                self.host_pool.release_reserved(slots);
+                self.release_backings(backings);
                 return false;
             }
             run.last().copied()
         };
-        let node = self.table.insert_cached(
-            after,
-            slots.into_iter().map(KvPageBacking::Swapped).collect(),
-            token_hashes,
-            page_hashes,
-        );
+        let node = self
+            .table
+            .insert_cached(after, backings, token_hashes, page_hashes);
         self.table.lease_cache_root(node);
         // An entry's pages are its path's, from token 0: the prefix it was
         // grafted below as well as its own.
@@ -700,6 +729,19 @@ impl KvStore {
             },
         );
         true
+    }
+
+    /// The tokens' hashes of every page of `run`, page after page: what a
+    /// worker that keeps the run without computing it needs to go on from
+    /// it. `None` when a page of it is not hashed whole.
+    pub fn run_slots(&self, run: &[TriePageLocation]) -> Option<Vec<Hash256>> {
+        let mut slots = Vec::new();
+        for location in run {
+            for hash in self.table.token_hashes_at(location)? {
+                slots.push((*hash)?);
+            }
+        }
+        Some(slots)
     }
 
     /// A run of sealed pages, held so it is neither moved nor reclaimed while

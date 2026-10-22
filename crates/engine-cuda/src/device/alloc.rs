@@ -4,29 +4,27 @@ use crate::error::{Fault, Result};
 pub struct Buffer {
     ptr: u64,
     bytes: usize,
+    /// The device heap's class this is a cell of, and the device
+    /// (`device::held::heap`).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    carved: Option<(usize, i32)>,
 }
 
-/// `bytes` of device memory for a [`Buffer`], freed exactly once in its
-/// `Drop`; on ROCm, one an earlier drop kept when its last reader landed.
+/// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`,
+/// and the device heap's class when it is a cell of it: small spans are
+/// carved (`device::held::heap`), larger ones are one an earlier drop kept
+/// when its last reader landed, where there is one (`device::held::recycle`).
 #[cfg(feature = "device")]
-fn alloc(bytes: usize) -> Result<*mut core::ffi::c_void> {
-    #[cfg(feature = "rocm")]
-    {
-        crate::device::hip::held::recycle::alloc(bytes).map(|ptr| ptr as *mut core::ffi::c_void)
+fn alloc(bytes: usize) -> Result<(*mut core::ffi::c_void, Option<(usize, i32)>)> {
+    use crate::device::held::heap::{self, Kind};
+    if let Some(class) = heap::class_of(Kind::Device, bytes) {
+        let cell = heap::take(Kind::Device, class)?;
+        return Ok((
+            cell.device as *mut core::ffi::c_void,
+            Some((class, cell.ordinal)),
+        ));
     }
-    #[cfg(not(feature = "rocm"))]
-    {
-        use crate::device::rt;
-
-        let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: `base` is a live local the call fills.
-        let allocated = unsafe {
-            crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))
-        };
-        allocated
-            .map(|()| base)
-            .map_err(|fault| out_of_room(fault, bytes))
-    }
+    crate::device::held::recycle::alloc(bytes).map(|ptr| (ptr as *mut core::ffi::c_void, None))
 }
 
 #[cfg(feature = "device")]
@@ -55,13 +53,17 @@ pub(crate) fn out_of_room(fault: Fault, bytes: usize) -> Fault {
 impl Buffer {
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
-            return Ok(Buffer { ptr: 0, bytes: 0 });
+            return Ok(Buffer {
+                ptr: 0,
+                bytes: 0,
+                carved: None,
+            });
         }
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
 
-            let base = alloc(bytes)?;
+            let (base, carved) = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes.
             unsafe {
                 crate::device::ctx::check("cudaMemset", rt::cudaMemset(base, 0, bytes))?;
@@ -69,6 +71,7 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
+                carved,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -79,13 +82,17 @@ impl Buffer {
 
     pub fn zeroed_on(stream: *mut core::ffi::c_void, bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
-            return Ok(Buffer { ptr: 0, bytes: 0 });
+            return Ok(Buffer {
+                ptr: 0,
+                bytes: 0,
+                carved: None,
+            });
         }
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
 
-            let base = alloc(bytes)?;
+            let (base, carved) = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes, and
             // `stream` is the one every later read of it is ordered on.
             unsafe {
@@ -97,6 +104,7 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
+                carved,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -449,16 +457,21 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         if self.ptr != 0 {
-            // SAFETY: the pointer came from this buffer's own `cudaMalloc` and is freed exactly once.
-            unsafe {
-                let _ = crate::device::rt::cudaFree(self.ptr as *mut core::ffi::c_void);
+            use crate::device::held::heap::{self, Cell, Kind};
+            match self.carved {
+                Some((class, ordinal)) => heap::give(
+                    Kind::Device,
+                    class,
+                    Cell {
+                        host: 0,
+                        device: self.ptr,
+                        ordinal,
+                    },
+                ),
+                None => crate::device::held::recycle::release(self.ptr, self.bytes),
             }
-        }
-        #[cfg(feature = "rocm")]
-        if self.ptr != 0 {
-            crate::device::hip::held::recycle::release(self.ptr, self.bytes);
         }
     }
 }
@@ -476,6 +489,9 @@ enum Origin {
     Allocated,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     Registered,
+    /// A cell of the pinned heap, of this class (`device::held::heap`).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    Carved(usize),
 }
 
 // SAFETY: concurrent-access soundness comes from the channel's SPSC discipline above this type (guest and engine each own one control word), not from anything here; moving the allocation is as sound as a `Box<[u8]>`.
@@ -519,6 +535,25 @@ impl Pinned {
                 bytes: 0,
                 origin: Origin::Allocated,
             });
+        }
+        // Small spans are carved from the pinned heap: pinning afresh takes
+        // the driver's lock, which another process's teardown may hold.
+        #[cfg(feature = "device")]
+        if let Some(class) =
+            crate::device::held::heap::class_of(crate::device::held::heap::Kind::Pinned, bytes)
+        {
+            let cell =
+                crate::device::held::heap::take(crate::device::held::heap::Kind::Pinned, class)?;
+            let pinned = Pinned {
+                host: cell.host as *mut u8,
+                device: cell.device,
+                bytes,
+                origin: Origin::Carved(class),
+            };
+            if zeroed {
+                pinned.zero();
+            }
+            return Ok(pinned);
         }
         #[cfg(feature = "device")]
         {
@@ -624,6 +659,18 @@ impl Drop for Pinned {
                     let _ = crate::device::rt::cudaFreeHost(self.host.cast());
                 }
             }
+            #[cfg(feature = "device")]
+            Origin::Carved(class) => crate::device::held::heap::give(
+                crate::device::held::heap::Kind::Pinned,
+                class,
+                crate::device::held::heap::Cell {
+                    host: self.host as usize,
+                    device: self.device,
+                    ordinal: -1,
+                },
+            ),
+            #[cfg(not(feature = "device"))]
+            Origin::Carved(_) => {}
             Origin::Registered => {
                 #[cfg(feature = "device")]
                 // SAFETY: the span is the one this structure registered.
@@ -703,6 +750,34 @@ pub struct Pinning {
 unsafe impl Send for Pinning {}
 
 impl Pinning {
+    /// `bytes` (rounded up to whole 2 MiB pages) from the kernel's reserved
+    /// huge pages (`vm.nr_hugepages`), or `None` when the pool cannot hold
+    /// them: reserved pages are set aside whole, so this never compacts, and
+    /// their unpinning when the process dies holds the driver's lock a fifth
+    /// as long as 4 KiB pages'.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn huge(bytes: usize) -> Option<Pinning> {
+        const HUGE_PAGE: usize = 2 << 20;
+        let bytes = bytes.max(1).next_multiple_of(HUGE_PAGE);
+        // SAFETY: a fresh private anonymous mapping of a stated length from
+        // the huge page pool; no fd, no offset, owned by nobody else.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                -1,
+                0,
+            )
+        };
+        (at != libc::MAP_FAILED).then(|| Pinning {
+            host: at.cast(),
+            bytes,
+        })
+    }
+
     pub fn uninit(bytes: usize) -> Result<Pinning> {
         let Some(at) = map_anon(bytes) else {
             return Err(Fault::Device {
@@ -910,6 +985,80 @@ pub fn copy_d2d(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
         let _ = (stream, dst, src);
         Err(Fault::Runtimeless)
     }
+}
+
+/// Copies every `(dst, src, bytes)` span between the device and pinned host
+/// memory in one call: a tier move of fragmented pages is thousands of spans
+/// (a page a plane), and a call each kept the engine's thread ~4 us a span.
+pub fn copy_batch(
+    stream: *mut core::ffi::c_void,
+    to_host: bool,
+    spans: &[(u64, u64, usize)],
+) -> Result<()> {
+    let live: Vec<(u64, u64, usize)> = spans.iter().copied().filter(|s| s.2 > 0).collect();
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+    if live.len() > 1 {
+        use crate::device::rt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REFUSED: AtomicBool = AtomicBool::new(false);
+        if !REFUSED.load(Ordering::Relaxed)
+            && let Some(device) = crate::device::held::current_device()
+        {
+            let dsts: Vec<*mut core::ffi::c_void> =
+                live.iter().map(|s| s.0 as *mut core::ffi::c_void).collect();
+            let srcs: Vec<*const core::ffi::c_void> = live
+                .iter()
+                .map(|s| s.1 as *const core::ffi::c_void)
+                .collect();
+            let sizes: Vec<usize> = live.iter().map(|s| s.2).collect();
+            let host = rt::cudaMemLocation {
+                type_: rt::cudaMemLocationType::cudaMemLocationTypeHost,
+                id: 0,
+            };
+            let on_device = rt::cudaMemLocation {
+                type_: rt::cudaMemLocationType::cudaMemLocationTypeDevice,
+                id: device,
+            };
+            let (src_hint, dst_hint) = if to_host {
+                (on_device, host)
+            } else {
+                (host, on_device)
+            };
+            let mut attrs = [rt::cudaMemcpyAttributes {
+                srcAccessOrder: rt::cudaMemcpySrcAccessOrder::cudaMemcpySrcAccessOrderStream,
+                srcLocHint: src_hint,
+                dstLocHint: dst_hint,
+                flags: 0,
+            }];
+            let mut attrs_at = [0usize];
+            // SAFETY: the spans are the caller's: device spans it resolved
+            // against its arenas, host spans inside its pinned tier.
+            let status = unsafe {
+                rt::cudaMemcpyBatchAsync(
+                    dsts.as_ptr(),
+                    srcs.as_ptr(),
+                    sizes.as_ptr(),
+                    live.len(),
+                    attrs.as_mut_ptr(),
+                    attrs_at.as_mut_ptr(),
+                    1,
+                    stream.cast(),
+                )
+            };
+            if status == rt::cudaError::cudaSuccess {
+                return Ok(());
+            }
+            // SAFETY: clearing the sticky error of the refused batch.
+            let _ = unsafe { rt::cudaGetLastError() };
+            REFUSED.store(true, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(all(feature = "cuda", not(feature = "rocm"))))]
+    let _ = to_host;
+    for (dst, src, bytes) in live {
+        copy_any(stream, dst, src, bytes)?;
+    }
+    Ok(())
 }
 
 pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {

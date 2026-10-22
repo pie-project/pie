@@ -119,4 +119,35 @@ pub struct RecurrentPool {
     pub begin_at: Tensor,
 
     pub fused_decay: bool,
+
+    pub snapshots: Snapshots,
+}
+
+/// The rows inside each lane whose state lands in a slot of its own: a
+/// lane's entries are `indptr[lane]..indptr[lane + 1]` of `rows` (inside the
+/// lane, ascending) and `slots`, all i32; `count` entries in the fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Snapshots {
+    pub indptr: Tensor,
+
+    pub rows: Tensor,
+
+    pub slots: Tensor,
+
+    pub count: u32,
+}
+
+impl Snapshots {
+    pub const NONE: Snapshots = Snapshots {
+        indptr: Tensor::ABSENT,
+        rows: Tensor::ABSENT,
+        slots: Tensor::ABSENT,
+        count: 0,
+    };
+
+    /// The kernels' `snap, snap_rows, snap_slots`.
+    #[must_use]
+    pub const fn args(&self) -> [ArgValue; 3] {
+        [self.indptr.arg(), self.rows.arg(), self.slots.arg()]
+    }
 }

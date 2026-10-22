@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "../common/register_table.metal"
 
 using namespace metal;
 
@@ -40,6 +41,43 @@ template <typename T>
       const constant uint&, uint2);
 
 instantiate_packed_swiglu(bfloat16, bfloat)
+
+// packed_swiglu over at most eight rows that also lays the register tile's
+// input table of the rows it writes, so the down projection runs no table
+// pass: a threadgroup per row of the table's eight, the rows past `rows` laid
+// as zeros, the first zeroing the split tile's `counters` arrival counters.
+[[kernel]] void packed_swiglu_table(
+    const device bfloat* packed [[buffer(0)]],
+    device bfloat* out          [[buffer(1)]],
+    const constant uint& intermediate [[buffer(2)]],
+    device bfloat* table        [[buffer(3)]],
+    const constant uint& rows   [[buffer(4)]],
+    const constant uint& counters [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 lid2 [[thread_position_in_threadgroup]],
+    uint2 threads2 [[threads_per_threadgroup]]) {
+  threadgroup bfloat values[8192];
+  const uint lid = lid2.x, threads = threads2.x;
+  const uint width = intermediate, row = group.y;
+  const bool live = row < rows;
+  const size_t at = size_t(row) * size_t(width);
+  for (uint k = lid; k < width; k += threads) {
+    bfloat v = bfloat(0.0f);
+    if (live) {
+      const float g = float(packed[at * 2 + k]);
+      const float u = float(packed[at * 2 + width + k]);
+      v = static_cast<bfloat>((g / (1.0f + metal::exp(-g))) * u);
+      out[at + k] = v;
+    }
+    table[register_table::slot(k, row)] = v;
+    values[k] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const threadgroup bfloat* laid = values;
+  register_table::lay_sums(laid, table, width, row, lid, threads);
+  if (row == 0)
+    register_table::lay_rest(table, width, 8, counters, lid, threads);
+}
 
 template <typename T>
 [[kernel]] void packed_swiglu_clamp(

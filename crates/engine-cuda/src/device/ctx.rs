@@ -62,6 +62,12 @@ pub struct Context {
     ordinal: i32,
     stream: *mut c_void,
     notify: *mut c_void,
+    /// Where taps read pages out, behind the layers that wrote them.
+    tap: *mut c_void,
+    /// Where kv pages move between the device and the host tier, beside
+    /// the fires: a move waits on the fires that wrote its pages, and a fire
+    /// on the moves that hold its own.
+    swap: *mut c_void,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     cublas: *mut c_void,
     ctx: Ctx,
@@ -88,8 +94,19 @@ impl Context {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
-                #[cfg(feature = "rocm")]
-                crate::device::hip::held::pool::adopt_stream(ordinal, stream.cast());
+                crate::device::held::adopt_stream(ordinal, stream.cast());
+                // The heaps' first chunks, while the load may wait.
+                let reserved =
+                    crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned)
+                        .and_then(|()| {
+                            crate::device::held::heap::reserve(
+                                crate::device::held::heap::Kind::Device,
+                            )
+                        });
+                if let Err(fault) = reserved {
+                    destroy_stream(ordinal, stream.cast());
+                    return Err(fault);
+                }
 
                 let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
                 let status = blas::cublasCreate_v2(&raw mut handle);
@@ -121,8 +138,35 @@ impl Context {
                     });
                 }
 
+                let mut tap: rt::cudaStream_t = core::ptr::null_mut();
+                let status = rt::cudaStreamCreateWithFlags(&raw mut tap, 1);
+                if status != rt::cudaError::cudaSuccess {
+                    let _ = rt::cudaStreamDestroy(notify);
+                    blas::cublasDestroy_v2(handle);
+                    destroy_stream(ordinal, stream.cast());
+                    return Err(Fault::Device {
+                        call: "cudaStreamCreateWithFlags",
+                        code: status as i32,
+                    });
+                }
+
+                let mut swap: rt::cudaStream_t = core::ptr::null_mut();
+                let status = rt::cudaStreamCreateWithFlags(&raw mut swap, 1);
+                if status != rt::cudaError::cudaSuccess {
+                    let _ = rt::cudaStreamDestroy(tap);
+                    let _ = rt::cudaStreamDestroy(notify);
+                    blas::cublasDestroy_v2(handle);
+                    destroy_stream(ordinal, stream.cast());
+                    return Err(Fault::Device {
+                        call: "cudaStreamCreateWithFlags",
+                        code: status as i32,
+                    });
+                }
+
                 let stream: *mut c_void = stream.cast();
                 let notify: *mut c_void = notify.cast();
+                let tap: *mut c_void = tap.cast();
+                let swap: *mut c_void = swap.cast();
                 let cublas: *mut c_void = handle.cast();
                 let slabs = Slabs::open();
                 slabs.attach(stream);
@@ -169,6 +213,8 @@ impl Context {
                     ordinal,
                     stream,
                     notify,
+                    tap,
+                    swap,
                     cublas,
                     ctx,
                     slabs,
@@ -209,33 +255,18 @@ impl Context {
         self.notify
     }
 
-    pub fn host_fn(&self, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
-        #[cfg(feature = "device")]
-        {
-            use crate::device::rt;
+    #[must_use]
+    pub fn tap_stream(&self) -> *mut c_void {
+        self.tap
+    }
 
-            let carried: *mut Box<dyn FnOnce() + Send + 'static> = Box::into_raw(Box::new(work));
-            // SAFETY: carried is a live leaked allocation, reclaimed exactly
-            // once — here on the failure path, or by the trampoline.
-            let code = unsafe {
-                rt::cudaLaunchHostFunc(self.notify.cast(), Some(host_fn_trampoline), carried.cast())
-            };
-            if code != rt::cudaError::cudaSuccess {
-                // SAFETY: the launch failed, so nothing else will ever see
-                // this pointer; reclaiming it here avoids a leak.
-                drop(unsafe { Box::from_raw(carried) });
-                return Err(Fault::Device {
-                    call: "cudaLaunchHostFunc",
-                    code: code as i32,
-                });
-            }
-            Ok(())
-        }
-        #[cfg(not(feature = "device"))]
-        {
-            let _ = work;
-            Err(Fault::Runtimeless)
-        }
+    #[must_use]
+    pub fn swap_stream(&self) -> *mut c_void {
+        self.swap
+    }
+
+    pub fn host_fn(&self, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
+        host_fn_on(self.notify, work)
     }
 
     pub fn open_lanes(&mut self, side: u32, events: u32) -> Result<()> {
@@ -392,11 +423,19 @@ impl Context {
     pub fn synchronize(&self) -> Result<()> {
         #[cfg(feature = "device")]
         {
-            // SAFETY: both handles are live for this context's lifetime.
+            // SAFETY: the handles are live for this context's lifetime.
             unsafe {
                 check(
                     "cudaStreamSynchronize",
                     crate::device::rt::cudaStreamSynchronize(self.stream.cast()),
+                )?;
+                check(
+                    "cudaStreamSynchronize",
+                    crate::device::rt::cudaStreamSynchronize(self.swap.cast()),
+                )?;
+                check(
+                    "cudaStreamSynchronize",
+                    crate::device::rt::cudaStreamSynchronize(self.tap.cast()),
                 )?;
                 check(
                     "cudaStreamSynchronize",
@@ -437,8 +476,44 @@ impl Drop for Context {
                 if !self.notify.is_null() {
                     let _ = crate::device::rt::cudaStreamDestroy(self.notify.cast());
                 }
+                if !self.tap.is_null() {
+                    let _ = crate::device::rt::cudaStreamDestroy(self.tap.cast());
+                }
+                if !self.swap.is_null() {
+                    let _ = crate::device::rt::cudaStreamDestroy(self.swap.cast());
+                }
             }
         }
+    }
+}
+
+/// `work` on the host once what `stream` has before it is done.
+pub fn host_fn_on(stream: *mut c_void, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
+    #[cfg(feature = "device")]
+    {
+        use crate::device::rt;
+
+        let carried: *mut Box<dyn FnOnce() + Send + 'static> = Box::into_raw(Box::new(work));
+        // SAFETY: carried is a live leaked allocation, reclaimed exactly
+        // once — here on the failure path, or by the trampoline.
+        let code = unsafe {
+            rt::cudaLaunchHostFunc(stream.cast(), Some(host_fn_trampoline), carried.cast())
+        };
+        if code != rt::cudaError::cudaSuccess {
+            // SAFETY: the launch failed, so nothing else will ever see
+            // this pointer; reclaiming it here avoids a leak.
+            drop(unsafe { Box::from_raw(carried) });
+            return Err(Fault::Device {
+                call: "cudaLaunchHostFunc",
+                code: code as i32,
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (stream, work);
+        Err(Fault::Runtimeless)
     }
 }
 
@@ -541,25 +616,18 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
     }
 }
 
-/// Destroys a context's compute stream; on ROCm, out of the reach of the
-/// memory held behind it first.
+/// Destroys a context's compute stream, out of the reach of the memory held
+/// behind it first.
 ///
 /// # Safety
 ///
 /// `stream` is a live stream nothing launches on again.
 #[cfg(feature = "device")]
 unsafe fn destroy_stream(ordinal: i32, stream: *mut c_void) {
-    #[cfg(feature = "rocm")]
-    crate::device::hip::held::pool::retire_stream(ordinal, stream, || {
+    crate::device::held::retire_stream(ordinal, stream, || {
         // SAFETY: as the caller promises.
         let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
     });
-    #[cfg(not(feature = "rocm"))]
-    {
-        let _ = ordinal;
-        // SAFETY: as the caller promises.
-        let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
-    }
 }
 
 #[cfg(feature = "device")]

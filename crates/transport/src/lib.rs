@@ -10,7 +10,7 @@ pub use crate::core::{
 };
 pub use backends::local::{D2dCopier, LocalBackend};
 #[cfg(feature = "nixl")]
-pub use backends::nixl::NixlBackend;
+pub use backends::nixl::{NixlBackend, objects::Objects};
 pub use error::{Result, TransportError};
 pub use registry::Registry;
 

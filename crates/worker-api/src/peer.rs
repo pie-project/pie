@@ -21,6 +21,19 @@ pub struct Hello {
     pub identity: Option<ModelIdentity>,
     pub class: Option<NumericsClass>,
     pub format: Option<StateFormat>,
+    /// How another worker reads this one's kv in place; `None`: only its
+    /// pages' bytes, over the bulk link.
+    #[serde(default)]
+    pub kv: Option<KvAccess>,
+}
+
+/// A worker's kv as another reads it in place: its engine's exported kv
+/// handle (`engine::KvHandle`, as serde writes it in JSON) and the transfer
+/// agent that reaches it (NIXL's metadata).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvAccess {
+    pub handle: Vec<u8>,
+    pub agent: Vec<u8>,
 }
 
 /// Prefill `tokens` and return the pages from `from_page` on that the run
@@ -33,6 +46,23 @@ pub struct Prefill {
     /// The asker's bulk-bytes address: the executor fetches from it, by key,
     /// the pages before `from_page` it holds nowhere itself.
     pub home: Option<String>,
+    /// How the asker takes the pages.
+    #[serde(default)]
+    pub delivery: Delivery,
+}
+
+/// How an asker takes a prefill's pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Delivery {
+    /// Fetched by key over the bulk link once the prefill is done.
+    #[default]
+    Fetched,
+    /// Read in place: hold them on the device, and say where, until the
+    /// asker releases them.
+    InPlace,
+    /// Fetched by key at once, each layer of them sent as the executor
+    /// computes it, where its engine can; else as fetched.
+    Streamed,
 }
 
 /// The pages a prefill sealed, left in the executor's cache: `count` from
@@ -45,6 +75,17 @@ pub struct Pages {
     pub class: NumericsClass,
     pub format: StateFormat,
     pub bulk: String,
+    /// Where the pages are held for an in-place read, if they are.
+    #[serde(default)]
+    pub held: Option<HeldPages>,
+}
+
+/// An executor's pages held for one in-place read: their device page ids,
+/// in order, until [`Peer::release`] of `lease`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldPages {
+    pub lease: u64,
+    pub pages: Vec<u32>,
 }
 
 #[tarpc::service]
@@ -52,4 +93,7 @@ pub trait Peer {
     async fn hello(hello: Hello) -> Result<Hello, String>;
 
     async fn prefill(request: Prefill) -> Result<Pages, String>;
+
+    /// The asker has read the pages a lease held.
+    async fn release(lease: u64) -> Result<(), String>;
 }

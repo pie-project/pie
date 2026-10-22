@@ -31,6 +31,10 @@ pub struct Request {
     pub message: ClientMessage,
     #[serde(default)]
     pub cluster_props: client_api::Props,
+    /// Workers the cluster policy names to run this process's passes, best
+    /// first (`placement.executors`); empty leaves them to the worker plane.
+    #[serde(default)]
+    pub executors: Vec<WorkerId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +63,10 @@ pub enum Control {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateReport {
     pub peer: Option<String>,
+    /// Where this worker's peer link listens: other workers send it passes
+    /// there.
+    #[serde(default)]
+    pub link: Option<String>,
     pub added: Vec<[u8; 32]>,
     pub removed: Vec<[u8; 32]>,
     pub full: bool,

@@ -284,6 +284,7 @@ fn a_random_activation_answers_the_host_decoded_weights(
     let scratch = quant::Scratch {
         precast: &none,
         partials: &none,
+        table: None,
     };
     let frame = device.frame().expect("a frame");
     let sink = Sink::new(device, &frame, pipelines, handles);

@@ -8,7 +8,10 @@
 //!
 //! `path` and `query` are there for the APIs that put meaning in them (Gemini
 //! chooses streaming by path); `time` is the request's wall-clock arrival in
-//! unix seconds, because the guest has no wall clock of its own. An input
+//! unix seconds, because the guest has no wall clock of its own. Its HTTP
+//! routes add `"continuable": true`, and `continuation` when they continue a
+//! turn whose worker was lost ([`crate::continuation`]); a `continuation`
+//! without `continuable`, or one that does not read, is refused. An input
 //! without a `body` key is taken to be the body itself, so `pie run` with a
 //! hand-written request works too.
 
@@ -24,8 +27,6 @@ pub struct Envelope {
     /// Unix seconds at the gateway, or 0 when the program was not launched
     /// through it.
     pub time: u64,
-    /// Set when the turn moved here from another worker.
-    pub resume: Option<crate::resume::Resume>,
 }
 
 impl Envelope {
@@ -41,7 +42,6 @@ impl Envelope {
                 query: BTreeMap::new(),
                 body: Value::Object(object),
                 time: 0,
-                resume: None,
             });
         };
         let path = object
@@ -65,14 +65,23 @@ impl Envelope {
             })
             .unwrap_or_default();
         let time = object.get("time").and_then(Value::as_u64).unwrap_or(0);
-        let resume = object.get("resume").and_then(crate::resume::Resume::parse);
-        crate::resume::set(resume.clone());
+        let continuable = object.get("continuable").and_then(Value::as_bool) == Some(true);
+        let continuation = match object.get("continuation") {
+            None => None,
+            Some(_) if !continuable => {
+                return Err("`continuation` is the gateway's, on a continuable input".into());
+            }
+            Some(value) => Some(
+                crate::continuation::Continuation::of(value)
+                    .ok_or("`continuation` does not read: an id, tokens and frames")?,
+            ),
+        };
+        crate::continuation::begin(continuable, continuation);
         Ok(Self {
             path,
             query,
             body,
             time,
-            resume,
         })
     }
 }
@@ -98,6 +107,21 @@ mod tests {
         assert_eq!(bare.body, serde_json::json!({"messages": []}));
         assert_eq!(bare.time, 0);
 
+        assert!(
+            Envelope::parse(r#"{"body":{},"continuation":{"id":"x","tokens":[],"frames":0}}"#)
+                .is_err(),
+            "a continuation on an input the gateway did not mark"
+        );
+        assert!(
+            Envelope::parse(r#"{"body":{},"continuable":true,"continuation":{"id":"x"}}"#).is_err(),
+            "a continuation that does not read"
+        );
+        assert!(
+            Envelope::parse(
+                r#"{"body":{},"continuable":true,"continuation":{"id":"x","tokens":[1],"frames":1}}"#
+            )
+            .is_ok()
+        );
         assert!(Envelope::parse("[]").is_err());
         assert!(Envelope::parse("nope").is_err());
     }

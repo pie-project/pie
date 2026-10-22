@@ -574,6 +574,35 @@ def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
         cfg["mtp_config"]["local_layer_ids"] = []
 
 
+def _rewrite_minimax_m3(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    # Both per-layer plans are lists of 0/1 by source layer: `moe_layer_freq`
+    # says dense vs routed MLP, `sparse_attention_freq` dense vs indexed
+    # attention (and `sparse_disable_index_value` rides with it).
+    if isinstance(tc.get("moe_layer_freq"), list):
+        tc["moe_layer_freq"] = _slice_list(tc["moe_layer_freq"], plan.src_layers)
+    sparse = tc.get("sparse_attention_config")
+    if isinstance(sparse, dict):
+        for key in ("sparse_attention_freq", "sparse_disable_index_value"):
+            if isinstance(sparse.get(key), list):
+                sparse[key] = _slice_list(sparse[key], plan.src_layers)
+    # The draft modules are not shipped; nothing may claim them.
+    if "num_mtp_modules" in tc:
+        tc["num_mtp_modules"] = 0
+
+
+def _rewrite_nemotron_h(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # `hybrid_override_pattern` is a character a source layer: M Mamba-2,
+    # E routed MoE, * attention.
+    pat = cfg.get("hybrid_override_pattern")
+    if isinstance(pat, str):
+        cfg["hybrid_override_pattern"] = "".join(pat[i] for i in plan.src_layers)
+    # The draft head is not shipped; nothing may claim it.
+    cfg.pop("mtp_hybrid_override_pattern", None)
+
+
 def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # `layer_types` is what makes a layer sliding vs full attention.
@@ -1402,6 +1431,35 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # The vision hMLP and the audio embedding are a few planes; kept so
         # the miniature loads unmodified as `InklingForConditionalGeneration`.
         keep_res=(re.compile(r"^model\.visual\."), re.compile(r"^model\.audio\.")),
+    ),
+    "minimax_m3_vl": dict(
+        layer_prefix="language_model.model.layers.",
+        expert_re=re.compile(r"\.block_sparse_moe\.experts\.(\d+)\."),
+        router_suffixes=("block_sparse_moe.gate.weight",
+                         "block_sparse_moe.e_score_correction_bias"),
+        globals_keep=("language_model.model.embed_tokens.weight",
+                      "language_model.model.norm.weight",
+                      "language_model.lm_head.weight"),
+        # Layers 0-2 are dense attention over a dense MLP, 3 on indexed
+        # attention over routed experts: 0-5 is every kind, the second three
+        # times.
+        default_layers="0-5",
+        config_rewrite=_rewrite_minimax_m3,
+        text_cfg_key="text_config",
+        # The tower is kept so the miniature loads unmodified as
+        # `MiniMaxM3SparseForConditionalGeneration`.
+        keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^multi_modal_projector\."),
+                  re.compile(r"^patch_merge_mlp\.")),
+    ),
+    "nemotron_h": dict(
+        layer_prefix="backbone.layers.",
+        expert_re=re.compile(r"\.mixer\.experts\.(\d+)\."),
+        router_suffixes=("mixer.gate.weight", "mixer.gate.e_score_correction_bias"),
+        globals_keep=("backbone.embeddings.weight", "backbone.norm_f.weight", "lm_head.weight"),
+        # MEMEMEM*E: four Mamba-2 mixers, four routed MoE layers and one
+        # attention, every kind the model has.
+        default_layers="0-8",
+        config_rewrite=_rewrite_nemotron_h,
     ),
     "gpt_oss": dict(
         layer_prefix="model.layers.",

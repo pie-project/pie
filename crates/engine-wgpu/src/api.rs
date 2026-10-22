@@ -476,6 +476,7 @@ impl Engine for Wgpu {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                max_scoring_lanes: 0,
             },
             profile,
 

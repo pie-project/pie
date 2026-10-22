@@ -408,6 +408,10 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     crate::policy::report(crate::policy::Event::Started(ctx.id()));
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one spawn request, as its callers have it"
+)]
 pub fn spawn(
     username: String,
     program_name: ProgramName,
@@ -416,6 +420,7 @@ pub fn spawn(
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
     arrival: Arrival,
+    executors: Vec<String>,
 ) -> Result<ProcessId> {
     spawn_inner(
         username,
@@ -427,6 +432,7 @@ pub fn spawn(
         None,
         None,
         arrival,
+        executors,
     )
 }
 
@@ -444,8 +450,12 @@ fn spawn_inner(
     inherit_seq: Option<u64>,
     inherit_client_pid: Option<ProcessId>,
     arrival: Arrival,
+    executors: Vec<String>,
 ) -> Result<ProcessId> {
     let id = Uuid::new_v4();
+    // The workers the cluster names to run its passes, best first: the
+    // offload's alone, before the process can run one.
+    crate::offload::executors::set(id, executors.clone());
     crate::policy::schedule::alias(id, inherit_client_pid.unwrap_or(id));
     if let Some(planner) = crate::planner::planner() {
         match inherit_seq {
@@ -463,11 +473,13 @@ fn spawn_inner(
         capture_outputs,
         result_tx,
         arrival,
+        executors,
     );
     if let Err(error) = SERVICES.spawn(id, || process) {
         if let Some(planner) = crate::planner::planner() {
             planner.unregister(id);
         }
+        crate::offload::executors::forget(id);
         return Err(error);
     }
 
@@ -614,6 +626,8 @@ struct Process {
     output_buffer: VecDeque<ProcessEvent>,
     result_tx: SharedResultTx,
     arrival: Arrival,
+    /// Kept for a restart: the new process runs its passes where this one did.
+    executors: Vec<String>,
 }
 
 impl Process {
@@ -631,6 +645,7 @@ impl Process {
         capture_outputs: bool,
         result_tx: SharedResultTx,
         arrival: Arrival,
+        executors: Vec<String>,
     ) -> Self {
         let task = Self::run(
             process_id,
@@ -656,6 +671,7 @@ impl Process {
             output_buffer: VecDeque::new(),
             result_tx,
             arrival,
+            executors,
         }
     }
 
@@ -816,6 +832,7 @@ impl Process {
             seq,
             Some(self.client_pid),
             self.arrival.clone(),
+            self.executors.clone(),
         );
         match spawned {
             Ok(new_id) => {
@@ -890,6 +907,7 @@ impl Process {
             planner.unregister(self.process_id);
         }
         residency::unregister_residency(self.process_id);
+        crate::offload::executors::forget(self.process_id);
     }
 }
 
@@ -1016,6 +1034,7 @@ mod tests {
             output_buffer: VecDeque::new(),
             result_tx,
             arrival: Arrival::default(),
+            executors: Vec::new(),
         }
     }
 

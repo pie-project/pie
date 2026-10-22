@@ -197,7 +197,10 @@ pub mod worker {
                 | Edge::Copied(_)
                 | Edge::Dropped(_)
                 | Edge::TierPressure(_)
-                | Edge::LinkChanged(_) => {}
+                | Edge::LinkChanged(_)
+                | Edge::PlacementChanged(_)
+                | Edge::ReplicationChanged(_)
+                | Edge::Published(_) => {}
             }
         }
         policy.plan(now_ms);
@@ -207,10 +210,10 @@ pub mod worker {
 /// The cluster world: one instance in the gateway. Where programs and their
 /// state live.
 pub mod cluster {
-    use crate::{Change, Dispatch, Edge, Exit, Id, Residency};
+    use crate::{Change, Dispatch, Edge, Exit, Id, Residency, Subject};
 
     pub use crate::bindings::plex::policy::cluster_writes::{
-        install_placement, install_scale, install_schedule,
+        install_placement, install_scale, install_schedule, publish,
     };
     pub use crate::bindings::plex::policy::state_writes::{
         discard, install_acceptance, install_replication, install_retention,
@@ -232,6 +235,18 @@ pub mod cluster {
         fn on_dropped(&mut self, _residency: &Residency) {}
         fn on_tier_pressure(&mut self, _worker: &Id) {}
         fn on_link_changed(&mut self, _link: &Id) {}
+        /// Another program changed this process's committed placement (a
+        /// call, or its death), since this program's last call (attrs
+        /// `placement/*`).
+        fn on_placement_changed(&mut self, _process: &Id) {}
+        /// Another program changed this group's committed replication (a
+        /// call, or its death), since this program's last call (attr
+        /// `replication/sites`).
+        fn on_replication_changed(&mut self, _group: &Id) {}
+        /// Another program published or withdrew a value about this subject
+        /// (a call, or its death), since this program's last call (attrs
+        /// `published/<program>/<name>`).
+        fn on_published(&mut self, _subject: &Subject) {}
         fn on_timer(&mut self) {}
 
         fn plan(&mut self, _now_ms: u64) {}
@@ -254,6 +269,9 @@ pub mod cluster {
                 Edge::Dropped(residency) => policy.on_dropped(residency),
                 Edge::TierPressure(worker) => policy.on_tier_pressure(worker),
                 Edge::LinkChanged(link) => policy.on_link_changed(link),
+                Edge::PlacementChanged(process) => policy.on_placement_changed(process),
+                Edge::ReplicationChanged(group) => policy.on_replication_changed(group),
+                Edge::Published(subject) => policy.on_published(subject),
                 Edge::Timer => policy.on_timer(),
                 // Worker edges: a cluster host does not send them.
                 Edge::Started(_)

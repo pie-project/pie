@@ -203,6 +203,7 @@ fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
                 quant::Scratch {
                     precast: &precast,
                     partials: &partials,
+                    table: None,
                 },
                 m.div_ceil(32) * 32,
             )
@@ -306,6 +307,7 @@ fn the_leading_output_columns_land_in_place() {
             let scratch = quant::Scratch {
                 precast: &precast,
                 partials: &partials,
+                table: None,
             };
             match columns {
                 None => quant::matmul(

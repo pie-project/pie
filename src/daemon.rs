@@ -72,12 +72,47 @@ impl BootSpec {
 
 pub struct Ctx {
     config: String,
+    /// The config file, read again on SIGHUP.
+    path: std::path::PathBuf,
     name: &'static str,
 }
 
 impl Ctx {
     pub fn config_str(&self) -> &str {
         &self.config
+    }
+
+    /// Calls `reload` with the config file read anew on every SIGHUP, for
+    /// as long as the process runs. A file that does not read is logged and
+    /// skipped.
+    pub fn on_hangup<F, Fut>(&self, reload: F)
+    where
+        F: Fn(String) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (path, name) = (self.path.clone(), self.name);
+            let mut hangups = match signal(SignalKind::hangup()) {
+                Ok(hangups) => hangups,
+                Err(e) => {
+                    tracing::error!("install SIGHUP handler: {e}");
+                    return;
+                }
+            };
+            tokio::spawn(async move {
+                while hangups.recv().await.is_some() {
+                    tracing::info!(path = %path.display(), "{name}: SIGHUP, reading the config again");
+                    match std::fs::read_to_string(&path) {
+                        Ok(config) => reload(config).await,
+                        Err(e) => tracing::error!(path = %path.display(), "{name}: SIGHUP: {e}"),
+                    }
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = reload;
     }
 
     pub async fn run_until_signal(self, shutdown: impl Future<Output = ()>) -> ExitCode {
@@ -111,6 +146,7 @@ pub fn init(spec: BootSpec, global: GlobalArgs) -> Result<Ctx> {
     runtime::catalog::install(&crate::paths::models_dir());
 
     let config = read_config(&spec, &global)?;
+    let (path, _) = config_path_or(&global, spec.default_config_filename);
 
     let metrics_addr: Option<SocketAddr> =
         match global.metrics_addr.as_deref().or(spec.default_metrics_addr) {
@@ -129,6 +165,7 @@ pub fn init(spec: BootSpec, global: GlobalArgs) -> Result<Ctx> {
 
     Ok(Ctx {
         config,
+        path,
         name: spec.name,
     })
 }

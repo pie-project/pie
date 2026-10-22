@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use controller_api::Role;
 pub use engine::runahead::Runahead;
 use serde::{Deserialize, Serialize};
@@ -24,26 +24,23 @@ pub use units::{ByteSize, Duration};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Client-facing listener.
-    /// OpenTelemetry export. Off by default.
-    /// Batching and timeout policy. Every field has a measured default; the
-    /// frame knobs are part of the guest contract.
-    /// The box an inferlet runs in: what it may reach, and how big it may get.
-    /// Distributed-cluster topology (controller + role + gateways). Absent, or
-    /// `controller` unset ⇒ single-node (gateway-free local inference).
-    /// Limits on remote clients leasing this worker's KV space.
-    /// Disaggregated serving: moving prefill and KV to partner workers.
     #[serde(default)]
     pub server: ServerConfig,
+    /// OpenTelemetry export. Off by default.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Batching and timeout policy. Every field has a measured default; the
+    /// frame knobs are part of the guest contract.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// The box an inferlet runs in: what it may reach, and how big it may get.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Distributed-cluster topology (controller + role + gateways). Absent, or
+    /// `controller` unset ⇒ single-node (gateway-free local inference).
     #[serde(default)]
     pub cluster: ClusterConfig,
-    #[serde(default)]
-    pub executor: ExecutorConfig,
+    /// Other workers' part in this one's passes, and its in theirs.
     #[serde(default)]
     pub offload: OffloadConfig,
     /// The single `[model]` table. Pie serves exactly one model.
@@ -70,6 +67,7 @@ impl Config {
         })?;
         let reshaped = crate::config::layout::reshape(file)?;
         refuse_retired_keys(&reshaped)?;
+        refuse_retired_config_keys(&reshaped)?;
         let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
         let cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
@@ -121,7 +119,6 @@ impl Config {
         self.runtime.validate()?;
         self.sandbox.validate()?;
         self.cluster.validate()?;
-        self.executor.validate()?;
         self.offload.validate()?;
         Ok(())
     }
@@ -129,51 +126,11 @@ impl Config {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExecutorConfig {
-    /// Remote clients that may hold a scratch lease at once; the KV pool is
-    /// divided evenly across this many slots.
-    #[serde(default = "default_executor_max_clients")]
-    pub max_clients: usize,
-}
-
-impl Default for ExecutorConfig {
-    fn default() -> Self {
-        Self {
-            max_clients: default_executor_max_clients(),
-        }
-    }
-}
-
-impl ExecutorConfig {
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            self.max_clients > 0,
-            "cluster.max_clients must be greater than zero"
-        );
-        Ok(())
-    }
-}
-
-fn default_executor_max_clients() -> usize {
-    4
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct OffloadConfig {
-    /// Serve prefill and KV from partner workers rather than only locally.
-    /// Off by default; enabling it also publishes an artifact digest.
-    /// Shortest suffix worth offloading a prefill for; `0` derives one from
-    /// the transport (512 tokens over NIXL, 2048 inline).
-    #[serde(default)]
-    pub enabled: bool,
+    /// Shortest uncached suffix worth a peer's prefill; `0`: 2048 tokens.
     #[serde(default)]
     pub prefill_min_suffix_tokens: usize,
-    /// Transfers in flight to any one partner before the next waits.
-    #[serde(default = "default_offload_max_outstanding")]
-    pub max_outstanding_per_partner: u32,
-    /// How KV pages cross between workers — see [`OffloadTransfer`]. No
-    /// shipped build hosts NIXL, so `nixl` refuses the boot.
+    /// How KV pages cross between workers — see [`OffloadTransfer`].
     #[serde(default)]
     pub transfer: OffloadTransfer,
     /// Where this worker serves other workers' passes (`host:port`); omit to
@@ -193,9 +150,7 @@ pub struct OffloadConfig {
 impl Default for OffloadConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             prefill_min_suffix_tokens: 0,
-            max_outstanding_per_partner: default_offload_max_outstanding(),
             transfer: OffloadTransfer::Auto,
             listen: None,
             peers: Vec::new(),
@@ -207,22 +162,20 @@ impl Default for OffloadConfig {
 impl OffloadConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.max_outstanding_per_partner > 0,
-            "cluster.max_outstanding_per_partner must be greater than zero"
+            cfg!(feature = "nixl") || self.transfer != OffloadTransfer::Nixl,
+            "[offload] transfer = \"nixl\" needs a build with the `nixl` feature; \"auto\" \
+             reads in place where the build can"
         );
         Ok(())
     }
 }
 
-fn default_offload_max_outstanding() -> u32 {
-    4
-}
-
 /// How KV pages cross between workers.
 ///
-/// No shipped build hosts `Nixl`: it parses but fails the boot at
-/// `link::partner::PartnerLinkManager::new` with a missing-feature error.
-/// `Auto` takes NIXL where available, which today is nowhere.
+/// `Nixl` and `Auto` read a peer's kv in place, device to device, where the
+/// build has the `nixl` feature (built against `NIXL_PREFIX`) and both
+/// workers export kv of one layout; otherwise, and with `Inline`, the pages'
+/// bytes ride the bulk link. A build without the feature refuses `Nixl`.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OffloadTransfer {
@@ -257,12 +210,11 @@ impl ClusterConfig {
                 "[cluster] role is required when controller is set"
             );
         }
-        if matches!(self.role, Some(Role::Prefill | Role::Encode)) {
-            ensure!(
-                self.controller.is_some(),
-                "[cluster] prefill and encode executors require a controller"
-            );
-        }
+        ensure!(
+            self.role != Some(Role::Encode),
+            "[cluster] role \"encode\" is not served: no worker computes a media encode for \
+             another"
+        );
         Ok(())
     }
 }
@@ -287,10 +239,11 @@ pub struct ServerConfig {
     /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
-    /// The cluster-plane PLEX policy: a built-in policy's name or a component
-    /// path; omit to run none. The worker plane's is `[runtime] policy`.
+    /// The cluster-plane policies: each a built-in policy's name or a
+    /// component path, no two granted the same write; omit to run none. The
+    /// worker plane's is `[runtime] policy`.
     #[serde(default)]
-    pub policy: Option<String>,
+    pub policies: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -301,7 +254,7 @@ impl Default for ServerConfig {
             verbose: false,
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
-            policy: None,
+            policies: Vec::new(),
         }
     }
 }
@@ -595,6 +548,47 @@ const RETIRED: &[(&str, &str)] = &[
     ("total_pages", "[model] device_kv_budget, in bytes"),
 ];
 
+/// Config keys that are gone (dotted, from the file's top), each refused with
+/// what replaced it.
+const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
+    (
+        "server.policy",
+        "`[server] policies` lists the cluster policies, each granted its own writes",
+    ),
+    (
+        "executor.max_clients",
+        "no worker leases kv to remote clients; a prefill worker runs a runtime",
+    ),
+    (
+        "offload.enabled",
+        "a pass goes to a peer whenever `[offload] peers` names one",
+    ),
+    (
+        "offload.max_outstanding_per_partner",
+        "it bounded the partner links, which are gone",
+    ),
+];
+
+fn refuse_retired_config_keys(config: &toml::Table) -> Result<()> {
+    for (key, why) in RETIRED_CONFIG_KEYS {
+        let mut at = Some(config);
+        let mut parts = key.split('.').peekable();
+        while let Some(part) = parts.next() {
+            match (at.and_then(|table| table.get(part)), parts.peek()) {
+                (Some(_), None) => {
+                    bail!(
+                        "{} is gone: {why}",
+                        crate::config::layout::to_file_path(key)
+                    )
+                }
+                (Some(value), Some(_)) => at = value.as_table(),
+                (None, _) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
 fn refuse_retired_keys(config: &toml::Table) -> Result<()> {
     let options = config
         .get("model")
@@ -730,6 +724,7 @@ impl ModelConfig {
             kv_seats: None,
             disk_kv_budget: self.disk_kv_budget.map(|b| b.as_bytes()),
             disk_kv_dir: self.disk_kv_path.clone(),
+            kv_export: false,
         }
     }
 

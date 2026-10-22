@@ -52,22 +52,76 @@ impl WorkerControl for NoTurns {
     async fn plex_session(self, _: tarpc::context::Context, _: String, _: Option<String>) {}
 }
 
-/// Serves a pool of `capacity` bytes of memory (and, with `dir`, every page
-/// on disk there) on `listen` (the bulk link), and reports it to the
-/// gateway's worker port `gateway` as worker `id`, dialing it again whenever
-/// the link goes: what the pool holds outlives a gateway restart.
+/// Where a pool keeps every page beyond its memory.
+pub enum PoolStore {
+    /// None: what memory cannot hold is refused.
+    Memory,
+    /// Files in a directory of its own.
+    Dir(std::path::PathBuf),
+    /// Objects under `prefix` in a store a NIXL storage plugin fronts
+    /// (`OBJ` for S3), set up by the plugin's own params.
+    Objects {
+        plugin: String,
+        params: Vec<(String, String)>,
+        prefix: String,
+    },
+}
+
+impl PoolStore {
+    fn open(self, capacity: usize, agent: &str) -> Result<engine_cpu::Pool> {
+        let store: Arc<dyn engine_cpu::Store> = match self {
+            PoolStore::Memory => return Ok(engine_cpu::Pool::new(capacity)),
+            PoolStore::Dir(dir) => Arc::new(
+                engine_cpu::Dir::open(dir.clone())
+                    .with_context(|| format!("open the pool's directory {}", dir.display()))?,
+            ),
+            PoolStore::Objects {
+                plugin,
+                params,
+                prefix,
+            } => objects(agent, &plugin, &params, prefix)?,
+        };
+        Ok(engine_cpu::Pool::with_store(capacity, store))
+    }
+}
+
+#[cfg(feature = "nixl")]
+fn objects(
+    agent: &str,
+    plugin: &str,
+    params: &[(String, String)],
+    prefix: String,
+) -> Result<Arc<dyn engine_cpu::Store>> {
+    let objects = transport::Objects::open(agent, plugin, params)
+        .with_context(|| format!("open the object store through NIXL's `{plugin}`"))?;
+    let store = engine_cpu::store::Objects::open(objects, prefix)
+        .map_err(|e| anyhow::anyhow!("open the pool's objects: {e}"))?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "nixl"))]
+fn objects(
+    _: &str,
+    _: &str,
+    _: &[(String, String)],
+    _: String,
+) -> Result<Arc<dyn engine_cpu::Store>> {
+    anyhow::bail!("this build keeps no object store: build with the `nixl` feature")
+}
+
+/// Serves a pool of `capacity` bytes of memory, beyond which it keeps pages
+/// in `store`, on `listen` (the bulk link), and reports it to the gateway's
+/// worker port `gateway` as worker `id`, dialing it again whenever the link
+/// goes: what the pool holds outlives a gateway restart.
 pub async fn run(
     listen: &str,
     gateway: &str,
     capacity: usize,
-    dir: Option<std::path::PathBuf>,
+    store: PoolStore,
     id: WorkerId,
 ) -> Result<()> {
-    let pool = match dir {
-        Some(dir) => engine_cpu::Pool::with_dir(capacity, dir.clone())
-            .with_context(|| format!("open the pool's directory {}", dir.display()))?,
-        None => engine_cpu::Pool::new(capacity),
-    };
+    let agent = format!("pie-pool-{id}");
+    let pool = tokio::task::spawn_blocking(move || store.open(capacity, &agent)).await??;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind the pool's bulk listener at {listen}"))?;

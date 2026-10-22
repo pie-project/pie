@@ -15,7 +15,7 @@ use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use super::manifest::{Manifest, ManifestError};
+use super::manifest::{Manifest, ManifestError, NAMESPACED};
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -100,10 +100,16 @@ pub struct StateCommit {
 #[derive(Debug, Default)]
 pub struct Commit {
     pub schedule: Option<Table>,
+    /// Where each process runs, and its props: what `placement` grants.
     pub placement: Option<HashMap<String, Placement>>,
+    /// The workers each process's passes run on, best first: what
+    /// `executors` grants. Empty lists are left out.
+    pub executors: Option<HashMap<String, Vec<String>>>,
     pub scale: Option<Vec<Scale>>,
     pub terminate: Vec<(String, String)>,
     pub state: StateCommit,
+    /// What the call published, in order: `None` withdraws a name.
+    pub publish: Vec<(Subject, String, Option<Value>)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -125,6 +131,17 @@ pub enum LoadError {
     Compile(String),
     #[error("does not instantiate: {0}")]
     Instantiate(String),
+    #[error("`{0}` {1}")]
+    Of(String, Box<LoadError>),
+    #[error("`{first}` and `{second}` are both granted `{grant}`")]
+    Shared {
+        grant: String,
+        first: String,
+        second: String,
+    },
+    /// A name keys what its program publishes (`published/<name>/…`).
+    #[error("two programs are named `{0}`")]
+    SameName(String),
 }
 
 pub struct Program {
@@ -238,9 +255,11 @@ impl Program {
         Commit {
             schedule: staged.schedule,
             placement: staged.placement,
+            executors: staged.executors,
             scale: staged.scale,
             terminate: staged.terminate,
             state: staged.state,
+            publish: staged.publish,
         }
     }
 
@@ -266,34 +285,74 @@ fn start(
     Ok((store, instance))
 }
 
-/// Loads a program on a thread of its own named `thread`, which then runs
-/// `serve` with it; the manifest, or why it did not load, comes back here.
+/// Loads programs on a thread of their own named `thread`, which then runs
+/// `serve` with them; their manifests, or why one did not load, come back
+/// here. No two may be granted the same write: each table has one author
+/// (a namespaced grant, such as `publish`, writes under each holder's name).
 pub fn spawn(
-    name: &str,
-    component: &[u8],
+    programs: Vec<(String, Vec<u8>)>,
     capability: fn(&str) -> bool,
     thread: &str,
-    serve: impl FnOnce(Program) + Send + 'static,
-) -> Result<Manifest, LoadError> {
-    let (name, component) = (name.to_string(), component.to_vec());
+    serve: impl FnOnce(Vec<Program>) + Send + 'static,
+) -> Result<Vec<Manifest>, LoadError> {
     let (loaded, outcome) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(thread.into())
-        .spawn(
-            move || match Program::load(&name, &component, &capability) {
-                Ok(program) => {
-                    let _ = loaded.send(Ok(program.manifest().clone()));
-                    serve(program);
-                }
-                Err(error) => {
-                    let _ = loaded.send(Err(error));
-                }
-            },
-        )
+        .spawn(move || match load_all(&programs, capability) {
+            Ok(programs) => {
+                let manifests = programs.iter().map(|p| p.manifest.clone()).collect();
+                let _ = loaded.send(Ok(manifests));
+                serve(programs);
+            }
+            Err(error) => {
+                let _ = loaded.send(Err(error));
+            }
+        })
         .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
     outcome
         .recv()
         .map_err(|_| LoadError::Instantiate("its thread ended before it loaded".into()))?
+}
+
+/// Loads `programs` on this thread, each whole or none: names unique, and
+/// no two granted the same write. What [`spawn`] starts, and what a reload
+/// swaps in.
+pub fn load_all(
+    programs: &[(String, Vec<u8>)],
+    capability: fn(&str) -> bool,
+) -> Result<Vec<Program>, LoadError> {
+    let mut named = std::collections::HashSet::new();
+    if let Some((name, _)) = programs
+        .iter()
+        .find(|(name, _)| !named.insert(name.as_str()))
+    {
+        return Err(LoadError::SameName(name.clone()));
+    }
+    let programs = programs
+        .iter()
+        .map(|(name, component)| {
+            Program::load(name, component, &capability)
+                .map_err(|error| LoadError::Of(name.clone(), Box::new(error)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut authors: HashMap<&str, &str> = HashMap::new();
+    for program in &programs {
+        let owned = program
+            .manifest
+            .grants
+            .iter()
+            .filter(|grant| !NAMESPACED.contains(&grant.as_str()));
+        for grant in owned {
+            if let Some(first) = authors.insert(grant, &program.name) {
+                return Err(LoadError::Shared {
+                    grant: grant.clone(),
+                    first: first.to_string(),
+                    second: program.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(programs)
 }
 
 /// Runs a call to completion on this thread, on a runtime of its own.
@@ -355,6 +414,9 @@ fn edge_name(edge: &Edge) -> &'static str {
         Edge::Dropped(_) => "dropped",
         Edge::TierPressure(_) => "tier-pressure",
         Edge::LinkChanged(_) => "link-changed",
+        Edge::PlacementChanged(_) => "placement-changed",
+        Edge::ReplicationChanged(_) => "replication-changed",
+        Edge::Published(_) => "published",
         Edge::Started(_) => "started",
         Edge::Paused(_) => "paused",
         Edge::Retained(_) => "retained",
@@ -367,6 +429,7 @@ fn edge_name(edge: &Edge) -> &'static str {
 struct Grants {
     schedule: bool,
     placement: bool,
+    executors: bool,
     scale: bool,
     terminate: bool,
     replication: bool,
@@ -374,6 +437,7 @@ struct Grants {
     transfer_shares: bool,
     acceptance: bool,
     discard: bool,
+    publish: bool,
 }
 
 struct HostState {
@@ -395,6 +459,7 @@ impl HostState {
             grants: Grants {
                 schedule: manifest.grants("schedule"),
                 placement: manifest.grants("placement"),
+                executors: manifest.grants("executors"),
                 scale: manifest.grants("scale"),
                 terminate: manifest.grants("terminate"),
                 replication: manifest.grants("replication"),
@@ -402,6 +467,7 @@ impl HostState {
                 transfer_shares: manifest.grants("transfer-shares"),
                 acceptance: manifest.grants("acceptance"),
                 discard: manifest.grants("discard"),
+                publish: manifest.grants("publish"),
             },
             call: None,
         }
@@ -448,9 +514,11 @@ impl Call {
 struct Staged {
     schedule: Option<Table>,
     placement: Option<HashMap<String, Placement>>,
+    executors: Option<HashMap<String, Vec<String>>>,
     scale: Option<Vec<Scale>>,
     terminate: Vec<(String, String)>,
     state: StateCommit,
+    publish: Vec<(Subject, String, Option<Value>)>,
     alarm: Option<u64>,
 }
 
@@ -510,14 +578,33 @@ impl cluster_writes::Host for HostState {
         });
     }
 
+    /// Each part of a placement is its own write: where a process runs and
+    /// its props under `placement`, the workers its passes run on under
+    /// `executors`; what the policy is not granted it does not write.
     fn install_placement(&mut self, entries: Vec<Placement>) {
         self.write("install-placement", |state| {
-            if !state.grants.placement {
+            let grants = (state.grants.placement, state.grants.executors);
+            if grants == (false, false) {
                 return Err(Refusal::NotGranted);
             }
             let entries = entries.into_iter().map(|p| (p.process.clone(), p));
-            let table = by_subject(entries.collect())?;
-            state.call()?.staged.placement = Some(table);
+            let mut table = by_subject(entries.collect())?;
+            let staged = &mut state.call()?.staged;
+            if grants.1 {
+                staged.executors = Some(
+                    table
+                        .iter_mut()
+                        .filter(|(_, p)| !p.executors.is_empty())
+                        .map(|(process, p)| (process.clone(), std::mem::take(&mut p.executors)))
+                        .collect(),
+                );
+            }
+            if grants.0 {
+                for placement in table.values_mut() {
+                    placement.executors.clear();
+                }
+                staged.placement = Some(table);
+            }
             Ok(())
         });
     }
@@ -535,6 +622,20 @@ impl cluster_writes::Host for HostState {
                 return Err(Refusal::DuplicateSubject);
             }
             state.call()?.staged.scale = Some(entries);
+            Ok(())
+        });
+    }
+
+    fn publish(&mut self, of: Subject, name: String, val: Option<Value>) {
+        self.write("publish", |state| {
+            if !state.grants.publish {
+                return Err(Refusal::NotGranted);
+            }
+            let staged = &mut state.call()?.staged;
+            if staged.publish.len() >= MAX_ENTRIES {
+                return Err(Refusal::TooLarge);
+            }
+            staged.publish.push((of, name, val));
             Ok(())
         });
     }

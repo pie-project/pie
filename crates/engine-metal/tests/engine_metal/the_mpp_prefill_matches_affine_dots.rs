@@ -183,6 +183,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                     quant::Scratch {
                         precast: &precast,
                         partials: &partials,
+                        table: None,
                     },
                     cap,
                 )

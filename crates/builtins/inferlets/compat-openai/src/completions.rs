@@ -158,7 +158,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         model: inferlet::model::name(),
     };
     let stream = parsed.req.stream;
-    if stream && parsed.echo && !compat::resume::resuming() {
+    if stream && parsed.echo {
         emit::send(&ids.chunk(&parsed.prompt, None));
     }
     let mut text = String::new();

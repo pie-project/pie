@@ -319,6 +319,7 @@ impl Lane {
             if let Err(error) = engine.bind_thread() {
                 tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
             }
+            engine.on_tapped(crate::offload::stream::sink());
             if engine.settles_asynchronously() {
                 engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome| {
                     // What lanes wrote is kept before their step is published
@@ -440,7 +441,7 @@ impl Lane {
                         }
                     }
                     tracing::debug!(frame, step, "channels pumped out after landing");
-                    settlements.settled(frame, &outcome, &broker);
+                    settlements.settled(frame, step as usize, &outcome, &broker);
                     if landed_instances
                         .get(&frame)
                         .is_some_and(|steps| step as usize + 1 >= steps.len())
@@ -566,10 +567,10 @@ impl Lane {
                     .collect(),
             );
         }
-        let mut wakes: Vec<u64> = Vec::new();
-        for step in &submitted.steps {
+        let mut wakes: Vec<Vec<u64>> = vec![Vec::new(); submitted.steps.len()];
+        for (step, woken) in submitted.steps.iter().zip(&mut wakes) {
             for attachment in &step.attachments {
-                let deferred = asynchronous.then_some(&mut wakes);
+                let deferred = asynchronous.then_some(&mut *woken);
                 if let Err(error) =
                     channels.pump_out_with(engine.as_mut(), attachment.instance, deferred)
                 {
@@ -586,15 +587,18 @@ impl Lane {
         }
 
         let completion = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
-        let cells: Vec<_> = frame.terminal_cells().collect();
-        settlements.expect(
-            ticket.id,
-            ticket.steps.len(),
-            cells,
-            wakes,
-            &completion,
-            broker,
-        );
+        // Each step publishes its own cells and waiters as it lands.
+        let steps = frame
+            .steps
+            .iter()
+            .zip(wakes)
+            .map(|(step, wakes)| completion::LandingStep {
+                cells: step.terminal_cells.clone(),
+                completions: step.completions.clone(),
+                wakes,
+            })
+            .collect();
+        settlements.expect(ticket.id, steps, &completion, broker);
         Ok(completion)
     }
 
@@ -791,6 +795,9 @@ impl Lane {
                         .copy_kv(&copy)
                         .and_then(|()| engine.read_host_kv(&slots))
                         .map_err(Into::into),
+                    HostKvOp::TapGroups => {
+                        Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
+                    }
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()
                         .and_then(|layout| serde_json::to_vec(&layout).ok())

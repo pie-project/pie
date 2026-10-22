@@ -176,16 +176,9 @@ fn land(
     budgets: engine::Budgets,
     residency: engine::Residency,
     platform: poem_ir::Platform,
-    component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     overrides: &runtime::engine::load::Overrides,
 ) -> Result<(engine::Loaded, String)> {
-    if component != crate::executor::ModelComponent::Full {
-        return Err(anyhow!(
-            "this build loads only the full model; {component:?} needs a traced plan the catalog \
-             does not ship"
-        ));
-    }
     let mut request = runtime::engine::load::request(
         overrides,
         snapshot_dir,
@@ -264,7 +257,6 @@ pub(crate) fn create_engine_backend_group(
     home: &Path,
     adapter_dir: Option<&Path>,
     group_id: usize,
-    component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
@@ -321,7 +313,6 @@ pub(crate) fn create_engine_backend_group(
         cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
         residency,
         poem_ir::Platform::Cuda,
-        component,
         frames_in_flight,
         overrides,
     )?;
@@ -352,7 +343,6 @@ pub(crate) fn create_engine_backend(
     home: &Path,
     adapter_dir: Option<&Path>,
     group_id: usize,
-    component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
@@ -619,7 +609,6 @@ pub(crate) fn create_engine_backend(
         budgets,
         residency,
         platform,
-        component,
         frames_in_flight,
         overrides,
     )?;

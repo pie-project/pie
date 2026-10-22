@@ -37,6 +37,22 @@ pub struct KvWrites {
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
 
+/// A group of a tapped lane's pages, read out: each page's spans of group
+/// `group` (of [`Engine::tap_groups`]), page after page; or why not. A tap
+/// that fails says so once, for its first group not told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tapped {
+    pub tag: u64,
+    pub group: u32,
+    pub bytes: std::result::Result<Vec<u8>, String>,
+}
+
+pub type TapSink = std::sync::Arc<dyn Fn(Tapped) + Send + Sync>;
+
+/// The groups a tap reads a page's planes out in, each its spans `(offset,
+/// bytes)` of a host kv slot.
+pub type TapGroups = Vec<Vec<(u64, u64)>>;
+
 pub trait Engine: Send + Sync {
     fn kind(&self) -> &'static str;
 
@@ -104,6 +120,17 @@ pub trait Engine: Send + Sync {
     }
 
     fn on_complete(&mut self, sink: CompletionSink) {
+        let _ = sink;
+    }
+
+    /// The groups a tapped page's planes are read out in, each as spans
+    /// `(offset, bytes)` of a host kv slot, in the order they land; `None`:
+    /// this engine taps nothing.
+    fn tap_groups(&self) -> Option<TapGroups> {
+        None
+    }
+
+    fn on_tapped(&mut self, sink: TapSink) {
         let _ = sink;
     }
 

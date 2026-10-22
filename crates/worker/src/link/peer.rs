@@ -6,7 +6,8 @@
 //! page layout: v1 moves a page's bytes as they are. The bytes ride the bulk
 //! link (`transport::tcp`), one port above the peer link.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -47,6 +48,7 @@ pub fn hello(worker: WorkerId, engine: &str) -> Hello {
             ranks: 1,
         }),
         identity,
+        kv: super::kv::access(),
     }
 }
 
@@ -82,12 +84,14 @@ impl runtime::offload::directory::Remote for Clients {
         Box::pin(async move {
             let stream = transport::tcp::fetch_stream(&addr, &keys, from)
                 .await
+                .and_then(transport::tcp::Stream::paged)
                 .map_err(|why| anyhow::anyhow!("fetching pages: {why}"))?;
             Ok(runtime::offload::prefill::PageStream {
                 count: stream.count,
                 page_bytes: stream.page_bytes,
                 layout: serde_json::from_slice(&stream.meta).ok(),
-                chunks: stream.chunks,
+                slots: stream.slots,
+                body: runtime::offload::prefill::Body::Pages(stream.chunks),
             })
         })
     }
@@ -107,17 +111,44 @@ impl transport::tcp::Source for Source {
             let pages = runtime::offload::prefill::fetch(keys, from)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
-            Ok(transport::tcp::Stream {
-                count: pages.count,
-                page_bytes: pages.page_bytes,
-                meta: pages
-                    .layout
-                    .as_ref()
-                    .and_then(|layout| serde_json::to_vec(layout).ok())
-                    .unwrap_or_default(),
-                chunks: pages.chunks,
-            })
+            Ok(wire(pages))
         })
+    }
+}
+
+/// A runtime stream as the bulk link sends it: whole pages as they are, a
+/// streamed run's parts as `transport::tcp::part`s.
+fn wire(pages: runtime::offload::prefill::PageStream) -> transport::tcp::Stream {
+    use runtime::offload::prefill::Body;
+    let meta = pages
+        .layout
+        .as_ref()
+        .and_then(|layout| serde_json::to_vec(layout).ok())
+        .unwrap_or_default();
+    let (groups, chunks) = match pages.body {
+        Body::Pages(chunks) => (Vec::new(), chunks),
+        Body::Parts { groups, mut parts } => {
+            let (tx, chunks) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(part) = parts.recv().await {
+                    let chunk = part.map(|part| {
+                        transport::tcp::part(part.group, part.first, part.pages, &part.bytes)
+                    });
+                    if tx.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            (groups, chunks)
+        }
+    };
+    transport::tcp::Stream {
+        count: pages.count,
+        page_bytes: pages.page_bytes,
+        meta,
+        slots: pages.slots,
+        groups,
+        chunks,
     }
 }
 
@@ -132,6 +163,16 @@ pub fn bulk_addr(listen: &str) -> Result<String> {
 }
 
 static LISTEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LINK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where this worker's peer link listens, as it tells the directory.
+pub fn set_link(addr: String) {
+    let _ = LINK.set(addr);
+}
+
+pub fn link() -> Option<String> {
+    LINK.get().cloned()
+}
 
 /// Where this worker serves its pages' bytes, as it tells the directory and
 /// the peers it sends passes to.
@@ -170,10 +211,14 @@ impl Peer for PeerServer {
             .ok_or("this worker has no kv store")?;
         let started = Instant::now();
         let bulk = listen().ok_or("this worker serves no bulk link")?;
-        let pages =
-            runtime::offload::prefill::serve(request.tokens, request.from_page, request.home)
-                .await
-                .map_err(|e| format!("{e:#}"))?;
+        let pages = runtime::offload::prefill::serve(
+            request.tokens,
+            request.from_page,
+            request.home,
+            from_wire(request.delivery),
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
         tracing::info!(
             target: "pie::offload",
             pages = pages.count,
@@ -186,7 +231,16 @@ impl Peer for PeerServer {
             class,
             format,
             bulk,
+            held: pages.held.map(|held| worker_api::peer::HeldPages {
+                lease: held.lease,
+                pages: held.pages,
+            }),
         })
+    }
+
+    async fn release(self, _: tarpc::context::Context, lease: u64) -> Result<(), String> {
+        runtime::offload::prefill::release(lease);
+        Ok(())
     }
 }
 
@@ -231,18 +285,77 @@ pub async fn serve(listen: &str, hello: Hello) -> Result<std::net::SocketAddr> {
 
 struct Dialed {
     client: PeerClient,
+    /// The peer's worker id, as it greeted.
+    worker: WorkerId,
     /// This worker's bulk-bytes address, for the peer to fetch prefixes from.
     home: Option<String>,
+    /// The key this worker reads the peer's kv in place by, if it can.
+    kv: Option<u64>,
+    /// A call on the link failed: the peer is dialed afresh next time.
+    broken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Dialed {
+    fn broken(&self) -> bool {
+        self.broken.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The wire's name for how a pass's pages come back.
+fn to_wire(delivery: runtime::offload::prefill::Delivery) -> worker_api::peer::Delivery {
+    use runtime::offload::prefill::Delivery as Here;
+    use worker_api::peer::Delivery as Wire;
+    match delivery {
+        Here::Fetched => Wire::Fetched,
+        Here::InPlace => Wire::InPlace,
+        Here::Streamed => Wire::Streamed,
+    }
+}
+
+fn from_wire(delivery: worker_api::peer::Delivery) -> runtime::offload::prefill::Delivery {
+    use runtime::offload::prefill::Delivery as Here;
+    use worker_api::peer::Delivery as Wire;
+    match delivery {
+        Wire::Fetched => Here::Fetched,
+        Wire::InPlace => Here::InPlace,
+        Wire::Streamed => Here::Streamed,
+    }
 }
 
 impl runtime::offload::prefill::PrefillPeer for Dialed {
+    fn reads_in_place(&self) -> bool {
+        self.kv.is_some()
+    }
+
+    fn read(&self, remote: Vec<u32>, local: Vec<u32>) -> BoxFuture<'static, Result<()>> {
+        match self.kv {
+            Some(peer) => super::kv::read(peer, remote, local),
+            None => Box::pin(async { bail!("this peer's kv is not read in place") }),
+        }
+    }
+
+    fn release(&self, lease: u64) -> BoxFuture<'static, Result<()>> {
+        let client = self.client.clone();
+        let broken = self.broken.clone();
+        Box::pin(async move {
+            client
+                .release(tarpc::context::current(), lease)
+                .await
+                .inspect_err(|_| broken.store(true, std::sync::atomic::Ordering::Relaxed))
+                .context("the peer link")?
+                .map_err(|why| anyhow::anyhow!("the peer refused the release: {why}"))
+        })
+    }
+
     fn prefill(
         &self,
         tokens: Vec<u32>,
         from_page: u32,
+        delivery: runtime::offload::prefill::Delivery,
     ) -> BoxFuture<'static, Result<runtime::offload::prefill::RemotePages>> {
         let client = self.client.clone();
         let home = self.home.clone();
+        let broken = self.broken.clone();
         Box::pin(async move {
             let mut ctx = tarpc::context::current();
             ctx.deadline = Instant::now() + PREFILL_DEADLINE;
@@ -254,9 +367,11 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
                         tokens,
                         from_page,
                         home,
+                        delivery: to_wire(delivery),
                     },
                 )
                 .await
+                .inspect_err(|_| broken.store(true, std::sync::atomic::Ordering::Relaxed))
                 .context("the peer link")?
                 .map_err(|why| anyhow::anyhow!("the peer refused: {why}"))?;
             tracing::debug!(target: "pie::offload", ms = t0.elapsed().as_millis() as u64, "the peer answered");
@@ -265,6 +380,10 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
                 page_tokens: pages.format.page_tokens,
                 count: pages.count as usize,
                 addr: pages.bulk,
+                held: pages.held.map(|held| runtime::offload::prefill::Held {
+                    lease: held.lease,
+                    pages: held.pages,
+                }),
             })
         })
     }
@@ -273,6 +392,20 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
 /// Dials `addr` and, if it can take this worker's passes, makes it the
 /// runtime's prefill peer.
 pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()> {
+    let dialed = greet(addr, ours, listen).await?;
+    tracing::info!(
+        peer = %addr,
+        worker = %dialed.worker,
+        in_place = dialed.kv.is_some(),
+        "prefilling passes on a peer"
+    );
+    runtime::offload::prefill::set_peer(Some(Arc::new(dialed)));
+    Ok(())
+}
+
+/// A link to the peer at `addr`, greeted: one of this worker's model, class
+/// and page.
+async fn greet(addr: &str, ours: &Hello, listen: Option<String>) -> Result<Dialed> {
     let client = connect(addr).await?;
     let theirs = client
         .hello(tarpc::context::current(), ours.clone())
@@ -292,13 +425,77 @@ pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()
     if page(&theirs) != page(ours) {
         bail!("the peer at {addr} pages its kv differently");
     }
-    runtime::offload::prefill::set_peer(Some(Arc::new(Dialed {
+    // Its kv is read in place where both have an agent and one layout.
+    let kv = match &theirs.kv {
+        Some(access) => super::kv::connect(access).unwrap_or_else(|error| {
+            tracing::warn!(peer = %addr, %error, "the peer's kv is not readable in place");
+            None
+        }),
+        None => None,
+    };
+    Ok(Dialed {
         client,
+        worker: theirs.worker,
         home: listen,
-    })));
-    tracing::info!(peer = %addr, worker = %theirs.worker, "prefilling passes on a peer");
-    Ok(())
+        kv,
+        broken: Arc::default(),
+    })
 }
+
+static HELLO: std::sync::OnceLock<Hello> = std::sync::OnceLock::new();
+
+/// What this worker greets its peers with.
+pub fn set_hello(hello: Hello) {
+    let _ = HELLO.set(hello);
+}
+
+/// Reaches the workers the cluster names by id: their links' addresses
+/// from the gateway's directory (the link this worker reports on now), each
+/// greeted once and kept while it stays where it was and its calls succeed.
+struct GatewayDialer {
+    gateway: Mutex<worker_api::GatewayInboundClient>,
+    dialed: Arc<Mutex<Reached>>,
+}
+
+/// The workers reached so far, by id: where each was, and its link.
+type Reached = HashMap<String, (String, Arc<Dialed>)>;
+
+impl runtime::offload::executors::Dialer for GatewayDialer {
+    fn dial(
+        &self,
+        worker: String,
+    ) -> BoxFuture<'static, Result<Arc<dyn runtime::offload::prefill::PrefillPeer>>> {
+        let gateway = self.gateway.lock().unwrap().clone();
+        let kept = self.dialed.lock().unwrap().get(&worker).cloned();
+        let cache = self.dialed.clone();
+        Box::pin(async move {
+            let id: u64 = worker.parse().context("a worker id")?;
+            let addr = gateway
+                .link(tarpc::context::current(), WorkerId(id))
+                .await
+                .context("asking the gateway's directory")?
+                .ok_or_else(|| anyhow::anyhow!("worker {worker} has no peer link"))?;
+            if let Some((at, dialed)) = kept
+                && at == addr
+                && !dialed.broken()
+            {
+                return Ok(dialed as Arc<dyn runtime::offload::prefill::PrefillPeer>);
+            }
+            let hello = HELLO
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("this worker greets no peer"))?;
+            let dialed = Arc::new(greet(&addr, hello, listen()).await?);
+            cache
+                .lock()
+                .unwrap()
+                .insert(worker.clone(), (addr.clone(), dialed.clone()));
+            tracing::info!(%worker, peer = %addr, "an executor reached");
+            Ok(dialed as Arc<dyn runtime::offload::prefill::PrefillPeer>)
+        })
+    }
+}
+
+static DIALER: std::sync::OnceLock<Arc<GatewayDialer>> = std::sync::OnceLock::new();
 
 /// The gateway's directory, asked by this worker.
 struct GatewayDirectory {
@@ -337,6 +534,17 @@ pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: Wor
         gateway: gateway.clone(),
         worker,
     })));
+    let dialer = DIALER
+        .get_or_init(|| {
+            Arc::new(GatewayDialer {
+                gateway: Mutex::new(gateway.clone()),
+                dialed: Arc::default(),
+            })
+        })
+        .clone();
+    // A later link (the gateway restarted, or another one) is the one asked.
+    *dialer.gateway.lock().unwrap() = gateway.clone();
+    runtime::offload::executors::set_dialer(Some(dialer));
     let peer = listen();
     let mut said: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut said_runs: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> =
@@ -383,6 +591,7 @@ pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: Wor
             },
             pool: false,
             published: (full || published != said_published).then(|| published.clone()),
+            link: link(),
         };
         // Sent even when nothing changed: it is also how a link finds its
         // gateway gone, and ends so the link is dialed again.
@@ -440,20 +649,10 @@ pub async fn push_to_pools(pools: Vec<String>) {
 
 async fn push(pool: &str, run: &[[u8; 32]], from: usize) -> Result<usize> {
     let stream = runtime::offload::prefill::fetch(run.to_vec(), from as u32).await?;
-    let meta = stream
-        .layout
-        .as_ref()
-        .and_then(|layout| serde_json::to_vec(layout).ok())
-        .unwrap_or_default();
-    let pages = transport::tcp::Stream {
-        count: stream.count,
-        page_bytes: stream.page_bytes,
-        meta,
-        chunks: stream.chunks,
-    }
-    .collect()
-    .await
-    .map_err(|why| anyhow::anyhow!(why))?;
+    let pages = wire(stream)
+        .collect()
+        .await
+        .map_err(|why| anyhow::anyhow!(why))?;
     let count = pages.count;
     transport::tcp::put(pool, &run[from..], &pages)
         .await

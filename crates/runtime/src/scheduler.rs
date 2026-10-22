@@ -163,6 +163,28 @@ pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout
     layout
 }
 
+/// The groups the engine reads a tapped page's planes out in, as spans of a
+/// host slot; `None` where it taps nothing. Once asked, known.
+pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> {
+    type Known = Option<Option<::engine::TapGroups>>;
+    static GROUPS: std::sync::Mutex<Vec<Known>> = std::sync::Mutex::new(Vec::new());
+    if let Some(Some(known)) = GROUPS.lock().unwrap().get(engine_id) {
+        return known.clone();
+    }
+    let bytes = scheduler_handle(engine_id)
+        .ok()?
+        .host_kv(worker::HostKvOp::TapGroups)
+        .await
+        .ok()?;
+    let groups: Option<::engine::TapGroups> = serde_json::from_slice(&bytes).ok().flatten();
+    let mut known = GROUPS.lock().unwrap();
+    if known.len() <= engine_id {
+        known.resize(engine_id + 1, None);
+    }
+    known[engine_id] = Some(groups.clone());
+    groups
+}
+
 pub async fn debug_dump(engine_id: usize) -> Result<String> {
     scheduler_handle(engine_id)?.debug_dump().await
 }

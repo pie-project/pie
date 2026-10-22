@@ -100,6 +100,7 @@ fn check_at(geo: Geometry, window: Option<Window>, boundary: Boundary, pad: usiz
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
+        snapshots: kernels_cuda::Snapshots::NONE,
     };
     let mut y = Tensor::new(y_at, rows, (vh * vd) as u32, Dtype::F32);
     ssm::gated_delta(

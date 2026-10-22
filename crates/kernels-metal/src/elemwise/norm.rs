@@ -128,6 +128,54 @@ pub fn residual_add_rmsnorm(
     )
 }
 
+/// [`residual_add_rmsnorm`] that also lays the register tile's input table of
+/// the normed rows in `table`, with `counters` arrival counters zeroed: the
+/// table `linear::quant`'s register matmul lays over `out`, bit for bit, so
+/// the projections of `out` read it and run no table pass. At most eight bf16
+/// rows, a whole number of 64-input groups wide.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rmsnorm_table(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    out: Tensor,
+    table: Tensor,
+    counters: u32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.residual_add_rmsnorm";
+    dtype_dispatch!(OP, y.dtype, { Bf16 => () });
+    if y.rows > 8 || !y.width.is_multiple_of(64) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a register table holds at most 8 rows of whole 64-input groups, not {} x {}",
+                y.rows, y.width
+            ),
+        ));
+    }
+    let grid = rms_grid(OP, y.width, y.width, y.rows)?;
+    ctx.fire(
+        Fire::at("elemwise/norm_rms.metal", "residual_add_rms_table_bfloat16").apply(grid),
+        &[
+            x.arg(),
+            y.arg_mut(),
+            weight.arg(),
+            out.arg_mut(),
+            eps.arg(),
+            stated(OP, y.width)?.arg(),
+            DENSE_BANK.arg(),
+            u32::from(plus_one).arg(),
+            UNIT_GAIN.arg(),
+            table.arg_mut(),
+            y.rows.arg(),
+            counters.arg(),
+        ],
+    )
+}
+
 pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
     rms_row(
         ctx,
@@ -140,6 +188,51 @@ pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) ->
         DENSE_BANK,
         ABSOLUTE_BANK,
         UNIT_GAIN,
+    )
+}
+
+/// [`rmsnorm`] (or [`rmsnorm_plus_one`]) over at most eight bf16 rows that also lays the register
+/// tile's input table of the normed rows in `table`, with `counters` arrival
+/// counters zeroed: the table `linear::quant`'s register matmul lays over `y`,
+/// bit for bit, so the projections of `y` run no table pass.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_table(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    y: Tensor,
+    table: Tensor,
+    counters: u32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    if y.rows > 8 || !y.width.is_multiple_of(64) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a register table holds at most 8 rows of whole 64-input groups, not {} x {}",
+                y.rows, y.width
+            ),
+        ));
+    }
+    let grid = rms_grid(OP, x.width, x.width, x.rows)?;
+    ctx.fire(
+        Fire::at("elemwise/norm_rms.metal", "rms_table_bfloat16").apply(grid),
+        &[
+            x.arg(),
+            weight.arg(),
+            y.arg_mut(),
+            eps.arg(),
+            stated(OP, x.width)?.arg(),
+            DENSE_BANK.arg(),
+            if plus_one { OFFSET_BANK } else { ABSOLUTE_BANK }.arg(),
+            UNIT_GAIN.arg(),
+            table.arg_mut(),
+            y.rows.arg(),
+            counters.arg(),
+        ],
     )
 }
 
