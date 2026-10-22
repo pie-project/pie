@@ -16,8 +16,10 @@ use cudarc::driver::sys as dr;
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
+const GEMM_SM100: &str = "linear/gemm_sm100.cu";
+
 const OP: &str = "linear.tc5";
-const FILE: &str = "linear/tc5.cuh";
+const FILE: &str = "linear/gemm_sm100.cu";
 const THREADS: u32 = 224;
 /// Eight transform warps more for a W4A16 weight.
 const THREADS_MIXED: u32 = 480;
@@ -1207,7 +1209,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     ];
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(
+        Fire::at(GEMM_SM100, entry).apply(
             Launch::grid(
                 [grid, 1, 1],
                 [
@@ -1245,7 +1247,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let quads = job.y_rows * n / 4;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::tc5_finalize")
+        Fire::at(GEMM_SM100, "::pie::linear::tc5_finalize")
             .apply(Launch::flat(quads, 256).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part),

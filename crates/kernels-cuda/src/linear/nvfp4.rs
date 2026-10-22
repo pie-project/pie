@@ -17,7 +17,10 @@ use crate::linear::moe::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/nvfp4.cuh";
+const DEQUANT: &str = "linear/dequant.cu";
+const SELECT_FP4_SM80: &str = "linear/moe/select_fp4_sm80.cu";
+
+const SELECT: &str = "linear/moe/select.cu";
 
 const WARP: u32 = 32;
 
@@ -223,7 +226,11 @@ fn grouped(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
-        Fire::at(FILE, symbol("::pie::linear::moe_matmul_select_nvfp4_mma")).apply(Launch::grid(
+        Fire::at(
+            SELECT_FP4_SM80,
+            symbol("::pie::linear::moe_matmul_select_nvfp4_mma"),
+        )
+        .apply(Launch::grid(
             [work_cap, y.width.div_ceil(GROUPED_TILE_N), 1],
             [GROUPED_BLOCK, 1, 1],
         )),
@@ -272,7 +279,7 @@ fn by_route(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            SELECT,
             symbol(&format!(
                 "::pie::linear::moe_matmul_select_nvfp4<{t}, ::pie::i32({ROWS_PER_WARP}){}>",
                 if lean { ", true" } else { "" }
@@ -335,7 +342,7 @@ pub fn decoded_plane(
     })?;
     ctx.fire(
         op,
-        Fire::at(FILE, symbol("::pie::linear::dequant_nvfp4<::pie::bf16>"))
+        Fire::at(DEQUANT, symbol("::pie::linear::dequant_nvfp4<::pie::bf16>"))
             .apply(Launch::flat(pairs, BLOCK)),
         &[
             codes.arg(),

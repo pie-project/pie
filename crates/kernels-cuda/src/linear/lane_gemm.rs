@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/lane_gemm.cuh";
+const GEMV: &str = "linear/gemv.cu";
 
 const BLOCK: u32 = 256;
 
@@ -57,7 +57,7 @@ pub fn act_x_wt(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            GEMV,
             symbol(&format!("::pie::linear::lane_gemm<{ta}, {tw}, {ty}>")),
         )
         .apply(Launch::grid([n.div_ceil(warps), y.rows, 1], [BLOCK, 1, 1])),

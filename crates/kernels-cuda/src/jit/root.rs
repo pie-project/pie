@@ -103,19 +103,20 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
 /// The units compiled for the arch-specific target, each with the NVRTC
 /// that first spells everything it asks of it (`.block16` is 12.9's).
 const SPECIFIC: &[(&str, Toolchain)] = &[
-    ("linear/tc5.cuh", Toolchain::new(12, 9)),
+    ("linear/gemm_sm100.cu", Toolchain::new(12, 9)),
     ("attn/tc5_fmha.cuh", Toolchain::new(12, 9)),
     ("attn/dsv4_sparse.cuh", Toolchain::new(12, 9)),
     ("attn/index_tc5.cuh", Toolchain::new(12, 9)),
     ("attn/mla_sparse.cuh", Toolchain::new(12, 9)),
     ("ssm/gdn_chunk_sm100.cu", Toolchain::new(12, 9)),
-    ("linear/moe_w4_cvt.cuh", Toolchain::new(12, 9)),
-    ("linear/moe_wgmma.cuh", Toolchain::ANY),
+    ("linear/moe/select_fp4_sm100.cu", Toolchain::new(12, 9)),
+    ("linear/moe/select_sm90.cu", Toolchain::ANY),
+    ("linear/w8a16_sm90.cu", Toolchain::ANY),
 ];
 
 /// The units compiled for the arch-specific target on a tcgen05 chip and the
 /// plain one elsewhere: the per-route NVFP4 quant's e2m1 conversion.
-const TCGEN05_TWIN: &[&str] = &["linear/act_quant.cuh"];
+const TCGEN05_TWIN: &[&str] = &["linear/act_quant.cu"];
 
 const fn specific_for(file: &str) -> Option<Toolchain> {
     let mut i = 0;
@@ -331,7 +332,7 @@ mod tests {
 
     #[test]
     fn an_arch_specific_unit_keys_apart_from_the_plain_one() {
-        let plain = Root::of("linear/skinny.cuh").expect("a carried unit");
+        let plain = Root::of("linear/gemv.cu").expect("a carried unit");
         let specific = plain.arch_specific();
         let a = plain.key("x", &plain.target("sm_100", true).expect("plain"));
         let b = specific.key("x", &specific.target("sm_100", true).expect("twin"));

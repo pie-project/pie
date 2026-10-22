@@ -8,7 +8,10 @@ use crate::linear::gemm;
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/quant.cuh";
+const AFFINE: &str = "linear/affine.cu";
+const CAST: &str = "linear/cast.cu";
+const DEQUANT: &str = "linear/dequant.cu";
+const W8A16_SM80: &str = "linear/w8a16_sm80.cu";
 
 const BLOCK: u32 = 256;
 
@@ -294,7 +297,7 @@ fn dense_affine(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            AFFINE,
             symbol(&format!(
                 "::pie::linear::matmul_affine<{t}, {f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group}), ::pie::i32({ROWS_PER_WARP})>",
@@ -346,7 +349,7 @@ fn affine_w4a16_mma(
     ctx.fire(
         op,
         Fire::at(
-            "linear/w8a16.cuh",
+            W8A16_SM80,
             symbol(&format!(
                 "::pie::linear::affine_w4a16_mma<1, {N_SUB}, 1, {WARPS_K}, {STAGES}, {DEPTH}>"
             )),
@@ -431,7 +434,7 @@ pub fn decoded_plane(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            DEQUANT,
             symbol(&format!(
                 "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group})>",
@@ -501,7 +504,7 @@ pub fn decode_into(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            DEQUANT,
             symbol(&format!(
                 "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group})>",
@@ -605,7 +608,7 @@ fn dense_affine_via_dense(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            DEQUANT,
             symbol(&format!(
                 "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group})>",
@@ -633,7 +636,7 @@ pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Erro
     let lanes = nonzero(OP, "the cast's element count", extent(OP, n)?)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::cast_f32_to<{t}>")))
+        Fire::at(CAST, symbol(&format!("::pie::linear::cast_f32_to<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[src.arg(), dst.arg(), n.arg()],
     )
@@ -646,7 +649,7 @@ pub fn scale_rows(ctx: &Ctx, l: Tensor, buf: &mut Tensor) -> Result<(), Error> {
     let width = stated(OP, nonzero(OP, "width", buf.width)?)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::scale_rows<{t}>")))
+        Fire::at(CAST, symbol(&format!("::pie::linear::scale_rows<{t}>")))
             .apply(route_rows(buf.rows, buf.width)),
         &[buf.arg(), l.arg(), width.arg()],
     )

@@ -344,7 +344,7 @@ mod tests {
             ],
         ),
         (
-            "linear/quant.cuh",
+            "linear/act_quant.cu",
             &["::pie::linear::quant_act_fp8_per_group"],
         ),
     ];
@@ -538,8 +538,13 @@ __global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* s
             ">" => arch > bound,
             _ => arch < bound,
         };
-        let units = ["linear/quant.cuh", "linear/tiled.cuh"]
-            .map(|file| Root::of(file).expect("a carried unit"));
+        let units = [
+            "linear/affine.cu",
+            "linear/dequant.cu",
+            "linear/quant.cuh",
+            "linear/codec.cuh",
+        ]
+        .map(|file| Root::of(file).expect("a carried unit"));
         let scanned = units.iter().map(|root| (root.name, root.text)).chain(
             SHIM.iter()
                 .chain(LIBRARY.iter().filter(|h| h.name.starts_with("prim/")))

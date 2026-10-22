@@ -15,7 +15,8 @@ use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/moe_w8a8.cuh";
+const ACT_QUANT: &str = "linear/act_quant.cu";
+
 const OK: lt::cublasStatus_t = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
 /// The workspace slab cuBLASLt's dense products share (`linear::dense`'s),
 /// requested at one size, the profile's `kernel.gemm.workspace_mb`, so the
@@ -274,10 +275,9 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
                     let ctx = Ctx::on(stream.cast());
                     let fired = ctx.fire(
                         op,
-                        Fire::at(FILE, "::pie::linear::fp8b128_atoms_to_lt").apply(Launch::grid(
-                            [((n / 128) * kbp).div_ceil(256), 1, 1],
-                            [256, 1, 1],
-                        )),
+                        Fire::at(ACT_QUANT, "::pie::linear::fp8b128_atoms_to_lt").apply(
+                            Launch::grid([((n / 128) * kbp).div_ceil(256), 1, 1], [256, 1, 1]),
+                        ),
                         &[
                             ArgValue::Ptr(atoms),
                             ArgValue::Ptr(at as u64),
@@ -343,7 +343,7 @@ pub fn matmul(
     let lanes = u64::from(mpad) * u64::from(blocks) * 16;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::quantize_rows_e4m3b128_lt").apply(Launch::grid(
+        Fire::at(ACT_QUANT, "::pie::linear::quantize_rows_e4m3b128_lt").apply(Launch::grid(
             [u32::try_from(lanes.div_ceil(128)).unwrap_or(u32::MAX), 1, 1],
             [128, 1, 1],
         )),

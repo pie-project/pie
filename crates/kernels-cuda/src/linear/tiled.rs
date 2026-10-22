@@ -5,7 +5,9 @@ use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/tiled.cuh";
+const AFFINE: &str = "linear/affine.cu";
+
+const FILE: &str = "linear/affine.cu";
 
 const BLOCK: u32 = 256;
 
@@ -249,7 +251,7 @@ fn tiled_launch(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            AFFINE,
             symbol(&format!(
                 "::pie::linear::matmul_affine_tiled<{t}, ::pie::i32(4), ::pie::i32({group}), \
                  ::pie::i32({m}), ::pie::i32({tile_n}), ::pie::i32({threads}), \
@@ -522,7 +524,7 @@ pub fn repack(
     let words = n_pad / BAND * (k / BAND) * 32;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::repack_affine_tiled<::pie::i32(4)>")
+        Fire::at(AFFINE, "::pie::linear::repack_affine_tiled<::pie::i32(4)>")
             .apply(Launch::flat(words, BLOCK)),
         &[
             codes.arg(),
@@ -533,7 +535,7 @@ pub fn repack(
     )?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::repack_factors_tiled")
+        Fire::at(AFFINE, "::pie::linear::repack_factors_tiled")
             .apply(Launch::flat(n_pad * groups, BLOCK)),
         &[
             scales.arg(),

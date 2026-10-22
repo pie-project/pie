@@ -3,7 +3,9 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/glu.cuh";
+const GLU: &str = "linear/glu.cu";
+
+const FILE: &str = "linear/glu.cu";
 
 const BLOCK: u32 = 256;
 
@@ -99,7 +101,7 @@ pub fn swiglu_clamp(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            GLU,
             symbol(&format!("::pie::linear::mlp_swiglu_clamp<{t}>")),
         )
         .apply(launch.programmatic(ctx.tuning().pdl)),
@@ -129,7 +131,7 @@ pub fn swiglu_clamp_alpha(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            GLU,
             symbol(&format!("::pie::linear::mlp_swiglu_clamp_alpha<{t}>")),
         )
         .apply(launch),
@@ -185,7 +187,7 @@ fn swiglu_clamp_lanes(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            GLU,
             symbol(&format!(
                 "::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}>"
             )),
@@ -282,11 +284,8 @@ pub fn swiglu_clamp_routed_e4m3(
     }
     ctx.fire(
         OP,
-        Fire::at(
-            "linear/act_quant.cuh",
-            "::pie::linear::mlp_swiglu_clamp_routed_e4m3",
-        )
-        .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(GLU, "::pie::linear::mlp_swiglu_clamp_routed_e4m3")
+            .apply(Launch::flat(lanes, BLOCK)),
         &[
             packed.arg(),
             weights.arg(),
@@ -344,7 +343,7 @@ pub fn geglu_tanh(
     nonzero(OP, "the activation's element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_geglu_tanh<{t}>")))
+        Fire::at(GLU, symbol(&format!("::pie::linear::mlp_geglu_tanh<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             gate.arg(),
@@ -390,7 +389,7 @@ fn act(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            GLU,
             symbol(&format!("::pie::linear::mlp_act<{t}, {relu2}>")),
         )
         .apply(Launch::flat(lanes, BLOCK)),
@@ -458,7 +457,7 @@ pub fn situ(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_situ<{t}>"))).apply(launch),
+        Fire::at(GLU, symbol(&format!("::pie::linear::mlp_situ<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),

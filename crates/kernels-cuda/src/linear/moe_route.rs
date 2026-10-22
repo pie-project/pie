@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/moe_route.cuh";
+const ROUTE: &str = "linear/moe/route.cu";
 
 const BLOCK: u32 = 256;
 
@@ -57,7 +57,7 @@ pub fn hash_route(
     let experts = nonzero(OP, "the expert count the logits span", logits.width)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::hash_route_gather").apply(Launch::flat(rows, BLOCK)),
+        Fire::at(ROUTE, "::pie::linear::hash_route_gather").apply(Launch::flat(rows, BLOCK)),
         &[
             ids.arg(),
             tid2eid.arg(),
@@ -89,7 +89,7 @@ pub fn group_routes(ctx: &Ctx, groups: u32, routes: &mut Tensor) -> Result<(), E
     })?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::group_routes").apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(ROUTE, "::pie::linear::group_routes").apply(Launch::flat(lanes, BLOCK)),
         &[
             routes.arg(),
             stated(OP, rows)?.arg(),

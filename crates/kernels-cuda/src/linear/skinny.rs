@@ -95,7 +95,7 @@ pub fn skinny_bf16(
     ];
     ctx.fire(
         "linear.skinny",
-        Fire::at("linear/skinny.cuh", entrypoint).apply(
+        Fire::at("linear/gemv.cu", entrypoint).apply(
             Launch::grid(
                 [(n / cols(epilogue) as i32) as u32, 1, 1],
                 [32 * WARPS, 1, 1],
