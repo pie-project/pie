@@ -62,6 +62,10 @@ pub struct WorkerInfo {
     /// (`PIE_LAUNCH`), so the controller knows which of its launches it is.
     #[serde(default)]
     pub launch: Option<String>,
+    /// Its process id, so a controller that did not spawn it, restarted
+    /// after the one that did, can still signal a launch it adopts.
+    #[serde(default)]
+    pub pid: Option<u32>,
     /// The id this worker had, registering again (a controller restarted,
     /// or one that timed it out): granted back if no one holds it, so the
     /// worker keeps its links and its turns.
@@ -135,6 +139,12 @@ pub struct RoutingTable {
     /// has slots to launch into (`cluster.scale`).
     #[serde(default)]
     pub scales: bool,
+    /// The gateway that authors the cluster-wide tables (scale,
+    /// replication, retention): the live one with the lowest id. Every
+    /// gateway runs its cluster policies; only this one enacts those
+    /// tables, and the controller takes a scale table only from it.
+    #[serde(default)]
+    pub author: Option<GatewayId>,
 }
 
 /// A shape of worker, and how many of it the cluster should run.
@@ -180,7 +190,9 @@ pub trait Control {
 
     /// The scale table a cluster policy installed: level-triggered, the
     /// whole table each time; a shape it does not name keeps what it has.
-    async fn desire_scale(entries: Vec<ScaleEntry>);
+    /// Taken only from `gateway` while it is the author
+    /// ([`RoutingTable::author`]); from any other, ignored.
+    async fn desire_scale(gateway: GatewayId, entries: Vec<ScaleEntry>);
 
     /// Each shape the scale table names, desired against current.
     async fn scale_status() -> Vec<ScaleStatus>;
@@ -216,6 +228,7 @@ mod tests {
         let table = RoutingTable {
             epoch: 7,
             scales: false,
+            author: Some(GatewayId(2)),
             workers: vec![RoutableWorker {
                 id: WorkerId(3),
                 addr: "10.0.0.4:7000".into(),

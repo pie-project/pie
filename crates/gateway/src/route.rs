@@ -313,6 +313,7 @@ mod tests {
             epoch: 1,
             workers,
             scales: false,
+            author: None,
         }
     }
 
