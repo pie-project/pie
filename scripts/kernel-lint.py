@@ -45,9 +45,12 @@ SYMBOL = re.compile(r'"::pie::[^"]*"')
 
 
 def host_text(trees):
-    return "".join(
-        p.read_text() for t in trees for p in (REPO / t).rglob("*.rs")
-    )
+    """The host's string literals, op names (`"attention.decode"`) left out:
+    an entry is named by a symbol or an entry literal, not by an op that
+    shares its spelling."""
+    text = "".join(p.read_text() for t in trees for p in (REPO / t).rglob("*.rs"))
+    literals = re.findall(r'"(?:[^"\\]|\\.)*"', text, re.S)
+    return "\n".join(l for l in literals if not re.fullmatch(r'"[a-z_]+\.[a-z0-9_]+"', l))
 
 
 def spliced(host):
@@ -68,7 +71,7 @@ def unnamed_entries(crate):
     patterns = spliced(host)
     skip = UNNAMED.get(crate, set())
     found = []
-    for path in sorted((REPO / tree).rglob("*.cuh")):
+    for path in sorted(p for p in (REPO / tree).rglob("*") if p.suffix in (".cu", ".cuh")):
         rel = path.relative_to(REPO / tree).as_posix()
         if any(rel.startswith(s) for s in skip):
             continue

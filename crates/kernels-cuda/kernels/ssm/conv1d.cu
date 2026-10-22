@@ -13,56 +13,6 @@ __device__ __forceinline__ float conv_out(float acc, float x_t) {
     }
 }
 
-template <class T, bool SILU>
-__global__ void ssm_causal_conv1d_chunked(
-    const T* __restrict__ x,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,
-    T* __restrict__ y,
-    T* __restrict__ state_out,
-    int N, int C, int K)
-{
-    const int c = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
-
-    if (c >= C) return;
-
-    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
-
-    for (int t = tid; t < N; t += block_size) {
-        float acc = bias_v;
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            if (k >= K) break;
-            const int src_t = t - (K - 1) + k;
-            float xv = 0.f;
-            if (src_t < 0) {
-                if (state_out) {
-                    xv = Elem<T>::to_f32(state_out[(K + src_t) * C + c]);
-                }
-            } else {
-                xv = Elem<T>::to_f32(x[src_t * C + c]);
-            }
-            const float wv = Elem<T>::to_f32(weight[c * K + k]);
-            acc += wv * xv;
-        }
-        y[t * C + c] = Elem<T>::from_f32(SILU ? silu_f(acc) : acc);
-    }
-
-    __syncthreads();
-
-    if (state_out && tid == 0) {
-        for (int s = 0; s < K; ++s) {
-            const int src_t = N - K + s;
-            const float v = (src_t < 0)
-                ? Elem<T>::to_f32(state_out[(K + src_t) * C + c])
-                : Elem<T>::to_f32(x[src_t * C + c]);
-            state_out[s * C + c] = Elem<T>::from_f32(v);
-        }
-    }
-}
-
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_causal_conv1d_chunked_batched(
     const T* __restrict__ x,
