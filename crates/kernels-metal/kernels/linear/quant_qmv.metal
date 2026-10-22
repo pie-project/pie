@@ -449,6 +449,181 @@ METAL_FUNC void qmv_gptoss_impl(
   }
 }
 
+// A routed 4-bit matmul whose threadgroup serves every pair one expert
+// takes: the first pair of an expert reads the expert's codes once and
+// multiplies each of its pairs' rows by them in the vector kernel's own
+// order, so each pair's result is the per-pair kernel's bit for bit; the
+// expert's other pairs leave at once.
+template <typename T, int group_size, int PPT>
+METAL_FUNC void qmv_grouped_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const device int* expert_ids,
+    int in_vec_size,
+    int out_vec_size,
+    int x_slot_stride,
+    int x_row_stride,
+    int slots_per_row,
+    uint3 tid,
+    uint3 tgs,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int bits = 4;
+  constexpr int packs_per_thread = PPT;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int chunk = 8;
+  typedef float U;
+
+  const int sel = int(tid.x) * slots_per_row + int(tid.z);
+  const int pairs = int(tgs.x) * slots_per_row;
+  const int e = expert_ids[sel];
+  if (e < 0) {
+    return;
+  }
+  // an earlier pair of the same expert serves this one
+  for (int j = 0; j < sel; j += SIMD_SIZE) {
+    const int at = j + int(simd_lid);
+    if (simd_any(at < sel && expert_ids[at] == e)) {
+      return;
+    }
+  }
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  ws += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_w);
+  scales += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g);
+  biases += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g);
+  const device uint8_t* ws_row = ws + out_row * in_vec_size_w;
+  const device T* sc_row = scales + out_row * in_vec_size_g;
+  const device T* bi_row = biases + out_row * in_vec_size_g;
+
+  // the pairs of this expert from `sel` on, a 64-pair window at a time
+  for (int window = sel; window < pairs; window += 2 * SIMD_SIZE) {
+    const int lo = window + int(simd_lid);
+    const int hi = lo + SIMD_SIZE;
+    ulong mask = ulong(static_cast<simd_vote::vote_t>(
+                     simd_ballot(lo < pairs && expert_ids[lo] == e))) &
+        0xffffffffUL;
+    mask |= (ulong(static_cast<simd_vote::vote_t>(
+                 simd_ballot(hi < pairs && expert_ids[hi] == e))) &
+             0xffffffffUL)
+        << 32;
+    while (mask != 0) {
+      int members[chunk];
+      int count = 0;
+#pragma unroll
+      for (int m = 0; m < chunk; m++) {
+        if (mask != 0) {
+          members[m] = window + int(ctz(mask));
+          mask &= mask - 1;
+          count = m + 1;
+        } else {
+          members[m] = members[0];
+        }
+      }
+      thread U x_thread[values_per_thread];
+      thread U result[chunk][results_per_simdgroup] = {{0}};
+      for (int k = 0; k < in_vec_size; k += block_size) {
+        const int base = k + int(simd_lid) * values_per_thread;
+        if (base + values_per_thread <= in_vec_size) {
+          const device uint8_t* wl =
+              ws_row + size_t(base) * size_t(bytes_per_pack) / size_t(pack_factor);
+          const int g = base / group_size;
+          uint16_t wt[results_per_simdgroup][values_per_thread / 4];
+          U s[results_per_simdgroup];
+          U b[results_per_simdgroup];
+#pragma unroll
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            const device uint16_t* wr = (const device uint16_t*)(wl + row * in_vec_size_w);
+#pragma unroll
+            for (int i = 0; i < values_per_thread / 4; i++) {
+              wt[row][i] = wr[i];
+            }
+            s[row] = U(sc_row[row * in_vec_size_g + g]);
+            b[row] = U(bi_row[row * in_vec_size_g + g]);
+          }
+#pragma unroll
+          for (int m = 0; m < chunk; m++) {
+            if (m < count) {
+              const int pair = members[m];
+              const device T* x_row = x + (pair / slots_per_row) * x_row_stride +
+                  (pair % slots_per_row) * x_slot_stride;
+              U sum = load_vector<T, U, values_per_thread, bits>(x_row + base, x_thread);
+#pragma unroll
+              for (int row = 0; row < results_per_simdgroup; row++) {
+                U accum = 0;
+#pragma unroll
+                for (int i = 0; i < (values_per_thread / 4); i++) {
+                  accum +=
+                      (x_thread[4 * i] * (wt[row][i] & 0x000f) +
+                       x_thread[4 * i + 1] * (wt[row][i] & 0x00f0) +
+                       x_thread[4 * i + 2] * (wt[row][i] & 0x0f00) +
+                       x_thread[4 * i + 3] * (wt[row][i] & 0xf000));
+                }
+                result[m][row] += s[row] * accum + sum * b[row];
+              }
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < chunk; m++) {
+        if (m < count) {
+          device T* y_row = y + members[m] * out_vec_size + out_row;
+#pragma unroll
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            U v = simd_sum(result[m][row]);
+            if (simd_lid == 0 && out_row + row < out_vec_size) {
+              y_row[row] = static_cast<T>(v);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <typename T, int group_size, int PPT>
+[[kernel]] void qmv_routed_grouped(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& in_vec_size  [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const device T* bias       [[buffer(7)]],
+    const device int* expert_ids [[buffer(8)]],
+    const constant int& x_slot_stride [[buffer(9)]],
+    const constant int& x_row_stride  [[buffer(10)]],
+    const constant int& slots_per_row [[buffer(11)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tgs       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  qmv_grouped_impl<T, group_size, PPT>(
+      w, scales, biases, x, y, expert_ids, in_vec_size, out_vec_size,
+      x_slot_stride, x_row_stride, slots_per_row, tid, tgs, simd_gid, simd_lid);
+}
+
+template [[host_name("affine_qmv_routed_grouped_bfloat16_gs_64_b_4")]] [[kernel]] void
+qmv_routed_grouped<bfloat, 64, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&, const constant int&,
+    const device bfloat*, const device int*, const constant int&, const constant int&,
+    const constant int&, uint3, uint3, uint, uint);
+
 #define gptoss_qmv_kernel(name, BIASED, ROUTED, PPT)                                \
   template <typename T, template <typename> class Codec>                       \
   [[kernel]] void name(                                                        \
