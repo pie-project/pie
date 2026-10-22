@@ -505,7 +505,7 @@ impl GemmSplit {
         })
     }
 
-    pub(crate) fn part_arg(self) -> ArgValue {
+    pub(crate) fn part_arg(self) -> ArgValue<'static> {
         if self.splits > 1 {
             ArgValue::Ptr(self.part)
         } else {
@@ -513,7 +513,7 @@ impl GemmSplit {
         }
     }
 
-    pub(crate) fn per_arg(self, op: &'static str) -> Result<ArgValue, Error> {
+    pub(crate) fn per_arg(self, op: &'static str) -> Result<ArgValue<'static>, Error> {
         Ok(stated(op, self.per)?.arg())
     }
 

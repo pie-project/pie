@@ -291,19 +291,15 @@ pub fn topk(
     } else {
         TopkLists::default()
     };
-    let row_args = |extra: &[ArgValue]| -> Vec<ArgValue> {
-        let mut v = vec![
-            q.indptr.arg(),
-            keys.page_indices.arg(),
-            keys.page_indptr.arg(),
-            keys.last_page_lens.arg(),
-            num_requests.arg(),
-            keys.page_size.arg(),
-            max_kv.arg(),
-        ];
-        v.extend_from_slice(extra);
-        v
-    };
+    let row_args = [
+        q.indptr.arg(),
+        keys.page_indices.arg(),
+        keys.page_indptr.arg(),
+        keys.last_page_lens.arg(),
+        num_requests.arg(),
+        keys.page_size.arg(),
+        max_kv.arg(),
+    ];
     let launch = Launch::grid([score_blocks, rows, 1], [SCORE_KEYS, 1, 1]);
     if mfma && lists.count == 0 {
         // A prefill's rows, SCORE_ROWS a block over the same keys.
@@ -387,16 +383,18 @@ pub fn topk(
         )?;
     }
     if lists.count != 0 {
-        let mut args = vec![by_value(&lists)];
-        args.extend(row_args(&[top_k.arg(), ratio.arg(), ctx.stage()]));
+        let mut args = vec![ArgValue::of(&lists)];
+        args.extend(row_args);
+        args.extend([top_k.arg(), ratio.arg(), ctx.stage()]);
         ctx.fire(
             OP,
             Fire::at(FILE, "::pie::attn::index_topk_bound")
                 .apply(Launch::grid([rows, 1, 1], [SELECT_BLOCK, 1, 1])),
             &args,
         )?;
-        let mut args = vec![by_value(&lists), scores];
-        args.extend(row_args(&[top_k.arg(), ratio.arg(), ctx.stage()]));
+        let mut args = vec![ArgValue::of(&lists), scores];
+        args.extend(row_args);
+        args.extend([top_k.arg(), ratio.arg(), ctx.stage()]);
         ctx.fire(
             OP,
             Fire::at(FILE, "::pie::attn::index_topk_collect").apply(Launch::grid(
@@ -407,12 +405,8 @@ pub fn topk(
         )?;
     }
     let mut args = vec![scores, selection.arg()];
-    args.extend(row_args(&[
-        top_k.arg(),
-        ratio.arg(),
-        by_value(&lists),
-        ctx.stage(),
-    ]));
+    args.extend(row_args);
+    args.extend([top_k.arg(), ratio.arg(), ArgValue::of(&lists), ctx.stage()]);
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::index_topk_select")
@@ -435,13 +429,6 @@ struct TopkLists {
 }
 
 const _: () = assert!(core::mem::size_of::<TopkLists>() == 48);
-
-fn by_value<P>(params: &P) -> ArgValue {
-    ArgValue::Bytes {
-        ptr: core::ptr::from_ref(params).cast::<u8>(),
-        len: core::mem::size_of::<P>(),
-    }
-}
 
 /// The most heads a block-max ranking holds, and the widest key row.
 const BLOCK_MAX_HEADS: i32 = 8;

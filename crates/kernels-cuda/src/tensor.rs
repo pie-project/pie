@@ -25,7 +25,7 @@ impl Tensor {
     }
 
     #[must_use]
-    pub const fn arg(&self) -> ArgValue {
+    pub const fn arg(&self) -> ArgValue<'static> {
         ArgValue::Ptr(self.ptr)
     }
 
@@ -147,7 +147,7 @@ impl Snapshots {
 
     /// The kernels' `snap, snap_rows, snap_slots`.
     #[must_use]
-    pub const fn args(&self) -> [ArgValue; 3] {
+    pub const fn args(&self) -> [ArgValue<'static>; 3] {
         [self.indptr.arg(), self.rows.arg(), self.slots.arg()]
     }
 }

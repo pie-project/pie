@@ -193,7 +193,7 @@ impl Slicing {
         rows: u32,
         width: u32,
         always: bool,
-    ) -> Result<ArgValue, Error> {
+    ) -> Result<ArgValue<'static>, Error> {
         if self.slices == 1 && !always {
             return Ok(ArgValue::ABSENT);
         }

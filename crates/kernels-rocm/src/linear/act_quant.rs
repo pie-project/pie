@@ -859,7 +859,7 @@ pub(crate) fn fp8_partials(
     splits: u32,
     rows: u32,
     n: u32,
-) -> Result<ArgValue, Error> {
+) -> Result<ArgValue<'static>, Error> {
     if splits <= 1 {
         return Ok(ArgValue::ABSENT);
     }

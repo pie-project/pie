@@ -81,13 +81,6 @@ pub fn rel_walks(group: u32, head_dim: u32) -> bool {
     group <= 16 && matches!(head_dim, 128 | 256)
 }
 
-fn by_value(args: &Args) -> ArgValue {
-    ArgValue::Bytes {
-        ptr: core::ptr::from_ref(args).cast::<u8>(),
-        len: core::mem::size_of::<Args>(),
-    }
-}
-
 const fn at(base: u64, offset: Option<u32>) -> u64 {
     match offset {
         Some(off) => base + off as u64,
@@ -295,7 +288,7 @@ pub fn decode(
             [info.padded_batch_size as u32, shape.num_kv_heads, 1],
             [threads, 1, 1],
         )),
-        &[by_value(&args)],
+        &[ArgValue::of(&args)],
     )?;
     match split {
         Some(parts) => merge(ctx, op, &parts),
@@ -462,11 +455,8 @@ fn prefill_walk(
             op,
             Fire::at(FILE, entry).apply(launch),
             &[
-                by_value(&args),
-                ArgValue::Bytes {
-                    ptr: core::ptr::from_ref(&sel).cast::<u8>(),
-                    len: core::mem::size_of::<PrefillSel>(),
-                },
+                ArgValue::of(&args),
+                ArgValue::of(&sel),
             ],
         )?;
     } else {
@@ -479,7 +469,7 @@ fn prefill_walk(
             "::pie::attn::{kernel}<{}, {hnd}, {causal}, {fp8}>",
             shape.head_dim
         ));
-        ctx.fire(op, Fire::at(FILE, entry).apply(launch), &[by_value(&args)])?;
+        ctx.fire(op, Fire::at(FILE, entry).apply(launch), &[ArgValue::of(&args)])?;
     }
     match split {
         Some(parts) => merge(ctx, op, &parts),

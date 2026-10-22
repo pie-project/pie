@@ -464,7 +464,7 @@ impl Ctx {
     }
 
     #[must_use]
-    pub fn stage(&self) -> ArgValue {
+    pub fn stage(&self) -> ArgValue<'static> {
         ArgValue::Ptr(self.stage.get())
     }
 

@@ -671,13 +671,6 @@ pub(crate) mod latent {
         (rank == RANK || rank == 2 * RANK) && (rope == 0 || rope == 64)
     }
 
-    fn by_value<P>(params: &P) -> ArgValue {
-        ArgValue::Bytes {
-            ptr: core::ptr::from_ref(params).cast::<u8>(),
-            len: core::mem::size_of::<P>(),
-        }
-    }
-
     const fn at(base: u64, off: Option<u32>) -> u64 {
         match off {
             Some(off) => base + off as u64,
@@ -831,7 +824,7 @@ pub(crate) mod latent {
         ctx.fire(
             op,
             Fire::at(FILE, entry).apply(Launch::grid(grid, [THREADS, 1, 1])),
-            &[by_value(&work)],
+            &[ArgValue::of(&work)],
         )?;
         let merge = Merge {
             start: at(int, info.merge_packed_offset_start_offset),
@@ -849,7 +842,7 @@ pub(crate) mod latent {
             op,
             Fire::at(FILE, "::pie::attn::mla::mla_merge")
                 .apply(Launch::grid([plan.device.num_sm.max(1), 1, 1], [256, 1, 1])),
-            &[by_value(&merge)],
+            &[ArgValue::of(&merge)],
         )
     }
 
@@ -913,7 +906,7 @@ pub(crate) mod latent {
                 [heads.div_ceil(BLOCK_ROWS), rows, splits * halves],
                 [THREADS, 1, 1],
             )),
-            &[by_value(&g)],
+            &[ArgValue::of(&g)],
         )?;
         if splits == 1 {
             return Ok(());

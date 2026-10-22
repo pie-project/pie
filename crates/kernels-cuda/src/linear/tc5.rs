@@ -1183,7 +1183,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
             _ => 0,
         },
     ));
-    let map = |m: &[u64; 16]| ArgValue::of(m);
+    let map = ArgValue::of::<[u64; 16]>;
     let values = [
         map(&map_p),
         map(&map_q),

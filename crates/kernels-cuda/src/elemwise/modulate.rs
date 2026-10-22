@@ -58,7 +58,7 @@ impl NormKind {
         }
     }
 
-    fn weight(self) -> ArgValue {
+    fn weight(self) -> ArgValue<'static> {
         match self {
             NormKind::RmsNorm { weight, .. } => weight.arg(),
             _ => ArgValue::ABSENT,
@@ -66,7 +66,7 @@ impl NormKind {
     }
 }
 
-fn lane_map(op: &'static str, lane_of_row: Option<Tensor>, rows: u32) -> Result<ArgValue, Error> {
+fn lane_map(op: &'static str, lane_of_row: Option<Tensor>, rows: u32) -> Result<ArgValue<'static>, Error> {
     let Some(map) = lane_of_row else {
         return Ok(ArgValue::ABSENT);
     };

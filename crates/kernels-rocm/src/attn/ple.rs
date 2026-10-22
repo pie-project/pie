@@ -113,10 +113,7 @@ pub fn ngram_ids(
             state.slot_stride_elems.arg(),
             ngram_ids.arg(),
             stated(OP, rows)?.arg(),
-            ArgValue::Bytes {
-                ptr: std::ptr::from_ref(&h).cast(),
-                len: size_of::<PleHash>(),
-            },
+            ArgValue::of(&h),
             ArgValue::Ptr(map.map_or(0, |t| t.ptr)),
             ctx.stage(),
         ],
@@ -174,10 +171,7 @@ pub fn ngram_ids_chunked(
             state.write_state_mask.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
-            ArgValue::Bytes {
-                ptr: std::ptr::from_ref(&h).cast(),
-                len: size_of::<PleHash>(),
-            },
+            ArgValue::of(&h),
             ArgValue::Ptr(map.map_or(0, |t| t.ptr)),
             state.snapshots.indptr.arg(),
             state.snapshots.rows.arg(),
