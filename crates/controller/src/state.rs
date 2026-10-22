@@ -13,6 +13,8 @@ pub struct Worker {
     pub addr: String,
     /// The token the actuator launched it with, if it did.
     pub launch: Option<String>,
+    /// Its process id, as it told it.
+    pub pid: Option<u32>,
     pub last_hb: Instant,
     pub load: WorkerStatus,
     /// Unreachable once its heartbeats have lagged for half the eviction
@@ -84,6 +86,7 @@ impl Cluster {
                 engine: String::new(),
                 addr,
                 launch: None,
+                pid: None,
                 last_hb: now,
                 health: Health::Healthy,
                 load: WorkerStatus::default(),
@@ -117,6 +120,12 @@ impl Cluster {
         };
         self.gateways.insert(id, Gateway { addr, last_hb: now });
         id
+    }
+
+    /// The gateway that authors the cluster-wide tables: the live one with
+    /// the lowest id. One that is evicted hands it to the next.
+    pub fn author(&self) -> Option<GatewayId> {
+        self.gateways.keys().min().copied()
     }
 
     pub fn touch(&mut self, node: NodeId, now: Instant) -> bool {

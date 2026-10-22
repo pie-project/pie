@@ -47,8 +47,12 @@ impl gateway::GatewayControl for EmbeddedControl {
         self.0.gateway_watch()
     }
 
-    async fn desire_scale(&self, entries: Vec<controller_api::ScaleEntry>) -> Result<()> {
-        self.0.desire_scale(entries).await;
+    async fn desire_scale(
+        &self,
+        gateway: GatewayId,
+        entries: Vec<controller_api::ScaleEntry>,
+    ) -> Result<()> {
+        self.0.desire_scale(gateway, entries).await;
         Ok(())
     }
 }

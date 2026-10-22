@@ -14,7 +14,8 @@ interface reads {
     /// - a process's `placement/worker` (text), `placement/executors` (a
     ///   JSON array of worker ids, best first) and `placement/props/<name>`;
     /// - a group's `replication/sites` (a JSON array of the worker ids its
-    ///   replication table asks for);
+    ///   replication table asks for) and `retention/key` (the key its
+    ///   retention table names; none is key 0);
     /// - any subject's `published/<program>/<name>`, what that program
     ///   published (`cluster-writes.publish`). On a worker subject, a
     ///   worker policy's own `published/<name>` shares the prefix; where a
@@ -106,7 +107,8 @@ interface state-writes {
 
     /// Cluster-wide: a group keeps at least one copy in the order of its
     /// key, demoted toward `pool` rather than dropped when the last worker
-    /// holding it lets it go. A group no entry names takes key 0.
+    /// holding it lets it go. A group no entry names takes key 0; a key of
+    /// 0 or below keeps no copy, and the group may be dropped.
     install-retention: func(entries: list<tuple<id, key>>);
 
     /// Bandwidth shares among transfer classes, on every link.

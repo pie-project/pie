@@ -299,4 +299,31 @@ mod tests {
             "no worker keeps the run any more"
         );
     }
+
+    #[test]
+    fn a_pool_s_runs_are_groups_after_every_worker_lets_them_go_and_after_it_restarts() {
+        let directory = Directory::default();
+        let run = vec![key(1), key(2)];
+        directory.report(WorkerId(1), Some("a:1".into()), run.clone(), vec![], true);
+        directory.report_runs(WorkerId(1), vec![run.clone()], vec![], true, false);
+        directory.report(WorkerId(7), Some("p:7".into()), run.clone(), vec![], true);
+        directory.report_runs(WorkerId(7), vec![run.clone()], vec![], true, true);
+        assert_eq!(
+            directory.groups()[&key(2)].sites,
+            vec![WorkerId(1), WorkerId(7)]
+        );
+        // The worker lets it go: the pool's copy is the group.
+        directory.report(WorkerId(1), None, vec![], run.clone(), false);
+        directory.report_runs(WorkerId(1), vec![], vec![key(2)], false, false);
+        assert_eq!(directory.groups()[&key(2)].sites, vec![WorkerId(7)]);
+        // The pool goes, and comes back whole under a new id.
+        directory.forget(WorkerId(7));
+        assert!(directory.groups().is_empty());
+        directory.report(WorkerId(8), Some("p:7".into()), run.clone(), vec![], true);
+        directory.report_runs(WorkerId(8), vec![run.clone()], vec![], true, true);
+        let groups = directory.groups();
+        assert_eq!(groups[&key(2)].sites, vec![WorkerId(8)]);
+        assert_eq!(*groups[&key(2)].keys, run);
+        assert_eq!(directory.pools(), vec![WorkerId(8)]);
+    }
 }
