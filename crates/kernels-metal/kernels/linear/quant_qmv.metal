@@ -508,80 +508,85 @@ METAL_FUNC void qmv_grouped_impl(
   const device T* sc_row = scales + out_row * in_vec_size_g;
   const device T* bi_row = biases + out_row * in_vec_size_g;
 
-  int members[chunk];
-  int count = 0;
-  int from = sel;
-  while (from < pairs) {
-    count = 0;
-    // the next `chunk` pairs of this expert, in pair order
-    for (; from < pairs && count < chunk; from += SIMD_SIZE) {
-      const int at = from + int(simd_lid);
-      const bool hit = at < pairs && expert_ids[at] == e;
-      simd_vote::vote_t mask = static_cast<simd_vote::vote_t>(simd_ballot(hit));
-      int stop = SIMD_SIZE;
-      for (int lane = 0; lane < SIMD_SIZE && mask != 0; lane++) {
-        if ((mask >> lane) & 1) {
-          if (count == chunk) {
-            stop = lane;
-            break;
-          }
-          members[count++] = from + lane;
-        }
-      }
-      if (stop < SIMD_SIZE) {
-        from += stop;
-        break;
-      }
-    }
-    thread U x_thread[values_per_thread];
-    thread U result[chunk][results_per_simdgroup] = {{0}};
-    for (int k = 0; k < in_vec_size; k += block_size) {
-      const int base = k + int(simd_lid) * values_per_thread;
-      if (base + values_per_thread <= in_vec_size) {
-        const device uint8_t* wl =
-            ws_row + size_t(base) * size_t(bytes_per_pack) / size_t(pack_factor);
-        const int g = base / group_size;
-        thread uint16_t wt[results_per_simdgroup][values_per_thread / 4];
-        U s[results_per_simdgroup];
-        U b[results_per_simdgroup];
-        for (int row = 0; row < results_per_simdgroup; row++) {
-          const device uint16_t* wr = (const device uint16_t*)(wl + row * in_vec_size_w);
-          for (int i = 0; i < values_per_thread / 4; i++) {
-            wt[row][i] = wr[i];
-          }
-          s[row] = U(sc_row[row * in_vec_size_g + g]);
-          b[row] = U(bi_row[row * in_vec_size_g + g]);
-        }
+  // the pairs of this expert from `sel` on, a 64-pair window at a time
+  for (int window = sel; window < pairs; window += 2 * SIMD_SIZE) {
+    const int lo = window + int(simd_lid);
+    const int hi = lo + SIMD_SIZE;
+    ulong mask = ulong(static_cast<simd_vote::vote_t>(
+                     simd_ballot(lo < pairs && expert_ids[lo] == e))) &
+        0xffffffffUL;
+    mask |= (ulong(static_cast<simd_vote::vote_t>(
+                 simd_ballot(hi < pairs && expert_ids[hi] == e))) &
+             0xffffffffUL)
+        << 32;
+    while (mask != 0) {
+      int members[chunk];
+      int count = 0;
 #pragma unroll
-        for (int m = 0; m < chunk; m++) {
-          if (m < count) {
-            const int pair = members[m];
-            const device T* x_row = x + (pair / slots_per_row) * x_row_stride +
-                (pair % slots_per_row) * x_slot_stride;
-            U sum = load_vector<T, U, values_per_thread, bits>(x_row + base, x_thread);
-            for (int row = 0; row < results_per_simdgroup; row++) {
-              U accum = 0;
-              for (int i = 0; i < (values_per_thread / 4); i++) {
-                accum +=
-                    (x_thread[4 * i] * (wt[row][i] & 0x000f) +
-                     x_thread[4 * i + 1] * (wt[row][i] & 0x00f0) +
-                     x_thread[4 * i + 2] * (wt[row][i] & 0x0f00) +
-                     x_thread[4 * i + 3] * (wt[row][i] & 0xf000));
+      for (int m = 0; m < chunk; m++) {
+        if (mask != 0) {
+          members[m] = window + int(ctz(mask));
+          mask &= mask - 1;
+          count = m + 1;
+        } else {
+          members[m] = members[0];
+        }
+      }
+      thread U x_thread[values_per_thread];
+      thread U result[chunk][results_per_simdgroup] = {{0}};
+      for (int k = 0; k < in_vec_size; k += block_size) {
+        const int base = k + int(simd_lid) * values_per_thread;
+        if (base + values_per_thread <= in_vec_size) {
+          const device uint8_t* wl =
+              ws_row + size_t(base) * size_t(bytes_per_pack) / size_t(pack_factor);
+          const int g = base / group_size;
+          uint16_t wt[results_per_simdgroup][values_per_thread / 4];
+          U s[results_per_simdgroup];
+          U b[results_per_simdgroup];
+#pragma unroll
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            const device uint16_t* wr = (const device uint16_t*)(wl + row * in_vec_size_w);
+#pragma unroll
+            for (int i = 0; i < values_per_thread / 4; i++) {
+              wt[row][i] = wr[i];
+            }
+            s[row] = U(sc_row[row * in_vec_size_g + g]);
+            b[row] = U(bi_row[row * in_vec_size_g + g]);
+          }
+#pragma unroll
+          for (int m = 0; m < chunk; m++) {
+            if (m < count) {
+              const int pair = members[m];
+              const device T* x_row = x + (pair / slots_per_row) * x_row_stride +
+                  (pair % slots_per_row) * x_slot_stride;
+              U sum = load_vector<T, U, values_per_thread, bits>(x_row + base, x_thread);
+#pragma unroll
+              for (int row = 0; row < results_per_simdgroup; row++) {
+                U accum = 0;
+#pragma unroll
+                for (int i = 0; i < (values_per_thread / 4); i++) {
+                  accum +=
+                      (x_thread[4 * i] * (wt[row][i] & 0x000f) +
+                       x_thread[4 * i + 1] * (wt[row][i] & 0x00f0) +
+                       x_thread[4 * i + 2] * (wt[row][i] & 0x0f00) +
+                       x_thread[4 * i + 3] * (wt[row][i] & 0xf000));
+                }
+                result[m][row] += s[row] * accum + sum * b[row];
               }
-              result[m][row] += s[row] * accum + sum * b[row];
             }
           }
         }
       }
-    }
 #pragma unroll
-    for (int m = 0; m < chunk; m++) {
-      if (m < count) {
-        device T* y_row = y + members[m] * out_vec_size + out_row;
-        for (int row = 0; row < results_per_simdgroup; row++) {
-          U v = simd_sum(result[m][row]);
-          if (simd_lid == 0 && out_row + row < out_vec_size) {
-            y_row[row] = static_cast<T>(v);
+      for (int m = 0; m < chunk; m++) {
+        if (m < count) {
+          device T* y_row = y + members[m] * out_vec_size + out_row;
+#pragma unroll
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            U v = simd_sum(result[m][row]);
+            if (simd_lid == 0 && out_row + row < out_vec_size) {
+              y_row[row] = static_cast<T>(v);
+            }
           }
         }
       }
