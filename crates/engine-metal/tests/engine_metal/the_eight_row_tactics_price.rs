@@ -171,8 +171,9 @@ fn the_eight_row_routed_tactics_price() {
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let (experts, tokens, top_k, layers) = (256u32, 8u32, 8u32, 40u32);
     let pairs = tokens * top_k;
-    let tactics: [(&str, &str); 6] = [
+    let tactics: [(&str, &str); 7] = [
         ("qmv", ""),
+        ("grouped", ""),
         ("tiled8", "[kernel]\nmoe.path = \"tiled\"\nmoe.tile_rows = [{ value = 8 }]"),
         ("tiled16", "[kernel]\nmoe.path = \"tiled\"\nmoe.tile_rows = [{ value = 16 }]"),
         ("mpp8", "[kernel]\nmoe.path = \"mpp\"\nmoe.tile_rows = [{ value = 8 }]"),
@@ -248,6 +249,24 @@ fn the_eight_row_routed_tactics_price() {
                 .iter()
                 .map(|b| Tensor::new(bind(b), tokens, top_k, Dtype::I32))
                 .collect();
+            let mut outs = Vec::new();
+            for grouped in [false, true] {
+                if grouped {
+                    unsafe { std::env::set_var("PIE_GROUPED", "1") };
+                } else {
+                    unsafe { std::env::remove_var("PIE_GROUPED") };
+                }
+                let mut got = Vec::new();
+                for r in &routes[..3] {
+                    let frame = device.frame().expect("frame");
+                    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                    moe::matmul_select_quant(&sink, x, bank, *r, y).expect("routed");
+                    frame.commit().expect("commit");
+                    got.push(handles.read(y.buf, u64::from(pairs * n * 2)).expect("read"));
+                }
+                outs.push(got);
+            }
+            assert!(outs[0] == outs[1], "the grouped kernel lands other bits at K={k} distinct {distinct}");
             let mut line = format!("K={k:>4} N={n:>4} distinct {distinct:>2}:");
             for (name, overrides) in &tactics {
                 let tuning = engine_metal::chip::tuning(overrides, false);
@@ -257,7 +276,12 @@ fn the_eight_row_routed_tactics_price() {
                     let frame = device.frame().expect("frame");
                     let sink = Sink::new(&device, &frame, &pipelines, &handles);
                     for r in &routes {
-                        let ran = if *name == "qmv" {
+                        if *name == "grouped" {
+                            unsafe { std::env::set_var("PIE_GROUPED", "1") };
+                        } else {
+                            unsafe { std::env::remove_var("PIE_GROUPED") };
+                        }
+                        let ran = if *name == "qmv" || *name == "grouped" {
                             moe::matmul_select_quant(&sink, x, bank, *r, y).map(|()| true)
                         } else {
                             moe::matmul_select_batched(
