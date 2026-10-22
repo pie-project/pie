@@ -19,7 +19,6 @@ const SHIMMED: [Header; SHIM.len() + LIBRARY.len()] =
 
 pub const DEVICE_HEADERS: &[Header] = &SHIMMED;
 
-
 const fn join<const N: usize>(left: &[Header], right: &[Header]) -> [Header; N] {
     let mut out = [Header { name: "", text: "" }; N];
     let mut w = 0;

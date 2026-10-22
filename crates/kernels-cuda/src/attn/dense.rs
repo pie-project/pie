@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "attn/dense.cuh";
+const DENSE: &str = "attn/dense.cu";
 
 const WARPS: u32 = 4;
 
@@ -87,7 +87,7 @@ pub fn bidirectional(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            DENSE,
             symbol(&format!(
                 "::pie::attn::dense_bidirectional<{stamp}, {WARPS}>"
             )),

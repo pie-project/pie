@@ -4,7 +4,9 @@ use crate::attn::fa2_abi::Partials;
 use crate::attn::plan::Device;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
-pub const FILE: &str = "attn/attention.cuh";
+const MERGE: &str = "attn/merge.cu";
+
+pub const FILE: &str = "attn/fa2.cu";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeArm {
@@ -378,7 +380,7 @@ fn grid_blocks(per_sm: u32, max_seq_len: u32, num_heads: u32, num_sms: u32) -> u
 fn merge_blocks_per_sm(instantiation: &'static str, smem: u32) -> u32 {
     use cudarc::driver::sys as dr;
 
-    let Some(root) = crate::jit::Root::of(FILE) else {
+    let Some(root) = crate::jit::Root::of(MERGE) else {
         return 1;
     };
     let Ok(resolved) = crate::jit::cache::resolve(&root, instantiation) else {
@@ -427,7 +429,7 @@ fn fold_warp(ctx: &Ctx, op: &'static str, split: &Partials, num_sms: u32) -> Res
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            MERGE,
             symbol(&format!(
                 "::pie::attn::merge_partials_warp<{}, {sink}{live}>",
                 split.head_dim
@@ -491,7 +493,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
 
     ctx.fire(
         op,
-        Fire::at(FILE, instantiation).apply(
+        Fire::at(MERGE, instantiation).apply(
             Launch::grid([blocks, 1, 1], [bdx, bdy, 1])
                 .smem(smem)
                 .programmatic(ctx.tuning().pdl),

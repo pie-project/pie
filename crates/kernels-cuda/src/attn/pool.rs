@@ -7,7 +7,8 @@ use crate::jit::{
 };
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/pool.cuh";
+const POOL: &str = "attn/compressed/pool.cu";
+const POOL_LSE_SM80: &str = "attn/compressed/pool_lse_sm80.cu";
 
 const META_BLOCK: u32 = 128;
 
@@ -82,7 +83,7 @@ pub fn boundary_decode(
     let rows = count(OP, "rows", boundary_pos.rows)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_boundary_decode<::pie::i32>")
+        Fire::at(POOL, "::pie::attn::pool_boundary_decode<::pie::i32>")
             .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
         &[
             positions.arg(),
@@ -114,7 +115,7 @@ pub fn boundary_prefill(
     let num_requests = kv::lanes_of(OP, positions.indptr)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_boundary_prefill<::pie::i32>")
+        Fire::at(POOL, "::pie::attn::pool_boundary_prefill<::pie::i32>")
             .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
         &[
             positions.data.arg(),
@@ -167,7 +168,7 @@ pub fn state_write(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_state_write<::pie::bf16>")
+        Fire::at(POOL, "::pie::attn::pool_state_write<::pie::bf16>")
             .apply(route_rows(kv.rows, width.unsigned_abs())),
         &[
             kv.arg(),
@@ -242,7 +243,7 @@ pub fn gather(
             + 256 / run.unsigned_abs() * 3 * head_dim.unsigned_abs() * 4;
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::attn::pool_gather_vec<::pie::bf16>")
+            Fire::at(POOL, "::pie::attn::pool_gather_vec<::pie::bf16>")
                 .apply(Launch::grid([boundary_pos.rows, 1, 1], [256, 1, 1]).smem(smem)),
             &[
                 state_kv.arg(),
@@ -264,7 +265,7 @@ pub fn gather(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_gather_paged<::pie::bf16>")
+        Fire::at(POOL, "::pie::attn::pool_gather_paged<::pie::bf16>")
             .apply(route_rows(boundary_pos.rows, head_dim.unsigned_abs())),
         &[
             state_kv.arg(),
@@ -339,7 +340,7 @@ pub fn kv_append(
     let div = packing(OP, pool, i64::from(head_dim))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_store_entries<::pie::bf16>")
+        Fire::at(POOL, "::pie::attn::pool_store_entries<::pie::bf16>")
             .apply(route_rows(entries.rows, entries.width)),
         &[
             entries.arg(),
@@ -413,7 +414,7 @@ pub fn attention_lse(
 
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_lse_paged<false>").apply(
+        Fire::at(POOL, "::pie::attn::pool_lse_paged<false>").apply(
             Launch::grid([o.rows, num_q_heads.unsigned_abs(), 1], [ATTN_BLOCK, 1, 1]).smem(smem),
         ),
         &[
@@ -532,7 +533,7 @@ pub fn attention_lse_selected(
 
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_lse_paged<true>").apply(
+        Fire::at(POOL, "::pie::attn::pool_lse_paged<true>").apply(
             Launch::grid([o.rows, num_q_heads.unsigned_abs(), 1], [ATTN_BLOCK, 1, 1]).smem(smem),
         ),
         &[
@@ -593,7 +594,7 @@ fn pool_mma(
     ctx.fire(
         op,
         Fire::at(
-            "attn/pool_mma.cuh",
+            POOL_LSE_SM80,
             symbol(&format!(
                 "::pie::attn::pool_mma::pool_lse_mma<{d}, {selected}>"
             )),
@@ -738,7 +739,7 @@ pub fn compress(
     let smem = (window * 8).next_multiple_of(16) + groups * 3 * head_dim * 4 + head_dim * 2;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::attn::pool_compress<{fp8}>")))
+        Fire::at(POOL, symbol(&format!("::pie::attn::pool_compress<{fp8}>")))
             .apply(Launch::grid([boundary_pos.rows, 1, 1], [256, 1, 1]).smem(smem)),
         &[
             state_kv.arg(),

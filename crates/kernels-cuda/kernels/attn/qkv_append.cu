@@ -1,5 +1,3 @@
-#pragma once
-
 #include <cuda_fp8.h>
 
 #include "prim/device.cuh"

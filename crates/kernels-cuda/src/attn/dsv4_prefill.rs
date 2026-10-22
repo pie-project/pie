@@ -12,7 +12,7 @@ use crate::linear::tc5::supported;
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
 
-const SPARSE_FILE: &str = "attn/dsv4_sparse.cuh";
+const PREFILL_SM100: &str = "attn/compressed/prefill_sm100.cu";
 
 /// `pie::attn::dsv4s::Params`, field for field.
 #[repr(C)]
@@ -395,7 +395,7 @@ fn sparse(
         ctx.fire(
             op,
             Fire::at(
-                SPARSE_FILE,
+                PREFILL_SM100,
                 symbol(&match quantized {
                     Some((wf, pf)) => format!(
                         "::pie::attn::dsv4s::dsv4_sparse<{selected}, {}, {}>",
@@ -495,7 +495,7 @@ fn stage(
         ctx.fire(
             op,
             Fire::at(
-                SPARSE_FILE,
+                PREFILL_SM100,
                 symbol(&format!("::pie::attn::dsv4s::stage_pages<{}>", fmt.code())),
             )
             .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),

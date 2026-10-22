@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, symbol};
 use crate::tensor::{KvPool, Tensor};
 
-const FILE: &str = "attn/xqa.cuh";
+const FILE: &str = "attn/decode_gqa_sm80.cu";
 
 /// One head width's stamp: key tiles of `16 * mt` rows, `warps` warps a
 /// block, `stages` tiles in flight a warp, its key rows swizzled rather than

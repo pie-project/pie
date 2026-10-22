@@ -1,5 +1,3 @@
-#pragma once
-
 #include "prim/device.cuh"
 
 // Bounded replay's floors (DeepSeek-V4.1's Causal Encoder-Decoder): a

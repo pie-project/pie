@@ -1,7 +1,5 @@
-#pragma once
-
-#include "attn/index.cuh"
-#include "attn/tc5_fmha.cuh"
+#include "attn/index/index.cuh"
+#include "attn/fmha_sm100.cuh"
 
 // A pooled index's scores at prefill widths on tcgen05 (sm_100a): for each
 // row and each block it sees, `sum_h w_h * relu(q_h . k)` over the row's

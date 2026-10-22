@@ -1,5 +1,3 @@
-#pragma once
-
 // `pool_lse_paged` (both forms) on tensor cores. Every query
 // head of a row reads the same compressed rows (one latent, its own key and
 // value), so a block serves one row's 16 heads (an mma's M) and walks the
@@ -15,8 +13,8 @@
 #include <cuda_pipeline.h>
 #include <math_constants.h>
 
-#include "attn/pool.cuh"
-#include "attn/sdpa_selected.cuh"
+#include "attn/compressed/pool.cuh"
+#include "attn/selected.cuh"
 
 namespace pie::attn::pool_mma {
 

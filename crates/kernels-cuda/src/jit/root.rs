@@ -56,17 +56,18 @@ pub struct Root {
 
 const CONFIGURED: &[(&str, &[&str], Toolchain)] = &[
     (
-        "attn/mla.cuh",
+        "attn/mla/decode_sm80.cu",
+        &["--device-as-default-execution-space"],
+        Toolchain::ANY,
+    ),
+    ("collective/all_reduce.cu", &[], Toolchain::ANY),
+    (
+        "attn/merge.cu",
         &["--device-as-default-execution-space"],
         Toolchain::ANY,
     ),
     (
-        "collective/all_reduce.cu",
-        &[],
-        Toolchain::ANY,
-    ),
-    (
-        "attn/attention.cuh",
+        "attn/fa2.cu",
         &["--device-as-default-execution-space"],
         Toolchain::ANY,
     ),
@@ -76,10 +77,10 @@ const CONFIGURED: &[(&str, &[&str], Toolchain)] = &[
 /// that first spells everything it asks of it (`.block16` is 12.9's).
 const SPECIFIC: &[(&str, Toolchain)] = &[
     ("linear/gemm_sm100.cu", Toolchain::new(12, 9)),
-    ("attn/tc5_fmha.cuh", Toolchain::new(12, 9)),
-    ("attn/dsv4_sparse.cuh", Toolchain::new(12, 9)),
-    ("attn/index_tc5.cuh", Toolchain::new(12, 9)),
-    ("attn/mla_sparse.cuh", Toolchain::new(12, 9)),
+    ("attn/prefill_sm100.cu", Toolchain::new(12, 9)),
+    ("attn/compressed/prefill_sm100.cu", Toolchain::new(12, 9)),
+    ("attn/index/logits_sm100.cu", Toolchain::new(12, 9)),
+    ("attn/mla/sparse_sm100.cu", Toolchain::new(12, 9)),
     ("ssm/gdn_chunk_sm100.cu", Toolchain::new(12, 9)),
     ("linear/moe/select_fp4_sm100.cu", Toolchain::new(12, 9)),
     ("linear/moe/select_sm90.cu", Toolchain::ANY),

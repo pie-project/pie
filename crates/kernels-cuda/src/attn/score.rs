@@ -6,7 +6,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/score.cuh";
+const SCORE: &str = "attn/score.cu";
 
 const WARPS: u32 = 8;
 
@@ -160,7 +160,7 @@ pub fn capture(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            SCORE,
             symbol(&format!(
                 "::pie::attn::score_capture<{stamp}, {WARPS}, {hnd}>"
             )),

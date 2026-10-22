@@ -6,6 +6,13 @@ use crate::attn::plan::MlaPlan;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
+const DECODE_SM80: &str = "attn/mla/decode_sm80.cu";
+#[cfg(feature = "cuda")]
+const EXPAND: &str = "attn/mla/expand.cu";
+const PREP: &str = "attn/mla/prep.cu";
+#[cfg(feature = "cuda")]
+const SPARSE_SM100: &str = "attn/mla/sparse_sm100.cu";
+
 const BLOCK: u32 = 256;
 
 const fn rms(rows: u32) -> Launch {
@@ -110,7 +117,7 @@ fn split_kv_a_norm(
     ctx.fire(
         op,
         Fire::at(
-            "attn/mla.cuh",
+            PREP,
             crate::jit::symbol(&format!("::pie::attn::mla_latents<{t}, 256>")),
         )
         .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl)),
@@ -201,7 +208,7 @@ pub fn split_q_b(
         return ctx.fire(
             OP,
             Fire::at(
-                "attn/mla.cuh",
+                PREP,
                 crate::jit::symbol(&format!("::pie::attn::mla_split_q_b_vec8<{t}>")),
             )
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
@@ -227,7 +234,7 @@ pub fn split_q_b(
     ctx.fire(
         OP,
         Fire::at(
-            "attn/mla.cuh",
+            PREP,
             crate::jit::symbol(&format!("::pie::attn::mla_split_q_b<{t}>")),
         )
         .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
@@ -458,6 +465,7 @@ pub fn kv_append(
 }
 
 pub(crate) mod naive {
+    use super::DECODE_SM80;
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::Arg;
 
@@ -585,7 +593,7 @@ pub(crate) mod naive {
             ctx.fire(
                 op,
                 Fire::at(
-                    "attn/mla.cuh",
+                    DECODE_SM80,
                     crate::jit::symbol(&format!(
                         "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel<{}{}>",
                         shape.rope_dim,
@@ -623,7 +631,7 @@ pub(crate) mod naive {
             return ctx.fire(
                 op,
                 Fire::at(
-                    "attn/mla.cuh",
+                    DECODE_SM80,
                     "::pie::attn::mla_naive::mma_detail::mla_mma_fold",
                 )
                 .apply(Launch::grid([rows, heads, 1], [128, 1, 1])),
@@ -682,7 +690,7 @@ pub(crate) mod naive {
         ctx.fire(
             op,
             Fire::at(
-                "attn/mla.cuh",
+                DECODE_SM80,
                 if ckv / 32 > 16 {
                     "::pie::attn::mla_naive::mla_naive_paged_kernel<32>"
                 } else {
@@ -721,13 +729,12 @@ pub(crate) mod naive {
 /// The selected attention a block a row on tcgen05 (`attn/mla_sparse.cuh`).
 #[cfg(feature = "cuda")]
 mod sparse {
+    use super::SPARSE_SM100;
 
     use super::{Ctx, Error, KvPool, Tensor};
     use crate::jit::{Arg, ArgValue, Fire, Launch, aligned16, symbol};
     use crate::linear::tc5::supported;
     use dtype::Dtype;
-
-    const FILE: &str = "attn/mla_sparse.cuh";
 
     /// `pie::attn::mlas::Params`, field for field.
     #[repr(C)]
@@ -1145,7 +1152,7 @@ mod sparse {
             return ctx.fire(
                 op,
                 Fire::at(
-                    FILE,
+                    SPARSE_SM100,
                     symbol(&format!("::pie::attn::mlas::mla_sparse_e4<{}>", s.rope)),
                 )
                 .apply(Launch::grid([rows.min(sms), 1, 1], [384, 1, 1]).smem(smem)),
@@ -1155,7 +1162,7 @@ mod sparse {
         ctx.fire(
             op,
             Fire::at(
-                FILE,
+                SPARSE_SM100,
                 symbol(&format!("::pie::attn::mlas::mla_sparse<{}, {fp8}>", s.rope)),
             )
             .apply(
@@ -1173,7 +1180,7 @@ mod sparse {
         }
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::mlas::mla_sparse_fold")
+            Fire::at(SPARSE_SM100, "::pie::attn::mlas::mla_sparse_fold")
                 .apply(Launch::grid([rows, 64, 1], [128, 1, 1]).programmatic(ctx.tuning().pdl)),
             &[
                 ArgValue::Ptr(part_o),
@@ -1189,12 +1196,11 @@ mod sparse {
 }
 
 mod mla_fa2 {
+    use super::DECODE_SM80;
     use super::{Ctx, Error, Layer, refuse};
     use crate::attn::fa2_abi::{UintFastdiv, resolve};
     use crate::attn::plan::{MlaPlan, MlaPlanInfo};
     use crate::jit::{Fire, Launch};
-
-    const FILE: &str = "attn/mla.cuh";
 
     pub const INST: [[&str; 2]; 3] = [
         [
@@ -1433,7 +1439,7 @@ mod mla_fa2 {
 
         ctx.fire(
             op,
-            Fire::at(FILE, row[usize::from(causal)]).apply(launch),
+            Fire::at(DECODE_SM80, row[usize::from(causal)]).apply(launch),
             &[crate::jit::ArgValue::of(params)],
         )
     }
@@ -1869,8 +1875,7 @@ pub fn prefill_expanded(
         let int = |v: u32| ArgValue::I32(i32::try_from(v).unwrap_or(i32::MAX));
         ctx.fire(
             OP,
-            Fire::at(EXPAND_FILE, "::pie::attn::mla_expand::gather")
-                .apply(Launch::flat(threads, BLOCK)),
+            Fire::at(EXPAND, "::pie::attn::mla_expand::gather").apply(Launch::flat(threads, BLOCK)),
             &[
                 ArgValue::Ptr(pool.keys.ptr),
                 ArgValue::Ptr(pool.values.ptr),
@@ -1899,7 +1904,7 @@ pub fn prefill_expanded(
         let key_runs = cells * u64::from(h.heads) * u64::from(dqk / 8);
         ctx.fire(
             OP,
-            Fire::at(EXPAND_FILE, "::pie::attn::mla_expand::pack_keys").apply(Launch::flat(
+            Fire::at(EXPAND, "::pie::attn::mla_expand::pack_keys").apply(Launch::flat(
                 u32::try_from(key_runs)
                     .map_err(|_| refuse(OP, "the key pack overflows a launch"))?,
                 BLOCK,
@@ -1929,13 +1934,11 @@ pub fn prefill_expanded(
                 let q_runs = u64::from(rows) * u64::from(h.heads) * u64::from(dqk / 8);
                 ctx.fire(
                     OP,
-                    Fire::at(EXPAND_FILE, "::pie::attn::mla_expand::pack_queries").apply(
-                        Launch::flat(
-                            u32::try_from(q_runs)
-                                .map_err(|_| refuse(OP, "the query pack overflows a launch"))?,
-                            BLOCK,
-                        ),
-                    ),
+                    Fire::at(EXPAND, "::pie::attn::mla_expand::pack_queries").apply(Launch::flat(
+                        u32::try_from(q_runs)
+                            .map_err(|_| refuse(OP, "the query pack overflows a launch"))?,
+                        BLOCK,
+                    )),
                     &[
                         q_nope.arg(),
                         q_pe.arg(),
@@ -1989,8 +1992,6 @@ pub fn prefill_expanded(
 }
 
 #[cfg(feature = "cuda")]
-const EXPAND_FILE: &str = "attn/mla_expand.cuh";
-
 #[cfg(test)]
 mod tests {
     use super::mla_fa2::{ARMS, BLOCK, arm_index};

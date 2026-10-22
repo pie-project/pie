@@ -1,5 +1,3 @@
-#pragma once
-
 #include "prim/device.cuh"
 
 // A paged decode on tensor cores, a whole GQA group a tile: one block reads

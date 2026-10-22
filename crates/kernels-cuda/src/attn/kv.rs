@@ -4,7 +4,10 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
 use crate::tensor::{KvPool, Tensor};
 
-const FILE: &str = "attn/kv.cuh";
+const KV_APPEND: &str = "attn/kv_append.cu";
+const KV_DEQUANT: &str = "attn/kv_dequant.cu";
+const KV_ENVELOPE: &str = "attn/kv_envelope.cu";
+const PREP: &str = "attn/mla/prep.cu";
 
 const BLOCK: u32 = 256;
 
@@ -100,7 +103,7 @@ pub(crate) fn widen_e4m3(
     let chunks = u64::from(pages) * row_bytes / 16;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::widen_e4m3_pages").apply(Launch::flat(
+        Fire::at(KV_DEQUANT, "::pie::attn::widen_e4m3_pages").apply(Launch::flat(
             u32::try_from(chunks).unwrap_or(u32::MAX),
             BLOCK,
         )),
@@ -227,7 +230,7 @@ fn write_kv_bf16(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            KV_APPEND,
             symbol(&format!(
                 "::pie::attn::kv_append_explicit<{layout}, {pages}>"
             )),
@@ -287,7 +290,7 @@ fn envelope_update_appended(
     ctx.fire(
         op,
         Fire::at(
-            "attn/kv_envelope.cu",
+            KV_ENVELOPE,
             "::pie::attn::envelope::update_appended<::pie::bf16>",
         )
         .apply(Launch::grid(
@@ -329,7 +332,7 @@ fn write_kv_quantised(
     match scheme_of(op, pool)? {
         KvScheme::Fp8PerTensor => ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::kv_append_fp8_per_tensor")
+            Fire::at(KV_APPEND, "::pie::attn::kv_append_fp8_per_tensor")
                 .apply(Launch::per_row(tokens, BLOCK)),
             &[
                 k.arg(),
@@ -358,7 +361,7 @@ fn write_kv_quantised(
             let smem = 2 * (BLOCK / 32) * (core::mem::size_of::<f32>() as u32);
             ctx.fire(
                 op,
-                Fire::at(FILE, instantiation)
+                Fire::at(KV_APPEND, instantiation)
                     .apply(Launch::grid([tokens, heads, 1], [BLOCK, 1, 1]).smem(smem)),
                 &[
                     k.arg(),
@@ -385,7 +388,7 @@ fn write_kv_quantised(
                 head_dim.div_euclid(block_size) + i32::from(head_dim.rem_euclid(block_size) != 0);
             ctx.fire(
                 op,
-                Fire::at(FILE, "::pie::attn::kv_append_fp4_block").apply(Launch::grid(
+                Fire::at(KV_APPEND, "::pie::attn::kv_append_fp4_block").apply(Launch::grid(
                     [tokens, heads, blocks.unsigned_abs()],
                     [32, 1, 1],
                 )),
@@ -449,7 +452,7 @@ pub(crate) fn dequant_active(
     match scheme_of(op, pool)? {
         KvScheme::Fp8PerTensor => ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::dequant_fp8_pages_active").apply(launch),
+            Fire::at(KV_DEQUANT, "::pie::attn::dequant_fp8_pages_active").apply(launch),
             &[
                 pool.keys.arg(),
                 pool.values.arg(),
@@ -464,7 +467,7 @@ pub(crate) fn dequant_active(
         KvScheme::Fp8PerTokenHead => ctx.fire(
             op,
             Fire::at(
-                FILE,
+                KV_DEQUANT,
                 "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
             )
             .apply(launch),
@@ -485,7 +488,7 @@ pub(crate) fn dequant_active(
         KvScheme::Int8PerTokenHead => ctx.fire(
             op,
             Fire::at(
-                FILE,
+                KV_DEQUANT,
                 "::pie::attn::dequant_int8_per_token_head_pages_active<::pie::bf16>",
             )
             .apply(launch),
@@ -505,7 +508,11 @@ pub(crate) fn dequant_active(
         ),
         KvScheme::Fp4Block => ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::dequant_fp4_pages_active<::pie::bf16>").apply(launch),
+            Fire::at(
+                KV_DEQUANT,
+                "::pie::attn::dequant_fp4_pages_active<::pie::bf16>",
+            )
+            .apply(launch),
             &[
                 pool.keys.arg(),
                 pool.values.arg(),
@@ -554,8 +561,7 @@ pub(crate) fn write_mla_fp8_rows(
     let num_requests = lanes_of(op, indptr)?;
     ctx.fire(
         op,
-        Fire::at("attn/mla.cuh", "::pie::attn::mla_kv_append_fp8")
-            .apply(Launch::per_row(ckv.rows, 160)),
+        Fire::at(PREP, "::pie::attn::mla_kv_append_fp8").apply(Launch::per_row(ckv.rows, 160)),
         &[
             ckv.arg(),
             kpe.arg(),
@@ -590,7 +596,7 @@ pub(crate) fn write_mla_to_pages(
     let num_requests = lanes_of(op, indptr)?;
     ctx.fire(
         op,
-        Fire::at("attn/mla.cuh", "::pie::attn::mla_kv_append")
+        Fire::at(PREP, "::pie::attn::mla_kv_append")
             .apply(Launch::per_row(ckv.rows, MLA_WRITE_BLOCK)),
         &[
             ckv.arg(),

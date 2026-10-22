@@ -1,5 +1,3 @@
-#pragma once
-
 #include "prim/device.cuh"
 #include "prim/paged_kv.cuh"
 

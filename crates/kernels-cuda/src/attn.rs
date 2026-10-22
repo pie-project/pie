@@ -44,6 +44,8 @@ use crate::attn::plan::{DecodePlan, PrefillPlan};
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
+const MERGE: &str = "attn/merge.cu";
+
 const BLOCK: u32 = 256;
 
 const NO_SOFT_CAP: f32 = 0.0;
@@ -811,7 +813,7 @@ pub fn sink(
     ctx.fire(
         OP,
         Fire::at(
-            "attn/attention.cuh",
+            MERGE,
             symbol(&format!("::pie::attn::sink_rescale<{t}, {s}>")),
         )
         .apply(per_head_elementwise(o.rows, heads, head_dim)),
@@ -856,7 +858,7 @@ pub fn merge_lse(
     ctx.fire(
         OP,
         Fire::at(
-            "attn/attention.cuh",
+            MERGE,
             symbol(&format!("::pie::attn::merge_lse_combine<{t}>")),
         )
         .apply(Launch::grid(
@@ -907,7 +909,7 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     ctx.fire(
         OP,
         Fire::at(
-            "attn/attention.cuh",
+            "attn/merge.cu",
             symbol(&format!("::pie::attn::{entry}<{t}>")),
         )
         .apply(elementwise(extent)),

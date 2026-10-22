@@ -1,5 +1,3 @@
-#pragma once
-
 // DeepSeek-V4's attention over a decode-width batch in one launch: a row's
 // sliding window of the shared key/value plane (`prefill_lse` over the
 // window), its compressed rows (`pool_lse`, or `pool_lse_selected` over the
@@ -30,7 +28,7 @@
 #include <cuda_pipeline.h>
 #include <math_constants.h>
 
-#include "attn/dsv4_kv.cuh"
+#include "prim/kv_rows.cuh"
 #include "prim/device.cuh"
 
 namespace pie::attn::dsv4 {

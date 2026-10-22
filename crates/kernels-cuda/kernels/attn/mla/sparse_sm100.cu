@@ -1,6 +1,4 @@
-#pragma once
-
-#include "attn/dsv4_sparse.cuh"
+#include "attn/compressed/sparse_sm100.cuh"
 
 // A DeepSeek-sparse MLA's attention on tcgen05, a block a row (GLM-5.3's
 // DSA: 64 absorbed heads over one 512-wide latent, plus a 64-wide rotated

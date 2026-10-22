@@ -1,15 +1,12 @@
-#pragma once
-
-
 #include "prim/device.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 template <class T>
 using Elem = ::pie::Elem<T>;
 
 template <class T>
-__global__ void block_dyn_conv(
+__global__ void dyn_conv(
     const T* __restrict__ x,
     const i32* __restrict__ indptr,
     const T* __restrict__ coeff,

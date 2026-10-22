@@ -21,8 +21,8 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, refuse, stated, symbol};
 use crate::tensor::{KvPool, Tensor};
 
-const FILE: &str = "attn/dsv4_decode.cuh";
-const KV_FILE: &str = "attn/dsv4_kv.cuh";
+const KV_FP8: &str = "attn/compressed/kv_fp8.cu";
+const DECODE: &str = "attn/compressed/decode.cu";
 
 /// The bytes of one position's fp8 row: data, then its share of the page's
 /// scale footer.
@@ -378,7 +378,7 @@ pub fn decode(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            DECODE,
             symbol(&format!(
                 "::pie::attn::dsv4::decode<{HEAD_DIM}, {sink_ty}, {ranks}, {wf}, {pf}>"
             )),
@@ -448,7 +448,7 @@ pub fn append(
     }
     ctx.fire(
         OP,
-        Fire::at(KV_FILE, rows_symbol("append", fmt))
+        Fire::at(KV_FP8, rows_symbol("append", fmt))
             .apply(Launch::grid([rows.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             rows.arg(),
@@ -482,7 +482,7 @@ pub fn store_entries(
     }
     ctx.fire(
         OP,
-        Fire::at(KV_FILE, rows_symbol("store_entries", fmt))
+        Fire::at(KV_FP8, rows_symbol("store_entries", fmt))
             .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             entries.arg(),

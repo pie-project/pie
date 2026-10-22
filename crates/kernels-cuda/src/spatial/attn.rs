@@ -3,7 +3,7 @@ use crate::jit::{Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refus
 use crate::tensor::Tensor;
 use crate::voxels::lanes_of;
 
-const FILE: &str = "spatial/attn.cuh";
+const FILE: &str = "attn/dense.cu";
 
 const OP: &str = "spatial.attention";
 
@@ -75,7 +75,10 @@ pub fn attention(
     let per_block = stated(OP, BLOCK / 32 * qpw)?;
     let blocks = q.rows.div_ceil(per_block.unsigned_abs());
     let scale_log2 = sm_scale * core::f32::consts::LOG2_E;
-    let entry = crate::jit::symbol(&format!("::pie::spatial::attention<{}, {qpw}>", q.width));
+    let entry = crate::jit::symbol(&format!(
+        "::pie::attn::voxel::attention<{}, {qpw}>",
+        q.width
+    ));
     ctx.fire(
         OP,
         Fire::at(FILE, entry).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),

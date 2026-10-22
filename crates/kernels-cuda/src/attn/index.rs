@@ -5,7 +5,10 @@ use crate::attn::kv;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/index.cuh";
+const POOL: &str = "attn/compressed/pool.cu";
+const INDEX: &str = "attn/index/index.cu";
+#[cfg(feature = "cuda")]
+const LOGITS_SM100: &str = "attn/index/logits_sm100.cu";
 
 const K_BLOCK: u32 = 256;
 
@@ -71,10 +74,10 @@ pub fn layernorm_rope(
         OP,
         // A warp a row where the profile says (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(FILE, "::pie::attn::index_knorm_rope_warp<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index_knorm_rope_warp<::pie::bf16>")
                 .apply(Launch::per_row(k.rows, 32))
         } else {
-            Fire::at(FILE, "::pie::attn::index_knorm_rope<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index_knorm_rope<::pie::bf16>")
                 .apply(Launch::per_row(k.rows, K_BLOCK))
         },
         &[
@@ -111,10 +114,10 @@ pub fn rope(
         // A thread a (head, pair) where the profile says
         // (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(FILE, "::pie::attn::index_q_rope_pairs<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index_q_rope_pairs<::pie::bf16>")
                 .apply(Launch::per_row(q.rows, K_BLOCK))
         } else {
-            Fire::at(FILE, "::pie::attn::index_q_rope<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index_q_rope<::pie::bf16>")
                 .apply(Launch::per_row(q.rows, q_rope_block(n_heads)))
         },
         &[
@@ -168,7 +171,7 @@ pub fn store_fp4(
     let div = crate::attn::pool::packing(OP, keys, i64::from(FP4_ROW))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_store_fp4")
+        Fire::at(INDEX, "::pie::attn::index_store_fp4")
             .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             entries.arg(),
@@ -199,7 +202,7 @@ fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTen
         let lanes = u32::try_from(runs).map_err(|_| refuse(op, "the queries overflow a launch"))?;
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::index_q_fp4").apply(Launch::flat(lanes, 256)),
+            Fire::at(INDEX, "::pie::attn::index_q_fp4").apply(Launch::flat(lanes, 256)),
             &[
                 q.data.arg(),
                 ArgValue::Ptr(out),
@@ -232,7 +235,7 @@ fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error
     if pages > 0 {
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::index_stage_fp4")
+            Fire::at(INDEX, "::pie::attn::index_stage_fp4")
                 .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
             &[
                 keys.keys.arg(),
@@ -307,11 +310,8 @@ pub fn block_mean(
     let rows = count(OP, "rows", boundary_pos.rows)?;
     ctx.fire(
         OP,
-        Fire::at(
-            "attn/pool.cuh",
-            "::pie::attn::index_block_mean_paged<::pie::bf16>",
-        )
-        .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
+        Fire::at(POOL, "::pie::attn::index_block_mean_paged<::pie::bf16>")
+            .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
         &[
             keys.keys.arg(),
             entries.arg(),
@@ -438,7 +438,7 @@ pub fn topk_tokens(
     let num_requests = kv::lanes_of(OP, q.indptr)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_pool_tokens")
+        Fire::at(INDEX, "::pie::attn::index_pool_tokens")
             .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             ArgValue::Ptr(blocks_at),
@@ -652,7 +652,7 @@ fn ranked(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
+        Fire::at(INDEX, symbol(&entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
         &[
             q.data.arg(),
             ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),
@@ -765,7 +765,7 @@ pub fn topk_block_max(
 
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_topk_block_max<::pie::bf16>")
+        Fire::at(INDEX, "::pie::attn::index_topk_block_max<::pie::bf16>")
             .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             q.data.arg(),
@@ -851,7 +851,6 @@ fn ranked_tc5(
     use crate::linear::tc5::supported;
 
     const OP: &str = "attention.index_topk";
-    const TC5_FILE: &str = "attn/index_tc5.cuh";
     let page = keys.page_size;
     let cells = keys.keys.rows;
     let per = if ratio > 0 && page % ratio == 0 {
@@ -943,7 +942,7 @@ fn ranked_tc5(
     ctx.fire(
         OP,
         Fire::at(
-            TC5_FILE,
+            LOGITS_SM100,
             symbol(&format!("::pie::attn::index_tc5::index_logits_tc5<{h}>")),
         )
         .apply(
@@ -959,7 +958,7 @@ fn ranked_tc5(
     ctx.fire(
         OP,
         Fire::at(
-            TC5_FILE,
+            LOGITS_SM100,
             symbol(&format!(
                 "::pie::attn::index_tc5::index_select_rows<{radix}>"
             )),

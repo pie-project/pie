@@ -4,7 +4,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::{RaggedTensor, Tensor};
 
-const FILE: &str = "attn/block_dyn_conv.cuh";
+const DYN_CONV: &str = "ssm/dyn_conv.cu";
 
 const BLOCK: u32 = 256;
 
@@ -93,7 +93,7 @@ pub fn block_dyn_conv(
     );
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::attn::block_dyn_conv<{t}>"))).apply(Launch::grid(
+        Fire::at(DYN_CONV, symbol(&format!("::pie::ssm::dyn_conv<{t}>"))).apply(Launch::grid(
             [channels.div_ceil(BLOCK), lanes, 1],
             [channels.min(BLOCK), 1, 1],
         )),

@@ -1,5 +1,3 @@
-#pragma once
-
 #include "prim/device.cuh"
 
 namespace pie::attn {

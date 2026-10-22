@@ -1,7 +1,7 @@
 #include "prim/device.cuh"
 #include "prim/paged_kv.cuh"
 #include "prim/rope.cuh"
-#include "attn/dsv4_kv.cuh"
+#include "prim/kv_rows.cuh"
 
 namespace pie::elemwise {
 

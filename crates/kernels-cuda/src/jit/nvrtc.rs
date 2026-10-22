@@ -334,11 +334,16 @@ mod tests {
     /// takes every kernel in the unit with it, not only the fp8 ones.
     const FP8_UNITS: &[(&str, &[&str])] = &[
         (
-            "attn/kv.cuh",
+            "attn/kv_append.cu",
             &[
                 "::pie::attn::kv_append_explicit<::pie::true_type::value>",
                 "::pie::attn::kv_append_fp8_per_tensor",
                 "::pie::attn::kv_append_per_token_head<::pie::true_type::value>",
+            ],
+        ),
+        (
+            "attn/kv_dequant.cu",
+            &[
                 "::pie::attn::dequant_fp8_pages_active",
                 "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
             ],

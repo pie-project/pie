@@ -12,7 +12,7 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
 use crate::linear::tc5::supported;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/tc5_fmha.cuh";
+const PREFILL_SM100: &str = "attn/prefill_sm100.cu";
 
 /// The pool's NHD layout code.
 const NHD: i32 = 0;
@@ -272,7 +272,7 @@ pub(crate) fn try_prefill(
         ctx.fire(
             op,
             Fire::at(
-                FILE,
+                PREFILL_SM100,
                 symbol(&format!(
                     "::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}, {io}, {pair}>"
                 )),
@@ -305,7 +305,7 @@ pub(crate) fn try_prefill(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            PREFILL_SM100,
             symbol(&format!(
                 "::pie::attn::fmha::tc5_fmha_prefill_wide<{}, {}, {}, {}, {}>",
                 w.d, w.bkv, w.qt, w.atoms, w.slots
@@ -440,7 +440,7 @@ pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Er
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            PREFILL_SM100,
             symbol(&format!(
                 "::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}>"
             )),

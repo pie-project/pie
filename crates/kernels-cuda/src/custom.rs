@@ -4,7 +4,9 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, Tensor};
 
-const FILE: &str = "attn/qkv_fused.cuh";
+const QKV_APPEND: &str = "attn/qkv_append.cu";
+
+const FILE: &str = "attn/qkv_append.cu";
 
 /// The packed row's qkv write; with `rest`, the row's columns past its qkv
 /// planes (a row split's second half) land there.
@@ -262,7 +264,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            QKV_APPEND,
             symbol(&format!(
                 "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false{pages}>"
             )),

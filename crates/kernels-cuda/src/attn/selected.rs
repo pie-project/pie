@@ -6,7 +6,9 @@ use crate::attn::mla::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/sdpa_selected.cuh";
+const SELECTED_SM80: &str = "attn/selected_sm80.cu";
+
+const FILE: &str = "attn/selected_sm80.cu";
 
 const ENTRY: &str = "::pie::attn::sdpa_selected::sdpa_paged_selected_kernel<::pie::bf16>";
 
@@ -164,7 +166,7 @@ fn selected(
         return ctx.fire(
             op,
             Fire::at(
-                FILE,
+                SELECTED_SM80,
                 symbol(&format!(
                     "::pie::attn::sdpa_selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"
                 )),
@@ -203,7 +205,7 @@ fn selected(
         return ctx.fire(
             op,
             Fire::at(
-                FILE,
+                SELECTED_SM80,
                 symbol(&format!(
                     "::pie::attn::sdpa_selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"
                 )),
