@@ -698,3 +698,74 @@ fn fp8_select_rate() {
         );
     }
 }
+
+/// Hopper's W4A8 MXFP4 select against the host product of the rows
+/// quantized as `quantize_rows_e4m3b128` lays them (`quant_e4m3` a 128) and
+/// the bank's codes under their row-major exponents.
+#[test]
+fn the_w4a8_selects_answer_the_quantized_dot() {
+    use crate::common::linear_ref::quant_e4m3;
+    use crate::common::tc5::{e2m1, e4m3};
+    if kernels_cuda::jit::cache::arch() != Some("sm_90") {
+        return;
+    }
+    // [experts, tokens, top, n, k], whether a route reads its token's row, the
+    // exponents' spread (binades) within a chunk.
+    for (ex, tokens, top, n, k, by_token, spread) in [
+        (8usize, 48usize, 4usize, 256usize, 512usize, true, 3u8),
+        (4, 24, 6, 128, 1024, false, 3),
+        (8, 64, 4, 384, 256, true, 7),
+    ] {
+        let what = format!("W4A8 {ex}x{tokens}x{top} {n}x{k} by_token {by_token} spread {spread}");
+        let mut b = Bench::new(0xa48 ^ (tokens * 7 + n) as u64);
+        let count = tokens * top;
+        let routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let rows_x = if by_token { tokens } else { count };
+        let (x, xv) = b.bf16(rows_x * k);
+        // The host's view of the rows: each 128-block quantized as the device does.
+        let mut qx = vec![0f64; rows_x * k];
+        for r in 0..rows_x {
+            for blk in 0..k / 128 {
+                let at = r * k + blk * 128;
+                let block: Vec<f32> = (0..128).map(|i| xv[at + i] as f32).collect();
+                let (q, e) = quant_e4m3(&block);
+                let s = f64::from(crate::common::tc5::ue8m0(e));
+                for i in 0..128 {
+                    qx[at + i] = f64::from(e4m3(q[i])) * s;
+                }
+            }
+        }
+        let codes = tab(ex * n * k / 2, |i| (i * 37 % 251) as u8);
+        let scales = tab(ex * n * k / 32, |i| {
+            120 + (i * 7 % (usize::from(spread) + 1)) as u8
+        });
+        let w = |e: usize, c: usize, i: usize| {
+            let byte = codes[(e * n + c) * (k / 2) + i / 2];
+            let code = if i % 2 == 0 { byte & 0xf } else { byte >> 4 };
+            f64::from(e2m1(code))
+                * f64::from(crate::common::tc5::ue8m0(
+                    scales[(e * n + c) * (k / 32) + i / 32],
+                ))
+        };
+        let (cd, sc) = (b.up(&codes), b.up(&scales));
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let took = moe::select_mxfp4_w4a8(
+            &ctx,
+            t(x, rows_x, k, Bf16),
+            t(cd, ex, n * k / 2, U8),
+            t(sc, ex, n * k / 32, U8),
+            t(b.up(&routes), tokens, top, I32),
+            &mut y,
+        )
+        .expect("the W4A8 select fires");
+        assert!(took, "{what}: the select takes the fire");
+        let div = if by_token { top } else { 1 };
+        let want = dot(
+            [count, n, k],
+            |r, i| qx[r / div * k + i],
+            |r, c, i| w(routes[r] as usize, c, i),
+        );
+        b.check(y.ptr, &want, TOL, &what);
+    }
+}

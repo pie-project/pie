@@ -3095,6 +3095,87 @@ pub fn select_mxfp4_atoms(
     Ok(true)
 }
 
+/// `y[route] = q(x[route or its token]) . W[routes[route]]^T` for an MXFP4
+/// bank (row-major ue8m0 exponents a 32 codes) against the rows quantized
+/// to e4m3 in 1x128 blocks (W4A8, as the deployment asks), on Hopper's wgmma
+/// (`moe_select_fp4a8_wgmma`): half the activation bytes the W4A16 select
+/// stages, the codes looked up as e4m3. `Ok(false)` where it does not take
+/// the fire (off sm_90a, under `WGMMA_FROM` routes an expert, or a shape it
+/// does not tile).
+#[cfg(feature = "cuda")]
+pub fn select_mxfp4_w4a8(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.moe_select_mxfp4_w4a8";
+    const STAGES: u32 = 3;
+    let fan = selected(OP, x, routes, y)?;
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    let per = fan.route_count.div_ceil(experts);
+    if !hopper_wgmma()
+        || x.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || x.width == 0
+        || !x.width.is_multiple_of(128)
+        || y.width == 0
+        || !y.width.is_multiple_of(128)
+        || per < WGMMA_FROM
+    {
+        return Ok(false);
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        OP,
+        routes,
+        &fan,
+        experts,
+        64,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/moe_wgmma.cuh",
+            symbol(&format!("::pie::linear::moe_select_fp4a8_wgmma<{STAGES}>")),
+        )
+        .apply(
+            Launch::grid([work_cap, y.width / 128, 1], [128, 1, 1])
+                .smem(STAGES * 17408 + 1024 + 128),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            codes.arg(),
+            scales.arg(),
+            y.arg(),
+            act_div.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, experts)?.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn matmul_select_mxfp4(
     ctx: &Ctx,

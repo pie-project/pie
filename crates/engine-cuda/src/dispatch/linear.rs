@@ -1405,7 +1405,7 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.moe_matmul_select_act_quant";
         if !linear::tc5::supported() {
-            return self.select_a16(OP, x, bank, routes, y);
+            return self.select_a16(OP, x, bank, routes, quant, y);
         }
         let (codes, scales, biases, seat) = self.planes(bank);
         per_tensor_e4m3_is_a_table(OP, codes)?;
@@ -1629,12 +1629,31 @@ impl Run<'_> {
         x: ValueId,
         bank: ValueId,
         routes: ValueId,
+        quant: ActQuant,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (codes, scales, _, seat) = self.planes(bank);
+        let (codes, scales, biases, seat) = self.planes(bank);
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
+                // An MXFP4 bank against the e4m3 rows the deployment asks
+                // for (W4A8), on Hopper's FP8 MMA where the fire tiles it.
+                if codes.dtype != Dtype::Nvfp4
+                    && quant == (ActQuant::E4m3 { gran: 128 })
+                    && biases.is_none()
+                    && !seat.streams()
+                    && !crate::device::alloc::is_host_pointer(codes.ptr)
+                    && linear::moe::select_mxfp4_w4a8(
+                        self.ctx(),
+                        x,
+                        codes,
+                        scales,
+                        self.tensor(routes),
+                        &mut self.tensor(y),
+                    )?
+                {
+                    return Ok(());
+                }
                 self.select_quant(x, bank, routes, y)
             }
             // A block-FP8 release's experts, their factors laid as ue8m0
