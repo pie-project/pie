@@ -468,7 +468,11 @@ mod tests {
             assert_eq!(
                 Engine::of(&profile),
                 Engine {
-                    prefill_lattice_from: if fine { 256 } else { 0 },
+                    prefill_lattice_from: if fine {
+                        256
+                    } else {
+                        Engine::of(&registry().defaults()).prefill_lattice_from
+                    },
                     prefill_lattice_steps: if fine { 8 } else { 4 },
                     ..Engine::of(&registry().defaults())
                 },
