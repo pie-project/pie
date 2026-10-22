@@ -1457,14 +1457,20 @@ pub fn coop_segments(
     )
 }
 
-/// Whether a matmul of `rows` rows by a 4-bit, 64-group bank of `cols` columns over a
-/// contraction of `k` takes the staged rung first, where its register-fed tile runs.
+/// Whether [`coop_segments`] takes matmuls of `rows` rows by 4-bit, 64-group banks of `widths`
+/// columns over a contraction of `k`: the staged rung runs the widest of them first, every
+/// segment is whole simdgroups of columns, and together they fill the device unsplit.
 #[must_use]
-pub fn stages(tuning: &Tuning, rows: u32, cols: u32, k: u32) -> bool {
+pub fn coop_segments_fit(tuning: &Tuning, rows: u32, widths: &[u32], k: u32) -> bool {
+    let (Some(&widest), total) = (widths.iter().max(), widths.iter().sum::<u32>()) else {
+        return false;
+    };
     rows > 0
         && rows <= STAGED_TILE.unsigned_abs()
         && k.is_multiple_of(COOP_SPAN.unsigned_abs())
-        && tuning.qmm(&tuning.qmm_at(rows, cols, k, 4, 64)).first() == Some(&Qmm::Staged)
+        && widths.iter().all(|w| w.is_multiple_of(32))
+        && total >= COOP_WHOLE_COLUMNS.unsigned_abs()
+        && tuning.qmm(&tuning.qmm_at(rows, widest, k, 4, 64)).first() == Some(&Qmm::Staged)
 }
 
 /// The gate and up of a packed `[gate | up]` bank and their swiglu into `h` in one

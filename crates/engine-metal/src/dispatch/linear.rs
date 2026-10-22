@@ -370,16 +370,15 @@ impl Run<'_> {
         }
         let x = self.tensor(act);
         let (m, k) = (x.rows, x.width);
-        // Where the staged rung takes every member, its register-fed tile runs them all whole.
+        // Where the staged rung takes the widest member and the members fill the device
+        // together, the register-fed tile runs them all whole.
+        let widths: Vec<u32> = members.iter().map(|&(_, y)| self.tensor(y).width).collect();
         let coop = x.dtype == poem_ir::Dtype::Bf16
-            && members.iter().all(|&(w, y)| {
-                self.banked(w).is_some_and(|b| {
-                    b.bits == 4
-                        && b.group == 64
-                        && b.biases.is_some()
-                        && linear::quant::stages(self.tuning(), m, self.tensor(y).width, k)
-                })
-            });
+            && members.iter().all(|&(w, _)| {
+                self.banked(w)
+                    .is_some_and(|b| b.bits == 4 && b.group == 64 && b.biases.is_some())
+            })
+            && linear::quant::coop_segments_fit(self.tuning(), m, &widths, k);
         let mut segments = Vec::with_capacity(3);
         // The left half of the split whose halves a segment pair lands.
         let mut halves = None;
