@@ -31,16 +31,23 @@ CRATES = {
         "crates/kernels-cuda/kernels",
         ["crates/kernels-cuda/src", "crates/engine-cuda/src"],
     ),
+    "kernels-rocm": (
+        "crates/kernels-rocm/kernels",
+        ["crates/kernels-rocm/src", "crates/engine-cuda/src"],
+    ),
 }
 
 # Entry points the host does not name, by path prefix, each with the reason.
 UNNAMED = {}
 
+# `__launch_bounds__(...)` and HIP's `__attribute__((...))` may sit on either
+# side of `void`.
+_ATTRS = (
+    r"(?:(?:__launch_bounds__\s*\((?:[^()]|\([^()]*\))*\)"
+    r"|__attribute__\s*\(\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)\))\s*)*"
+)
 GLOBAL = re.compile(
-    r"__global__\s+(?:static\s+)?"
-    r"(?:__launch_bounds__\s*\((?:[^()]|\([^()]*\))*\)\s*)?void\s+"
-    r"(?:__launch_bounds__\s*\((?:[^()]|\([^()]*\))*\)\s*)?"
-    r"([A-Za-z_]\w*)\s*\("
+    r"__global__\s+(?:static\s+)?" + _ATTRS + r"void\s+" + _ATTRS + r"([A-Za-z_]\w*)\s*\("
 )
 SYMBOL = re.compile(r'"::pie::[^"]*"')
 
@@ -74,7 +81,7 @@ def unnamed_entries(crate):
     patterns = spliced(host)
     skip = UNNAMED.get(crate, set())
     found = []
-    for path in sorted(p for p in (REPO / tree).rglob("*") if p.suffix in (".cu", ".cuh")):
+    for path in sorted(p for p in (REPO / tree).rglob("*") if p.suffix in (".cu", ".cuh", ".hip")):
         rel = path.relative_to(REPO / tree).as_posix()
         if any(rel.startswith(s) for s in skip):
             continue
@@ -90,7 +97,7 @@ def unnamed_entries(crate):
     return found
 
 
-UNIT_CONST = re.compile(r'const ([A-Z_0-9]+): &str = "([a-z_0-9/]+\.cuh?)";')
+UNIT_CONST = re.compile(r'const ([A-Z_0-9]+): &str = "([a-z_0-9/]+\.(?:cuh?|hip))";')
 LAUNCH = re.compile(
     r"Fire::at\(\s*(?:if \w+ \{ ([A-Z_0-9]+) \} else \{ ([A-Z_0-9]+) \}|([A-Z_0-9]+)|\"([^\"]+)\")"
     r'\s*,\s*(?:symbol\(\s*&?(?:format!\()?\s*)?"::((?:\w+::)*)(\w*)(\{?)'
