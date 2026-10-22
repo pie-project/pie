@@ -631,10 +631,25 @@ pub fn matmul_select_quant(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
+    matmul_select_quant_shared(ctx, x, bank, routes, y, None)
+}
+
+/// [`matmul_select_quant`], with the shared expert `(bank, x, y)` of the
+/// fire's tokens landed by the same launch as one more route of each token.
+pub fn matmul_select_quant_shared(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    bank: Bank,
+    routes: Tensor,
+    y: Tensor,
+    shared: Option<(Bank, Tensor, Tensor)>,
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let mut entry = routed_point(OP, bank, false)?;
-    if entry == "affine_qmv_routed_bfloat16_gs_64_b_4" && std::env::var_os("PIE_GROUPED").is_some() {
+    let grouped = entry == "affine_qmv_routed_bfloat16_gs_64_b_4"
+        && (shared.is_some() || std::env::var_os("PIE_GROUPED").is_some());
+    if grouped {
         entry = "affine_qmv_routed_grouped_bfloat16_gs_64_b_4";
     }
     let by_rank = entry == "affine_qmv_routed_bfloat16_gs_64_b_4"
@@ -645,29 +660,47 @@ pub fn matmul_select_quant(
     }
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
+    let mut grid = if by_rank {
+        [routes.rows * routes.width * 32, y.width.div_ceil(4), 1]
+    } else {
+        routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?
+    };
+    let mut args = vec![
+        bank.codes.arg(),
+        bank.scales.arg(),
+        zero_points(ctx, bank)?,
+        x.arg(),
+        y.arg_mut(),
+        stated(OP, x.width)?.arg(),
+        stated(OP, y.width)?.arg(),
+        ctx.absent()?,
+        routes.arg(),
+        stated(OP, fan.x_slot_stride)?.arg(),
+        stated(OP, fan.x_row_stride)?.arg(),
+        stated(OP, fan.top_k)?.arg(),
+    ];
+    if grouped {
+        match shared {
+            Some((sbank, sx, sy)) => {
+                grid[2] += 1;
+                args.extend([
+                    sbank.codes.arg(),
+                    sbank.scales.arg(),
+                    zero_points(ctx, sbank)?,
+                    sx.arg(),
+                    sy.arg_mut(),
+                    stated(OP, sx.width)?.arg(),
+                ]);
+            }
+            None => {
+                let absent = ctx.absent()?;
+                args.extend([absent, absent, absent, absent, absent, 0u32.arg()]);
+            }
+        }
+    }
     ctx.fire(
-        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
-            if by_rank {
-                [routes.rows * routes.width * 32, y.width.div_ceil(4), 1]
-            } else {
-                routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?
-            },
-            QMV_GROUP,
-        )),
-        &[
-            bank.codes.arg(),
-            bank.scales.arg(),
-            zero_points(ctx, bank)?,
-            x.arg(),
-            y.arg_mut(),
-            stated(OP, x.width)?.arg(),
-            stated(OP, y.width)?.arg(),
-            ctx.absent()?,
-            routes.arg(),
-            stated(OP, fan.x_slot_stride)?.arg(),
-            stated(OP, fan.x_row_stride)?.arg(),
-            stated(OP, fan.top_k)?.arg(),
-        ],
+        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(grid, QMV_GROUP)),
+        &args,
     )
 }
 

@@ -467,6 +467,12 @@ METAL_FUNC void qmv_grouped_impl(
     int x_slot_stride,
     int x_row_stride,
     int slots_per_row,
+    const device uint32_t* sw,
+    const device T* ss,
+    const device T* sb,
+    const device T* sx,
+    device T* sy,
+    int sx_row_stride,
     uint3 tid,
     uint3 tgs,
     uint simd_gid,
@@ -479,51 +485,64 @@ METAL_FUNC void qmv_grouped_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int chunk = 8;
   typedef float U;
 
-  const int sel = int(tid.x) * slots_per_row + int(tid.z);
-  const int pairs = int(tgs.x) * slots_per_row;
-  const int e = expert_ids[sel];
-  if (e < 0) {
-    return;
-  }
-  // an earlier pair of the same expert serves this one
-  for (int j = 0; j < sel; j += SIMD_SIZE) {
-    const int at = j + int(simd_lid);
-    if (simd_any(at < sel && expert_ids[at] == e)) {
-      return;
-    }
-  }
-
-  const device uint8_t* ws = (const device uint8_t*)w;
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
-  ws += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_w);
-  scales += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g);
-  biases += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g);
-  const device uint8_t* ws_row = ws + out_row * in_vec_size_w;
-  const device T* sc_row = scales + out_row * in_vec_size_g;
-  const device T* bi_row = biases + out_row * in_vec_size_g;
+  const int tokens = int(tgs.x);
+  const int pairs = tokens * slots_per_row;
+  // The shared expert: the slot past the routes, every token's, read once by token 0's threadgroup.
+  const bool shared = int(tid.z) == slots_per_row;
+  int sel = 0, e = 0;
+  if (shared) {
+    if (tid.x != 0) {
+      return;
+    }
+  } else {
+    sel = int(tid.x) * slots_per_row + int(tid.z);
+    e = expert_ids[sel];
+    if (e < 0) {
+      return;
+    }
+    // an earlier pair of the same expert serves this one
+    for (int j = 0; j < sel; j += SIMD_SIZE) {
+      const int at = j + int(simd_lid);
+      if (simd_any(at < sel && expert_ids[at] == e)) {
+        return;
+      }
+    }
+  }
 
-  // the pairs of this expert from `sel` on, a 64-pair window at a time
-  for (int window = sel; window < pairs; window += 2 * SIMD_SIZE) {
+  const device uint8_t* ws = (const device uint8_t*)(shared ? sw : w);
+  const device T* sc = shared ? ss : scales;
+  const device T* bi = shared ? sb : biases;
+  ws += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_w);
+  sc += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g);
+  bi += size_t(e) * size_t(out_vec_size) * size_t(in_vec_size_g);
+  const device uint8_t* ws_row = ws + out_row * in_vec_size_w;
+  const device T* sc_row = sc + out_row * in_vec_size_g;
+  const device T* bi_row = bi + out_row * in_vec_size_g;
+
+  // the pairs of this expert from `sel` on, a 64-pair window at a time; the shared expert's, every token
+  const int count = shared ? tokens : pairs;
+  for (int window = sel; window < count; window += 2 * SIMD_SIZE) {
     const int lo = window + int(simd_lid);
     const int hi = lo + SIMD_SIZE;
     ulong mask = ulong(static_cast<simd_vote::vote_t>(
-                     simd_ballot(lo < pairs && expert_ids[lo] == e))) &
+                     simd_ballot(lo < count && (shared || expert_ids[lo] == e)))) &
         0xffffffffUL;
     mask |= (ulong(static_cast<simd_vote::vote_t>(
-                 simd_ballot(hi < pairs && expert_ids[hi] == e))) &
+                 simd_ballot(hi < count && (shared || expert_ids[hi] == e)))) &
              0xffffffffUL)
         << 32;
     while (mask != 0) {
       const int pair = window + int(ctz(mask));
       mask &= mask - 1;
-      const device T* x_row = x + (pair / slots_per_row) * x_row_stride +
-          (pair % slots_per_row) * x_slot_stride;
+      const device T* x_row = shared ? sx + pair * sx_row_stride
+                                     : x + (pair / slots_per_row) * x_row_stride +
+              (pair % slots_per_row) * x_slot_stride;
       thread U x_thread[values_per_thread];
       thread U result[results_per_simdgroup] = {0};
       for (int k = 0; k < in_vec_size; k += block_size) {
@@ -541,7 +560,7 @@ METAL_FUNC void qmv_grouped_impl(
           }
         }
       }
-      device T* y_row = y + pair * out_vec_size + out_row;
+      device T* y_row = (shared ? sy : y) + pair * out_vec_size + out_row;
       for (int row = 0; row < results_per_simdgroup; row++) {
         U v = simd_sum(result[row]);
         if (simd_lid == 0 && out_row + row < out_vec_size) {
@@ -566,13 +585,20 @@ template <typename T, int group_size, int PPT>
     const constant int& x_slot_stride [[buffer(9)]],
     const constant int& x_row_stride  [[buffer(10)]],
     const constant int& slots_per_row [[buffer(11)]],
+    const device uint32_t* sw  [[buffer(12)]],
+    const device T* ss         [[buffer(13)]],
+    const device T* sb         [[buffer(14)]],
+    const device T* sx         [[buffer(15)]],
+    device T* sy               [[buffer(16)]],
+    const constant int& sx_row_stride [[buffer(17)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tgs       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
   qmv_grouped_impl<T, group_size, PPT>(
       w, scales, biases, x, y, expert_ids, in_vec_size, out_vec_size,
-      x_slot_stride, x_row_stride, slots_per_row, tid, tgs, simd_gid, simd_lid);
+      x_slot_stride, x_row_stride, slots_per_row, sw, ss, sb, sx, sy, sx_row_stride,
+      tid, tgs, simd_gid, simd_lid);
 }
 
 template [[host_name("affine_qmv_routed_grouped_bfloat16_gs_64_b_4")]] [[kernel]] void
@@ -580,7 +606,8 @@ qmv_routed_grouped<bfloat, 64, 2>(
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&, const constant int&,
     const device bfloat*, const device int*, const constant int&, const constant int&,
-    const constant int&, uint3, uint3, uint, uint);
+    const constant int&, const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&, uint3, uint3, uint, uint);
 
 // The per-pair routed 4-bit matmul with its threadgroups in expert order:
 // threadgroup x takes the pair of rank x among the fire's (at most 64) pairs

@@ -588,3 +588,135 @@ fn the_eight_row_shared_route_prices() {
         }
     }
 }
+
+/// A verify's routed matmul and its shared expert: the per-pair kernel then the
+/// shared expert's register matmul, the grouped kernel then the same, and the
+/// grouped kernel landing the shared expert as one more expert of every token.
+#[test]
+#[ignore = "a microbenchmark"]
+fn the_eight_row_shared_grouped_prices() {
+    use kernels_metal::linear::moe;
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let (experts, tokens, top_k, layers) = (256u32, 8u32, 8u32, 40u32);
+    let pairs = tokens * top_k;
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]", false);
+    for &(k, n, per_pair) in &[(2048u32, 1024u32, false), (512, 2048, true)] {
+        let groups = k / 64;
+        let mut keep = Vec::new();
+        let mut make = |rows: u32, seed: u64| {
+            let codes: Vec<u8> = (0..u64::from(rows) * u64::from(k) / 2).map(|a| noise(a ^ seed)).collect();
+            let scales: Vec<u8> = (0..rows * groups)
+                .flat_map(|at| bf16(0.0031 + f32::from(noise(u64::from(at) ^ seed ^ 0x11)) * 0.000173))
+                .collect();
+            let biases: Vec<u8> = (0..rows * groups)
+                .flat_map(|at| bf16(-0.2 + f32::from(noise(u64::from(at) ^ seed ^ 0x5678)) * 0.00157))
+                .collect();
+            let p = [upload(&codes), upload(&scales), upload(&biases)];
+            let bank = Bank {
+                mpp_codes: None,
+                codes: Tensor::new(bind(&p[0]), rows, k, Dtype::U4g64),
+                scales: Tensor::new(bind(&p[1]), rows, groups, Dtype::Bf16),
+                biases: Some(Tensor::new(bind(&p[2]), rows, groups, Dtype::Bf16)),
+                group: 64,
+                bits: 4,
+                ld: k,
+            };
+            keep.push(p);
+            bank
+        };
+        let bank = make(experts * n, 1);
+        let shared: Vec<Bank> = (0..layers).map(|l| make(n, 100 + u64::from(l))).collect();
+        let x_rows = if per_pair { pairs } else { tokens };
+        let act = |rows: u32, salt: u64| -> Vec<u8> {
+            (0..rows * k)
+                .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ salt)) - 127.0) * 0.0197))
+                .collect()
+        };
+        let x_b = upload(&act(x_rows, 0xabcd));
+        let x = Tensor::new(bind(&x_b), x_rows, k, Dtype::Bf16);
+        let sx_b = upload(&act(tokens, 0x1234));
+        let sx = Tensor::new(bind(&sx_b), tokens, k, Dtype::Bf16);
+        let y_b = upload(&vec![0u8; (pairs * n * 2) as usize]);
+        let y = Tensor::new(bind(&y_b), pairs, n, Dtype::Bf16);
+        let sy_b = upload(&vec![0u8; (tokens * n * 2) as usize]);
+        let sy = Tensor::new(bind(&sy_b), tokens, n, Dtype::Bf16);
+        let table_rows = 16 + (4 * n / 64).div_ceil(2 * k) + 2;
+        let table_b = upload(&vec![0u8; (table_rows * k * 2) as usize]);
+        let precast = |rows: u32, width: u32| {
+            (rows <= table_rows && width == k).then(|| Tensor::new(bind(&table_b), rows, width, Dtype::F16))
+        };
+        let pb = upload(&vec![0u8; (64 * n * 4) as usize + 64]);
+        let partials = |rows: u32, width: u32| {
+            (rows <= 64 && width <= n).then(|| Tensor::new(bind(&pb), rows, width, Dtype::F32))
+        };
+        for distinct in [40u32, 24] {
+            let route_b: Vec<Buffer> = (0..layers)
+                .map(|l| {
+                    let base = l * 61;
+                    let routes: Vec<u8> = (0..tokens)
+                        .flat_map(|t| {
+                            (0..top_k).flat_map(move |s| {
+                                let local = (t * top_k + s) % distinct;
+                                let local = (local / top_k) * top_k + (local + t) % top_k;
+                                (((base + local) % experts) as i32).to_le_bytes()
+                            })
+                        })
+                        .collect();
+                    upload(&routes)
+                })
+                .collect();
+            let routes: Vec<Tensor> = route_b
+                .iter()
+                .map(|b| Tensor::new(bind(b), tokens, top_k, Dtype::I32))
+                .collect();
+            let mut line = format!("K={k:>4} N={n:>4} distinct {distinct}:");
+            for variant in ["qmv+reg", "grouped+reg", "grouped+shared"] {
+                let mut times = Vec::new();
+                for i in 0..12 {
+                    let frame = device.frame().expect("frame");
+                    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                    for (r, s) in routes.iter().zip(&shared) {
+                        unsafe { std::env::remove_var("PIE_GROUPED") };
+                        match variant {
+                            "qmv+reg" | "grouped+reg" => {
+                                if variant == "grouped+reg" {
+                                    unsafe { std::env::set_var("PIE_GROUPED", "1") };
+                                }
+                                moe::matmul_select_quant(&sink, x, bank, *r, y).expect("routed");
+                                quant::matmul(
+                                    &sink,
+                                    &tuning,
+                                    sx,
+                                    *s,
+                                    sy,
+                                    quant::Scratch { precast: &precast, partials: &partials, table: None },
+                                    8,
+                                )
+                                .expect("shared");
+                            }
+                            _ => moe::matmul_select_quant_shared(&sink, x, bank, *r, y, Some((*s, sx, sy)))
+                                .expect("fused"),
+                        }
+                    }
+                    let t = frame.commit_timed().expect("commit");
+                    if i >= 2 {
+                        times.push(t * 1e6 / f64::from(layers));
+                    }
+                }
+                times.sort_by(f64::total_cmp);
+                line += &format!("  {variant} {:.1}us", times[times.len() / 2]);
+            }
+            eprintln!("{line}");
+        }
+    }
+}
