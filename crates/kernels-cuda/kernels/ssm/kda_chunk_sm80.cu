@@ -1,8 +1,8 @@
 #include "ssm/tile_sm80.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
-__global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
+__global__ void __launch_bounds__(KDA16_TASKS * 64, 4) kda_chunk_prep(
     const bf16* __restrict__ mixed,
     float eps,
     const bf16* __restrict__ raw_g,
@@ -557,7 +557,7 @@ __device__ __forceinline__ void kda16_walk(
     }
 }
 
-__global__ void __launch_bounds__(128) ssm_kda16_scan(
+__global__ void __launch_bounds__(128) kda_chunk_scan(
     const float* __restrict__ decay,
     const bf16* __restrict__ mixed,
     const bf16* __restrict__ qg,

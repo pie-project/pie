@@ -1,6 +1,6 @@
 #include "ssm/tile_sm80.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 // Mamba-2: a head's state `[head_dim = 64][state_dim = 128]` in f32, its
 // rows read off one convolved `xbc` row (`x`, then the groups' `B`, then
@@ -17,7 +17,7 @@ __device__ __forceinline__ float m2_dt(float raw, float bias) {
 // whole 16-byte runs a lane, a warp a state row at a time (lane `l` its
 // columns `4l..4l+3`), eight rows a warp. Lands `(C S + D x) * silu(z)`, the
 // group norm after it.
-__global__ void __launch_bounds__(256) ssm_mamba2_step(
+__global__ void __launch_bounds__(256) mamba2_step(
     const bf16* __restrict__ xbc,
     const bf16* __restrict__ dt,
     const bf16* __restrict__ z,
@@ -87,7 +87,7 @@ __global__ void __launch_bounds__(256) ssm_mamba2_step(
     }
 }
 
-// A prompt's walk in sixteen-token chunks, as `ssm_kda16_scan` walks KDA's:
+// A prompt's walk in sixteen-token chunks, as `kda_chunk_scan` walks KDA's:
 // a block a (request, head), a warp 32 state columns in f32 fragments, the
 // state in shared memory in bf16 for each chunk's products. Its decay is one
 // scalar a step, so a chunk's causal scores `P = tril(C_i . B_j exp(G_i -
@@ -99,7 +99,7 @@ constexpr int M2_STAGE = 2 * KDA_CH * GDN_LD * 2 + KDA_CH * M2_LDV * 2 + KDA_CH 
 constexpr int M2_SCAN_SMEM = 2 * M2_STAGE + M2_N * M2_LDV * 2 + 2 * KDA_CH * M2_LDV * 2 +
                              KDA_CH * KDA16_LDT * 2 + 2 * KDA_CH * 4;
 
-__global__ void __launch_bounds__(128) ssm_mamba2_scan(
+__global__ void __launch_bounds__(128) mamba2_scan(
     const bf16* __restrict__ xbc,
     const bf16* __restrict__ dt,
     const bf16* __restrict__ z,

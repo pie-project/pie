@@ -4,7 +4,7 @@
 #include "ssm/chunk.cuh"
 #include "ssm/copy.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 // The chunked scan's tensor-core pieces: a bf16 `m16n8k16` with f32
 // accumulators and `ldmatrix` fragment loads, plain and transposed.

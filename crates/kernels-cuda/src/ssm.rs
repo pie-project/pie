@@ -236,7 +236,7 @@ fn conv1d_update(
     seated(
         op,
         state,
-        "ssm_causal_conv1d_update_batched",
+        "conv1d_update",
         true,
         false,
         false,
@@ -265,7 +265,7 @@ fn conv1d_update(
     let (entrypoint, launch) = if vectors {
         (
             symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_update_batched_vec8{}",
+                "::pie::ssm::conv1d_update_vec8{}",
                 out.args()
             )),
             Launch::grid(
@@ -278,7 +278,7 @@ fn conv1d_update(
         args.push(dil.arg());
         (
             symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_update_batched{}",
+                "::pie::ssm::conv1d_update{}",
                 out.args()
             )),
             Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
@@ -368,7 +368,7 @@ fn conv1d_chunked(
     seated(
         op,
         state,
-        "ssm_causal_conv1d_chunked_batched",
+        "conv1d_chunked",
         true,
         true,
         true,
@@ -385,7 +385,7 @@ fn conv1d_chunked(
     let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4 {
         (
             symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile_vec4{}",
+                "::pie::ssm::conv1d_chunked_row_tile_vec4{}",
                 out.args()
             )),
             Launch::grid(
@@ -400,7 +400,7 @@ fn conv1d_chunked(
     } else if vec8 {
         (
             symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile_vec8{}",
+                "::pie::ssm::conv1d_chunked_row_tile_vec8{}",
                 out.args()
             )),
             Launch::grid(
@@ -415,7 +415,7 @@ fn conv1d_chunked(
     } else if row_tiled {
         (
             symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile{}",
+                "::pie::ssm::conv1d_chunked_row_tile{}",
                 out.args()
             )),
             Launch::grid(
@@ -430,7 +430,7 @@ fn conv1d_chunked(
     } else if lanes >= CHANNEL_TILE_FROM {
         (
             symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched_channel_tile{}",
+                "::pie::ssm::conv1d_chunked_channel_tile{}",
                 out.args()
             )),
             Launch::grid(
@@ -441,7 +441,7 @@ fn conv1d_chunked(
     } else {
         (
             symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched{}",
+                "::pie::ssm::conv1d_chunked{}",
                 out.args()
             )),
             Launch::grid([channels, lanes, 1], [PER_CHANNEL_BLOCK, 1, 1]),
@@ -487,7 +487,7 @@ fn conv1d_chunked(
         op,
         Fire::at(
             CONV1D,
-            symbol("::pie::attn::ssm_causal_conv1d_state_commit<::pie::bf16>"),
+            symbol("::pie::ssm::conv1d_state_commit<::pie::bf16>"),
         )
         .apply(Launch::grid(
             [channels.div_ceil(TILE_BLOCK), lanes, 1],
@@ -542,7 +542,7 @@ pub fn gdn_prep(
     let rows = nonzero(OP, "rows", ba.rows)?;
     ctx.fire(
         OP,
-        Fire::at(GDN_PREP, "::pie::attn::ssm_gdn_prep_ba_gates<::pie::bf16>").apply(Launch::grid(
+        Fire::at(GDN_PREP, "::pie::ssm::gdn_prep_ba_gates<::pie::bf16>").apply(Launch::grid(
             [rows, v_heads.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -657,7 +657,7 @@ impl Delta {
         let q_scale = (self.k_dim as f32).sqrt().recip();
         ctx.fire(
             op,
-            Fire::at(GDN_PREP, "::pie::attn::ssm_gdn_prep_qk_norm<::pie::bf16, 128>")
+            Fire::at(GDN_PREP, "::pie::ssm::gdn_prep_qk_norm<::pie::bf16, 128>")
                 .apply(Launch::grid([self.n, self.k_heads, 1], [PREP_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
@@ -672,7 +672,7 @@ impl Delta {
         )?;
         ctx.fire(
             op,
-            Fire::at(GDN_PREP, "::pie::attn::ssm_gdn_prep_v_gates<::pie::bf16, 128>")
+            Fire::at(GDN_PREP, "::pie::ssm::gdn_prep_v_gates<::pie::bf16, 128>")
                 .apply(Launch::grid([self.n, self.v_heads, 1], [PREP_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
@@ -719,7 +719,7 @@ pub fn gated_delta(
     seated(
         OP,
         state,
-        "ssm_gated_delta_step_batched_gqa",
+        "gdn_step",
         true,
         false,
         false,
@@ -731,13 +731,13 @@ pub fn gated_delta(
 
     let (entrypoint, launch) = if v_dim == SMEM_ARM_WIDTH && k_dim == SMEM_ARM_WIDTH {
         (
-            "::pie::attn::ssm_gated_delta_step_batched_gqa_smem<::pie::attn::gqa_smem_bv>",
+            "::pie::ssm::gdn_step_smem<::pie::ssm::gqa_smem_bv>",
             Launch::grid([v_dim.div_ceil(SMEM_BV), shape.n, v_heads], [SMEM_BV, 1, 1])
                 .smem(k_dim * SMEM_BV * 2 + 2 * k_dim * FLOAT),
         )
     } else {
         (
-            "::pie::attn::ssm_gated_delta_step_batched_gqa<::pie::attn::state_bf16, false>",
+            "::pie::ssm::gdn_step<::pie::ssm::state_bf16, false>",
             Launch::grid([shape.n, v_heads, 1], [GDN_BLOCK, 1, 1]).smem(2 * k_dim * FLOAT),
         )
     };
@@ -834,7 +834,7 @@ impl Delta {
             .min(sms * fused_blocks_per_sm(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks));
         ctx.fire(
             op,
-            Fire::at(GDN_RECURRENT, "::pie::attn::ssm_gdn_decode_step<4>")
+            Fire::at(GDN_RECURRENT, "::pie::ssm::gdn_step_fused<4>")
                 .apply(Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1]).smem(FUSED_SMEM)),
             &[
                 qkv.arg(),
@@ -899,7 +899,7 @@ pub fn gdn_lands_snapshots(ctx: &Ctx, k_dim: u32) -> bool {
     k_dim == 128 && fused_scan(ctx, k_dim).is_some()
 }
 
-/// `pie::attn::gdn::Params`, field for field.
+/// `pie::ssm::sm100::Params`, field for field.
 #[cfg(feature = "cuda")]
 #[repr(C)]
 struct Tc5Params {
@@ -937,7 +937,7 @@ fn gated_delta_chunked_tc5(
     use crate::linear::tc5::{Map, encode, supported};
     use cudarc::driver::sys as dr;
     const GDN_CHUNK_SM100: &str = "ssm/gdn_chunk_sm100.cu";
-    /// `pie::attn::gdn::smem_bytes()`.
+    /// `pie::ssm::sm100::smem_bytes()`.
     const SMEM: u32 = 213_504 + 1024;
     if !(ctx.tuning().ssm_gdn_tc5
         && supported()
@@ -953,7 +953,7 @@ fn gated_delta_chunked_tc5(
         return Ok(false);
     }
     let lanes = requests(op, qkv)?;
-    seated(op, state, "gdn_chunked_tc5", true, true, true)?;
+    seated(op, state, "sm100::gdn_chunked", true, true, true)?;
     let map = crate::attn::bf16_map(
         qkv.data.ptr,
         [shape.conv_dim, qkv.data.rows, 1],
@@ -1011,7 +1011,7 @@ fn gated_delta_chunked_tc5(
     let grid = tiles.min(ctx.multiprocessors().unwrap_or(148)).max(1);
     ctx.fire(
         op,
-        Fire::at(GDN_CHUNK_SM100, symbol("::pie::attn::gdn::gdn_chunked_tc5"))
+        Fire::at(GDN_CHUNK_SM100, symbol("::pie::ssm::sm100::gdn_chunked"))
             .apply(Launch::grid([grid, 1, 1], [384, 1, 1]).smem(SMEM)),
         &[
             ArgValue::of(&map),
@@ -1085,7 +1085,7 @@ fn gated_delta_chunked_fla(
         2 * CH * LD * 2 + 2 * CH * LDC * 2 + CH * LDA * FLOAT + 3 * CH * FLOAT + 4 * 256 * FLOAT;
     ctx.fire(
         op,
-        Fire::at(GDN_CHUNK_SM80, "::pie::attn::ssm_gdn_chunk_prep<128, 128>")
+        Fire::at(GDN_CHUNK_SM80, "::pie::ssm::gdn_chunk_prep<128, 128>")
             .apply(Launch::grid([v_heads, slots, 1], [2 * BLOCK, 1, 1]).smem(prep_smem)),
         &[
             qkv.data.arg(),
@@ -1112,9 +1112,9 @@ fn gated_delta_chunked_fla(
     )?;
     let scan_smem = scan_smem_at(k_dim, bv);
     let entry = if bv == SCAN_BV {
-        "::pie::attn::ssm_chunk_scan<64>"
+        "::pie::ssm::gdn_chunk_scan<64>"
     } else {
-        "::pie::attn::ssm_chunk_scan<32>"
+        "::pie::ssm::gdn_chunk_scan<32>"
     };
     ctx.fire(
         op,
@@ -1226,7 +1226,7 @@ fn gated_delta_chunked_split(
     let wu_smem = CH * CH * FLOAT + CH * k_dim * 2 + CH * CH * 2 + 4 * CH * FLOAT;
     ctx.fire(
         op,
-        Fire::at(GDN_CHUNK_SM80, "::pie::attn::ssm_gdn_chunk_wu<128, 128>")
+        Fire::at(GDN_CHUNK_SM80, "::pie::ssm::gdn_chunk_wu<128, 128>")
             .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1]).smem(wu_smem)),
         &[
             ArgValue::Ptr(staged.q_norm),
@@ -1254,7 +1254,7 @@ fn gated_delta_chunked_split(
         op,
         Fire::at(
             GDN_CHUNK_SM80,
-            "::pie::attn::ssm_gdn_chunk_h<::pie::attn::state_bf16, 128, 128, 16>",
+            "::pie::ssm::gdn_chunk_h<::pie::ssm::state_bf16, 128, 128, 16>",
         )
         .apply(Launch::grid(
             [lanes * v_heads * (v_dim / BVT), 1, 1],
@@ -1283,7 +1283,7 @@ fn gated_delta_chunked_split(
     )?;
     ctx.fire(
         op,
-        Fire::at(GDN_CHUNK_SM80, "::pie::attn::ssm_gdn_chunk_o<128, 128, 16>")
+        Fire::at(GDN_CHUNK_SM80, "::pie::ssm::gdn_chunk_o<128, 128, 16>")
             .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(gcum),
@@ -1387,7 +1387,7 @@ pub fn gated_delta_chunked(
         let rows = nonzero(OP, "rows", y.rows)?;
         return ctx.fire(
             OP,
-            Fire::at(GDN_CHUNK_SM80, "::pie::attn::ssm_gdn_narrow_rows").apply(Launch::grid(
+            Fire::at(GDN_CHUNK_SM80, "::pie::ssm::gdn_narrow_rows").apply(Launch::grid(
                 [rows, y.width.div_ceil(4 * 128), 1],
                 [128, 1, 1],
             )),
@@ -1424,7 +1424,7 @@ pub fn gated_delta_chunked(
         seated(
             OP,
             state,
-            "ssm_gated_delta_chunked_batched_fla",
+            "gdn_chunked_fla",
             true,
             true,
             true,
@@ -1433,7 +1433,7 @@ pub fn gated_delta_chunked(
             OP,
             Fire::at(
                 GDN_CHUNK,
-                "::pie::attn::ssm_gated_delta_chunked_batched_fla<::pie::attn::state_bf16, 128, 128>",
+                "::pie::ssm::gdn_chunked_fla<::pie::ssm::state_bf16, 128, 128>",
             )
             .apply(
                 Launch::grid([v_dim / BV_FLA, lanes, v_heads], [BV_FLA, 1, 1])
@@ -1477,7 +1477,7 @@ pub fn gated_delta_chunked(
         seated(
             OP,
             state,
-            "ssm_gated_delta_chunked_batched_warp_tiled_gqa",
+            "gdn_chunked_warp_tiled",
             true,
             false,
             false,
@@ -1486,7 +1486,7 @@ pub fn gated_delta_chunked(
             OP,
             Fire::at(
                 GDN_CHUNK,
-                "::pie::attn::ssm_gated_delta_chunked_batched_warp_tiled_gqa<::pie::attn::state_bf16, false>",
+                "::pie::ssm::gdn_chunked_warp_tiled<::pie::ssm::state_bf16, false>",
             )
             .apply(Launch::grid(
                 [lanes, v_heads, v_dim.div_ceil(SCAN_WARPS)],
@@ -1517,7 +1517,7 @@ pub fn gated_delta_chunked(
     seated(
         OP,
         state,
-        "ssm_gated_delta_chunked_batched",
+        "gdn_chunked",
         false,
         false,
         false,
@@ -1533,7 +1533,7 @@ pub fn gated_delta_chunked(
                 OP,
                 Fire::at(
                     GDN_PREP,
-                    "::pie::attn::repeat_interleave_heads_fp32<::pie::attn::f32>",
+                    "::pie::ssm::repeat_heads_f32<::pie::ssm::f32>",
                 )
                 .apply(Launch::grid([shape.n, v_heads, 1], [BLOCK, 1, 1])),
                 &[
@@ -1553,7 +1553,7 @@ pub fn gated_delta_chunked(
         OP,
         Fire::at(
             GDN_CHUNK,
-            "::pie::attn::ssm_gated_delta_chunked_batched<::pie::attn::state_bf16, false>",
+            "::pie::ssm::gdn_chunked<::pie::ssm::state_bf16, false>",
         )
         .apply(Launch::grid([lanes, v_heads, 1], [GDN_BLOCK, 1, 1]).smem(2 * k_dim * FLOAT)),
         &[
@@ -1694,7 +1694,7 @@ impl Kda {
             if self.head_dim > 0 && self.width.is_multiple_of(self.head_dim) {
                 Fire::at(
                     KDA,
-                    "::pie::attn::ssm_kda_qkv_prep_heads<::pie::bf16, 128>",
+                    "::pie::ssm::kda_qkv_prep_heads<::pie::bf16, 128>",
                 )
                 .apply(
                     Launch::grid(
@@ -1708,7 +1708,7 @@ impl Kda {
                     .programmatic(ctx.tuning().pdl),
                 )
             } else {
-                Fire::at(KDA, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>")
+                Fire::at(KDA, "::pie::ssm::kda_qkv_prep<::pie::bf16, 128>")
                     .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1]))
             },
             &[
@@ -1724,12 +1724,12 @@ impl Kda {
         )?;
         // A row a block, four channels a thread.
         let gates = if self.head_dim.is_multiple_of(4) {
-            Fire::at(KDA, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>").apply(
+            Fire::at(KDA, "::pie::ssm::kda_gate_beta_rows<::pie::bf16>").apply(
                 Launch::grid([self.n, self.width.div_ceil(1024), 1], [256, 1, 1])
                     .programmatic(ctx.tuning().pdl),
             )
         } else {
-            Fire::at(KDA, "::pie::attn::ssm_kda_gate_beta<::pie::bf16>").apply(Launch::grid(
+            Fire::at(KDA, "::pie::ssm::kda_gate_beta<::pie::bf16>").apply(Launch::grid(
                 [self.n, self.heads, 1],
                 [self.head_dim.clamp(WARP, PREP_BLOCK), 1, 1],
             ))
@@ -1793,7 +1793,7 @@ pub fn kda_step(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_kda_step_batched", true, false, false)?;
+    seated(OP, state, "kda_step", true, false, false)?;
     let work = shape.work(ctx, OP, state, shape.n)?;
     if ctx.tuning().ssm_kda_step_fused && matches!(shape.head_dim, 32 | 64 | 128) {
         // Enough blocks to fill the device twice: each (row, head) split
@@ -1809,7 +1809,7 @@ pub fn kda_step(
             Fire::at(
                 KDA,
                 symbol(&format!(
-                    "::pie::attn::ssm_kda_step_fused<::pie::bf16, {}>",
+                    "::pie::ssm::kda_step_fused<::pie::bf16, {}>",
                     shape.head_dim / WARP
                 )),
             )
@@ -1841,7 +1841,7 @@ pub fn kda_step(
     let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
     ctx.fire(
         OP,
-        Fire::at(KDA, "::pie::attn::ssm_kda_step_batched").apply(
+        Fire::at(KDA, "::pie::ssm::kda_step").apply(
             Launch::grid(
                 [
                     shape.n,
@@ -1934,7 +1934,7 @@ fn kda_chunked_mma(
     )?;
     ctx.fire(
         op,
-        Fire::at(KDA_CHUNK_SM80, "::pie::attn::ssm_kda16_prep").apply(
+        Fire::at(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_prep").apply(
             Launch::grid([heads.div_ceil(TASKS), slots, 1], [TASKS * 2 * WARP, 1, 1])
                 .smem(TASKS * TASK_SMEM),
         ),
@@ -1963,7 +1963,7 @@ fn kda_chunked_mma(
     )?;
     ctx.fire(
         op,
-        Fire::at(KDA_CHUNK_SM80, "::pie::attn::ssm_kda16_scan")
+        Fire::at(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_scan")
             .apply(Launch::grid([lanes * heads * 2, 1, 1], [128, 1, 1]).smem(3 * STAGE + 64)),
         &[
             ArgValue::Ptr(gl),
@@ -2016,7 +2016,7 @@ pub fn kda_chunked(
     let shape = Kda::of(OP, mixed.data, f, b, y, heads, head_dim)?;
     let lanes = requests(OP, mixed)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_kda_chunked_batched", true, true, true)?;
+    seated(OP, state, "kda_chunked", true, true, true)?;
     if ctx.tuning().ssm_kda_chunked && shape.head_dim == 128 {
         // The tensor-core prep reads the raw rows and forms the norms and
         // gates itself.
@@ -2035,7 +2035,7 @@ pub fn kda_chunked(
     let work = shape.work(ctx, OP, state, lanes)?;
     ctx.fire(
         OP,
-        Fire::at(KDA, "::pie::attn::ssm_kda_chunked_batched").apply(
+        Fire::at(KDA, "::pie::ssm::kda_chunked").apply(
             Launch::grid(
                 [lanes, shape.heads, 1],
                 [shape.head_dim.min(PREFILL_MAX_WARPS) * WARP, 1, 1],
@@ -2142,14 +2142,14 @@ pub fn mamba2_step(
     state_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_mamba2_step";
+    const OP: &str = "attention.mamba2_step";
     m.check(OP, xbc, dt, z, y, state_dim)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_mamba2_step", true, false, false)?;
+    seated(OP, state, "mamba2_step", true, false, false)?;
     let rows = nonzero(OP, "rows", xbc.rows)?;
     ctx.fire(
         OP,
-        Fire::at(MAMBA2, "::pie::attn::ssm_mamba2_step")
+        Fire::at(MAMBA2, "::pie::ssm::mamba2_step")
             .apply(Launch::grid([rows, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.arg(),
@@ -2195,10 +2195,10 @@ pub fn mamba2_chunked(
     m.check(OP, xbc.data, dt, z, y, state_dim)?;
     let lanes = requests(OP, xbc)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_mamba2_scan", true, true, true)?;
+    seated(OP, state, "mamba2_scan", true, true, true)?;
     ctx.fire(
         OP,
-        Fire::at(MAMBA2, "::pie::attn::ssm_mamba2_scan")
+        Fire::at(MAMBA2, "::pie::ssm::mamba2_scan")
             .apply(Launch::grid([lanes * m.heads, 1, 1], [128, 1, 1]).smem(SMEM)),
         &[
             xbc.data.arg(),

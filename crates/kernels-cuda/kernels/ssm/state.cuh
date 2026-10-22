@@ -3,7 +3,7 @@
 #include <cuda_bf16.h>
 #include "prelude/device.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 using f32 = float;
 using state_bf16 = __nv_bfloat16;

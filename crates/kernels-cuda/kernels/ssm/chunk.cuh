@@ -2,7 +2,7 @@
 
 #include "ssm/state.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 constexpr int GDN_CH = 64;
 

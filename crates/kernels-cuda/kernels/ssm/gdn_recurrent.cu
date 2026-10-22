@@ -1,11 +1,11 @@
 #include "ssm/copy.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 constexpr int gqa_smem_bv = 128;
 
 template <typename StateT, bool KLast>
-__global__ void ssm_gated_delta_step_batched_gqa(
+__global__ void gdn_step(
     const float* __restrict__ q_norm_kh,
     const float* __restrict__ k_norm_kh,
     const float* __restrict__ v,
@@ -85,7 +85,7 @@ __global__ void ssm_gated_delta_step_batched_gqa(
 }
 
 template <int BV>
-__global__ void ssm_gated_delta_step_batched_gqa_smem(
+__global__ void gdn_step_smem(
     const float* __restrict__ q_norm_kh,
     const float* __restrict__ k_norm_kh,
     const float* __restrict__ v,
@@ -205,7 +205,7 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
 constexpr int GDN_STREAM_STAGE = 4096 + 512 + 32 + 32;
 
 template <int W>
-__global__ void __launch_bounds__(W * 32) ssm_gdn_decode_step(
+__global__ void __launch_bounds__(W * 32) gdn_step_fused(
     const bf16* __restrict__ qkv_post,
     const float* __restrict__ gates,
     __nv_bfloat16* __restrict__ state_base,

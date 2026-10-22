@@ -26,7 +26,7 @@
 // their thread 0 issues the chain's products and the TMA loads, a chunk
 // ahead. Twelve warps leave each thread 168 registers.
 
-namespace pie::attn::gdn {
+namespace pie::ssm::sm100 {
 
 using tc5::u32;
 using tc5::u64;
@@ -263,7 +263,7 @@ __device__ __forceinline__ void tma_store_3d(const tc5::TmaMap* map, const void*
         : "memory");
 }
 
-__global__ void __launch_bounds__(384, 1) gdn_chunked_tc5(
+__global__ void __launch_bounds__(384, 1) gdn_chunked(
     const __grid_constant__ tc5::TmaMap map_qkv, const __grid_constant__ tc5::TmaMap map_out,
     const Params p) {
     using namespace tc5;
@@ -987,4 +987,4 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked_tc5(
     }
 }
 
-}  // namespace pie::attn::gdn
+}  // namespace pie::ssm::gdn

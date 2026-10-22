@@ -1,9 +1,9 @@
 #include "ssm/copy.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 template <class ElemT>
-__global__ void ssm_kda_gate_beta(
+__global__ void kda_gate_beta(
     const ElemT* __restrict__ raw_g,
     const ElemT* __restrict__ raw_beta,
     const float* __restrict__ A_log,
@@ -45,11 +45,11 @@ __global__ void ssm_kda_gate_beta(
     }
 }
 
-// `ssm_kda_gate_beta` a row a block: each thread four channels of the
+// `kda_gate_beta` a row a block: each thread four channels of the
 // row's heads at once, the same values (each channel's gate as that kernel
 // forms it, each head's beta).
 template <class ElemT>
-__global__ void ssm_kda_gate_beta_rows(
+__global__ void kda_gate_beta_rows(
     const ElemT* __restrict__ raw_g,
     const ElemT* __restrict__ raw_beta,
     const float* __restrict__ A_log,
@@ -96,13 +96,13 @@ __global__ void ssm_kda_gate_beta_rows(
     }
 }
 
-// `ssm_kda_qkv_prep` a warp a head: block (row, plane, z) takes heads
+// `kda_qkv_prep` a warp a head: block (row, plane, z) takes heads
 // z * BLOCK / 32 .. +BLOCK / 32, each warp its head's sum of squares (folded
 // across its lanes) and the head's normalized values, no shared memory
 // between: a decode's row over the card rather than one block a plane.
 // `width` whole `head_dim`s.
 template <class ElemT, int BLOCK>
-__global__ void ssm_kda_qkv_prep_heads(
+__global__ void kda_qkv_prep_heads(
     const ElemT* __restrict__ mixed,
     float* __restrict__ q_out,
     float* __restrict__ k_out,
@@ -140,7 +140,7 @@ __global__ void ssm_kda_qkv_prep_heads(
 }
 
 template <class ElemT, int BLOCK>
-__global__ void ssm_kda_qkv_prep(
+__global__ void kda_qkv_prep(
     const ElemT* __restrict__ mixed,
     float* __restrict__ q_out,
     float* __restrict__ k_out,
@@ -211,13 +211,13 @@ __device__ __forceinline__ float* kda_state_or_copy(
     return copy;
 }
 
-// `ssm_kda_step_batched` over the packed `[q | k | v]` rows themselves: the
+// `kda_step` over the packed `[q | k | v]` rows themselves: the
 // query and key norms and the gates and beta formed in place, the same
 // values without the staged planes and their two launches. A lane holds
 // `kPer` consecutive dims of a state row in registers (`D = 32 kPer`), and a
 // warp walks four rows at once: one load and one store a row.
 template <class ElemT, int kPer>
-__global__ void ssm_kda_step_fused(
+__global__ void kda_step_fused(
     const ElemT* __restrict__ mixed,
     const ElemT* __restrict__ raw_g,
     const ElemT* __restrict__ raw_beta,
@@ -360,7 +360,7 @@ __global__ void ssm_kda_step_fused(
     }
 }
 
-// `ssm_kda_step_batched`'s value rows `v_lo..v_hi` of a head's `D = 128
+// `kda_step`'s value rows `v_lo..v_hi` of a head's `D = 128
 // kRuns` state in registers: a lane's float4 of each 128-column run, a
 // warp's `kPair` rows loaded together so their reads are in flight at
 // once, each row read once and written once.
@@ -431,7 +431,7 @@ __device__ __forceinline__ void kda_step_rows(float* st, const float* sq, const 
     }
 }
 
-__global__ void ssm_kda_step_batched(
+__global__ void kda_step(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
     const float* __restrict__ v,
@@ -534,7 +534,7 @@ __global__ void ssm_kda_step_batched(
     }
 }
 
-__global__ void ssm_kda_chunked_batched(
+__global__ void kda_chunked(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
     const float* __restrict__ v,

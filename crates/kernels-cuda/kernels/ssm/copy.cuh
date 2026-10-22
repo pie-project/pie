@@ -2,7 +2,7 @@
 
 #include "ssm/state.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 __device__ __forceinline__ void gdn_load8(
     const __nv_bfloat16* __restrict__ p, float (&s)[8]) {

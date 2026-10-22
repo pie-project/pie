@@ -1,6 +1,6 @@
 #include "ssm/state.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 template <bool SILU, bool RESIDUAL>
 __device__ __forceinline__ float conv_out(float acc, float x_t) {
@@ -14,7 +14,7 @@ __device__ __forceinline__ float conv_out(float acc, float x_t) {
 }
 
 template <class T, bool SILU = true, bool RESIDUAL = false>
-__global__ void ssm_causal_conv1d_chunked_batched(
+__global__ void conv1d_chunked(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
@@ -101,7 +101,7 @@ __global__ void ssm_causal_conv1d_chunked_batched(
 }
 
 template <class T, bool SILU = true, bool RESIDUAL = false>
-__global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
+__global__ void conv1d_chunked_channel_tile(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
@@ -187,7 +187,7 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
 constexpr int CONV_TT = 32;
 
 template <class T, bool SILU = true, bool RESIDUAL = false>
-__global__ void ssm_causal_conv1d_chunked_batched_row_tile(
+__global__ void conv1d_chunked_row_tile(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
@@ -275,7 +275,7 @@ __global__ void ssm_causal_conv1d_chunked_batched_row_tile(
 // three rows before the current one in registers, and reads a tile's rows
 // eight at a time so their loads are in flight together.
 template <class T, bool SILU = true, bool RESIDUAL = false>
-__global__ void ssm_causal_conv1d_chunked_batched_row_tile_vec8(
+__global__ void conv1d_chunked_row_tile_vec8(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
@@ -403,7 +403,7 @@ __global__ void ssm_causal_conv1d_chunked_batched_row_tile_vec8(
 // 64-register bound keeps eight blocks resident on sm_100. Same sums, same
 // order, same bits as the 16-byte form.
 template <class T, bool SILU = true, bool RESIDUAL = false>
-__global__ void __launch_bounds__(128, 8) ssm_causal_conv1d_chunked_batched_row_tile_vec4(
+__global__ void __launch_bounds__(128, 8) conv1d_chunked_row_tile_vec4(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
@@ -525,7 +525,7 @@ __global__ void __launch_bounds__(128, 8) ssm_causal_conv1d_chunked_batched_row_
 
 
 template <class T>
-__global__ void ssm_causal_conv1d_state_commit(
+__global__ void conv1d_state_commit(
     const T* __restrict__ x,
     T* __restrict__ state_out_base,
     const int* __restrict__ slot_ids,
@@ -587,7 +587,7 @@ __global__ void ssm_causal_conv1d_state_commit(
 }
 
 template <class T, bool SILU = true, bool RESIDUAL = false>
-__global__ void ssm_causal_conv1d_update_batched(
+__global__ void conv1d_update(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
@@ -642,7 +642,7 @@ __global__ void ssm_causal_conv1d_update_batched(
 }
 
 template <class T, bool SILU = true, bool RESIDUAL = false>
-__global__ void ssm_causal_conv1d_update_batched_vec8(
+__global__ void conv1d_update_vec8(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,

@@ -1,12 +1,12 @@
 #include "ssm/tile_sm80.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 // A gated delta walk's f32 rows narrowed to bf16 where its trace asked for
 // a bf16 output and the walk could not land one itself: a block a row and
 // span of `blockDim.x` runs of four (a few rows' fire is otherwise a few
 // blocks walking a long row), the staged window's rows only.
-__global__ void ssm_gdn_narrow_rows(
+__global__ void gdn_narrow_rows(
     const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, int width,
     const u32* __restrict__ win)
 {
@@ -41,7 +41,7 @@ __global__ void ssm_gdn_narrow_rows(
 // causal scores `P = tril(q_i . k_j exp(G_i - G_j))`, beside the normalized
 // queries and keys (written once per key head) and the decay's running sum.
 template <int BK, int BV>
-__global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
+__global__ void __launch_bounds__(256) gdn_chunk_prep(
     const bf16* __restrict__ qkv_post,
     const float* __restrict__ gates,
     const int* __restrict__ slot_ids,
@@ -366,7 +366,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
 // and value columns two over the eight warps; each next-chunk operand
 // streams in as soon as its buffer frees, so two blocks fit an SM.
 template <int BV>
-__global__ void __launch_bounds__(256) ssm_chunk_scan(
+__global__ void __launch_bounds__(256) gdn_chunk_scan(
     const float* __restrict__ decay,
     const bf16* __restrict__ qn,
     const bf16* __restrict__ kn,
@@ -699,7 +699,7 @@ __global__ void __launch_bounds__(256) ssm_chunk_scan(
 constexpr int GDN_WARPS = 8;
 
 template <int BK, int BV>
-__global__ void __launch_bounds__(256) ssm_gdn_chunk_wu(
+__global__ void __launch_bounds__(256) gdn_chunk_wu(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
     const float* __restrict__ v,
@@ -873,7 +873,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_wu(
 }
 
 template <typename StateT, int BK, int BV, int BVT>
-__global__ void __launch_bounds__(256) ssm_gdn_chunk_h(
+__global__ void __launch_bounds__(256) gdn_chunk_h(
     const float* __restrict__ gcum,
     const __nv_bfloat16* __restrict__ kT,
     const __nv_bfloat16* __restrict__ w,
@@ -991,7 +991,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_h(
 }
 
 template <int BK, int BV, int BVT>
-__global__ void __launch_bounds__(256) ssm_gdn_chunk_o(
+__global__ void __launch_bounds__(256) gdn_chunk_o(
     const float* __restrict__ gcum,
     const __nv_bfloat16* __restrict__ qb,
     const __nv_bfloat16* __restrict__ kb,

@@ -1,6 +1,6 @@
 #include "ssm/state.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 template <class T>
 __global__ void widen(
@@ -19,7 +19,7 @@ __global__ void narrow(
 }
 
 template <class T>
-__global__ void repeat_interleave_heads_fp32(
+__global__ void repeat_heads_f32(
     const T* __restrict__ in, T* __restrict__ out,
     int K_h, int V_h, int D, int repeat,
     const u32* __restrict__ win)
@@ -42,7 +42,7 @@ __global__ void repeat_interleave_heads_fp32(
 }
 
 template <class T, int BLOCK>
-__global__ void ssm_gdn_prep_qk_norm(
+__global__ void gdn_prep_qk_norm(
     const T* __restrict__ qkv_post,
     float* __restrict__ q_out,
     float* __restrict__ k_out,
@@ -96,7 +96,7 @@ __global__ void ssm_gdn_prep_qk_norm(
 }
 
 template <class T>
-__global__ void ssm_gdn_prep_ba_gates(
+__global__ void gdn_prep_ba_gates(
     const T* __restrict__ ba,
     const float* __restrict__ A_log,
     const T* __restrict__ dt_bias,
@@ -125,7 +125,7 @@ __global__ void ssm_gdn_prep_ba_gates(
 }
 
 template <class T, int BLOCK>
-__global__ void ssm_gdn_prep_v_gates(
+__global__ void gdn_prep_v_gates(
     const T* __restrict__ qkv_post,
     const float* __restrict__ gates,
     float* __restrict__ v_out,

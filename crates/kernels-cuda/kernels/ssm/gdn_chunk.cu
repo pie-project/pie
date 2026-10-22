@@ -1,9 +1,9 @@
 #include "ssm/state.cuh"
 
-namespace pie::attn {
+namespace pie::ssm {
 
 template <typename StateT, bool KLast>
-__global__ void ssm_gated_delta_chunked_batched(
+__global__ void gdn_chunked(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
     const float* __restrict__ v,
@@ -83,7 +83,7 @@ __global__ void ssm_gated_delta_chunked_batched(
 }
 
 template <typename StateT, bool KLast>
-__global__ void ssm_gated_delta_chunked_batched_warp_tiled_gqa(
+__global__ void gdn_chunked_warp_tiled(
     const float* __restrict__ q_norm_kh,
     const float* __restrict__ k_norm_kh,
     const float* __restrict__ v,
@@ -189,7 +189,7 @@ __global__ void ssm_gated_delta_chunked_batched_warp_tiled_gqa(
 }
 
 template <typename StateT, int BV, int BK_MAX>
-__global__ void ssm_gated_delta_chunked_batched_fla(
+__global__ void gdn_chunked_fla(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
     const float* __restrict__ v,
