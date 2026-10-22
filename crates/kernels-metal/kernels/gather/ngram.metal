@@ -48,7 +48,7 @@ inline void ple_hash_row(
   }
 }
 
-[[kernel]] void ple_ngram_ids_update(
+[[kernel]] void ngram_ids_update(
     const device int* ids                   [[buffer(0)]],
     device int* state                       [[buffer(1)]],
     const device uint* slots                [[buffer(2)]],
@@ -87,7 +87,7 @@ inline void ple_hash_row(
   state[slab + size_t(span - 1)] = fresh + 1;
 }
 
-[[kernel]] void ple_ngram_ids_chunked(
+[[kernel]] void ngram_ids_chunked(
     const device int* ids                   [[buffer(0)]],
     const device int* indptr                [[buffer(1)]],
     device int* state                       [[buffer(2)]],
@@ -142,7 +142,7 @@ inline void ple_hash_row(
   }
 }
 
-[[kernel]] void ple_ngram_ids_committed(
+[[kernel]] void ngram_ids_committed(
     const device int* ids                   [[buffer(0)]],
     const device int* indptr                [[buffer(1)]],
     const device int* replay                [[buffer(2)]],

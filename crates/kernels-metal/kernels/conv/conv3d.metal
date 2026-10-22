@@ -48,7 +48,7 @@ inline int conv_tap_row(
 }
 
 template <typename T>
-[[kernel]] void spatial_conv3d(
+[[kernel]] void conv3d(
     const device T* x                 [[buffer(0)]],
     const device int* grid            [[buffer(1)]],
     const device T* w                 [[buffer(2)]],
@@ -127,9 +127,9 @@ template <typename T>
   }
 }
 
-#define instantiate_spatial_conv3d(name, itype)                            \
-  template [[host_name("spatial_conv3d_" #name)]]                          \
-  [[kernel]] void spatial_conv3d<itype>(                                   \
+#define instantiate_conv3d(name, itype)                            \
+  template [[host_name("conv3d_" #name)]]                          \
+  [[kernel]] void conv3d<itype>(                                   \
       const device itype*, const device int*, const device itype*,         \
       const device float*, const device itype*, device itype*,             \
       const device int*,                                                   \
@@ -141,5 +141,5 @@ template <typename T>
       const constant int&, const constant uint&,                           \
       uint2, uint, uint, uint);
 
-instantiate_spatial_conv3d(bfloat16, bfloat)
+instantiate_conv3d(bfloat16, bfloat)
 

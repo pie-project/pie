@@ -2,7 +2,7 @@
 
 
 template <typename T>
-[[kernel]] void spatial_upsample_nearest(
+[[kernel]] void upsample_nearest(
     const device T* x                 [[buffer(0)]],
     const device int* grid            [[buffer(1)]],
     device T* y                       [[buffer(2)]],
@@ -34,8 +34,8 @@ template <typename T>
 }
 
 #define instantiate_upsample(name, itype)                                  \
-  template [[host_name("spatial_upsample_nearest_" #name)]]                \
-  [[kernel]] void spatial_upsample_nearest<itype>(                         \
+  template [[host_name("upsample_nearest_" #name)]]                \
+  [[kernel]] void upsample_nearest<itype>(                         \
       const device itype*, const device int*, device itype*,               \
       const device int*, const constant uint&, const constant uint&,       \
       const constant uint&, const constant uint&, const constant uint&,    \
@@ -45,7 +45,7 @@ instantiate_upsample(bfloat16, bfloat)
 instantiate_upsample(float32, float)
 
 template <typename T>
-[[kernel]] void spatial_pixel_shuffle(
+[[kernel]] void pixel_shuffle(
     const device T* x                 [[buffer(0)]],
     const device int* grid            [[buffer(1)]],
     device T* y                       [[buffer(2)]],
@@ -78,8 +78,8 @@ template <typename T>
 }
 
 #define instantiate_shuffle(name, itype)                                   \
-  template [[host_name("spatial_pixel_shuffle_" #name)]]                   \
-  [[kernel]] void spatial_pixel_shuffle<itype>(                            \
+  template [[host_name("pixel_shuffle_" #name)]]                   \
+  [[kernel]] void pixel_shuffle<itype>(                            \
       const device itype*, const device int*, device itype*,               \
       const device int*, const constant uint&, const constant uint&,       \
       const constant uint&, const constant uint&, const constant uint&,    \
@@ -89,7 +89,7 @@ instantiate_shuffle(bfloat16, bfloat)
 instantiate_shuffle(float32, float)
 
 template <typename T>
-[[kernel]] void spatial_pixel_unshuffle(
+[[kernel]] void pixel_unshuffle(
     const device T* x                 [[buffer(0)]],
     const device int* grid            [[buffer(1)]],
     device T* y                       [[buffer(2)]],
@@ -125,8 +125,8 @@ template <typename T>
 }
 
 #define instantiate_unshuffle(name, itype)                                 \
-  template [[host_name("spatial_pixel_unshuffle_" #name)]]                 \
-  [[kernel]] void spatial_pixel_unshuffle<itype>(                          \
+  template [[host_name("pixel_unshuffle_" #name)]]                 \
+  [[kernel]] void pixel_unshuffle<itype>(                          \
       const device itype*, const device int*, device itype*,               \
       const device int*, const constant uint&, const constant uint&,       \
       const constant uint&, const constant uint&, const constant uint&,    \
@@ -136,7 +136,7 @@ instantiate_unshuffle(bfloat16, bfloat)
 instantiate_unshuffle(float32, float)
 
 template <typename T>
-[[kernel]] void spatial_avg_down(
+[[kernel]] void avg_down(
     const device T* x                 [[buffer(0)]],
     const device int* grid            [[buffer(1)]],
     device T* y                       [[buffer(2)]],
@@ -180,8 +180,8 @@ template <typename T>
 }
 
 #define instantiate_avg_down(name, itype)                                  \
-  template [[host_name("spatial_avg_down_" #name)]]                        \
-  [[kernel]] void spatial_avg_down<itype>(                                 \
+  template [[host_name("avg_down_" #name)]]                        \
+  [[kernel]] void avg_down<itype>(                                 \
       const device itype*, const device int*, device itype*,               \
       const device int*, const constant uint&, const constant uint&,       \
       const constant uint&, const constant uint&, const constant uint&,    \
@@ -190,7 +190,7 @@ template <typename T>
 instantiate_avg_down(bfloat16, bfloat)
 
 template <typename T>
-[[kernel]] void spatial_cache_gather(
+[[kernel]] void cache_gather(
     const device T* slab              [[buffer(0)]],
     const device int* slot_ids        [[buffer(1)]],
     const device int* grid            [[buffer(2)]],
@@ -231,7 +231,7 @@ template <typename T>
 }
 
 template <typename T>
-[[kernel]] void spatial_cache_store(
+[[kernel]] void cache_store(
     const device T* x                 [[buffer(0)]],
     const device T* cache             [[buffer(1)]],
     const device int* slot_ids        [[buffer(2)]],
@@ -283,8 +283,8 @@ template <typename T>
 }
 
 #define instantiate_cache_gather(name, itype)                              \
-  template [[host_name("spatial_cache_gather_" #name)]]                    \
-  [[kernel]] void spatial_cache_gather<itype>(                             \
+  template [[host_name("cache_gather_" #name)]]                    \
+  [[kernel]] void cache_gather<itype>(                             \
       const device itype*, const device int*, const device int*,           \
       device itype*, const constant uint&, const constant uint&,           \
       const constant uint&, const constant uint&, uint2);
@@ -292,8 +292,8 @@ template <typename T>
 instantiate_cache_gather(bfloat16, bfloat)
 
 #define instantiate_cache_store(name, itype)                               \
-  template [[host_name("spatial_cache_store_" #name)]]                     \
-  [[kernel]] void spatial_cache_store<itype>(                              \
+  template [[host_name("cache_store_" #name)]]                     \
+  [[kernel]] void cache_store<itype>(                              \
       const device itype*, const device itype*, const device int*,         \
       const device int*, device itype*, const constant uint&,              \
       const constant uint&, const constant uint&, const constant uint&,    \

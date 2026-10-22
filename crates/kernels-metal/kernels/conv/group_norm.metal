@@ -15,7 +15,7 @@ inline void welford_merge(
 }
 
 template <typename T>
-[[kernel]] void spatial_group_norm_stats(
+[[kernel]] void group_norm_stats(
     const device T* x                 [[buffer(0)]],
     const device int* grid            [[buffer(1)]],
     device float4* partials           [[buffer(2)]],
@@ -79,15 +79,15 @@ template <typename T>
 }
 
 #define instantiate_gn_stats(name, itype)                                  \
-  template [[host_name("spatial_group_norm_stats_" #name)]]                \
-  [[kernel]] void spatial_group_norm_stats<itype>(                         \
+  template [[host_name("group_norm_stats_" #name)]]                \
+  [[kernel]] void group_norm_stats<itype>(                         \
       const device itype*, const device int*, device float4*,              \
       const constant uint&, const constant uint&, const constant uint&,    \
       uint3, uint3, uint3, uint, uint);
 
 instantiate_gn_stats(bfloat16, bfloat)
 
-[[kernel]] void spatial_group_norm_finalize(
+[[kernel]] void group_norm_finalize(
     const device float4* partials     [[buffer(0)]],
     device float2* stats              [[buffer(1)]],
     const constant uint& groups       [[buffer(2)]],
@@ -117,7 +117,7 @@ instantiate_gn_stats(bfloat16, bfloat)
 }
 
 template <typename T>
-[[kernel]] void spatial_group_norm_apply(
+[[kernel]] void group_norm_apply(
     const device T* x                 [[buffer(0)]],
     const device int* grid            [[buffer(1)]],
     const device float2* stats        [[buffer(2)]],
@@ -146,8 +146,8 @@ template <typename T>
 }
 
 #define instantiate_gn_apply(name, itype)                                  \
-  template [[host_name("spatial_group_norm_apply_" #name)]]                \
-  [[kernel]] void spatial_group_norm_apply<itype>(                         \
+  template [[host_name("group_norm_apply_" #name)]]                \
+  [[kernel]] void group_norm_apply<itype>(                         \
       const device itype*, const device int*, const device float2*,        \
       const device float*, const device float*, device itype*,             \
       const constant uint&, const constant uint&, const constant uint&,    \

@@ -2,7 +2,7 @@
 #include "../conv/grid.h"
 
 template <typename T, int C_MAX, int SIMDS>
-[[kernel]] void spatial_attention(
+[[kernel]] void voxel_attention(
     const device T* q                 [[buffer(0)]],
     const device T* k                 [[buffer(1)]],
     const device T* v                 [[buffer(2)]],
@@ -106,14 +106,14 @@ template <typename T, int C_MAX, int SIMDS>
   }
 }
 
-#define instantiate_spatial_attention(name, itype, cmax)                   \
-  template [[host_name("spatial_attention_" #name "_c_" #cmax)]]           \
-  [[kernel]] void spatial_attention<itype, cmax, 4>(                       \
+#define instantiate_voxel_attention(name, itype, cmax)                   \
+  template [[host_name("voxel_attention_" #name "_c_" #cmax)]]           \
+  [[kernel]] void voxel_attention<itype, cmax, 4>(                       \
       const device itype*, const device itype*, const device itype*,       \
       device itype*, const device int*, const constant uint&,              \
       const constant uint&, const constant int&, const constant float&,    \
       uint, uint, uint);
 
-instantiate_spatial_attention(bfloat16, bfloat, 256)
-instantiate_spatial_attention(bfloat16, bfloat, 512)
-instantiate_spatial_attention(bfloat16, bfloat, 1024)
+instantiate_voxel_attention(bfloat16, bfloat, 256)
+instantiate_voxel_attention(bfloat16, bfloat, 512)
+instantiate_voxel_attention(bfloat16, bfloat, 1024)

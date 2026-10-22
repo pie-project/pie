@@ -7,7 +7,7 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
     return span / (s > 0 ? s : 1) + 1;
 }
 
-[[kernel]] void spatial_grid_rule(
+[[kernel]] void grid_rule(
     const device int* grid            [[buffer(0)]],
     device int* out                   [[buffer(1)]],
     const constant int& kind          [[buffer(2)]],

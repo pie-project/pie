@@ -126,7 +126,11 @@ pub fn swiglu_clamp_alpha_sorted(
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/glu_packed.metal", "packed_gptoss_swiglu_sorted").apply(cut.grid),
+        Fire::at(
+            "linear/glu_packed.metal",
+            "packed_swiglu_clamp_alpha_sorted",
+        )
+        .apply(cut.grid),
         &[
             cut.packed.arg(),
             cut.y.arg_mut(),
@@ -220,7 +224,7 @@ pub fn swiglu_clamp_alpha(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.swiglu_clamp_alpha";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_gptoss_swiglu_bfloat16" });
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_clamp_alpha_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
         Fire::at("linear/glu_packed.metal", entry).apply(cut.grid),
