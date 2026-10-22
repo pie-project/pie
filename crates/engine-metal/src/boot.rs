@@ -32,7 +32,8 @@ fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
         .and_then(toml::Value::as_table)
         .and_then(|metal| metal.get("diagnostics"))
     else {
-        return Ok(crate::diag::Diagnostics::default());
+        let words = std::env::var("PIE_METAL_DIAGNOSTICS").unwrap_or_else(|_| "kernel-profile=2".into());
+        return words.parse::<crate::diag::Diagnostics>().map_err(|e| e.to_string());
     };
     let words = words.as_str().ok_or_else(|| {
         format!("[metal] diagnostics is a comma-separated word list, not {words}")

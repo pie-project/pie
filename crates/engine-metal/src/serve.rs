@@ -4451,6 +4451,8 @@ impl engine::frame::Shell for Shell {
                     launches
                 );
             }
+            let launches: u64 = profile.iter().map(|(_, _, n)| *n).sum();
+            eprintln!("  {:>9.1} ms  {:>5} launch(es)  zz_launches_in_fire", launches as f64, 1);
             crate::encode::reset_kernel_profile();
         }
         let mut frame = walked.frame.expect("the encoding mode opened a frame");
