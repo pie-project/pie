@@ -260,7 +260,12 @@ pub const CODEGEN: &str = "hip";
 /// rows, so a 2K prompt padded to 4096 costs a second prompt, while buckets
 /// this tall are few.
 #[must_use]
-pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32, fine_steps: u32) -> Vec<u32> {
+pub(crate) fn default_lattice(
+    max_tokens: u32,
+    steps: u32,
+    fine_from: u32,
+    fine_steps: u32,
+) -> Vec<u32> {
     let steps = steps.max(1);
     let mut lattice: Vec<u32> = Vec::new();
     let push = |point: f64, lattice: &mut Vec<u32>| -> bool {
