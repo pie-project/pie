@@ -492,7 +492,7 @@ impl Run<'_> {
                 if *x == act && *b == bank && *o == y)
         })?;
         let (routed, out, x) = (self.planes(bank), self.tensor(y), self.tensor(act));
-        readers.iter().copied().filter(|&at| at > first).find_map(|at| {
+        let (at, shared, packed) = readers.iter().copied().filter(|&at| at > first).find_map(|at| {
             let Some(Operation::Fused(Fused::MlpSwiglu { act: a, gate_up, packed, .. })) = op(at) else {
                 return None;
             };
@@ -505,8 +505,28 @@ impl Run<'_> {
                 && shared.codes.rows == out.width
                 && to.width == out.width
                 && to.rows == x.rows)
-                .then_some((shared, *packed))
-        })
+                .then_some((at, shared, *packed))
+        })?;
+        // Landed ahead, the gate-up's bytes stand clear of every value the
+        // nodes up to its MLP's read or write, which would read or write them.
+        let span = |v: poem_ir::ValueId| {
+            let t = self.tensor(v);
+            self.address(t.buf)
+                .map(|(slab, at)| (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2))
+        };
+        let mine = span(packed)?;
+        let apart = |b: (u64, u64, u64)| mine.0 != b.0 || mine.2 <= b.1 || b.2 <= mine.1;
+        let mut touched = Vec::new();
+        for n in first..at {
+            let node = &self.nodes().get(n as usize)?.op;
+            node.inputs(&mut touched);
+            node.outputs(&mut touched);
+        }
+        touched.retain(|v| matches!(self.values()[v.0 as usize].def, poem_ir::Def::Op(_)));
+        touched
+            .iter()
+            .all(|&v| span(v).is_some_and(apart))
+            .then_some((shared, packed))
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
