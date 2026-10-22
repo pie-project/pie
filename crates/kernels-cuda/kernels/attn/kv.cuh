@@ -1,6 +1,6 @@
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

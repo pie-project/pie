@@ -39,6 +39,7 @@ pub mod layout_pixels;
 
 pub mod channel;
 pub mod collective;
+pub mod conv;
 pub mod custom;
 pub mod disk;
 pub mod elemwise;

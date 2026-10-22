@@ -1,13 +1,12 @@
-#pragma once
-
-
-#include "prelude/device.cuh"
-#include "prelude/mma.cuh"
-#include "spatial/grid.cuh"
+#include "prim/device.cuh"
+#include "prim/mma_sm80.cuh"
+#include "prim/voxels.cuh"
 
 #include <cuda_pipeline.h>
 
-namespace pie::spatial {
+namespace pie::conv {
+
+using namespace ::pie::voxels;
 
 struct ConvGeom {
     int c_in;

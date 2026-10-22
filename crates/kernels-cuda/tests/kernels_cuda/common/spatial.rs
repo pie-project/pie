@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use kernels_cuda::spatial::{Conv3d, TimePad};
+use kernels_cuda::conv::{Conv3d, TimePad};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Box3 {

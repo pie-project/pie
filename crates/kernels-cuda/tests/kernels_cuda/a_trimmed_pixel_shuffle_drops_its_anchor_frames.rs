@@ -3,7 +3,8 @@
 use crate::common::spatial::{Box3, pixel_shuffle_ref, table};
 use crate::common::{Gpu, Lcg, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::spatial::{GridRule, derive_grid, pixel_shuffle};
+use kernels_cuda::conv::pixel_shuffle;
+use kernels_cuda::spatial::{GridRule, derive_grid};
 use kernels_cuda::tensor::Tensor;
 
 const BOXES: [Box3; 2] = [Box3::new(3, 2, 3), Box3::new(2, 3, 2)];

@@ -389,7 +389,7 @@ pub(crate) fn relabel_conv_weights(
         crate::device::alloc::copy_d2d(device.stream(), aside.ptr(), handle.ptr, bytes)?;
         let natural = Tensor::new(aside.ptr(), handle.rows, handle.width, handle.dtype);
         let mut relabelled = handle;
-        kernels_cuda::spatial::conv_weight_taps_major(
+        kernels_cuda::conv::conv_weight_taps_major(
             device.ctx(),
             natural,
             c_in,

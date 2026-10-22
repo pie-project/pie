@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 #include "flashinfer/attention/cascade.cuh"
 #include "flashinfer/attention/decode.cuh"

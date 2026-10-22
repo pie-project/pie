@@ -1,7 +1,7 @@
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
-use crate::spatial::{flat_elements, lanes_of};
 use crate::tensor::Tensor;
+use crate::voxels::{flat_elements, lanes_of};
 use dtype::Dtype;
 
 const FILE: &str = "spatial/norm.cuh";

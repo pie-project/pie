@@ -1,9 +1,9 @@
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
-use crate::spatial::{flat_elements, lane_pair};
 use crate::tensor::Tensor;
+use crate::voxels::{flat_elements, lane_pair};
 
-const FILE: &str = "spatial/resample.cuh";
+const FILE: &str = "conv/resample.cu";
 
 const BLOCK: u32 = 256;
 
@@ -39,7 +39,7 @@ pub fn upsample_nearest(
         OP,
         Fire::at(
             FILE,
-            crate::jit::symbol(&format!("::pie::spatial::upsample_nearest<{t}>")),
+            crate::jit::symbol(&format!("::pie::conv::upsample_nearest<{t}>")),
         )
         .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
@@ -103,7 +103,7 @@ pub fn pixel_shuffle(
         OP,
         Fire::at(
             FILE,
-            crate::jit::symbol(&format!("::pie::spatial::pixel_shuffle<{t}>")),
+            crate::jit::symbol(&format!("::pie::conv::pixel_shuffle<{t}>")),
         )
         .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
@@ -150,7 +150,7 @@ pub fn pixel_unshuffle(
         OP,
         Fire::at(
             FILE,
-            crate::jit::symbol(&format!("::pie::spatial::pixel_unshuffle<{t}>")),
+            crate::jit::symbol(&format!("::pie::conv::pixel_unshuffle<{t}>")),
         )
         .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
@@ -200,7 +200,7 @@ pub fn avg_down(
         OP,
         Fire::at(
             FILE,
-            crate::jit::symbol(&format!("::pie::spatial::avg_down<{t}>")),
+            crate::jit::symbol(&format!("::pie::conv::avg_down<{t}>")),
         )
         .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[

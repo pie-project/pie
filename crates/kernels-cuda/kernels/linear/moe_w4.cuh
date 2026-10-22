@@ -16,8 +16,8 @@
 
 #include <cuda_pipeline.h>
 
-#include "prelude/device.cuh"
-#include "prelude/glu.cuh"
+#include "prim/device.cuh"
+#include "prim/act.cuh"
 
 namespace pie::linear {
 

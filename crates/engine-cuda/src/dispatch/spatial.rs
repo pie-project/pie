@@ -1,5 +1,5 @@
-use kernels_cuda::spatial;
 use kernels_cuda::tensor::Tensor;
+use kernels_cuda::{conv, spatial};
 use poem_exec::{DispatchSpatial, KernelError};
 use poem_ir::{GridRule, Spatial, TimePad, VoxelSegment};
 
@@ -70,22 +70,22 @@ impl Run<'_> {
                 y_grid,
                 y,
             } => {
-                let conv = spatial::Conv3d {
+                let conv = conv::Conv3d {
                     k: *k,
                     stride: *stride,
                     pad: *pad,
                     pad_back: *pad_back,
                     causal_t: *causal_t,
                     time_pad: match time_pad {
-                        TimePad::Zero => spatial::TimePad::Zero,
-                        TimePad::Replicate => spatial::TimePad::Replicate,
+                        TimePad::Zero => conv::TimePad::Zero,
+                        TimePad::Replicate => conv::TimePad::Replicate,
                     },
                 };
                 let x = self.tensor(*x);
                 let grid = self.tensor(*grid);
                 let bias = bias.map(|b| self.tensor(b));
                 let Some(state) = cache else {
-                    return spatial::conv3d(
+                    return conv::conv3d(
                         self.ctx(),
                         x,
                         grid,
@@ -116,7 +116,7 @@ impl Run<'_> {
                     usize::try_from(bytes).unwrap_or(usize::MAX),
                 )? as u64;
                 let mut frame_cache = Tensor::new(scratch, rows, x.width, x.dtype);
-                spatial::cache_gather(
+                conv::cache_gather(
                     self.ctx(),
                     pool.slab,
                     slot_ids,
@@ -124,7 +124,7 @@ impl Run<'_> {
                     frames,
                     &mut frame_cache,
                 )?;
-                spatial::conv3d(
+                conv::conv3d(
                     self.ctx(),
                     x,
                     grid,
@@ -136,7 +136,7 @@ impl Run<'_> {
                     self.tensor(*y_grid),
                 )?;
                 let mut slab = pool.slab;
-                spatial::cache_store(
+                conv::cache_store(
                     self.ctx(),
                     x,
                     frame_cache,
@@ -191,7 +191,7 @@ impl Run<'_> {
                 keep_first_frame,
                 y_grid,
                 y,
-            } => spatial::upsample_nearest(
+            } => conv::upsample_nearest(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -207,7 +207,7 @@ impl Run<'_> {
                 trim_t,
                 y_grid,
                 y,
-            } => spatial::pixel_shuffle(
+            } => conv::pixel_shuffle(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -222,7 +222,7 @@ impl Run<'_> {
                 r,
                 y_grid,
                 y,
-            } => spatial::pixel_unshuffle(
+            } => conv::pixel_unshuffle(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -237,7 +237,7 @@ impl Run<'_> {
                 group,
                 y_grid,
                 y,
-            } => spatial::avg_down(
+            } => conv::avg_down(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -265,7 +265,7 @@ impl Run<'_> {
                                 .to_string(),
                     })?;
                 let mut slab = pool.slab;
-                spatial::cache_store(self.ctx(), x, x, slot_ids, grid, *frames, &mut slab)
+                conv::cache_store(self.ctx(), x, x, slot_ids, grid, *frames, &mut slab)
             }
             Spatial::Patchify {
                 x,
@@ -273,7 +273,7 @@ impl Run<'_> {
                 p,
                 tgrid,
                 y,
-            } => spatial::patchify(
+            } => conv::patchify(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -287,7 +287,7 @@ impl Run<'_> {
                 p,
                 grid,
                 y,
-            } => spatial::unpatchify(
+            } => conv::unpatchify(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*tgrid),

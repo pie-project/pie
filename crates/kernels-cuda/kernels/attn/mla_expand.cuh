@@ -2,7 +2,7 @@
 
 #include <cuda_bf16.h>
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 // A latent attention's prefill expanded to one key and value head a query
 // head (what vLLM's MLA prefill runs): the fire's latent rows gathered out

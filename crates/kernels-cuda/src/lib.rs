@@ -39,6 +39,7 @@ pub mod layout_pixels;
 
 pub mod channel;
 pub mod collective;
+pub mod conv;
 pub mod custom;
 pub mod disk;
 pub mod elemwise;
@@ -53,6 +54,7 @@ pub mod source;
 pub mod spatial;
 pub mod ssm;
 pub mod tensor;
+mod voxels;
 
 pub use error::Error;
 pub use jit::{Arg, ArgValue, Ctx, Fire, Launch, Pad, Slabs};

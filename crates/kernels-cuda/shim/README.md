@@ -120,7 +120,7 @@ reading the error, and adding the name it asked for.
 | `cooperative_groups.h` | `cluster_group`, `this_cluster()`, `grid_group::cluster_rank()`, `grid_group::num_clusters()` | `IndexHelper` and `FusedOp::rms_norm`, both inside `#if __CUDA_ARCH__ >= 900`. **Assembles at `sm_90a` and has never been run**: the one GPU here is an sm_89 L40S, which cannot launch a cluster. That file's banner says so at length |
 
 **The one change OUTSIDE this directory belongs in this table anyway**, because
-a reader chasing a missing name will land here first: `kernels/prelude/device.cuh`
+a reader chasing a missing name will land here first: `kernels/prim/device.cuh`
 gave `bf16` and `f16` `constexpr` bit constructors (which the two `_raw`
 additions above need in a constant expression) and an `operator=(float)`
 (which `vec_add`'s `ret[i] = float + float` needs, because `vec_t::operator[]`
@@ -192,8 +192,8 @@ its includer:
 
 | direction | directive                                              |
 | --------- | ------------------------------------------------------ |
-| out       | `kernels/prelude/fp8.cuh` → `"cuda_fp16.h"`, `"cuda_fp8.h"` |
-| out       | `kernels/prelude/half2.cuh` → `"cuda_fp16.h"`           |
+| out       | `kernels/prim/fp8.cuh` → `"cuda_fp16.h"`, `"cuda_fp8.h"` |
+| out       | `kernels/prim/half2.cuh` → `"cuda_fp16.h"`           |
 | in        | `shim/cuda_fp16.h` → `"pie_device.cuh"`                 |
 | in        | `shim/cuda_bf16.h` → `"pie_device.cuh"`                 |
 

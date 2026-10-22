@@ -424,7 +424,7 @@ mod tests {
     /// Every tcgen05 wrapper, issued once: what the arch-specific target
     /// must take and the plain one must refuse.
     const TCGEN05_PROBE: &str = r#"
-#include "prelude/tc5.cuh"
+#include "prim/mma_sm100.cuh"
 namespace pie {
 __global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* src, unsigned* out) {
     using namespace tc5;
@@ -525,7 +525,7 @@ __global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* s
 
     /// The affine-u4 arms are chosen by shape, never by capability, so
     /// sm_90 keeps every arm sm_89 has: no `__CUDA_ARCH__` gate in those
-    /// units, the prelude or the shims may admit 890 and refuse 900 (#680).
+    /// units, the prim headers or the shims may admit 890 and refuse 900 (#680).
     #[test]
     fn no_arch_gate_on_the_affine_u4_path_refuses_sm_90() {
         use crate::source::{LIBRARY, SHIM};
@@ -542,7 +542,7 @@ __global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* s
             .map(|file| Root::of(file).expect("a carried unit"));
         let scanned = units.iter().map(|root| (root.name, root.text)).chain(
             SHIM.iter()
-                .chain(LIBRARY.iter().filter(|h| h.name.starts_with("prelude/")))
+                .chain(LIBRARY.iter().filter(|h| h.name.starts_with("prim/")))
                 .map(|h| (h.name, h.text)),
         );
         let mut gates = 0;

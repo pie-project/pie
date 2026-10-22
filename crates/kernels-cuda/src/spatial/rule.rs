@@ -1,7 +1,7 @@
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, stated};
-use crate::spatial::lane_pair;
 use crate::tensor::Tensor;
+use crate::voxels::lane_pair;
 
 const FILE: &str = "spatial/rule.cuh";
 

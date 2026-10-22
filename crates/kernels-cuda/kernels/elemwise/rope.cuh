@@ -1,10 +1,10 @@
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
-#include "prelude/kv_paged_addr.cuh"
+#include "prim/paged_kv.cuh"
 
-#include "prelude/rope.cuh"
+#include "prim/rope.cuh"
 
 #include "attn/dsv4_kv.cuh"
 

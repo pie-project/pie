@@ -1,6 +1,6 @@
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 // A paged decode on tensor cores, a whole GQA group a tile: one block reads
 // one (request, kv head, kv chunk) of the decode plan the FA2 decode kernel

@@ -2,7 +2,7 @@
 
 #include <cuda_fp8.h>
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 namespace pie::custom {
 

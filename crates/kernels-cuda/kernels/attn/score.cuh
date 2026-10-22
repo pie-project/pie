@@ -1,7 +1,7 @@
 #pragma once
 
-#include "prelude/device.cuh"
-#include "prelude/kv_paged_addr.cuh"
+#include "prim/device.cuh"
+#include "prim/paged_kv.cuh"
 
 namespace pie::attn {
 

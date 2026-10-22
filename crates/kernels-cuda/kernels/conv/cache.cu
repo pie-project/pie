@@ -1,10 +1,9 @@
-#pragma once
+#include "prim/device.cuh"
+#include "prim/voxels.cuh"
 
+namespace pie::conv {
 
-#include "prelude/device.cuh"
-#include "spatial/grid.cuh"
-
-namespace pie::spatial {
+using namespace ::pie::voxels;
 
 __device__ __forceinline__ int cache_lane_of(
     const int* __restrict__ grid, int lanes, int frames, int row, int& base, Lane& out)

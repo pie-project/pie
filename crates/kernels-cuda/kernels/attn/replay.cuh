@@ -1,6 +1,6 @@
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 // Bounded replay's floors (DeepSeek-V4.1's Causal Encoder-Decoder): a
 // lane's least position whose window keys its decoder layers hold. A block

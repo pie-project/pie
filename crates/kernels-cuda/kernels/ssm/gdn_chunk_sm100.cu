@@ -1,6 +1,6 @@
 #include "ssm/chunk.cuh"
 #include "ssm/copy.cuh"
-#include "prelude/tc5.cuh"
+#include "prim/mma_sm100.cuh"
 
 // The chunked gated delta rule's prefill on tcgen05, one block a (request,
 // value head) walking the request's 64-token chunks in order, the state in

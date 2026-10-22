@@ -1,10 +1,9 @@
-#pragma once
+#include "prim/device.cuh"
+#include "prim/voxels.cuh"
 
+namespace pie::conv {
 
-#include "prelude/device.cuh"
-#include "spatial/grid.cuh"
-
-namespace pie::spatial {
+using namespace ::pie::voxels;
 
 template <class T>
 __global__ __launch_bounds__(256) void upsample_nearest(

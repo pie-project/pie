@@ -1,11 +1,11 @@
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 #ifdef __CUDACC_RTC__
-#include "prelude/half2.cuh"
-#include "prelude/fp8.cuh"
-#include "prelude/mma.cuh"
+#include "prim/half2.cuh"
+#include "prim/fp8.cuh"
+#include "prim/mma_sm80.cuh"
 #else
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

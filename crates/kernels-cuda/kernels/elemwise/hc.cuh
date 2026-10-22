@@ -1,6 +1,6 @@
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 #include "elemwise/norm.cuh"
 #include "linear/act_quant.cuh"
 

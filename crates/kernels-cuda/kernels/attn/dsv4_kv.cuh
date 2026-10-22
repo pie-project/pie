@@ -12,8 +12,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include "prelude/device.cuh"
-#include "prelude/rope.cuh"
+#include "prim/device.cuh"
+#include "prim/rope.cuh"
 
 namespace pie::attn::dsv4 {
 

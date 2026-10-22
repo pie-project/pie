@@ -1,10 +1,12 @@
 #pragma once
 
 
-#include "prelude/device.cuh"
-#include "spatial/grid.cuh"
+#include "prim/device.cuh"
+#include "prim/voxels.cuh"
 
 namespace pie::spatial {
+
+using namespace ::pie::voxels;
 
 namespace detail {
 

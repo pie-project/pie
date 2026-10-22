@@ -8,8 +8,8 @@
 #include <cuda_pipeline.h>
 #include <math_constants.h>
 
-#include "prelude/device.cuh"
-#include "prelude/rope.cuh"
+#include "prim/device.cuh"
+#include "prim/rope.cuh"
 
 #include "flashinfer/attention/mla.cuh"
 #include "flashinfer/attention/mla_params.cuh"

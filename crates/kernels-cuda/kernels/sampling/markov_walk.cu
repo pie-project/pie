@@ -3,7 +3,7 @@
 #include <cuda_bf16.h>
 #include <type_traits>
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 // DSpark's Markov head over a drafted block's readouts (DeepSeek-V4.1): a
 // readout at depth `i` of its block takes the bias `head . embed[t]` of the

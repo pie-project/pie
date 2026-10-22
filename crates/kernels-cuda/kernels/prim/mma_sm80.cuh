@@ -1,6 +1,6 @@
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 using __nv_bfloat16 = ::pie::bf16;
 

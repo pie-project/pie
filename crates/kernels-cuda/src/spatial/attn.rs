@@ -1,7 +1,7 @@
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refuse, stated};
-use crate::spatial::lanes_of;
 use crate::tensor::Tensor;
+use crate::voxels::lanes_of;
 
 const FILE: &str = "spatial/attn.cuh";
 

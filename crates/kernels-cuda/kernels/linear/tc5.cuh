@@ -1,8 +1,8 @@
 #pragma once
 
-#include "prelude/device.cuh"
-#include "prelude/tc5.cuh"
-#include "prelude/glu.cuh"
+#include "prim/device.cuh"
+#include "prim/mma_sm100.cuh"
+#include "prim/act.cuh"
 
 // One persistent, warp-specialized tcgen05 GEMM for every operand kind:
 //

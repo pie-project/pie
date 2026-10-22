@@ -1,7 +1,7 @@
 #pragma once
 
-#include "prelude/device.cuh"
-#include "prelude/rope.cuh"
+#include "prim/device.cuh"
+#include "prim/rope.cuh"
 
 #include "attn/dsv4_kv.cuh"
 

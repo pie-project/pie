@@ -1,4 +1,4 @@
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 namespace pie::sampling {
 

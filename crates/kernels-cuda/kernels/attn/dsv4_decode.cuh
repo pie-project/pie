@@ -31,7 +31,7 @@
 #include <math_constants.h>
 
 #include "attn/dsv4_kv.cuh"
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 namespace pie::attn::dsv4 {
 

@@ -28,8 +28,8 @@
 // end. `16 * kMT` activation rows a block (the live ones read, the rest
 // zero-filled), a grid row a tile of them.
 
-#include "prelude/device.cuh"
-#include "prelude/mma.cuh"
+#include "prim/device.cuh"
+#include "prim/mma_sm80.cuh"
 
 #include <cuda_bf16.h>
 

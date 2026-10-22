@@ -767,7 +767,7 @@ as well as the summary here:
      `return static_cast<float>(val);` out of a function returning
      `__nv_bfloat16`, `static_cast<short>(val.x)` on a `__nv_bfloat16`.
      NVIDIA's classes have a converting constructor per arithmetic type;
-     `kernels/prelude/device.cuh`'s `pie::f16` and `pie::bf16` declare
+     `kernels/prim/device.cuh`'s `pie::f16` and `pie::bf16` declare
      every one of theirs `explicit` on purpose, and THE EDIT THAT IS NOT A
      REMOVAL above is a second, independent record of that explicitness being
      load-bearing.
@@ -842,7 +842,7 @@ none of it is upstream's:
                                           `__nv_bfloat16_raw(unsigned short)`
     shim/cooperative_groups.h      + `cluster_group`, `this_cluster`,
                                           `grid_group::{cluster_rank,num_clusters}`
-    kernels/prelude/device.cuh          `bf16`/`f16`'s bit constructors became
+    kernels/prim/device.cuh          `bf16`/`f16`'s bit constructors became
                                           `constexpr`; both gained
                                           `operator=(float)`
 

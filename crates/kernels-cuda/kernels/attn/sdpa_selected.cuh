@@ -7,7 +7,7 @@
 #include <cuda_pipeline.h>
 #include <math_constants.h>
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 namespace pie::attn::sdpa_selected {
 

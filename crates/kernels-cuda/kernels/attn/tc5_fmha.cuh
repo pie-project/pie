@@ -1,6 +1,6 @@
 #pragma once
 
-#include "prelude/tc5.cuh"
+#include "prim/mma_sm100.cuh"
 
 // A causal (or full, or sliding) prefill over a paged bf16 KV cache on
 // tcgen05.

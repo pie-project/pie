@@ -5,7 +5,7 @@ use crate::common::spatial::{
 };
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::spatial::{
+use kernels_cuda::conv::{
     avg_down, patchify, pixel_shuffle, pixel_unshuffle, unpatchify, upsample_nearest,
 };
 use kernels_cuda::tensor::Tensor;

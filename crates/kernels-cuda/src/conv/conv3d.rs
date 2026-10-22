@@ -2,11 +2,11 @@ use crate::error::Error;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refuse, stated,
 };
-use crate::spatial::lane_pair;
 use crate::tensor::Tensor;
+use crate::voxels::lane_pair;
 use dtype::Dtype;
 
-const FILE: &str = "spatial/conv.cuh";
+const FILE: &str = "conv/conv3d.cu";
 
 const OP: &str = "spatial.conv3d";
 
@@ -237,7 +237,7 @@ pub fn conv3d_on(
 
     let (entry, tile, block, smem) = if mma {
         (
-            crate::jit::symbol(&format!("::pie::spatial::conv3d_mma<{MMA_STAGES}>")),
+            crate::jit::symbol(&format!("::pie::conv::conv3d_mma<{MMA_STAGES}>")),
             MMA_TILE,
             MMA_BLOCK,
             MMA_SMEM,
@@ -245,9 +245,9 @@ pub fn conv3d_on(
     } else {
         (
             if vectorised {
-                "::pie::spatial::conv3d_direct<true>"
+                "::pie::conv::conv3d_direct<true>"
             } else {
-                "::pie::spatial::conv3d_direct<false>"
+                "::pie::conv::conv3d_direct<false>"
             },
             DIRECT_TILE,
             DIRECT_BLOCK,
@@ -302,10 +302,10 @@ pub fn conv_weight_taps_major(
             ),
         ));
     }
-    let (blocks, _) = crate::spatial::flat_elements(OP, src, BLOCK)?;
+    let (blocks, _) = crate::voxels::flat_elements(OP, src, BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::spatial::conv_weight_taps_major")
+        Fire::at(FILE, "::pie::conv::conv_weight_taps_major")
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[src.arg(), dst.arg(), c_out.arg(), c_in.arg(), taps.arg()],
     )

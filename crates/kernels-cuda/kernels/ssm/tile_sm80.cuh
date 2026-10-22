@@ -1,6 +1,6 @@
 #pragma once
 
-#include "prelude/mma.cuh"
+#include "prim/mma_sm80.cuh"
 #include "ssm/chunk.cuh"
 #include "ssm/copy.cuh"
 

@@ -1,8 +1,8 @@
 
 #pragma once
 
-#include "prelude/device.cuh"
-#include "prelude/mma.cuh"
+#include "prim/device.cuh"
+#include "prim/mma_sm80.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>

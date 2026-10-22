@@ -4,7 +4,7 @@
 // only at the rows its ids gather: each code widened and scaled, then
 // rounded to the output dtype once.
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 namespace pie::layout {
 
