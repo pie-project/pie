@@ -19,4 +19,5 @@ moe.tile_rows   = [
   { value = 16 },
 ]
 sdpa.prefill    = "mpp"
+sdpa.split_bf16 = true
 gdn.scan        = { use = "staged", min_rows = 32 }
