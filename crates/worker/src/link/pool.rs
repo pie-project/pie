@@ -38,7 +38,7 @@ impl WorkerControl for NoTurns {
         let pages = transport::tcp::fetch(&from, &keys, 0).await?;
         let count = pages.count as u32;
         let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || pool.put_run(&keys, pages, retention))
+        tokio::task::spawn_blocking(move || pool.put_run(&keys, 0, pages, retention))
             .await
             .map_err(|e| e.to_string())??;
         tracing::info!(pages = count, %from, retention, "took a run");

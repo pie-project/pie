@@ -169,11 +169,18 @@ impl Pool {
         pool
     }
 
-    /// Keeps `pages`, one per key, as [`Self::put`] at `retention`, and
-    /// the run `keys` (from token 0) whole: one of [`Self::runs`] while
-    /// every page of it is here.
-    pub fn put_run(&self, keys: &[Key], pages: Pages, retention: i64) -> Result<(), String> {
-        self.put_at(keys, pages, retention)?;
+    /// Keeps `pages`, those of `keys[from..]`, as [`Self::put`] at
+    /// `retention`, and the run `keys` (from token 0) whole: one of
+    /// [`Self::runs`] while every page of it is here.
+    pub fn put_run(
+        &self,
+        keys: &[Key],
+        from: usize,
+        pages: Pages,
+        retention: i64,
+    ) -> Result<(), String> {
+        let sent = keys.get(from..).ok_or("the pages start past their run")?;
+        self.put_at(sent, pages, retention)?;
         let Some(last) = keys.last() else {
             return Ok(());
         };
@@ -390,10 +397,11 @@ impl Source for Pool {
         })
     }
 
-    fn write(&self, keys: Vec<Key>, pages: Pages) -> Taken {
+    /// A worker's own push, at key 0: a `replicate` for the run raises it.
+    fn write(&self, keys: Vec<Key>, from: u32, pages: Pages) -> Taken {
         let pool = self.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || pool.put(&keys, pages))
+            tokio::task::spawn_blocking(move || pool.put_run(&keys, from as usize, pages, 0))
                 .await
                 .map_err(|e| e.to_string())?
         })
@@ -465,19 +473,19 @@ mod tests {
     fn a_full_pool_lets_the_lowest_key_go_first_and_never_for_a_lower_one() {
         let pool = Pool::new(32);
         let (high, low) = ([[1u8; 32], [2u8; 32]], [[3u8; 32], [4u8; 32]]);
-        pool.put_run(&high, pages(1, 2), 5).unwrap();
-        pool.put_run(&low, pages(3, 2), 1).unwrap();
+        pool.put_run(&high, 0, pages(1, 2), 5).unwrap();
+        pool.put_run(&low, 0, pages(3, 2), 1).unwrap();
         // Reading the high run makes it the most recent; still the low run
         // is what goes for a third run at key 3.
         pool.get(&high, 0).unwrap();
         pool.get(&low, 0).unwrap();
         let mid = [[5u8; 32], [6u8; 32]];
-        pool.put_run(&mid, pages(5, 2), 3).unwrap();
+        pool.put_run(&mid, 0, pages(5, 2), 3).unwrap();
         let mut runs: Vec<Key> = pool.runs().iter().map(|run| run[1]).collect();
         runs.sort();
         assert_eq!(runs, [high[1], mid[1]], "the run at key 1 went");
         assert!(
-            pool.put_run(&low, pages(3, 2), 2).is_err(),
+            pool.put_run(&low, 0, pages(3, 2), 2).is_err(),
             "a run at key 2 takes no room from runs at 3 and 5"
         );
         // A page sent in no run is at key 0, and takes no room from them.
@@ -495,8 +503,8 @@ mod tests {
         let prefix = [[1u8; 32]];
         {
             let pool = Pool::with_store(8, Arc::new(Dir::open(dir.clone()).unwrap()));
-            pool.put_run(&run, pages(3, 2), 1).unwrap();
-            pool.put_run(&prefix, pages(3, 1), 1).unwrap();
+            pool.put_run(&run, 0, pages(3, 2), 1).unwrap();
+            pool.put_run(&prefix, 0, pages(3, 1), 1).unwrap();
             // Pages sent alone make no run.
             pool.put(&[[9u8; 32]], pages(9, 1)).unwrap();
             let mut runs = pool.runs();
@@ -511,6 +519,41 @@ mod tests {
         held.sort();
         assert_eq!(held, [run[0], run[1], [9u8; 32]], "the runs are no page");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_a_worker_pushes_is_kept_as_a_run_at_key_0_and_a_replicate_raises_it() {
+        let pool = Pool::new(16);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(transport::tcp::serve(listener, Arc::new(pool.clone())));
+        let (prefix, run) = ([[1u8; 32]], [[1u8; 32], [2u8; 32]]);
+        transport::tcp::put(&addr, &prefix, 0, &pages(1, 1))
+            .await
+            .unwrap();
+        // The run is pushed from the page the pool was not sent.
+        transport::tcp::put(&addr, &run, 1, &pages(2, 1))
+            .await
+            .unwrap();
+        let mut runs = pool.runs();
+        runs.sort();
+        assert_eq!(runs, [prefix.to_vec(), run.to_vec()]);
+        assert_eq!(
+            pool.get(&run, 0).unwrap().data,
+            [[1u8; 8], [2u8; 8]].concat()
+        );
+        // At key 0, a run at key 1 takes its room.
+        let other = [[3u8; 32], [4u8; 32]];
+        pool.put_run(&other, 0, pages(3, 2), 1).unwrap();
+        assert_eq!(pool.runs(), [other.to_vec()]);
+        // A replicate at key 3 raises the run, and a push again at key 0
+        // does not lower it: a run at key 2 finds no room.
+        pool.put_run(&run, 0, pages(1, 2), 3).unwrap();
+        transport::tcp::put(&addr, &run, 0, &pages(1, 2))
+            .await
+            .unwrap();
+        assert!(pool.put_run(&other, 0, pages(3, 2), 2).is_err());
+        assert_eq!(pool.runs(), [run.to_vec()]);
     }
 
     #[test]
