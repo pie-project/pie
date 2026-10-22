@@ -2855,7 +2855,7 @@ fn batch_mlp(
             )),
         )
         .apply(Launch::grid(
-            [shared_items + ordered.work_cap, i.div_ceil(64), 1],
+            [shared_items + ordered.work_cap, i.div_ceil(32), 1],
             [GROUP_BLOCK, 1, 1],
         )),
         &[

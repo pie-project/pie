@@ -1043,15 +1043,17 @@ struct BatchAffine {
 
 // y[route] = W·act[route / act_div] (+ bias) for ≤ MT routes of one
 // expert, weight rows [tile·64·NBW, +64·NBW), rounded once after the bias.
-// SWIGLU reads a packed [gate | up] bank (a wave's two blocks its gate rows
-// and the matching up rows). [s0, s1) of K into `part` leaves the sum
-// unbiased and unrounded; NT reads the weight non-temporally.
+// SWIGLU reads a packed [gate | up] bank, outputs [tile·32, +32): the first
+// half of the waves their gate rows, the second the matching up rows, met
+// in LDS. A wave's 16·NBW rows streamed deep stream faster than more rows
+// shallower. [s0, s1) of K into `part` leaves the sum unbiased and
+// unrounded; NT reads the weight non-temporally.
 template <class C, class T, int MT, int NBW, int DEPTH, bool SWIGLU = false, bool NT = true>
 __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
                                            int count, const typename C::Planes& p, const T* __restrict__ bias,
                                            T* __restrict__ out, int act_div, int n, int k, int tile, int s0 = 0,
                                            int s1 = -1, float* __restrict__ part = nullptr) {
-    static_assert(!SWIGLU || NBW == 2, "a SwiGLU wave takes a gate block and its up block");
+    static_assert(!SWIGLU || NBW == 1, "a SwiGLU wave takes one gate or up block");
     static_assert(MT == 4 || MT == 8 || MT == 16 || MT == 32 || MT == 64, "a batch item is 4 to 64 routes");
     constexpr int MB = MT < 16 ? 1 : MT / 16, KC = C::kStageK, LD = KC + 8, R = DEPTH + 1;
     constexpr int RT = MT < 16 ? MT + 1 : MT;  // LDS rows a buffer
@@ -1071,7 +1073,9 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
 
     const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
     const int wave = __builtin_amdgcn_readfirstlane(tid / kWave);
-    const int row0 = (tile * WAVES + wave) * (SWIGLU ? 16 : 16 * NBW);
+    // The wave's first output row; under SWIGLU half its waves read the up
+    // rows n further on.
+    const int row0 = SWIGLU ? (tile * 2 + wave % 2) * 16 : (tile * WAVES + wave) * 16 * NBW;
     const int all = (k + KC - 1) / KC, first = s0;
     const int stages = (s1 < 0 ? all : min(s1, all)) - first;
     // The item's 16-route blocks that hold a route: the rest neither read
@@ -1080,7 +1084,7 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
     const typename C::Run run = C::run(p, SWIGLU ? 2 * n : n, k);
     // The bank row of the wave's local row r; a row past the bank reads the
     // last.
-    auto bank_row = [&](int r) { return SWIGLU ? min(row0 + r % 16, n - 1) + r / 16 * n : min(row0 + r, n - 1); };
+    auto bank_row = [&](int r) { return min(row0 + r, n - 1) + (SWIGLU ? wave / 2 * n : 0); };
     auto route = [&](int m) { return order != nullptr ? order[begin + m] : begin + m; };
     const moe_rsrc wr = C::codes(run);
 
@@ -1288,6 +1292,21 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
         for (int nb = 0; nb < NBW; ++nb) C::tie_factors(f[r][nb]);
     }
 
+    // The up waves' sums to the gate waves, through the activation's LDS.
+    mfma_cd up[MB];
+    if constexpr (SWIGLU) {
+        static_assert(2 * MB * kWave * sizeof(mfma_cd) <= sizeof(xs), "the up sums fit the activation's LDS");
+        if (part == nullptr) {
+            mfma_cd* x = reinterpret_cast<mfma_cd*>(xs) + wave % 2 * MB * kWave;
+            if (wave >= 2)
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) x[mb * kWave + l] = acc[0][mb];
+            lds_barrier();
+            if (wave >= 2) return;
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb) up[mb] = x[mb * kWave + l];
+        }
+    }
     // D cell (route 4g + t, weight row r16) of block (nb, mb).
 #pragma unroll
     for (int mb = 0; mb < MB; ++mb)
@@ -1299,8 +1318,8 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
                 float* q = part + static_cast<long long>(route(m)) * (SWIGLU ? 2 * n : n);
 #pragma unroll
                 for (int nb = 0; nb < NBW; ++nb) {
-                    const int c = row0 + (SWIGLU ? 0 : nb * 16) + r16;
-                    if (c < n) q[(SWIGLU ? nb * n : 0) + c] = acc[nb][mb][t];
+                    const int c = row0 + nb * 16 + r16;
+                    if (c < n) q[(SWIGLU ? wave / 2 * n : 0) + c] = acc[nb][mb][t];
                 }
                 continue;
             }
@@ -1308,8 +1327,8 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
             if constexpr (SWIGLU) {
                 const int c = row0 + r16;
                 if (c >= n) continue;
-                const float gt = to_f32(from_f32<T>(acc[0][mb][t])), up = to_f32(from_f32<T>(acc[1][mb][t]));
-                o[c] = from_f32<T>(gt * (1.f / (1.f + __expf(-gt))) * up);
+                const float gt = to_f32(from_f32<T>(acc[0][mb][t])), u = to_f32(from_f32<T>(up[mb][t]));
+                o[c] = from_f32<T>(gt * (1.f / (1.f + __expf(-gt))) * u);
             } else {
 #pragma unroll
                 for (int nb = 0; nb < NBW; ++nb) {

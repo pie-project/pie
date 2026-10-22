@@ -783,8 +783,8 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
 
 
 // The gate-up leg's batch with its swiglu: h[route] = silu(G·x)·(U·x) over
-// a packed [gate | up] bank of 2n rows, a wave 16 gate rows and their up
-// rows (grid (shared items + work cap, ⌈n / 64⌉), 256 threads); a shared
+// a packed [gate | up] bank of 2n rows, as batch_tile's SWIGLU (grid
+// (shared items + work cap, ⌈n / 32⌉), 256 threads); a shared
 // expert as moe_matmul_select_dense_batch's, from the token rows `act`.
 template <class T, int MT>
 __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch_swiglu(
@@ -794,14 +794,14 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch_swiglu(
     constexpr int SBY = MT >= 32 ? 128 : 256;
     const int items = (shared_rows + MT - 1) / MT, b = static_cast<int>(blockIdx.x);
     if (b < items) {
-        batch_tile<BatchDense<T, SBY>, T, MT, 2, 3, true>(act, nullptr, b * MT, min(MT, shared_rows - b * MT),
+        batch_tile<BatchDense<T, SBY>, T, MT, 1, 3, true>(act, nullptr, b * MT, min(MT, shared_rows - b * MT),
                                                           {shared}, nullptr, shared_h, 1, n, k, blockIdx.y);
         return;
     }
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, b - items)) return;
     const T* w = bank + static_cast<long long>(item.expert) * 2 * n * k;
-    batch_tile<BatchDense<T, SBY>, T, MT, 2, 3, true>(act, order, item.begin, item.count, {w}, nullptr, h, act_div, n,
+    batch_tile<BatchDense<T, SBY>, T, MT, 1, 3, true>(act, order, item.begin, item.count, {w}, nullptr, h, act_div, n,
                                                       k, blockIdx.y);
 }
 
@@ -825,7 +825,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_wide(
 }
 
 // A dense projection as one expert every row routes to (SWIGLU: a packed
-// [gate | up] bank), MT rows an item, 64 output rows a block, tiles dealt
+// [gate | up] bank), MT rows an item, 64 output rows (SwiGLU: 32) a block, tiles dealt
 // round the eight XCDs so a tile's items share one L2. SPLIT lands each K
 // slice's f32 partial for `mgemm_finalize`.
 template <int MT, bool SWIGLU, bool SPLIT, bool NT>
@@ -839,7 +839,7 @@ __global__ __launch_bounds__(256) void dense_batch_bf16(const bf16* __restrict__
     if (tile >= tiles) return;
     const int begin = item * MT;
     float* slice = SPLIT ? part + static_cast<long long>(split) * m * (SWIGLU ? 2 * n : n) : nullptr;
-    batch_tile<BatchDense<bf16, SBY>, bf16, MT, SWIGLU ? 2 : 1, 3, SWIGLU, NT>(
+    batch_tile<BatchDense<bf16, SBY>, bf16, MT, 1, 3, SWIGLU, NT>(
         act, nullptr, begin, min(MT, m - begin), {w}, nullptr, y, 1, n, k, tile, split * per, (split + 1) * per,
         slice);
 }
