@@ -371,7 +371,9 @@ impl Shell {
             ..boot
         };
         let elsewhere = device.held_elsewhere();
-        let keepalive = if crate::keepalive::KeepAlive::wanted() {
+        let keepalive = if crate::keepalive::KeepAlive::wanted()
+            && *chip.get::<crate::chip::KeepAliveSpin>() == crate::chip::KeepAliveSpin::Spin
+        {
             Some(crate::keepalive::KeepAlive::start(&device)?)
         } else {
             None
