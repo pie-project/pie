@@ -492,6 +492,54 @@ pub(crate) fn closer_outside_string(text: &str, closer: &str) -> Option<usize> {
     None
 }
 
+/// `msg`'s text and the calls written in it as ChatML's
+/// `<tool_call>{"name", "arguments"}</tool_call>`, each the call's JSON; a
+/// call whose JSON does not read or names nothing stays in the text.
+pub(crate) fn split_calls(msg: &str) -> (String, Vec<serde_json::Value>) {
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    let mut rest = msg;
+    while let Some(at) = rest.find(TOOL_CALL_OPEN) {
+        text.push_str(&rest[..at]);
+        let after = &rest[at + TOOL_CALL_OPEN.len()..];
+        let Some(end) = closer_outside_string(after, TOOL_CALL_CLOSE) else {
+            text.push_str(&rest[at..]);
+            rest = "";
+            break;
+        };
+        match serde_json::from_str::<serde_json::Value>(after[..end].trim()) {
+            Ok(call) if call["name"].is_string() => calls.push(call),
+            _ => text.push_str(&rest[at..at + TOOL_CALL_OPEN.len() + end + TOOL_CALL_CLOSE.len()]),
+        }
+        rest = &after[end + TOOL_CALL_CLOSE.len()..];
+    }
+    text.push_str(rest);
+    (text, calls)
+}
+
+/// [`split_calls`] as each call's name and arguments (an empty object for
+/// none), the text's trailing newlines dropped ahead of the calls.
+pub(crate) fn lift_calls(msg: &str) -> (String, Vec<(String, serde_json::Value)>) {
+    let (mut text, calls) = split_calls(msg);
+    let calls: Vec<_> = calls
+        .into_iter()
+        .map(|mut call| {
+            let arguments = call
+                .get_mut("arguments")
+                .map(serde_json::Value::take)
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+            (
+                call["name"].as_str().unwrap_or_default().to_string(),
+                arguments,
+            )
+        })
+        .collect();
+    if !calls.is_empty() {
+        text.truncate(text.trim_end_matches('\n').len());
+    }
+    (text, calls)
+}
+
 impl ToolDecoder for ChatMLToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> Vec<ToolEvent> {
         let text = self.decoder.feed(tokens);
@@ -565,6 +613,21 @@ mod tests {
         a_stripping_model_replays_the_answer_without_its_reasoning();
         a_preserving_model_replays_the_turn_whole();
         a_non_thinking_model_replays_verbatim();
+        a_call_is_lifted_whole_past_a_closer_inside_its_arguments();
+    }
+
+    fn a_call_is_lifted_whole_past_a_closer_inside_its_arguments() {
+        let (text, calls) = lift_calls(
+            "Saving.\n<tool_call>\n{\"name\": \"save\", \"arguments\": {\"text\": \"a </tool_call> b\"}}\n</tool_call>",
+        );
+        assert_eq!(text, "Saving.");
+        assert_eq!(
+            calls,
+            vec![(
+                "save".to_string(),
+                serde_json::json!({"text": "a </tool_call> b"})
+            )]
+        );
     }
 
     fn a_stripping_model_replays_the_answer_without_its_reasoning() {
