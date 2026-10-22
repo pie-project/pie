@@ -633,6 +633,9 @@ pub fn matmul_select_quant(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    if routes.rows > 1 && routes.rows <= 8 {
+        return Ok(());
+    }
     let entry = routed_point(OP, bank, false)?;
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
