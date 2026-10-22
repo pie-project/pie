@@ -85,6 +85,7 @@ struct Register {
     table: Room,
     hidden: Room,
     y: Room,
+    mix: Room,
 }
 
 #[derive(Debug)]
@@ -273,6 +274,7 @@ impl Scratch {
                 table: Room::lay(&mut at, 1, table, Dtype::Bf16),
                 hidden: Room::lay(&mut at, 1, table, Dtype::Bf16),
                 y: Room::lay(&mut at, register_tiles * 8, register_n, Dtype::Bf16),
+                mix: Room::lay(&mut at, 1, u64::from(moe::REGISTER_MIX), Dtype::F32),
             }
         });
 
@@ -314,7 +316,7 @@ impl Scratch {
             .map_or(0, |r| r.at + r.bytes())
             .max(partials.map_or(0, |r| r.at + r.bytes()))
             .max(routed.map_or(0, |r| r.sums.at + r.sums.bytes()))
-            .max(register.map_or(0, |r| r.y.at + r.y.bytes()))
+            .max(register.map_or(0, |r| r.mix.at + r.mix.bytes()))
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
         let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
@@ -502,6 +504,7 @@ impl Scratch {
                 table: r.table.bind(handles, &self.plane)?,
                 hidden: r.hidden.bind(handles, &self.plane)?,
                 y: r.y.bind(handles, &self.plane)?,
+                mix: r.mix.bind(handles, &self.plane)?,
             })
         };
         Some(mint())
