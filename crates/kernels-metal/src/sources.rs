@@ -269,10 +269,6 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/quant_qmv_rows.metal")),
     ),
     (
-        "linear/register_table.h",
-        include_str!(concat!(source_root!(), "/linear/register_table.h")),
-    ),
-    (
         "prim/gemm_loader.h",
         include_str!(concat!(source_root!(), "/prim/gemm_loader.h")),
     ),
@@ -291,6 +287,10 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "prim/mpp.h",
         include_str!(concat!(source_root!(), "/prim/mpp.h")),
+    ),
+    (
+        "prim/register_table.h",
+        include_str!(concat!(source_root!(), "/prim/register_table.h")),
     ),
     (
         "runtime/blit.metal",

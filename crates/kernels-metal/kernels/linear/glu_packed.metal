@@ -1,5 +1,5 @@
 #include <metal_stdlib>
-#include "register_table.h"
+#include "../prim/register_table.h"
 
 using namespace metal;
 
