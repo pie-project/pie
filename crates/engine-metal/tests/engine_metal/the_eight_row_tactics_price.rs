@@ -34,6 +34,7 @@ fn the_eight_row_tactics_price() {
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let tactics = [
         ("register", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-packed", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
         ("staged", "[kernel]\nqmm = [\"staged\", \"qmv\"]"),
         ("tiled96", "[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 96 }, \"qmv\"]"),
         ("qmv", "[kernel]\nqmm = [{ use = \"qmv\", rows_max = 8, packs = 1, crossover_tg = 96 }]"),
@@ -83,6 +84,36 @@ fn the_eight_row_tactics_price() {
                 });
                 planes.push(p);
             }
+            // each bank's codes and factors as the MPP pack lays them, for the packed register walk
+            let mut packed_banks = Vec::new();
+            let mut packed_planes = Vec::new();
+            for bank in &banks {
+                let words = n * (k / 8);
+                let bytes = u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
+                let buffer = Buffer::zeroed(&device, bytes).expect("packed");
+                let t = Tensor::new(bind(&buffer), n, k, Dtype::U4g64);
+                let frame = device.frame().expect("frame");
+                let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                use kernels_metal::encode::{Arg, Encode};
+                sink.fire(
+                    kernels_metal::encode::Fire::at("linear/quant_qmm_mpp.metal", "qmm_mpp_pack_bank")
+                        .apply(kernels_metal::encode::Grid::of([words, 1, 1], [256, 1, 1])),
+                    &[
+                        bank.codes.arg(),
+                        bank.scales.arg(),
+                        bank.biases.unwrap().arg(),
+                        t.arg_mut(),
+                        k.arg(),
+                        n.arg(),
+                    ],
+                )
+                .expect("pack");
+                frame.commit().expect("commit");
+                let mut b = *bank;
+                b.mpp_codes = Some(t);
+                packed_banks.push(b);
+                packed_planes.push(buffer);
+            }
             let cap = 8;
             let inputs: Vec<u8> = (0..cap * k)
                 .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0xabcd)) - 127.0) * 0.0197))
@@ -102,14 +133,22 @@ fn the_eight_row_tactics_price() {
                 (rows <= cap * 8 && width <= n).then(|| Tensor::new(ph, rows, width, Dtype::F32))
             };
             let mut line = format!("M={m} K={k:>5} N={n:>6} x{copies:>2}:");
+            let mut reference = Vec::new();
             for (name, overrides) in &tactics {
                 let tuning = engine_metal::chip::tuning(overrides, false);
+                let use_packed = *name == "reg-packed";
+                if use_packed {
+                    unsafe { std::env::set_var("PIE_SG_PACKED", "1") };
+                } else {
+                    unsafe { std::env::remove_var("PIE_SG_PACKED") };
+                }
+                let banks_now = if use_packed { &packed_banks } else { &banks };
                 let mut times = Vec::new();
                 let mut failed = false;
                 for i in 0..12 {
                     let frame = device.frame().expect("frame");
                     let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                    for bank in &banks {
+                    for bank in banks_now {
                         if quant::matmul(
                             &sink,
                             &tuning,
@@ -140,6 +179,14 @@ fn the_eight_row_tactics_price() {
                 if failed {
                     line += &format!("  {name} -");
                     continue;
+                }
+                if *name == "register" || *name == "reg-packed" {
+                    let got = handles.read(ho, u64::from(m * n * 2)).expect("read");
+                    if *name == "register" {
+                        reference = got;
+                    } else {
+                        assert!(got == reference, "the packed walk lands other bits at K={k} N={n} M={m}");
+                    }
                 }
                 times.sort_by(f64::total_cmp);
                 let us = times[times.len() / 2];

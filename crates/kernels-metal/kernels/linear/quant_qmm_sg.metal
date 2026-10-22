@@ -94,7 +94,7 @@ constant constexpr int kSpan = 256;
   }
 }
 
-template <int SPLIT>
+template <int SPLIT, bool PACKED = false>
 [[kernel]] void
 affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
               const device bfloat *biases [[buffer(2)]], const device bfloat *table [[buffer(3)]],
@@ -112,9 +112,15 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   const uint c = fn >> 1;
   const uint column = position.x * 32 * NF + simd * 8 * NF + fm;
   const ulong words = ulong(stride) / 8, groups = ulong(stride) / 64;
-  const device uint2 *w0 = reinterpret_cast<const device uint2 *>(weights + ulong(column) * words) + c;
-  const ulong apart = 8 * words / 2; // uint2s between the two fragments
-  const device bfloat *s0 = scales + ulong(column) * groups, *b0 = biases + ulong(column) * groups;
+  const ulong pbase = (ulong(column / 256) * groups) * 256 + column % 256;
+  const device bfloat *fac = reinterpret_cast<const device bfloat *>(weights + ulong(columns) * words);
+  const device uint2 *w0 = PACKED ? reinterpret_cast<const device uint2 *>(weights) + pbase * 4 + c
+                                  : reinterpret_cast<const device uint2 *>(weights + ulong(column) * words) + c;
+  const ulong apart = PACKED ? 32 : 8 * words / 2; // uint2s between the two fragments
+  const ulong wstep = PACKED ? 1024 : 4;           // uint2s between two groups
+  const ulong fstep = PACKED ? 8 : 8 * groups, gstep = PACKED ? 256 : 1;
+  const device bfloat *s0 = PACKED ? fac + pbase : scales + ulong(column) * groups;
+  const device bfloat *b0 = PACKED ? fac + ulong(columns) * groups + pbase : biases + ulong(column) * groups;
   const device vec<bfloat, 16> *xt =
       reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
   const device float *sums = reinterpret_cast<const device float *>(table + 8 * ulong(width));
@@ -134,9 +140,9 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   for (int u = 0; u < U; ++u)
 #pragma unroll
     for (int f = 0; f < NF; ++f) {
-      q[u][f] = w0[f * apart + ulong(first + u) * 4];
-      qs[u][f] = float(s0[8 * f * groups + first + u]);
-      qb[u][f] = float(b0[8 * f * groups + first + u]);
+      q[u][f] = w0[f * apart + ulong(first + u) * wstep];
+      qs[u][f] = float(s0[f * fstep + (first + u) * gstep]);
+      qb[u][f] = float(b0[f * fstep + (first + u) * gstep]);
     }
   for (int h0 = first; h0 < last; h0 += U) {
     uint2 cw[U][NF];
@@ -153,9 +159,9 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
       for (int u = 0; u < U; ++u)
 #pragma unroll
         for (int f = 0; f < NF; ++f) {
-          q[u][f] = w0[f * apart + ulong(h0 + U + u) * 4];
-          qs[u][f] = float(s0[8 * f * groups + h0 + U + u]);
-          qb[u][f] = float(b0[8 * f * groups + h0 + U + u]);
+          q[u][f] = w0[f * apart + ulong(h0 + U + u) * wstep];
+          qs[u][f] = float(s0[f * fstep + (h0 + U + u) * gstep]);
+          qb[u][f] = float(b0[f * fstep + (h0 + U + u) * gstep]);
         }
     }
 #pragma unroll
@@ -243,6 +249,11 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   }
 }
 
+#define PIE_SG_PACKED_POINT(name, split)                                                           \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split, true>(                         \
+      const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
+      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
+      constant int &, uint2, uint, uint);
 #define PIE_SG_POINT(name, split)                                                                  \
   template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split>(                               \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \

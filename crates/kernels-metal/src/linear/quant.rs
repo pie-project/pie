@@ -834,8 +834,14 @@ fn act_x_wt_over(
                             &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
                         )?;
                     }
-                    let entry = symbol(&format!("affine_qmm_sg_k{split}"));
-                    let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})"));
+                    let packed = w.mpp_codes.filter(|_| std::env::var_os("PIE_SG_PACKED").is_some());
+                    let (entry, stamp) = if packed.is_some() {
+                        let entry = symbol(&format!("affine_qmm_sg_packed_k{split}"));
+                        (entry, symbol(&format!("PIE_SG_PACKED_POINT(\"{entry}\",{split})")))
+                    } else {
+                        let entry = symbol(&format!("affine_qmm_sg_k{split}"));
+                        (entry, symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})")))
+                    };
                     return ctx.fire(
                         Fire::at(REGISTER_FILE, entry).stamp(stamp).apply(Grid::of(
                             [
@@ -846,7 +852,7 @@ fn act_x_wt_over(
                             [128, 1, 1],
                         )),
                         &[
-                            w.codes.arg(),
+                            packed.unwrap_or(w.codes).arg(),
                             w.scales.arg(),
                             biases.arg(),
                             table.arg(),
