@@ -124,6 +124,8 @@ fn fire_of(slot: &Slot) -> kernels_metal::Fire {
         stamp: slot.point.stamp,
         lanes: slot.lanes,
         group: slot.group,
+        // A tape launches its lanes, which a kernel with an indirect grid takes too.
+        indirect: None,
     }
 }
 
