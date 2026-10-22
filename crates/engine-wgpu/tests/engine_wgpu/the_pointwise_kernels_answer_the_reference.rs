@@ -48,21 +48,23 @@ fn the_pointwise_kernels_answer_the_reference() {
             .collect();
 
         let (x, _) = gpu.up(&xv);
-        gpu.run_slang(|k| kernels_slang::elemwise::silu_scaled::silu(k, st(bt(x))));
+        gpu.run_slang(|k| kernels_slang::elemwise::pointwise::silu(k, st(bt(x))));
         close(
             &gpu.down(x, n + 1),
             &silued,
             &format!("slang silu bf16 {shape}"),
         );
         let (x, _) = gpu.up(&xv);
-        gpu.run_slang(|k| kernels_slang::elemwise::tanh::tanh(k, st(bt(x))));
+        gpu.run_slang(|k| kernels_slang::elemwise::pointwise::tanh(k, st(bt(x))));
         close(
             &gpu.down(x, n + 1),
             &tanhed,
             &format!("slang tanh bf16 {shape}"),
         );
         let z = gpu.zeros(n + 1);
-        gpu.run_slang(|k| kernels_slang::elemwise::add::add(k, st(bt(x0)), st(bt(y0)), st(bt(z))));
+        gpu.run_slang(|k| {
+            kernels_slang::elemwise::pointwise::add(k, st(bt(x0)), st(bt(y0)), st(bt(z)))
+        });
         close(
             &gpu.down(z, n),
             &summed[..n],
@@ -70,7 +72,7 @@ fn the_pointwise_kernels_answer_the_reference() {
         );
 
         let x = gpu.up_f32(&xv);
-        gpu.run_slang(|k| kernels_slang::elemwise::tanh::tanh(k, st(ft(x))));
+        gpu.run_slang(|k| kernels_slang::elemwise::pointwise::tanh(k, st(ft(x))));
         let want = keep(xv.iter().map(|v| f64::from(*v).tanh()).collect(), 7.0);
         close(
             &gpu.down_f32(x, n + 1),
@@ -78,7 +80,7 @@ fn the_pointwise_kernels_answer_the_reference() {
             &format!("slang tanh f32 {shape}"),
         );
         let x = gpu.up_f32(&xv);
-        gpu.run_slang(|k| kernels_slang::elemwise::silu_scaled::silu(k, st(ft(x))));
+        gpu.run_slang(|k| kernels_slang::elemwise::pointwise::silu(k, st(ft(x))));
         let want = keep(xv.iter().map(|v| silu(f64::from(*v))).collect(), 7.0);
         close(
             &gpu.down_f32(x, n + 1),
@@ -87,7 +89,9 @@ fn the_pointwise_kernels_answer_the_reference() {
         );
         let (x, y) = (gpu.up_f32(&xv), gpu.up_f32(&yv));
         let z = gpu.up_f32(&vec![0.0; n + 1]);
-        gpu.run_slang(|k| kernels_slang::elemwise::add::add(k, st(ft(x)), st(ft(y)), st(ft(z))));
+        gpu.run_slang(|k| {
+            kernels_slang::elemwise::pointwise::add(k, st(ft(x)), st(ft(y)), st(ft(z)))
+        });
         let want: Vec<f64> = xv
             .iter()
             .zip(&yv)
@@ -102,7 +106,9 @@ fn the_pointwise_kernels_answer_the_reference() {
         // The cast rounds each f32 to the nearest bf16, ties to even.
         let x = gpu.up_f32(&xv);
         let (o, _) = gpu.up(&vec![7.0; n + 1]);
-        gpu.run_slang(|k| kernels_slang::elemwise::cast::cast_f32_to_bf16(k, st(ft(x)), st(bt(o))));
+        gpu.run_slang(|k| {
+            kernels_slang::elemwise::pointwise::cast_f32_to_bf16(k, st(ft(x)), st(bt(o)))
+        });
         let want = keep(xr.iter().map(|v| f64::from(*v)).collect(), 7.0);
         close(
             &gpu.down(o, n + 1),
@@ -170,7 +176,7 @@ fn the_clamps_and_the_gate_answer_the_reference() {
             let who = if slang { "slang " } else { "" };
             let (x, _) = gpu.up(&xv);
             if slang {
-                gpu.run_slang(|k| kernels_slang::elemwise::clamp::clamp(k, lo, hi, st(bt(x))));
+                gpu.run_slang(|k| kernels_slang::elemwise::pointwise::clamp(k, lo, hi, st(bt(x))));
             } else {
                 gpu.run(|k| clip::clamp(k, lo, hi, bt(x)));
             }
@@ -182,7 +188,7 @@ fn the_clamps_and_the_gate_answer_the_reference() {
             let (x, _) = gpu.up(&xv);
             if slang {
                 gpu.run_slang(|k| {
-                    kernels_slang::elemwise::clamp::clamp_learned(
+                    kernels_slang::elemwise::pointwise::clamp_learned(
                         k,
                         st(one(lo_t)),
                         st(one(hi_t)),
@@ -204,7 +210,7 @@ fn the_clamps_and_the_gate_answer_the_reference() {
             let (x, _) = gpu.up(&xv);
             if slang {
                 gpu.run_slang(|k| {
-                    kernels_slang::elemwise::sigmoid_mul::sigmoid_mul(k, st(bt(g)), st(bt(x)))
+                    kernels_slang::elemwise::pointwise::sigmoid_mul(k, st(bt(g)), st(bt(x)))
                 });
             } else {
                 gpu.run(|k| gate::sigmoid_mul(k, bt(g), bt(x)));

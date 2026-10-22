@@ -241,7 +241,7 @@ fn the_gated_norms_answer_the_reference() {
             );
             let y = gpu.zeros(n);
             gpu.run_slang(|s| {
-                kernels_slang::elemwise::gated_rms::rmsnorm_gated(
+                kernels_slang::elemwise::norm::rmsnorm_gated(
                     s,
                     st(f32t(x, width)),
                     st(bt(z)),
@@ -261,7 +261,7 @@ fn the_gated_norms_answer_the_reference() {
         let want = gated_reference(&xv, &zv, &wv, vd, eps, true);
         let y = gpu.zeros(n);
         gpu.run_slang(|s| {
-            kernels_slang::elemwise::gated_rms::rmsnorm_gated_by(
+            kernels_slang::elemwise::norm::rmsnorm_gated_by(
                 s,
                 st(f32t(x, width)),
                 st(bt(z)),
@@ -313,7 +313,7 @@ fn the_sums_answer_the_reference() {
             let (yt, xt) = (bt(y, rows, width), bt(x, rows, width));
             if slang {
                 gpu.run_slang(|s| {
-                    kernels_slang::elemwise::residual_add::residual_add(s, st(xt), st(yt))
+                    kernels_slang::elemwise::pointwise::residual_add(s, st(xt), st(yt))
                 });
             } else {
                 gpu.run(|s| norm::residual_add(s, xt, yt));
@@ -327,7 +327,7 @@ fn the_sums_answer_the_reference() {
             let (b, _) = gpu.up(&bv);
             let (yt, b) = (bt(y, rows, width), bt(b, 1, width));
             if slang {
-                gpu.run_slang(|s| kernels_slang::elemwise::add_bias::add_bias(s, st(b), st(yt)));
+                gpu.run_slang(|s| kernels_slang::elemwise::pointwise::add_bias(s, st(b), st(yt)));
             } else {
                 gpu.run(|s| norm::add_bias(s, b, yt));
             }
@@ -349,7 +349,7 @@ fn the_sums_answer_the_reference() {
         let x = gpu.up_f32(&xv);
         let y = gpu.up_f32(&yv);
         gpu.run_slang(|s| {
-            kernels_slang::elemwise::residual_add::residual_add(
+            kernels_slang::elemwise::pointwise::residual_add(
                 s,
                 st(ft(x, rows, width)),
                 st(ft(y, rows, width)),
@@ -371,7 +371,7 @@ fn the_sums_answer_the_reference() {
         let y = gpu.up_f32(&yv);
         let b = gpu.up_f32(&bv);
         gpu.run_slang(|s| {
-            kernels_slang::elemwise::add_bias::add_bias(
+            kernels_slang::elemwise::pointwise::add_bias(
                 s,
                 st(ft(b, 1, width)),
                 st(ft(y, rows, width)),
@@ -394,7 +394,7 @@ fn the_sums_answer_the_reference() {
         let y = gpu.up_f32(&yv);
         let bias = Tensor::new(b, 1, width as u32, Dtype::Bf16);
         gpu.run_slang(|s| {
-            kernels_slang::elemwise::add_bias::add_bias(s, st(bias), st(ft(y, rows, width)))
+            kernels_slang::elemwise::pointwise::add_bias(s, st(bias), st(ft(y, rows, width)))
         });
         close(
             &gpu.down_f32(y, n),
@@ -454,7 +454,7 @@ fn the_layernorms_answer_the_reference() {
         close(&gpu.down(y, n), &want, &format!("layernorm {shape}"));
         let y = gpu.zeros(n);
         gpu.run_slang(|s| {
-            kernels_slang::elemwise::layernorm::layernorm(
+            kernels_slang::elemwise::norm::layernorm(
                 s,
                 st(bt(x, rows)),
                 st(bt(w, 1)),
@@ -467,7 +467,7 @@ fn the_layernorms_answer_the_reference() {
         let want = layernorm_reference(&xr, width, eps, None);
         let y = gpu.zeros(n);
         gpu.run_slang(|s| {
-            kernels_slang::elemwise::layernorm::layernorm_no_scale(
+            kernels_slang::elemwise::norm::layernorm_no_scale(
                 s,
                 st(bt(x, rows)),
                 eps,
@@ -490,7 +490,7 @@ fn the_layernorms_answer_the_reference() {
         let x = gpu.up_f32(&xv);
         let y = gpu.zeros(2 * n);
         gpu.run_slang(|s| {
-            kernels_slang::elemwise::layernorm::layernorm_no_scale(s, st(ft(x)), eps, st(ft(y)))
+            kernels_slang::elemwise::norm::layernorm_no_scale(s, st(ft(x)), eps, st(ft(y)))
         });
         let want = layernorm_reference(&xv, width, eps, None);
         close(
@@ -524,7 +524,7 @@ fn standardize_answers_the_reference() {
         close(&gpu.down(y, n), &want, &format!("standardize {shape}"));
         let (y, _) = gpu.up(&xv);
         gpu.run_slang(|k| {
-            kernels_slang::elemwise::standardize::standardize(
+            kernels_slang::elemwise::norm::standardize(
                 k,
                 st(bt(b, 1)),
                 st(bt(s, 1)),
@@ -584,7 +584,7 @@ fn the_scalars_answer_the_reference() {
             let who = if slang { "slang " } else { "" };
             let (x, _) = gpu.up(&xv);
             if slang {
-                gpu.run_slang(|k| kernels_slang::elemwise::scale::mul_scalar(k, s, st(bt(x))));
+                gpu.run_slang(|k| kernels_slang::elemwise::pointwise::mul_scalar(k, s, st(bt(x))));
             } else {
                 gpu.run(|k| norm::mul_scalar(k, s, bt(x)));
             }
@@ -596,7 +596,7 @@ fn the_scalars_answer_the_reference() {
             let (x, _) = gpu.up(&xv);
             let sv = Tensor::new(sbuf, 1, 1, Dtype::Bf16);
             if slang {
-                gpu.run_slang(|k| kernels_slang::elemwise::scale::scale(k, st(sv), st(bt(x))));
+                gpu.run_slang(|k| kernels_slang::elemwise::pointwise::scale(k, st(sv), st(bt(x))));
             } else {
                 gpu.run(|k| norm::scale(k, sv, bt(x)));
             }
@@ -607,9 +607,7 @@ fn the_scalars_answer_the_reference() {
             );
             let (x, _) = gpu.up(&xv);
             if slang {
-                gpu.run_slang(|k| {
-                    kernels_slang::elemwise::silu_scaled::silu_scaled(k, s, st(bt(x)))
-                });
+                gpu.run_slang(|k| kernels_slang::elemwise::pointwise::silu_scaled(k, s, st(bt(x))));
             } else {
                 gpu.run(|k| norm::silu_scaled(k, s, bt(x)));
             }
@@ -629,7 +627,7 @@ fn the_scalars_answer_the_reference() {
             want[n] = f64::from(yr[n]);
             let (x, _) = gpu.up(&xv);
             gpu.run_slang(|k| {
-                kernels_slang::elemwise::residual_add::residual_add(k, st(bt(x)), st(bt(y)))
+                kernels_slang::elemwise::pointwise::residual_add(k, st(bt(x)), st(bt(y)))
             });
             close(
                 &gpu.down(y, n + 1),
@@ -639,7 +637,7 @@ fn the_scalars_answer_the_reference() {
         }
         let ft = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
         let x = gpu.up_f32(&xv);
-        gpu.run_slang(|k| kernels_slang::elemwise::scale::mul_scalar(k, s, st(ft(x))));
+        gpu.run_slang(|k| kernels_slang::elemwise::pointwise::mul_scalar(k, s, st(ft(x))));
         let mut want: Vec<f64> = xv.iter().map(|v| f64::from(*v) * f64::from(s)).collect();
         want[n] = 7.0;
         close(
@@ -648,7 +646,7 @@ fn the_scalars_answer_the_reference() {
             &format!("slang mul scalar f32 {shape}"),
         );
         let x = gpu.up_f32(&xv);
-        gpu.run_slang(|k| kernels_slang::elemwise::silu_scaled::silu_scaled(k, s, st(ft(x))));
+        gpu.run_slang(|k| kernels_slang::elemwise::pointwise::silu_scaled(k, s, st(ft(x))));
         let mut want: Vec<f64> = xv
             .iter()
             .map(|v| silu(f64::from(*v) * f64::from(s)))
@@ -747,7 +745,7 @@ fn res_blend_answers_the_reference() {
         let y = gpu.zeros(n);
         let sblocks: Vec<_> = blocks.iter().map(|b| st(*b)).collect();
         gpu.run_slang(|k| {
-            kernels_slang::elemwise::res_blend::res_blend(
+            kernels_slang::elemwise::norm::res_blend(
                 k,
                 st(t(prefix, rows)),
                 &sblocks,
