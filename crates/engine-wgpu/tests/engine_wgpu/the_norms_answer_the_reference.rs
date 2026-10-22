@@ -790,3 +790,102 @@ fn the_scalars_answer_the_reference() {
         );
     }
 }
+
+/// Each row the softmax-weighted sum of its candidates (the stacked blocks,
+/// then the prefix), each candidate's logit `rms_norm(c) * w . proj`.
+fn blend_reference(
+    prefix: &[f32],
+    stack: &[f32],
+    n_blocks: usize,
+    (w, proj): (&[f32], &[f32]),
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(rows * hidden);
+    for r in 0..rows {
+        let cands: Vec<&[f32]> = (0..n_blocks)
+            .map(|j| &stack[(j * rows + r) * hidden..][..hidden])
+            .chain(std::iter::once(&prefix[r * hidden..][..hidden]))
+            .collect();
+        let logits: Vec<f64> = cands
+            .iter()
+            .map(|c| {
+                let ms = c.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / hidden as f64;
+                let inv = 1.0 / (ms + f64::from(eps)).sqrt();
+                (0..hidden)
+                    .map(|h| f64::from(c[h]) * inv * f64::from(w[h]) * f64::from(proj[h]))
+                    .sum()
+            })
+            .collect();
+        let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let e: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+        let sum: f64 = e.iter().sum();
+        for h in 0..hidden {
+            out.push(
+                cands
+                    .iter()
+                    .zip(&e)
+                    .map(|(c, p)| p / sum * f64::from(c[h]))
+                    .sum(),
+            );
+        }
+    }
+    out
+}
+
+#[test]
+fn res_blend_answers_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let eps = 1e-6;
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    for (rows, hidden, n_blocks) in [(3usize, 64usize, 0usize), (2, 1000, 3), (4, 512, 5)] {
+        let n = rows * hidden;
+        let t = |buf: u32, rows: usize| Tensor::new(buf, rows as u32, hidden as u32, Dtype::Bf16);
+        let (prefix, pr) = gpu.up(&noise(hidden as u64 + 20, n));
+        let (stack, sr) = gpu.up(&noise(
+            hidden as u64 + 21,
+            (n_blocks * rows).max(1) * hidden,
+        ));
+        // A small projection keeps the logits apart but not one-hot.
+        let pv: Vec<f32> = noise(hidden as u64 + 23, hidden)
+            .iter()
+            .map(|v| v * 0.05)
+            .collect();
+        let (w, wr) = gpu.up(&noise(hidden as u64 + 22, hidden));
+        let (proj, projr) = gpu.up(&pv);
+        let want = blend_reference(&pr, &sr, n_blocks, (&wr, &projr), rows, hidden, eps);
+        let blocks = vec![t(stack, rows); n_blocks];
+        let shape = format!("{rows} x {hidden}, {n_blocks} blocks");
+        let y = gpu.zeros(n);
+        gpu.run(|k| {
+            norm::res_blend(
+                k,
+                t(prefix, rows),
+                &blocks,
+                t(w, 1),
+                eps,
+                t(proj, 1),
+                t(y, rows),
+            )
+        });
+        close(&gpu.down(y, n), &want, &format!("res blend {shape}"));
+        let y = gpu.zeros(n);
+        let sblocks: Vec<_> = blocks.iter().map(|b| st(*b)).collect();
+        gpu.run_slang(|k| {
+            kernels_slang::elemwise::res_blend::res_blend(
+                k,
+                st(t(prefix, rows)),
+                &sblocks,
+                st(t(w, 1)),
+                eps,
+                st(t(proj, 1)),
+                st(t(y, rows)),
+            )
+        });
+        close(&gpu.down(y, n), &want, &format!("slang res blend {shape}"));
+    }
+}

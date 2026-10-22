@@ -401,16 +401,21 @@ impl Run<'_> {
                 y,
             } => {
                 let y = self.tensor(*y);
-                let blocks = self.stacked_blocks(blocks, y)?;
-                elemwise::norm::res_blend(
-                    self.ctx(),
-                    self.tensor(*prefix),
+                let blocks: Vec<_> = self
+                    .stacked_blocks(blocks, y)?
+                    .into_iter()
+                    .map(crate::encode::slang_tensor)
+                    .collect();
+                kernels_slang::elemwise::res_blend::res_blend(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*prefix)),
                     &blocks,
-                    self.tensor(*weight),
+                    crate::encode::slang_tensor(self.tensor(*weight)),
                     *eps,
-                    self.tensor(*proj),
-                    y,
+                    crate::encode::slang_tensor(self.tensor(*proj)),
+                    crate::encode::slang_tensor(y),
                 )
+                .map_err(crate::encode::from_slang)
             }
 
             Elemwise::RopeFull {
