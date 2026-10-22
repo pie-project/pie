@@ -644,8 +644,8 @@ impl Engine for Cuda {
             media_encode: false,
             device_channel_commit: true,
             rs_verbs: true,
-            rs_snapshots: if state_rows {
-                crate::store::rs::snapshots(shell.trace())
+            rs_snapshots: if state_rows && shell.lands_snapshots() {
+                crate::store::rs::SNAPSHOTS
             } else {
                 0
             },

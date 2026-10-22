@@ -1386,7 +1386,6 @@ impl Inputs {
             write_state_mask: Tensor::ABSENT,
             commit_len: Tensor::ABSENT,
             begin_at: Tensor::ABSENT,
-            #[cfg(feature = "rocm")]
             snapshots: kernels_cuda::Snapshots::NONE,
         }
     }

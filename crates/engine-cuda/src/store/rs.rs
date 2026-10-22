@@ -483,12 +483,11 @@ pub const SNAPSHOTS: u32 = 16;
 
 /// The snapshots this engine lands in a lane: [`SNAPSHOTS`] where every op
 /// that reads a state slot is a recurrent scan or window whose chunked arm
-/// lands them (a single-token arm never meets one), else none.
+/// lands them (a single-token arm never meets one), else none. On CUDA the
+/// gated delta rule's prefill lands them on the two-launch scan, where
+/// `gdn_lands` says this device takes it at a key width.
 #[must_use]
-pub fn snapshots(trace: &Trace) -> u32 {
-    if !cfg!(feature = "rocm") {
-        return 0;
-    }
+pub fn snapshots(trace: &Trace, gdn_lands: impl Fn(u32) -> bool) -> u32 {
     let state = |id: &ValueId| {
         matches!(
             trace.values.get(id.0 as usize).map(|value| &value.def),
@@ -500,24 +499,49 @@ pub fn snapshots(trace: &Trace) -> u32 {
     let lands = trace.nodes.iter().all(|node| {
         reads.clear();
         node.op.inputs(&mut reads);
-        !reads.iter().any(state)
-            || matches!(
-                node.op,
-                Operation::Attention(
-                    Attention::SsmCausalConv1d { .. }
-                        | Attention::SsmCausalConv1dChunked { .. }
-                        | Attention::ShortConv { .. }
-                        | Attention::ShortConvChunked { .. }
-                        | Attention::SsmGatedDelta { .. }
-                        | Attention::SsmGatedDeltaChunked { .. }
-                        | Attention::SsmKdaStep { .. }
-                        | Attention::SsmKdaChunked { .. }
-                        | Attention::PleNgramIds { .. }
-                        | Attention::PleNgramIdsChunked { .. }
-                ) | Operation::Fused(poem_ir::Fused::GdnStep { .. })
-            )
+        !reads.iter().any(state) || lands_snapshots(&node.op, &gdn_lands)
     });
     if lands { SNAPSHOTS } else { 0 }
+}
+
+#[cfg(feature = "rocm")]
+fn lands_snapshots(op: &Operation, _gdn_lands: &impl Fn(u32) -> bool) -> bool {
+    matches!(
+        op,
+        Operation::Attention(
+            Attention::SsmCausalConv1d { .. }
+                | Attention::SsmCausalConv1dChunked { .. }
+                | Attention::ShortConv { .. }
+                | Attention::ShortConvChunked { .. }
+                | Attention::SsmGatedDelta { .. }
+                | Attention::SsmGatedDeltaChunked { .. }
+                | Attention::SsmKdaStep { .. }
+                | Attention::SsmKdaChunked { .. }
+                | Attention::PleNgramIds { .. }
+                | Attention::PleNgramIdsChunked { .. }
+        ) | Operation::Fused(poem_ir::Fused::GdnStep { .. })
+    )
+}
+
+/// CUDA's arms that land a snapshot: the causal conv's row-tiled commit
+/// (a reach of at most 32 rows) and the gated delta rule's scans.
+#[cfg(not(feature = "rocm"))]
+fn lands_snapshots(op: &Operation, gdn_lands: &impl Fn(u32) -> bool) -> bool {
+    match op {
+        Operation::Attention(Attention::SsmCausalConv1dChunked {
+            conv_width,
+            dilation,
+            ..
+        }) => conv_width.saturating_sub(1).saturating_mul(*dilation) <= 32,
+        Operation::Attention(Attention::SsmGatedDeltaChunked { k_dim, v_dim, .. }) => {
+            *k_dim == 128 && *v_dim == 128 && gdn_lands(*k_dim)
+        }
+        Operation::Attention(
+            Attention::SsmCausalConv1d { .. } | Attention::SsmGatedDelta { .. },
+        )
+        | Operation::Fused(poem_ir::Fused::GdnStep { .. }) => true,
+        _ => false,
+    }
 }
 
 /// A fire's snapshots in fire-lane order: lane `l`'s are entries
@@ -538,11 +562,9 @@ pub struct Predicate {
     at_indptr: u64,
     at_mask: u64,
     at_len: u64,
-    #[cfg(feature = "rocm")]
     at_snap: Option<[u64; 3]>,
     /// The lane bounds the last fire left nonzero, which the next fire that
     /// takes no snapshot zeroes; a run of fires taking none stages nothing.
-    #[cfg(feature = "rocm")]
     snap_dirty: usize,
     lanes: u32,
 }
@@ -562,13 +584,10 @@ impl Predicate {
         let at_indptr = take((lanes + 1) * 4);
         let at_mask = take(lanes);
         let at_len = take(lanes * 4);
-        #[cfg(feature = "rocm")]
         let at_snap = snapshots.then(|| {
             let entries = lanes * u64::from(SNAPSHOTS);
             [take((lanes + 1) * 4), take(entries * 4), take(entries * 4)]
         });
-        #[cfg(not(feature = "rocm"))]
-        let _ = snapshots;
         let mut region = Buffer::zeroed(usize::try_from(at).unwrap_or(usize::MAX))?;
         region.write(at_one, &1u32.to_le_bytes())?;
         let identity: Vec<u8> = (0..=max_lanes)
@@ -583,9 +602,7 @@ impl Predicate {
             at_indptr,
             at_mask,
             at_len,
-            #[cfg(feature = "rocm")]
             at_snap,
-            #[cfg(feature = "rocm")]
             snap_dirty: 0,
             lanes: max_lanes,
         })
@@ -642,10 +659,15 @@ impl Predicate {
         kernels_cuda::Tensor::new(self.region.ptr() + self.at_len, lanes, 1, Dtype::I32)
     }
 
+    /// Whether this load lands snapshots: its table's planes are reserved.
+    #[must_use]
+    pub fn lands_snapshots(&self) -> bool {
+        self.at_snap.is_some()
+    }
+
     /// The fire's snapshot table, staged on every fire of an engine that
     /// lands them (its lanes' bounds, zero where none takes one), so every
     /// launch reads it where a body recorded it.
-    #[cfg(feature = "rocm")]
     pub fn snapshots(
         &mut self,
         stream: *mut core::ffi::c_void,

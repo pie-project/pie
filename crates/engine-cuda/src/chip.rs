@@ -475,7 +475,7 @@ mod tests {
                 assert_eq!(tuning.moe_tc5, b200, "{gpu}");
                 assert_eq!(
                     tuning.ssm_gdn_fused_scan,
-                    major == 10 && minor == 0,
+                    (major, minor) == (10, 0) || (major, minor) == (12, 0),
                     "{gpu}"
                 );
                 assert_eq!(tuning.ssm_gdn_tc5, b200, "{gpu}");
@@ -642,7 +642,17 @@ mod tests {
                 assert_eq!((tuning.mxfp4_mma_from, tuning.mxfp4_mma_until), (28, 1024));
                 assert_eq!((tuning.bf16_mma_from, tuning.bf16_mma_until), (16, 65536));
             } else {
-                assert_eq!(tuning, defaults, "{gpu}");
+                // The 99 KiB and A100 families take the two-launch gated
+                // delta scan alone; Orin keeps the three wmma launches.
+                assert_eq!(
+                    kernels_cuda::tuning::Tuning {
+                        ssm_gdn_fused_scan: false,
+                        ..tuning
+                    },
+                    defaults,
+                    "{gpu}"
+                );
+                assert_eq!(tuning.ssm_gdn_fused_scan, minor != 7, "{gpu}");
             }
         }
     }
@@ -759,15 +769,20 @@ mod tests {
         assert_eq!(Engine::of(&family).lattice_steps, 1);
     }
 
-    /// The two-launch gated delta scan is a Hopper and sm_100 family decision;
+    /// The two-launch gated delta scan is a decision of the A100, the 99 KiB
+    /// cards (a quarter head a block there), Hopper and the sm_100 family;
     /// every other family keeps the three wmma launches it ran before.
     #[cfg(not(feature = "rocm"))]
     #[test]
-    fn only_hopper_and_the_sm100_family_run_the_two_launch_gated_delta_scan() {
+    fn the_gated_delta_scan_runs_where_its_family_measured_it() {
         for (name, major, minor, sms) in [
             ("NVIDIA B200", 10, 0, 148),
             ("NVIDIA GB200", 10, 0, 152),
             ("NVIDIA H100 80GB HBM3", 9, 0, 132),
+            ("NVIDIA A100-SXM4-80GB", 8, 0, 108),
+            ("NVIDIA GeForce RTX 3090", 8, 6, 82),
+            ("NVIDIA L40S", 8, 9, 142),
+            ("NVIDIA GeForce RTX 5090", 12, 0, 170),
         ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
             assert!(
@@ -776,13 +791,9 @@ mod tests {
             );
         }
         for (name, major, minor, sms) in [
-            ("NVIDIA A100-SXM4-80GB", 8, 0, 108),
-            ("NVIDIA GeForce RTX 3090", 8, 6, 82),
             ("NVIDIA Jetson AGX Orin", 8, 7, 16),
-            ("NVIDIA L40S", 8, 9, 142),
             ("NVIDIA B300", 10, 3, 148),
             ("NVIDIA Thor", 11, 0, 20),
-            ("NVIDIA GeForce RTX 5090", 12, 0, 170),
             ("NVIDIA GB10", 12, 1, 48),
         ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
@@ -921,12 +932,19 @@ mod tests {
         assert!(report.untuned());
         for p in [&l40s, &rtx] {
             assert_eq!(Engine::of(p), Engine::of(&registry().defaults()));
+            assert!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_fused_scan);
             assert_eq!(
-                kernels_cuda::tuning::Tuning::of(p),
+                kernels_cuda::tuning::Tuning {
+                    ssm_gdn_fused_scan: false,
+                    ..kernels_cuda::tuning::Tuning::of(p)
+                },
                 kernels_cuda::tuning::Tuning::of(&registry().defaults()),
-                "what an Ada GPU ran before its family file"
+                "what an Ada GPU ran before its family file, past the gated delta scan"
             );
             for (spec, rungs, _) in p.entries() {
+                if spec.id == "kernel.ssm.gdn_fused_scan" {
+                    continue;
+                }
                 assert_eq!(
                     rungs,
                     registry()

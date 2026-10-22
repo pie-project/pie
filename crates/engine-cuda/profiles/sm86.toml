@@ -3,3 +3,9 @@ api = 1
 [target]
 tier    = "sm_86"
 assumes = { cc = 86 }
+
+# The gated delta rule's prefill on the two-launch scan (a quarter head a
+# block where a block holds 99 KiB): Qwen3.5-0.8B's prefill fire 23% to
+# 57% less GPU time than on the three wmma launches.
+[kernel]
+ssm.gdn_fused_scan = true

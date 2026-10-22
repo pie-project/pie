@@ -734,7 +734,17 @@ impl Shell {
         arena.ensure(&mut pools, arena_bytes)?;
         let predicate = crate::store::rs::Predicate::reserve(
             boot.budget.max_lanes,
-            crate::store::rs::snapshots(&boot.trace) > 0,
+            crate::store::rs::snapshots(&boot.trace, |k_dim| {
+                #[cfg(not(feature = "rocm"))]
+                {
+                    kernels_cuda::attn::ssm::gdn_lands_snapshots(device.ctx(), k_dim)
+                }
+                #[cfg(feature = "rocm")]
+                {
+                    let _ = k_dim;
+                    true
+                }
+            }) > 0,
         )?;
         let spaces = boot
             .trace

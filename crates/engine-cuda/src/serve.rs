@@ -358,6 +358,12 @@ impl Shell {
         self.pools.state_bytes(slot)
     }
 
+    /// Whether this load lands recurrent-state snapshots inside a fire.
+    #[must_use]
+    pub fn lands_snapshots(&self) -> bool {
+        self.predicate.lands_snapshots()
+    }
+
     pub fn fold_predicate(&self, lanes: u32) -> Result<Vec<u8>> {
         self.predicate.read_mask(lanes)
     }
@@ -693,7 +699,6 @@ struct RsFire<'a> {
     buffered: bool,
     reads: Vec<Vec<std::ops::Range<u32>>>,
     rows_ext: u32,
-    #[cfg(feature = "rocm")]
     snapshots: crate::store::rs::SnapTable,
 }
 
