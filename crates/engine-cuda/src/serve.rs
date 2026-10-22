@@ -393,15 +393,18 @@ impl Shell {
         self.pools.host_kv_layout(ranks)
     }
 
-    /// Once every copy on the stream has landed.
+    /// Once the moves and read-outs that write `slots` have landed: host
+    /// slots are written only on the swap and tap streams, so the fires
+    /// beside them go on.
     pub fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
-        self.device.synchronize()?;
+        self.pools.settle_host_slots(slots)?;
         self.pools.read_host_kv(slots)
     }
 
-    /// Behind every copy on the stream, so none still reads the slots.
+    /// Behind the moves and read-outs that touch `slots`, so none still
+    /// reads or writes them; the fires beside them go on.
     pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
-        self.device.synchronize()?;
+        self.pools.settle_host_slots(slots)?;
         self.pools.write_host_kv(slots, bytes)
     }
 
