@@ -72,7 +72,9 @@ struct Shared {
 pub struct Cluster {
     events: Sender<Event>,
     shared: Arc<Shared>,
-    gate: Duration,
+    /// How long a launch waits for the slowest program to hear it, in ms;
+    /// a reload sets it anew.
+    gate_ms: AtomicU64,
     next_seq: AtomicU64,
     dead: Arc<AtomicBool>,
 }
@@ -110,6 +112,12 @@ enum Event {
         id: String,
         worker: Option<String>,
         why: String,
+    },
+    /// Swap every program for these (name, component), loaded whole first:
+    /// the answer is the new set's gate, or why it did not load.
+    Reload {
+        programs: Vec<(String, Vec<u8>)>,
+        answer: tokio::sync::oneshot::Sender<Result<u64, LoadError>>,
     },
     /// The directory's groups and pools, and what worker policies
     /// published, as of now.
@@ -164,8 +172,7 @@ impl Cluster {
             let (fleet, handle) = (fleet.clone(), tokio::runtime::Handle::current());
             move |programs| run(programs, rx, shared, routing, dead, fleet, handle)
         })?;
-        // A launch waits for the slowest to hear it.
-        let gate = Duration::from_millis(manifests.iter().map(|m| m.gate_ms).max().unwrap_or(0));
+        let gate_ms = gate_of(manifests.iter());
 
         let workers = events.clone();
         tokio::spawn(async move {
@@ -207,7 +214,7 @@ impl Cluster {
             Arc::new(Self {
                 events,
                 shared,
-                gate,
+                gate_ms: AtomicU64::new(gate_ms),
                 next_seq: AtomicU64::new(0),
                 dead,
             }),
@@ -218,6 +225,35 @@ impl Cluster {
 
     fn send(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+
+    /// Swaps every running program for `programs` (spec, component), as a
+    /// SIGHUP asks. The new set loads whole before anything changes; on an
+    /// error the old one runs on. The old programs stop as a dead one does:
+    /// their tables and what they published are withdrawn, and the others
+    /// hear it. The new ones start with no state of their own, a program
+    /// in both sets too, and read the cluster as it stands.
+    pub async fn reload(&self, programs: Vec<(String, Vec<u8>)>) -> Result<(), LoadError> {
+        if programs.is_empty() {
+            return Err(LoadError::Instantiate(
+                "a reload names at least one cluster policy; a gateway with none starts without \
+                 them"
+                    .into(),
+            ));
+        }
+        let programs = programs
+            .into_iter()
+            .map(|(spec, component)| (program_name(&spec), component))
+            .collect();
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        self.events
+            .send(Event::Reload { programs, answer })
+            .map_err(|_| LoadError::Instantiate("the policy thread has ended".into()))?;
+        let gate_ms = answered
+            .await
+            .map_err(|_| LoadError::Instantiate("the policy thread has ended".into()))??;
+        self.gate_ms.store(gate_ms, Ordering::Release);
+        Ok(())
     }
 
     /// The scale table the policies installed (`install-scale`), whole;
@@ -267,10 +303,11 @@ impl Cluster {
         routing: &RoutingHandle,
     ) -> Result<(), AdmitReject> {
         let (id, seq) = (waiting.id, waiting.seq);
-        if !self.gate.is_zero() && !self.dead.load(Ordering::Acquire) {
+        let gate = Duration::from_millis(self.gate_ms.load(Ordering::Acquire));
+        if !gate.is_zero() && !self.dead.load(Ordering::Acquire) {
             // Unanswered, the launch goes by the gateway's default.
             let mut heard = self.shared.heard.subscribe();
-            let _ = tokio::time::timeout(self.gate, heard.wait_for(|&h| h >= seq)).await;
+            let _ = tokio::time::timeout(gate, heard.wait_for(|&h| h >= seq)).await;
         }
 
         {
@@ -440,6 +477,8 @@ fn run(
     // The last arrival heard, owed to the gate until the rounds its calls'
     // changes carry to the others have run too.
     let mut owed: Option<u64> = None;
+    // The last arrival seen at all: what a set coming back to life has heard.
+    let mut last_seq = 0u64;
     loop {
         // What the last round's calls changed reaches the others now.
         let carried = std::mem::take(&mut registry.carried);
@@ -467,12 +506,45 @@ fn run(
         };
         let mut edges = Vec::new();
         let mut heard = None;
+        let mut reloads = Vec::new();
         registry.forget_exited();
         for event in first.into_iter().chain(events.try_iter()) {
-            if let Event::Arrived { seq, .. } = &event {
-                heard = heard.max(Some(*seq));
+            match event {
+                Event::Reload { programs, answer } => reloads.push((programs, answer)),
+                event => {
+                    if let Event::Arrived { seq, .. } = &event {
+                        heard = heard.max(Some(*seq));
+                        last_seq = last_seq.max(*seq);
+                    }
+                    registry.apply(event, &mut edges);
+                }
             }
-            registry.apply(event, &mut edges);
+        }
+        for (next, answer) in reloads {
+            match program::load_all(&next, capability) {
+                Ok(next) => {
+                    let (old, new): (Vec<&str>, Vec<&str>) = (
+                        programs.iter().map(Program::name).collect(),
+                        next.iter().map(Program::name).collect(),
+                    );
+                    tracing::info!(?old, ?new, "cluster policies reloaded");
+                    // The old ones stop as a dead one does.
+                    for program in &programs {
+                        withdraw(&shared, &mut registry, program.name(), program.manifest());
+                    }
+                    let gate_ms = gate_of(next.iter().map(Program::manifest));
+                    programs = next;
+                    if dead.swap(false, Ordering::AcqRel) {
+                        // The launches let through while none ran stay heard.
+                        shared.heard.send_replace(last_seq);
+                    }
+                    let _ = answer.send(Ok(gate_ms));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "cluster policies not reloaded; the running ones go on");
+                    let _ = answer.send(Err(error));
+                }
+            }
         }
         // A worker the controller now grades degraded is draining.
         let degraded: BTreeSet<String> = routing
@@ -532,11 +604,14 @@ fn run(
         for at in withdrawn.into_iter().rev() {
             programs.remove(at);
         }
+        // With none left, launches go by the gateway's default until a
+        // reload starts a set again.
         if programs.is_empty() {
-            dead.store(true, Ordering::Release);
-            shared.heard.send_replace(u64::MAX);
-            shared.changed.notify_waiters();
-            return;
+            if !dead.swap(true, Ordering::AcqRel) {
+                shared.heard.send_replace(u64::MAX);
+                shared.changed.notify_waiters();
+            }
+            continue;
         }
         // A replication table stands until replaced: what it asks for and
         // is not yet so is asked for again.
@@ -602,6 +677,11 @@ fn withdraw(
         .collect();
     registry.say(author, gone);
     shared.changed.notify_waiters();
+}
+
+/// How long a launch waits for the slowest of `manifests` to hear it.
+fn gate_of<'a>(manifests: impl Iterator<Item = &'a super::manifest::Manifest>) -> u64 {
+    manifests.map(|m| m.gate_ms).max().unwrap_or(0)
 }
 
 fn program_name(spec: &str) -> String {
@@ -882,6 +962,13 @@ impl Registry {
                         }
                     }
                 }
+            }
+            // The policy thread swaps programs before a round applies its
+            // events; one here has no set to swap.
+            Event::Reload { answer, .. } => {
+                let _ = answer.send(Err(LoadError::Instantiate(
+                    "a reload reached the registry, not the policy thread".into(),
+                )));
             }
             Event::State(groups, pools, published) => {
                 self.published = published;
@@ -1656,6 +1743,85 @@ mod tests {
             cancelled,
             _connected: connected,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_swaps_the_programs_and_withdraws_the_old_ones_tables() {
+        let rig = rig(0);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+        // Below test-route's floor, a launch waits.
+        let held = launch(2, serde_json::json!({"key": 0}));
+        let waiting = {
+            let (router, routing) = (rig.router.clone(), rig.routing.clone());
+            tokio::spawn(async move { router.admit(&held, &routing).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "held below the floor");
+
+        rig.router.reload(programs(&["replicate"])).await.unwrap();
+        // test-route's schedule and placement are withdrawn with it: the
+        // held launch leaves, and nothing places the first any more.
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("let through once the floor is withdrawn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rig.router.placement(&placed).0, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_that_does_not_load_leaves_the_running_set() {
+        let rig = rig(0);
+        let mut broken = programs(&["replicate"]);
+        broken.push(("garbled".to_string(), vec![0, 1, 2, 3]));
+        assert!(matches!(
+            rig.router.reload(broken).await,
+            Err(LoadError::Of(name, _)) if name == "garbled"
+        ));
+        assert!(matches!(
+            rig.router
+                .reload(programs(&["test-route", "cache-aware"]))
+                .await,
+            Err(LoadError::Shared { .. })
+        ));
+        // test-route still places.
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_tells_the_new_programs_what_the_old_ones_withdrew() {
+        // test-share publishes the placement test-route made; test-route
+        // names it as the process's executors.
+        let rig = rig_of(0, &["test-share", "test-route"]);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        let until = |want: &[WorkerId]| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (router, want) = (rig.router.clone(), want.to_vec());
+            let placed = placed.clone();
+            async move {
+                loop {
+                    let (worker, _, executors) = router.placement(&placed);
+                    if executors == want && worker == Some(WorkerId(1)) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "executors {executors:?}, wanted {want:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        until(&[WorkerId(1)]).await;
+        // Without test-share, its value is withdrawn; the new test-route,
+        // told so, places the process again and names no executors.
+        rig.router.reload(programs(&["test-route"])).await.unwrap();
+        until(&[]).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

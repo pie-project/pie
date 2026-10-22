@@ -246,6 +246,7 @@ impl Gateway {
         let worker_task = self._worker_task;
         let listener = self.listener;
         let app = self.app;
+        let policies = self.state.router.clone();
         let serve_shutdown = shutdown.clone();
         let serve_task = tokio::spawn(async move {
             let graceful = async move { serve_shutdown.notified().await };
@@ -259,6 +260,7 @@ impl Gateway {
         GatewayHandle {
             listen_addr,
             worker_addr,
+            policies,
             shutdown,
             serve_task,
             worker_task,
@@ -269,6 +271,7 @@ impl Gateway {
 pub struct GatewayHandle {
     pub listen_addr: SocketAddr,
     pub worker_addr: SocketAddr,
+    policies: Option<Arc<policy::Cluster>>,
     shutdown: Arc<Notify>,
     serve_task: tokio::task::JoinHandle<()>,
     worker_task: tokio::task::JoinHandle<()>,
@@ -278,6 +281,13 @@ pub struct GatewayHandle {
 pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl GatewayHandle {
+    /// The running cluster policies, which [`reload_policies`] swaps; none
+    /// on a gateway that started without any.
+    #[must_use]
+    pub fn policies(&self) -> Option<Arc<policy::Cluster>> {
+        self.policies.clone()
+    }
+
     /// Stops taking connections and lets open streams finish, for up to
     /// [`SHUTDOWN_GRACE`]: a stream that does not end in that time is cut.
     pub async fn shutdown(mut self) {
@@ -294,6 +304,24 @@ impl GatewayHandle {
     }
 }
 
+/// The components `specs` names, each a built-in policy's name or a file.
+fn policy_components(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    specs
+        .iter()
+        .map(|spec| Ok((spec.clone(), builtins::policy_component(spec)?.into_owned())))
+        .collect()
+}
+
+/// Swaps the cluster policies `policies` runs for those `specs` names (a
+/// SIGHUP's `[server] policies`): the new set loads whole or the old one
+/// runs on ([`policy::Cluster::reload`]).
+pub async fn reload_policies(policies: &policy::Cluster, specs: &[String]) -> Result<()> {
+    policies
+        .reload(policy_components(specs)?)
+        .await
+        .context("reload the cluster policies")
+}
+
 pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gateway> {
     let routing_rx = control.routing_watch();
 
@@ -302,11 +330,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
     let router = if config.policies.is_empty() {
         None
     } else {
-        let programs = config
-            .policies
-            .iter()
-            .map(|spec| Ok((spec.clone(), builtins::policy_component(spec)?.into_owned())))
-            .collect::<Result<Vec<_>>>()?;
+        let programs = policy_components(&config.policies)?;
         let (router, cancelled, moves) = policy::Cluster::start(
             programs,
             routing.table_watch(),

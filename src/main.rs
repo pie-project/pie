@@ -161,6 +161,26 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
         "pie standalone serving",
     );
     println!("✓ Server ready at ws://{}", handle.listen_addr);
+    // SIGHUP swaps both planes' policies for the file's; nothing else in it
+    // is read again.
+    let reload = handle.policy_reload();
+    ctx.on_hangup(move |config| {
+        let reload = reload.clone();
+        async move {
+            let config = match worker::standalone::derive_standalone(&config) {
+                Ok((_, _, worker)) => worker,
+                Err(e) => {
+                    tracing::error!(
+                        "SIGHUP: the config does not parse, so the policies stand: {e:#}"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = reload.reload(&config).await {
+                tracing::error!("SIGHUP: {e:#}");
+            }
+        }
+    });
     Ok(ctx
         .run_until_signal(async move { handle.shutdown().await })
         .await)

@@ -11,6 +11,16 @@ in the config:
   `replicate` keeps runs on two workers); `publish` is excepted, for each
   program publishes under its own name.
 
+SIGHUP reloads them from the config file, without a restart: `pie-gateway`
+its `[server] policies`, `pie-worker` its `[runtime] policy`, `pie serve`
+both; nothing else in the file is read again. The new set loads whole or
+the running one goes on, and the error is logged. The old programs stop as
+a dead one does: their tables and what they published are withdrawn, and
+the others hear it. The new ones start with no state of their own, a policy
+in both sets too, and read the cluster as it stands; they act on the next
+edge they subscribe to. A gateway that started with no cluster policy takes
+none on a reload.
+
 A policy reads the props a client sends with a launch (as request headers,
 in a compat body, or as `LaunchProcess.props`) and the session it names.
 

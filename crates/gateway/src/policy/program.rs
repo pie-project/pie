@@ -298,57 +298,61 @@ pub fn spawn(
     let (loaded, outcome) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(thread.into())
-        .spawn(move || {
-            let mut named = std::collections::HashSet::new();
-            if let Some((name, _)) = programs
-                .iter()
-                .find(|(name, _)| !named.insert(name.as_str()))
-            {
-                let _ = loaded.send(Err(LoadError::SameName(name.clone())));
-                return;
+        .spawn(move || match load_all(&programs, capability) {
+            Ok(programs) => {
+                let manifests = programs.iter().map(|p| p.manifest.clone()).collect();
+                let _ = loaded.send(Ok(manifests));
+                serve(programs);
             }
-            let programs = programs
-                .iter()
-                .map(|(name, component)| {
-                    Program::load(name, component, &capability)
-                        .map_err(|error| LoadError::Of(name.clone(), Box::new(error)))
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|programs| {
-                    let mut authors: HashMap<&str, &str> = HashMap::new();
-                    for program in &programs {
-                        let owned = program
-                            .manifest
-                            .grants
-                            .iter()
-                            .filter(|grant| !NAMESPACED.contains(&grant.as_str()));
-                        for grant in owned {
-                            if let Some(first) = authors.insert(grant, &program.name) {
-                                return Err(LoadError::Shared {
-                                    grant: grant.clone(),
-                                    first: first.to_string(),
-                                    second: program.name.clone(),
-                                });
-                            }
-                        }
-                    }
-                    Ok(programs)
-                });
-            match programs {
-                Ok(programs) => {
-                    let manifests = programs.iter().map(|p| p.manifest.clone()).collect();
-                    let _ = loaded.send(Ok(manifests));
-                    serve(programs);
-                }
-                Err(error) => {
-                    let _ = loaded.send(Err(error));
-                }
+            Err(error) => {
+                let _ = loaded.send(Err(error));
             }
         })
         .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
     outcome
         .recv()
         .map_err(|_| LoadError::Instantiate("its thread ended before it loaded".into()))?
+}
+
+/// Loads `programs` on this thread, each whole or none: names unique, and
+/// no two granted the same write. What [`spawn`] starts, and what a reload
+/// swaps in.
+pub fn load_all(
+    programs: &[(String, Vec<u8>)],
+    capability: fn(&str) -> bool,
+) -> Result<Vec<Program>, LoadError> {
+    let mut named = std::collections::HashSet::new();
+    if let Some((name, _)) = programs
+        .iter()
+        .find(|(name, _)| !named.insert(name.as_str()))
+    {
+        return Err(LoadError::SameName(name.clone()));
+    }
+    let programs = programs
+        .iter()
+        .map(|(name, component)| {
+            Program::load(name, component, &capability)
+                .map_err(|error| LoadError::Of(name.clone(), Box::new(error)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut authors: HashMap<&str, &str> = HashMap::new();
+    for program in &programs {
+        let owned = program
+            .manifest
+            .grants
+            .iter()
+            .filter(|grant| !NAMESPACED.contains(&grant.as_str()));
+        for grant in owned {
+            if let Some(first) = authors.insert(grant, &program.name) {
+                return Err(LoadError::Shared {
+                    grant: grant.clone(),
+                    first: first.to_string(),
+                    second: program.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(programs)
 }
 
 /// Runs a call to completion on this thread, on a runtime of its own.

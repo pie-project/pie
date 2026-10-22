@@ -53,6 +53,7 @@ telemetry = false
 # policies        = []        # cluster policies: built-in names or .wasm paths,
 #                             # no two granted the same write (`publish`
 #                             # excepted: each writes under its own name)
+#                             # SIGHUP reloads this and `[runtime] policy`
 
 "#;
 
