@@ -31,7 +31,7 @@ use compat::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{chat_logprob, choice_request, choices, invalid, stop_sequences, usage};
+use crate::{chat_logprob, choices, invalid, run_choices, stop_sequences, usage_of};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -394,8 +394,9 @@ fn logprobs_field(asked: bool, entries: Vec<Value>) -> Value {
     }
 }
 
-/// One choice's generation, its chunks streamed under `index`.
-async fn choice(req: &Request, index: u32, ids: &Ids) -> Result<compat::Outcome, String> {
+/// One choice's generation, its chunks streamed under its index.
+async fn choice(req: Request, ids: &Ids) -> Result<compat::Outcome, String> {
+    let index = req.choice;
     let stream = req.stream;
     let asked = req.sampling.logprobs.is_some();
     // The role rides on the first delta, as the open servers send it: an
@@ -412,7 +413,7 @@ async fn choice(req: &Request, index: u32, ids: &Ids) -> Result<compat::Outcome,
     let mut calls = 0usize;
     // Logprobs of sampled tokens not yet sent: they ride on the next chunk.
     let mut pending: Vec<Value> = Vec::new();
-    let outcome = compat::run(req, |event| {
+    let outcome = compat::run(&req, |event| {
         if !stream {
             return;
         }
@@ -456,24 +457,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     let stream = req.stream;
     let asked = req.sampling.logprobs.is_some();
 
-    let requests: Vec<Request> = (0..n).map(|i| choice_request(&req, i)).collect();
-    let outcomes: Vec<compat::Outcome> = if n == 1 {
-        vec![choice(&req, 0, &ids).await?]
-    } else {
-        compat::join_all(
-            requests
-                .iter()
-                .zip(0u32..)
-                .map(|(req, i)| {
-                    Box::pin(choice(req, i, &ids))
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = _>>>
-                })
-                .collect(),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?
-    };
+    let outcomes = run_choices(&req, n, |req| choice(req, &ids)).await?;
     let total = usage_of(&outcomes);
 
     if stream {
@@ -535,14 +519,4 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         "usage": total,
     })
     .to_string())
-}
-
-/// The usage of every choice together: the prompt once, every choice's
-/// completion.
-fn usage_of(outcomes: &[compat::Outcome]) -> Value {
-    let mut total = usage(&outcomes[0]);
-    let completion: usize = outcomes.iter().map(|o| o.completion_tokens).sum();
-    total["completion_tokens"] = json!(completion);
-    total["total_tokens"] = json!(outcomes[0].prompt_tokens + completion);
-    total
 }

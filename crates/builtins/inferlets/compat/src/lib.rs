@@ -19,7 +19,7 @@
 //!
 //! An adapter is then a translation in both directions and nothing else.
 
-mod continuation;
+pub mod continuation;
 pub mod demux;
 pub mod emit;
 pub mod envelope;
@@ -41,11 +41,11 @@ pub use run::{Finish, Outcome, run};
 
 /// Runs `futures` side by side to their ends, their outputs in order: the
 /// `n` choices of one request, each its own generation, fly together.
-pub async fn join_all<T>(
-    futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = T> + '_>>>,
-) -> Vec<T> {
-    let mut futures: Vec<_> = futures.into_iter().map(Some).collect();
-    let mut outputs: Vec<Option<T>> = futures.iter().map(|_| None).collect();
+pub async fn join_all<F: std::future::Future>(
+    futures: impl IntoIterator<Item = F>,
+) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
     std::future::poll_fn(|cx| {
         let mut pending = false;
         for (slot, out) in futures.iter_mut().zip(outputs.iter_mut()) {
@@ -82,8 +82,11 @@ pub fn short_id() -> String {
         .collect()
 }
 
-/// The id of the `index`-th tool call this process made, so streamed chunks
-/// and the final body name the same call the same way.
-pub fn call_id(index: usize) -> String {
-    format!("call_{}_{index}", short_id())
+/// The id of the `index`-th tool call choice `choice` of this process made,
+/// so streamed chunks and the final body name the same call the same way.
+pub fn call_id(choice: u32, index: usize) -> String {
+    match choice {
+        0 => format!("call_{}_{index}", short_id()),
+        _ => format!("call_{}_{choice}_{index}", short_id()),
+    }
 }

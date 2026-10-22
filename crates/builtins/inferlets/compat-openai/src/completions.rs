@@ -16,7 +16,7 @@ use compat::{ApiError, Envelope, Event, Finish, Request, emit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{choice_request, choices, invalid, stop_sequences, token_text, usage};
+use crate::{alternatives, choices, invalid, run_choices, stop_sequences, token_text, usage_of};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -163,22 +163,19 @@ impl Ids {
 }
 
 /// Legacy logprobs over `steps`, the first token's text starting at
-/// `offset`: each token, its logprob, its alternatives (the sampled token
-/// among them, as vLLM lists it) and where its text starts.
+/// character `offset`: each token, its logprob, its [`alternatives`] and
+/// the character its text starts at.
 fn legacy_logprobs(steps: &[(u32, compat::Logprob)], offset: usize) -> Value {
     let (mut tokens, mut values, mut tops, mut offsets) = (vec![], vec![], vec![], vec![]);
     let mut at = offset;
     for (token, lp) in steps {
         let text = token_text(*token);
         let mut top = serde_json::Map::new();
-        let alternatives = std::iter::once((*token, lp.logprob))
-            .chain(lp.top.iter().copied().filter(|&(t, _)| t != *token))
-            .take(lp.top.len());
-        for (alt, alt_lp) in alternatives {
+        for (alt, alt_lp) in alternatives(*token, lp) {
             top.entry(token_text(alt)).or_insert(json!(alt_lp));
         }
         offsets.push(at);
-        at += text.len();
+        at += text.chars().count();
         tokens.push(text);
         values.push(lp.logprob);
         tops.push(Value::Object(top));
@@ -186,22 +183,32 @@ fn legacy_logprobs(steps: &[(u32, compat::Logprob)], offset: usize) -> Value {
     json!({"tokens": tokens, "token_logprobs": values, "top_logprobs": tops, "text_offset": offsets})
 }
 
-/// One choice's generation, its chunks streamed under `index`.
+/// Where a choice's generated text starts, in characters: after the prompt
+/// where it is echoed.
+fn text_offset(parsed: &Parsed) -> usize {
+    if parsed.echo {
+        parsed.prompt.chars().count()
+    } else {
+        0
+    }
+}
+
+/// One choice's generation, its chunks streamed under its index.
 async fn choice(
     parsed: &Parsed,
-    req: &Request,
-    index: u32,
+    req: Request,
     ids: &Ids,
 ) -> Result<(compat::Outcome, String), String> {
+    let index = req.choice;
     let stream = req.stream;
     let asked = req.sampling.logprobs.is_some();
     if stream && parsed.echo {
         emit::send(&ids.chunk(index, &parsed.prompt, None, Value::Null));
     }
     let mut text = String::new();
-    let mut offset = if parsed.echo { parsed.prompt.len() } else { 0 };
+    let mut offset = text_offset(parsed);
     let mut pending: Vec<(u32, compat::Logprob)> = Vec::new();
-    let outcome = compat::run(req, |event| {
+    let outcome = compat::run(&req, |event| {
         let piece = match event {
             Event::Text(t) | Event::Reasoning(t) => t,
             Event::ReasoningEnd => return,
@@ -219,7 +226,7 @@ async fn choice(
             } else {
                 Value::Null
             };
-            offset += piece.len();
+            offset += piece.chars().count();
             emit::send(&ids.chunk(index, &piece, None, logprobs));
         } else {
             text.push_str(&piece);
@@ -246,30 +253,8 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     };
     let stream = parsed.req.stream;
     let asked = parsed.req.sampling.logprobs.is_some();
-    let requests: Vec<Request> = (0..parsed.n)
-        .map(|i| choice_request(&parsed.req, i))
-        .collect();
-    let outcomes: Vec<(compat::Outcome, String)> = if parsed.n == 1 {
-        vec![choice(&parsed, &parsed.req, 0, &ids).await?]
-    } else {
-        compat::join_all(
-            requests
-                .iter()
-                .zip(0u32..)
-                .map(|(req, i)| {
-                    Box::pin(choice(&parsed, req, i, &ids))
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = _>>>
-                })
-                .collect(),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?
-    };
-    let mut total = usage(&outcomes[0].0);
-    let completion: usize = outcomes.iter().map(|(o, _)| o.completion_tokens).sum();
-    total["completion_tokens"] = json!(completion);
-    total["total_tokens"] = json!(outcomes[0].0.prompt_tokens + completion);
+    let outcomes = run_choices(&parsed.req, parsed.n, |req| choice(&parsed, req, &ids)).await?;
+    let total = usage_of(outcomes.iter().map(|(o, _)| o));
 
     if stream {
         if parsed.include_usage {
@@ -290,9 +275,8 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
             } else {
                 text
             };
-            let offset = if parsed.echo { parsed.prompt.len() } else { 0 };
             let logprobs = if asked {
-                legacy_logprobs(&outcome.logprobs, offset)
+                legacy_logprobs(&outcome.logprobs, text_offset(&parsed))
             } else {
                 Value::Null
             };

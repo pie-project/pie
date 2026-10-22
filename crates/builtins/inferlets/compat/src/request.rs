@@ -121,6 +121,9 @@ pub struct Request {
     pub thinking: Thinking,
     pub effort: Effort,
     pub stream: bool,
+    /// Which of a request's choices this is, 0 for the first: it keeps the
+    /// choices' tool-call ids apart.
+    pub choice: u32,
 }
 
 /// The cap when a request names none. OpenAI's default is "up to the
@@ -144,6 +147,7 @@ impl Request {
             thinking: Thinking::ModelDefault,
             effort: Effort::Xhigh,
             stream: false,
+            choice: 0,
         }
     }
 
