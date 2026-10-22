@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/rope_table.cuh";
+const ROPE: &str = "elemwise/rope.cu";
 
 /// The most pairs a table turns (`kRopeTablePairs`).
 pub const TABLE_PAIRS: usize = 256;
@@ -114,7 +114,7 @@ pub fn rope(
     let rows = nonzero(op, "rows", q.rows)?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::elemwise::rope_table<::pie::bf16>")
+        Fire::at(ROPE, "::pie::elemwise::rope_table<::pie::bf16>")
             .apply(Launch::per_row(rows, ROTATE_BLOCK).smem(2 * turned * 4)),
         &[
             q.arg(),

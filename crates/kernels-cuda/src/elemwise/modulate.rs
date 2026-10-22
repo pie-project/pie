@@ -6,7 +6,7 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/modulate.cuh";
+const MODULATE: &str = "elemwise/modulate.cu";
 
 const BLOCK: u32 = 256;
 
@@ -155,7 +155,7 @@ fn fire(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            MODULATE,
             symbol(&format!(
                 "::pie::elemwise::modulate<{t}, {tm}, {}>",
                 form.stamp()
@@ -254,7 +254,7 @@ pub fn gated_residual_add(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            MODULATE,
             symbol(&format!("::pie::elemwise::gated_residual_add<{t}, {tm}>")),
         )
         .apply(Launch::per_row(rows, BLOCK)),
@@ -283,7 +283,7 @@ pub fn norm_modulate(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            MODULATE,
             symbol(&format!(
                 "::pie::elemwise::norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()
@@ -342,7 +342,7 @@ pub fn gated_residual_norm_modulate(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            MODULATE,
             symbol(&format!(
                 "::pie::elemwise::gated_residual_norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()

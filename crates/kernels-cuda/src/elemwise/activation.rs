@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/pointwise.cuh";
+const POINTWISE: &str = "elemwise/pointwise.cu";
 
 const BLOCK: u32 = 256;
 
@@ -42,7 +42,7 @@ fn fire(ctx: &Ctx, op: &'static str, stamp: &str, x: Tensor, o: &mut Tensor) -> 
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            POINTWISE,
             symbol(&format!("::pie::elemwise::activation<{t}, {stamp}>")),
         )
         .apply(Launch::flat(lanes, BLOCK)),

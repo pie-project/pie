@@ -1,7 +1,7 @@
 #pragma once
 
 #include "prim/device.cuh"
-#include "elemwise/norm.cuh"
+#include "elemwise/row.cuh"
 #include "linear/act_quant.cuh"
 
 namespace pie::elemwise {

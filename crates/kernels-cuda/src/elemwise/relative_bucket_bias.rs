@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/relative_bucket_bias.cuh";
+const POSENC: &str = "elemwise/posenc.cu";
 
 const BLOCK: u32 = 256;
 
@@ -75,7 +75,7 @@ pub fn relative_bucket_bias(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            POSENC,
             symbol(&format!("::pie::elemwise::relative_bucket_bias<{t}>")),
         )
         .apply(Launch::flat(lanes, BLOCK)),

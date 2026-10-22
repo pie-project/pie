@@ -6,7 +6,8 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/norm.cuh";
+const NORM: &str = "elemwise/norm.cu";
+const POINTWISE: &str = "elemwise/pointwise.cu";
 
 const BLOCK: u32 = 256;
 
@@ -17,6 +18,8 @@ const VEC_WIDTH: u32 = 8;
 const ABSOLUTE_BANK: &str = "rmsnorm";
 
 const OFFSET_BANK: &str = "rmsnorm_plus_one";
+const MODULATE: &str = "elemwise/modulate.cu";
+const NORM_RESIDUAL: &str = "elemwise/norm_residual.cu";
 
 fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
@@ -117,7 +120,7 @@ fn rms_row(
         return ctx.fire(
             op,
             Fire::at(
-                FILE,
+                NORM,
                 symbol(&format!(
                     "::pie::elemwise::rmsnorm_runs<{t}, {runs}, {plus_one}>"
                 )),
@@ -156,7 +159,7 @@ fn rms_row(
         return ctx.fire(
             op,
             Fire::at(
-                FILE,
+                NORM,
                 symbol(&format!(
                     "::pie::elemwise::rmsnorm_in_warp<{t}, {}, {plus_one}>",
                     width / 32
@@ -180,7 +183,7 @@ fn rms_row(
         return ctx.fire(
             op,
             Fire::at(
-                FILE,
+                NORM,
                 symbol(&format!(
                     "::pie::elemwise::rmsnorm_held<{t}, {}, {plus_one}>",
                     width / 256
@@ -193,7 +196,7 @@ fn rms_row(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            NORM,
             symbol(&format!("::pie::elemwise::{template}<{t}, 256>")),
         )
         .apply(launch),
@@ -377,7 +380,7 @@ pub fn norm_gate(
         args.push(stated(OP, rows)?.arg());
     }
     args.push(ctx.stage());
-    ctx.fire(OP, Fire::at(FILE, symbol(&entry)).apply(launch), &args)
+    ctx.fire(OP, Fire::at(MODULATE, symbol(&entry)).apply(launch), &args)
 }
 
 pub fn rmsnorm_no_scale(
@@ -416,7 +419,7 @@ pub fn rmsnorm_no_scale(
         return ctx.fire(
             OP,
             Fire::at(
-                FILE,
+                NORM,
                 symbol(&format!(
                     "::pie::elemwise::rmsnorm_no_scale_vec<{t}, {}, {lanes}>",
                     hidden / (8 * lanes)
@@ -450,7 +453,7 @@ pub fn rmsnorm_no_scale(
         return ctx.fire(
             OP,
             Fire::at(
-                FILE,
+                NORM,
                 symbol(&format!(
                     "::pie::elemwise::rmsnorm_no_scale_warp<{t}, {}>",
                     hidden / 256
@@ -470,7 +473,7 @@ pub fn rmsnorm_no_scale(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            NORM,
             symbol(&format!("::pie::elemwise::rmsnorm_no_scale<{t}, 256>")),
         )
         .apply(launch),
@@ -551,7 +554,7 @@ pub fn rmsnorm_gated(
         return ctx.fire(
             OP,
             Fire::at(
-                FILE,
+                NORM,
                 symbol(&format!(
                     "::pie::elemwise::rmsnorm_gated_in_warp<{xin}, {t}, {per}, {lanes}>"
                 )),
@@ -576,7 +579,7 @@ pub fn rmsnorm_gated(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            NORM,
             symbol(&format!(
                 "::pie::elemwise::rmsnorm_gated_in<{xin}, {t}, 256>"
             )),
@@ -650,7 +653,7 @@ pub(crate) fn rmsnorm_grouped(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            NORM,
             symbol(&format!(
                 "::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"
             )),
@@ -703,7 +706,7 @@ pub fn rmsnorm_gated_by(
     ctx.fire(
         OP,
         Fire::at(
-            "elemwise/norm.cuh",
+            NORM,
             symbol(&format!(
                 "::pie::elemwise::rmsnorm_gated_by<{t}, {per_warp}>"
             )),
@@ -735,7 +738,7 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let lanes = u32::try_from(n / 8).unwrap_or(u32::MAX);
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::elemwise::residual_add_vec8")
+            Fire::at(POINTWISE, "::pie::elemwise::residual_add_vec8")
                 .apply(Launch::flat(lanes, BLOCK).programmatic(ctx.tuning().pdl)),
             &[
                 y.arg(),
@@ -748,7 +751,11 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::residual_add<{t}>"))).apply(launch),
+        Fire::at(
+            POINTWISE,
+            symbol(&format!("::pie::elemwise::residual_add<{t}>")),
+        )
+        .apply(launch),
         &[
             y.arg(),
             x.arg(),
@@ -803,7 +810,7 @@ pub fn residual_add_rmsnorm(
     ctx.fire(
         OP,
         // The register kernel waits on its producer in-kernel (`kernel.pdl`).
-        Fire::at(FILE, symbol(&entrypoint)).apply(
+        Fire::at(NORM_RESIDUAL, symbol(&entrypoint)).apply(
             Launch::per_row(rows, block)
                 .programmatic(ctx.tuning().pdl && entrypoint.contains("_reg<")),
         ),
@@ -961,7 +968,7 @@ pub fn rmsnorm_residual_add_keeping(
     ctx.fire(
         OP,
         // The vec8 form waits on its producer in-kernel (`kernel.pdl`).
-        Fire::at(FILE, symbol(&entrypoint))
+        Fire::at(NORM_RESIDUAL, symbol(&entrypoint))
             .apply(Launch::per_row(rows, block).programmatic(ctx.tuning().pdl && vectors)),
         &[
             x.arg(),
@@ -989,7 +996,7 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            POINTWISE,
             symbol(&format!("::pie::elemwise::add_bias<{t}, {tb}>")),
         )
         .apply(route_rows(out.rows, out.width)),
@@ -1026,7 +1033,7 @@ pub fn standardize(ctx: &Ctx, bias: Tensor, scale: Tensor, out: &mut Tensor) -> 
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::standardize<{t}>")))
+        Fire::at(NORM, symbol(&format!("::pie::elemwise::standardize<{t}>")))
             .apply(route_rows(out.rows, out.width)),
         &[out.arg(), bias.arg(), scale.arg(), width.arg()],
     )
@@ -1038,7 +1045,11 @@ pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::silu_scaled<{t}>"))).apply(launch),
+        Fire::at(
+            POINTWISE,
+            symbol(&format!("::pie::elemwise::silu_scaled<{t}>")),
+        )
+        .apply(launch),
         &[
             x.arg(),
             s.arg(),
@@ -1055,7 +1066,11 @@ pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::mul_scalar<{t}>"))).apply(launch),
+        Fire::at(
+            POINTWISE,
+            symbol(&format!("::pie::elemwise::mul_scalar<{t}>")),
+        )
+        .apply(launch),
         &[
             x.arg(),
             s.arg(),
@@ -1072,7 +1087,7 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::scale<{t}>")))
+        Fire::at(POINTWISE, symbol(&format!("::pie::elemwise::scale<{t}>")))
             .apply(launch.programmatic(ctx.tuning().pdl)),
         &[
             x.arg(),

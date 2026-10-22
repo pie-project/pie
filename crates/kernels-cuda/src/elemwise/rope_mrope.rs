@@ -4,8 +4,7 @@ use dtype::Dtype;
 use crate::elemwise::rope::ROTATE_BLOCK;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
-
-const FILE: &str = "elemwise/rope_mrope.cuh";
+const ROPE: &str = "elemwise/rope.cu";
 
 pub const AXES: u32 = 3;
 
@@ -127,7 +126,7 @@ fn fire(
     let rows = nonzero(OP, "rows", q.rows)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::per_row(rows, ROTATE_BLOCK)),
+        Fire::at(ROPE, entry).apply(Launch::per_row(rows, ROTATE_BLOCK)),
         &[
             q.arg(),
             k.arg(),

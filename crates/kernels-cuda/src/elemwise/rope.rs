@@ -8,7 +8,8 @@ use crate::jit::{
 };
 use crate::tensor::{KvPool, Tensor};
 
-const FILE: &str = "elemwise/rope.cuh";
+const NORM_ROPE: &str = "elemwise/norm_rope.cu";
+const ROPE: &str = "elemwise/rope.cu";
 
 pub const ROTATE_BLOCK: u32 = 256;
 
@@ -117,7 +118,7 @@ pub fn full(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            ROPE,
             "::pie::elemwise::rope_full<::pie::false_type::value, false>",
         )
         .apply(rotate_launch(
@@ -245,7 +246,7 @@ pub fn rmsnorm_rope_partial_q(
         return ctx.fire(
             OP,
             Fire::at(
-                FILE,
+                NORM_ROPE,
                 symbol(&format!(
                     "::pie::elemwise::q_rmsnorm_rope_partial_warp<{WARPS}, {runs}>"
                 )),
@@ -269,7 +270,7 @@ pub fn rmsnorm_rope_partial_q(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::q_rmsnorm_rope_partial<128>")
+        Fire::at(NORM_ROPE, "::pie::elemwise::q_rmsnorm_rope_partial<128>")
             .apply(Launch::grid([y.rows, heads, 1], [128, 1, 1])),
         &[
             x.arg(),
@@ -382,7 +383,7 @@ pub fn partial_last(
         let heads_per_block = (ROTATE_BLOCK / (half / 4)).max(1);
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::elemwise::rope_partial_last_vec").apply(
+            Fire::at(ROPE, "::pie::elemwise::rope_partial_last_vec").apply(
                 Launch::grid(
                     [q.rows, num_q_heads.div_ceil(heads_per_block), 1],
                     [ROTATE_BLOCK, 1, 1],
@@ -412,7 +413,7 @@ pub fn partial_last(
         let heads = num_q_heads;
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::elemwise::rope_partial_last_spread").apply(
+            Fire::at(ROPE, "::pie::elemwise::rope_partial_last_spread").apply(
                 Launch::grid([q.rows, heads.div_ceil(HEADS), 1], [ROTATE_BLOCK, 1, 1])
                     .smem(half * 8),
             ),
@@ -435,7 +436,7 @@ pub fn partial_last(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::rope_partial_last")
+        Fire::at(ROPE, "::pie::elemwise::rope_partial_last")
             .apply(Launch::per_row(q.rows, ROTATE_BLOCK)),
         &[
             q.arg(),
@@ -643,7 +644,7 @@ fn one_pass(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            NORM_ROPE,
             symbol(&format!(
                 "::pie::elemwise::norm_rope_last<{per}, {weighted}, {appends}>"
             )),
@@ -780,7 +781,7 @@ pub fn yarn_split_append(
     let per_block = heads_per_block(half);
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::rope_yarn_split_append").apply(rotate_launch(
+        Fire::at(ROPE, "::pie::elemwise::rope_yarn_split_append").apply(rotate_launch(
             q_out.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -869,7 +870,7 @@ fn yarn_fire(
     };
     ctx.fire(
         op,
-        Fire::at(FILE, entry).apply(rotate_launch(
+        Fire::at(ROPE, entry).apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -918,7 +919,7 @@ fn rope_partial(
     let num_kv_heads = heads(op, k.width, head_dim)?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::elemwise::rope_partial<::pie::bf16>")
+        Fire::at(ROPE, "::pie::elemwise::rope_partial<::pie::bf16>")
             .apply(Launch::per_row(q.rows, ROTATE_BLOCK)),
         &[
             q.arg(),
@@ -992,7 +993,7 @@ pub fn qg_qknorm_rope_append(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            NORM_ROPE,
             symbol(&format!(
                 "::pie::elemwise::qg_qknorm_rope_append<{}>",
                 head_dim / 32
@@ -1127,7 +1128,7 @@ pub fn norm_rope_pair(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            NORM_ROPE,
             symbol(&format!(
                 "::pie::elemwise::norm_rope_pair<{qper}, {appends}>"
             )),

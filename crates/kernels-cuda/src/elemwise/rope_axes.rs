@@ -5,7 +5,7 @@ use crate::elemwise::rope::ROTATE_BLOCK;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/rope_axes.cuh";
+const ROPE: &str = "elemwise/rope.cu";
 
 pub const MAX_AXES: usize = 4;
 
@@ -182,7 +182,7 @@ fn fire(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            ROPE,
             symbol(&format!(
                 "::pie::elemwise::rope_axes<{t}, {}>",
                 form.stamp()

@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/clip.cuh";
+const POINTWISE: &str = "elemwise/pointwise.cu";
 
 const BLOCK: u32 = 256;
 
@@ -29,7 +29,7 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
     nonzero(OP, "the element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::clamp<{t}>")))
+        Fire::at(POINTWISE, symbol(&format!("::pie::elemwise::clamp<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
@@ -77,7 +77,7 @@ pub fn clamp_learned(ctx: &Ctx, lo: Tensor, hi: Tensor, x: &mut Tensor) -> Resul
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            POINTWISE,
             symbol(&format!("::pie::elemwise::clamp_learned<{t}>")),
         )
         .apply(Launch::flat(lanes, BLOCK)),

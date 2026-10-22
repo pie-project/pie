@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/layernorm.cuh";
+const NORM: &str = "elemwise/norm.cu";
 
 const BLOCK: u32 = 256;
 
@@ -15,7 +15,7 @@ pub fn layernorm_no_scale(ctx: &Ctx, x: Tensor, eps: f32, y: &mut Tensor) -> Res
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            NORM,
             symbol(&format!("::pie::elemwise::layernorm_no_scale<{t}, 256>")),
         )
         .apply(Launch::per_row(rows, BLOCK)),
@@ -38,7 +38,7 @@ pub fn layernorm(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            NORM,
             symbol(&format!("::pie::elemwise::layernorm<{t}, 256>")),
         )
         .apply(Launch::per_row(rows, BLOCK)),

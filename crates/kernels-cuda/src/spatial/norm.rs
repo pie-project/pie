@@ -4,7 +4,7 @@ use crate::tensor::Tensor;
 use crate::voxels::{flat_elements, lanes_of};
 use dtype::Dtype;
 
-const FILE: &str = "spatial/norm.cuh";
+const NORM: &str = "elemwise/norm.cu";
 
 const OP: &str = "spatial.group_norm";
 
@@ -72,7 +72,7 @@ pub fn group_norm(
 
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::spatial::group_norm_stats<1024>").apply(Launch::grid(
+        Fire::at(NORM, "::pie::elemwise::group_norm_stats<1024>").apply(Launch::grid(
             [splits.unsigned_abs(), lanes.unsigned_abs(), 1],
             [STATS_BLOCK, 1, 1],
         )),
@@ -87,7 +87,7 @@ pub fn group_norm(
     )?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::spatial::group_norm_finalize").apply(Launch::grid(
+        Fire::at(NORM, "::pie::elemwise::group_norm_finalize").apply(Launch::grid(
             [groups.unsigned_abs(), lanes.unsigned_abs(), 1],
             [32, 1, 1],
         )),
@@ -103,11 +103,11 @@ pub fn group_norm(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            NORM,
             if silu {
-                "::pie::spatial::group_norm_apply<true>"
+                "::pie::elemwise::group_norm_apply<true>"
             } else {
-                "::pie::spatial::group_norm_apply<false>"
+                "::pie::elemwise::group_norm_apply<false>"
             },
         )
         .apply(Launch::grid([blocks, 1, 1], [APPLY_BLOCK, 1, 1])),

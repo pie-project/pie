@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/rel_bias.cuh";
+const POSENC: &str = "elemwise/posenc.cu";
 
 const BLOCK: u32 = 256;
 
@@ -52,7 +52,7 @@ pub fn rel_bias(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::rel_bias<{t}>"))).apply(Launch::grid(
+        Fire::at(POSENC, symbol(&format!("::pie::elemwise::rel_bias<{t}>"))).apply(Launch::grid(
             [extent.div_ceil(BLOCK), heads, rows],
             [BLOCK, 1, 1],
         )),

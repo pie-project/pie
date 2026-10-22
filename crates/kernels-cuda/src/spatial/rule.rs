@@ -3,7 +3,7 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, stated};
 use crate::tensor::Tensor;
 use crate::voxels::lane_pair;
 
-const FILE: &str = "spatial/rule.cuh";
+const POSENC: &str = "elemwise/posenc.cu";
 
 const OP: &str = "spatial.grid";
 
@@ -113,7 +113,7 @@ pub fn derive_grid(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::spatial::grid_rule").apply(Launch::grid([1, 1, 1], [32, 1, 1])),
+        Fire::at(POSENC, "::pie::elemwise::grid_rule").apply(Launch::grid([1, 1, 1], [32, 1, 1])),
         &[grid.arg(), o_grid.arg(), ArgValue::of(&geom)],
     )
 }

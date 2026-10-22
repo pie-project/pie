@@ -44,6 +44,8 @@ use crate::attn::plan::{DecodePlan, PrefillPlan};
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
+const MODULATE: &str = "elemwise/modulate.cu";
+
 const BLOCK: u32 = 256;
 
 const NO_SOFT_CAP: f32 = 0.0;
@@ -993,7 +995,7 @@ pub fn res_blend(
     ctx.fire(
         OP,
         Fire::at(
-            "elemwise/norm.cuh",
+            MODULATE,
             symbol(&format!("::pie::elemwise::res_blend<{t}>")),
         )
         .apply(Launch::per_row(y.rows, BLOCK)),
@@ -1066,7 +1068,7 @@ pub fn res_blend_norm(
     ctx.fire(
         OP,
         Fire::at(
-            "elemwise/norm.cuh",
+            MODULATE,
             symbol(&format!("::pie::elemwise::res_blend_norm<{t}, {threads}>")),
         )
         .apply(Launch::per_row(y.rows, threads)),

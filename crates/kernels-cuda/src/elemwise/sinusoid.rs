@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/sinusoid.cuh";
+const POSENC: &str = "elemwise/posenc.cu";
 
 const BLOCK: u32 = 256;
 
@@ -59,7 +59,7 @@ pub fn sinusoid(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::sinusoid").apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(POSENC, "::pie::elemwise::sinusoid").apply(Launch::per_row(rows, BLOCK)),
         &[
             t.arg(),
             o.arg(),
