@@ -193,6 +193,7 @@ shelved!(
     cuda: [
         "sm80.toml",
         "sm80/nvidia-a100-80gb-pcie.toml",
+        "sm80/nvidia-a100-sxm4-80gb.toml",
         "sm86.toml",
         "sm87.toml",
         "sm89.toml",
@@ -444,7 +445,7 @@ mod tests {
     fn each_capability_takes_its_family_and_from_10_0_the_blackwell_kernels() {
         let defaults = kernels_cuda::tuning::Tuning::of(&registry().defaults());
         for (major, minor, gpu) in [
-            (8, 0, "NVIDIA A100-SXM4-80GB"),
+            (8, 0, "NVIDIA A30"),
             (8, 6, "NVIDIA A10"),
             (8, 7, "Orin"),
             (8, 9, "NVIDIA L4"),
