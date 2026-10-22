@@ -92,16 +92,6 @@ pub enum Layout {
         vocab: u32,
         y: ValueId,
     },
-    Argmax {
-        xs: Vec<ValueId>,
-        y: ValueId,
-    },
-    TopK {
-        x: ValueId,
-        k: u32,
-        values: ValueId,
-        indices: ValueId,
-    },
     PackRows {
         x: ValueId,
         perm: ValueId,
@@ -199,8 +189,6 @@ impl Operands for Layout {
                 sink.extend([*ids, *table]);
                 sink.extend(*scales);
             }
-            Self::Argmax { xs, .. } => sink.extend(xs.iter().copied()),
-            Self::TopK { x, .. } => sink.push(*x),
             Self::PackRows { x, perm, .. } => sink.extend([*x, *perm]),
             Self::UnpackRows { x, perm, .. } => sink.extend([*x, *perm]),
             Self::Pixels { x, .. } => sink.push(*x),
@@ -228,10 +216,6 @@ impl Operands for Layout {
             Self::MergeRows { y, .. } => sink.push(*y),
             Self::ScatterLiveRows { y_out, .. } => sink.push(*y_out),
             Self::EmbedConcat { y, .. } => sink.push(*y),
-            Self::Argmax { y, .. } => sink.push(*y),
-            Self::TopK {
-                values, indices, ..
-            } => sink.extend([*values, *indices]),
             Self::PackRows { y, .. } => sink.push(*y),
             Self::UnpackRows { y, .. } => sink.push(*y),
             Self::Pixels { y, .. } => sink.push(*y),
@@ -252,8 +236,6 @@ impl Operands for Layout {
             | Self::PoolRows { .. }
             | Self::MergeRows { .. }
             | Self::EmbedConcat { .. }
-            | Self::Argmax { .. }
-            | Self::TopK { .. }
             | Self::PackRows { .. }
             | Self::UnpackRows { .. }
             | Self::Pixels { .. }
@@ -279,8 +261,6 @@ impl Operands for Layout {
             Self::MergeRows { .. } => "layout.merge_rows",
             Self::ScatterLiveRows { .. } => "layout.scatter_live_rows",
             Self::EmbedConcat { .. } => "layout.embed_concat",
-            Self::Argmax { .. } => "layout.argmax",
-            Self::TopK { .. } => "layout.topk",
             Self::PackRows { .. } => "layout.pack_rows",
             Self::UnpackRows { .. } => "layout.unpack_rows",
             Self::Pixels { .. } => "layout.pixels",

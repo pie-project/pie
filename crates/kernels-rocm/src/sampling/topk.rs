@@ -13,7 +13,7 @@ const TOPK_THREADS: u32 = 1024;
 const TOPK_POOL_BYTES: u32 = 56 * 1024;
 
 pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.argmax";
+    const OP: &str = "sampling.argmax";
     const THREADS: u32 = 1024;
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
     debug_assert_eq!(y.dtype, Dtype::I32, "`{OP}` writes i32 column indices");
@@ -47,14 +47,14 @@ pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), E
     )
 }
 
-pub fn topk(
+pub fn top_k(
     ctx: &Ctx,
     x: Tensor,
     k: u32,
     values: &mut Tensor,
     indices: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.topk";
+    const OP: &str = "sampling.top_k";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
     if k != 8 && k != 16 {
         return Err(refuse(

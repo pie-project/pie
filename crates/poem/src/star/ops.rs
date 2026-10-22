@@ -625,7 +625,7 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("attn.selector_walk", || {
-                    ops::attn::selector_walk(
+                    ops::sampling::selector_walk(
                         &cand,
                         &unary,
                         hp.as_ref(),
@@ -3071,8 +3071,8 @@ pub(crate) static OPS: &[Op] = &[
             let xs: Vec<Value> = a.next()?;
             result(
                 heap,
-                dsl("layout.argmax", || {
-                    ops::layout::argmax(&xs.iter().collect::<Vec<_>>())
+                dsl("sampling.argmax", || {
+                    ops::sampling::argmax(&xs.iter().collect::<Vec<_>>())
                 })?,
             )
         },
@@ -3168,7 +3168,7 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("attn.markov_walk", || {
-                    ops::attn::markov_walk(
+                    ops::sampling::markov_walk(
                         &logits, &tokens, &positions, &ends, &embed, &head, block,
                     )
                 })?,
@@ -3182,7 +3182,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let k: u32 = a.next()?;
-            result(heap, dsl("layout.topk", || ops::layout::topk(&x, k))?)
+            result(heap, dsl("sampling.top_k", || ops::sampling::top_k(&x, k))?)
         },
     },
     Op {

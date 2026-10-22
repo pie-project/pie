@@ -6,7 +6,7 @@ use kernels_cuda::Tensor;
 use poem_compiler::{CompiledModel, Lowering, Phase, Region};
 use poem_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use poem_exec::store::check::{self, rebase};
-use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
+use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, RuntimeInput, Trace, Ty};
 
 use crate::error::{Fault, Result};
 use crate::store::kv::Geometry;
@@ -238,21 +238,8 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
         let Some(node) = trace.nodes.get(node as usize) else {
             return false;
         };
-        macro_rules! collect {
-            ($op:expr) => {{
-                $op.inputs(&mut operands);
-                $op.outputs(&mut operands);
-            }};
-        }
-        match &node.op {
-            Operation::Attention(op) => collect!(op),
-            Operation::Linear(op) => collect!(op),
-            Operation::Elementwise(op) => collect!(op),
-            Operation::Layout(op) => collect!(op),
-            Operation::Collective(op) => collect!(op),
-            Operation::Fused(op) => collect!(op),
-            Operation::Spatial(op) => collect!(op),
-        }
+        node.op.inputs(&mut operands);
+        node.op.outputs(&mut operands);
     }
     operands.iter().all(|id| {
         let Some(decl) = trace.values.get(id.0 as usize) else {

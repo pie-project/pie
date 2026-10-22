@@ -709,7 +709,7 @@ fn argmax_and_topk() {
         for k in [8u32, 16] {
             let mut v = gpu.zeros(rows, k, Dtype::F32);
             let mut i = gpu.zeros(rows, k, Dtype::I32);
-            sampling::topk(&ctx, x, k, &mut v, &mut i).unwrap();
+            sampling::top_k(&ctx, x, k, &mut v, &mut i).unwrap();
             let (gv, gi) = (gpu.read(&v), gpu.read_as::<i32>(&i));
             for r in 0..rows as usize {
                 let k = k as usize;

@@ -14,18 +14,6 @@ impl DispatchLayout for Run<'_> {
 impl Run<'_> {
     fn layout(&mut self, op: &Layout) -> Result<(), kernels_cerebras::Error> {
         match op {
-            Layout::TopK {
-                x,
-                k,
-                values,
-                indices,
-            } => layout::topk(
-                self.ctx(),
-                self.tensor(*x),
-                *k,
-                self.tensor(*values),
-                self.tensor(*indices),
-            ),
             Layout::EmbedConcat {
                 ids,
                 table,
@@ -125,17 +113,6 @@ impl Run<'_> {
                 *vocab,
                 self.tensor(*y),
             ),
-            Layout::Argmax { xs, y } => {
-                for (column, x) in xs.iter().enumerate() {
-                    layout::argmax(
-                        self.ctx(),
-                        self.tensor(*x),
-                        u32::try_from(column).expect("a draft depth inside u32"),
-                        self.tensor(*y),
-                    )?;
-                }
-                Ok(())
-            }
             other => Err(kernels_cerebras::Error::Unsupported { op: other.name() }),
         }
     }

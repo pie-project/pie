@@ -7,3 +7,4 @@ mod elemwise;
 mod layout;
 mod linear;
 mod rs;
+mod sampling;

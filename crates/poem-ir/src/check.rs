@@ -30,6 +30,7 @@ pub enum DefKind {
 pub enum Port {
     In(usize),
     Out(usize),
+    Named(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,16 @@ pub enum Expect {
     Struct(&'static [StructKind]),
     Cache,
     Tensor(Dtype),
+}
+
+impl Expect {
+    pub const I32: Self = Self::Tensor(Dtype::I32);
+    pub const F32: Self = Self::Tensor(Dtype::F32);
+    pub const U8: Self = Self::Tensor(Dtype::U8);
+    pub const CACHE: Self = Self::Cache;
+    pub const DECODE_PLAN: Self = Self::Struct(&[StructKind::AttnDecodePlan]);
+    pub const PREFILL_PLAN: Self = Self::Struct(&[StructKind::AttnPrefillPlan]);
+    pub const MLA_PLAN: Self = Self::Struct(&[StructKind::MlaPlan]);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,6 +216,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     let mut matched = vec![false; len];
     let mut folded: Vec<Option<(usize, &'static str)>> = vec![None; len];
     let (mut ins, mut outs, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut named = Vec::new();
     let mut seen = HashSet::new();
 
     for (j, node) in trace.nodes.iter().enumerate() {
@@ -297,15 +309,27 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             }
         }
 
+        let mut ports: Vec<(Port, ValueId, Expect)> = Vec::new();
         for &(port, want) in expect(&node.op) {
             let id = match port {
                 Port::In(i) => ins.get(i),
                 Port::Out(i) => outs.get(i),
+                Port::Named(_) => unreachable!("the table is positional"),
             };
             let Some(&id) = id else {
                 faults.push(Fault::PortMissing { node: j, op, port });
                 continue;
             };
+            ports.push((port, id, want));
+        }
+        named.clear();
+        node.op.ports(&mut named);
+        ports.extend(
+            named
+                .iter()
+                .map(|&(name, id, want)| (Port::Named(name), id, want)),
+        );
+        for (port, id, want) in ports {
             if !in_range(id) {
                 continue;
             }
@@ -612,13 +636,13 @@ fn intact(
 fn expect(op: &Operation) -> &'static [(Port, Expect)] {
     use Port::{In, Out};
 
-    const I32: Expect = Expect::Tensor(Dtype::I32);
-    const F32: Expect = Expect::Tensor(Dtype::F32);
-    const U8: Expect = Expect::Tensor(Dtype::U8);
-    const CACHE: Expect = Expect::Cache;
-    const DECODE_PLAN: Expect = Expect::Struct(&[StructKind::AttnDecodePlan]);
-    const PREFILL_PLAN: Expect = Expect::Struct(&[StructKind::AttnPrefillPlan]);
-    const MLA_PLAN: Expect = Expect::Struct(&[StructKind::MlaPlan]);
+    const I32: Expect = Expect::I32;
+    const F32: Expect = Expect::F32;
+    const U8: Expect = Expect::U8;
+    const CACHE: Expect = Expect::CACHE;
+    const DECODE_PLAN: Expect = Expect::DECODE_PLAN;
+    const PREFILL_PLAN: Expect = Expect::PREFILL_PLAN;
+    const MLA_PLAN: Expect = Expect::MLA_PLAN;
 
     match op {
         Operation::Attention(op) => match op {
@@ -689,7 +713,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Attention::ShortConv { .. }
             | Attention::ShortConvChunked { .. } => &[(In(2), CACHE)],
             Attention::BlockDynConv { .. } => &[],
-            Attention::SelectorWalk { .. } => &[(In(0), I32), (In(1), F32), (Out(0), I32)],
             Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
             Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. } => {
                 &[(In(3), CACHE)]
@@ -737,9 +760,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::ReplayFloor { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
             Attention::KvEnds { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
             Attention::WindowSink { .. } => &[(In(1), I32), (In(2), I32), (In(3), CACHE)],
-            Attention::MarkovWalk { .. } => {
-                &[(In(1), I32), (In(2), I32), (In(3), I32), (Out(1), I32)]
-            }
         },
         Operation::Linear(op) => match op {
             Linear::MoeTopkSoftmax { .. }
@@ -858,9 +878,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Layout::SplitRows { .. }
             | Layout::Select { .. }
             | Layout::PoolRows { .. }
-            | Layout::MergeRows { .. }
-            | Layout::Argmax { .. } => &[],
-            Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
+            | Layout::MergeRows { .. } => &[],
             Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
             Layout::Pixels { .. } => &[(In(0), U8)],
             Layout::ConcatCols { .. } => &[],
@@ -1039,7 +1057,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 _ => &[(In(2), I32), (In(3), F32)],
             },
         },
-        Operation::Collective(_) => &[],
+        Operation::Collective(_) | Operation::Sampling(_) => &[],
         Operation::Spatial(op) => match op {
             Spatial::Grid { .. } => &[(In(0), I32), (Out(0), I32)],
             Spatial::Conv3d { .. } => &[(In(1), I32)],
@@ -1131,6 +1149,7 @@ impl Display for Port {
         match self {
             Port::In(i) => write!(f, "input {i}"),
             Port::Out(i) => write!(f, "output {i}"),
+            Port::Named(name) => write!(f, "`{name}`"),
         }
     }
 }

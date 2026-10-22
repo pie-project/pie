@@ -1,5 +1,5 @@
 use poem_ir::{
-    Attention, Collective, Elementwise, Fused, Layout, Linear, Node, Operation, Spatial,
+    Attention, Collective, Elementwise, Fused, Layout, Linear, Node, Operation, Sampling, Spatial,
 };
 
 use crate::error::KernelError;
@@ -24,6 +24,10 @@ pub trait DispatchCollective {
     fn dispatch(&mut self, op: &Collective) -> Result<(), KernelError>;
 }
 
+pub trait DispatchSampling {
+    fn dispatch(&mut self, op: &Sampling) -> Result<(), KernelError>;
+}
+
 pub trait DispatchFused {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError>;
 }
@@ -42,6 +46,7 @@ pub trait Dispatch:
     + DispatchElementwise
     + DispatchLayout
     + DispatchCollective
+    + DispatchSampling
     + DispatchFused
     + DispatchSpatial
     + DispatchProbe
@@ -53,6 +58,7 @@ pub trait Dispatch:
             Operation::Elementwise(op) => DispatchElementwise::dispatch(self, op),
             Operation::Layout(op) => DispatchLayout::dispatch(self, op),
             Operation::Collective(op) => DispatchCollective::dispatch(self, op),
+            Operation::Sampling(op) => DispatchSampling::dispatch(self, op),
             Operation::Fused(op) => DispatchFused::dispatch(self, op),
             Operation::Spatial(op) => DispatchSpatial::dispatch(self, op),
         };
@@ -69,6 +75,7 @@ impl<T> Dispatch for T where
         + DispatchElementwise
         + DispatchLayout
         + DispatchCollective
+        + DispatchSampling
         + DispatchFused
         + DispatchSpatial
         + DispatchProbe

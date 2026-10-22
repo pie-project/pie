@@ -367,16 +367,6 @@ pub enum Attention {
         group: u32,
         y: ValueId,
     },
-    SelectorWalk {
-        cand: ValueId,
-        unary: ValueId,
-        hp: Option<ValueId>,
-        tokens: ValueId,
-        pred: ValueId,
-        succ: ValueId,
-        first: u32,
-        picks: ValueId,
-    },
     SsmGdnPrep {
         ba: ValueId,
         dt_bias: ValueId,
@@ -624,24 +614,6 @@ pub enum Attention {
         head_dim: u32,
         sm_scale: f32,
         o: ValueId,
-    },
-    /// DSpark's Markov head over a drafted block's readouts: the one at depth
-    /// `i` (its position past `ends - block + 1`, `ends` its lane's last key)
-    /// adds the bias `head . embed[t]` of the token `t` picked at depth `i - 1`
-    /// (at depth 0, its own in `tokens`) and picks the argmax. `tokens`,
-    /// `positions` and `ends` are i32 a readout; `biased` the biased logits.
-    MarkovWalk {
-        logits: ValueId,
-        tokens: ValueId,
-        positions: ValueId,
-        ends: ValueId,
-        embed: ValueId,
-        head: ValueId,
-        /// The most readouts a lane's run holds (the drafted block's rows).
-        block: u32,
-        biased: ValueId,
-        /// Each readout's pick (i32), its biased row's argmax.
-        picks: ValueId,
     },
 }
 
@@ -893,19 +865,6 @@ impl Operands for Attention {
                 sink.extend(*bias);
             }
             Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
-            Self::SelectorWalk {
-                cand,
-                unary,
-                hp,
-                tokens,
-                pred,
-                succ,
-                ..
-            } => {
-                sink.extend([*cand, *unary]);
-                sink.extend(hp.iter().copied());
-                sink.extend([*tokens, *pred, *succ]);
-            }
             Self::SsmGdnPrep {
                 ba, dt_bias, a_log, ..
             } => sink.extend([*ba, *dt_bias, *a_log]),
@@ -1087,15 +1046,6 @@ impl Operands for Attention {
                 sink: sinks,
                 ..
             } => sink.extend([*q, *positions, *request_of_token, *cache, *sinks]),
-            Self::MarkovWalk {
-                logits,
-                tokens,
-                positions,
-                ends,
-                embed,
-                head,
-                ..
-            } => sink.extend([*logits, *tokens, *positions, *ends, *embed, *head]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -1146,7 +1096,6 @@ impl Operands for Attention {
             Self::ShortConvChunked { y, .. } => sink.push(*y),
             Self::SsmCausalConv1dChunked { y, .. } => sink.push(*y),
             Self::BlockDynConv { y, .. } => sink.push(*y),
-            Self::SelectorWalk { picks, .. } => sink.push(*picks),
             Self::SsmGdnPrep { gates, .. } => sink.push(*gates),
             Self::SsmGatedDelta { y, .. } => sink.push(*y),
             Self::SsmGatedDeltaChunked { y, .. } => sink.push(*y),
@@ -1184,7 +1133,6 @@ impl Operands for Attention {
             Self::ReplayFloor { floor, .. } => sink.push(*floor),
             Self::KvEnds { ends, .. } => sink.push(*ends),
             Self::WindowSink { o, .. } => sink.push(*o),
-            Self::MarkovWalk { biased, picks, .. } => sink.extend([*biased, *picks]),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -1223,7 +1171,6 @@ impl Operands for Attention {
             Self::ShortConv { .. } => {}
             Self::ShortConvChunked { .. } => {}
             Self::BlockDynConv { .. } => {}
-            Self::SelectorWalk { .. } => {}
             Self::SsmGdnPrep { .. } => {}
             Self::SsmGatedDelta { .. } => {}
             Self::SsmGatedDeltaChunked { .. } => {}
@@ -1245,7 +1192,7 @@ impl Operands for Attention {
             Self::PleNgramIds { .. } => {}
             Self::PleNgramIdsChunked { .. } => {}
             Self::ReplayFloor { .. } => {}
-            Self::KvEnds { .. } | Self::WindowSink { .. } | Self::MarkovWalk { .. } => {}
+            Self::KvEnds { .. } | Self::WindowSink { .. } => {}
         }
     }
     fn name(&self) -> &'static str {
@@ -1285,7 +1232,6 @@ impl Operands for Attention {
             Self::ShortConv { .. } => "attention.short_conv",
             Self::ShortConvChunked { .. } => "attention.short_conv_chunked",
             Self::BlockDynConv { .. } => "attention.block_dyn_conv",
-            Self::SelectorWalk { .. } => "attention.selector_walk",
             Self::SsmGdnPrep { .. } => "attention.ssm_gdn_prep",
             Self::SsmGatedDelta { .. } => "attention.ssm_gated_delta",
             Self::SsmGatedDeltaChunked { .. } => "attention.ssm_gated_delta_chunked",
@@ -1310,7 +1256,6 @@ impl Operands for Attention {
             Self::ReplayFloor { .. } => "attention.replay_floor",
             Self::KvEnds { .. } => "attention.kv_ends",
             Self::WindowSink { .. } => "attention.window_sink",
-            Self::MarkovWalk { .. } => "attention.markov_walk",
         }
     }
 }

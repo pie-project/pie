@@ -38,7 +38,7 @@ pub fn embed(
 }
 
 pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.argmax";
+    const OP: &str = "sampling.argmax";
     debug_assert_eq!(y.dtype, Dtype::I32, "`{OP}` writes i32 column indices");
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "argmax_rows_bfloat16",
@@ -887,7 +887,7 @@ pub fn topk(
     values: Tensor,
     indices: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.topk";
+    const OP: &str = "sampling.top_k";
     let wide = x.width >= TOPK_WIDE_FROM;
     let entry = match (x.dtype, k, wide) {
         (Dtype::Bf16, 8, false) => "topk_rows_bfloat16_k_8",

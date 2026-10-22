@@ -26,6 +26,7 @@ micros! {
     ElementwiseUs = "compiler.cost.elementwise_us", 4.0, "An elementwise op, in microseconds.";
     LayoutUs = "compiler.cost.layout_us", 4.0, "A layout op, in microseconds.";
     CollectiveUs = "compiler.cost.collective_us", 50.0, "A collective, in microseconds.";
+    SamplingUs = "compiler.cost.sampling_us", 4.0, "A sampling op, in microseconds.";
     CustomUs = "compiler.cost.custom_us", 20.0, "A custom fused op, in microseconds.";
     SpatialUs = "compiler.cost.spatial_us", 40.0, "A spatial op, in microseconds.";
 }
@@ -86,6 +87,7 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
         .add::<ElementwiseUs>()
         .add::<LayoutUs>()
         .add::<CollectiveUs>()
+        .add::<SamplingUs>()
         .add::<CustomUs>()
         .add::<SpatialUs>()
         .add::<Branches>()
@@ -119,6 +121,7 @@ impl DeviceProfile {
                 elementwise: us(profile.get::<ElementwiseUs>().0),
                 layout: us(profile.get::<LayoutUs>().0),
                 collective: us(profile.get::<CollectiveUs>().0),
+                sampling: us(profile.get::<SamplingUs>().0),
                 custom: us(profile.get::<CustomUs>().0),
                 spatial: us(profile.get::<SpatialUs>().0),
             },

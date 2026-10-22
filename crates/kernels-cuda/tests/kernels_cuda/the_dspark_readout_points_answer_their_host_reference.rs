@@ -121,7 +121,7 @@ fn the_topk_is_sorted_with_ties_to_the_lower_column() {
             let i_at = gpu.zeros(rows * k * 4);
             let mut values = Tensor::new(v_at, rows as u32, k as u32, Dtype::F32);
             let mut indices = Tensor::new(i_at, rows as u32, k as u32, Dtype::I32);
-            sampling::topk(
+            sampling::top_k(
                 &gpu.ctx(),
                 Tensor::new(at, rows as u32, width as u32, dtype),
                 k as u32,

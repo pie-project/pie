@@ -467,7 +467,7 @@ pub fn selector_walk(
     first: u32,
     picks: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.selector_walk";
+    const OP: &str = "sampling.selector_walk";
     if first > 1 {
         return Err(refuse(
             OP,

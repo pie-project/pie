@@ -1,4 +1,4 @@
-use poem::{Attention, BlockDrafter, Dtype, Layout, Operation, Platform, Trace};
+use poem::{Attention, BlockDrafter, Dtype, Operation, Platform, Sampling, Trace};
 
 const PLATFORMS: [Platform; 2] = [Platform::Metal, Platform::Cuda];
 
@@ -24,7 +24,7 @@ fn block_dyn_conv(op: &Operation) -> bool {
 }
 
 fn top_k(op: &Operation) -> bool {
-    matches!(op, Operation::Layout(Layout::TopK { .. }))
+    matches!(op, Operation::Sampling(Sampling::TopK { .. }))
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn the_dflash2_plan_convolves_and_reads_its_block_out_once() {
             "{platform:?}: five blocks x two sublayers x two sides"
         );
         let walks = count(&trace, |op| {
-            matches!(op, Operation::Attention(Attention::SelectorWalk { .. }))
+            matches!(op, Operation::Sampling(Sampling::SelectorWalk { .. }))
         });
         assert_eq!(
             (count(&trace, top_k), walks),
@@ -106,7 +106,7 @@ fn the_dspark_plan_walks_a_bigram_from_the_anchor() {
         .nodes
         .iter()
         .filter_map(|n| match &n.op {
-            Operation::Attention(Attention::SelectorWalk { hp, first, .. }) => Some((*hp, *first)),
+            Operation::Sampling(Sampling::SelectorWalk { hp, first, .. }) => Some((*hp, *first)),
             _ => None,
         })
         .collect();

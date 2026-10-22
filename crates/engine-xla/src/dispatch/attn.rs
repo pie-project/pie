@@ -142,8 +142,7 @@ impl Run<'_> {
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
             Attention::ReplayFloor { .. }
             | Attention::KvEnds { .. }
-            | Attention::WindowSink { .. }
-            | Attention::MarkovWalk { .. } => {
+            | Attention::WindowSink { .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
             }
             Attention::DecodeSelected {
@@ -1405,30 +1404,6 @@ impl Run<'_> {
                 *taps,
                 *group,
                 self.tensor(*y),
-            ),
-            Attention::SelectorWalk {
-                cand,
-                unary,
-                hp,
-                tokens,
-                pred,
-                succ,
-                first,
-                picks,
-            } => attn::ple::selector_walk(
-                self.ctx(),
-                self.ragged(*cand),
-                self.tensor(*unary),
-                // The candidates are readout-rowed (a block drafter reads
-                // every row back), the tokens and the projected hidden
-                // token-rowed, padded past them: the GPU kernel reads the
-                // first rows.
-                hp.map(|hp| self.first_rows(self.tensor(hp), *cand)),
-                self.first_rows(self.tensor(*tokens), *cand),
-                self.tensor(*pred),
-                self.tensor(*succ),
-                *first,
-                self.tensor(*picks),
             ),
         }
     }

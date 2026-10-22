@@ -1224,7 +1224,7 @@ fn best(cx: &mut Cx<'_>, x: Val, skip: Option<Val>) -> Result<(Val, Val), Error>
 /// i32 `y`; ties go to the lowest index, NaN is never picked, an all-NaN row
 /// answers 0.
 pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.argmax";
+    const OP: &str = "sampling.argmax";
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::F16) {
         return Err(Error::DtypeUnsupported {
             op: OP,
@@ -1285,7 +1285,7 @@ pub fn topk(
     values: Tensor,
     indices: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.topk";
+    const OP: &str = "sampling.top_k";
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::F16) {
         return Err(Error::DtypeUnsupported {
             op: OP,

@@ -447,10 +447,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::MlaPrefillSelected { .. }
             | Attention::SsmGdnPrep { .. }
             | Attention::BlockDynConv { .. }
-            | Attention::SelectorWalk { .. }
             | Attention::KvEnds { .. }
             | Attention::WindowSink { .. }
-            | Attention::MarkovWalk { .. }
             | Attention::IndexLayernormRope { .. }
             | Attention::IndexRope { .. }
             | Attention::IndexTopk { .. }
@@ -488,7 +486,8 @@ fn writes_cache(op: &Operation) -> bool {
         Operation::Linear(_)
         | Operation::Elementwise(_)
         | Operation::Layout(_)
-        | Operation::Collective(_) => false,
+        | Operation::Collective(_)
+        | Operation::Sampling(_) => false,
     }
 }
 

@@ -32,6 +32,7 @@ macro_rules! primitive {
 primitive!(
     poem_ir::Attention,
     poem_ir::Linear,
+    poem_ir::Sampling,
     poem_ir::Elementwise,
     poem_ir::Layout,
     poem_ir::Collective,

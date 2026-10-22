@@ -282,29 +282,6 @@ impl Run<'_> {
                     ),
                 )
             }
-            Layout::TopK {
-                x,
-                k,
-                values,
-                indices,
-            } => kernels_cuda::sampling::topk(
-                self.ctx(),
-                self.tensor(*x),
-                *k,
-                &mut self.tensor(*values),
-                &mut self.tensor(*indices),
-            ),
-            Layout::Argmax { xs, y } => {
-                for (column, x) in xs.iter().enumerate() {
-                    kernels_cuda::sampling::argmax(
-                        self.ctx(),
-                        self.tensor(*x),
-                        u32::try_from(column).expect("a draft depth inside u32"),
-                        &mut self.tensor(*y),
-                    )?;
-                }
-                Ok(())
-            }
             Layout::GatherRows { x, rows, y } => gather::gather_rows(
                 self.ctx(),
                 self.tensor(*x),

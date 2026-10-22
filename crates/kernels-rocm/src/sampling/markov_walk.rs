@@ -18,6 +18,6 @@ pub fn markov_walk(
     _picks: &mut Tensor,
 ) -> Result<(), Error> {
     Err(Error::Unsupported {
-        op: "attention.markov_walk",
+        op: "sampling.markov_walk",
     })
 }

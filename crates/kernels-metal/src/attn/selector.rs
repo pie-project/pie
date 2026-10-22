@@ -22,7 +22,7 @@ pub fn walk(
     first: u32,
     picks: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.selector_walk";
+    const OP: &str = "sampling.selector_walk";
     let entry = dtype_dispatch!(OP, pred.dtype, { Bf16 => "selector_walk_bfloat16" });
     if succ.dtype != pred.dtype || hp.is_some_and(|h| h.dtype != pred.dtype) {
         return Err(refuse(

@@ -184,7 +184,6 @@ impl Run<'_> {
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
             Attention::KvEnds { .. }
             | Attention::WindowSink { .. }
-            | Attention::MarkovWalk { .. }
             | Attention::ReplayFloor { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
@@ -257,7 +256,6 @@ impl Run<'_> {
             Attention::Masked { causal: false, .. }
             | Attention::MaskedLse { causal: false, .. }
             | Attention::BlockDynConv { .. }
-            | Attention::SelectorWalk { .. }
             | Attention::Ragged { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Attention::DecodeRel { .. }
             | Attention::PrefillRel { .. }

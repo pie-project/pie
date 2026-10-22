@@ -4391,7 +4391,17 @@ name = "pie-poem-ir"
 version = "0.5.4"
 dependencies = [
  "pie-dtype",
+ "pie-poem-ir-macros",
  "serde",
+]
+
+[[package]]
+name = "pie-poem-ir-macros"
+version = "0.5.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

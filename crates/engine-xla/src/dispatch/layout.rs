@@ -204,18 +204,6 @@ impl Run<'_> {
                 self.uncut(*y),
             ),
 
-            Layout::TopK {
-                x,
-                k,
-                values,
-                indices,
-            } => layout::topk(
-                self.ctx(),
-                self.tensor(*x),
-                *k,
-                self.tensor(*values),
-                self.tensor(*indices),
-            ),
             Layout::PackRows { x, perm, y } => layout::pack_rows(
                 self.ctx(),
                 self.uncut(*x),
@@ -228,17 +216,6 @@ impl Run<'_> {
                 self.tensor(*perm),
                 self.uncut(*y),
             ),
-            Layout::Argmax { xs, y } => {
-                for (column, x) in xs.iter().enumerate() {
-                    layout::argmax(
-                        self.ctx(),
-                        self.tensor(*x),
-                        u32::try_from(column).expect("a draft depth inside u32"),
-                        self.tensor(*y),
-                    )?;
-                }
-                Ok(())
-            }
             Layout::GatherRows { x, rows, y } => layout::gather_rows(
                 self.ctx(),
                 self.uncut(*x),

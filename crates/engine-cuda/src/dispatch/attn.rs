@@ -1025,28 +1025,6 @@ impl Run<'_> {
                     &mut self.tensor(*o),
                 )
             }
-            Attention::MarkovWalk {
-                logits,
-                tokens,
-                positions,
-                ends,
-                embed,
-                head,
-                block,
-                biased,
-                picks,
-            } => kernels_cuda::sampling::markov_walk(
-                self.ctx(),
-                self.tensor(*logits),
-                self.tensor(*tokens),
-                self.tensor(*positions),
-                self.tensor(*ends),
-                self.tensor(*embed),
-                self.tensor(*head),
-                *block,
-                &mut self.tensor(*biased),
-                &mut self.tensor(*picks),
-            ),
             Attention::PleNgramIdsChunked {
                 ids,
                 state,
@@ -1779,26 +1757,6 @@ impl Run<'_> {
                 *taps,
                 *group,
                 &mut self.tensor(*y),
-            ),
-            Attention::SelectorWalk {
-                cand,
-                unary,
-                hp,
-                tokens,
-                pred,
-                succ,
-                first,
-                picks,
-            } => kernels_cuda::sampling::selector_walk(
-                self.ctx(),
-                self.ragged(*cand),
-                self.tensor(*unary),
-                hp.map(|hp| self.tensor(hp)),
-                self.tensor(*tokens),
-                self.tensor(*pred),
-                self.tensor(*succ),
-                *first,
-                &mut self.tensor(*picks),
             ),
         }
     }

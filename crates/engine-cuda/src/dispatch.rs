@@ -14,4 +14,5 @@ mod linear;
 #[path = "dispatch/hip/linear.rs"]
 mod linear;
 mod probe;
+mod sampling;
 mod spatial;

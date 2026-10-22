@@ -9,6 +9,7 @@ pub mod elemwise;
 pub mod fused;
 pub mod layout;
 pub mod linear;
+pub mod sampling;
 pub mod spatial;
 
 pub use attn::{Attention, IndexScore, RaggedMask};
@@ -19,6 +20,7 @@ pub use elemwise::{
 pub use fused::{Fused, NormKind};
 pub use layout::{Layout, PixelOrder, TapKind};
 pub use linear::{ActQuant, Linear};
+pub use sampling::Sampling;
 pub use spatial::{GridRule, Spatial, TimePad, VoxelSegment};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,6 +30,7 @@ pub enum Operation {
     Elementwise(Elementwise),
     Layout(Layout),
     Collective(Collective),
+    Sampling(Sampling),
     Fused(Fused),
     Spatial(Spatial),
 }
@@ -40,6 +43,7 @@ impl Operation {
             Self::Elementwise(op) => op,
             Self::Layout(op) => op,
             Self::Collective(op) => op,
+            Self::Sampling(op) => op,
             Self::Fused(op) => op,
             Self::Spatial(op) => op,
         }
@@ -58,6 +62,9 @@ impl Operands for Operation {
     }
     fn name(&self) -> &'static str {
         self.operands().name()
+    }
+    fn ports(&self, sink: &mut Vec<(&'static str, ValueId, crate::check::Expect)>) {
+        self.operands().ports(sink);
     }
 }
 
@@ -84,6 +91,11 @@ impl From<Layout> for Operation {
 impl From<Collective> for Operation {
     fn from(op: Collective) -> Self {
         Self::Collective(op)
+    }
+}
+impl From<Sampling> for Operation {
+    fn from(op: Sampling) -> Self {
+        Self::Sampling(op)
     }
 }
 impl From<Fused> for Operation {

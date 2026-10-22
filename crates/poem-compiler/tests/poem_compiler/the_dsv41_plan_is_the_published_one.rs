@@ -5,7 +5,7 @@
 //! and its Causal Encoder-Decoder's bounded replay, where a prompt's
 //! leading rows run the encoder alone.
 
-use poem_ir::{Attention, CacheRow, Fact, Operands, Operation, Platform};
+use poem_ir::{Attention, CacheRow, Fact, Operands, Operation, Platform, Sampling};
 
 #[test]
 fn the_dsv41_plan_is_the_published_one() {
@@ -161,7 +161,7 @@ fn the_dsv41_dspark_head_drafts_through_its_stages() {
     assert_eq!(
         count(|op| matches!(
             op,
-            Operation::Attention(Attention::MarkovWalk { block: 5, .. })
+            Operation::Sampling(Sampling::MarkovWalk { block: 5, .. })
         )),
         1
     );

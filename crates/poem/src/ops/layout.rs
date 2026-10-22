@@ -212,20 +212,6 @@ pub fn merge_rows(x: &Value, side: u32) -> Value {
     y
 }
 
-pub fn argmax(xs: &[&Value]) -> Value {
-    let first = xs.first().expect("an argmax over at least one value");
-    let r = first.rec();
-    let y = r.fresh(tensor(first.rows(), xs.len() as u64, Dtype::I32));
-    r.push(
-        Layout::Argmax {
-            xs: xs.iter().map(|x| x.id()).collect(),
-            y: y.id(),
-        },
-        xs,
-    );
-    y
-}
-
 /// `xs` side by side: a row's columns of each, in order.
 pub fn concat_cols(xs: &[&Value]) -> Value {
     let first = xs.first().expect("a concat of at least one value");
@@ -240,22 +226,6 @@ pub fn concat_cols(xs: &[&Value]) -> Value {
         xs,
     );
     y
-}
-
-pub fn topk(x: &Value, k: u32) -> (Value, Value) {
-    let r = x.rec();
-    let values = r.fresh(tensor(x.rows(), u64::from(k), Dtype::F32));
-    let indices = r.fresh(tensor(x.rows(), u64::from(k), Dtype::I32));
-    r.push(
-        Layout::TopK {
-            x: x.id(),
-            k,
-            values: values.id(),
-            indices: indices.id(),
-        },
-        &[x],
-    );
-    (values, indices)
 }
 
 pub fn scatter_live_rows(src: &Value, routes: &Value, y: &Value) -> Value {

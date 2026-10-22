@@ -1,5 +1,5 @@
 //! DSpark's Markov head over a drafted block's readouts
-//! (`attention.markov_walk`, DeepSeek-V4.1).
+//! (`sampling.markov_walk`, DeepSeek-V4.1).
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -37,7 +37,7 @@ pub fn markov_walk(
     biased: &mut Tensor,
     picks: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.markov_walk";
+    const OP: &str = "sampling.markov_walk";
     let t = match logits.dtype {
         Dtype::F32 => "float",
         Dtype::Bf16 => "__nv_bfloat16",

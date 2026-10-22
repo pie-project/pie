@@ -505,7 +505,7 @@ pub fn topk(
     values: Tensor,
     indices: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.topk";
+    const OP: &str = "sampling.top_k";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, values, &[Dtype::F32])?;
     expect(OP, indices, &[Dtype::I32])?;
@@ -576,7 +576,7 @@ pub fn topk(
 /// answers 0. The rows ranked are the vocabulary-sized logits the host
 /// already holds, so the host ranks them.
 pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.argmax";
+    const OP: &str = "sampling.argmax";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::I32])?;
     if x.rows == 0 || x.width == 0 {

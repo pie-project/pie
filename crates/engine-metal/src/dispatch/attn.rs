@@ -184,7 +184,6 @@ impl Run<'_> {
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
             Attention::KvEnds { .. }
             | Attention::WindowSink { .. }
-            | Attention::MarkovWalk { .. }
             | Attention::ReplayFloor { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
@@ -1031,26 +1030,6 @@ impl Run<'_> {
                     self.uncut(*o),
                 )
             }
-            Attention::SelectorWalk {
-                cand,
-                unary,
-                hp,
-                tokens,
-                pred,
-                succ,
-                first,
-                picks,
-            } => attn::selector::walk(
-                self.ctx(),
-                self.ragged(*cand),
-                self.tensor(*unary),
-                hp.map(|hp| self.tensor(hp)),
-                self.tensor(*tokens),
-                self.tensor(*pred),
-                self.tensor(*succ),
-                *first,
-                self.tensor(*picks),
-            ),
             Attention::SsmGdnPrep {
                 ba,
                 dt_bias,

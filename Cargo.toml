@@ -40,6 +40,7 @@ members = [
     "crates/wasmtime-web",
 
     "crates/poem-ir",
+    "crates/poem-ir-macros",
     "crates/poem",
     "crates/poem-compiler",
     "crates/chat-template",
@@ -89,6 +90,7 @@ default-members = [
     "crates/poem-exec",
     "crates/eta-exec",
     "crates/poem-ir",
+    "crates/poem-ir-macros",
     "crates/poem",
     "crates/poem-compiler",
     "crates/checkpoint",
