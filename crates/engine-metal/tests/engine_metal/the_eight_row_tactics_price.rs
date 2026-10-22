@@ -364,3 +364,126 @@ fn the_eight_row_routed_tactics_price() {
         }
     }
 }
+
+/// The 35B's GDN in-projection as the engine launches it (its 64 gate columns,
+/// and its 12288 projection columns landed in halves of 8192 and 4096, in one
+/// segment launch) against the plain register walk of the 12288 columns.
+#[test]
+#[ignore = "a microbenchmark"]
+fn the_eight_row_segments_price() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let (k, m) = (2048u32, 8u32);
+    let groups = k / 64;
+    let make = |n: u32, seed: u64, keep: &mut Vec<[Buffer; 3]>| {
+        let codes: Vec<u8> = (0..u64::from(n) * u64::from(k) / 2).map(|at| noise(at ^ seed)).collect();
+        let scales: Vec<u8> = (0..n * groups)
+            .flat_map(|at| bf16(0.0031 + f32::from(noise(u64::from(at) ^ seed ^ 0x11)) * 0.000173))
+            .collect();
+        let biases: Vec<u8> = (0..n * groups)
+            .flat_map(|at| bf16(-0.2 + f32::from(noise(u64::from(at) ^ seed ^ 0x5678)) * 0.00157))
+            .collect();
+        let p = [upload(&codes), upload(&scales), upload(&biases)];
+        let bank = Bank {
+            mpp_codes: None,
+            codes: Tensor::new(bind(&p[0]), n, k, Dtype::U4g64),
+            scales: Tensor::new(bind(&p[1]), n, groups, Dtype::Bf16),
+            biases: Some(Tensor::new(bind(&p[2]), n, groups, Dtype::Bf16)),
+            group: 64,
+            bits: 4,
+            ld: k,
+        };
+        keep.push(p);
+        bank
+    };
+    let mut keep = Vec::new();
+    let copies = 22;
+    let pairs: Vec<(Bank, Bank)> = (0..copies)
+        .map(|c| (make(64, c as u64 * 77, &mut keep), make(12288, c as u64 * 77 + 1, &mut keep)))
+        .collect();
+    let inputs: Vec<u8> = (0..m * k)
+        .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0xabcd)) - 127.0) * 0.0197))
+        .collect();
+    let act_b = upload(&inputs);
+    let act = Tensor::new(bind(&act_b), m, k, Dtype::Bf16);
+    let outs: Vec<Buffer> = [64u32, 4096, 8192, 12288]
+        .iter()
+        .map(|&n| upload(&vec![0u8; (m * n * 2) as usize]))
+        .collect();
+    let y = |i: usize, n: u32| Tensor::new(bind(&outs[i]), m, n, Dtype::Bf16);
+    let table_rows = (17 * k + 4 * 256).div_ceil(2 * k) + 1;
+    let table_b = upload(&vec![0u8; (table_rows * k * 2) as usize]);
+    let table = Tensor::new(bind(&table_b), table_rows, k, Dtype::Bf16);
+    let partial_b = upload(&vec![0u8; (8 * m * 12288 * 4 + 8 * m * 64 * 4) as usize]);
+    let partials = Tensor::new(bind(&partial_b), 1, 8 * m * (12288 + 64), Dtype::F32);
+    let precast = |rows: u32, width: u32| {
+        (rows <= table_rows && width == k).then(|| Tensor::new(bind(&table_b), rows, width, Dtype::F16))
+    };
+    let pb = upload(&vec![0u8; (8 * m * 12288 * 4) as usize + 64]);
+    let partials_plain = |rows: u32, width: u32| {
+        (rows <= 64 && width <= 12288).then(|| Tensor::new(bind(&pb), rows, width, Dtype::F32))
+    };
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]", false);
+    let cores = tuning.cores();
+    let split = |n: u32| quant::register_split(n as i32, k as i32, cores);
+    for round in 0..2 {
+        let mut seg_t = Vec::new();
+        let mut plain_t = Vec::new();
+        for i in 0..12 {
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            for (a, b) in &pairs {
+                let mut segments = vec![
+                    quant::Segment { w: *a, first: 0, y: y(0, 64), split: split(64) },
+                    quant::Segment { w: *b, first: 8192, y: y(1, 4096), split: split(12288) },
+                    quant::Segment { w: *b, first: 0, y: y(2, 8192), split: split(12288) },
+                ];
+                segments.sort_by_key(|s| s.y.width);
+                let (counters, _) = quant::segments_scratch(&segments, m);
+                quant::register_table(&sink, act, table, m as i32, k as i32, counters as i32).expect("table");
+                quant::register_segments(&sink, &segments, table, m as i32, k as i32, Some(partials))
+                    .expect("segments");
+            }
+            let s = frame.commit_timed().expect("commit");
+            if i >= 2 {
+                seg_t.push(s * 1e6 / copies as f64);
+            }
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            for (_, b) in &pairs {
+                quant::matmul(
+                    &sink,
+                    &tuning,
+                    act,
+                    *b,
+                    y(3, 12288),
+                    quant::Scratch { precast: &precast, partials: &partials_plain, table: None },
+                    8,
+                )
+                .expect("plain");
+            }
+            let s = frame.commit_timed().expect("commit");
+            if i >= 2 {
+                plain_t.push(s * 1e6 / copies as f64);
+            }
+        }
+        seg_t.sort_by(f64::total_cmp);
+        plain_t.sort_by(f64::total_cmp);
+        eprintln!(
+            "round {round}: GDN in-projection segments {:.1}us (splits {} {}), plain 12288 walk {:.1}us (table included in both)",
+            seg_t[seg_t.len() / 2],
+            split(64),
+            split(12288),
+            plain_t[plain_t.len() / 2]
+        );
+    }
+}
