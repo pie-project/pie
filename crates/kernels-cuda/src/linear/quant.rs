@@ -248,6 +248,10 @@ fn affine(
     Ok(Affine { bits, group, n, k })
 }
 
+/// The most rows the 4-bit affine GEMV on mma.sync (`affine_w4a16_mma`)
+/// takes: one 16-row tile of the mma.
+pub const AFFINE_MMA_UNTIL: u32 = 16;
+
 #[allow(clippy::too_many_arguments)]
 fn dense_affine(
     ctx: &Ctx,
@@ -269,6 +273,22 @@ fn dense_affine(
     let Affine { bits, group, n, k } = affine(op, act, codes, scales, offset, biases, y)?;
     if y.rows == 0 {
         return Ok(());
+    }
+    // A decode's few rows of a 4-bit MLX plane on the tensor cores, its
+    // codes read once for every row.
+    if let Some(biases) = biases
+        && bits == 4
+        && group == 64
+        && matches!(offset, OffsetKind::Post)
+        && act.dtype == Dtype::Bf16
+        && factor == Dtype::Bf16
+        && y.dtype == Dtype::Bf16
+        && !seat.streams()
+        && y.rows <= AFFINE_MMA_UNTIL
+        && k.is_multiple_of(64)
+        && ctx.tuning().affine_mma
+    {
+        return affine_w4a16_mma(ctx, op, act, codes, scales, biases, y, n, k);
     }
     let tile = (BLOCK_LANES / WARP) * ROWS_PER_WARP;
     ctx.fire(
@@ -294,6 +314,59 @@ fn dense_affine(
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
             ArgValue::Ptr(seat.cell),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// `y = act . W^T` for an affine 4-bit MLX plane (group 64, its bias after
+/// the scale) at a decode's rows, on mma.sync (`linear/w8a16.cuh`): 32
+/// columns a block, eight warps over K, the codes three steps ahead
+/// (Llama-3.1-8B's decode 117 tok/s against the per-row kernel's 52; 16
+/// columns 108, a deeper prefetch spills to 93).
+#[allow(clippy::too_many_arguments)]
+fn affine_w4a16_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Tensor,
+    y: &mut Tensor,
+    n: u32,
+    k: u32,
+) -> Result<(), Error> {
+    const STAGES: u32 = 2;
+    const DEPTH: u32 = 3;
+    const N_SUB: u32 = 4;
+    const WARPS_K: u32 = 8;
+    const COLUMNS: u32 = 8 * N_SUB;
+    // Each K group's activation ring, or the fold of the groups' partials.
+    let smem = (WARPS_K * STAGES * 16 * 128).max(WARPS_K * 16 * COLUMNS * 4);
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/w8a16.cuh",
+            symbol(&format!(
+                "::pie::linear::affine_w4a16_mma<1, {N_SUB}, 1, {WARPS_K}, {STAGES}, {DEPTH}>"
+            )),
+        )
+        .apply(
+            Launch::grid(
+                [n.div_ceil(COLUMNS), y.rows.div_ceil(16), 1],
+                [32 * WARPS_K, 1, 1],
+            )
+            .smem(smem),
+        ),
+        &[
+            act.arg(),
+            codes.arg(),
+            scales.arg(),
+            biases.arg(),
+            y.arg(),
+            stated(op, y.rows)?.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
             ctx.stage(),
         ],
     )

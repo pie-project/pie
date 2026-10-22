@@ -629,6 +629,14 @@ pub struct MoeMxfp4SelectLean;
 #[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
 pub struct GemmGroupedGemv;
 
+/// Whether a decode's few rows (`linear::quant::AFFINE_MMA_UNTIL`) of a
+/// 4-bit MLX plane run on the mma.sync GEMV (`affine_w4a16_mma`), its codes
+/// read once for every row, rather than the per-row affine kernel. Off but
+/// where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.affine_mma", flag, default = false, tune = search)]
+pub struct GemmAffineMma;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -756,6 +764,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnStepBlocks>()
         .add::<MoeMxfp4SelectLean>()
         .add::<GemmGroupedGemv>()
+        .add::<GemmAffineMma>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -886,6 +895,7 @@ tuning! {
     ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
     mxfp4_select_lean: bool = false, on MoeMxfp4SelectLean;
     grouped_gemv: bool = false, on GemmGroupedGemv;
+    affine_mma: bool = false, on GemmAffineMma;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
