@@ -195,3 +195,146 @@ fn the_fold_with_the_shared_experts_add_lands_both_launches_rows() {
         );
     }
 }
+
+/// Microbench (not a test): the 35B's verify (8 rows) and decode (1 row) MoE launches, fused and
+/// not, over distinct 256-expert banks so the weights stream from memory as a fire's do.
+/// Run: cargo test --release -p engine-metal --test engine_metal \
+///        a_fused_moe_launch_prices -- --ignored --nocapture
+#[test]
+#[ignore = "a microbenchmark"]
+fn a_fused_moe_launch_prices() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let mut keep = Vec::new();
+    let mut bind = |bytes: &[u8]| {
+        let mut b = Buffer::zeroed(&device, bytes.len().max(16) as u64).expect("a plane");
+        b.write(0, bytes).expect("write");
+        let h = handles.bind(&b, 0, b.bytes()).expect("a handle");
+        keep.push(b);
+        h
+    };
+    let (experts, top_k, k, inter, banks) = (256u32, 8u32, 2048u32, 512u32, 4u32);
+    let (n, groups) = (2 * inter, k / 64);
+    let columns = u64::from(experts * n);
+    let bank: Vec<Bank> = (0..banks)
+        .map(|at| Bank {
+            mpp_codes: None,
+            codes: Tensor::new(
+                bind(
+                    &(0..columns * u64::from(k) / 2)
+                        .map(|i| noise(i ^ u64::from(at)))
+                        .collect::<Vec<_>>(),
+                ),
+                experts * n,
+                k,
+                Dtype::U4g64,
+            ),
+            scales: Tensor::new(
+                bind(&plane(columns * u64::from(groups), 0x11, 0.0002)),
+                experts * n,
+                groups,
+                Dtype::Bf16,
+            ),
+            biases: Some(Tensor::new(
+                bind(&plane(columns * u64::from(groups), 0x22, 0.003)),
+                experts * n,
+                groups,
+                Dtype::Bf16,
+            )),
+            group: 64,
+            bits: 4,
+            ld: k,
+        })
+        .collect();
+    for tokens in [8u32, 1] {
+        let pairs = tokens * top_k;
+        let x = Tensor::new(
+            bind(&plane(u64::from(tokens * k), 0x33, 0.02)),
+            tokens,
+            k,
+            Dtype::Bf16,
+        );
+        let routes: Vec<u8> = (0..tokens)
+            .flat_map(|t| (0..top_k).flat_map(move |s| ((t * 37 + s * 29) % experts).to_le_bytes()))
+            .collect();
+        let routes = Tensor::new(bind(&routes), tokens, top_k, Dtype::I32);
+        let packed = Tensor::new(
+            bind(&vec![0; (pairs * n * 2) as usize]),
+            pairs,
+            n,
+            Dtype::Bf16,
+        );
+        let hidden = Tensor::new(
+            bind(&vec![0; (pairs * inter * 2) as usize]),
+            pairs,
+            inter,
+            Dtype::Bf16,
+        );
+        let routed = Tensor::new(
+            bind(&plane(u64::from(pairs * k), 0x44, 0.05)),
+            pairs,
+            k,
+            Dtype::Bf16,
+        );
+        let weights: Vec<u8> = (0..pairs)
+            .flat_map(|at| (at as f32 / 997.0).to_le_bytes())
+            .collect();
+        let w = Tensor::new(bind(&weights), tokens, top_k, Dtype::F32);
+        let mut row = |salt| {
+            Tensor::new(
+                bind(&plane(u64::from(tokens * k), salt, 0.05)),
+                tokens,
+                k,
+                Dtype::Bf16,
+            )
+        };
+        let (folded, shared, out) = (row(0x55), row(0x66), row(0x77));
+        let gate = Tensor::new(
+            bind(&plane(u64::from(tokens), 0x88, 0.03)),
+            tokens,
+            1,
+            Dtype::Bf16,
+        );
+        let time = |body: &dyn Fn(&Sink<'_>)| {
+            let mut v = Vec::new();
+            for i in 0..=20 {
+                let frame = device.frame().expect("frame");
+                let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                for _ in 0..10 {
+                    body(&sink);
+                }
+                let s = frame.commit_timed().expect("commit");
+                if i > 0 {
+                    v.push(s * 1e6 / 10.0);
+                }
+            }
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let gate_up = time(&|sink| {
+            for &b in &bank {
+                moe::matmul_select_quant(sink, x, b, routes, packed).expect("gate-up");
+                mlp::swiglu(sink, packed, inter, hidden).expect("swiglu");
+            }
+        }) / f64::from(banks);
+        let gate_up_fused = time(&|sink| {
+            for &b in &bank {
+                moe::matmul_select_swiglu(sink, x, b, routes, packed, hidden).expect("fused");
+            }
+        }) / f64::from(banks);
+        let fold = time(&|sink| {
+            moe::weighted_sum(sink, routed, w, folded).expect("fold");
+            moe::sigmoid_gate_add(sink, folded, shared, gate, out).expect("add");
+        });
+        let fold_fused = time(&|sink| {
+            moe::weighted_sum_gate_add(sink, routed, w, folded, shared, gate, out).expect("fused");
+        });
+        eprintln!(
+            "{tokens} row(s): gate-up + swiglu {gate_up:.1} us, fused {gate_up_fused:.1} us; \
+             fold + add {fold:.1} us, fused {fold_fused:.1} us"
+        );
+    }
+}

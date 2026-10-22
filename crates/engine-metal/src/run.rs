@@ -438,7 +438,7 @@ impl<'c> Run<'c> {
     /// region, so one launch lands the fold and the add. The fold's rows and
     /// the add's stand apart from the weights, the gate and the routed rows
     /// (the add's may lie over the routed rows from their first, which the
-    /// launch walks past), and may be each other's or the shared rows, which
+    /// launch reads before it stores), and may be each other's or the shared rows, which
     /// a thread reads before it writes them.
     pub(crate) fn fold_gate_add(
         &self,
@@ -474,7 +474,7 @@ impl<'c> Run<'c> {
         };
         let apart_or_same = |a: ValueId, b: ValueId| same_rows(a, b) || self.rows_apart(a, &[b]);
         // The add's rows over the routed rows' first, of their width: the
-        // fused launch walks each column down the rows, past what it read.
+        // fused launch reads a column's every row before it stores any.
         let same_start = |a: ValueId, b: ValueId| {
             let (a, b) = (self.tensor(a), self.tensor(b));
             a.width == b.width && a.dtype == b.dtype && self.address(a.buf) == self.address(b.buf)
@@ -487,6 +487,7 @@ impl<'c> Run<'c> {
         (adjacent
             && *r == folded
             && one_pass
+            && self.tensor(folded).rows <= kernels_metal::linear::moe::COMBINE_ROWS
             && nodes.contains(&fold)
             && (nodes.contains(&add) || next)
             && self.rows_apart(*y, &[weights, *gate])

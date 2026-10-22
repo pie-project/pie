@@ -18,6 +18,12 @@ const SOFTMAX_OVER_SELECTED: u32 = 0;
 
 const ROUTE_FILE: &str = "linear/moe_route.metal";
 
+/// The columns a threadgroup of [`weighted_sum_gate_add`] holds, every row of each.
+const COMBINE_COLUMNS: u32 = 32;
+
+/// The most rows [`weighted_sum_gate_add`] lands, a threadgroup holding all of them.
+pub const COMBINE_ROWS: u32 = 1024 / COMBINE_COLUMNS;
+
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 
 const QMM_BK: u32 = 32;
@@ -1305,10 +1311,11 @@ pub fn sigmoid_gate_add(
 /// [`weighted_sum`] into `folded` and [`sigmoid_gate_add`] of it into `y`, in
 /// one launch: each row's routes summed under their weights and rounded as the
 /// fold lands them, then the shared expert under its gate added as the gate add
-/// adds it, bit for bit. A thread walks one column down the rows, so `y` may
-/// be the routed rows' own bytes from their first row (row `r` lands on route
-/// row `r`, which no later row reads) or stand apart from them; `folded`
-/// stands apart from them. Both stand apart from the weights and the gate,
+/// adds it, bit for bit. A threadgroup holds every row of its columns and
+/// stores once all have read, so `y` may be the routed rows' own bytes from
+/// their first row (row `r` lands on route row `r` of the same columns) or
+/// stand apart from them; `folded` stands apart from them. At most
+/// [`COMBINE_ROWS`] rows. Both stand apart from the weights and the gate,
 /// and each may be the other or the shared rows, which a thread reads before
 /// it writes.
 pub fn weighted_sum_gate_add(
@@ -1334,6 +1341,16 @@ pub fn weighted_sum_gate_add(
         ));
     }
     let top_k = routed.rows / y.rows;
+    if y.rows > COMBINE_ROWS {
+        return Err(refuse(
+            OP,
+            format!(
+                "a threadgroup holds every row of its {COMBINE_COLUMNS} columns, at most \
+                 {COMBINE_ROWS} rows, not {}",
+                y.rows
+            ),
+        ));
+    }
     debug_assert!(
         routed.width == y.width
             && shared.width == y.width
@@ -1351,7 +1368,8 @@ pub fn weighted_sum_gate_add(
         "the gate is one scalar per row"
     );
     ctx.fire(
-        Fire::at(ROUTE_FILE, "expert_shared_combine").apply(route_rows(OP, y.width, 1)?),
+        Fire::at(ROUTE_FILE, "expert_shared_combine")
+            .apply(Grid::of([y.width, y.rows, 1], [COMBINE_COLUMNS, y.rows, 1])),
         &[
             routed.arg(),
             weights.arg(),
@@ -1361,7 +1379,6 @@ pub fn weighted_sum_gate_add(
             y.arg_mut(),
             stated(OP, y.width)?.arg(),
             stated(OP, top_k)?.arg(),
-            y.rows.arg(),
         ],
     )
 }
