@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::decode::{GenericChatDecoder, ThinkingDecoder};
+use crate::json::tojson;
 use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, special, specials};
 
 /// MiniMax-M3's format (`chat_template.jinja` beside the checkpoint): a
@@ -101,7 +102,7 @@ fn tools_section(tools: &[String]) -> String {
             Err(_) => Value::String(tool.clone()),
         };
         out.push_str("<tool>");
-        py_json(&function, &mut out);
+        out.push_str(&tojson(&function));
         out.push_str("</tool>\n");
     }
     out.push_str("</tools>\n\n");
@@ -116,36 +117,6 @@ fn tools_section(tools: &[String]) -> String {
          {NS}</tool_call>"
     ));
     out
-}
-
-/// `value` as Python's `json.dumps(ensure_ascii=False)` writes it: keys in
-/// their order, `, ` and `: ` between items.
-pub(crate) fn py_json(value: &Value, out: &mut String) {
-    match value {
-        Value::Object(map) => {
-            out.push('{');
-            for (i, (key, value)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(&Value::String(key.clone()).to_string());
-                out.push_str(": ");
-                py_json(value, out);
-            }
-            out.push('}');
-        }
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                py_json(item, out);
-            }
-            out.push(']');
-        }
-        other => out.push_str(&other.to_string()),
-    }
 }
 
 /// The template's `to_xml`: a mapping's non-null fields and a list's items as
@@ -192,44 +163,14 @@ fn invoke(name: &str, arguments: &Value, out: &mut String) {
     out.push_str(&format!("{NS}</invoke>\n"));
 }
 
-/// A replayed turn's ChatML calls (`<tool_call>{"name", "arguments"}</tool_call>`),
-/// lifted out of its text; a turn already in the namespaced form is kept whole.
-pub(crate) fn lift_calls(msg: &str) -> (String, Vec<(String, Value)>) {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
-    let mut calls = Vec::new();
+/// A replayed turn's ChatML calls lifted out of its text
+/// ([`crate::chatml::lift_calls`]); a turn already in the namespaced form is
+/// kept whole.
+fn lift_calls(msg: &str) -> (String, Vec<(String, Value)>) {
     if msg.contains(NS) {
-        return (msg.to_string(), calls);
+        return (msg.to_string(), Vec::new());
     }
-    let mut text = String::new();
-    let mut rest = msg;
-    while let Some(at) = rest.find(OPEN) {
-        let Some(len) = rest[at + OPEN.len()..].find(CLOSE) else {
-            break;
-        };
-        let body = &rest[at + OPEN.len()..at + OPEN.len() + len];
-        let parsed = serde_json::from_str::<Value>(body.trim()).ok();
-        let Some(name) = parsed
-            .as_ref()
-            .and_then(|call| call.get("name"))
-            .and_then(Value::as_str)
-        else {
-            break;
-        };
-        let arguments = parsed
-            .as_ref()
-            .and_then(|call| call.get("arguments"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        calls.push((name.to_string(), arguments));
-        text.push_str(&rest[..at]);
-        rest = &rest[at + OPEN.len() + len + CLOSE.len()..];
-    }
-    text.push_str(rest);
-    if !calls.is_empty() {
-        text = text.trim_end_matches('\n').to_string();
-    }
-    (text, calls)
+    crate::chatml::lift_calls(msg)
 }
 
 /// An assistant turn as the template writes one: its reasoning split off at

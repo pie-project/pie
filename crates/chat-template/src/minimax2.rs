@@ -11,8 +11,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
+use crate::chatml::lift_calls;
 use crate::decode::{GenericChatDecoder, ThinkingDecoder};
-use crate::minimax::{lift_calls, py_json};
+use crate::json::tojson;
 use crate::{
     ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, special, specials,
 };
@@ -38,6 +39,7 @@ pub struct MiniMax2 {
 impl MiniMax2 {
     #[must_use]
     pub fn new(tokenizer: Arc<Tokenizer>, identity: &str) -> Self {
+        // The tokenizer must spell these as specials.
         let _ = specials(&tokenizer, &[BOD, BOS, EOS, CALL_OPEN, CALL_CLOSE]);
         Self {
             identity: identity.to_string(),
@@ -72,7 +74,7 @@ fn tools_section(tools: &[String]) -> String {
             Err(_) => Value::String(tool.clone()),
         };
         out.push_str("<tool>");
-        py_json(&function, &mut out);
+        out.push_str(&tojson(&function));
         out.push_str("</tool>\n");
     }
     out.push_str(
@@ -103,7 +105,7 @@ fn assistant_body(msg: &str) -> String {
                     out.push_str(&format!("<parameter name=\"{key}\">"));
                     match value {
                         Value::String(text) => out.push_str(text),
-                        other => py_json(other, &mut out),
+                        other => out.push_str(&tojson(other)),
                     }
                     out.push_str("</parameter>\n");
                 }
