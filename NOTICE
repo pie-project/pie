@@ -31,8 +31,9 @@ https://github.com/ml-explore/mlx
 MIT License
 Copyright (c) 2023 Apple Inc.
 
-  The Metal shaders under `crates/kernels-metal/kernels/third_party/` are
-  vendored from MLX, as each file's header states.
+  The Metal headers `crates/kernels-metal/kernels/prim/steel_*.h` and
+  `crates/kernels-metal/kernels/linear/quant_block.h` derive from MLX, as each
+  file's header states.
 
 --------------------------------------------------------------------------------
 NIXL

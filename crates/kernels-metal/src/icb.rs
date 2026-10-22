@@ -1,4 +1,4 @@
-pub const FILE: &str = "icb/rebind.metal";
+pub const FILE: &str = "runtime/rebind.metal";
 
 pub const ENTRYPOINT: &str = "icb_rebind";
 

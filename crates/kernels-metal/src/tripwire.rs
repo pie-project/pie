@@ -4,7 +4,7 @@ use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, refuse};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
-const FILE: &str = "probe/nan_check.metal";
+const FILE: &str = "runtime/nan_check.metal";
 
 pub fn nan_check(
     ctx: &Ctx<'_>,

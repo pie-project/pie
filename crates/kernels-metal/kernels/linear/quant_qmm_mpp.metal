@@ -38,7 +38,7 @@ kernel void qmm_mpp_pack_bank(const device uint *codes [[buffer(0)]],
   }
 }
 
-#include "../common/mpp.metal"
+#include "../prim/mpp.h"
 
 template <int M, int N, int S, bool PACKED, bool RELAXED, int PARTS, bool PAIRED, bool LOCAL,
           int ROW_GROUP, class Index>

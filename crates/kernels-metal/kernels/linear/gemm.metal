@@ -17,10 +17,10 @@ inline float mxfp4_block_scale(uint8_t code) {
   return code == 0xff ? NAN : metal::ldexp(1.0f, int(code) - 127);
 }
 
-#include "../third_party/mlx_steel_prelude.metal"
-#include "../third_party/mlx_steel_transforms.metal"
-#include "../third_party/mlx_steel_mma.metal"
-#include "../third_party/mlx_steel_loader.metal"
+#include "../prim/steel_prelude.h"
+#include "../prim/steel_transforms.h"
+#include "../prim/steel_mma.h"
+#include "../prim/steel_loader.h"
 
 template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
 [[kernel]] void dense_gemm_t(

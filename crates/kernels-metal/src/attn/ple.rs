@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::encode::{Arg, ArgValue, Ctx, Fire, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
-const FILE: &str = "attn/ple.metal";
+const FILE: &str = "gather/ngram.metal";
 
 const MAX_NGRAM: usize = 4;
 

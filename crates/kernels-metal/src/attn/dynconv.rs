@@ -4,7 +4,7 @@ use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, state
 use crate::error::Error;
 use crate::tensor::{RaggedTensor, Tensor};
 
-const FILE: &str = "attn/block_dyn_conv.metal";
+const FILE: &str = "ssm/dyn_conv.metal";
 
 const GROUP: u32 = 256;
 

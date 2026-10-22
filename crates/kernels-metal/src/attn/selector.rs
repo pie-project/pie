@@ -4,7 +4,7 @@ use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, state
 use crate::error::Error;
 use crate::tensor::{RaggedTensor, Tensor};
 
-const FILE: &str = "attn/selector_walk.metal";
+const FILE: &str = "sampling/selector_walk.metal";
 
 const THREADS: u32 = 256;
 

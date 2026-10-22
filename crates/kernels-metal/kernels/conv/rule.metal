@@ -1,4 +1,4 @@
-#include "grid.metal"
+#include "grid.h"
 
 
 inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) {

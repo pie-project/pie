@@ -2,7 +2,7 @@ use crate::encode::{Arg, Ctx, Fire, Grid, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
-const FILE: &str = "spatial/rule.metal";
+const FILE: &str = "conv/rule.metal";
 
 const OP: &str = "conv.grid";
 

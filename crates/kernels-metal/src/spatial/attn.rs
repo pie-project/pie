@@ -4,7 +4,7 @@ use crate::encode::{Arg, Ctx, Fire, Grid, refuse};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
-const FILE: &str = "spatial/attn.metal";
+const FILE: &str = "attn/voxel.metal";
 
 const OP: &str = "attn.voxel";
 

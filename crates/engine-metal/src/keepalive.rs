@@ -47,7 +47,7 @@ impl KeepAlive {
                 why: "the device would not open the keep-alive queue".to_string(),
             })?;
         let pipelines = crate::device::library::Pipelines::new();
-        let fire = Fire::at("layout/keepalive.metal", "keepalive_spin")
+        let fire = Fire::at("runtime/keepalive.metal", "keepalive_spin")
             .apply(Grid::of([32, 1, 1], [32, 1, 1]));
         let pipeline = pipelines.at(device.device(), fire)?;
         let sink = crate::device::Buffer::zeroed(device, 256)?;

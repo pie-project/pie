@@ -29,7 +29,7 @@ const LANES_PER_COLUMN: u32 = 32;
 
 pub const VECTOR_MAX_ROWS: u32 = 4;
 
-const FILE: &str = "linear/gemm_dense.metal";
+const FILE: &str = "linear/gemm.metal";
 
 const LANES_PER_TILE: u32 = 32;
 

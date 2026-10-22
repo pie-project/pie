@@ -40,11 +40,11 @@ inline constexpr int routed_tgp() {
   return routed_wm<BM>() * 2 * SIMD_SIZE;
 }
 
-#include "../third_party/mlx_steel_prelude.metal"
-#include "../third_party/mlx_steel_transforms.metal"
-#include "../third_party/mlx_steel_mma.metal"
-#include "../third_party/mlx_steel_loader.metal"
-#include "../third_party/mlx_quantized_block.metal"
+#include "../prim/steel_prelude.h"
+#include "../prim/steel_transforms.h"
+#include "../prim/steel_mma.h"
+#include "../prim/steel_loader.h"
+#include "quant_block.h"
 
 template <
     typename T,

@@ -18,7 +18,7 @@ const BANK_FLOATS: u64 = V_HEADS as u64 * V_DIM as u64 * K_DIM as u64;
 const T: u32 = 33;
 const J: u32 = 5;
 
-const OLD_FILE: &str = "attn/ssm_gated_delta.metal";
+const OLD_FILE: &str = "ssm/gated_delta.metal";
 
 const SLOTS: u32 = 8;
 const SLOT_OLD_COMMITTED: u32 = 0;

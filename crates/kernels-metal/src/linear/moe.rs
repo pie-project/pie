@@ -16,7 +16,7 @@ const MXFP4_BLOCK: u32 = 32;
 
 const SOFTMAX_OVER_SELECTED: u32 = 0;
 
-const ROUTE_FILE: &str = "linear/moe_route.metal";
+const ROUTE_FILE: &str = "linear/moe/route.metal";
 
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 
@@ -140,7 +140,7 @@ pub fn topk_softmax(
     let lanes = router_lanes(OP, experts)?;
     nonzero(OP, "rows", logits.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry)
+        Fire::at("linear/moe/route.metal", entry)
             .apply(Grid::of([lanes, logits.rows, 1], [lanes, 1, 1])),
         &[
             logits.arg(),
@@ -177,7 +177,7 @@ pub fn topk_softmax_scaled(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             routes.arg_mut(),
@@ -206,7 +206,7 @@ pub fn topk_sigmoid(
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid" });
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             routes.arg_mut(),
@@ -240,7 +240,7 @@ pub fn topk_sigmoid_biased(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             bias.arg(),
@@ -275,7 +275,7 @@ pub fn topk_sqrt_softplus(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             bias.arg(),
@@ -307,7 +307,7 @@ pub fn predict_route(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             bias.arg(),
@@ -522,7 +522,7 @@ pub fn matmul_select(
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(OP, x, routes, y)?;
     ctx.fire(
-        Fire::at("linear/moe_select.metal", entry).apply(select_gemv_grid(OP, y.width, y.rows)?),
+        Fire::at("linear/moe/select.metal", entry).apply(select_gemv_grid(OP, y.width, y.rows)?),
         &[
             x.arg(),
             bank.arg(),
@@ -1122,7 +1122,7 @@ pub fn weighted_sum(
     );
     let grid = route_rows(OP, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             routed.arg(),
             weights.arg(),
@@ -1151,7 +1151,7 @@ pub fn weighted_sum_sorted(
         "the sorted rows are the routed width"
     );
     ctx.fire(
-        Fire::at("linear/moe_route.metal", "expert_combine_sorted")
+        Fire::at("linear/moe/route.metal", "expert_combine_sorted")
             .apply(route_rows(OP, y.width, y.rows)?),
         &[
             sorted.arg(),
@@ -1199,7 +1199,7 @@ pub fn bias_sum(
     let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
     let grid = route_rows(OP, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             x.arg(),
             bias.arg(),
@@ -1236,7 +1236,7 @@ pub fn sigmoid_gate_add(
     );
     let grid = route_rows(OP, routed.width, routed.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             routed.arg(),
             shared.arg(),

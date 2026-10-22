@@ -1,4 +1,4 @@
-#include "grid.metal"
+#include "grid.h"
 
 
 template <typename T>

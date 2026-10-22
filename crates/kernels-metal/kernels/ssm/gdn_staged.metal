@@ -1,4 +1,4 @@
-#include "ssm_gdn_scan.metal"
+#include "gdn_scan.metal"
 
 template <int BLOCK>
 [[kernel]] void

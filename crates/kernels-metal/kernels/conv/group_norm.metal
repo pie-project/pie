@@ -1,5 +1,5 @@
 #include <metal_simdgroup>
-#include "grid.metal"
+#include "grid.h"
 
 
 inline void welford_merge(

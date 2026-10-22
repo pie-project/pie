@@ -1,5 +1,5 @@
 #include <metal_simdgroup>
-#include "grid.metal"
+#include "grid.h"
 
 struct ConvGeom {
     int c_in;

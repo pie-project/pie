@@ -23,7 +23,7 @@ pub fn embed(
         "the token ids handed over are the rows this gather lands"
     );
     ctx.fire(
-        Fire::at("layout/embed.metal", entry).apply(Grid::of(
+        Fire::at("gather/embed.metal", entry).apply(Grid::of(
             elementwise_rows(OP, y.width, y.rows)?,
             [256, 1, 1],
         )),
@@ -57,7 +57,8 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     }
     debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
     ctx.fire(
-        Fire::at("layout/argmax.metal", entry).apply(Grid::of([1024, rows, 1], [1024, 1, 1])),
+        Fire::at("sampling/argmax_rows.metal", entry)
+            .apply(Grid::of([1024, rows, 1], [1024, 1, 1])),
         &[
             x.arg(),
             y.arg_mut(),
@@ -105,7 +106,7 @@ pub fn embed_concat(
     nonzero(OP, "the row count this embedding table states", vocab)?;
     let (slices, width) = concat_slices(OP, ids, y)?;
     ctx.fire(
-        Fire::at("layout/embed.metal", entry)
+        Fire::at("gather/embed.metal", entry)
             .apply(Grid::of(elementwise_rows(OP, width, slices)?, [256, 1, 1])),
         &[
             ids.arg(),
@@ -142,7 +143,7 @@ pub fn split_qkv(
     const OP: &str = "gather.split_qkv";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "split_qkv_bf16" });
     ctx.fire(
-        Fire::at("attn/split_qkv.metal", entry).apply(Grid::of(
+        Fire::at("gather/split_qkv.metal", entry).apply(Grid::of(
             elementwise_rows(OP, packed.width, packed.rows)?,
             [256, 1, 1],
         )),
@@ -214,7 +215,7 @@ pub fn split_rows(
         "the two halves cover the packed row"
     );
     ctx.fire(
-        Fire::at("layout/deinterleave.metal", entry).apply(Grid::of(
+        Fire::at("gather/deinterleave.metal", entry).apply(Grid::of(
             elementwise_rows(OP, x.width, x.rows)?,
             [256, 1, 1],
         )),
@@ -264,7 +265,7 @@ pub fn select(
         ));
     }
     ctx.fire(
-        Fire::at("layout/deinterleave.metal", entry).apply(Grid::of(
+        Fire::at("gather/deinterleave.metal", entry).apply(Grid::of(
             elementwise_rows(OP, y.width, y.rows)?,
             [256, 1, 1],
         )),
@@ -350,7 +351,7 @@ fn gather_mb_4bit(
     )?;
     let _ = y;
     ctx.fire(
-        Fire::at("layout/embed_gather.metal", ENTRIES[point])
+        Fire::at("gather/embed_gather.metal", ENTRIES[point])
             .apply(Grid::of(elementwise_rows(op, width, slices)?, [256, 1, 1])),
         &[
             table.codes.arg(),
@@ -401,7 +402,7 @@ fn move_rows(
     let rows = nonzero(op, "rows to move", tight.rows)?;
     let width = nonzero(op, "the width of a row this copy moves", tight.width)?;
     ctx.fire(
-        Fire::at("layout/row_gather.metal", entry)
+        Fire::at("gather/rows.metal", entry)
             .apply(Grid::of(elementwise_rows(op, width, rows)?, [256, 1, 1])),
         &[
             args[0].arg(),
@@ -479,7 +480,7 @@ fn permute_rows(
     }
     let width = nonzero(op, "the width of a row this permutation moves", o.width)?;
     ctx.fire(
-        Fire::at("layout/row_gather.metal", entry)
+        Fire::at("gather/rows.metal", entry)
             .apply(Grid::of(elementwise_rows(op, width, rows)?, [256, 1, 1])),
         &[
             args[0].arg(),
@@ -558,7 +559,7 @@ pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), E
     }
     let lanes = elementwise_rows(OP, x.width, out)?;
     ctx.fire(
-        Fire::at("layout/fold.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
+        Fire::at("gather/fold.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
         &[
             x.arg(),
             y.arg_mut(),
@@ -604,7 +605,7 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
     }
     let lanes = elementwise_rows(OP, merged, out)?;
     ctx.fire(
-        Fire::at("layout/fold.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
+        Fire::at("gather/fold.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
         &[x.arg(), y.arg_mut(), stated(OP, merged)?.arg()],
     )
 }
@@ -645,7 +646,7 @@ pub fn pixels(
     let lanes = elementwise_rows(OP, y.width, x.rows)?;
     let order: i32 = if channel_major { 0 } else { 1 };
     ctx.fire(
-        Fire::at("layout/pixels.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
+        Fire::at("gather/pixels.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
         &[
             x.arg(),
             y.arg_mut(),
@@ -697,7 +698,7 @@ pub fn grid_taps(
     let kind: i32 = if bilinear { 0 } else { 1 };
     let lanes = [positions.rows, 1, 1];
     ctx.fire(
-        Fire::at("layout/grid_taps.metal", "grid_taps")
+        Fire::at("gather/grid_taps.metal", "grid_taps")
             .apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
         &[
             positions.arg(),
@@ -781,7 +782,7 @@ pub fn embed_weighted(
     let taps = stated(OP, nonzero(OP, "the taps per row", ids.width)?)?;
     let vocab = stated(OP, nonzero(OP, "the table's row count", vocab)?)?;
     ctx.fire(
-        Fire::at("layout/embed_weighted.metal", entry).apply(Grid::of(
+        Fire::at("gather/embed_weighted.metal", entry).apply(Grid::of(
             elementwise_rows(OP, y.width, y.rows)?,
             [256, 1, 1],
         )),
@@ -815,7 +816,7 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
         )
     })?;
     ctx.fire(
-        Fire::at("layout/blit.metal", "rs_copy_words")
+        Fire::at("runtime/blit.metal", "rs_copy_words")
             .apply(Grid::of([words, 1, 1], [words.min(256), 1, 1])),
         &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
     )
@@ -866,7 +867,7 @@ pub fn copy_words_batch(ctx: &Ctx<'_>, copies: &[(Tensor, Tensor, u64)]) -> Resu
     let widest = words.iter().copied().max().unwrap_or(1).max(1);
     args.extend(words.iter().map(|w| w.arg()));
     ctx.fire(
-        Fire::at("layout/blit.metal", "rs_copy_words4").apply(Grid::of(
+        Fire::at("runtime/blit.metal", "rs_copy_words4").apply(Grid::of(
             [widest, copies.len() as u32, 1],
             [widest.min(256), 1, 1],
         )),
@@ -927,7 +928,7 @@ pub fn topk(
         TOPK_THREADS
     };
     ctx.fire(
-        Fire::at("layout/topk.metal", entry).apply(Grid::of([threads, rows, 1], [threads, 1, 1])),
+        Fire::at("sampling/topk.metal", entry).apply(Grid::of([threads, rows, 1], [threads, 1, 1])),
         &[
             x.arg(),
             values.arg_mut(),

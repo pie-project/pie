@@ -1,7 +1,7 @@
 
 
 #include <metal_stdlib>
-#include "../common/register_table.metal"
+#include "../linear/register_table.h"
 
 using namespace metal;
 
@@ -65,7 +65,7 @@ template <typename T>
 }
 
 // [`block_dyn_conv`] over at most eight rows, a threadgroup a row of the register tile's input
-// table (common/register_table.metal) for the projections of `y`, which it lays as it writes
+// table (linear/register_table.h) for the projections of `y`, which it lays as it writes
 // them: a row past `rows` as zeros, one inside them past every lane as `y` holds it.
 [[kernel]] void block_dyn_conv_table(
     const device bfloat* x         [[buffer(0)]],

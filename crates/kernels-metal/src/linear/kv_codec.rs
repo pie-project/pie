@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
-const FILE: &str = "linear/kv_codec.metal";
+const FILE: &str = "attn/kv_codec.metal";
 
 /// The block sizes stamped in the codec shader (one whole attention head each).
 pub const BLOCKS: [u32; 3] = [64, 256, 128];

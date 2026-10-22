@@ -4,7 +4,7 @@ use crate::encode::{Arg, Ctx, Fire, Grid, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
-const FILE: &str = "spatial/conv.metal";
+const FILE: &str = "conv/conv3d.metal";
 
 const OP: &str = "conv.conv3d";
 

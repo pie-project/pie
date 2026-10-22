@@ -1,5 +1,5 @@
 #include <metal_simdgroup>
-#include "grid.metal"
+#include "../conv/grid.h"
 
 template <typename T, int C_MAX, int SIMDS>
 [[kernel]] void spatial_attention(

@@ -4,7 +4,7 @@ use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
-const FILE: &str = "spatial/resample.metal";
+const FILE: &str = "conv/resample.metal";
 
 fn grid_of(op: &'static str, columns: u32, rows: u32) -> Result<Grid, Error> {
     nonzero(op, "the row's width", columns)?;

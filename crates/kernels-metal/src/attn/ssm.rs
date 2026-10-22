@@ -16,7 +16,7 @@ const CONV_X4_TAPS: u32 = 8;
 
 const SCAN_WIDTH: u32 = 128;
 
-const GDN_SCAN_FILE: &str = "attn/ssm_gdn_scan.metal";
+const GDN_SCAN_FILE: &str = "ssm/gdn_scan.metal";
 
 const GDN_SCAN_LANES: u32 = 32;
 
@@ -309,7 +309,7 @@ pub fn causal_conv1d(
         "the state bank a dilated conv reads is `(width - 1) * dilation + 1` rows of channels"
     );
     ctx.fire(
-        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, rows)),
+        Fire::at("ssm/conv1d.metal", entry).apply(conv_grid(channels, rows)),
         &[
             x.arg(),
             weight.arg(),
@@ -402,7 +402,7 @@ pub fn causal_conv1d_chunked_landing(
         (entry, channels)
     };
     ctx.fire(
-        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
+        Fire::at("ssm/conv1d.metal", entry).apply(Grid::of(
             [threads, lanes, runs],
             [threads.min(CONV_GROUP), 1, 1],
         )),
@@ -451,7 +451,7 @@ pub fn gdn_prep(
     );
     let rows = nonzero(OP, "rows", ba.rows)?;
     ctx.fire(
-        Fire::at("attn/ssm_gdn_prep.metal", entry)
+        Fire::at("ssm/gdn_prep.metal", entry)
             .apply(Grid::of([v_heads, rows, 1], [v_heads.min(256), 1, 1])),
         &[
             ba.arg(),
@@ -511,7 +511,7 @@ pub fn gated_delta(
         [SCAN_WIDTH, 1, 1],
     );
     ctx.fire(
-        Fire::at("attn/ssm_gated_delta.metal", entry).apply(grid),
+        Fire::at("ssm/gated_delta.metal", entry).apply(grid),
         &[
             qkv.arg(),
             gates.arg(),
@@ -587,12 +587,9 @@ pub fn gated_delta_chunked_landing(
     ];
     if let Some(grid) = gdn_staged_launch_at(&shape, lanes, qkv.data.rows, tuning.gdn_scan()) {
         return ctx.fire(
-            Fire::at(
-                "attn/ssm_gdn_staged.metal",
-                "gated_delta_staged_bfloat16_b16",
-            )
-            .stamp("PIE_GDN_STAGED(\"gated_delta_staged_bfloat16_b16\", 16)")
-            .apply(grid),
+            Fire::at("ssm/gdn_staged.metal", "gated_delta_staged_bfloat16_b16")
+                .stamp("PIE_GDN_STAGED(\"gated_delta_staged_bfloat16_b16\", 16)")
+                .apply(grid),
             &args,
         );
     }
@@ -605,7 +602,7 @@ pub fn gated_delta_chunked_landing(
         );
     }
     ctx.fire(
-        Fire::at("attn/ssm_gated_delta.metal", entry).apply(recurrence_grid(shape.v_heads, lanes)),
+        Fire::at("ssm/gated_delta.metal", entry).apply(recurrence_grid(shape.v_heads, lanes)),
         &args,
     )
 }
@@ -633,7 +630,7 @@ pub fn kda_step(
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     let rows = nonzero(OP, "rows", mixed.rows)?;
     ctx.fire(
-        Fire::at("attn/ssm_kda.metal", entry).apply(recurrence_grid(shape.heads, rows)),
+        Fire::at("ssm/kda.metal", entry).apply(recurrence_grid(shape.heads, rows)),
         &[
             mixed.arg(),
             f.arg(),
@@ -674,7 +671,7 @@ pub fn kda_chunked(
     let shape = Kda::of(OP, mixed.data, f, b, y, heads, head_dim)?;
     let lanes = requests(OP, mixed)?;
     ctx.fire(
-        Fire::at("attn/ssm_kda.metal", entry).apply(recurrence_grid(shape.heads, lanes)),
+        Fire::at("ssm/kda.metal", entry).apply(recurrence_grid(shape.heads, lanes)),
         &[
             mixed.data.arg(),
             mixed.indptr.arg(),
@@ -719,7 +716,7 @@ pub fn kda_committed(
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     let lanes = committed_lanes(OP, indptr)?;
     ctx.fire(
-        Fire::at("attn/ssm_kda.metal", entry).apply(recurrence_grid(shape.heads, lanes)),
+        Fire::at("ssm/kda.metal", entry).apply(recurrence_grid(shape.heads, lanes)),
         &[
             mixed.arg(),
             indptr.arg(),
@@ -885,7 +882,7 @@ pub fn causal_conv1d_committed_landing(
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     ctx.fire(
-        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, lanes)),
+        Fire::at("ssm/conv1d.metal", entry).apply(conv_grid(channels, lanes)),
         &[
             x.arg(),
             indptr.arg(),
@@ -988,7 +985,7 @@ pub fn gated_delta_committed_landing(
         [SCAN_WIDTH, 1, 1],
     );
     ctx.fire(
-        Fire::at("attn/ssm_gated_delta.metal", entry).apply(grid),
+        Fire::at("ssm/gated_delta.metal", entry).apply(grid),
         &[
             qkv.arg(),
             indptr.arg(),
@@ -1300,7 +1297,7 @@ pub fn causal_conv1d_verify(
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
     ctx.fire(
-        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
+        Fire::at("ssm/conv1d.metal", entry).apply(Grid::of(
             [channels / 4, CONV_VERIFY_ROWS, lanes],
             [CONV_VERIFY_CHANNELS, CONV_VERIFY_ROWS, 1],
         )),

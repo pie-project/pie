@@ -895,7 +895,7 @@ pub fn sink(
     );
     let lanes = head_grid(OP, head_dim, heads, o.rows)?;
     ctx.fire(
-        Fire::at("attn/attn_sink.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
+        Fire::at("attn/sink.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
         &[o.arg(), o.arg_mut(), lse.arg(), sink.arg()],
     )
 }
