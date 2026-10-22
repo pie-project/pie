@@ -7,7 +7,7 @@ use super::CAPABILITIES;
 pub const SECTION: &str = "plex.manifest";
 
 const DEFAULT_DEADLINE_MS: u64 = 50;
-const MAX_DEADLINE_MS: u64 = 1000;
+pub(crate) const MAX_DEADLINE_MS: u64 = 1000;
 /// A gate longer than this would hold every launch on a stuck program.
 const MAX_GATE_MS: u64 = 1000;
 
