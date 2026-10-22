@@ -396,6 +396,7 @@ fn the_sparse_mla_lands_on_tcgen05() {
     // selections here read none past a row's position, so both answer alike.
     check(64, None, true, false);
 }
+
 /// GLM-5.3's decode at 8 rows: each request's one row selecting 2048 of its
 /// keys, the selected attention dealt over splits a row on tcgen05 and
 /// folded, against the warp-a-key form; then both paced.
@@ -546,6 +547,7 @@ fn glm_decodes_selected_attention_lands_split_over_the_multiprocessors() {
         );
     }
 }
+
 /// An e4m3 byte's value (no NaN is drawn).
 fn e4m3(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
