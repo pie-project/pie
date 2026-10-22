@@ -608,6 +608,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut prices = Prices::new(block);
     let mut budget = Budget::new(widest.saturating_sub(1).max(1) as usize);
     let mut budget_expected = 0.0;
+    let mut budgeting = input.verify_budget;
     let mut plain_fires: usize = 0;
     // Drafting rounds since the plain fire was last priced, and plain fires
     // still owed to the current re-pricing; see `REPRICE`.
@@ -655,7 +656,7 @@ async fn main(input: Input) -> Result<Output> {
         } else {
             Vec::new()
         };
-        let planned = if input.verify_budget && !ngram {
+        let planned = if budgeting && !ngram {
             // The width is the draft's to choose; see below.
             Some(pinned.unwrap_or(widest))
         } else if floor.is_infinite() {
@@ -719,11 +720,11 @@ async fn main(input: Input) -> Result<Output> {
             let conf = Channel::new([shown * 2], dtype::f32)
                 .capacity(channel_capacity() as u32)
                 .named("conf_d");
-            let want_margin = input.margin_width && !input.verify_budget;
+            let want_margin = input.margin_width && !budgeting;
             let sure = Channel::new([shown], dtype::f32)
                 .capacity(channel_capacity() as u32)
                 .named("sure_d");
-            let want_sure = input.verify_budget;
+            let want_sure = budgeting;
 
             let fwd = ForwardPass::new();
             fwd.set_drafting_block(true)
@@ -846,6 +847,14 @@ async fn main(input: Input) -> Result<Output> {
         let verify_ns = monotonic_now_ns().saturating_sub(verified_at);
         if drafting || survivors == 0 {
             prices.verified(verify, verify_ns);
+            // A target whose narrow verify saves little (a dense one) gains less from the budget than its confidence pass costs.
+            if let (true, Some(two), Some(full)) = (
+                budgeting,
+                Prices::median(&prices.verify[2]),
+                Prices::median(&prices.verify[widest as usize]),
+            ) {
+                budgeting = two < 0.7 * full;
+            }
         }
 
         // ── what the target kept ────────────────────────────────────────
