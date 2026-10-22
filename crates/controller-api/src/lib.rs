@@ -103,22 +103,15 @@ pub enum Ack {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NeighborPeer {
-    pub id: WorkerId,
-    pub addr: String,
-    pub role: Role,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayEndpoint {
     pub id: GatewayId,
     pub addr: String,
 }
 
+/// What a worker hears from the controller: the gateways to link to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Neighbors {
     pub epoch: u64,
-    pub peers: Vec<NeighborPeer>,
     pub gateways: Vec<GatewayEndpoint>,
 }
 

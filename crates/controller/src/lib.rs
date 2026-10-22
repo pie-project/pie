@@ -174,7 +174,8 @@ impl ControllerHandle {
         let _ = self.cmd.send(Command::DesireScale { entries }).await;
     }
 
-    /// Each shape the scale table names, desired against current.
+    /// Each shape the scale table names, desired against current; none
+    /// once the controller's actor has stopped.
     pub async fn scale_status(&self) -> Vec<ScaleStatus> {
         let (reply, rx) = oneshot::channel();
         let _ = self.cmd.send(Command::ScaleStatus { reply }).await;

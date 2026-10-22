@@ -139,6 +139,9 @@ pub enum LoadError {
         first: String,
         second: String,
     },
+    /// A name keys what its program publishes (`published/<name>/…`).
+    #[error("two programs are named `{0}`")]
+    SameName(String),
 }
 
 pub struct Program {
@@ -296,6 +299,14 @@ pub fn spawn(
     std::thread::Builder::new()
         .name(thread.into())
         .spawn(move || {
+            let mut named = std::collections::HashSet::new();
+            if let Some((name, _)) = programs
+                .iter()
+                .find(|(name, _)| !named.insert(name.as_str()))
+            {
+                let _ = loaded.send(Err(LoadError::SameName(name.clone())));
+                return;
+            }
             let programs = programs
                 .iter()
                 .map(|(name, component)| {

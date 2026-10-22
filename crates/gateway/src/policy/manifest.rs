@@ -48,7 +48,7 @@ const GRANTS: &[&str] = &[
 
 /// Grants whose writes land under the writer's own name, so any number of
 /// programs may hold them: each is still the one author of what it writes.
-pub const NAMESPACED: &[&str] = &["publish"];
+pub(crate) const NAMESPACED: &[&str] = &["publish"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]

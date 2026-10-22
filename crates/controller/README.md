@@ -47,10 +47,20 @@ With slots configured, the controller's actuator converges on it every tick:
 - **What it leaves alone:** a worker it did not launch is never stopped, and
   a shape the table does not name keeps what it has.
 - **Short of slots:** when the table asks for more than the slots of a shape
-  can give, it says so in its log and in its status.
+  can give, or a slot's command will not start, it says so once in its log,
+  and in its status.
+- **A launch that never registers** holds its slot until its process exits.
+  One that registers as another shape than its slot's is warned about, and
+  not counted.
+- **Orphans:** a worker a previous controller launched, registered again
+  after that controller died, is not adopted. It counts as serving, keeps
+  its slot taken, and is never stopped by this controller.
 
 Which worker of a shape is stopped is the host's choice, not a policy's:
-the most recently launched.
+one that does not take turns first (not registered yet, draining,
+unreachable), then the most recently launched. A SIGTERM that cannot be
+sent is tried again on the next tick. When the controller goes, it signals
+what it launched to drain; those still draining outlive it.
 
 `cluster.scale` answers true to a policy only while the controller has slots.
 Without them, the scale table still reaches the controller, and

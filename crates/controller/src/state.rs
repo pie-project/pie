@@ -13,7 +13,6 @@ pub struct Worker {
     pub addr: String,
     /// The token the actuator launched it with, if it did.
     pub launch: Option<String>,
-    pub neighbors: Vec<WorkerId>,
     pub last_hb: Instant,
     pub load: WorkerStatus,
     /// Unreachable once its heartbeats have lagged for half the eviction
@@ -85,7 +84,6 @@ impl Cluster {
                 engine: String::new(),
                 addr,
                 launch: None,
-                neighbors: Vec::new(),
                 last_hb: now,
                 health: Health::Healthy,
                 load: WorkerStatus::default(),

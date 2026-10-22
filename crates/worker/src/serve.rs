@@ -239,7 +239,7 @@ async fn boot_decode(user_cfg: &config::Config, home: &Path) -> Result<(String, 
 /// Serves other workers' passes, and dials the peers this worker's passes
 /// may be prefilled on, retrying until one takes them.
 async fn start_peers(user_cfg: &config::Config) -> Result<()> {
-    let engine = format!("{:?}", user_cfg.model.engine.kind).to_lowercase();
+    let engine = engine_of(user_cfg);
     // Its kv agent first: the hello says whether peers can read it in place.
     if let Some(handle) = runtime::offload::home_kv_handle() {
         let name = match &user_cfg.offload.listen {

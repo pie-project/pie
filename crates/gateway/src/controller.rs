@@ -186,14 +186,15 @@ impl GatewayControl for Controller {
 }
 
 /// Beats for the gateway, registering it again when the controller lost it;
-/// and keeps the controller's scale table the policies' one: sent when it
-/// changes, again when a send failed, and again after a re-registration (a
-/// restarted controller desires nothing).
+/// and keeps the controller's scale table the policies' one: sent once a
+/// program granted `scale` has written one, when it changes, again when a
+/// send failed, and again after a re-registration (a restarted controller
+/// desires nothing). A gateway whose programs wrote none sends none.
 pub(crate) async fn heartbeat_loop<C: GatewayControl>(
     control: C,
     mut id: GatewayId,
     info: GatewayInfo,
-    mut scale: Option<watch::Receiver<Vec<ScaleEntry>>>,
+    mut scale: Option<watch::Receiver<Option<Vec<ScaleEntry>>>>,
 ) {
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut owed = scale.is_some();
@@ -242,13 +243,17 @@ pub(crate) async fn heartbeat_loop<C: GatewayControl>(
 
 async fn send_scale<C: GatewayControl>(
     control: &C,
-    scale: Option<&mut watch::Receiver<Vec<ScaleEntry>>>,
+    scale: Option<&mut watch::Receiver<Option<Vec<ScaleEntry>>>>,
     owed: &mut bool,
 ) {
     let Some(scale) = scale.filter(|_| *owed) else {
         return;
     };
-    let entries = scale.borrow_and_update().clone();
+    let Some(entries) = scale.borrow_and_update().clone() else {
+        // No table written yet: nothing to speak for.
+        *owed = false;
+        return;
+    };
     match control.desire_scale(entries).await {
         Ok(()) => *owed = false,
         Err(e) => {

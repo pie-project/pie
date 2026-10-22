@@ -55,8 +55,10 @@ struct Tables {
 
 struct Shared {
     tables: RwLock<Tables>,
-    /// The scale table, for the controller to converge on.
-    scale: watch::Sender<Vec<ScaleEntry>>,
+    /// The scale table, for the controller to converge on: none until a
+    /// program granted `scale` writes one, so a gateway whose programs hold
+    /// no such grant never speaks for the cluster's size.
+    scale: watch::Sender<Option<Vec<ScaleEntry>>>,
     waiting: Mutex<BTreeMap<u64, String>>,
     refused: Mutex<HashMap<String, Option<String>>>,
     cancels: mpsc::UnboundedSender<ReqId>,
@@ -136,11 +138,17 @@ impl Cluster {
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
         fleet: crate::worker::WorkerRegistry,
     ) -> Result<Started, LoadError> {
+        // A program is named by its built-in name, or by its file's stem: the
+        // name keys what it publishes, so it holds no `/`.
+        let programs: Vec<(String, Vec<u8>)> = programs
+            .into_iter()
+            .map(|(spec, component)| (program_name(&spec), component))
+            .collect();
         let (cancels, cancelled) = mpsc::unbounded_channel();
         let (migrations, moves) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             tables: RwLock::default(),
-            scale: watch::Sender::new(Vec::new()),
+            scale: watch::Sender::new(None),
             waiting: Mutex::default(),
             refused: Mutex::default(),
             cancels,
@@ -212,9 +220,10 @@ impl Cluster {
         let _ = self.events.send(event);
     }
 
-    /// The scale table the policies installed (`install-scale`), whole.
+    /// The scale table the policies installed (`install-scale`), whole;
+    /// none while no program granted `scale` has written one.
     #[must_use]
-    pub fn scale_watch(&self) -> watch::Receiver<Vec<ScaleEntry>> {
+    pub fn scale_watch(&self) -> watch::Receiver<Option<Vec<ScaleEntry>>> {
         self.shared.scale.subscribe()
     }
 
@@ -428,6 +437,9 @@ fn run(
     handle: tokio::runtime::Handle,
 ) {
     let mut registry = Registry::default();
+    // The last arrival heard, owed to the gate until the rounds its calls'
+    // changes carry to the others have run too.
+    let mut owed: Option<u64> = None;
     loop {
         // What the last round's calls changed reaches the others now.
         let carried = std::mem::take(&mut registry.carried);
@@ -455,7 +467,7 @@ fn run(
         };
         let mut edges = Vec::new();
         let mut heard = None;
-        registry.exited.clear();
+        registry.forget_exited();
         for event in first.into_iter().chain(events.try_iter()) {
             if let Event::Arrived { seq, .. } = &event {
                 heard = heard.max(Some(*seq));
@@ -533,8 +545,13 @@ fn run(
             registry.replaced = false;
             replicate(&mut registry, &fleet, &handle);
         }
-        // Whether or not a call ran, the gate has nothing more to wait for.
-        if let Some(seq) = heard {
+        // A launch's gate opens once every program has heard it and what
+        // their calls about it changed has reached the others: a program
+        // reading another's placement then reads the one made for it.
+        owed = owed.max(heard);
+        if registry.carried.is_empty()
+            && let Some(seq) = owed.take()
+        {
             shared.heard.send_modify(|h| *h = (*h).max(seq));
         }
     }
@@ -550,40 +567,48 @@ fn withdraw(
 ) {
     {
         let mut tables = shared.tables.write().unwrap();
-        let before = placed_all(&tables);
         if manifest.grants("schedule") {
             tables.schedule = None;
         }
-        if manifest.grants("placement") {
-            tables.placement.clear();
+        let (placement, executors) = (manifest.grants("placement"), manifest.grants("executors"));
+        if placement || executors {
+            registry.replace_placement(&mut tables, author, |tables| {
+                if placement {
+                    tables.placement.clear();
+                }
+                if executors {
+                    tables.executors.clear();
+                }
+            });
         }
-        if manifest.grants("executors") {
-            tables.executors.clear();
-        }
-        let after = placed_all(&tables);
-        registry.carry_placements(author, &before, &after);
     }
     if manifest.grants("scale") {
         // No shape named: each keeps what it has.
-        shared.scale.send_replace(Vec::new());
+        shared.scale.send_replace(Some(Vec::new()));
     }
     if manifest.grants("replication") {
-        let before = replicated(&registry.replication);
-        registry.replication.clear();
-        registry.carry_replications(author, &before);
+        registry.replace_replication(author, Vec::new());
     }
+    let prefix = format!("{author}/");
     let gone: Vec<(Subject, String, Option<Value>)> = registry
         .said
         .values()
         .flat_map(|(subject, said)| {
             said.keys()
-                .filter_map(|key| key.strip_prefix(&format!("{author}/")))
+                .filter_map(|key| key.strip_prefix(&prefix))
                 .map(|name| (subject.clone(), name.to_string(), None))
                 .collect::<Vec<_>>()
         })
         .collect();
     registry.say(author, gone);
     shared.changed.notify_waiters();
+}
+
+fn program_name(spec: &str) -> String {
+    std::path::Path::new(spec)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map_or_else(|| spec.to_string(), str::to_string)
 }
 
 /// Asks each site the replication table names, and that does not hold its
@@ -650,57 +675,46 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit, author: &str)
             })
             .collect();
         shared.scale.send_if_modified(|table| {
-            let changed = *table != entries;
-            *table = entries;
+            let changed = table.as_ref() != Some(&entries);
+            *table = Some(entries);
             changed
         });
     }
     if let Some(replication) = commit.state.replication {
-        let before = replicated(&registry.replication);
-        registry.replication = replication;
-        registry.replaced = true;
-        registry.carry_replications(author, &before);
+        registry.replace_replication(author, replication);
     }
     registry.say(author, commit.publish);
     let mut changed = false;
     {
         let mut tables = shared.tables.write().unwrap();
-        let placing = commit.placement.is_some() || commit.executors.is_some();
-        let before = if placing {
-            placed_all(&tables)
-        } else {
-            HashMap::new()
-        };
         if let Some(schedule) = commit.schedule {
             tables.schedule = Some(schedule);
             changed = true;
         }
-        if let Some(executors) = commit.executors {
-            tables.executors = executors;
-        }
-        if let Some(placement) = commit.placement {
-            // A running process given another worker moves there.
-            for (id, entry) in &placement {
-                let Some(target) = entry.worker.as_deref() else {
-                    continue;
-                };
-                let Some(proc) = registry.procs.get(id) else {
-                    continue;
-                };
-                let Some(at) = proc.worker.as_deref() else {
-                    continue;
-                };
-                if at != target
-                    && let (Ok(req), Ok(worker)) = (id.parse::<u64>(), target.parse::<u64>())
-                {
-                    let _ = shared.migrations.send((ReqId(req), WorkerId(worker)));
-                }
+        // A running process given another worker moves there.
+        for (id, entry) in commit.placement.iter().flatten() {
+            let Some(target) = entry.worker.as_deref() else {
+                continue;
+            };
+            let Some(at) = registry.procs.get(id).and_then(|p| p.worker.as_deref()) else {
+                continue;
+            };
+            if at != target
+                && let (Ok(req), Ok(worker)) = (id.parse::<u64>(), target.parse::<u64>())
+            {
+                let _ = shared.migrations.send((ReqId(req), WorkerId(worker)));
             }
-            tables.placement = placement;
         }
-        if placing {
-            let after = placed_all(&tables);
-            registry.carry_placements(author, &before, &after);
+        if commit.placement.is_some() || commit.executors.is_some() {
+            let (placement, executors) = (commit.placement, commit.executors);
+            registry.replace_placement(&mut tables, author, |tables| {
+                if let Some(executors) = executors {
+                    tables.executors = executors;
+                }
+                if let Some(placement) = placement {
+                    tables.placement = placement;
+                }
+            });
         }
     }
     for (id, reason) in commit.terminate {
@@ -723,11 +737,21 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit, author: &str)
 
 /// A process's committed placement as another program reads it: its
 /// worker, its executors and its props.
-type Placed = (
-    Option<String>,
-    Vec<String>,
-    Vec<(String, Option<serde_json::Value>)>,
-);
+type Placed = (Option<String>, Vec<String>, Vec<(String, ValueKey)>);
+
+/// A value as it compares: its kind and its payload, a float by its bits,
+/// so a value is changed exactly when what a reader would read changed.
+type ValueKey = (u8, String);
+
+fn value_key(value: &Value) -> ValueKey {
+    match value {
+        Value::Boolean(b) => (0, b.to_string()),
+        Value::Int(i) => (1, i.to_string()),
+        Value::Float(f) => (2, f.to_bits().to_string()),
+        Value::Text(text) => (3, text.clone()),
+        Value::Json(text) => (4, text.clone()),
+    }
+}
 
 fn placed_all(tables: &Tables) -> HashMap<String, Placed> {
     let ids: BTreeSet<&String> = tables
@@ -742,7 +766,12 @@ fn placed_all(tables: &Tables) -> HashMap<String, Placed> {
                 placement.and_then(|p| p.worker.clone()),
                 tables.executors.get(id).cloned().unwrap_or_default(),
                 placement
-                    .map(|p| p.props.iter().map(|(n, v)| (n.clone(), json(v))).collect())
+                    .map(|p| {
+                        p.props
+                            .iter()
+                            .map(|(n, v)| (n.clone(), value_key(v)))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             );
             (id.clone(), placed)
@@ -975,6 +1004,8 @@ impl Registry {
             }
             Event::SessionClosed { id } => {
                 self.sessions.remove(&id);
+                self.said
+                    .remove(&subject_key(&Subject::Session(id.clone())));
                 edges.push(Edge::Closed(id));
             }
             Event::Workers(now) => {
@@ -985,6 +1016,38 @@ impl Registry {
                 self.workers = now;
             }
         }
+    }
+
+    /// The processes the last round's calls read as exited are gone, and
+    /// what programs published about them with them, without an edge.
+    fn forget_exited(&mut self) {
+        for id in std::mem::take(&mut self.exited).into_keys() {
+            self.said.remove(&subject_key(&Subject::Process(id)));
+        }
+    }
+
+    /// Changes the committed placement by `f`, and carries
+    /// `placement-changed`, caused by `author`, for each process whose
+    /// placement differs.
+    fn replace_placement(
+        &mut self,
+        tables: &mut Tables,
+        author: &str,
+        f: impl FnOnce(&mut Tables),
+    ) {
+        let before = placed_all(tables);
+        f(tables);
+        let after = placed_all(tables);
+        self.carry_placements(author, &before, &after);
+    }
+
+    /// Replaces the replication table, and carries `replication-changed`,
+    /// caused by `author`, for each group whose sites differ.
+    fn replace_replication(&mut self, author: &str, table: Vec<wit::Replicate>) {
+        let before = replicated(&self.replication);
+        self.replication = table;
+        self.replaced = true;
+        self.carry_replications(author, &before);
     }
 
     /// `placement-changed` for each process whose committed placement
@@ -1028,9 +1091,7 @@ impl Registry {
                 .said
                 .entry(key.clone())
                 .or_insert_with(|| (subject.clone(), BTreeMap::new()));
-            let was = entry.1.get(&full).and_then(json);
-            let now = value.as_ref().and_then(json);
-            if was == now {
+            if entry.1.get(&full).map(value_key) == value.as_ref().map(value_key) {
                 continue;
             }
             match value {
@@ -1649,17 +1710,19 @@ mod tests {
             .admit(&launch(1, ask.clone()), &granted.routing)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), scale.wait_for(|t| !t.is_empty()))
+        tokio::time::timeout(Duration::from_secs(5), scale.wait_for(Option::is_some))
             .await
             .expect("the scale table is installed")
             .unwrap();
         assert_eq!(
-            *scale.borrow(),
-            [ScaleEntry {
-                model: Some("m".into()),
-                engine: "cuda_native".into(),
-                workers: 2,
-            }]
+            scale.borrow().as_deref(),
+            Some(
+                &[ScaleEntry {
+                    model: Some("m".into()),
+                    engine: "cuda_native".into(),
+                    workers: 2,
+                }][..]
+            )
         );
 
         // test-route installs one too, and holds no `scale` grant.
@@ -1671,7 +1734,10 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(scale.borrow().is_empty(), "refused: not granted");
+        assert!(
+            scale.borrow().is_none(),
+            "refused, and a gateway granted no `scale` speaks for no size"
+        );
     }
 
     #[test]

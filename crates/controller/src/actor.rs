@@ -119,6 +119,7 @@ impl Actor {
         if let Some(worker) = self.cluster.workers.get_mut(&id) {
             worker.engine = info.engine;
             worker.launch = info.launch;
+            self.actuator.registered(worker);
         }
         self.cluster.worker_epoch += 1;
         self.cluster.gateway_epoch += 1;
@@ -163,22 +164,12 @@ impl Actor {
 
     fn replan_and_publish(&mut self) {
         let (topology, routing) = reassign(&self.cluster);
-        self.cache_neighbors(&topology);
         let _ = self.worker_tx.send(topology);
         let _ = self.gateway_tx.send(routing);
     }
 
     fn publish_worker_view(&mut self) {
         let (topology, _routing) = reassign(&self.cluster);
-        self.cache_neighbors(&topology);
         let _ = self.worker_tx.send(topology);
-    }
-
-    fn cache_neighbors(&mut self, topology: &Topology) {
-        for (id, peers) in &topology.peers {
-            if let Some(w) = self.cluster.workers.get_mut(id) {
-                w.neighbors = peers.iter().map(|p| p.id).collect();
-            }
-        }
     }
 }

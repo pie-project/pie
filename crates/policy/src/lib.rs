@@ -235,14 +235,17 @@ pub mod cluster {
         fn on_dropped(&mut self, _residency: &Residency) {}
         fn on_tier_pressure(&mut self, _worker: &Id) {}
         fn on_link_changed(&mut self, _link: &Id) {}
-        /// Another program's call changed this process's committed
-        /// placement (attrs `placement/*`).
+        /// Another program changed this process's committed placement (a
+        /// call, or its death), since this program's last call (attrs
+        /// `placement/*`).
         fn on_placement_changed(&mut self, _process: &Id) {}
-        /// Another program's call changed this group's committed
-        /// replication (attr `replication/sites`).
+        /// Another program changed this group's committed replication (a
+        /// call, or its death), since this program's last call (attr
+        /// `replication/sites`).
         fn on_replication_changed(&mut self, _group: &Id) {}
         /// Another program published or withdrew a value about this subject
-        /// (attrs `published/<program>/<name>`).
+        /// (a call, or its death), since this program's last call (attrs
+        /// `published/<program>/<name>`).
         fn on_published(&mut self, _subject: &Subject) {}
         fn on_timer(&mut self) {}
 

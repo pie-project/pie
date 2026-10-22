@@ -62,7 +62,6 @@ impl ControlLink for ControlClient {
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
         let (tx, rx) = watch::channel(Neighbors {
             epoch: 0,
-            peers: Vec::new(),
             gateways: Vec::new(),
         });
         tokio::spawn(watch_neighbors_loop(self.clone(), id, tx));
@@ -159,7 +158,6 @@ impl ControlLink for Controller {
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
         let (tx, rx) = watch::channel(Neighbors {
             epoch: 0,
-            peers: Vec::new(),
             gateways: Vec::new(),
         });
         let control = self.clone();
@@ -388,7 +386,6 @@ pub fn spawn_control_tasks<C: ControlLink>(
         loop {
             tracing::debug!(
                 worker = %worker_id,
-                peers = last.peers.len(),
                 gateways = last.gateways.len(),
                 epoch = last.epoch,
                 "neighbor view updated"
