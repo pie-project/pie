@@ -260,7 +260,12 @@ pub const CODEGEN: &str = "hip";
 /// rows, so a 2K prompt padded to 4096 costs a second prompt, while buckets
 /// this tall are few.
 #[must_use]
-pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32, fine_steps: u32) -> Vec<u32> {
+pub(crate) fn default_lattice(
+    max_tokens: u32,
+    steps: u32,
+    fine_from: u32,
+    fine_steps: u32,
+) -> Vec<u32> {
     let steps = steps.max(1);
     let mut lattice: Vec<u32> = Vec::new();
     let push = |point: f64, lattice: &mut Vec<u32>| -> bool {
@@ -315,12 +320,16 @@ pub(crate) fn lattice(
 /// profile states them.
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 
-fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+/// The load's budgets for `trace`: its logit readouts sized to what the
+/// trace drafts, not the general 16 a lane, so a vocab-wide head carves only
+/// the rows a fire can read out.
+fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
         max_adapters: budgets.max_adapters,
+        readouts_per_lane: poem_compiler::arena::readouts_per_lane(trace),
     }
 }
 
@@ -513,11 +522,12 @@ impl Engine for Cuda {
 
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);
+        let budget = bake_budgets(&budgets, &trace);
         let mut shell = Shell::load(Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
-            budget: bake_budgets(&budgets),
+            budget,
             patches,
             voxels,
             page_size: budgets.page_size,
