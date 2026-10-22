@@ -1821,7 +1821,7 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
-        if crate::diag::on().fire_timeline
+        if (true || crate::diag::on().fire_timeline)
             && waited.is_ok()
             && let Some(lines) = self.timeline.land(
                 (flight.rows, flight.dispatches),
