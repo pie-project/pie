@@ -12,7 +12,9 @@ device = "NVIDIA A100 80GB PCIe"
 # 16-128 request decode 2.3-6x on Qwen3-30B-A3B and Gemma 4, whose
 # tiled GEMM waits for 12 routes an expert);
 # MXFP4 selects of 17 routes or more on the register-dequant MMA (fewer stay
-# on the per-route kernel, which streams a decode's bank faster); Qwen3.5's
+# on the per-route kernel, which streams a decode's bank faster) whatever
+# their experts average (the L40S's grouped wmma below 33 cost gpt-oss-20b
+# and -120b 17% of a 256-request decode here); Qwen3.5's
 # gated delta on the fused scan; DeepSeek-V4.1's bounded replay, as B200's.
 [kernel]
 gemm.fp8_gemv_until = 2
@@ -44,6 +46,7 @@ mla.expanded_from = 256
 attn_res.fused_norm = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
+moe.mxfp4_mma_per_from = 0
 moe.mxfp4_select_lean = true
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
@@ -93,6 +96,7 @@ measured = [
   "kernel.sdpa.selected_mma",
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
+  "kernel.moe.mxfp4_mma_per_from",
   "kernel.moe.mxfp4_select_lean",
   "kernel.moe.nvfp4_mma_from",
   "kernel.moe.nvfp4_mma_until",
