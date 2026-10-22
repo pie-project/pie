@@ -425,6 +425,10 @@ def layout(id, deploy):
     # Ternary-Bonsai's token embedding is gathered whole, which no ternary
     # kernel does: it is served decoded.
     embed = weight("embed", [d.vocab, hidden], dense if bonsai else table)
+    # A tied head reads the embedding: split by vocab, each rank's lm_head
+    # streams its share of the rows, as an untied head's columns do.
+    if d.tied and not bonsai:
+        embed = embed.packed([d.vocab])
     head = None
     if not d.tied:
         head = weight("lm_head", [d.vocab, hidden], proj if table == w else table).columns()
