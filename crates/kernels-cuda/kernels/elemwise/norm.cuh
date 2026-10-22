@@ -326,70 +326,6 @@ __global__ void rmsnorm_grouped(
     }
 }
 
-template <int BLOCK, bool WEIGHT_PLUS_ONE, bool EMIT_FP16 = false>
-__global__ void rmsnorm_vec8(
-    const bf16* __restrict__ x,
-    const bf16* __restrict__ weight,
-    bf16* __restrict__ y,
-
-    f16* __restrict__ y_fp16,
-    int hidden,
-    int x_row_stride,
-    int y_row_stride,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int nvec = hidden / 8;
-
-    const float4* xr =
-        reinterpret_cast<const float4*>(x + static_cast<long long>(row) * x_row_stride);
-    float4* yr =
-        reinterpret_cast<float4*>(y + static_cast<long long>(row) * y_row_stride);
-    const float4* wr = reinterpret_cast<const float4*>(weight);
-
-    float local = 0.f;
-    for (int i = tid; i < nvec; i += BLOCK) {
-        float4 v = xr[i];
-        const bf16x2* h = reinterpret_cast<const bf16x2*>(&v);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 f = bf16x2_to_f32(h[j]);
-            local += f.x * f.x + f.y * f.y;
-        }
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
-
-    for (int i = tid; i < nvec; i += BLOCK) {
-        float4 v = xr[i];
-        float4 g = wr[i];
-        float4 o;
-        const bf16x2* hv = reinterpret_cast<const bf16x2*>(&v);
-        const bf16x2* hg = reinterpret_cast<const bf16x2*>(&g);
-        bf16x2* ho = reinterpret_cast<bf16x2*>(&o);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 a = bf16x2_to_f32(hv[j]);
-            float2 b = bf16x2_to_f32(hg[j]);
-            if constexpr (WEIGHT_PLUS_ONE) { b.x += 1.f; b.y += 1.f; }
-            ho[j] = f32_to_bf16x2(a.x * inv_rms * b.x,
-                                  a.y * inv_rms * b.y);
-        }
-        yr[i] = o;
-        if constexpr (EMIT_FP16) {
-
-            const bf16* ob = reinterpret_cast<const bf16*>(&o);
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                y_fp16[i * 8 + j] = f32_to_f16(bf16_to_f32(ob[j]));
-            }
-        }
-    }
-}
-
 template <class T, int BLOCK, bool WEIGHT_PLUS_ONE>
 __global__ void residual_add_rmsnorm(
     const T* __restrict__ x,
@@ -1417,16 +1353,6 @@ __global__ void standardize(
                       * Elem<T>::to_f32(scale[d]);
         row[d] = Elem<T>::from_f32(v);
     }
-}
-
-template <class T>
-__global__ void add_bias_strided(
-    T* __restrict__ out,
-    const T* __restrict__ bias,
-    int dim,
-    int stride)
-{
-    add_bias_row<T>(out + static_cast<long long>(blockIdx.x) * stride, bias, dim);
 }
 
 constexpr int kMaxBlocks = 32;

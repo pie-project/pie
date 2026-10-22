@@ -149,37 +149,6 @@ __global__ void gather_width_concat(
 }
 
 template <class T>
-__global__ void deinterleave_rows(
-    const T* __restrict__ fused,
-    T* __restrict__       gate_out,
-    T* __restrict__       up_out,
-    int H)
-{
-    const int row = blockIdx.x;
-    const T* gate_src = fused + (2 * row    ) * H;
-    const T* up_src   = fused + (2 * row + 1) * H;
-    T* gate_dst = gate_out + row * H;
-    T* up_dst   = up_out   + row * H;
-    for (int j = threadIdx.x; j < H; j += blockDim.x) {
-        gate_dst[j] = gate_src[j];
-        up_dst[j]   = up_src[j];
-    }
-}
-
-template <class T>
-__global__ void deinterleave_vec(
-    const T* __restrict__ fused,
-    T* __restrict__       gate_out,
-    T* __restrict__       up_out,
-    int I)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= I) return;
-    gate_out[i] = fused[2 * i];
-    up_out[i]   = fused[2 * i + 1];
-}
-
-template <class T>
 __global__ void split_q_gate(
     const T* __restrict__ packed,
     T* __restrict__ q_out,
@@ -228,41 +197,6 @@ __global__ void split_q_gate_vec8(
     *reinterpret_cast<uint4*>(q_out + u * head_dim + c * 8) = *reinterpret_cast<const uint4*>(row);
     *reinterpret_cast<uint4*>(gate_out + u * head_dim + c * 8) =
         *reinterpret_cast<const uint4*>(row + head_dim);
-}
-
-template <class T>
-__global__ void concat_rows(
-    const T* __restrict__ left,
-    const T* __restrict__ right,
-    T* __restrict__ out,
-    int left_dim, int right_dim)
-{
-    const int n = blockIdx.x;
-    const int total_dim = left_dim + right_dim;
-    const T* l = left + (long long)n * left_dim;
-    const T* r = right + (long long)n * right_dim;
-    T* o = out + (long long)n * total_dim;
-    for (int i = threadIdx.x; i < total_dim; i += blockDim.x) {
-        o[i] = (i < left_dim) ? l[i] : r[i - left_dim];
-    }
-}
-
-template <class T>
-__global__ void split_gdn_ba(
-    const T* __restrict__ ba,
-    T* __restrict__ b_out,
-    T* __restrict__ a_out,
-    int v_h)
-{
-    const int n = blockIdx.x;
-    const int tid = threadIdx.x;
-    const T* ba_row = ba + (long long)n * (2 * v_h);
-    T* b_row = b_out + (long long)n * v_h;
-    T* a_row = a_out + (long long)n * v_h;
-    for (int i = tid; i < v_h; i += blockDim.x) {
-        b_row[i] = ba_row[i];
-        a_row[i] = ba_row[v_h + i];
-    }
 }
 
 template <class T>
@@ -339,26 +273,6 @@ __global__ void select(
     const T* src = table + (long long)row * stride + offset;
     T* dst = out + (long long)row * width;
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
-template <class T>
-__global__ void repeat_interleave_heads(
-    const T* __restrict__ in,
-    T* __restrict__ out,
-    int N, int kv_heads, int q_heads, int head_dim)
-{
-    const int n = blockIdx.x;
-    const int qh = blockIdx.y;
-    if (n >= N || qh >= q_heads) return;
-    const int repeat = q_heads / kv_heads;
-    const int kh = qh / repeat;
-    const T* src =
-        in + ((long long)n * kv_heads + kh) * head_dim;
-    T* dst =
-        out + ((long long)n * q_heads + qh) * head_dim;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         dst[i] = src[i];
     }
 }
@@ -468,38 +382,6 @@ __global__ void split_qkv_padded_vec8(
             width = vw;
         }
         dst[h * d8 + c] = c * 8 < width ? src_row[base8 + c] : make_uint4(0, 0, 0, 0);
-    }
-}
-
-template <class T>
-__global__ void split_qkv_devwin(
-    const T* __restrict__ src,
-    T* __restrict__ q_out,
-    T* __restrict__ k_out,
-    T* __restrict__ v_out,
-    const u32* __restrict__ devwin,
-    i32 q_dim, i32 kv_dim)
-{
-
-    const int n = static_cast<int>(blockIdx.x);
-
-    const int w0 = static_cast<int>(devwin[0]);
-    const int w1 = static_cast<int>(devwin[1]);
-    if (n < w0 || n >= w0 + w1) return;
-    const int stride = q_dim + 2 * kv_dim;
-    const T* src_row = src + static_cast<long long>(n) * stride;
-    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < q_dim;
-         j += static_cast<int>(blockDim.x * gridDim.y)) {
-        q_out[static_cast<long long>(n) * q_dim + j] = src_row[j];
-    }
-    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < kv_dim;
-         j += static_cast<int>(blockDim.x * gridDim.y)) {
-        k_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + j];
-    }
-    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < kv_dim;
-         j += static_cast<int>(blockDim.x * gridDim.y)) {
-        v_out[static_cast<long long>(n) * kv_dim + j] =
-            src_row[q_dim + kv_dim + j];
     }
 }
 

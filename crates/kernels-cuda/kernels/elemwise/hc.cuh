@@ -865,65 +865,6 @@ __global__ void __launch_bounds__(BLOCK) hc_rmsnorm_f32_vec8(
     }
 }
 
-template <class T>
-__global__ void attn_sink_correction(
-    T* __restrict__ out,
-    const float* __restrict__ lse,
-    const float* __restrict__ sink,
-    int num_heads,
-    int head_dim)
-{
-    const int n = blockIdx.x;
-    const int h = blockIdx.y;
-    const float s = 1.0f / (1.0f + expf(sink[h] - lse[n * num_heads + h]));
-    T* row = out + (static_cast<long long>(n) * num_heads + h) * head_dim;
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        row[d] = Elem<T>::from_f32(Elem<T>::to_f32(row[d]) * s);
-    }
-}
-
-template <class T>
-__global__ void per_head_rmsnorm(
-    T* __restrict__ q,
-    int head_dim,
-    float eps)
-{
-
-    const int n = blockIdx.x;
-    const int h = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int num_heads = gridDim.y;
-
-    T* row = q + (static_cast<long long>(n) * num_heads + h) * head_dim;
-
-    float local_sum = 0.f;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        const float v = Elem<T>::to_f32(row[d]);
-        local_sum += v * v;
-    }
-    for (int off = 16; off > 0; off >>= 1)
-        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);
-
-    __shared__ float scale;
-    __shared__ float reduce_buf[32];
-    if ((tid & 31) == 0) reduce_buf[tid >> 5] = local_sum;
-    __syncthreads();
-    if (tid < 32) {
-        float v = (tid < (blockDim.x + 31) / 32) ? reduce_buf[tid] : 0.f;
-        for (int off = 16; off > 0; off >>= 1)
-            v += __shfl_down_sync(0xFFFFFFFF, v, off);
-        if (tid == 0) scale = rsqrtf(v / static_cast<float>(head_dim) + eps);
-    }
-    __syncthreads();
-
-    const float s = scale;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        row[d] = Elem<T>::from_f32(Elem<T>::to_f32(row[d]) * s);
-    }
-}
-
-
-
 template <class T, int BLOCK = 256>
 __global__ void hc_mix(
     const T* __restrict__ gates,

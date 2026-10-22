@@ -123,6 +123,7 @@ jobs:
           python3 scripts/workflow-ref-audit.py
           python3 scripts/cfg-feature-audit.py
           python3 scripts/metal-kernel-audit.py --one-way
+          python3 scripts/kernel-lint.py
 
   pie-no-engine:
     name: "pie: no engine (${{ matrix.os }})"

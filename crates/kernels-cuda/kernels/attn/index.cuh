@@ -332,68 +332,6 @@ __global__ void index_q_rope_pairs(
     }
 }
 
-template <class T>
-__global__ void index_topk_mask(
-    const T* __restrict__ idx_q,
-    const T* __restrict__ idx_k,
-    const T* __restrict__ idx_w,
-    u8* __restrict__ mask,
-    i32 N, i32 H, i32 D, i32 topk)
-{
-    const int i = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    u8* mrow = mask + static_cast<long long>(i) * N;
-    const int nkeys = i + 1;
-
-    for (int j = nkeys + tid; j < N; j += kBlock) mrow[j] = 0;
-
-    if (nkeys <= topk) {
-        for (int j = tid; j < nkeys; j += kBlock) mrow[j] = 1;
-        return;
-    }
-
-    extern __shared__ float logit[];
-    const T* qi = idx_q + static_cast<long long>(i) * H * D;
-    const T* wi = idx_w + static_cast<long long>(i) * H;
-    for (int j = tid; j < nkeys; j += kBlock) {
-        const T* kj = idx_k + static_cast<long long>(j) * D;
-        float acc = 0.f;
-        for (int h = 0; h < H; ++h) {
-            const T* qh = qi + static_cast<long long>(h) * D;
-            float dot = 0.f;
-            for (int d = 0; d < D; ++d) dot += Elem<T>::to_f32(qh[d]) * Elem<T>::to_f32(kj[d]);
-            acc += fmaxf(dot, 0.f) * Elem<T>::to_f32(wi[h]);
-        }
-        logit[j] = acc;
-    }
-    __syncthreads();
-
-    __shared__ float lo_s, hi_s;
-    if (tid == 0) {
-        float lo = pos_inf(), hi = -pos_inf();
-        for (int j = 0; j < nkeys; ++j) { lo = fminf(lo, logit[j]); hi = fmaxf(hi, logit[j]); }
-        lo_s = lo; hi_s = hi;
-    }
-    __syncthreads();
-    float lo = lo_s, hi = hi_s;
-    __shared__ int cnt_s;
-    float thr = hi;
-    for (int it = 0; it < 40; ++it) {
-        const float mid = 0.5f * (lo + hi);
-        if (tid == 0) cnt_s = 0;
-        __syncthreads();
-        int c = 0;
-        for (int j = tid; j < nkeys; j += kBlock) if (logit[j] >= mid) c++;
-        atomicAdd(&cnt_s, c);
-        __syncthreads();
-        const int cnt = cnt_s;
-        if (cnt > topk) lo = mid; else hi = mid;
-        __syncthreads();
-        thr = hi;
-    }
-    for (int j = tid; j < nkeys; j += kBlock) mrow[j] = (logit[j] >= thr) ? 1 : 0;
-}
-
 // The `topk` best of a row's `nkeys` scores, ascending, `-1` past the end:
 // the threshold the counts bisect to, then the scores at or above it in order.
 __device__ __forceinline__ void select_top(const float* __restrict__ frow, int nkeys, int topk,

@@ -58,15 +58,6 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     let arch = job.arch;
     let headers = job.headers;
     admits(unit, job.floor)?;
-    if job.wanted.is_empty() {
-        return Err(Fault::Compile {
-            unit,
-            log: format!(
-                "`{unit}` was asked for a cubin with no instantiations in it, which would \
-                 be cached under this architecture and satisfy no fire"
-            ),
-        });
-    }
     let options = options(arch, job.options)?;
 
     let root = CString::new(job.source.clone()).map_err(|_| Fault::Compile {
@@ -386,6 +377,36 @@ mod tests {
             eprintln!("skipped: libnvrtc is not loadable on this box");
         }
         present
+    }
+
+    /// Every unit under `kernels/` lowers with no instantiation asked of it:
+    /// its text parses and its non-template code compiles. A template's body
+    /// is only checked where something instantiates it.
+    #[test]
+    fn every_unit_lowers() {
+        if !nvrtc_is_here() {
+            return;
+        }
+        let mut failed = Vec::new();
+        for header in crate::source::LIBRARY {
+            let Some(root) = Root::of(header.name) else {
+                continue;
+            };
+            let arch = if root.specific { "sm_100a" } else { "sm_90" };
+            let built = compile_text(&Job {
+                name: root.name,
+                source: root.text.to_owned(),
+                arch,
+                options: root.options,
+                headers: root.header_set(),
+                floor: Toolchain::ANY,
+                wanted: &[],
+            });
+            if let Err(why) = built {
+                failed.push(format!("{} at {arch}: {why}", header.name));
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n\n"));
     }
 
     #[test]
