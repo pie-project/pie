@@ -192,6 +192,7 @@ constant constexpr uint kMixGates = kGroupRoutes;
   threadgroup int staged[kGroupRoutes];
   threadgroup atomic_uint present[kGroupExperts / 32];
   threadgroup int expert_of, count_of, token_of[8];
+  threadgroup uint hits[32];
   const uint n = min(tokens * top_k, kGroupRoutes), tile = at.z;
   for (uint w = lid; w < kGroupExperts / 32; w += threads)
     atomic_store_explicit(&present[w], 0u, memory_order_relaxed);
@@ -226,22 +227,29 @@ constant constexpr uint kMixGates = kGroupRoutes;
     return;
   const int expert = expert_of;
   const bool first = group.y == 0;
-  if (lid == 0) {
-    uint slot = 0;
-    if (expert == int(experts)) {
-      for (; slot < tokens; ++slot)
-        token_of[slot] = int(slot);
-    } else {
-      for (uint r = 0; r < n && slot < 8; ++r)
-        if (staged[r] == expert) {
-          token_of[slot] = int(r / top_k);
-          if (first)
-            inv[r] = int(tile * 8 + slot);
-          ++slot;
-        }
-    }
-    for (; slot < 8; ++slot)
-      token_of[slot] = -1;
+  // Route `lid`'s slot in its expert's tile: the expert's routes before it
+  // (a token routes to an expert at most once, so at most eight), counted
+  // across the simdgroups; the threadgroup's threads cover every route.
+  const bool hit = expert != int(experts) && lid < n && staged[lid] == expert;
+  const uint before = simd_prefix_exclusive_sum(uint(hit)), own = simd_sum(uint(hit));
+  if (lane == 0)
+    hits[simd] = own;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint held = 0, slot_of = before;
+  for (uint s = 0; s < threads / 32; ++s) {
+    slot_of += s < simd ? hits[s] : 0;
+    held += hits[s];
+  }
+  if (hit && slot_of < 8) {
+    token_of[slot_of] = int(lid / top_k);
+    if (first)
+      inv[lid] = int(tile * 8 + slot_of);
+  }
+  if (lid < 8) {
+    if (expert == int(experts))
+      token_of[lid] = lid < tokens ? int(lid) : -1;
+    else if (lid >= held)
+      token_of[lid] = -1;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (first && lid < 8) {
