@@ -491,9 +491,7 @@ pub fn matmul_select(
             routes.rows,
             fan.route_count,
         ) {
-            // A tcgen05 launch that fails falls back to the arm below, said
-            // once a process.
-            match select_tc5(
+            return select_tc5(
                 ctx,
                 OP,
                 x,
@@ -502,10 +500,7 @@ pub fn matmul_select(
                 routes,
                 y,
                 crate::linear::tc5::Epilogue::STORE,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(why) => tc5_fell_back(OP, &why),
-            }
+            );
         }
         // Where there are no tcgen05 GEMMs, a batch whose experts fill their
         // tiles (past 12 routes an expert, `BF16_GEMM_FROM` routes a fire) on
@@ -990,16 +985,6 @@ const fn fp8_mma_smem(nb: u32) -> u32 {
     3 * (128 + 8 * nb) * (128 + 16)
 }
 
-/// Says, once a process, that a select the tcgen05 GEMM was to take fell
-/// back to the GEMV, and why: a silent fallback reads as a slow kernel.
-#[cfg(feature = "cuda")]
-fn tc5_fell_back(op: &'static str, why: &Error) {
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("kernels-cuda: `{op}` fell back from the tcgen05 grouped GEMM: {why}");
-    }
-}
-
 /// Whether a bf16 select runs on the grouped tcgen05 GEMM: a resident bank
 /// of `count` experts at widths its tiles take, from `kernel.moe.tc5_from`
 /// tokens or two routes an expert (fewer keep the one-launch GEMV, which
@@ -1224,8 +1209,7 @@ pub fn select_glu(
         && x.width > 0
         && x.width.is_multiple_of(32)
     {
-        // A launch that fails leaves the select and the GLU to run apart.
-        return Ok(select_mxfp4_mma(
+        select_mxfp4_mma(
             ctx,
             OP,
             x,
@@ -1238,8 +1222,8 @@ pub fn select_glu(
             Some(glu),
             None,
             false,
-        )
-        .is_ok());
+        )?;
+        return Ok(true);
     }
     // A narrow NVFP4 (W4A16) fire likewise, where the profile says.
     if let GluBank::Nvfp4 {
@@ -1249,7 +1233,7 @@ pub fn select_glu(
     } = bank
         && nvfp4_mma_worth(ctx, x, y, experts, &fan)
     {
-        return Ok(select_mxfp4_mma(
+        select_mxfp4_mma(
             ctx,
             OP,
             x,
@@ -1262,8 +1246,8 @@ pub fn select_glu(
             Some(glu),
             Some(tensor_scales),
             false,
-        )
-        .is_ok());
+        )?;
+        return Ok(true);
     }
     let Some((w, rows, bias, weight_scale, dtype)) = bank_operand(x, bank, 2 * y.width) else {
         return Ok(false);
@@ -1279,8 +1263,7 @@ pub fn select_glu(
     ) {
         return Ok(false);
     }
-    // A tcgen05 launch that fails leaves the select and the GLU to run apart.
-    Ok(select_tc5(
+    select_tc5(
         ctx,
         OP,
         x,
@@ -1294,8 +1277,8 @@ pub fn select_glu(
             weight_scale,
             ..tc5::Epilogue::STORE
         },
-    )
-    .is_ok())
+    )?;
+    Ok(true)
 }
 
 /// A routed MLP's operands: the activations, the gate-up and down banks
@@ -1455,8 +1438,8 @@ pub fn experts(
         )?;
         act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, norm, y)
     };
-    // A tcgen05 launch that fails leaves the four to run apart.
-    Ok(run().is_ok())
+    run()?;
+    Ok(true)
 }
 
 /// The most routes an expert on average whose W4A4 legs run swapped
@@ -1682,8 +1665,8 @@ fn experts_w4a4(
         )?;
         act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, norm, y)
     };
-    // A tcgen05 launch that fails leaves the four to run apart.
-    Ok(run().is_ok())
+    run()?;
+    Ok(true)
 }
 
 /// How a W4A8 routed MLP's routes fold into a token's row.
@@ -1952,8 +1935,8 @@ fn experts_w4a8_as(ctx: &Ctx, m: RoutedMlp, y: &mut Tensor, sum: W4a8Sum) -> Res
             }
         }
     };
-    // A tcgen05 launch that fails leaves the four to run apart.
-    Ok(run().is_ok())
+    run()?;
+    Ok(true)
 }
 
 #[cfg(feature = "cuda")]
@@ -3187,15 +3170,11 @@ fn matmul_select_mxfp4(
         "the expert bias rides the activation's dtype"
     );
     let fan = selected(op, x, routes, y)?;
-    // A launch that fails falls back to the arms below.
     #[cfg(feature = "cuda")]
-    if mxfp4_mma_worth(ctx, x, y, seat, &fan, codes.rows)
-        && select_mxfp4_mma(
+    if mxfp4_mma_worth(ctx, x, y, seat, &fan, codes.rows) {
+        return select_mxfp4_mma(
             ctx, op, x, codes, scales, bias, routes, y, &fan, None, None, false,
-        )
-        .is_ok()
-    {
-        return Ok(());
+        );
     }
     #[cfg(feature = "cuda")]
     if !seat.streams()
@@ -3210,8 +3189,7 @@ fn matmul_select_mxfp4(
         )
     {
         use crate::linear::tc5;
-        // A tcgen05 launch that fails falls back to the arm below.
-        if select_tc5(
+        return select_tc5(
             ctx,
             op,
             x,
@@ -3223,11 +3201,7 @@ fn matmul_select_mxfp4(
                 bias: bias.map_or(0, |b| b.ptr),
                 ..tc5::Epilogue::STORE
             },
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
+        );
     }
     if x.width == 0 || !x.width.is_multiple_of(MXFP4_BLOCK) {
         return Err(refuse(
@@ -3403,8 +3377,7 @@ fn matmul_select_mlxu4(
         )
     {
         use crate::linear::tc5;
-        // A tcgen05 launch that fails falls back to the arm below.
-        if select_tc5(
+        return select_tc5(
             ctx,
             op,
             x,
@@ -3413,11 +3386,7 @@ fn matmul_select_mlxu4(
             routes,
             y,
             tc5::Epilogue::STORE,
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
+        );
     }
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;

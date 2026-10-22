@@ -251,7 +251,7 @@ fn write_kv_bf16(
 
     if pool.has_envelopes && !hnd && k.rows > 0 && native_bf16(pool) {
         let num_requests = lanes_of(op, indptr)?;
-        let _ = envelope_update_appended(
+        envelope_update_appended(
             ctx,
             op,
             pool,
@@ -260,7 +260,7 @@ fn write_kv_bf16(
             max_touched_pages(stated(op, k.rows)?, num_requests, pool.page_size),
             kv_heads,
             head_dim,
-        );
+        )?;
     }
     Ok(())
 }

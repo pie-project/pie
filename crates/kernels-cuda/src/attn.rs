@@ -198,13 +198,13 @@ fn fa2_decode_with(
         ));
     }
 
-    let _ = kv::dequant_active(
+    kv::dequant_active(
         ctx,
         op,
         pool,
         stated(op, plan.shape.num_kv_heads)?,
         stated(op, head_dim)?,
-    );
+    )?;
 
     let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
     bufs.qo_indptr = q.indptr.ptr;
@@ -328,13 +328,13 @@ fn fa2_prefill_with(
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
 
-    let _ = kv::dequant_active(
+    kv::dequant_active(
         ctx,
         op,
         pool,
         stated(op, plan.shape.num_kv_heads)?,
         stated(op, head_dim)?,
-    );
+    )?;
 
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
     // The tcgen05 kernel lands the log-sum-exp too, and bf16 sinks in its
