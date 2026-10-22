@@ -664,6 +664,7 @@ mod tests {
                         ssm_gdn_fused_scan: false,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
+                        mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                         ..tuning
                     },
                     defaults,
@@ -978,6 +979,7 @@ mod tests {
                     ssm_gdn_fused_scan: false,
                     mxfp4_mma_from: defaults.mxfp4_mma_from,
                     mxfp4_mma_until: defaults.mxfp4_mma_until,
+                    mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
