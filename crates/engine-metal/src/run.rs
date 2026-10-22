@@ -814,8 +814,8 @@ impl<'c> Run<'c> {
     /// the fold (`fold_at`, landing `folded`) are, in turn, the shared expert
     /// (a fused MLP of `x`), its gate's matmul of `x` (a bank of one column)
     /// and their sigmoid-gated add, which alone reads the fold, the expert and
-    /// the gate; all of them in one region whose rows run in one pass, so the
-    /// walk runs them in turn with nothing between.
+    /// the gate; the walk runs them in turn with nothing between
+    /// ([`Run::walks_in_turn`]).
     fn shared_tile(
         &self,
         x: ValueId,
@@ -827,17 +827,7 @@ impl<'c> Run<'c> {
     ) -> Option<SharedTile> {
         use kernels_metal::linear::moe;
         use poem_ir::{Fused, Linear, Operation};
-        let (region, nodes) = self
-            .regions?
-            .iter()
-            .enumerate()
-            .find(|(_, r)| r.nodes.contains(&fold_at))?;
-        let region = u32::try_from(region).ok()?;
-        if !nodes.nodes.contains(&(fold_at + 3)) || self.windows.runs(region) != 1 {
-            return None;
-        }
-        let window = self.windows.at(region, 0);
-        if window.gathered.is_some() || window.passes > 1 {
+        if !self.walks_in_turn(fold_at, fold_at + 3) {
             return None;
         }
         let at = |n: u32| {
@@ -904,6 +894,44 @@ impl<'c> Run<'c> {
             gate_bank,
             out: *out,
         })
+    }
+
+    /// Whether the walk runs the nodes `first..=last` in turn, each once over
+    /// the same rows, with nothing between: their regions (a layer's fold
+    /// sits in the region of its routed passes, its shared expert in the
+    /// next) launch unconditionally, each in one run over one window of the
+    /// same rows, in one pass.
+    fn walks_in_turn(&self, first: u32, last: u32) -> bool {
+        let Some(regions) = self.regions else {
+            return false;
+        };
+        let Some(from) = regions.iter().position(|r| r.nodes.contains(&first)) else {
+            return false;
+        };
+        let mut rows = None;
+        for (at, region) in regions.iter().enumerate().skip(from) {
+            let Ok(index) = u32::try_from(at) else {
+                return false;
+            };
+            if region.lowering != poem_compiler::Lowering::AlwaysLaunch
+                || region.phase != regions[from].phase
+                || self.windows.runs(index) != 1
+            {
+                return false;
+            }
+            let window = self.windows.at(index, 0);
+            if window.gathered.is_some()
+                || window.passes > 1
+                || window.span.rows == 0
+                || *rows.get_or_insert(window.span.rows) != window.span.rows
+            {
+                return false;
+            }
+            if region.nodes.contains(&last) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether the SwiGLU of `packed` into `hidden` is the register chain's,
