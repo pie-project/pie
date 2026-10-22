@@ -1302,6 +1302,70 @@ pub fn sigmoid_gate_add(
     )
 }
 
+/// [`weighted_sum`] into `folded` and [`sigmoid_gate_add`] of it into `y`, in
+/// one launch: each row's routes summed under their weights and rounded as the
+/// fold lands them, then the shared expert under its gate added as the gate add
+/// adds it, bit for bit. A thread walks one column down the rows, so `y` may
+/// be the routed rows' own bytes from their first row (row `r` lands on route
+/// row `r`, which no later row reads) or stand apart from them; `folded`
+/// stands apart from them. Both stand apart from the weights and the gate,
+/// and each may be the other or the shared rows, which a thread reads before
+/// it writes.
+pub fn weighted_sum_gate_add(
+    ctx: &Ctx<'_>,
+    routed: Tensor,
+    weights: Tensor,
+    folded: Tensor,
+    shared: Tensor,
+    gate: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_sigmoid_gate_add";
+    dtype_dispatch!(OP, routed.dtype, { Bf16 => () });
+    debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
+    nonzero(OP, "the token rows this fold lands on", y.rows)?;
+    if !routed.rows.is_multiple_of(y.rows) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the routed rectangle's {} rows do not fold into the {} token rows",
+                routed.rows, y.rows
+            ),
+        ));
+    }
+    let top_k = routed.rows / y.rows;
+    debug_assert!(
+        routed.width == y.width
+            && shared.width == y.width
+            && shared.rows == y.rows
+            && folded.width == y.width
+            && folded.rows == y.rows,
+        "the routed and shared rows are the width the fold lands"
+    );
+    debug_assert!(
+        weights.rows == y.rows && weights.width == top_k,
+        "the weight plane is one weight per route"
+    );
+    debug_assert!(
+        gate.rows == y.rows && gate.width == 1,
+        "the gate is one scalar per row"
+    );
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "expert_shared_combine").apply(route_rows(OP, y.width, 1)?),
+        &[
+            routed.arg(),
+            weights.arg(),
+            folded.arg_mut(),
+            shared.arg(),
+            gate.arg(),
+            y.arg_mut(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, top_k)?.arg(),
+            y.rows.arg(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

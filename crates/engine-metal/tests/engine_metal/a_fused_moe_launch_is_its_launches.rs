@@ -1,6 +1,7 @@
 #![cfg(target_vendor = "apple")]
 //! A routed MLP's fused launches land their unfused launches' rows, bit for
-//! bit: the routed gate-up with its swiglu.
+//! bit: the routed gate-up with its swiglu, and the routes' fold with the
+//! gated shared expert's add.
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
@@ -109,6 +110,88 @@ fn the_routed_gate_up_with_its_swiglu_lands_both_launches_rows() {
         assert!(
             read(&hidden_own) == read(&hidden_one),
             "experts={experts} tokens={tokens}: the fused launch lands other swiglu rows"
+        );
+    }
+}
+
+#[test]
+fn the_fold_with_the_shared_experts_add_lands_both_launches_rows() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut b = Buffer::zeroed(&device, bytes.len().max(16) as u64).expect("a plane");
+        b.write(0, bytes).expect("write");
+        b
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("a handle");
+    let read = |b: &Buffer| handles.read(bind(b), b.bytes()).expect("read");
+    for (tokens, top_k, width) in [(8u32, 8u32, 2048u32), (1, 8, 2048), (5, 2, 300)] {
+        let pairs = tokens * top_k;
+        let routed = upload(&plane(u64::from(pairs * width), 0x44, 0.05));
+        let shared = upload(&plane(u64::from(tokens * width), 0x55, 0.05));
+        let gate = upload(&plane(u64::from(tokens), 0x66, 0.03));
+        let weights: Vec<u8> = (0..pairs)
+            .flat_map(|at| (f32::from(noise(u64::from(at) ^ 0x88)) / 997.0).to_le_bytes())
+            .collect();
+        let weights = upload(&weights);
+        let out = || upload(&vec![0x5a; (tokens * width * 2) as usize]);
+        let (folded, own, folded_one, one) = (out(), out(), out(), out());
+        let t = |b: &Buffer, rows: u32| Tensor::new(bind(b), rows, width, Dtype::Bf16);
+        let w = Tensor::new(bind(&weights), tokens, top_k, Dtype::F32);
+        let g = Tensor::new(bind(&gate), tokens, 1, Dtype::Bf16);
+        let frame = device.frame().expect("a frame");
+        let sink = Sink::new(&device, &frame, &pipelines, &handles);
+        moe::weighted_sum(&sink, t(&routed, pairs), w, t(&folded, tokens)).expect("the fold");
+        moe::sigmoid_gate_add(
+            &sink,
+            t(&folded, tokens),
+            t(&shared, tokens),
+            g,
+            t(&own, tokens),
+        )
+        .expect("the gate add");
+        moe::weighted_sum_gate_add(
+            &sink,
+            t(&routed, pairs),
+            w,
+            t(&folded_one, tokens),
+            t(&shared, tokens),
+            g,
+            t(&one, tokens),
+        )
+        .expect("the fused launch");
+        frame.commit().expect("the commit");
+        let own = read(&own);
+        assert!(own.chunks(2).any(|v| v != [0x5a, 0x5a]), "the add ran");
+        assert!(
+            own == read(&one),
+            "tokens={tokens} width={width}: the fused launch lands other rows"
+        );
+        assert!(
+            read(&folded) == read(&folded_one),
+            "tokens={tokens} width={width}: the fused launch lands other fold rows"
+        );
+        // Over the routed rows' own bytes, as the planner may lay the add's.
+        let frame = device.frame().expect("a frame");
+        let sink = Sink::new(&device, &frame, &pipelines, &handles);
+        moe::weighted_sum_gate_add(
+            &sink,
+            t(&routed, pairs),
+            w,
+            t(&folded_one, tokens),
+            t(&shared, tokens),
+            g,
+            t(&routed, tokens),
+        )
+        .expect("the fused launch in place");
+        frame.commit().expect("the commit");
+        let over = read(&routed);
+        assert!(
+            over[..own.len()] == own[..],
+            "tokens={tokens} width={width}: the fused launch over the routed rows lands other rows"
         );
     }
 }

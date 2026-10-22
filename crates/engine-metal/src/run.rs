@@ -197,10 +197,13 @@ pub struct Run<'c> {
 /// The values a segment launch landed at `rows` of region `region` ahead of
 /// the nodes that write them (a later matmul's output, a split's left half):
 /// each of those nodes, reached at the same place, has nothing left to do.
+/// A launch at a region's last node may land the first node's of the next
+/// (`through`, which is `region` otherwise).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Landed {
     ys: [Option<ValueId>; 3],
     region: u32,
+    through: u32,
     rows: Rows,
 }
 
@@ -425,6 +428,74 @@ impl<'c> Run<'c> {
             .iter()
             .filter(|&&v| self.resolvable(v))
             .all(|&v| span(v).is_some_and(|b| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1))
+    }
+
+    /// The gated add of the shared expert the trace places right after the
+    /// fold of `routed` under `weights` into `folded`, in the region the walk
+    /// is in or opening the next (the routed region ends at its fold), when
+    /// the fold is its only reader's routed rows and its region runs in one
+    /// pass: its shared rows, gate and output, and whether it opens the next
+    /// region, so one launch lands the fold and the add. The fold's rows and
+    /// the add's stand apart from the weights, the gate and the routed rows
+    /// (the add's may lie over the routed rows from their first, which the
+    /// launch walks past), and may be each other's or the shared rows, which
+    /// a thread reads before it writes them.
+    pub(crate) fn fold_gate_add(
+        &self,
+        routed: ValueId,
+        weights: ValueId,
+        folded: ValueId,
+    ) -> Option<(ValueId, ValueId, ValueId, bool)> {
+        use poem_ir::{Linear, Operation};
+        let (nodes, one_pass) = self.region_nodes()?;
+        let add = match self.readers_of(folded) {
+            &[at] => at,
+            _ => return None,
+        };
+        let op = |at: u32| self.nodes.get(at as usize).map(|n| &n.op);
+        let Some(Operation::Linear(Linear::MoeSigmoidGateAdd {
+            routed: r,
+            shared,
+            gate,
+            y,
+        })) = op(add)
+        else {
+            return None;
+        };
+        let fold = add.checked_sub(1)?;
+        let adjacent = matches!(
+            op(fold),
+            Some(Operation::Linear(Linear::MoeWeightedSum { routed: a, weights: w, y: b }))
+                if *a == routed && *w == weights && *b == folded
+        );
+        let same_rows = |a: ValueId, b: ValueId| {
+            let (a, b) = (self.tensor(a), self.tensor(b));
+            a.rows == b.rows && a.width == b.width && self.address(a.buf) == self.address(b.buf)
+        };
+        let apart_or_same = |a: ValueId, b: ValueId| same_rows(a, b) || self.rows_apart(a, &[b]);
+        // The add's rows over the routed rows' first, of their width: the
+        // fused launch walks each column down the rows, past what it read.
+        let same_start = |a: ValueId, b: ValueId| {
+            let (a, b) = (self.tensor(a), self.tensor(b));
+            a.width == b.width && a.dtype == b.dtype && self.address(a.buf) == self.address(b.buf)
+        };
+        // The routed region ends at the fold, so the add may open the next.
+        let next = self
+            .regions
+            .and_then(|regions| regions.get(self.place.region.get() as usize + 1))
+            .is_some_and(|region| region.nodes.start == add);
+        (adjacent
+            && *r == folded
+            && one_pass
+            && nodes.contains(&fold)
+            && (nodes.contains(&add) || next)
+            && self.rows_apart(*y, &[weights, *gate])
+            && (self.rows_apart(*y, &[routed]) || same_start(*y, routed))
+            && self.rows_apart(folded, &[routed, weights, *gate])
+            && apart_or_same(*y, *shared)
+            && apart_or_same(folded, *shared)
+            && apart_or_same(*y, folded))
+        .then_some((*shared, *gate, *y, !nodes.contains(&add)))
     }
 
     /// The merge of the arms `value` is one of, when the merge's rows here are
@@ -1303,9 +1374,24 @@ impl<'c> Run<'c> {
     /// Records that a segment launch here landed `ys` ahead of the nodes that
     /// write them.
     pub(crate) fn land_ahead(&self, ys: [Option<ValueId>; 3]) {
+        let region = self.place.region.get();
         self.landed.set(Some(Landed {
             ys,
-            region: self.place.region.get(),
+            region,
+            through: region,
+            rows: self.rows_here(),
+        }));
+    }
+
+    /// [`Run::land_ahead`] of the output of the next region's first node, by
+    /// a launch at this region's last: that node finds it landed where it
+    /// reads the same rows.
+    pub(crate) fn land_ahead_next(&self, y: ValueId) {
+        let region = self.place.region.get();
+        self.landed.set(Some(Landed {
+            ys: [Some(y), None, None],
+            region,
+            through: region + 1,
             rows: self.rows_here(),
         }));
     }
@@ -1317,7 +1403,8 @@ impl<'c> Run<'c> {
         let Some(mut landed) = self.landed.get() else {
             return false;
         };
-        if landed.region != self.place.region.get() || landed.rows != self.rows_here() {
+        let region = self.place.region.get();
+        if !(landed.region..=landed.through).contains(&region) || landed.rows != self.rows_here() {
             self.landed.set(None);
             return false;
         }

@@ -1011,12 +1011,33 @@ impl Run<'_> {
                     top_k,
                     self.tensor(*y),
                 ),
-                None => linear::moe::weighted_sum(
-                    self.ctx(),
-                    self.tensor(*routed),
-                    self.tensor(*weights),
-                    self.tensor(*y),
-                ),
+                None => match self.fold_gate_add(*routed, *weights, *y) {
+                    // The gated add of the shared expert lands in the same
+                    // launch, and finds its rows landed.
+                    Some((shared, gate, out, next)) => {
+                        linear::moe::weighted_sum_gate_add(
+                            self.ctx(),
+                            self.tensor(*routed),
+                            self.tensor(*weights),
+                            self.tensor(*y),
+                            self.tensor(shared),
+                            self.tensor(gate),
+                            self.tensor(out),
+                        )?;
+                        if next {
+                            self.land_ahead_next(out);
+                        } else {
+                            self.land_ahead([Some(out), None, None]);
+                        }
+                        Ok(())
+                    }
+                    None => linear::moe::weighted_sum(
+                        self.ctx(),
+                        self.tensor(*routed),
+                        self.tensor(*weights),
+                        self.tensor(*y),
+                    ),
+                },
             },
             Linear::MoeBiasSum {
                 x,
@@ -1032,6 +1053,9 @@ impl Run<'_> {
                 self.tensor(*weights),
                 self.tensor(*y),
             ),
+            // The fold before it landed these rows; anywhere else the add
+            // runs again on the fold's rows, which that launch landed too.
+            Linear::MoeSigmoidGateAdd { y, .. } if self.landed_ahead(*y) => Ok(()),
             Linear::MoeSigmoidGateAdd {
                 routed,
                 shared,

@@ -27,6 +27,13 @@ def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
 
 def moe(x, f):
     """The routed MLP: `f.top_k` of `f.experts`, plus the gated shared expert."""
+    # The shared expert and its gate first, so the routes' fold sits right
+    # before the add that reads it, and the two may run as one launch.
+    shared = ops.linear.matmul(
+        ops.linear.mlp_swiglu(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter),
+        f.shared_down,
+    )
+    gate = ops.linear.matmul(x, f.shared_gate)
     experts, weights = ops.linear.moe_topk_softmax(ops.linear.matmul(x, f.router), f.experts, f.top_k)
 
     def select(act, bank):
@@ -36,11 +43,7 @@ def moe(x, f):
 
     hidden = ops.linear.mlp_swiglu(select(x, f.gate_up), f.inter)
     routed = ops.linear.moe_weighted_sum(select(hidden, f.down), weights)
-    shared = ops.linear.matmul(
-        ops.linear.mlp_swiglu(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter),
-        f.shared_down,
-    )
-    return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
+    return ops.linear.moe_sigmoid_gate_add(routed, shared, gate)
 
 MROPE_SECTIONS = [11, 11, 10]
 

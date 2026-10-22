@@ -734,6 +734,42 @@ constant constexpr uint kMaxExperts = 1024;
   out[row * (out_pitch != 0u ? out_pitch : width) + c] = static_cast<bfloat>(acc);
 }
 
+// expert_combine and shared_expert_combine in one launch: a row's routes
+// summed under their weights and rounded into `folded` as expert_combine lands
+// them, then the shared expert under its sigmoid gate added as
+// shared_expert_combine adds it. A thread walks one column down the rows in
+// order, so `out` may be the routed rows' own bytes from their first: row r
+// lands on route row r, which no row from r on reads.
+[[kernel]] void expert_shared_combine(
+    const device bfloat* y             [[buffer(0)]],
+    const device float* expert_weights [[buffer(1)]],
+    device bfloat* folded              [[buffer(2)]],
+    const device bfloat* shared        [[buffer(3)]],
+    const device bfloat* gate          [[buffer(4)]],
+    device bfloat* out                 [[buffer(5)]],
+    const constant uint& width             [[buffer(6)]],
+    const constant uint& experts_per_token [[buffer(7)]],
+    const constant uint& rows              [[buffer(8)]],
+    uint gid                           [[thread_position_in_grid]]) {
+  const uint c = gid;
+  if (c >= width) return;
+  const uint k = experts_per_token;
+  for (uint row = 0; row < rows; ++row) {
+    const size_t base = size_t(row) * size_t(k);
+    float acc = 0.0f;
+    for (uint e = 0; e < k; ++e) {
+      const size_t at = base + size_t(e);
+      acc += expert_weights[at] * float(y[at * size_t(width) + size_t(c)]);
+    }
+    const bfloat routed = static_cast<bfloat>(acc);
+    const float g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
+    const uint at = row * width + c;
+    const float s = float(shared[at]);
+    folded[at] = routed;
+    out[at] = static_cast<bfloat>(float(routed) + g * s);
+  }
+}
+
 [[kernel]] void shared_expert_combine_strided(
     const device bfloat* routed [[buffer(0)]],
     const device bfloat* shared [[buffer(1)]],
