@@ -1,5 +1,6 @@
 #![cfg(feature = "wgpu")]
 
+mod argmax_answers_the_reference;
 mod gpu;
 mod the_embeddings_answer_the_reference;
 mod the_hyper_connections_answer_the_reference;

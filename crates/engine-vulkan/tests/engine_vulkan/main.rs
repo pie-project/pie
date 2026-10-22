@@ -1,6 +1,7 @@
 #![cfg(feature = "vulkan")]
 
 mod a_narrow_device_reads_what_a_wide_one_does;
+mod argmax_answers_the_reference;
 mod gpu;
 mod the_embeddings_answer_the_reference;
 mod the_hyper_connections_answer_the_reference;

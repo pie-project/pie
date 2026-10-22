@@ -1,4 +1,3 @@
-use kernels_wgpu::layout;
 use poem_exec::{DispatchSampling, KernelError};
 use poem_ir::{Operands, Sampling};
 
@@ -15,12 +14,13 @@ impl Run<'_> {
         match op {
             Sampling::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
-                    layout::argmax(
-                        self.ctx(),
-                        self.tensor(*x),
+                    kernels_slang::sampling::argmax::argmax(
+                        &self.slang(),
+                        crate::encode::slang_tensor(self.tensor(*x)),
                         u32::try_from(column).expect("a draft depth inside u32"),
-                        self.tensor(*y),
-                    )?;
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang)?;
                 }
                 Ok(())
             }
