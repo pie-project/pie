@@ -445,7 +445,7 @@ pub(super) fn order_mxfp4_banks(
             };
             let n = trace.params[at].shape[1];
             let k = 2 * u64::from(codes.width) / n;
-            (2 * u64::from(codes.width) == n * k && k % 128 == 0).then_some((
+            (2 * u64::from(codes.width) == n * k && k.is_multiple_of(128)).then_some((
                 at,
                 scales,
                 u64::from(codes.rows),

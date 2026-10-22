@@ -393,9 +393,10 @@ __device__ __forceinline__ unsigned byte_codes(unsigned w, unsigned sel) {
 /// dequantizes the A fragment mma.sync's m16n8k16 would hold of its warp's
 /// 16 rows of each tile, k-step `s`'s codes `16 s + 2 c (+ 1)` and `+ 8` the
 /// bytes `8 s + c` and `8 s + 4 + c` of the row's chunk, and the warpgroup's
-/// m64n64k16 MMAs read them from registers. `k` whole 128s. Grid
-/// `[work_cap, rows / 128]` (64 GLU columns), 128 threads, `kStages 25600 +
-/// 5120` bytes of shared memory past a 1024-byte alignment.
+/// m64n64k16 MMAs read them from registers. `k` whole 64s: a last chunk of
+/// 64 codes stages its half (the rest zero) and steps its first four k-steps
+/// alone. Grid `[work_cap, rows / 128]` (64 GLU columns), 128 threads,
+/// `kStages 25600 + 5120` bytes of shared memory past a 1024-byte alignment.
 
 template <int kGlu, bool kNv, int kStages>
 __global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
@@ -446,7 +447,9 @@ __global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
         return kGlu != 0 ? base + t * inter : base + 64 * t;
     };
 
-    const int chunks = k >> 7;
+    const int chunks = (k + 127) >> 7;
+    // A last chunk of 64 codes: the K steps it holds.
+    const int tail_steps = (k & 127) != 0 ? (k & 127) >> 4 : 8;
     const long long row_bytes = k >> 1;
     const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
     const int sf_row = kNv ? k >> 4 : k >> 5;
@@ -470,31 +473,67 @@ __global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
         const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(from), "r"(live));
     };
+    // Where a bank row's scales are not whole cp.async words apart (gpt-oss's
+    // 90 bytes a row) or a last chunk holds half of them, a chunk's scales
+    // come through registers a stage ahead, read in halves and words.
+    const bool sf_regs = (sf_row & (kNv ? 7 : 3)) != 0 || tail_steps < 8;
+    uint2 sf_next[kSfs];
+    auto sf_read = [&](int ch) {
+#pragma unroll
+        for (int j = 0; j < kSfs; ++j) {
+            sf_next[j] = make_uint2(0u, 0u);
+            if (ch >= chunks || tid + kThreads * j >= kRows) continue;
+            const bool half = ch == chunks - 1 && tail_steps < 8;
+            const u8* from = s_e + static_cast<long long>(sr[j]) * sf_row + ch * (kNv ? 8 : 4);
+            if constexpr (kNv) {
+                const unsigned* w = reinterpret_cast<const unsigned*>(from);
+                sf_next[j] = make_uint2(w[0], half ? 0u : w[1]);
+            } else {
+                const unsigned short* h = reinterpret_cast<const unsigned short*>(from);
+                sf_next[j].x = h[0] | (half ? 0u : static_cast<unsigned>(h[1]) << 16);
+            }
+        }
+    };
+    if (sf_regs) sf_read(0);
     auto stage = [&](int ch) {
         if (ch < chunks) {
             u8* st = ring + (ch % kStages) * kStage;
+            // A chunk of 64 codes (the last, where `k` is no whole 128s)
+            // stages its half; the codes and routes past `k` land as zero.
+            const bool half = ch == chunks - 1 && tail_steps < 8;
 #pragma unroll
             for (int j = 0; j < kRuns; ++j) {
                 const int u = tid + kThreads * j, row = u >> 4, q = u & 15;
-                const bool live = src[j] >= 0;
+                const bool live = src[j] >= 0 && (!half || q < 8);
                 const bf16* from = live ? act + static_cast<long long>(src[j]) * k + ch * 128 + q * 8 : act;
                 cp(st + (q >> 3) * kAtom + row * 128 + (((q & 7) ^ (row & 7)) << 4), from, live ? 16 : 0);
             }
 #pragma unroll
             for (int j = 0; j < kSegs; ++j) {
                 const int u = tid + kThreads * j, r = u >> 2, q = u & 3;
-                cp(st + kB + r * 64 + ((q ^ ((r >> 1) & 3)) << 4), w_e + wr[j] * row_bytes + ch * 64 + q * 16, 16);
+                const bool live = !half || q < 2;
+                cp(st + kB + r * 64 + ((q ^ ((r >> 1) & 3)) << 4),
+                   live ? w_e + wr[j] * row_bytes + ch * 64 + q * 16 : w_e, live ? 16 : 0);
             }
+            if (sf_regs) {
 #pragma unroll
-            for (int j = 0; j < kSfs; ++j) {
-                const int r = tid + kThreads * j;
-                if (r >= kRows) break;
-                const u8* from = s_e + static_cast<long long>(sr[j]) * sf_row + ch * (kNv ? 8 : 4);
-                const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(st + kB + kRows * 64 + r * 8));
-                if constexpr (kNv) {
-                    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(at), "l"(from));
-                } else {
-                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(at), "l"(from));
+                for (int j = 0; j < kSfs; ++j) {
+                    const int r = tid + kThreads * j;
+                    if (r < kRows) *reinterpret_cast<uint2*>(st + kB + kRows * 64 + r * 8) = sf_next[j];
+                }
+                sf_read(ch + 1);
+            } else {
+#pragma unroll
+                for (int j = 0; j < kSfs; ++j) {
+                    const int r = tid + kThreads * j;
+                    if (r >= kRows) break;
+                    const u8* from = s_e + static_cast<long long>(sr[j]) * sf_row + ch * (kNv ? 8 : 4);
+                    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(st + kB + kRows * 64 + r * 8));
+                    if constexpr (kNv) {
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(at), "l"(from));
+                    } else {
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(at), "l"(from));
+                    }
                 }
             }
         }
@@ -562,10 +601,12 @@ __global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
             wide = __any_sync(0xffffffffu, wide);
         }
         const unsigned sel = 0x4440u | static_cast<unsigned>(c);
+        const int steps = ch == chunks - 1 ? tail_steps : 8;
 
         unsigned a[2][kT][4];
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
+            if (s >= steps) break;
             unsigned (&as)[kT][4] = a[s & 1];
 #pragma unroll
             for (int t = 0; t < kT; ++t) {

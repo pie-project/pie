@@ -37,6 +37,7 @@ pub fn e4m3_values(
     op: &'static str,
     x: Tensor,
     gran: u32,
+    fan: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
@@ -78,6 +79,7 @@ pub fn e4m3_values(
             y.arg(),
             stated(op, x.rows)?.arg(),
             stated(op, x.width)?.arg(),
+            stated(op, fan)?.arg(),
             ctx.stage(),
         ],
     )
@@ -86,8 +88,15 @@ pub fn e4m3_values(
 /// `x` quantized as `e4m3_values` does, into this fire's scratch: as many
 /// rows as a product reading it launches over (`Ctx::opaque_rows`, the
 /// bucket a forward's rows pad to), so a GEMM over the padded rows reads
-/// memory this slab holds.
-pub fn quantized(ctx: &Ctx, op: &'static str, x: Tensor, gran: u32) -> Result<Tensor, Error> {
+/// memory this slab holds. `fan` rows a staged window's token row (a
+/// route's rows: the top-k).
+pub fn quantized(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    gran: u32,
+    fan: u32,
+) -> Result<Tensor, Error> {
     let rows = usize::try_from(ctx.opaque_rows(i32::try_from(x.rows).unwrap_or(i32::MAX)))
         .unwrap_or(x.rows as usize);
     let bytes = rows
@@ -96,7 +105,7 @@ pub fn quantized(ctx: &Ctx, op: &'static str, x: Tensor, gran: u32) -> Result<Te
         .saturating_mul(2);
     let at = ctx.scratch(op, "linear.act_quant_values", bytes.max(16))? as usize as u64;
     let mut y = Tensor::new(at, x.rows, x.width, Dtype::Bf16);
-    e4m3_values(ctx, op, x, gran, &mut y)?;
+    e4m3_values(ctx, op, x, gran, fan, &mut y)?;
     Ok(y)
 }
 
@@ -199,7 +208,7 @@ pub fn matmul_fp8b128(
     if act.rows == 0 {
         return Ok(());
     }
-    let q = quantized(ctx, op, act, gran)?;
+    let q = quantized(ctx, op, act, gran, 1)?;
     if act.rows <= GEMV_ROWS || !tile_holds {
         let threads = n
             .checked_mul(WAVE)
@@ -302,6 +311,7 @@ pub fn quantized_codes(
     x: Tensor,
     gran: u32,
     pow2: bool,
+    fan: u32,
 ) -> Result<(Tensor, Tensor), Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     if gran != FP8_BLOCK || x.width == 0 || !x.width.is_multiple_of(gran) {
@@ -327,16 +337,18 @@ pub fn quantized_codes(
     )? as usize as u64;
     let codes = Tensor::new(at, x.rows, x.width, Dtype::U8);
     let scales = Tensor::new(sat, x.rows, blocks, Dtype::F32);
-    quantize_codes_into(ctx, op, x, gran, pow2, codes, scales)?;
+    quantize_codes_into(ctx, op, x, gran, pow2, fan, codes, scales)?;
     Ok((codes, scales))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quantize_codes_into(
     ctx: &Ctx,
     op: &'static str,
     x: Tensor,
     gran: u32,
     pow2: bool,
+    fan: u32,
     codes: Tensor,
     scales: Tensor,
 ) -> Result<(), Error> {
@@ -360,6 +372,7 @@ fn quantize_codes_into(
             scales.arg(),
             stated(op, x.rows)?.arg(),
             stated(op, x.width)?.arg(),
+            stated(op, fan)?.arg(),
             ctx.stage(),
         ],
     )
@@ -396,7 +409,7 @@ pub fn matmul_fp8(
     if act.rows == 0 {
         return Ok(());
     }
-    let (q, act_scales) = quantized_codes(ctx, op, act, FP8_BLOCK, false)?;
+    let (q, act_scales) = quantized_codes(ctx, op, act, FP8_BLOCK, false, 1)?;
     matmul_fp8_quantized(ctx, op, q, act_scales, codes, factors, y)
 }
 
@@ -435,9 +448,10 @@ pub fn quantized_codes_held(
     x: Tensor,
     hold: usize,
     pow2: bool,
+    fan: u32,
 ) -> Result<(Tensor, Tensor), Error> {
     if x.rows > 64 {
-        return quantized_codes(ctx, op, x, FP8_BLOCK, pow2);
+        return quantized_codes(ctx, op, x, FP8_BLOCK, pow2, fan);
     }
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     if x.width == 0 || !x.width.is_multiple_of(FP8_BLOCK) {
@@ -463,7 +477,7 @@ pub fn quantized_codes_held(
     )? as usize as u64;
     let codes = Tensor::new(at, x.rows, x.width, Dtype::U8);
     let scales = Tensor::new(sat, x.rows, blocks, Dtype::F32);
-    quantize_codes_into(ctx, op, x, FP8_BLOCK, pow2, codes, scales)?;
+    quantize_codes_into(ctx, op, x, FP8_BLOCK, pow2, fan, codes, scales)?;
     Ok((codes, scales))
 }
 

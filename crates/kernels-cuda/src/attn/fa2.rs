@@ -618,6 +618,10 @@ pub struct DecodeGeometry {
     pub head_dim: u32,
 }
 
+/// The GQA groups the decode kernel is stamped at; a plan of another group
+/// reads its cache through the prefill kernel instead.
+pub const DECODE_GROUPS: [u32; 9] = [1, 2, 3, 4, 5, 6, 8, 12, 16];
+
 impl DecodeGeometry {
     pub fn derive(
         op: &'static str,
@@ -641,7 +645,7 @@ impl DecodeGeometry {
                 format!("fa2 decode head_dim {head_dim} needs bdx > 32 (decode.cuh:765)"),
             ));
         }
-        if !matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16) {
+        if !DECODE_GROUPS.contains(&group_size) {
             return Err(refuse(
                 op,
                 format!(

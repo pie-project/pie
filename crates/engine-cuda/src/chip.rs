@@ -462,7 +462,18 @@ mod tests {
                 "{gpu}"
             );
             assert!(report.untuned(), "{gpu}");
-            assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
+            // Ampere through Blackwell's consumer parts bucket a prefill
+            // eight a doubling from 256 rows; the rest keep the defaults.
+            let fine = matches!((major, minor), (8, 0 | 6 | 9) | (9, 0) | (12, 0));
+            assert_eq!(
+                Engine::of(&profile),
+                Engine {
+                    prefill_lattice_from: if fine { 256 } else { 0 },
+                    prefill_lattice_steps: if fine { 8 } else { 4 },
+                    ..Engine::of(&registry().defaults())
+                },
+                "{gpu}"
+            );
             let tuning = kernels_cuda::tuning::Tuning::of(&profile);
             // sm_100 alone runs the tcgen05 prefill and reads a wide
             // group's single-token rows through the prefill kernel; every
@@ -667,20 +678,32 @@ mod tests {
                     tuning.ssm_gdn_fused_scan && tuning.pool_mma && tuning.pdl,
                     "{gpu}"
                 );
-                assert_eq!((tuning.mxfp4_mma_from, tuning.mxfp4_mma_until), (28, 1024));
+                assert_eq!(
+                    (tuning.mxfp4_mma_from, tuning.mxfp4_mma_until),
+                    (28, 16_777_216)
+                );
                 assert_eq!((tuning.bf16_mma_from, tuning.bf16_mma_until), (16, 65536));
             } else {
                 // The 99 KiB and A100 families take the two-launch gated
-                // delta scan alone; Orin keeps the three wmma launches.
+                // delta scan and a prefill's MXFP4 selects on mma.sync
+                // alone; Orin keeps the three wmma launches and the GEMV.
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         ssm_gdn_fused_scan: false,
+                        mxfp4_mma_from: defaults.mxfp4_mma_from,
+                        mxfp4_mma_until: defaults.mxfp4_mma_until,
+                        mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                         ..tuning
                     },
                     defaults,
                     "{gpu}"
                 );
                 assert_eq!(tuning.ssm_gdn_fused_scan, minor != 7, "{gpu}");
+                assert_eq!(
+                    tuning.mxfp4_mma_until,
+                    if minor == 7 { 0 } else { 16_777_216 },
+                    "{gpu}"
+                );
             }
         }
     }
@@ -877,7 +900,10 @@ mod tests {
         // Hopper takes the register-dequant selects and none of tcgen05's.
         let h100 = tuning(9, 0, 132);
         assert!(!h100.moe_tc5 && !h100.mxfp4_cvt && h100.gemm_tc5_split_tickets == 0);
-        assert_eq!((h100.mxfp4_mma_from, h100.mxfp4_mma_until), (28, 1024));
+        assert_eq!(
+            (h100.mxfp4_mma_from, h100.mxfp4_mma_until),
+            (28, 16_777_216)
+        );
         assert_eq!((h100.nvfp4_mma_from, h100.nvfp4_mma_until), (32, 8192));
         for (major, minor) in [
             (8, 0),
@@ -895,9 +921,16 @@ mod tests {
                 !other.merge_warp,
                 "sm_{major}{minor} keeps the staged merge"
             );
+            // Ampere, Ada and the RTX Blackwells take a prefill's MXFP4
+            // selects on mma.sync; the rest keep the GEMV.
             assert_eq!(
-                other.mxfp4_mma_until, 0,
-                "sm_{major}{minor} keeps the mxfp4 GEMV"
+                other.mxfp4_mma_until,
+                if matches!((major, minor), (8, 0 | 6 | 9) | (12, 0)) {
+                    16_777_216
+                } else {
+                    0
+                },
+                "sm_{major}{minor} MXFP4 selects"
             );
             assert_eq!(
                 other.gemm_split_launch_ns, 0,
@@ -962,18 +995,32 @@ mod tests {
         assert_eq!(report.used, profile::Source::Seeded("sm89.toml".into()));
         assert!(report.untuned());
         for p in [&l40s, &rtx] {
-            assert_eq!(Engine::of(p), Engine::of(&registry().defaults()));
+            assert_eq!(
+                Engine::of(p),
+                Engine {
+                    prefill_lattice_from: 256,
+                    prefill_lattice_steps: 8,
+                    ..Engine::of(&registry().defaults())
+                }
+            );
             assert!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_fused_scan);
+            let defaults = kernels_cuda::tuning::Tuning::of(&registry().defaults());
             assert_eq!(
                 kernels_cuda::tuning::Tuning {
                     ssm_gdn_fused_scan: false,
+                    mxfp4_mma_from: defaults.mxfp4_mma_from,
+                    mxfp4_mma_until: defaults.mxfp4_mma_until,
+                    mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
-                kernels_cuda::tuning::Tuning::of(&registry().defaults()),
-                "what an Ada GPU ran before its family file, past the gated delta scan"
+                defaults,
+                "what an Ada GPU ran before its family file, past the gated delta scan and the MXFP4 selects"
             );
             for (spec, rungs, _) in p.entries() {
-                if spec.id == "kernel.ssm.gdn_fused_scan" {
+                if spec.id == "kernel.ssm.gdn_fused_scan"
+                    || spec.id.starts_with("kernel.moe.mxfp4_mma_")
+                    || spec.id.starts_with("engine.prefill_lattice_")
+                {
                     continue;
                 }
                 assert_eq!(

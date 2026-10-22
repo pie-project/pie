@@ -380,6 +380,10 @@ pub struct Ceilings<'c> {
     pub readers: &'c [Option<u32>],
 
     pub carve: Option<Carve<'c>>,
+
+    /// The template's regions, each walked whole: what one region holds
+    /// back for a later op of its own lands within the walk.
+    pub regions: &'c [poem_compiler::Region],
 }
 
 impl<'c> Ceilings<'c> {
@@ -595,6 +599,14 @@ pub struct Run<'c> {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     held: Option<HeldAct>,
 
+    /// A shared expert's swiglu MLP held back for the routed MLP that lands
+    /// it ([`Run::holds_shared`]).
+    #[cfg(feature = "rocm")]
+    pub(crate) shared_mlp: Option<HeldShared>,
+    /// A shared expert's gate projection held back for the routed MLP's fold.
+    #[cfg(feature = "rocm")]
+    pub(crate) shared_gate_w: Option<HeldGate>,
+
     /// The routed GLU rows that land read back through e4m3 already
     /// ([`Run::lands_read_back`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -612,6 +624,24 @@ pub(crate) struct HeldAct {
     pub rows: u32,
     pub k: u32,
     pub planes: [u64; 2],
+}
+
+/// A shared expert's swiglu MLP into `y` over its packed `[gate | up]` and
+/// down banks.
+#[cfg(feature = "rocm")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeldShared {
+    pub y: ValueId,
+    pub gate_up: ValueId,
+    pub down: ValueId,
+}
+
+/// A shared expert's gate logits `gate` over its one-row weight `w`.
+#[cfg(feature = "rocm")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeldGate {
+    pub gate: ValueId,
+    pub w: ValueId,
 }
 
 impl<'c> Run<'c> {
@@ -654,9 +684,20 @@ impl<'c> Run<'c> {
             fp8_rows: Vec::new(),
             #[cfg(feature = "rocm")]
             fp8_holds: Vec::new(),
+            #[cfg(feature = "rocm")]
+            shared_mlp: None,
+            #[cfg(feature = "rocm")]
+            shared_gate_w: None,
             held: None,
             read_back: Cell::new(None),
         }
+    }
+
+    /// Forget the rows quantized so far: the next pass quantizes its own.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn forget_fp8_rows(&mut self) {
+        self.fp8_rows.clear();
+        self.fp8_holds.clear();
     }
 
     /// Whether `y`, a routed GLU's rows, lands as its e4m3 1x128 read-back: its one
@@ -1080,6 +1121,14 @@ impl<'c> Run<'c> {
 
     pub(crate) fn nodes(&self) -> &'c [Node] {
         self.nodes
+    }
+
+    /// Whether nodes `a` and `b` sit in one region of the template.
+    pub(crate) fn one_region(&self, a: u32, b: u32) -> bool {
+        self.ceilings
+            .regions
+            .iter()
+            .any(|r| r.nodes.contains(&a) && r.nodes.contains(&b))
     }
 
     pub(crate) fn at_region(&self) -> u32 {

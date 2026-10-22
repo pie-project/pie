@@ -57,7 +57,9 @@ def bank(reads, w, stems):
         nvfp4_bank(reads, w, [[s] for s in stems])
         return
     dims = list(w.shape)
-    dims[w.cut_axis] = -1
+    # A bank cut across ranks reads its rank's share; a whole one, every row.
+    if w.cut_axis != None:
+        dims[w.cut_axis] = -1
     reads.read_expr(w, concat(0, [src(s + ".weight") for s in stems]).transmute(dims, BF))
 
 def read(m, reads):

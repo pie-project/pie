@@ -234,6 +234,13 @@ pub struct GemmBiasEpilogue;
 #[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct MoeMxfp4MmaFrom(pub u32);
 
+/// The fewest routes an expert averages that a routed mxfp4 select runs on
+/// the register-dequant MMA kernel with, past `kernel.moe.mxfp4_mma_from`;
+/// fewer keep the grouped kernel (0 any).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_mma_per_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4MmaPerFrom(pub u32);
+
 /// The fewest routes a routed bf16 select runs on the graph-safe grouped
 /// mma.sync kernel with (`moe_select_bf16_mma`), rather than the per-route
 /// GEMV. Bf16 experts have no tcgen05 or cuBLAS grouped path under a
@@ -652,6 +659,14 @@ pub struct MoeMxfp4SelectLean;
 #[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
 pub struct GemmGroupedGemv;
 
+/// Whether a decode's few rows (`linear::quant::AFFINE_MMA_UNTIL`) of a
+/// 4-bit MLX plane run on the mma.sync GEMV (`affine_w4a16_mma`), its codes
+/// read once for every row, rather than the per-row affine kernel. Off but
+/// where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.affine_mma", flag, default = false, tune = search)]
+pub struct GemmAffineMma;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -782,9 +797,11 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnStepBlocks>()
         .add::<MoeMxfp4SelectLean>()
         .add::<GemmGroupedGemv>()
+        .add::<GemmAffineMma>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
+        .add::<MoeMxfp4MmaPerFrom>()
         .add::<MoeBf16MmaFrom>()
         .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
@@ -915,9 +932,11 @@ tuning! {
     ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
     mxfp4_select_lean: bool = false, on MoeMxfp4SelectLean;
     grouped_gemv: bool = false, on GemmGroupedGemv;
+    affine_mma: bool = false, on GemmAffineMma;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
+    mxfp4_mma_per_from: u32 = 0, get MoeMxfp4MmaPerFrom;
     bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
     bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;

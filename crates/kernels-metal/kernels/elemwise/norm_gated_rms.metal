@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "../common/register_table.metal"
 using namespace metal;
 
 template <typename T, int N_READS>
@@ -130,3 +131,55 @@ instantiate_gated_rms(bfloat16, bfloat, bfloat)
 instantiate_gated_rms(f32_bfloat16, float, bfloat)
 
 instantiate_gated_rms_sigmoid(f32_bfloat16, float, bfloat)
+
+// gated_rms (f32 rows, bf16 gate and output, SiLU gate) that also lays the
+// register tile's input table of the rows it writes, so the out projection
+// runs no table pass: a threadgroup per head and row lays its head's columns
+// once the row's values are written, the first row's threadgroups lay the
+// rows past `rows` as zeros, and the first threadgroup zeroes the split
+// tile's `counters` arrival counters. Bit for bit `qmm_sg_table`'s table.
+[[kernel]] void gated_rms_table_f32_bfloat16(
+    const device float* x      [[buffer(0)]],
+    const device bfloat* z     [[buffer(1)]],
+    const device float* w      [[buffer(2)]],
+    device bfloat* out         [[buffer(3)]],
+    const constant float& eps  [[buffer(4)]],
+    const constant uint& vd    [[buffer(5)]],
+    device bfloat* table       [[buffer(6)]],
+    const constant uint& rows  [[buffer(7)]],
+    const constant uint& counters [[buffer(8)]],
+    uint3 tgpos       [[threadgroup_position_in_grid]],
+    uint3 tpg         [[threadgroups_per_grid]],
+    uint3 lid3        [[thread_position_in_threadgroup]],
+    uint  simd_lane   [[thread_index_in_simdgroup]],
+    uint  simd_group  [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  const uint lid = lid3.x;
+  const size_t idx =
+      size_t(tgpos.z * tpg.y + tgpos.y) * vd + lid;
+  gated_rms_body<float, bfloat, true>(
+      x, z, w, out, eps, vd, idx, lid,
+      inv_rms, partials, simd_lane, simd_group);
+  // The head's writes, seen by every thread of its threadgroup.
+  threadgroup_barrier(mem_flags::mem_device);
+  const uint width = tpg.y * vd, row = tgpos.z, from = tgpos.y * vd;
+  const device bfloat* src = out + size_t(row) * width;
+  table[register_table::slot(from + lid, row)] = src[from + lid];
+  device float* sums = register_table::sums(table, width);
+  if (lid < vd / 32) {
+    const uint n = from / 32 + lid;
+    sums[ulong(n) * 8 + row] = register_table::half_sum(src, n >> 1, n & 1);
+  }
+  if (row != 0)
+    return;
+  for (uint gone = rows; gone < 8; ++gone) {
+    table[register_table::slot(from + lid, gone)] = bfloat(0.0f);
+    if (lid < vd / 32)
+      sums[ulong(from / 32 + lid) * 8 + gone] = 0.0f;
+  }
+  if (tgpos.y == 0) {
+    device uint* count = reinterpret_cast<device uint*>(sums) + width / 4;
+    for (uint n = lid; n < counters; n += vd)
+      count[n] = 0;
+  }
+}

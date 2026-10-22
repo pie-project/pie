@@ -18,6 +18,7 @@ fn budget() -> Budget {
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
         ],
         max_adapters: 8,
+        readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
     }
 }
 

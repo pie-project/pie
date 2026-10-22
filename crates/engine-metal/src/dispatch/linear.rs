@@ -264,6 +264,213 @@ impl Run<'_> {
         ane.after(self.ctx(), plan, out)
     }
 
+    /// The matmuls of `act` the trace places right after the one by `w` into
+    /// `y` (a GDN layer's in-projection then its gates; a query, key and
+    /// value, the query's split into query and gate between the query's and
+    /// the key's) in one register-tile launch with it, when every one of them
+    /// runs on the register tile, all in the region the walk is in, and their
+    /// outputs stand clear of each other and of `act`: each lands as its own
+    /// launch would land it, bit for bit, and the later ones' nodes find it
+    /// done ([`Run::landed_ahead`]). A projection whose only reader is a split
+    /// of its rows in two (the GDN in-projection's convolved half and its
+    /// gate) lands its halves where the split would copy them, as two
+    /// segments of its bank at its own split, and the split finds them done.
+    /// False where they run as their own launches.
+    fn matmul_segments(
+        &self,
+        act: poem_ir::ValueId,
+        w: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Result<bool, kernels_metal::Error> {
+        use linear::quant::{Segment, register_split};
+        use poem_ir::Operation;
+        let Some((nodes, one_pass)) = self.region_nodes() else {
+            return Ok(false);
+        };
+        let op = |at: u32| self.nodes().get(at as usize).map(|n| &n.op);
+        let matmul = |at: u32| match op(at) {
+            Some(Operation::Linear(Linear::Matmul { act: a, w, y })) if *a == act => Some((*w, *y)),
+            _ => None,
+        };
+        let Some(first) = self
+            .readers_of(act)
+            .iter()
+            .copied()
+            .find(|&at| matmul(at) == Some((w, y)))
+        else {
+            return Ok(false);
+        };
+        let mut members = vec![(w, y)];
+        // What a node between the matmuls writes: a query's split into query
+        // and gate, between the query's projection and the key's.
+        let mut between: Vec<poem_ir::ValueId> = Vec::new();
+        let (mut at, mut last) = (first + 1, first);
+        while members.len() < 3 && nodes.contains(&at) {
+            if let Some(next) = matmul(at) {
+                members.push(next);
+                last = at;
+            } else {
+                match op(at) {
+                    Some(Operation::Layout(poem_ir::Layout::SplitQGate {
+                        packed,
+                        q,
+                        gate,
+                        ..
+                    })) if between.is_empty() && members.iter().any(|m| m.1 == *packed) => {
+                        between.extend([*q, *gate]);
+                    }
+                    _ => break,
+                }
+            }
+            at += 1;
+        }
+        if members.len() < 2 || !nodes.contains(&first) {
+            return Ok(false);
+        }
+        let x = self.tensor(act);
+        let (m, k) = (x.rows, x.width);
+        let mut segments = Vec::with_capacity(3);
+        // The left half of the split whose halves a segment pair lands.
+        let mut halves = None;
+        for (i, &(w, y)) in members.iter().enumerate() {
+            let out = self.tensor(y);
+            let fits = self.register_counters(act, w, out.width).is_some()
+                && out.rows == m
+                && self.ane().and_then(|ane| ane.plan_columns(w, m)).is_none();
+            let Some(bank) = self.banked(w).filter(|b| fits && b.ld % 256 == 0) else {
+                return Ok(false);
+            };
+            let split = register_split(
+                i32::try_from(out.width).unwrap_or(0),
+                i32::try_from(k).unwrap_or(0),
+                self.tuning().cores(),
+            );
+            // The split of this output's rows, its only reader, in this
+            // region after the matmuls, into halves of whole column tiles.
+            let split_rows = self
+                .readers_of(y)
+                .iter()
+                .copied()
+                .find_map(|at| match op(at) {
+                    Some(Operation::Layout(poem_ir::Layout::SplitRows {
+                        x,
+                        width,
+                        left,
+                        right,
+                    })) if *x == y
+                        && self.readers_of(y).len() == 1
+                        && nodes.contains(&at)
+                        && at > last
+                        && width % 64 == 0
+                        && *width < out.width =>
+                    {
+                        Some((*width, *left, *right))
+                    }
+                    _ => None,
+                });
+            match split_rows {
+                Some((width, left, right))
+                    if one_pass && halves.is_none() && members.len() < 3 && i == 0 =>
+                {
+                    let (l, r) = (self.tensor(left), self.tensor(right));
+                    if l.width != width
+                        || r.width != out.width - width
+                        || l.rows != m
+                        || r.rows != m
+                    {
+                        return Ok(false);
+                    }
+                    segments.push(Segment {
+                        w: bank,
+                        first: 0,
+                        y: l,
+                        split,
+                    });
+                    segments.push(Segment {
+                        w: bank,
+                        first: width,
+                        y: r,
+                        split,
+                    });
+                    halves = Some(left);
+                }
+                _ => segments.push(Segment {
+                    w: bank,
+                    first: 0,
+                    y: out,
+                    split,
+                }),
+            }
+        }
+        if segments.len() > 3 {
+            return Ok(false);
+        }
+        // The narrow segments' threadgroups first, so they run in the first
+        // wave rather than trail the wide ones'.
+        segments.sort_by_key(|s| s.y.width);
+        // Every output its own bytes, apart from each other and the activation.
+        let span = |t: kernels_metal::Tensor| {
+            self.address(t.buf)
+                .map(|(slab, at)| (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2))
+        };
+        let mut spans = vec![span(x)];
+        spans.extend(segments.iter().map(|s| span(s.y)));
+        let Some(spans) = spans.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(false);
+        };
+        let apart =
+            |a: &(u64, u64, u64), b: &(u64, u64, u64)| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1;
+        for (i, a) in spans.iter().enumerate() {
+            if spans[i + 1..].iter().any(|b| !apart(a, b)) {
+                return Ok(false);
+            }
+        }
+        // ... and from what a node between them writes, which runs after the
+        // launch landed the later matmuls' outputs (it reads the first's).
+        let first_out = span(self.tensor(y));
+        for &v in &between {
+            let Some(b) = span(self.tensor(v)) else {
+                return Ok(false);
+            };
+            if spans[1..]
+                .iter()
+                .any(|a| Some(*a) != first_out && !apart(a, &b))
+            {
+                return Ok(false);
+            }
+        }
+        let (counters, floats) = linear::quant::segments_scratch(&segments, m);
+        // Each split segment sums as its own launch would, or they run alone.
+        let partials = if floats > 0 {
+            match self.partials(1, floats) {
+                Some(partials) => Some(partials),
+                None => return Ok(false),
+            }
+        } else {
+            None
+        };
+        let (m, k, counters) = (
+            i32::try_from(m).unwrap_or(0),
+            i32::try_from(k).unwrap_or(0),
+            i32::try_from(counters).unwrap_or(0),
+        );
+        let rows = (17 * x.width + 4 * counters.unsigned_abs()).div_ceil(2 * x.width);
+        let Some((table, laid)) = self.register_table(act, rows, x.width, counters.unsigned_abs())
+        else {
+            return Ok(false);
+        };
+        if !laid {
+            linear::quant::register_table(self.ctx(), x, table, m, k, counters)?;
+        }
+        linear::quant::register_segments(self.ctx(), &segments, table, m, k, partials)?;
+        self.land_ahead([
+            members.get(1).map(|s| s.1),
+            members.get(2).map(|s| s.1),
+            halves,
+        ]);
+        Ok(true)
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::MlpRelu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
@@ -280,7 +487,14 @@ impl Run<'_> {
             }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => {
+                    // A segment launch of an earlier matmul of this activation landed it.
+                    if self.landed_ahead(*y) {
+                        return Ok(());
+                    }
                     let x = self.tensor(*act);
+                    if self.matmul_segments(*act, *w, *y)? {
+                        return Ok(());
+                    }
                     if let Some((ane, plan)) = self
                         .ane()
                         .and_then(|ane| Some((ane, ane.plan_columns(*w, x.rows)?)))

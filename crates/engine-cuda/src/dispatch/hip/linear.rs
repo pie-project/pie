@@ -74,6 +74,15 @@ impl Run<'_> {
                 h,
                 y,
             } => {
+                let held = crate::run::HeldShared {
+                    y: *y,
+                    gate_up: *gate_up,
+                    down: *down,
+                };
+                if self.holds_shared(*act, held) {
+                    self.shared_mlp = Some(held);
+                    return Ok(());
+                }
                 if self.tensor(*act).dtype == Dtype::Bf16
                     && self.dense_weight(*gate_up)
                     && linear::gemm::matmul_swiglu(
@@ -176,6 +185,13 @@ impl Run<'_> {
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        if let Linear::Matmul { act, w, y } = op {
+            let held = crate::run::HeldGate { gate: *y, w: *w };
+            if self.tensor(*y).width == 1 && self.holds_gate(*act, held) {
+                self.shared_gate_w = Some(held);
+                return Ok(());
+            }
+        }
         match op {
             Linear::Matmul { act, w, y } if self.tensor(*act).dtype == Dtype::F32 => {
                 let weight = self.dense_or_decoded(
@@ -374,8 +390,9 @@ impl Run<'_> {
                         })
                     }
                     poem_ir::ActQuant::E4m3 { gran } => {
-                        let x =
-                            linear::act_quant::quantized(self.ctx(), OP, self.tensor(*x), gran)?;
+                        let x = self.tensor(*x);
+                        let fan = self.plane_fan(x.rows);
+                        let x = linear::act_quant::quantized(self.ctx(), OP, x, gran, fan)?;
                         self.select_quant(x, *bank, *routes, *y)
                     }
                     poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
@@ -742,7 +759,7 @@ impl Run<'_> {
         }
     }
 
-    fn dense_weight(&mut self, w: ValueId) -> bool {
+    pub(super) fn dense_weight(&mut self, w: ValueId) -> bool {
         self.maybe_tiled_planes(w).is_none() && self.maybe_planes(w).is_none()
     }
 
@@ -816,7 +833,8 @@ impl Run<'_> {
                 0
             }
         } % linear::act_quant::FP8_HOLDS;
-        let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold, pow2)?;
+        let fan = self.plane_fan(x.rows);
+        let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold, pow2, fan)?;
         // The hold's earlier rows are gone; past a decode batch nothing is
         // held (the stream's slab).
         self.fp8_rows

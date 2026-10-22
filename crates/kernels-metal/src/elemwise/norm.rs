@@ -301,6 +301,62 @@ pub fn rmsnorm_per_head_plus_one(
     )
 }
 
+/// Two [`rmsnorm_per_head_plus_one`]s of one head width and epsilon in one
+/// launch (a layer's query and key heads), each landing its own launch's bits.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_per_head_plus_one_pair(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    y: Tensor,
+    x2: Tensor,
+    weight2: Tensor,
+    y2: Tensor,
+    head_dim: u32,
+    eps: f32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_per_head_plus_one";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    if x2.dtype != x.dtype || y.dtype != x.dtype || y2.dtype != x.dtype {
+        return Err(refuse(OP, "a norm pair runs over bf16 rows alone"));
+    }
+    let threads = rms_threads(OP, head_dim)?;
+    let groups = |t: Tensor| -> Result<u32, Error> {
+        nonzero(OP, "rows", t.rows)?;
+        if !t.width.is_multiple_of(head_dim) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {}-wide row holds no whole {head_dim}-wide heads",
+                    t.width
+                ),
+            ));
+        }
+        Ok(t.width / head_dim * t.rows)
+    };
+    let (first, second) = (groups(x)?, groups(x2)?);
+    ctx.fire(
+        Fire::at("elemwise/norm_rms.metal", "rms_single_row_pair_bfloat16").apply(Grid::of(
+            [threads * (first + second), 1, 1],
+            [threads, 1, 1],
+        )),
+        &[
+            x.arg(),
+            weight.arg(),
+            y.arg_mut(),
+            x2.arg(),
+            weight2.arg(),
+            y2.arg_mut(),
+            first.arg(),
+            eps.arg(),
+            head_dim.arg(),
+            DENSE_BANK.arg(),
+            OFFSET_BANK.arg(),
+            UNIT_GAIN.arg(),
+        ],
+    )
+}
+
 pub fn rmsnorm_grouped_plus_one(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -404,6 +460,58 @@ pub fn rmsnorm_gated(
             y.arg_mut(),
             eps.arg(),
             stated(OP, vd)?.arg(),
+        ],
+    )
+}
+
+/// [`rmsnorm_gated`] with the SiLU gate over at most eight rows that also
+/// lays the register tile's input table of `y` in `table`, with `counters`
+/// arrival counters zeroed: the table `linear::quant`'s register matmul lays
+/// over `y`, bit for bit, so the out projection runs no table pass.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_gated_table(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    gate: Tensor,
+    weight: Tensor,
+    head_dim: u32,
+    eps: f32,
+    y: Tensor,
+    table: Tensor,
+    counters: u32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_gated";
+    debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
+    debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
+    dtype_dispatch!(OP, gate.dtype, { Bf16 => () });
+    let vd = head_width(OP, head_dim)?;
+    if x.width == 0 || !x.width.is_multiple_of(vd) || !vd.is_multiple_of(32) || y.rows > 8 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a register table takes at most 8 rows of whole 32-input heads' halves, not {} \
+                 rows of {}-wide heads",
+                y.rows, vd
+            ),
+        ));
+    }
+    let lanes = head_row_grid(OP, vd, x.width / vd, x.rows)?;
+    ctx.fire(
+        Fire::at(
+            "elemwise/norm_gated_rms.metal",
+            "gated_rms_table_f32_bfloat16",
+        )
+        .apply(Grid::of(lanes, [vd, 1, 1])),
+        &[
+            x.arg(),
+            gate.arg(),
+            weight.arg(),
+            y.arg_mut(),
+            eps.arg(),
+            stated(OP, vd)?.arg(),
+            table.arg_mut(),
+            y.rows.arg(),
+            counters.arg(),
         ],
     )
 }

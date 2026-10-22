@@ -3999,7 +3999,8 @@ impl Shell {
                 &self.scratch,
                 &self.tuning,
             )
-            .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)));
+            .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)))
+            .with_regions(self.compiled.template());
             walk(
                 &self.trace,
                 &self.compiled,
@@ -4092,7 +4093,8 @@ impl Shell {
                 &place,
                 &self.scratch,
                 &self.tuning,
-            );
+            )
+            .with_regions(self.compiled.template());
             walk(
                 &self.trace,
                 &self.compiled,
