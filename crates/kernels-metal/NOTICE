@@ -16,11 +16,11 @@ MLX
                 kernels/prim/gemm_loader.h
                 kernels/prim/gemm_mma.h
                 kernels/prim/gemm_transforms.h
-                kernels/linear/quant_block.h
+                kernels/linear/dequant.h
                 kernels/linear/gemm.metal
-                kernels/linear/quant_qmv.metal
-                kernels/linear/quant_qmv_rows.metal
-                kernels/linear/quant_qmm_t.metal
+                kernels/linear/qmv.metal
+                kernels/linear/qmv_rows.metal
+                kernels/linear/qmm_t.metal
 
 The simdgroup-matrix GEMM tile (type traits, block loader, MMA, epilogue
 transforms), the affine dequantize and quantized block loader, and the dense

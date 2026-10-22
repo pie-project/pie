@@ -68,7 +68,7 @@ inline constexpr int routed_tgp() {
 #include "../prim/gemm_transforms.h"
 #include "../prim/gemm_mma.h"
 #include "../prim/gemm_loader.h"
-#include "quant_block.h"
+#include "dequant.h"
 
 template <
     typename T,

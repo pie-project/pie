@@ -18,7 +18,7 @@ const SOFTMAX_OVER_SELECTED: u32 = 0;
 
 const ROUTE_FILE: &str = "linear/moe/route.metal";
 
-const QMM_FILE: &str = "linear/quant_qmm_t.metal";
+const QMM_FILE: &str = "linear/qmm_t.metal";
 
 const QMM_BK: u32 = 32;
 
@@ -552,7 +552,7 @@ fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static s
         (affine, group, bits) => Err(refuse(
             op,
             format!(
-                "the bank is {} at {bits} bits in groups of {group}, and `quant_qmv.metal` \
+                "the bank is {} at {bits} bits in groups of {group}, and `qmv.metal` \
                  instantiates the routed shapes at affine/{{32,64,128}}/2, affine/64/4 \
                  and mxfp4/32/4 only",
                 if affine { "affine" } else { "symmetric" }
@@ -603,7 +603,7 @@ pub fn matmul_select_bias(
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
     ctx.fire(
-        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
+        Fire::at("linear/qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
             QMV_GROUP,
         )),
@@ -637,7 +637,7 @@ pub fn matmul_select_quant(
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
     ctx.fire(
-        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
+        Fire::at("linear/qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
             QMV_GROUP,
         )),
@@ -945,7 +945,7 @@ pub fn matmul_select_batched(
     }
 
     if let Some((m, n, simdgroups)) = mxfp4 {
-        const FILE: &str = "linear/quant_qmm_mpp.metal";
+        const FILE: &str = "linear/qmm_mpp.metal";
         let biased = bias.is_some();
         let entry = crate::linear::quant::symbol(&format!(
             "mxfp4_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}_b{}",
@@ -975,7 +975,7 @@ pub fn matmul_select_batched(
             ],
         )?;
     } else if let Some((m, n, simdgroups)) = mpp {
-        const FILE: &str = "linear/quant_qmm_mpp.metal";
+        const FILE: &str = "linear/qmm_mpp.metal";
         let k = stated(op, x.width)?;
         debug_assert!(
             !sorted.sums

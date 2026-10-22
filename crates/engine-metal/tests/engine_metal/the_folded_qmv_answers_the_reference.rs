@@ -275,7 +275,7 @@ fn the_folded_qmv_answers_the_reference() {
                             ki.arg(),
                         ];
                         sink.fire(
-                            Fire::at("linear/quant_qmv_rows.metal", point.entry)
+                            Fire::at("linear/qmv_rows.metal", point.entry)
                                 .stamp(point.stamp)
                                 .apply(Grid::of(
                                     quant::qmv_rows_grid("ref-grid", mi, rung, ni).expect("grid"),

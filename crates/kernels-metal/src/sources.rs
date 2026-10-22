@@ -181,6 +181,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/ane.metal")),
     ),
     (
+        "linear/dequant.h",
+        include_str!(concat!(source_root!(), "/linear/dequant.h")),
+    ),
+    (
         "linear/gemm.metal",
         include_str!(concat!(source_root!(), "/linear/gemm.metal")),
     ),
@@ -209,36 +213,32 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/moe/select.metal")),
     ),
     (
-        "linear/quant_block.h",
-        include_str!(concat!(source_root!(), "/linear/quant_block.h")),
+        "linear/qmm_mpp.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_mpp.metal")),
     ),
     (
-        "linear/quant_ptq1_0.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_ptq1_0.metal")),
+        "linear/qmm_sg.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_sg.metal")),
     ),
     (
-        "linear/quant_qmm_mpp.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_mpp.metal")),
+        "linear/qmm_staged.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_staged.metal")),
     ),
     (
-        "linear/quant_qmm_sg.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_sg.metal")),
+        "linear/qmm_t.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_t.metal")),
     ),
     (
-        "linear/quant_qmm_staged.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_staged.metal")),
+        "linear/qmv.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv.metal")),
     ),
     (
-        "linear/quant_qmm_t.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_t.metal")),
+        "linear/qmv_ptq1_0.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv_ptq1_0.metal")),
     ),
     (
-        "linear/quant_qmv.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmv.metal")),
-    ),
-    (
-        "linear/quant_qmv_rows.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmv_rows.metal")),
+        "linear/qmv_rows.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv_rows.metal")),
     ),
     (
         "prim/gemm_loader.h",

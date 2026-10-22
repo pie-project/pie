@@ -221,20 +221,20 @@ fn forcing(q: &Qmm) -> String {
 fn ran(files: &[&str], q: &Qmm) -> bool {
     let has = |name: &str| files.iter().any(|f| f.contains(name));
     match q {
-        Qmm::Mpp => has("quant_qmm_mpp"),
-        Qmm::Staged => has("quant_qmm_staged"),
-        Qmm::Register => has("quant_qmm_sg"),
+        Qmm::Mpp => has("linear/qmm_mpp.metal"),
+        Qmm::Staged => has("linear/qmm_staged.metal"),
+        Qmm::Register => has("linear/qmm_sg.metal"),
         Qmm::Tiled { .. } => {
-            !has("quant_qmm_mpp")
-                && !has("quant_qmm_staged")
-                && !has("quant_qmm_sg")
-                && has("quant_qmm_t")
+            !has("linear/qmm_mpp.metal")
+                && !has("linear/qmm_staged.metal")
+                && !has("linear/qmm_sg.metal")
+                && has("linear/qmm_t.metal")
         }
         Qmm::Qmv { .. } => {
-            !has("quant_qmm_mpp")
-                && !has("quant_qmm_staged")
-                && !has("quant_qmm_sg")
-                && !has("quant_qmm_t")
+            !has("linear/qmm_mpp.metal")
+                && !has("linear/qmm_staged.metal")
+                && !has("linear/qmm_sg.metal")
+                && !has("linear/qmm_t.metal")
         }
     }
 }
