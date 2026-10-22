@@ -226,14 +226,13 @@ pub struct MoeTileRows(pub u32);
 
 /// Whether a routed MLP over a verify's few tokens (2 to 8) runs on the register
 /// tile, as Splash's Apple9 expert tiles do: the routes grouped into an 8-row
-/// tile an expert, each tile's codes streamed once for its rows, the gate-up
-/// landing its SwiGLU as the down's input table, and the shared expert, where
-/// one follows, riding along as one more tile. A tile costs its eight rows'
-/// MMAs however few it holds, so it pays where a verify's tokens share their
-/// experts: on an M4 Pro over a 35B-A3B layer's eight rows it takes a quarter
-/// off the per-route kernel and the shared expert at 21 experts, matches them
-/// at 35 and adds a quarter at 59, and a spec decode round, whose verify rows
-/// route to about 35, runs as fast either way.
+/// tile an expert, each tile's codes streamed once for its rows on a grid of
+/// the live tiles alone, the gate-up landing its SwiGLU as the down's input
+/// table, and the shared expert, where one follows, riding along as one more
+/// tile, its gate landed by the grouping and the gated sum by one combine. On
+/// an M4 Pro over Qwen3.6-35B-A3B's speculative verify, its expert matmuls
+/// take 12.1 ms (Splash's 12.2) where the per-route kernel and the shared
+/// expert took 13.6, and a round 29.0 ms where it took 29.8.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.register", flag, default = false, tune = search)]
 pub struct MoeRegister;
