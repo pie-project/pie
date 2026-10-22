@@ -164,7 +164,7 @@ impl OffloadConfig {
         ensure!(
             cfg!(feature = "nixl") || self.transfer != OffloadTransfer::Nixl,
             "[offload] transfer = \"nixl\" needs a build with the `nixl` feature; \"auto\" \
-             reads in place where the build can"
+             takes the bulk link"
         );
         Ok(())
     }
@@ -172,10 +172,14 @@ impl OffloadConfig {
 
 /// How KV pages cross between workers.
 ///
-/// `Nixl` and `Auto` read a peer's kv in place, device to device, where the
-/// build has the `nixl` feature (built against `NIXL_PREFIX`) and both
-/// workers export kv of one layout; otherwise, and with `Inline`, the pages'
-/// bytes ride the bulk link. A build without the feature refuses `Nixl`.
+/// `Nixl` reads a peer's kv in place, device to device, where both workers
+/// export kv of one layout; a build without the `nixl` feature (built
+/// against `NIXL_PREFIX`) refuses it. Otherwise the pages' bytes ride the
+/// bulk link, a peer's prefill streamed back a layer at a time as it is
+/// computed. `Auto` takes the bulk link: the stream overlaps the transfer
+/// with the prefill, a read in place starts only once it is done, and only
+/// the operator knows whether NIXL reaches the peer's device memory directly
+/// (RDMA, NVLink) or copies it through host memory over TCP.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OffloadTransfer {
