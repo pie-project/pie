@@ -245,7 +245,6 @@ impl Run<'_> {
 impl poem_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &poem_ir::Node) {
         use poem_ir::Operands as _;
-        self.walk_one();
         if !crate::diag::on().nan_check {
             return;
         }
