@@ -296,9 +296,27 @@ impl Pipelines {
             return Ok(Arc::clone(pipeline));
         }
 
+        let cache = self.cache(device);
+        // kernels-slang's entries come compiled: one WGSL module, no tiers.
+        if let Some(wgsl) = kernels_slang::wgsl(entrypoint) {
+            let wgsl = promote_storage(wgsl);
+            let pipeline = Arc::new(build(
+                device.core(),
+                cache.as_ref(),
+                fire,
+                entrypoint,
+                kernels_wgpu::Capability::Baseline,
+                &wgsl,
+            )?);
+            self.compiles.set(self.compiles.get() + 1);
+            self.built
+                .borrow_mut()
+                .insert(entrypoint, Arc::clone(&pipeline));
+            return Ok(pipeline);
+        }
+
         let mut tiers = device.tiers();
         tiers.push(kernels_wgpu::Capability::Baseline);
-        let cache = self.cache(device);
         let mut last = None;
         let mut built = None;
         for tier in tiers {

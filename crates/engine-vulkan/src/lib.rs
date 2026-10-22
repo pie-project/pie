@@ -44,9 +44,9 @@ pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as Ad
 pub use boot::open;
 pub use device::{Buffer, Context, Handles, Pipelines};
 pub use encode::{
-    DispatchShape, Sink, barriers, between_fires_ns, capture_shapes, fence_ns, frame_span_ns,
-    host_encode_ns, kernel_profile, profile_kernels, profiling, reset_kernel_profile, submit_ns,
-    take_shapes,
+    DispatchShape, Sink, Slang, barriers, between_fires_ns, capture_shapes, fence_ns,
+    frame_span_ns, host_encode_ns, kernel_profile, profile_kernels, profiling,
+    reset_kernel_profile, submit_ns, take_shapes,
 };
 pub use error::{Fault, Result};
 pub use inputs::Inputs;

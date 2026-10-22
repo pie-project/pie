@@ -15,6 +15,7 @@ path = "src/lib.rs"
 toml = "1.1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-wgpu = { path = "../kernels-wgpu" }
+kernels-slang = { path = "../kernels-slang" }
 engine = { path = "../engine" }
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
@@ -50,4 +51,11 @@ wgpu = { version = "30", default-features = false, features = [
 
 [features]
 default = []
-wgpu = ["dep:wgpu", "dep:naga", "dep:ash", "dep:kernels-vulkan", "kernels-vulkan/probe"]
+wgpu = [
+    "dep:wgpu",
+    "dep:naga",
+    "dep:ash",
+    "dep:kernels-vulkan",
+    "kernels-vulkan/probe",
+    "kernels-slang/wgsl",
+]

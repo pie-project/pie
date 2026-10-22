@@ -42,15 +42,20 @@ runs:
       shell: bash
       run: brew install cmake ninja libomp
 
-    # The Vulkan kernels compile to SPIR-V at build time.
-    - if: contains(inputs.features, 'vulkan')
+    # The Vulkan kernels compile to SPIR-V at build time, and kernels-slang
+    # to SPIR-V and WGSL (wgpu).
+    - if: contains(inputs.features, 'vulkan') || contains(inputs.features, 'wgpu')
       shell: bash
       env:
         SLANG_VERSION: '2026.17'
       run: |
         set -euo pipefail
         arch=x86_64; [[ "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && arch=aarch64
-        if [[ "$RUNNER_OS" == Windows ]]; then asset="slang-${SLANG_VERSION}-windows-${arch}.zip"; else asset="slang-${SLANG_VERSION}-linux-${arch}.tar.gz"; fi
+        case "$RUNNER_OS" in
+          Windows) asset="slang-${SLANG_VERSION}-windows-${arch}.zip" ;;
+          macOS)   asset="slang-${SLANG_VERSION}-macos-${arch}.tar.gz" ;;
+          *)       asset="slang-${SLANG_VERSION}-linux-${arch}.tar.gz" ;;
+        esac
         curl -fsSL -o "${RUNNER_TEMP}/${asset}" "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/${asset}"
         mkdir -p "${RUNNER_TEMP}/slang"
         case "$asset" in

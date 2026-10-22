@@ -279,6 +279,7 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-unknown-unknown
+          features: wgpu
       - uses: actions/setup-node@v7
         with:
           node-version: 22

@@ -280,6 +280,74 @@ impl Encode for Sink<'_> {
     }
 }
 
+/// Any kernels-vulkan context as a kernels-slang one: its `Fire` and arguments
+/// are kernels-vulkan's, field for field.
+pub struct Slang<'a>(pub &'a kernels_vulkan::Ctx<'a>);
+
+impl kernels_slang::Encode for Slang<'_> {
+    fn fire(
+        &self,
+        fire: kernels_slang::Fire,
+        args: &[kernels_slang::ArgValue],
+    ) -> std::result::Result<(), kernels_slang::Error> {
+        let fire = Fire {
+            file: fire.file,
+            entrypoint: fire.entrypoint,
+            groups: fire.groups,
+            group: fire.group,
+        };
+        let args: Vec<ArgValue> = args.iter().map(|a| vulkan_arg(*a)).collect();
+        self.0.fire(fire, &args).map_err(slang_error)
+    }
+
+    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
+        match self.0.absent().map_err(slang_error)? {
+            ArgValue::Buffer(h) => Ok(kernels_slang::ArgValue::Buffer(h)),
+            ArgValue::BufferMut(h) => Ok(kernels_slang::ArgValue::BufferMut(h)),
+            ArgValue::I32(v) => Ok(kernels_slang::ArgValue::I32(v)),
+            ArgValue::U32(v) => Ok(kernels_slang::ArgValue::U32(v)),
+            ArgValue::F32(v) => Ok(kernels_slang::ArgValue::F32(v)),
+        }
+    }
+}
+
+fn vulkan_arg(arg: kernels_slang::ArgValue) -> ArgValue {
+    match arg {
+        kernels_slang::ArgValue::Buffer(h) => ArgValue::Buffer(h),
+        kernels_slang::ArgValue::BufferMut(h) => ArgValue::BufferMut(h),
+        kernels_slang::ArgValue::I32(v) => ArgValue::I32(v),
+        kernels_slang::ArgValue::U32(v) => ArgValue::U32(v),
+        kernels_slang::ArgValue::F32(v) => ArgValue::F32(v),
+    }
+}
+
+/// kernels-slang's refusal as kernels-vulkan's.
+pub fn from_slang(e: kernels_slang::Error) -> Error {
+    match e {
+        kernels_slang::Error::Backend { op, detail } => Error::Backend { op, detail },
+        kernels_slang::Error::Unsupported { op } => Error::Unsupported { op },
+        kernels_slang::Error::DtypeUnsupported { op, dtype } => {
+            Error::DtypeUnsupported { op, dtype }
+        }
+    }
+}
+
+/// A kernels-vulkan tensor as kernels-slang's: the same handle and shape.
+#[must_use]
+pub fn slang_tensor(t: kernels_vulkan::Tensor) -> kernels_slang::Tensor {
+    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
+}
+
+fn slang_error(e: Error) -> kernels_slang::Error {
+    match e {
+        Error::Backend { op, detail } => kernels_slang::Error::Backend { op, detail },
+        Error::Unsupported { op } => kernels_slang::Error::Unsupported { op },
+        Error::DtypeUnsupported { op, dtype } => {
+            kernels_slang::Error::DtypeUnsupported { op, dtype }
+        }
+    }
+}
+
 #[cfg(feature = "vulkan")]
 impl Sink<'_> {
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {

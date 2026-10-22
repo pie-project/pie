@@ -1925,6 +1925,7 @@ dependencies = [
  "engine",
  "eta-compiler",
  "eta-exec",
+ "kernels-slang",
  "kernels-vulkan",
  "libc",
  "memmap2",
@@ -1949,6 +1950,7 @@ dependencies = [
  "engine",
  "eta-compiler",
  "eta-exec",
+ "kernels-slang",
  "kernels-vulkan",
  "kernels-wgpu",
  "libc",
@@ -3156,6 +3158,13 @@ dependencies = [
  "pie-dtype",
  "pie-profile",
  "tracing",
+]
+
+[[package]]
+name = "kernels-slang"
+version = "0.5.4"
+dependencies = [
+ "pie-dtype",
 ]
 
 [[package]]

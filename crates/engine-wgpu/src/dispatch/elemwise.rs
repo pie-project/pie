@@ -20,54 +20,58 @@ impl Run<'_> {
                 eps,
                 y,
                 axis: NormAxis::Row,
-            } => elemwise::norm::rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::norm::rmsnorm(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::Scale(weight),
                 axis: NormAxis::Head(head_dim),
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_per_head(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::norm::rmsnorm_per_head(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *head_dim,
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),
                 eps,
                 y,
                 axis: NormAxis::Row,
-            } => elemwise::norm::rmsnorm_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::norm::rmsnorm_plus_one(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),
                 axis: NormAxis::Head(head_dim),
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_per_head_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::norm::rmsnorm_per_head_plus_one(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *head_dim,
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             // Muse Spark's post-norm gate is served on CUDA.
             Elemwise::NormGate { .. } => Err(kernels_wgpu::Error::Unsupported {
                 op: "elemwise.norm_gate",
@@ -154,14 +158,15 @@ impl Run<'_> {
                 axis: NormAxis::Group(group),
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_grouped_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::norm::rmsnorm_grouped_plus_one(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *group,
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::SiluScaled { s, x, x_out: _ } => {
                 elemwise::norm::silu_scaled(self.ctx(), *s, self.tensor(*x))
             }

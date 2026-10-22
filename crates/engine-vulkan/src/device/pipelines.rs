@@ -71,15 +71,16 @@ impl Pipelines {
         if let Some(pipeline) = self.built.borrow().get(entrypoint) {
             return Ok(Arc::clone(pipeline));
         }
-        let code = kernels_vulkan::sources::module_for(entrypoint, device.lanes()).ok_or(
-            Fault::Shader {
+        let code = kernels_vulkan::sources::module_for(entrypoint, device.lanes())
+            .or_else(|| kernels_slang::spirv(entrypoint))
+            .ok_or(Fault::Shader {
                 file: fire.file,
                 entrypoint,
-                why: "the kernel table holds no compiled module by that name (built without \
-                  `kernels-vulkan/native`, or the variant is not instantiated)"
+                why: "neither kernel table holds a compiled module by that name (built \
+                  without `kernels-vulkan/native` or `kernels-slang/spirv`, or the variant is \
+                  not instantiated)"
                     .to_string(),
-            },
-        )?;
+            })?;
         let cache = device.pipeline_cache();
         let pipeline = Arc::new(build(device.core(), cache.handle(), fire, code)?);
         cache.built();

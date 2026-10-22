@@ -1,0 +1,29 @@
+[package]
+name = "kernels-slang"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "One Slang kernel tree for Vulkan and WebGPU: build.rs compiles every instantiation to SPIR-V (`spirv`) and WGSL (`wgsl`), and the host side names each entry once, for any engine that implements `Encode`."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+links = "pie_kernels_slang"
+build = "build.rs"
+
+[lib]
+name = "kernels_slang"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+# SPIR-V modules (engine-vulkan).
+spirv = []
+
+# WGSL modules (engine-wgpu).
+wgsl = []
+
+[dependencies]
+dtype = { package = "pie-dtype", path = "../dtype" }
+
+[lints]
+workspace = true

@@ -311,6 +311,11 @@ impl<'c> Run<'c> {
         self.ctx
     }
 
+    /// The same context for kernels-slang's entries.
+    pub(crate) fn slang(&self) -> crate::encode::Slang<'c> {
+        crate::encode::Slang(self.ctx)
+    }
+
     pub(crate) fn bindings(&self) -> &FireBindings {
         &self.fire
     }
