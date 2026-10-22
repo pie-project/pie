@@ -44,6 +44,14 @@ impl Run<'_> {
                         w: *gate_up,
                         y: *packed,
                     })?;
+                    // A routed down landed the SwiGLU and the down.
+                    if self.landed_ahead(*h) {
+                        return self.linear(&Linear::Matmul {
+                            act: *h,
+                            w: *down,
+                            y: *y,
+                        });
+                    }
                     // The down on the register tile reads its input table as
                     // the swiglu lays it.
                     let laid = self
@@ -471,29 +479,69 @@ impl Run<'_> {
         Ok(true)
     }
 
-    /// The gate-up of the shared expert of `act` (its fused MLP) that the trace
-    /// places after the routed matmul of `act` into `y` by `bank`, an expert of
-    /// `bank`'s shape: the routed launch lands it as one more route of every
-    /// token, and the MLP's gate-up finds it done ([`Run::landed_ahead`]).
+    /// Whether `values`' bytes stand clear of every value the nodes `from..to`
+    /// read or write, which would read or write them: so they may land ahead.
+    fn clear_of_nodes(&self, values: &[poem_ir::ValueId], from: u32, to: u32) -> bool {
+        let span = |v: poem_ir::ValueId| {
+            let t = self.tensor(v);
+            self.address(t.buf)
+                .map(|(slab, at)| (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2))
+        };
+        let mut touched = Vec::new();
+        for n in from..to {
+            let Some(node) = self.nodes().get(n as usize) else {
+                return false;
+            };
+            node.op.inputs(&mut touched);
+            node.op.outputs(&mut touched);
+        }
+        touched.retain(|v| matches!(self.values()[v.0 as usize].def, poem_ir::Def::Op(_)));
+        values.iter().all(|&mine| {
+            let Some(mine) = span(mine) else {
+                return false;
+            };
+            touched.iter().all(|&v| {
+                span(v).is_some_and(|b| mine.0 != b.0 || mine.2 <= b.1 || b.2 <= mine.1)
+            })
+        })
+    }
+
+    /// The node of the routed matmul of `act` into `y` by `bank`.
+    fn select_at(
+        &self,
+        act: poem_ir::ValueId,
+        bank: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Option<u32> {
+        use poem_ir::Operation;
+        self.readers_of(act).iter().copied().find(|&at| {
+            matches!(self.nodes().get(at as usize).map(|n| &n.op),
+                Some(Operation::Linear(Linear::MoeMatmulSelectQuant { x, bank: b, y: o, .. }))
+                if *x == act && *b == bank && *o == y)
+        })
+    }
+
+    /// The shared expert of `act` (its fused MLP, at its node) that the trace
+    /// places after the routed gate-up of `act` into `y` by `bank`, an expert
+    /// of `bank`'s shape, when its gate-up may land ahead: the routed launch
+    /// lands it as one more route of every token, and the MLP's gate-up finds
+    /// it done ([`Run::landed_ahead`]).
     fn shared_route(
         &self,
         act: poem_ir::ValueId,
         bank: poem_ir::ValueId,
         y: poem_ir::ValueId,
-    ) -> Option<(kernels_metal::Bank, poem_ir::ValueId)> {
+    ) -> Option<(u32, kernels_metal::Bank, poem_ir::ValueId)> {
         use poem_ir::Operation;
         if !self.region_nodes()?.1 {
             return None;
         }
-        let op = |at: u32| self.nodes().get(at as usize).map(|n| &n.op);
-        let readers = self.readers_of(act);
-        let first = readers.iter().copied().find(|&at| {
-            matches!(op(at), Some(Operation::Linear(Linear::MoeMatmulSelectQuant { x, bank: b, y: o, .. }))
-                if *x == act && *b == bank && *o == y)
-        })?;
+        let first = self.select_at(act, bank, y)?;
         let (routed, out, x) = (self.planes(bank), self.tensor(y), self.tensor(act));
-        let (at, shared, packed) = readers.iter().copied().filter(|&at| at > first).find_map(|at| {
-            let Some(Operation::Fused(Fused::MlpSwiglu { act: a, gate_up, packed, .. })) = op(at) else {
+        let (at, shared, packed) = self.readers_of(act).iter().copied().filter(|&at| at > first).find_map(|at| {
+            let Some(Operation::Fused(Fused::MlpSwiglu { act: a, gate_up, packed, .. })) =
+                self.nodes().get(at as usize).map(|n| &n.op)
+            else {
                 return None;
             };
             let shared = self.banked(*gate_up).filter(|_| *a == act)?;
@@ -507,26 +555,44 @@ impl Run<'_> {
                 && to.rows == x.rows)
                 .then_some((at, shared, *packed))
         })?;
-        // Landed ahead, the gate-up's bytes stand clear of every value the
-        // nodes up to its MLP's read or write, which would read or write them.
-        let span = |v: poem_ir::ValueId| {
-            let t = self.tensor(v);
-            self.address(t.buf)
-                .map(|(slab, at)| (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2))
-        };
-        let mine = span(packed)?;
-        let apart = |b: (u64, u64, u64)| mine.0 != b.0 || mine.2 <= b.1 || b.2 <= mine.1;
-        let mut touched = Vec::new();
-        for n in first..at {
-            let node = &self.nodes().get(n as usize)?.op;
-            node.inputs(&mut touched);
-            node.outputs(&mut touched);
+        self.clear_of_nodes(&[packed], first, at).then_some((at, shared, packed))
+    }
+
+    /// The down of the shared expert whose gate-up the routed gate-up of these
+    /// `routes` landed, when the routed down of `act` into `y` by `bank` may
+    /// land it too: its SwiGLU then runs here, and the MLP finds all of it
+    /// done.
+    fn shared_down(
+        &self,
+        act: poem_ir::ValueId,
+        bank: poem_ir::ValueId,
+        routes: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Option<(kernels_metal::Bank, poem_ir::ValueId, poem_ir::ValueId, poem_ir::ValueId, u32)> {
+        use poem_ir::Operation;
+        let (mlp, rode) = self.riding.take()?;
+        if rode != routes {
+            return None;
         }
-        touched.retain(|v| matches!(self.values()[v.0 as usize].def, poem_ir::Def::Op(_)));
-        touched
-            .iter()
-            .all(|&v| span(v).is_some_and(apart))
-            .then_some((shared, packed))
+        let first = self.select_at(act, bank, y)?;
+        let Some(Operation::Fused(Fused::MlpSwiglu { down, packed, h, y: sy, intermediate, .. })) =
+            self.nodes().get(mlp as usize).map(|n| &n.op)
+        else {
+            return None;
+        };
+        let (routed, out, hidden) = (self.planes(bank), self.tensor(y), self.tensor(*h));
+        let shared = self.banked(*down)?;
+        let to = self.tensor(*sy);
+        (shared.affine()
+            && shared.bits == routed.bits
+            && shared.group == routed.group
+            && shared.ld == hidden.width
+            && hidden.width == self.tensor(act).width
+            && shared.codes.rows == out.width
+            && to.width == out.width
+            && to.rows == hidden.rows
+            && self.clear_of_nodes(&[*h, *sy], first, mlp))
+            .then_some((shared, *packed, *h, *sy, *intermediate))
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
@@ -972,6 +1038,25 @@ impl Run<'_> {
                     );
                     self.chain_clear();
                 }
+                if let Some((shared, packed, h, sy, intermediate)) =
+                    self.shared_down(*x, *bank, *routes, *y)
+                {
+                    self.linear(&Linear::MlpSwiglu {
+                        packed,
+                        intermediate,
+                        y: h,
+                    })?;
+                    linear::moe::matmul_select_quant_shared(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.planes(*bank),
+                        self.tensor(*routes),
+                        self.tensor(*y),
+                        Some((shared, self.tensor(h), self.tensor(sy))),
+                    )?;
+                    self.land_ahead([Some(packed), Some(h), Some(sy)]);
+                    return Ok(());
+                }
                 let shared = self.shared_route(*x, *bank, *y);
                 linear::moe::matmul_select_quant_shared(
                     self.ctx(),
@@ -979,10 +1064,11 @@ impl Run<'_> {
                     self.planes(*bank),
                     self.tensor(*routes),
                     self.tensor(*y),
-                    shared.map(|(b, ys)| (b, self.tensor(*x), self.tensor(ys))),
+                    shared.map(|(_, b, ys)| (b, self.tensor(*x), self.tensor(ys))),
                 )?;
-                if let Some((_, ys)) = shared {
+                if let Some((mlp, _, ys)) = shared {
                     self.land_ahead([Some(ys), None, None]);
+                    self.riding.set(Some((mlp, *routes)));
                 }
                 Ok(())
             }

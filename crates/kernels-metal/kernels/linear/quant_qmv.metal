@@ -493,15 +493,13 @@ METAL_FUNC void qmv_grouped_impl(
       simd_gid * results_per_simdgroup;
   const int tokens = int(tgs.x);
   const int pairs = tokens * slots_per_row;
-  // The shared expert: the slot past the routes, every token's, read once by token 0's threadgroup.
-  const bool shared = int(tid.z) == slots_per_row;
-  int sel = 0, e = 0;
-  if (shared) {
-    if (tid.x != 0) {
-      return;
-    }
-  } else {
-    sel = int(tid.x) * slots_per_row + int(tid.z);
+  // The shared expert, when the grid holds it: the first slot, a token a threadgroup, so its
+  // tokens' threadgroups run first and side by side, reading its codes once between them.
+  const int lead = int(tgs.z) - slots_per_row;
+  const bool shared = int(tid.z) < lead;
+  int sel = int(tid.x), e = 0;
+  if (!shared) {
+    sel = int(tid.x) * slots_per_row + int(tid.z) - lead;
     e = expert_ids[sel];
     if (e < 0) {
       return;
@@ -525,8 +523,8 @@ METAL_FUNC void qmv_grouped_impl(
   const device T* sc_row = sc + out_row * in_vec_size_g;
   const device T* bi_row = bi + out_row * in_vec_size_g;
 
-  // the pairs of this expert from `sel` on, a 64-pair window at a time; the shared expert's, every token
-  const int count = shared ? tokens : pairs;
+  // the pairs of this expert from `sel` on, a 64-pair window at a time; the shared expert's, its token's
+  const int count = shared ? sel + 1 : pairs;
   for (int window = sel; window < count; window += 2 * SIMD_SIZE) {
     const int lo = window + int(simd_lid);
     const int hi = lo + SIMD_SIZE;

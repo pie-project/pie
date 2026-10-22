@@ -189,6 +189,10 @@ pub struct Run<'c> {
     /// The outputs a segment launch landed ahead of the nodes that write them.
     landed: std::cell::Cell<Option<Landed>>,
 
+    /// The shared expert whose gate-up a routed gate-up landed, as
+    /// `(its MLP's node, the routes)`: the routed down may land its down.
+    pub(crate) riding: std::cell::Cell<Option<(u32, ValueId)>>,
+
     /// The compiled regions the walk's place indexes, when the encode names
     /// them: a segment launch takes only nodes of the region it runs in.
     regions: Option<&'c [poem_compiler::Region]>,
@@ -292,6 +296,7 @@ impl<'c> Run<'c> {
             readers: std::cell::OnceCell::new(),
             table: std::cell::Cell::new(None),
             landed: std::cell::Cell::new(None),
+            riding: std::cell::Cell::new(None),
             regions: None,
         }
     }
