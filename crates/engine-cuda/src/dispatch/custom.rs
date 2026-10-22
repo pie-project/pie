@@ -691,7 +691,7 @@ impl Run<'_> {
                 ratio: *ratio,
                 selection: *selection,
             });
-        if !decode::takes(heads, head_dim, &window_pool, pooled.as_ref()) {
+        if !decode::takes(self.ctx(), heads, head_dim, &window_pool, pooled.as_ref()) {
             return None;
         }
         Some(decode::decode(

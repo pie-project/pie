@@ -151,6 +151,7 @@ fn selected(
     if let Some(dim) = mma_dim(ctx, head_dim, q_heads / kv_heads)
         && q_heads / kv_heads <= TILE_GROUP
         && max_blocks <= TILE_MAX_BLOCKS
+        && ctx.smem_fits(tile_smem_bytes(dim))
         && total_tokens >= TILE_ROWS * num_requests.max(1)
     {
         #[allow(clippy::cast_sign_loss)]

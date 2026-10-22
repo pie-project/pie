@@ -140,6 +140,9 @@ fn check(
         let o_at = gpu.zeros(n * H * D * 2);
         let (o, (floor_t, sink_t, s)) = (&mut ten(o_at, n, H * D, Bf16), t);
         let fired = match pass {
+            // Below the opt-in shared memory it lays out (sm_86, sm_89) the
+            // fused decode stands down; the engine runs its primitives.
+            Pass::Decode if !decode::takes(&ctx, 64, 512, &win, pooled.as_ref()) => continue,
             Pass::Decode => decode::decode(
                 &ctx, qt, pos_t, req_t, floor_t, &win, 128, pooled, sink_t, 64, 512, s, turned, o,
             ),

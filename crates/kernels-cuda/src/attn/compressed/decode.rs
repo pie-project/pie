@@ -167,9 +167,27 @@ pub struct Pooled<'a> {
 }
 
 /// Whether [`decode`] takes this shape: 64 heads at 512 over bf16 planes, or
-/// over fp8 rows (window and pool alike).
+/// over fp8 rows (window and pool alike), in shared memory this device lets
+/// a block hold (sm_86 and sm_89 do not: their opt-in tops at 99 KiB).
 #[must_use]
-pub fn takes(heads: u32, head_dim: u32, window: &KvPool, pooled: Option<&Pooled<'_>>) -> bool {
+pub fn takes(
+    ctx: &Ctx,
+    heads: u32,
+    head_dim: u32,
+    window: &KvPool,
+    pooled: Option<&Pooled<'_>>,
+) -> bool {
+    shaped(heads, head_dim, window, pooled) && ctx.smem_fits(smem(formats(window, pooled)))
+}
+
+/// The window's and the pool's row formats (a window-only layer reads no
+/// pool; its format stands in); `None` over bf16 planes.
+fn formats(window: &KvPool, pooled: Option<&Pooled<'_>>) -> Option<(Rows, Rows)> {
+    let view = pooled.map(|p| entries_view(p.entries, p.ratio, entry_row(p.entries)).0);
+    rows_of(window).map(|w| (w, view.as_ref().and_then(rows_of).unwrap_or(w)))
+}
+
+fn shaped(heads: u32, head_dim: u32, window: &KvPool, pooled: Option<&Pooled<'_>>) -> bool {
     let fp8 = ds_rows(window);
     let alike = |p: &KvPool| {
         if fp8 {
@@ -308,7 +326,7 @@ pub fn decode(
 ) -> Result<(), Error> {
     const OP: &str = "attention.dsv4_decode";
     let turn = TurnArgs::of(turn);
-    if !takes(heads, head_dim, window_pool, pooled.as_ref()) {
+    if !takes(ctx, heads, head_dim, window_pool, pooled.as_ref()) {
         return Err(refuse(
             OP,
             format!(
@@ -331,15 +349,13 @@ pub fn decode(
     if rows == 0 {
         return Ok(());
     }
-    // The window's and the pool's row formats (a window-only layer reads
-    // no pool; its format stands in).
     // A compact pool read through its view: an entry a row, `page_size /
     // ratio` a page.
     let (view, pool_compact) = pooled.as_ref().map_or((None, false), |p| {
         let (v, compact) = entries_view(p.entries, p.ratio, entry_row(p.entries));
         (Some(v), compact)
     });
-    let formats = rows_of(window_pool).map(|w| (w, view.as_ref().and_then(rows_of).unwrap_or(w)));
+    let formats = formats(window_pool, pooled.as_ref());
     let (wf, pf) = formats.map_or((0, 0), |(w, p)| (w.code(), p.code()));
     let window = count(OP, "the sliding window", window)?;
     let ranks = ranks(ctx, rows);

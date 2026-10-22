@@ -510,6 +510,13 @@ impl Ctx {
         }
     }
 
+    /// Whether a block asking `bytes` of dynamic shared memory can launch
+    /// here; true where the device does not say.
+    #[must_use]
+    pub fn smem_fits(&self, bytes: u32) -> bool {
+        self.smem_per_block_optin().is_none_or(|max| bytes <= max)
+    }
+
     /// The shared memory one SM holds across its resident blocks.
     #[allow(clippy::unused_self)]
     #[must_use]
