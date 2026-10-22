@@ -1234,7 +1234,7 @@ const COOP_LEAST_COLUMNS: i32 = 4096;
 /// From this many columns the register-fed tile fills the device without a k cut.
 const COOP_WHOLE_COLUMNS: i32 = 12288;
 
-const COOP_SPLIT: i32 = 4;
+const COOP_SPLIT: i32 = 2;
 
 #[allow(clippy::too_many_arguments)]
 fn staged(
