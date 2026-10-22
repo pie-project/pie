@@ -115,8 +115,13 @@ template <class Multiply, class A, class B, class Total>
 METAL_FUNC void coop_walk(thread Multiply &multiply, thread A &a, thread B &b, thread Total &total,
                           const device uint4 *codes, const device bfloat *scale,
                           const device bfloat *bias, const device uint4 *x, ulong words,
-                          ulong groups, int first, int last, bool live) {
-  for (int span = first; span < last; ++span) {
+                          ulong groups, int first, int last, bool live, uint tile) {
+  // Each tile starts its walk (tile * 40503 mod 2^16) / 2^16 of the way in and wraps, so the
+  // tiles of a launch do not all fetch the same slice of the input at once.
+  const int count = last - first;
+  const int lead = int((ulong((tile * 40503u) & 0xFFFFu) * uint(count)) >> 16);
+  for (int step = 0; step < count; ++step) {
+    const int span = first + (lead + step) % count;
     half2 s[4], z[4];
 #pragma unroll
     for (ushort j = 0; j < 4; ++j) {
@@ -207,7 +212,8 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
   const device bfloat *bias = biases + ulong(column + sub) * groups + q;
   const device uint4 *x = reinterpret_cast<const device uint4 *>(
                               input + ulong(min(int(sub), rows - 1)) * width) + 8 * q;
-  coop_walk(multiply, a, b, total, codes, scale, bias, x, words, groups, first, last, live);
+  coop_walk(multiply, a, b, total, codes, scale, bias, x, words, groups, first, last, live,
+            position.x);
 #pragma unroll
   for (ushort i = 0; i < total.get_capacity(); ++i) {
     if (!total.is_valid_element(i))
@@ -373,7 +379,8 @@ affine_qmm_coop_segments(const device uint *w0 [[buffer(0)]], const device bfloa
   const device bfloat *bias = biases + ulong(column + sub) * groups + q;
   const device uint4 *x = reinterpret_cast<const device uint4 *>(
                               input + ulong(min(int(sub), rows - 1)) * width) + 8 * q;
-  coop_walk(multiply, a, b, total, codes, scale, bias, x, words, groups, 0, width / 256, live);
+  coop_walk(multiply, a, b, total, codes, scale, bias, x, words, groups, 0, width / 256, live,
+            g / 2);
 #pragma unroll
   for (ushort i = 0; i < total.get_capacity(); ++i) {
     if (!total.is_valid_element(i))
