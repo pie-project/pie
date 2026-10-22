@@ -86,7 +86,7 @@ impl Default for Diagnostics {
             pass_half: true,
             route_prefetch: true,
             expert_passes: true,
-            keepalive: true,
+            keepalive: false,
             scratch_no_zero: false,
             host_rows: false,
             nan_check: false,
