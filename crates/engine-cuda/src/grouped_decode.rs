@@ -213,11 +213,14 @@ mod tests {
                 .trace(poem::Platform::Cuda);
             let rewritten = rewrite(trace, 0);
             poem_ir::check(&rewritten).expect("the rewritten trace types");
-            rewritten.nodes.iter().fold((0, 0), |(decodes, prefills), node| match &node.op {
-                Operation::Attention(Attention::PlanDecode { .. }) => (decodes + 1, prefills),
-                Operation::Attention(Attention::PlanPrefill { .. }) => (decodes, prefills + 1),
-                _ => (decodes, prefills),
-            })
+            rewritten
+                .nodes
+                .iter()
+                .fold((0, 0), |(decodes, prefills), node| match &node.op {
+                    Operation::Attention(Attention::PlanDecode { .. }) => (decodes + 1, prefills),
+                    Operation::Attention(Attention::PlanPrefill { .. }) => (decodes, prefills + 1),
+                    _ => (decodes, prefills),
+                })
         };
         let (decodes, _) = plans("nemotron3-ultra-mini-bf16-kv-bf16");
         assert_eq!(decodes, 0, "no group-32 plan stays a decode");

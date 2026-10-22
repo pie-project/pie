@@ -197,7 +197,12 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
 #[test]
 fn the_affine_gemv_on_the_tensor_cores_answers_the_dequantized_dot() {
     use kernels_cuda::linear::quant;
-    for (rows, n, k) in [(1usize, 320usize, 1024usize), (2, 4096, 4096), (9, 1000, 2048), (16, 512, 14336)] {
+    for (rows, n, k) in [
+        (1usize, 320usize, 1024usize),
+        (2, 4096, 4096),
+        (9, 1000, 2048),
+        (16, 512, 14336),
+    ] {
         let seat = GroupSeat::RESIDENT;
         let mut b = Bench::new(0x4a + rows as u64);
         let (x, xv) = b.bf16(rows * k);

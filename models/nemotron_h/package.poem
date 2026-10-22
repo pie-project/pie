@@ -1,10 +1,10 @@
 # Nemotron-3 Super and Ultra (`nemotron_h`): Mamba-2 mixers, a few NoPE
-# attention layers and latent MoE layers of relu2 experts; and Super's
-# and Ultra's nine-layer miniatures (four of each mixer kind but one attention;
-# Ultra's at 64 experts). Super is
-# served as modelopt exports it and vLLM serves it: routed experts NVFP4
-# against NVFP4 activations, the projections the export keeps FP8 at FP8, the
-# rest bf16. Ultra is served as released, every weight bf16.
+# attention layers and latent MoE layers of relu2 experts; and their
+# nine-layer miniatures (four of each mixer kind but one attention, Ultra's at
+# 64 experts). Super is served as modelopt exports it and vLLM serves it:
+# routed experts NVFP4 against NVFP4 activations, the projections the export
+# keeps FP8 at FP8, the rest bf16. Ultra is served as released, every weight
+# bf16.
 
 STOP = ["<|im_end|>"]
 CHATML = template("chatml", thinking = True, tools = True, generation_suffix = "<think>\n", stop = STOP)
