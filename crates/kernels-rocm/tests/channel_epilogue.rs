@@ -550,3 +550,32 @@ fn the_epilogue_matches_the_host_rings() {
         check(lanes);
     }
 }
+
+#[test]
+fn gather_words_lands_each_run_at_its_word() {
+    let Some(gpu) = Gpu::open() else { return };
+    let src = gpu.ints(&(0..64).map(|i| 1000 + i).collect::<Vec<_>>());
+    let dst = gpu.ints(&[-1; 96]);
+    // Runs of 1, 3 and 64 words (dst word, src word, words), the long one
+    // past a block.
+    let runs = [(0u32, 5u32, 1u32), (2, 10, 3), (8, 0, 64)];
+    let table: Vec<channel::WordRun> = runs
+        .iter()
+        .map(|&(dst_word, from, words)| channel::WordRun {
+            src: src.ptr + u64::from(from) * 4,
+            dst_word: dst_word + 20,
+            words,
+        })
+        .collect();
+    let table = gpu.upload(&table, 1, table.len() as u32 * 4, dtype::Dtype::I32);
+    channel::gather_words(&gpu.ctx(), table.ptr, dst.ptr, runs.len() as u32).unwrap();
+    let have = gpu.read(&kernels_rocm::Tensor::new(dst.ptr, 1, 96, dtype::Dtype::F32));
+    let mut want = vec![-1i32; 96];
+    for &(dst_word, from, words) in &runs {
+        for w in 0..words {
+            want[(dst_word + 20 + w) as usize] = 1000 + (from + w) as i32;
+        }
+    }
+    let have: Vec<i32> = have.iter().map(|v| v.to_bits() as i32).collect();
+    assert_eq!(have, want);
+}

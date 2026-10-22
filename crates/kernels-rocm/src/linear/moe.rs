@@ -19,6 +19,11 @@ const fn router_lane(rows: u32) -> Launch {
     Launch::per_row(rows, ROUTER_LANES)
 }
 
+/// The score slots a router lane holds over `experts` scores.
+fn router_slots(experts: u32) -> u32 {
+    experts.div_ceil(ROUTER_LANES).max(1)
+}
+
 fn router_fan(op: &'static str, fan: u32) -> Result<(), Error> {
     if fan > ROUTER_LANES {
         return Err(refuse(
@@ -92,7 +97,7 @@ pub fn topk_softmax(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::linear::moe_topk_softmax<{t}>")),
+            symbol(&format!("::pie::linear::moe_topk_softmax<{t}, {}>", router_slots(experts))),
         )
         .apply(router_lane(logits.rows)),
         &[
@@ -135,7 +140,7 @@ pub fn topk_softmax_scaled(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::linear::moe_topk_softmax_scaled<{t}>")),
+            symbol(&format!("::pie::linear::moe_topk_softmax_scaled<{t}, {}>", router_slots(experts))),
         )
         .apply(router_lane(logits.rows)),
         &[
@@ -204,7 +209,7 @@ pub fn topk_sigmoid(
         ctx,
         OP,
         FILE,
-        symbol(&format!("::pie::linear::moe_topk_sigmoid<{t}>")),
+        symbol(&format!("::pie::linear::moe_topk_sigmoid<{t}, {}>", router_slots(experts))),
         logits,
         correction_bias,
         experts,
@@ -273,7 +278,7 @@ pub fn topk_sigmoid_sink(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")),
+            symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}, {}>", router_slots(experts))),
         )
         .apply(router_lane(logits.rows)),
         &[
@@ -314,7 +319,7 @@ pub fn topk_sqrt_softplus(
         ctx,
         OP,
         FILE,
-        symbol(&format!("::pie::linear::moe_topk_sqrt_softplus<{t}>")),
+        symbol(&format!("::pie::linear::moe_topk_sqrt_softplus<{t}, {}>", router_slots(experts))),
         logits,
         Some(bias),
         experts,
@@ -947,7 +952,10 @@ fn route_order(
     }
     ctx.fire(
         op,
-        Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
+        Fire::at(
+            "linear/quant.hip",
+            symbol(&format!("::pie::linear::moe_route_order<{}>", spans > 0)),
+        )
             .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
         &[
             routes.arg(),
@@ -2991,14 +2999,13 @@ fn weighted_fold(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::linear::moe_weighted_sum<{t}, {vec}>")),
+            symbol(&format!("::pie::linear::moe_weighted_sum<{t}, {vec}, {top_k}>")),
         )
         .apply(elementwise_rows(OP, y.rows, y.width / vec)?),
         &[
             shared.map_or(*y, |s| s.y).arg(),
             routed.arg(),
             weights.arg(),
-            stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
             ArgValue::Ptr(shared.map_or(0, |s| s.shared.ptr)),
             ArgValue::Ptr(shared.map_or(0, |s| s.gate.ptr)),

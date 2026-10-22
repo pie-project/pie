@@ -187,6 +187,44 @@ const _: () = assert!(
     "channel::Rings: a registry is four addresses, a slot count and its padding",
 );
 
+/// One run `gather_words` copies: `words` u32 words from `src` to
+/// `dst_word` words past the destination.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WordRun {
+    pub src: DevicePtr,
+    pub dst_word: u32,
+    pub words: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<WordRun>() == 16);
+
+const GATHER_BLOCK: u32 = 64;
+
+/// Copies each of `run_count` runs at `runs` into `dst`, a block a run: one
+/// launch where a copy a run would be a blit kernel apiece.
+pub fn gather_words(
+    ctx: &Ctx,
+    runs: DevicePtr,
+    dst: DevicePtr,
+    run_count: u32,
+) -> Result<(), Error> {
+    const OP: &str = "channel.gather_words";
+    if run_count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::channel::gather_words")
+            .apply(Launch::grid([run_count, 1, 1], [GATHER_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::Ptr(dst),
+            ArgValue::U32(run_count),
+        ],
+    )
+}
+
 pub fn pull_validate(
     ctx: &Ctx,
     tickets: DevicePtr,

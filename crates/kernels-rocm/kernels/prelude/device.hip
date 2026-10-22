@@ -131,7 +131,7 @@ struct Window {
 
     // Whether row `row` of a launch over `per` rows per stated row is live.
     __device__ __forceinline__ bool live(long long row, int per = 1) const {
-        return w == nullptr || row / per < static_cast<long long>(w[0]);
+        return w == nullptr || row < static_cast<long long>(w[0]) * per;
     }
     // The row of the plane the launch's row `row` lands on.
     __device__ __forceinline__ long long plane(long long row, int per = 1) const {

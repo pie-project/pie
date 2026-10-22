@@ -130,7 +130,64 @@ __global__ __launch_bounds__(256) void rmsnorm_lanes(const T* __restrict__ x,
     *reinterpret_cast<Pack8<T>*>(y + row + c) = q;
 }
 
-// y += x (the residual stream, rounded once), then out = rmsnorm(y) · (w [+ 1]).
+// y += x (the residual stream, rounded once), then out = rmsnorm(y) · (w [+ 1]),
+// over 16-byte rows of at most PPT packs a thread: a row stays in registers
+// from the add to the scale. The sums walk the same packs in the same order
+// as `norm_row`'s.
+template <class T, int PPT, bool PLUS_ONE>
+__global__ __launch_bounds__(256) void residual_add_rmsnorm_packed(const T* __restrict__ x, T* __restrict__ y,
+                                                                   const T* __restrict__ w, T* __restrict__ out,
+                                                                   int hidden, float eps,
+                                                                   const u32* __restrict__ win) {
+    constexpr int BLOCK = 256;
+    __shared__ float smem[BLOCK / kWave];
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x) * hidden;
+    const int packs = hidden / 8;
+    Pack8<T> b[PPT], wv[PPT];
+#pragma unroll
+    for (int p = 0; p < PPT; ++p) {
+        const int i = threadIdx.x + p * BLOCK;
+        if (i < packs) {
+            const Pack8<T> a = reinterpret_cast<const Pack8<T>*>(x + row)[i];
+            b[p] = reinterpret_cast<const Pack8<T>*>(y + row)[i];
+            if (w != nullptr) wv[p] = reinterpret_cast<const Pack8<T>*>(w)[i];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) b[p].v[j] = from_f32<T>(to_f32(b[p].v[j]) + to_f32(a.v[j]));
+        }
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int p = 0; p < PPT; ++p) {
+        const int i = threadIdx.x + p * BLOCK;
+        if (i < packs) {
+            reinterpret_cast<Pack8<T>*>(y + row)[i] = b[p];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = to_f32(b[p].v[j]);
+                local += v * v;
+            }
+        }
+    }
+    const float inv = rsqrtf(block_sum(local, smem) / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int p = 0; p < PPT; ++p) {
+        const int i = threadIdx.x + p * BLOCK;
+        if (i < packs) {
+            Pack8<T> q;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float sc = w == nullptr ? 1.f : to_f32(wv[p].v[j]);
+                if constexpr (PLUS_ONE) sc += 1.f;
+                q.v[j] = from_f32<T>(to_f32(b[p].v[j]) * inv * sc);
+            }
+            reinterpret_cast<Pack8<T>*>(out + row)[i] = q;
+        }
+    }
+}
+
+// residual_add_rmsnorm_packed for any other row: the add, then the norm.
 template <class T, int BLOCK, bool PLUS_ONE>
 __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restrict__ x,
                                                               T* __restrict__ y,
@@ -144,55 +201,6 @@ __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restric
     const T* xr = x + row;
     T* yr = y + row;
     const bool packed = hidden % 8 == 0 && aligned16(xr) && aligned16(yr);
-    // A row of at most PPT packs a thread stays in registers from the add to
-    // the scale: no store and reload of the stream between them. The sums
-    // walk the same packs in the same order as `norm_row`'s.
-    constexpr int PPT = 4;
-    if (packed && hidden / 8 <= PPT * BLOCK && aligned16(out + row) && (w == nullptr || aligned16(w))) {
-        __shared__ float smem[BLOCK / kWave];
-        const int packs = hidden / 8;
-        Pack8<T> b[PPT], wv[PPT];
-#pragma unroll
-        for (int p = 0; p < PPT; ++p) {
-            const int i = threadIdx.x + p * BLOCK;
-            if (i < packs) {
-                const Pack8<T> a = reinterpret_cast<const Pack8<T>*>(xr)[i];
-                b[p] = reinterpret_cast<const Pack8<T>*>(yr)[i];
-                if (w != nullptr) wv[p] = reinterpret_cast<const Pack8<T>*>(w)[i];
-#pragma unroll
-                for (int j = 0; j < 8; ++j) b[p].v[j] = from_f32<T>(to_f32(b[p].v[j]) + to_f32(a.v[j]));
-            }
-        }
-        float local = 0.f;
-#pragma unroll
-        for (int p = 0; p < PPT; ++p) {
-            const int i = threadIdx.x + p * BLOCK;
-            if (i < packs) {
-                reinterpret_cast<Pack8<T>*>(yr)[i] = b[p];
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float v = to_f32(b[p].v[j]);
-                    local += v * v;
-                }
-            }
-        }
-        const float inv = rsqrtf(block_sum(local, smem) / static_cast<float>(hidden) + eps);
-#pragma unroll
-        for (int p = 0; p < PPT; ++p) {
-            const int i = threadIdx.x + p * BLOCK;
-            if (i < packs) {
-                Pack8<T> q;
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    float sc = w == nullptr ? 1.f : to_f32(wv[p].v[j]);
-                    if constexpr (PLUS_ONE) sc += 1.f;
-                    q.v[j] = from_f32<T>(to_f32(b[p].v[j]) * inv * sc);
-                }
-                reinterpret_cast<Pack8<T>*>(out + row)[i] = q;
-            }
-        }
-        return;
-    }
     if (packed) {
         for (int i = threadIdx.x; i < hidden / 8; i += BLOCK) {
             const Pack8<T> a = reinterpret_cast<const Pack8<T>*>(xr)[i];

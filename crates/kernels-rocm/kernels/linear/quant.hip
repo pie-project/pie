@@ -935,15 +935,16 @@ namespace pie::linear {
 // offsets[num_experts + 1]. One block of 256 threads; dynamic LDS of
 // 2·(num_experts + 1) ints. A thread holds its first kOrderHeld routes in
 // registers across the two passes over them, and owns a run of the buckets
-// for the prefix, so the block meets at four barriers. Given `hist` (a
-// prefill's routes, `spans` blocks of moe_route_span_count having bucketed
-// kOrderSpan routes each), the counts are the spans' and in place of the
-// scatter each span's count becomes where its routes start, for
+// for the prefix, so the block meets at four barriers. With SPANS, given
+// `hist` (a prefill's routes, `spans` blocks of moe_route_span_count having
+// bucketed kOrderSpan routes each), the counts are the spans' and in place
+// of the scatter each span's count becomes where its routes start, for
 // moe_route_span_scatter.
 constexpr int kOrderThreads = 1024;
 constexpr int kOrderHeld = 2;
 constexpr int kOrderSpan = 2048;
 
+template <bool SPANS>
 __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __restrict__ routes,
                                                                  i32* __restrict__ order, i32* __restrict__ offsets,
                                                                  i32* __restrict__ work, int work_cap,
@@ -965,17 +966,17 @@ __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __re
 #pragma unroll
     for (int i = 0; i < kOrderHeld; ++i) {
         const int r = tid + i * kOrderThreads;
-        held[i] = hist == nullptr && r < live ? bucket(r) : -1;
+        held[i] = !SPANS && r < live ? bucket(r) : -1;
     }
     for (int e = tid; e <= num_experts; e += kOrderThreads) {
         int c = 0;
-        if (hist != nullptr)
+        if constexpr (SPANS)
             for (int b = 0; b < spans; ++b) c += hist[b * (num_experts + 1) + e];
         counts[e] = c;
         fill[e] = 0;
     }
     __syncthreads();
-    if (hist == nullptr) {
+    if constexpr (!SPANS) {
 #pragma unroll
         for (int i = 0; i < kOrderHeld; ++i)
             if (held[i] >= 0) atomicAdd(counts + held[i], 1);
@@ -1030,7 +1031,7 @@ __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __re
     }
     if (tid == 0) offsets[num_experts + 1] = min(total, work_cap);
     __syncthreads();
-    if (hist != nullptr) {
+    if constexpr (SPANS) {
         for (int e = tid; e <= num_experts; e += kOrderThreads) {
             int at = counts[e];
             for (int b = 0; b < spans; ++b) {
@@ -1039,15 +1040,14 @@ __global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __re
                 at += c;
             }
         }
-        return;
-    }
-
+    } else {
 #pragma unroll
-    for (int i = 0; i < kOrderHeld; ++i)
-        if (held[i] >= 0) order[counts[held[i]] + atomicAdd(fill + held[i], 1)] = base + tid + i * kOrderThreads;
-    for (int r = tid + kOrderHeld * kOrderThreads; r < live; r += kOrderThreads) {
-        const int e = bucket(r);
-        order[counts[e] + atomicAdd(fill + e, 1)] = base + r;
+        for (int i = 0; i < kOrderHeld; ++i)
+            if (held[i] >= 0) order[counts[held[i]] + atomicAdd(fill + held[i], 1)] = base + tid + i * kOrderThreads;
+        for (int r = tid + kOrderHeld * kOrderThreads; r < live; r += kOrderThreads) {
+            const int e = bucket(r);
+            order[counts[e] + atomicAdd(fill + e, 1)] = base + r;
+        }
     }
 }
 

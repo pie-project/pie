@@ -11,15 +11,15 @@ namespace pie::linear {
 
 // ------------------------------------------------------------- routers --
 
-// A router holds a token's scores in registers, kRouterSlots a lane (score
-// j in lane j % kWave, slot j / kWave), and one wavefront picks.
-constexpr int kRouterMax = 512;
-constexpr int kRouterSlots = kRouterMax / kWave;
+// A router holds a token's scores in registers, SL slots a lane (score j in
+// lane j % kWave, slot j / kWave: SL whole waves cover the row), and one
+// wavefront picks.
 
+template <int SL>
 struct Ranked {
-    float rank[kRouterSlots];  // what orders the picks
-    float keep[kRouterSlots];  // what a pick weighs
-    u32 out;                   // slots out of the running: picked, or past the row
+    float rank[SL];  // what orders the picks
+    float keep[SL];  // what a pick weighs
+    u32 out;         // slots out of the running: picked, or past the row
 };
 
 // A candidate as one key whose max is the pick: a larger score, an equal
@@ -34,61 +34,81 @@ __device__ __forceinline__ unsigned long long router_key(float v, int i) {
 
 // max(x, x of the lane DPP control CTRL names), rows outside ROWS keeping x.
 template <int CTRL, int ROWS>
-__device__ __forceinline__ unsigned long long dpp_max_key(unsigned long long x) {
-    const int hi = static_cast<int>(x >> 32), lo = static_cast<int>(x);
-    const unsigned long long o =
-        (static_cast<unsigned long long>(static_cast<u32>(__builtin_amdgcn_update_dpp(hi, hi, CTRL, ROWS, 0xf, false)))
-         << 32) |
-        static_cast<u32>(__builtin_amdgcn_update_dpp(lo, lo, CTRL, ROWS, 0xf, false));
-    return o > x ? o : x;
+__device__ __forceinline__ u32 dpp_max(u32 x) {
+    return max(x, static_cast<u32>(__builtin_amdgcn_update_dpp(static_cast<int>(x), static_cast<int>(x), CTRL, ROWS,
+                                                               0xf, false)));
 }
 
-// The wavefront's largest key, every lane: a butterfly over quads, rows'
+// The wavefront's largest value, every lane: a butterfly over quads, rows'
 // halves and rows by DPP, rows' maxima carried up to lane 63.
-__device__ __forceinline__ unsigned long long wave_max_key(unsigned long long x) {
+__device__ __forceinline__ u32 wave_max_u32(u32 x) {
     if constexpr (kWave == 64) {
-        x = dpp_max_key<0xB1, 0xf>(x);   // quad_perm [1, 0, 3, 2]
-        x = dpp_max_key<0x4E, 0xf>(x);   // quad_perm [2, 3, 0, 1]
-        x = dpp_max_key<0x141, 0xf>(x);  // row_half_mirror
-        x = dpp_max_key<0x140, 0xf>(x);  // row_mirror
-        x = dpp_max_key<0x142, 0xa>(x);  // row_bcast:15
-        x = dpp_max_key<0x143, 0xc>(x);  // row_bcast:31
-        const u32 hi = __builtin_amdgcn_readlane(static_cast<int>(x >> 32), 63);
-        const u32 lo = __builtin_amdgcn_readlane(static_cast<int>(x), 63);
-        return (static_cast<unsigned long long>(hi) << 32) | lo;
+        x = dpp_max<0xB1, 0xf>(x);   // quad_perm [1, 0, 3, 2]
+        x = dpp_max<0x4E, 0xf>(x);   // quad_perm [2, 3, 0, 1]
+        x = dpp_max<0x141, 0xf>(x);  // row_half_mirror
+        x = dpp_max<0x140, 0xf>(x);  // row_mirror
+        x = dpp_max<0x142, 0xa>(x);  // row_bcast:15
+        x = dpp_max<0x143, 0xc>(x);  // row_bcast:31
+        return static_cast<u32>(__builtin_amdgcn_readlane(static_cast<int>(x), 63));
     } else {
 #pragma unroll
-        for (int off = kWave / 2; off > 0; off >>= 1) {
-            const unsigned long long o = __shfl_xor(x, off, kWave);
-            x = o > x ? o : x;
-        }
+        for (int off = kWave / 2; off > 0; off >>= 1)
+            x = max(x, static_cast<u32>(__shfl_xor(static_cast<int>(x), off, kWave)));
         return x;
     }
 }
 
-// The best score still running, its weight, and takes it out of the running;
-// -1 once none is left.
-__device__ __forceinline__ int router_pick(Ranked& s, float& weight) {
-    const int l = lane();
-    unsigned long long best = 0;
+// The picks over a row's keys: each lane's slots as keys (0 once out of the
+// running) and the best of them, which only a pick's owner recomputes.
+template <int SL>
+struct Picks {
+    unsigned long long key[SL];
+    unsigned long long best;
+
+    __device__ __forceinline__ void rank() {
+        best = 0;
 #pragma unroll
-    for (int t = 0; t < kRouterSlots; ++t) {
-        if ((s.out >> t) & 1u) continue;
-        const unsigned long long key = router_key(s.rank[t], l + kWave * t);
-        best = key > best ? key : best;
+        for (int t = 0; t < SL; ++t) best = key[t] > best ? key[t] : best;
     }
-    best = wave_max_key(best);
-    if (best == 0) {
+};
+
+template <int SL>
+__device__ __forceinline__ Picks<SL> router_picks(const Ranked<SL>& s) {
+    Picks<SL> p;
+    const int l = lane();
+#pragma unroll
+    for (int t = 0; t < SL; ++t) p.key[t] = (s.out >> t) & 1u ? 0ull : router_key(s.rank[t], l + kWave * t);
+    p.rank();
+    return p;
+}
+
+// The best key still running, its weight, and takes it out of the running;
+// -1 once none is left. The wave's largest high word first, then (only on a
+// tie there) the largest low word among the lanes holding it.
+template <int SL>
+__device__ __forceinline__ int router_pick(const Ranked<SL>& s, Picks<SL>& p, float& weight) {
+    const int l = lane();
+    const u32 hi = static_cast<u32>(p.best >> 32), lo = static_cast<u32>(p.best);
+    const u32 top = wave_max_u32(hi);
+    const unsigned long long holders = __ballot(hi == top);
+    const u32 low = __popcll(holders) == 1
+                        ? static_cast<u32>(__builtin_amdgcn_readlane(static_cast<int>(lo), __ffsll(holders) - 1))
+                        : wave_max_u32(hi == top ? lo : 0u);
+    if (top == 0 && low == 0) {
         weight = 0.f;
         return -1;
     }
-    const int bi = static_cast<int>(0xFFFFFFFFu - static_cast<u32>(best));
+    const int bi = static_cast<int>(0xFFFFFFFFu - low);
     const int owner = bi % kWave, slot = bi / kWave;
     float kw = 0.f;
 #pragma unroll
-    for (int t = 0; t < kRouterSlots; ++t) kw = t == slot ? s.keep[t] : kw;
+    for (int t = 0; t < SL; ++t) kw = t == slot ? s.keep[t] : kw;
     weight = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, kw), owner));
-    if (l == owner) s.out |= 1u << slot;
+    if (l == owner) {
+#pragma unroll
+        for (int t = 0; t < SL; ++t) p.key[t] = t == slot ? 0ull : p.key[t];
+        p.rank();
+    }
     return bi;
 }
 
@@ -99,19 +119,28 @@ __device__ __forceinline__ long long router_row(const u32* win) {
     return window.plane(blockIdx.x);
 }
 
-// Loads a row's `E` scores through f(x) -> (rank, keep).
-template <class T, class F>
-__device__ __forceinline__ Ranked router_load(const T* __restrict__ row, int E, F&& f) {
-    Ranked s;
+// Loads a row's `E` scores (and their `bias`, 0 without) through
+// f(x, bias) -> (rank, keep). Every slot reads (past the row: the last
+// score) so that the loads issue together.
+template <int SL, class T, class F>
+__device__ __forceinline__ Ranked<SL> router_load(const T* __restrict__ row, const float* __restrict__ bias, int E,
+                                                  F&& f) {
+    Ranked<SL> s;
     s.out = 0;
     const int l = lane();
+    float x[SL], b[SL];
 #pragma unroll
-    for (int t = 0; t < kRouterSlots; ++t) {
-        const int e = l + kWave * t;
+    for (int t = 0; t < SL; ++t) {
+        const int e = min(l + kWave * t, E - 1);
+        x[t] = to_f32(row[e]);
+        b[t] = bias != nullptr ? bias[e] : 0.f;
+    }
+#pragma unroll
+    for (int t = 0; t < SL; ++t) {
         s.rank[t] = 0.f;
         s.keep[t] = 0.f;
-        if (e < E) {
-            f(e, to_f32(row[e]), s.rank[t], s.keep[t]);
+        if (l + kWave * t < E) {
+            f(x[t], b[t], s.rank[t], s.keep[t]);
         } else {
             s.out |= 1u << t;
         }
@@ -121,22 +150,23 @@ __device__ __forceinline__ Ranked router_load(const T* __restrict__ row, int E, 
 
 // softmax over the row, the top K by probability, renormalized over the
 // picks (and scaled by `gain[expert]` when given). One wavefront a row.
-template <class T>
+template <int SL, class T>
 __device__ __forceinline__ void topk_softmax_row(const T* __restrict__ logits, const T* __restrict__ gain,
                                                  i32* __restrict__ topk_idx, float* __restrict__ topk_w, int E, int K,
                                                  const u32* __restrict__ win) {
     if (threadIdx.x >= kWave) return;
     const long long row = router_row(win);
     if (row < 0) return;
-    Ranked s = router_load(logits + row * E, E, [](int, float x, float& r, float& k) { r = k = x; });
+    Ranked<SL> s =
+        router_load<SL>(logits + row * E, nullptr, E, [](float x, float, float& r, float& k) { r = k = x; });
     float m = neg_inf();
 #pragma unroll
-    for (int t = 0; t < kRouterSlots; ++t)
+    for (int t = 0; t < SL; ++t)
         if (!((s.out >> t) & 1u)) m = fmaxf(m, s.rank[t]);
     m = wave_max(m);
     float z = 0.f;
 #pragma unroll
-    for (int t = 0; t < kRouterSlots; ++t) {
+    for (int t = 0; t < SL; ++t) {
         if (!((s.out >> t) & 1u)) {
             s.rank[t] = expf(s.rank[t] - m);
             z += s.rank[t];
@@ -144,14 +174,15 @@ __device__ __forceinline__ void topk_softmax_row(const T* __restrict__ logits, c
     }
     const float inv_z = 1.f / wave_sum(z);
 #pragma unroll
-    for (int t = 0; t < kRouterSlots; ++t) s.keep[t] = s.rank[t] = s.rank[t] * inv_z;
+    for (int t = 0; t < SL; ++t) s.keep[t] = s.rank[t] = s.rank[t] * inv_z;
 
     const int l = lane();
     int mine = -1;
     float mine_w = 0.f, sum = 0.f;
+    Picks<SL> p = router_picks(s);
     for (int k = 0; k < K; ++k) {
         float w;
-        const int e = router_pick(s, w);
+        const int e = router_pick(s, p, w);
         if (e < 0) w = 0.f;
         sum += w;
         if (l == k) {
@@ -167,27 +198,27 @@ __device__ __forceinline__ void topk_softmax_row(const T* __restrict__ logits, c
     }
 }
 
-template <class T>
+template <class T, int SL>
 __global__ __launch_bounds__(64) void moe_topk_softmax(const T* __restrict__ logits, const T* __restrict__,
                                                        const T* __restrict__, i32* __restrict__ topk_idx,
                                                        float* __restrict__ topk_w, int num_experts, int K, int,
                                                        const u32* __restrict__ win) {
-    topk_softmax_row<T>(logits, nullptr, topk_idx, topk_w, num_experts, K, win);
+    topk_softmax_row<SL, T>(logits, nullptr, topk_idx, topk_w, num_experts, K, win);
 }
 
-template <class T>
+template <class T, int SL>
 __global__ __launch_bounds__(64) void moe_topk_softmax_scaled(const T* __restrict__ logits, const T* __restrict__,
                                                               const T* __restrict__ per_expert_scale,
                                                               i32* __restrict__ topk_idx, float* __restrict__ topk_w,
                                                               int num_experts, int K, int,
                                                               const u32* __restrict__ win) {
-    topk_softmax_row<T>(logits, per_expert_scale, topk_idx, topk_w, num_experts, K, win);
+    topk_softmax_row<SL, T>(logits, per_expert_scale, topk_idx, topk_w, num_experts, K, win);
 }
 
 // The top K by score + bias (no bias: by score), weighed by the score;
 // renormalized to `scaling` over the picks when asked, else scaled by it.
 // Picks past E land expert 0 at weight 0.
-template <class T, class F>
+template <int SL, class T, class F>
 __device__ __forceinline__ void topk_biased_row(const T* __restrict__ logits, i32* __restrict__ topk_idx,
                                                 float* __restrict__ topk_w, const float* __restrict__ bias, int E,
                                                 int K, bool renormalize, float scaling, const u32* __restrict__ win,
@@ -195,17 +226,18 @@ __device__ __forceinline__ void topk_biased_row(const T* __restrict__ logits, i3
     if (threadIdx.x >= kWave) return;
     const long long row = router_row(win);
     if (row < 0) return;
-    Ranked s = router_load(logits + row * E, E, [&](int e, float x, float& r, float& k) {
+    Ranked<SL> s = router_load<SL>(logits + row * E, bias, E, [&](float x, float b, float& r, float& k) {
         k = score(x);
-        r = bias != nullptr ? k + bias[e] : k;
+        r = k + b;
     });
     const int l = lane();
     int mine = 0;
     float mine_w = 0.f, sum = 0.f;
     const int picks = min(K, E);
+    Picks<SL> p = router_picks(s);
     for (int k = 0; k < picks; ++k) {
         float w;
-        const int e = router_pick(s, w);
+        const int e = router_pick(s, p, w);
         sum += w;
         if (l == k) {
             mine = e;
@@ -226,30 +258,30 @@ __device__ __forceinline__ float sqrt_softplus(float x) {
     return sqrtf(fmaxf(sp, 0.f));
 }
 
-template <class T>
+template <class T, int SL>
 __global__ __launch_bounds__(64) void moe_topk_sigmoid(const T* __restrict__ logits, i32* __restrict__ topk_idx,
                                                        float* __restrict__ topk_w,
                                                        const float* __restrict__ correction_bias, int E, int K,
                                                        bool renormalize, float routed_scaling_factor,
                                                        const u32* __restrict__ win) {
-    topk_biased_row(logits, topk_idx, topk_w, correction_bias, E, K, renormalize, routed_scaling_factor, win,
-                    router_sigmoid);
+    topk_biased_row<SL>(logits, topk_idx, topk_w, correction_bias, E, K, renormalize, routed_scaling_factor, win,
+                        router_sigmoid);
 }
 
-template <class T>
+template <class T, int SL>
 __global__ __launch_bounds__(64) void moe_topk_sqrt_softplus(const T* __restrict__ logits, i32* __restrict__ topk_idx,
                                                              float* __restrict__ topk_w,
                                                              const float* __restrict__ correction_bias, int E, int K,
                                                              bool renormalize, float routed_scaling_factor,
                                                              const u32* __restrict__ win) {
-    topk_biased_row(logits, topk_idx, topk_w, correction_bias, E, K, renormalize, routed_scaling_factor, win,
-                    sqrt_softplus);
+    topk_biased_row<SL>(logits, topk_idx, topk_w, correction_bias, E, K, renormalize, routed_scaling_factor, win,
+                        sqrt_softplus);
 }
 
 // A row of E routed + S sink scores: the top K routed by sigmoid + bias,
 // then every sink, all weighed by sigmoid and normalized together to
 // scaling · global_scale. Picks past E land expert -1 at weight 0.
-template <class T>
+template <class T, int SL>
 __global__ __launch_bounds__(64) void moe_topk_sigmoid_sink(const T* __restrict__ logits, i32* __restrict__ topk_idx,
                                                             float* __restrict__ topk_w,
                                                             const float* __restrict__ correction_bias,
@@ -260,17 +292,18 @@ __global__ __launch_bounds__(64) void moe_topk_sigmoid_sink(const T* __restrict_
     if (row < 0) return;
     const int W = E + S;
     const T* x = logits + row * W;
-    Ranked s = router_load(x, E, [&](int e, float v, float& r, float& k) {
+    Ranked<SL> s = router_load<SL>(x, correction_bias, E, [](float v, float b, float& r, float& k) {
         k = router_sigmoid(v);
-        r = correction_bias != nullptr ? k + correction_bias[e] : k;
+        r = k + b;
     });
     const int l = lane();
     int mine = -1;
     float mine_w = 0.f, sum = 0.f;
     const int picks = min(K, E);
+    Picks<SL> p = router_picks(s);
     for (int k = 0; k < picks; ++k) {
         float w;
-        const int e = router_pick(s, w);
+        const int e = router_pick(s, p, w);
         sum += w;
         if (l == k) {
             mine = e;
@@ -300,57 +333,60 @@ __global__ __launch_bounds__(64) void moe_topk_sigmoid_sink(const T* __restrict_
 // given `shared`, rounded and then shared[n][h]·sigmoid(gate[n·gate_stride])
 // added, as `moe_sigmoid_gate_add` would. Given `gate_w` (one row of k), the
 // gate is act[n] · gate_w, rounded, the block's own. VEC elements a thread
-// (8: hidden a multiple of 8, the rows 16-byte aligned).
-template <class T, int VEC>
+// (8: hidden a multiple of 8, the rows 16-byte aligned), K routes a token.
+template <class T, int VEC, int K>
 __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src, const float* __restrict__ weights,
-                                 int top_k, int hidden, const T* __restrict__ shared, const T* __restrict__ gate,
+                                 int hidden, const T* __restrict__ shared, const T* __restrict__ gate,
                                  int gate_stride, const u32* __restrict__ win, const T* __restrict__ gate_w,
                                  const T* __restrict__ act, int k) {
+    using V = conditional<VEC == 8, Pack8<T>, T>::type;
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long n = window.plane(blockIdx.x);
+    const int h = (blockIdx.y * blockDim.x + threadIdx.x) * VEC;
+    // The routed rows, their weights and the shared row in flight before
+    // the gate's dot waits on its own reads (past the row: its last column).
+    const int hc = min(h, hidden - VEC);
+    float w[K];
+    V v[K], sh;
+#pragma unroll
+    for (int r = 0; r < K; ++r) {
+        w[r] = weights[n * K + r];
+        v[r] = *reinterpret_cast<const V*>(src + (n * K + r) * hidden + hc);
+    }
+    if (shared != nullptr) sh = *reinterpret_cast<const V*>(shared + n * hidden + hc);
     float logit = 0.f;
     if (gate_w != nullptr) {
         __shared__ float red[kWave];
         float dot = 0.f;
         for (int c = static_cast<int>(threadIdx.x) * 8; c < k; c += static_cast<int>(blockDim.x) * 8) {
             const Pack8<T> a = *reinterpret_cast<const Pack8<T>*>(act + n * k + c);
-            const Pack8<T> w = *reinterpret_cast<const Pack8<T>*>(gate_w + c);
+            const Pack8<T> g = *reinterpret_cast<const Pack8<T>*>(gate_w + c);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) dot = fmaf(to_f32(a.v[j]), to_f32(w.v[j]), dot);
+            for (int j = 0; j < 8; ++j) dot = fmaf(to_f32(a.v[j]), to_f32(g.v[j]), dot);
         }
         logit = to_f32(from_f32<T>(block_sum(dot, red)));
     } else if (shared != nullptr) {
         logit = to_f32(gate[n * gate_stride]);
     }
-    const int h = (blockIdx.y * blockDim.x + threadIdx.x) * VEC;
     if (h >= hidden) return;
-    const long long base = n * top_k;
+    const T* vs = reinterpret_cast<const T*>(v);
+    const T* shs = reinterpret_cast<const T*>(&sh);
     float acc[VEC] = {};
-    for (int k = 0; k < top_k; ++k) {
-        const float w = weights[base + k];
-        const T* row = src + (base + k) * hidden + h;
-        if constexpr (VEC == 8) {
-            const Pack8<T> v = *reinterpret_cast<const Pack8<T>*>(row);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) acc[j] += w * to_f32(v.v[j]);
-        } else {
-            acc[0] += w * to_f32(row[0]);
-        }
-    }
-    const float s = shared != nullptr ? 1.f / (1.f + __expf(-logit)) : 0.f;
-    T o[VEC];
+    for (int r = 0; r < K; ++r)
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) acc[j] += w[r] * to_f32(vs[r * VEC + j]);
+    const float sg = shared != nullptr ? 1.f / (1.f + __expf(-logit)) : 0.f;
+    V o;
+    T* os = reinterpret_cast<T*>(&o);
 #pragma unroll
     for (int j = 0; j < VEC; ++j) {
         float a = acc[j];
-        if (shared != nullptr) a = to_f32(from_f32<T>(a)) + to_f32(shared[n * hidden + h + j]) * s;
-        o[j] = from_f32<T>(a);
+        if (shared != nullptr) a = to_f32(from_f32<T>(a)) + to_f32(shs[j]) * sg;
+        os[j] = from_f32<T>(a);
     }
-    if constexpr (VEC == 8) {
-        *reinterpret_cast<Pack8<T>*>(out + n * hidden + h) = *reinterpret_cast<const Pack8<T>*>(o);
-    } else {
-        out[n * hidden + h] = o[0];
-    }
+    *reinterpret_cast<V*>(out + n * hidden + h) = o;
 }
 
 // y[n][h] = Σ_k src[n·top_k + k][h] + shared[n][h], the routed rows already

@@ -186,6 +186,23 @@ __global__ void pull_validate(const Ticket* __restrict__ tickets, const PullLane
     }
 }
 
+// One run `gather_words` copies: `words` u32 words from `src` to `dst_word`
+// words past the destination.
+struct WordRun {
+    const u32* src;
+    u32 dst_word;
+    u32 words;
+};
+
+static_assert(sizeof(WordRun) == 16, "WordRun: the Rust `channel::WordRun` mirrors this layout");
+
+// Each of `run_count` runs into `dst`, a block a run.
+__global__ void gather_words(const WordRun* __restrict__ runs, u32* __restrict__ dst, u32 run_count) {
+    if (blockIdx.x >= run_count) return;
+    const WordRun r = runs[blockIdx.x];
+    for (u32 word = threadIdx.x; word < r.words; word += blockDim.x) dst[r.dst_word + word] = r.src[word];
+}
+
 // On commit: a cell put fills the tail and advances it, a cell taken
 // empties the head and advances it, in list order. A thread per entry (a
 // block's worth at a time): the k-th put of a slot fills the cell k past

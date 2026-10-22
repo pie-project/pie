@@ -562,7 +562,15 @@ pub fn residual_add_rmsnorm(
     let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;
     let plus = if plus_one { "true" } else { "false" };
-    let entrypoint = format!("::pie::elemwise::residual_add_rmsnorm<{t}, 256, {plus}>");
+    let packs = (y.width / 8).div_ceil(BLOCK);
+    let entrypoint = if y.width.is_multiple_of(8)
+        && packs <= 4
+        && [x.ptr, y.ptr, weight.ptr, out.ptr].iter().all(|p| p.is_multiple_of(16))
+    {
+        format!("::pie::elemwise::residual_add_rmsnorm_packed<{t}, {packs}, {plus}>")
+    } else {
+        format!("::pie::elemwise::residual_add_rmsnorm<{t}, 256, {plus}>")
+    };
     let block = BLOCK;
     ctx.fire(
         OP,
