@@ -358,7 +358,13 @@ struct Mxfp4 {
   }
 };
 
-template <typename T, typename Codec, bool BIASED, bool ROUTED, int PPT>
+// SWIGLU: the output is a gate-up's packed rows (gate, then up, each
+// `out_vec_size / 2` wide). A threadgroup's first simdgroup sums four gate
+// rows and its second the four up rows they pair with, each row summed as the
+// plain routed matmul sums it; the up rows, rounded as `y` stores them, cross
+// to the first through `up_rows`, which lands silu(gate) * up into `hidden`
+// as `packed_swiglu` computes it from the stored rows.
+template <typename T, typename Codec, bool BIASED, bool ROUTED, int PPT, bool SWIGLU = false>
 METAL_FUNC void qmv_gptoss_impl(
     const device uint32_t* w,
     const device typename Codec::scale_t* scales,
@@ -374,7 +380,9 @@ METAL_FUNC void qmv_gptoss_impl(
     int slots_per_row,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    device T* hidden = nullptr,
+    threadgroup float* up_rows = nullptr) {
   constexpr int bits = Codec::bits;
   constexpr int group_size = Codec::group_size;
   constexpr int packs_per_thread = PPT;
@@ -393,8 +401,10 @@ METAL_FUNC void qmv_gptoss_impl(
 
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
+  const int intermediate = out_vec_size / 2;
+  const int out_row = SWIGLU
+      ? int(tid.y) * results_per_simdgroup + int(simd_gid) * intermediate
+      : tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
 
   const int row = int(tid.x);
   const int slot = ROUTED ? int(tid.z) : 0;
@@ -439,6 +449,27 @@ METAL_FUNC void qmv_gptoss_impl(
   const device T* bias_row = bias;
   if (BIASED && ROUTED) {
     bias_row += size_t(expert_ids[sel]) * size_t(out_vec_size);
+  }
+  if (SWIGLU) {
+    thread U stored[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const T v = static_cast<T>(simd_sum(result[row]));
+      stored[row] = U(v);
+      if (simd_lid == 0) {
+        y_row[row] = v;
+        if (simd_gid == 1) up_rows[row] = U(v);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 0 && simd_lid == 0) {
+      device T* h_row = hidden + size_t(sel) * size_t(intermediate) + out_row;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const float g = stored[row];
+        const float u = up_rows[row];
+        h_row[row] = static_cast<T>((g / (1.0f + metal::exp(-g))) * u);
+      }
+    }
+    return;
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
     U v = simd_sum(result[row]);
@@ -495,6 +526,40 @@ instantiate_gptoss_qmv(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64
 instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias_p2, AffineU4, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed_p2, AffineU4, bfloat16, bfloat, 64, 4)
+
+// The routed gate-up with its swiglu: `y` takes the packed rows as
+// affine_qmv_routed lands them, `hidden` silu(gate) * up of each route's row.
+// Two simdgroups per threadgroup, over `out_vec_size / 8` threadgroups.
+template <typename T, template <typename> class Codec>
+[[kernel]] void qmv_routed_swiglu(
+    const device uint32_t* w   [[buffer(0)]],
+    const device typename Codec<T>::scale_t* scales [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& in_vec_size  [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    device T* hidden           [[buffer(7)]],
+    const device int* expert_ids [[buffer(8)]],
+    const constant int& x_slot_stride [[buffer(9)]],
+    const constant int& x_row_stride  [[buffer(10)]],
+    const constant int& slots_per_row [[buffer(11)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  threadgroup float up_rows[4];
+  qmv_gptoss_impl<T, Codec<T>, false, true, 2, true>(
+      w, scales, biases, x, y, nullptr, expert_ids, in_vec_size, out_vec_size,
+      x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid, hidden, up_rows);
+}
+
+template [[host_name("affine_qmv_routed_swiglu_bfloat16_gs_64_b_4")]]
+[[kernel]] void qmv_routed_swiglu<bfloat, AffineU4>(
+    const device uint32_t*, const device AffineU4<bfloat>::scale_t*,
+    const device bfloat*, const device bfloat*, device bfloat*,
+    const constant int&, const constant int&, device bfloat*, const device int*,
+    const constant int&, const constant int&, const constant int&,
+    uint3, uint, uint);
 
 instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU2, bfloat16, bfloat, 64, 2)
 instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU2, bfloat16, bfloat, 64, 2)

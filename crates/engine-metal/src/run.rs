@@ -407,6 +407,26 @@ impl<'c> Run<'c> {
             .then_some((*x2, *w2, *y2))
     }
 
+    /// Whether the rows of arena value `value` stand apart from those of each
+    /// arena value of `others` (a weight or an input is in no arena slab): in
+    /// another slab, or past each other's bytes in it. False where an address
+    /// is not known.
+    pub(crate) fn rows_apart(&self, value: ValueId, others: &[ValueId]) -> bool {
+        let span = |v: ValueId| {
+            let t = self.tensor(v);
+            let bytes = t.dtype.row_bytes(t.width)? * u64::from(t.rows);
+            let (slab, at) = self.address(t.buf)?;
+            Some((slab, at, at + bytes))
+        };
+        let Some(a) = self.resolvable(value).then(|| span(value)).flatten() else {
+            return false;
+        };
+        others
+            .iter()
+            .filter(|&&v| self.resolvable(v))
+            .all(|&v| span(v).is_some_and(|b| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1))
+    }
+
     /// The merge of the arms `value` is one of, when the merge's rows here are
     /// the very bytes `value` lands in: the merge's readers then read what the
     /// arm writes, in place.

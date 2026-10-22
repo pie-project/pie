@@ -658,6 +658,61 @@ pub fn matmul_select_quant(
     )
 }
 
+/// [`matmul_select_quant`] of a gate-up bank whose swiglu lands in the same
+/// launch: `y` takes the packed gate and up rows as the matmul alone lands
+/// them, `hidden` silu(gate) * up of each route's row as `linear.mlp_swiglu`
+/// computes it from them, bit for bit. A 4-bit, 64-group affine bank over a
+/// gate and up of whole fours of rows; `Ok(false)` where it is not one, and
+/// nothing ran.
+pub fn matmul_select_swiglu(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    bank: Bank,
+    routes: Tensor,
+    y: Tensor,
+    hidden: Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.moe_matmul_select_quant";
+    let intermediate = y.width / 2;
+    if x.dtype != Dtype::Bf16
+        || !(bank.affine() && bank.group == 64 && bank.bits == 4)
+        || !intermediate.is_multiple_of(4)
+        || y.width != 2 * intermediate
+        || hidden.width != intermediate
+        || hidden.rows != y.rows
+        || hidden.dtype != Dtype::Bf16
+    {
+        return Ok(false);
+    }
+    let fan = selected(OP, x, routes, y)?;
+    routed_bank(OP, x, bank)?;
+    ctx.fire(
+        Fire::at(
+            "linear/quant_qmv.metal",
+            "affine_qmv_routed_swiglu_bfloat16_gs_64_b_4",
+        )
+        .apply(Grid::of(
+            routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
+            QMV_GROUP,
+        )),
+        &[
+            bank.codes.arg(),
+            bank.scales.arg(),
+            zero_points(ctx, bank)?,
+            x.arg(),
+            y.arg_mut(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, y.width)?.arg(),
+            hidden.arg_mut(),
+            routes.arg(),
+            stated(OP, fan.x_slot_stride)?.arg(),
+            stated(OP, fan.x_row_stride)?.arg(),
+            stated(OP, fan.top_k)?.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RoutedScratch {
     pub perm: Tensor,

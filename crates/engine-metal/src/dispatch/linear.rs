@@ -479,6 +479,46 @@ impl Run<'_> {
         Ok(true)
     }
 
+    /// Where the swiglu of the routed gate-up of `x` over `routes` into `y`
+    /// lands, when it is the only reader of `y`, the node right after the
+    /// gate-up's in the region the walk is in, and its rows stand apart from
+    /// what the gate-up reads and writes and need no register table laid:
+    /// the gate-up's launch then lands them too.
+    fn routed_swiglu(
+        &self,
+        x: poem_ir::ValueId,
+        routes: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Option<poem_ir::ValueId> {
+        use poem_ir::Operation;
+        let (nodes, _) = self.region_nodes()?;
+        let at = match self.readers_of(y) {
+            &[at] => at,
+            _ => return None,
+        };
+        let Some(Operation::Linear(Linear::MlpSwiglu {
+            packed,
+            intermediate,
+            y: hidden,
+        })) = self.nodes().get(at as usize).map(|n| &n.op)
+        else {
+            return None;
+        };
+        let gate_up = at.checked_sub(1)?;
+        let adjacent = matches!(
+            self.nodes().get(gate_up as usize).map(|n| &n.op),
+            Some(Operation::Linear(Linear::MoeMatmulSelectQuant { y: out, .. })) if *out == y
+        );
+        (adjacent
+            && *packed == y
+            && nodes.contains(&gate_up)
+            && nodes.contains(&at)
+            && 2 * *intermediate == self.tensor(y).width
+            && self.register_readers(*hidden).is_none()
+            && self.rows_apart(*hidden, &[x, routes, y]))
+        .then_some(*hidden)
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::MlpRelu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
@@ -559,6 +599,8 @@ impl Run<'_> {
                 ),
             },
 
+            // The routed gate-up before it landed these rows.
+            Linear::MlpSwiglu { y, .. } if self.landed_ahead(*y) => Ok(()),
             Linear::MlpSwiglu {
                 packed,
                 intermediate,
@@ -921,6 +963,21 @@ impl Run<'_> {
                         "a chain starts only where the batched matmul runs"
                     );
                     self.chain_clear();
+                }
+                // The swiglu the trace places right after it lands in the same
+                // launch, and finds its rows landed.
+                if let Some(hidden) = self.routed_swiglu(*x, *routes, *y)
+                    && linear::moe::matmul_select_swiglu(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.planes(*bank),
+                        self.tensor(*routes),
+                        self.tensor(*y),
+                        self.tensor(hidden),
+                    )?
+                {
+                    self.land_ahead([Some(hidden), None, None]);
+                    return Ok(());
                 }
                 linear::moe::matmul_select_quant(
                     self.ctx(),
