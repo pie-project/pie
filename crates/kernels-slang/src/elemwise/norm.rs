@@ -154,3 +154,19 @@ pub fn rmsnorm_grouped_plus_one(
         ],
     )
 }
+
+/// Each `head_dim`-wide head normed alone, unscaled.
+pub fn rmsnorm_no_scale(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    head_dim: u32,
+    eps: f32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elemwise.rmsnorm";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_rms_unscaled_bf16" });
+    ctx.fire(
+        Fire::at(NORM, entry).apply(grid(OP, x.width, head_dim, x.rows)?),
+        &[x.arg(), y.arg_mut(), eps.arg(), stated(OP, head_dim)?.arg()],
+    )
+}

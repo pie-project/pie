@@ -5,14 +5,28 @@
 // RMS norm over a row's `axis_size`-wide runs, one workgroup a run:
 // `y = gain * x / rms(x) * (plus_one ? 1 + w : w)`, the weight read every
 // `w_stride` (1: a bank as wide as the run; 0: one scalar). Grouped, each run
-// reads its own slice of a bank as wide as the row. Rows land two values a
-// word, so a run is an even number wide.
+// reads its own slice of a bank as wide as the row; unscaled
+// (`PIE_UNSCALED`), there is no weight at all. Rows land two values a word,
+// so a run is an even number wide.
 
 #ifndef N_READS
 #define N_READS 4
 #endif
 
 [[vk::binding(0)]] StructuredBuffer<uint> x;
+#ifdef PIE_UNSCALED
+[[vk::binding(1)]] RWStructuredBuffer<uint> y;
+
+struct Params {
+    float eps;
+    int axis_size;
+};
+PIE_PARAMS(2, Params, params);
+
+float gain_at(uint i, uint plane) {
+    return 1.0;
+}
+#else
 [[vk::binding(1)]] StructuredBuffer<uint> w;
 [[vk::binding(2)]] RWStructuredBuffer<uint> y;
 
@@ -32,6 +46,7 @@ float gain_at(uint i, uint plane) {
     float wv = bf16_at(w, plane + params.w_stride * i);
     return params.gain * (params.plus_one != 0u ? 1.0 + wv : wv);
 }
+#endif
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -72,3 +87,4 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 // pie:instantiate elemwise_rms_bf16 PIE_GROUP_X=256 N_READS=4
 // pie:instantiate elemwise_rms_grouped_bf16 PIE_GROUP_X=256 N_READS=4 PIE_GROUPED=1
+// pie:instantiate elemwise_rms_unscaled_bf16 PIE_GROUP_X=256 N_READS=4 PIE_UNSCALED=1

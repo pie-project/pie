@@ -90,13 +90,14 @@ impl Run<'_> {
                 eps,
                 y,
                 weight: NormWeight::None,
-            } => elemwise::norm::rmsnorm_no_scale(
-                self.ctx(),
-                self.tensor(*x),
+            } => kernels_slang::elemwise::norm::rmsnorm_no_scale(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
                 *head_dim,
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::Layernorm {
                 x,

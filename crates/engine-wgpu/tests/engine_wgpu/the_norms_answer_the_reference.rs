@@ -252,7 +252,7 @@ fn the_norms_answer_the_reference() {
         let st = |buf: u32, rows: usize, width: usize| {
             kernels_slang::Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16)
         };
-        let cases: [Case<'_>; 5] = [
+        let cases: [Case<'_>; 6] = [
             ("rmsnorm", width, Box::new(|c| f64::from(wv[c]))),
             ("rmsnorm +1", width, Box::new(|c| 1.0 + f64::from(wv[c]))),
             (
@@ -270,6 +270,7 @@ fn the_norms_answer_the_reference() {
                 head,
                 Box::new(|c| 1.0 + f64::from(wv[c])),
             ),
+            ("rmsnorm no scale", head, Box::new(|_| 1.0)),
         ];
         for (i, (what, run, scale)) in cases.iter().enumerate() {
             let y = gpu.zeros(n);
@@ -279,7 +280,8 @@ fn the_norms_answer_the_reference() {
                 1 => slang::rmsnorm_plus_one(s, xs, st(w, 1, width), eps, ys),
                 2 => slang::rmsnorm_per_head(s, xs, st(hw, 1, head), head as u32, eps, ys),
                 3 => slang::rmsnorm_per_head_plus_one(s, xs, st(hw, 1, head), head as u32, eps, ys),
-                _ => slang::rmsnorm_grouped_plus_one(s, xs, st(w, 1, width), head as u32, eps, ys),
+                4 => slang::rmsnorm_grouped_plus_one(s, xs, st(w, 1, width), head as u32, eps, ys),
+                _ => slang::rmsnorm_no_scale(s, xs, head as u32, eps, ys),
             });
             close(
                 &gpu.down(y, n),
