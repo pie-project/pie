@@ -2,7 +2,7 @@ use kernels_metal::linear;
 use poem_exec::{DispatchLinear, KernelError};
 use poem_ir::{Fused, Linear, Operands};
 
-use crate::run::Run;
+use crate::run::{Run, TiledFold};
 
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
@@ -12,6 +12,13 @@ impl DispatchLinear for Run<'_> {
 
 impl Run<'_> {
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
+        // The shared expert rides along on the routed register tiles: its rows
+        // are tile 0 of their down, which the gated add reads.
+        if let Fused::MlpSwiglu { y, .. } = op
+            && self.tiles_shared(*y)
+        {
+            return Ok(());
+        }
         match op {
             Fused::MlpSwiglu {
                 act,
@@ -540,6 +547,13 @@ impl Run<'_> {
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
+        // The register expert tiles' grouping landed the riding shared
+        // expert's gate.
+        if let Linear::Matmul { y, .. } = op
+            && self.tiles_gate(*y)
+        {
+            return Ok(());
+        }
         match op {
             Linear::MlpRelu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y }
@@ -619,6 +633,8 @@ impl Run<'_> {
                 ),
             },
 
+            // The register chain's gate-up landed its SwiGLU already.
+            Linear::MlpSwiglu { packed, y, .. } if self.tiles_swiglu(*packed, *y) => Ok(()),
             Linear::MlpSwiglu {
                 packed,
                 intermediate,
@@ -956,6 +972,12 @@ impl Run<'_> {
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
+                // A routed MLP of a verify's few tokens on the register expert tiles.
+                if self.tiles_down(*x, *bank, *routes, *y)?
+                    || self.tiles_start(*x, *bank, *routes, *y)?
+                {
+                    return Ok(());
+                }
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
@@ -1005,7 +1027,12 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => match self.chain_combine(*routed) {
+            Linear::MoeWeightedSum { routed, weights, y } => match match self.tiles_fold(*routed) {
+                // The gated add lands the register chain's sum.
+                Some(TiledFold::Deferred) => return Ok(()),
+                Some(TiledFold::Sorted(sorted, inv, top_k)) => Some((sorted, inv, top_k)),
+                None => self.chain_combine(*routed),
+            } {
                 Some((sorted, inv, top_k)) => linear::moe::weighted_sum_sorted(
                     self.ctx(),
                     sorted,
@@ -1035,6 +1062,9 @@ impl Run<'_> {
                 self.tensor(*weights),
                 self.tensor(*y),
             ),
+            // The register chain's rooms hold the routes' rows, the shared
+            // expert's and its gate.
+            Linear::MoeSigmoidGateAdd { y, .. } if self.tiles_gate_add(*y)? => Ok(()),
             Linear::MoeSigmoidGateAdd {
                 routed,
                 shared,
