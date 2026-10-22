@@ -246,3 +246,135 @@ fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
         }
     }
 }
+
+#[test]
+fn the_coop_segments_are_their_matmuls() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len().max(16) as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let k = 2048u32;
+    let groups = k / 64;
+    // (columns, the segment's first row, its width): a split bank's halves (the second entry's
+    // own bank unused), and a narrow one
+    let banks = [(6144u32, 0u32, 4096u32), (6144, 4096, 2048), (96, 0, 96)];
+    let mut keep = Vec::new();
+    let mut planes = Vec::new();
+    for (b, &(n, _, _)) in banks.iter().enumerate() {
+        let salt = b as u64 * 0x1000;
+        let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) / 2).map(|at| noise(at ^ salt)).collect();
+        let scales: Vec<f32> = (0..n * groups)
+            .map(|at| {
+                let v = 0.004 + (f32::from(noise(u64::from(at) ^ salt ^ 0x11)) - 127.0) * 0.00002;
+                f32::from_bits(v.to_bits() & 0xffff_0000)
+            })
+            .collect();
+        let biases: Vec<f32> = (0..n * groups)
+            .map(|at| {
+                let v = (f32::from(noise(u64::from(at) ^ salt ^ 0x22)) - 127.0) * 0.0002;
+                f32::from_bits(v.to_bits() & 0xffff_0000)
+            })
+            .collect();
+        let cb = upload(&codes);
+        let sb = upload(&scales.iter().flat_map(|&v| bf16(v)).collect::<Vec<_>>());
+        let bb = upload(&biases.iter().flat_map(|&v| bf16(v)).collect::<Vec<_>>());
+        let bank = Bank {
+            mpp_codes: None,
+            codes: Tensor::new(bind(&cb), n, k, Dtype::U4g64),
+            scales: Tensor::new(bind(&sb), n, groups, Dtype::Bf16),
+            biases: Some(Tensor::new(bind(&bb), n, groups, Dtype::Bf16)),
+            group: 64,
+            bits: 4,
+            ld: k,
+        };
+        keep.extend([cb, sb, bb]);
+        planes.push((bank, codes, scales, biases));
+    }
+    for m in [5u32, 8] {
+        let input: Vec<f32> = (0..m * k)
+            .map(|at| {
+                let v = (f32::from(noise(u64::from(at) ^ 0x33)) - 127.0) / 128.0;
+                f32::from_bits(v.to_bits() & 0xffff_0000)
+            })
+            .collect();
+        let xb = upload(&input.iter().flat_map(|&v| bf16(v)).collect::<Vec<_>>());
+        let act = Tensor::new(bind(&xb), m, k, Dtype::Bf16);
+        let outs: Vec<Buffer> = banks
+            .iter()
+            .map(|&(_, _, w)| upload(&vec![0xa5; (m * w * 2) as usize]))
+            .collect();
+        let segments: Vec<quant::Segment> = banks
+            .iter()
+            .zip(&planes)
+            .zip(&outs)
+            .enumerate()
+            .map(|(i, ((&(_, first, w), plane), out))| quant::Segment {
+                // the two halves of one bank
+                w: if i == 1 { planes[0].0 } else { plane.0 },
+                first,
+                y: Tensor::new(bind(out), m, w, Dtype::Bf16),
+                split: 1,
+            })
+            .collect();
+        let frame = device.frame().expect("frame");
+        let sink = Sink::new(&device, &frame, &pipelines, &handles);
+        quant::coop_segments(&sink, &segments, act, m as i32, k as i32).expect("segments");
+        // the 6144-row bank alone, unsplit, for the halves to match
+        let whole = upload(&vec![0; (m * 6144 * 2) as usize]);
+        let whole_t = Tensor::new(bind(&whole), m, 6144, Dtype::Bf16);
+        quant::coop_matmul(
+            &sink,
+            act,
+            planes[0].0,
+            planes[0].0.biases.expect("biases"),
+            whole_t,
+            (m as i32, 6144, k as i32, 6144, k as i32),
+            1,
+        )
+        .expect("alone");
+        frame.commit().expect("commit");
+        let whole = handles.read(whole_t.buf, u64::from(m * 6144) * 2).expect("read");
+        for (s, &(_, first, w)) in segments.iter().zip(&banks).take(2) {
+            let got = handles.read(s.y.buf, u64::from(m * w) * 2).expect("read");
+            for row in 0..m as usize {
+                let at = (row * 6144 + first as usize) * 2;
+                assert!(
+                    got[row * w as usize * 2..(row + 1) * w as usize * 2] == whole[at..at + w as usize * 2],
+                    "M={m}: the half from {first} differs from the unsplit tile's"
+                );
+            }
+        }
+        // the narrow segment against an fp64 dot of its dequantized weights
+        let (_, codes, scales, biases) = &planes[2];
+        let got = handles.read(segments[2].y.buf, u64::from(m * 96) * 2).expect("read");
+        for row in 0..m {
+            for col in 0..96u32 {
+                let (mut want, mut absolute) = (0.0f64, 0.0f64);
+                for at in 0..k {
+                    let code_at = col * k + at;
+                    let q = (codes[(code_at / 2) as usize] >> ((code_at % 2) * 4)) & 15;
+                    let f = (col * groups + at / 64) as usize;
+                    let p = f64::from(input[(row * k + at) as usize])
+                        * (f64::from(q) * f64::from(scales[f]) + f64::from(biases[f]));
+                    want += p;
+                    absolute += p.abs();
+                }
+                let o = ((row * 96 + col) * 2) as usize;
+                let actual = f64::from(f32::from_bits(u32::from(u16::from_le_bytes([got[o], got[o + 1]])) << 16));
+                let allowance = 0.00002 + 0.001 * absolute / f64::from(k).sqrt();
+                assert!(
+                    (actual - want).abs() <= 0.004 * want.abs() + allowance,
+                    "M={m} narrow col={col} row={row}: {actual} vs {want}"
+                );
+            }
+        }
+    }
+    drop(keep);
+}

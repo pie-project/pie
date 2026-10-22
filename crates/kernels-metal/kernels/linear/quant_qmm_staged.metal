@@ -323,43 +323,137 @@ affine_qmm_coop_x(const device uint *weights [[buffer(0)]], const device bfloat 
       constant int &, uint2, uint, uint);
 #endif
 
-// `SPLIT` is the grid's y extent: each partition publishes its sums to `partials`.
+// A threadgroup holds 64 columns as two simdgroups, and `SPLIT` partitions of the contraction
+// as that many such pairs: simdgroup `2p + c` walks partition `p` of columns `32c` on. Each
+// partition past the first hands its sums over in threadgroup memory, and the first adds them
+// in partition order from zero, as the split reduction of the partials would.
 template <int SPLIT>
 [[kernel]] void
 affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
                 const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
                 device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
-                constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
-                constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+                constant int &columns [[buffer(6)]], constant int &rows [[buffer(8)]],
+                constant int &stride [[buffer(9)]],
                 uint2 position [[threadgroup_position_in_grid]],
                 uint lane [[thread_index_in_simdgroup]],
                 uint simd [[simdgroup_index_in_threadgroup]]) {
 #if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
-  const uint column = position.x * 64 + simd * 32;
+  const uint part = simd / 2, column = position.x * 64 + (simd % 2) * 32;
   const int spans = width / 256 / SPLIT;
-  const int first = int(position.y) * spans;
+  const int first = int(part) * spans;
   auto total = coop_destination();
   coop_walk(weights, scales, biases, input, width, rows, stride, column, first, first + spans,
             lane, total);
+  // The eight live rows of a lane's elements, in element order.
+  threadgroup float handed[SPLIT > 1 ? (SPLIT - 1) * 2 * 8 * 32 : 1];
+  threadgroup float *mine = handed + (simd % 2) * 8 * 32 + lane;
+  if constexpr (SPLIT > 1) {
+    if (part > 0) {
+      ushort slot = 0;
+#pragma unroll
+      for (ushort i = 0; i < total.get_capacity(); ++i) {
+        if (!total.is_valid_element(i) || total.get_multidimensional_index(i)[1] >= 8)
+          continue;
+        mine[((part - 1) * 2 * 8 + slot++) * 32] = total[i];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (part > 0)
+      return;
+  }
+  ushort slot = 0;
 #pragma unroll
   for (ushort i = 0; i < total.get_capacity(); ++i) {
     if (!total.is_valid_element(i))
       continue;
     const auto at = total.get_multidimensional_index(i);
     const uint row = at[1];
-    if (row >= uint(rows) || row >= 8)
+    if (row >= 8)
       continue;
-    const ulong o = ulong(row) * columns + column + at[0];
-    if constexpr (SPLIT > 1)
-      partials[ulong(position.y) * rows * columns + o] = total[i];
-    else
-      output[o] = bfloat(total[i]);
+    float sum = total[i];
+    if constexpr (SPLIT > 1) {
+      sum = 0.0f + sum;
+      for (int p = 1; p < SPLIT; ++p)
+        sum += mine[((p - 1) * 2 * 8 + slot) * 32];
+    }
+    ++slot;
+    if (row < uint(rows))
+      output[ulong(row) * columns + column + at[0]] = bfloat(sum);
   }
 #else
+  // The first pair walks the whole contraction alone.
   threadgroup half stages[2 * 2 * 32 * 32];
   threadgroup uint4 pairs[2 * 2 * 32];
-  staged_tile<8, SPLIT>(weights, scales, biases, input, output, width, columns, partials, rows,
-                        stride, position, lane, simd, stages, pairs);
+  if (simd >= 2)
+    return;
+  staged_tile<8, 1>(weights, scales, biases, input, output, width, columns, nullptr, rows,
+                    stride, position, lane, simd, stages, pairs);
+#endif
+}
+
+// Up to three matmuls of one activation in one launch, each segment `i` the rows `first[i]` on
+// of its bank, `widths[i]` of them, into its own output: a simdgroup per 32 columns of the
+// segments laid end to end, each over the whole contraction as the unsplit tile walks it.
+[[kernel]] void
+affine_qmm_coop_segments(const device uint *w0 [[buffer(0)]], const device bfloat *s0 [[buffer(1)]],
+                         const device bfloat *b0 [[buffer(2)]], device bfloat *y0 [[buffer(3)]],
+                         const device uint *w1 [[buffer(4)]], const device bfloat *s1 [[buffer(5)]],
+                         const device bfloat *b1 [[buffer(6)]], device bfloat *y1 [[buffer(7)]],
+                         const device uint *w2 [[buffer(8)]], const device bfloat *s2 [[buffer(9)]],
+                         const device bfloat *b2 [[buffer(10)]], device bfloat *y2 [[buffer(11)]],
+                         const device bfloat *input [[buffer(12)]], constant int &width [[buffer(13)]],
+                         constant int &rows [[buffer(14)]], constant int &width0 [[buffer(15)]],
+                         constant int &width1 [[buffer(16)]], constant int &width2 [[buffer(17)]],
+                         constant int &stride0 [[buffer(18)]], constant int &stride1 [[buffer(19)]],
+                         constant int &stride2 [[buffer(20)]], constant int &first0 [[buffer(21)]],
+                         constant int &first1 [[buffer(22)]], constant int &first2 [[buffer(23)]],
+                         uint position [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint simd [[simdgroup_index_in_threadgroup]]) {
+  const uint g = position * 2 + simd;
+  const uint t0 = uint(width0) / 32, t1 = t0 + uint(width1) / 32, t2 = t1 + uint(width2) / 32;
+  if (g >= t2)
+    return;
+  const uint i = g < t0 ? 0 : g < t1 ? 1 : 2;
+  const uint local = (g - (i == 0 ? 0 : i == 1 ? t0 : t1)) * 32;
+  const device uint *weights = i == 0 ? w0 : i == 1 ? w1 : w2;
+  const device bfloat *scales = i == 0 ? s0 : i == 1 ? s1 : s2;
+  const device bfloat *biases = i == 0 ? b0 : i == 1 ? b1 : b2;
+  device bfloat *output = i == 0 ? y0 : i == 1 ? y1 : y2;
+  const int columns = i == 0 ? width0 : i == 1 ? width1 : width2;
+  const int stride = i == 0 ? stride0 : i == 1 ? stride1 : stride2;
+  const uint column = uint(i == 0 ? first0 : i == 1 ? first1 : first2) + local;
+#if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
+  auto total = coop_destination();
+  coop_walk(weights, scales, biases, input, width, rows, stride, column, 0, width / 256, lane,
+            total);
+#pragma unroll
+  for (ushort e = 0; e < total.get_capacity(); ++e) {
+    if (!total.is_valid_element(e))
+      continue;
+    const auto at = total.get_multidimensional_index(e);
+    const uint row = at[1];
+    if (row >= uint(rows) || row >= 8)
+      continue;
+    output[ulong(row) * columns + local + at[0]] = bfloat(total[e]);
+  }
+#else
+  // Without the tensor ops a lane sums its outputs' dot products alone: correct, not quick.
+  const ulong groups = ulong(stride) / 64;
+  for (uint at = lane; at < 8 * 32; at += 32) {
+    const uint row = at / 32, n = column + at % 32;
+    if (row >= uint(rows))
+      continue;
+    const device uint *codes = weights + ulong(n) * (stride / 8);
+    float sum = 0.0f;
+    for (int k = 0; k < width; ++k) {
+      const float code = float((codes[k / 8] >> (4 * (k % 8))) & 15);
+      const float w = float(half(fma(half(code), half(float(scales[n * groups + k / 64])),
+                                     half(float(biases[n * groups + k / 64])))));
+      sum += float(input[ulong(row) * width + k]) * w;
+    }
+    output[ulong(row) * columns + local + at % 32] = bfloat(sum);
+  }
 #endif
 }
 
@@ -433,5 +527,5 @@ affine_qmm_coop_swiglu(const device uint *weights [[buffer(0)]], const device bf
 #define PIE_COOP_POINT(name, split)                                                                \
   template [[host_name(name)]] [[kernel]] void affine_qmm_coop<split>(                             \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
-      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
-      constant int &, uint2, uint, uint);
+      device bfloat *, constant int &, constant int &, constant int &, constant int &, uint2,      \
+      uint, uint);

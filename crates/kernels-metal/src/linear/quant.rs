@@ -1297,30 +1297,14 @@ fn staged(
     let tiles = cols / 64;
     if cols >= COOP_LEAST_COLUMNS && k % COOP_SPAN == 0 {
         // Wide enough to fill the device from its columns alone, it runs whole; narrower, the
-        // contraction is cut in four so a 5120-column projection is not 160 simdgroups.
+        // contraction is cut in four, within each column tile's threadgroup, so a 5120-column
+        // projection is not 160 simdgroups.
         let split = if cols >= COOP_WHOLE_COLUMNS || (k / COOP_SPAN) % COOP_SPLIT != 0 {
             1
         } else {
             COOP_SPLIT
         };
-        let partial = if split > 1 {
-            (scratch.partials)(m.unsigned_abs() * split.unsigned_abs(), n.unsigned_abs())
-        } else {
-            None
-        };
-        if split == 1 || partial.is_some() {
-            return coop_matmul(
-                ctx,
-                op,
-                act,
-                w,
-                biases,
-                y,
-                (m, n, k, cols, ld),
-                if partial.is_some() { split } else { 1 },
-                partial,
-            );
-        }
+        return coop_matmul(ctx, act, w, biases, y, (m, n, k, cols, ld), split);
     }
     let mut split = if k >= STAGED_DEEP || tiles < STAGED_FEW_TILES {
         STAGED_SPLIT_WIDE
@@ -1369,27 +1353,26 @@ fn staged(
 
 /// One register-fed (Apple10 cooperative) tile matmul of `act` into `y`: `(m, n, k, cols, ld)`
 /// its rows, row stride, contraction, columns computed and the bank's row stride; `split`
-/// partitions of the contraction, whose sums go to `partial` when there are more than one.
+/// partitions of the contraction, each a pair of simdgroups of the column tile's threadgroup,
+/// which sums them in place.
 #[allow(clippy::too_many_arguments)]
 pub fn coop_matmul(
     ctx: &Ctx<'_>,
-    op: &'static str,
     act: Tensor,
     w: Bank,
     biases: Tensor,
     y: Tensor,
     (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
     split: i32,
-    partial: Option<Tensor>,
 ) -> Result<(), Error> {
-    let tiles = cols / 64;
+    let tiles = (cols / 64).unsigned_abs();
     let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
     let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
+    let threads = 64 * split.unsigned_abs();
     ctx.fire(
-        Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
-            [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
-            [64, 1, 1],
-        )),
+        Fire::at(STAGED_FILE, entry)
+            .stamp(stamp)
+            .apply(Grid::of([threads * tiles, 1, 1], [threads, 1, 1])),
         &[
             w.codes.arg(),
             w.scales.arg(),
@@ -1398,18 +1381,89 @@ pub fn coop_matmul(
             y.arg_mut(),
             k.arg(),
             n.arg(),
-            match partial {
-                Some(partial) => partial.arg_mut(),
-                None => ctx.absent()?,
-            },
+            ctx.absent()?,
             m.arg(),
             ld.arg(),
         ],
-    )?;
-    match partial {
-        Some(partial) if split > 1 => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
-        _ => Ok(()),
+    )
+}
+
+/// Two or three matmuls of one `m`-row, `k`-wide activation in one register-fed (Apple10
+/// cooperative) launch, each segment's columns over the whole contraction as
+/// [`coop_matmul`] walks them unsplit (`Segment::split` is not read).
+pub fn coop_segments(
+    ctx: &Ctx<'_>,
+    segments: &[Segment],
+    act: Tensor,
+    m: i32,
+    k: i32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_segments";
+    if !(2..=3).contains(&segments.len()) {
+        return Err(refuse(OP, "a segment launch takes two or three matmuls"));
     }
+    if !(1..=8).contains(&m) || k % COOP_SPAN != 0 {
+        return Err(refuse(
+            OP,
+            "the register-fed tile takes up to 8 rows of whole 256-input spans",
+        ));
+    }
+    let mut tiles = 0u32;
+    let mut args = Vec::with_capacity(24);
+    for s in segments {
+        let Some(biases) = s.w.biases else {
+            return Err(refuse(OP, "a segment's bank holds no biases"));
+        };
+        let ld = stated(OP, s.w.ld)?;
+        if s.w.bits != 4
+            || s.w.group != 64
+            || !s.y.width.is_multiple_of(32)
+            || !s.first.is_multiple_of(32)
+            || s.first + s.y.width > s.w.codes.rows
+            || ld % 64 != 0
+            || ld < k
+            || s.y.rows != m.unsigned_abs()
+        {
+            return Err(refuse(OP, "a segment the register-fed tile does not walk"));
+        }
+        tiles += s.y.width / 32;
+        args.extend([
+            s.w.codes.arg(),
+            s.w.scales.arg(),
+            biases.arg(),
+            s.y.arg_mut(),
+        ]);
+    }
+    for _ in segments.len()..3 {
+        let absent = ctx.absent()?;
+        args.extend([absent; 4]);
+    }
+    args.extend([act.arg(), k.arg(), m.arg()]);
+    let at = |i: usize, of: &dyn Fn(&Segment) -> i32| segments.get(i).map_or(0, of);
+    for of in [
+        &(|s: &Segment| s.y.width.cast_signed()) as &dyn Fn(&Segment) -> i32,
+        &|s: &Segment| s.w.ld.cast_signed(),
+        &|s: &Segment| s.first.cast_signed(),
+    ] {
+        for i in 0..3 {
+            args.push(at(i, of).arg());
+        }
+    }
+    ctx.fire(
+        Fire::at(STAGED_FILE, "affine_qmm_coop_segments")
+            .apply(Grid::of([64 * tiles.div_ceil(2), 1, 1], [64, 1, 1])),
+        &args,
+    )
+}
+
+/// Whether a matmul of `rows` rows by a 4-bit, 64-group bank of `cols` columns over a
+/// contraction of `k` takes the staged rung first, where its register-fed tile runs.
+#[must_use]
+pub fn stages(tuning: &Tuning, rows: u32, cols: u32, k: u32) -> bool {
+    rows > 0
+        && rows <= STAGED_TILE.unsigned_abs()
+        && k.is_multiple_of(COOP_SPAN.unsigned_abs())
+        && tuning.qmm(&tuning.qmm_at(rows, cols, k, 4, 64)).first() == Some(&Qmm::Staged)
 }
 
 /// The gate and up of a packed `[gate | up]` bank and their swiglu into `h` in one

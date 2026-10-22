@@ -174,14 +174,12 @@ fn the_coop_tiles_price_their_matmuls() {
                 for (w, y) in banks.iter().zip(&ys) {
                     quant::coop_matmul(
                         ctx,
-                        "bench",
                         act,
                         *w,
                         w.biases.expect("biases"),
                         *y,
                         (ROWS as i32, n as i32, k as i32, n as i32, k as i32),
                         split as i32,
-                        (split > 1).then_some(partials),
                     )
                     .expect("matmul");
                 }
@@ -244,14 +242,12 @@ fn the_coop_tiles_price_their_matmuls() {
                 }
                 quant::coop_matmul(
                     ctx,
-                    "bench",
                     act,
                     *w,
                     w.biases.expect("biases"),
                     packed,
                     (ROWS as i32, (2 * intermediate) as i32, k as i32, (2 * intermediate) as i32, k as i32),
                     1,
-                    None,
                 )
                 .expect("matmul");
                 kernels_metal::linear::mlp::swiglu(ctx, packed, intermediate, *h).expect("swiglu");
@@ -320,7 +316,7 @@ fn the_coop_variants_price_their_matmuls() {
         let mut line = format!("{what:13} K={k:5} N={n:6} x{layers:2} k{split}");
         let base = b.time(&|ctx| {
             for (w, y) in banks.iter().zip(&ys) {
-                quant::coop_matmul(ctx, "bench", act, *w, w.biases.expect("b"), *y, shape, split, (split > 1).then_some(partials))
+                quant::coop_matmul(ctx, act, *w, w.biases.expect("b"), *y, shape, split)
                     .expect("matmul");
             }
         }) / f64::from(layers);
