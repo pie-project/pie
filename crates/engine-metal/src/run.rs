@@ -1309,7 +1309,9 @@ impl<'c> Run<'c> {
         let Some(mut landed) = self.landed.get() else {
             return false;
         };
-        if landed.region != self.place.region.get() || landed.rows != self.rows_here() {
+        // A plain window's span names the same rows in a later region (a layer's
+        // shared expert sits in the region after its routed passes).
+        if landed.rows != self.rows_here() {
             self.landed.set(None);
             return false;
         }

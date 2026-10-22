@@ -471,6 +471,44 @@ impl Run<'_> {
         Ok(true)
     }
 
+    /// The gate-up of the shared expert of `act` (its fused MLP) that the trace
+    /// places after the routed matmul of `act` into `y` by `bank`, an expert of
+    /// `bank`'s shape: the routed launch lands it as one more route of every
+    /// token, and the MLP's gate-up finds it done ([`Run::landed_ahead`]).
+    fn shared_route(
+        &self,
+        act: poem_ir::ValueId,
+        bank: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Option<(kernels_metal::Bank, poem_ir::ValueId)> {
+        use poem_ir::Operation;
+        if !self.region_nodes()?.1 {
+            return None;
+        }
+        let op = |at: u32| self.nodes().get(at as usize).map(|n| &n.op);
+        let readers = self.readers_of(act);
+        let first = readers.iter().copied().find(|&at| {
+            matches!(op(at), Some(Operation::Linear(Linear::MoeMatmulSelectQuant { x, bank: b, y: o, .. }))
+                if *x == act && *b == bank && *o == y)
+        })?;
+        let (routed, out, x) = (self.planes(bank), self.tensor(y), self.tensor(act));
+        readers.iter().copied().filter(|&at| at > first).find_map(|at| {
+            let Some(Operation::Fused(Fused::MlpSwiglu { act: a, gate_up, packed, .. })) = op(at) else {
+                return None;
+            };
+            let shared = self.banked(*gate_up).filter(|_| *a == act)?;
+            let to = self.tensor(*packed);
+            (shared.affine()
+                && shared.bits == routed.bits
+                && shared.group == routed.group
+                && shared.ld == x.width
+                && shared.codes.rows == out.width
+                && to.width == out.width
+                && to.rows == x.rows)
+                .then_some((shared, *packed))
+        })
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::MlpRelu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
@@ -914,13 +952,19 @@ impl Run<'_> {
                     );
                     self.chain_clear();
                 }
-                linear::moe::matmul_select_quant(
+                let shared = self.shared_route(*x, *bank, *y);
+                linear::moe::matmul_select_quant_shared(
                     self.ctx(),
                     self.tensor(*x),
                     self.planes(*bank),
                     self.tensor(*routes),
                     self.tensor(*y),
-                )
+                    shared.map(|(b, ys)| (b, self.tensor(*x), self.tensor(ys))),
+                )?;
+                if let Some((_, ys)) = shared {
+                    self.land_ahead([Some(ys), None, None]);
+                }
+                Ok(())
             }
             Linear::LoraCorrect {
                 x,
