@@ -13,14 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_CP_ASYNC_CUH_
-#define FLASHINFER_CP_ASYNC_CUH_
+#ifndef PIE_FA2_CP_ASYNC_CUH_
+#define PIE_FA2_CP_ASYNC_CUH_
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 namespace cp_async {
 
@@ -36,7 +36,7 @@ enum class PrefetchMode {
 
 #if (__CUDACC_VER_MAJOR__ >= 11)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
-#define FLASHINFER_CP_ASYNC_ENABLED
+#define PIE_FA2_CP_ASYNC_ENABLED
 #endif
 #endif
 
@@ -44,7 +44,7 @@ enum class PrefetchMode {
 
 
 __device__ __forceinline__ void commit_group() {
-#ifdef FLASHINFER_CP_ASYNC_ENABLED
+#ifdef PIE_FA2_CP_ASYNC_ENABLED
   asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
@@ -54,7 +54,7 @@ __device__ __forceinline__ void commit_group() {
 
 template <size_t n>
 __device__ __forceinline__ void wait_group() {
-#ifdef FLASHINFER_CP_ASYNC_ENABLED
+#ifdef PIE_FA2_CP_ASYNC_ENABLED
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 #endif
 }
@@ -68,7 +68,7 @@ __device__ __forceinline__ void wait_group() {
 
 template <PrefetchMode prefetch_mode, typename T>
 __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
-#ifdef FLASHINFER_CP_ASYNC_ENABLED
+#ifdef PIE_FA2_CP_ASYNC_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
     asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
@@ -94,7 +94,7 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
 
 template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
 __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
-#ifdef FLASHINFER_CP_ASYNC_ENABLED
+#ifdef PIE_FA2_CP_ASYNC_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
     int src_in_bytes = predicate ? 16 : 0;
@@ -184,7 +184,7 @@ __device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool p
 template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
 __device__ __forceinline__ void pred_load_128b_from_64b(T* smem_ptr, const T* gmem_ptr,
                                                         bool predicate) {
-#ifdef FLASHINFER_CP_ASYNC_ENABLED
+#ifdef PIE_FA2_CP_ASYNC_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
     int src_in_bytes = predicate ? 8 : 0;
@@ -226,7 +226,7 @@ __device__ __forceinline__ void pred_load_128b_from_64b(T* smem_ptr, const T* gm
 template <SharedMemFillMode fill_mode>
 __device__ __forceinline__ void pred_load_32b(uint32_t* smem_ptr, const uint32_t* gmem_ptr,
                                               bool predicate) {
-#ifdef FLASHINFER_CP_ASYNC_ENABLED
+#ifdef PIE_FA2_CP_ASYNC_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
     int src_in_bytes = predicate ? 4 : 0;

@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_FRAG_LAYOUT_SWIZZLE_CUH_
-#define FLASHINFER_FRAG_LAYOUT_SWIZZLE_CUH_
+#ifndef PIE_FA2_FRAG_LAYOUT_SWIZZLE_CUH_
+#define PIE_FA2_FRAG_LAYOUT_SWIZZLE_CUH_
 
 #include <cuda_runtime.h>
 

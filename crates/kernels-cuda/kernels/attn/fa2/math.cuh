@@ -13,15 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MATH_CUH_
-#define FLASHINFER_MATH_CUH_
+#ifndef PIE_FA2_MATH_CUH_
+#define PIE_FA2_MATH_CUH_
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 namespace math {
 
 constexpr float log2e = 1.44269504088896340736f;

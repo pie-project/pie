@@ -12,15 +12,13 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/headers.rs"));
 }
 
-pub use generated::{LIBRARY, SHIM, UPSTREAM};
+pub use generated::{LIBRARY, SHIM};
 
 const SHIMMED: [Header; SHIM.len() + LIBRARY.len()] =
     join::<{ SHIM.len() + LIBRARY.len() }>(SHIM, LIBRARY);
 
 pub const DEVICE_HEADERS: &[Header] = &SHIMMED;
 
-pub const ALL_HEADERS: &[Header] =
-    &join::<{ SHIM.len() + LIBRARY.len() + UPSTREAM.len() }>(&SHIMMED, UPSTREAM);
 
 const fn join<const N: usize>(left: &[Header], right: &[Header]) -> [Header; N] {
     let mut out = [Header { name: "", text: "" }; N];

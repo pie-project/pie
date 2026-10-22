@@ -13,18 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_ATTENTION_VARIANTS_CUH_
-#define FLASHINFER_ATTENTION_VARIANTS_CUH_
+#ifndef PIE_FA2_ATTENTION_VARIANTS_CUH_
+#define PIE_FA2_ATTENTION_VARIANTS_CUH_
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <type_traits>
 
-#include "../math.cuh"
-#include "../utils.cuh"
-#include "variant_helper.cuh"
+#include "attn/fa2/math.cuh"
+#include "attn/fa2/utils.cuh"
+#include "attn/fa2/variant_helper.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 DEFINE_HAS_MEMBER(maybe_mask_indptr)
 

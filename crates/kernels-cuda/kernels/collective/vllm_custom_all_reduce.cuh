@@ -198,70 +198,9 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
-                               T* __restrict__ result, int rank, int size) {
-  using P = typename packed_t<T>::P;
-  using A = typename packed_t<T>::A;
-
-  auto dp = *_dp;
-  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
-
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
-    ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
-  }
-  multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
-}
-
 template <typename P>
 DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
-
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
-                               T* __restrict__ result, int rank, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int stride = gridDim.x * blockDim.x;
-  using P = typename packed_t<T>::P;
-  using A = typename packed_t<T>::A;
-  int part = size / ngpus;
-  int start = rank * part;
-  int end = rank == ngpus - 1 ? size : start + part;
-  int largest_part = part + size % ngpus;
-  const P* ptrs[ngpus];
-  P* tmps[ngpus];
-#pragma unroll
-  for (int i = 0; i < ngpus; i++) {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
-    tmps[i] = get_tmp_buf<P>(sg.signals[target]);
-  }
-  auto tmp_out = tmps[0];
-  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
-
-  for (int idx = start + tid; idx < end; idx += stride) {
-    tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
-  }
-  multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
-
-  for (int idx = tid; idx < largest_part; idx += stride) {
-#pragma unroll
-    for (int i = 0; i < ngpus; i++) {
-      int gather_from_rank = ((rank + i) % ngpus);
-      if (gather_from_rank == ngpus - 1 || idx < part) {
-        int dst_idx = gather_from_rank * part + idx;
-        ((P*)result)[dst_idx] = tmps[i][idx];
-      }
-    }
-  }
-}
-
-
-
-
-
 
 }

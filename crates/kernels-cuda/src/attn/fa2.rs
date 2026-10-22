@@ -65,8 +65,8 @@ fn decode_symbol(
     // with e4m3 pages (`attention.cuh`'s `*8` spellings).
     let width = if kv == KvWidth::E4M3 { "8" } else { "" };
     Ok(symbol(&format!(
-        "::flashinfer::BatchDecodeWithPagedKVCacheKernel<\
-         ::flashinfer::PosEncodingMode::kNone, \
+        "::pie::attn::fa2::BatchDecodeWithPagedKVCacheKernel<\
+         ::pie::attn::fa2::PosEncodingMode::kNone, \
          {ns}, {tile}, {vec}, {bdx}, {bdy}, {bdz}, \
          ::pie::attn::fa2::{variant}, ::pie::attn::fa2::{params}{width}>",
         ns = g.num_stages_smem,
@@ -111,8 +111,8 @@ fn prefill_symbol(
         (params, "")
     };
     Ok(symbol(&format!(
-        "::flashinfer::BatchPrefillWithPagedKVCacheKernel<\
-         ::pie::attn::fa2::PagedTraits<::flashinfer::MaskMode::{mask}, \
+        "::pie::attn::fa2::BatchPrefillWithPagedKVCacheKernel<\
+         ::pie::attn::fa2::PagedTraits<::pie::attn::fa2::MaskMode::{mask}, \
          {q}, {mmaq}, {kv}, {dqk}, {dvo}, {wq}, {wkv}, \
          ::pie::attn::fa2::{variant}{pages}>, ::pie::attn::fa2::{params}>",
         q = g.cta_tile_q,
@@ -148,8 +148,8 @@ fn prefill_ragged_symbol(
         RaggedArm::RelativeBias => ("kNone", "RelativeBias", "RaggedBiasParams"),
     };
     Ok(symbol(&format!(
-        "::flashinfer::BatchPrefillWithRaggedKVCacheKernel<\
-         ::pie::attn::fa2::PagedTraits<::flashinfer::MaskMode::{mask}, \
+        "::pie::attn::fa2::BatchPrefillWithRaggedKVCacheKernel<\
+         ::pie::attn::fa2::PagedTraits<::pie::attn::fa2::MaskMode::{mask}, \
          {q}, {mmaq}, {kv}, {dqk}, {dvo}, {wq}, {wkv}, \
          ::pie::attn::fa2::{variant}>, ::pie::attn::fa2::{params}>",
         q = g.cta_tile_q,
@@ -352,7 +352,7 @@ const fn merge_smem_bytes(head_dim: u32) -> Option<u32> {
 fn merge_varlen_inst(head_dim: u32) -> Option<&'static str> {
     let (vec_size, bdx, bdy) = merge_geometry(head_dim)?;
     Some(symbol(&format!(
-        "::flashinfer::PersistentVariableLengthMergeStatesKernel<\
+        "::pie::attn::fa2::PersistentVariableLengthMergeStatesKernel<\
          {vec_size}, {bdx}, {bdy}, {NUM_SMEM_STAGES}, \
          ::pie::attn::merge_lse::DTypeIn, ::pie::attn::merge_lse::DTypeO, \
          ::pie::attn::merge_lse::IdType>",

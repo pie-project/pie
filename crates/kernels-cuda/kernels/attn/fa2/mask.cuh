@@ -13,10 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_ATTENTION_MASK_CUH_
-#define FLASHINFER_ATTENTION_MASK_CUH_
+#ifndef PIE_FA2_ATTENTION_MASK_CUH_
+#define PIE_FA2_ATTENTION_MASK_CUH_
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 enum class MaskMode {
   kNone = 0U,

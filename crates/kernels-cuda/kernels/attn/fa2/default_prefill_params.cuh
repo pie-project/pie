@@ -13,16 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_PREFILL_PARAMS_CUH_
-#define FLASHINFER_PREFILL_PARAMS_CUH_
+#ifndef PIE_FA2_PREFILL_PARAMS_CUH_
+#define PIE_FA2_PREFILL_PARAMS_CUH_
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-#include "../page.cuh"
+#include "attn/fa2/page.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
 struct SinglePrefillParams {

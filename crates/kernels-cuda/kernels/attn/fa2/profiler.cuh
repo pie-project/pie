@@ -13,11 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_PROFILER_CUH_
-#define FLASHINFER_PROFILER_CUH_
+#ifndef PIE_FA2_PROFILER_CUH_
+#define PIE_FA2_PROFILER_CUH_
 #include <cuda.h>
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 __device__ __forceinline__ uint32_t get_block_idx() {
   return (blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
@@ -68,7 +68,7 @@ struct ProfilerEntry {
   };
 };
 
-#ifdef FLASHINFER_ENABLE_PROFILER
+#ifdef PIE_FA2_ENABLE_PROFILER
 #define PROFILER_CLOSURE_PARAMS_DECL \
   ProfilerEntry entry;               \
   uint64_t* profiler_write_ptr;      \

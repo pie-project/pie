@@ -29,16 +29,16 @@
 #include <array>
 #include <type_traits>
 
-#include "../fp4_layout.cuh"
+#include "attn/fa2/fp4_layout.cuh"
 
-#include "../utils.cuh"
-#include "../vec_dtypes.cuh"
+#include "attn/fa2/utils.cuh"
+#include "attn/fa2/vec_dtypes.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 namespace trtllm_allreduce_fusion {
 
-using flashinfer::QuantizationSFLayout;
+using pie::attn::fa2::QuantizationSFLayout;
 
 namespace details {
 
@@ -1107,140 +1107,6 @@ class IndexHelper {
   int access_stride;
   int tot_access;
 };
-
-template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc,
-          bool TriggerCompletionAtEnd = true>
-__global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T> params) {
-  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
-  IndexHelper<T> index_helper(params);
-  int token_id = index_helper.token_id;
-  int access_id_in_token = index_helper.access_id_in_token;
-  int token_stride = index_helper.token_stride;
-  int access_id = index_helper.access_id;
-  int access_stride = index_helper.access_stride;
-  int tot_access = index_helper.tot_access;
-  vec_t<T, VEC_SIZE> clear_vec;
-  clear_vec.fill(neg_zero_v<T>);
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
-  if constexpr (!TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
-  LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access = comm.clear_size / VEC_SIZE;
-
-  for (int idx = access_id; idx < tot_access; idx += access_stride) {
-    vec_t<T, VEC_SIZE> val;
-    val.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
-    remove_neg_zero<T, VEC_SIZE>(val);
-#pragma unroll
-    for (int r = 0; r < NRanks; ++r) {
-
-      val.store(reinterpret_cast<T*>(comm.data_bufs[r]) +
-                (params.rank * tot_access + idx) * VEC_SIZE);
-    }
-  }
-  for (int idx = access_id; idx < clear_access; idx += access_stride) {
-
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
-  }
-
-  for (int idx = access_id, tidx = token_id; idx < tot_access;
-       idx += access_stride, tidx += token_stride) {
-    fused_op.update(idx);
-    vec_t<T, VEC_SIZE> vals[NRanks];
-    bool done = false;
-
-    while (!done) {
-      done = true;
-#pragma unroll
-      for (int r = 0; r < NRanks; ++r) {
-
-        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
-                                     (r * tot_access + idx) * VEC_SIZE);
-        done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
-      }
-    }
-    vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
-    fused_op(sum_val, tidx);
-  }
-
-  comm.update(params.size * NRanks);
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if constexpr (TriggerCompletionAtEnd) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
-}
-
-template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> params,
-                                                     std::array<int, NRanks> begin_tokens,
-                                                     std::array<int, NRanks> token_num_per_ranks) {
-  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
-  IndexHelper<T> index_helper(params);
-  int token_id = index_helper.token_id;
-  int access_id_in_token = index_helper.access_id_in_token;
-  int token_stride = index_helper.token_stride;
-  int access_id = index_helper.access_id;
-  int access_stride = index_helper.access_stride;
-  int tot_access = index_helper.tot_access;
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
-#endif
-  SyncComm<NRanks> comm(params.workspace);
-#pragma unroll
-  for (int r = 0; r < NRanks; ++r) {
-    int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
-    int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / VEC_SIZE;
-    for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-      reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] =
-          reinterpret_cast<float4*>(params.allreduce_in)[idx];
-    }
-  }
-  Barrier<NRanks> barrier(params.rank, comm);
-  barrier.sync();
-  int comm_access_id = access_id + begin_tokens[params.rank] * params.hidden_dim / VEC_SIZE;
-  int comm_tot_access =
-      (begin_tokens[params.rank] + token_num_per_ranks[params.rank]) * params.hidden_dim / VEC_SIZE;
-  for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-    vec_t<T, VEC_SIZE> vals[NRanks];
-#pragma unroll
-    for (int r = 0; r < NRanks; ++r) {
-      vals[r].load(reinterpret_cast<T*>(comm.comm_bufs[r]) + idx * VEC_SIZE);
-    }
-    vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
-#pragma unroll
-    for (int r = 0; r < NRanks; ++r) {
-      sum_val.store(reinterpret_cast<T*>(comm.comm_bufs[r]) + (tot_access + idx) * VEC_SIZE);
-    }
-  }
-  barrier.sync();
-#pragma unroll
-  for (int r = 0; r < NRanks; ++r) {
-    int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
-    int comm_token_id = token_id + begin_tokens[r];
-    int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / VEC_SIZE;
-    for (int idx = comm_access_id, tidx = comm_token_id; idx < comm_tot_access;
-         idx += access_stride, tidx += token_stride) {
-      fused_op.update(idx);
-      vec_t<T, VEC_SIZE> sum_val;
-      sum_val.load(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
-                   (tot_access + idx) * VEC_SIZE);
-      fused_op(sum_val, tidx);
-    }
-  }
-  comm.update(barrier.m_flag_value);
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaTriggerProgrammaticLaunchCompletion();
-#endif
-}
-
 
 }
 

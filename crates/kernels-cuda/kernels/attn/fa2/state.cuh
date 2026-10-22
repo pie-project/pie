@@ -13,13 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_STATE_CUH_
-#define FLASHINFER_STATE_CUH_
+#ifndef PIE_FA2_STATE_CUH_
+#define PIE_FA2_STATE_CUH_
 
-#include "../math.cuh"
-#include "../vec_dtypes.cuh"
+#include "attn/fa2/math.cuh"
+#include "attn/fa2/vec_dtypes.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 
 

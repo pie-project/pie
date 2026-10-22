@@ -23,11 +23,11 @@ impl UintFastdiv {
 
 const _: () = assert!(
     core::mem::size_of::<UintFastdiv>() == 24,
-    "UintFastdiv: sizeof disagrees with the measured ::flashinfer::uint_fastdiv",
+    "UintFastdiv: sizeof disagrees with the measured ::pie::attn::fa2::uint_fastdiv",
 );
 const _: () = assert!(
     core::mem::align_of::<UintFastdiv>() == 8,
-    "UintFastdiv: alignof disagrees with the measured ::flashinfer::uint_fastdiv",
+    "UintFastdiv: alignof disagrees with the measured ::pie::attn::fa2::uint_fastdiv",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -173,11 +173,11 @@ pub struct PrefillRaggedParams {
 
 const _: () = assert!(
     core::mem::size_of::<PrefillRaggedParams>() == 312,
-    "PrefillRaggedParams: sizeof disagrees with ::flashinfer::BatchPrefillRaggedParams",
+    "PrefillRaggedParams: sizeof disagrees with ::pie::attn::fa2::BatchPrefillRaggedParams",
 );
 const _: () = assert!(
     core::mem::align_of::<PrefillRaggedParams>() == 8,
-    "PrefillRaggedParams: alignof disagrees with ::flashinfer::BatchPrefillRaggedParams",
+    "PrefillRaggedParams: alignof disagrees with ::pie::attn::fa2::BatchPrefillRaggedParams",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

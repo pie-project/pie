@@ -6,13 +6,13 @@
 
 #include "prim/device.cuh"
 
-#include "flashinfer/attention/cascade.cuh"
-#include "flashinfer/attention/decode.cuh"
-#include "flashinfer/attention/default_decode_params.cuh"
-#include "flashinfer/attention/default_prefill_params.cuh"
-#include "flashinfer/attention/mask.cuh"
-#include "flashinfer/attention/prefill.cuh"
-#include "flashinfer/attention/variants.cuh"
+#include "attn/fa2/cascade.cuh"
+#include "attn/fa2/decode.cuh"
+#include "attn/fa2/default_decode_params.cuh"
+#include "attn/fa2/default_prefill_params.cuh"
+#include "attn/fa2/mask.cuh"
+#include "attn/fa2/prefill.cuh"
+#include "attn/fa2/variants.cuh"
 
 namespace pie::attn {
 
@@ -107,28 +107,28 @@ using DTypeKV = __nv_bfloat16;
 using DTypeO = __nv_bfloat16;
 using IdType = std::int32_t;
 
-inline constexpr auto POS_ENC = ::flashinfer::PosEncodingMode::kNone;
+inline constexpr auto POS_ENC = ::pie::attn::fa2::PosEncodingMode::kNone;
 
-using VariantWindow = ::flashinfer::DefaultAttention<false, true, false, false>;
+using VariantWindow = ::pie::attn::fa2::DefaultAttention<false, true, false, false>;
 
-using VariantWindowSoftcap = ::flashinfer::DefaultAttention<false, true, true, false>;
+using VariantWindowSoftcap = ::pie::attn::fa2::DefaultAttention<false, true, true, false>;
 
-using VariantFull = ::flashinfer::DefaultAttention<false, false, false, false>;
+using VariantFull = ::pie::attn::fa2::DefaultAttention<false, false, false, false>;
 
-using VariantFullSoftcap = ::flashinfer::DefaultAttention<false, false, true, false>;
+using VariantFullSoftcap = ::pie::attn::fa2::DefaultAttention<false, false, true, false>;
 
-using VariantCustom = ::flashinfer::DefaultAttention<true, true, false, false>;
+using VariantCustom = ::pie::attn::fa2::DefaultAttention<true, true, false, false>;
 
-using VariantCustomSoftcap = ::flashinfer::DefaultAttention<true, true, true, false>;
+using VariantCustomSoftcap = ::pie::attn::fa2::DefaultAttention<true, true, true, false>;
 
-using DecodeParams = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
-using PrefillParams = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+using DecodeParams = ::pie::attn::fa2::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+using PrefillParams = ::pie::attn::fa2::BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 // An e4m3 pool's (vLLM's `fp8` KV, a unit scale): its pages read as they
 // are, the queries bf16.
 using DTypeKV8 = __nv_fp8_e4m3;
-using DecodeParams8 = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
-using PrefillParams8 = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
+using DecodeParams8 = ::pie::attn::fa2::BatchDecodeParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
+using PrefillParams8 = ::pie::attn::fa2::BatchPrefillPagedParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
 
 using CaptureWindow = PieScoreCapture<VariantWindow>;
 using CaptureFull = PieScoreCapture<VariantFull>;
@@ -150,8 +150,8 @@ struct RelBiasParams : Base {
 
 template <bool use_sliding_window>
 struct VariantRelBias
-    : ::flashinfer::DefaultAttention<false, use_sliding_window, false, false> {
-    using Base = ::flashinfer::DefaultAttention<false, use_sliding_window, false, false>;
+    : ::pie::attn::fa2::DefaultAttention<false, use_sliding_window, false, false> {
+    using Base = ::pie::attn::fa2::DefaultAttention<false, use_sliding_window, false, false>;
 
     const float* bias_rows = nullptr;
     std::uint32_t extent = 0;
@@ -164,7 +164,7 @@ struct VariantRelBias
     __device__ __host__ VariantRelBias(
         const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
         : Base(params, batch_idx, smem_ptr) {
-        this->sm_scale_log2 = ::flashinfer::math::log2e;
+        this->sm_scale_log2 = ::pie::attn::fa2::math::log2e;
         scale = params.sm_scale;
         extent = params.rel_extent;
         heads = params.rel_heads;
@@ -203,12 +203,12 @@ using PrefillRelParams = RelBiasParams<PrefillParams>;
 using DecodeRelParams8 = RelBiasParams<DecodeParams8>;
 using PrefillRelParams8 = RelBiasParams<PrefillParams8>;
 
-template <::flashinfer::MaskMode MASK, std::uint32_t CTA_TILE_Q, std::uint32_t NUM_MMA_Q,
+template <::pie::attn::fa2::MaskMode MASK, std::uint32_t CTA_TILE_Q, std::uint32_t NUM_MMA_Q,
           std::uint32_t NUM_MMA_KV, std::uint32_t NUM_MMA_D_QK, std::uint32_t NUM_MMA_D_VO,
           std::uint32_t NUM_WARPS_Q, std::uint32_t NUM_WARPS_KV, class Variant,
           class Params = PrefillParams, class KV = DTypeKV>
 using PagedTraits =
-    ::flashinfer::KernelTraits<MASK, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+    ::pie::attn::fa2::KernelTraits<MASK, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                               NUM_WARPS_Q, NUM_WARPS_KV, POS_ENC, DTypeQ, KV, DTypeO, float,
                               IdType, Variant>;
 
@@ -217,7 +217,7 @@ __device__ unsigned smem_bytes_paged =
     static_cast<unsigned>(sizeof(typename KTraits::SharedStoragePaged));
 
 
-using RaggedParams = ::flashinfer::BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+using RaggedParams = ::pie::attn::fa2::BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 static_assert(sizeof(RaggedParams) == 312,
               "fa2_abi::PrefillRaggedParams mirrors a 312-byte BatchPrefillRaggedParams");
@@ -332,7 +332,7 @@ struct RelativeBias : VariantFull {
         bias = params.bias;
         centre = params.max_len - 1;
         span = 2 * params.max_len - 1;
-        sm_scale_log2 = ::flashinfer::math::log2e;
+        sm_scale_log2 = ::pie::attn::fa2::math::log2e;
     }
 
     REGISTER_LOGITS_TRANSFORM(
@@ -396,7 +396,7 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
         const u32 head = pair % num_heads;
         const int begin = indptr[pos];
         const int end = indptr[pos + 1];
-        float m = -::flashinfer::math::inf;
+        float m = -::pie::attn::fa2::math::inf;
         for (int k = begin + static_cast<int>(lane); k < end; k += 32) {
             m = fmaxf(m, s[static_cast<long long>(k) * num_heads + head]);
         }
@@ -408,7 +408,7 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
 #pragma unroll
         for (int j = 0; j < PER; ++j) acc[j] = 0.f;
         float d = 0.f;
-        if (m != -::flashinfer::math::inf) {
+        if (m != -::pie::attn::fa2::math::inf) {
 #pragma unroll 4
             for (int k = begin; k < end; ++k) {
                 const long long at = static_cast<long long>(k) * num_heads + head;
@@ -438,7 +438,7 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
             *reinterpret_cast<u32*>(dst + j) = lo | (hi << 16);
         }
         if (s_merged != nullptr && lane == 0) {
-            s_merged[out] = d > 0.f ? m + log2f(d) : -::flashinfer::math::inf;
+            s_merged[out] = d > 0.f ? m + log2f(d) : -::pie::attn::fa2::math::inf;
         }
     }
 }

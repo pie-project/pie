@@ -13,16 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_ATTENTION_VARIANT_HELPER_H
-#define FLASHINFER_ATTENTION_VARIANT_HELPER_H
+#ifndef PIE_FA2_ATTENTION_VARIANT_HELPER_H
+#define PIE_FA2_ATTENTION_VARIANT_HELPER_H
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-#include "../utils.cuh"
+#include "attn/fa2/utils.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 DEFINE_HAS_MEMBER(v_scale)
 

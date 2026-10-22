@@ -11,8 +11,8 @@
 #include "prim/device.cuh"
 #include "prim/rope.cuh"
 
-#include "flashinfer/attention/mla.cuh"
-#include "flashinfer/attention/mla_params.cuh"
+#include "attn/fa2/mla.cuh"
+#include "attn/fa2/mla_params.cuh"
 
 namespace pie::attn {
 
@@ -881,7 +881,7 @@ using DTypeKV = __nv_bfloat16;
 using DTypeO = __nv_bfloat16;
 using IdType = std::int32_t;
 
-using Params = ::flashinfer::MLAParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+using Params = ::pie::attn::fa2::MLAParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 inline constexpr std::uint32_t HEAD_DIM_CKV = 512;
 inline constexpr std::uint32_t HEAD_DIM_KPE = 64;
@@ -889,7 +889,7 @@ inline constexpr std::uint32_t CTA_TILE_Q = 64;
 
 template <bool CAUSAL, std::uint32_t NUM_STAGES, bool QK_SHARD, std::uint32_t CTA_TILE_KV>
 using Traits =
-    ::flashinfer::mla::KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
+    ::pie::attn::fa2::mla::KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
                                    CTA_TILE_Q, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
 
 template <class KTraits>

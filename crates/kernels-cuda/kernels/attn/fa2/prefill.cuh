@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_PREFILL_CUH_
-#define FLASHINFER_PREFILL_CUH_
+#ifndef PIE_FA2_PREFILL_CUH_
+#define PIE_FA2_PREFILL_CUH_
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -25,20 +25,20 @@
 #endif
 #include <cuda_runtime.h>
 
-#include "../cp_async.cuh"
-#include "../fastdiv.cuh"
+#include "attn/fa2/cp_async.cuh"
+#include "attn/fa2/fastdiv.cuh"
 
-#include "../frag_layout_swizzle.cuh"
-#include "../math.cuh"
-#include "../mma.cuh"
-#include "../page.cuh"
-#include "../permuted_smem.cuh"
-#include "../pos_enc.cuh"
-#include "../utils.cuh"
-#include "cascade.cuh"
-#include "mask.cuh"
-#include "variants.cuh"
-namespace flashinfer {
+#include "attn/fa2/frag_layout_swizzle.cuh"
+#include "attn/fa2/math.cuh"
+#include "attn/fa2/mma.cuh"
+#include "attn/fa2/page.cuh"
+#include "attn/fa2/permuted_smem.cuh"
+#include "attn/fa2/pos_enc.cuh"
+#include "attn/fa2/utils.cuh"
+#include "attn/fa2/cascade.cuh"
+#include "attn/fa2/mask.cuh"
+#include "attn/fa2/variants.cuh"
+namespace pie::attn::fa2 {
 
 DEFINE_HAS_MEMBER(maybe_q_rope_offset)
 DEFINE_HAS_MEMBER(maybe_k_rope_offset)
@@ -1830,7 +1830,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
           uint32_t o_frag_f16[8 / 2];
           vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[mma_q][mma_d]);
 
-#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_STMATRIX_M8N8X4_ENABLED
           uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
               (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx % 16,
               mma_d * 2 + lane_idx / 16);
@@ -1931,7 +1931,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
-    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
+    PIE_FA2_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
     using DTypeKV = typename Params::DTypeKV;
@@ -2291,18 +2291,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 #endif
 }
 
-template <typename KTraits, typename Params>
-__global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCacheKernel(
-    const __grid_constant__ Params params) {
-  extern __shared__ uint8_t smem[];
-  using SmemStorage =
-      std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
-                         typename KTraits::SharedStoragePaged, typename KTraits::SharedStorage>;
-  auto& smem_storage = reinterpret_cast<SmemStorage&>(smem);
-  SinglePrefillWithKVCacheDevice<KTraits>(params, smem_storage);
-}
-
-
 template <typename KTraits>
 __device__ __forceinline__ void vosplit_softmax_store_p(
     typename KTraits::AttentionVariant variant,
@@ -2330,7 +2318,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
-    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
+    PIE_FA2_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
     using DTypeKV = typename Params::DTypeKV;
@@ -3077,7 +3065,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
-    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
+    PIE_FA2_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
     using DTypeKV = typename Params::DTypeKV;

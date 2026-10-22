@@ -1198,26 +1198,26 @@ mod mla_fa2 {
 
     pub const INST: [[&str; 2]; 3] = [
         [
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
+            "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
              <::pie::attn::mla_fa2::Traits<false, 2u, true, 64u>, \
              ::pie::attn::mla_fa2::Params>",
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
+            "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
              <::pie::attn::mla_fa2::Traits<true, 2u, true, 64u>, \
              ::pie::attn::mla_fa2::Params>",
         ],
         [
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
+            "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
              <::pie::attn::mla_fa2::Traits<false, 2u, true, 32u>, \
              ::pie::attn::mla_fa2::Params>",
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
+            "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
              <::pie::attn::mla_fa2::Traits<true, 2u, true, 32u>, \
              ::pie::attn::mla_fa2::Params>",
         ],
         [
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
+            "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
              <::pie::attn::mla_fa2::Traits<false, 1u, false, 16u>, \
              ::pie::attn::mla_fa2::Params>",
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
+            "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
              <::pie::attn::mla_fa2::Traits<true, 1u, false, 16u>, \
              ::pie::attn::mla_fa2::Params>",
         ],
@@ -1312,11 +1312,11 @@ mod mla_fa2 {
 
     const _: () = assert!(
         core::mem::size_of::<MlaParams>() == 288,
-        "MlaParams: sizeof disagrees with the measured ::flashinfer::MLAParams",
+        "MlaParams: sizeof disagrees with the measured ::pie::attn::fa2::MLAParams",
     );
     const _: () = assert!(
         core::mem::align_of::<MlaParams>() == 8,
-        "MlaParams: alignof disagrees with the measured ::flashinfer::MLAParams",
+        "MlaParams: alignof disagrees with the measured ::pie::attn::fa2::MLAParams",
     );
     const _: () = assert!(core::mem::offset_of!(MlaParams, q_nope) == 0);
     const _: () = assert!(core::mem::offset_of!(MlaParams, work_indptr) == 176);

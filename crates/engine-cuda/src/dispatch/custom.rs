@@ -777,7 +777,7 @@ impl Run<'_> {
         };
         // DeepSeek-V4's window and sinks (its layers without a pool, its
         // draft head): the one launch at a decode's rows; over fp8 rows that
-        // or a refusal, never FlashInfer reading them as bf16.
+        // or a refusal, never the FA2 kernels reading them as bf16.
         if let poem_ir::Attention::PrefillLse { .. } = **attn {
             // A prefill's rows, where the profile says
             // (`kernel.sdpa.dsv4_prefill_from`): the window in the tcgen05 pass.

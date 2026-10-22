@@ -13,14 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MLA_PARAMS_CUH_
-#define FLASHINFER_MLA_PARAMS_CUH_
+#ifndef PIE_FA2_MLA_PARAMS_CUH_
+#define PIE_FA2_MLA_PARAMS_CUH_
 #include <cuda.h>
 
-#include "../fastdiv.cuh"
-#include "../profiler.cuh"
+#include "attn/fa2/fastdiv.cuh"
+#include "attn/fa2/profiler.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
 struct MLAParams {

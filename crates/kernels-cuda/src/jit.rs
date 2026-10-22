@@ -21,7 +21,7 @@ mod root;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{Ctx, Fire, Launch, Pad, Slabs, kernels_strict, strict_kernels};
-pub use root::{Features, Headers, Root, Toolchain, specific_of};
+pub use root::{Features, Root, Toolchain, specific_of};
 
 use crate::error::Error;
 

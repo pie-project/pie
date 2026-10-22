@@ -13,20 +13,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MLA_FA2_CUH_
-#define FLASHINFER_MLA_FA2_CUH_
+#ifndef PIE_FA2_MLA_FA2_CUH_
+#define PIE_FA2_MLA_FA2_CUH_
 #include <cooperative_groups.h>
 
 #include <cstdint>
 #include <cuda/std/limits>
 
 
-#include "../profiler.cuh"
-#include "mla_params.cuh"
-#include "prefill.cuh"
-#include "variant_helper.cuh"
+#include "attn/fa2/profiler.cuh"
+#include "attn/fa2/mla_params.cuh"
+#include "attn/fa2/prefill.cuh"
+#include "attn/fa2/variant_helper.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 namespace mla {
 
@@ -517,7 +517,7 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
     constexpr uint32_t UPCAST_STRIDE_P = KTraits::UPCAST_STRIDE_P;
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
-#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_STMATRIX_M8N8X4_ENABLED
       uint32_t p_smem_offset_w = p_smem.template get_permuted_offset<UPCAST_STRIDE_P>(
           warp_idx_in_wg * 16 + lane_idx % 16,
           warpgroup_idx * NUM_MMA_KV + mma_kv * 2 + lane_idx / 16);
@@ -747,7 +747,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
   for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
     uint32_t o_frag_f16[8 / 2];
     vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[mma_d]);
-#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_STMATRIX_M8N8X4_ENABLED
     uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
         warp_idx_in_wg * 16 + lane_idx % 16,
         warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2 + lane_idx / 16);
@@ -1077,7 +1077,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   } else {                                                                              \
     std::ostringstream err;                                                             \
     err << "Unsupported shared memory size: " << smem_limit_per_sm;                     \
-    FLASHINFER_ERROR(err.str());                                                        \
+    PIE_FA2_ERROR(err.str());                                                        \
     return cudaErrorNotSupported;                                                       \
   }
 

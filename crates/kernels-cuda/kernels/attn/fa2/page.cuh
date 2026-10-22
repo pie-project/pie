@@ -13,16 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_PAGE_CUH_
-#define FLASHINFER_PAGE_CUH_
+#ifndef PIE_FA2_PAGE_CUH_
+#define PIE_FA2_PAGE_CUH_
 
 
-#include "fastdiv.cuh"
-#include "layout.cuh"
-#include "utils.cuh"
-#include "vec_dtypes.cuh"
+#include "attn/fa2/fastdiv.cuh"
+#include "attn/fa2/layout.cuh"
+#include "attn/fa2/utils.cuh"
+#include "attn/fa2/vec_dtypes.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 
 
@@ -243,196 +243,6 @@ __device__ __forceinline__ bool nvfp4_append_is_positive_finite_scale(float scal
 
 
 
-template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
-__global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_kv,
-                                               DType* __restrict__ key, DType* __restrict__ value) {
-  uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t num_heads = paged_kv.num_heads;
-  uint32_t batch_idx = blockIdx.x;
-  uint32_t head_idx = ty;
-
-  uint32_t seq_len =
-      (paged_kv.indptr[batch_idx + 1] - paged_kv.indptr[batch_idx] - 1) * paged_kv.page_size +
-      paged_kv.last_page_len[batch_idx];
-
-  uint32_t page_iter = paged_kv.indptr[batch_idx] + (seq_len - 1) / paged_kv.page_size;
-  uint32_t entry_idx = (seq_len - 1) % paged_kv.page_size;
-
-  DType* k_ptr = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
-  DType* v_ptr = paged_kv.get_v_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
-  vec_t<DType, vec_size>::memcpy(
-      k_ptr, key + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-
-  vec_t<DType, vec_size>::memcpy(
-      v_ptr, value + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
-__global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
-                                         DType* __restrict__ append_key,
-                                         DType* __restrict__ append_value,
-                                         IdType* __restrict__ batch_indices,
-                                         IdType* __restrict__ positions, uint32_t nnz,
-                                         size_t append_k_stride_n, size_t append_k_stride_h,
-                                         size_t append_v_stride_n, size_t append_v_stride_h) {
-  uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t num_heads = paged_kv.num_heads;
-  uint32_t head_idx = ty;
-  uint32_t cta_id = blockIdx.x;
-  uint32_t num_ctas = gridDim.x;
-
-#pragma unroll 4
-  for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
-    uint32_t page_iter, entry_idx;
-    paged_kv.page_size.divmod(paged_kv.indptr[batch_indices[i]] * paged_kv.page_size + positions[i],
-                              page_iter, entry_idx);
-    DType* k_ptr = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
-    DType* v_ptr = paged_kv.get_v_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
-    vec_t<DType, vec_size>::memcpy(
-        k_ptr, append_key + i * append_k_stride_n + head_idx * append_k_stride_h + tx * vec_size);
-    vec_t<DType, vec_size>::memcpy(
-        v_ptr, append_value + i * append_v_stride_n + head_idx * append_v_stride_h + tx * vec_size);
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-template <uint32_t HEAD_DIM, typename DType, typename IdType>
-__global__ void NVFP4QuantizeAppendPagedKVCacheKernel(
-    paged_kv_t<uint8_t, IdType> paged_kv, const DType* __restrict__ append_key,
-    const DType* __restrict__ append_value, const IdType* __restrict__ batch_indices,
-    const IdType* __restrict__ positions, uint32_t nnz, size_t append_k_stride_n,
-    size_t append_k_stride_h, size_t append_v_stride_n, size_t append_v_stride_h,
-    uint8_t* __restrict__ k_scale_cache, uint8_t* __restrict__ v_scale_cache,
-    size_t k_sf_stride_page, size_t k_sf_stride_n, size_t k_sf_stride_h, size_t v_sf_stride_page,
-    size_t v_sf_stride_n, size_t v_sf_stride_h, float k_scale, float v_scale) {
-  constexpr uint32_t SF_VEC_SIZE = 16;
-  constexpr uint32_t PACKED_PER_SF = SF_VEC_SIZE / 2;
-  constexpr uint32_t NUM_SF_BLOCKS = HEAD_DIM / SF_VEC_SIZE;
-  static_assert(HEAD_DIM % SF_VEC_SIZE == 0);
-
-  const uint32_t token_idx = blockIdx.x;
-  const uint32_t head_idx = blockIdx.y;
-  if (token_idx >= nnz) return;
-
-  const IdType batch_idx = batch_indices[token_idx];
-  const IdType pos = positions[token_idx];
-  uint32_t page_iter, entry_idx;
-  paged_kv.page_size.divmod(paged_kv.indptr[batch_idx] * paged_kv.page_size + pos, page_iter,
-                            entry_idx);
-  const IdType page_idx = paged_kv.indices[page_iter];
-
-  const size_t append_k_base =
-      static_cast<size_t>(token_idx) * append_k_stride_n + head_idx * append_k_stride_h;
-  const size_t append_v_base =
-      static_cast<size_t>(token_idx) * append_v_stride_n + head_idx * append_v_stride_h;
-  uint8_t* k_out = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, 0);
-  uint8_t* v_out = paged_kv.get_v_ptr(page_iter, head_idx, entry_idx, 0);
-  uint8_t* k_sf_out = k_scale_cache + static_cast<size_t>(page_idx) * k_sf_stride_page +
-                      entry_idx * k_sf_stride_n + head_idx * k_sf_stride_h;
-  uint8_t* v_sf_out = v_scale_cache + static_cast<size_t>(page_idx) * v_sf_stride_page +
-                      entry_idx * v_sf_stride_n + head_idx * v_sf_stride_h;
-
-  for (uint32_t sf_idx = threadIdx.x; sf_idx < NUM_SF_BLOCKS * 2; sf_idx += blockDim.x) {
-    const bool is_v = sf_idx >= NUM_SF_BLOCKS;
-    const uint32_t block_idx = is_v ? sf_idx - NUM_SF_BLOCKS : sf_idx;
-    const uint32_t dim_base = block_idx * SF_VEC_SIZE;
-    const uint32_t packed_base = block_idx * PACKED_PER_SF;
-    if (is_v) {
-      nvfp4_append_quantize_block(append_value, v_scale, append_v_base, dim_base,
-                                  v_out + packed_base, v_sf_out + block_idx);
-    } else {
-      nvfp4_append_quantize_block(append_key, k_scale, append_k_base, dim_base, k_out + packed_base,
-                                  k_sf_out + block_idx);
-    }
-  }
-}
-
-template <uint32_t HEAD_DIM, typename DType, typename IdType>
-__global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
-    const DType* __restrict__ append_key, const DType* __restrict__ append_value,
-    const IdType* __restrict__ slot_mapping, uint32_t nnz, uint32_t num_heads, uint32_t page_size,
-    uint32_t max_num_pages, size_t append_k_stride_n, size_t append_k_stride_h,
-    size_t append_v_stride_n, size_t append_v_stride_h, uint8_t* __restrict__ paged_k_cache,
-    uint8_t* __restrict__ paged_v_cache, uint8_t* __restrict__ k_scale_cache,
-    uint8_t* __restrict__ v_scale_cache, size_t k_stride_page, size_t k_stride_n, size_t k_stride_h,
-    size_t v_stride_page, size_t v_stride_n, size_t v_stride_h, size_t k_sf_stride_page,
-    size_t k_sf_stride_n, size_t k_sf_stride_h, size_t v_sf_stride_page, size_t v_sf_stride_n,
-    size_t v_sf_stride_h, const float* __restrict__ k_scale_ptr,
-    const float* __restrict__ v_scale_ptr) {
-  constexpr uint32_t SF_VEC_SIZE = 16;
-  constexpr uint32_t PACKED_PER_SF = SF_VEC_SIZE / 2;
-  constexpr uint32_t NUM_SF_BLOCKS = HEAD_DIM / SF_VEC_SIZE;
-  static_assert(HEAD_DIM % SF_VEC_SIZE == 0);
-
-  const uint32_t token_idx = blockIdx.x;
-  const uint32_t head_idx = blockIdx.y;
-  if (token_idx >= nnz) return;
-
-  const float k_scale = __ldg(k_scale_ptr);
-  const float v_scale = __ldg(v_scale_ptr);
-  if (!(nvfp4_append_is_positive_finite_scale(k_scale) &&
-        nvfp4_append_is_positive_finite_scale(v_scale))) {
-    asm volatile("trap;");
-    return;
-  }
-
-  const IdType slot = slot_mapping[token_idx];
-  if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(max_num_pages) * page_size) {
-    return;
-  }
-
-  const size_t page_idx = static_cast<size_t>(slot) / page_size;
-  const size_t entry_idx = static_cast<size_t>(slot) % page_size;
-  const size_t append_k_base =
-      static_cast<size_t>(token_idx) * append_k_stride_n + head_idx * append_k_stride_h;
-  const size_t append_v_base =
-      static_cast<size_t>(token_idx) * append_v_stride_n + head_idx * append_v_stride_h;
-
-  uint8_t* k_out =
-      paged_k_cache + page_idx * k_stride_page + entry_idx * k_stride_n + head_idx * k_stride_h;
-  uint8_t* v_out =
-      paged_v_cache + page_idx * v_stride_page + entry_idx * v_stride_n + head_idx * v_stride_h;
-  uint8_t* k_sf_out = k_scale_cache + page_idx * k_sf_stride_page + entry_idx * k_sf_stride_n +
-                      head_idx * k_sf_stride_h;
-  uint8_t* v_sf_out = v_scale_cache + page_idx * v_sf_stride_page + entry_idx * v_sf_stride_n +
-                      head_idx * v_sf_stride_h;
-
-  for (uint32_t sf_idx = threadIdx.x; sf_idx < NUM_SF_BLOCKS * 2; sf_idx += blockDim.x) {
-    const bool is_v = sf_idx >= NUM_SF_BLOCKS;
-    const uint32_t block_idx = is_v ? sf_idx - NUM_SF_BLOCKS : sf_idx;
-    const uint32_t dim_base = block_idx * SF_VEC_SIZE;
-    const uint32_t packed_base = block_idx * PACKED_PER_SF;
-    if (is_v) {
-      nvfp4_append_quantize_block(append_value, v_scale, append_v_base, dim_base,
-                                  v_out + packed_base, v_sf_out + block_idx);
-    } else {
-      nvfp4_append_quantize_block(append_key, k_scale, append_k_base, dim_base, k_out + packed_base,
-                                  k_sf_out + block_idx);
-    }
-  }
-}
-
-
 template <typename DType, typename IdType>
 struct paged_kv_mla_t {
   uint_fastdiv page_size;
@@ -546,36 +356,6 @@ struct paged_kv_mla_t {
     return kpe_data + get_elem_offset_kpe(__ldg(indices + page_idx), entry_idx, feat_idx);
   }
 };
-
-template <uint32_t head_dim_ckv, uint32_t head_dim_kpe, uint32_t vec_size, typename DType,
-          typename IdType>
-__global__ void AppendPagedKVMlaCacheKernel(paged_kv_mla_t<DType, IdType> paged_kv_mla,
-                                            DType* __restrict__ append_ckv,
-                                            DType* __restrict__ append_kpe,
-                                            IdType* __restrict__ batch_indices,
-                                            IdType* __restrict__ positions, uint32_t nnz,
-                                            size_t append_ckv_stride_n,
-                                            size_t append_kpe_stride_n) {
-  uint32_t tx = threadIdx.x;
-  uint32_t cta_id = blockIdx.x;
-  uint32_t num_ctas = gridDim.x;
-
-#pragma unroll 4
-  for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
-    uint32_t page_iter, entry_idx;
-    paged_kv_mla.page_size.divmod(
-        paged_kv_mla.indptr[batch_indices[i]] * paged_kv_mla.page_size + positions[i], page_iter,
-        entry_idx);
-    DType* ckv_ptr = paged_kv_mla.get_ckv_ptr(page_iter, entry_idx, tx * vec_size);
-    vec_t<DType, vec_size>::memcpy(ckv_ptr, append_ckv + i * append_ckv_stride_n + tx * vec_size);
-
-    if (tx * vec_size < head_dim_kpe) {
-      DType* kpe_ptr = paged_kv_mla.get_kpe_ptr(page_iter, entry_idx, tx * vec_size);
-      vec_t<DType, vec_size>::memcpy(kpe_ptr, append_kpe + i * append_kpe_stride_n + tx * vec_size);
-    }
-  }
-}
-
 
 }
 

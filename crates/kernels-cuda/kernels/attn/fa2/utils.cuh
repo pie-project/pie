@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_UTILS_CUH_
-#define FLASHINFER_UTILS_CUH_
+#ifndef PIE_FA2_UTILS_CUH_
+#define PIE_FA2_UTILS_CUH_
 #include <cuda_bf16.h>
 
 #include <cuda_fp16.h>
@@ -30,12 +30,12 @@
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
-#ifndef FLASHINFER_ALWAYS_DISUSE_FP16_QK_REDUCTION
-#define FLASHINFER_ALWAYS_DISUSE_FP16_QK_REDUCTION 0
+#ifndef PIE_FA2_ALWAYS_DISUSE_FP16_QK_REDUCTION
+#define PIE_FA2_ALWAYS_DISUSE_FP16_QK_REDUCTION 0
 #endif
 
 #ifndef NDEBUG
-#define FLASHINFER_CUDA_CALL(func, ...)                                                     \
+#define PIE_FA2_CUDA_CALL(func, ...)                                                     \
   {                                                                                         \
     cudaError_t e = (func);                                                                 \
     if (e != cudaSuccess) {                                                                 \
@@ -45,7 +45,7 @@
     }                                                                                       \
   }
 #else
-#define FLASHINFER_CUDA_CALL(func, ...) \
+#define PIE_FA2_CUDA_CALL(func, ...) \
   {                                     \
     cudaError_t e = (func);             \
     if (e != cudaSuccess) {             \
@@ -54,22 +54,22 @@
   }
 #endif
 
-#define FLASHINFER_CUDA_CHECK(func)                                                         \
+#define PIE_FA2_CUDA_CHECK(func)                                                         \
   do {                                                                                      \
     cudaError_t e = (func);                                                                 \
-    FLASHINFER_CHECK(e == cudaSuccess, "CUDA Error: ", cudaGetErrorString(e), " (", int(e), \
+    PIE_FA2_CHECK(e == cudaSuccess, "CUDA Error: ", cudaGetErrorString(e), " (", int(e), \
                      ") at ", __FILE__, ":", __LINE__, " in ", STR(func));                  \
   } while (0)
 
-#define FLASHINFER_CHECK_ALIGNMENT(ptr, size_bytes)                            \
-  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(ptr) % (size_bytes) == 0, #ptr, \
+#define PIE_FA2_CHECK_ALIGNMENT(ptr, size_bytes)                            \
+  PIE_FA2_CHECK(reinterpret_cast<uintptr_t>(ptr) % (size_bytes) == 0, #ptr, \
                    " must be aligned to ", (size_bytes), " bytes, got address ", (uintptr_t)(ptr))
 
-#define FLASHINFER_CHECK_TMA_ALIGNED(ptr) FLASHINFER_CHECK_ALIGNMENT(ptr, 128)
+#define PIE_FA2_CHECK_TMA_ALIGNED(ptr) PIE_FA2_CHECK_ALIGNMENT(ptr, 128)
 
 #define DISPATCH_USE_FP16_QK_REDUCTION(use_fp16_qk_reduction, USE_FP16_QK_REDUCTION, ...) \
   if (use_fp16_qk_reduction) {                                                            \
-    FLASHINFER_ERROR("FP16_QK_REDUCTION disabled at compile time");                       \
+    PIE_FA2_ERROR("FP16_QK_REDUCTION disabled at compile time");                       \
   } else {                                                                                \
     constexpr bool USE_FP16_QK_REDUCTION = false;                                         \
     __VA_ARGS__                                                                           \
@@ -85,7 +85,7 @@
   } else {                                             \
     std::ostringstream err_msg;                        \
     err_msg << "Unsupported num_mma_q: " << num_mma_q; \
-    FLASHINFER_ERROR(err_msg.str());                   \
+    PIE_FA2_ERROR(err_msg.str());                   \
   }
 
 #define DISPATCH_NUM_MMA_KV(max_mma_kv, NUM_MMA_KV, ...) \
@@ -104,7 +104,7 @@
   } else {                                               \
     std::ostringstream err_msg;                          \
     err_msg << "Unsupported max_mma_kv: " << max_mma_kv; \
-    FLASHINFER_ERROR(err_msg.str());                     \
+    PIE_FA2_ERROR(err_msg.str());                     \
   }
 
 #define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \
@@ -132,7 +132,7 @@
     default: {                                             \
       std::ostringstream err_msg;                          \
       err_msg << "Unsupported cta_tile_q: " << cta_tile_q; \
-      FLASHINFER_ERROR(err_msg.str());                     \
+      PIE_FA2_ERROR(err_msg.str());                     \
     }                                                      \
   }
 
@@ -158,7 +158,7 @@
   } else {                                                   \
     std::ostringstream err_msg;                              \
     err_msg << "Unsupported group_size: " << group_size;     \
-    FLASHINFER_ERROR(err_msg.str());                         \
+    PIE_FA2_ERROR(err_msg.str());                         \
   }
 
 #define DISPATCH_MASK_MODE(mask_mode, MASK_MODE, ...)             \
@@ -186,7 +186,7 @@
     default: {                                                    \
       std::ostringstream err_msg;                                 \
       err_msg << "Unsupported mask_mode: " << int(mask_mode);     \
-      FLASHINFER_ERROR(err_msg.str());                            \
+      PIE_FA2_ERROR(err_msg.str());                            \
     }                                                             \
   }
 
@@ -215,7 +215,7 @@
     default: {                                         \
       std::ostringstream err_msg;                      \
       err_msg << "Unsupported head_dim: " << head_dim; \
-      FLASHINFER_ERROR(err_msg.str());                 \
+      PIE_FA2_ERROR(err_msg.str());                 \
     }                                                  \
   }
 
@@ -260,7 +260,7 @@
       err_msg << "Unsupported ROPE_DIM: " << rope_dim;       \
       err_msg << ". Supported values: 16, 32, 64, 128, 256"; \
       err_msg << " in DISPATCH_ROPE_DIM";                    \
-      FLASHINFER_ERROR(err_msg.str());                       \
+      PIE_FA2_ERROR(err_msg.str());                       \
     }                                                        \
   }
 
@@ -284,7 +284,7 @@
     default: {                                                                   \
       std::ostringstream err_msg;                                                \
       err_msg << "Unsupported pos_encoding_mode: " << int(pos_encoding_mode);    \
-      FLASHINFER_ERROR(err_msg.str());                                           \
+      PIE_FA2_ERROR(err_msg.str());                                           \
     }                                                                            \
   }
 
@@ -318,7 +318,7 @@
     default: {                                                             \
       std::ostringstream err_msg;                                          \
       err_msg << "Unsupported aligned_vec_size: " << aligned_vec_size;     \
-      FLASHINFER_ERROR(err_msg.str());                                     \
+      PIE_FA2_ERROR(err_msg.str());                                     \
     }                                                                      \
   }
 
@@ -331,7 +331,7 @@
     __VA_ARGS__                                                                             \
   }
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y) noexcept {

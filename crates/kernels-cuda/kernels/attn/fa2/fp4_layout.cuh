@@ -15,7 +15,7 @@
  */
 #pragma once
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 enum class QuantizationSFLayout {
 

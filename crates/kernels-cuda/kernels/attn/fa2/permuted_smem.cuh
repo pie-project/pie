@@ -13,18 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_PERMUTED_SMEM_CUH_
-#define FLASHINFER_PERMUTED_SMEM_CUH_
+#ifndef PIE_FA2_PERMUTED_SMEM_CUH_
+#define PIE_FA2_PERMUTED_SMEM_CUH_
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 
-#include "cp_async.cuh"
-#include "mma.cuh"
+#include "attn/fa2/cp_async.cuh"
+#include "attn/fa2/mma.cuh"
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 enum class SwizzleMode {
   k64B,

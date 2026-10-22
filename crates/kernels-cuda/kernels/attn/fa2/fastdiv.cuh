@@ -13,12 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_FASTDIV_CUH_
-#define FLASHINFER_FASTDIV_CUH_
+#ifndef PIE_FA2_FASTDIV_CUH_
+#define PIE_FA2_FASTDIV_CUH_
 #include <cstdint>
 #include <cuda/cmath>
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 struct uint_fastdiv {
   __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}

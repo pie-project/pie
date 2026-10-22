@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MMA_CUH_
-#define FLASHINFER_MMA_CUH_
+#ifndef PIE_FA2_MMA_CUH_
+#define PIE_FA2_MMA_CUH_
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -23,35 +23,35 @@
 
 #include <type_traits>
 
-namespace flashinfer {
+namespace pie::attn::fa2 {
 
 namespace mma {
 
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120400)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890))
-#define FLASHINFER_MMA_F8F8F32_M16N8K32_ENABLED
+#define PIE_FA2_MMA_F8F8F32_M16N8K32_ENABLED
 #endif
 #endif
 
 #if (__CUDACC_VER_MAJOR__ >= 11)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
-#define FLASHINFER_STMATRIX_M8N8X4_ENABLED
+#define PIE_FA2_STMATRIX_M8N8X4_ENABLED
 #endif
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
-#define FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED
-#define FLASHINFER_MMA_F16F16F16_M16N8K16_ENABLED
+#define PIE_FA2_MMA_F16F16F32_M16N8K16_ENABLED
+#define PIE_FA2_MMA_F16F16F16_M16N8K16_ENABLED
 #endif
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750))
-#define FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED
-#define FLASHINFER_MMA_F16F16F16_M16N8K8_ENABLED
-#define FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#define PIE_FA2_MMA_F16F16F32_M16N8K8_ENABLED
+#define PIE_FA2_MMA_F16F16F16_M16N8K8_ENABLED
+#define PIE_FA2_LDMATRIX_M8N8X4_ENABLED
 #endif
 #endif
 
 #if defined(__CUDA_ARCH__)
-#define FLASHINFER_RUNTIME_ASSERT(x) __brkpt()
+#define PIE_FA2_RUNTIME_ASSERT(x) __brkpt()
 #else
-#define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
+#define PIE_FA2_RUNTIME_ASSERT(x) assert(0 && x)
 #endif
 
 enum class MMAMode {
@@ -67,13 +67,13 @@ enum class MMAMode {
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
-#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -85,13 +85,13 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_ptr) {
-#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, _, %1, _}, [%2];\n"
                : "=r"(R[0]), "=r"(R[1])
                : "r"(smem_int_ptr));
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -103,13 +103,13 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_p
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t* R, T* smem_ptr) {
-#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_, %0, _, %1}, [%2];\n"
                : "=r"(R[0]), "=r"(R[1])
                : "r"(smem_int_ptr));
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -121,13 +121,13 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t* R, T* smem_
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) {
-#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.trans.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -139,13 +139,13 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t* R, T* smem_ptr) {
-#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.trans.m8n8.x4.shared.b16 {%0, %1, _, _}, [%2];\n"
                : "=r"(R[0]), "=r"(R[1])
                : "r"(smem_int_ptr));
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -157,13 +157,13 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t* R, T* 
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T* smem_ptr) {
-#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.trans.m8n8.x4.shared.b16 {_, _, %0, %1}, [%2];\n"
                : "=r"(R[0]), "=r"(R[1])
                : "r"(smem_int_ptr));
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -175,7 +175,7 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T*
 
 template <typename T>
 __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
-#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
+#ifdef PIE_FA2_STMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                :
@@ -209,7 +209,7 @@ template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uint32_t* A,
                                                                    uint32_t* B) {
   static_assert(sizeof(T) == 1, "DType must be 8bit floating data type");
-#if defined(FLASHINFER_MMA_F8F8F32_M16N8K32_ENABLED)
+#if defined(PIE_FA2_MMA_F8F8F32_M16N8K32_ENABLED)
   if constexpr (mma_mode == MMAMode::kInit) {
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
       asm volatile(
@@ -292,7 +292,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
     }
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT(
+  PIE_FA2_RUNTIME_ASSERT(
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
@@ -308,7 +308,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
 template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
                                                                      uint32_t* B) {
-#if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
+#if defined(PIE_FA2_MMA_F16F16F32_M16N8K16_ENABLED)
   if constexpr (mma_mode == MMAMode::kInit) {
     if constexpr (std::is_same_v<T, half>) {
       asm volatile(
@@ -390,7 +390,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
             "f"(C[6]), "f"(C[7]));
     }
   }
-#elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
+#elif defined(PIE_FA2_MMA_F16F16F32_M16N8K8_ENABLED)
   if constexpr (std::is_same_v<T, half>) {
     if constexpr (mma_mode == MMAMode::kInit) {
       asm volatile(
@@ -460,10 +460,10 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
           : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
     }
   } else {
-    FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+    PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
@@ -473,7 +473,7 @@ template <typename DType>
 __device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 1, "DType must be 8bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
-#if defined(FLASHINFER_MMA_F8F8F32_M16N8K32_ENABLED)
+#if defined(PIE_FA2_MMA_F8F8F32_M16N8K32_ENABLED)
   if constexpr (std::is_same_v<DType, __nv_fp8_e4m3>) {
     asm volatile(
         "{\n"
@@ -500,7 +500,7 @@ __device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
           "r"(1010580540), "f"(d[0]), "f"(d[1]));
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT(
+  PIE_FA2_RUNTIME_ASSERT(
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
@@ -511,7 +511,7 @@ template <typename DType>
 __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
-#if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
+#if defined(PIE_FA2_MMA_F16F16F32_M16N8K16_ENABLED)
   if constexpr (std::is_same_v<DType, half>) {
     asm volatile(
         "{\n"
@@ -537,7 +537,7 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
         : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1065369472),
           "r"(1065369472), "f"(d[0]), "f"(d[1]));
   }
-#elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
+#elif defined(PIE_FA2_MMA_F16F16F32_M16N8K8_ENABLED)
   if constexpr (std::is_same_v<DType, half>) {
     asm volatile(
         "{\n"
@@ -560,10 +560,10 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
         : "=f"(d[0]), "=f"(d[1])
         : "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
   } else {
-    FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+    PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
@@ -577,7 +577,7 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C, uint32_t* A,
                                                                      uint32_t* B) {
-#if defined(FLASHINFER_MMA_F16F16F16_M16N8K16_ENABLED)
+#if defined(PIE_FA2_MMA_F16F16F16_M16N8K16_ENABLED)
   if constexpr (mma_mode == MMAMode::kInit) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
@@ -613,7 +613,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
         : "=r"(C[2]), "=r"(C[3])
         : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "r"(C[2]), "r"(C[3]));
   }
-#elif defined(FLASHINFER_MMA_F16F16F16_M16N8K8_ENABLED)
+#elif defined(PIE_FA2_MMA_F16F16F16_M16N8K8_ENABLED)
   if constexpr (mma_mode == MMAMode::kInit) {
     asm volatile(
         "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
@@ -682,7 +682,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
         : "r"(A[2]), "r"(A[3]), "r"(B[3]), "r"(C[2]), "r"(C[3]));
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
