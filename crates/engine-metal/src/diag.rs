@@ -92,7 +92,7 @@ impl Default for Diagnostics {
             nan_check: false,
             nan_limit: 3.0e38,
             prefault: false,
-            copy_resident: false,
+            copy_resident: true,
             prefetch_k: None,
             seat_threads: None,
             keepalive_iters: None,
