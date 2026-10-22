@@ -1544,6 +1544,50 @@ pub fn coop_swiglu(
     Ok(true)
 }
 
+/// EXPERIMENT: the staged tile at `split`, its partials in `partial`.
+#[allow(clippy::too_many_arguments)]
+pub fn staged_matmul(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    w: Bank,
+    biases: Tensor,
+    y: Tensor,
+    (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
+    split: i32,
+    partial: Option<Tensor>,
+) -> Result<(), Error> {
+    let tiles = cols / 64;
+    let entry = symbol(&format!("affine_qmm_staged_m{STAGED_TILE}_k{split}"));
+    let stamp = symbol(&format!(
+        "PIE_STAGED_POINT(\"{entry}\",{STAGED_TILE},{split})"
+    ));
+    ctx.fire(
+        Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
+            [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
+            [64, 1, 1],
+        )),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            biases.arg(),
+            act.arg(),
+            y.arg_mut(),
+            k.arg(),
+            n.arg(),
+            match partial {
+                Some(partial) => partial.arg_mut(),
+                None => ctx.absent()?,
+            },
+            m.arg(),
+            ld.arg(),
+        ],
+    )?;
+    match partial {
+        Some(partial) if split > 1 => splitk_reduce(ctx, "bench", y, partial, (m, n, cols), split),
+        _ => Ok(()),
+    }
+}
+
 /// Folds the `split` stacked f32 partials of an `m x n` product into `y`, over `cols` columns.
 fn splitk_reduce(
     ctx: &Ctx<'_>,

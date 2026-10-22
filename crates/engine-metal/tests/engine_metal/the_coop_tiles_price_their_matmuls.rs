@@ -313,6 +313,7 @@ fn the_coop_layers_sustain_their_chain() {
         .chunks(2)
         .flat_map(|c| bf16((f32::from(c[0]) - 127.5) / 256.0))
         .collect();
+    let qkv_wide = plane(2 * inner);
     let (x, qkv, o_in, mid, h, y) = (
         Tensor::new(b.upload(&x), ROWS, hidden, Dtype::Bf16),
         plane(gdn),
@@ -321,64 +322,103 @@ fn the_coop_layers_sustain_their_chain() {
         plane(inner),
         plane(hidden),
     );
-    let one = |ctx: &Sink<'_>, which: usize, w: &[Bank; 4]| {
-        match which {
-            0 => quant::coop_matmul(
-                ctx,
-                x,
-                w[0],
-                w[0].biases.unwrap(),
-                qkv,
-                (8, gdn as i32, hidden as i32, gdn as i32, hidden as i32),
-                1,
-            ),
+    let plane_f = Buffer::zeroed(&device, 64 << 20).expect("partials");
+    let partials = Tensor::new(
+        handles.bind(&plane_f, 0, plane_f.bytes()).expect("bind"),
+        1,
+        16 << 20,
+        Dtype::F32,
+    );
+    // variant 0: the coop tile as served; 1: its split projections at k8; 2: the staged tile
+    let one = |ctx: &Sink<'_>, variant: usize, which: usize, w: &[Bank; 4]| {
+        let (act, bank, out, n, k, split) = match which {
+            0 => (x, w[0], qkv, gdn, hidden, 1),
+            1 => (o_in, w[1], mid, hidden, out, 4),
+            2 => {
+                if variant == 2 {
+                    let packed = qkv_wide;
+                    quant::staged_matmul(
+                        ctx,
+                        mid,
+                        w[2],
+                        w[2].biases.unwrap(),
+                        packed,
+                        (
+                            8,
+                            (2 * inner) as i32,
+                            hidden as i32,
+                            (2 * inner) as i32,
+                            hidden as i32,
+                        ),
+                        1,
+                        None,
+                    )
+                    .expect("staged");
+                    kernels_metal::linear::mlp::swiglu(ctx, packed, inner, h).expect("swiglu");
+                    return;
+                }
+                quant::coop_swiglu(ctx, &tuning, mid, w[2], inner, h, 8).expect("glu");
+                return;
+            }
+            _ => (h, w[3], y, hidden, inner, 4),
+        };
+        let shape = (8, n as i32, k as i32, n as i32, k as i32);
+        match variant {
+            0 => quant::coop_matmul(ctx, act, bank, bank.biases.unwrap(), out, shape, split),
             1 => quant::coop_matmul(
                 ctx,
-                o_in,
-                w[1],
-                w[1].biases.unwrap(),
-                mid,
-                (8, hidden as i32, out as i32, hidden as i32, out as i32),
-                4,
+                act,
+                bank,
+                bank.biases.unwrap(),
+                out,
+                shape,
+                if split > 1 { 8 } else { 1 },
             ),
-            2 => quant::coop_swiglu(ctx, &tuning, mid, w[2], inner, h, 8).map(|_| ()),
-            _ => quant::coop_matmul(
+            _ => quant::staged_matmul(
                 ctx,
-                h,
-                w[3],
-                w[3].biases.unwrap(),
-                y,
-                (8, hidden as i32, inner as i32, hidden as i32, inner as i32),
-                4,
+                act,
+                bank,
+                bank.biases.unwrap(),
+                out,
+                shape,
+                if split > 1 { 4 } else { 1 },
+                Some(partials),
             ),
         }
-        .expect("projection")
+        .expect("projection");
     };
-    let chain = |ctx: &Sink<'_>| {
+    let chain = |ctx: &Sink<'_>, variant: usize| {
         for w in &banks {
             for which in 0..4 {
-                one(ctx, which, w);
+                one(ctx, variant, which, w);
             }
         }
     };
-    // 30 s of back-to-back chains, each window's median frame
-    let began = std::time::Instant::now();
-    let mut window = Vec::new();
-    let mut mark = 0u64;
-    while began.elapsed().as_secs() < 30 {
+    let frame_ms = |variant: usize| {
         let frame = b.device.frame().expect("frame");
         let sink = Sink::new(b.device, &frame, b.pipelines, b.handles);
-        chain(&sink);
-        window.push(frame.commit_timed().expect("commit") * 1e3);
-        let at = began.elapsed().as_secs() / 3;
-        if at != mark {
-            let n = window.len();
-            eprintln!(
-                "sustained x{layers} t={:2}s frame {:6.2}ms ({n} frames)",
-                mark * 3 + 3,
-                median(std::mem::take(&mut window))
-            );
-            mark = at;
+        chain(&sink, variant);
+        frame.commit_timed().expect("commit") * 1e3
+    };
+    // 15 s of the served tile to heat the device, then the variants in turn, 2 s each
+    let began = std::time::Instant::now();
+    while began.elapsed().as_secs() < 15 {
+        frame_ms(0);
+    }
+    let mut times = [Vec::new(), Vec::new(), Vec::new()];
+    for round in 0..8 {
+        for (variant, t) in times.iter_mut().enumerate() {
+            let at = std::time::Instant::now();
+            let mut v = Vec::new();
+            while at.elapsed().as_millis() < 2000 {
+                v.push(frame_ms(variant));
+            }
+            let m = median(v);
+            eprintln!("hot x{layers} round {round} variant {variant}: {m:6.2}ms");
+            t.push(m);
         }
+    }
+    for (variant, t) in times.into_iter().enumerate() {
+        eprintln!("hot x{layers} variant {variant} median {:6.2}ms", median(t));
     }
 }
