@@ -1,0 +1,299 @@
+//! The rotary kernels on the first Vulkan device against an f64 host reference,
+//! beside the hand-written kernels: by halves at a span (full, partial,
+//! proportional), the rotated tail (halves or interleaved, forward or back,
+//! with and without a YaRN ramp), and whole-head YaRN.
+
+use crate::gpu::{Gpu, close, noise};
+use kernels_vulkan::Tensor;
+use kernels_vulkan::elemwise::rope;
+use poem_ir::Dtype;
+
+const ROWS: usize = 3;
+const HEADS: usize = 4;
+const POSITIONS: [i32; ROWS] = [0, 7, 1000];
+
+/// Turn pair `(a, b)` of every head of every row by `angle(row, k)`, `k`
+/// the pair's index; `scale` multiplies cos and sin.
+fn turn(
+    x: &[f32],
+    head_dim: usize,
+    pairs: impl Fn(usize) -> (usize, usize),
+    count: usize,
+    angle: impl Fn(f64, usize) -> f64,
+    scale: f64,
+) -> Vec<f64> {
+    let mut out: Vec<f64> = x.iter().map(|v| f64::from(*v)).collect();
+    for (r, position) in POSITIONS.iter().enumerate() {
+        for h in 0..HEADS {
+            let base = (r * HEADS + h) * head_dim;
+            for k in 0..count {
+                let (a, b) = pairs(k);
+                let t = angle(f64::from(*position), k);
+                let (c, s) = (t.cos() * scale, t.sin() * scale);
+                let (xa, xb) = (out[base + a], out[base + b]);
+                out[base + a] = xa * c - xb * s;
+                out[base + b] = xa * s + xb * c;
+            }
+        }
+    }
+    out
+}
+
+/// The YaRN ramp's first and last pair, as the host states them.
+fn ramp(width: f64, theta: f64, beta_fast: f64, beta_slow: f64, max_position: f64) -> (f64, f64) {
+    let corr =
+        |rot: f64| width * (max_position / (rot * std::f64::consts::TAU)).ln() / (2.0 * theta.ln());
+    let low = corr(beta_fast).floor().max(0.0);
+    (low, corr(beta_slow).ceil().min(width / 2.0 - 1.0).max(low))
+}
+
+fn ramped(f: f64, k: usize, factor: f64, low: f64, high: f64) -> f64 {
+    let r = ((k as f64 - low) / if high == low { 1e-3 } else { high - low }).clamp(0.0, 1.0);
+    f * ((1.0 - r) + r / factor)
+}
+
+#[test]
+fn the_ropes_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    let pos = gpu.up_i32(&POSITIONS);
+    let pt = Tensor::new(pos, ROWS as u32, 1, Dtype::I32);
+    let theta = 10_000.0f32;
+    let th = f64::from(theta);
+
+    // By halves at a span: full (span = head / 2), partial (span = rotary / 2)
+    // and proportional (span = head / 2 over a narrower rotary).
+    for (head_dim, rotary, span) in [(64usize, 64usize, 32usize), (128, 64, 32), (128, 64, 64)] {
+        let width = HEADS * head_dim;
+        let n = ROWS * width;
+        let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+        let qv = noise(head_dim as u64 + span as u64, n);
+        let kv = noise(head_dim as u64 + span as u64 + 1, n);
+        let (_, qr) = gpu.up(&qv);
+        let (_, kr) = gpu.up(&kv);
+        let angle = |p: f64, k: usize| p * th.powf(-(k as f64) / span as f64);
+        let pairs = |k: usize| (k, k + span);
+        let wq = turn(&qr, head_dim, pairs, rotary / 2, angle, 1.0);
+        let wk = turn(&kr, head_dim, pairs, rotary / 2, angle, 1.0);
+        let shape = format!("head {head_dim}, rotary {rotary}, span {span}");
+        for slang in [false, true] {
+            let who = if slang { "slang " } else { "" };
+            let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+            let (hd, rd, sp) = (head_dim as u32, rotary as u32, span as u32);
+            match (slang, rotary == head_dim) {
+                (false, true) => gpu.run(|c| rope::full(c, t(q), t(k), pt, hd, theta, false)),
+                (false, false) => gpu.run(|c| rope::partial(c, t(q), t(k), pt, rd, hd, theta, sp)),
+                (true, true) => gpu.run_slang(|c| {
+                    kernels_slang::elemwise::rope::full(
+                        c,
+                        st(t(q)),
+                        st(t(k)),
+                        st(pt),
+                        hd,
+                        theta,
+                        false,
+                    )
+                }),
+                (true, false) => gpu.run_slang(|c| {
+                    kernels_slang::elemwise::rope::partial(
+                        c,
+                        st(t(q)),
+                        st(t(k)),
+                        st(pt),
+                        rd,
+                        hd,
+                        theta,
+                        sp,
+                    )
+                }),
+            }
+            close(&gpu.down(q, n), &wq, &format!("{who}rope q {shape}"));
+            close(&gpu.down(k, n), &wk, &format!("{who}rope k {shape}"));
+            let (q, _) = gpu.up(&qv);
+            if slang {
+                gpu.run_slang(|c| {
+                    kernels_slang::elemwise::rope::partial_q(c, st(t(q)), st(pt), rd, hd, theta, sp)
+                });
+            } else {
+                gpu.run(|c| rope::partial_q(c, t(q), pt, rd, hd, theta, sp));
+            }
+            close(&gpu.down(q, n), &wq, &format!("{who}rope q alone {shape}"));
+        }
+    }
+
+    // The rotated tail.
+    let (head_dim, rotary) = (128usize, 64usize);
+    let width = HEADS * head_dim;
+    let n = ROWS * width;
+    let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+    let qv = noise(77, n);
+    let (_, qr) = gpu.up(&qv);
+    let yarn = rope::Yarn {
+        factor: 4.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        original_max_position: 4096,
+    };
+    let (low, high) = ramp(rotary as f64, th, 32.0, 1.0, 4096.0);
+    for interleaved in [false, true] {
+        for inverse in [false, true] {
+            for ramped_tail in [false, true] {
+                let off = head_dim - rotary;
+                let half = rotary / 2;
+                let sign = if inverse { -1.0 } else { 1.0 };
+                let angle = |p: f64, k: usize| {
+                    let f = th.powf(-2.0 * k as f64 / rotary as f64);
+                    let f = if ramped_tail {
+                        ramped(f, k, 4.0, low, high)
+                    } else {
+                        f
+                    };
+                    sign * p * f
+                };
+                let want = if interleaved {
+                    turn(
+                        &qr,
+                        head_dim,
+                        |k| (off + 2 * k, off + 2 * k + 1),
+                        half,
+                        angle,
+                        1.0,
+                    )
+                } else {
+                    turn(
+                        &qr,
+                        head_dim,
+                        |k| (off + k, off + k + half),
+                        half,
+                        angle,
+                        1.0,
+                    )
+                };
+                let shape =
+                    format!("interleaved {interleaved}, inverse {inverse}, yarn {ramped_tail}");
+                let (hd, rd) = (head_dim as u32, rotary as u32);
+                let (q, _) = gpu.up(&qv);
+                gpu.run(|c| {
+                    rope::partial_last(
+                        c,
+                        t(q),
+                        pt,
+                        rd,
+                        hd,
+                        theta,
+                        interleaved,
+                        inverse,
+                        ramped_tail.then_some(yarn),
+                    )
+                });
+                close(&gpu.down(q, n), &want, &format!("rope tail {shape}"));
+                let (q, _) = gpu.up(&qv);
+                let sy = kernels_slang::elemwise::rope::Yarn {
+                    factor: yarn.factor,
+                    beta_fast: yarn.beta_fast,
+                    beta_slow: yarn.beta_slow,
+                    original_max_position: yarn.original_max_position,
+                };
+                gpu.run_slang(|c| {
+                    kernels_slang::elemwise::rope::partial_last(
+                        c,
+                        st(t(q)),
+                        st(pt),
+                        rd,
+                        hd,
+                        theta,
+                        interleaved,
+                        inverse,
+                        ramped_tail.then_some(sy),
+                    )
+                });
+                close(&gpu.down(q, n), &want, &format!("slang rope tail {shape}"));
+            }
+        }
+    }
+
+    // Whole-head YaRN.
+    let head_dim = 64usize;
+    let width = HEADS * head_dim;
+    let n = ROWS * width;
+    let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+    let (qv, kv) = (noise(91, n), noise(92, n));
+    let (_, qr) = gpu.up(&qv);
+    let (_, kr) = gpu.up(&kv);
+    let (low, high) = ramp(head_dim as f64, th, 32.0, 1.0, 4096.0);
+    let mscale = 1.1f32;
+    for interleaved in [false, true] {
+        let half = head_dim / 2;
+        let angle = |p: f64, k: usize| {
+            p * ramped(
+                th.powf(-2.0 * k as f64 / head_dim as f64),
+                k,
+                4.0,
+                low,
+                high,
+            )
+        };
+        let pairs = |k: usize| {
+            if interleaved {
+                (2 * k, 2 * k + 1)
+            } else {
+                (k, k + half)
+            }
+        };
+        let wq = turn(&qr, head_dim, pairs, half, angle, f64::from(mscale));
+        let wk = turn(&kr, head_dim, pairs, half, angle, f64::from(mscale));
+        let hd = head_dim as u32;
+        for slang in [false, true] {
+            let who = if slang { "slang " } else { "" };
+            let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+            if slang {
+                gpu.run_slang(|c| {
+                    kernels_slang::elemwise::rope::yarn(
+                        c,
+                        st(t(q)),
+                        st(t(k)),
+                        st(pt),
+                        hd,
+                        theta,
+                        4.0,
+                        32.0,
+                        1.0,
+                        mscale,
+                        4096,
+                        interleaved,
+                    )
+                });
+            } else {
+                gpu.run(|c| {
+                    rope::yarn(
+                        c,
+                        t(q),
+                        t(k),
+                        pt,
+                        hd,
+                        theta,
+                        4.0,
+                        32.0,
+                        1.0,
+                        mscale,
+                        4096,
+                        interleaved,
+                    )
+                });
+            }
+            close(
+                &gpu.down(q, n),
+                &wq,
+                &format!("{who}rope yarn q interleaved {interleaved}"),
+            );
+            close(
+                &gpu.down(k, n),
+                &wk,
+                &format!("{who}rope yarn k interleaved {interleaved}"),
+            );
+        }
+    }
+}
