@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """The kernel lint: rules every `kernels-*` crate's device tree keeps.
 
-One check so far, the one the rest of the convention leans on:
+Two checks so far, the ones the rest of the convention leans on:
 
-  * every entry point in a crate's kernel tree is named by its host code.
+  * every entry point in a crate's kernel tree is named by its host code;
+  * every launch the host writes with a literal symbol names, by namespace
+    and name, a kernel its unit (or a header the unit includes) defines.
 
 A CUDA entry is a `__global__` function; the host names it in a symbol
 string (`"::pie::attn::kv_append<...>"`), sometimes with a placeholder
@@ -37,7 +39,8 @@ UNNAMED = {
 }
 
 GLOBAL = re.compile(
-    r"__global__\s+(?:static\s+)?void\s+"
+    r"__global__\s+(?:static\s+)?"
+    r"(?:__launch_bounds__\s*\((?:[^()]|\([^()]*\))*\)\s*)?void\s+"
     r"(?:__launch_bounds__\s*\((?:[^()]|\([^()]*\))*\)\s*)?"
     r"([A-Za-z_]\w*)\s*\("
 )
@@ -87,10 +90,68 @@ def unnamed_entries(crate):
     return found
 
 
+UNIT_CONST = re.compile(r'const ([A-Z_0-9]+): &str = "([a-z_0-9/]+\.cuh?)";')
+LAUNCH = re.compile(
+    r"Fire::at\(\s*(?:if \w+ \{ ([A-Z_0-9]+) \} else \{ ([A-Z_0-9]+) \}|([A-Z_0-9]+)|\"([^\"]+)\")"
+    r'\s*,\s*(?:symbol\(\s*&?(?:format!\()?\s*)?"::((?:\w+::)*)(\w*)(\{?)'
+)
+
+
+def namespace_at(text, pos):
+    stack = []
+    for m in re.finditer(r"namespace ([\w:]+) \{|\{|\}", text[:pos]):
+        if m.group(1):
+            stack.append(m.group(1))
+        elif m.group(0) == "{":
+            stack.append(None)
+        elif stack:
+            stack.pop()
+    return "::".join(x for x in stack if x)
+
+
+def unit_kernels(tree, unit, seen):
+    path = tree / unit
+    if unit in seen or not path.exists():
+        return set()
+    seen.add(unit)
+    text = path.read_text()
+    found = {(namespace_at(text, m.start()), m.group(1)) for m in GLOBAL.finditer(text)}
+    for inc in re.findall(r'#include "([^"]+)"', text):
+        found |= unit_kernels(tree, inc, seen)
+    return found
+
+
+def misdirected_launches(crate):
+    tree = REPO / CRATES[crate][0]
+    src = tree.parent / "src"
+    found = []
+    for path in sorted(src.rglob("*.rs")):
+        text = path.read_text()
+        here = dict(UNIT_CONST.findall(text))
+        parent = path.parent.with_suffix(".rs")
+        above = dict(UNIT_CONST.findall(parent.read_text())) if parent.exists() else {}
+        for m in LAUNCH.finditer(text):
+            a, b, c, literal, qual, name, spliced = m.groups()
+            fn_at = max(text.rfind(k, 0, m.start()) for k in ("\nfn ", "\npub fn ", "\npub(crate) fn "))
+            local = dict(UNIT_CONST.findall(text[fn_at : m.start()]))
+            units = [local.get(x) or here.get(x) or above.get(x) for x in (a, b, c) if x] or [literal]
+            if None in units:
+                continue
+            ns = qual.rstrip(":")
+            kernels = set().union(*(unit_kernels(tree, u, set()) for u in units))
+            hit = any(n == ns and (k.startswith(name) if spliced else k == name) for n, k in kernels)
+            if not hit:
+                line = text.count("\n", 0, m.start()) + 1
+                rel = path.relative_to(REPO)
+                found.append(f"{rel}:{line}: `{ns}::{name}` is defined in none of {units}")
+    return found
+
+
 def main():
     findings = []
     for crate in CRATES:
         findings += unnamed_entries(crate)
+        findings += misdirected_launches(crate)
     for f in findings:
         print(f)
     print(f"kernel-lint: {len(findings)} finding(s)", file=sys.stderr)

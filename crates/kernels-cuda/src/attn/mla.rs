@@ -6,7 +6,6 @@ use crate::attn::plan::MlaPlan;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const ROUTE: &str = "linear/moe/route.cu";
 
 const BLOCK: u32 = 256;
 
@@ -1871,7 +1870,7 @@ pub fn prefill_expanded(
         let int = |v: u32| ArgValue::I32(i32::try_from(v).unwrap_or(i32::MAX));
         ctx.fire(
             OP,
-            Fire::at(ROUTE, "::pie::attn::mla_expand::gather").apply(Launch::flat(threads, BLOCK)),
+            Fire::at(EXPAND_FILE, "::pie::attn::mla_expand::gather").apply(Launch::flat(threads, BLOCK)),
             &[
                 ArgValue::Ptr(pool.keys.ptr),
                 ArgValue::Ptr(pool.values.ptr),
