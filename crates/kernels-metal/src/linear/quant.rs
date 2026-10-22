@@ -1341,6 +1341,78 @@ pub fn coop_matmul(
     )
 }
 
+/// The gate and up of a packed `[gate | up]` bank and their swiglu into `h` in one
+/// register-fed (Apple10 cooperative) launch, where the matmul of `act` by the whole bank
+/// takes that tile with no contraction split: `h` lands as [`matmul`] then
+/// [`super::mlp::swiglu`] land it, bit for bit, without the packed plane between them.
+/// `Ok(false)`, and nothing fired, where the matmul takes another tile.
+pub fn coop_swiglu(
+    ctx: &Ctx<'_>,
+    tuning: &Tuning,
+    act: Tensor,
+    w: Bank,
+    intermediate: u32,
+    h: Tensor,
+    capacity_rows: u32,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.mlp_swiglu";
+    let Some(biases) = w.biases else {
+        return Ok(false);
+    };
+    let (rows, k) = (act.rows, act.width);
+    let cols = intermediate.saturating_mul(2);
+    if act.dtype != Dtype::Bf16
+        || h.dtype != Dtype::Bf16
+        || w.codes.dtype != Dtype::U4g64
+        || w.bits != 4
+        || w.group != 64
+        || h.rows != rows
+        || h.width != intermediate
+        || w.codes.rows < cols
+        || w.codes.width != k
+        || rows == 0
+        || !intermediate.is_multiple_of(32)
+        || !k.is_multiple_of(COOP_SPAN.unsigned_abs())
+        || !w.ld.is_multiple_of(64)
+        || w.ld < k
+        || STAGED_TILE.unsigned_abs() > capacity_rows
+    {
+        return Ok(false);
+    }
+    let at = tuning.qmm_at(rows, cols, k, w.bits, w.group);
+    let (m, k, ld, n) = (
+        stated(OP, rows)?,
+        stated(OP, k)?,
+        stated(OP, w.ld)?,
+        stated(OP, intermediate)?,
+    );
+    // The matmul's own choice: the staged rung first, and on it the whole cooperative tile.
+    if tuning.qmm(&at).first() != Some(&Qmm::Staged)
+        || m > STAGED_TILE
+        || 2 * n < COOP_LEAST_COLUMNS
+        || (2 * n < COOP_WHOLE_COLUMNS && (k / COOP_SPAN) % COOP_SPLIT == 0)
+    {
+        return Ok(false);
+    }
+    ctx.fire(
+        Fire::at(STAGED_FILE, "affine_qmm_coop_swiglu")
+            .apply(Grid::of([64 * (intermediate / 32), 1, 1], [64, 1, 1])),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            biases.arg(),
+            act.arg(),
+            h.arg_mut(),
+            k.arg(),
+            n.arg(),
+            ctx.absent()?,
+            m.arg(),
+            ld.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
 /// Folds the `split` stacked f32 partials of an `m x n` product into `y`, over `cols` columns.
 fn splitk_reduce(
     ctx: &Ctx<'_>,

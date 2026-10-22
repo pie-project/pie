@@ -266,6 +266,73 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
 #endif
 }
 
+// A packed `[gate | up]` bank's gate and up columns into their swiglu, `output` rows of
+// `intermediate`: a threadgroup's first simdgroup walks the gate's 32 columns from 32x, its
+// second the up's same columns, which it hands over rounded to bf16, so each output is
+// `packed_swiglu` of the gate and up the plain tile lands, bit for bit.
+[[kernel]] void
+affine_qmm_coop_swiglu(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
+                       const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
+                       device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+                       constant int &intermediate [[buffer(6)]], constant int &rows [[buffer(8)]],
+                       constant int &stride [[buffer(9)]],
+                       uint2 position [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint simd [[simdgroup_index_in_threadgroup]]) {
+#if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
+  threadgroup bfloat up[16 * 32];
+  const uint column = position.x * 32;
+  auto total = coop_destination();
+  coop_walk(weights, scales, biases, input, width, rows, stride, column + simd * intermediate, 0,
+            width / 256, lane, total);
+  if (simd == 1) {
+#pragma unroll
+    for (ushort i = 0; i < total.get_capacity(); ++i)
+      up[i * 32 + lane] = bfloat(total[i]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd == 1)
+    return;
+#pragma unroll
+  for (ushort i = 0; i < total.get_capacity(); ++i) {
+    if (!total.is_valid_element(i))
+      continue;
+    const auto at = total.get_multidimensional_index(i);
+    const uint row = at[1];
+    if (row >= uint(rows) || row >= 8)
+      continue;
+    const float g = float(bfloat(total[i]));
+    const float u = float(up[i * 32 + lane]);
+    output[ulong(row) * intermediate + column + at[0]] = bfloat((g / (1.0f + metal::exp(-g))) * u);
+  }
+#else
+  // Without the tensor ops a thread sums its outputs' dot products alone: correct, not quick.
+  const uint column = position.x * 32;
+  const ulong groups = ulong(stride) / 64;
+  for (uint at = simd * 32 + lane; at < 8 * 32; at += 64) {
+    const uint row = at / 32, c = column + at % 32;
+    if (row >= uint(rows))
+      continue;
+    float sums[2];
+    for (uint half_ = 0; half_ < 2; ++half_) {
+      const uint n = c + half_ * intermediate;
+      const device uint *codes = weights + ulong(n) * (stride / 8);
+      float sum = 0.0f;
+      for (int k = 0; k < width; ++k) {
+        const float code = float((codes[k / 8] >> (4 * (k % 8))) & 15);
+        const float w = float(half(fma(half(code), half(float(scales[n * groups + k / 64])),
+                                       half(float(biases[n * groups + k / 64])))));
+        sum += float(input[ulong(row) * width + k]) * w;
+      }
+      sums[half_] = sum;
+    }
+    const float g = float(bfloat(sums[0]));
+    const float u = float(bfloat(sums[1]));
+    output[ulong(row) * intermediate + c] = bfloat((g / (1.0f + metal::exp(-g))) * u);
+  }
+#endif
+}
+
 #define PIE_COOP_POINT(name, split)                                                                \
   template [[host_name(name)]] [[kernel]] void affine_qmm_coop<split>(                             \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \

@@ -39,6 +39,14 @@ impl Run<'_> {
                     *y,
                 ),
                 None => {
+                    // On the register-fed tile the swiglu runs in the gate and up's launch.
+                    if self.coop_swiglu(*act, *gate_up, *intermediate, *h)? {
+                        return self.linear(&Linear::Matmul {
+                            act: *h,
+                            w: *down,
+                            y: *y,
+                        });
+                    }
                     self.linear(&Linear::Matmul {
                         act: *act,
                         w: *gate_up,
@@ -73,6 +81,39 @@ impl Run<'_> {
             },
             _ => Err(kernels_metal::Error::Unsupported { op: op.name() }),
         }
+    }
+
+    /// The gate and up of `act` and their swiglu into `h` as one launch, where
+    /// the gate-up matmul takes the register-fed tile whole and runs on the GPU
+    /// alone: `h` lands as the matmul and the swiglu land it, and the packed
+    /// plane between them is left unwritten (nothing past the MLP reads it).
+    /// False where they run as their own launches.
+    fn coop_swiglu(
+        &self,
+        act: poem_ir::ValueId,
+        gate_up: poem_ir::ValueId,
+        intermediate: u32,
+        h: poem_ir::ValueId,
+    ) -> Result<bool, kernels_metal::Error> {
+        let Some(bank) = self.banked(gate_up) else {
+            return Ok(false);
+        };
+        let x = self.tensor(act);
+        if self
+            .ane()
+            .is_some_and(|ane| ane.plan_columns(gate_up, x.rows).is_some())
+        {
+            return Ok(false);
+        }
+        linear::quant::coop_swiglu(
+            self.ctx(),
+            self.tuning(),
+            x,
+            bank,
+            intermediate,
+            self.tensor(h),
+            self.capacity(act).min(self.capacity(h)),
+        )
     }
 
     /// Whether the plan's rows, padded to the matmul tile, fit the planes
