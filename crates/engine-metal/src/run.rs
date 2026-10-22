@@ -899,8 +899,9 @@ impl<'c> Run<'c> {
     /// Whether the walk runs the nodes `first..=last` in turn, each once over
     /// the same rows, with nothing between: their regions (a layer's fold
     /// sits in the region of its routed passes, its shared expert in the
-    /// next) launch unconditionally, each in one run over one window of the
-    /// same rows, in one pass.
+    /// next) are no arms of a switch (the walk's sink runs an `If` region's
+    /// nodes as any other), each in one run over one window of the same rows,
+    /// in one pass.
     fn walks_in_turn(&self, first: u32, last: u32) -> bool {
         let Some(regions) = self.regions else {
             return false;
@@ -913,7 +914,7 @@ impl<'c> Run<'c> {
             let Ok(index) = u32::try_from(at) else {
                 return false;
             };
-            if region.lowering != poem_compiler::Lowering::AlwaysLaunch
+            if matches!(region.lowering, poem_compiler::Lowering::Switch { .. })
                 || region.phase != regions[from].phase
                 || self.windows.runs(index) != 1
             {
