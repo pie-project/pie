@@ -210,16 +210,15 @@ step 3 needs upstream's tarball.
 
 ### What was changed
 
-Guards, markers, and the `#include` lines named above. **39 `// PIE:` markers
-across 12 of the 24 files, 156 added lines**; the other 12 files are
-byte-identical to upstream. Only **two** `#ifndef __CUDACC_RTC__` directives
-remain in the whole FlashInfer tree, both in `attention/mla.cuh`, both
-two-sided; there were thirty-three markers over ten files when every guard was
-still a guard.
-Every copyright header is intact and untouched. Nothing was reformatted,
-renamed, reordered or "improved" -- include order in particular is upstream's,
-which is why several files carry four small markers where one large one would
-have needed a line moved.
+Commit `1f667f90` (2026-09-09) cut comments and blank lines across the
+tree, upstream's copyright headers included; the headers were put back on
+2026-10-22. The cut also took the `// PIE:` markers that named each local
+change, so a diff against upstream v0.6.15 is now the only exact record of
+what changed. The changes include sliding-window decode
+(`attention/decode.cuh`, `attention/variants.cuh`), the two
+`#ifndef __CUDACC_RTC__` directives left in `attention/mla.cuh`, and the
+`#include` lines named above. The counts this section used to give predate
+the cut and no longer hold.
 
 A guard existed because NVRTC compiles for the device only. It refuses a
 function marked `__host__` outright ("a function explicitly marked as a
