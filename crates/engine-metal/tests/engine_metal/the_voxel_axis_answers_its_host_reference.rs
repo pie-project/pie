@@ -3,7 +3,8 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::spatial::{attn, conv, norm, resample, rule};
+use kernels_metal::attn::voxel;
+use kernels_metal::conv::{conv3d, group_norm, resample, rule};
 use poem_ir::Dtype;
 
 type Case = (
@@ -285,16 +286,16 @@ fn the_convolution_answers_the_tap_walk() {
     let (_ogb, hog) = rig.i32s(&o_grid);
     let (_yb, hy) = rig.empty((rows * C_OUT) as u64 * 2);
 
-    let conv3d = conv::Conv3d {
+    let conv3d = conv3d::Conv3d {
         k: [1, 3, 3],
         stride: [1, 1, 1],
         pad: [0, 1, 1],
         pad_back: [0, 1, 1],
         causal_t: false,
-        time_pad: conv::TimePad::Zero,
+        time_pad: conv3d::TimePad::Zero,
     };
     rig.fire(|s| {
-        conv::conv3d(
+        conv3d::conv3d(
             s,
             Tensor::new(hx, rows as u32, C_IN as u32, Dtype::Bf16),
             Tensor::new(hg, 2, 4, Dtype::I32),
@@ -362,7 +363,7 @@ fn the_group_norm_answers_the_two_pass_reference() {
     let (_bb, hb) = rig.f32s(&bias);
     let (_gb, hg) = rig.i32s(&grid);
     let (_yb, hy) = rig.empty((rows * C) as u64 * 2);
-    let floats = norm::scratch_floats(2, GROUPS as u32);
+    let floats = group_norm::scratch_floats(2, GROUPS as u32);
     let (_pb, hp) = rig.empty(floats * 4);
 
     let partials_floats = 2 * 32 * GROUPS as u64 * 4;
@@ -371,7 +372,7 @@ fn the_group_norm_answers_the_two_pass_reference() {
     let (_sb, hs) = rig.empty(2 * GROUPS as u64 * 2 * 4);
 
     rig.fire(|s| {
-        norm::group_norm(
+        group_norm::group_norm(
             s,
             Tensor::new(hx, rows as u32, C as u32, Dtype::Bf16),
             Tensor::new(hg, 2, 4, Dtype::I32),
@@ -441,11 +442,11 @@ fn the_mid_block_attention_answers_the_plain_softmax() {
     let plane = |h: u32| Tensor::new(h, rows as u32, C as u32, Dtype::Bf16);
 
     for (segment, name) in [
-        (attn::Segment::Clip, "clip"),
-        (attn::Segment::Frames(1), "frames1"),
+        (voxel::Segment::Clip, "clip"),
+        (voxel::Segment::Frames(1), "frames1"),
     ] {
         rig.fire(|s| {
-            attn::attention(
+            voxel::attention(
                 s,
                 plane(hq),
                 plane(hk),
@@ -465,8 +466,8 @@ fn the_mid_block_attention_answers_the_plain_softmax() {
             let plane_rows = h * wd;
             for row in off..off + t * plane_rows {
                 let (begin, end) = match segment {
-                    attn::Segment::Clip => (off, off + t * plane_rows),
-                    attn::Segment::Frames(n) => {
+                    voxel::Segment::Clip => (off, off + t * plane_rows),
+                    voxel::Segment::Frames(n) => {
                         let frame = (row - off) / plane_rows;
                         let first = frame / n as usize * n as usize;
                         let last = (first + n as usize).min(t);

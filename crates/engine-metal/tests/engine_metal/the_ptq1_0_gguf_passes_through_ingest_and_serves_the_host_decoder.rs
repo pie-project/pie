@@ -2,7 +2,7 @@
 
 //! M1c: a REAL PTQ1_0 (ternary, `g128_t3_f16_n`, ggml type 143) tensor loads into
 //! pie as a servable `Ptq1_0` bank by NATIVE PASS-THROUGH — the ternary block bytes
-//! are kept verbatim (no decode to fp, no re-encode to MLX affine) — and the M1b
+//! are kept verbatim (no decode to fp, no re-encode to affine) — and the M1b
 //! Metal kernel serves that ingested bank bit-exact against the M1a host decoder.
 //!
 //! The loop this closes is file -> ingest -> bank -> kernel, on real data:

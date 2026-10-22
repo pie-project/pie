@@ -1,12 +1,33 @@
-
-
+// Portions derived from MLX (https://github.com/ml-explore/mlx, MIT License):
+//   mlx/backend/metal/kernels/quantized.h
+// renamed into Pie's namespaces; crates/kernels-metal/NOTICE lists the changes.
+//
+// Copyright © 2023 Apple Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
 
-#define MLX_MTL_CONST static constant constexpr const
-MLX_MTL_CONST int SIMD_SIZE = 32;
+#define PIE_CONST static constant constexpr const
+PIE_CONST int SIMD_SIZE = 32;
 
 template <int bits, int wsize = 8>
 inline constexpr short get_pack_factor() {
@@ -21,7 +42,7 @@ inline constexpr short get_bytes_per_pack() {
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector(const device T* x, thread U* x_thread) {
   static_assert(bits == 2 || bits == 4 || bits == 8,
-                "port covers the widths mlx affine ships this box");
+                "port covers the affine widths this box ships");
   U sum = 0;
   if (bits == 2) {
 
@@ -62,7 +83,7 @@ inline U qdot_staged(
     U bias,
     U sum) {
   static_assert(bits == 2 || bits == 4 || bits == 8,
-                "port covers the widths mlx affine ships this box");
+                "port covers the affine widths this box ships");
   U accum = 0;
   if (bits == 2) {
 

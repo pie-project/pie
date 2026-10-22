@@ -1,5 +1,5 @@
-use kernels_metal::attn;
-use kernels_metal::layout;
+use kernels_metal::elemwise::gate;
+use kernels_metal::gather;
 use poem_exec::{DispatchGather, KernelError};
 use poem_ir::Gather;
 use poem_ir::Operands;
@@ -43,7 +43,7 @@ impl Run<'_> {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
                 let ext_ids = self.rs_extend(OP, &seat, *ids)?;
-                attn::ple::ngram_ids_committed(
+                gather::ngram::ngram_ids_committed(
                     self.ctx(),
                     ext_ids,
                     self.qo_indptr(),
@@ -73,7 +73,7 @@ impl Run<'_> {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
-                attn::ple::ngram_ids(
+                gather::ngram::ngram_ids(
                     self.ctx(),
                     self.tensor(*ids),
                     &self.recurrent(*state),
@@ -101,7 +101,7 @@ impl Run<'_> {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
-                attn::ple::ngram_ids_chunked(
+                gather::ngram::ngram_ids_chunked(
                     self.ctx(),
                     self.ragged(*ids),
                     &self.recurrent(*state),
@@ -121,14 +121,14 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.banked(*table) {
-                Some(bank) => layout::embed_gather_mb_4bit(
+                Some(bank) => gather::embed_gather_mb_4bit(
                     self.ctx(),
                     self.tensor(*ids),
                     bank,
                     *vocab,
                     self.tensor(*y),
                 ),
-                None => layout::embed(
+                None => gather::embed(
                     self.ctx(),
                     self.tensor(*ids),
                     self.tensor(*table),
@@ -150,7 +150,7 @@ impl Run<'_> {
             } => match self.banked(*table) {
                 Some(bank) => {
                     let guard = bank.codes.rows.min(*vocab);
-                    layout::embed_concat_mb_4bit(
+                    gather::embed_concat_mb_4bit(
                         self.ctx(),
                         self.tensor(*ids),
                         bank,
@@ -161,7 +161,7 @@ impl Run<'_> {
                 None => {
                     let plane = self.tensor(*table);
                     let guard = plane.rows.min(*vocab);
-                    layout::embed_concat(
+                    gather::embed_concat(
                         self.ctx(),
                         self.tensor(*ids),
                         plane,
@@ -177,7 +177,7 @@ impl Run<'_> {
                 q,
                 k,
                 v,
-            } => layout::split_qkv(
+            } => gather::split_qkv(
                 self.ctx(),
                 self.tensor(*packed),
                 *q_width,
@@ -191,7 +191,7 @@ impl Run<'_> {
                 head_dim,
                 q,
                 gate,
-            } => layout::split_q_gate(
+            } => gate::split_q_gate(
                 self.ctx(),
                 self.tensor(*packed),
                 *head_dim,
@@ -205,7 +205,7 @@ impl Run<'_> {
                 width,
                 left,
                 right,
-            } => layout::split_rows(
+            } => gather::split_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *width,
@@ -213,10 +213,10 @@ impl Run<'_> {
                 self.tensor(*right),
             ),
             Gather::PoolRows { x, side, y } => {
-                layout::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+                gather::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
             Gather::MergeRows { x, side, y } => {
-                layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+                gather::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
             Gather::Pixels {
                 x,
@@ -226,7 +226,7 @@ impl Run<'_> {
                 order,
                 temporal,
                 y,
-            } => layout::pixels(
+            } => gather::pixels(
                 self.ctx(),
                 self.tensor(*x),
                 *patch,
@@ -251,7 +251,7 @@ impl Run<'_> {
                 side,
                 ids,
                 weights,
-            } => layout::grid_taps(
+            } => gather::grid_taps(
                 self.ctx(),
                 self.tensor(*positions),
                 self.tensor(*grids),
@@ -266,7 +266,7 @@ impl Run<'_> {
                 routes,
                 y,
                 y_out: _,
-            } => layout::scatter_live_rows(
+            } => gather::scatter_live_rows(
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
@@ -278,7 +278,7 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
-            } => layout::embed_weighted(
+            } => gather::embed_weighted(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*weights),
@@ -291,25 +291,25 @@ impl Run<'_> {
                 routes,
                 y,
                 y_out: _,
-            } => layout::scatter_rows(
+            } => gather::scatter_rows(
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
                 self.uncut(*y),
             ),
-            Gather::PackRows { x, perm, y } => layout::pack_rows(
+            Gather::PackRows { x, perm, y } => gather::pack_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*perm),
                 self.tensor(*y),
             ),
-            Gather::UnpackRows { x, perm, y } => layout::unpack_rows(
+            Gather::UnpackRows { x, perm, y } => gather::unpack_rows(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*perm),
                 self.uncut(*y),
             ),
-            Gather::Rows { x, rows, y } => layout::gather_rows(
+            Gather::Rows { x, rows, y } => gather::gather_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*rows),
@@ -320,7 +320,7 @@ impl Run<'_> {
                 layer,
                 width,
                 y,
-            } => layout::select(
+            } => gather::select(
                 self.ctx(),
                 self.tensor(*table),
                 *layer,

@@ -1,3 +1,27 @@
+// Portions derived from MLX (https://github.com/ml-explore/mlx, MIT License):
+//   mlx/backend/metal/kernels/quantized.h
+// renamed into Pie's namespaces; crates/kernels-metal/NOTICE lists the changes.
+//
+// Copyright © 2023 Apple Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
@@ -13,8 +37,8 @@ inline float mxfp4_block_scale(uint8_t code) {
 
 using namespace metal;
 
-#define MLX_MTL_CONST static constant constexpr const
-MLX_MTL_CONST int SIMD_SIZE = 32;
+#define PIE_CONST static constant constexpr const
+PIE_CONST int SIMD_SIZE = 32;
 
 template <int BM>
 inline constexpr int qmm_wm() {
@@ -28,7 +52,7 @@ inline constexpr int qmm_tgp() {
 }
 
 // A routed tile of at most 16 rows multiplies in two simdgroups side by side, each all of
-// its rows, as MLX's gather_qmm does: the rows one expert's tile holds are few, and four
+// its rows: the rows one expert's tile holds are few, and four
 // simdgroups of eight rows apiece reload each weight fragment twice as often.
 template <int BM>
 inline constexpr int routed_wm() {
@@ -40,11 +64,11 @@ inline constexpr int routed_tgp() {
   return routed_wm<BM>() * 2 * SIMD_SIZE;
 }
 
-#include "../third_party/mlx_steel_prelude.metal"
-#include "../third_party/mlx_steel_transforms.metal"
-#include "../third_party/mlx_steel_mma.metal"
-#include "../third_party/mlx_steel_loader.metal"
-#include "../third_party/mlx_quantized_block.metal"
+#include "../prim/gemm_traits.h"
+#include "../prim/gemm_transforms.h"
+#include "../prim/gemm_mma.h"
+#include "../prim/gemm_loader.h"
+#include "quant_block.h"
 
 template <
     typename T,
@@ -57,13 +81,13 @@ template <
 struct AffineVec4Loader {
   static_assert(BCOLS <= group_size, "The group size should be larger than the columns");
   static_assert(group_size % BCOLS == 0, "The group size should be divisible by the columns");
-  MLX_MTL_CONST short pack_factor = 2;
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
+  PIE_CONST short pack_factor = 2;
+  PIE_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  PIE_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
+  PIE_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
   static_assert(VEC == 2 || VEC == 4, "a thread reads two or four bytes");
-  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+  PIE_CONST short group_steps = group_size / BCOLS;
 
   const int src_ld;
   const int tile_stride;
@@ -103,10 +127,10 @@ struct AffineVec4Loader {
     const D bias = static_cast<D>(*biases);
     const D s0 = scale;
     const D s1 = scale / static_cast<D>(16.0f);
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < n_reads; i += VEC) {
       const vec<uint8_t, VEC> run = *((const device vec<uint8_t, VEC>*)(src + i));
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < VEC; j += 2) {
         const uint8_t lo = run[j];
         const uint8_t hi = run[j + 1];
@@ -161,10 +185,10 @@ METAL_FUNC void qmm_t_loaded_impl(
     uint simd_lid,
     thread LoaderW& loader_w) {
   constexpr int BK_padded = BK + 16 / sizeof(T);
-  using mma_t = mlx::steel::
+  using mma_t = pie::gemm::
       BlockMMA<T, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
-      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+      pie::gemm::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
 
   const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN;
@@ -220,9 +244,9 @@ METAL_FUNC void qmm_t_cast_loaded_impl(
     uint simd_lid,
     thread LoaderW& loader_w) {
   constexpr int BK_padded = BK + 16 / sizeof(half);
-  using loader_x_t = mlx::steel::
+  using loader_x_t = pie::gemm::
       BlockLoaderCast<T, half, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  using mma_t = mlx::steel::
+  using mma_t = pie::gemm::
       BlockMMA<half, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
 
   const int y_row = int(tid.y) * BM;
@@ -620,12 +644,12 @@ template <
     typename D = T>
 struct Mxfp4VecLoader {
   static_assert(BCOLS == 32, "MXFP4 blocks are exactly 32 values");
-  MLX_MTL_CONST short pack_factor = 2;
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
+  PIE_CONST short pack_factor = 2;
+  PIE_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  PIE_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
 
-  MLX_MTL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
+  PIE_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
   static_assert(VEC == 2 || VEC == 4, "a thread reads two or four bytes");
 
   const int src_ld;
@@ -657,11 +681,11 @@ struct Mxfp4VecLoader {
 
   void load_unsafe() const {
     const D scale = D(mxfp4_block_scale(*exponents));
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < n_reads; i += VEC) {
       const vec<uint8_t, VEC> run =
           *((const device vec<uint8_t, VEC>*)(src + i));
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < VEC; j += 2) {
         const uint8_t lo = run[j];
         const uint8_t hi = run[j + 1];

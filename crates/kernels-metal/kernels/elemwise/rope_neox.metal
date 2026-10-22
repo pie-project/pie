@@ -55,25 +55,6 @@ template <typename T>
 instantiate_rope_neox_mb(bfloat16, bfloat)
 
 template <typename T>
-[[kernel]] void rope_neox_freqs_decode(
-    device T* x                       [[buffer(0)]],
-    const device int* position        [[buffer(1)]],
-    const constant float& scale       [[buffer(2)]],
-    const device float* inv_freq      [[buffer(3)]],
-    const constant int& head_dim      [[buffer(4)]],
-
-    const constant float& mscale      [[buffer(5)]],
-    uint2 pos  [[thread_position_in_grid]],
-    uint2 grid [[threads_per_grid]]) {
-  const int i = int(pos.x);
-  const int h = int(pos.y);
-  const int half_rd = int(grid.x);
-  rope_neox_freqs_body(
-      x, position[0], scale, inv_freq, head_dim, half_rd,
-      mscale, i, h, 0);
-}
-
-template <typename T>
 [[kernel]] void rope_neox_freqs_mb(
     device T* x                       [[buffer(0)]],
     const device int* position        [[buffer(1)]],
@@ -94,10 +75,6 @@ template <typename T>
 }
 
 #define instantiate_rope_freqs(name, itype)                        \
-  template [[host_name("neox_freqs_decode_" #name)]]          \
-  [[kernel]] void rope_neox_freqs_decode<itype>(                   \
-      device itype*, const device int*, const constant float&,     \
-      const device float*, const constant int&, const constant float&, uint2, uint2); \
   template [[host_name("neox_freqs_mb_" #name)]]              \
   [[kernel]] void rope_neox_freqs_mb<itype>(                       \
       device itype*, const device int*, const constant float&,     \

@@ -25,7 +25,7 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::linear::kv_codec;
+use kernels_metal::attn::kv_codec;
 use poem_ir::Dtype;
 
 const BLOCK: usize = 256;

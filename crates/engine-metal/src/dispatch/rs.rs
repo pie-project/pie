@@ -1,5 +1,7 @@
-use kernels_metal::attn::{self, ssm::Committed};
-use kernels_metal::{Error, Tensor, layout};
+use kernels_metal::runtime::blit;
+use kernels_metal::ssm;
+use kernels_metal::ssm::Committed;
+use kernels_metal::{Error, Tensor};
 use poem_ir::{Operation, Ssm, ValueId};
 
 use crate::rs::{Convolved, Seat};
@@ -70,7 +72,7 @@ impl Run<'_> {
     /// where one launch a copy paid the device's launch cost per row run.
     fn rs_flush(&self, copies: &[(Tensor, Tensor, u64)]) -> Result<(), Error> {
         for chunk in copies.chunks(4) {
-            layout::copy_words_batch(self.ctx(), chunk)?;
+            blit::copy_words_batch(self.ctx(), chunk)?;
         }
         Ok(())
     }
@@ -267,7 +269,7 @@ impl Run<'_> {
         const OP: &str = "ssm.gdn_gates";
         let ext_ba = self.rs_extend(OP, seat, ba)?;
         let ext_gates = self.rs_out(OP, seat, gates)?;
-        attn::ssm::gdn_prep(self.ctx(), ext_ba, dt_bias, a_log, ext_gates)?;
+        ssm::gdn_prep(self.ctx(), ext_ba, dt_bias, a_log, ext_gates)?;
         self.rs_land(OP, seat, ext_gates, gates)
     }
 
@@ -284,14 +286,13 @@ impl Run<'_> {
         // The verify conv lands the window's own rows itself, and through the
         // page table reads and lands the buffer's too.
         let paged = seat.paged(self.handles(), conv.x);
-        let fits =
-            attn::ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
+        let fits = ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
         if fits {
             let source = match paged {
                 Some(_) => self.tensor(conv.x),
                 None => self.rs_extend(OP, seat, conv.x)?,
             };
-            attn::ssm::causal_conv1d_verify(
+            ssm::causal_conv1d_verify(
                 self.ctx(),
                 source,
                 paged,
@@ -308,7 +309,7 @@ impl Run<'_> {
             return Ok(ext_y);
         }
         let ext_x = self.rs_extend(OP, seat, conv.x)?;
-        attn::ssm::causal_conv1d_committed_landing(
+        ssm::causal_conv1d_committed_landing(
             self.ctx(),
             ext_x,
             self.qo_indptr(),

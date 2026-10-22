@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::encode::{Ctx, Fire, Grid, dtype_dispatch, head_grid, head_group, refuse};
 use crate::tensor::Tensor;
 
-const FILE: &str = "attn/merge_lse.metal";
+const FILE: &str = "attn/merge.metal";
 
 const MERGE_HEAD_MAX: u32 = 1024;
 

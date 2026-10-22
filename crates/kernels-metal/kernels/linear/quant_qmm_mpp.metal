@@ -38,7 +38,7 @@ kernel void qmm_mpp_pack_bank(const device uint *codes [[buffer(0)]],
   }
 }
 
-#include "../common/mpp.metal"
+#include "../prim/mpp.h"
 
 template <int M, int N, int S, bool PACKED, bool RELAXED, int PARTS, bool PAIRED, bool LOCAL,
           int ROW_GROUP, class Index>
@@ -214,7 +214,7 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
       device bfloat *, constant int &, constant int &, const device float *, const device int *,   \
       uint3);
 
-// The routed MXFP4 matmul on the MPP matmul, as mlx-lm's `gather_qmm_rhs_nax` runs it: each
+// The routed MXFP4 matmul on the MPP matmul: each
 // 64-wide slice of the expert's codes is decoded into threadgroup bfloat (an E2M1 value times
 // its power-of-two block scale is exact in bfloat) and multiplied there, two slices in flight
 // so one barrier separates a slice's decode from its multiply.
@@ -297,7 +297,7 @@ mxfp4_qmm_mpp_routed(const device uchar *codes [[buffer(0)]],
   const device uchar *exponent_row = exponents + (column + n) * blocks;
   // A run starts on a 16-byte boundary inside one 32-wide block, so it reads one exponent and
   // one aligned word quad; an E2M1 code's low three bits placed at a half's bits 9..11 read
-  // as the code's value over 2^14, exactly (as mlx's `fp4_e2m1` decodes it).
+  // as the code's value over 2^14, exactly.
   static_assert(PER_THREAD == 16, "a thread decodes one aligned quad of words");
   struct Slice {
     uint4 words;

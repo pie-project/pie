@@ -1,22 +1,12 @@
 pub mod arbiter;
-pub mod q8;
-pub mod split;
-
 pub mod dense;
-
+pub mod kv_codec;
 pub mod merge;
-
-pub mod ple;
-
-pub mod score;
-
-pub mod ssm;
-
-pub mod dynconv;
-
-pub mod selector;
-
+pub mod q8;
 pub mod ragged;
+pub mod score;
+pub mod split;
+pub mod voxel;
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -895,7 +885,7 @@ pub fn sink(
     );
     let lanes = head_grid(OP, head_dim, heads, o.rows)?;
     ctx.fire(
-        Fire::at("attn/attn_sink.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
+        Fire::at("attn/sink.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
         &[o.arg(), o.arg_mut(), lse.arg(), sink.arg()],
     )
 }
@@ -1002,7 +992,7 @@ fn append_paged(
                         format!(
                             "the packed KV codec has no write shader stamped at head width \
                              {other}; it packs whole {:?}-element heads",
-                            crate::linear::kv_codec::BLOCKS
+                            crate::attn::kv_codec::BLOCKS
                         ),
                     ));
                 }

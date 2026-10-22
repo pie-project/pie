@@ -1,0 +1,36 @@
+NOTICE
+======
+
+This crate carries source derived from the project below. Every derived file
+keeps the upstream copyright line and MIT permission notice in its header;
+this file names the project, its licence and what was changed.
+
+
+MLX
+---
+
+    Upstream:   https://github.com/ml-explore/mlx
+    Copyright:  Copyright © 2023 Apple Inc.
+    Licence:    MIT License
+    Derived:    kernels/prim/gemm_traits.h
+                kernels/prim/gemm_loader.h
+                kernels/prim/gemm_mma.h
+                kernels/prim/gemm_transforms.h
+                kernels/linear/quant_block.h
+                kernels/linear/gemm.metal
+                kernels/linear/quant_qmv.metal
+                kernels/linear/quant_qmv_rows.metal
+                kernels/linear/quant_qmm_t.metal
+
+The simdgroup-matrix GEMM tile (type traits, block loader, MMA, epilogue
+transforms), the affine dequantize and quantized block loader, and the dense
+and quantized matmul and matvec kernels built on them. Changed from upstream:
+
+  * moved from `kernels/third_party/` into `kernels/prim/` and
+    `kernels/linear/`, as `.h` headers;
+  * the namespace `mlx::steel` renamed `pie::gemm`, the `STEEL_` and
+    `MLX_MTL_` macros `PIE_`, the upstream-named helpers given Pie names;
+  * the matmul and matvec kernels carry Pie's own entry points and forms
+    (MXFP4, routed MoE tiles) beside the derived code.
+
+A diff against upstream is the exact record of every change.
