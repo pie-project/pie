@@ -159,3 +159,103 @@ fn every_staged_row_answers_an_affine_reference() {
     }
     eprintln!("checked {checked} staged outputs against exact and random affine dots");
 }
+
+#[test]
+fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"staged\", \"qmv\"]", false);
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    for &(k, intermediate) in &[(1024u32, 6144u32), (5120, 6400)] {
+        let (n, groups) = (2 * intermediate, k / 64);
+        let codes = upload(
+            &(0..u64::from(k) * u64::from(n) / 2)
+                .map(noise)
+                .collect::<Vec<_>>(),
+        );
+        let factor = |at: u32, salt: u64, base: f32, step: f32| {
+            bf16(base + (f32::from(noise(u64::from(at) ^ salt)) - 127.0) * step)
+        };
+        let scales = upload(
+            &(0..n * groups)
+                .flat_map(|at| factor(at, 0x11, 0.004, 0.00002))
+                .collect::<Vec<_>>(),
+        );
+        let biases = upload(
+            &(0..n * groups)
+                .flat_map(|at| factor(at, 0x22, 0.0, 0.0002))
+                .collect::<Vec<_>>(),
+        );
+        let bank = Bank {
+            mpp_codes: None,
+            codes: Tensor::new(bind(&codes), n, k, Dtype::U4g64),
+            scales: Tensor::new(bind(&scales), n, groups, Dtype::Bf16),
+            biases: Some(Tensor::new(bind(&biases), n, groups, Dtype::Bf16)),
+            group: 64,
+            bits: 4,
+            ld: k,
+        };
+        for m in [5u32, 6, 8] {
+            let x = upload(
+                &(0..m * k)
+                    .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x33)) - 127.0) / 128.0))
+                    .collect::<Vec<_>>(),
+            );
+            let packed = upload(&vec![0; (m * n * 2) as usize]);
+            let (two, one) = (
+                upload(&vec![0; (m * intermediate * 2) as usize]),
+                upload(&vec![0xa5; (m * intermediate * 2) as usize + 64]),
+            );
+            let act = Tensor::new(bind(&x), m, k, Dtype::Bf16);
+            let packed = Tensor::new(bind(&packed), m, n, Dtype::Bf16);
+            let (two, one) = (
+                Tensor::new(bind(&two), m, intermediate, Dtype::Bf16),
+                Tensor::new(bind(&one), m, intermediate, Dtype::Bf16),
+            );
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            quant::matmul(
+                &sink,
+                &tuning,
+                act,
+                bank,
+                packed,
+                quant::Scratch {
+                    precast: &|_, _| None,
+                    partials: &|_, _| None,
+                    table: None,
+                },
+                8,
+            )
+            .expect("gate and up");
+            kernels_metal::linear::mlp::swiglu(&sink, packed, intermediate, two).expect("swiglu");
+            assert!(
+                quant::coop_swiglu(&sink, &tuning, act, bank, intermediate, one, 8).expect("fused"),
+                "the fused tile takes K={k} I={intermediate}"
+            );
+            frame.commit().expect("commit");
+            let bytes = u64::from(m * intermediate) * 2;
+            let (want, got) = (
+                handles.read(two.buf, bytes).expect("read"),
+                handles.read(one.buf, bytes + 64).expect("read"),
+            );
+            assert!(
+                got[bytes as usize..].iter().all(|&b| b == 0xa5),
+                "a write past h"
+            );
+            assert!(
+                want == got[..bytes as usize],
+                "M={m} K={k} I={intermediate}: the fused tile differs from the two launches"
+            );
+            assert!(want.iter().any(|&b| b != 0), "the swiglu is not all zeros");
+        }
+    }
+}

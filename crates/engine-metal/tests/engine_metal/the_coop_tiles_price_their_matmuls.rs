@@ -187,4 +187,79 @@ fn the_coop_tiles_price_their_matmuls() {
         eprintln!("{line}");
         b.keep.borrow_mut().clear();
     }
+    // The gate and up of each layer then their swiglu, as two launches and as one.
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"staged\", \"qmv\"]", false);
+    // at least the columns the whole tile takes unsplit
+    let (k, intermediate) = (5120u32, (17408 / divisor).max(6144));
+    let bytes = u64::from(k) * u64::from(2 * intermediate) * 9 / 16;
+    let layers = STREAM.div_ceil(bytes).clamp(2, 64) as u32;
+    let banks: Vec<Bank> = (0..layers)
+        .map(|l| b.bank(u64::from(l) * 7919 + 3, k, 2 * intermediate))
+        .collect();
+    let x: Vec<u8> = fill(0x5150, u64::from(ROWS) * u64::from(k) * 2)
+        .chunks(2)
+        .flat_map(|c| bf16((f32::from(c[0]) - 127.5) / 64.0))
+        .collect();
+    let act = Tensor::new(b.upload(&x), ROWS, k, Dtype::Bf16);
+    let packed = Tensor::new(
+        b.zeroed(u64::from(ROWS * 2 * intermediate) * 2),
+        ROWS,
+        2 * intermediate,
+        Dtype::Bf16,
+    );
+    let hs: Vec<Tensor> = (0..layers)
+        .map(|_| {
+            Tensor::new(
+                b.zeroed(u64::from(ROWS * intermediate) * 2),
+                ROWS,
+                intermediate,
+                Dtype::Bf16,
+            )
+        })
+        .collect();
+    let mut line = format!("gate_up+swiglu K={k:5} I={intermediate:6} x{layers:2}");
+    let mut reference: Option<Vec<Vec<u8>>> = None;
+    for fused in [false, true] {
+        let run = |ctx: &Sink<'_>| {
+            for (w, h) in banks.iter().zip(&hs) {
+                if fused {
+                    assert!(
+                        quant::coop_swiglu(ctx, &tuning, act, *w, intermediate, *h, 8)
+                            .expect("fused"),
+                        "the fused tile takes the shape"
+                    );
+                    continue;
+                }
+                quant::coop_matmul(
+                    ctx,
+                    act,
+                    *w,
+                    w.biases.expect("biases"),
+                    packed,
+                    (
+                        ROWS as i32,
+                        (2 * intermediate) as i32,
+                        k as i32,
+                        (2 * intermediate) as i32,
+                        k as i32,
+                    ),
+                    1,
+                )
+                .expect("matmul");
+                kernels_metal::linear::mlp::swiglu(ctx, packed, intermediate, *h).expect("swiglu");
+            }
+        };
+        let us = b.time(&run) / f64::from(layers);
+        let out: Vec<Vec<u8>> = hs.iter().map(|h| b.read(*h)).collect();
+        match &reference {
+            None => reference = Some(out),
+            Some(r) => assert!(*r == out, "the fused gate/up differs from the two launches"),
+        }
+        line += &format!(
+            "  {} {us:7.1}us {:5.0}GB/s",
+            if fused { "one" } else { "two" },
+            bytes as f64 / us / 1e3
+        );
+    }
+    eprintln!("{line}");
 }
