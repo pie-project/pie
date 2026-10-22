@@ -201,18 +201,23 @@ impl Run<'_> {
                 *scale,
                 self.tensor(*y),
             ),
-            Elemwise::Silu { x, x_out: _ } => {
-                elemwise::pointwise::silu(self.ctx(), self.tensor(*x), self.tensor(*x))
-            }
-            Elemwise::Tanh { x, x_out: _ } => {
-                elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
-            }
-            Elemwise::Add { x, y, z } => elemwise::pointwise::add(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*z),
-            ),
+            Elemwise::Silu { x, x_out: _ } => kernels_slang::elemwise::silu_scaled::silu(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Tanh { x, x_out: _ } => kernels_slang::elemwise::tanh::tanh(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Add { x, y, z } => kernels_slang::elemwise::add::add(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+                crate::encode::slang_tensor(self.tensor(*z)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RopeAxes {
                 x,
                 positions,

@@ -148,16 +148,31 @@ impl Run<'_> {
                 self.tensor(*x),
             ),
 
+            Elemwise::Silu { x, x_out: _ } => kernels_slang::elemwise::silu_scaled::silu(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Tanh { x, x_out: _ } => kernels_slang::elemwise::tanh::tanh(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Add { x, y, z } => kernels_slang::elemwise::add::add(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+                crate::encode::slang_tensor(self.tensor(*z)),
+            )
+            .map_err(crate::encode::from_slang),
+
             Elemwise::Modulate { .. }
             | Elemwise::GatedResidualAdd { .. }
             | Elemwise::Sinusoid { .. }
             | Elemwise::RelativeBucketBias { .. }
-            | Elemwise::Silu { .. }
             | Elemwise::Gelu { .. }
-            | Elemwise::Tanh { .. }
             | Elemwise::Hadamard { .. }
             | Elemwise::Mul { .. }
-            | Elemwise::Add { .. }
             | Elemwise::RopeAxes { .. }
             | Elemwise::GateSigmoidMulHeads { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
