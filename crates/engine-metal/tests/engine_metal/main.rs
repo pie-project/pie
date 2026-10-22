@@ -43,6 +43,7 @@ mod the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder;
 mod the_q8_kv_roundtrip;
 mod the_ragged_attention_answers_its_host_reference;
 mod the_register_routed_mlp_answers_the_per_route_path;
+mod the_register_routed_mlp_prices_its_layer;
 mod the_register_rows_match_affine_dots;
 mod the_rotated_packed_kv_serves;
 mod the_selector_reads_out_the_reference_walk;
