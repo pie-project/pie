@@ -929,7 +929,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
             const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(from), "r"(live));
         };
-        constexpr int kLag = 2;
+        constexpr int kLag = 1;
         for (int kb = 0; kb < steps; ++kb) {
             const int s = kb % kStages;
             if (kb >= kStages) wgbf16gemm::bar_wait(empty + s, ((kb / kStages) - 1) & 1);
