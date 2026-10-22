@@ -90,13 +90,14 @@ impl Run<'_> {
                 eps,
                 y,
                 weight: NormWeight::None,
-            } => elemwise::norm::rmsnorm_no_scale(
-                self.ctx(),
-                self.tensor(*x),
+            } => kernels_slang::elemwise::norm::rmsnorm_no_scale(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
                 *head_dim,
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::Layernorm {
                 x,
@@ -104,50 +105,111 @@ impl Run<'_> {
                 bias: Some(bias),
                 eps,
                 y,
-            } => elemwise::norm::layernorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                self.tensor(*bias),
+            } => kernels_slang::elemwise::norm::layernorm(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
+                crate::encode::slang_tensor(self.tensor(*bias)),
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+
+            Elemwise::Layernorm {
+                x,
+                eps,
+                y,
+                weight: None,
+                bias: None,
+            } => kernels_slang::elemwise::norm::layernorm_no_scale(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                *eps,
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::Clamp {
                 x,
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp(self.ctx(), *lo, *hi, self.tensor(*x)),
+            } => kernels_slang::elemwise::pointwise::clamp(
+                &self.slang(),
+                *lo,
+                *hi,
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::ClampLearned {
                 x,
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp_learned(
-                self.ctx(),
-                self.tensor(*lo),
-                self.tensor(*hi),
-                self.tensor(*x),
-            ),
+            } => kernels_slang::elemwise::pointwise::clamp_learned(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*lo)),
+                crate::encode::slang_tensor(self.tensor(*hi)),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
 
-            Elemwise::Layernorm {
-                weight: None,
-                bias: None,
-                ..
-            }
-            | Elemwise::Modulate { .. }
+            Elemwise::Silu { x, x_out: _ } => kernels_slang::elemwise::pointwise::silu(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Tanh { x, x_out: _ } => kernels_slang::elemwise::pointwise::tanh(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Add { x, y, z } => kernels_slang::elemwise::pointwise::add(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+                crate::encode::slang_tensor(self.tensor(*z)),
+            )
+            .map_err(crate::encode::from_slang),
+
+            Elemwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form,
+                rotary_dim,
+                head_dim,
+                x_out: _,
+            } => kernels_slang::elemwise::rope::axes(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
+                *dims,
+                *thetas,
+                match form {
+                    poem_ir::RopeForm::Interleaved => {
+                        kernels_slang::elemwise::rope::RopeForm::Interleaved
+                    }
+                    poem_ir::RopeForm::Neox => kernels_slang::elemwise::rope::RopeForm::Neox,
+                    poem_ir::RopeForm::Split => kernels_slang::elemwise::rope::RopeForm::Split,
+                    poem_ir::RopeForm::SplitLadder => {
+                        kernels_slang::elemwise::rope::RopeForm::SplitLadder
+                    }
+                },
+                *rotary_dim,
+                *head_dim,
+            )
+            .map_err(crate::encode::from_slang),
+
+            Elemwise::Modulate { .. }
             | Elemwise::GatedResidualAdd { .. }
             | Elemwise::Sinusoid { .. }
             | Elemwise::RelativeBucketBias { .. }
-            | Elemwise::Silu { .. }
             | Elemwise::Gelu { .. }
-            | Elemwise::Tanh { .. }
             | Elemwise::Hadamard { .. }
             | Elemwise::Mul { .. }
-            | Elemwise::Add { .. }
-            | Elemwise::RopeAxes { .. }
             | Elemwise::GateSigmoidMulHeads { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
@@ -168,7 +230,12 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
             Elemwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::norm::silu_scaled(self.ctx(), *s, self.tensor(*x))
+                kernels_slang::elemwise::pointwise::silu_scaled(
+                    &self.slang(),
+                    *s,
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                )
+                .map_err(crate::encode::from_slang)
             }
             Elemwise::HcMix {
                 gates,
@@ -222,16 +289,17 @@ impl Run<'_> {
                 eps,
                 act,
                 y,
-            } => elemwise::norm::rmsnorm_gated(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::norm::rmsnorm_gated(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*gate)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *head_dim,
                 *eps,
                 matches!(act, poem_ir::GateActivation::Sigmoid),
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RmsnormGatedBy {
                 x,
                 gate,
@@ -239,41 +307,61 @@ impl Run<'_> {
                 heads,
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_gated_by(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::norm::rmsnorm_gated_by(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*gate)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *heads,
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::ResidualAdd { x, y, y_out: _ } => {
-                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
+                kernels_slang::elemwise::pointwise::residual_add(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                    crate::encode::slang_tensor(self.tensor(*y)),
+                )
+                .map_err(crate::encode::from_slang)
             }
             Elemwise::AddBias {
                 bias,
                 out,
                 out_out: _,
-            } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
+            } => kernels_slang::elemwise::pointwise::add_bias(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*bias)),
+                crate::encode::slang_tensor(self.tensor(*out)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::Standardize {
                 x,
                 bias,
                 scale,
                 x_out: _,
-            } => elemwise::norm::standardize(
-                self.ctx(),
-                self.tensor(*bias),
-                self.tensor(*scale),
-                self.tensor(*x),
-            ),
+            } => kernels_slang::elemwise::norm::standardize(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*bias)),
+                crate::encode::slang_tensor(self.tensor(*scale)),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::MulScalar { s, x, x_out: _ } => {
-                elemwise::norm::mul_scalar(self.ctx(), *s, self.tensor(*x))
+                kernels_slang::elemwise::pointwise::mul_scalar(
+                    &self.slang(),
+                    *s,
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                )
+                .map_err(crate::encode::from_slang)
             }
-            Elemwise::Scale { s, x, x_out: _ } => {
-                elemwise::norm::scale(self.ctx(), self.tensor(*s), self.tensor(*x))
-            }
+            Elemwise::Scale { s, x, x_out: _ } => kernels_slang::elemwise::pointwise::scale(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*s)),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::ResBlend {
                 prefix,
                 blocks,
@@ -283,16 +371,21 @@ impl Run<'_> {
                 y,
             } => {
                 let y = self.tensor(*y);
-                let blocks = self.stacked_blocks(blocks, y)?;
-                elemwise::norm::res_blend(
-                    self.ctx(),
-                    self.tensor(*prefix),
+                let blocks: Vec<_> = self
+                    .stacked_blocks(blocks, y)?
+                    .into_iter()
+                    .map(crate::encode::slang_tensor)
+                    .collect();
+                kernels_slang::elemwise::norm::res_blend(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*prefix)),
                     &blocks,
-                    self.tensor(*weight),
+                    crate::encode::slang_tensor(self.tensor(*weight)),
                     *eps,
-                    self.tensor(*proj),
-                    y,
+                    crate::encode::slang_tensor(self.tensor(*proj)),
+                    crate::encode::slang_tensor(y),
                 )
+                .map_err(crate::encode::from_slang)
             }
 
             Elemwise::RopeFull {
@@ -305,15 +398,16 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope::full(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::full(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *head_dim,
                 *theta,
                 *interleaved,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RopePartial {
                 q,
                 k,
@@ -325,16 +419,17 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope::partial(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::partial(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *rotary_dim,
                 *head_dim,
                 *theta,
                 *span,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RopeMrope {
                 q,
                 k,
@@ -347,16 +442,17 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::interleaved(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::mrope_interleaved(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *sections,
                 *rotary_dim,
                 *head_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::RopeMrope {
                 q,
@@ -370,16 +466,17 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::split(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::mrope_split(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *sections,
                 *rotary_dim,
                 *head_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::RopeMrope {
                 q,
@@ -393,16 +490,17 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::blocked(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::mrope_blocked(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *sections,
                 *rotary_dim,
                 *head_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RopePartialQ {
                 q,
                 positions,
@@ -412,15 +510,16 @@ impl Run<'_> {
                 span,
                 freqs: None,
                 q_out: _,
-            } => elemwise::rope::partial_q(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::partial_q(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *rotary_dim,
                 *head_dim,
                 *theta,
                 *span,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RopePartialLast {
                 q,
                 positions,
@@ -431,22 +530,23 @@ impl Run<'_> {
                 inverse,
                 yarn,
                 q_out: _,
-            } => elemwise::rope::partial_last(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::partial_last(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *rotary_dim,
                 *head_dim,
                 *theta,
                 *interleaved,
                 *inverse,
-                yarn.map(|y| elemwise::rope::Yarn {
+                yarn.map(|y| kernels_slang::elemwise::rope::Yarn {
                     factor: y.factor,
                     beta_fast: y.beta_fast,
                     beta_slow: y.beta_slow,
                     original_max_position: y.original_max_position,
                 }),
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RopeYarn {
                 q,
                 k,
@@ -461,11 +561,11 @@ impl Run<'_> {
                 interleaved,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope::yarn(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope::yarn(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *head_dim,
                 *theta,
                 *factor,
@@ -474,10 +574,16 @@ impl Run<'_> {
                 *attention_factor,
                 *original_max_position,
                 *interleaved,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
+                kernels_slang::elemwise::pointwise::sigmoid_mul(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*gate)),
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                )
+                .map_err(crate::encode::from_slang)
             }
 
             Elemwise::HcExpand { x, streams, y } => {
