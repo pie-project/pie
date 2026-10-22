@@ -72,6 +72,14 @@ pub(crate) fn begin(continuable: bool, continuation: Option<Continuation>) {
     CONTINUES.set(continuation);
 }
 
+/// This run is not continued, whatever its input said: its frames go out
+/// plain, so the gateway keeps nothing to continue it from. A request of
+/// several choices generates them side by side, and their tokens would
+/// interleave in what the frames name.
+pub fn opt_out() {
+    begin(false, None);
+}
+
 /// The turn this run continues, if it does.
 #[must_use]
 pub(crate) fn get() -> Option<Continuation> {
