@@ -134,19 +134,26 @@ impl Run<'_> {
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp(self.ctx(), *lo, *hi, self.tensor(*x)),
+            } => kernels_slang::elemwise::clamp::clamp(
+                &self.slang(),
+                *lo,
+                *hi,
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::ClampLearned {
                 x,
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp_learned(
-                self.ctx(),
-                self.tensor(*lo),
-                self.tensor(*hi),
-                self.tensor(*x),
-            ),
+            } => kernels_slang::elemwise::clamp::clamp_learned(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*lo)),
+                crate::encode::slang_tensor(self.tensor(*hi)),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::Silu { x, x_out: _ } => kernels_slang::elemwise::silu_scaled::silu(
                 &self.slang(),
@@ -532,7 +539,12 @@ impl Run<'_> {
             ),
 
             Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
+                kernels_slang::elemwise::sigmoid_mul::sigmoid_mul(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*gate)),
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                )
+                .map_err(crate::encode::from_slang)
             }
 
             Elemwise::HcExpand { x, streams, y } => {

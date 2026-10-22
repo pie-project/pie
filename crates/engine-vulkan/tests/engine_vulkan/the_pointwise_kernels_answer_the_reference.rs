@@ -2,9 +2,10 @@
 //! first Vulkan device against an f64 host reference, beside the hand-written
 //! kernels, over even and odd counts.
 
-use crate::gpu::{Gpu, close, noise};
+use crate::gpu::{Gpu, bf16, close, noise, widen};
 use kernels_vulkan::Tensor;
 use kernels_vulkan::elemwise::pointwise;
+use kernels_vulkan::elemwise::{clip, gate};
 use poem_ir::Dtype;
 
 fn silu(v: f64) -> f64 {
@@ -126,5 +127,104 @@ fn the_pointwise_kernels_answer_the_reference() {
                 .all(|(g, w)| g.to_bits() == w.to_bits()),
             "the cast lands on the host's bf16 rounding"
         );
+    }
+}
+
+/// The in-place bounds and gate: `clamp` (stated and learned bounds) and
+/// `x *= sigmoid(gate)`, beside the hand-written kernels.
+#[test]
+fn the_clamps_and_the_gate_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    let (lo, hi) = (-0.7f32, 1.3f32);
+    let round = |v: f32| f64::from(widen(bf16(v)));
+    for (rows, width) in [(3usize, 64usize), (5, 1000), (3, 7)] {
+        let n = rows * width;
+        let bt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        let one = |buf: u32| Tensor::new(buf, 1, 1, Dtype::Bf16);
+        let shape = format!("{rows} x {width}");
+        let mut xv = noise(width as u64 + 40, n);
+        xv.push(7.0);
+        let mut gv: Vec<f32> = noise(width as u64 + 41, n)
+            .iter()
+            .map(|v| v * 20.0)
+            .collect();
+        gv.push(0.0);
+        let (_, xr) = gpu.up(&xv);
+        let (g, gr) = gpu.up(&gv);
+        let (lo_t, _) = gpu.up(&[-0.4]);
+        let (hi_t, _) = gpu.up(&[0.9]);
+        let keep = |mut v: Vec<f64>| {
+            v[n] = 7.0;
+            v
+        };
+        let clamped = keep(
+            xr.iter()
+                .map(|v| f64::from(*v).clamp(round(lo), round(hi)))
+                .collect(),
+        );
+        let learned = keep(
+            xr.iter()
+                .map(|v| f64::from(*v).clamp(round(-0.4), round(0.9)))
+                .collect(),
+        );
+        let gated = keep(
+            xr.iter()
+                .zip(&gr)
+                .map(|(v, g)| f64::from(*v) / (1.0 + (-f64::from(*g)).exp()))
+                .collect(),
+        );
+        for slang in [false, true] {
+            let who = if slang { "slang " } else { "" };
+            let (x, _) = gpu.up(&xv);
+            if slang {
+                gpu.run_slang(|k| kernels_slang::elemwise::clamp::clamp(k, lo, hi, st(bt(x))));
+            } else {
+                gpu.run(|k| clip::clamp(k, lo, hi, bt(x)));
+            }
+            close(
+                &gpu.down(x, n + 1),
+                &clamped,
+                &format!("{who}clamp bf16 {shape}"),
+            );
+            let (x, _) = gpu.up(&xv);
+            if slang {
+                gpu.run_slang(|k| {
+                    kernels_slang::elemwise::clamp::clamp_learned(
+                        k,
+                        st(one(lo_t)),
+                        st(one(hi_t)),
+                        st(bt(x)),
+                    )
+                });
+            } else {
+                gpu.run(|k| clip::clamp_learned(k, one(lo_t), one(hi_t), bt(x)));
+            }
+            close(
+                &gpu.down(x, n + 1),
+                &learned,
+                &format!("{who}clamp learned bf16 {shape}"),
+            );
+            if !slang && n % 2 == 1 {
+                // The hand-written gate is not asked about an odd count.
+                continue;
+            }
+            let (x, _) = gpu.up(&xv);
+            if slang {
+                gpu.run_slang(|k| {
+                    kernels_slang::elemwise::sigmoid_mul::sigmoid_mul(k, st(bt(g)), st(bt(x)))
+                });
+            } else {
+                gpu.run(|k| gate::sigmoid_mul(k, bt(g), bt(x)));
+            }
+            close(
+                &gpu.down(x, n + 1),
+                &gated,
+                &format!("{who}sigmoid mul bf16 {shape}"),
+            );
+        }
     }
 }
