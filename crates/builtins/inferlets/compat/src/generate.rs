@@ -105,7 +105,9 @@ impl Sampling {
             return Err("min_p must be in [0, 1]".into());
         }
         if self.logprobs.is_some_and(|k| k > MAX_TOP_LOGPROBS) {
-            return Err(format!("top_logprobs must be at most {MAX_TOP_LOGPROBS}"));
+            return Err(format!(
+                "logprobs are at most {MAX_TOP_LOGPROBS} alternatives a token"
+            ));
         }
         Ok(())
     }
@@ -322,8 +324,18 @@ fn logprob_channels(
     })
 }
 
+/// A step's landed logprobs put in its channels, where asked.
+fn land(landed: Option<Landed>, channels: Option<(Channel, Option<Channel>)>) {
+    if let (Some(landed), Some((values, ids))) = (landed, channels) {
+        values.put(&landed.logprobs);
+        if let (Some(landed), Some(ids)) = (landed.ids, ids) {
+            ids.put(&landed);
+        }
+    }
+}
+
 /// A step's logprobs off the host side of its channels.
-async fn take_logprob(channels: &Option<(Channel, Option<Channel>)>) -> Result<Option<Logprob>> {
+async fn take_logprob(channels: Option<&(Channel, Option<Channel>)>) -> Result<Option<Logprob>> {
     let Some((values, ids)) = channels else {
         return Ok(None);
     };
@@ -462,8 +474,13 @@ pub async fn generate(
         });
         let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask_p"));
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
+        // Only the last span's token is sampled for the answer, so only it
+        // lands logprobs.
+        let sampling = Sampling {
+            logprobs: sampling.logprobs.filter(|_| k + 1 == spans.len()),
+            ..sampling
+        };
         let lp_ch = logprob_channels(sampling.logprobs, "_p", 1);
-        let lp_dev = lp_ch;
         let knobs = KnobChannels::new(&sampling, "_p");
 
         let fwd = ForwardPass::new();
@@ -491,12 +508,7 @@ pub async fn generate(
             );
             let token = reshape(token, [1]);
             g0_ch.put(&token);
-            if let (Some(landed), Some((values, ids))) = (landed, lp_dev) {
-                values.put(&landed.logprobs);
-                if let (Some(landed), Some(ids)) = (landed.ids, ids) {
-                    ids.put(&landed);
-                }
-            }
+            land(landed, lp_ch);
             if let Some((tok_in, hist)) = onward {
                 tok_in.put(&token);
                 if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
@@ -524,7 +536,7 @@ pub async fn generate(
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("prefill drain @{base}"))?;
-            lp0 = take_logprob(&lp_ch).await?;
+            lp0 = take_logprob(lp_ch.as_ref()).await?;
         }
     }
     let cached = ws.cached_tokens();
@@ -562,7 +574,6 @@ pub async fn generate(
     let rng = Channel::from([sampling.seed ^ 0x9e37, 1u32]).named("rng");
     let knobs = KnobChannels::new(&sampling, "");
     let lp_ch = logprob_channels(sampling.logprobs, "", channel_capacity() as u32);
-    let lp_dev = lp_ch;
     let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
     let hist = carried_hist.unwrap_or_else(|| {
         penalized.then(|| {
@@ -603,12 +614,7 @@ pub async fn generate(
             m.as_ref(),
         );
         let token = reshape(token, [1]);
-        if let (Some(landed), Some((values, ids))) = (landed, lp_dev) {
-            values.put(&landed.logprobs);
-            if let (Some(landed), Some(ids)) = (landed.ids, ids) {
-                ids.put(&landed);
-            }
-        }
+        land(landed, lp_ch);
         let r_next = &r + iota(2);
 
         tok_in.put(&token);
@@ -635,7 +641,7 @@ pub async fn generate(
                 fired += 1;
                 let t = out.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
-                let lp = take_logprob(&lp_ch).await?;
+                let lp = take_logprob(lp_ch.as_ref()).await?;
                 sampled += 1;
                 matcher.accept_tokens(&[token]).context("advance grammar")?;
                 if on_token(token, lp).is_break() || matcher.is_terminated() {
@@ -646,16 +652,14 @@ pub async fn generate(
         _ => {
             // A sampled token off `ch` to `on_token`: the prompt's, read once
             // the decode fires are queued, then each decode fire's off `out`
-            // (with its logprobs where asked; a carried prompt token has none).
+            // (with its logprobs where asked: logprobs turn the carry off, so
+            // a carried prompt token never has any).
             let mut take = async |ch: Channel,
                                   lp: Option<&(Channel, Option<Channel>)>|
                    -> std::result::Result<ControlFlow<()>, String> {
                 let t = ch.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
-                let lp = match lp {
-                    Some(lp) => take_logprob(&Some(*lp)).await?,
-                    None => None,
-                };
+                let lp = take_logprob(lp).await?;
                 sampled += 1;
                 Ok(on_token(token, lp))
             };
