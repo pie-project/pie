@@ -1818,6 +1818,9 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        if let Some(keepalive) = &self.keepalive {
+            keepalive.end();
+        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(
@@ -4398,6 +4401,7 @@ impl engine::frame::Shell for Shell {
     {
         if let Some(keepalive) = &self.keepalive {
             keepalive.touch();
+            keepalive.begin();
         }
         fire_trace(|| "encode-begin".to_string());
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
