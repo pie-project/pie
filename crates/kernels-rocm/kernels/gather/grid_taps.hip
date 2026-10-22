@@ -6,7 +6,7 @@
 // column into the first `side` rows and one on the row into the next
 // `side`. One thread per patch.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

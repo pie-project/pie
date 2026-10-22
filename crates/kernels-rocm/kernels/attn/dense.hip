@@ -7,8 +7,8 @@
 // LDS (V transposed), each lane masking to its row's segment. The head is
 // zero-padded to the stamp D; scores in the log2 domain.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 
 namespace pie::attn {
 

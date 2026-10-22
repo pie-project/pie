@@ -4,7 +4,7 @@
 // each, landing side by side ([rows, heads·width]); an id outside the table
 // lands zeros. One thread per element.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 #include "linear/act_quant.hip"
 
 namespace pie::layout {

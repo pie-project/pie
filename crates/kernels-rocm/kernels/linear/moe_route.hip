@@ -4,7 +4,7 @@
 // experts, and the identity fan-out of a grouped projection. One thread per
 // token row (per route slot for the grouping).
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::linear {
 

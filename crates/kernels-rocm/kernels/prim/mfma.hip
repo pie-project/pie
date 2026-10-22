@@ -5,7 +5,7 @@
 // 4(l/16)+t, col l%16), so a row-major A and a k-major B each load one
 // 8-byte read a lane.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie {
 

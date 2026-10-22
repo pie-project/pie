@@ -9,7 +9,7 @@ use crate::jit::{
 };
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
-const FILE: &str = "attn/ssm.hip";
+const FILE: &str = "ssm/mixers.hip";
 
 const BLOCK: u32 = 256;
 

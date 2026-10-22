@@ -151,7 +151,7 @@ fn envelope_update_appended(
 
     ctx.fire(
         op,
-        Fire::at("layout/envelope.hip", "::pie::layout::update_appended").apply(Launch::grid(
+        Fire::at("attn/kv_envelope.hip", "::pie::layout::update_appended").apply(Launch::grid(
             [max_touched.unsigned_abs(), kv_heads.unsigned_abs(), 1],
             [threads_for(head_dim), 1, 1],
         )),

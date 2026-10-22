@@ -6,7 +6,7 @@
 // into device cells, and on commit the rings advance and device-written
 // cells are published back.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::channel {
 

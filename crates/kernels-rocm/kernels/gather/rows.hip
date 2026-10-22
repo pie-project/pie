@@ -3,7 +3,7 @@
 // Row gathers, splits and copies: pure data movement, 16 bytes at a time
 // where the row allows it.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

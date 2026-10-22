@@ -5,7 +5,7 @@
 // channel-major (order 0) or pixel-major (order 1), the frame repeated
 // width / (3·patch²) times. One block per patch.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

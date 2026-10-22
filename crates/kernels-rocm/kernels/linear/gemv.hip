@@ -4,7 +4,7 @@
 // projection a decode step runs. Weight rows are K bf16, K a multiple of 8,
 // loaded 16 bytes per lane; f32 accumulation.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::linear {
 

@@ -4,7 +4,7 @@
 // table rows (a vision tower's position table resampled to an image's
 // grid). An id outside the table reads row 0. One block per row.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

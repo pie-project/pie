@@ -5,7 +5,7 @@
 // rounded outward (min down, max up) so a bf16 envelope still contains every
 // key it summarises.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

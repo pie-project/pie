@@ -11,8 +11,8 @@
 // no NaN is made; a reader converts in registers to bf16 of half the value
 // and folds `kE4m3Unit` into its scales.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 
 namespace pie::attn {
 

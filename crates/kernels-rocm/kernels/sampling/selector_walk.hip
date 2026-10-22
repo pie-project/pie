@@ -9,7 +9,7 @@
 // first row). The rows chain through their picks, so a request is one block
 // that walks its rows in order; within a row, 16 lanes score each candidate.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::attn {
 

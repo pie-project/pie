@@ -8,8 +8,8 @@
 // S' rounds. A slot's conv state holds its last (K−1)·dil + 1 inputs, oldest
 // first. A captured launch reads its extent from the window.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 
 namespace pie::attn {
 

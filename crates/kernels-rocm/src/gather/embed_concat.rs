@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "layout/embed_concat.hip";
+const FILE: &str = "gather/embed_concat.hip";
 
 const BLOCK: u32 = 256;
 
@@ -180,7 +180,7 @@ pub fn embed_mlx_affine(
     // A tensor-parallel vocab band gathers only its own ids and lands zeros for
     // the rest; the model's all-reduce after the embed sums the bands.
     let offset = if band < vocab {
-        crate::layout::comm_rank(ctx, OP)?.saturating_mul(band)
+        crate::gather::rows::comm_rank(ctx, OP)?.saturating_mul(band)
     } else {
         0
     };

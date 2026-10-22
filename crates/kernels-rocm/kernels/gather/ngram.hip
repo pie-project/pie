@@ -6,7 +6,7 @@
 // an eos sees eos; those before the fire come from the slot's state (the
 // last `ngram − 1` ids, stored + 1 so 0 reads as none).
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::attn {
 

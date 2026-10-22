@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const TOPK_FILE: &str = "layout/topk.hip";
+const TOPK_FILE: &str = "sampling/topk.hip";
 
 const TOPK_THREADS: u32 = 1024;
 

@@ -3,7 +3,7 @@
 // Flat pointwise ops: one thread per element of a `width`-wide plane, f32
 // arithmetic, one rounding on the store.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::elemwise {
 

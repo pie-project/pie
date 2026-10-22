@@ -5,7 +5,7 @@
 // + coeff[t][k·groups + c/group]) · x[t−k][c], t from the request's first
 // row. A thread a (channel, request), walking the request's rows.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::attn {
 

@@ -6,7 +6,7 @@
 // a tie to the lower column; NaN never ranks; an empty slot (-inf, kNone)
 // loses to every column.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

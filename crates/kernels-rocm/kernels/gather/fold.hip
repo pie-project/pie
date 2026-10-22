@@ -4,7 +4,7 @@
 // squares, laid out block by block): averaged into one row, or set side by
 // side into one wide row. One block per folded row.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

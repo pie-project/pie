@@ -2,7 +2,7 @@ use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Launch};
 
-const FILE: &str = "channel/channels.hip";
+const FILE: &str = "runtime/channel.hip";
 
 pub type DevicePtr = u64;
 
@@ -56,11 +56,11 @@ impl Ticket {
 
 const _: () = assert!(
     core::mem::size_of::<Ticket>() == 64,
-    "channel::Ticket: sizeof disagrees with `channel/channels.cuh`'s Ticket",
+    "channel::Ticket: sizeof disagrees with `runtime/channel.hip`'s Ticket",
 );
 const _: () = assert!(
     core::mem::align_of::<Ticket>() == 8,
-    "channel::Ticket: alignof disagrees with `channel/channels.cuh`'s Ticket",
+    "channel::Ticket: alignof disagrees with `runtime/channel.hip`'s Ticket",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,7 +76,7 @@ pub struct PullLane {
 
 const _: () = assert!(
     core::mem::size_of::<PullLane>() == 32,
-    "channel::PullLane: sizeof disagrees with `channel/channels.cuh`'s PullLane",
+    "channel::PullLane: sizeof disagrees with `runtime/channel.hip`'s PullLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,7 +95,7 @@ pub struct BumpLane {
 
 const _: () = assert!(
     core::mem::size_of::<BumpLane>() == 72,
-    "channel::BumpLane: sizeof disagrees with `channel/channels.cuh`'s BumpLane",
+    "channel::BumpLane: sizeof disagrees with `runtime/channel.hip`'s BumpLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -108,7 +108,7 @@ pub struct PublishLane {
 
 const _: () = assert!(
     core::mem::size_of::<PublishLane>() == 16,
-    "channel::PublishLane: sizeof disagrees with `channel/channels.cuh`'s PublishLane",
+    "channel::PublishLane: sizeof disagrees with `runtime/channel.hip`'s PublishLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,7 +121,7 @@ pub struct SettleLane {
 
 const _: () = assert!(
     core::mem::size_of::<SettleLane>() == 16,
-    "channel::SettleLane: sizeof disagrees with `channel/channels.cuh`'s SettleLane",
+    "channel::SettleLane: sizeof disagrees with `runtime/channel.hip`'s SettleLane",
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

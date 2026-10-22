@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "layout/embed_weighted.hip";
+const FILE: &str = "gather/embed_weighted.hip";
 
 /// Lanes per wavefront on CDNA: a block is a whole number of them.
 const WAVE: u32 = 64;

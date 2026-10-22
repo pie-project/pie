@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, Tensor};
 
-const FILE: &str = "attn/selector_walk.hip";
+const FILE: &str = "sampling/selector_walk.hip";
 
 const THREADS: u32 = 256;
 

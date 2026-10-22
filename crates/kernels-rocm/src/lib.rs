@@ -1,30 +1,6 @@
 pub mod attn;
 pub mod tuning;
 
-#[path = "layout/fold.rs"]
-mod layout_fold;
-
-#[path = "layout/scatter_live.rs"]
-mod layout_scatter_live;
-
-#[path = "layout/embed_weighted.rs"]
-mod layout_embed_weighted;
-
-#[path = "attn/ple.rs"]
-mod attn_ple;
-
-#[path = "layout/embed_concat.rs"]
-mod layout_embed_concat;
-
-#[path = "layout/embed_e4m3.rs"]
-mod layout_embed_e4m3;
-
-#[path = "layout/concat_cols.rs"]
-mod layout_concat_cols;
-
-#[path = "layout/pixels.rs"]
-mod layout_pixels;
-
 pub mod collective;
 pub mod conv;
 pub mod disk;
@@ -34,7 +10,6 @@ pub mod gather;
 #[cfg(feature = "rocm")]
 pub mod hip;
 pub mod jit;
-mod layout;
 pub mod linear;
 pub mod runtime;
 pub mod sampling;

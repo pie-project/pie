@@ -4,7 +4,7 @@
 // a tower's rows placed into the token rows they stand for. One block per
 // row.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::layout {
 

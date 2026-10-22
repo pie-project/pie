@@ -6,7 +6,7 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "layout/layout.hip";
+const FILE: &str = "gather/rows.hip";
 
 const BLOCK: u32 = 256;
 

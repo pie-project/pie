@@ -231,7 +231,7 @@ fn embed_scale_add_and_shards() {
     let y = gpu.zeros(rows, hidden, Dtype::Bf16);
     ctx.fire(
         "test.embed_vocab_shard",
-        Fire::at("layout/layout.hip", "::pie::layout::embed_vocab_shard")
+        Fire::at("gather/rows.hip", "::pie::layout::embed_vocab_shard")
             .apply(Launch::grid([rows, 1, 1], [256, 1, 1])),
         &[
             id_t.arg(),
@@ -264,7 +264,7 @@ fn embed_scale_add_and_shards() {
     let total = rows * (world * shard) as u32;
     ctx.fire(
         "test.gather_width_concat",
-        Fire::at("layout/layout.hip", "::pie::layout::gather_width_concat")
+        Fire::at("gather/rows.hip", "::pie::layout::gather_width_concat")
             .apply(Launch::flat(total, 256)),
         &[
             src.arg(),
@@ -799,7 +799,7 @@ fn envelope_update_appended() {
         let fire = || {
             ctx.fire(
                 "test.envelope",
-                Fire::at("layout/envelope.hip", "::pie::layout::update_appended")
+                Fire::at("attn/kv_envelope.hip", "::pie::layout::update_appended")
                     // Two slots past the four touched pages do nothing.
                     .apply(Launch::grid(
                         [6, kv_heads as u32, 1],
