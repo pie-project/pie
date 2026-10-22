@@ -3,3 +3,4 @@ pub mod gated_rms;
 pub mod layernorm;
 pub mod norm;
 pub mod residual_add;
+pub mod standardize;

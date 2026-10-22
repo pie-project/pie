@@ -368,12 +368,13 @@ impl Run<'_> {
                 bias,
                 scale,
                 x_out: _,
-            } => elemwise::norm::standardize(
-                self.ctx(),
-                self.tensor(*bias),
-                self.tensor(*scale),
-                self.tensor(*x),
-            ),
+            } => kernels_slang::elemwise::standardize::standardize(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*bias)),
+                crate::encode::slang_tensor(self.tensor(*scale)),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::MulScalar { s, x, x_out: _ } => {
                 elemwise::norm::mul_scalar(self.ctx(), *s, self.tensor(*x))
             }

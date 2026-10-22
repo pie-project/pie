@@ -629,3 +629,41 @@ fn the_layernorms_answer_the_reference() {
         );
     }
 }
+
+#[test]
+fn standardize_answers_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    for (rows, width) in [(3usize, 64usize), (5, 1000)] {
+        let n = rows * width;
+        let bt = |buf: u32, rows: usize| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        let xv = noise(width as u64 + 11, n);
+        let (_, xr) = gpu.up(&xv);
+        let (b, br) = gpu.up(&noise(width as u64 + 12, width));
+        let (s, sr) = gpu.up(&noise(width as u64 + 13, width));
+        let want: Vec<f64> = (0..n)
+            .map(|i| (f64::from(xr[i]) - f64::from(br[i % width])) * f64::from(sr[i % width]))
+            .collect();
+        let shape = format!("{rows} x {width}");
+        let (y, _) = gpu.up(&xv);
+        gpu.run(|k| norm::standardize(k, bt(b, 1), bt(s, 1), bt(y, rows)));
+        close(&gpu.down(y, n), &want, &format!("standardize {shape}"));
+        let (y, _) = gpu.up(&xv);
+        gpu.run_slang(|k| {
+            kernels_slang::elemwise::standardize::standardize(
+                k,
+                st(bt(b, 1)),
+                st(bt(s, 1)),
+                st(bt(y, rows)),
+            )
+        });
+        close(
+            &gpu.down(y, n),
+            &want,
+            &format!("slang standardize {shape}"),
+        );
+    }
+}
