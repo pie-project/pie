@@ -94,7 +94,7 @@ constant constexpr int kSpan = 256;
   }
 }
 
-template <int SPLIT, bool PACKED = false>
+template <int SPLIT, bool PACKED = false, bool TWO = false, int DIAG = 0>
 [[kernel]] void
 affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
               const device bfloat *biases [[buffer(2)]], const device bfloat *table [[buffer(3)]],
@@ -159,7 +159,7 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
       for (int u = 0; u < U; ++u)
 #pragma unroll
         for (int f = 0; f < NF; ++f) {
-          q[u][f] = w0[f * apart + ulong(h0 + U + u) * wstep];
+          q[u][f] = DIAG == 2 ? q[u][f] ^ uint2(h0) : w0[f * apart + ulong(h0 + U + u) * wstep];
           qs[u][f] = float(s0[f * fstep + (h0 + U + u) * gstep]);
           qb[u][f] = float(b0[f * fstep + (h0 + U + u) * gstep]);
         }
@@ -168,20 +168,32 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
     for (int u = 0; u < U; ++u) {
       const int h = h0 + u;
       const vec<bfloat, 16> x = xt[ulong(h) * 32];
-      // One chain per 64 codes (one scale and bias).
-      float2 d[NF];
+      // One chain per 64 codes (one scale and bias); TWO: one per 32 of them, added.
+      float2 d[NF], d2[NF];
 #pragma unroll
       for (int f = 0; f < NF; ++f)
-        d[f] = float2(0.0f);
+        d[f] = d2[f] = float2(0.0f);
 #pragma unroll
       for (int j = 0; j < 2; ++j)
 #pragma unroll
         for (uint p = 0; p < 4; ++p) {
           const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
 #pragma unroll
-          for (int f = 0; f < NF; ++f)
-            mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
+          for (int f = 0; f < NF; ++f) {
+            if (DIAG == 1) {
+              // no MMA: the operands still built and folded in
+              d[f] += float2(as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u)) * float2(b);
+            } else {
+              mma(TWO && j == 1 ? d2[f] : d[f],
+                  as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
+            }
+          }
         }
+      if (TWO) {
+#pragma unroll
+        for (int f = 0; f < NF; ++f)
+          d[f] += d2[f];
+      }
       const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
                         *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
 #pragma unroll
@@ -249,6 +261,16 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   }
 }
 
+#define PIE_SG_DIAG_POINT(name, split, diag)                                                       \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split, false, false, diag>(           \
+      const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
+      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
+      constant int &, uint2, uint, uint);
+#define PIE_SG_TWO_POINT(name, split)                                                              \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split, false, true>(                  \
+      const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
+      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
+      constant int &, uint2, uint, uint);
 #define PIE_SG_PACKED_POINT(name, split)                                                           \
   template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split, true>(                         \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \

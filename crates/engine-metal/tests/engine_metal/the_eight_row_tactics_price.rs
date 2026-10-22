@@ -35,6 +35,9 @@ fn the_eight_row_tactics_price() {
     let tactics = [
         ("register", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
         ("reg-packed", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-two", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-nomma", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-noload", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
         ("reg-s1", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
         ("reg-s2", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
         ("reg-s4", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
@@ -147,6 +150,16 @@ fn the_eight_row_tactics_price() {
                     unsafe { std::env::remove_var("PIE_SG_PACKED") };
                 }
                 let banks_now = if use_packed { &packed_banks } else { &banks };
+                match *name {
+                    "reg-nomma" => unsafe { std::env::set_var("PIE_SG_DIAG", "1") },
+                    "reg-noload" => unsafe { std::env::set_var("PIE_SG_DIAG", "2") },
+                    _ => unsafe { std::env::remove_var("PIE_SG_DIAG") },
+                }
+                if *name == "reg-two" {
+                    unsafe { std::env::set_var("PIE_SG_TWO", "1") };
+                } else {
+                    unsafe { std::env::remove_var("PIE_SG_TWO") };
+                }
                 match name.strip_prefix("reg-s") {
                     Some(sp) => unsafe { std::env::set_var("PIE_SG_SPLIT", sp) },
                     None => unsafe { std::env::remove_var("PIE_SG_SPLIT") },

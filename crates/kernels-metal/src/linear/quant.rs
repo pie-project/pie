@@ -838,7 +838,14 @@ fn act_x_wt_over(
                         )?;
                     }
                     let packed = w.mpp_codes.filter(|_| std::env::var_os("PIE_SG_PACKED").is_some());
-                    let (entry, stamp) = if packed.is_some() {
+                    let diag: Option<u32> = std::env::var("PIE_SG_DIAG").ok().and_then(|v| v.parse().ok());
+                    let (entry, stamp) = if let Some(diag) = diag {
+                        let entry = symbol(&format!("affine_qmm_sg_diag{diag}_k{split}"));
+                        (entry, symbol(&format!("PIE_SG_DIAG_POINT(\"{entry}\",{split},{diag})")))
+                    } else if std::env::var_os("PIE_SG_TWO").is_some() {
+                        let entry = symbol(&format!("affine_qmm_sg_two_k{split}"));
+                        (entry, symbol(&format!("PIE_SG_TWO_POINT(\"{entry}\",{split})")))
+                    } else if packed.is_some() {
                         let entry = symbol(&format!("affine_qmm_sg_packed_k{split}"));
                         (entry, symbol(&format!("PIE_SG_PACKED_POINT(\"{entry}\",{split})")))
                     } else {
