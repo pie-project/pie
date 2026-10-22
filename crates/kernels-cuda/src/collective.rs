@@ -13,6 +13,17 @@ const MAX_BLOCKS: u64 = 36;
 /// Bytes of one `vllm::Signal`, rounded up to what a rank allocates.
 pub const SIGNAL_BYTES: u64 = 4096;
 
+/// Packs (16 bytes) of one rank's push slot: what one launch of the push
+/// kernel's blocks owns, 512 a block.
+pub const PUSH_PACKS: u64 = MAX_BLOCKS * 512;
+
+/// Bytes past a rank's stage of its push slots: two alternating sets, one
+/// slot for every rank of a group as wide as `world`.
+#[must_use]
+pub const fn push_bytes(world: u64) -> u64 {
+    2 * world * PUSH_PACKS * 16
+}
+
 /// A rank's view of a group whose ranks map one another's memory; its
 /// collectives read the peers' stages directly instead of going through NCCL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,11 +37,114 @@ pub struct Peers {
     pub stages: u64,
     /// `vllm::RankSignals`: every rank's signal block, in rank order.
     pub signals: u64,
+    /// The ranks reach one another only through host memory: `stage` is the
+    /// group's pinned, mapped block (`host_bytes`: the slots, `stage_bytes`
+    /// a gather slot), `stages` its flags there, and `signal` this rank's
+    /// epoch counts on its device (`HOST_COUNT_BYTES`).
+    pub host: bool,
 }
+
+/// Flags a rank holds in each lane of the host path: `kHostBlocks`, one a
+/// block.
+const HOST_BLOCKS: u64 = 36;
+
+/// Bytes of a rank's slot in the host path's reduce lane: a decode's
+/// residuals; past it NCCL reduces.
+const HOST_REDUCE_BYTES: u64 = 64 << 10;
+
+/// The host path's two lanes, each with its own slots, flags and epochs, so
+/// each always launches the same blocks: a block's slots and epoch are its
+/// own, and the packs a block stores are the packs its peer block reads in
+/// every call of its lane. Reduces run one block (a few kilobytes and one
+/// flag to poll), gathers eight (a vocabulary's logits).
+const HOST_REDUCE_GRID: u32 = 1;
+const HOST_GATHER_GRID: u32 = 8;
+
+/// Bytes of the pinned block the host path maps for a group as wide as
+/// `world` whose gather slots are `slot` bytes: both lanes' slot sets and
+/// flags.
+#[must_use]
+pub const fn host_bytes(world: u64, slot: u64) -> u64 {
+    2 * world * (HOST_REDUCE_BYTES + slot) + 2 * world * HOST_BLOCKS * 4
+}
+
+/// Where the flags start in that block: past both lanes' slot sets.
+#[must_use]
+pub const fn host_flags_at(world: u64, slot: u64) -> u64 {
+    2 * world * (HOST_REDUCE_BYTES + slot)
+}
+
+/// Bytes of a rank's epoch counts on its device: both lanes'.
+pub const HOST_COUNT_BYTES: u64 = 2 * HOST_BLOCKS * 4;
 
 impl Peers {
     fn carries(&self, t: &Tensor) -> bool {
         t.dtype == dtype::Dtype::Bf16 && aligned16(t.ptr) && (t.elements() * 2).is_multiple_of(16)
+    }
+
+    /// Whether the host path's lane for a reduce (or a gather) holds a
+    /// rank's `bytes`; always where the ranks map one another.
+    fn holds(&self, reduce: bool, bytes: u64) -> bool {
+        !self.host
+            || bytes
+                <= if reduce {
+                    HOST_REDUCE_BYTES
+                } else {
+                    self.stage_bytes
+                }
+    }
+
+    /// The lane's launch and its slots, slot bytes, flags and counts.
+    fn host_lane(&self, reduce: bool) -> (Launch, u64, u64, u64, u64) {
+        let world = u64::from(self.world);
+        let flags = world * HOST_BLOCKS * 4;
+        if reduce {
+            (
+                Launch::grid([HOST_REDUCE_GRID, 1, 1], [THREADS, 1, 1]),
+                self.stage,
+                HOST_REDUCE_BYTES,
+                self.stages,
+                self.signal,
+            )
+        } else {
+            (
+                Launch::grid([HOST_GATHER_GRID, 1, 1], [THREADS, 1, 1]),
+                self.stage + 2 * world * HOST_REDUCE_BYTES,
+                self.stage_bytes,
+                self.stages + flags,
+                self.signal + HOST_BLOCKS * 4,
+            )
+        }
+    }
+
+    fn host_entry(&self, reduce: bool) -> Option<&'static str> {
+        Some(match (reduce, self.world) {
+            (true, 2) => "::pie::collective::all_reduce_host<__nv_bfloat16, 2>",
+            (false, 2) => "::pie::collective::all_gather_host<__nv_bfloat16, 2>",
+            (true, 4) => "::pie::collective::all_reduce_host<__nv_bfloat16, 4>",
+            (false, 4) => "::pie::collective::all_gather_host<__nv_bfloat16, 4>",
+            (true, 8) => "::pie::collective::all_reduce_host<__nv_bfloat16, 8>",
+            (false, 8) => "::pie::collective::all_gather_host<__nv_bfloat16, 8>",
+            _ => return None,
+        })
+    }
+
+    fn push_entry(&self) -> Option<&'static str> {
+        Some(match self.world {
+            2 => "::pie::collective::all_reduce_push<__nv_bfloat16, 2>",
+            4 => "::pie::collective::all_reduce_push<__nv_bfloat16, 4>",
+            8 => "::pie::collective::all_reduce_push<__nv_bfloat16, 8>",
+            _ => return None,
+        })
+    }
+
+    fn push_gather_entry(&self) -> Option<&'static str> {
+        Some(match self.world {
+            2 => "::pie::collective::all_gather_push<__nv_bfloat16, 2>",
+            4 => "::pie::collective::all_gather_push<__nv_bfloat16, 4>",
+            8 => "::pie::collective::all_gather_push<__nv_bfloat16, 8>",
+            _ => return None,
+        })
     }
 
     fn entry(&self, reduce: bool) -> Option<&'static str> {
@@ -69,10 +183,60 @@ impl Peers {
     }
 
     fn all_reduce(&self, ctx: &Ctx, op: &'static str, buf: &Tensor) -> Result<(), Error> {
+        let total = buf.elements() * 2;
+        if self.host {
+            let entry = self
+                .host_entry(true)
+                .ok_or_else(|| refuse(op, "no host-path kernel for this world"))?;
+            let packs = total / 16;
+            let (launch, slots, slot_bytes, flags, counts) = self.host_lane(true);
+            return ctx.fire(
+                op,
+                Fire::at(FILE, entry).apply(launch),
+                &[
+                    ArgValue::Ptr(flags),
+                    ArgValue::Ptr(counts),
+                    ArgValue::Ptr(slots),
+                    ArgValue::I64(slot_bytes as i64),
+                    ArgValue::Ptr(buf.ptr),
+                    ArgValue::I32(self.rank as i32),
+                    ArgValue::I32(
+                        i32::try_from(packs).map_err(|_| refuse(op, "a message past i32"))?,
+                    ),
+                ],
+            );
+        }
+        // A message the push slots hold goes in one launch, no staging copy.
+        if total / 16 <= PUSH_PACKS
+            && let Some(entry) = self.push_entry()
+        {
+            let packs = total / 16;
+            let threads = if packs >= 512 {
+                512
+            } else {
+                packs.next_multiple_of(32).max(32) as u32
+            };
+            return ctx.fire(
+                op,
+                Fire::at(FILE, entry).apply(Launch::grid(
+                    [packs.div_ceil(512).max(1) as u32, 1, 1],
+                    [threads, 1, 1],
+                )),
+                &[
+                    ArgValue::Ptr(self.stages),
+                    ArgValue::Ptr(self.signals),
+                    ArgValue::Ptr(self.signal),
+                    ArgValue::Ptr(buf.ptr),
+                    ArgValue::I32(self.rank as i32),
+                    ArgValue::I32(packs as i32),
+                    ArgValue::I64(self.stage_bytes as i64),
+                    ArgValue::I32(PUSH_PACKS as i32),
+                ],
+            );
+        }
         let entry = self
             .entry(true)
             .ok_or_else(|| refuse(op, "no peer kernel for this world"))?;
-        let total = buf.elements() * 2;
         let chunk = self.stage_bytes & !15;
         let mut done = 0;
         while done < total {
@@ -99,6 +263,60 @@ impl Peers {
     }
 
     fn all_gather(&self, ctx: &Ctx, op: &'static str, x: &Tensor, y: &Tensor) -> Result<(), Error> {
+        // A shard the push slots hold goes in one launch, no staging copy.
+        let shard = x.elements() * 2 / 16;
+        if !self.host
+            && shard <= PUSH_PACKS
+            && let Some(entry) = self.push_gather_entry()
+        {
+            let threads = if shard >= 512 {
+                512
+            } else {
+                shard.next_multiple_of(32).max(32) as u32
+            };
+            return ctx.fire(
+                op,
+                Fire::at(FILE, entry).apply(Launch::grid(
+                    [shard.div_ceil(512).max(1) as u32, 1, 1],
+                    [threads, 1, 1],
+                )),
+                &[
+                    ArgValue::Ptr(self.stages),
+                    ArgValue::Ptr(self.signals),
+                    ArgValue::Ptr(self.signal),
+                    ArgValue::Ptr(x.ptr),
+                    ArgValue::Ptr(y.ptr),
+                    ArgValue::I32(self.rank as i32),
+                    ArgValue::I32(x.rows as i32),
+                    ArgValue::I32((u64::from(x.width) * 2 / 16) as i32),
+                    ArgValue::I64(self.stage_bytes as i64),
+                    ArgValue::I32(PUSH_PACKS as i32),
+                ],
+            );
+        }
+        if self.host {
+            let entry = self
+                .host_entry(false)
+                .ok_or_else(|| refuse(op, "no host-path kernel for this world"))?;
+            let width = i32::try_from(u64::from(x.width) * 2 / 16)
+                .map_err(|_| refuse(op, "a row past i32 packs"))?;
+            let (launch, slots, slot_bytes, flags, counts) = self.host_lane(false);
+            return ctx.fire(
+                op,
+                Fire::at(FILE, entry).apply(launch),
+                &[
+                    ArgValue::Ptr(flags),
+                    ArgValue::Ptr(counts),
+                    ArgValue::Ptr(slots),
+                    ArgValue::I64(slot_bytes as i64),
+                    ArgValue::Ptr(x.ptr),
+                    ArgValue::Ptr(y.ptr),
+                    ArgValue::I32(self.rank as i32),
+                    ArgValue::I32(x.rows as i32),
+                    ArgValue::I32(width),
+                ],
+            );
+        }
         let entry = self
             .entry(false)
             .ok_or_else(|| refuse(op, "no peer kernel for this world"))?;
@@ -167,6 +385,7 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_reduce";
     if let Some(peers) = ctx.peers()
         && peers.carries(buf)
+        && peers.holds(true, buf.elements() * 2)
     {
         return peers.all_reduce(ctx, OP, buf);
     }
@@ -204,6 +423,7 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_gather";
     if let Some(peers) = ctx.peers()
         && peers.carries(&x)
+        && peers.holds(false, x.elements() * 2)
         && x.width.is_multiple_of(8)
         && aligned16(y.ptr)
         && y.rows == x.rows

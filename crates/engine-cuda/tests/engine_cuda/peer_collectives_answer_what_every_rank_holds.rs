@@ -64,6 +64,39 @@ fn peer_collectives_answer_what_every_rank_holds() {
         assert_eq!(values(&got), want);
     }
 
+    // A decode's messages go through the push slots, a launch each; their
+    // sets alternate, so a run of them in mixed sizes reuses every slot.
+    for (rows, width) in [
+        (1u32, 1024u32),
+        (40, 2880),
+        (3, 1024),
+        (1, 2880),
+        (40, 2880),
+    ] {
+        let mut bufs: Vec<Buffer> = (0..2)
+            .map(|rank| {
+                let mut buf = Buffer::zeroed((rows * width * 2) as usize).unwrap();
+                buf.write(0, &plane(rows, width, rank)).unwrap();
+                buf
+            })
+            .collect();
+        for (ctx, buf) in ctxs.iter().zip(&mut bufs) {
+            let mut t = Tensor::new(buf.ptr(), rows, width, Dtype::Bf16);
+            collective::all_reduce(ctx, &mut t).unwrap();
+        }
+        for device in &devices {
+            device.synchronize().unwrap();
+        }
+        let want: Vec<f32> = (0..rows * width)
+            .map(|i| 2.0 * (i % 61) as f32 + 100.0)
+            .collect();
+        for buf in &bufs {
+            let mut got = vec![0u8; (rows * width * 2) as usize];
+            buf.read(0, &mut got).unwrap();
+            assert_eq!(values(&got), want);
+        }
+    }
+
     let (rows, width) = (5u32, 1024u32);
     let xs: Vec<Buffer> = (0..2)
         .map(|rank| {
@@ -102,4 +135,89 @@ fn peer_collectives_answer_what_every_rank_holds() {
         y.read(0, &mut got).unwrap();
         assert_eq!(values(&got), want);
     }
+}
+
+/// The host path, two ranks on one device: a run of decode-sized reduces in
+/// mixed sizes and gathers (a vocabulary's logits row among them) through the
+/// pinned slots, each lane's slots alternating as their epochs do.
+#[test]
+fn host_collectives_answer_what_every_rank_holds() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let peers = engine_cuda::comm::open_host_peers(&[0, 0]).expect("the host path opens");
+    assert!(peers.iter().all(|p| p.host));
+    let devices: Vec<Context> = (0..2).map(|_| Context::bind(0, None).unwrap()).collect();
+    // SAFETY: the slots outlive the test; each context's stream is live.
+    let ctxs: Vec<Ctx> = devices
+        .iter()
+        .zip(&peers)
+        .map(|(device, peers)| unsafe { Ctx::on(device.stream()).with_peers(*peers) })
+        .collect();
+    let gather = |rows: u32, width: u32| {
+        let xs: Vec<Buffer> = (0..2)
+            .map(|rank| {
+                let mut buf = Buffer::zeroed((rows * width * 2) as usize).unwrap();
+                buf.write(0, &plane(rows, width, rank)).unwrap();
+                buf
+            })
+            .collect();
+        let ys: Vec<Buffer> = (0..2)
+            .map(|_| Buffer::zeroed((rows * width * 4) as usize).unwrap())
+            .collect();
+        for ((ctx, x), y) in ctxs.iter().zip(&xs).zip(&ys) {
+            let mut out = Tensor::new(y.ptr(), rows, 2 * width, Dtype::Bf16);
+            collective::all_gather(
+                ctx,
+                Tensor::new(x.ptr(), rows, width, Dtype::Bf16),
+                &mut out,
+            )
+            .unwrap();
+        }
+        for device in &devices {
+            device.synchronize().unwrap();
+        }
+        let shards: Vec<Vec<f32>> = (0..2)
+            .map(|rank| values(&plane(rows, width, rank)))
+            .collect();
+        let want: Vec<f32> = (0..rows as usize)
+            .flat_map(|r| {
+                shards
+                    .iter()
+                    .flat_map(move |s| s[r * width as usize..(r + 1) * width as usize].to_vec())
+            })
+            .collect();
+        for y in &ys {
+            let mut got = vec![0u8; (rows * width * 4) as usize];
+            y.read(0, &mut got).unwrap();
+            assert_eq!(values(&got), want, "a {rows} x {width} gather");
+        }
+    };
+    for (rows, width) in [(1u32, 1024u32), (8, 2880), (3, 1024), (1, 2880), (8, 2880)] {
+        let mut bufs: Vec<Buffer> = (0..2)
+            .map(|rank| {
+                let mut buf = Buffer::zeroed((rows * width * 2) as usize).unwrap();
+                buf.write(0, &plane(rows, width, rank)).unwrap();
+                buf
+            })
+            .collect();
+        for (ctx, buf) in ctxs.iter().zip(&mut bufs) {
+            let mut t = Tensor::new(buf.ptr(), rows, width, Dtype::Bf16);
+            collective::all_reduce(ctx, &mut t).unwrap();
+        }
+        for device in &devices {
+            device.synchronize().unwrap();
+        }
+        let want: Vec<f32> = (0..rows * width)
+            .map(|i| 2.0 * (i % 61) as f32 + 100.0)
+            .collect();
+        for buf in &bufs {
+            let mut got = vec![0u8; (rows * width * 2) as usize];
+            buf.read(0, &mut got).unwrap();
+            assert_eq!(values(&got), want, "a {rows} x {width} reduce");
+        }
+        gather(1, 124_160);
+    }
+    gather(5, 1024);
 }

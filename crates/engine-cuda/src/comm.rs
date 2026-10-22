@@ -180,10 +180,21 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
                 eprintln!("engine-cuda: peer collectives carry the group's bf16 messages");
                 peers
             }
-            Err(fault) => {
-                eprintln!("engine-cuda: peer collectives are off, NCCL carries them: {fault}");
-                None
-            }
+            Err(fault) => match wire_host(ordinals) {
+                Ok(peers) => {
+                    eprintln!(
+                        "engine-cuda: peer collectives go through host memory, NCCL carries \
+                         what a slot cannot hold: {fault}"
+                    );
+                    Some(peers)
+                }
+                Err(host) => {
+                    eprintln!(
+                        "engine-cuda: peer collectives are off, NCCL carries them: {fault}; {host}"
+                    );
+                    None
+                }
+            },
         }
     }
     #[cfg(not(feature = "device"))]
@@ -191,6 +202,75 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
         let _ = ordinals;
         None
     }
+}
+
+/// The host path alone, as `open_peers` falls back to it: for tests, which
+/// run it where the devices could reach one another.
+#[must_use]
+pub fn open_host_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peers>> {
+    #[cfg(feature = "device")]
+    {
+        wire_host(ordinals).ok()
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = ordinals;
+        None
+    }
+}
+
+/// Bytes of a rank's host slot: a decode's messages and a vocabulary's
+/// logits row; past it NCCL carries the message.
+#[cfg(feature = "device")]
+const HOST_SLOT_BYTES: u64 = 1 << 20;
+
+/// The host path where devices cannot reach one another: one pinned block
+/// every device maps, two sets of a slot a rank and a flag a rank and block,
+/// and on each device its epoch counts. A peer read of a few kilobytes
+/// across PCIe and a flag poll cost a decode's all-reduce a few microseconds,
+/// where NCCL's host transport costs it tens.
+#[cfg(feature = "device")]
+fn wire_host(ordinals: &[i32]) -> Result<Vec<kernels_cuda::collective::Peers>> {
+    use crate::device::rt;
+
+    use crate::device::ctx::check;
+
+    let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
+    if !matches!(world, 2 | 4 | 8) {
+        return Err(Fault::program(
+            "comm::wire_host",
+            format!("no host path for a group of {world}"),
+        ));
+    }
+    let total = kernels_cuda::collective::host_bytes(u64::from(world), HOST_SLOT_BYTES);
+    let flags_at = kernels_cuda::collective::host_flags_at(u64::from(world), HOST_SLOT_BYTES);
+    let block = crate::device::Pinned::mapped(usize::try_from(total).unwrap_or(usize::MAX))?;
+    block.zero();
+    let base = block.device();
+    // The group's collectives use the block for the process's lifetime.
+    std::mem::forget(block);
+    let mut peers = Vec::with_capacity(ordinals.len());
+    for (rank, &a) in ordinals.iter().enumerate() {
+        let count_bytes = kernels_cuda::collective::HOST_COUNT_BYTES as usize;
+        let mut counts: *mut c_void = core::ptr::null_mut();
+        // SAFETY: live out-parameters; the counts live as long as the group.
+        unsafe {
+            check("cudaSetDevice", rt::cudaSetDevice(a))?;
+            check("cudaMalloc", rt::cudaMalloc(&raw mut counts, count_bytes))?;
+            check("cudaMemset", rt::cudaMemset(counts, 0, count_bytes))?;
+        }
+        peers.push(kernels_cuda::collective::Peers {
+            rank: rank as u32,
+            world,
+            stage: base,
+            stage_bytes: HOST_SLOT_BYTES,
+            signal: counts as u64,
+            stages: base + flags_at,
+            signals: 0,
+            host: true,
+        });
+    }
+    Ok(peers)
 }
 
 #[cfg(feature = "device")]
@@ -279,9 +359,14 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
         unsafe {
             check("cudaSetDevice", rt::cudaSetDevice(a))?;
             let signal_bytes = kernels_cuda::collective::SIGNAL_BYTES as usize + table;
-            let stage =
-                crate::device::elastic::shared(a, ordinals, STAGE_BYTES + signal_bytes as u64)?;
-            let signal = stage + STAGE_BYTES;
+            // The stage, then the push slots past it, then the signal block.
+            let push = kernels_cuda::collective::push_bytes(u64::from(world));
+            let stage = crate::device::elastic::shared(
+                a,
+                ordinals,
+                STAGE_BYTES + push + signal_bytes as u64,
+            )?;
+            let signal = stage + STAGE_BYTES + push;
             check(
                 "cudaMemset",
                 rt::cudaMemset(signal as *mut c_void, 0, signal_bytes),
@@ -323,6 +408,7 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             signal: signals[rank],
             stages: tables[rank],
             signals: tables[rank] + size_of::<[u64; 8]>() as u64,
+            host: false,
         });
     }
     // What the driver advertises is not always what the link carries (#757).
