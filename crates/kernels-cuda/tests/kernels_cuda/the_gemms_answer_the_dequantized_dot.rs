@@ -4,7 +4,7 @@
 use crate::common::linear_ref::{Bench, TOL, Want, affine, check, dot, fp8_bank, glu_want};
 use crate::common::linear_ref::{pick, t, tab};
 use crate::common::{SM100, from_bf16, to_bf16};
-use dtype::Dtype::{Bf16, F32, I32, U8};
+use dtype::Dtype::{Bf16, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{self, Format, Source, Weight};
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::tc5::{Elem, Glu, atom_bytes, supported};
@@ -173,7 +173,7 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
             let s = b.side(Elem::E2m1, Some(16), n, k);
             let ts = tab(n, |r| 0.5 + (r % 9) as f32 / 8.0);
             let (c, sc, tt) = (b.up(&s.bytes), b.up(&s.codes), b.up(&ts));
-            let (c, sc, tt) = (t(c, n, k / 2, U8), t(sc, n, k / 16, U8), t(tt, n, 4, U8));
+            let (c, sc, tt) = (t(c, n, k / 2, Nvfp4), t(sc, n, k / 16, U8), t(tt, n, 4, U8));
             nvfp4::matmul(&ctx, "linear.matmul", xt, c, sc, tt, &mut y, seat).expect("fires");
             tab(n * k, |i| f64::from(s.value(i / k, k, i % k) * ts[i / k]))
         } else {
