@@ -262,7 +262,12 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
             Elemwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::norm::silu_scaled(self.ctx(), *s, self.tensor(*x))
+                kernels_slang::elemwise::silu_scaled::silu_scaled(
+                    &self.slang(),
+                    *s,
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                )
+                .map_err(crate::encode::from_slang)
             }
             Elemwise::HcMix {
                 gates,
@@ -375,12 +380,18 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*x)),
             )
             .map_err(crate::encode::from_slang),
-            Elemwise::MulScalar { s, x, x_out: _ } => {
-                elemwise::norm::mul_scalar(self.ctx(), *s, self.tensor(*x))
-            }
-            Elemwise::Scale { s, x, x_out: _ } => {
-                elemwise::norm::scale(self.ctx(), self.tensor(*s), self.tensor(*x))
-            }
+            Elemwise::MulScalar { s, x, x_out: _ } => kernels_slang::elemwise::scale::mul_scalar(
+                &self.slang(),
+                *s,
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Scale { s, x, x_out: _ } => kernels_slang::elemwise::scale::scale(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*s)),
+                crate::encode::slang_tensor(self.tensor(*x)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::ResBlend {
                 prefix,
                 blocks,

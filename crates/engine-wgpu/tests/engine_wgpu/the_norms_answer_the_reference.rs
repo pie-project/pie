@@ -667,3 +667,126 @@ fn standardize_answers_the_reference() {
         );
     }
 }
+
+fn silu(v: f64) -> f64 {
+    v / (1.0 + (-v).exp())
+}
+
+/// The in-place scalar forms, `x *= s` (stated or read) and `x = silu(x * s)`,
+/// over even and odd counts: an odd bf16 tensor ends mid-word, and the half
+/// past it must come back untouched.
+#[test]
+fn the_scalars_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    let s = 0.3f32;
+    let sb = f64::from(widen(bf16(s)));
+    for (rows, width) in [(3usize, 64usize), (5, 1000), (3, 7)] {
+        let n = rows * width;
+        let bt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        // One element past the tensor, a sentinel the kernels leave alone.
+        let mut xv = noise(width as u64 + 14, n);
+        xv.push(7.0);
+        let (sbuf, sr) = gpu.up(&[-1.25]);
+        let (_, xr) = gpu.up(&xv);
+        let mut stated: Vec<f64> = xr.iter().map(|v| f64::from(*v) * sb).collect();
+        let mut read: Vec<f64> = xr
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(sr[0]))
+            .collect();
+        let mut silued: Vec<f64> = xr
+            .iter()
+            .map(|v| silu(f64::from(*v) * f64::from(s)))
+            .collect();
+        for want in [&mut stated, &mut read, &mut silued] {
+            want[n] = 7.0;
+        }
+        let shape = format!("{rows} x {width}");
+        let even = n % 2 == 0;
+        for slang in [false, true] {
+            if !slang && !even {
+                continue;
+            }
+            let who = if slang { "slang " } else { "" };
+            let (x, _) = gpu.up(&xv);
+            if slang {
+                gpu.run_slang(|k| kernels_slang::elemwise::scale::mul_scalar(k, s, st(bt(x))));
+            } else {
+                gpu.run(|k| norm::mul_scalar(k, s, bt(x)));
+            }
+            close(
+                &gpu.down(x, n + 1),
+                &stated,
+                &format!("{who}mul scalar bf16 {shape}"),
+            );
+            let (x, _) = gpu.up(&xv);
+            let sv = Tensor::new(sbuf, 1, 1, Dtype::Bf16);
+            if slang {
+                gpu.run_slang(|k| kernels_slang::elemwise::scale::scale(k, st(sv), st(bt(x))));
+            } else {
+                gpu.run(|k| norm::scale(k, sv, bt(x)));
+            }
+            close(
+                &gpu.down(x, n + 1),
+                &read,
+                &format!("{who}scale bf16 {shape}"),
+            );
+            let (x, _) = gpu.up(&xv);
+            if slang {
+                gpu.run_slang(|k| {
+                    kernels_slang::elemwise::silu_scaled::silu_scaled(k, s, st(bt(x)))
+                });
+            } else {
+                gpu.run(|k| norm::silu_scaled(k, s, bt(x)));
+            }
+            close(
+                &gpu.down(x, n + 1),
+                &silued,
+                &format!("{who}silu scaled bf16 {shape}"),
+            );
+        }
+        if !even {
+            let (y, yr) = gpu.up(&noise(width as u64 + 15, n + 1));
+            let mut want: Vec<f64> = xr
+                .iter()
+                .zip(&yr)
+                .map(|(a, b)| f64::from(*a) + f64::from(*b))
+                .collect();
+            want[n] = f64::from(yr[n]);
+            let (x, _) = gpu.up(&xv);
+            gpu.run_slang(|k| {
+                kernels_slang::elemwise::residual_add::residual_add(k, st(bt(x)), st(bt(y)))
+            });
+            close(
+                &gpu.down(y, n + 1),
+                &want,
+                &format!("slang residual add bf16 {shape}"),
+            );
+        }
+        let ft = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
+        let x = gpu.up_f32(&xv);
+        gpu.run_slang(|k| kernels_slang::elemwise::scale::mul_scalar(k, s, st(ft(x))));
+        let mut want: Vec<f64> = xv.iter().map(|v| f64::from(*v) * f64::from(s)).collect();
+        want[n] = 7.0;
+        close(
+            &gpu.down_f32(x, n + 1),
+            &want,
+            &format!("slang mul scalar f32 {shape}"),
+        );
+        let x = gpu.up_f32(&xv);
+        gpu.run_slang(|k| kernels_slang::elemwise::silu_scaled::silu_scaled(k, s, st(ft(x))));
+        let mut want: Vec<f64> = xv
+            .iter()
+            .map(|v| silu(f64::from(*v) * f64::from(s)))
+            .collect();
+        want[n] = 7.0;
+        close(
+            &gpu.down_f32(x, n + 1),
+            &want,
+            &format!("slang silu scaled f32 {shape}"),
+        );
+    }
+}
