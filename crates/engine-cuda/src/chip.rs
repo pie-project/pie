@@ -936,9 +936,10 @@ mod tests {
                 other.gemm_tc5_split_tickets == 0,
                 "sm_{major}{minor} sums a tcgen05 GEMM's splits in a finalize launch"
             );
-            assert!(
-                !other.pdl,
-                "sm_{major}{minor} launches no kernel as a programmatic dependent"
+            assert_eq!(
+                other.pdl,
+                (major, minor) == (12, 0),
+                "sm_120 alone of these launches its kernels as programmatic dependents"
             );
             assert_eq!(
                 other.moe_w4a4_fused_from, 65_536,

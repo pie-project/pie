@@ -18,6 +18,10 @@ ssm.gdn_fused_scan = true
 moe.mxfp4_mma_from = 28
 moe.mxfp4_mma_until = 16777216
 
+# Kernels launch as programmatic dependents, their prologues under the
+# previous one's tail: Qwen3.5-0.8B decode +4% on one RTX PRO 6000, +7% on two.
+pdl = true
+
 # A prefill's fire on eight buckets a doubling from 256 rows: its GEMMs run
 # its bucket's rows, and a 556-row prompt padded to 1024 ran 84% more of
 # them (Qwen3.6-27B's prefill 30-35% faster on an H100, an A100 and an RTX
@@ -25,3 +29,8 @@ moe.mxfp4_mma_until = 16777216
 [engine]
 prefill_lattice_from = 256
 prefill_lattice_steps = 8
+
+# Independent chains on side streams: Qwen3.5-0.8B decode on two RTX PRO
+# 6000s +1% past the dependents alone.
+[compiler]
+dag_streams = true
