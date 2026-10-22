@@ -965,6 +965,28 @@ mod tests {
 
     #[cfg(not(feature = "rocm"))]
     #[test]
+    fn every_a100_runs_the_a100_file_and_another_ampere_its_family_alone() {
+        for gpu in [
+            "NVIDIA A100 80GB PCIe",
+            "NVIDIA A100-SXM4-80GB",
+            "NVIDIA A100-PCIE-40GB",
+        ] {
+            let (_, report) = resolve(gpu, &facts(8, 0, 108), None);
+            assert_eq!(
+                report.layers,
+                [
+                    profile::Source::Seeded("sm80.toml".into()),
+                    profile::Source::Seeded("sm80/nvidia-a100.toml".into())
+                ],
+                "{gpu}"
+            );
+        }
+        let (_, report) = resolve("NVIDIA A30", &facts(8, 0, 56), None);
+        assert_eq!(report.layers, [profile::Source::Seeded("sm80.toml".into())]);
+    }
+
+    #[cfg(not(feature = "rocm"))]
+    #[test]
     fn the_l40s_runs_its_family_measured_and_another_ada_the_same_unmeasured() {
         let (l40s, report) = resolve("NVIDIA L40S", &facts(8, 9, 142), None);
         assert_eq!(
