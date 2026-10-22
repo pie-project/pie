@@ -160,38 +160,43 @@ impl Run<'_> {
                 lane_of_row,
                 form,
                 y,
-            } => elemwise::modulate::modulate(
-                self.ctx(),
+            } => kernels_slang::elemwise::modulate::modulate(
+                &self.slang(),
                 match form {
-                    poem_ir::ModulateForm::ScaleShift => elemwise::modulate::Form::ScaleShift,
-                    poem_ir::ModulateForm::Scale => elemwise::modulate::Form::Scale,
-                    poem_ir::ModulateForm::TanhGate => elemwise::modulate::Form::TanhGate,
+                    poem_ir::ModulateForm::ScaleShift => {
+                        kernels_slang::elemwise::modulate::Form::ScaleShift
+                    }
+                    poem_ir::ModulateForm::Scale => kernels_slang::elemwise::modulate::Form::Scale,
+                    poem_ir::ModulateForm::TanhGate => {
+                        kernels_slang::elemwise::modulate::Form::TanhGate
+                    }
                 },
-                self.tensor(*x),
-                match lane_of_row {
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(match lane_of_row {
                     Some(_) => self.uncut(*m),
                     None => self.tensor(*m),
-                },
-                lane_of_row.map(|lanes| self.tensor(lanes)),
-                self.tensor(*y),
-            ),
+                }),
+                lane_of_row.map(|lanes| crate::encode::slang_tensor(self.tensor(lanes))),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::GatedResidualAdd {
                 r,
                 g,
                 y,
                 lane_of_row,
                 r_out: _,
-            } => elemwise::modulate::gated_residual_add(
-                self.ctx(),
-                self.tensor(*r),
-                match lane_of_row {
+            } => kernels_slang::elemwise::modulate::gated_residual_add(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*r)),
+                crate::encode::slang_tensor(match lane_of_row {
                     Some(_) => self.uncut(*g),
                     None => self.tensor(*g),
-                },
-                self.tensor(*y),
-                lane_of_row.map(|lanes| self.tensor(lanes)),
-                self.tensor(*r),
-            ),
+                }),
+                crate::encode::slang_tensor(self.tensor(*y)),
+                lane_of_row.map(|lanes| crate::encode::slang_tensor(self.tensor(lanes))),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::Sinusoid {
                 t,
                 dim,
@@ -199,15 +204,16 @@ impl Run<'_> {
                 flip_sin_cos,
                 scale,
                 y,
-            } => elemwise::sinusoid::sinusoid(
-                self.ctx(),
-                self.tensor(*t),
+            } => kernels_slang::elemwise::posenc::sinusoid(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*t)),
                 *dim,
                 *max_period,
                 *flip_sin_cos,
                 *scale,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::Silu { x, x_out: _ } => kernels_slang::elemwise::pointwise::silu(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*x)),

@@ -203,10 +203,68 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Elemwise::Modulate { .. }
-            | Elemwise::GatedResidualAdd { .. }
-            | Elemwise::Sinusoid { .. }
-            | Elemwise::RelativeBucketBias { .. }
+            Elemwise::Modulate {
+                x,
+                m,
+                lane_of_row,
+                form,
+                y,
+            } => kernels_slang::elemwise::modulate::modulate(
+                &self.slang(),
+                match form {
+                    poem_ir::ModulateForm::ScaleShift => {
+                        kernels_slang::elemwise::modulate::Form::ScaleShift
+                    }
+                    poem_ir::ModulateForm::Scale => kernels_slang::elemwise::modulate::Form::Scale,
+                    poem_ir::ModulateForm::TanhGate => {
+                        kernels_slang::elemwise::modulate::Form::TanhGate
+                    }
+                },
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(match lane_of_row {
+                    Some(_) => self.uncut(*m),
+                    None => self.tensor(*m),
+                }),
+                lane_of_row.map(|lanes| crate::encode::slang_tensor(self.tensor(lanes))),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::GatedResidualAdd {
+                r,
+                g,
+                y,
+                lane_of_row,
+                r_out: _,
+            } => kernels_slang::elemwise::modulate::gated_residual_add(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*r)),
+                crate::encode::slang_tensor(match lane_of_row {
+                    Some(_) => self.uncut(*g),
+                    None => self.tensor(*g),
+                }),
+                crate::encode::slang_tensor(self.tensor(*y)),
+                lane_of_row.map(|lanes| crate::encode::slang_tensor(self.tensor(lanes))),
+            )
+            .map_err(crate::encode::from_slang),
+            Elemwise::Sinusoid {
+                t,
+                dim,
+                max_period,
+                flip_sin_cos,
+                scale,
+                y,
+            } => kernels_slang::elemwise::posenc::sinusoid(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*t)),
+                *dim,
+                *max_period,
+                *flip_sin_cos,
+                *scale,
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+
+            Elemwise::RelativeBucketBias { .. }
             | Elemwise::Gelu { .. }
             | Elemwise::Hadamard { .. }
             | Elemwise::Mul { .. }
