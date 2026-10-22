@@ -40,7 +40,7 @@ fn too_large(len: usize) -> Option<String> {
 }
 
 enum Incoming {
-    Turn(TurnInput),
+    Turn(Box<TurnInput>),
     Cancel,
 }
 
@@ -218,8 +218,9 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
 
             incoming = rx_ws.next() => match incoming {
                 Some(Ok(frame @ (Message::Text(_) | Message::Binary(_)))) => match read(&frame) {
-                    Ok(Incoming::Turn(req)) if is_launch(&req) => admitting.push(admit(req)),
+                    Ok(Incoming::Turn(req)) if is_launch(&req) => admitting.push(admit(*req)),
                     Ok(Incoming::Turn(req)) => {
+                        let req = *req;
                         let corr = req.message.corr_id();
                         match handle.turn(req).await {
                             Ok(new_rx) => live.push(corr, new_rx),
@@ -258,7 +259,7 @@ async fn read_first_turn(
     loop {
         match rx_ws.next().await {
             Some(Ok(frame @ (Message::Text(_) | Message::Binary(_)))) => match read(&frame) {
-                Ok(Incoming::Turn(req)) => return Ok(req),
+                Ok(Incoming::Turn(req)) => return Ok(*req),
                 Ok(Incoming::Cancel) => continue,
                 Err(why) => return Err(Some((corr_of(&frame), why))),
             },
@@ -298,13 +299,13 @@ fn parse_incoming(text: &str) -> Result<Incoming, String> {
     }
     let payload: ClientMessage =
         serde_json::from_str(text).map_err(|e| format!("bad client frame: {e}"))?;
-    Ok(Incoming::Turn(into_turn(payload)))
+    Ok(Incoming::Turn(Box::new(into_turn(payload))))
 }
 
 fn parse_incoming_bytes(bytes: &[u8]) -> Result<Incoming, String> {
     let payload: ClientMessage =
         rmp_serde::from_slice(bytes).map_err(|e| format!("bad client frame: {e}"))?;
-    Ok(Incoming::Turn(into_turn(payload)))
+    Ok(Incoming::Turn(Box::new(into_turn(payload))))
 }
 
 fn into_turn(payload: ClientMessage) -> TurnInput {

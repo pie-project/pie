@@ -1,4 +1,6 @@
-//! Keeps running turns even across the serving workers by moving them.
+//! Keeps running turns even across the serving workers by moving them. The
+//! gateway moves a turn only while it has sent no output, so in practice a
+//! turn that has not streamed yet; one it refuses is not asked again.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -6,7 +8,11 @@ use policy::{Dispatch, Id, Placement, Subject, SubjectKind, attr, candidates, cl
 
 #[derive(Default)]
 struct Rebalance {
+    /// Turns asked to move, which moved or are moving: each moves at most
+    /// once.
     moved: HashSet<Id>,
+    /// Moves the gateway refused, for the turn had sent output.
+    refused: HashSet<Id>,
 }
 
 impl cluster::Policy for Rebalance {
@@ -14,8 +20,14 @@ impl cluster::Policy for Rebalance {
         self.moved.insert(dispatch.process.clone());
     }
 
+    fn on_migration_failed(&mut self, process: &Id) {
+        self.moved.remove(process);
+        self.refused.insert(process.clone());
+    }
+
     fn on_exited(&mut self, exit: &policy::Exit) {
         self.moved.remove(&exit.process);
+        self.refused.remove(&exit.process);
     }
 
     fn plan(&mut self, _now_ms: u64) {
@@ -63,7 +75,7 @@ impl cluster::Policy for Rebalance {
             // The youngest has the least to carry.
             if let Some((_, process)) = turns
                 .iter()
-                .filter(|(_, p)| !self.moved.contains(p))
+                .filter(|(_, p)| !self.moved.contains(p) && !self.refused.contains(p))
                 .max_by_key(|(arrived, _)| *arrived)
             {
                 let _ = from;

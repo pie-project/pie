@@ -235,6 +235,20 @@ pub struct Lane {
     /// committed.
     #[serde(default)]
     pub reports: u64,
+    /// Pages of this lane's to read out as the fire computes them; only to
+    /// an engine that taps ([`crate::Engine::tap_groups`]).
+    #[serde(default)]
+    pub tap: Option<Tap>,
+}
+
+/// Pool pages `pages[i]` read into host kv slots `slots[i]` as the fire
+/// writes them, a group of their planes at a time (a layer's), each group
+/// told to the engine's tap sink under `tag` as it lands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tap {
+    pub tag: u64,
+    pub pages: Vec<u32>,
+    pub slots: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1,261 +1,27 @@
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
+//! Other workers' part in this one's passes: a pass's prefill run on a peer
+//! (`prefill`, streamed as it is computed by `stream`), and pages another
+//! worker's cache holds (`directory`).
 
-use anyhow::{Result, anyhow};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, RwLock};
 
 pub mod directory;
+pub mod executors;
 pub mod prefill;
+pub mod stream;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PartnerRole {
-    Prefill,
-    Encode,
-}
+static PREFILL_MIN_SUFFIX_TOKENS: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum TransferKind {
-    #[default]
-    Inline,
-    Nixl,
-}
-
-pub struct Partner {
-    worker_id: u64,
-    destination_worker_id: u64,
-    engine_id: Option<usize>,
-    role: PartnerRole,
-    transfer: TransferKind,
-    blob_host: RwLock<Option<IpAddr>>,
-    max_outstanding: u32,
-    outstanding: AtomicU32,
-    available: AtomicBool,
-    drained: tokio::sync::Notify,
-}
-
-impl Partner {
-    pub fn worker_id(&self) -> u64 {
-        self.worker_id
-    }
-
-    pub fn destination_worker_id(&self) -> u64 {
-        self.destination_worker_id
-    }
-
-    pub fn engine_id(&self) -> usize {
-        self.engine_id
-            .expect("only prefill partners have remote engine slots")
-    }
-
-    pub fn role(&self) -> PartnerRole {
-        self.role
-    }
-
-    pub fn outstanding(&self) -> u32 {
-        self.outstanding.load(Ordering::Relaxed)
-    }
-
-    pub fn mark_suspect(&self) {
-        self.available.store(false, Ordering::Release);
-    }
-
-    pub fn mark_available(&self) {
-        self.available.store(true, Ordering::Release);
-    }
-
-    pub fn blob_host(&self) -> Option<IpAddr> {
-        *self.blob_host.read().unwrap()
-    }
-
-    pub async fn wait_drained(&self) {
-        loop {
-            if self.outstanding() == 0 {
-                return;
-            }
-            let notified = self.drained.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.outstanding() == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    pub async fn pull_kv(&self, src_page_ids: Vec<u32>, dst_page_ids: Vec<u32>) -> Result<()> {
-        let _ = (src_page_ids, dst_page_ids);
-        Err(self.no_transport("pull_kv"))
-    }
-
-    pub async fn encode(&self, plan: engine::MediaEncode) -> Result<engine::MediaEncode> {
-        let _ = plan;
-        Err(self.no_transport("encode"))
-    }
-
-    fn no_transport(&self, verb: &'static str) -> anyhow::Error {
-        COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
-        anyhow!(
-            "partner {} cannot serve `{verb}`: remote executors are not \
-             supported in this release",
-            self.worker_id
-        )
-    }
-
-    fn try_claim(self: &Arc<Self>) -> Option<PartnerGuard> {
-        if self.transfer == TransferKind::Nixl && NIXL_QUARANTINED.load(Ordering::Acquire) {
-            return None;
-        }
-        if !self.available.load(Ordering::Acquire) {
-            return None;
-        }
-        let claimed = self
-            .outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.max_outstanding).then_some(current + 1)
-            })
-            .is_ok();
-        if !claimed {
-            return None;
-        }
-        if !self.available.load(Ordering::Acquire)
-            || (self.transfer == TransferKind::Nixl && NIXL_QUARANTINED.load(Ordering::Acquire))
-        {
-            let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
-            if previous == 1 {
-                self.drained.notify_waiters();
-            }
-            return None;
-        }
-        Some(PartnerGuard {
-            partner: Arc::clone(self),
-        })
-    }
-}
-
-pub struct PartnerGuard {
-    partner: Arc<Partner>,
-}
-
-impl PartnerGuard {
-    pub fn partner(&self) -> &Arc<Partner> {
-        &self.partner
-    }
-}
-
-impl Drop for PartnerGuard {
-    fn drop(&mut self) {
-        let previous = self.partner.outstanding.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0);
-        if previous == 1 {
-            self.partner.drained.notify_waiters();
-        }
-    }
-}
-
-type PartnerKey = (PartnerRole, u64);
-
-static PARTNERS: LazyLock<RwLock<HashMap<PartnerKey, Arc<Partner>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-pub fn remove_partner(worker_id: u64, role: PartnerRole) {
-    if let Some(partner) = PARTNERS.write().unwrap().remove(&(role, worker_id)) {
-        partner.mark_suspect();
-    }
-}
-
-pub fn close_engine_surrogates(engine_id: usize) {
-    let _ = engine_id;
-}
-
-pub(crate) fn close_home_instance(home_instance_id: u64) {
-    let _ = home_instance_id;
-}
-
-pub fn unregister_remote_store(model_idx: usize, engine_idx: usize) -> anyhow::Result<()> {
-    crate::store::registry::unregister_engine(model_idx, engine_idx)
-}
-
-pub fn select_partner(role: PartnerRole) -> Option<PartnerGuard> {
-    let candidates = PARTNERS
-        .read()
-        .unwrap()
-        .values()
-        .filter(|partner| {
-            partner.role == role
-                && partner.available.load(Ordering::Acquire)
-                && partner.outstanding() < partner.max_outstanding
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    match candidates.len() {
-        0 => None,
-        1 => candidates[0].try_claim(),
-        len => {
-            let first = (next_random() % len as u64) as usize;
-            let mut second = (next_random() % (len as u64 - 1)) as usize;
-            if second >= first {
-                second += 1;
-            }
-            let (a, b) = (&candidates[first], &candidates[second]);
-            let preferred = if (a.outstanding(), a.engine_id) <= (b.outstanding(), b.engine_id) {
-                [Arc::clone(a), Arc::clone(b)]
-            } else {
-                [Arc::clone(b), Arc::clone(a)]
-            };
-            let selected = preferred
-                .into_iter()
-                .find_map(|partner| partner.try_claim());
-            selected.or_else(|| candidates.iter().find_map(|partner| partner.try_claim()))
-        }
-    }
-}
-
-fn next_random() -> u64 {
-    static STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
-    let mut value = STATE
-        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
-        .wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OffloadSettings {
-    enabled: bool,
-    prefill_min_suffix_tokens: usize,
-    encode_injection: bool,
-    encode_hidden_size: u32,
-}
-
-static SETTINGS: LazyLock<RwLock<OffloadSettings>> = LazyLock::new(|| {
-    RwLock::new(OffloadSettings {
-        enabled: false,
-        prefill_min_suffix_tokens: 0,
-        encode_injection: false,
-        encode_hidden_size: 0,
-    })
-});
-static OFFLOAD_ENABLED: AtomicBool = AtomicBool::new(false);
-static ENCODE_INJECTION_ENABLED: AtomicBool = AtomicBool::new(false);
 static HOME_KV_HANDLE: LazyLock<RwLock<Option<engine::KvHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
-pub fn configure(enabled: bool, prefill_min_suffix_tokens: usize) {
-    let mut settings = SETTINGS.write().unwrap();
-    settings.enabled = enabled;
-    settings.prefill_min_suffix_tokens = prefill_min_suffix_tokens;
-    OFFLOAD_ENABLED.store(enabled, Ordering::Release);
+/// The configuration's shortest suffix worth a peer's prefill (`0`: the
+/// default).
+pub fn configure(prefill_min_suffix_tokens: usize) {
+    PREFILL_MIN_SUFFIX_TOKENS.store(prefill_min_suffix_tokens, Ordering::Release);
 }
 
-pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
-    let mut settings = SETTINGS.write().unwrap();
-    settings.encode_injection = enabled;
-    settings.encode_hidden_size = if enabled { hidden_size } else { 0 };
-    ENCODE_INJECTION_ENABLED.store(enabled, Ordering::Release);
-}
-
+/// This worker's kv as its engine exported it, for peers to read in place.
 pub fn set_home_kv_handle(handle: engine::KvHandle) {
     *HOME_KV_HANDLE.write().unwrap() = Some(handle);
 }
@@ -264,74 +30,25 @@ pub fn home_kv_handle() -> Option<engine::KvHandle> {
     HOME_KV_HANDLE.read().unwrap().clone()
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OffloadCounterSnapshot {
-    pub no_partner: u64,
-    pub below_threshold: u64,
-    pub noncanonical: u64,
-    pub recurrent_state: u64,
-    pub user_mask: u64,
-    pub channels: u64,
-    pub media: u64,
-    pub shape: u64,
-    pub remote_failure: u64,
-    pub transfer_failure: u64,
-    pub adopted: u64,
-    pub nixl_quarantined: bool,
-}
-
-#[derive(Default)]
-struct OffloadCounters {
-    no_partner: AtomicU64,
-    below_threshold: AtomicU64,
-    noncanonical: AtomicU64,
-    recurrent_state: AtomicU64,
-    user_mask: AtomicU64,
-    channels: AtomicU64,
-    media: AtomicU64,
-    shape: AtomicU64,
-    remote_failure: AtomicU64,
-    transfer_failure: AtomicU64,
-    adopted: AtomicU64,
-}
-
-static COUNTERS: LazyLock<OffloadCounters> = LazyLock::new(OffloadCounters::default);
-static NIXL_QUARANTINED: AtomicBool = AtomicBool::new(false);
-
-pub fn counters() -> OffloadCounterSnapshot {
-    let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
-    OffloadCounterSnapshot {
-        no_partner: load(&COUNTERS.no_partner),
-        below_threshold: load(&COUNTERS.below_threshold),
-        noncanonical: load(&COUNTERS.noncanonical),
-        recurrent_state: load(&COUNTERS.recurrent_state),
-        user_mask: load(&COUNTERS.user_mask),
-        channels: load(&COUNTERS.channels),
-        media: load(&COUNTERS.media),
-        shape: load(&COUNTERS.shape),
-        remote_failure: load(&COUNTERS.remote_failure),
-        transfer_failure: load(&COUNTERS.transfer_failure),
-        adopted: load(&COUNTERS.adopted),
-        nixl_quarantined: NIXL_QUARANTINED.load(Ordering::Acquire),
-    }
-}
-
-pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool {
-    let _ = request;
-    if !ENCODE_INJECTION_ENABLED.load(Ordering::Acquire) {
-        return false;
-    }
-    let Some(guard) = select_partner(PartnerRole::Encode) else {
-        COUNTERS.no_partner.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    if let Err(error) = guard.partner().encode(engine::MediaEncode::default()).await {
-        tracing::warn!(%error, "encode offload declined");
-    }
-    false
-}
-
 /// Below this many uncached tokens a pass is not worth sending away.
+/// Starts, once, the sweep that gives back what askers left past their
+/// TTLs, pages held for one that never released them and runs no fetch
+/// took, so an executor that serves nothing more still lets them go.
+fn sweep_idle() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let every = prefill::LEASE_TTL.min(stream::UNTAKEN_TTL) / 2;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                prefill::expire_leases();
+                stream::expire_untaken();
+            }
+        });
+    });
+}
+
 pub(crate) fn prefill_min_suffix_tokens() -> usize {
-    SETTINGS.read().unwrap().prefill_min_suffix_tokens
+    PREFILL_MIN_SUFFIX_TOKENS.load(Ordering::Acquire)
 }

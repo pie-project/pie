@@ -20,7 +20,7 @@ pub use settle::{Done, Settled};
 
 use engine::fire::LayerScores;
 use engine::frame::{
-    Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell, Supply,
+    Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell,
 };
 use poem_compiler::{Budget, Budgets, CompiledModel};
 use poem_exec::fire::{Composition, FireDescriptor};
@@ -112,6 +112,12 @@ pub struct Shell {
     programs: ProgramPlane,
     settlement: crate::settle::Settlement,
     taps: Vec<Option<crate::device::Pinned>>,
+    /// How a tapped lane's pages are read out, a layer's planes at a time:
+    /// each group's layer, planes, and spans of a host slot. `None`: this
+    /// load reads no layer out as it goes ([`crate::tap`]).
+    kv_taps: Option<Vec<crate::store::TapGroup>>,
+    /// Where taps tell what they read.
+    tap_sink: Option<engine::TapSink>,
     airborne: crate::settle::Airborne,
     owed: Owed,
     /// Landed events of reaped batches, for the next to record.
@@ -134,6 +140,24 @@ pub(crate) struct KvReport {
 }
 
 impl Shell {
+    /// Whether a lane may ask this load for a tap: it reads its layers out
+    /// as they go, and someone is told what it read.
+    #[must_use]
+    pub fn taps_kv(&self) -> bool {
+        self.kv_taps.is_some() && self.tap_sink.is_some()
+    }
+
+    /// The groups a tap reads a host slot's planes in, as spans of it.
+    #[must_use]
+    pub fn tap_groups(&self) -> Option<engine::TapGroups> {
+        let groups = self.kv_taps.as_ref()?;
+        Some(groups.iter().map(|group| group.spans.clone()).collect())
+    }
+
+    pub fn on_tapped(&mut self, sink: engine::TapSink) {
+        self.tap_sink = Some(sink);
+    }
+
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         match self.rs_ahead.get(&src).copied() {
             Some(at) => self.rs_ahead.insert(dst, at),
@@ -240,7 +264,49 @@ impl Shell {
                     .to_string(),
             });
         }
+        self.pools.fence_all_swaps(self.device.stream())?;
         self.pools.copy_kv(self.device.stream(), moves, &[])
+    }
+
+    /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).
+    pub fn back_whole(&mut self) -> Result<()> {
+        self.pools.back_whole()
+    }
+
+    /// The kv planes, for another worker to read in place
+    /// ([`crate::store::Pools::export_kv`]). One rank's planes hold a band of
+    /// each layer's heads, so a tensor-parallel load is refused until a
+    /// handle carries every rank's.
+    pub fn export_kv(&mut self, world: crate::World) -> Result<engine::KvHandle> {
+        if world.size > 1 {
+            return Err(Fault::Residency(
+                "a tensor-parallel load's kv is split across its ranks, and a handle names \
+                 one rank's planes"
+                    .to_string(),
+            ));
+        }
+        let ordinal = u32::try_from(self.ordinal()).map_err(|_| {
+            Fault::Residency(format!("device ordinal {} names no device", self.ordinal()))
+        })?;
+        let exported = self.pools.export_kv(ordinal)?;
+        let layout = engine::KvLayout {
+            num_layers: exported.layers,
+            num_kv_heads: exported.heads,
+            head_dim: exported.head_dim,
+            page_size: exported.page_size,
+            dtype: exported.dtype,
+            kind: engine::KvLayoutKind::KvSeparate,
+            storage_format: format!("cuda {} {:?}", self.trace().name, exported.dtype),
+            region_page_bytes: exported
+                .regions
+                .iter()
+                .map(|region| region.page_stride)
+                .collect(),
+        };
+        Ok(engine::KvHandle {
+            regions: exported.regions,
+            layout,
+        })
     }
 
     /// Pins this rank's host pool: one rs row per device slot, then kv
@@ -317,6 +383,7 @@ impl Shell {
     }
 
     pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
+        self.pools.fence_all_swaps(self.device.stream())?;
         self.pools
             .spill_kv(self.device.stream(), to_disk, device, disk)
     }
@@ -345,8 +412,14 @@ impl Shell {
         host: &[u32],
         windowed: &[(u32, u32)],
     ) -> Result<()> {
-        self.pools
-            .swap_kv(self.device.stream(), to_host, device, host, windowed)
+        self.pools.swap_kv(
+            self.device.stream(),
+            self.device.swap_stream(),
+            to_host,
+            device,
+            host,
+            windowed,
+        )
     }
 
     #[must_use]
@@ -524,10 +597,6 @@ impl Shell {
     pub fn fire_program(&mut self, instance_id: u64) -> Result<Fired> {
         self.reap_guests()?;
         self.programs.fire(&self.device, instance_id)
-    }
-
-    pub fn trim(&mut self, hint: engine::frame::Demand) {
-        Supply::trim(&mut self.pools, hint);
     }
 
     fn keyable_units(compiled: &CompiledModel) -> bool {
@@ -736,6 +805,8 @@ pub(crate) struct MergeLand {
 
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
+    /// Each lane's seat in the score slab, where it captures.
+    score_seat_of: Vec<Option<u32>>,
     attachments: &'a [Attached],
     composition: Composition,
     readout_rows: Vec<i32>,

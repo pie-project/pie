@@ -1,4 +1,5 @@
 mod ffi;
+pub mod objects;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -21,19 +22,24 @@ fn err(ctx: &str, st: nixl_capi_status_t) -> TransportError {
     TransportError::Transfer(format!("nixl {ctx}: status {st}"))
 }
 
-fn mem_type(domain: MemoryDomain) -> nixl_capi_mem_type_t {
+/// The NIXL segment a domain's memory registers as, and its device id: host
+/// memory as DRAM, a CUDA or ROCm device's as VRAM. The rest (Metal, Vulkan,
+/// wgpu, XLA, Cerebras memory, a slot file) NIXL cannot reach.
+fn segment(domain: MemoryDomain) -> Result<(nixl_capi_mem_type_t, u64)> {
     match domain {
-        MemoryDomain::HostPinned => nixl_capi_mem_type_t_NIXL_CAPI_MEM_DRAM,
-        MemoryDomain::CudaDevice(_) | MemoryDomain::RocmDevice(_) => {
-            nixl_capi_mem_type_t_NIXL_CAPI_MEM_VRAM
+        MemoryDomain::HostPinned => Ok((nixl_capi_mem_type_t_NIXL_CAPI_MEM_DRAM, 0)),
+        MemoryDomain::CudaDevice(n) | MemoryDomain::RocmDevice(n) => {
+            Ok((nixl_capi_mem_type_t_NIXL_CAPI_MEM_VRAM, u64::from(n)))
         }
-    }
-}
-
-fn dev_id(domain: MemoryDomain) -> u64 {
-    match domain {
-        MemoryDomain::HostPinned => 0,
-        MemoryDomain::CudaDevice(n) | MemoryDomain::RocmDevice(n) => n as u64,
+        MemoryDomain::MetalShared
+        | MemoryDomain::MetalPrivate
+        | MemoryDomain::VulkanDevice(_)
+        | MemoryDomain::WgpuDevice(_)
+        | MemoryDomain::XlaDevice(_)
+        | MemoryDomain::CerebrasDevice(_)
+        | MemoryDomain::LocalDisk => Err(TransportError::Unsupported(
+            "NIXL reaches host memory and CUDA or ROCm device memory only",
+        )),
     }
 }
 
@@ -172,17 +178,21 @@ unsafe fn build_xfer_dlist(handle: &KvHandle, pages: &PageSet) -> Result<nixl_ca
         .regions
         .first()
         .ok_or(TransportError::Unsupported("handle has no KV region"))?;
+    let (kind, _) = segment(first.domain)?;
     let mut dl: nixl_capi_xfer_dlist_t = ptr::null_mut();
-    let st = unsafe { nixl_capi_create_xfer_dlist(mem_type(first.domain), &mut dl) };
+    let st = unsafe { nixl_capi_create_xfer_dlist(kind, &mut dl) };
     if st != OK {
         return Err(err("create_xfer_dlist", st));
     }
     for &page in &pages.pages {
         for region in &handle.regions {
-            if mem_type(region.domain) != mem_type(first.domain) || region.page_stride == 0 {
-                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
-                return Err(TransportError::LayoutMismatch);
-            }
+            let device = match segment(region.domain) {
+                Ok((other, device)) if other == kind && region.page_stride != 0 => device,
+                _ => {
+                    unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+                    return Err(TransportError::LayoutMismatch);
+                }
+            };
             let offset = page as u64 * region.page_stride;
             if offset + region.page_stride > region.len {
                 unsafe { nixl_capi_destroy_xfer_dlist(dl) };
@@ -193,7 +203,7 @@ unsafe fn build_xfer_dlist(handle: &KvHandle, pages: &PageSet) -> Result<nixl_ca
                     dl,
                     (region.base + offset) as usize,
                     region.page_stride as usize,
-                    dev_id(region.domain),
+                    device,
                 )
             };
             if st != OK {
@@ -213,9 +223,10 @@ impl Backend for NixlBackend {
     fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
         let mut g = self.inner.lock().unwrap();
         for region in &handle.regions {
+            let (kind, device) = segment(region.domain)?;
             unsafe {
                 let mut dl: nixl_capi_reg_dlist_t = ptr::null_mut();
-                let st = nixl_capi_create_reg_dlist(mem_type(region.domain), &mut dl);
+                let st = nixl_capi_create_reg_dlist(kind, &mut dl);
                 if st != OK {
                     return Err(err("create_reg_dlist", st));
                 }
@@ -223,7 +234,7 @@ impl Backend for NixlBackend {
                     dl,
                     region.base as usize,
                     region.len as usize,
-                    dev_id(region.domain),
+                    device,
                     ptr::null(),
                     0,
                 );
@@ -368,5 +379,85 @@ impl Drop for NixlBackend {
                 nixl_capi_destroy_agent(g.agent);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::{KvLayout, KvLayoutKind, KvRegion};
+
+    const PAGES: u64 = 8;
+    const STRIDE: u64 = 4096;
+
+    fn layout() -> KvLayout {
+        KvLayout {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 64,
+            page_size: 16,
+            dtype: dtype::Dtype::Bf16,
+            kind: KvLayoutKind::KvSeparate,
+            storage_format: "test".to_string(),
+            region_page_bytes: vec![STRIDE],
+        }
+    }
+
+    /// A host region at `base`, `len` bytes: NIXL reads or writes it.
+    fn host(base: *mut u8, len: usize) -> KvHandle {
+        KvHandle {
+            regions: vec![KvRegion {
+                base: base as u64,
+                len: len as u64,
+                page_stride: STRIDE,
+                domain: MemoryDomain::HostPinned,
+            }],
+            layout: layout(),
+        }
+    }
+
+    #[test]
+    fn a_read_brings_the_peers_pages_into_the_named_slots() {
+        let mut theirs: Vec<u8> = (0..PAGES * STRIDE)
+            .map(|i| (i / STRIDE) as u8 + 1)
+            .collect();
+        let mut ours = vec![0u8; (PAGES * STRIDE) as usize];
+        let (a, b) = (
+            NixlBackend::new("home").unwrap(),
+            NixlBackend::new("peer").unwrap(),
+        );
+        let ours_at = (ours.as_mut_ptr(), ours.len());
+        let theirs_at = (theirs.as_mut_ptr(), theirs.len());
+        let mine = a.register(WorkerId(1), host(ours_at.0, ours_at.1)).unwrap();
+        b.register(WorkerId(2), host(theirs_at.0, theirs_at.1))
+            .unwrap();
+        a.connect(&PeerConn {
+            worker: WorkerId(2),
+            handle: host(theirs_at.0, theirs_at.1),
+            metadata: b.local_metadata().unwrap(),
+        })
+        .unwrap();
+        let id = a
+            .recv_mapped(
+                &mine,
+                &PageSet::new(vec![0, 5]),
+                &PageSet::new(vec![3, 6]),
+                WorkerId(2),
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            match a.poll(id).unwrap() {
+                Completion::Done => break,
+                Completion::Pending => assert!(started.elapsed().as_secs() < 10, "never landed"),
+                Completion::Failed(why) => panic!("{why}"),
+            }
+        }
+        let page = |at: u64| &ours[(at * STRIDE) as usize..((at + 1) * STRIDE) as usize];
+        assert!(page(0).iter().all(|&b| b == 4), "slot 0 holds their page 3");
+        assert!(page(5).iter().all(|&b| b == 7), "slot 5 holds their page 6");
+        assert!(page(1).iter().all(|&b| b == 0), "slot 1 was not asked for");
+        // The peer's region stays alive until the read is checked.
+        drop(theirs);
     }
 }

@@ -454,6 +454,7 @@ impl Client {
             props,
             session,
             cluster_props: Props::new(),
+            executors: Vec::new(),
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 

@@ -71,6 +71,13 @@ pub struct Grouped;
 #[decision(id = "engine.working_set_percent", constant(range(10..=90)), default = 50, tune = engine)]
 pub struct WorkingSetPercent(pub u32);
 
+/// The lanes of one fire that may capture attention scores: the score slab
+/// seats this many lanes' planes, each the whole model's heads by the kv
+/// ceiling, and the scheduler holds a fire's capturing lanes to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.scoring_lanes", constant(range(1..=256)), default = 8, tune = engine)]
+pub struct ScoringLanes(pub u32);
+
 /// Row buckets per doubling of the default lattice: 1 is powers of two, 2
 /// adds a bucket between each, which pads less and records more bodies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -118,9 +125,13 @@ pub struct HostPlanes;
 
 /// Rows from which the default bucket lattice takes
 /// `engine.prefill_lattice_steps` buckets a doubling whatever
-/// `engine.lattice_steps` says (a prefill's GEMMs run its bucket's rows); 0 never.
+/// `engine.lattice_steps` says (a prefill's GEMMs run its bucket's rows); 0
+/// never. Past a GEMM's ridge, where its rows cost compute rather than the
+/// weights' read, every padded row costs as much as a real one; the ridge
+/// (peak flops over memory bandwidth) is some 150 to 450 rows on the cards
+/// CUDA serves, so the default starts there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 0, tune = engine)]
+#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 256, tune = engine)]
 pub struct PrefillLatticeFrom(pub u32);
 
 /// Buckets a doubling the default lattice takes past `engine.prefill_lattice_from`.
@@ -136,6 +147,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
+        .add::<ScoringLanes>()
         .add::<LatticeSteps>()
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
@@ -217,6 +229,7 @@ pub struct Engine {
     pub copies: bool,
     pub grouped: bool,
     pub working_set_percent: u32,
+    pub scoring_lanes: u32,
     pub lattice_steps: u32,
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
@@ -247,6 +260,7 @@ impl Engine {
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
+            scoring_lanes: profile.get::<ScoringLanes>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
@@ -684,6 +698,7 @@ mod tests {
                 copies: true,
                 grouped: true,
                 working_set_percent: 50,
+                scoring_lanes: 8,
                 lattice_steps: 1,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
@@ -691,7 +706,7 @@ mod tests {
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 host_planes: false,
-                prefill_lattice_from: 0,
+                prefill_lattice_from: 256,
                 prefill_lattice_steps: 4,
             }
         );

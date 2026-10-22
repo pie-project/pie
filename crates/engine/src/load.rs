@@ -78,6 +78,11 @@ pub struct Residency {
     pub disk_kv_budget: Option<u64>,
     #[serde(default)]
     pub disk_kv_dir: Option<PathBuf>,
+    /// Hands the kv planes to other workers to read in place
+    /// ([`crate::Engine::export_kv_handle`]): the engine commits them whole
+    /// at load and keeps them mapped for its life.
+    #[serde(default)]
+    pub kv_export: bool,
 }
 
 fn deferred_by_default() -> bool {
@@ -115,6 +120,7 @@ impl Residency {
             kv_seats: None,
             disk_kv_budget: Some(0),
             disk_kv_dir: None,
+            kv_export: false,
         }
     }
 

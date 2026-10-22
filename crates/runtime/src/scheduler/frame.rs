@@ -784,10 +784,15 @@ impl FramePolicy {
         let max_wave_tokens = self.max_wave_tokens;
         // One frame of prompts on the card at a time: prompts arriving behind
         // it bind together into the next, while decodes keep running ahead.
-        let prompt_in_flight = self
+        // A lane whose own prompt is in flight continues it in the next frame
+        // (its next piece reads what that one writes, in order on the
+        // device): there is no prompt behind it to bind.
+        let prompting_in_flight: BTreeSet<ProcessId> = self
             .in_flight_lanes
             .iter()
-            .any(|lane| self.lanes.get(lane).is_some_and(|state| state.prompting));
+            .copied()
+            .filter(|lane| self.lanes.get(lane).is_some_and(|state| state.prompting))
+            .collect();
         loop {
             let mut fresh: Vec<ProcessId> = Vec::new();
             let mut continuing: Vec<ProcessId> = Vec::new();
@@ -919,7 +924,9 @@ impl FramePolicy {
                     .and_then(LaneState::group_key)
                     .is_some();
                 if (self.prompts_only && (!prompt || grouped))
-                    || (prompt && !grouped && prompt_in_flight)
+                    || (prompt
+                        && !grouped
+                        && prompting_in_flight.iter().any(|lane| !unit.contains(lane)))
                 {
                     continue;
                 }
@@ -1403,47 +1410,68 @@ mod tests {
         graceful_close_releases_the_wait();
         no_prompt_waits_for_a_lane_off_a_prompt();
         consumed_release_leaves_no_phantom_hold_for_bystander();
-        a_burst_of_cut_prefills_seals_its_pieces_frame_by_frame();
+        a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
     }
 
-    /// Concurrent prompts whose prefills are cut at checkpoints, each piece
-    /// submitted once the one before it retired: every piece carries a
-    /// frame of its own (`piece_frames`), so the first pieces of every lane
-    /// seal into one frame and the second pieces, once submitted, into the
-    /// next — not one unframed launch at a time.
-    fn a_burst_of_cut_prefills_seals_its_pieces_frame_by_frame() {
+    /// Concurrent prompts whose prefills are cut at checkpoints, each lane's
+    /// pieces submitted together: a lane's pieces fill the steps of its
+    /// frames in order (`piece_frames`), so the pieces of every lane seal
+    /// into one frame, each piece in its own step, not one unframed launch
+    /// at a time.
+    fn a_burst_of_cut_prefills_seals_its_pieces_step_by_step() {
         const LANES: usize = 8;
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lanes: Vec<ProcessId> = (0..LANES).map(|_| pid()).collect();
-        let frames: Vec<Vec<Option<FrameStamp>>> = lanes
-            .iter()
-            .map(|&lane| {
-                let mut seq = 0u64;
-                crate::pipeline::fire::piece_frames(Some(stamp(lane, 0, 0, 1)), 2, || {
+        let mut ids = Vec::new();
+        for (at, &lane) in lanes.iter().enumerate() {
+            let mut seq = 0u64;
+            let framed =
+                crate::pipeline::fire::piece_frames(Some(stamp(lane, 0, 0, 1)), 2, 2, || {
                     seq += 1;
                     seq
-                })
-            })
-            .collect();
-        for piece in 0..2 {
-            let mut ids = Vec::new();
-            for (at, (&lane, framed)) in lanes.iter().zip(&frames).enumerate() {
-                let frame = framed[piece].expect("every piece is framed");
+                });
+            assert_eq!(
+                framed,
+                vec![Some(stamp(lane, 0, 0, 2)), Some(stamp(lane, 0, 1, 2))],
+                "two pieces are one frame's two steps"
+            );
+            for (piece, frame) in framed.into_iter().enumerate() {
                 let id = 100 + 2 * at as u64 + piece as u64;
-                policy.on_fire_enqueued(frame, Some(lane), id, 128, 1, None);
+                policy.on_fire_enqueued(frame.expect("framed"), Some(lane), id, 128, 1, None);
                 ids.push(id);
             }
-            let queued: QueuedFireIds = ids.iter().copied().collect();
-            let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
-            sealed.sort_unstable();
-            assert_eq!(
-                sealed, ids,
-                "piece {piece} of every lane seals into one frame"
-            );
-            policy.on_frame_retired(lanes.iter().copied());
+        }
+        let queued: QueuedFireIds = ids.iter().copied().collect();
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+            panic!("expected a whole-frame dispatch");
+        };
+        for (step, wave) in waves.iter().enumerate() {
+            let mut wave = wave.clone();
+            wave.sort_unstable();
+            let want: Vec<u64> = (0..LANES as u64)
+                .map(|at| 100 + 2 * at + step as u64)
+                .collect();
+            assert_eq!(wave, want, "step {step} holds piece {step} of every lane");
         }
 
-        let shared = crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 9, 1, 2)), 3, || 0);
+        let mut seq = 0u64;
+        let three =
+            crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 4, 0, 1)), 3, 2, || {
+                seq += 1;
+                seq
+            });
+        assert_eq!(
+            three,
+            vec![
+                Some(stamp(lanes[0], 4, 0, 2)),
+                Some(stamp(lanes[0], 4, 1, 2)),
+                Some(stamp(lanes[0], 1, 0, 1)),
+            ],
+            "a third piece opens the next frame, alone"
+        );
+
+        let shared =
+            crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 9, 1, 2)), 3, 2, || 0);
         assert_eq!(
             shared,
             vec![None, None, Some(stamp(lanes[0], 9, 1, 2))],

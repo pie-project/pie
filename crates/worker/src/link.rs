@@ -1,9 +1,8 @@
 pub mod blob;
 pub mod client;
 pub mod control;
-pub mod executor;
 pub mod gateway;
-pub mod partner;
+pub mod kv;
 pub mod peer;
 pub mod pool;
 pub mod topology;

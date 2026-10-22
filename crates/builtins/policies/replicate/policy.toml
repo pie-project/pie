@@ -1,0 +1,7 @@
+# Keeps every run some worker caches on two serving workers, so losing one
+# leaves it on another: a level-triggered replication table, re-enacted as
+# runs are copied and dropped and workers come and go.
+plane = "cluster"
+subscribe = ["copied", "dropped", "worker-removed", "worker-draining"]
+grants = ["replication"]
+uses = ["state.replicate"]

@@ -46,19 +46,54 @@ impl gateway::GatewayControl for EmbeddedControl {
     fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
         self.0.gateway_watch()
     }
+
+    async fn desire_scale(&self, entries: Vec<controller_api::ScaleEntry>) -> Result<()> {
+        self.0.desire_scale(entries).await;
+        Ok(())
+    }
+}
+
+/// Swaps both planes' policies of a `pie serve` process.
+#[derive(Clone)]
+pub struct PolicyReload {
+    policies: Option<std::sync::Arc<gateway::policy::Cluster>>,
+}
+
+impl PolicyReload {
+    /// For those `config` names: the in-proc gateway's `[server] policies`,
+    /// where it started with any, and the worker's `[runtime] policy`.
+    pub async fn reload(&self, config: &crate::Config) -> Result<()> {
+        match &self.policies {
+            Some(policies) => gateway::reload_policies(policies, &config.server.policies).await?,
+            None if !config.server.policies.is_empty() => {
+                tracing::warn!("no cluster policies to reload: this server started with none");
+            }
+            None => {}
+        }
+        crate::reload_policy(config).await
+    }
 }
 
 pub struct StandaloneHandle {
     pub listen_addr: SocketAddr,
     pub worker_addr: SocketAddr,
+    policies: Option<std::sync::Arc<gateway::policy::Cluster>>,
     _controller: controller::Handle,
     worker: crate::WorkerHandle,
     gateway: JoinHandle<()>,
 }
 
 impl StandaloneHandle {
+    /// What swaps this server's policies (a SIGHUP's reload).
+    #[must_use]
+    pub fn policy_reload(&self) -> PolicyReload {
+        PolicyReload {
+            policies: self.policies.clone(),
+        }
+    }
+
     pub fn summary(&self) -> &Summary {
-        self.worker.summary().expect("a standalone worker decodes")
+        self.worker.summary()
     }
 
     pub async fn shutdown(self) {
@@ -94,6 +129,7 @@ pub async fn run_standalone(
         .context("bind in-proc gateway")?;
     let listen_addr = gw.listen_addr;
     let worker_addr = gw.worker_addr;
+    let policies = gw.state.router.clone();
 
     let worker = crate::run_with(
         worker,
@@ -114,6 +150,7 @@ pub async fn run_standalone(
     Ok(StandaloneHandle {
         listen_addr,
         worker_addr,
+        policies,
         _controller: handle,
         worker,
         gateway,
@@ -128,6 +165,6 @@ pub fn derive_standalone(
     let worker = crate::Config::parse(combined).context("parsing config")?;
     let controller = controller::Config::parse("").context("controller defaults")?;
     let mut gateway = gateway::Config::parse("").context("gateway defaults")?;
-    gateway.policy = worker.server.policy.clone();
+    gateway.policies = worker.server.policies.clone();
     Ok((controller, gateway, worker))
 }

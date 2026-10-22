@@ -30,6 +30,9 @@ pub trait GatewayInbound {
     /// The workers, not `worker_id`, that hold a run of `keys` from token 0:
     /// each one's bulk address and how many pages of the run, longest first.
     async fn locate(worker_id: WorkerId, keys: Vec<[u8; 32]>) -> Vec<(WorkerId, String, u32)>;
+
+    /// Where worker `worker`'s peer link listens, as it last said.
+    async fn link(worker: WorkerId) -> Option<String>;
 }
 
 #[tarpc::service]

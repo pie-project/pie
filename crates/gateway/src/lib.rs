@@ -39,10 +39,11 @@ pub struct Config {
     pub worker_listen: SocketAddr,
     #[serde(default = "default_controller")]
     pub controller: String,
-    /// A built-in policy's name or a component path; none keeps the gateway's
-    /// own order.
+    /// The cluster policies: each a built-in policy's name or a component
+    /// path, no two granted the same write; none keeps the gateway's own
+    /// order.
     #[serde(default)]
-    pub policy: Option<String>,
+    pub policies: Vec<String>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -61,7 +62,7 @@ impl Default for Config {
             listen: default_listen(),
             worker_listen: default_worker_listen(),
             controller: default_controller(),
-            policy: None,
+            policies: Vec::new(),
         }
     }
 }
@@ -137,9 +138,10 @@ impl TurnRouter for RouteBackend {
         let placed: Request;
         let (req, preferred) = match router {
             Some(router) => {
-                let (preferred, cluster_props) = router.placement(req);
+                let (preferred, cluster_props, executors) = router.placement(req);
                 placed = Request {
                     cluster_props,
+                    executors,
                     ..req.clone()
                 };
                 (&placed, preferred)
@@ -244,6 +246,7 @@ impl Gateway {
         let worker_task = self._worker_task;
         let listener = self.listener;
         let app = self.app;
+        let policies = self.state.router.clone();
         let serve_shutdown = shutdown.clone();
         let serve_task = tokio::spawn(async move {
             let graceful = async move { serve_shutdown.notified().await };
@@ -257,6 +260,7 @@ impl Gateway {
         GatewayHandle {
             listen_addr,
             worker_addr,
+            policies,
             shutdown,
             serve_task,
             worker_task,
@@ -267,6 +271,7 @@ impl Gateway {
 pub struct GatewayHandle {
     pub listen_addr: SocketAddr,
     pub worker_addr: SocketAddr,
+    policies: Option<Arc<policy::Cluster>>,
     shutdown: Arc<Notify>,
     serve_task: tokio::task::JoinHandle<()>,
     worker_task: tokio::task::JoinHandle<()>,
@@ -276,6 +281,13 @@ pub struct GatewayHandle {
 pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl GatewayHandle {
+    /// The running cluster policies, which [`reload_policies`] swaps; none
+    /// on a gateway that started without any.
+    #[must_use]
+    pub fn policies(&self) -> Option<Arc<policy::Cluster>> {
+        self.policies.clone()
+    }
+
     /// Stops taking connections and lets open streams finish, for up to
     /// [`SHUTDOWN_GRACE`]: a stream that does not end in that time is cut.
     pub async fn shutdown(mut self) {
@@ -292,27 +304,44 @@ impl GatewayHandle {
     }
 }
 
+/// The components `specs` names, each a built-in policy's name or a file.
+fn policy_components(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    specs
+        .iter()
+        .map(|spec| Ok((spec.clone(), builtins::policy_component(spec)?.into_owned())))
+        .collect()
+}
+
+/// Swaps the cluster policies `policies` runs for those `specs` names (a
+/// SIGHUP's `[server] policies`): the new set loads whole or the old one
+/// runs on ([`policy::Cluster::reload`]).
+pub async fn reload_policies(policies: &policy::Cluster, specs: &[String]) -> Result<()> {
+    policies
+        .reload(policy_components(specs)?)
+        .await
+        .context("reload the cluster policies")
+}
+
 pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gateway> {
     let routing_rx = control.routing_watch();
 
     let workers = WorkerRegistry::new();
     let routing = RoutingHandle::new(routing_rx, workers.connected_watch());
-    let router = match &config.policy {
-        Some(spec) => {
-            let component = builtins::policy_component(spec)?;
-            let (router, cancelled, moves) = policy::Cluster::start(
-                spec,
-                &component,
-                routing.table_watch(),
-                workers.connected_watch(),
-                workers.clone(),
-            )
-            .with_context(|| format!("load the cluster policy `{spec}`"))?;
-            Some((router, cancelled, moves))
-        }
-        None => None,
+    let router = if config.policies.is_empty() {
+        None
+    } else {
+        let programs = policy_components(&config.policies)?;
+        let (router, cancelled, moves) = policy::Cluster::start(
+            programs,
+            routing.table_watch(),
+            workers.connected_watch(),
+            workers.clone(),
+        )
+        .context("load the cluster policies")?;
+        Some((router, cancelled, moves))
     };
     let policy_router = router.as_ref().map(|(router, _, _)| router.clone());
+    let scale = policy_router.as_ref().map(|router| router.scale_watch());
     let sessions = Sessions::new(Arc::new(RouteBackend {
         routing: routing.clone(),
         workers: workers.clone(),
@@ -332,7 +361,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
                 let moving = moving.clone();
                 tokio::spawn(async move {
                     if !moving.migrate(req, target).await {
-                        tracing::debug!(%req, %target, "a turn did not move: ended, or already moving");
+                        tracing::debug!(%req, %target, "a turn did not move: it ended, has sent output, or is already there");
                     }
                 });
             }
@@ -363,7 +392,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         .await
         .context("register gateway with controller")?;
     tracing::info!(%gateway_id, %worker_addr, "gateway registered with controller");
-    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info));
+    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info, scale));
 
     let app = Router::new()
         .merge(ingress::router(state.clone()))

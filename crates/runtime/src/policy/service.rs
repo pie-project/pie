@@ -42,6 +42,38 @@ pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Swaps the worker policy for `next` (name, component), or for none, as a
+/// SIGHUP asks. It loads whole before anything changes; on an error the
+/// running one goes on. The old one stops as a dead one does: its tables and
+/// what it published are withdrawn. The new one starts with no state of its
+/// own, the same policy too. Blocks while it loads.
+pub fn reload(next: Option<(&str, &[u8])>) -> Result<(), String> {
+    let next = next.map(|(name, component)| (name.to_string(), component.to_vec()));
+    let Some(events) = EVENTS.get() else {
+        // None ran from boot: this starts one.
+        return match next {
+            Some((name, component)) => start(&name, &component).map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+    };
+    let (answer, answered) = std::sync::mpsc::sync_channel(1);
+    events
+        .send(Event::Reload(next, answer))
+        .map_err(|_| "the worker policy's thread has ended".to_string())?;
+    answered
+        .recv()
+        .map_err(|_| "the worker policy's thread has ended".to_string())?
+}
+
+/// A stopped policy's tables revert to the configuration's, and what it
+/// published is withdrawn.
+fn withdraw() {
+    schedule::install(None);
+    retention::install(None);
+    super::offload::install(None);
+    super::withdraw_published();
+}
+
 pub(super) fn report(event: Event) {
     if let Some(events) = EVENTS.get() {
         let _ = events.send(event);
@@ -58,7 +90,7 @@ fn capability(name: &str) -> bool {
         "retention.tier" => crate::planner::planner().is_some_and(|p| p.can_pause()),
         // Passes go to a peer while one is linked; `cost` reads only the
         // rule's threshold.
-        "offload.remote" => crate::offload::prefill::has_peer(),
+        "offload.remote" => crate::offload::executors::reachable(),
         // The worker's own values reach the cluster plane with its state
         // report; a process's do not yet.
         "publish" => true,
@@ -102,14 +134,16 @@ impl Activity {
     }
 }
 
-fn run(mut program: Program, events: Receiver<Event>) {
+fn run(program: Program, events: Receiver<Event>) {
     let mut registry = Registry::new(STORES);
     let mut activity = Activity {
         since_ms: now_ms(),
         ..Activity::default()
     };
+    // None once it died, or a reload named none, until a reload names one.
+    let mut current = Some(program);
     loop {
-        let first = match program.alarm() {
+        let first = match current.as_ref().and_then(Program::alarm) {
             Some(at_ms) => {
                 let wait = at_ms.saturating_sub(now_ms());
                 match events.recv_timeout(Duration::from_millis(wait)) {
@@ -124,10 +158,41 @@ fn run(mut program: Program, events: Receiver<Event>) {
             },
         };
         let mut edges = Vec::new();
+        let mut reloads = Vec::new();
         registry.exited.clear();
         for event in first.into_iter().chain(events.try_iter()) {
-            edges.extend(registry.apply(event));
+            match event {
+                Event::Reload(next, answer) => reloads.push((next, answer)),
+                event => edges.extend(registry.apply(event)),
+            }
         }
+        for (next, answer) in reloads {
+            let loaded = match &next {
+                Some((name, component)) => Program::load(name, component, &capability).map(Some),
+                None => Ok(None),
+            };
+            match loaded {
+                Ok(next) => {
+                    tracing::info!(
+                        old = current.as_ref().map(Program::name),
+                        new = next.as_ref().map(Program::name),
+                        "worker policy reloaded"
+                    );
+                    if current.is_some() {
+                        withdraw();
+                    }
+                    current = next;
+                    let _ = answer.send(Ok(()));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "worker policy not reloaded; the running one goes on");
+                    let _ = answer.send(Err(error.to_string()));
+                }
+            }
+        }
+        let Some(program) = current.as_mut() else {
+            continue;
+        };
         let now = now_ms();
         if program.alarm().is_some_and(|at_ms| at_ms <= now) {
             edges.push(Edge::Timer);
@@ -162,9 +227,9 @@ fn run(mut program: Program, events: Receiver<Event>) {
             }
             Err(Fault::Dead(error)) => {
                 tracing::error!(policy = program.name(), %error, "worker policy is dead; its tables are withdrawn");
-                schedule::install(None);
-                retention::install(None);
-                return;
+                withdraw();
+                current = None;
+                continue;
             }
             Err(fault) => {
                 activity.discarded += 1;
@@ -589,6 +654,12 @@ impl Registry {
             Event::SessionClosed(session) => {
                 self.sessions.remove(&session);
                 Some(Edge::Closed(session))
+            }
+            // The policy thread swaps programs before a round applies its
+            // events; one here has none to swap.
+            Event::Reload(_, answer) => {
+                let _ = answer.send(Err("a reload reached the registry".into()));
+                None
             }
             Event::Kept(owner, tokens) => {
                 if let Some((blocks, held)) = self.prompts.get_mut(&owner) {

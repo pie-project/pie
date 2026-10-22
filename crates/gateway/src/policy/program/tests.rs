@@ -43,7 +43,7 @@ impl Plane for Fake {
     }
 
     fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
-        let Subject::Process(id) = of else {
+        let (Subject::Process(id) | Subject::Worker(id)) = of else {
             return None;
         };
         self.attrs
@@ -236,4 +236,64 @@ fn cluster_priority_orders_the_gateway_and_passes_priority_on() {
         [(name, Value::Int(3))] if name == "priority"
     ));
     assert!(!placement.contains_key("2"));
+}
+
+#[test]
+fn a_program_publishes_under_the_publish_grant_and_one_without_it_is_refused() {
+    let mut share = load("test-share").unwrap();
+    let plane =
+        Fake::default()
+            .with("7", &[])
+            .attr("7", "placement/worker", Value::Text("3".into()));
+    let commit = share
+        .react(Box::new(plane), vec![Edge::PlacementChanged("7".into())], 0)
+        .unwrap();
+    assert!(matches!(
+        commit.publish.as_slice(),
+        [(Subject::Process(p), name, Some(Value::Text(w)))] if p == "7" && name == "placed" && w == "3"
+    ));
+
+    let mut route = load("test-route").unwrap();
+    let plane = Fake::default().with("8", &[("publish", Value::Text("x".into()))]);
+    let commit = route
+        .react(Box::new(plane), vec![Edge::Arrived("8".into())], 0)
+        .unwrap();
+    assert!(
+        commit.publish.is_empty(),
+        "test-route is not granted `publish`"
+    );
+    assert!(commit.placement.is_some(), "its granted writes stand");
+}
+
+#[test]
+fn disaggregate_puts_first_the_prefill_workers_on_the_placed_process_s_host() {
+    let mut disaggregate = Program::load(
+        "disaggregate",
+        builtins::policy("disaggregate").unwrap().component,
+        &|_| true,
+    )
+    .unwrap();
+    let text = |t: &str| Value::Text(t.into());
+    let plane = Fake::default()
+        .with("7", &[])
+        .attr("7", "placement/worker", text("1"))
+        .worker("1")
+        .attr("1", "role", text("decode"))
+        .attr("1", "host", text("node-b"))
+        .worker("2")
+        .attr("2", "role", text("prefill"))
+        .attr("2", "host", text("node-a"))
+        .attr("2", "running", Value::Int(0))
+        .worker("3")
+        .attr("3", "role", text("prefill"))
+        .attr("3", "host", text("node-b"))
+        .attr("3", "running", Value::Int(5));
+    let commit = disaggregate
+        .react(Box::new(plane), vec![Edge::PlacementChanged("7".into())], 0)
+        .unwrap();
+    assert_eq!(
+        commit.executors.unwrap()["7"],
+        ["3", "2"],
+        "the loaded one on the placed host first, then the idle one elsewhere"
+    );
 }

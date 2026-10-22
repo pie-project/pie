@@ -62,6 +62,7 @@ pub struct Cuda {
     next_frame: FrameId,
     channels: BTreeMap<ChannelId, Arc<crate::program::Endpoint>>,
     sink: Option<engine::CompletionSink>,
+    tap_sink: Option<engine::TapSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
     replay: Option<crate::replay::Replay>,
@@ -80,6 +81,7 @@ impl Cuda {
             next_frame: 1,
             channels: BTreeMap::new(),
             sink: None,
+            tap_sink: None,
             pending: None,
             adapters: BTreeMap::new(),
             replay: None,
@@ -480,6 +482,10 @@ impl Engine for Cuda {
         self.caps.as_ref().map(|caps| &caps.device)
     }
 
+    fn export_kv_handle(&self) -> Option<engine::KvHandle> {
+        self.caps.as_ref()?.kv_handle.clone()
+    }
+
     fn bind_thread(&mut self) -> EngineResult<()> {
         match self.shell.as_ref() {
             Some(shell) => shell.bind_thread().map_err(fault),
@@ -558,6 +564,15 @@ impl Engine for Cuda {
                 self.boot.world.size,
             )
             .map_err(fault)?;
+        // Every page the load serves is backed now, so serving maps nothing:
+        // a dying process holding the driver's lock stalls no fire of this
+        // one's.
+        shell.back_whole().map_err(fault)?;
+        let kv_handle = if residency.kv_export {
+            Some(shell.export_kv(self.boot.world).map_err(fault)?)
+        } else {
+            None
+        };
         let disk_kv_pages = shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
@@ -628,6 +643,7 @@ impl Engine for Cuda {
                 prefill_rows: 0,
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
                     .unwrap_or(u32::MAX),
+                max_scoring_lanes: shell.scoring_lanes(),
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
@@ -640,7 +656,7 @@ impl Engine for Cuda {
                 host_to_device: host_kv_pages > 0,
                 host_to_host: false,
             },
-            kv_handle: None,
+            kv_handle,
             media_encode: false,
             device_channel_commit: true,
             rs_verbs: true,
@@ -655,6 +671,9 @@ impl Engine for Cuda {
         };
 
         self.replay = crate::replay::Replay::of(&shell);
+        if let Some(sink) = &self.tap_sink {
+            shell.on_tapped(sink.clone());
+        }
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -740,6 +759,19 @@ impl Engine for Cuda {
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         self.sink = Some(sink);
+    }
+
+    /// One rank's planes hold a band of each layer's heads, so a
+    /// tensor-parallel rank taps nothing.
+    fn tap_groups(&self) -> Option<engine::TapGroups> {
+        self.shell.as_ref()?.tap_groups()
+    }
+
+    fn on_tapped(&mut self, sink: engine::TapSink) {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.on_tapped(sink.clone());
+        }
+        self.tap_sink = Some(sink);
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -1123,6 +1155,7 @@ impl Cuda {
                     ports: &lane.ports,
                     attn_classes: lane.attn_classes.as_ref(),
                     reports: lane.reports,
+                    tap: lane.tap.as_ref(),
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

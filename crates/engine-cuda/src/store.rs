@@ -474,6 +474,21 @@ pub struct Pools {
     buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
+    /// Every declared page and slot is backed ([`Pools::back_whole`]), and
+    /// never trimmed since.
+    whole: bool,
+    /// The moves to or from the host tier still on the swap stream, and
+    /// the read-outs on the tap stream, each with the device pages it holds.
+    swaps: Vec<Swap>,
+}
+
+/// A move between the device and the host tier, on the swap stream: its
+/// paged and windowed device pages, and the event it lands at.
+#[derive(Debug)]
+struct Swap {
+    landed: crate::device::graph::Event,
+    paged: Vec<u32>,
+    windowed: Vec<u32>,
 }
 
 /// The slot file kv is suspended into below host memory, and the pinned
@@ -495,6 +510,53 @@ struct HostKv {
     window_pages: u32,
     rows: u32,
     row_bytes: u64,
+}
+
+/// `bytes` pinned on reserved huge pages, where the host's pool holds them.
+#[cfg(target_os = "linux")]
+fn huge_tier(bytes: usize) -> Option<crate::device::Pinned> {
+    let pinned = crate::device::Pinning::huge(bytes)?.lock().ok()?;
+    eprintln!(
+        "engine-cuda: the host kv tier ({} MiB) is pinned on reserved huge pages",
+        bytes >> 20
+    );
+    Some(pinned)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn huge_tier(_bytes: usize) -> Option<crate::device::Pinned> {
+    None
+}
+
+/// A group a tap reads a host slot's planes in: its layer, its planes (of
+/// the paged planes, in a slot's order), and their spans `(offset, bytes)`
+/// of a slot.
+#[derive(Debug, Clone, Default)]
+pub struct TapGroup {
+    pub layer: u32,
+    pub planes: Vec<usize>,
+    pub spans: Vec<(u64, u64)>,
+}
+
+/// A tap's pages of a group: the copies `(dst, src, bytes)` out to the host
+/// tier, and where each page's planes land there, page after page,
+/// `(address, bytes)`.
+#[derive(Debug, Clone, Default)]
+pub struct TapSpans {
+    pub copies: Vec<(u64, u64, usize)>,
+    pub lands: Vec<(u64, usize)>,
+}
+
+/// What [`Pools::export_kv`] hands out: the planes' regions and the shape
+/// their pages have.
+#[derive(Debug, Clone)]
+pub struct ExportedKv {
+    pub regions: Vec<engine::KvRegion>,
+    pub layers: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub dtype: Dtype,
+    pub page_size: u32,
 }
 
 impl Pools {
@@ -657,6 +719,8 @@ impl Pools {
             buffered: (0, 1),
             host: None,
             disk: None,
+            whole: false,
+            swaps: Vec::new(),
         })
     }
 
@@ -1470,6 +1534,93 @@ impl Pools {
         planes
     }
 
+    /// Backs every page and slot the pools declare, at load, and keeps them
+    /// so: backing a page as a fire first touches it takes
+    /// the driver's lock, which a dying process on the host holds for
+    /// seconds, and a worker taking a dead peer's turns needs new pages then
+    /// above all.
+    pub fn back_whole(&mut self) -> Result<()> {
+        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
+        let slots = if self.has_state() {
+            self.paging.slots
+        } else {
+            0
+        };
+        match self.commit_to(pages, slots)? {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
+        self.note_backed(&[(0, u64::from(pages))]);
+        self.ensure_windowed(0..self.paging.window_pages())?;
+        self.whole = true;
+        Ok(())
+    }
+
+    /// The kv planes as another worker reads them: every declared page, one
+    /// region per paged plane, a page `p` at `base + p * page_stride`. A
+    /// windowed space is refused: its pages are named by its own ring, not by
+    /// the kv pages a peer reads.
+    pub fn export_kv(&mut self, ordinal: u32) -> Result<ExportedKv> {
+        if !self.windowed_planes().is_empty() {
+            return Err(Fault::Residency(
+                "a windowed kv space names its pages by its own ring, so it cannot be \
+                 handed to another worker by the kv pages it reads"
+                    .to_string(),
+            ));
+        }
+        if !self.whole {
+            self.back_whole()?;
+        }
+        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
+        let mut regions = Vec::new();
+        for (arena, page_bytes) in self.paged_planes() {
+            let len = u64::from(pages) * page_bytes;
+            regions.push(engine::KvRegion {
+                base: arena.span(0, len)?,
+                len,
+                page_stride: page_bytes,
+                domain: engine::MemoryDomain::CudaDevice(ordinal),
+            });
+        }
+        let (layers, heads, head_dim, dtype) = self
+            .shapes
+            .iter()
+            .find_map(|shape| match *shape {
+                Shape::Kv {
+                    windowed: false,
+                    dtype,
+                    keys_width,
+                    head_stride,
+                    ..
+                } => Some((dtype, keys_width, head_stride)),
+                _ => None,
+            })
+            .map(|(dtype, keys_width, head_stride)| {
+                let layers = self
+                    .shapes
+                    .iter()
+                    .filter(|shape| matches!(shape, Shape::Kv { .. }))
+                    .count();
+                (
+                    u32::try_from(layers).unwrap_or(u32::MAX),
+                    u32::try_from(keys_width / head_stride.max(1)).unwrap_or(u32::MAX),
+                    u32::try_from(head_stride).unwrap_or(u32::MAX),
+                    dtype,
+                )
+            })
+            .ok_or_else(|| {
+                Fault::Residency("this load pages no full-attention kv row to export".to_string())
+            })?;
+        Ok(ExportedKv {
+            regions,
+            layers,
+            heads,
+            head_dim,
+            dtype,
+            page_size: self.paging.page_size,
+        })
+    }
+
     /// The bytes one windowed kv page holds over every windowed plane.
     #[must_use]
     pub fn window_page_bytes(&self) -> u64 {
@@ -1483,7 +1634,12 @@ impl Pools {
     }
 
     /// Pins `pages` host kv pages, `window_pages` host windowed pages and
-    /// `rows` host rs rows of `row_bytes`, in that order.
+    /// `rows` host rs rows of `row_bytes`, in that order: on reserved huge
+    /// pages where the host keeps a pool that holds them. The tier is most
+    /// of what a worker pins, and when a process dies the driver unpins its
+    /// memory under a lock every process on the host waits on for any
+    /// allocation, about 0.17 s a GiB of 4 KiB pages and a fifth of that of
+    /// huge ones.
     pub fn seat_host(
         &mut self,
         pages: u32,
@@ -1497,7 +1653,9 @@ impl Pools {
             + u64::from(rows) * row_bytes;
         self.host = (bytes > 0)
             .then(|| {
-                crate::device::Pinned::mapped_uninit(usize::try_from(bytes).unwrap_or(usize::MAX))
+                let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+                huge_tier(bytes)
+                    .map_or_else(|| crate::device::Pinned::mapped_uninit(bytes), Ok)
                     .map(|buffer| HostKv {
                         buffer,
                         pages,
@@ -1649,11 +1807,14 @@ impl Pools {
     }
     /// Copies whole kv pages between the device pool and the host pages,
     /// `device[i]` with `host[i]`, and the windowed pages `(device, host)`
-    /// between the windowed rows and theirs, enqueued on `stream` behind the
-    /// fires that wrote them.
+    /// between the windowed rows and theirs: on `swap`, behind what `stream`
+    /// has enqueued (the fires that wrote them), so the fires after run
+    /// beside it; one that holds its pages waits for it
+    /// ([`Pools::fence_swaps`]).
     pub fn swap_kv(
         &mut self,
         stream: *mut core::ffi::c_void,
+        swap: *mut core::ffi::c_void,
         to_host: bool,
         device: &[u32],
         host: &[u32],
@@ -1680,6 +1841,7 @@ impl Pools {
             return Ok(());
         };
         let mut base = 0u64;
+        let mut spans: Vec<(u64, u64, usize)> = Vec::new();
         let spaces = [
             (self.paged_planes(), &paged[..], have[0]),
             (self.windowed_planes(), windowed, have[1]),
@@ -1702,11 +1864,86 @@ impl Pools {
                     } else {
                         (on_device, on_host)
                     };
-                    crate::device::copy_any(stream, dst, src, usize::try_from(bytes).unwrap_or(0))?;
+                    spans.push((dst, src, usize::try_from(bytes).unwrap_or(0)));
                 }
                 base += have * page_bytes;
             }
         }
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let written = crate::device::graph::Event::new()?;
+        written.record(stream)?;
+        written.wait(swap)?;
+        crate::device::copy_batch(swap, to_host, &spans)?;
+        let landed = crate::device::graph::Event::new()?;
+        landed.record(swap)?;
+        self.swaps.push(Swap {
+            landed,
+            paged: device.to_vec(),
+            windowed: windowed.iter().map(|&(page, _)| page).collect(),
+        });
+        Ok(())
+    }
+
+    /// `paged` device pages are read on `stream` by what it has enqueued:
+    /// a fire that names one waits for it, as for a move.
+    pub fn hold_until(&mut self, stream: *mut core::ffi::c_void, paged: Vec<u32>) -> Result<()> {
+        let landed = crate::device::graph::Event::new()?;
+        landed.record(stream)?;
+        self.swaps.push(Swap {
+            landed,
+            paged,
+            windowed: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Orders `stream` behind the moves still landing that hold any of the
+    /// device pages a fire names: its paged runs `(first, count)` and its
+    /// windowed pages.
+    pub fn fence_swaps(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        paged: &[(u64, u64)],
+        windowed: &[u64],
+    ) -> Result<()> {
+        self.prune_swaps()?;
+        for swap in &self.swaps {
+            let holds = swap.paged.iter().any(|&page| {
+                let page = u64::from(page);
+                paged
+                    .iter()
+                    .any(|&(first, count)| first <= page && page < first + count)
+            }) || swap
+                .windowed
+                .iter()
+                .any(|&page| windowed.contains(&u64::from(page)));
+            if holds {
+                swap.landed.wait(stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Orders `stream` behind every move still landing: for work that reads
+    /// or writes pages without naming them.
+    pub fn fence_all_swaps(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        self.prune_swaps()?;
+        for swap in &self.swaps {
+            swap.landed.wait(stream)?;
+        }
+        Ok(())
+    }
+
+    fn prune_swaps(&mut self) -> Result<()> {
+        let mut kept = Vec::with_capacity(self.swaps.len());
+        for swap in self.swaps.drain(..) {
+            if !swap.landed.done()? {
+                kept.push(swap);
+            }
+        }
+        self.swaps = kept;
         Ok(())
     }
 
@@ -1777,6 +2014,104 @@ impl Pools {
             base += u64::from(have) * page_bytes;
         }
         Ok(spans)
+    }
+
+    /// The cache row of each paged plane, in a host slot's order.
+    fn paged_plane_rows(&self) -> Vec<usize> {
+        let mut rows = Vec::new();
+        for (row, (arenas, shape)) in self.rows.iter().zip(&self.shapes).enumerate() {
+            if matches!(
+                shape,
+                Shape::Kv {
+                    windowed: false,
+                    ..
+                }
+            ) {
+                rows.extend(std::iter::repeat_n(row, arenas.len()));
+            }
+        }
+        rows
+    }
+
+    /// How a tap reads a host slot's planes out: a group a layer, each the
+    /// planes of the kv rows `row_layer` puts in it, as `(planes, spans of a
+    /// slot)`, in the layers' order. `None` where a tap cannot read a layer
+    /// whole: windowed rows (named by their own pages), compressor slabs, or
+    /// a kv row no layer writes.
+    #[must_use]
+    pub fn tap_groups(&self, row_layer: &[Option<u32>]) -> Option<Vec<TapGroup>> {
+        let windowed = self
+            .shapes
+            .iter()
+            .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }));
+        if windowed || !self.pooled.is_empty() {
+            return None;
+        }
+        let mut groups: std::collections::BTreeMap<u32, TapGroup> =
+            std::collections::BTreeMap::new();
+        let mut offset = 0u64;
+        for (plane, (row, (_, bytes))) in self
+            .paged_plane_rows()
+            .into_iter()
+            .zip(self.paged_planes())
+            .enumerate()
+        {
+            let layer = (*row_layer.get(row)?)?;
+            let group = groups.entry(layer).or_insert_with(|| TapGroup {
+                layer,
+                ..TapGroup::default()
+            });
+            group.planes.push(plane);
+            group.spans.push((offset, bytes));
+            offset += bytes;
+        }
+        Some(groups.into_values().collect())
+    }
+
+    /// For planes `planes`, device pages `device[i]` to host slots
+    /// `host[i]`.
+    pub fn tap_spans(
+        &mut self,
+        planes: &[usize],
+        device: &[u32],
+        host: &[u32],
+    ) -> Result<TapSpans> {
+        let have = self.host_pages();
+        if let Some(&slot) = host.iter().find(|&&slot| slot >= have) {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: u64::from(slot) + 1,
+                have: u64::from(have),
+            });
+        }
+        self.ensure_kv(device.iter().map(|&page| page + 1).max().unwrap_or(0))?;
+        let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: 1,
+                have: 0,
+            });
+        };
+        let all = self.paged_planes();
+        let mut bases = Vec::with_capacity(all.len());
+        let mut base = 0u64;
+        for &(_, bytes) in &all {
+            bases.push(base);
+            base += u64::from(have) * bytes;
+        }
+        let mut copies = Vec::with_capacity(planes.len() * device.len());
+        let mut lands = Vec::with_capacity(planes.len() * device.len());
+        for (&d, &h) in device.iter().zip(host) {
+            for &plane in planes {
+                let (arena, bytes) = all[plane];
+                let on_host = buffer + bases[plane] + u64::from(h) * bytes;
+                let on_device = arena.span(u64::from(d) * bytes, bytes)?;
+                let len = usize::try_from(bytes).unwrap_or(0);
+                copies.push((on_host, on_device, len));
+                lands.push((on_host, len));
+            }
+        }
+        Ok(TapSpans { copies, lands })
     }
 
     /// Host kv slots `slots`, one after another, each its planes in order.
@@ -2012,33 +2347,6 @@ impl Pools {
         }
         Ok(outcome)
     }
-
-    fn release_to(&mut self, kv_pages: u32, state_slots: u32) {
-        let page_size = self.paging.page_size;
-        let windowed = narrow_pages(self.paging.window_pages());
-        let Pools {
-            pool,
-            rows,
-            shapes,
-            pooled,
-            ..
-        } = self;
-        for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
-            for (at, arena) in planes.iter_mut().enumerate() {
-                let bytes = watermark_bytes(shape, at, kv_pages, windowed, state_slots, page_size);
-                arena.release_tail(pool, bytes);
-            }
-        }
-        for row in pooled.iter_mut() {
-            let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
-            for arena in row.planes.iter_mut() {
-                arena.release_tail(pool, bytes);
-            }
-        }
-        self.committed_kv_pages = kv_pages;
-        self.committed_state_slots = state_slots;
-        self.backed_pages.clear();
-    }
 }
 
 const POOL_STATE: Dtype = Dtype::Bf16;
@@ -2241,48 +2549,6 @@ impl engine::frame::Supply for Pools {
             Commit::Committed => Ok(()),
             refusal => Err(refuse(&self.pool, refusal)),
         }
-    }
-
-    fn trim(&mut self, hint: engine::frame::Demand) {
-        let idle = self
-            .airborne
-            .as_ref()
-            .is_none_or(|counts| counts.count() == 0);
-        if !idle {
-            return;
-        }
-        if u64::from(hint.kv_pages) >= u64::from(self.committed_kv_pages)
-            && hint.state_slots >= self.committed_state_slots
-        {
-            return;
-        }
-        if !self.trim_is_worth_the_unmap(hint) {
-            return;
-        }
-        self.release_to(
-            hint.kv_pages.min(self.committed_kv_pages),
-            hint.state_slots.min(self.committed_state_slots),
-        );
-    }
-}
-
-const TRIM_HYSTERESIS_SHIFT: u32 = 3;
-
-impl Pools {
-    fn trim_is_worth_the_unmap(&self, hint: engine::frame::Demand) -> bool {
-        let budget = self.pool.budget_pages();
-        let free = budget.saturating_sub(self.pool.committed_pages());
-        if free <= budget >> TRIM_HYSTERESIS_SHIFT {
-            return true;
-        }
-        let kv_drop = u64::from(self.committed_kv_pages)
-            .saturating_sub(u64::from(hint.kv_pages.min(self.committed_kv_pages)));
-        let state_drop = u64::from(
-            self.committed_state_slots
-                .saturating_sub(hint.state_slots.min(self.committed_state_slots)),
-        );
-        kv_drop > u64::from(self.committed_kv_pages) >> TRIM_HYSTERESIS_SHIFT
-            || state_drop > u64::from(self.committed_state_slots) >> TRIM_HYSTERESIS_SHIFT
     }
 }
 
