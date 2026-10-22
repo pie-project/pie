@@ -1,8 +1,10 @@
 //! A pool worker: it loads no model and computes nothing. It keeps the
 //! sealed pages workers send it (`engine_cpu::Pool`), serves them back by key
-//! on the bulk link, and tells the gateway's directory what it holds, so a
-//! worker that lacks a run finds it here as it would at any worker.
+//! on the bulk link, and tells the gateway's directory what it holds, the
+//! runs it was asked to take among it, so a worker that lacks a run finds it
+//! here as it would at any worker, and a cluster policy sees its groups.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,14 +33,15 @@ impl WorkerControl for NoTurns {
         _: tarpc::context::Context,
         keys: Vec<[u8; 32]>,
         from: String,
+        retention: i64,
     ) -> Result<u32, String> {
         let pages = transport::tcp::fetch(&from, &keys, 0).await?;
         let count = pages.count as u32;
         let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || pool.put(&keys, pages))
+        tokio::task::spawn_blocking(move || pool.put_run(&keys, pages, retention))
             .await
             .map_err(|e| e.to_string())??;
-        tracing::info!(pages = count, %from, "took a run");
+        tracing::info!(pages = count, %from, retention, "took a run");
         Ok(count)
     }
 
@@ -138,8 +141,9 @@ pub async fn run(
 /// A link that goes is dialed again after this.
 const REDIAL_AFTER: Duration = Duration::from_secs(1);
 
-/// One link to the gateway: registers, then reports what the pool holds
-/// (the whole of it first) each tick until the link goes.
+/// One link to the gateway: registers, then reports what the pool holds,
+/// its pages and its runs (the whole of it first), each tick until the link
+/// goes.
 async fn link(pool: &engine_cpu::Pool, listen: &str, gateway: &str, id: WorkerId) -> Result<()> {
     let addr = gateway.strip_prefix("tcp://").unwrap_or(gateway);
     let mut conn = tcp::connect(addr, dispatch_codec);
@@ -163,18 +167,32 @@ async fn link(pool: &engine_cpu::Pool, listen: &str, gateway: &str, id: WorkerId
         .context("registering the pool with the gateway")?;
     tracing::info!(%id, "pool registered with the gateway");
 
-    let mut said: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut said: HashSet<[u8; 32]> = HashSet::new();
+    let mut said_runs: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
     let mut full = true;
     loop {
-        let now: std::collections::HashSet<[u8; 32]> = pool.keys().into_iter().collect();
-        let added: Vec<[u8; 32]> = now.difference(&said).copied().collect();
-        let removed: Vec<[u8; 32]> = said.difference(&now).copied().collect();
+        let now: HashSet<[u8; 32]> = pool.keys().into_iter().collect();
+        let runs: HashMap<[u8; 32], Vec<[u8; 32]>> = pool
+            .runs()
+            .into_iter()
+            .filter_map(|run| Some((*run.last()?, run)))
+            .collect();
         // Sent each tick, changed or not: it is how the link is seen gone.
         let report = worker_api::StateReport {
             peer: Some(listen.to_string()),
-            added,
-            removed,
+            added: now.difference(&said).copied().collect(),
+            removed: said.difference(&now).copied().collect(),
             full,
+            runs_added: runs
+                .iter()
+                .filter(|(last, _)| !said_runs.contains_key(*last))
+                .map(|(_, run)| run.clone())
+                .collect(),
+            runs_removed: said_runs
+                .keys()
+                .filter(|last| !runs.contains_key(*last))
+                .copied()
+                .collect(),
             pool: true,
             ..Default::default()
         };
@@ -182,8 +200,14 @@ async fn link(pool: &engine_cpu::Pool, listen: &str, gateway: &str, id: WorkerId
             .state(tarpc::context::current(), id, report)
             .await
             .context("the link to the gateway")?;
-        tracing::debug!(pages = now.len(), mb = pool.bytes() >> 20, "pool reported");
+        tracing::debug!(
+            pages = now.len(),
+            runs = runs.len(),
+            mb = pool.bytes() >> 20,
+            "pool reported"
+        );
         said = now;
+        said_runs = runs;
         full = false;
         tokio::time::sleep(REPORT_EVERY).await;
     }

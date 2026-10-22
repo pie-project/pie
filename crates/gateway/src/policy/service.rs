@@ -702,7 +702,10 @@ fn program_name(spec: &str) -> String {
 /// each site the replication table names that does not hold its group, and
 /// for each group retained above key 0 that no pool holds, a pool (the one
 /// a hash of the group picks), highest key first. Each is asked to take the
-/// group from a site that holds it.
+/// group from a site that holds it, told the group's retention key. That a
+/// pool holds a group is what the pool reports, as a worker does: the group
+/// stays in the directory, with the pool its site, after every worker lets
+/// it go, and comes back when the pool restarts.
 fn replicate(
     registry: &mut Registry,
     fleet: &crate::worker::WorkerRegistry,
@@ -753,10 +756,11 @@ fn replicate(
         };
         registry.asked.insert(key, now);
         let keys = group.keys.as_ref().clone();
+        let retention = registry.retention.key(&group_id);
         handle.spawn(async move {
             let mut ctx = tarpc::context::current();
             ctx.deadline = std::time::Instant::now() + Duration::from_secs(120);
-            match client.replicate(ctx, keys, from).await {
+            match client.replicate(ctx, keys, from, retention).await {
                 Ok(Ok(pages)) => tracing::info!(group = %group_id, worker = %target, table, pages, "replicated"),
                 Ok(Err(why)) => tracing::warn!(group = %group_id, worker = %target, table, %why, "replication refused"),
                 Err(error) => tracing::warn!(group = %group_id, worker = %target, table, %error, "replication not delivered"),
@@ -2328,6 +2332,32 @@ mod tests {
             ],
             "a pool already holds `held`, `zero` is at 0, `gone` is in no directory"
         );
+    }
+
+    #[test]
+    fn a_group_only_a_pool_holds_is_listed_with_the_pool_its_site_and_not_asked_again() {
+        let directory = crate::directory::Directory::default();
+        let run = vec![[1; 32], [2; 32]];
+        directory.report(WorkerId(9), Some("p:9".into()), run.clone(), vec![], true);
+        directory.report_runs(WorkerId(9), vec![run], vec![], true, true);
+        let mut registry = Registry::default();
+        registry.groups = directory
+            .groups()
+            .into_iter()
+            .map(|(last, group)| (hex(&last), group))
+            .collect();
+        registry.pools = vec!["9".into()];
+        let id = hex(&[2; 32]);
+        registry.retention = retention(&[(&id, 1)]);
+        assert!(registry.retained().is_empty(), "the pool holds it");
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            matches!(plane.attr(&Subject::Group(id.clone()), "sites"), Some(Value::Json(j)) if j == r#"["9"]"#)
+        );
+        assert!(matches!(
+            plane.attr(&Subject::Group(id), "retention/key"),
+            Some(Value::Int(1))
+        ));
     }
 
     fn shared() -> Shared {
