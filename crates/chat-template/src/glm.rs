@@ -191,7 +191,13 @@ fn split_calls(msg: &str) -> (String, Vec<(String, serde_json::Value)>) {
 }
 
 impl Instruct for Glm {
+    /// What a raw prompt goes after: `[gMASK]<sop>`, and nothing for
+    /// GLM-5.3, whose opening is a system turn (its effort line) a raw
+    /// prompt would continue.
     fn prefix(&self) -> Vec<u32> {
+        if self.style == Style::Glm5 {
+            return Vec::new();
+        }
         self.prefix.clone()
     }
 
@@ -339,15 +345,8 @@ impl Instruct for Glm {
     }
 }
 
-/// GLM's calls: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>
-/// …</tool_call>` (GLM-4.5 with newlines between), each value JSON where it
-/// parses as JSON and a string where it does not.
-struct GlmToolDecoder {
-    decoder: TokenizerDecoder,
-    accumulated: String,
-    inside: bool,
-}
-
+/// One call's body, what sits between `<tool_call>` and `</tool_call>`, as
+/// its name and its arguments' JSON; none where it does not read.
 fn parse_call(call: &str) -> Option<(String, String)> {
     let (name, mut rest) = match call.find("<arg_key>") {
         Some(at) => (call[..at].trim(), &call[at..]),
@@ -375,6 +374,15 @@ fn parse_call(call: &str) -> Option<(String, String)> {
         name.to_string(),
         serde_json::Value::Object(arguments).to_string(),
     ))
+}
+
+/// GLM's calls: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>
+/// …</tool_call>` (GLM-4.5 with newlines between), each value JSON where it
+/// parses as JSON and a string where it does not.
+struct GlmToolDecoder {
+    decoder: TokenizerDecoder,
+    accumulated: String,
+    inside: bool,
 }
 
 impl ToolDecoder for GlmToolDecoder {
