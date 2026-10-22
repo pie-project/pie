@@ -107,6 +107,18 @@ impl Gpu {
             .map(|c| widen(u16::from_le_bytes(*c)))
             .collect()
     }
+    fn down_f32(&self, handle: u32, n: usize) -> Vec<f32> {
+        let bytes = self
+            .handles
+            .read(handle, (n * 4) as u64)
+            .expect("read back");
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()
+    }
 }
 
 /// `x / rms(x)` over each `run`-wide slice, times `scale(i)` at column `i`
@@ -392,6 +404,131 @@ fn the_gated_norms_answer_the_reference() {
             &gpu.down(y, n),
             &want,
             &format!("slang gated rms by heads {shape}"),
+        );
+    }
+}
+
+/// The adds a norm leans on: `y += x` over a tensor and `out[r, c] +=
+/// bias[c]`, bf16 and f32 (odd-sized f32, the pair's tail half there).
+#[test]
+fn the_sums_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    for (rows, width) in [(3usize, 64usize), (5, 1000)] {
+        let n = rows * width;
+        let (xv, yv) = (noise(width as u64, n), noise(width as u64 + 1, n));
+        let bv = noise(width as u64 + 2, width);
+        let bt = |buf: u32, rows: usize, width: usize| {
+            Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16)
+        };
+        let (x, xr) = gpu.up(&xv);
+        let (_, yr) = gpu.up(&yv);
+        let (_, br) = gpu.up(&bv);
+        let sum: Vec<f64> = xr
+            .iter()
+            .zip(&yr)
+            .map(|(a, b)| f64::from(*a) + f64::from(*b))
+            .collect();
+        let biased: Vec<f64> = (0..n)
+            .map(|i| f64::from(yr[i]) + f64::from(br[i % width]))
+            .collect();
+        let shape = format!("{rows} x {width}");
+        for slang in [false, true] {
+            let who = if slang { "slang " } else { "" };
+            let (y, _) = gpu.up(&yv);
+            let (yt, xt) = (bt(y, rows, width), bt(x, rows, width));
+            if slang {
+                gpu.run_slang(|s| {
+                    kernels_slang::elemwise::residual_add::residual_add(s, st(xt), st(yt))
+                });
+            } else {
+                gpu.run(|s| norm::residual_add(s, xt, yt));
+            }
+            close(
+                &gpu.down(y, n),
+                &sum,
+                &format!("{who}residual add bf16 {shape}"),
+            );
+            let (y, _) = gpu.up(&yv);
+            let (b, _) = gpu.up(&bv);
+            let (yt, b) = (bt(y, rows, width), bt(b, 1, width));
+            if slang {
+                gpu.run_slang(|s| kernels_slang::elemwise::add_bias::add_bias(s, st(b), st(yt)));
+            } else {
+                gpu.run(|s| norm::add_bias(s, b, yt));
+            }
+            close(
+                &gpu.down(y, n),
+                &biased,
+                &format!("{who}add bias bf16 {shape}"),
+            );
+        }
+    }
+    for (rows, width) in [(3usize, 7usize), (5, 1001)] {
+        let n = rows * width;
+        let (xv, yv) = (noise(width as u64 + 3, n), noise(width as u64 + 4, n));
+        let bv = noise(width as u64 + 5, width);
+        let ft = |buf: u32, rows: usize, width: usize| {
+            Tensor::new(buf, rows as u32, width as u32, Dtype::F32)
+        };
+        let shape = format!("{rows} x {width}");
+        let x = gpu.up_f32(&xv);
+        let y = gpu.up_f32(&yv);
+        gpu.run_slang(|s| {
+            kernels_slang::elemwise::residual_add::residual_add(
+                s,
+                st(ft(x, rows, width)),
+                st(ft(y, rows, width)),
+            )
+        });
+        let want: Vec<f64> = xv
+            .iter()
+            .zip(&yv)
+            .map(|(a, b)| f64::from(*a) + f64::from(*b))
+            .collect();
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("slang residual add f32 {shape}"),
+        );
+        let want: Vec<f64> = (0..n)
+            .map(|i| f64::from(yv[i]) + f64::from(bv[i % width]))
+            .collect();
+        let y = gpu.up_f32(&yv);
+        let b = gpu.up_f32(&bv);
+        gpu.run_slang(|s| {
+            kernels_slang::elemwise::add_bias::add_bias(
+                s,
+                st(ft(b, 1, width)),
+                st(ft(y, rows, width)),
+            )
+        });
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("slang add bias f32 {shape}"),
+        );
+        if width % 2 == 0 {
+            continue;
+        }
+        // A bf16 bias under f32 rows; the bias is read an element at a time,
+        // so it may be odd wide.
+        let (b, br) = gpu.up(&bv);
+        let want: Vec<f64> = (0..n)
+            .map(|i| f64::from(yv[i]) + f64::from(br[i % width]))
+            .collect();
+        let y = gpu.up_f32(&yv);
+        let bias = Tensor::new(b, 1, width as u32, Dtype::Bf16);
+        gpu.run_slang(|s| {
+            kernels_slang::elemwise::add_bias::add_bias(s, st(bias), st(ft(y, rows, width)))
+        });
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("slang add bf16 bias to f32 {shape}"),
         );
     }
 }

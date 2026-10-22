@@ -343,13 +343,23 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
             Elemwise::ResidualAdd { x, y, y_out: _ } => {
-                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
+                kernels_slang::elemwise::residual_add::residual_add(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                    crate::encode::slang_tensor(self.tensor(*y)),
+                )
+                .map_err(crate::encode::from_slang)
             }
             Elemwise::AddBias {
                 bias,
                 out,
                 out_out: _,
-            } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
+            } => kernels_slang::elemwise::add_bias::add_bias(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*bias)),
+                crate::encode::slang_tensor(self.tensor(*out)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::Standardize {
                 x,
