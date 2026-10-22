@@ -1341,6 +1341,90 @@ pub fn coop_matmul(
     )
 }
 
+/// Two or three matmuls of one `m`-row, `k`-wide activation in one register-fed (Apple10
+/// cooperative) launch, each segment's columns over the whole contraction as
+/// [`coop_matmul`] walks them unsplit (`Segment::split` is not read).
+pub fn coop_segments(
+    ctx: &Ctx<'_>,
+    segments: &[Segment],
+    act: Tensor,
+    m: i32,
+    k: i32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_segments";
+    if !(2..=3).contains(&segments.len()) {
+        return Err(refuse(OP, "a segment launch takes two or three matmuls"));
+    }
+    if !(1..=8).contains(&m) || k % COOP_SPAN != 0 {
+        return Err(refuse(
+            OP,
+            "the register-fed tile takes up to 8 rows of whole 256-input spans",
+        ));
+    }
+    let mut tiles = 0u32;
+    let mut args = Vec::with_capacity(24);
+    for s in segments {
+        let Some(biases) = s.w.biases else {
+            return Err(refuse(OP, "a segment's bank holds no biases"));
+        };
+        let ld = stated(OP, s.w.ld)?;
+        if s.w.bits != 4
+            || s.w.group != 64
+            || !s.y.width.is_multiple_of(32)
+            || !s.first.is_multiple_of(32)
+            || s.first + s.y.width > s.w.codes.rows
+            || ld % 64 != 0
+            || ld < k
+            || s.y.rows != m.unsigned_abs()
+        {
+            return Err(refuse(OP, "a segment the register-fed tile does not walk"));
+        }
+        tiles += s.y.width / 32;
+        args.extend([
+            s.w.codes.arg(),
+            s.w.scales.arg(),
+            biases.arg(),
+            s.y.arg_mut(),
+        ]);
+    }
+    for _ in segments.len()..3 {
+        let absent = ctx.absent()?;
+        args.extend([absent; 4]);
+    }
+    args.extend([act.arg(), k.arg(), m.arg()]);
+    let at = |i: usize, of: &dyn Fn(&Segment) -> i32| segments.get(i).map_or(0, of);
+    for of in [
+        &(|s: &Segment| s.y.width.cast_signed()) as &dyn Fn(&Segment) -> i32,
+        &|s: &Segment| s.w.ld.cast_signed(),
+        &|s: &Segment| s.first.cast_signed(),
+    ] {
+        for i in 0..3 {
+            args.push(at(i, of).arg());
+        }
+    }
+    ctx.fire(
+        Fire::at(STAGED_FILE, "affine_qmm_coop_segments")
+            .apply(Grid::of([64 * tiles.div_ceil(2), 1, 1], [64, 1, 1])),
+        &args,
+    )
+}
+
+/// Whether [`coop_segments`] takes matmuls of `rows` rows by 4-bit, 64-group banks of `widths`
+/// columns over a contraction of `k`: the staged rung runs the widest of them first, every
+/// segment is whole simdgroups of columns, and together they fill the device unsplit.
+#[must_use]
+pub fn coop_segments_fit(tuning: &Tuning, rows: u32, widths: &[u32], k: u32) -> bool {
+    let (Some(&widest), total) = (widths.iter().max(), widths.iter().sum::<u32>()) else {
+        return false;
+    };
+    rows > 0
+        && rows <= STAGED_TILE.unsigned_abs()
+        && k.is_multiple_of(COOP_SPAN.unsigned_abs())
+        && widths.iter().all(|w| w.is_multiple_of(32))
+        && total >= COOP_WHOLE_COLUMNS.unsigned_abs()
+        && tuning.qmm(&tuning.qmm_at(rows, widest, k, 4, 64)).first() == Some(&Qmm::Staged)
+}
+
 /// The gate and up of a packed `[gate | up]` bank and their swiglu into `h` in one
 /// register-fed (Apple10 cooperative) launch, where the matmul of `act` by the whole bank
 /// takes that tile with no contraction split: `h` lands as [`matmul`] then

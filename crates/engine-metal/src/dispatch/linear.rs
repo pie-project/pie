@@ -370,13 +370,25 @@ impl Run<'_> {
         }
         let x = self.tensor(act);
         let (m, k) = (x.rows, x.width);
+        // Where the staged rung takes the widest member and the members fill the device
+        // together, the register-fed tile runs them all whole.
+        let widths: Vec<u32> = members.iter().map(|&(_, y)| self.tensor(y).width).collect();
+        let coop = x.dtype == poem_ir::Dtype::Bf16
+            && members.iter().all(|&(w, _)| {
+                self.banked(w)
+                    .is_some_and(|b| b.bits == 4 && b.group == 64 && b.biases.is_some())
+            })
+            && linear::quant::coop_segments_fit(self.tuning(), m, &widths, k);
         let mut segments = Vec::with_capacity(3);
         // The left half of the split whose halves a segment pair lands.
         let mut halves = None;
         for (i, &(w, y)) in members.iter().enumerate() {
             let out = self.tensor(y);
-            let fits = self.register_counters(act, w, out.width).is_some()
-                && out.rows == m
+            let fits = (if coop {
+                out.width.is_multiple_of(32)
+            } else {
+                self.register_counters(act, w, out.width).is_some()
+            }) && out.rows == m
                 && self.ane().and_then(|ane| ane.plan_columns(w, m)).is_none();
             let Some(bank) = self.banked(w).filter(|b| fits && b.ld % 256 == 0) else {
                 return Ok(false);
@@ -479,6 +491,21 @@ impl Run<'_> {
             {
                 return Ok(false);
             }
+        }
+        if coop {
+            linear::quant::coop_segments(
+                self.ctx(),
+                &segments,
+                x,
+                i32::try_from(m).unwrap_or(0),
+                i32::try_from(k).unwrap_or(0),
+            )?;
+            self.land_ahead([
+                members.get(1).map(|s| s.1),
+                members.get(2).map(|s| s.1),
+                halves,
+            ]);
+            return Ok(true);
         }
         let (counters, floats) = linear::quant::segments_scratch(&segments, m);
         // Each split segment sums as its own launch would, or they run alone.
