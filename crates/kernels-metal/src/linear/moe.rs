@@ -701,8 +701,8 @@ fn mpp_point(
 }
 
 /// The MPP point of a routed MXFP4 matmul, as `(row tile, column tile, simdgroups)`: the
-/// codes are decoded into threadgroup bfloat a 64-wide slice at a time, as mlx-lm's
-/// `gather_qmm_rhs_nax` does, so a row tile is the sorted tile, inside one expert's rows.
+/// codes are decoded into threadgroup bfloat a 64-wide slice at a time, so a row tile is
+/// the sorted tile, inside one expert's rows.
 fn mxfp4_mpp_point(
     x: Tensor,
     bank: Bank,
@@ -1039,7 +1039,7 @@ pub fn matmul_select_batched(
             stated(op, tile)?,
             1,
         )?;
-        // The stamped affine kernel is the steel tile's own; the MXFP4 and fp16 ones
+        // The stamped affine kernel is the gemm tile's own; the MXFP4 and fp16 ones
         // take the routed threadgroup.
         let group = if point.stamp.is_empty() {
             let group = crate::linear::quant::routed_group(stated(op, tile)?);

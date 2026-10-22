@@ -1,9 +1,33 @@
+// Portions derived from MLX (https://github.com/ml-explore/mlx, MIT License):
+//   mlx/backend/metal/kernels/quantized.h
+// renamed into Pie's namespaces; crates/kernels-metal/NOTICE lists the changes.
+//
+// Copyright © 2023 Apple Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
 
-#define STEEL_CONST static constant constexpr const
-STEEL_CONST int SIMD_SIZE = 32;
+#define PIE_CONST static constant constexpr const
+PIE_CONST int SIMD_SIZE = 32;
 
 template <int bits, int wsize = 8>
 inline constexpr short get_pack_factor() {
@@ -309,10 +333,10 @@ inline float mxfp4_block_scale(uint8_t code) {
 template <typename T, int BITS, int GROUP = 64>
 struct AffineQ {
   typedef T scale_t;
-  STEEL_CONST int bits = BITS;
+  PIE_CONST int bits = BITS;
 
-  STEEL_CONST int group_size = GROUP;
-  STEEL_CONST bool zero_point = true;
+  PIE_CONST int group_size = GROUP;
+  PIE_CONST bool zero_point = true;
   static METAL_FUNC float scale_of(scale_t s) { return float(s); }
   template <typename U, int VPT>
   static METAL_FUNC U prepare(const device T* x, thread U* x_thread) {
@@ -335,9 +359,9 @@ template <typename T> using AffineU2_gs128 = AffineQ<T, 2, 128>;
 template <typename T>
 struct Mxfp4 {
   typedef uint8_t scale_t;
-  STEEL_CONST int bits = 4;
-  STEEL_CONST int group_size = 32;
-  STEEL_CONST bool zero_point = false;
+  PIE_CONST int bits = 4;
+  PIE_CONST int group_size = 32;
+  PIE_CONST bool zero_point = false;
   static METAL_FUNC float scale_of(scale_t s) { return mxfp4_block_scale(s); }
   template <typename U, int VPT>
   static METAL_FUNC U prepare(const device T* x, thread U* x_thread) {

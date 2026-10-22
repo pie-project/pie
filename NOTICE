@@ -31,9 +31,11 @@ https://github.com/ml-explore/mlx
 MIT License
 Copyright (c) 2023 Apple Inc.
 
-  The Metal headers `crates/kernels-metal/kernels/prim/steel_*.h` and
-  `crates/kernels-metal/kernels/linear/quant_block.h` derive from MLX, as each
-  file's header states.
+  Internalized, not vendored: the GEMM tile under
+  `crates/kernels-metal/kernels/prim/gemm_*.h` and the affine matmul and
+  matvec kernels in `crates/kernels-metal/kernels/linear/` derive from MLX,
+  renamed into Pie's namespaces; each file keeps its copyright and permission
+  notice. crates/kernels-metal/NOTICE lists the files and the changes.
 
 --------------------------------------------------------------------------------
 NIXL

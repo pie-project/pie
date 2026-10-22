@@ -412,7 +412,7 @@ METAL_FUNC void sdpa_wide_land(threadgroup bfloat* dst, const thread uint4* w, c
 // the queries against a 16-key block staged in threadgroup memory, the
 // slices' partial scores are summed through the same memory before the online
 // softmax, and each simdgroup accumulates its own slice of the output, in
-// f32. MLX's steel attention splits a 256-wide head the same way.
+// f32.
 template <typename T, int D, bool WITH_LSE>
 inline void sdpa_paged_mma_wide_body(
     const device T* queries,

@@ -1,11 +1,35 @@
+// Portions derived from MLX (https://github.com/ml-explore/mlx, MIT License):
+//   mlx/backend/metal/kernels/steel/gemm/gemm.h
+// renamed into Pie's namespaces; crates/kernels-metal/NOTICE lists the changes.
+//
+// Copyright © 2023 Apple Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 
 using namespace metal;
 
-#define STEEL_CONST static constant constexpr const
-STEEL_CONST int SIMD_SIZE = 32;
+#define PIE_CONST static constant constexpr const
+PIE_CONST int SIMD_SIZE = 32;
 
 constant float kMxfp4Lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -17,10 +41,10 @@ inline float mxfp4_block_scale(uint8_t code) {
   return code == 0xff ? NAN : metal::ldexp(1.0f, int(code) - 127);
 }
 
-#include "../prim/steel_prelude.h"
-#include "../prim/steel_transforms.h"
-#include "../prim/steel_mma.h"
-#include "../prim/steel_loader.h"
+#include "../prim/gemm_traits.h"
+#include "../prim/gemm_transforms.h"
+#include "../prim/gemm_mma.h"
+#include "../prim/gemm_loader.h"
 
 template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
 [[kernel]] void dense_gemm_t(
@@ -35,9 +59,9 @@ template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BK_padded = BK + 16 / sizeof(T);
   constexpr int tgp_size = WM * WN * SIMD_SIZE;
-  using loader_a_t = pie::steel::BlockLoader<T, BM, BK, BK_padded, 1, tgp_size>;
-  using loader_b_t = pie::steel::BlockLoader<T, BN, BK, BK_padded, 1, tgp_size>;
-  using mma_t = pie::steel::
+  using loader_a_t = pie::gemm::BlockLoader<T, BM, BK, BK_padded, 1, tgp_size>;
+  using loader_b_t = pie::gemm::BlockLoader<T, BN, BK, BK_padded, 1, tgp_size>;
+  using mma_t = pie::gemm::
       BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
 
   threadgroup T As[BM * BK_padded];
@@ -170,8 +194,8 @@ template <typename T>
 
 instantiate_dense_gemv_t(bfloat16, bfloat)
 
-STEEL_CONST int KSPLIT_GROUP = 128;
-STEEL_CONST int KSPLIT_SIMDGROUPS = KSPLIT_GROUP / SIMD_SIZE;
+PIE_CONST int KSPLIT_GROUP = 128;
+PIE_CONST int KSPLIT_SIMDGROUPS = KSPLIT_GROUP / SIMD_SIZE;
 
 template <typename T>
 [[kernel]] void dense_gemv_t_ksplit(

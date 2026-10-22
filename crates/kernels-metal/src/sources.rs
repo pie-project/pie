@@ -293,20 +293,20 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/prim/mpp.h")),
     ),
     (
-        "prim/steel_loader.h",
-        include_str!(concat!(source_root!(), "/prim/steel_loader.h")),
+        "prim/gemm_loader.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_loader.h")),
     ),
     (
-        "prim/steel_mma.h",
-        include_str!(concat!(source_root!(), "/prim/steel_mma.h")),
+        "prim/gemm_mma.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_mma.h")),
     ),
     (
-        "prim/steel_prelude.h",
-        include_str!(concat!(source_root!(), "/prim/steel_prelude.h")),
+        "prim/gemm_traits.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_traits.h")),
     ),
     (
-        "prim/steel_transforms.h",
-        include_str!(concat!(source_root!(), "/prim/steel_transforms.h")),
+        "prim/gemm_transforms.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_transforms.h")),
     ),
     (
         "ptir/logits_copy.metal",

@@ -1,15 +1,32 @@
 // BlockLoader, the tile stager
 //
-// Upstream: steel/gemm/loader.h
+// Portions derived from MLX (https://github.com/ml-explore/mlx, MIT License):
+//   mlx/backend/metal/kernels/steel/gemm/loader.h
+// renamed into Pie's namespaces; crates/kernels-metal/NOTICE lists the changes.
 //
-// Derived from MLX (https://github.com/ml-explore/mlx), MIT License,
-// Copyright (c) 2023 Apple Inc.; see NOTICE. Pie owns it now: the names are
-// Pie's, and a change lands here as in any other kernel.
+// Copyright © 2023 Apple Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
-#ifndef PIE_PRIM_STEEL_LOADER_H
-#define PIE_PRIM_STEEL_LOADER_H
+#ifndef PIE_PRIM_GEMM_LOADER_H
+#define PIE_PRIM_GEMM_LOADER_H
 
-// ── steel/gemm/loader.h ──
 
 
 
@@ -19,7 +36,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace pie {
-namespace steel {
+namespace gemm {
 
 template <
     typename T,
@@ -33,8 +50,8 @@ template <
     short TCOLS = BCOLS / n_reads,
     short TROWS = tgp_size / TCOLS>
 struct BlockLoader {
-  STEEL_CONST short n_rows = (BROWS + TROWS - 1) / TROWS;
-  STEEL_CONST short vec_size = n_reads;
+  PIE_CONST short n_rows = (BROWS + TROWS - 1) / TROWS;
+  PIE_CONST short vec_size = n_reads;
 
   // Leading dimension for src
   const int src_ld;
@@ -71,9 +88,9 @@ struct BlockLoader {
   /* Apply operation to threadgroup without bound checking */
   template <typename UnaryOp>
   METAL_FUNC void apply_inplace_op(thread const UnaryOp& op) const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
         dst[i * dst_ld + j] = op.apply(dst[i * dst_ld + j]);
       }
@@ -82,7 +99,7 @@ struct BlockLoader {
 
   /* Load from device memory into threadgroup memory - without bound checking */
   METAL_FUNC void load_unsafe() const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
           *((const device ReadVector*)(&src[i * src_ld]));
@@ -95,9 +112,9 @@ struct BlockLoader {
 
     // Skip loading if thread has no valid reads
     if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short i = 0; i < BROWS; i += TROWS) {
-        STEEL_PRAGMA_UNROLL
+        PIE_PRAGMA_UNROLL
         for (short j = 0; j < vec_size; j++) {
           dst[i * dst_ld + j] = T(0);
         }
@@ -109,28 +126,28 @@ struct BlockLoader {
     bool tmp_idx[vec_size];
     T tmp_val[vec_size];
 
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       // Make sure tmp_idx only contains valid indices
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
         tmp_idx[j] = (i < src_tile_dim.y) && (j < src_tile_dim.x);
       }
 
       // Read valid indices into tmp_val
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
         tmp_val[j] = src[(tmp_idx[j] ? i * src_ld + j : 0)];
       }
 
       // Zero out unneeded values
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
         tmp_val[j] = tmp_idx[j] ? tmp_val[j] : T(0);
       }
 
       // Copy values to threadgroup memory
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
         dst[i * dst_ld + j] = tmp_val[j];
       }
@@ -165,11 +182,11 @@ template <
     short reduction_dim,
     short tgp_size>
 struct BlockLoaderCast {
-  STEEL_CONST short n_reads = (BCOLS * BROWS) < tgp_size
+  PIE_CONST short n_reads = (BCOLS * BROWS) < tgp_size
                                   ? 1
                                   : (BCOLS * BROWS) / tgp_size;
-  STEEL_CONST short TCOLS = BCOLS / n_reads;
-  STEEL_CONST short TROWS = tgp_size / TCOLS;
+  PIE_CONST short TCOLS = BCOLS / n_reads;
+  PIE_CONST short TROWS = tgp_size / TCOLS;
 
   const int src_ld;
   const int tile_stride;
@@ -195,9 +212,9 @@ struct BlockLoaderCast {
         src(src_ + bi * src_ld + bj) {}
 
   METAL_FUNC void load_unsafe() const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < n_reads; j++) {
         dst[i * dst_ld + j] = D(float(src[i * src_ld + j]));
       }
@@ -209,7 +226,7 @@ struct BlockLoaderCast {
   }
 };
 
-} // namespace steel
+} // namespace gemm
 } // namespace pie
 
 #endif

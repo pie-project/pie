@@ -735,7 +735,7 @@ pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
         None => Ok(()),
         Some(param) => Err(Fault::Param {
             name: param.name.clone(),
-            why: "is declared U4g64tiled — MLX affine codes in m16n8k16 fragment order, which \
+            why: "is declared U4g64tiled — affine codes in m16n8k16 fragment order, which \
                   this shell has no reader for: its qmm and qmv arms index an affine bank \
                   row-major and would answer nonsense off a relaid plane. The order is \
                   `kernels_cuda::linear::tiled`'s, and a model text reaches it only by asking \

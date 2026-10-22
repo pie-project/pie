@@ -1,15 +1,32 @@
 // The epilogue transforms and the MXFP4 block loader
 //
-// Upstream: steel/gemm/transforms.h
+// Portions derived from MLX (https://github.com/ml-explore/mlx, MIT License):
+//   mlx/backend/metal/kernels/steel/gemm/transforms.h
+// renamed into Pie's namespaces; crates/kernels-metal/NOTICE lists the changes.
 //
-// Derived from MLX (https://github.com/ml-explore/mlx), MIT License,
-// Copyright (c) 2023 Apple Inc.; see NOTICE. Pie owns it now: the names are
-// Pie's, and a change lands here as in any other kernel.
+// Copyright © 2023 Apple Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
-#ifndef PIE_PRIM_STEEL_TRANSFORMS_H
-#define PIE_PRIM_STEEL_TRANSFORMS_H
+#ifndef PIE_PRIM_GEMM_TRANSFORMS_H
+#define PIE_PRIM_GEMM_TRANSFORMS_H
 
-// ── steel/gemm/transforms.h ──
 
 
 
@@ -19,7 +36,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace pie {
-namespace steel {
+namespace gemm {
 
 template <typename OutT, typename InT>
 struct TransformNone {
@@ -88,9 +105,9 @@ template <
     typename D = T>
 struct Mxfp4BlockLoader {
   static_assert(BCOLS == 32, "MXFP4 blocks are exactly 32 values");
-  STEEL_CONST short pack_factor = 2;
-  STEEL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  STEEL_CONST short n_reads =
+  PIE_CONST short pack_factor = 2;
+  PIE_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  PIE_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
 
   const int src_ld;
@@ -138,7 +155,7 @@ struct Mxfp4BlockLoader {
   }
 };
 
-} // namespace steel
+} // namespace gemm
 } // namespace pie
 
 #endif

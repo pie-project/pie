@@ -1,15 +1,32 @@
 // The simdgroup-matrix GEMM: BaseMMAFrag, MMATile, BlockMMA
 //
-// Upstream: steel/gemm/mma.h
+// Portions derived from MLX (https://github.com/ml-explore/mlx, MIT License):
+//   mlx/backend/metal/kernels/steel/gemm/mma.h
+// renamed into Pie's namespaces; crates/kernels-metal/NOTICE lists the changes.
 //
-// Derived from MLX (https://github.com/ml-explore/mlx), MIT License,
-// Copyright (c) 2023 Apple Inc.; see NOTICE. Pie owns it now: the names are
-// Pie's, and a change lands here as in any other kernel.
+// Copyright © 2023 Apple Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
-#ifndef PIE_PRIM_STEEL_MMA_H
-#define PIE_PRIM_STEEL_MMA_H
+#ifndef PIE_PRIM_GEMM_MMA_H
+#define PIE_PRIM_GEMM_MMA_H
 
-// ── steel/gemm/mma.h ──
 
 
 
@@ -25,7 +42,7 @@ using namespace metal;
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace pie {
-namespace steel {
+namespace gemm {
 
 template <typename T, int kFragRows_, int kFragCols_>
 struct BaseMMAFrag {
@@ -39,13 +56,13 @@ struct BaseMMAFrag {
 
 template <typename T>
 struct BaseMMAFrag<T, 8, 8> {
-  STEEL_CONST int kFragRows = 8;
-  STEEL_CONST int kFragCols = 8;
+  PIE_CONST int kFragRows = 8;
+  PIE_CONST int kFragCols = 8;
 
-  STEEL_CONST int kElemsPerFrag = (kFragRows * kFragCols) / 32;
+  PIE_CONST int kElemsPerFrag = (kFragRows * kFragCols) / 32;
 
-  STEEL_CONST int kElemRows = 1;
-  STEEL_CONST int kElemCols = 2;
+  PIE_CONST int kElemRows = 1;
+  PIE_CONST int kElemCols = 2;
 
   static_assert(
       kElemRows * kElemCols == kElemsPerFrag,
@@ -65,9 +82,9 @@ struct BaseMMAFrag<T, 8, 8> {
   template <typename SrcPtrType, typename StrX, typename StrY>
   METAL_FUNC static constexpr void
   load(thread frag_type& dst, SrcPtrType src, StrX str_x, StrY str_y) {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kElemRows; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kElemCols; j++) {
         dst[i * kElemCols + j] = static_cast<T>(src[i * str_x + j * str_y]);
       }
@@ -91,9 +108,9 @@ struct BaseMMAFrag<T, 8, 8> {
       LimY lim_y,
       OffX off_x = Int<0>{},
       OffY off_y = Int<0>{}) {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kElemRows; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kElemCols; j++) {
         if ((off_x + i) < lim_x && (off_y + j) < lim_y) {
           dst[i * kElemCols + j] =
@@ -110,9 +127,9 @@ struct BaseMMAFrag<T, 8, 8> {
   store(const thread frag_type& src, DstPtrType dst, StrX str_x, StrY str_y) {
     using U = pointer_element_t<DstPtrType>;
 
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kElemRows; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kElemCols; j++) {
         dst[i * str_x + j * str_y] = static_cast<U>(src[i * kElemCols + j]);
       }
@@ -133,9 +150,9 @@ struct BaseMMAFrag<T, 8, 8> {
                                               StrY str_y, BiasPtrType bias) {
     using U = pointer_element_t<DstPtrType>;
 
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kElemRows; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kElemCols; j++) {
         dst[i * str_x + j * str_y] = static_cast<U>(
             float(src[i * kElemCols + j]) + float(bias[j]));
@@ -162,9 +179,9 @@ struct BaseMMAFrag<T, 8, 8> {
       OffY off_y = Int<0>{}) {
     using U = pointer_element_t<DstPtrType>;
 
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kElemRows; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kElemCols; j++) {
         if ((off_x + i) < lim_x && (off_y + j) < lim_y) {
           dst[(off_x + i) * str_x + (off_y + j) * str_y] =
@@ -197,9 +214,9 @@ struct BaseMMAFrag<T, 8, 8> {
       OffY off_y = Int<0>{}) {
     using U = pointer_element_t<DstPtrType>;
 
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kElemRows; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kElemCols; j++) {
         if ((off_x + i) < stop_x && (off_x + i) >= start_x &&
             (off_y + j) < stop_y && (off_y + j) >= start_y) {
@@ -246,18 +263,18 @@ template <
 struct MMATile {
   using MMAFrag_t = MMAFrag_;
   using elem_type = T;
-  STEEL_CONST int kFragRows = MMAFrag_t::kFragRows;
-  STEEL_CONST int kFragCols = MMAFrag_t::kFragCols;
-  STEEL_CONST int kElemsPerFrag = MMAFrag_t::kElemsPerFrag;
+  PIE_CONST int kFragRows = MMAFrag_t::kFragRows;
+  PIE_CONST int kFragCols = MMAFrag_t::kFragCols;
+  PIE_CONST int kElemsPerFrag = MMAFrag_t::kElemsPerFrag;
 
-  STEEL_CONST int kTileRows = kTileRows_;
-  STEEL_CONST int kTileCols = kTileCols_;
+  PIE_CONST int kTileRows = kTileRows_;
+  PIE_CONST int kTileCols = kTileCols_;
 
-  STEEL_CONST int kRows = kTileRows * kFragRows;
-  STEEL_CONST int kCols = kTileCols * kFragCols;
+  PIE_CONST int kRows = kTileRows * kFragRows;
+  PIE_CONST int kCols = kTileCols * kFragCols;
 
-  STEEL_CONST int kNumFrags = kTileRows * kTileCols;
-  STEEL_CONST int kElemsPerTile = kNumFrags * kElemsPerFrag;
+  PIE_CONST int kNumFrags = kTileRows * kTileCols;
+  PIE_CONST int kElemsPerTile = kNumFrags * kElemsPerFrag;
 
   typedef typename MMAFrag_t::mat_type mat_type;
   typedef typename MMAFrag_t::frag_type frag_type;
@@ -267,7 +284,7 @@ struct MMATile {
   METAL_FUNC MMATile() thread {}
 
   METAL_FUNC constexpr void clear() {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kNumFrags; ++i) {
       val_frags[i] = frag_type(0);
     }
@@ -285,7 +302,7 @@ struct MMATile {
 
   METAL_FUNC mat_type mat_at(const short i, const short j) {
     mat_type val_mat;
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short ii = 0; ii < kElemsPerFrag; ++ii) {
       val_mat.thread_elements()[ii] = frag_at(i, j)[ii];
     }
@@ -302,9 +319,9 @@ struct MMATile {
 
   template <typename U, int w_x, int w_y, int str_x, int str_y>
   METAL_FUNC void load(const threadgroup U* src) {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kTileCols; ++j) {
         MMAFrag_t::load(
             frag_at(i, j),
@@ -319,9 +336,9 @@ struct MMATile {
 
   template <typename U, int w_x, int w_y, int str_x, int str_y>
   METAL_FUNC void store(threadgroup U* dst) const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kTileCols; ++j) {
         MMAFrag_t::store(
             frag_at(i, j),
@@ -336,9 +353,9 @@ struct MMATile {
 
   template <typename U, int w_x, int w_y>
   METAL_FUNC void load(const device U* src, const int ld) {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kTileCols; ++j) {
         MMAFrag_t::load(
             frag_at(i, j),
@@ -351,9 +368,9 @@ struct MMATile {
 
   template <typename U, int w_x, int w_y>
   METAL_FUNC void store(device U* dst, const int ld) const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kTileCols; ++j) {
         MMAFrag_t::store(
             frag_at(i, j),
@@ -367,9 +384,9 @@ struct MMATile {
   template <typename U, int w_x, int w_y>
   METAL_FUNC void store_bias(device U* dst, const int ld,
                              const device U* bias) const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < kTileCols; ++j) {
         MMAFrag_t::store_bias(
             frag_at(i, j),
@@ -384,9 +401,9 @@ struct MMATile {
   template <typename U, int w_x, int w_y>
   METAL_FUNC void
   load_safe(const device U* src, const int ld, const short2 src_tile_dims) {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (int i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (int j = 0; j < kTileCols; ++j) {
         MMAFrag_t::load_safe(
             frag_at(i, j),
@@ -404,9 +421,9 @@ struct MMATile {
   template <typename U, int w_x, int w_y>
   METAL_FUNC void
   store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (int i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (int j = 0; j < kTileCols; ++j) {
         MMAFrag_t::store_safe(
             frag_at(i, j),
@@ -427,9 +444,9 @@ struct MMATile {
       const int ld,
       const short2 start,
       const short2 stop) const {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (int i = 0; i < kTileRows; ++i) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (int j = 0; j < kTileCols; ++j) {
         MMAFrag_t::store_slice(
             frag_at(i, j),
@@ -453,12 +470,12 @@ METAL_FUNC void tile_matmad(
     thread MMATile<U, M, K>& A,
     thread MMATile<U, K, N>& B,
     thread MMATile<T, M, N>& C) {
-  STEEL_PRAGMA_UNROLL
+  PIE_PRAGMA_UNROLL
   for (short m = 0; m < M; ++m) {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short n = 0; n < N; ++n) {
       short n_serp = (m % 2) ? (N - 1 - n) : n;
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short k = 0; k < K; ++k) {
         MMATile<T, M, N>::MMAFrag_t::mma(
             D.frag_at(m, n_serp),
@@ -487,30 +504,30 @@ template <
     typename Epilogue = TransformNone<U, AccumType>>
 struct BlockMMA {
   // MMAFrag size
-  STEEL_CONST short kFragSize = 8;
+  PIE_CONST short kFragSize = 8;
   using MMAFrag_acc_t = BaseMMAFrag<AccumType, kFragSize, kFragSize>;
 
   // Warp tile simdgroup matrix strides along M
-  STEEL_CONST short TM_stride = kFragSize * WM;
+  PIE_CONST short TM_stride = kFragSize * WM;
   // Warp tile simdgroup matrix strides along M
-  STEEL_CONST short TN_stride = kFragSize * WN;
+  PIE_CONST short TN_stride = kFragSize * WN;
 
   // Warp tile size along M
-  STEEL_CONST short TM = BM / (kFragSize * WM);
+  PIE_CONST short TM = BM / (kFragSize * WM);
   // Warp tile size along N
-  STEEL_CONST short TN = BN / (kFragSize * WN);
+  PIE_CONST short TN = BN / (kFragSize * WN);
 
   // Threadgroup A strides
-  STEEL_CONST short A_str_m = transpose_a ? 1 : lda_tgp; // M
-  STEEL_CONST short A_str_k = transpose_a ? lda_tgp : 1; // K
+  PIE_CONST short A_str_m = transpose_a ? 1 : lda_tgp; // M
+  PIE_CONST short A_str_k = transpose_a ? lda_tgp : 1; // K
 
   // Threadgroup B strides
-  STEEL_CONST short B_str_k = transpose_b ? 1 : ldb_tgp; // K
-  STEEL_CONST short B_str_n = transpose_b ? ldb_tgp : 1; // N
+  PIE_CONST short B_str_k = transpose_b ? 1 : ldb_tgp; // K
+  PIE_CONST short B_str_n = transpose_b ? ldb_tgp : 1; // N
 
   // Threadgroup strides along K
-  STEEL_CONST short tile_stride_a = kFragSize * A_str_k;
-  STEEL_CONST short tile_stride_b = kFragSize * B_str_k;
+  PIE_CONST short tile_stride_a = kFragSize * A_str_k;
+  PIE_CONST short tile_stride_b = kFragSize * B_str_k;
 
   // Simdgroup matrices
   MMATile<AccumType, TM, 1, MMAFrag_acc_t> Atile;
@@ -551,7 +568,7 @@ struct BlockMMA {
     Bs += Bs_offset;
 
     // Iterate over BK in blocks of kFragSize
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short kk = 0; kk < BK; kk += kFragSize) {
       simdgroup_barrier(mem_flags::mem_none);
 
@@ -574,7 +591,7 @@ struct BlockMMA {
   /* Store results from simdgroup_matrix results into device memory */
   METAL_FUNC void store_result(device U* D, const int ldd) {
     // Apply epilogue
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
       Ctile.elems()[i] = Epilogue::apply(Ctile.elems()[i]);
     }
@@ -601,7 +618,7 @@ struct BlockMMA {
    */
   METAL_FUNC void store_result_bias(device U* D, const int ldd,
                                     const device U* bias) {
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
       Ctile.elems()[i] = Epilogue::apply(Ctile.elems()[i]);
     }
@@ -615,7 +632,7 @@ struct BlockMMA {
   METAL_FUNC void
   store_result_slice(device U* D, const int ldd, short2 start, short2 stop) {
     // Apply epilogue
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
       Ctile.elems()[i] = Epilogue::apply(Ctile.elems()[i]);
     }
@@ -635,7 +652,7 @@ struct BlockMMA {
   METAL_FUNC void
   store_result_safe(device U* D, const int ldd, short2 dst_tile_dims) {
     // Apply epilogue
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
       Ctile.elems()[i] = Epilogue::apply(Ctile.elems()[i]);
     }
@@ -654,7 +671,7 @@ struct BlockMMA {
   template <typename UnaryEpilogue>
   METAL_FUNC void apply_epilogue(thread const UnaryEpilogue& epilogue_op) {
     // Loop over all simdgroup tiles
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < decltype(Ctile)::kElemsPerTile; i++) {
       Ctile.elems()[i] = epilogue_op.apply(Ctile.elems()[i]);
     }
@@ -671,16 +688,16 @@ struct BlockMMA {
     C += (sm)*ldc + (sn)*fdc;
 
     // Loop over all simdgroup tiles
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < TM; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < TN; j++) {
         // Get accumulated result and associated offset in C
         thread auto& accum = Ctile.frag_at(i, j);
         int offset_c = (i * TM_stride) * ldc + (j * TN_stride) * fdc;
 
         // Apply epilogue
-        STEEL_PRAGMA_UNROLL
+        PIE_PRAGMA_UNROLL
         for (short k = 0; k < decltype(Ctile)::kElemsPerFrag; k++) {
           accum[k] = epilogue_op.apply(accum[k], C[offset_c + k * fdc]);
         }
@@ -704,9 +721,9 @@ struct BlockMMA {
       return;
 
     // Loop over all simdgroup tiles
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < TM; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < TN; j++) {
         // Get accumulated result and associated offset in C
         thread auto& accum = Ctile.frag_at(i, j);
@@ -717,7 +734,7 @@ struct BlockMMA {
         // Read C
         U c_elems[kelems] = {0};
 
-        STEEL_PRAGMA_UNROLL
+        PIE_PRAGMA_UNROLL
         for (short k = 0; k < kelems; k++) {
           if ((j * TN_stride + k) < dst_tile_dims.x) {
             c_elems[k] = C[offset_c + k * fdc];
@@ -725,7 +742,7 @@ struct BlockMMA {
         }
 
         // Apply epilogue
-        STEEL_PRAGMA_UNROLL
+        PIE_PRAGMA_UNROLL
         for (short k = 0; k < kelems; k++) {
           accum[k] = epilogue_op.apply(accum[k], c_elems[k]);
         }
@@ -748,9 +765,9 @@ struct BlockMMA {
     constexpr short kelems = decltype(Ctile)::kElemsPerFrag;
 
     // Loop over all simdgroup tiles
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (short i = 0; i < TM; i++) {
-      STEEL_PRAGMA_UNROLL
+      PIE_PRAGMA_UNROLL
       for (short j = 0; j < TN; j++) {
         // Get accumulated result and associated offset in C
         thread const auto& accum = Ctile.frag_at(i, j);
@@ -758,7 +775,7 @@ struct BlockMMA {
         int offset_d = (i * TM_stride) * ldd + (j * TN_stride);
 
         // Apply epilogue
-        STEEL_PRAGMA_UNROLL
+        PIE_PRAGMA_UNROLL
         for (short k = 0; k < kelems; k++) {
           D[offset_d + k] = epilogue_op.apply(accum[k], C[offset_c + k * fdc]);
         }
@@ -784,10 +801,10 @@ struct BlockMMA {
 
     constexpr short kelems = decltype(Ctile)::kElemsPerFrag;
 
-    STEEL_PRAGMA_UNROLL
+    PIE_PRAGMA_UNROLL
     for (int i = 0; i < TM; i++) {
       if (i * TM_stride < dst_tile_dims.y) {
-        STEEL_PRAGMA_UNROLL
+        PIE_PRAGMA_UNROLL
         for (int j = 0; j < TN; j++) {
           // Get accumulated result and associated offset in C
           thread const auto& accum = Ctile.frag_at(i, j);
@@ -795,7 +812,7 @@ struct BlockMMA {
           int offset_d = (i * TM_stride) * ldd + (j * TN_stride);
 
           // Apply epilogue
-          STEEL_PRAGMA_UNROLL
+          PIE_PRAGMA_UNROLL
           for (short k = 0; k < kelems; k++) {
             if ((j * TN_stride + k) < dst_tile_dims.x) {
               D[offset_d + k] =
@@ -808,7 +825,7 @@ struct BlockMMA {
   }
 };
 
-} // namespace steel
+} // namespace gemm
 } // namespace pie
 
 #endif
