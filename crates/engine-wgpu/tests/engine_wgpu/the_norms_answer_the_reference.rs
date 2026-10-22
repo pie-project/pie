@@ -60,6 +60,16 @@ impl Gpu {
         (handle, halves.into_iter().map(widen).collect())
     }
 
+    /// `values` as f32 rows.
+    fn up_f32(&mut self, values: &[f32]) -> u32 {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut buf = Buffer::zeroed(&self.device, bytes.len() as u64).expect("a buffer");
+        buf.write(0, &bytes).expect("written");
+        let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
+        self.held.push(buf);
+        handle
+    }
+
     fn zeros(&mut self, n: usize) -> u32 {
         let buf = Buffer::zeroed(&self.device, (n * 2) as u64).expect("a buffer");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
@@ -289,5 +299,99 @@ fn the_norms_answer_the_reference() {
                 &format!("slang {what} {shape}"),
             );
         }
+    }
+}
+
+/// `y = x / rms(x) * w * gate(z)` over each `vd`-wide head.
+fn gated_reference(
+    x: &[f32],
+    z: &[f32],
+    w: &[f32],
+    vd: usize,
+    eps: f32,
+    sigmoid: bool,
+) -> Vec<f64> {
+    let mut out = vec![0.0; x.len()];
+    for (h, head) in x.chunks_exact(vd).enumerate() {
+        let ms = head.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / vd as f64;
+        let inv = 1.0 / (ms + f64::from(eps)).sqrt();
+        for (i, v) in head.iter().enumerate() {
+            let zr = f64::from(z[h * vd + i]);
+            let sig = 1.0 / (1.0 + (-zr).exp());
+            let gate = if sigmoid { sig } else { zr * sig };
+            out[h * vd + i] = f64::from(*v) * inv * f64::from(w[i]) * gate;
+        }
+    }
+    out
+}
+
+#[test]
+fn the_gated_norms_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let eps = 1e-6;
+    for (rows, heads, vd) in [(3usize, 2usize, 64usize), (4, 8, 128)] {
+        let width = heads * vd;
+        let n = rows * width;
+        let xv = noise(rows as u64 * 17 + vd as u64, n);
+        let x = gpu.up_f32(&xv);
+        let (z, zv) = gpu.up(&noise(vd as u64 + 3, n));
+        let wv = noise(vd as u64 + 5, vd);
+        let w = gpu.up_f32(&wv);
+        let f32t = |buf: u32, width: usize| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
+        let bt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+        let shape = format!("{rows} x {heads} x {vd}");
+        for sigmoid in [false, true] {
+            let want = gated_reference(&xv, &zv, &wv, vd, eps, sigmoid);
+            let wt = Tensor::new(w, 1, vd as u32, Dtype::F32);
+            let y = gpu.zeros(n);
+            gpu.run(|s| {
+                norm::rmsnorm_gated(s, f32t(x, width), bt(z), wt, vd as u32, eps, sigmoid, bt(y))
+            });
+            close(
+                &gpu.down(y, n),
+                &want,
+                &format!("gated rms sigmoid={sigmoid} {shape}"),
+            );
+            let y = gpu.zeros(n);
+            gpu.run_slang(|s| {
+                kernels_slang::elemwise::gated_rms::rmsnorm_gated(
+                    s,
+                    st(f32t(x, width)),
+                    st(bt(z)),
+                    st(wt),
+                    vd as u32,
+                    eps,
+                    sigmoid,
+                    st(bt(y)),
+                )
+            });
+            close(
+                &gpu.down(y, n),
+                &want,
+                &format!("slang gated rms sigmoid={sigmoid} {shape}"),
+            );
+        }
+        let want = gated_reference(&xv, &zv, &wv, vd, eps, true);
+        let y = gpu.zeros(n);
+        gpu.run_slang(|s| {
+            kernels_slang::elemwise::gated_rms::rmsnorm_gated_by(
+                s,
+                st(f32t(x, width)),
+                st(bt(z)),
+                st(Tensor::new(w, 1, vd as u32, Dtype::F32)),
+                heads as u32,
+                eps,
+                st(bt(y)),
+            )
+        });
+        close(
+            &gpu.down(y, n),
+            &want,
+            &format!("slang gated rms by heads {shape}"),
+        );
     }
 }

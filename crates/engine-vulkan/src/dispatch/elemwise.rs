@@ -314,16 +314,17 @@ impl Run<'_> {
                 eps,
                 act,
                 y,
-            } => elemwise::norm::rmsnorm_gated(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::gated_rms::rmsnorm_gated(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*gate)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *head_dim,
                 *eps,
                 matches!(act, poem_ir::GateActivation::Sigmoid),
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RmsnormGatedBy {
                 x,
                 gate,
@@ -331,15 +332,16 @@ impl Run<'_> {
                 heads,
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_gated_by(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
+            } => kernels_slang::elemwise::gated_rms::rmsnorm_gated_by(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*gate)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
                 *heads,
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
