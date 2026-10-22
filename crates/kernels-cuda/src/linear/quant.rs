@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::linear::gemm;
 use crate::linear::moe::GroupSeat;
@@ -262,6 +262,7 @@ fn dense_affine(
     seat: GroupSeat,
 ) -> Result<(), Error> {
     const ROWS_PER_WARP: u32 = 4;
+    const WORD_ROWS_PER_WARP: u32 = 4;
     const BLOCK_LANES: u32 = 128;
 
     let t = dtype_dispatch!(op, act.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -270,18 +271,32 @@ fn dense_affine(
     if y.rows == 0 {
         return Ok(());
     }
-    let tile = (BLOCK_LANES / WARP) * ROWS_PER_WARP;
+    // A few tokens at four bits stream the codes a word a lane, the warp's
+    // words contiguous: the per-group walk above reads an activation element
+    // at a time and keeps too few loads in flight for a decode's rows.
+    let words = bits == 4 && group.is_multiple_of(8) && aligned16(act.ptr) && y.rows <= 4;
+    let rows_per_warp = if words {
+        WORD_ROWS_PER_WARP
+    } else {
+        ROWS_PER_WARP
+    };
+    let tile = (BLOCK_LANES / WARP) * rows_per_warp;
+    let entry = if words {
+        format!(
+            "::pie::linear::matmul_affine_words<{t}, {f}, {}, ::pie::i32({group}), \
+             ::pie::i32({WORD_ROWS_PER_WARP})>",
+            offset.axis()
+        )
+    } else {
+        format!(
+            "::pie::linear::matmul_affine<{t}, {f}, ::pie::i32({bits}), {}, \
+             ::pie::i32({group}), ::pie::i32({ROWS_PER_WARP})>",
+            offset.axis()
+        )
+    };
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::linear::matmul_affine<{t}, {f}, ::pie::i32({bits}), {}, \
-                 ::pie::i32({group}), ::pie::i32({ROWS_PER_WARP})>",
-                offset.axis()
-            )),
-        )
-        .apply(Launch::grid(
+        Fire::at(FILE, symbol(&entry)).apply(Launch::grid(
             [y.rows, n.div_ceil(tile), 1],
             [BLOCK_LANES, 1, 1],
         )),

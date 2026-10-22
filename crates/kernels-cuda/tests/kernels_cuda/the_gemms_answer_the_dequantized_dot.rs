@@ -162,9 +162,13 @@ fn the_strided_grouped_projection_answers_each_group() {
 #[test]
 fn the_quantized_dense_projections_answer_the_dequantized_dot() {
     use kernels_cuda::linear::{nvfp4, quant};
-    // (NVFP4, bits, rows): the affine kernel at eight bits and four; NVFP4
-    // by route at one row, through a decoded bf16 tile past it.
-    for (nv, bits, rows) in [(false, 8, 5), (false, 4, 26), (true, 4, 1), (true, 4, 7)] {
+    // (NVFP4, bits, rows): the affine kernel at eight bits and four, a
+    // decode's few rows at four on the word-a-lane kernel; NVFP4 by route at
+    // one row, through a decoded bf16 tile past it.
+    #[rustfmt::skip]
+    let cases = [(false, 8, 5), (false, 4, 26), (false, 4, 1), (false, 4, 3), (true, 4, 1),
+        (true, 4, 7)];
+    for (nv, bits, rows) in cases {
         let (n, k, seat) = (320usize, 1024usize, GroupSeat::RESIDENT);
         let mut b = Bench::new(0x61 + rows as u64);
         let (x, xv) = b.bf16(rows * k);

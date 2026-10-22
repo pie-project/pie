@@ -1953,6 +1953,134 @@ __global__ void matmul_affine(
     }
 }
 
+// `matmul_affine` at four bits for a few tokens: a lane takes one code word
+// (eight codes) a step and the warp the 32 words after it, so the warp's
+// code loads and the activation's 16-byte loads are each one contiguous
+// stretch, and `kRows` rows share every activation load. A step's word lies
+// in one group, so its scale (and offset) fold in as the step ends. Two
+// steps' loads go out before either is folded.
+template <class T, class F, int kOffset, int kGroup, int kRowsT>
+__global__ void __launch_bounds__(128) matmul_affine_words(
+    const T* __restrict__ act,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const u8* __restrict__ biases,
+    T* __restrict__ out,
+    int n,
+    int k,
+    const MoeGroupBases* __restrict__ bases,
+    const u32* __restrict__ win)
+{
+    constexpr int kRows = kRowsT;
+    constexpr int kWordsPerGroup = kGroup / 8;
+    constexpr float kExcess = 8.f;
+    const int token = blockIdx.x;
+    if (win != nullptr && token >= static_cast<int>(win[0])) return;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * kRows;
+    if (row0 >= n) return;
+
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    const u8* biases_at = biases;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+        biases_at = seat.biases;
+    }
+    const int words_per_row = k / 8;
+    const int groups_per_row = k / kGroup;
+    const unsigned* w32 = reinterpret_cast<const unsigned*>(codes_at);
+    const F* sf = reinterpret_cast<const F*>(scales_at);
+    const F* bf = reinterpret_cast<const F*>(biases_at);
+    const u8* zb = biases_at;
+    const uint4* x4 = reinterpret_cast<const uint4*>(act + static_cast<long long>(token) * k);
+
+    const unsigned* wr[kRows];
+    long long fr[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+        const int row = min(row0 + r, n - 1);
+        wr[r] = w32 + static_cast<long long>(row) * words_per_row;
+        fr[r] = static_cast<long long>(row) * groups_per_row;
+    }
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+
+    constexpr int kSteps = 4;
+    for (int base = lane; base < words_per_row; base += 32 * kSteps) {
+        unsigned word[kSteps][kRows];
+        float sv[kSteps][kRows];
+        float ov[kSteps][kRows];
+        uint4 xv[kSteps];
+#pragma unroll
+        for (int s = 0; s < kSteps; ++s) {
+            const int w = base + s * 32;
+            if (w < words_per_row) {
+                xv[s] = __ldg(x4 + w);
+                const int g = w / kWordsPerGroup;
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    word[s][r] = __ldcs(wr[r] + w);
+                    sv[s][r] = Elem<F>::to_f32(sf[fr[r] + g]);
+                    if constexpr (kOffset == kOffPost || kOffset == kOffPreReal) {
+                        ov[s][r] = Elem<F>::to_f32(bf[fr[r] + g]);
+                    } else if constexpr (kOffset == kOffPreInt) {
+                        ov[s][r] = static_cast<float>(zb[fr[r] + g]);
+                    } else {
+                        ov[s][r] = kExcess;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kSteps; ++s) {
+            const int w = base + s * 32;
+            if (w >= words_per_row) continue;
+            const unsigned xw[4] = {xv[s].x, xv[s].y, xv[s].z, xv[s].w};
+            float xf[8];
+            float xsum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const T* h = reinterpret_cast<const T*>(&xw[j]);
+                xf[2 * j] = Elem<T>::to_f32(h[0]);
+                xf[2 * j + 1] = Elem<T>::to_f32(h[1]);
+                xsum += xf[2 * j] + xf[2 * j + 1];
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                float part = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    part = fmaf(static_cast<float>((word[s][r] >> (4 * j)) & 15u), xf[j], part);
+                }
+                if constexpr (kOffset == kOffPost) {
+                    acc[r] = fmaf(part, sv[s][r], acc[r]);
+                    acc[r] = fmaf(xsum, ov[s][r], acc[r]);
+                } else {
+                    acc[r] = fmaf(sv[s][r], fmaf(-ov[s][r], xsum, part), acc[r]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int row = row0 + r;
+            if (row < n)
+                out[static_cast<long long>(token) * n + row] = Elem<T>::from_f32(acc[r]);
+        }
+    }
+}
+
 template <class F, int kBits, int kOffset, int kGroup>
 __global__ void dequant_affine(
     const u8* __restrict__ codes,
