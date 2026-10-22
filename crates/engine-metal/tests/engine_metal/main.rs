@@ -58,3 +58,4 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
         .expect("a test's paging");
     Some(engine_metal::store::pool_bytes(trace, paging).expect("the pool sizes"))
 }
+mod zz_qwen38_27b_projections_price;
