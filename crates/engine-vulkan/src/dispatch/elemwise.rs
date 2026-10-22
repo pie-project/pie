@@ -105,14 +105,15 @@ impl Run<'_> {
                 bias: Some(bias),
                 eps,
                 y,
-            } => elemwise::norm::layernorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                self.tensor(*bias),
+            } => kernels_slang::elemwise::layernorm::layernorm(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
+                crate::encode::slang_tensor(self.tensor(*bias)),
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::Clamp {
                 x,
@@ -139,12 +140,13 @@ impl Run<'_> {
                 y,
                 weight: None,
                 bias: None,
-            } => elemwise::norm::layernorm_no_scale(
-                self.ctx(),
-                self.tensor(*x),
+            } => kernels_slang::elemwise::layernorm::layernorm_no_scale(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
                 *eps,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::Modulate {
                 x,
                 m,

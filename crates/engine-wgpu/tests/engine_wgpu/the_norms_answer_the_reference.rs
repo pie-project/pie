@@ -532,3 +532,100 @@ fn the_sums_answer_the_reference() {
         );
     }
 }
+
+/// `(x - mean) / sqrt(var + eps)` over each row, times `w` plus `b` when given.
+fn layernorm_reference(
+    x: &[f32],
+    width: usize,
+    eps: f32,
+    affine: Option<(&[f32], &[f32])>,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(x.len());
+    for row in x.chunks_exact(width) {
+        let mean = row.iter().map(|v| f64::from(*v)).sum::<f64>() / width as f64;
+        let var = row
+            .iter()
+            .map(|v| (f64::from(*v) - mean).powi(2))
+            .sum::<f64>()
+            / width as f64;
+        let inv = 1.0 / (var + f64::from(eps)).sqrt();
+        for (c, v) in row.iter().enumerate() {
+            let n = (f64::from(*v) - mean) * inv;
+            out.push(match affine {
+                Some((w, b)) => n * f64::from(w[c]) + f64::from(b[c]),
+                None => n,
+            });
+        }
+    }
+    out
+}
+
+#[test]
+fn the_layernorms_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let eps = 1e-5;
+    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
+    for (rows, width) in [(3usize, 64usize), (5, 1000), (2, 4096)] {
+        let n = rows * width;
+        let bt = |buf: u32, rows: usize| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        // Off-centre rows, so a missed mean shows.
+        let xv: Vec<f32> = noise(width as u64 + 7, n).iter().map(|v| v + 1.5).collect();
+        let (x, xr) = gpu.up(&xv);
+        let (w, wr) = gpu.up(&noise(width as u64 + 8, width));
+        let (b, br) = gpu.up(&noise(width as u64 + 9, width));
+        let shape = format!("{rows} x {width}");
+        let want = layernorm_reference(&xr, width, eps, Some((&wr, &br)));
+        let y = gpu.zeros(n);
+        gpu.run(|s| norm::layernorm(s, bt(x, rows), bt(w, 1), bt(b, 1), eps, bt(y, rows)));
+        close(&gpu.down(y, n), &want, &format!("layernorm {shape}"));
+        let y = gpu.zeros(n);
+        gpu.run_slang(|s| {
+            kernels_slang::elemwise::layernorm::layernorm(
+                s,
+                st(bt(x, rows)),
+                st(bt(w, 1)),
+                st(bt(b, 1)),
+                eps,
+                st(bt(y, rows)),
+            )
+        });
+        close(&gpu.down(y, n), &want, &format!("slang layernorm {shape}"));
+        let want = layernorm_reference(&xr, width, eps, None);
+        let y = gpu.zeros(n);
+        gpu.run_slang(|s| {
+            kernels_slang::elemwise::layernorm::layernorm_no_scale(
+                s,
+                st(bt(x, rows)),
+                eps,
+                st(bt(y, rows)),
+            )
+        });
+        close(
+            &gpu.down(y, n),
+            &want,
+            &format!("slang layernorm no scale {shape}"),
+        );
+    }
+    for (rows, width) in [(3usize, 7usize), (4, 1001)] {
+        let n = rows * width;
+        let ft = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
+        let xv: Vec<f32> = noise(width as u64 + 10, n)
+            .iter()
+            .map(|v| v - 0.75)
+            .collect();
+        let x = gpu.up_f32(&xv);
+        let y = gpu.zeros(2 * n);
+        gpu.run_slang(|s| {
+            kernels_slang::elemwise::layernorm::layernorm_no_scale(s, st(ft(x)), eps, st(ft(y)))
+        });
+        let want = layernorm_reference(&xv, width, eps, None);
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("slang layernorm no scale f32 {rows} x {width}"),
+        );
+    }
+}
