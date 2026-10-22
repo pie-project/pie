@@ -683,7 +683,7 @@ impl Run<'_> {
                 scaling,
                 routes,
                 weights,
-            } => linear::moe_route::hash_route(
+            } => linear::moe::hash_route(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*tid2eid),
@@ -696,7 +696,7 @@ impl Run<'_> {
                 &mut self.tensor(*weights),
             ),
             Linear::GroupRoutes { groups, routes } => {
-                linear::moe_route::group_routes(self.ctx(), *groups, &mut self.tensor(*routes))
+                linear::moe::group_routes(self.ctx(), *groups, &mut self.tensor(*routes))
             }
             Linear::MatmulGrouped {
                 x,

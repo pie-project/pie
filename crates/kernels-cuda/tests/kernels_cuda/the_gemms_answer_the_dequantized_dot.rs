@@ -225,9 +225,9 @@ fn the_affine_gemv_on_the_tensor_cores_answers_the_dequantized_dot() {
 
 #[test]
 fn the_fp8_block_projections_answer_the_dot() {
+    use kernels_cuda::linear::moe::group_routes;
     use kernels_cuda::linear::moe::{dense_fp8_shape, matmul_grouped_fp8, matmul_grouped_fp8_with};
     use kernels_cuda::linear::moe::{matmul_fp8_w8a8, select_fp8_w8a8};
-    use kernels_cuda::linear::moe_route::group_routes;
     // (arm, rows, groups, n, k): 0, the mma.sync kernel in each CTA shape
     // the dense pick lands; 1, its grouped projection; 2, a row's groups as
     // its routes on the grouped tcgen05 GEMM; 3, the GEMV over bf16 rows (K
