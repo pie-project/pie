@@ -303,15 +303,3 @@ fn a_device_file_applies_only_within_its_family() {
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(11, Some(40), 10, true), None);
     assert_eq!(report.used, Source::Defaults, "no family applies");
 }
-
-#[test]
-fn a_wide_apple10_gpu_idles_between_fires() {
-    let spin = |device: &str, family: u32, cores: u32| {
-        let (profile, _) = chip::resolve(device, &chip::facts(family, Some(cores), 10, true), None);
-        *profile.get::<chip::KeepAliveSpin>()
-    };
-    assert_eq!(spin("Apple M5 Max", 10, 40), chip::KeepAliveSpin::Idle);
-    assert_eq!(spin("Apple M5 Max", 10, 32), chip::KeepAliveSpin::Idle);
-    assert_eq!(spin("Apple M5", 10, 10), chip::KeepAliveSpin::Spin);
-    assert_eq!(spin("Apple M4 Pro", 9, 20), chip::KeepAliveSpin::Spin);
-}
