@@ -131,6 +131,35 @@ constant constexpr uint kGroupRoutes = 128;
 // The most experts a fire groups: a bit each in 32 words.
 constant constexpr uint kGroupExperts = 1024;
 
+// The shared expert's scalar gate of row `row` of `x`: its dot with the gate's
+// one column (an affine bank of 64-code groups, `bits` 4 or 8), summed by the
+// threadgroup's simdgroups in turn, landed in bf16 as the gate's matmul lands
+// it, then its sigmoid, as the gated add takes it.
+inline float shared_gate(const device bfloat *x, const device uchar *codes, const device bfloat *scales,
+                         const device bfloat *biases, uint bits, uint width, uint row, uint lid,
+                         uint threads, uint lane, uint simd, threadgroup float *parts) {
+  float acc = 0.0f;
+  for (uint k = lid; k < width; k += threads) {
+    const uint q = bits == 8 ? uint(codes[k]) : (uint(codes[k / 2]) >> (4 * (k & 1))) & 15u;
+    const float w = fma(float(scales[k / 64]), float(q), float(biases[k / 64]));
+    acc = fma(float(x[ulong(row) * width + k]), w, acc);
+  }
+  acc = simd_sum(acc);
+  if (lane == 0)
+    parts[simd] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float dot = 0.0f;
+  for (uint s = 0; s < threads / 32; ++s)
+    dot += parts[s];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float g = float(bfloat(dot));
+  return 1.0f / (1.0f + metal::exp(-g));
+}
+
+// Where `moe_sg_combine` reads the shared expert's gates in `mix`, after
+// the routes' weights.
+constant constexpr uint kMixGates = kGroupRoutes;
+
 // Groups `tokens` x `top_k` routes (at most kGroupRoutes, of at most
 // kGroupExperts experts) by expert and lays each live tile's input table from
 // its rows' tokens in `x`, in one pass: every threadgroup groups the routes
@@ -139,16 +168,23 @@ constant constexpr uint kGroupExperts = 1024;
 // where `shared`, each expert's rows in route order; the first of a tile's
 // threadgroups records its expert, rows and routes, the first of tile 0's the
 // live count. Then `qmm_sg_table` over the tile's rows: a simdgroup per
-// 64-input group (grid y) and tile (grid z), a lane per slot.
+// 64-input group (grid y) and tile (grid z), a lane per slot. Where
+// `gate_bits` is not 0, the shared tile's threadgroups also land what
+// `moe_sg_combine` reads in `mix`: the routes' `weights`, and each row's
+// sigmoid of the shared expert's scalar gate (a threadgroup a row in turn),
+// so the gate's own matmul runs nothing.
 [[kernel]] void moe_sg_group_gather(
     const device bfloat *x [[buffer(0)]], const device int *routes [[buffer(1)]],
     device bfloat *tables [[buffer(2)]], device int *tiles [[buffer(3)]], device int *rows [[buffer(4)]],
     device int *inv [[buffer(5)]], constant uint &width [[buffer(6)]], constant uint &tokens [[buffer(7)]],
     constant uint &top_k [[buffer(8)]], constant uint &experts [[buffer(9)]],
-    constant uint &shared [[buffer(10)]], uint3 at [[thread_position_in_grid]],
-    uint3 group [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
-    uint3 extent [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]]) {
+    constant uint &shared [[buffer(10)]], const device float *weights [[buffer(11)]],
+    const device uchar *gate_codes [[buffer(12)]], const device bfloat *gate_scales [[buffer(13)]],
+    const device bfloat *gate_biases [[buffer(14)]], device float *mix [[buffer(15)]],
+    constant uint &gate_bits [[buffer(16)]], uint3 at [[thread_position_in_grid]],
+    uint3 group [[threadgroup_position_in_grid]], uint3 groups [[threadgroups_per_grid]],
+    uint lid [[thread_index_in_threadgroup]], uint3 extent [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
   const uint threads = extent.x * extent.y * extent.z;
   threadgroup int staged[kGroupRoutes];
   threadgroup atomic_uint present[kGroupExperts / 32];
@@ -244,6 +280,41 @@ constant constexpr uint kGroupExperts = 1024;
     for (int r = 0; r < 2; ++r)
       sums[(2 * ulong(h) + (fm >> 2)) * 8 + 2 * c + r] = sum[r];
   }
+  if (gate_bits == 0 || tile != 0)
+    return;
+  threadgroup float parts[32];
+  if (group.y == 0)
+    for (uint r = lid; r < n; r += threads)
+      mix[r] = weights[r];
+  for (uint row = group.y; row < tokens; row += groups.y) {
+    const float g = shared_gate(x, gate_codes, gate_scales, gate_biases, gate_bits, width, row, lid,
+                                threads, lane, simd, parts);
+    if (lid == 0)
+      mix[kMixGates + row] = g;
+  }
+}
+
+// Each token's row of the routed MLP and its gated shared expert, from the
+// register tiles' down rows: the routes' rows weighed by their weights, in
+// route order, then the shared expert's row (tile 0's row of the token) by
+// its gate's sigmoid, as `moe_sg_group_gather` landed both in `mix`. Four
+// columns a thread, a token a grid row.
+[[kernel]] void moe_sg_combine(const device bfloat *down [[buffer(0)]], const device int *inv [[buffer(1)]],
+                               const device float *mix [[buffer(2)]], device bfloat *out [[buffer(3)]],
+                               constant uint &width [[buffer(4)]], constant uint &top_k [[buffer(5)]],
+                               uint2 at [[thread_position_in_grid]]) {
+  const uint c = 4 * at.x, row = at.y;
+  if (c >= width)
+    return;
+  float4 acc = float4(0.0f);
+  for (uint k = 0; k < top_k; ++k) {
+    const uint route = row * top_k + k;
+    acc = fma(float4(*reinterpret_cast<const device vec<bfloat, 4> *>(down + ulong(inv[route]) * width + c)),
+              mix[route], acc);
+  }
+  acc = fma(float4(*reinterpret_cast<const device vec<bfloat, 4> *>(down + ulong(row) * width + c)),
+            mix[kMixGates + row], acc);
+  *reinterpret_cast<device vec<bfloat, 4> *>(out + ulong(row) * width + c) = vec<bfloat, 4>(acc);
 }
 
 // A routed gate-up and its SwiGLU: each of the threadgroup's SG simdgroups

@@ -2,11 +2,13 @@
 //! The routed MLP on the register tile (`moe_sg.metal`: expert tiles, the
 //! gate-up landing its SwiGLU as the down's table, the down into sorted rows)
 //! against the per-route path (`matmul_select_quant`, `swiglu`, again, and
-//! the fold), with and without the shared expert riding along as tile 0.
+//! the fold), with and without the shared expert riding along as tile 0; and
+//! where it rides along, the tiles' combine against the fold's gated add of
+//! the shared expert, and both against f64.
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::linear::{mlp, moe};
+use kernels_metal::linear::{mlp, moe, quant};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -48,6 +50,7 @@ fn to_bf16(v: f64) -> f64 {
 /// A bank's planes on the host: row `row`'s dot with `x` in f64.
 struct Host {
     k: usize,
+    bits: u32,
     codes: Vec<u8>,
     scales: Vec<f32>,
     biases: Vec<f32>,
@@ -59,7 +62,11 @@ impl Host {
         (0..self.k)
             .map(|at| {
                 let code = row * self.k + at;
-                let q = f64::from((self.codes[code / 2] >> ((code % 2) * 4)) & 15);
+                let q = f64::from(if self.bits == 8 {
+                    self.codes[code]
+                } else {
+                    (self.codes[code / 2] >> ((code % 2) * 4)) & 15
+                });
                 let g = row * groups + at / 64;
                 x[at] * (q * f64::from(self.scales[g]) + f64::from(self.biases[g]))
             })
@@ -106,13 +113,25 @@ fn bank_of(
     n: u32,
     seed: u64,
 ) -> (Bank, [Buffer; 3], Host) {
+    bits_bank_of(device, handles, k, n, seed, 4)
+}
+
+/// A `bits`-bit (4 or 8), 64-group affine bank of `n` rows of `k` codes.
+fn bits_bank_of(
+    device: &Context,
+    handles: &Handles,
+    k: u32,
+    n: u32,
+    seed: u64,
+    bits: u32,
+) -> (Bank, [Buffer; 3], Host) {
     let groups = k / 64;
     let upload = |bytes: &[u8]| {
         let mut buffer = Buffer::zeroed(device, bytes.len() as u64).expect("a plane");
         buffer.write(0, bytes).expect("upload");
         buffer
     };
-    let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) / 2)
+    let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) * u64::from(bits) / 8)
         .map(|at| noise(at ^ seed))
         .collect();
     let factor = |at: u32, salt: u64, base: f32, step: f32| {
@@ -128,6 +147,7 @@ fn bank_of(
     let values = |bytes: &[u8]| -> Vec<f32> { floats(bytes).into_iter().map(bf16_value).collect() };
     let host = Host {
         k: k as usize,
+        bits,
         scales: values(&scales),
         biases: values(&biases),
         codes,
@@ -135,11 +155,20 @@ fn bank_of(
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let bank = Bank {
         mpp_codes: None,
-        codes: Tensor::new(bind(&planes[0]), n, k, Dtype::U4g64),
+        codes: Tensor::new(
+            bind(&planes[0]),
+            n,
+            k,
+            if bits == 8 {
+                Dtype::U8g64
+            } else {
+                Dtype::U4g64
+            },
+        ),
         scales: Tensor::new(bind(&planes[1]), n, groups, Dtype::Bf16),
         biases: Some(Tensor::new(bind(&planes[2]), n, groups, Dtype::Bf16)),
         group: 64,
-        bits: 4,
+        bits,
         ld: k,
     };
     (bank, planes, host)
@@ -184,6 +213,7 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
+    let tuning = engine_metal::chip::tuning("", false);
     // The routed banks as a checkpoint's experts land: an expert a row.
     let expert_rows = |bank: Bank, columns: u32| Bank {
         codes: Tensor::new(
@@ -201,8 +231,11 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
     let (shared_gate_up, _sg, shared_gate_up_host) =
         bank_of(&device, &handles, HIDDEN, 2 * INTER, 0x3);
     let (shared_down, _sd, shared_down_host) = bank_of(&device, &handles, INTER, HIDDEN, 0x4);
+    let (gate, _gb, gate_host) = bits_bank_of(&device, &handles, HIDDEN, 1, 0x5, 8);
     // Each path's largest spread from the f64 reference.
     let (mut route_off, mut tile_off) = (0f64, 0f64);
+    // And of the gated sums, the per-route path's and the tiles' combine.
+    let (mut sum_off, mut combine_off) = (0f64, 0f64);
     let plane = |bytes: u64| Buffer::zeroed(&device, bytes.max(4)).expect("a plane");
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let upload = |bytes: &[u8]| {
@@ -252,6 +285,14 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                 let own_hidden = plane(u64::from(tokens) * u64::from(INTER) * 2);
                 let own = plane(u64::from(tokens) * u64::from(HIDDEN) * 2);
                 let zero = upload(&vec![0u8; tokens as usize * 4]);
+                let gates = plane(u64::from(tokens) * 2);
+                let gated = plane(u64::from(tokens) * u64::from(HIDDEN) * 2);
+                let combined = plane(u64::from(tokens) * u64::from(HIDDEN) * 2);
+                let (gt, gdt, ct) = (
+                    Tensor::new(bind(&gates), tokens, 1, Dtype::Bf16),
+                    Tensor::new(bind(&gated), tokens, HIDDEN, Dtype::Bf16),
+                    Tensor::new(bind(&combined), tokens, HIDDEN, Dtype::Bf16),
+                );
                 let (pt, ht, yt, ft) = (
                     Tensor::new(bind(&packed), pairs, 2 * INTER, Dtype::Bf16),
                     Tensor::new(bind(&hidden), pairs, INTER, Dtype::Bf16),
@@ -286,13 +327,19 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                     Dtype::Bf16,
                     out_bytes,
                 );
+                let (_m, mix_t) = room(
+                    u64::from(moe::REGISTER_MIX),
+                    Dtype::F32,
+                    u64::from(moe::REGISTER_MIX) * 4,
+                );
                 let rooms = moe::RegisterRooms {
                     tiles: tiles_t,
                     rows: rows_t,
                     inv: inv_t,
                     table: table_t,
                     hidden: hidden_t,
-                    y: y_t,
+                    y: Tensor::new(y_t.buf, tiles * 8, HIDDEN, Dtype::Bf16),
+                    mix: mix_t,
                 };
                 let sorted_fold = plane(u64::from(tokens) * u64::from(HIDDEN) * 2);
                 let sft = Tensor::new(bind(&sorted_fold), tokens, HIDDEN, Dtype::Bf16);
@@ -306,9 +353,25 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                 moe::matmul_select_quant(&sink, xt, shared_gate_up, zt, opt).expect("own gate-up");
                 mlp::swiglu(&sink, opt, INTER, oht).expect("own swiglu");
                 moe::matmul_select_quant(&sink, oht, shared_down, zt, ot).expect("own down");
+                quant::matmul(
+                    &sink,
+                    &tuning,
+                    xt,
+                    gate,
+                    gt,
+                    quant::Scratch {
+                        precast: &|_, _| None,
+                        partials: &|_, _| None,
+                        table: None,
+                    },
+                    tokens,
+                )
+                .expect("gate");
+                moe::sigmoid_gate_add(&sink, ft, ot, gt, gdt).expect("gated add");
 
                 let own_banks = |bank| shared.then_some(bank);
-                moe::register_group(&sink, xt, rt, EXPERTS, shared, rooms).expect("group");
+                let landed = shared.then_some(moe::RegisterGate { weights: wt, gate });
+                moe::register_group(&sink, xt, rt, EXPERTS, shared, landed, rooms).expect("group");
                 moe::register_glu(
                     &sink,
                     gate_up,
@@ -336,6 +399,9 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                 let sorted = Tensor::new(y_t.buf, tiles * 8, HIDDEN, Dtype::Bf16);
                 moe::weighted_sum_sorted(&sink, sorted, inv_t, wt, TOP_K, sft)
                     .expect("sorted fold");
+                if shared {
+                    moe::register_combine(&sink, rooms, tiles, TOP_K, ct).expect("combine");
+                }
                 frame.commit().expect("commit");
 
                 let read = |b: &Buffer, bytes: u64| {
@@ -421,6 +487,54 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                         );
                     }
                 }
+                if shared {
+                    let rows = u64::from(tokens) * u64::from(HIDDEN) * 2;
+                    let (want, got) = (read(&gated, rows), read(&combined, rows));
+                    let off = spread(&want, &got);
+                    assert!(
+                        off < 0.02,
+                        "tokens {tokens} cut {cut:?}: the combine is {off:.2e} off the gated add"
+                    );
+                    // Each token's gated sum in f64: its routes' rows weighed, and the
+                    // shared expert's by the sigmoid of its gate (landed in bf16).
+                    let mut raw = vec![0u8; pairs as usize * 4];
+                    wb.read(0, &mut raw).expect("weights");
+                    let w: Vec<f64> = raw
+                        .chunks(4)
+                        .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                        .collect();
+                    for t in [0usize, tokens as usize - 1] {
+                        let x = token_row(t);
+                        let g = to_bf16(gate_host.dot(0, &x));
+                        let g = 1.0 / (1.0 + (-g).exp());
+                        let own = reference(
+                            &shared_gate_up_host,
+                            &shared_down_host,
+                            0,
+                            INTER as usize,
+                            width,
+                            &x,
+                        );
+                        let mut exact: Vec<f64> = own.iter().map(|v| g * v).collect();
+                        for k in 0..TOP_K as usize {
+                            let route = t * TOP_K as usize + k;
+                            let row = reference(
+                                &gate_up_host,
+                                &down_host,
+                                r[route] as usize,
+                                INTER as usize,
+                                width,
+                                &x,
+                            );
+                            for (e, v) in exact.iter_mut().zip(row) {
+                                *e += w[route] * v;
+                            }
+                        }
+                        sum_off = sum_off.max(spread64(&exact, &want[t * width..(t + 1) * width]));
+                        combine_off =
+                            combine_off.max(spread64(&exact, &got[t * width..(t + 1) * width]));
+                    }
+                }
                 eprintln!("tokens {tokens} cut {cut:?} shared {shared}: fold {off:.2e} off");
             }
         }
@@ -429,8 +543,16 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
         "checked {checked} register routes against the per-route path; against f64 the per-route \
          path is {route_off:.2e} off and the register tiles {tile_off:.2e}"
     );
+    eprintln!(
+        "against f64 the gated sums are {sum_off:.2e} off on the per-route path and \
+         {combine_off:.2e} from the tiles' combine"
+    );
     assert!(
         tile_off <= 1.5 * route_off.max(2e-3),
         "the register tiles are {tile_off:.2e} off f64, the per-route path {route_off:.2e}"
+    );
+    assert!(
+        combine_off <= sum_off.max(2e-3),
+        "the tiles' combine is {combine_off:.2e} off f64, the per-route gated add {sum_off:.2e}"
     );
 }

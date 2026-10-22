@@ -1149,6 +1149,39 @@ pub struct RegisterRooms {
     /// Each tile's eight rows of the down's output, of which those that hold
     /// a route are written.
     pub y: Tensor,
+    /// What [`register_combine`] reads beside the rows: the routes' weights,
+    /// then from [`REGISTER_MIX_GATES`] each token's shared expert gate: f32,
+    /// [`REGISTER_MIX`].
+    pub mix: Tensor,
+}
+
+/// Where the shared expert's gates sit in [`RegisterRooms::mix`], past the
+/// most routes a fire groups (`kMixGates`).
+pub const REGISTER_MIX_GATES: u32 = 128;
+
+/// The f32 width of [`RegisterRooms::mix`].
+pub const REGISTER_MIX: u32 = REGISTER_MIX_GATES + REGISTER_TOKENS;
+
+/// The routes' weights and the shared expert's scalar gate (a bank of one
+/// column), which the grouping lands for [`register_combine`].
+#[derive(Clone, Copy, Debug)]
+pub struct RegisterGate {
+    pub weights: Tensor,
+    pub gate: Bank,
+}
+
+/// Whether the register grouping takes `bank` as the shared expert's scalar
+/// gate over `width` inputs: one column, 4- or 8-bit, 64-group affine with
+/// bf16 factors.
+#[must_use]
+pub fn register_gate_bank(bank: Bank, width: u32) -> bool {
+    bank.affine()
+        && matches!(bank.bits, 4 | 8)
+        && bank.group == 64
+        && bank.scales.dtype == Dtype::Bf16
+        && bank.codes.rows == 1
+        && bank.ld == width
+        && width.is_multiple_of(256)
 }
 
 /// The tiles a fire of `tokens` tokens routing to `top_k` of `experts`
@@ -1191,13 +1224,16 @@ pub fn register_cuts(inter: u32, columns: u32, cut: RegisterCut) -> bool {
 
 /// The routes of `routes` (at most [`REGISTER_TOKENS`] tokens) grouped into
 /// the register tile's expert tiles, after the shared expert's where `shared`,
-/// and each tile's input table laid from `x`, in one launch.
+/// and each tile's input table laid from `x`, in one launch; where `gate`,
+/// the routes' weights and each token's shared expert gate land in
+/// `rooms.mix` too, for [`register_combine`].
 pub fn register_group(
     ctx: &Ctx<'_>,
     x: Tensor,
     routes: Tensor,
     experts: u32,
     shared: bool,
+    gate: Option<RegisterGate>,
     rooms: RegisterRooms,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
@@ -1235,6 +1271,31 @@ pub fn register_group(
             ),
         ));
     }
+    if let Some(gate) = gate
+        && (!shared
+            || !register_gate_bank(gate.gate, x.width)
+            || gate.weights.rows != tokens
+            || gate.weights.width != top_k
+            || rooms.mix.width < REGISTER_MIX)
+    {
+        return Err(refuse(
+            OP,
+            "the register grouping lands the shared expert's gate of a one-column 4- or 8-bit \
+             affine bank, beside the shared tile, and the weights of the routes it groups"
+                .to_string(),
+        ));
+    }
+    // A fire without a gate binds the input in its planes' places; nothing reads them.
+    let (weights, codes, scales, biases, bits) = match gate {
+        Some(RegisterGate { weights, gate }) => (
+            weights.arg(),
+            gate.codes.arg(),
+            gate.scales.arg(),
+            zero_points(ctx, gate)?,
+            gate.bits,
+        ),
+        None => (x.arg(), x.arg(), x.arg(), x.arg(), 0),
+    };
     ctx.fire(
         Fire::at(REGISTER_FILE, "moe_sg_group_gather")
             .apply(Grid::of([32, x.width / 64, tiles], [32, 4, 1])),
@@ -1250,6 +1311,56 @@ pub fn register_group(
             top_k.arg(),
             experts.arg(),
             u32::from(shared).arg(),
+            weights,
+            codes,
+            scales,
+            biases,
+            rooms.mix.arg_mut(),
+            bits.arg(),
+        ],
+    )
+}
+
+/// Each of `y`'s token rows from the register tiles' down rows: its routes'
+/// rows weighed and the shared expert's (tile 0's) gated, by what
+/// [`register_group`] landed in `rooms.mix`. `y` is the gated add's output, so
+/// the fold, the shared expert's own pass and its gate run nothing.
+pub fn register_combine(
+    ctx: &Ctx<'_>,
+    rooms: RegisterRooms,
+    tiles: u32,
+    top_k: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_sigmoid_gate_add";
+    dtype_dispatch!(OP, y.dtype, { Bf16 => () });
+    let tokens = nonzero(OP, "the token rows the combine lands", y.rows)?;
+    if tokens > REGISTER_TOKENS
+        || top_k > REGISTER_FAN_OUT
+        || !y.width.is_multiple_of(4)
+        || rooms.mix.width < REGISTER_MIX
+        || rooms.y.rows < 8 * tiles
+        || rooms.y.width < y.width
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the register combine lands at most {REGISTER_TOKENS} rows of whole 4-column \
+                 spans from the rows its rooms hold, not {tokens} x {}",
+                y.width
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(REGISTER_FILE, "moe_sg_combine")
+            .apply(Grid::of([y.width / 4, tokens, 1], [128, 1, 1])),
+        &[
+            rooms.y.arg(),
+            rooms.inv.arg(),
+            rooms.mix.arg(),
+            y.arg_mut(),
+            y.width.arg(),
+            top_k.arg(),
         ],
     )
 }
