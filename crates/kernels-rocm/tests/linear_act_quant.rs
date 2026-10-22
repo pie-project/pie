@@ -77,7 +77,7 @@ fn e4m3_activations_land_their_exact_values() {
         x[..gran].fill(0.0);
         let xt = gpu.tensor(&x, rows as u32, k as u32, Dtype::Bf16);
         let mut y = gpu.zeros(rows as u32, k as u32, Dtype::Bf16);
-        act_quant::e4m3_values(&ctx, "test", xt, gran as u32, &mut y).unwrap();
+        act_quant::e4m3_values(&ctx, "test", xt, gran as u32, 1, &mut y).unwrap();
         let want = host_quantized(&x, k, gran);
         assert!(
             want.iter().all(|v| round_bf16(*v) == *v),
@@ -167,6 +167,7 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
                 gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
                 128,
                 true,
+                1,
             )
             .unwrap();
             act_quant::matmul_fp8_quantized(

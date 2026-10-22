@@ -10,7 +10,7 @@ use common::{Gpu, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
 use kernels_rocm::hip::lt_grouped;
-use kernels_rocm::linear::moe;
+use kernels_rocm::linear::{gemm, mlp, moe};
 use kernels_rocm::tuning::Tuning;
 
 /// Distinct top-k routes over `experts`, every `dead`-th one -1.
@@ -202,36 +202,86 @@ fn the_ordered_routed_mlp_answers_the_steps() {
 fn the_decode_routed_mlp_answers_the_steps() {
     let Some(gpu) = Gpu::open() else { return };
     let dt = Dtype::Bf16;
-    let hidden = 1024usize;
+    let (hidden, inter) = (1024usize, 512usize);
     let ctx = gpu.ctx().with_tuning(tuning(0, 0, None));
     for tokens in [1usize, 32] {
-        let m = mlp(&gpu, dt, tokens, 8, 32, hidden, 512, 3);
+        let m = mlp(&gpu, dt, tokens, 8, 32, hidden, inter, 3);
         let rows = tokens as u32;
         let shared = gpu.tensor(&values(tokens * hidden, 5, 1.0), rows, hidden as u32, dt);
         let gate = gpu.tensor(&values(tokens * 2, 6, 1.0), rows, 2, dt);
+        // The shared expert's banks, and its MLP by the steps.
+        let banks = moe::SharedBanks {
+            gate_up: gpu.tensor(
+                &values(2 * inter * hidden, 8, 0.05),
+                2 * inter as u32,
+                hidden as u32,
+                dt,
+            ),
+            down: gpu.tensor(
+                &values(hidden * inter, 9, 0.05),
+                hidden as u32,
+                inter as u32,
+                dt,
+            ),
+        };
+        let mut packed = gpu.zeros(rows, 2 * inter as u32, dt);
+        let mut h = gpu.zeros(rows, inter as u32, dt);
+        let mut by_steps = gpu.zeros(rows, hidden as u32, dt);
+        gemm::matmul(&ctx, m.p.x, banks.gate_up, &mut packed).unwrap();
+        mlp::swiglu(&ctx, packed, inter as u32, 1, &mut h).unwrap();
+        gemm::matmul(&ctx, h, banks.down, &mut by_steps).unwrap();
+        let gate_w = gpu.tensor(&values(hidden, 12, 0.05), 1, hidden as u32, dt);
+        let mut gate_steps = gpu.zeros(rows, 1, dt);
+        gemm::matmul(&ctx, m.p.x, gate_w, &mut gate_steps).unwrap();
+        let unlanded = gpu.zeros(rows, 1, dt);
         let mut routed = m.y;
         moe::mlp_swiglu(&ctx, &m.p, &mut routed).unwrap();
-        let mut want = gpu.zeros(rows, hidden as u32, dt);
-        moe::sigmoid_gate_add(&ctx, routed, shared, gate, &mut want).unwrap();
-        for gated in [false, true] {
-            let mut y = gpu.zeros(rows, hidden as u32, dt);
-            let out = gpu.zeros(rows, hidden as u32, dt);
-            let fold = gated.then_some(moe::SharedGate {
-                shared,
-                gate,
-                y: out,
-            });
-            assert!(moe::decode_mlp(&ctx, &m.p, fold, &mut y).unwrap());
-            let (have, want) = if gated {
-                (gpu.read(&out), gpu.read(&want))
+        for absorbed in [false, true] {
+            let mut want = gpu.zeros(rows, hidden as u32, dt);
+            let (input, logits) = if absorbed {
+                (by_steps, gate_steps)
             } else {
-                (gpu.read(&y), gpu.read(&routed))
+                (shared, gate)
             };
-            for (j, (&h, &w)) in have.iter().zip(&want).enumerate() {
-                assert!(
-                    (h - w).abs() <= w.abs() / 64.0 + 0.01,
-                    "{tokens} tokens, gated {gated}: y[{j}] = {h}, steps {w}"
-                );
+            moe::sigmoid_gate_add(&ctx, routed, input, logits, &mut want).unwrap();
+            for gated in [false, true] {
+                if absorbed && !gated {
+                    continue;
+                }
+                let mut y = gpu.zeros(rows, hidden as u32, dt);
+                let out = gpu.zeros(rows, hidden as u32, dt);
+                let landed = gpu.zeros(rows, hidden as u32, dt);
+                let fold = gated.then_some(moe::SharedGate {
+                    shared: if absorbed { landed } else { shared },
+                    gate: if absorbed { unlanded } else { gate },
+                    y: out,
+                    banks: absorbed.then_some(banks),
+                    gate_w: absorbed.then_some(gate_w),
+                });
+                if absorbed {
+                    let takes = moe::absorbs_shared(&ctx, &m.p, fold.unwrap(), hidden as u32);
+                    assert_eq!(
+                        takes,
+                        tokens > 1,
+                        "{tokens} tokens: the batch legs land the shared expert"
+                    );
+                    if !takes {
+                        assert!(!moe::decode_mlp(&ctx, &m.p, fold, &mut y).unwrap());
+                        continue;
+                    }
+                }
+                assert!(moe::decode_mlp(&ctx, &m.p, fold, &mut y).unwrap());
+                let (have, want) = if gated {
+                    (gpu.read(&out), gpu.read(&want))
+                } else {
+                    (gpu.read(&y), gpu.read(&routed))
+                };
+                for (j, (&h, &w)) in have.iter().zip(&want).enumerate() {
+                    assert!(
+                        (h - w).abs() <= w.abs() / 64.0 + 0.01,
+                        "{tokens} tokens, gated {gated}, absorbed {absorbed}: y[{j}] = {h}, steps {w}"
+                    );
+                }
             }
         }
     }
