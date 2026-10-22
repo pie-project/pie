@@ -359,14 +359,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "h3-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -486,14 +478,6 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lora-probe"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "ltx2-parity"
 version = "0.1.0"
 dependencies = [
  "inferlet",
