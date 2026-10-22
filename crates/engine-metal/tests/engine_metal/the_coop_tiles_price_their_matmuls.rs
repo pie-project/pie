@@ -390,3 +390,32 @@ fn the_coop_layers_price_their_chain() {
     }) / 4e3;
     eprintln!("{line}  sum {alone:6.2}ms  chained {chained:6.2}ms  sustained {sustained:6.2}ms");
 }
+
+// EXPERIMENT: the device time of a launch that does almost nothing, back to back.
+#[test]
+#[ignore = "a microbenchmark"]
+fn the_coop_launches_price_their_overhead() {
+    let Ok(device) = Context::bind() else { return };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let b = Bench {
+        device: &device,
+        handles: &handles,
+        pipelines: &pipelines,
+        keep: RefCell::new(Vec::new()),
+    };
+    for width in [256u32, 5120, 17408] {
+        let packed = Tensor::new(b.zeroed(u64::from(8 * 2 * width) * 2), 8, 2 * width, Dtype::Bf16);
+        let h = Tensor::new(b.zeroed(u64::from(8 * width) * 2), 8, width, Dtype::Bf16);
+        let mut line = format!("swiglu 8x{width}:");
+        for launches in [1u32, 100, 1000] {
+            let us = b.time(&|ctx| {
+                for _ in 0..launches {
+                    kernels_metal::linear::mlp::swiglu(ctx, packed, width, h).expect("swiglu");
+                }
+            });
+            line += &format!("  x{launches} {:6.2}us/launch", us / f64::from(launches));
+        }
+        eprintln!("{line}");
+    }
+}
