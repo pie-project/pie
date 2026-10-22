@@ -776,7 +776,15 @@ async fn main(input: Input) -> Result<Output> {
                     .context("confidence readback")?;
                 confidence = value[from..shown as usize].to_vec();
                 // `verify` holds the widest the block (or `verify_rows`) allows.
+                let widest_now = verify;
                 verify = budget.width(&confidence, verify, |w| prices.budget_round(w));
+                // A wider verify that costs no more keeps more of the draft for free.
+                if let Some(price) = prices.budget_round(verify) {
+                    verify = (verify..=widest_now)
+                        .rev()
+                        .find(|&w| prices.budget_round(w).is_some_and(|p| p <= price))
+                        .unwrap_or(verify);
+                }
                 budget_expected += budget.expected(&confidence, verify);
             }
             if want_margin {
