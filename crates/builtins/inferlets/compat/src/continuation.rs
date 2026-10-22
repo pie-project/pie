@@ -2,10 +2,13 @@
 //! mid-stream.
 //!
 //! These are the built-in text APIs, whose meaning the gateway knows, so it
-//! does this for them alone; no other program is continued. Each frame this
-//! program sends carries, under `continuation`, the tokens it covers since
-//! the frame before (and the first frame the response id), which the gateway
-//! keeps and takes off before the client sees the frame. If the worker is
+//! does this for them alone; no other program is continued. Launched through
+//! the gateway's HTTP routes, whose input says `"continuable": true`, each
+//! frame this program sends carries, under `continuation`, the tokens it
+//! covers since the frame before (and the first frame the response id),
+//! which the gateway keeps and takes off before the client sees the frame.
+//! Launched any other way (a websocket client, `pie run`), its frames are
+//! plain and a `continuation` in the input is refused. If the worker is
 //! lost after the client had output, the gateway launches the request again
 //! elsewhere with what it kept, as the input's `continuation`:
 //!
@@ -24,17 +27,17 @@ use std::cell::RefCell;
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Continuation {
-    pub id: String,
-    pub tokens: Vec<u32>,
+pub(crate) struct Continuation {
+    pub(crate) id: String,
+    pub(crate) tokens: Vec<u32>,
     /// The frames the client has been sent.
-    pub frames: usize,
+    pub(crate) frames: usize,
 }
 
 impl Continuation {
     /// The input's `continuation`, if it has one that reads.
     #[must_use]
-    pub fn of(value: &Value) -> Option<Self> {
+    pub(crate) fn of(value: &Value) -> Option<Self> {
         Some(Self {
             id: value.get("id")?.as_str()?.to_string(),
             tokens: value
@@ -49,6 +52,8 @@ impl Continuation {
 }
 
 thread_local! {
+    /// The gateway keeps what the frames cover: they name it.
+    static CONTINUABLE: RefCell<bool> = const { RefCell::new(false) };
     /// The turn this run continues, as the input stated it.
     static CONTINUES: RefCell<Option<Continuation>> = const { RefCell::new(None) };
     /// The first frame has gone out (or this run continues one that did).
@@ -58,8 +63,10 @@ thread_local! {
     static PENDING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// This run continues `continuation` (from the launch input).
-pub(crate) fn begin(continuation: Option<Continuation>) {
+/// This run's frames name what they cover (`continuable`), and it
+/// continues `continuation` (from the launch input).
+pub(crate) fn begin(continuable: bool, continuation: Option<Continuation>) {
+    CONTINUABLE.set(continuable);
     OPENED.set(continuation.is_some());
     MUTED.set(continuation.as_ref().map_or(0, |c| c.frames));
     CONTINUES.set(continuation);
@@ -67,7 +74,7 @@ pub(crate) fn begin(continuation: Option<Continuation>) {
 
 /// The turn this run continues, if it does.
 #[must_use]
-pub fn get() -> Option<Continuation> {
+pub(crate) fn get() -> Option<Continuation> {
     CONTINUES.with_borrow(Clone::clone)
 }
 
@@ -80,8 +87,12 @@ pub(crate) fn note(token: u32) {
 /// frame of a run names the response id. A continued run's first frames,
 /// which the client has, are dropped.
 pub(crate) fn send(mut frame: Value) {
-    let tokens = PENDING.with_borrow_mut(std::mem::take);
     if MUTED.with_borrow_mut(|muted| std::mem::replace(muted, muted.saturating_sub(1)) > 0) {
+        return;
+    }
+    let tokens = PENDING.with_borrow_mut(std::mem::take);
+    if !CONTINUABLE.with_borrow(|on| *on) {
+        inferlet::session::send(&frame.to_string());
         return;
     }
     let mut covers = json!({ "tokens": tokens });

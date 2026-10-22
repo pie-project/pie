@@ -210,8 +210,10 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The one request a relayed turn sends: its launch, answered under this id.
+const CORR: u32 = 1;
+
 /// What a turn is launched with, kept so it can be launched again.
-#[derive(Clone)]
 struct Launch {
     state: GatewayState,
     identity: Identity,
@@ -234,7 +236,7 @@ impl Launch {
         }
         let turn = TurnInput {
             message: ClientMessage::LaunchProcess {
-                corr_id: 1,
+                corr_id: CORR,
                 inferlet: self.inferlet.clone(),
                 input: input.to_string(),
                 capture_outputs: true,
@@ -319,11 +321,15 @@ async fn relay(
         state,
         identity: identity(&headers),
         inferlet: inferlet.to_string(),
+        // `continuable`: frames name what they cover, which this relay
+        // keeps and takes off ([`Kept`]); a program launched any other way
+        // sends its frames plain.
         input: json!({
             "path": uri.path(),
             "query": query,
             "body": body,
             "time": unix_now(),
+            "continuable": true,
         }),
         props,
         session: headers
@@ -331,7 +337,7 @@ async fn relay(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
     };
-    let (handle, mut rx) = match launch.start(None).await {
+    let (mut handle, mut rx) = match launch.start(None).await {
         Ok(pair) => pair,
         Err(e @ SessionError::Launch(_)) => {
             return error_body(StatusCode::BAD_REQUEST, e.to_string());
@@ -359,6 +365,7 @@ async fn relay(
                     };
                     return error_body(status, format!("{inferlet}: {result}"));
                 }
+                continue;
             }
             Some(Tokens::Chunk(ServerMessage::ProcessEvent { event, value, .. })) => {
                 match event.as_str() {
@@ -368,19 +375,38 @@ async fn relay(
                             .into_response();
                     }
                     "return" => return body_response(&value),
+                    // The session counts stdout and stderr as output, but
+                    // this relay drops them: the client has had nothing, so
+                    // the request runs again from the start.
+                    "error" if rx.lost() => {}
                     "error" => return error_response(&value),
-                    _ => {} // stdout / stderr: the inferlet's own noise
+                    _ => continue, // stdout / stderr: the inferlet's own noise
                 }
             }
-            Some(Tokens::Chunk(ServerMessage::File { .. })) => {}
+            Some(Tokens::Chunk(ServerMessage::File { .. })) => continue,
             Some(Tokens::Eos) => {
                 return error_body(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("{inferlet} ended without answering"),
                 );
             }
+            None if rx.lost() => {}
             None => return error_body(StatusCode::BAD_GATEWAY, "stream aborted"),
         }
+        tracing::info!(
+            inferlet,
+            "running a request again: its worker was lost before it answered"
+        );
+        (handle, rx) = match launch.start(None).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(inferlet, error = %e, "a request whose worker was lost did not launch again");
+                return error_body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    crate::session::LOST_AFTER_OUTPUT,
+                );
+            }
+        };
     }
 }
 
@@ -471,6 +497,15 @@ fn frames(
                         _ => false,
                     }
                 }
+                Some(Tokens::Chunk(ServerMessage::Response {
+                    ok: false, result, ..
+                })) => {
+                    let data = json!({"error": {"message": result, "type": "server_error"}});
+                    return Some((
+                        Ok(Event::default().event("error").data(data.to_string())),
+                        None,
+                    ));
+                }
                 Some(Tokens::Chunk(_)) => false,
                 Some(Tokens::Eos) => return None,
                 None if rx.lost() => true,
@@ -487,7 +522,13 @@ fn frames(
             // The worker is gone after the client had output: the request
             // runs again elsewhere, going on after what the client has.
             let again = match kept.continuation() {
-                Some(continuation) => launch.start(Some(continuation)).await.ok(),
+                Some(continuation) => match launch.start(Some(continuation)).await {
+                    Ok(pair) => Some(pair),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "a reply its worker lost did not launch again");
+                        None
+                    }
+                },
                 None => None,
             };
             let Some((next_handle, next_rx)) = again else {
@@ -514,7 +555,7 @@ fn frames(
 pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
     let turn = TurnInput {
         message: ClientMessage::Query {
-            corr_id: 1,
+            corr_id: CORR,
             subject: client_api::message::QUERY_MODEL_STATUS.to_string(),
             record: String::new(),
         },

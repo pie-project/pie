@@ -337,7 +337,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
                 let moving = moving.clone();
                 tokio::spawn(async move {
                     if !moving.migrate(req, target).await {
-                        tracing::debug!(%req, %target, "a turn did not move: ended, or already moving");
+                        tracing::debug!(%req, %target, "a turn did not move: it ended, has sent output, or is already there");
                     }
                 });
             }

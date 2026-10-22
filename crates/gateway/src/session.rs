@@ -125,8 +125,11 @@ struct TurnState {
     worker: Option<WorkerId>,
     request: Request,
     affinity: Option<u64>,
-    /// The client has had output (a process event or a file), not just
-    /// the launch's answer: from then on the turn is not run again.
+    /// The client has been handed output: a process event (a message, a
+    /// return, stdout, stderr, an error) or a file, not just the launch's
+    /// answer. From then on the turn is not run again. It is marked as the
+    /// output goes to the client's pipe, before the send waits on it, so a
+    /// slow reader cannot leave the turn looking unsent.
     emitted: bool,
     sink: mpsc::Sender<Tokens>,
     open: Arc<AtomicBool>,
@@ -397,29 +400,34 @@ impl Sessions {
                 {
                     process_id.clone_from(known);
                 }
+                // The client knows this process: a launch run again answers
+                // it again, which it hears only if the launch failed.
                 let relaunch = turn.relaunched && is_launch_answer(turn, message);
-                self.note(turn, req_id, message);
                 if relaunch {
                     turn.relaunched = false;
+                }
+                self.note(turn, req_id, message);
+                if relaunch && matches!(message, ServerMessage::Response { ok: true, .. }) {
                     return Control::Continue;
+                }
+                if let ServerMessage::ProcessEvent { process_id, .. }
+                | ServerMessage::File { process_id, .. } = message
+                {
+                    turn.emitted = true;
+                    // What the client calls it, if it never had the answer.
+                    if turn.process.is_none() {
+                        turn.process = Some(process_id.clone());
+                    }
                 }
             }
             turn.sink.clone()
         };
 
         let is_eos = matches!(chunk, Tokens::Eos);
-        let output = matches!(
-            chunk,
-            Tokens::Chunk(ServerMessage::ProcessEvent { .. } | ServerMessage::File { .. })
-        );
         match sink.send(chunk).await {
             Ok(()) => {
                 if is_eos {
                     self.inner.end(req_id, Outcome::Completed, By::Host);
-                } else if output
-                    && let Some(turn) = self.inner.turns.lock().unwrap().get_mut(&req_id)
-                {
-                    turn.emitted = true;
                 }
                 Control::Continue
             }
@@ -486,11 +494,23 @@ impl Sessions {
             }
             // Run again, it would send what the client already has.
             if turn.emitted {
+                Err(turn.request.clone())
+            } else {
+                relaunch(turn, old);
+                Ok((old, turn.request.clone(), turn.affinity, turn.open.clone()))
+            }
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(request) => {
                 tracing::debug!(req = %req_id, "a turn that sent output is not moved");
+                self.inner.router.moved(
+                    &request,
+                    None,
+                    "it has sent output, so it finishes where it runs",
+                );
                 return false;
             }
-            relaunch(turn, old);
-            (old, turn.request.clone(), turn.affinity, turn.open.clone())
         };
         let (old, request, affinity, open) = entry;
         tracing::info!(req = %req_id, from = %old, to = %target, "moving a turn");
@@ -630,25 +650,17 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                 turns
                     .iter()
                     .filter(|(_, t)| t.worker.is_some_and(|w| !live.contains(&w)))
-                    .map(|(id, t)| {
-                        (
-                            *id,
-                            t.emitted,
-                            t.request.clone(),
-                            t.affinity,
-                            t.open.clone(),
-                        )
-                    })
+                    .map(|(id, t)| (*id, t.affinity, t.open.clone()))
                     .collect()
             };
 
             // A turn that has sent no output is launched again from its own
             // input; one that has is told why it ends, and ends: what it sent
             // cannot be unsent.
-            for (req_id, _, _, affinity, open) in affected {
+            for (req_id, affinity, open) in affected {
                 enum Next {
                     Again(Box<Request>),
-                    Lost(mpsc::Sender<Tokens>, String),
+                    Lost(mpsc::Sender<Tokens>, Option<String>),
                     End,
                 }
                 let next = {
@@ -664,7 +676,7 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                     } else if turn.emitted {
                         turn.lost.store(true, Ordering::Release);
                         tracing::info!(req = %req_id, from = %old, "a turn that sent output lost its worker");
-                        Next::Lost(turn.sink.clone(), turn.process.clone().unwrap_or_default())
+                        Next::Lost(turn.sink.clone(), turn.process.clone())
                     } else {
                         relaunch(turn, old);
                         tracing::info!(req = %req_id, from = %old, "running a turn again: its worker dropped it before it sent output");
@@ -676,14 +688,22 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                         let _ = inner.dispatch(req_id, &request, affinity, &open).await;
                     }
                     Next::Lost(sink, process_id) => {
-                        let _ = sink
-                            .send(Tokens::Chunk(ServerMessage::ProcessEvent {
-                                process_id,
-                                event: "error".to_string(),
-                                value: LOST_AFTER_OUTPUT.to_string(),
-                            }))
-                            .await;
+                        // Ended first, so nothing the lost worker still sends
+                        // reaches the client after the error; told on its
+                        // own, so a client that does not read holds no other
+                        // turn's recovery.
                         inner.end(req_id, Outcome::Failed, By::Host);
+                        if let Some(process_id) = process_id {
+                            tokio::spawn(async move {
+                                let _ = sink
+                                    .send(Tokens::Chunk(ServerMessage::ProcessEvent {
+                                        process_id,
+                                        event: "error".to_string(),
+                                        value: LOST_AFTER_OUTPUT.to_string(),
+                                    }))
+                                    .await;
+                            });
+                        }
                     }
                     Next::End => {
                         inner.end(req_id, Outcome::Failed, By::Host);

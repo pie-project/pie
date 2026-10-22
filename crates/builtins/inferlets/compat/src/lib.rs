@@ -19,7 +19,7 @@
 //!
 //! An adapter is then a translation in both directions and nothing else.
 
-pub mod continuation;
+mod continuation;
 pub mod demux;
 pub mod emit;
 pub mod envelope;
