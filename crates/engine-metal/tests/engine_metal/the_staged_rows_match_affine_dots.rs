@@ -352,7 +352,6 @@ fn the_coop_segments_are_their_matmuls() {
             whole_t,
             (m as i32, 6144, k as i32, 6144, k as i32),
             1,
-            2,
         )
         .expect("alone");
         frame.commit().expect("commit");

@@ -159,7 +159,7 @@ fn the_coop_tiles_price_their_matmuls() {
             .map(|_| Tensor::new(b.zeroed(u64::from(ROWS * n) * 2), ROWS, n, Dtype::Bf16))
             .collect();
         let mut line = format!("{what:13} K={k:5} N={n:6} x{layers:2}");
-        for (split, wide) in [(1, 2), (1, 1), (2, 2), (2, 1), (4, 2), (4, 1), (8, 1)] {
+        for split in [1, 2, 4, 8] {
             let run = |ctx: &Sink<'_>| {
                 for (w, y) in banks.iter().zip(&ys) {
                     quant::coop_matmul(
@@ -170,7 +170,6 @@ fn the_coop_tiles_price_their_matmuls() {
                         *y,
                         (ROWS as i32, n as i32, k as i32, n as i32, k as i32),
                         split,
-                        wide,
                     )
                     .expect("matmul");
                 }
@@ -180,7 +179,7 @@ fn the_coop_tiles_price_their_matmuls() {
                 .iter()
                 .fold(0u64, |h, y| h.rotate_left(5) ^ hash(&b.read(*y)));
             line += &format!(
-                "  k{split}w{wide} {us:6.1}us {:4.0}GB/s #{:04x}",
+                "  k{split} {us:6.1}us {:4.0}GB/s #{:04x}",
                 bytes as f64 / us / 1e3,
                 h & 0xffff
             );
@@ -245,7 +244,6 @@ fn the_coop_tiles_price_their_matmuls() {
                         k as i32,
                     ),
                     1,
-                    2,
                 )
                 .expect("matmul");
                 kernels_metal::linear::mlp::swiglu(ctx, packed, intermediate, *h).expect("swiglu");
@@ -264,158 +262,4 @@ fn the_coop_tiles_price_their_matmuls() {
         );
     }
     eprintln!("{line}");
-}
-
-// EXPERIMENT: a verify's dense layers as one chained frame, against each projection alone.
-#[test]
-#[ignore = "a microbenchmark"]
-fn the_coop_layers_price_their_chain() {
-    let Ok(device) = Context::bind() else { return };
-    let handles = Handles::new();
-    let pipelines = Pipelines::new();
-    let b = Bench {
-        device: &device,
-        handles: &handles,
-        pipelines: &pipelines,
-        keep: RefCell::new(Vec::new()),
-    };
-    // a whole verify's 64 layers where the machine holds them
-    let memory: u64 = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let layers: usize = std::env::var("PIE_COOP_BENCH_LAYERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if memory >= 48 << 30 { 64 } else { 8 });
-    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"staged\", \"qmv\"]", false);
-    let (hidden, inner, gdn, out) = (5120u32, 17408u32, 16384u32, 6144u32);
-    let banks: Vec<[Bank; 4]> = (0..layers as u64)
-        .map(|l| {
-            [
-                b.bank(l * 4 + 1, hidden, gdn),
-                b.bank(l * 4 + 2, out, hidden),
-                b.bank(l * 4 + 3, hidden, 2 * inner),
-                b.bank(l * 4 + 4, inner, hidden),
-            ]
-        })
-        .collect();
-    let plane = |width: u32| {
-        Tensor::new(
-            b.zeroed(u64::from(ROWS * width) * 2),
-            ROWS,
-            width,
-            Dtype::Bf16,
-        )
-    };
-    let x: Vec<u8> = fill(0x99, u64::from(ROWS * hidden) * 2)
-        .chunks(2)
-        .flat_map(|c| bf16((f32::from(c[0]) - 127.5) / 256.0))
-        .collect();
-    let (x, qkv, o_in, mid, h, y) = (
-        Tensor::new(b.upload(&x), ROWS, hidden, Dtype::Bf16),
-        plane(gdn),
-        plane(out),
-        plane(hidden),
-        plane(inner),
-        plane(hidden),
-    );
-    let one = |ctx: &Sink<'_>, which: usize, w: &[Bank; 4]| {
-        match which {
-            0 => quant::coop_matmul(
-                ctx,
-                x,
-                w[0],
-                w[0].biases.unwrap(),
-                qkv,
-                (8, gdn as i32, hidden as i32, gdn as i32, hidden as i32),
-                1,
-                2,
-            ),
-            1 => quant::coop_matmul(
-                ctx,
-                o_in,
-                w[1],
-                w[1].biases.unwrap(),
-                mid,
-                (8, hidden as i32, out as i32, hidden as i32, out as i32),
-                4,
-                2,
-            ),
-            2 => quant::coop_swiglu(ctx, &tuning, mid, w[2], inner, h, 8).map(|_| ()),
-            _ => quant::coop_matmul(
-                ctx,
-                h,
-                w[3],
-                w[3].biases.unwrap(),
-                y,
-                (8, hidden as i32, inner as i32, hidden as i32, inner as i32),
-                4,
-                2,
-            ),
-        }
-        .expect("projection")
-    };
-    let names = ["in_proj", "out k4", "gate_up+glu", "down k4"];
-    let mut alone = 0.0;
-    let mut line = format!("layers x{layers}:");
-    for which in 0..4 {
-        let ms = b.time(&|ctx| {
-            for w in &banks {
-                one(ctx, which, w);
-            }
-        }) / 1e3;
-        alone += ms;
-        line += &format!("  {} {ms:6.2}ms", names[which]);
-    }
-    let chained = b.time(&|ctx| {
-        for w in &banks {
-            for which in 0..4 {
-                one(ctx, which, w);
-            }
-        }
-    }) / 1e3;
-    // the same chain four times in one frame, the device busy throughout
-    let sustained = b.time(&|ctx| {
-        for _ in 0..4 {
-            for w in &banks {
-                for which in 0..4 {
-                    one(ctx, which, w);
-                }
-            }
-        }
-    }) / 4e3;
-    eprintln!("{line}  sum {alone:6.2}ms  chained {chained:6.2}ms  sustained {sustained:6.2}ms");
-}
-
-// EXPERIMENT: the device time of a launch that does almost nothing, back to back.
-#[test]
-#[ignore = "a microbenchmark"]
-fn the_coop_launches_price_their_overhead() {
-    let Ok(device) = Context::bind() else { return };
-    let handles = Handles::new();
-    let pipelines = Pipelines::new();
-    let b = Bench {
-        device: &device,
-        handles: &handles,
-        pipelines: &pipelines,
-        keep: RefCell::new(Vec::new()),
-    };
-    for width in [256u32, 5120, 17408] {
-        let packed = Tensor::new(b.zeroed(u64::from(8 * 2 * width) * 2), 8, 2 * width, Dtype::Bf16);
-        let h = Tensor::new(b.zeroed(u64::from(8 * width) * 2), 8, width, Dtype::Bf16);
-        let mut line = format!("swiglu 8x{width}:");
-        for launches in [1u32, 100, 1000] {
-            let us = b.time(&|ctx| {
-                for _ in 0..launches {
-                    kernels_metal::linear::mlp::swiglu(ctx, packed, width, h).expect("swiglu");
-                }
-            });
-            line += &format!("  x{launches} {:6.2}us/launch", us / f64::from(launches));
-        }
-        eprintln!("{line}");
-    }
 }

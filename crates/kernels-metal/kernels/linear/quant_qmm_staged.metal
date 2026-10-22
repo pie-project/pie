@@ -197,12 +197,12 @@ METAL_FUNC void coop_walk(const device uint *weights, const device bfloat *scale
 }
 #endif
 
-// A threadgroup holds `32 * WIDE` columns as `WIDE` simdgroups, and `SPLIT` partitions of the
-// contraction as that many such rows of simdgroups: simdgroup `WIDE * p + c` walks partition `p`
-// (its share of the 256-input spans, as the register tile cuts them) of columns `32c` on. Each
-// partition past the first hands its sums over in threadgroup memory, and the first adds them
-// in partition order from zero, as the split reduction of the partials would.
-template <int SPLIT, int WIDE>
+// A threadgroup holds 64 columns as two simdgroups, and `SPLIT` partitions of the contraction
+// as that many such pairs: simdgroup `2p + c` walks partition `p` (its share of the 256-input
+// spans, as the register tile cuts them) of columns `32c` on. Each partition past the first
+// hands its sums over in threadgroup memory, and the first adds them in partition order from
+// zero, as the split reduction of the partials would.
+template <int SPLIT>
 [[kernel]] void
 affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
                 const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
@@ -213,15 +213,15 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
                 uint lane [[thread_index_in_simdgroup]],
                 uint simd [[simdgroup_index_in_threadgroup]]) {
 #if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
-  const uint part = simd / WIDE, column = position.x * 32 * WIDE + (simd % WIDE) * 32;
+  const uint part = simd / 2, column = position.x * 64 + (simd % 2) * 32;
   const int spans = width / 256;
   const int first = int(part) * spans / SPLIT, last = (int(part) + 1) * spans / SPLIT;
   auto total = coop_destination();
   coop_walk(weights, scales, biases, input, width, rows, stride, column, first, last, lane,
             total);
   // The eight live rows of a lane's elements, in element order.
-  threadgroup float handed[SPLIT > 1 ? (SPLIT - 1) * WIDE * 8 * 32 : 1];
-  threadgroup float *mine = handed + (simd % WIDE) * 8 * 32 + lane;
+  threadgroup float handed[SPLIT > 1 ? (SPLIT - 1) * 2 * 8 * 32 : 1];
+  threadgroup float *mine = handed + (simd % 2) * 8 * 32 + lane;
   if constexpr (SPLIT > 1) {
     if (part > 0) {
       ushort slot = 0;
@@ -229,7 +229,7 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
       for (ushort i = 0; i < total.get_capacity(); ++i) {
         if (!total.is_valid_element(i) || total.get_multidimensional_index(i)[1] >= 8)
           continue;
-        mine[((part - 1) * WIDE * 8 + slot++) * 32] = total[i];
+        mine[((part - 1) * 2 * 8 + slot++) * 32] = total[i];
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -249,21 +249,20 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
     if constexpr (SPLIT > 1) {
       sum = 0.0f + sum;
       for (int p = 1; p < SPLIT; ++p)
-        sum += mine[((p - 1) * WIDE * 8 + slot) * 32];
+        sum += mine[((p - 1) * 2 * 8 + slot) * 32];
     }
     ++slot;
     if (row < uint(rows))
       output[ulong(row) * columns + column + at[0]] = bfloat(sum);
   }
 #else
-  // The first row of simdgroups walks the whole contraction alone, as the staged tile's halves.
+  // The first pair walks the whole contraction alone.
   threadgroup half stages[2 * 2 * 32 * 32];
   threadgroup uint4 pairs[2 * 2 * 32];
-  if (simd >= WIDE)
+  if (simd >= 2)
     return;
   staged_tile<8, 1>(weights, scales, biases, input, output, width, columns, nullptr, rows,
-                    stride, uint2(position.x * WIDE + simd, 0) / 2, lane, (position.x * WIDE + simd) % 2,
-                    stages, pairs);
+                    stride, position, lane, simd, stages, pairs);
 #endif
 }
 
@@ -400,8 +399,8 @@ affine_qmm_coop_swiglu(const device uint *weights [[buffer(0)]], const device bf
 #endif
 }
 
-#define PIE_COOP_POINT(name, split, wide)                                                          \
-  template [[host_name(name)]] [[kernel]] void affine_qmm_coop<split, wide>(                             \
+#define PIE_COOP_POINT(name, split)                                                                \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_coop<split>(                             \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
       device bfloat *, constant int &, constant int &, constant int &, constant int &, uint2,      \
       uint, uint);
