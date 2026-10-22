@@ -128,12 +128,13 @@ impl NixlBackend {
             return Err(TransportError::LayoutMismatch);
         }
 
+        if local_pages.len() != remote_pages.len() {
+            return Err(TransportError::LayoutMismatch);
+        }
+        let (locals, remotes) = runs(local_pages, remote_pages);
         unsafe {
-            if local_pages.len() != remote_pages.len() {
-                return Err(TransportError::LayoutMismatch);
-            }
-            let local_dl = build_xfer_dlist(local.handle(), local_pages)?;
-            let remote_dl = match build_xfer_dlist(&remote_handle, remote_pages) {
+            let local_dl = build_xfer_dlist(local.handle(), &locals)?;
+            let remote_dl = match build_xfer_dlist(&remote_handle, &remotes) {
                 Ok(dl) => dl,
                 Err(e) => {
                     nixl_capi_destroy_xfer_dlist(local_dl);
@@ -157,7 +158,12 @@ impl NixlBackend {
                 return Err(err("create_xfer_req", st));
             }
 
-            let _post_status = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
+            let st = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
+            if st != OK && st != INPROG {
+                nixl_capi_release_xfer_req(g.agent, req);
+                nixl_capi_destroy_xfer_req(req);
+                return Err(err("post_xfer_req", st));
+            }
 
             let id = g.next_id;
             g.next_id += 1;
@@ -173,7 +179,35 @@ impl NixlBackend {
     }
 }
 
-unsafe fn build_xfer_dlist(handle: &KvHandle, pages: &PageSet) -> Result<nixl_capi_xfer_dlist_t> {
+/// Runs of consecutive pages, each as `(first page, pages)`.
+type Runs = Vec<(u32, u32)>;
+
+/// The pages paired index by index, cut where either side stops being
+/// consecutive: each side's runs, one per run, so a run moves as one
+/// descriptor per region rather than one per page.
+fn runs(local: &PageSet, remote: &PageSet) -> (Runs, Runs) {
+    let (mut locals, mut remotes) = (Runs::new(), Runs::new());
+    for (&l, &r) in local.pages.iter().zip(&remote.pages) {
+        match (locals.last_mut(), remotes.last_mut()) {
+            (Some((lf, ln)), Some((rf, rn)))
+                if lf.checked_add(*ln) == Some(l) && rf.checked_add(*rn) == Some(r) =>
+            {
+                *ln += 1;
+                *rn += 1;
+            }
+            _ => {
+                locals.push((l, 1));
+                remotes.push((r, 1));
+            }
+        }
+    }
+    (locals, remotes)
+}
+
+unsafe fn build_xfer_dlist(
+    handle: &KvHandle,
+    runs: &[(u32, u32)],
+) -> Result<nixl_capi_xfer_dlist_t> {
     let first = handle
         .regions
         .first()
@@ -184,25 +218,28 @@ unsafe fn build_xfer_dlist(handle: &KvHandle, pages: &PageSet) -> Result<nixl_ca
     if st != OK {
         return Err(err("create_xfer_dlist", st));
     }
-    for &page in &pages.pages {
-        for region in &handle.regions {
-            let device = match segment(region.domain) {
-                Ok((other, device)) if other == kind && region.page_stride != 0 => device,
-                _ => {
-                    unsafe { nixl_capi_destroy_xfer_dlist(dl) };
-                    return Err(TransportError::LayoutMismatch);
-                }
-            };
-            let offset = page as u64 * region.page_stride;
-            if offset + region.page_stride > region.len {
+    for region in &handle.regions {
+        let device = match segment(region.domain) {
+            Ok((other, device)) if other == kind && region.page_stride != 0 => device,
+            _ => {
                 unsafe { nixl_capi_destroy_xfer_dlist(dl) };
-                return Err(TransportError::PageOutOfBounds { page });
+                return Err(TransportError::LayoutMismatch);
+            }
+        };
+        for &(page, count) in runs {
+            let offset = u64::from(page) * region.page_stride;
+            let len = u64::from(count) * region.page_stride;
+            if offset + len > region.len {
+                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+                return Err(TransportError::PageOutOfBounds {
+                    page: page + count - 1,
+                });
             }
             let st = unsafe {
                 nixl_capi_xfer_dlist_add_desc(
                     dl,
                     (region.base + offset) as usize,
-                    region.page_stride as usize,
+                    len as usize,
                     device,
                 )
             };
@@ -440,8 +477,8 @@ mod tests {
         let id = a
             .recv_mapped(
                 &mine,
-                &PageSet::new(vec![0, 5]),
-                &PageSet::new(vec![3, 6]),
+                &PageSet::new(vec![0, 1, 5]),
+                &PageSet::new(vec![2, 3, 6]),
                 WorkerId(2),
             )
             .unwrap();
@@ -454,10 +491,21 @@ mod tests {
             }
         }
         let page = |at: u64| &ours[(at * STRIDE) as usize..((at + 1) * STRIDE) as usize];
-        assert!(page(0).iter().all(|&b| b == 4), "slot 0 holds their page 3");
+        assert!(page(0).iter().all(|&b| b == 3), "slot 0 holds their page 2");
+        assert!(page(1).iter().all(|&b| b == 4), "slot 1 holds their page 3");
         assert!(page(5).iter().all(|&b| b == 7), "slot 5 holds their page 6");
-        assert!(page(1).iter().all(|&b| b == 0), "slot 1 was not asked for");
+        assert!(page(2).iter().all(|&b| b == 0), "slot 2 was not asked for");
         // The peer's region stays alive until the read is checked.
         drop(theirs);
+    }
+
+    #[test]
+    fn pages_consecutive_on_both_sides_move_as_one_run() {
+        let (ours, theirs) = runs(
+            &PageSet::new(vec![0, 1, 2, 5, 6, 9]),
+            &PageSet::new(vec![4, 5, 7, 8, 9, 3]),
+        );
+        assert_eq!(ours, vec![(0, 2), (2, 1), (5, 2), (9, 1)]);
+        assert_eq!(theirs, vec![(4, 2), (7, 1), (8, 2), (3, 1)]);
     }
 }

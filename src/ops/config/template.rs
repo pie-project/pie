@@ -109,7 +109,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # peers  = ["10.0.0.2:7100"]   # workers to prefill this worker's passes on
 # pools  = ["10.0.0.3:7201"]   # pool workers (`pie-pool`) to keep its runs on,
 #                              # by their bulk address
-# transfer = "auto"            # peers' kv read in place where the build has NIXL
+# transfer = "auto"            # the bulk link; "nixl" reads peers' kv in place
 # prefill_min_suffix_tokens = 0  # shortest uncached suffix worth a peer's
 #                                # prefill; 0: 2048 tokens
 "#;
