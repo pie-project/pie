@@ -1122,7 +1122,18 @@ pub const REGISTER_CUT: RegisterCut = RegisterCut {
 };
 
 impl RegisterCut {
-    /// The tile slots of a pass over up to `tiles` tiles.
+    /// The column threadgroups of the gate-up over an intermediate of
+    /// `inter` and of the down over `columns`.
+    #[must_use]
+    pub fn groups(&self, inter: u32, columns: u32) -> [u32; 2] {
+        [
+            inter / (8 * self.fragments * self.glu_simdgroups),
+            columns / (16 * self.down_simdgroups),
+        ]
+    }
+
+    /// The tile slots of a pass over up to `tiles` tiles, where its encoder
+    /// cannot launch the grid the grouping wrote.
     #[must_use]
     pub fn slots(&self, tiles: u32) -> u32 {
         if self.slots == 0 {
@@ -1153,7 +1164,16 @@ pub struct RegisterRooms {
     /// then from [`REGISTER_MIX_GATES`] each token's shared expert gate: f32,
     /// [`REGISTER_MIX`].
     pub mix: Tensor,
+    /// The gate-up's and the down's threadgroup counts over the live tiles,
+    /// which the grouping writes: u32, [`REGISTER_GRIDS`].
+    pub grids: Tensor,
 }
+
+/// The u32 width of [`RegisterRooms::grids`]: the gate-up's three counts at
+/// 0, the down's at [`REGISTER_DOWN_GRID`] bytes.
+pub const REGISTER_GRIDS: u32 = 8;
+
+const REGISTER_DOWN_GRID: u32 = 16;
 
 /// Where the shared expert's gates sit in [`RegisterRooms::mix`], past the
 /// most routes a fire groups (`kMixGates`).
@@ -1226,7 +1246,10 @@ pub fn register_cuts(inter: u32, columns: u32, cut: RegisterCut) -> bool {
 /// the register tile's expert tiles, after the shared expert's where `shared`,
 /// and each tile's input table laid from `x`, in one launch; where `gate`,
 /// the routes' weights and each token's shared expert gate land in
-/// `rooms.mix` too, for [`register_combine`].
+/// `rooms.mix` too, for [`register_combine`]; and the expert passes' grids
+/// over the live tiles in `rooms.grids`, of `groups` column threadgroups
+/// ([`RegisterCut::groups`]).
+#[allow(clippy::too_many_arguments)]
 pub fn register_group(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -1234,6 +1257,7 @@ pub fn register_group(
     experts: u32,
     shared: bool,
     gate: Option<RegisterGate>,
+    groups: [u32; 2],
     rooms: RegisterRooms,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
@@ -1317,6 +1341,9 @@ pub fn register_group(
             biases,
             rooms.mix.arg_mut(),
             bits.arg(),
+            rooms.grids.arg_mut(),
+            groups[0].arg(),
+            groups[1].arg(),
         ],
     )
 }
@@ -1386,7 +1413,8 @@ fn register_banks(
 /// A routed gate-up (`gate_up`: each expert's `2 * inter` packed gate and up
 /// rows over `width` inputs) and its SwiGLU on the register tile, over the
 /// tiles [`register_group`] laid: lands each tile's down input table in
-/// `rooms.hidden`.
+/// `rooms.hidden`. Launched on the live tiles' grid the grouping wrote for
+/// `cut`, where the encoder can; else on `cut`'s tile slots.
 #[allow(clippy::too_many_arguments)]
 pub fn register_glu(
     ctx: &Ctx<'_>,
@@ -1427,10 +1455,12 @@ pub fn register_glu(
     let [codes, scales, biases, own_codes, own_scales, own_biases] =
         register_banks(ctx, gate_up, shared)?;
     ctx.fire(
-        Fire::at(REGISTER_FILE, entry).apply(Grid::of(
-            [32 * simdgroups * (inter / columns), cut.slots(tiles), 1],
-            [32 * simdgroups, 1, 1],
-        )),
+        Fire::at(REGISTER_FILE, entry)
+            .apply(Grid::of(
+                [32 * simdgroups * (inter / columns), cut.slots(tiles), 1],
+                [32 * simdgroups, 1, 1],
+            ))
+            .indirect(rooms.grids.buf, 0),
         &[
             codes,
             scales,
@@ -1451,6 +1481,7 @@ pub fn register_glu(
 /// A routed down (each expert's `columns` rows over `inter` inputs) on the
 /// register tile, over the tables [`register_glu`] landed: each tile's rows
 /// that hold a route into `rooms.y`, route `at`'s at row `rooms.inv[at]`.
+/// Launched as [`register_glu`] is.
 #[allow(clippy::too_many_arguments)]
 pub fn register_down(
     ctx: &Ctx<'_>,
@@ -1486,10 +1517,12 @@ pub fn register_down(
     let [codes, scales, biases, own_codes, own_scales, own_biases] =
         register_banks(ctx, down, shared)?;
     ctx.fire(
-        Fire::at(REGISTER_FILE, entry).apply(Grid::of(
-            [32 * simdgroups * (columns / span), cut.slots(tiles), 1],
-            [32 * simdgroups, 1, 1],
-        )),
+        Fire::at(REGISTER_FILE, entry)
+            .apply(Grid::of(
+                [32 * simdgroups * (columns / span), cut.slots(tiles), 1],
+                [32 * simdgroups, 1, 1],
+            ))
+            .indirect(rooms.grids.buf, REGISTER_DOWN_GRID),
         &[
             codes,
             scales,

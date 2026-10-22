@@ -167,7 +167,8 @@ constant constexpr uint kMixGates = kGroupRoutes;
 // and takes its tile, the tiles in expert order after the shared expert's
 // where `shared`, each expert's rows in route order; the first of a tile's
 // threadgroups records its expert, rows and routes, the first of tile 0's the
-// live count. Then `qmm_sg_table` over the tile's rows: a simdgroup per
+// live count and the expert passes' `grids` over the live tiles alone. Then
+// `qmm_sg_table` over the tile's rows: a simdgroup per
 // 64-input group (grid y) and tile (grid z), a lane per slot. Where
 // `gate_bits` is not 0, the shared tile's threadgroups also land what
 // `moe_sg_combine` reads in `mix`: the routes' `weights`, and each row's
@@ -181,7 +182,9 @@ constant constexpr uint kMixGates = kGroupRoutes;
     constant uint &shared [[buffer(10)]], const device float *weights [[buffer(11)]],
     const device uchar *gate_codes [[buffer(12)]], const device bfloat *gate_scales [[buffer(13)]],
     const device bfloat *gate_biases [[buffer(14)]], device float *mix [[buffer(15)]],
-    constant uint &gate_bits [[buffer(16)]], uint3 at [[thread_position_in_grid]],
+    constant uint &gate_bits [[buffer(16)]], device uint *grids [[buffer(17)]],
+    constant uint &glu_groups [[buffer(18)]], constant uint &down_groups [[buffer(19)]],
+    uint3 at [[thread_position_in_grid]],
     uint3 group [[threadgroup_position_in_grid]], uint3 groups [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]], uint3 extent [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
@@ -245,8 +248,13 @@ constant constexpr uint kMixGates = kGroupRoutes;
     rows[tile * 8 + lid] = token_of[lid];
     if (lid == 0) {
       tiles[1 + tile] = expert;
-      if (tile == 0)
+      if (tile == 0) {
         tiles[0] = count_of;
+        // The gate-up's and the down's grids: their column threadgroups by
+        // the live tiles.
+        grids[0] = glu_groups, grids[1] = uint(count_of), grids[2] = 1;
+        grids[4] = down_groups, grids[5] = uint(count_of), grids[6] = 1;
+      }
     }
   }
   const uint slot = at.x, h = at.y;
@@ -324,9 +332,8 @@ constant constexpr uint kMixGates = kGroupRoutes;
 // them, straight into the down's input table of the tile; the threadgroup's
 // 8 HF SG columns are whole halves of 64-input groups, whose sums it adds as
 // `qmm_sg_table` does. The grid's y extent is its tile slots: slot y takes
-// tiles y, y + slots, ... of the live count, so a grid of fewer slots than
-// tiles a fire may fill dispatches fewer threadgroups past the count, each
-// pure cost.
+// tiles y, y + slots, ... of the live count; launched on the grid the
+// grouping wrote, a slot a live tile.
 template <int HF, int SG>
 [[kernel]] void affine_qmm_sg_glu_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
