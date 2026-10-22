@@ -1180,6 +1180,10 @@ impl<'c> Run<'c> {
     /// counters (a fused MLP's swiglu, whose down the same node runs).
     pub(crate) fn laid_table(&self, value: ValueId, counters: u32) -> Option<(Tensor, u32)> {
         let width = self.tensor(value).width;
+        // A producer stages at most 8192 of a row's inputs; the projection lays a wider table itself.
+        if width > 8192 {
+            return None;
+        }
         let rows = (17 * width + 4 * counters).div_ceil(2 * width);
         let (table, _) = self.register_table(value, rows, width, counters)?;
         Some((table, counters))
