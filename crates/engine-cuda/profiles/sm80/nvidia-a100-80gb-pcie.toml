@@ -22,6 +22,7 @@ gemv.splitk_max_n = 1048576
 gemm.narrow_n = 8
 gemm.fp8_shadow = true
 gemm.grouped_gemv = true
+gemm.affine_mma = true
 elemwise.rows_vec = true
 sdpa.merge_warp = true
 sdpa.decode.grouped_prefill_from = 8
@@ -79,6 +80,7 @@ measured = [
   "kernel.gemm.narrow_n",
   "kernel.gemm.fp8_shadow",
   "kernel.gemm.grouped_gemv",
+  "kernel.gemm.affine_mma",
   "kernel.elemwise.rows_vec",
   "kernel.sdpa.merge_warp",
   "kernel.sdpa.decode.grouped_prefill_from",

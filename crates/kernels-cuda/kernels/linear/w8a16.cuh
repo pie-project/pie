@@ -294,6 +294,191 @@ __global__ void __launch_bounds__(kWarpsN * kWarpsK * 32) fp8_w8a16_mma(
     }
 }
 
+namespace w8a16 {
+
+// Two of a 16-bit run's four codes (`half` 0, codes 0 and 1; 1, codes 2 and
+// 3) as a bf16x2 of `s * q + b`: a code laid in a half's mantissa under
+// 0x4300 reads 128 + q exactly, 128 comes off exactly, and one fused
+// multiply-add applies the group's scale and bias.
+__device__ __forceinline__ unsigned affine2(unsigned run, int half, unsigned s2, unsigned b2) {
+    const unsigned p = run >> (8 * half);
+    const unsigned h = ((p & 0xFu) | ((p & 0xF0u) << 12)) | 0x43004300u;
+    unsigned q, w;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(q) : "r"(h), "r"(0x3F803F80u), "r"(0xC300C300u));
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(w) : "r"(q), "r"(s2), "r"(b2));
+    return w;
+}
+
+}  // namespace w8a16
+
+// `y[m] = x[m] . W^T` for an affine 4-bit plane (MLX's: `[n, k / 2]` codes
+// low nibble first, a bf16 scale and bias a row a 64 columns, `w = s q + b`)
+// on mma.sync, for a decode's few rows: `fp8_w8a16_mma`'s walk, each lane's
+// sixteen columns of a step its row's eight bytes, widened in registers.
+template <int kMT, int kNSub, int kWarpsN, int kWarpsK, int kStages, int kDepth>
+__global__ void __launch_bounds__(kWarpsN * kWarpsK * 32) affine_w4a16_mma(
+    const bf16* __restrict__ x,
+    const u8* __restrict__ codes,
+    const bf16* __restrict__ scales,
+    const bf16* __restrict__ biases,
+    bf16* __restrict__ y,
+    int m,
+    int n,
+    int k,
+    const u32* __restrict__ win)
+{
+    using namespace w8a16;
+    static_assert(kWarpsK <= 15, "a K group's barrier id is 1 + its index");
+    constexpr int kBM = 16 * kMT;
+    constexpr int kBN = 8 * kNSub * kWarpsN;
+    constexpr int kGroupThreads = 32 * kWarpsN;
+    constexpr int kStageElems = kBM * 64;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int wn = warp % kWarpsN;
+    const int wk = warp / kWarpsN;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+
+    int rows = m;
+    if (win != nullptr) rows = min(rows, static_cast<int>(win[0]));
+    const int m0 = static_cast<int>(blockIdx.y) * kBM;
+    if (rows <= m0) return;
+    rows -= m0;
+    x += static_cast<long long>(m0) * k;
+    y += static_cast<long long>(m0) * n;
+
+    extern __shared__ __align__(16) unsigned char w8a16_smem[];
+    bf16* ring = reinterpret_cast<bf16*>(w8a16_smem) + wk * kStages * kStageElems;
+
+    const int n0 = static_cast<int>(blockIdx.x) * kBN + wn * 8 * kNSub;
+    const int steps = k >> 6;
+    const int iters = steps > wk ? (steps - wk + kWarpsK - 1) / kWarpsK : 0;
+    const int gtid = wn * 32 + lane;
+    const long long row_bytes = k >> 1;
+
+    auto issue = [&](int it) {
+        if (it < iters) {
+            const int k0 = (wk + it * kWarpsK) * 64;
+            bf16* dst = ring + (it % kStages) * kStageElems;
+#pragma unroll
+            for (int i = gtid; i < kBM * 8; i += kGroupThreads) {
+                const int r = i >> 3;
+                const int c = i & 7;
+                const bf16* src = x + static_cast<long long>(min(r, rows - 1)) * k + k0 + c * 8;
+                cp_async16(smem_addr(dst + r * 64 + ((c ^ (r & 7)) * 8)), src, r < rows ? 16 : 0);
+            }
+        }
+        cp_commit();
+    };
+
+    // A lane's columns' codes, scales and biases for a step (its group).
+    auto fetch = [&](int it, uint2 (&b)[kNSub], unsigned (&s)[kNSub], unsigned (&z)[kNSub]) {
+        if (it >= iters) return;
+        const int step = wk + it * kWarpsK;
+#pragma unroll
+        for (int j = 0; j < kNSub; ++j) {
+            const int col = min(n0 + 8 * j + g, n - 1);
+            b[j] = *reinterpret_cast<const uint2*>(codes + col * row_bytes + step * 32 + 8 * t);
+            const long long at = static_cast<long long>(col) * steps + step;
+            const unsigned sv = scales[at].raw;
+            const unsigned bv = biases[at].raw;
+            s[j] = sv | (sv << 16);
+            z[j] = bv | (bv << 16);
+        }
+    };
+
+    float acc[kMT][kNSub][4];
+#pragma unroll
+    for (int i = 0; i < kMT; ++i)
+#pragma unroll
+        for (int j = 0; j < kNSub; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) issue(s);
+
+    // The codes, scales and biases `kDepth` steps ahead (deeper spills).
+    uint2 bring[kDepth][kNSub];
+    unsigned sring[kDepth][kNSub];
+    unsigned zring[kDepth][kNSub];
+#pragma unroll
+    for (int d = 0; d < kDepth; ++d) fetch(d, bring[d], sring[d], zring[d]);
+
+    for (int it0 = 0; it0 < iters; it0 += kDepth) {
+#pragma unroll
+        for (int d = 0; d < kDepth; ++d) {
+            const int it = it0 + d;
+            if (it >= iters) break;
+            cp_wait<kStages - 2>();
+            group_sync(1 + wk, kGroupThreads);
+            const bf16* tile = ring + (it % kStages) * kStageElems;
+#pragma unroll
+            for (int mt = 0; mt < kMT; ++mt) {
+                const int ra = mt * 16 + g;
+                const int rb = ra + 8;
+                const uint4 a_lo = *reinterpret_cast<const uint4*>(tile + ra * 64 + (((2 * t) ^ (ra & 7)) * 8));
+                const uint4 a_hi = *reinterpret_cast<const uint4*>(tile + ra * 64 + (((2 * t + 1) ^ (ra & 7)) * 8));
+                const uint4 b_lo = *reinterpret_cast<const uint4*>(tile + rb * 64 + (((2 * t) ^ (rb & 7)) * 8));
+                const uint4 b_hi = *reinterpret_cast<const uint4*>(tile + rb * 64 + (((2 * t + 1) ^ (rb & 7)) * 8));
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const uint4& ar = c < 2 ? a_lo : a_hi;
+                    const uint4& br = c < 2 ? b_lo : b_hi;
+                    const unsigned a[4] = {
+                        (c & 1) ? ar.z : ar.x,
+                        (c & 1) ? br.z : br.x,
+                        (c & 1) ? ar.w : ar.y,
+                        (c & 1) ? br.w : br.y,
+                    };
+#pragma unroll
+                    for (int j = 0; j < kNSub; ++j) {
+                        // Chunk c's four codes: the lane's columns 16t + 4c .. + 3.
+                        const unsigned word = c < 2 ? bring[d][j].x : bring[d][j].y;
+                        const unsigned run = (word >> (16 * (c & 1))) & 0xFFFFu;
+                        const unsigned bf[2] = {affine2(run, 0, sring[d][j], zring[d][j]),
+                                                affine2(run, 1, sring[d][j], zring[d][j])};
+                        nvcuda::wmma::detail::mma_m16n8k16(acc[mt][j], a, bf, acc[mt][j]);
+                    }
+                }
+            }
+            issue(it + kStages - 1);
+            fetch(it + kDepth, bring[d], sring[d], zring[d]);
+        }
+    }
+    cp_wait<0>();
+
+    __syncthreads();
+    float* red = reinterpret_cast<float*>(w8a16_smem);
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt)
+#pragma unroll
+        for (int j = 0; j < kNSub; ++j) {
+            const int cl = wn * 8 * kNSub + 8 * j + 2 * t;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = mt * 16 + g + 8 * h;
+                float* at = red + (wk * kBM + r) * kBN + cl;
+                at[0] = acc[mt][j][2 * h];
+                at[1] = acc[mt][j][2 * h + 1];
+            }
+        }
+    __syncthreads();
+    const int live = min(rows, kBM);
+    for (int i = threadIdx.x; i < live * kBN; i += kWarpsN * kWarpsK * 32) {
+        const int r = i / kBN;
+        const int cl = i % kBN;
+        const int col = static_cast<int>(blockIdx.x) * kBN + cl;
+        if (col >= n) continue;
+        float sum = 0.f;
+#pragma unroll
+        for (int w = 0; w < kWarpsK; ++w) sum += red[(w * kBM + r) * kBN + cl];
+        y[static_cast<long long>(r) * n + col] = f32_to_bf16(sum);
+    }
+}
+
 // The same product at a wide fire's rows as a tiled GEMM: a CTA `kBM`
 // activation rows by 128 weight rows, its eight warps 2 x 4 over the tile
 // (a warp `kBM / 2` rows by 32 columns), both operands staged through a

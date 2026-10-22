@@ -249,6 +249,10 @@ fn affine(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The most rows the 4-bit affine GEMV on mma.sync (`affine_w4a16_mma`)
+/// takes: one 16-row tile of the mma.
+pub const AFFINE_MMA_UNTIL: u32 = 16;
+
 fn dense_affine(
     ctx: &Ctx,
     op: &'static str,
@@ -269,6 +273,55 @@ fn dense_affine(
     let Affine { bits, group, n, k } = affine(op, act, codes, scales, offset, biases, y)?;
     if y.rows == 0 {
         return Ok(());
+    }
+    // A decode's few rows of a 4-bit MLX plane on the tensor cores, its
+    // codes read once for every row (`affine_w4a16_mma`).
+    if bits == 4
+        && group == 64
+        && matches!(offset, OffsetKind::Post)
+        && act.dtype == Dtype::Bf16
+        && factor == Dtype::Bf16
+        && y.dtype == Dtype::Bf16
+        && biases.is_some()
+        && !seat.streams()
+        && y.rows <= AFFINE_MMA_UNTIL
+        && k.is_multiple_of(64)
+        && ctx.tuning().affine_mma
+    {
+        // 32 columns a block, eight warps over K, the codes three steps
+        // ahead: Llama-3.1-8B's decode at 117 tok/s against the per-row
+        // kernel's 52 (16 columns 108, deeper prefetch spills to 93).
+        const STAGES: u32 = 2;
+        const DEPTH: u32 = 3;
+        const N_SUB: u32 = 4;
+        const WARPS_K: u32 = 8;
+        let columns = 8 * N_SUB;
+        let ring = WARPS_K * STAGES * 16 * 128;
+        let fold = WARPS_K * 16 * columns * 4;
+        return ctx.fire(
+            op,
+            Fire::at(
+                "linear/w8a16.cuh",
+                symbol(&format!(
+                    "::pie::linear::affine_w4a16_mma<1, {N_SUB}, 1, {WARPS_K}, {STAGES}, {DEPTH}>"
+                )),
+            )
+            .apply(
+                Launch::grid([n.div_ceil(columns), y.rows.div_ceil(16), 1], [32 * WARPS_K, 1, 1])
+                    .smem(ring.max(fold)),
+            ),
+            &[
+                act.arg(),
+                codes.arg(),
+                scales.arg(),
+                biases.map_or(ArgValue::ABSENT, |b| b.arg()),
+                y.arg(),
+                stated(op, y.rows)?.arg(),
+                stated(op, n)?.arg(),
+                stated(op, k)?.arg(),
+                ctx.stage(),
+            ],
+        );
     }
     let tile = (BLOCK_LANES / WARP) * ROWS_PER_WARP;
     ctx.fire(

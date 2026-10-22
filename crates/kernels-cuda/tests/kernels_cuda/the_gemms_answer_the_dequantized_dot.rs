@@ -191,6 +191,33 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
     }
 }
 
+/// A decode's few rows of a 4-bit MLX plane on the mma.sync GEMV
+/// (`kernel.gemm.affine_mma`): each row against the dequantized dot, one
+/// tile's rows and a part of one, a plane whose columns end mid-block.
+#[test]
+fn the_affine_gemv_on_the_tensor_cores_answers_the_dequantized_dot() {
+    use kernels_cuda::linear::quant;
+    for (rows, n, k) in [(1usize, 320usize, 1024usize), (2, 4096, 4096), (9, 1000, 2048), (16, 512, 14336)] {
+        let seat = GroupSeat::RESIDENT;
+        let mut b = Bench::new(0x4a + rows as u64);
+        let (x, xv) = b.bf16(rows * k);
+        let (xt, mut y) = (t(x, rows, k, Bf16), b.out(rows, n));
+        let ctx = b.ctx().with_tuning(Tuning {
+            affine_mma: true,
+            ..b.ctx().tuning()
+        });
+        let (s, f, z) = affine(&mut b.lcg, [n, k, 64, 4]);
+        let (c, f, z) = (b.up(&s.bytes), b.up(&f), b.up(&z));
+        let c = t(c, n, k / 2, U8);
+        let (f, z) = (t(f, n, k / 32, U8), t(z, n, k / 32, U8));
+        let post = quant::OffsetKind::Post;
+        quant::matmul(&ctx, xt, c, f, post, Some(z), Bf16, &mut y, seat).expect("fires");
+        let w = tab(n * k, |i| f64::from(s.values[i]));
+        let want = dense(&xv, &w, [rows, n, k], None);
+        b.check(y.ptr, &want, TOL, &format!("{rows} rows, {n} x {k}"));
+    }
+}
+
 #[test]
 fn the_fp8_block_projections_answer_the_dot() {
     use kernels_cuda::linear::moe::{dense_fp8_shape, matmul_grouped_fp8, matmul_grouped_fp8_with};
