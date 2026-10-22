@@ -49,6 +49,8 @@ pub struct Sink<'a> {
     /// Launches left before the borrowed frame commits its head and goes on
     /// in a fresh buffer; zero never.
     flush_in: std::cell::Cell<u32>,
+    /// Launches encoded so far.
+    dispatched: std::cell::Cell<u32>,
 }
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -116,6 +118,7 @@ impl<'a> Sink<'a> {
             #[cfg(target_vendor = "apple")]
             handoff: None,
             flush_in: std::cell::Cell::new(0),
+            dispatched: std::cell::Cell::new(0),
         }
     }
 
@@ -136,6 +139,7 @@ impl<'a> Sink<'a> {
             #[cfg(target_vendor = "apple")]
             handoff: None,
             flush_in: std::cell::Cell::new(0),
+            dispatched: std::cell::Cell::new(0),
         }
     }
 
@@ -385,6 +389,7 @@ impl Encode for Sink<'_> {
                 }
                 self.dispatch(&encoder, &pipeline, fire)
             })?;
+            self.dispatched.set(self.dispatched.get() + 1);
             if let Held::Borrowed(frame) = &self.frame
                 && let left = self.flush_in.get()
                 && left > 0
@@ -441,6 +446,12 @@ impl Encode for Sink<'_> {
 }
 
 impl<'a> Sink<'a> {
+    /// Launches encoded so far.
+    #[must_use]
+    pub fn dispatched(&self) -> u32 {
+        self.dispatched.get()
+    }
+
     /// Commits the borrowed frame's head once `launches` are encoded, so the
     /// device starts on them while the rest of the fire is still encoding.
     #[must_use]

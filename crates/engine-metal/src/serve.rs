@@ -292,6 +292,8 @@ pub struct Shell {
     arms: Arms,
     airborne: Airborne,
     inflight: VecDeque<Flight>,
+    /// Fires' host and device times, under the `fire-timeline` diagnostic.
+    timeline: crate::timeline::Timeline,
     grafted: Option<Pending>,
     landed: BTreeMap<u64, Vec<Vec<f32>>>,
     host_rows: bool,
@@ -1096,6 +1098,7 @@ impl PreparedLoad<'_> {
             arms: Arms::of(arms),
             airborne: Airborne::new(),
             inflight: VecDeque::new(),
+            timeline: crate::timeline::Timeline::default(),
             grafted: None,
             landed: BTreeMap::new(),
             host_rows: crate::diag::on().host_rows,
@@ -1820,6 +1823,18 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        if crate::diag::on().fire_timeline
+            && waited.is_ok()
+            && let Some(lines) = self.timeline.land(
+                (flight.rows, flight.dispatches),
+                &flight.pending.timeline(),
+                crate::device::ctx::host_seconds(),
+            )
+        {
+            for line in lines {
+                eprintln!("{line}");
+            }
+        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(
@@ -4020,6 +4035,10 @@ impl Shell {
             .iter()
             .map(|class| (class.rows, class.lanes))
             .collect();
+        let dispatches = match &sink {
+            Encoded::Live(sink) => sink.dispatched(),
+            _ => 0,
+        };
         #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
         let mut built = None;
         let taped = match sink {
@@ -4039,6 +4058,7 @@ impl Shell {
             tape: taped,
             built,
             launches,
+            dispatches,
         })
     }
 
@@ -4106,6 +4126,10 @@ impl Shell {
                 Filter::default(),
             )?;
         }
+        let dispatches = match &sink {
+            Encoded::Live(sink) => sink.dispatched(),
+            _ => 0,
+        };
         let frame = match sink {
             Encoded::Live(sink) => sink.into_frame(),
             Encoded::Taped(_) => None,
@@ -4120,6 +4144,7 @@ impl Shell {
             tape: None,
             built: None,
             launches,
+            dispatches,
         })
     }
 
@@ -4279,6 +4304,8 @@ struct Walked {
     #[cfg(not(target_vendor = "apple"))]
     built: Option<()>,
     launches: u32,
+    /// Launches a live encode put on the device; none for the others.
+    dispatches: u32,
 }
 
 pub struct StepView<'a> {
@@ -4330,6 +4357,8 @@ pub struct Enqueued<'a> {
     arm: usize,
     lanes: usize,
     launches: u32,
+    rows: u32,
+    dispatches: u32,
     attached: Vec<u64>,
     step: PhantomData<&'a ()>,
 }
@@ -4370,6 +4399,8 @@ struct Flight {
     seq: u64,
     arm: usize,
     lanes: usize,
+    rows: u32,
+    dispatches: u32,
     pending: Pending,
     attached: Vec<u64>,
 }
@@ -4607,6 +4638,8 @@ impl engine::frame::Shell for Shell {
             arm: prepared.arm,
             lanes: prepared.lanes.len(),
             launches: walked.launches,
+            rows: prepared.descriptor.rows,
+            dispatches: walked.dispatches,
             attached,
             step: PhantomData,
         })
@@ -4622,6 +4655,8 @@ impl engine::frame::Shell for Shell {
             arm,
             lanes,
             launches,
+            rows,
+            dispatches,
             attached,
             step: _,
         } = enqueued;
@@ -4631,6 +4666,8 @@ impl engine::frame::Shell for Shell {
             seq,
             arm,
             lanes,
+            rows,
+            dispatches,
             pending,
             attached,
         });

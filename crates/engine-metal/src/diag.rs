@@ -44,6 +44,7 @@ pub struct Diagnostics {
     pub tier_trace: bool,
     pub rs_trace: bool,
     pub fire_trace: bool,
+    pub fire_timeline: bool,
     pub region_trace: bool,
     pub streamed_trace: bool,
     pub kernel_profile: Profile,
@@ -78,6 +79,7 @@ impl Default for Diagnostics {
             tier_trace: false,
             rs_trace: false,
             fire_trace: false,
+            fire_timeline: false,
             region_trace: false,
             streamed_trace: false,
             kernel_profile: Profile::Off,
@@ -129,7 +131,7 @@ fn number<T: std::str::FromStr>(word: &str, value: &str) -> std::result::Result<
         .map_err(|_| format!("`{word}` takes a number; `{value}` is not one"))
 }
 
-const WORDS: &str = "`cut-trace`, `tier-trace`, `rs-trace`, `fire-trace`, \
+const WORDS: &str = "`cut-trace`, `tier-trace`, `rs-trace`, `fire-trace`, `fire-timeline`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
      `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, `route-dump=<file>`, `pass-half=off`, \
      `route-prefetch=off`, `expert-passes=off`, `keepalive=off`, \
@@ -158,6 +160,7 @@ impl std::str::FromStr for Diagnostics {
                 "tier-trace" => diag.tier_trace = switch(word, value)?,
                 "rs-trace" => diag.rs_trace = switch(word, value)?,
                 "fire-trace" => diag.fire_trace = switch(word, value)?,
+                "fire-timeline" => diag.fire_timeline = switch(word, value)?,
                 "region-trace" => diag.region_trace = switch(word, value)?,
                 "streamed-trace" => diag.streamed_trace = switch(word, value)?,
                 "pass-half" => diag.pass_half = switch(word, value)?,

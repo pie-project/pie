@@ -16,6 +16,35 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLResourceOptions, MTLSize,
 };
 
+/// Seconds on the host's monotonic clock, the one a command buffer's
+/// `GPUStartTime` and `GPUEndTime` are read on.
+#[must_use]
+#[allow(deprecated, reason = "libc's mach bindings are what this crate links")]
+pub fn host_seconds() -> f64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::sync::OnceLock;
+        static SCALE: OnceLock<f64> = OnceLock::new();
+        let scale = *SCALE.get_or_init(|| {
+            let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: a plain query into a live struct.
+            let rc = unsafe { libc::mach_timebase_info(&raw mut base) };
+            if rc == 0 && base.denom != 0 {
+                f64::from(base.numer) / f64::from(base.denom) / 1e9
+            } else {
+                1e-9
+            }
+        });
+        // SAFETY: reads a counter.
+        let ticks = unsafe { libc::mach_absolute_time() };
+        ticks as f64 * scale
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        0.0
+    }
+}
+
 static RESERVATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[must_use]
@@ -376,6 +405,8 @@ impl Context {
                 blit: None,
                 committed: RefCell::new(Vec::new()),
                 flushed: RefCell::new(Vec::new()),
+                opened: host_seconds(),
+                commits: RefCell::new(Vec::new()),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -411,6 +442,13 @@ pub struct Frame {
     /// the order the queue runs them.
     #[cfg(target_vendor = "apple")]
     flushed: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    /// When the frame opened, on the host clock the device stamps its
+    /// buffers' start and end on (see [`host_seconds`]).
+    #[cfg(target_vendor = "apple")]
+    opened: f64,
+    /// When each buffer was committed, heads first, on the same clock.
+    #[cfg(target_vendor = "apple")]
+    commits: RefCell<Vec<f64>>,
 }
 
 // SAFETY: a `Frame` is created, encoded into and committed on one thread —
@@ -458,6 +496,7 @@ impl Frame {
             why: "the command buffer would not open a compute pass".to_string(),
         })?;
         head.commit();
+        self.commits.borrow_mut().push(host_seconds());
         for then in self.committed.borrow_mut().drain(..) {
             then();
         }
@@ -472,6 +511,7 @@ impl Frame {
         self.end_pass();
         let buffer = self.buffer.get_mut().clone();
         buffer.commit();
+        self.commits.get_mut().push(host_seconds());
         for then in self.committed.get_mut().drain(..) {
             then();
         }
@@ -766,9 +806,12 @@ impl Frame {
                         .addCompletedHandler(block2::RcBlock::as_ptr(&handler));
                 }
             }
+            let buffer = self.commit_buffer();
             Ok(Pending {
-                buffer: self.commit_buffer(),
+                buffer,
                 flushed,
+                opened: self.opened,
+                commits: std::mem::take(self.commits.get_mut()),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -805,6 +848,10 @@ pub struct Pending {
     /// The heads a flushed frame committed ahead of `buffer`.
     #[cfg(target_vendor = "apple")]
     flushed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    #[cfg(target_vendor = "apple")]
+    opened: f64,
+    #[cfg(target_vendor = "apple")]
+    commits: Vec<f64>,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
@@ -853,6 +900,35 @@ impl Pending {
         #[cfg(not(target_vendor = "apple"))]
         {
             (0, 0)
+        }
+    }
+
+    /// When the frame opened, and each of its buffers' commit, device start
+    /// and device end, in the order the queue ran them, all in seconds on
+    /// the host clock. Read once the frame has landed.
+    #[must_use]
+    pub fn timeline(&self) -> crate::timeline::Fire {
+        #[cfg(target_vendor = "apple")]
+        {
+            let buffers = self
+                .flushed
+                .iter()
+                .chain([&self.buffer])
+                .zip(&self.commits)
+                .map(|(buffer, &commit)| crate::timeline::Buffer {
+                    commit,
+                    start: buffer.GPUStartTime(),
+                    end: buffer.GPUEndTime(),
+                })
+                .collect();
+            crate::timeline::Fire {
+                opened: self.opened,
+                buffers,
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            crate::timeline::Fire::default()
         }
     }
 
