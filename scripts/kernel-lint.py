@@ -32,11 +32,8 @@ CRATES = {
     ),
 }
 
-# Entry points the host does not name, each with the reason.
-UNNAMED = {
-    # Vendored FlashInfer, cut down when it is internalized (Incheon P3).
-    "kernels-cuda": {"flashinfer/"},
-}
+# Entry points the host does not name, by path prefix, each with the reason.
+UNNAMED = {}
 
 GLOBAL = re.compile(
     r"__global__\s+(?:static\s+)?"
@@ -52,6 +49,8 @@ def host_text(trees):
     an entry is named by a symbol or an entry literal, not by an op that
     shares its spelling."""
     text = "".join(p.read_text() for t in trees for p in (REPO / t).rglob("*.rs"))
+    # Char literals first: a '"' would pair with the next string's quote.
+    text = re.sub(r"'(?:\\.|[^'\\])'", "''", text)
     literals = re.findall(r'"(?:[^"\\]|\\.)*"', text, re.S)
     return "\n".join(l for l in literals if not re.fullmatch(r'"[a-z_]+\.[a-z0-9_]+"', l))
 

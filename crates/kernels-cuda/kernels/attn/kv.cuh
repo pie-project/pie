@@ -39,69 +39,6 @@ __device__ __forceinline__ int find_request(const u32* qo_indptr,
     return R - 1;
 }
 
-template <bool HND_LAYOUT>
-__global__ void kv_append(
-    const bf16* __restrict__ k_curr,
-    const bf16* __restrict__ v_curr,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
-    const u32* __restrict__ qo_indptr,
-    const u32* __restrict__ kv_page_indices,
-    const u32* __restrict__ kv_page_indptr,
-    const u32* __restrict__ kv_last_page_lens,
-    const u8* __restrict__ row_valid,
-    const u32* __restrict__ devwin,
-    int R,
-    int page_size,
-    int h_kv,
-    int d,
-    int first_token)
-{
-
-    const int t = blockIdx.x + first_token;
-
-    if (devwin != nullptr) {
-        const int w0 = static_cast<int>(devwin[0]);
-        const int w1 = static_cast<int>(devwin[1]);
-        if (t < w0 || t >= w0 + w1) return;
-    }
-    if (row_valid != nullptr && row_valid[t] == 0) return;
-
-    const int r = find_request(qo_indptr, R, t);
-    const int qo_lo = qo_indptr[r];
-    const int qo_hi = qo_indptr[r + 1];
-    const int new_tokens_r = qo_hi - qo_lo;
-    const int offset_in_new = t - qo_lo;
-
-    const int pages_first = kv_page_indptr[r];
-    const int pages_last  = kv_page_indptr[r + 1];
-    const int num_pages_r = pages_last - pages_first;
-    const int total_kv_after = (num_pages_r - 1) * page_size + kv_last_page_lens[r];
-    const int pre_kv_len = total_kv_after - new_tokens_r;
-    const int abs_kv_pos = pre_kv_len + offset_in_new;
-
-    const int page_in_req     = abs_kv_pos / page_size;
-    const int offset_in_page  = abs_kv_pos % page_size;
-    const int actual_page     = static_cast<int>(kv_page_indices[pages_first + page_in_req]);
-
-    const long long row = h_kv * d;
-    const long long src = static_cast<long long>(t) * row;
-    for (int i = threadIdx.x; i < row; i += blockDim.x) {
-        long long dst;
-        if constexpr (HND_LAYOUT) {
-            const int h = i / d;
-            const int j = i - h * d;
-            dst = ((static_cast<long long>(actual_page) * h_kv + h) *
-                   page_size + offset_in_page) * d + j;
-        } else {
-            dst = ((static_cast<long long>(actual_page) * page_size) +
-                   offset_in_page) * row + i;
-        }
-        k_pages[dst] = k_curr[src + i];
-        v_pages[dst] = v_curr[src + i];
-    }
-}
-
 // A row's key and value landed at its explicit page and offset, as bf16 or,
 // into an e4m3 pool, rounded to e4m3 (saturating, under a unit scale).
 template <bool HND_LAYOUT, class KV = bf16>

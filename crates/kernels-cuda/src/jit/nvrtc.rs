@@ -387,8 +387,18 @@ mod tests {
         if !nvrtc_is_here() {
             return;
         }
+        // A unit another unit includes is a header: it compiles as part of
+        // its includers, under their options, not on its own.
+        let included: std::collections::BTreeSet<&str> = crate::source::LIBRARY
+            .iter()
+            .flat_map(|h| h.text.lines())
+            .filter_map(|line| line.strip_prefix("#include \"")?.split('"').next())
+            .collect();
         let mut failed = Vec::new();
         for header in crate::source::LIBRARY {
+            if included.contains(header.name) {
+                continue;
+            }
             let Some(root) = Root::of(header.name) else {
                 continue;
             };

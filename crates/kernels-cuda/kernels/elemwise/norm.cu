@@ -364,42 +364,6 @@ __global__ void __launch_bounds__(256) rmsnorm_no_scale_vec(
     }
 }
 
-template <class T, int BLOCK = 256>
-__global__ void rmsnorm_gated(
-    const T* __restrict__ x,
-    const T* __restrict__ gate,
-    const float* __restrict__ weight,
-    T* __restrict__ y,
-    int hidden,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const T* xr = x + static_cast<long long>(row) * hidden;
-    const T* gr = gate + static_cast<long long>(row) * hidden;
-    T* yr = y + static_cast<long long>(row) * hidden;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float v = Elem<T>::to_f32(xr[i]);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
-
-    for (int i = tid; i < hidden; i += BLOCK) {
-        const float xv = Elem<T>::to_f32(xr[i]) * inv_rms;
-        const float wv = weight[i];
-        const float gv = Elem<T>::to_f32(gr[i]);
-
-        const float sg = gv / (1.f + __expf(-gv));
-        yr[i] = Elem<T>::from_f32(wv * xv * sg);
-    }
-}
-
 // The gated norm over an f32 accumulator, or one landed in bf16 (`X`).
 template <class X, class T, int BLOCK = 256>
 __global__ void rmsnorm_gated_in(
