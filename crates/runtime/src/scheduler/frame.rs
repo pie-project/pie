@@ -59,6 +59,7 @@ struct ArrivedFire {
     fire_id: Option<u64>,
     tokens: usize,
     rows: usize,
+    readouts: usize,
 }
 
 struct PlacedFire {
@@ -66,6 +67,7 @@ struct PlacedFire {
     fire_id: u64,
     rows: usize,
     tokens: usize,
+    readouts: usize,
 }
 
 struct PendingFrame {
@@ -229,6 +231,9 @@ pub(super) struct FramePolicy {
     k: usize,
     max_wave_tokens: usize,
     max_wave_rows: usize,
+    /// The rows a wave may read out, the engine's `max_readouts`; 0 bounds
+    /// nothing.
+    max_wave_readouts: usize,
     lanes: BTreeMap<ProcessId, LaneState>,
     sealed: VecDeque<SealedFrame>,
     executing_now: bool,
@@ -265,6 +270,14 @@ impl FramePolicy {
         self
     }
 
+    /// Waves read out no more than `readouts` rows (the engine refuses a
+    /// fire past them), a fire that alone reads more still taking a wave of
+    /// its own.
+    pub fn with_max_wave_readouts(mut self, readouts: usize) -> Self {
+        self.max_wave_readouts = readouts;
+        self
+    }
+
     #[cfg(test)]
     fn with_silence_timeout(mut self, timeout: Duration) -> Self {
         self.silence_timeout = timeout;
@@ -281,6 +294,7 @@ impl FramePolicy {
             k,
             max_wave_tokens,
             max_wave_rows,
+            max_wave_readouts: 0,
             lanes: BTreeMap::new(),
             sealed: VecDeque::new(),
             executing_now: false,
@@ -312,6 +326,8 @@ impl FramePolicy {
         self.k == 1
     }
 
+    /// [`Self::on_fire_reading`] for a fire that reads out one row a lane.
+    #[cfg(test)]
     pub fn on_fire_enqueued(
         &mut self,
         stamp: FrameStamp,
@@ -319,6 +335,20 @@ impl FramePolicy {
         fire_id: u64,
         tokens: usize,
         rows: usize,
+        cohort: Option<(u32, u32)>,
+    ) {
+        self.on_fire_reading(stamp, owner, fire_id, tokens, rows, rows, cohort);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_fire_reading(
+        &mut self,
+        stamp: FrameStamp,
+        owner: Option<ProcessId>,
+        fire_id: u64,
+        tokens: usize,
+        rows: usize,
+        readouts: usize,
         cohort: Option<(u32, u32)>,
     ) {
         let accept_began = self.stats.is_some().then(Instant::now);
@@ -331,6 +361,7 @@ impl FramePolicy {
                 fire_id: Some(fire_id),
                 tokens,
                 rows,
+                readouts,
             },
         );
         if let Some((group, _)) = cohort
@@ -358,6 +389,7 @@ impl FramePolicy {
                 fire_id: None,
                 tokens: 0,
                 rows: 0,
+                readouts: 0,
             },
         );
     }
@@ -782,6 +814,7 @@ impl FramePolicy {
         let k = self.k;
         let max_wave_rows = self.max_wave_rows;
         let max_wave_tokens = self.max_wave_tokens;
+        let max_wave_readouts = self.max_wave_readouts;
         // One frame of prompts on the card at a time: prompts arriving behind
         // it bind together into the next, while decodes keep running ahead.
         // A lane whose own prompt is in flight continues it in the next frame
@@ -840,6 +873,7 @@ impl FramePolicy {
             let mut fire_waves = HashMap::new();
             let mut wave_tokens = vec![0usize; k];
             let mut wave_rows = vec![0usize; k];
+            let mut wave_readouts = vec![0usize; k];
             let mut members: HashSet<ProcessId> = HashSet::new();
             let mut dropped_empty = false;
             let mut units: Vec<Vec<ProcessId>> = Vec::with_capacity(order.len());
@@ -868,6 +902,7 @@ impl FramePolicy {
                     Vec::with_capacity(unit.len());
                 let mut unit_rows = vec![0usize; k];
                 let mut unit_tokens = vec![0usize; k];
+                let mut unit_readouts = vec![0usize; k];
                 let mut short = false;
                 for lane_id in &unit {
                     let Some(lane) = self.lanes.get_mut(lane_id) else {
@@ -887,6 +922,7 @@ impl FramePolicy {
                                 fire_id,
                                 rows: fire.rows.max(1),
                                 tokens: fire.tokens,
+                                readouts: fire.readouts,
                             })
                         })
                         .collect();
@@ -897,9 +933,13 @@ impl FramePolicy {
                         continue;
                     }
                     let fits = live.iter().all(|fire| {
+                        let reading = wave_readouts[fire.wave] + unit_readouts[fire.wave];
                         wave_rows[fire.wave] + unit_rows[fire.wave] + fire.rows <= max_wave_rows
                             && wave_tokens[fire.wave] + unit_tokens[fire.wave] + fire.tokens
                                 <= max_wave_tokens
+                            && (max_wave_readouts == 0
+                                || reading == 0
+                                || reading + fire.readouts <= max_wave_readouts)
                     });
                     if !fits {
                         short = true;
@@ -908,6 +948,7 @@ impl FramePolicy {
                     for fire in &live {
                         unit_rows[fire.wave] += fire.rows;
                         unit_tokens[fire.wave] += fire.tokens;
+                        unit_readouts[fire.wave] += fire.readouts;
                     }
                     unit_fires.push((*lane_id, live));
                 }
@@ -935,6 +976,7 @@ impl FramePolicy {
                     for fire in &live {
                         wave_rows[fire.wave] += fire.rows;
                         wave_tokens[fire.wave] += fire.tokens;
+                        wave_readouts[fire.wave] += fire.readouts;
                         waves[fire.wave].push(fire.fire_id);
                         fire_waves.insert(fire.fire_id, fire.wave);
                     }
@@ -1411,6 +1453,50 @@ mod tests {
         no_prompt_waits_for_a_lane_off_a_prompt();
         consumed_release_leaves_no_phantom_hold_for_bystander();
         a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
+        a_wave_reads_out_no_more_than_the_engine_carves();
+    }
+
+    /// Lanes that read out several rows each (a verified draft block) share
+    /// a wave only within the engine's readout ceiling; the rest wait a
+    /// frame instead of the fire being refused, and a fire past the ceiling
+    /// alone still takes a wave of its own.
+    fn a_wave_reads_out_no_more_than_the_engine_carves() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None).with_max_wave_readouts(8);
+        let lanes: Vec<ProcessId> = (0..3).map(|_| pid()).collect();
+        for (at, &lane) in lanes.iter().enumerate() {
+            policy.on_fire_reading(
+                stamp(lane, 0, 0, 1),
+                Some(lane),
+                10 + at as u64,
+                5,
+                1,
+                5,
+                None,
+            );
+        }
+        let mut sealed_ids = Vec::new();
+        for _ in 0..3 {
+            let queued: QueuedFireIds = (10..13).filter(|id| !sealed_ids.contains(id)).collect();
+            let sealed = fires(&plan(&mut policy, &queued, Instant::now()));
+            assert_eq!(
+                sealed.len(),
+                1,
+                "two lanes of five readouts each pass a ceiling of eight"
+            );
+            sealed_ids.extend(sealed);
+            policy.on_frame_retired(lanes.iter().copied());
+        }
+        sealed_ids.sort_unstable();
+        assert_eq!(sealed_ids, vec![10, 11, 12], "every lane seals in its turn");
+
+        let lone = pid();
+        policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12, None);
+        let queued: QueuedFireIds = [20].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![20],
+            "a fire past the ceiling alone takes a wave of its own"
+        );
     }
 
     /// Concurrent prompts whose prefills are cut at checkpoints, each lane's
