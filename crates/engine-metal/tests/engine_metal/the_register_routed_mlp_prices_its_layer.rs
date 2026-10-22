@@ -4,8 +4,8 @@
 //! an 8-bit gate) over a verify's eight rows: the per-route path as a verify
 //! runs it (the routed gate-up, SwiGLU, down and fold; the shared expert on
 //! the register tile; its gate; the gated add) against the register expert
-//! tiles (the grouping with the gate, the gate-up, the down, the combine) at
-//! a few tile slot counts, each pass alone and the whole. Three layers' banks
+//! tiles (the grouping with the gate, the gate-up and the down on the live
+//! tiles' grids, the combine), each pass alone and the whole. Three layers' banks
 //! in turn, so no layer's codes sit in the cache from the last.
 //! Run: cargo test --release -p engine-metal --test engine_metal \
 //!        the_register_routed_mlp_prices_its_layer -- --ignored --nocapture
@@ -186,6 +186,7 @@ fn the_register_routed_mlp_prices_its_layer() {
         let (_e, hidden_t) = plane(tiles, wide(INTER), Dtype::Bf16);
         let (_r, y_t) = plane(tiles * 8, HIDDEN, Dtype::Bf16);
         let (_m, mix_t) = plane(1, moe::REGISTER_MIX, Dtype::F32);
+        let (_n, grids_t) = plane(1, moe::REGISTER_GRIDS, Dtype::I32);
         let rooms = moe::RegisterRooms {
             tiles: tiles_t,
             rows: rows_t,
@@ -194,6 +195,7 @@ fn the_register_routed_mlp_prices_its_layer() {
             hidden: hidden_t,
             y: y_t,
             mix: mix_t,
+            grids: grids_t,
         };
 
         let time = |f: &dyn Fn(&Sink, &[Bank; 5])| -> f64 {
@@ -226,26 +228,43 @@ fn the_register_routed_mlp_prices_its_layer() {
             quant::matmul(s, &register, xt, l[4], gt, scratch(), 8).expect("gate");
             moe::sigmoid_gate_add(s, ft, syt, gt, ot).expect("gated add");
         };
-        let cut = |slots| moe::RegisterCut {
-            slots,
-            ..moe::REGISTER_CUT
-        };
+        let cut = moe::REGISTER_CUT;
+        let groups = cut.groups(INTER, HIDDEN);
         let group = |s: &Sink, l: &[Bank; 5]| {
             let gate = moe::RegisterGate {
                 weights: wt,
                 gate: l[4],
             };
-            moe::register_group(s, xt, rt, EXPERTS, true, Some(gate), rooms).expect("group");
+            moe::register_group(s, xt, rt, EXPERTS, true, Some(gate), groups, rooms)
+                .expect("group");
         };
-        // Each pass's grid over `n` tiles: every tile a fire may fill, or the
-        // live ones alone, as an indirect grid would launch them.
-        let glu = |s: &Sink, l: &[Bank; 5], c, n| {
-            moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, n, EXPERTS, rooms, c)
-                .expect("glu");
+        let glu = |s: &Sink, l: &[Bank; 5]| {
+            moe::register_glu(
+                s,
+                l[0],
+                Some(l[2]),
+                HIDDEN,
+                INTER,
+                tiles,
+                EXPERTS,
+                rooms,
+                cut,
+            )
+            .expect("glu");
         };
-        let down = |s: &Sink, l: &[Bank; 5], c, n| {
-            moe::register_down(s, l[1], Some(l[3]), INTER, HIDDEN, n, EXPERTS, rooms, c)
-                .expect("down");
+        let down = |s: &Sink, l: &[Bank; 5]| {
+            moe::register_down(
+                s,
+                l[1],
+                Some(l[3]),
+                INTER,
+                HIDDEN,
+                tiles,
+                EXPERTS,
+                rooms,
+                cut,
+            )
+            .expect("down");
         };
         let combine = |s: &Sink| {
             moe::register_combine(s, rooms, tiles, TOP_K, ot).expect("combine");
@@ -255,37 +274,23 @@ fn the_register_routed_mlp_prices_its_layer() {
             own(s, l);
             gated(s, l);
         });
-        let mut line = format!(
+        let line = format!(
             "rows={tokens} unique={unique:2}: per-route {per_route:6.1} us (routed {:6.1}, shared {:5.1}, \
-             gate+add {:5.1})\n  register: group {:5.1}, combine {:5.1}",
+             gate+add {:5.1})\n  register {:6.1} us: group {:5.1}, glu {:6.1}, down {:6.1}, combine {:5.1}",
             time(&|s, l| routed(s, l)),
             time(&|s, l| own(s, l)),
             time(&|s, l| gated(s, l)),
+            time(&|s, l| {
+                group(s, l);
+                glu(s, l);
+                down(s, l);
+                combine(s);
+            }),
             time(&|s, l| group(s, l)),
+            time(&|s, l| glu(s, l)),
+            time(&|s, l| down(s, l)),
             time(&|s, _| combine(s)),
         );
-        let live = u32::try_from(unique).expect("a count") + 1;
-        for (label, slots, n) in [
-            ("slots  0", 0, tiles),
-            ("slots 16", 16, tiles),
-            ("slots 24", 24, tiles),
-            ("slots 32", 32, tiles),
-            ("slots 40", 40, tiles),
-            ("live    ", 0, live),
-        ] {
-            let c = cut(slots);
-            line += &format!(
-                "\n  {label}: glu {:6.1} down {:6.1} whole {:6.1} us",
-                time(&|s, l| glu(s, l, c, n)),
-                time(&|s, l| down(s, l, c, n)),
-                time(&|s, l| {
-                    group(s, l);
-                    glu(s, l, c, n);
-                    down(s, l, c, n);
-                    combine(s);
-                }),
-            );
-        }
         eprintln!("{line}");
     }
 }

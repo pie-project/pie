@@ -786,7 +786,16 @@ impl<'c> Run<'c> {
             weights: self.tensor(*weights),
             gate: s.gate_bank,
         });
-        moe::register_group(self.ctx(), xt, rt, experts, shared.is_some(), gate, rooms)?;
+        moe::register_group(
+            self.ctx(),
+            xt,
+            rt,
+            experts,
+            shared.is_some(),
+            gate,
+            moe::REGISTER_CUT.groups(inter, columns),
+            rooms,
+        )?;
         moe::register_glu(
             self.ctx(),
             gate_up,
