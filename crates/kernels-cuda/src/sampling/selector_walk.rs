@@ -4,14 +4,14 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, Tensor};
 
-const FILE: &str = "attn/selector_walk.cuh";
+const FILE: &str = "sampling/selector_walk.cu";
 
 const THREADS: u32 = 256;
 
 const MAX_K: u32 = THREADS / 16;
 
 #[allow(clippy::too_many_arguments)]
-pub fn walk(
+pub fn selector_walk(
     ctx: &Ctx,
     cand: RaggedTensor,
     unary: Tensor,
@@ -115,7 +115,7 @@ pub fn walk(
     let hp_arg = hp.map_or_else(|| pred.arg(), |h| h.arg());
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::selector_walk<::pie::bf16>")
+        Fire::at(FILE, "::pie::sampling::selector_walk<::pie::bf16>")
             .apply(Launch::per_row(lanes, THREADS)),
         &[
             cand.data.arg(),

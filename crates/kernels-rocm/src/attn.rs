@@ -6,8 +6,6 @@ pub mod index;
 
 pub mod kv;
 
-pub mod markov;
-
 pub mod mla;
 
 pub mod paged;
@@ -27,8 +25,6 @@ pub mod sched_decode;
 pub mod sched_mla;
 
 pub mod sched_prefill;
-
-pub mod selector;
 
 use crate::error::Error;
 use dtype::Dtype;

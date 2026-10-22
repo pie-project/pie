@@ -1034,7 +1034,7 @@ impl Run<'_> {
                 block,
                 biased,
                 picks,
-            } => kernels_cuda::attn::markov::walk(
+            } => kernels_cuda::sampling::markov_walk(
                 self.ctx(),
                 self.tensor(*logits),
                 self.tensor(*tokens),
@@ -1788,7 +1788,7 @@ impl Run<'_> {
                 succ,
                 first,
                 picks,
-            } => kernels_cuda::attn::selector::walk(
+            } => kernels_cuda::sampling::selector_walk(
                 self.ctx(),
                 self.ragged(*cand),
                 self.tensor(*unary),

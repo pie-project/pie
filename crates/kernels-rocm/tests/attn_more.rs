@@ -11,7 +11,8 @@ mod common;
 
 use common::{Gpu, KV, STATE, bf16s, close_abs, close_bf16, e4m3_value, indptr_of, values};
 use dtype::Dtype;
-use kernels_rocm::attn::{self, plan, selected, selector};
+use kernels_rocm::attn::{self, plan, selected};
+use kernels_rocm::sampling;
 use kernels_rocm::{KvPool, RaggedTensor, RecurrentPool};
 
 /// A bf16 NHD pool and the host keys and values it holds, [request][token]
@@ -539,7 +540,7 @@ fn selector_walk_chains_each_rows_pick() {
             gpu.tensor(&succ, vocab, rank, Dtype::Bf16),
         );
         let mut picks = gpu.upload(&vec![-7i32; rows], rows as u32, 1, Dtype::I32);
-        selector::walk(&ctx, c, un, hpt, tok, pr, su, first, &mut picks).unwrap();
+        sampling::selector_walk(&ctx, c, un, hpt, tok, pr, su, first, &mut picks).unwrap();
         let got = gpu.read_as::<i32>(&picks);
 
         let mut want = vec![-7i32; rows];

@@ -47,6 +47,7 @@ pub mod graph;
 pub mod jit;
 pub mod layout;
 pub mod linear;
+pub mod sampling;
 pub mod seat;
 pub mod source;
 pub mod spatial;

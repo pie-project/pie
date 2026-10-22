@@ -291,7 +291,7 @@ impl Run<'_> {
                 k,
                 values,
                 indices,
-            } => layout::topk(
+            } => kernels_cuda::sampling::topk(
                 self.ctx(),
                 self.tensor(*x),
                 *k,
@@ -300,7 +300,7 @@ impl Run<'_> {
             ),
             Layout::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
-                    layout::argmax(
+                    kernels_cuda::sampling::argmax(
                         self.ctx(),
                         self.tensor(*x),
                         u32::try_from(column).expect("a draft depth inside u32"),

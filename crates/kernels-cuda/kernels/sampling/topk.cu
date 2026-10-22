@@ -1,9 +1,6 @@
-#pragma once
-
-
 #include "prelude/device.cuh"
 
-namespace pie::layout {
+namespace pie::sampling {
 
 __device__ __forceinline__ float topk_load(bf16 v) { return ::pie::Elem<bf16>::to_f32(v); }
 __device__ __forceinline__ float topk_load(float v) { return v; }
@@ -28,7 +25,7 @@ __device__ __forceinline__ void warp_best(float& v, unsigned& i)
 }
 
 template <class T>
-__global__ void argmax_rows(
+__global__ void argmax(
     const T* __restrict__ x,
     int* __restrict__ y,
     int width,
@@ -97,7 +94,7 @@ constexpr unsigned TOPK_THREADS = 128;
 constexpr unsigned TOPK_WARPS = TOPK_THREADS / 32;
 
 template <class T, int K>
-__global__ void __launch_bounds__(TOPK_THREADS) topk_rows(
+__global__ void __launch_bounds__(TOPK_THREADS) topk(
     const T* __restrict__ x,
     float* __restrict__ values,
     int* __restrict__ indices,

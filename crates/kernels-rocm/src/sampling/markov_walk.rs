@@ -5,7 +5,7 @@ use crate::jit::Ctx;
 use crate::tensor::Tensor;
 
 #[allow(clippy::too_many_arguments)]
-pub fn walk(
+pub fn markov_walk(
     _ctx: &Ctx,
     _logits: Tensor,
     _tokens: Tensor,

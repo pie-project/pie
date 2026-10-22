@@ -7,15 +7,15 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, nonzero, refuse, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "attn/markov_walk.cuh";
+const FILE: &str = "sampling/markov_walk.cu";
 
 /// The Markov embeddings' rank the kernel holds.
-pub const RANK: u32 = 256;
+pub const MARKOV_RANK: u32 = 256;
 
-/// A step's shared memory (`markov_walk.cuh`'s `kSmem`): the head's 128-row
+/// A step's shared memory (`markov_walk.cu`'s `kSmem`): the head's 128-row
 /// tile and a 32-readout chunk's embeddings, rows padded 16 bytes, and the
 /// chunk's f32 products.
-const STEP_SMEM: u32 = (128 + 32) * (RANK + 8) * 2 + 32 * (128 + 4) * 4;
+const STEP_SMEM: u32 = (128 + 32) * (MARKOV_RANK + 8) * 2 + 32 * (128 + 4) * 4;
 
 /// `biased` (`[readouts, vocab]`, the logits' element): `logits` with each
 /// readout's bias `head . embed[t]` added. A readout's depth in its drafted
@@ -25,7 +25,7 @@ const STEP_SMEM: u32 = (128 + 32) * (RANK + 8) * 2 + 32 * (128 + 4) * 4;
 /// row. `picks` (i32 a readout): each one's pick, its biased row's argmax
 /// taken in f32.
 #[allow(clippy::too_many_arguments)]
-pub fn walk(
+pub fn markov_walk(
     ctx: &Ctx,
     logits: Tensor,
     tokens: Tensor,
@@ -52,11 +52,11 @@ pub fn walk(
     if embed.dtype != Dtype::Bf16 || head.dtype != Dtype::Bf16 {
         return Err(refuse(OP, "the Markov embeddings and head are bf16"));
     }
-    if embed.width != RANK || head.width != RANK || head.rows != logits.width {
+    if embed.width != MARKOV_RANK || head.width != MARKOV_RANK || head.rows != logits.width {
         return Err(refuse(
             OP,
             format!(
-                "a rank-{RANK} head over the logits' {} columns, not [{}, {}] and [{}, {}]",
+                "a rank-{MARKOV_RANK} head over the logits' {} columns, not [{}, {}] and [{}, {}]",
                 logits.width, embed.rows, embed.width, head.rows, head.width
             ),
         ));
@@ -77,7 +77,7 @@ pub fn walk(
     let keys = ctx.scratch_stream(OP, "markov.keys", r * 8)? as u64;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::markov::markov_plan")
+        Fire::at(FILE, "::pie::sampling::markov::plan")
             .apply(Launch::grid([1, 1, 1], [1024, 1, 1])),
         &[
             positions.arg(),
@@ -91,12 +91,12 @@ pub fn walk(
         ],
     )?;
     let tiles = logits.width.div_ceil(128);
-    let gathered = ctx.scratch_stream(OP, "markov.gathered", r * RANK as usize * 2)? as u64;
+    let gathered = ctx.scratch_stream(OP, "markov.gathered", r * MARKOV_RANK as usize * 2)? as u64;
     for s in 0..steps {
         // The depth's embeddings, a warp a readout, then its tiles.
         ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::attn::markov::markov_gather")
+            Fire::at(FILE, "::pie::sampling::markov::gather")
                 .apply(Launch::grid([readouts.div_ceil(8), 1, 1], [256, 1, 1])),
             &[
                 tokens.arg(),
@@ -112,11 +112,8 @@ pub fn walk(
         )?;
         ctx.fire(
             OP,
-            Fire::at(
-                FILE,
-                symbol(&format!("::pie::attn::markov::markov_step<{t}>")),
-            )
-            .apply(Launch::grid([tiles, 1, 1], [256, 1, 1]).smem(STEP_SMEM)),
+            Fire::at(FILE, symbol(&format!("::pie::sampling::markov::step<{t}>")))
+                .apply(Launch::grid([tiles, 1, 1], [256, 1, 1]).smem(STEP_SMEM)),
             &[
                 logits.arg(),
                 ArgValue::Ptr(gathered),
@@ -133,7 +130,7 @@ pub fn walk(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::markov::markov_picks").apply(Launch::flat(readouts, 128)),
+        Fire::at(FILE, "::pie::sampling::markov::picks").apply(Launch::flat(readouts, 128)),
         &[ArgValue::Ptr(keys), picks.arg(), int(readouts).arg()],
     )
 }

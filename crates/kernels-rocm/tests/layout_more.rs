@@ -18,7 +18,7 @@ use kernels_rocm::layout_fold::{merge_rows, pool_rows};
 use kernels_rocm::layout_pixels::{grid_taps, pixels};
 use kernels_rocm::layout_scatter_live::scatter_live_rows;
 use kernels_rocm::linear::moe::GroupSeat;
-use kernels_rocm::{ArgValue, Ctx, Fire, Launch, Tensor, layout};
+use kernels_rocm::{ArgValue, Ctx, Fire, Launch, Tensor, layout, sampling};
 
 /// bf16 values as the bytes of a u8 plane [rows, 2·width].
 fn bf16_bytes(gpu: &Gpu, v: &[f32], rows: u32, width: u32) -> Tensor {
@@ -699,7 +699,7 @@ fn argmax_and_topk() {
 
         // argmax lands in column 1 of a 2-wide plane.
         let mut y = gpu.zeros(rows, 2, Dtype::I32);
-        layout::argmax(&ctx, x, 1, &mut y).unwrap();
+        sampling::argmax(&ctx, x, 1, &mut y).unwrap();
         let got = gpu.read_as::<i32>(&y);
         for r in 0..rows as usize {
             assert_eq!(got[2 * r], 0, "argmax {width} row {r} column 0 untouched");
@@ -709,7 +709,7 @@ fn argmax_and_topk() {
         for k in [8u32, 16] {
             let mut v = gpu.zeros(rows, k, Dtype::F32);
             let mut i = gpu.zeros(rows, k, Dtype::I32);
-            layout::topk(&ctx, x, k, &mut v, &mut i).unwrap();
+            sampling::topk(&ctx, x, k, &mut v, &mut i).unwrap();
             let (gv, gi) = (gpu.read(&v), gpu.read_as::<i32>(&i));
             for r in 0..rows as usize {
                 let k = k as usize;
@@ -730,7 +730,7 @@ fn argmax_and_topk() {
         // Under a window of 2 rows, rows 2.. are not written.
         let mut y = gpu.zeros(rows, 1, Dtype::I32);
         windowed(&gpu, &ctx, 2, 0, 0, || {
-            layout::argmax(&ctx, x, 0, &mut y).unwrap()
+            sampling::argmax(&ctx, x, 0, &mut y).unwrap()
         });
         let got = gpu.read_as::<i32>(&y);
         assert_eq!(

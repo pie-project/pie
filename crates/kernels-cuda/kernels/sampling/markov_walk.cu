@@ -1,5 +1,3 @@
-#pragma once
-
 #include <cstdint>
 
 #include <cuda_bf16.h>
@@ -11,12 +9,12 @@
 // readout at depth `i` of its block takes the bias `head . embed[t]` of the
 // token `t` the readout at depth `i - 1` picked (depth 0, its own token),
 // and picks its biased logits' argmax. The readouts at one depth are walked
-// together: `markov_plan` finds each one's depth, then `markov_step` (once
+// together: `plan` finds each one's depth, then `step` (once
 // a depth) holds a tile of the head's rows in registers, multiplies them by
 // the depth's embeddings on mma.sync a chunk at a time, and lands each
 // chunk's biased rows a readout row at a time, coalesced, folding its
 // argmax into the readout's key.
-namespace pie::attn::markov {
+namespace pie::sampling::markov {
 
 constexpr int kRank = 256;
 constexpr int kTileV = 128;   // vocab rows a CTA
@@ -43,7 +41,7 @@ __device__ __forceinline__ int pick_of(unsigned long long key) {
 // token), and one outside its block not at all. One block: depths first,
 // then the lists (a list's order is free: each readout reads the key of the
 // readout before it, settled a step earlier).
-__global__ void markov_plan(const int* __restrict__ positions, const int* __restrict__ ends,
+__global__ void plan(const int* __restrict__ positions, const int* __restrict__ ends,
                             int readouts, int steps, int* __restrict__ lists,
                             int* __restrict__ counts, int* __restrict__ depth,
                             unsigned long long* __restrict__ keys) {
@@ -134,7 +132,7 @@ __device__ __forceinline__ void store_quad(T* p, const float (&in)[4]) {
 // Depth `s`'s embeddings, its list's order: each readout's previous pick
 // (its own token at depth 0), gathered once for every tile's CTA to read
 // contiguously. A warp a readout, 16 bytes a lane.
-__global__ void markov_gather(const int* __restrict__ tokens, const __nv_bfloat16* __restrict__ embed,
+__global__ void gather(const int* __restrict__ tokens, const __nv_bfloat16* __restrict__ embed,
                               const int* __restrict__ lists, const int* __restrict__ counts,
                               const int* __restrict__ depth,
                               const unsigned long long* __restrict__ keys,
@@ -160,7 +158,7 @@ constexpr int kLd = kRank + 8;
 // warp then walks whole readout rows of the tile (128 contiguous logits),
 // adding, landing and folding the argmax in f32 before it lands at `T`.
 template <typename T>
-__global__ void __launch_bounds__(kThreads, 2) markov_step(
+__global__ void __launch_bounds__(kThreads, 2) step(
     const T* __restrict__ logits,
     const __nv_bfloat16* __restrict__ gathered, const __nv_bfloat16* __restrict__ head,
     T* __restrict__ biased, const int* __restrict__ lists, const int* __restrict__ counts,
@@ -296,10 +294,10 @@ __global__ void __launch_bounds__(kThreads, 2) markov_step(
 }
 
 // Each readout's pick, out of its key.
-__global__ void markov_picks(const unsigned long long* __restrict__ keys, int* __restrict__ picks,
+__global__ void picks(const unsigned long long* __restrict__ keys, int* __restrict__ picks,
                              int readouts) {
     const int r = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (r < readouts) picks[r] = pick_of(keys[r]);
 }
 
-}  // namespace pie::attn::markov
+}  // namespace pie::sampling::markov

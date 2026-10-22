@@ -11,7 +11,7 @@ const THREADS: u32 = 256;
 const MAX_K: u32 = THREADS / 16;
 
 #[allow(clippy::too_many_arguments)]
-pub fn walk(
+pub fn selector_walk(
     ctx: &Ctx,
     cand: RaggedTensor,
     unary: Tensor,

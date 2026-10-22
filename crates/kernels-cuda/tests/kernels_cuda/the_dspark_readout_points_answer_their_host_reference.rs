@@ -5,8 +5,7 @@
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::attn::{markov, selector};
-use kernels_cuda::layout;
+use kernels_cuda::sampling;
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn beats(av: f32, ai: usize, bv: f32, bi: usize) -> bool {
@@ -69,7 +68,7 @@ fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     let y_at = gpu.zeros(rows * depth * 4);
     for column in 0..depth {
         let mut y = Tensor::new(y_at, rows as u32, depth as u32, Dtype::I32);
-        layout::argmax(
+        sampling::argmax(
             &gpu.ctx(),
             Tensor::new(x_at, rows as u32, width as u32, Dtype::Bf16),
             column as u32,
@@ -94,7 +93,7 @@ fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     let x32_at = gpu.up(&x);
     let y32_at = gpu.zeros(rows * 4);
     let mut y = Tensor::new(y32_at, rows as u32, 1, Dtype::I32);
-    layout::argmax(
+    sampling::argmax(
         &gpu.ctx(),
         Tensor::new(x32_at, rows as u32, width as u32, Dtype::F32),
         0,
@@ -122,7 +121,7 @@ fn the_topk_is_sorted_with_ties_to_the_lower_column() {
             let i_at = gpu.zeros(rows * k * 4);
             let mut values = Tensor::new(v_at, rows as u32, k as u32, Dtype::F32);
             let mut indices = Tensor::new(i_at, rows as u32, k as u32, Dtype::I32);
-            layout::topk(
+            sampling::topk(
                 &gpu.ctx(),
                 Tensor::new(at, rows as u32, width as u32, dtype),
                 k as u32,
@@ -183,7 +182,7 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
     for (with_hp, first) in [(false, 1u32), (true, 0)] {
         let picks_at = gpu.zeros(rows * 4);
         let mut picks = Tensor::new(picks_at, rows as u32, 1, Dtype::I32);
-        selector::walk(
+        sampling::selector_walk(
             &gpu.ctx(),
             RaggedTensor {
                 data: Tensor::new(cand_at, rows as u32, k as u32, Dtype::I32),
@@ -259,7 +258,7 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
 /// 5, 1, 3 and 5 rows deep, f32 logits and the trunk's bf16 ones.
 #[test]
 fn the_markov_walk_biases_each_row_by_the_pick_before_it() {
-    let (vocab, rank, rows) = (1000usize, markov::RANK as usize, 14usize);
+    let (vocab, rank, rows) = (1000usize, sampling::MARKOV_RANK as usize, 14usize);
     let (indptr, firsts) = ([0usize, 5, 6, 9, 14], [100i32, 7, 50, 200]);
     let lane = |r: usize| indptr.iter().rposition(|&s| s <= r).unwrap();
     let positions: Vec<i32> = (0..rows)
@@ -299,7 +298,7 @@ fn the_markov_walk_biases_each_row_by_the_pick_before_it() {
             &mut t(picks_at, rows, 1, Dtype::I32),
         );
         let logits_t = t(logits_at, rows, vocab, dtype);
-        let fired = markov::walk(
+        let fired = sampling::markov_walk(
             &gpu.ctx(),
             logits_t,
             tok_t,

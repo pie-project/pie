@@ -1,9 +1,6 @@
-#pragma once
-
-
 #include "prelude/device.cuh"
 
-namespace pie::attn {
+namespace pie::sampling {
 
 template <class T>
 using Elem = ::pie::Elem<T>;
