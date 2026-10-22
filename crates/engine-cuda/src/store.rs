@@ -664,9 +664,9 @@ impl Pools {
                         let ds_row = *dtype == Dtype::U8
                             && heads == 512
                             && [
-                                kernels_cuda::attn::dsv4::Rows::Ds,
-                                kernels_cuda::attn::dsv4::Rows::Mx8,
-                                kernels_cuda::attn::dsv4::Rows::Nv4,
+                                kernels_cuda::attn::compressed::decode::Rows::Ds,
+                                kernels_cuda::attn::compressed::decode::Rows::Mx8,
+                                kernels_cuda::attn::compressed::decode::Rows::Nv4,
                             ]
                             .iter()
                             .any(|r| keys_width == u64::from(r.bytes()))

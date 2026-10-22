@@ -1,4 +1,4 @@
-use kernels_cuda::custom;
+use kernels_cuda::attn::qkv_append;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::{Fused, Operands};
 
@@ -462,7 +462,7 @@ impl Run<'_> {
                 poem_ir::Attention::PoolLse { positions, .. }
                 | poem_ir::Attention::PoolLseSelected { positions, .. },
             ) if q == o_out && at == positions && d == head_dim => {
-                Some(kernels_cuda::attn::dsv4::Turn {
+                Some(kernels_cuda::attn::compressed::decode::Turn {
                     dim: *rotary_dim,
                     theta: *theta,
                     yarn: yarn.map(|y| kernels_cuda::elemwise::rope::Yarn {
@@ -525,7 +525,7 @@ impl Run<'_> {
             },
         ) = (&**window, &**pool)
         {
-            use kernels_cuda::attn::dsv4_prefill::{self, Pooled};
+            use kernels_cuda::attn::compressed::prefill::{self, Pooled};
             let from = self.ctx().tuning().dsv4_prefill_from;
             let mut out = self.tensor(*o_out);
             // Its request ids index the whole fire's page tables too.
@@ -544,8 +544,8 @@ impl Run<'_> {
                     ratio: *ratio,
                     selection,
                 };
-                if dsv4_prefill::takes(*heads, *d, *span, &window_pool, &pooled) {
-                    return dsv4_prefill::prefill(
+                if prefill::takes(*heads, *d, *span, &window_pool, &pooled) {
+                    return prefill::prefill(
                         self.ctx(),
                         op.name(),
                         self.tensor(*q),
@@ -593,15 +593,15 @@ impl Run<'_> {
         from > 0
             && rows >= from
             && matches!(*window, poem_ir::Attention::PrefillLse { cache, .. }
-                if matches!(kernels_cuda::attn::dsv4::rows_of(&self.pool(cache)),
-                    Some(kernels_cuda::attn::dsv4::Rows::Mx8)))
+                if matches!(kernels_cuda::attn::compressed::decode::rows_of(&self.pool(cache)),
+                    Some(kernels_cuda::attn::compressed::decode::Rows::Mx8)))
     }
 
     /// Whether `window`'s cache holds DeepSeek's quantized rows.
     fn fp8_rows(&self, window: &poem_ir::Attention) -> bool {
         match *window {
             poem_ir::Attention::PrefillLse { cache, .. } => {
-                kernels_cuda::attn::dsv4::ds_rows(&self.pool(cache))
+                kernels_cuda::attn::compressed::decode::ds_rows(&self.pool(cache))
             }
             _ => false,
         }
@@ -616,7 +616,7 @@ impl Run<'_> {
     }
 
     /// DeepSeek-V4's window (`PrefillLse`), pool if any (`PoolLse[Selected]`) and
-    /// sinks in one launch (`attn::dsv4::decode`) into `o_out`; `None` where the
+    /// sinks in one launch (`attn::compressed::decode::decode`) into `o_out`; `None` where the
     /// shape doesn't fit or the region reads gathered seats.
     fn dsv4_decode(
         &mut self,
@@ -624,9 +624,9 @@ impl Run<'_> {
         pool: Option<&poem_ir::Attention>,
         sink: poem_ir::ValueId,
         o_out: poem_ir::ValueId,
-        turn: Option<kernels_cuda::attn::dsv4::Turn>,
+        turn: Option<kernels_cuda::attn::compressed::decode::Turn>,
     ) -> Option<Result<(), kernels_cuda::Error>> {
-        use kernels_cuda::attn::dsv4;
+        use kernels_cuda::attn::compressed::decode;
         let poem_ir::Attention::PrefillLse {
             q,
             cache,
@@ -686,15 +686,15 @@ impl Run<'_> {
         let window_pool = self.pool_whole(cache)?;
         let pooled = pooled
             .as_ref()
-            .map(|(entries, ratio, selection)| dsv4::Pooled {
+            .map(|(entries, ratio, selection)| decode::Pooled {
                 entries,
                 ratio: *ratio,
                 selection: *selection,
             });
-        if !dsv4::takes(heads, head_dim, &window_pool, pooled.as_ref()) {
+        if !decode::takes(heads, head_dim, &window_pool, pooled.as_ref()) {
             return None;
         }
-        Some(dsv4::decode(
+        Some(decode::decode(
             self.ctx(),
             q,
             self.tensor(positions),
@@ -713,7 +713,7 @@ impl Run<'_> {
     }
 
     /// DeepSeek-V4's window and sinks at a prefill's width in the tcgen05
-    /// pass (`attn::dsv4_prefill::window_only`); `None` where the profile or
+    /// pass (`attn::compressed::prefill::window_only`); `None` where the profile or
     /// the shape keeps it off.
     #[cfg(feature = "cuda")]
     fn dsv4_window_prefill(
@@ -723,7 +723,7 @@ impl Run<'_> {
         sink: poem_ir::ValueId,
         o_out: poem_ir::ValueId,
     ) -> Option<Result<(), kernels_cuda::Error>> {
-        use kernels_cuda::attn::dsv4_prefill;
+        use kernels_cuda::attn::compressed::prefill;
         let poem_ir::Attention::PrefillLse {
             q,
             cache,
@@ -748,10 +748,10 @@ impl Run<'_> {
         let window_pool = self.pool_whole(cache)?;
         let q = self.tensor(q);
         let heads = q.width / head_dim.max(1);
-        if !dsv4_prefill::takes_window(heads, head_dim, span, &window_pool) {
+        if !prefill::takes_window(heads, head_dim, span, &window_pool) {
             return None;
         }
-        Some(dsv4_prefill::window_only(
+        Some(prefill::window_only(
             self.ctx(),
             name,
             q,
@@ -1069,7 +1069,7 @@ impl Run<'_> {
                 write_page,
                 write_offset,
                 ..
-            }) if one_a_request => Some(kernels_cuda::attn::pool::StateRows {
+            }) if one_a_request => Some(kernels_cuda::attn::compressed::pool::StateRows {
                 kv: self.tensor(*kv),
                 score: self.tensor(*score),
                 write_page: self.tensor(*write_page),
@@ -1115,7 +1115,7 @@ impl Run<'_> {
         let state = self.pool(*pages);
         let out = self.pool(*into);
         let gather_ape = ape.map_or(slabs.ape, |id| self.tensor(id));
-        let landed = kernels_cuda::attn::pool::compress(
+        let landed = kernels_cuda::attn::compressed::pool::compress(
             self.ctx(),
             self.tensor(*boundary_pos),
             self.tensor(*boundary_req),
@@ -1276,7 +1276,7 @@ impl Run<'_> {
             && q_yarn == kv_yarn;
         if alike {
             let pool = self.pool(*cache);
-            let fp8 = kernels_cuda::attn::dsv4::fp8_ds(&pool);
+            let fp8 = kernels_cuda::attn::compressed::decode::fp8_ds(&pool);
             let yarn = q_yarn.map(|y| rope::Yarn {
                 factor: y.factor,
                 beta_fast: y.beta_fast,
@@ -1312,9 +1312,9 @@ impl Run<'_> {
                 if fp8 {
                     return Ok(());
                 }
-                if kernels_cuda::attn::dsv4::ds_rows(&pool) {
+                if kernels_cuda::attn::compressed::decode::ds_rows(&pool) {
                     // V4.1's rows: the write quantizes them apart.
-                    return kernels_cuda::attn::dsv4::append(
+                    return kernels_cuda::attn::compressed::decode::append(
                         self.ctx(),
                         self.ragged_lanes(*ky).data,
                         &pool,
@@ -1365,7 +1365,7 @@ impl Run<'_> {
             beta_slow: y.beta_slow,
             original_max_position: y.original_max_position,
         });
-        let fp8 = kernels_cuda::attn::dsv4::fp8_ds(&pool);
+        let fp8 = kernels_cuda::attn::compressed::decode::fp8_ds(&pool);
         let landed = norm_rope::norm_rope_last_append(
             self.ctx(),
             self.tensor(*x),
@@ -1402,8 +1402,8 @@ impl Run<'_> {
             yarn,
             &mut self.tensor(*y),
         )?;
-        if kernels_cuda::attn::dsv4::ds_rows(&pool) {
-            kernels_cuda::attn::dsv4::append(
+        if kernels_cuda::attn::compressed::decode::ds_rows(&pool) {
+            kernels_cuda::attn::compressed::decode::append(
                 self.ctx(),
                 self.ragged_lanes(*y).data,
                 &pool,
@@ -1513,7 +1513,7 @@ impl Run<'_> {
                 v_scale,
                 widths,
                 q,
-            } => custom::qkv_fused_qknorm_rope_vnorm_write(
+            } => qkv_append::qkv_fused_qknorm_rope_vnorm_write(
                 self.ctx(),
                 self.tensor(*packed),
                 positions.map(|p| self.tensor(p)),
@@ -1545,7 +1545,7 @@ impl Run<'_> {
 fn fp8_unread(op: &'static str) -> kernels_cuda::Error {
     kernels_cuda::Error::Backend {
         op,
-        detail: "the cache holds DeepSeek's fp8 rows and only `attn::dsv4::decode` reads them; \
+        detail: "the cache holds DeepSeek's fp8 rows and only `attn::compressed::decode::decode` reads them; \
                  it does not take this shape or this region's gathered seats"
             .to_string(),
     }

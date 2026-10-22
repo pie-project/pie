@@ -1,3 +1,6 @@
+mod dyn_conv;
+pub use dyn_conv::dyn_conv;
+
 use crate::error::Error;
 use dtype::Dtype;
 

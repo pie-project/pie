@@ -10,8 +10,8 @@ use crate::common::attn_ref::{quantized, ten, tuned, turn};
 use crate::common::host::rows_read;
 use crate::common::{Gpu, Lcg, captured, forget, host::upload_to, replay};
 use dtype::Dtype::{Bf16, F32, I32, U8, U32};
-use kernels_cuda::attn::dsv4::{self, Pooled, Rows, Turn};
-use kernels_cuda::attn::{dsv4_prefill as pre, pool as pools};
+use kernels_cuda::attn::compressed::decode::{self, Pooled, Rows, Turn};
+use kernels_cuda::attn::compressed::{pool as pools, prefill as pre};
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 
 const PAGE: usize = 64;
@@ -47,7 +47,7 @@ fn plane(gpu: &mut Gpu, src: u64, exact: &[f32], fmt: Option<Rows>) -> (KvPool, 
     let off: Vec<u32> = (0..CELLS as u32).map(|c| c % PAGE as u32).collect();
     let (page, off) = (col(gpu, &page, U32), col(gpu, &off, U32));
     let src = ten(src, CELLS, D, Bf16);
-    dsv4::append(&gpu.ctx(), src, &rows, page, off).expect("the append fires");
+    decode::append(&gpu.ctx(), src, &rows, page, off).expect("the append fires");
     gpu.sync();
     let read = rows_read(&gpu.down::<u8>(at, CELLS * row), CELLS, PAGE, fmt);
     match fmt {
@@ -140,7 +140,7 @@ fn check(
         let o_at = gpu.zeros(n * H * D * 2);
         let (o, (floor_t, sink_t, s)) = (&mut ten(o_at, n, H * D, Bf16), t);
         let fired = match pass {
-            Pass::Decode => dsv4::decode(
+            Pass::Decode => decode::decode(
                 &ctx, qt, pos_t, req_t, floor_t, &win, 128, pooled, sink_t, 64, 512, s, turned, o,
             ),
             // The prefill and window-only kernels are tcgen05's: elsewhere

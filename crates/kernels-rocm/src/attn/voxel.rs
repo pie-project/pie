@@ -1,4 +1,4 @@
-//! The voxel-grid attention, norm and grid rules: no HIP kernels yet, so every one refuses.
+//! Attention over a voxel grid: no HIP kernel yet, so it refuses.
 
 use crate::tensor::Tensor;
 

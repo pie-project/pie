@@ -168,7 +168,7 @@ pub fn store_fp4(
     if entries.rows == 0 {
         return Ok(());
     }
-    let div = crate::attn::pool::packing(OP, keys, i64::from(FP4_ROW))?;
+    let div = crate::attn::compressed::pool::packing(OP, keys, i64::from(FP4_ROW))?;
     ctx.fire(
         OP,
         Fire::at(INDEX, "::pie::attn::index_store_fp4")
@@ -224,7 +224,7 @@ fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTen
 fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error> {
     // A compact pool's keys a row each, `page_size / div` a page: staged a
     // row a key, the staged pool as compact (128 / div wide a position).
-    let div = crate::attn::pool::packing(op, keys, i64::from(FP4_ROW))?;
+    let div = crate::attn::compressed::pool::packing(op, keys, i64::from(FP4_ROW))?;
     let pages = keys.page_indices.rows;
     let page = u32::try_from(keys.page_size / div).unwrap_or(0);
     let cells = pages.saturating_mul(page);
@@ -505,13 +505,13 @@ fn ranked(
         }
         q
     } else {
-        if !crate::attn::pool::compact(keys, ratio.max(1), i64::from(head_dim)) {
+        if !crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(head_dim)) {
             pool_pitch(OP, keys, head_dim)?;
         }
         q
     };
     // The keys a row each (`page_size / ratio` a page) in a compact pool.
-    let compact = crate::attn::pool::compact(
+    let compact = crate::attn::compressed::pool::compact(
         keys,
         ratio.max(1),
         if fp4 {

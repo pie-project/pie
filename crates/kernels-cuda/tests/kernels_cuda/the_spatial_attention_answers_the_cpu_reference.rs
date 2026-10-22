@@ -7,7 +7,7 @@ use crate::common::host::spatial_attention_ref;
 use crate::common::spatial::{Box3, table};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::spatial::{Segment, attention};
+use kernels_cuda::attn::voxel::{Segment, attention};
 use kernels_cuda::tensor::Tensor;
 
 fn check(c: usize) {

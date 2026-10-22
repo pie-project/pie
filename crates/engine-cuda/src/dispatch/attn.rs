@@ -1,9 +1,10 @@
+use kernels_cuda::attn::compressed::pool;
+use kernels_cuda::attn::dense;
 #[cfg(not(feature = "rocm"))]
 use kernels_cuda::attn::fa2;
 #[cfg(feature = "rocm")]
 use kernels_cuda::attn::paged;
-use kernels_cuda::attn::{self, index, mla, plan, pool, selected};
-use kernels_cuda::attn_dense;
+use kernels_cuda::attn::{self, index, mla, plan, selected};
 use poem_exec::{DispatchAttention, KernelError};
 use poem_ir::{Attention, IndexScore, Operation, StructKind};
 
@@ -40,7 +41,7 @@ impl Run<'_> {
         let mut slab = seat.slab;
         let mut q_rows = self.ragged(q);
         q_rows.data = self.windowed(q_rows.data);
-        kernels_cuda::attn_score::capture(
+        kernels_cuda::attn::score::capture(
             self.ctx(),
             q_rows,
             self.prefill_plan(plan),
@@ -407,7 +408,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn_dense::bidirectional(
+            } => dense::bidirectional(
                 self.ctx(),
                 self.tensor(*q),
                 self.tensor(*k),
@@ -459,7 +460,7 @@ impl Run<'_> {
                             .to_string(),
                     });
                 }
-                if attn::dsv4::ds_rows(&self.pool(*cache)) {
+                if attn::compressed::decode::ds_rows(&self.pool(*cache)) {
                     return Err(kernels_cuda::Error::Backend {
                         op: "attention.prefill_lse",
                         detail: "the cache holds DeepSeek's quantized rows, which only the fused \
@@ -540,9 +541,9 @@ impl Run<'_> {
                 write_offset,
             } => {
                 let pool = self.pool(*cache);
-                if attn::dsv4::ds_rows(&pool) {
+                if attn::compressed::decode::ds_rows(&pool) {
                     // DeepSeek's quantized rows, quantized on the way in.
-                    attn::dsv4::append(
+                    attn::compressed::decode::append(
                         self.ctx(),
                         self.ragged_lanes(*plane).data,
                         &pool,
@@ -959,7 +960,7 @@ impl Run<'_> {
                 state,
                 mark,
                 floor,
-            } => kernels_cuda::attn_replay::floor(
+            } => kernels_cuda::attn::kv_window::floor(
                 self.ctx(),
                 self.ragged_lanes(*positions),
                 &self.recurrent_absolute(*state),
@@ -979,7 +980,7 @@ impl Run<'_> {
                         op: "attention.kv_ends",
                         detail: "a cache over gathered seats".to_string(),
                     })?;
-                kernels_cuda::attn_replay::kv_ends(
+                kernels_cuda::attn::kv_window::kv_ends(
                     self.ctx(),
                     self.tensor(*request_of_token),
                     &pool,
@@ -1007,7 +1008,7 @@ impl Run<'_> {
                         detail: "a window over gathered seats".to_string(),
                     })?;
                 let q = self.tensor(*q);
-                kernels_cuda::attn::dsv4::decode(
+                kernels_cuda::attn::compressed::decode::decode(
                     self.ctx(),
                     q,
                     self.tensor(*positions),
@@ -1595,8 +1596,8 @@ impl Run<'_> {
                 write_offset,
             } => {
                 let into = self.pool(*into);
-                if attn::dsv4::ds_rows(&into) {
-                    attn::dsv4::store_entries(
+                if attn::compressed::decode::ds_rows(&into) {
+                    attn::compressed::decode::store_entries(
                         self.ctx(),
                         self.tensor(*entries),
                         self.tensor(*boundary_pos),
@@ -1713,7 +1714,7 @@ impl Run<'_> {
                                 ),
                             }),
                         };
-                        kernels_cuda::attn_ragged::RaggedMask::ClassTable {
+                        kernels_cuda::attn::ragged::RaggedMask::ClassTable {
                             q_classes: classes_of(*q_indptr, "query")?,
                             kv_classes: classes_of(*kv_indptr, "key")?,
                             table,
@@ -1721,7 +1722,7 @@ impl Run<'_> {
                         }
                     }
                     poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {
-                        kernels_cuda::attn_ragged::RaggedMask::None
+                        kernels_cuda::attn::ragged::RaggedMask::None
                     }
                     poem_ir::RaggedMask::ReferenceSelfOnly { .. }
                     | poem_ir::RaggedMask::RelativeBias { .. }
@@ -1736,19 +1737,19 @@ impl Run<'_> {
                         });
                     }
                     poem_ir::RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
-                        kernels_cuda::attn_ragged::RaggedMask::ReferenceTags {
+                        kernels_cuda::attn::ragged::RaggedMask::ReferenceTags {
                             q_tags: self.fire_wide(*q_tags),
                             kv_tags: self.fire_wide(*kv_tags),
                         }
                     }
                     poem_ir::RaggedMask::RelativeBias { table, max_len } => {
-                        kernels_cuda::attn_ragged::RaggedMask::RelativeBias {
+                        kernels_cuda::attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
                             max_len: *max_len,
                         }
                     }
                 };
-                kernels_cuda::attn_ragged::ragged(
+                kernels_cuda::attn::ragged::ragged(
                     self.ctx(),
                     self.fire_wide(*q),
                     self.fire_wide(*k),
@@ -1769,7 +1770,7 @@ impl Run<'_> {
                 taps,
                 group,
                 y,
-            } => kernels_cuda::attn::dynconv::block_dyn_conv(
+            } => kernels_cuda::ssm::dyn_conv(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*coeff),

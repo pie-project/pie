@@ -278,7 +278,7 @@ fn dense_attends_inside_each_segment() {
         let seg = gpu.column(&segments);
         let scale = 1.0 / (d as f32).sqrt();
         let mut o = gpu.zeros(rows, hq * d, Dtype::Bf16);
-        kernels_rocm::attn_dense::bidirectional(&ctx, q, k, v, seg, d, scale, &mut o).unwrap();
+        kernels_rocm::attn::dense::bidirectional(&ctx, q, k, v, seg, d, scale, &mut o).unwrap();
         let got = gpu.read(&o);
         let (d_, g) = (d as usize, (hq / hk) as usize);
         for r in 0..rows as usize {
@@ -655,7 +655,7 @@ fn score_capture_averages_the_observed_rows_mass() {
     let scale = 1.0 / (d as f32).sqrt();
     // Each lane seated at its own block.
     let seat_of = gpu.column(&(0..(lane_offset + n) as i32).collect::<Vec<_>>());
-    kernels_rocm::attn_score::capture(
+    kernels_rocm::attn::score::capture(
         &ctx,
         q,
         &built,
@@ -742,7 +742,7 @@ fn block_dyn_conv_convolves_inside_each_request() {
         let coeff = gpu.tensor(&cs, rows as u32, (2 * taps * groups) as u32, Dtype::Bf16);
         let base = gpu.tensor(&bs, (2 * taps) as u32, channels as u32, Dtype::Bf16);
         let mut y = gpu.zeros(rows as u32, channels as u32, Dtype::Bf16);
-        kernels_rocm::attn::dynconv::block_dyn_conv(
+        kernels_rocm::ssm::dyn_conv(
             &ctx,
             x,
             coeff,
@@ -1002,7 +1002,7 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
             if let Some(w) = win {
                 ctx.arm_stage(gpu.ints(&w).ptr);
             }
-            kernels_rocm::custom::qkv_fused_qknorm_rope_vnorm_write(
+            kernels_rocm::attn::qkv_append::qkv_fused_qknorm_rope_vnorm_write(
                 &ctx,
                 gpu.tensor(&packed_s, rows, width, Dtype::Bf16),
                 Some(gpu.column(&positions)),

@@ -657,10 +657,10 @@ pub fn compress(
 ) -> Result<bool, Error> {
     const OP: &str = "attention.pool_compress";
     // V4's fp8 rows, or a bf16 pool; either a row a position or compact.
-    let fp8 = crate::attn::dsv4::rows_packed(out)
-        .is_some_and(|(rows, _)| rows == crate::attn::dsv4::Rows::Ds);
+    let fp8 = crate::attn::compressed::decode::rows_packed(out)
+        .is_some_and(|(rows, _)| rows == crate::attn::compressed::decode::Rows::Ds);
     let out_div = if fp8 {
-        crate::attn::dsv4::rows_packed(out).map_or(1, |(_, div)| div)
+        crate::attn::compressed::decode::rows_packed(out).map_or(1, |(_, div)| div)
     } else {
         packing(OP, out, i64::from(head_dim))?
     };

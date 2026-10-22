@@ -115,7 +115,7 @@ pub fn rows_packed(pool: &KvPool) -> Option<(Rows, i32)> {
 /// whether it is one.
 #[must_use]
 pub fn entries_view(pool: &KvPool, ratio: u32, row: i64) -> (KvPool, bool) {
-    if !crate::attn::pool::compact(pool, ratio, row) {
+    if !crate::attn::compressed::pool::compact(pool, ratio, row) {
         return (*pool, false);
     }
     let r = i64::from(ratio);

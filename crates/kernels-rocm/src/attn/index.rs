@@ -216,7 +216,7 @@ pub fn topk(
     let top_k = count(OP, "the selection budget this ranking states", top_k)?;
 
     // The keys a row each (`page_size / ratio` a page) in a compact pool.
-    let compact = crate::attn::pool::compact(keys, ratio.max(1), i64::from(head_dim));
+    let compact = crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(head_dim));
     if !compact {
         pool_pitch(OP, keys, head_dim)?;
     }

@@ -1,13 +1,13 @@
 #![cfg(feature = "cuda")]
 
-//! `attn_ragged::ragged` against the host softmax: each mask arm, each head
+//! `ragged::ragged` against the host softmax: each mask arm, each head
 //! width, cross tables, an armed seat and a captured graph's replays.
 
 use crate::common::attn_ref::{landed, ten, wide};
 use crate::common::host::{indptr, ragged_attention, upload_to};
 use crate::common::{Gpu, Lcg, captured, forget, replay};
 use dtype::Dtype::{Bf16, F32, I32, U8};
-use kernels_cuda::attn_ragged::{RaggedMask, ragged};
+use kernels_cuda::attn::ragged::{RaggedMask, ragged};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mask {

@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::attn::dynconv;
+use kernels_cuda::ssm;
 use kernels_cuda::tensor::{RaggedTensor, Tensor};
 
 #[test]
@@ -29,7 +29,7 @@ fn the_dynamic_conv_mixes_each_row_with_the_one_before_it() {
     for side in 0..2usize {
         let y_at = gpu.zeros(rows * channels * 2);
         let mut y = Tensor::new(y_at, rows as u32, channels as u32, Dtype::Bf16);
-        dynconv::block_dyn_conv(
+        ssm::dyn_conv(
             &gpu.ctx(),
             RaggedTensor {
                 data: Tensor::new(x_at, rows as u32, channels as u32, Dtype::Bf16),

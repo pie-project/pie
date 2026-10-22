@@ -103,7 +103,7 @@ fn the_fused_prologue_lands_what_its_primitives_land() {
                 }
                 if fused {
                     assert!(
-                        kernels_rocm::custom::q_gate_k_norm_rope_append(
+                        kernels_rocm::attn::qkv_append::q_gate_k_norm_rope_append(
                             &ctx, qg, k, v, qw, kw, positions, 1e-6, 1e-6, &pool, w_page, w_off, d,
                             rotary, span, theta, &mut q, &mut gate, &mut qs,
                         )

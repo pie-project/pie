@@ -1,12 +1,6 @@
 pub mod attn;
 pub mod tuning;
 
-#[path = "attn/dense.rs"]
-pub mod attn_dense;
-
-#[path = "attn/ragged.rs"]
-pub mod attn_ragged;
-
 #[path = "layout/fold.rs"]
 mod layout_fold;
 
@@ -16,14 +10,8 @@ mod layout_scatter_live;
 #[path = "layout/embed_weighted.rs"]
 mod layout_embed_weighted;
 
-#[path = "attn/score.rs"]
-pub mod attn_score;
-
 #[path = "attn/ple.rs"]
 mod attn_ple;
-
-#[path = "attn/replay.rs"]
-pub mod attn_replay;
 
 #[path = "layout/embed_concat.rs"]
 mod layout_embed_concat;
@@ -39,7 +27,6 @@ mod layout_pixels;
 
 pub mod collective;
 pub mod conv;
-pub mod custom;
 pub mod disk;
 pub mod elemwise;
 pub mod error;
@@ -53,7 +40,6 @@ pub mod runtime;
 pub mod sampling;
 pub mod seat;
 pub mod source;
-pub mod spatial;
 pub mod ssm;
 pub mod tensor;
 

@@ -1,5 +1,6 @@
+use kernels_cuda::attn::voxel;
+use kernels_cuda::conv;
 use kernels_cuda::tensor::Tensor;
-use kernels_cuda::{conv, spatial};
 use poem_exec::{DispatchSpatial, KernelError};
 use poem_ir::{GridRule, Spatial, TimePad, VoxelSegment};
 
@@ -11,10 +12,10 @@ impl DispatchSpatial for Run<'_> {
     }
 }
 
-fn segment(segment: VoxelSegment) -> spatial::Segment {
+fn segment(segment: VoxelSegment) -> voxel::Segment {
     match segment {
-        VoxelSegment::Clip => spatial::Segment::Lane,
-        VoxelSegment::Frames(n) => spatial::Segment::Frames(n),
+        VoxelSegment::Clip => voxel::Segment::Lane,
+        VoxelSegment::Frames(n) => voxel::Segment::Frames(n),
     }
 }
 
@@ -178,7 +179,7 @@ impl Run<'_> {
                 segment: how,
                 sm_scale,
                 y,
-            } => spatial::attention(
+            } => voxel::attention(
                 self.ctx(),
                 self.tensor(*q),
                 self.tensor(*k),

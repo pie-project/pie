@@ -5,7 +5,7 @@
 //! latent, a 128-key window, bf16 NHD pools. Anything else is the caller's to
 //! run as its four ops.
 
-use crate::attn::dsv4::Rows;
+use crate::attn::compressed::decode::Rows;
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
 use crate::linear::tc5::supported;
@@ -42,7 +42,7 @@ struct SparseParams {
     q_stride: i32,
     o_stride: i32,
     scale_log2: f32,
-    turn: crate::attn::dsv4::TurnArgs,
+    turn: crate::attn::compressed::decode::TurnArgs,
 }
 
 /// `pie::attn::dsv4s::smem_bytes` (a block a multiprocessor, walking rows):
@@ -70,9 +70,9 @@ fn entries_of(pooled: &Pooled<'_>) -> (KvPool, bool) {
     if pooled.ratio == NO_ENTRY {
         return (*pooled.entries, false);
     }
-    let row = crate::attn::dsv4::rows_packed(pooled.entries)
+    let row = crate::attn::compressed::decode::rows_packed(pooled.entries)
         .map_or(i64::from(HEAD_DIM), |(rows, _)| i64::from(rows.bytes()));
-    crate::attn::dsv4::entries_view(pooled.entries, pooled.ratio, row)
+    crate::attn::compressed::decode::entries_view(pooled.entries, pooled.ratio, row)
 }
 
 fn plain_bf16(pool: &KvPool) -> bool {
@@ -95,7 +95,8 @@ pub fn takes(
     pooled: &Pooled<'_>,
 ) -> bool {
     // DeepSeek's quantized rows (both planes), staged to bf16 pages first.
-    let fp8 = crate::attn::dsv4::ds_rows(window_pool) && crate::attn::dsv4::ds_rows(pooled.entries);
+    let fp8 = crate::attn::compressed::decode::ds_rows(window_pool)
+        && crate::attn::compressed::decode::ds_rows(pooled.entries);
     supported()
         && heads == HEADS
         && head_dim == HEAD_DIM
@@ -135,7 +136,7 @@ pub fn prefill(
     pooled: &Pooled<'_>,
     sinks: Tensor,
     sm_scale: f32,
-    turn: Option<crate::attn::dsv4::Turn>,
+    turn: Option<crate::attn::compressed::decode::Turn>,
     o: &mut Tensor,
 ) -> Result<(), Error> {
     let rows = o.rows;
@@ -174,7 +175,7 @@ pub fn prefill(
     // so, V4's too: the staged planes are sized by the page tables a fire
     // states, which a replay's fire outgrows.
     let from = ctx.tuning().dsv4_prefill_from;
-    let wf = crate::attn::dsv4::rows_of(window_pool);
+    let wf = crate::attn::compressed::decode::rows_of(window_pool);
     if let Some(wf @ (Rows::Mx8 | Rows::Ds)) = wf
         && (graph_safe || wf == Rows::Mx8 && (from == 0 || rows < from))
     {
@@ -182,7 +183,7 @@ pub fn prefill(
         let pf = if alone {
             wf
         } else {
-            crate::attn::dsv4::rows_of(&ent_view).unwrap_or(wf)
+            crate::attn::compressed::decode::rows_of(&ent_view).unwrap_or(wf)
         };
         let viewed = Pooled {
             entries: &ent_view,
@@ -206,7 +207,7 @@ pub fn prefill(
             o,
         );
     }
-    if let Some(wf) = crate::attn::dsv4::rows_of(window_pool) {
+    if let Some(wf) = crate::attn::compressed::decode::rows_of(window_pool) {
         // DeepSeek's quantized rows: every page of both pools' tables widened
         // into bf16 planes laid out in table order (as vLLM gathers its
         // prefill's rows to bf16), read through the same page_indptr. A
@@ -216,7 +217,7 @@ pub fn prefill(
         let entries_bf16 = if pooled.entries.keys.ptr == window_pool.keys.ptr {
             window_bf16
         } else {
-            let pf = crate::attn::dsv4::rows_of(&ent_view).unwrap_or(wf);
+            let pf = crate::attn::compressed::decode::rows_of(&ent_view).unwrap_or(wf);
             stage(ctx, op, &ent_view, Staged::Entries, pf)?
         };
         let staged = Pooled {
@@ -282,7 +283,7 @@ fn sparse(
     quantized: Option<(Rows, Rows)>,
     sinks: Tensor,
     sm_scale: f32,
-    turn: Option<crate::attn::dsv4::Turn>,
+    turn: Option<crate::attn::compressed::decode::Turn>,
     o: &mut Tensor,
 ) -> Result<(), Error> {
     let rows = o.rows;
@@ -390,7 +391,7 @@ fn sparse(
             q_stride: int(q.width),
             o_stride: int(o.width),
             scale_log2: sm_scale * core::f32::consts::LOG2_E,
-            turn: crate::attn::dsv4::TurnArgs::of(turn),
+            turn: crate::attn::compressed::decode::TurnArgs::of(turn),
         };
         ctx.fire(
             op,
@@ -479,7 +480,7 @@ fn stage(
     op: &'static str,
     pool: &KvPool,
     which: Staged,
-    fmt: crate::attn::dsv4::Rows,
+    fmt: crate::attn::compressed::decode::Rows,
 ) -> Result<KvPool, Error> {
     let (plane_name, table_name) = match which {
         Staged::Window => ("dsv4.stage.window", "dsv4.stage.window_table"),

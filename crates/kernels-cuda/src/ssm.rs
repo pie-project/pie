@@ -9,6 +9,7 @@ use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 const GDN_PREP: &str = "ssm/gdn_prep.cu";
 
 mod conv1d;
+mod dyn_conv;
 mod gdn_chunk;
 mod gdn_prep;
 mod gdn_recurrent;
@@ -16,6 +17,7 @@ mod kda;
 mod mamba2;
 
 pub use conv1d::{causal_conv1d, causal_conv1d_chunked, short_conv, short_conv_chunked};
+pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_prep;
 pub use gdn_recurrent::gated_delta;

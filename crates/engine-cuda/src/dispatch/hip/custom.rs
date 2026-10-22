@@ -1,4 +1,4 @@
-use kernels_cuda::custom;
+use kernels_cuda::attn::qkv_append;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::{Fused, Operands};
 
@@ -656,7 +656,7 @@ impl Run<'_> {
         else {
             unreachable!("only the gated attention prologue comes here");
         };
-        if custom::q_gate_k_norm_rope_append(
+        if qkv_append::q_gate_k_norm_rope_append(
             self.ctx(),
             self.tensor(qg),
             self.tensor(k),
@@ -758,7 +758,7 @@ impl Run<'_> {
                 v_scale,
                 widths,
                 q,
-            } => custom::qkv_fused_qknorm_rope_vnorm_write(
+            } => qkv_append::qkv_fused_qknorm_rope_vnorm_write(
                 self.ctx(),
                 self.tensor(*packed),
                 positions.map(|p| self.tensor(p)),

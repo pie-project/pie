@@ -377,7 +377,8 @@ fn the_kv_ends_land_what_the_host_lands() {
         gpu.zeros(7 * 4),
     );
     let ends = &mut Tensor::new(ends_at, 7, 1, Dtype::I32);
-    kernels_cuda::attn_replay::kv_ends(&gpu.ctx(), req_t, &pool, ends).expect("the kv ends fire");
+    kernels_cuda::attn::kv_window::kv_ends(&gpu.ctx(), req_t, &pool, ends)
+        .expect("the kv ends fire");
     gpu.sync();
     assert_eq!(
         gpu.down::<i32>(ends_at, 7),

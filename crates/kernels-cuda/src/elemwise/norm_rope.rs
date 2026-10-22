@@ -194,7 +194,10 @@ pub fn norm_rope_last_append(
     let Some(append) = append else {
         return Ok(false);
     };
-    if head_dim != 512 || y.width != head_dim || !crate::attn::dsv4::fp8_ds(append.pool) {
+    if head_dim != 512
+        || y.width != head_dim
+        || !crate::attn::compressed::decode::fp8_ds(append.pool)
+    {
         return Ok(false);
     }
     let tail = Tail {
@@ -465,7 +468,7 @@ pub fn norm_rope_pair(
         && q.y.rows == kv.y.rows
         && append
             .as_ref()
-            .is_none_or(|a| crate::attn::dsv4::fp8_ds(a.pool))
+            .is_none_or(|a| crate::attn::compressed::decode::fp8_ds(a.pool))
         && [q.x.ptr, q.y.ptr, kv.x.ptr, kv.y.ptr, kv_weight.ptr]
             .iter()
             .all(|&at| aligned16(at));

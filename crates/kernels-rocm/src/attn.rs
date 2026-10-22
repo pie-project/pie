@@ -1,24 +1,26 @@
-pub mod dsv4;
-
-pub mod dynconv;
+pub mod compressed;
+pub mod dense;
 
 pub mod index;
 
 pub mod kv;
+pub mod kv_window;
 
 pub mod mla;
 
 pub mod paged;
 
 pub mod plan;
-
-pub mod pool;
+pub mod qkv_append;
+pub mod ragged;
 
 pub mod rel;
 
 pub mod selected;
 
 pub mod sched;
+pub mod score;
+pub mod voxel;
 
 pub mod sched_decode;
 

@@ -10,7 +10,8 @@ mod common;
 
 use common::{Gpu, KV, bf16s, close_abs, close_bf16, round_bf16};
 use dtype::Dtype;
-use kernels_rocm::attn::{index, pool};
+use kernels_rocm::attn::compressed::pool;
+use kernels_rocm::attn::index;
 use kernels_rocm::{KvPool, RaggedTensor, Tensor};
 
 /// Page tables for `cells[r]` cells of request r at `ps` a page, pages in
