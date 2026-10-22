@@ -332,6 +332,11 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                     Dtype::F32,
                     u64::from(moe::REGISTER_MIX) * 4,
                 );
+                let (_n, grids_t) = room(
+                    u64::from(moe::REGISTER_GRIDS),
+                    Dtype::I32,
+                    u64::from(moe::REGISTER_GRIDS) * 4,
+                );
                 let rooms = moe::RegisterRooms {
                     tiles: tiles_t,
                     rows: rows_t,
@@ -340,6 +345,7 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                     hidden: hidden_t,
                     y: Tensor::new(y_t.buf, tiles * 8, HIDDEN, Dtype::Bf16),
                     mix: mix_t,
+                    grids: grids_t,
                 };
                 let sorted_fold = plane(u64::from(tokens) * u64::from(HIDDEN) * 2);
                 let sft = Tensor::new(bind(&sorted_fold), tokens, HIDDEN, Dtype::Bf16);
@@ -371,7 +377,9 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
 
                 let own_banks = |bank| shared.then_some(bank);
                 let landed = shared.then_some(moe::RegisterGate { weights: wt, gate });
-                moe::register_group(&sink, xt, rt, EXPERTS, shared, landed, rooms).expect("group");
+                let groups = cut.groups(INTER, HIDDEN);
+                moe::register_group(&sink, xt, rt, EXPERTS, shared, landed, groups, rooms)
+                    .expect("group");
                 moe::register_glu(
                     &sink,
                     gate_up,
