@@ -439,8 +439,16 @@ pub fn gemv_with(
     // From `kernel.qmm.gemv_mma_from` rows the tensor-core twin multiplies:
     // its rows are half an mma tile or a whole one.
     let mma = y.rows >= ctx.tuning().qmm_gemv_mma_from;
-    let rows = if mma { if y.rows <= 8 { 8 } else { BAND } } else { bucket(y.rows) };
-    let entry = if mma { "gemv_affine_tiled_mma" } else { "gemv_affine_tiled" };
+    let rows = if mma {
+        if y.rows <= 8 { 8 } else { BAND }
+    } else {
+        bucket(y.rows)
+    };
+    let entry = if mma {
+        "gemv_affine_tiled_mma"
+    } else {
+        "gemv_affine_tiled"
+    };
     let Carve { bands, split } = carve;
     let threads = carve.threads();
     ctx.fire(

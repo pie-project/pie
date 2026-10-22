@@ -51,7 +51,7 @@ const fn elementwise(n: u32) -> Launch {
 /// a row's threads over grid y.
 #[must_use]
 const fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> (u32, Launch) {
-    let vec = if head_dim % 8 == 0 { 8 } else { 1 };
+    let vec = if head_dim.is_multiple_of(8) { 8 } else { 1 };
     let threads = heads * head_dim / vec;
     (
         vec,
