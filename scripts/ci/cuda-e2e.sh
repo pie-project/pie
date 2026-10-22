@@ -18,15 +18,13 @@ cargo build -p pie --features cuda --bin pie
 mkdir -p "$PIE_HOME"
 cat > "$PIE_HOME/config.toml" <<TOML
 [server]
-host = "127.0.0.1"
-port = $port
-telemetry = false
+listen = "127.0.0.1:$port"
 [model]
 name = "default"
-model = "Qwen/Qwen3.5-0.8B"
+source = "Qwen/Qwen3.5-0.8B"
 device_memory_share = 0.85
 [engine]
-type = "cuda_native"
+type = "cuda"
 device = ["cuda:0"]
 activation_dtype = "bfloat16"
 [sandbox]

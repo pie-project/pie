@@ -6,7 +6,7 @@
 
 `__aenter__` renders the `Config` to the TOML `pie serve --config` reads and
 hands it to `pie._engine.bootstrap`, off-thread since the boot blocks. With
-`ServerConfig.port == 0` the OS picks the port and `url` says which.
+`ServerConfig.listen` at port 0 the OS picks the port and `url` says which.
 `__aexit__` closes the clients from `connect()` and shuts the engine down;
 the handle's own `Drop` does the same if `__aexit__` never runs.
 """
@@ -44,7 +44,7 @@ class Server:
     def url(self) -> str:
         """`ws://host:port` the engine listens on."""
         if self._handle is None:
-            return f"ws://{self._config.server.host or '127.0.0.1'}:{self._config.server.port}"
+            return f"ws://{self._config.server.listen or '127.0.0.1:8080'}"
         return self._handle.url
 
     @property

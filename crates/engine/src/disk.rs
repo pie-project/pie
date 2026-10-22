@@ -101,7 +101,7 @@ impl SlotFile {
         let file = open_direct(&path)?;
         file.try_lock().map_err(|_| {
             io::Error::other(format!(
-                "{} is in use by another server; give this one its own disk_kv_path",
+                "{} is in use by another server; give this one its own disk_kv_dir",
                 path.display()
             ))
         })?;

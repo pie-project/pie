@@ -31,12 +31,12 @@ pub use link::pool::{PoolStore, run as run_pool};
 #[cfg(feature = "net")]
 pub use serve::{WorkerHandle, run, run_with};
 
-/// Swaps the worker policy for the one `config`'s `[runtime] policy` names,
+/// Swaps the worker policy for the one `config`'s `[runtime] worker_policy` names,
 /// or for none (a SIGHUP's reload): it loads whole or the running one goes
 /// on ([`runtime::policy::reload`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn reload_policy(config: &Config) -> anyhow::Result<()> {
-    let next = match config.runtime.policy.as_deref() {
+    let next = match config.runtime.worker_policy.as_deref() {
         Some(spec) => Some((
             spec.to_string(),
             builtins::policy_component(spec)?.into_owned(),

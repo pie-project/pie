@@ -23,7 +23,7 @@ pub struct Server {
 #[napi]
 impl Server {
     /// `ws://host:port` the gateway listens on; its HTTP routes share the
-    /// port. With `server.port = 0` this is the port the OS handed out.
+    /// port. With `server.listen` at port 0 this is the port the OS handed out.
     #[napi(getter)]
     pub fn url(&self) -> String {
         self.url.clone()

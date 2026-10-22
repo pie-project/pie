@@ -14,6 +14,7 @@ crate-type = ["rlib"]
 
 
 [dependencies]
+units = { path = "../units" }
 controller-api = { path = "../controller-api" }
 ids = { path = "../ids" }
 tarpc = { version = "0.38", features = [

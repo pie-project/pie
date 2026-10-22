@@ -68,7 +68,7 @@ def bench_args(args: argparse.Namespace) -> argparse.Namespace:
     configured by `pie_bench.build_config` and nothing here restates it."""
     argv = [
         "tput", "--model", args.model,
-        "--engine", "cuda_native",
+        "--engine", "cuda",
         "--max-model-len", str(args.max_model_len),
         "--gpu-mem-util", str(args.gpu_mem_util),
         "--inferlet-dir", args.inferlet_dir,
@@ -182,7 +182,7 @@ async def run(args: argparse.Namespace, mem: MemSampler) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["offline", "serve"])
-    ap.add_argument("--model", required=True, help="what `[model] model` serves: an artifact path or store name")
+    ap.add_argument("--model", required=True, help="what `[model] source` serves: an artifact path or store name")
     ap.add_argument("--hf", required=True, help="the checkpoint snapshot, for its tokenizer's vocabulary")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-model-len", type=int, default=8192)
@@ -193,7 +193,7 @@ def main() -> None:
     ap.add_argument("--inferlet-dir", default=str(ROOT / "examples" / "text-completion-bench"))
     ap.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
     ap.add_argument("--engine-option", action="append", default=[], metavar="KEY=VALUE")
-    ap.add_argument("--precision", default=None, help="[model] precision, e.g. bf16+nvfp4a4")
+    ap.add_argument("--precision", default=None, help="[model] weight_precision, e.g. bf16+nvfp4a4")
     ap.add_argument("--kv", default=None, help="[model] kv, e.g. e4m3 (DeepSeek-V4's fp8 rows)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)

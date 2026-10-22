@@ -67,5 +67,5 @@ sequence; the decode epilogue rebuilds the next row on the device
 
 ```bash
 cargo build --release --target wasm32-wasip3
-python tests/examples/run_all.py --engine cuda_native --model <model-path>
+python tests/examples/run_all.py --engine cuda --model <model-path>
 ```

@@ -32,7 +32,7 @@ exercise the door name their config:
     CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_image.py \\
         --config ~/.pie/config.minidit.toml --expect-refusal
 
-where the config's `[model] model` is the imported `.zt` (`pie model import
+where the config's `[model] source` is the imported `.zt` (`pie model import
 <diffusers folder> --deployment flux2-klein-4b-bf16-kv-bf16 --out ...`). Unlike the
 curated suites this one does not use the embedded `pie.server` wheel: what is
 under test includes `pie run -o`, so it runs the binary.
@@ -48,9 +48,10 @@ per-slot token ceiling, and a 1024² job is 4096 latent rows a lane; at the
 default 4096 the engine refuses the second fire by name ("this fire wants 8192
 kv tokens in one slot and the load reserved 4096" -- the frame carries the
 depth, not one lane). Set it at or above the rows the job carries times the
-submit depth: `max_model_len = 32768` covers 1024² comfortably. `[engine]
-graphs = "on"` is the recording policy the denoise arm is meant to run under;
-`off` works and is slower.
+submit depth: `max_model_len = 32768` covers 1024² comfortably. The
+profile's `engine.graphs = "on"` (its default) is the recording policy the
+denoise arm is meant to run under; `off`, pinned in a user profile, works and
+is slower.
 """
 
 from __future__ import annotations
@@ -283,7 +284,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None,
-                    help="the serving config; its `[model] model` is the imported artifact")
+                    help="the serving config; its `[model] source` is the imported artifact")
     ap.add_argument("--pie", default=None, help="the `pie` binary (default: target/{release,debug})")
     ap.add_argument("--model-dir", default=None,
                     help="the diffusers folder to decode with; without it the latent is "

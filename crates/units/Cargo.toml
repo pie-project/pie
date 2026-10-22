@@ -1,0 +1,19 @@
+[package]
+name = "units"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The unit-carrying config values every pie role reads: durations (`50ms`) and byte sizes (`4GiB`), written with their unit."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "units"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[lints]
+workspace = true

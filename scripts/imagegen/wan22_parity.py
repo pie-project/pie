@@ -13,7 +13,7 @@ two with `compare.py`.
     python wan22_parity.py case  --out /tmp/wan22-parity
     python wan22_parity.py case  --out /tmp/wan22-parity --pertoken
 
-    # 2. run it (the config's `[model] model` is the imported artifact:
+    # 2. run it (the config's `[model] source` is the imported artifact:
     #    `pie model import <dir with wan22_mini_d128.safetensors> --deployment wan22-mini-d128-bf16-kv-bf16`)
     python wan22_parity.py run   --out /tmp/wan22-parity --config ~/.pie/config.wan22-mini.toml
 
@@ -243,7 +243,7 @@ def scratch_dir(config: str | None) -> str | None:
     if not config:
         return None
     with open(os.path.expanduser(config)) as f:
-        found = re.search(r'^\s*fs_scratch_dir\s*=\s*"([^"]*)"', f.read(), re.M)
+        found = re.search(r'^\s*scratch_dir\s*=\s*"([^"]*)"', f.read(), re.M)
     return found.group(1) if found else None
 
 def run(args) -> None:
@@ -398,7 +398,7 @@ def main() -> int:
                     help="the miniatures' TI2V per-token-timestep forward: two video lanes")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/wan2-parity"))
     ap.add_argument("--config", default=None,
-                    help="the serving config; its `[model] model` must be the imported row")
+                    help="the serving config; its `[model] source` must be the imported row")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--compact", action="store_true",
                     help="state the case's rectangles as base64 f32 and give the context "

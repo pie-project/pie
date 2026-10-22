@@ -1,3 +1,7 @@
+//! The unit-carrying values a config writes with their unit: [`Duration`]
+//! (`"50ms"`, `"8s"`) and [`ByteSize`] (`"4GiB"`). A bare number is refused
+//! rather than assumed.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -18,6 +22,12 @@ impl Duration {
     }
     pub fn as_secs_f64(&self) -> f64 {
         self.0.as_secs_f64()
+    }
+}
+
+impl From<Duration> for std::time::Duration {
+    fn from(d: Duration) -> Self {
+        d.0
     }
 }
 

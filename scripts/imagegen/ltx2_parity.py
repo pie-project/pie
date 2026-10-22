@@ -361,7 +361,7 @@ def main() -> int:
     ap.add_argument(
         "--config",
         default=None,
-        help="the serving config; its `[model] model` must be the imported miniature",
+        help="the serving config; its `[model] source` must be the imported miniature",
     )
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument(

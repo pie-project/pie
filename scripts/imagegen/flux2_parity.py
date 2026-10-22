@@ -11,7 +11,7 @@ into an `.npz` under the golden's own key names, and diffs the two with
     # 1. the case the inferlet reads
     python flux2_parity.py case  --out /tmp/flux2-parity
 
-    # 2. run it (the config's `[model] model` is the imported artifact:
+    # 2. run it (the config's `[model] source` is the imported artifact:
     #    `pie model import $PIE_IMAGEGEN_GOLDEN/flux2/ --deployment flux2-mini-bf16-kv-bf16`)
     python flux2_parity.py run   --out /tmp/flux2-parity --config ~/.pie/config.flux2-mini.toml
 
@@ -219,7 +219,7 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/flux2-parity")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/flux2-parity"))
     ap.add_argument("--config", default=None,
-                    help=f"the serving config; its `[model] model` must be the artifact "
+                    help=f"the serving config; its `[model] source` must be the artifact "
                          f"`{DEFAULT_DEPLOYMENT}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true", help="pass the case as a scratch file instead of argv pieces")

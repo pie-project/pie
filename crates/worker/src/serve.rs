@@ -148,7 +148,7 @@ pub async fn run(cfg: config::Config, home: &Path) -> Result<WorkerHandle> {
         (Some(_), None) => bail!("[cluster] role is required when controller is set"),
         (None, _) => TopologyMode::SingleNode,
     };
-    let control_addr = topology::addr_from_host_port(&cfg.server.host, cfg.server.port);
+    let control_addr = cfg.server.listen.to_string();
     let coordinator = topology::connect(&mode, control_addr)?;
     // A prefill worker runs a runtime like any other: it takes no client
     // turns (the gateway routes to decode workers) and computes peers'
@@ -195,7 +195,7 @@ pub async fn start_runtime_embedded<C: ControlLink>(
     client_edge: Option<String>,
 ) -> Result<RuntimeHandle> {
     let (model, booted) = boot_decode(&user_cfg, home).await?;
-    let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
+    let addr = user_cfg.server.listen.to_string();
     let (edge_server, control_tasks, worker_id) = assemble_distributed(
         control,
         &gateways,
@@ -327,7 +327,7 @@ async fn assemble_control_and_edge(
         }
         TopologyMode::SingleNode => {
             let _ = model;
-            let listen = format!("{}:{}", user_cfg.server.host, user_cfg.server.port);
+            let listen = user_cfg.server.listen.to_string();
             let edge = EdgeServer::Standalone(
                 client::spawn(&listen)
                     .await
@@ -341,7 +341,7 @@ async fn assemble_control_and_edge(
 
 /// The engine kind a worker registers its shape with, as its config spells it.
 fn engine_of(cfg: &config::Config) -> String {
-    cfg.model.engine.kind.as_str().to_string()
+    cfg.engine.kind.as_str().to_string()
 }
 
 async fn assemble_distributed<C: ControlLink>(

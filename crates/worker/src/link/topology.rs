@@ -33,14 +33,6 @@ fn is_valid_addr(addr: &str) -> bool {
     addr.starts_with("unix:") || addr.strip_prefix("tcp://").unwrap_or(addr).contains(':')
 }
 
-pub fn addr_from_host_port(host: &str, port: u16) -> String {
-    if host.starts_with("unix:") || host.starts_with("tcp://") {
-        host.to_string()
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Coordinator {
     pub mode: TopologyMode,

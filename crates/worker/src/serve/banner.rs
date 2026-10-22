@@ -9,10 +9,10 @@ pub(super) struct StartupBanner {
 impl StartupBanner {
     pub(super) fn from_config(cfg: &config::Config) -> Self {
         let m = &cfg.model;
-        let model = format!("{} ({})", m.name, m.model);
-        let backend = m.engine.kind.as_str().to_string();
+        let model = format!("{} ({})", m.name, m.source);
+        let backend = cfg.engine.kind.as_str().to_string();
         let device = {
-            let device = m.engine.device.join(", ");
+            let device = cfg.engine.device.join(", ");
             if device.is_empty() {
                 "-".to_string()
             } else {

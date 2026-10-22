@@ -44,6 +44,7 @@ nixl = ["dep:transport", "transport/nixl", "engine-cpu?/nixl"]
 profile-fire = ["runtime/profile-fire"]
 
 [dependencies]
+units = { path = "../units" }
 runtime = { path = "../runtime" }
 poem = { package = "pie-poem", path = "../poem" }
 controller-api = { path = "../controller-api" }

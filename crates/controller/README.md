@@ -7,10 +7,11 @@ table. `pie-controller -c controller.toml` runs it (`pie serve` embeds one).
 ## Config
 
 ```toml
-listen_addr = "tcp://0.0.0.0:7000"
-heartbeat_timeout_secs = 8   # a node silent this long is evicted
-tick_interval_secs = 2       # how often it grades, evicts and scales
-command_buffer = 256
+listen = "tcp://0.0.0.0:7000"
+heartbeat_timeout = "8s"     # a node silent this long is evicted
+tick_interval = "2s"         # how often it grades, evicts and scales
+cluster_policies = ["persist-prefix"]  # built-in names or .wasm paths;
+                                       # SIGHUP reloads them
 
 # Workers the actuator may launch to meet a scale table (`cluster.scale`).
 # Each is one worker: a command that starts it, with its own config
@@ -18,35 +19,33 @@ command_buffer = 256
 [[scale.slot]]
 model = "qwen3-14b"          # the model as workers serve it (`[model] name`);
                              # unset: a worker that loads no model
-engine = "cuda_native"       # as the worker's `[engine] type` spells it
+engine = "cuda"       # as the worker's `[engine] type` spells it
 command = ["pie-worker", "-c", "/etc/pie/gpu0.toml"]
 
 [[scale.slot]]
 model = "qwen3-14b"
-engine = "cuda_native"
+engine = "cuda"
 command = ["pie-worker", "-c", "/etc/pie/gpu1.toml"]
 ```
 
-## Author
+## Cluster policies
 
-Every gateway runs every cluster policy. Per-request writes (schedule,
-placement, executors, moves) are each gateway's own, for its own requests.
-The cluster-wide ones (scale, replication, retention) have one author: the
-live gateway with the lowest id, which the controller names in the routing
-table (`author`). Only the author enacts them; the others' policies run
-all the same and their tables are taken, as an absent capability's are,
-and not enacted. The controller takes a scale table (`desire_scale`) only
-from the author. When the author is evicted, the next lowest is named on
-that tick and sends and enacts the tables it has at once: they are
-level-triggered, and its directory is built from the workers' reports.
+The controller runs every cluster policy, once. Gateways tell it what
+happens to their processes and apply what it decides about them (the gate,
+the order launches leave in, placement, terminations, moves); workers
+report what they hold to its directory. The tables that reach workers
+(replication, retention) are carried by one gateway, the routing table's
+`author` (the live gateway with the lowest id); when it is evicted, the
+next lowest carries them on that tick. A controller dialed again hears each
+gateway's live processes and each worker's whole state, so a restarted one
+takes up where the last left off.
 
 ## Scale
 
 A cluster policy granted `scale` installs a scale table (`install-scale`):
 how many workers of each shape, a shape being a model as workers serve it
-(their `[model] name`, or none) and an engine kind. The author gateway sends the
-table to the controller whole, again when it changes and after the
-controller restarts or it becomes the author.
+(their `[model] name`, or none) and an engine kind. The controller's
+actuator takes the table whole, again whenever it changes.
 
 With slots configured, the controller's actuator converges on it every tick:
 

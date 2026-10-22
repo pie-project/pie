@@ -888,7 +888,7 @@ mod tests {
         let ask = serde_json::json!({
             "key": 1,
             "scale-workers": 2,
-            "scale-engine": "cuda_native",
+            "scale-engine": "cuda",
             "scale-model": "m",
         });
         let granted = rig_of(0, &["scale-by-prop", "test-route"]).await;
@@ -907,7 +907,7 @@ mod tests {
             Some(
                 &[ScaleEntry {
                     model: Some("m".into()),
-                    engine: "cuda_native".into(),
+                    engine: "cuda".into(),
                     workers: 2,
                 }][..]
             )

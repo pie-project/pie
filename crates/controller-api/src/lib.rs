@@ -436,7 +436,7 @@ mod tests {
                 addr: "10.0.0.4:7000".into(),
                 role: Role::Decode,
                 model: "llama3-8b".into(),
-                engine: "cuda_native".into(),
+                engine: "cuda".into(),
                 health: Health::Healthy,
                 coarse_load: WorkerStatus {
                     kv_pressure_bucket: 42,

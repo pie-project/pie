@@ -11,7 +11,7 @@ script is the other half: it turns the golden's *inputs* into the case JSON the
     python mini_dit_parity.py case  --out /tmp/mini-dit-parity
     python mini_dit_parity.py case  --out /tmp/mini-dit-parity --euler
 
-    # 2. run it (the config's `[model] model` is the imported artifact; the
+    # 2. run it (the config's `[model] source` is the imported artifact; the
     #    case files must be reachable as /scratch/<name> inside the sandbox)
     python mini_dit_parity.py run   --out /tmp/mini-dit-parity --config ~/.pie/config.toml
 
@@ -550,7 +550,7 @@ def main() -> int:
                     help="the four-step schedule instead of one step")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/mini-dit-parity"))
     ap.add_argument("--config", default=None,
-                    help=f"the serving config; its `[model] model` must be the artifact "
+                    help=f"the serving config; its `[model] source` must be the artifact "
                          f"`{DEFAULT_DEPLOYMENT}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true", help="pass the case as a scratch file instead of argv pieces")

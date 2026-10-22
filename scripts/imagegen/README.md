@@ -315,8 +315,8 @@ checked against the reference's own `patches` tensor on every invocation.
 
 Both runs pass the gate (one step: cos 0.99996, max-abs 0.047; four Euler
 steps: worst cos 0.99996, max-abs 0.049 on the velocities, 0.024 on the
-latents).  The config the row is served under keeps `[engine] graphs = "off"`
-so the parity walks eagerly.
+latents).  The row is served with `engine.graphs = "off"` pinned in a user profile
+(`$PIE_HOME/profiles/cuda/user/<device>.toml`), so the parity walks eagerly.
 
 **Bisecting a mismatch.**  `--tap <dump key>` on `run`, `collect` and
 `compare` reads an INTERMEDIATE out in the velocity's place: `run` sets the
@@ -394,9 +394,9 @@ read off `intrinsics::pixels()`, and the picture out through
 
 ```bash
 cp ~/.pie/config.minidit.toml ~/.pie/config.zimage-vae.toml
-# then edit: [model] model = the imported z-image-turbo artifact,
-#            [engine] graphs = "on", max_model_len = 32768,
-#            [server] port = something nothing else is using
+# then edit: [model] source = the imported z-image-turbo artifact,
+#            [engine] max_model_len = 32768,
+#            [server] listen = something nothing else is using
 python zimage_vae_parity.py all --out /tmp/zimage-vae \
     --config ~/.pie/config.zimage-vae.toml
 ```
@@ -514,7 +514,7 @@ CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
 ```
 
 The config needs `[engine] max_model_len = 32768` (rows × submit depth) and
-`[model] model` at the artifact. It needs nothing said about `[runtime]
+`[model] source` at the artifact. It needs nothing said about `[runtime]
 submit_deadline` any more: this parity used to demand `"10s"` because at the
 50 ms default the cohort gate sealed the denoise group's FIRST frame with
 the image lane alone and the velocity came back unconditioned (cos ≈ 0.535
@@ -764,7 +764,7 @@ python h3_parity.py all --out /tmp/h3-parity --config ~/.pie/config.h3-mini.toml
 The guest (`examples/h3-parity`) runs the `refine` pass (the text lane
 alone) and then one `denoise` step of FOUR lanes in one attention group — text,
 video, audio, reference — one pipeline each, one timestep cell per pass. Use a
-PRIVATE config with its own `[server] port` and an `[engine] max_model_len` at
+PRIVATE config with its own `[server] listen` and an `[engine] max_model_len` at
 least the packed row count times the submit depth.
 
 Measured (fp32 reference vs pie's bf16 trunk, one denoise step on one GPU):
@@ -796,7 +796,7 @@ pie model import $PIE_IMAGEGEN_GOLDEN/hy3/artifact \
 python hy3_parity.py all --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.toml
 ```
 
-The config must be the run's OWN (its own `[server] port`), and
+The config must be the run's OWN (its own `[server] listen`), and
 `[engine] max_model_len` at least the sequence.
 
 **A whole denoise step, in three fires, each fed pie's own answer to the one
@@ -1004,8 +1004,8 @@ Each has been paid for once already.
 
 - **Its own config, its own port.**  Every gate gets
   `~/.pie/config.gates-<name>.toml`, written fresh each run, with its own
-  `[server] port` (probed free before it is written), its own
-  `fs_scratch_dir`, and `[engine] max_model_len` at rows × submit depth —
+  `[server] listen` (probed free before it is written), its own
+  `scratch_dir`, and `[engine] max_model_len` at rows × submit depth —
   never the 4096 default, which kills a 1024² job on its second fire.  Several
   agents share this box and a shared config file has been repointed at another
   artifact mid-run, which reads exactly like a numerics regression.

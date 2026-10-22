@@ -100,7 +100,7 @@ export class Server {
    * Boot the engine. `{ model, config }` names the model (`Qwen/Qwen3.5-0.8B`,
    * a path, an artifact) and gives the rest of `pie serve`'s config as an
    * object; a bare config — TOML text, or an object of the file's shape with
-   * `model.model` inside — is accepted as well. `server.port = 0` asks the OS
+   * `model.source` inside — is accepted as well. `server.listen` at port 0 asks the OS
    * for a free port; `url` says which. Resolves once the engine is serving,
    * with every registered language component installed.
    */
@@ -110,7 +110,7 @@ export class Server {
     if (options && typeof options === 'object' && typeof options.model === 'string') {
       const { model, config: rest = {} } = options;
       if (typeof rest !== 'object') throw new Error('Server.start: with `model`, `config` is an object');
-      config = { ...rest, model: { name: 'default', ...(rest.model ?? {}), model } };
+      config = { ...rest, model: { name: 'default', ...(rest.model ?? {}), source: model } };
       home = options.home ?? home;
     }
     const api = load();

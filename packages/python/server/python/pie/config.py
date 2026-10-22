@@ -15,8 +15,7 @@ from typing import Optional
 
 @dataclass
 class ServerConfig:
-    host: Optional[str] = None
-    port: Optional[int] = None  # 0 asks the OS for a free port
+    listen: Optional[str] = None  # "host:port"; port 0 asks the OS for a free one
     verbose: Optional[bool] = None
     worker_threads: Optional[int] = None
     max_upload_mb: Optional[int] = None
@@ -24,7 +23,7 @@ class ServerConfig:
 
 @dataclass
 class TelemetryConfig:
-    enabled: Optional[bool] = None
+    # An OTLP collector; unset exports none.
     endpoint: Optional[str] = None
     service_name: Optional[str] = None
 
@@ -38,6 +37,8 @@ class RuntimeConfig:
     # Durations are written with their unit ("50ms", "120s").
     submit_deadline: Optional[str] = None
     max_concurrent_processes: Optional[int] = None
+    # The worker-plane policy: a built-in name or a .wasm path.
+    worker_policy: Optional[str] = None
 
 
 @dataclass
@@ -47,16 +48,22 @@ class SandboxConfig:
     warm_memory_mb: Optional[int] = None
     warm_slots: Optional[int] = None
     allow_fs: Optional[bool] = None
-    fs_scratch_dir: Optional[str] = None
+    scratch_dir: Optional[str] = None
     allow_network: Optional[bool] = None
     network_allowed_hosts: Optional[list[str]] = None
+
+
+@dataclass
+class ClusterConfig:
+    # The cluster policies the in-process controller runs.
+    cluster_policies: list[str] = field(default_factory=list)
 
 
 @dataclass
 class EngineConfig:
     """`[engine]`: `type` and `device` are required; `options` are the
     engine's own knobs, written beside the common keys."""
-    type: str = "cuda_native"
+    type: str = "cuda"
     device: list[str] = field(default_factory=list)
     tensor_parallel_size: Optional[int] = None
     activation_dtype: Optional[str] = None
@@ -66,13 +73,14 @@ class EngineConfig:
 @dataclass
 class ModelConfig:
     name: str = "default"
-    hf_repo: str = ""
+    # A store name ("Qwen/Qwen3.5-0.8B") or a path to a `.zt` artifact.
+    source: str = ""
     # What the deployment changes about the one its checkpoint states:
     # the precision it expects ("u4g64", "u4g64+u2g64"), the kv dtype, the
-    # parts left off ("vision") and the drafter ("mtp", or "none").
-    precision: Optional[str] = None
-    kv: Optional[str] = None
-    off: list[str] = field(default_factory=list)
+    # parts left unloaded ("vision") and the drafter ("mtp", or "none").
+    weight_precision: Optional[str] = None
+    kv_dtype: Optional[str] = None
+    skip_parts: list[str] = field(default_factory=list)
     drafter: Optional[str] = None
     weight_dtype: Optional[str] = None
     # Sizes with a unit ("20GiB"); omit for uncapped.
@@ -88,63 +96,60 @@ class ModelConfig:
     # Disk bytes suspended kv spills to below the host (the only tier on metal
     # and vulkan); omit for the engine's default, "0B" for off.
     disk_kv_budget: Optional[str] = None
-    disk_kv_path: Optional[str] = None
+    disk_kv_dir: Optional[str] = None
     # Keep the disk tier for the next run (cuda): a restart takes back the
     # sealed pages it holds as cache.
     disk_kv_persistent: Optional[bool] = None
-    engine: EngineConfig = field(default_factory=EngineConfig)
 
 
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    engine: EngineConfig = field(default_factory=EngineConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
+    cluster: ClusterConfig = field(default_factory=ClusterConfig)
 
     def to_toml(self) -> str:
-        """The document `pie serve --config` reads: `[server]` (telemetry
-        folded in), `[model]`, `[engine]` (common keys and the engine's
-        options side by side), `[runtime]`, `[sandbox]`."""
+        """The document `pie serve --config` reads: one table a section,
+        `[engine]` with the engine's options beside its common keys."""
 
         def put(table: dict, key: str, value) -> None:
             if value is not None:
                 table[key] = value
 
-        s = self.server
-        server: dict = {}
-        for name in ("host", "port", "verbose", "worker_threads"):
-            put(server, name, getattr(s, name))
-        put(server, "max_upload", _mib(s.max_upload_mb))
-        t = self.telemetry
-        put(server, "telemetry", t.enabled)
-        put(server, "otlp_endpoint", t.endpoint)
-        put(server, "service_name", t.service_name)
-
         m = self.model
-        model: dict = {"name": m.name, "model": m.hf_repo}
-        for name in ("precision", "kv", "drafter", "weight_dtype", "device_weight_budget", "host_weight_budget",
-                     "device_kv_budget", "device_memory_share", "host_kv_budget", "disk_kv_budget",
-                     "disk_kv_path", "disk_kv_persistent"):
+        model: dict = {"name": m.name, "source": m.source}
+        for name in ("weight_precision", "kv_dtype", "drafter", "weight_dtype", "device_weight_budget",
+                     "host_weight_budget", "device_kv_budget", "device_memory_share", "host_kv_budget",
+                     "disk_kv_budget", "disk_kv_dir", "disk_kv_persistent"):
             put(model, name, getattr(m, name))
-        if m.off:
-            model["off"] = list(m.off)
+        if m.skip_parts:
+            model["skip_parts"] = list(m.skip_parts)
 
-        engine: dict = {"type": m.engine.type, "device": m.engine.device}
-        put(engine, "tensor_parallel_size", m.engine.tensor_parallel_size)
-        put(engine, "activation_dtype", m.engine.activation_dtype)
-        for key, value in m.engine.options.items():
+        e = self.engine
+        engine: dict = {"type": e.type, "device": e.device}
+        put(engine, "tensor_parallel_size", e.tensor_parallel_size)
+        put(engine, "activation_dtype", e.activation_dtype)
+        for key, value in e.options.items():
             if key in engine:
                 raise ValueError(f"engine option {key!r} collides with a common [engine] key")
             engine[key] = value
 
+        cluster: dict = {}
+        if self.cluster.cluster_policies:
+            cluster["cluster_policies"] = list(self.cluster.cluster_policies)
+
         buf = io.StringIO()
-        _emit_table(buf, "server", server)
+        _emit_table(buf, "server", _block(self.server))
+        _emit_table(buf, "telemetry", _block(self.telemetry), leading_newline=True)
         _emit_table(buf, "model", model, leading_newline=True)
         _emit_table(buf, "engine", engine, leading_newline=True)
         _emit_table(buf, "runtime", _block(self.runtime), leading_newline=True)
         _emit_table(buf, "sandbox", _block(self.sandbox), leading_newline=True)
+        _emit_table(buf, "cluster", cluster, leading_newline=True)
         return buf.getvalue().lstrip("\n")
 
 

@@ -195,7 +195,7 @@ mod tests {
     fn table(workers: u32) -> Vec<ScaleEntry> {
         vec![ScaleEntry {
             model: Some("m".into()),
-            engine: "cuda_native".into(),
+            engine: "cuda".into(),
             workers,
         }]
     }

@@ -105,11 +105,12 @@ pub struct PolicyReload {
 
 impl PolicyReload {
     /// For those `config` names: the in-proc controller's cluster policies
-    /// (`[server] policies`) and the worker's `[runtime] policy`.
+    /// (`[cluster] cluster_policies`) and the worker's `[runtime]
+    /// worker_policy`.
     pub async fn reload(&self, config: &crate::Config) -> Result<()> {
-        if !config.server.policies.is_empty() {
+        if !config.cluster.cluster_policies.is_empty() {
             self.controller
-                .reload_policies(&config.server.policies)
+                .reload_policies(&config.cluster.cluster_policies)
                 .await?;
         }
         crate::reload_policy(config).await
@@ -158,13 +159,7 @@ pub async fn run_standalone(
 
     gateway.worker_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
 
-    let host: std::net::IpAddr = worker.server.host.parse().with_context(|| {
-        format!(
-            "[server] host {:?} is not an IP address",
-            worker.server.host
-        )
-    })?;
-    gateway.listen = SocketAddr::new(host, worker.server.port);
+    gateway.listen = worker.server.listen;
     let gw = gateway::bind(gateway, control.clone())
         .await
         .context("bind in-proc gateway")?;
@@ -203,7 +198,7 @@ pub fn derive_standalone(
 ) -> Result<(controller::Config, gateway::Config, crate::Config)> {
     let worker = crate::Config::parse(combined).context("parsing config")?;
     let mut controller = controller::Config::parse("").context("controller defaults")?;
-    controller.policies = worker.server.policies.clone();
+    controller.cluster_policies = worker.cluster.cluster_policies.clone();
     let gateway = gateway::Config::parse("").context("gateway defaults")?;
     Ok((controller, gateway, worker))
 }

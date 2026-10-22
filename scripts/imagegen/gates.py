@@ -15,7 +15,7 @@ WHAT A GATE IS HERE
 -------------------
 A row of the table: a family's harness invoked exactly the way its README
 states, with a config file of its OWN (`~/.pie/config.gates-<name>.toml`,
-its own `[server] port`, its own scratch dir), and one headline number lifted
+its own `[server] listen`, its own scratch dir), and one headline number lifted
 out of the harness's own output.  This runner never re-implements a gate's
 arithmetic -- every number in the table is printed by the harness or by
 `compare.py`, and every PASS/FAIL is the harness's own exit status.
@@ -98,19 +98,17 @@ CONFIG = """\
 # not this file.
 
 [server]
-host = "127.0.0.1"
-port = {port}
+listen = "127.0.0.1:{port}"
 verbose = false
 
 [model]
 name = "gates-{name}"
-model = "{model}"
+source = "{model}"
 device_memory_share = {mem}
 {voxels}
 
 [engine]
-graphs = "{graphs}"
-type = "cuda_native"
+type = "cuda"
 device = ["cuda:0"]          # whatever CUDA_VISIBLE_DEVICES selects
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
@@ -124,7 +122,7 @@ silence_timeout = "{timeout}"
 [sandbox]
 allow_fs = true
 allow_network = false
-fs_scratch_dir = "{scratch}"
+scratch_dir = "{scratch}"
 """
 
 def port_free(port: int) -> bool:
@@ -152,7 +150,6 @@ def write_config(ctx, gate) -> str:
     text = CONFIG.format(
         name=gate.name, port=port, scratch=scratch,
         model=spec.pop("model"),
-        graphs=spec.pop("graphs", "on"),
         mem=float(os.environ.get("PIE_GATES_MEM") or spec.pop("mem", 0.90)),
         rows=int(os.environ.get("PIE_GATES_ROWS") or spec.pop("rows", 32768)),
         timeout=spec.pop("timeout", "600s"),

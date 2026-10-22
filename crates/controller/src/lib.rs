@@ -33,43 +33,49 @@ const T_HANG: Duration = Duration::from_secs(20);
 /// within it go out as one view.
 const DIRECTORY_EVERY: Duration = Duration::from_millis(200);
 
+/// The controller's actor queue: commands from every worker and gateway
+/// link wait here.
+const COMMAND_BUFFER: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub listen_addr: String,
+    /// Where the Control endpoint listens: `host:port`, `tcp://host:port`
+    /// or `unix:/path`.
+    pub listen: String,
     pub heartbeat_timeout: Duration,
     pub tick_interval: Duration,
-    pub command_buffer: usize,
     /// The workers the actuator may launch to meet a scale table; none,
     /// and the controller does not scale (`cluster.scale` is absent).
     pub slots: Vec<Slot>,
     /// The cluster policies: each a built-in policy's name or a `.wasm`
     /// path, no two granted the same write. None: every gateway goes by its
     /// defaults.
-    pub policies: Vec<String>,
+    pub cluster_policies: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:7000".to_string(),
+            listen: "0.0.0.0:7000".to_string(),
             heartbeat_timeout: Duration::from_secs(8),
             tick_interval: Duration::from_secs(2),
-            command_buffer: 256,
             slots: Vec::new(),
-            policies: Vec::new(),
+            cluster_policies: Vec::new(),
         }
     }
 }
 
+/// The controller's file: `listen`, `heartbeat_timeout` and `tick_interval`
+/// (written with their unit, `"8s"`), `cluster_policies`, and
+/// `[[scale.slot]]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigToml {
-    listen_addr: String,
-    heartbeat_timeout_secs: u64,
-    tick_interval_secs: u64,
-    command_buffer: usize,
+    listen: String,
+    heartbeat_timeout: units::Duration,
+    tick_interval: units::Duration,
     scale: ScaleToml,
-    policies: Vec<String>,
+    cluster_policies: Vec<String>,
 }
 
 /// `[scale]`: `[[scale.slot]]` entries, each a worker the actuator may
@@ -84,12 +90,11 @@ impl Default for ConfigToml {
     fn default() -> Self {
         let d = Config::default();
         Self {
-            listen_addr: d.listen_addr,
-            heartbeat_timeout_secs: d.heartbeat_timeout.as_secs(),
-            tick_interval_secs: d.tick_interval.as_secs(),
-            command_buffer: d.command_buffer,
+            listen: d.listen,
+            heartbeat_timeout: units::Duration::from_secs(d.heartbeat_timeout.as_secs()),
+            tick_interval: units::Duration::from_secs(d.tick_interval.as_secs()),
             scale: ScaleToml::default(),
-            policies: d.policies,
+            cluster_policies: d.cluster_policies,
         }
     }
 }
@@ -97,12 +102,11 @@ impl Default for ConfigToml {
 impl From<ConfigToml> for Config {
     fn from(t: ConfigToml) -> Self {
         Self {
-            listen_addr: t.listen_addr,
-            heartbeat_timeout: Duration::from_secs(t.heartbeat_timeout_secs),
-            tick_interval: Duration::from_secs(t.tick_interval_secs),
-            command_buffer: t.command_buffer,
+            listen: t.listen,
+            heartbeat_timeout: t.heartbeat_timeout.into(),
+            tick_interval: t.tick_interval.into(),
             slots: t.scale.slot,
-            policies: t.policies,
+            cluster_policies: t.cluster_policies,
         }
     }
 }
@@ -117,16 +121,16 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         ensure!(
-            !self.listen_addr.trim().is_empty(),
-            "controller config: `listen_addr` must not be empty"
+            !self.listen.trim().is_empty(),
+            "controller config: `listen` must not be empty"
         );
         ensure!(
-            self.command_buffer > 0,
-            "controller config: `command_buffer` must be > 0"
+            !self.heartbeat_timeout.is_zero(),
+            "controller config: `heartbeat_timeout` must be > 0"
         );
         ensure!(
             !self.tick_interval.is_zero(),
-            "controller config: `tick_interval_secs` must be > 0"
+            "controller config: `tick_interval` must be > 0"
         );
         for (at, slot) in self.slots.iter().enumerate() {
             ensure!(
@@ -373,7 +377,7 @@ impl ControllerHandle {
 }
 
 pub fn embed(config: Config) -> ControllerHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(config.command_buffer);
+    let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (worker_tx, worker_rx) = watch::channel(Topology::default());
     let (gateway_tx, gateway_rx) = watch::channel(empty_routing());
     let shutdown = CancellationToken::new();
@@ -425,10 +429,10 @@ pub fn embed(config: Config) -> ControllerHandle {
 
     // A policy that does not load is the operator's to fix; the cluster
     // runs on by its defaults meanwhile.
-    let cluster = if config.policies.is_empty() {
+    let cluster = if config.cluster_policies.is_empty() {
         None
     } else {
-        match policy_components(&config.policies).and_then(|programs| {
+        match policy_components(&config.cluster_policies).and_then(|programs| {
             start_cluster(
                 programs,
                 gateway_rx.clone(),
@@ -531,9 +535,9 @@ async fn publish_directory(
 
 pub async fn run(config: Config) -> Result<ControllerHandle> {
     let handle = embed(config.clone());
-    let serve = service::serve(&config.listen_addr, handle.clone(), handle.shutdown.clone())
+    let serve = service::serve(&config.listen, handle.clone(), handle.shutdown.clone())
         .await
-        .with_context(|| format!("bind controller Control endpoint on {}", config.listen_addr))?;
+        .with_context(|| format!("bind controller Control endpoint on {}", config.listen))?;
     handle
         .tasks
         .lock()
@@ -558,11 +562,11 @@ mod tests {
             r#"
             [[scale.slot]]
             model = "Qwen/Qwen3-14B"
-            engine = "cuda_native"
+            engine = "cuda"
             command = ["pie-worker", "-c", "wa.toml"]
 
             [[scale.slot]]
-            engine = "cuda_native"
+            engine = "cuda"
             command = ["pie-pool"]
             "#,
         )
@@ -570,32 +574,35 @@ mod tests {
         assert_eq!(cfg.slots.len(), 2);
         assert_eq!(cfg.slots[0].model.as_deref(), Some("Qwen/Qwen3-14B"));
         assert_eq!(cfg.slots[1].model, None);
-        assert!(Config::parse("[[scale.slot]]\nengine = \"cuda_native\"\ncommand = []\n").is_err());
+        assert!(Config::parse("[[scale.slot]]\nengine = \"cuda\"\ncommand = []\n").is_err());
     }
 
     fn parse_empty_is_default() {
         let cfg = Config::parse("").expect("empty config parses to defaults");
         let d = Config::default();
-        assert_eq!(cfg.listen_addr, d.listen_addr);
+        assert_eq!(cfg.listen, d.listen);
         assert_eq!(cfg.heartbeat_timeout, d.heartbeat_timeout);
         assert_eq!(cfg.tick_interval, d.tick_interval);
-        assert_eq!(cfg.command_buffer, d.command_buffer);
     }
 
     fn parse_overrides_fields() {
         let cfg = Config::parse(
             r#"
-            listen_addr = "127.0.0.1:9000"
-            heartbeat_timeout_secs = 12
-            tick_interval_secs = 3
-            command_buffer = 64
+            listen = "127.0.0.1:9000"
+            heartbeat_timeout = "12s"
+            tick_interval = "500ms"
+            cluster_policies = ["persist-prefix"]
             "#,
         )
         .expect("valid config parses");
-        assert_eq!(cfg.listen_addr, "127.0.0.1:9000");
+        assert_eq!(cfg.listen, "127.0.0.1:9000");
         assert_eq!(cfg.heartbeat_timeout, Duration::from_secs(12));
-        assert_eq!(cfg.tick_interval, Duration::from_secs(3));
-        assert_eq!(cfg.command_buffer, 64);
+        assert_eq!(cfg.tick_interval, Duration::from_millis(500));
+        assert_eq!(cfg.cluster_policies, ["persist-prefix"]);
+        assert!(
+            Config::parse("heartbeat_timeout = 12").is_err(),
+            "a duration is written with its unit"
+        );
     }
 
     #[tokio::test]

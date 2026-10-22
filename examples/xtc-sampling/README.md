@@ -62,7 +62,7 @@ an L40S with Qwen3-0.6B — a threshold scan plus the Bernoulli gate.
 
 ```bash
 cargo build --release --target wasm32-wasip3
-python tests/examples/run_all.py --engine cuda_native --model <model-path>
+python tests/examples/run_all.py --engine cuda --model <model-path>
 ```
 
 The tests pin both gate endpoints (`fire_rate` exactly `0.0` and `1.0`).

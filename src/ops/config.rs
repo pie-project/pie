@@ -19,6 +19,9 @@ pub(crate) fn default_config_for_test() -> String {
 pub enum ConfigCmd {
     List {
         prefix: Option<String>,
+        /// Also the tuning keys: measured defaults that are rarely changed.
+        #[arg(long)]
+        all: bool,
     },
 
     Show {
@@ -46,7 +49,7 @@ pub enum ConfigCmd {
 
 pub async fn run(cmd: ConfigCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
     match cmd {
-        ConfigCmd::List { prefix } => list(global, prefix),
+        ConfigCmd::List { prefix, all } => list(global, prefix, all),
         ConfigCmd::Show { key } => show(global, key),
         ConfigCmd::Set { key, value } => set(global, key, value),
         ConfigCmd::Unset { key } => unset(global, key),
@@ -75,7 +78,7 @@ fn init(global: &crate::args::GlobalArgs, force: bool) -> Result<Answer> {
     Ok(Answer::did(did))
 }
 
-fn list(global: &crate::args::GlobalArgs, prefix: Option<String>) -> Result<Answer> {
+fn list(global: &crate::args::GlobalArgs, prefix: Option<String>, all: bool) -> Result<Answer> {
     let (cfg_path, origin) = crate::args::config_path(global);
     let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
         Ok(content) => toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
@@ -87,25 +90,14 @@ fn list(global: &crate::args::GlobalArgs, prefix: Option<String>) -> Result<Answ
         ),
     };
 
-    let engine = worker::config::schema::lookup(&file, "engine.type")
-        .and_then(|v| v.as_str())
-        .and_then(|s| match s {
-            "cuda_native" | "cuda" => Some(worker::config::EngineKind::CudaNative),
-            "metal" => Some(worker::config::EngineKind::Metal),
-            "vulkan" => Some(worker::config::EngineKind::Vulkan),
-            "wgpu" => Some(worker::config::EngineKind::Wgpu),
-            "xla" => Some(worker::config::EngineKind::Xla),
-            "cerebras" => Some(worker::config::EngineKind::Cerebras),
-            _ => None,
-        })
-        .unwrap_or(default_engine_kind());
-
-    let fields = worker::config::schema::fields(engine);
+    let fields = worker::config::schema::fields(engine_kind(&file));
     let selected: Vec<_> = fields
         .iter()
         .filter(|f| match &prefix {
-            None => true,
-            Some(p) => f.key == *p || f.key.starts_with(&format!("{p}.")),
+            // A key named whole is shown, tuning or not.
+            Some(p) if f.key == *p => true,
+            Some(p) => f.key.starts_with(&format!("{p}.")) && (all || !f.tuning),
+            None => all || !f.tuning,
         })
         .collect();
     if selected.is_empty() {
@@ -228,23 +220,12 @@ fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config::schema:
     bail!("unknown key {key:?}; did you mean {}?", near.join(" or "))
 }
 
+/// The engine `file` names, for the keys it reads; cuda where it names none.
 fn engine_kind(file: &toml::Value) -> worker::config::EngineKind {
     worker::config::schema::lookup(file, "engine.type")
-        .and_then(|v| v.as_str())
-        .and_then(|s| match s {
-            "cuda_native" | "cuda" => Some(worker::config::EngineKind::CudaNative),
-            "metal" => Some(worker::config::EngineKind::Metal),
-            "vulkan" => Some(worker::config::EngineKind::Vulkan),
-            "wgpu" => Some(worker::config::EngineKind::Wgpu),
-            "xla" => Some(worker::config::EngineKind::Xla),
-            "cerebras" => Some(worker::config::EngineKind::Cerebras),
-            _ => None,
-        })
-        .unwrap_or(default_engine_kind())
-}
-
-fn default_engine_kind() -> worker::config::EngineKind {
-    worker::config::EngineKind::CudaNative
+        .cloned()
+        .and_then(|kind| kind.try_into().ok())
+        .unwrap_or(worker::config::EngineKind::Cuda)
 }
 
 fn is_set(file: &toml::Value, key: &str) -> bool {
@@ -673,33 +654,34 @@ mod tests {
 
     fn show_and_list_agree_about_an_unset_key_with_a_default() {
         let file: toml::Value = toml::from_str("[model]\nname = \"a\"\n").unwrap();
-        let field = schema_field(&file, "server.port").unwrap();
-        assert_eq!(field.default, Some(toml::Value::Integer(8080)));
-        assert_eq!(effective(&file, &field), "8080");
+        let field = schema_field(&file, "server.listen").unwrap();
+        assert_eq!(field.default, Some("127.0.0.1:8080".into()));
+        assert_eq!(effective(&file, &field), "127.0.0.1:8080");
     }
 
     fn effective_distinguishes_set_from_default_from_derived_from_required() {
         use worker::config::schema::Field;
-        let file: toml::Value = toml::from_str("[server]\nport = 9090\n").unwrap();
+        let file: toml::Value = toml::from_str("[server]\nlisten = \"0.0.0.0:9090\"\n").unwrap();
         let field = |key: &str, default: Option<toml::Value>, required: bool| Field {
             key: key.to_string(),
             doc: String::new(),
             default,
             required,
+            tuning: false,
         };
         assert_eq!(
             effective(
                 &file,
-                &field("server.port", Some(toml::Value::Integer(8080)), false)
+                &field("server.listen", Some("127.0.0.1:8080".into()), false)
             ),
-            "9090"
+            "0.0.0.0:9090"
         );
         assert_eq!(
             effective(
                 &file,
-                &field("server.host", Some("127.0.0.1".into()), false)
+                &field("server.max_upload", Some("256MiB".into()), false)
             ),
-            "127.0.0.1"
+            "256MiB"
         );
         assert_eq!(
             effective(
@@ -733,7 +715,7 @@ mod tests {
         let original = r#"
 [model]
 name = "default"
-model = "Qwen/Qwen3-0.6B"
+source = "Qwen/Qwen3-0.6B"
 
 [engine]
 type = "vulkan"
@@ -752,11 +734,11 @@ device = ["vulkan:0"]
     fn fixture() -> &'static str {
         r#"
 [server]
-port = 8080
+listen = "127.0.0.1:8080"
 
 [model]
 name = "default"
-model = "Qwen/Qwen3-0.6B"
+source = "Qwen/Qwen3-0.6B"
 
 [engine]
 type = "vulkan"
@@ -791,25 +773,28 @@ device = ["vulkan:0"]
 # Delete a line to get the default back.
 
 [server]
-# The port the engine listens on.
-port = 8080
+# Where the engine listens.
+listen = "127.0.0.1:8080"
 
 [model]
 name = "default"
-model = "Qwen/Qwen3-0.6B"
+source = "Qwen/Qwen3-0.6B"
 
 [engine]
 type = "vulkan"         # trailing note
 device = ["vulkan:0"]
 "#;
-        let (written, _) = typed_by_schema(annotated, "server.port", "9090").unwrap();
+        let (written, _) = typed_by_schema(annotated, "server.listen", "0.0.0.0:9090").unwrap();
         assert!(written.contains("# pie configuration"), "got: {written}");
         assert!(
-            written.contains("# The port the engine listens on."),
+            written.contains("# Where the engine listens."),
             "got: {written}"
         );
         assert!(written.contains("# trailing note"), "got: {written}");
-        assert!(written.contains("port = 9090"), "got: {written}");
-        assert!(!written.contains("port = 8080"), "got: {written}");
+        assert!(
+            written.contains("listen = \"0.0.0.0:9090\""),
+            "got: {written}"
+        );
+        assert!(!written.contains("127.0.0.1:8080"), "got: {written}");
     }
 }

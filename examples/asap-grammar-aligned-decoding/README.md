@@ -68,7 +68,7 @@ guide, expect roughly `rounds ×` a constrained single-pass decode.
 
 ```bash
 cargo build --release --target wasm32-wasip3
-python tests/examples/run_all.py --engine cuda_native --model <model-path>
+python tests/examples/run_all.py --engine cuda --model <model-path>
 ```
 
 The test asserts `monotone`, which is the paper's actual guarantee — a

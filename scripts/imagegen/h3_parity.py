@@ -14,7 +14,7 @@ into an `.npz` under the golden's own key names, and diffs the two with
     # 1. import the miniature it wrote, and point a PRIVATE config at it
     pie model import $PIE_IMAGEGEN_GOLDEN/minimax_h3/h3_mini.safetensors \\
         --deployment minimax-h3-mini-bf16-kv-bf16
-    #    ~/.pie/config.h3-mini.toml with its own [server] port and
+    #    ~/.pie/config.h3-mini.toml with its own [server] listen and
     #    [engine] max_model_len >= packed rows x submit depth
 
     # 2. the case, the run, the pie-side npz, the diff
@@ -256,7 +256,7 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/h3-parity")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/h3-parity"))
     ap.add_argument("--config", default=None,
-                    help="the serving config; its `[model] model` must be the imported miniature")
+                    help="the serving config; its `[model] source` must be the imported miniature")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true",
                     help="pass the case as a scratch file instead of argv pieces")

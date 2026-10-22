@@ -174,7 +174,7 @@ interface types {
         /// None: workers that load no model, holding state only.
         model: option<id>,
         /// An engine kind as workers' configs spell it, such as
-        /// `cuda_native` (a worker's attr `engine`).
+        /// `cuda` (a worker's attr `engine`).
         engine: id,
         workers: u32,
     }

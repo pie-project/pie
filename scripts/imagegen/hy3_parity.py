@@ -14,7 +14,7 @@ the other half: it turns the golden's *inputs* into the case JSON the
     # 1. the case the inferlet reads
     python hy3_parity.py case --out /tmp/hy3-parity
 
-    # 2. run it (give the run its OWN config file and its own [server] port,
+    # 2. run it (give the run its OWN config file and its own [server] listen,
     #    and set [engine] max_model_len >= the sequence)
     python hy3_parity.py run --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.toml
 
@@ -383,7 +383,7 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/hy3-parity")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/hy3-parity"))
     ap.add_argument("--config", default=None,
-                    help="the serving config; its `[model] model` must be the imported miniature")
+                    help="the serving config; its `[model] source` must be the imported miniature")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true",
                     help="pass the case as a scratch file instead of argv pieces")

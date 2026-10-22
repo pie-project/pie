@@ -4,23 +4,23 @@ The policies built into pie (the contract is `crates/policy/wit`). Name one
 in the config:
 
 - the worker plane (when a worker's passes run, where its state sits) in
-  `[runtime] policy`;
+  `[runtime] worker_policy`;
 - the cluster plane (where programs and their state live), run by the
-  controller: in `pie serve`, `[server] policies`; in `pie-controller`'s
-  file, `policies`. A list: several run side by side so long as no
+  controller: in `pie serve`, `[cluster] cluster_policies`; in
+  `pie-controller`'s file, `cluster_policies`. A list: several run side by side so long as no
   two are granted the same write (`cache-aware` places launches while
   `replicate` keeps runs on two workers); `publish` is excepted, for each
   program publishes under its own name.
 
 SIGHUP reloads them from the config file, without a restart:
-`pie-controller` its `policies`, `pie-worker` its `[runtime] policy`, `pie serve`
-both; nothing else in the file is read again. The new set loads whole or
+`pie-controller` its `cluster_policies`, `pie-worker` its `[runtime]
+worker_policy`, `pie serve` both; nothing else in the file is read again. The new set loads whole or
 the running one goes on, and the error is logged. The old programs stop as
 a dead one does: their tables and what they published are withdrawn, and
 the others hear it. The new ones start with no state of their own, a policy
 in both sets too, and read the cluster as it stands; they act on the next
-edge they subscribe to. A gateway that started with no cluster policy takes
-none on a reload.
+edge they subscribe to. A controller that started with no cluster policy
+starts them on a reload.
 
 A policy reads the props a client sends with a launch (as request headers,
 in a compat body, or as `LaunchProcess.props`) and the session it names.

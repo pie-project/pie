@@ -9,10 +9,7 @@ struct Cli {
     global: pie::args::GlobalArgs,
 
     #[arg(long)]
-    host: Option<String>,
-
-    #[arg(long)]
-    port: Option<u16>,
+    listen: Option<std::net::SocketAddr>,
 
     #[arg(long)]
     controller: Option<String>,
@@ -30,11 +27,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     )?;
 
     let mut cfg = worker::Config::parse(ctx.config_str())?;
-    if let Some(host) = cli.host {
-        cfg.server.host = host;
-    }
-    if let Some(port) = cli.port {
-        cfg.server.port = port;
+    if let Some(listen) = cli.listen {
+        cfg.server.listen = listen;
     }
     if let Some(controller) = cli.controller {
         cfg.cluster.controller = Some(controller);
@@ -45,7 +39,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     cfg.validate()?;
 
     let handle = worker::run(cfg, &pie::paths::pie_home()).await?;
-    // SIGHUP swaps the worker policy for the file's `[runtime] policy`;
+    // SIGHUP swaps the worker policy for the file's `[runtime] worker_policy`;
     // nothing else in it is read again, and the worker serves on.
     ctx.on_hangup(|config| async move {
         match worker::Config::parse(&config) {

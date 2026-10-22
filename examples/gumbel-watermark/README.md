@@ -95,7 +95,7 @@ the table as evidence that one spelling is faster.
 
 ```bash
 cargo build --release --target wasm32-wasip3
-python tests/examples/run_all.py --engine cuda_native --model <model-path>
+python tests/examples/run_all.py --engine cuda --model <model-path>
 ```
 
 The smoke test is deliberately structural: at the handful of tokens a smoke

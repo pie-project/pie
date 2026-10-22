@@ -49,7 +49,7 @@ impl cluster::Policy for Route {
         {
             cluster::install_scale(&[Scale {
                 model: None,
-                engine: "cuda_native".to_string(),
+                engine: "cuda".to_string(),
                 workers: u32::try_from(workers.max(0)).unwrap_or(0),
             }]);
         }

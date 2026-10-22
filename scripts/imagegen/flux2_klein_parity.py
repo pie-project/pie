@@ -91,8 +91,8 @@ if a partial group is ever sealed again, this parity is what says so.
 THE CASE CROSSES AS FILES
 -------------------------
 Eight megabytes of f32 is past argv. The sandbox mounts
-`<fs_scratch_dir>/<instance-id>` at `/scratch` when the instance starts, so
-`run` watches the config's `fs_scratch_dir` for the new directory, drops the
+`<scratch_dir>/<instance-id>` at `/scratch` when the instance starts, so
+`run` watches the config's `scratch_dir` for the new directory, drops the
 case there, and the guest (which polls for it) reads on. Answers come back
 through `session::send_file`, which `pie run -o DIR` writes as
 `file-NNNN.bin` in send order; the guest's JSON names them.
@@ -235,9 +235,9 @@ def scratch_base(config: str) -> str:
     sandbox = cfg.get("sandbox", {})
     if not sandbox.get("allow_fs"):
         raise SystemExit(f"{config}: `[sandbox] allow_fs = true` is needed; the case crosses as files")
-    base = sandbox.get("fs_scratch_dir")
+    base = sandbox.get("scratch_dir")
     if not base:
-        raise SystemExit(f"{config}: set `[sandbox] fs_scratch_dir` to a directory of its own")
+        raise SystemExit(f"{config}: set `[sandbox] scratch_dir` to a directory of its own")
     os.makedirs(base, exist_ok=True)
     return base
 
@@ -246,7 +246,7 @@ def run(args) -> None:
     if not os.path.exists(case_path):
         raise SystemExit(f"{case_path}: no case; run `case` first")
     if not args.config:
-        raise SystemExit("`run` needs --config (its `[model] model` is the imported artifact)")
+        raise SystemExit("`run` needs --config (its `[model] source` is the imported artifact)")
     pie = args.pie or shutil.which("pie") or os.path.join(REPO, "target/debug/pie")
     if not os.path.exists(pie):
         raise SystemExit(f"{pie}: no pie binary. Build one with `cargo build -p pie --features cuda`, or pass --pie.")
@@ -479,7 +479,7 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/flux2-klein-parity")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/flux2-klein-parity"))
     ap.add_argument("--config", default=None,
-                    help=f"the serving config; its `[model] model` must be the artifact `{DEFAULT_DEPLOYMENT}` imported")
+                    help=f"the serving config; its `[model] source` must be the artifact `{DEFAULT_DEPLOYMENT}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--wait", type=int, default=600, help="seconds to wait for the instance to start")
     ap.add_argument("--native", action="store_true", help="also run the trajectory over pie's own text rows")

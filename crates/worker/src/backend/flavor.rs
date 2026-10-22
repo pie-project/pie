@@ -36,14 +36,14 @@ impl Flavor {
 
     pub fn from_kind(kind: EngineKind) -> Result<Self, String> {
         match kind {
-            EngineKind::CudaNative => {
+            EngineKind::Cuda => {
                 #[cfg(feature = "engine-cuda")]
                 {
                     Ok(Flavor::Cuda)
                 }
                 #[cfg(not(feature = "engine-cuda"))]
                 {
-                    Err(missing_feature_msg("cuda_native", "cuda"))
+                    Err(missing_feature_msg("cuda", "cuda"))
                 }
             }
             EngineKind::Metal => {
@@ -167,7 +167,7 @@ pub fn compiled_summary() -> String {
 
 pub fn compiled_embedded() -> [(&'static str, bool); 6] {
     [
-        ("cuda_native", cfg!(feature = "engine-cuda")),
+        ("cuda", cfg!(feature = "engine-cuda")),
         (
             "metal",
             cfg!(all(feature = "metal", target_vendor = "apple")),
