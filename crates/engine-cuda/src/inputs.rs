@@ -286,6 +286,10 @@ pub struct Fire<'a> {
     pub tokens: &'a [i32],
     pub positions: &'a [i32],
     pub windows: &'a [i32],
+    /// The shared table `windows` reads, when the fire's windows come from
+    /// one the shell keeps: a fire whose table the store already holds
+    /// stages no window bytes.
+    pub windows_key: Option<&'a std::sync::Arc<[i32]>>,
     pub qo_absolute: &'a [i32],
     pub live: &'a [u32],
     pub slot_ids: &'a [i32],
@@ -379,6 +383,10 @@ pub struct Staged {
     rows: u32,
     lanes: u32,
     windows: usize,
+    windows_key: Option<std::sync::Arc<[i32]>>,
+    /// Whether the slot's host bytes hold the window table: not when the
+    /// store held it as the fire was written.
+    windows_written: bool,
     qo_absolute: Option<usize>,
     live: Option<usize>,
     adapter_rows: Option<u32>,
@@ -508,6 +516,9 @@ pub struct Inputs {
     plans: Vec<Option<Workspace>>,
     plan_values: usize,
     inject_runs: Option<Buffer>,
+    /// The window table the store's window span last received, so a run of
+    /// fires over one table copies it once.
+    resident_windows: Option<std::sync::Arc<[i32]>>,
 }
 
 impl Inputs {
@@ -694,6 +705,7 @@ impl Inputs {
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs: None,
+            resident_windows: None,
             plan_values: grants.len(),
             plans: (0..runs as usize)
                 .flat_map(|run| {
@@ -847,11 +859,17 @@ impl Inputs {
 
         put(self.tokens, bytes_of(fire.tokens), "staged tokens")?;
         put(self.positions, bytes_of(fire.positions), "staged positions")?;
-        put(
-            self.windows,
-            bytes_of(fire.windows),
-            "staged window boundaries",
-        )?;
+        let resident = fire
+            .windows_key
+            .zip(self.resident_windows.as_ref())
+            .is_some_and(|(key, held)| std::sync::Arc::ptr_eq(key, held));
+        if !resident {
+            put(
+                self.windows,
+                bytes_of(fire.windows),
+                "staged window boundaries",
+            )?;
+        }
         let live = if fire.live_rows == 0 {
             rows
         } else {
@@ -1056,6 +1074,8 @@ impl Inputs {
             rows,
             lanes,
             windows: fire.windows.len(),
+            windows_key: fire.windows_key.cloned(),
+            windows_written: !resident,
             qo_absolute,
             live,
             adapter_rows,
@@ -1239,6 +1259,8 @@ impl Inputs {
             rows,
             lanes,
             windows,
+            windows_key,
+            windows_written,
             qo_absolute,
             live,
             adapter_rows,
@@ -1254,6 +1276,31 @@ impl Inputs {
         let (rows, lanes) = (*rows, *lanes);
         let packed = *packed;
         let space_lanes = *space_lanes;
+        // The store's window span holds this fire's table when the last fire
+        // copied there staged the same one: nothing to copy. Otherwise the
+        // slot's host bytes take the table if writing it was skipped, and
+        // the store holds it from here on.
+        let resident = windows_key
+            .as_ref()
+            .zip(self.resident_windows.as_ref())
+            .is_some_and(|(key, held)| std::sync::Arc::ptr_eq(key, held));
+        let windows = if resident {
+            0
+        } else {
+            if !*windows_written {
+                let table = windows_key.as_ref().map_or(&[][..], |key| &key[..]);
+                let at = usize::try_from(self.windows).unwrap_or(usize::MAX);
+                if !self.staging[slot.at() as usize].write(at, bytes_of(table)) {
+                    return Err(crate::error::Fault::Ceiling {
+                        what: "staged window boundaries",
+                        need: self.windows + table.len() as u64 * 4,
+                        have: self.stage_bytes,
+                    });
+                }
+            }
+            self.resident_windows.clone_from(windows_key);
+            *windows
+        };
         let base = self.store.ptr();
         let (at_tokens, at_positions, at_windows) = (self.tokens, self.positions, self.windows);
         let at_qo_absolute = self.qo_absolute;

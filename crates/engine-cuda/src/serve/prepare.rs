@@ -21,7 +21,7 @@ pub(super) struct WindowsMemo {
     bucket: u32,
     copies: bool,
     windows: Windows,
-    packed: Vec<i32>,
+    packed: std::sync::Arc<[i32]>,
 }
 
 impl FrameShell for Shell {
@@ -1383,10 +1383,12 @@ impl FrameShell for Shell {
                 && memo.tables[1] == *class_tables[1]
                 && memo.tables[2] == *class_tables[2]
         });
-        let (mut windows, boundaries) = match held {
+        // `shared`: the table is the memo's, which a later fire over the same
+        // windows shares, so the store copies it once for the run.
+        let (mut windows, boundaries, shared) = match held {
             Some(at) => {
                 let memo = &self.windows_memo[at];
-                (memo.windows.clone(), memo.packed.clone())
+                (memo.windows.clone(), memo.packed.clone(), true)
             }
             None => {
                 let windows = Windows::of(
@@ -1401,7 +1403,7 @@ impl FrameShell for Shell {
                     },
                     self.inputs.window_slots(),
                 )?;
-                let packed = windows.packed();
+                let packed: std::sync::Arc<[i32]> = windows.packed().into();
                 if windows.copied() == 0 {
                     if self.windows_memo.len() >= WINDOWS_MEMO {
                         self.windows_memo.remove(0);
@@ -1418,8 +1420,10 @@ impl FrameShell for Shell {
                         windows: windows.clone(),
                         packed: packed.clone(),
                     });
+                    (windows, packed, true)
+                } else {
+                    (windows, packed, false)
                 }
-                (windows, packed)
             }
         };
         if !arming {
@@ -1547,6 +1551,7 @@ impl FrameShell for Shell {
                 tokens: &tokens,
                 positions: &positions,
                 windows: &boundaries,
+                windows_key: shared.then_some(&boundaries),
                 readout_rows: &readout_rows,
                 readout_live,
                 qo_absolute: &qo_absolute,
