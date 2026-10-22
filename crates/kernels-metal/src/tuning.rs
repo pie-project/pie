@@ -311,6 +311,7 @@ pub struct Tuning {
     profile: Profile,
     wide_range: bool,
     cores: Option<u32>,
+    coop_inputs: bool,
 }
 
 impl Tuning {
@@ -323,7 +324,21 @@ impl Tuning {
             profile,
             wide_range,
             cores,
+            coop_inputs: false,
         }
+    }
+
+    /// Whether the system compiles the register-fed tile's cooperative
+    /// inputs (the 26.2 tensor ops), which its one-launch forms need.
+    #[must_use]
+    pub fn with_coop_inputs(mut self, on: bool) -> Tuning {
+        self.coop_inputs = on;
+        self
+    }
+
+    #[must_use]
+    pub fn coop_inputs(&self) -> bool {
+        self.coop_inputs
     }
 
     #[must_use]

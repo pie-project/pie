@@ -282,6 +282,7 @@ pub fn tell_untuned(device: &str, report: &Report) {
 #[must_use]
 pub fn tuning(overrides: &str, wide_range: bool) -> kernels_metal::Tuning {
     kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range, Some(16))
+        .with_coop_inputs(crate::device::ctx::coop_inputs())
 }
 
 #[cfg(test)]

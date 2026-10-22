@@ -362,7 +362,8 @@ impl Shell {
         let (chip, chip_report) =
             crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
-        let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range, device.cores());
+        let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range, device.cores())
+            .with_coop_inputs(crate::device::ctx::coop_inputs());
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
@@ -1818,6 +1819,9 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        if let Some(keepalive) = &self.keepalive {
+            keepalive.end();
+        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(
@@ -4398,6 +4402,7 @@ impl engine::frame::Shell for Shell {
     {
         if let Some(keepalive) = &self.keepalive {
             keepalive.touch();
+            keepalive.begin();
         }
         fire_trace(|| "encode-begin".to_string());
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {

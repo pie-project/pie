@@ -914,6 +914,24 @@ pub(crate) fn compile_options() -> Retained<objc2_metal::MTLCompileOptions> {
     options
 }
 
+/// Whether the OS compiles the 26.2 tensor ops' cooperative inputs.
+#[must_use]
+pub fn coop_inputs() -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo};
+        NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
+            majorVersion: 26,
+            minorVersion: 2,
+            patchVersion: 0,
+        })
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
