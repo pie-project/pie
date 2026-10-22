@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 use client_api::{ClientMessage, Props};
 use controller_api::{Health, Role, RoutableWorker, RoutingTable, ScaleEntry};
-use ids::{ReqId, WorkerId};
+use ids::{GatewayId, ReqId, WorkerId};
 use tokio::sync::{Notify, mpsc, watch};
 use worker_api::Request;
 
@@ -144,9 +144,15 @@ impl Cluster {
     /// Starts the cluster policies `programs` names, (name, component), on
     /// one thread: each call goes to every one, and each writes what its
     /// manifest grants it, which no other may.
+    ///
+    /// `me` is this gateway's id once registered: while the routing table
+    /// names it the author, it enacts the cluster-wide tables (replication,
+    /// retention; scale goes by the heartbeat loop). Otherwise its programs
+    /// run all the same and their tables are taken, but not enacted.
     pub fn start(
         programs: Vec<(String, Vec<u8>)>,
         routing: watch::Receiver<RoutingTable>,
+        me: watch::Receiver<Option<GatewayId>>,
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
         fleet: crate::worker::WorkerRegistry,
     ) -> Result<Started, LoadError> {
@@ -174,7 +180,7 @@ impl Cluster {
         let manifests = program::spawn(programs, capability, "pie-cluster-policy", {
             let (shared, dead) = (shared.clone(), dead.clone());
             let (fleet, handle) = (fleet.clone(), tokio::runtime::Handle::current());
-            move |programs| run(programs, rx, shared, routing, dead, fleet, handle)
+            move |programs| run(programs, rx, shared, routing, me, dead, fleet, handle)
         })?;
         let gate_ms = gate_of(manifests.iter());
 
@@ -468,11 +474,13 @@ impl Drop for Waiting<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut programs: Vec<Program>,
     events: Receiver<Event>,
     shared: Arc<Shared>,
     routing: watch::Receiver<RoutingTable>,
+    me: watch::Receiver<Option<GatewayId>>,
     dead: Arc<AtomicBool>,
     fleet: crate::worker::WorkerRegistry,
     handle: tokio::runtime::Handle,
@@ -618,7 +626,8 @@ fn run(
             continue;
         }
         // A replication or retention table stands until replaced: what it
-        // asks for and is not yet so is asked for again.
+        // asks for and is not yet so is asked for again, by the author.
+        registry.author = crate::controller::authors(&routing.borrow(), *me.borrow());
         if registry.ticked || registry.replaced {
             registry.ticked = false;
             registry.replaced = false;
@@ -716,27 +725,7 @@ fn replicate(
         .asked
         .retain(|_, at| now.duration_since(*at) < REPLICATE_RETRY);
     let directory = fleet.directory();
-    let mut wanted: Vec<(String, WorkerId, &str)> = Vec::new();
-    for entry in &registry.replication {
-        let Some(group) = registry.groups.get(&entry.group) else {
-            continue;
-        };
-        for site in &entry.at {
-            let Ok(target) = site.worker.parse::<u64>().map(WorkerId) else {
-                continue;
-            };
-            if !group.sites.contains(&target) {
-                wanted.push((entry.group.clone(), target, "replication"));
-            }
-        }
-    }
-    wanted.extend(
-        registry
-            .retained()
-            .into_iter()
-            .map(|(group, pool)| (group, pool, "retention")),
-    );
-    for (group_id, target, table) in wanted {
+    for (group_id, target, table) in registry.wanted() {
         let Some(group) = registry.groups.get(&group_id) else {
             continue;
         };
@@ -959,6 +948,9 @@ struct Registry {
     /// A replication or retention table was replaced since `replicate`
     /// last ran.
     replaced: bool,
+    /// This gateway is the author the routing table names, as of this
+    /// round: only then are the replication and retention tables enacted.
+    author: bool,
     /// What each worker's policy published about it, by name.
     published: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Workers draining, as of the routing table last heard.
@@ -1193,6 +1185,34 @@ impl Registry {
                 "retention table taken; no pool is known to keep a copy in, so none is kept"
             );
         }
+    }
+
+    /// The copies to ask for, (group, worker, the table that wants it): none
+    /// unless this gateway is the author, whose tables alone are enacted.
+    fn wanted(&self) -> Vec<(String, WorkerId, &'static str)> {
+        if !self.author {
+            return Vec::new();
+        }
+        let mut wanted = Vec::new();
+        for entry in &self.replication {
+            let Some(group) = self.groups.get(&entry.group) else {
+                continue;
+            };
+            for site in &entry.at {
+                let Ok(target) = site.worker.parse::<u64>().map(WorkerId) else {
+                    continue;
+                };
+                if !group.sites.contains(&target) {
+                    wanted.push((entry.group.clone(), target, "replication"));
+                }
+            }
+        }
+        wanted.extend(
+            self.retained()
+                .into_iter()
+                .map(|(group, pool)| (group, pool, "retention")),
+        );
+        wanted
     }
 
     /// For each group the directory shows, retained above key 0 and held by
@@ -1597,6 +1617,7 @@ mod tests {
         RoutingTable {
             epoch: 1,
             scales: false,
+            author: None,
             workers: vec![RoutableWorker {
                 id: WorkerId(1),
                 addr: "w1".into(),
@@ -1830,6 +1851,7 @@ mod tests {
         let (router, cancelled, _moves) = Cluster::start(
             programs(names),
             table_rx,
+            watch::channel(None).1,
             connected_rx,
             crate::worker::WorkerRegistry::new(),
         )
@@ -2036,6 +2058,7 @@ mod tests {
             Cluster::start(
                 programs(&["cache-aware", "disaggregate"]),
                 table_rx,
+                watch::channel(None).1,
                 connected_rx,
                 crate::worker::WorkerRegistry::new(),
             )
@@ -2051,6 +2074,7 @@ mod tests {
         let started = Cluster::start(
             programs(&["test-route", "cache-aware"]),
             table_rx,
+            watch::channel(None).1,
             connected_rx,
             crate::worker::WorkerRegistry::new(),
         );
@@ -2336,6 +2360,61 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_that_is_not_the_author_takes_its_state_tables_and_does_not_enact_them() {
+        let shared = shared();
+        let mut registry = Registry {
+            groups: HashMap::from([("g".to_string(), group(&[1]))]),
+            pools: vec!["9".into()],
+            ..Default::default()
+        };
+        let commit = Commit {
+            state: super::super::StateCommit {
+                replication: Some(vec![wit::Replicate {
+                    group: "g".into(),
+                    upto: None,
+                    at: vec![wit::Site {
+                        worker: "2".into(),
+                        tier: wit::Tier::Host,
+                    }],
+                }]),
+                retention: Some(retention(&[("g", 4)])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enact(&shared, &mut registry, commit, "keeper");
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            matches!(
+                plane.attr(&Subject::Group("g".into()), "retention/key"),
+                Some(Value::Int(4))
+            ),
+            "taken: the programs read it"
+        );
+        assert!(
+            registry.wanted().is_empty(),
+            "not the author: nothing asked"
+        );
+        registry.author = true;
+        assert_eq!(
+            registry.wanted(),
+            [
+                ("g".to_string(), WorkerId(2), "replication"),
+                ("g".to_string(), WorkerId(9), "retention")
+            ],
+            "the author asks for what both tables want"
+        );
+
+        // The author is the gateway the routing table names.
+        let mut routing = table(0);
+        assert!(!crate::controller::authors(&routing, Some(GatewayId(1))));
+        routing.author = Some(GatewayId(1));
+        assert!(crate::controller::authors(&routing, Some(GatewayId(1))));
+        assert!(!crate::controller::authors(&routing, Some(GatewayId(2))));
+        assert!(!crate::controller::authors(&routing, None));
+    }
+
+    #[test]
     fn a_group_only_a_pool_holds_is_listed_with_the_pool_its_site_and_not_asked_again() {
         let directory = crate::directory::Directory::default();
         let run = vec![[1; 32], [2; 32]];
@@ -2465,6 +2544,7 @@ mod tests {
             Cluster::start(
                 vec![("one".into(), share.clone()), ("two".into(), share)],
                 table_rx,
+                watch::channel(None).1,
                 connected_rx,
                 crate::worker::WorkerRegistry::new(),
             )
