@@ -119,7 +119,7 @@ impl Run<'_> {
                 && self.tensor(*y).width == 4096
             {
                 let planes = self.hold_e4m3(*y)?;
-                if kernels_cuda::elemwise::hc::rmsnorm_emit(
+                if kernels_cuda::linear::act_quant::rmsnorm_act_quant_e4m3(
                     self.ctx(),
                     self.tensor(*x),
                     self.tensor(*weight),

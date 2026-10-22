@@ -4,7 +4,8 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/hc.cuh";
+const HC: &str = "elemwise/hc.cu";
+const HC_PROJECT: &str = "elemwise/hc_project.cu";
 
 const BLOCK: u32 = 256;
 
@@ -58,7 +59,7 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
     );
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_expand<{t}>")))
+        Fire::at(HC, symbol(&format!("::pie::elemwise::hc_expand<{t}>")))
             .apply(elementwise_in(OP, x.rows, x.width)?),
         &[
             x.arg(),
@@ -95,7 +96,7 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::per_row(y.rows, block)),
+        Fire::at(HC, entry).apply(Launch::per_row(y.rows, block)),
         &[
             streams.arg(),
             y.arg(),
@@ -177,7 +178,7 @@ pub fn project(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::hc_project<256>")
+        Fire::at(HC_PROJECT, "::pie::elemwise::hc_project<256>")
             .apply(Launch::grid([rows * mix_hc, 1, 1], [BLOCK, 1, 1])),
         &[
             normed.arg(),
@@ -258,7 +259,7 @@ pub fn gates(
         };
         return ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&entry)).apply(Launch::grid([x.rows, grid_y, 1], [BLOCK, 1, 1])),
+            Fire::at(HC, symbol(&entry)).apply(Launch::grid([x.rows, grid_y, 1], [BLOCK, 1, 1])),
             &[
                 normed.arg(),
                 scale.arg(),
@@ -278,11 +279,8 @@ pub fn gates(
     }
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::elemwise::hc_gates<{t}, 256>")),
-        )
-        .apply(Launch::per_row(x.rows, BLOCK)),
+        Fire::at(HC, symbol(&format!("::pie::elemwise::hc_gates<{t}, 256>")))
+            .apply(Launch::per_row(x.rows, BLOCK)),
         &[
             normed.arg(),
             scale.arg(),
@@ -363,7 +361,7 @@ fn gates_norm_launch(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            HC,
             symbol(&format!(
                 "::pie::elemwise::hc_gates_norm<{t}, {}, {}, {threads}, {}>",
                 y.width / BLOCK,
@@ -466,11 +464,8 @@ pub fn fold(
     {
         return ctx.fire(
             OP,
-            Fire::at(
-                FILE,
-                symbol(&format!("::pie::elemwise::hc_fold_rows4<{t}>")),
-            )
-            .apply(Launch::per_row(y.rows, 128)),
+            Fire::at(HC, symbol(&format!("::pie::elemwise::hc_fold_rows4<{t}>")))
+                .apply(Launch::per_row(y.rows, 128)),
             &[
                 x.arg(),
                 streams.arg(),
@@ -494,7 +489,7 @@ pub fn fold(
     // The vec8 fold waits on its producer in-kernel (`kernel.pdl`).
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry))
+        Fire::at(HC, symbol(&entry))
             .apply(elementwise_in(OP, y.rows, width)?.programmatic(ctx.tuning().pdl && vec8)),
         &[
             x.arg(),
@@ -545,7 +540,7 @@ pub fn collapse(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            HC,
             symbol(&format!("::pie::elemwise::hc_head_postprocess<{t}, 256>")),
         )
         .apply(Launch::per_row(y.rows, BLOCK)),
@@ -611,7 +606,7 @@ pub fn mix(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry)).apply(launch),
+        Fire::at(HC, symbol(&entry)).apply(launch),
         &[
             gates.arg(),
             normed.arg(),
@@ -660,7 +655,7 @@ pub fn inject(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry)).apply(launch),
+        Fire::at(HC, symbol(&entry)).apply(launch),
         &[
             o.arg(),
             gates.arg(),
@@ -704,11 +699,8 @@ pub fn ple_gate(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::elemwise::ple_gate<{t}, 256>")),
-        )
-        .apply(Launch::per_row(blocks, BLOCK)),
+        Fire::at(HC, symbol(&format!("::pie::elemwise::ple_gate<{t}, 256>")))
+            .apply(Launch::per_row(blocks, BLOCK)),
         &[
             key.arg(),
             query.arg(),
@@ -824,7 +816,7 @@ fn prenorm_launch(
     );
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&entry)).apply(
+        Fire::at(HC_PROJECT, symbol(&entry)).apply(
             Launch {
                 smem,
                 ..Launch::grid([row_blocks, slices, 1], [threads, 1, 1])
@@ -871,7 +863,7 @@ fn prenorm_launch_mma(
         ctx.scratch_shared(op, "elementwise.hc_fn_split", (48 * fan) as usize * 2)? as usize as u64;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::elemwise::hc_fn_split").apply(Launch::grid(
+        Fire::at(HC_PROJECT, "::pie::elemwise::hc_fn_split").apply(Launch::grid(
             [(24 * fan).div_ceil(4 * 256), 1, 1],
             [256, 1, 1],
         )),
@@ -903,7 +895,7 @@ fn prenorm_launch_mma(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            HC_PROJECT,
             symbol(&format!(
                 "::pie::elemwise::hc_prenorm_project_mma_t<{STAGES}, {TILES}>"
             )),
@@ -950,10 +942,10 @@ pub fn prenorm_project(
         // A few slices over many rows (the tensor-core form's) fold a
         // thread a row; a decode's many slices a warp a mix.
         let fold = if ctx.tuning().hc_mma && landed.slices <= 8 && rows >= 1024 {
-            Fire::at(FILE, "::pie::elemwise::hc_prenorm_project_fold_rows")
+            Fire::at(HC_PROJECT, "::pie::elemwise::hc_prenorm_project_fold_rows")
                 .apply(Launch::grid([rows.div_ceil(256), 1, 1], [256, 1, 1]))
         } else {
-            Fire::at(FILE, "::pie::elemwise::hc_prenorm_project_fold").apply(Launch::grid(
+            Fire::at(HC_PROJECT, "::pie::elemwise::hc_prenorm_project_fold").apply(Launch::grid(
                 [(rows * mix_hc).div_ceil(8), 1, 1],
                 [BLOCK, 1, 1],
             ))
@@ -1092,7 +1084,7 @@ fn project_sliced(
     };
     let fire = if tile {
         Fire::at(
-            FILE,
+            HC_PROJECT,
             symbol(&format!(
                 "::pie::elemwise::hc_project_tile<{br}, {kg}, {kt}, {stages}>"
             )),
@@ -1103,7 +1095,7 @@ fn project_sliced(
         })
     } else {
         Fire::at(
-            FILE,
+            HC_PROJECT,
             symbol(&format!(
                 "::pie::elemwise::hc_project_split<{PROJECT_ROWS}, {PROJECT_COLS}>"
             )),
@@ -1129,7 +1121,7 @@ fn project_sliced(
     }
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::elemwise::hc_project_fold")
+        Fire::at(HC_PROJECT, "::pie::elemwise::hc_project_fold")
             .apply(Launch::flat(rows * mix_hc, BLOCK)),
         &[
             crate::jit::ArgValue::Ptr(out),
@@ -1140,45 +1132,4 @@ fn project_sliced(
             ctx.stage(),
         ],
     )
-}
-
-/// A prefill's RMS norm of a 4096-wide row landing, beside the bf16 row, its
-/// e4m3 1x128 operand in `planes` (`[codes, atoms]`, act_quant's layout) for
-/// the GEMM that reads it next (`rmsnorm_emit_e4m3`). `Ok(false)` where the
-/// row is not that shape: the caller norms as before.
-pub fn rmsnorm_emit(
-    ctx: &Ctx,
-    x: Tensor,
-    weight: Tensor,
-    eps: f32,
-    y: &mut Tensor,
-    planes: [u64; 2],
-) -> Result<bool, Error> {
-    const OP: &str = "elementwise.rmsnorm_emit";
-    if x.dtype != Dtype::Bf16
-        || y.dtype != Dtype::Bf16
-        || weight.dtype != Dtype::Bf16
-        || x.width != 4096
-        || y.width != 4096
-        || weight.rows * weight.width != 4096
-        || ![x.ptr, y.ptr, weight.ptr].iter().all(|at| at % 16 == 0)
-    {
-        return Ok(false);
-    }
-    ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::elemwise::rmsnorm_emit_e4m3<::pie::bf16>")
-            .apply(Launch::per_row(y.rows, 256)),
-        &[
-            x.arg(),
-            weight.arg(),
-            y.arg(),
-            stated(OP, y.width)?.arg(),
-            eps.arg(),
-            crate::jit::ArgValue::Ptr(planes[0]),
-            crate::jit::ArgValue::Ptr(planes[1]),
-            ctx.stage(),
-        ],
-    )?;
-    Ok(true)
 }
