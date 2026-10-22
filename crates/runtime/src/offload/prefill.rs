@@ -652,7 +652,7 @@ fn keyed_pages(stores: &Stores, tokens: &[u32]) -> (Vec<Vec<Option<Hash256>>>, V
 
 /// How long an executor holds pages for an asker that never releases them
 /// (it died, or its link did).
-const LEASE_TTL: Duration = Duration::from_secs(60);
+pub(super) const LEASE_TTL: Duration = Duration::from_secs(60);
 
 struct Lease {
     kv: Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
@@ -675,7 +675,7 @@ pub fn release(lease: u64) {
 }
 
 /// Gives back what askers held past [`LEASE_TTL`].
-fn expire_leases() {
+pub(super) fn expire_leases() {
     let stale: Vec<Lease> = {
         let mut leases = LEASES.lock().unwrap();
         let old: Vec<u64> = leases
@@ -729,6 +729,7 @@ pub async fn serve(
     home: Option<String>,
     delivery: Delivery,
 ) -> Result<RemotePages> {
+    super::sweep_idle();
     expire_leases();
     let stores = crate::store::registry::try_get(0, 0)
         .ok_or_else(|| anyhow!("no engine serves a model here"))?;
@@ -979,6 +980,7 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
         false,
         Some(tx),
         crate::policy::Arrival::default(),
+        Vec::new(),
     )?;
     rx.await
         .map_err(|_| anyhow!("the prefill program went away"))?

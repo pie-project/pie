@@ -1,6 +1,5 @@
 #![cfg(feature = "device")]
 
-use engine::frame::{Demand, Supply};
 use engine_cuda::store::{Pools, kv};
 use poem::{Dtype, Platform};
 use poem_exec::store::kv::Paging;
@@ -67,8 +66,8 @@ fn an_exported_kv_stays_mapped() {
         assert_eq!(region.domain, engine::MemoryDomain::CudaDevice(0));
     }
 
-    // The last page of every plane holds what is put there, before and after
-    // an idle trim that would release an unexported pool's tail.
+    // The last page of every plane holds what is put there: every declared
+    // page is backed.
     let last = |region: &engine::KvRegion| region.base + (pages - 1) * region.page_stride;
     for (at, region) in exported.regions.iter().enumerate() {
         let pattern = vec![at as u8 + 1; region.page_stride as usize];
@@ -79,7 +78,6 @@ fn an_exported_kv_stays_mapped() {
             cudaMemcpyHostToDevice,
         );
     }
-    pools.trim(Demand::ZERO);
     for (at, region) in exported.regions.iter().enumerate() {
         let mut read = vec![0u8; region.page_stride as usize];
         copy(
@@ -90,7 +88,7 @@ fn an_exported_kv_stays_mapped() {
         );
         assert!(
             read.iter().all(|&byte| byte == at as u8 + 1),
-            "plane {at}'s last page survives the trim"
+            "plane {at}'s last page holds what was put there"
         );
     }
 }

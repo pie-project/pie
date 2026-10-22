@@ -3,6 +3,8 @@
 # `scale-engine` (and `scale-model`, none for workers that load no model)
 # props name. The last ask of a shape stands; a shape never asked for
 # keeps what it has. The controller's actuator converges (`cluster.scale`).
+# The asks live in the program: a gateway restart forgets them, and every
+# shape then keeps what it has until asked again.
 plane = "cluster"
 subscribe = ["arrived"]
 grants = ["scale"]
@@ -10,7 +12,7 @@ uses = ["cluster.scale"]
 
 [props.scale-workers]
 type = "int"
-doc = "How many workers of the shape the cluster should run."
+doc = "How many workers of the shape the cluster should run; a negative count asks for 0."
 
 [props.scale-engine]
 type = "text"

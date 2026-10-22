@@ -20,7 +20,7 @@ pub use settle::{Done, Settled};
 
 use engine::fire::LayerScores;
 use engine::frame::{
-    Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell, Supply,
+    Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell,
 };
 use poem_compiler::{Budget, Budgets, CompiledModel};
 use poem_exec::fire::{Composition, FireDescriptor};
@@ -591,10 +591,6 @@ impl Shell {
     pub fn fire_program(&mut self, instance_id: u64) -> Result<Fired> {
         self.reap_guests()?;
         self.programs.fire(&self.device, instance_id)
-    }
-
-    pub fn trim(&mut self, hint: engine::frame::Demand) {
-        Supply::trim(&mut self.pools, hint);
     }
 
     fn keyable_units(compiled: &CompiledModel) -> bool {

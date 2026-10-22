@@ -21,7 +21,7 @@ use crate::store::kv::page_table::HostKvSlotId;
 use crate::store::registry::{Stores, with_kv_lock};
 
 /// A run no fetch took is let go after this.
-const UNTAKEN_TTL: Duration = Duration::from_secs(60);
+pub(super) const UNTAKEN_TTL: Duration = Duration::from_secs(60);
 
 /// A run being computed here for an asker.
 struct Run {
@@ -103,17 +103,10 @@ pub(crate) async fn expect(keys: &[Hash256], from: usize) -> Option<u64> {
         slots: Vec::new(),
         body: Body::Parts { groups, parts },
     };
+    super::sweep_idle();
+    expire_untaken();
     let mut streams = STREAMS.lock().unwrap();
     let now = Instant::now();
-    let stale: Vec<u64> = streams
-        .runs
-        .iter()
-        .filter(|(_, run)| run.stream.is_some() && now - run.since > UNTAKEN_TTL)
-        .map(|(&id, _)| id)
-        .collect();
-    for id in stale {
-        streams.runs.remove(&id);
-    }
     streams.next += 1;
     let id = streams.next;
     streams.runs.insert(
@@ -130,6 +123,15 @@ pub(crate) async fn expect(keys: &[Hash256], from: usize) -> Option<u64> {
         },
     );
     Some(id)
+}
+
+/// Lets go the runs no fetch took within [`UNTAKEN_TTL`].
+pub(super) fn expire_untaken() {
+    let mut streams = STREAMS.lock().unwrap();
+    let now = Instant::now();
+    streams
+        .runs
+        .retain(|_, run| run.stream.is_none() || now - run.since <= UNTAKEN_TTL);
 }
 
 /// The stream of the run a fetch for `keys` from page `from` asks for: the

@@ -544,8 +544,8 @@ impl Session {
                 tenant: self.tenant.clone(),
                 session,
                 props,
-                executors,
             },
+            executors,
         ) {
             Ok(process_id) => {
                 if capture_outputs {

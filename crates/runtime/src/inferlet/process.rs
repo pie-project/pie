@@ -408,6 +408,10 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     crate::policy::report(crate::policy::Event::Started(ctx.id()));
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one spawn request, as its callers have it"
+)]
 pub fn spawn(
     username: String,
     program_name: ProgramName,
@@ -416,6 +420,7 @@ pub fn spawn(
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
     arrival: Arrival,
+    executors: Vec<String>,
 ) -> Result<ProcessId> {
     spawn_inner(
         username,
@@ -427,6 +432,7 @@ pub fn spawn(
         None,
         None,
         arrival,
+        executors,
     )
 }
 
@@ -444,8 +450,12 @@ fn spawn_inner(
     inherit_seq: Option<u64>,
     inherit_client_pid: Option<ProcessId>,
     arrival: Arrival,
+    executors: Vec<String>,
 ) -> Result<ProcessId> {
     let id = Uuid::new_v4();
+    // The workers the cluster names to run its passes, best first: the
+    // offload's alone, before the process can run one.
+    crate::offload::executors::set(id, executors.clone());
     crate::policy::schedule::alias(id, inherit_client_pid.unwrap_or(id));
     if let Some(planner) = crate::planner::planner() {
         match inherit_seq {
@@ -463,11 +473,13 @@ fn spawn_inner(
         capture_outputs,
         result_tx,
         arrival,
+        executors,
     );
     if let Err(error) = SERVICES.spawn(id, || process) {
         if let Some(planner) = crate::planner::planner() {
             planner.unregister(id);
         }
+        crate::offload::executors::forget(id);
         return Err(error);
     }
 
@@ -614,6 +626,8 @@ struct Process {
     output_buffer: VecDeque<ProcessEvent>,
     result_tx: SharedResultTx,
     arrival: Arrival,
+    /// Kept for a restart: the new process runs its passes where this one did.
+    executors: Vec<String>,
 }
 
 impl Process {
@@ -631,6 +645,7 @@ impl Process {
         capture_outputs: bool,
         result_tx: SharedResultTx,
         arrival: Arrival,
+        executors: Vec<String>,
     ) -> Self {
         let task = Self::run(
             process_id,
@@ -656,6 +671,7 @@ impl Process {
             output_buffer: VecDeque::new(),
             result_tx,
             arrival,
+            executors,
         }
     }
 
@@ -697,12 +713,11 @@ impl Process {
         input: String,
         capture_outputs: bool,
         result_tx: SharedResultTx,
-        mut arrival: Arrival,
+        arrival: Arrival,
     ) {
         // A process arrives, as a policy sees it, before it waits: every gate
-        // below orders by its key. Its executors are the offload's alone.
+        // below orders by its key.
         let props = arrival.props.clone();
-        crate::offload::executors::set(process_id, std::mem::take(&mut arrival.executors));
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
@@ -817,6 +832,7 @@ impl Process {
             seq,
             Some(self.client_pid),
             self.arrival.clone(),
+            self.executors.clone(),
         );
         match spawned {
             Ok(new_id) => {
@@ -1018,6 +1034,7 @@ mod tests {
             output_buffer: VecDeque::new(),
             result_tx,
             arrival: Arrival::default(),
+            executors: Vec::new(),
         }
     }
 

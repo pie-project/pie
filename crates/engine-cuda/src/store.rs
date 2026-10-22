@@ -1538,7 +1538,7 @@ impl Pools {
     }
 
     /// Backs every page and slot the pools declare, at load, and keeps them
-    /// so (trim spares them): backing a page as a fire first touches it takes
+    /// so: backing a page as a fire first touches it takes
     /// the driver's lock, which a dying process on the host holds for
     /// seconds, and a worker taking a dead peer's turns needs new pages then
     /// above all.
@@ -2350,33 +2350,6 @@ impl Pools {
         }
         Ok(outcome)
     }
-
-    fn release_to(&mut self, kv_pages: u32, state_slots: u32) {
-        let page_size = self.paging.page_size;
-        let windowed = narrow_pages(self.paging.window_pages());
-        let Pools {
-            pool,
-            rows,
-            shapes,
-            pooled,
-            ..
-        } = self;
-        for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
-            for (at, arena) in planes.iter_mut().enumerate() {
-                let bytes = watermark_bytes(shape, at, kv_pages, windowed, state_slots, page_size);
-                arena.release_tail(pool, bytes);
-            }
-        }
-        for row in pooled.iter_mut() {
-            let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
-            for arena in row.planes.iter_mut() {
-                arena.release_tail(pool, bytes);
-            }
-        }
-        self.committed_kv_pages = kv_pages;
-        self.committed_state_slots = state_slots;
-        self.backed_pages.clear();
-    }
 }
 
 const POOL_STATE: Dtype = Dtype::Bf16;
@@ -2579,51 +2552,6 @@ impl engine::frame::Supply for Pools {
             Commit::Committed => Ok(()),
             refusal => Err(refuse(&self.pool, refusal)),
         }
-    }
-
-    fn trim(&mut self, hint: engine::frame::Demand) {
-        if self.whole {
-            return;
-        }
-        let idle = self
-            .airborne
-            .as_ref()
-            .is_none_or(|counts| counts.count() == 0);
-        if !idle {
-            return;
-        }
-        if u64::from(hint.kv_pages) >= u64::from(self.committed_kv_pages)
-            && hint.state_slots >= self.committed_state_slots
-        {
-            return;
-        }
-        if !self.trim_is_worth_the_unmap(hint) {
-            return;
-        }
-        self.release_to(
-            hint.kv_pages.min(self.committed_kv_pages),
-            hint.state_slots.min(self.committed_state_slots),
-        );
-    }
-}
-
-const TRIM_HYSTERESIS_SHIFT: u32 = 3;
-
-impl Pools {
-    fn trim_is_worth_the_unmap(&self, hint: engine::frame::Demand) -> bool {
-        let budget = self.pool.budget_pages();
-        let free = budget.saturating_sub(self.pool.committed_pages());
-        if free <= budget >> TRIM_HYSTERESIS_SHIFT {
-            return true;
-        }
-        let kv_drop = u64::from(self.committed_kv_pages)
-            .saturating_sub(u64::from(hint.kv_pages.min(self.committed_kv_pages)));
-        let state_drop = u64::from(
-            self.committed_state_slots
-                .saturating_sub(hint.state_slots.min(self.committed_state_slots)),
-        );
-        kv_drop > u64::from(self.committed_kv_pages) >> TRIM_HYSTERESIS_SHIFT
-            || state_drop > u64::from(self.committed_state_slots) >> TRIM_HYSTERESIS_SHIFT
     }
 }
 

@@ -11,6 +11,10 @@ doc = "The process's key; below 1 holds it. Absent is 1."
 type = "text"
 doc = "The worker to send it to."
 
+[props.executors]
+type = "text"
+doc = "The workers its passes run on, comma-separated, best first."
+
 [props.refuse]
 type = "text"
 doc = "Terminate it while it waits, for this reason."

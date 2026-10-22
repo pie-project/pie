@@ -31,6 +31,24 @@ pub fn home_kv_handle() -> Option<engine::KvHandle> {
 }
 
 /// Below this many uncached tokens a pass is not worth sending away.
+/// Starts, once, the sweep that gives back what askers left past their
+/// TTLs, pages held for one that never released them and runs no fetch
+/// took, so an executor that serves nothing more still lets them go.
+fn sweep_idle() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let every = prefill::LEASE_TTL.min(stream::UNTAKEN_TTL) / 2;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                prefill::expire_leases();
+                stream::expire_untaken();
+            }
+        });
+    });
+}
+
 pub(crate) fn prefill_min_suffix_tokens() -> usize {
     PREFILL_MIN_SUFFIX_TOKENS.load(Ordering::Acquire)
 }

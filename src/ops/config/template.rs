@@ -51,7 +51,8 @@ telemetry = false
 # worker_threads  = 16        # derived from visible CPUs, capped at 64
 # max_upload      = "256MiB"
 # policies        = []        # cluster policies: built-in names or .wasm paths,
-#                             # no two granted the same write
+#                             # no two granted the same write (`publish`
+#                             # excepted: each writes under its own name)
 
 "#;
 
@@ -98,8 +99,6 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # controller = "tcp://10.0.0.1:9102"
 # role = "decode"                # or "prefill": takes peers' passes, no client turns
 # gateways = ["tcp://10.0.0.2:8081"]
-# transfer = "auto"               # peers' kv read in place where the build has NIXL
-# prefill_min_suffix_tokens = 0
 
 # [offload]
 # Other workers' part in this one's passes, and its in theirs. Omit to serve
@@ -109,6 +108,9 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # peers  = ["10.0.0.2:7100"]   # workers to prefill this worker's passes on
 # pools  = ["10.0.0.3:7201"]   # pool workers (`pie-pool`) to keep its runs on,
 #                              # by their bulk address
+# transfer = "auto"            # peers' kv read in place where the build has NIXL
+# prefill_min_suffix_tokens = 0  # shortest uncached suffix worth a peer's
+#                                # prefill; 0: 2048 tokens
 "#;
 
 #[cfg(any(feature = "engine-cuda", test))]

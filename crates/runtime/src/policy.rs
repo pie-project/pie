@@ -66,8 +66,6 @@ pub struct Arrival {
     pub tenant: String,
     pub session: Option<String>,
     pub props: Props,
-    /// The workers the cluster names to run its passes, best first.
-    pub executors: Vec<String>,
 }
 
 /// Each is a no-op when no policy is loaded.
