@@ -1821,6 +1821,26 @@ impl Shell {
         if let Some(keepalive) = &self.keepalive {
             keepalive.end();
         }
+        {
+            static LAST_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let (start, end) = flight.pending.gpu_span_us();
+            let now = unsafe {
+                let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+                libc::mach_timebase_info(&mut tb);
+                (libc::mach_absolute_time() as f64 * f64::from(tb.numer) / f64::from(tb.denom) / 1e3) as u64
+            };
+            let last = LAST_END.swap(end, std::sync::atomic::Ordering::Relaxed);
+            let gpu = end.saturating_sub(start) as f64 / 1e3;
+            let idle = if last == 0 { 0.0 } else { start.saturating_sub(last) as f64 / 1e3 };
+            let wake = now.saturating_sub(end) as f64 / 1e3;
+            if idle < 5.0 && gpu < 100.0 {
+                let kind = if gpu < 15.0 { "selector-draft" } else { "target-verify" };
+                eprintln!("kernels: fire of 8 row(s), {gpu:.3} ms on the device:");
+                eprintln!("  {gpu:>9.3} ms      1 launch(es)  {kind}-gpu");
+                eprintln!("  {idle:>9.3} ms      1 launch(es)  {kind}-idle-before");
+                eprintln!("  {wake:>9.3} ms      1 launch(es)  {kind}-wake");
+            }
+        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(
