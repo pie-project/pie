@@ -237,12 +237,14 @@ fn the_register_routed_mlp_prices_its_layer() {
             };
             moe::register_group(s, xt, rt, EXPERTS, true, Some(gate), rooms).expect("group");
         };
-        let glu = |s: &Sink, l: &[Bank; 5], c| {
-            moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, c)
+        // Each pass's grid over `n` tiles: every tile a fire may fill, or the
+        // live ones alone, as an indirect grid would launch them.
+        let glu = |s: &Sink, l: &[Bank; 5], c, n| {
+            moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, n, EXPERTS, rooms, c)
                 .expect("glu");
         };
-        let down = |s: &Sink, l: &[Bank; 5], c| {
-            moe::register_down(s, l[1], Some(l[3]), INTER, HIDDEN, tiles, EXPERTS, rooms, c)
+        let down = |s: &Sink, l: &[Bank; 5], c, n| {
+            moe::register_down(s, l[1], Some(l[3]), INTER, HIDDEN, n, EXPERTS, rooms, c)
                 .expect("down");
         };
         let combine = |s: &Sink| {
@@ -262,16 +264,24 @@ fn the_register_routed_mlp_prices_its_layer() {
             time(&|s, l| group(s, l)),
             time(&|s, _| combine(s)),
         );
-        for slots in [0, 16, 24, 32, 40] {
+        let live = u32::try_from(unique).expect("a count") + 1;
+        for (label, slots, n) in [
+            ("slots  0", 0, tiles),
+            ("slots 16", 16, tiles),
+            ("slots 24", 24, tiles),
+            ("slots 32", 32, tiles),
+            ("slots 40", 40, tiles),
+            ("live    ", 0, live),
+        ] {
             let c = cut(slots);
             line += &format!(
-                "\n  slots {slots:2}: glu {:6.1} down {:6.1} whole {:6.1} us",
-                time(&|s, l| glu(s, l, c)),
-                time(&|s, l| down(s, l, c)),
+                "\n  {label}: glu {:6.1} down {:6.1} whole {:6.1} us",
+                time(&|s, l| glu(s, l, c, n)),
+                time(&|s, l| down(s, l, c, n)),
                 time(&|s, l| {
                     group(s, l);
-                    glu(s, l, c);
-                    down(s, l, c);
+                    glu(s, l, c, n);
+                    down(s, l, c, n);
                     combine(s);
                 }),
             );
