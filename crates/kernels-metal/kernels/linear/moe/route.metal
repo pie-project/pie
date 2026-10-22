@@ -130,8 +130,6 @@ template <typename T, typename W, bool SCALED>
       const constant uint&, const constant uint&,                  \
       uint3, uint, uint, uint3, uint3);
 
-instantiate_router_topk(bfloat16, bfloat, bfloat)
-
 instantiate_router_topk(f32w_bfloat16, bfloat, float)
 
 inline float router_sigmoid(float x) {

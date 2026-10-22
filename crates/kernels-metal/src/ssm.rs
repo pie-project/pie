@@ -434,7 +434,7 @@ pub fn gdn_prep(
     gates: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.gdn_gates";
-    let entry = dtype_dispatch!(OP, ba.dtype, { Bf16 => "qwen_gdn_ba_gates_bfloat16" });
+    let entry = dtype_dispatch!(OP, ba.dtype, { Bf16 => "gdn_prep_bfloat16" });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");
     if ba.width == 0 || !ba.width.is_multiple_of(2) {

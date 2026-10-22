@@ -508,7 +508,7 @@ inline ushort gdn_rows_lane(int v) {
   return lane;
 }
 
-// A row's `[b | a]` gates of head `hv`, as `qwen_gdn_ba_gates` derives them:
+// A row's `[b | a]` gates of head `hv`, as `gdn_prep` derives them:
 // `ba` the extended rows, or through a page table the window's own rows,
 // the replayed rows read from the lane's buffer and the window's own landed
 // there for the next fire.
@@ -666,7 +666,7 @@ template <typename T, int LANES, int SG, int VROWS>
       const size_t vbase = size_t(begin + c0 + j) * pitch + 2 * keys + size_t(hv) * D;
       v_s[j][v] = float(qkv[vbase + size_t(group_base + v)]);
     }
-    // The row's gates, as `qwen_gdn_ba_gates` derives them; the first
+    // The row's gates, as `gdn_prep` derives them; the first
     // group of the head lands a row of the window's own in `gates`.
     if (tid < rows) {
       const int t = c0 + tid;

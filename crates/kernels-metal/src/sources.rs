@@ -69,14 +69,6 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/attn/sdpa_paged_mma.metal")),
     ),
     (
-        "attn/sdpa_sliding.metal",
-        include_str!(concat!(source_root!(), "/attn/sdpa_sliding.metal")),
-    ),
-    (
-        "attn/sdpa_vector.metal",
-        include_str!(concat!(source_root!(), "/attn/sdpa_vector.metal")),
-    ),
-    (
         "attn/sink.metal",
         include_str!(concat!(source_root!(), "/attn/sink.metal")),
     ),
@@ -309,10 +301,6 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/prim/gemm_transforms.h")),
     ),
     (
-        "ptir/logits_copy.metal",
-        include_str!(concat!(source_root!(), "/ptir/logits_copy.metal")),
-    ),
-    (
         "runtime/blit.metal",
         include_str!(concat!(source_root!(), "/runtime/blit.metal")),
     ),
@@ -355,10 +343,6 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "ssm/gated_delta.metal",
         include_str!(concat!(source_root!(), "/ssm/gated_delta.metal")),
-    ),
-    (
-        "ssm/gdn_core.metal",
-        include_str!(concat!(source_root!(), "/ssm/gdn_core.metal")),
     ),
     (
         "ssm/gdn_prep.metal",
