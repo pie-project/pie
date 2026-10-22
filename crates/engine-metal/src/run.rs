@@ -182,6 +182,34 @@ pub struct Run<'c> {
 
     /// Per value, the nodes that read it, made on first ask.
     readers: std::cell::OnceCell<Vec<Vec<u32>>>,
+
+    /// The register tile's input table the precast room holds, if one does.
+    table: std::cell::Cell<Option<Laid>>,
+}
+
+/// A register-tile input table standing in the precast room: `act`'s rows as
+/// the tile's lanes take them, laid over the window `rows` names, with
+/// `counters` arrival counters zeroed. Another matmul of `act` over the same
+/// window reads it rather than laying it again, in this region or a later one
+/// (a layer's MoE norm and its shared expert sit in different regions);
+/// anything else that takes a scratch room the precast room overlaps knocks
+/// it down, and `act` is written once, so it cannot change under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Laid {
+    act: ValueId,
+    rows: Rows,
+    contraction: u32,
+    counters: u32,
+}
+
+/// The rows of a value a walk's place reads: its window's spans (rows,
+/// patches, voxels), pass and tail; or, where the window is gathered into the
+/// copy room or cut into passes the encoder may skip, the region, run and
+/// tail themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rows {
+    Span([poem_exec::fire::MaskSpan; 3], u32, bool),
+    Region(u32, u32, bool),
 }
 
 /// Where a routed MLP that keeps its rows sorted, as Splash's does, has got
@@ -245,11 +273,20 @@ impl<'c> Run<'c> {
             tuning,
             chain: std::cell::Cell::new(None),
             readers: std::cell::OnceCell::new(),
+            table: std::cell::Cell::new(None),
         }
     }
 
     /// The single node that reads `value`, if exactly one does.
     pub(crate) fn sole_reader(&self, value: ValueId) -> Option<&'c Node> {
+        match self.readers_of(value) {
+            &[only] => self.nodes.get(only as usize),
+            _ => None,
+        }
+    }
+
+    /// The nodes that read `value`, in trace order.
+    fn readers_of(&self, value: ValueId) -> &[u32] {
         use poem_ir::Operands as _;
         let readers = self.readers.get_or_init(|| {
             let mut readers = vec![Vec::new(); self.values.len()];
@@ -267,10 +304,65 @@ impl<'c> Run<'c> {
             }
             readers
         });
-        match readers.get(value.0 as usize).map(Vec::as_slice) {
-            Some(&[only]) => self.nodes.get(only as usize),
-            _ => None,
+        readers.get(value.0 as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// When a projection of `value` may run on the register tile (a 4-bit,
+    /// 64-group bank over at most eight rows, a whole number of the tile's
+    /// 64 columns), the arrival counters the widest split one takes: the
+    /// producer of `value` then lays the tile's input table with that many
+    /// zeroed, and the projections read it. A fused MLP's gate-up is one.
+    pub(crate) fn register_readers(&self, value: ValueId) -> Option<u32> {
+        use poem_ir::{Fused, Linear, Operation};
+        self.readers_of(value)
+            .iter()
+            .filter_map(|&at| match &self.nodes.get(at as usize)?.op {
+                Operation::Linear(Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y })
+                    if *act == value =>
+                {
+                    self.register_counters(value, *w, self.tensor(*y).width)
+                }
+                Operation::Fused(Fused::MlpSwiglu {
+                    act,
+                    gate_up,
+                    packed,
+                    ..
+                }) if *act == value => {
+                    self.register_counters(value, *gate_up, self.tensor(*packed).width)
+                }
+                _ => None,
+            })
+            .max()
+    }
+
+    /// When the projection of `act` by bank `w` into `columns` columns runs on
+    /// the register tile, the arrival counters its split takes.
+    pub(crate) fn register_counters(&self, act: ValueId, w: ValueId, columns: u32) -> Option<u32> {
+        let x = self.tensor(act);
+        if !self.tuning.qmm_register()
+            || x.dtype != poem_ir::Dtype::Bf16
+            || x.rows == 0
+            || x.rows > 8
+            || !x.width.is_multiple_of(256)
+            || !columns.is_multiple_of(64)
+        {
+            return None;
         }
+        let bank = self.banked(w)?;
+        if bank.bits != 4 || bank.group != 64 || bank.biases.is_none() {
+            return None;
+        }
+        // Only where the profile runs the register tile first (not one row's
+        // decode, which runs the qmv): a table nothing reads is work for none.
+        let at = self
+            .tuning
+            .qmm_at(x.rows, columns, x.width, bank.bits, bank.group);
+        if self.tuning.qmm(&at).first() != Some(&kernels_metal::tuning::Qmm::Register) {
+            return None;
+        }
+        let (cols, k) = (i32::try_from(columns).ok()?, i32::try_from(x.width).ok()?);
+        let split = kernels_metal::linear::quant::register_split(cols, k, self.tuning.cores());
+        Some(if split > 1 { columns / 64 } else { 0 })
     }
 
     pub(crate) fn chain_clear(&self) {
@@ -568,6 +660,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn copy_room(&self, offset: u64, bytes: u64) -> Option<u32> {
+        self.table.set(None);
         Some(
             self.scratch
                 .copy(self.handles, offset, bytes)?
@@ -943,12 +1036,26 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn routed_scratch(&self) -> Option<RoutedScratch> {
+        self.table.set(None);
+        self.routed_rooms()
+    }
+
+    /// The routed scratch, for a pass that may yet decline it: one that runs
+    /// over it knocks the register table down itself ([`Run::knock_table`]).
+    pub(crate) fn routed_rooms(&self) -> Option<RoutedScratch> {
         Some(self.scratch.routed(self.handles)?.unwrap_or_else(|fault| {
             panic!("the routed scratch this load reserved does not mint: {fault}")
         }))
     }
 
+    /// Forgets the register table: a pass wrote a scratch room the precast
+    /// room overlaps.
+    pub(crate) fn knock_table(&self) {
+        self.table.set(None);
+    }
+
     pub(crate) fn index_scores(&self) -> Option<Tensor> {
+        self.table.set(None);
         Some(
             self.scratch
                 .index_scores(self.handles)?
@@ -990,6 +1097,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Option<Tensor> {
+        self.table.set(None);
         Some(
             self.scratch
                 .precast(self.handles, rows, contraction)?
@@ -1000,6 +1108,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Option<(Tensor, Tensor)> {
+        self.table.set(None);
         Some(
             self.scratch
                 .spatial_moments(self.handles, clips, groups)?
@@ -1009,7 +1118,77 @@ impl<'c> Run<'c> {
         )
     }
 
+    /// The register tile's input table for `act` in the precast room, and
+    /// whether it already stands there, laid by another matmul or the
+    /// producer of `act` over the same window with at least `counters` arrival counters
+    /// zeroed (each split matmul's last partition puts its counters back to
+    /// zero, so the next reader finds them so). A table laid now is
+    /// remembered as standing: the caller lays it before anything else runs.
+    pub(crate) fn register_table(
+        &self,
+        act: ValueId,
+        rows: u32,
+        contraction: u32,
+        counters: u32,
+    ) -> Option<(Tensor, bool)> {
+        let room = self
+            .scratch
+            .precast(self.handles, rows, contraction)?
+            .unwrap_or_else(|fault| {
+                panic!("the precast plane this load reserved does not mint: {fault}")
+            });
+        let window = self.window();
+        let rows = if window.gathered.is_some() || window.passes > 1 {
+            Rows::Region(
+                self.place.region.get(),
+                self.place.run.get(),
+                self.place.tail.get(),
+            )
+        } else {
+            Rows::Span(
+                [window.span, window.patch, window.voxel],
+                window.pass,
+                self.place.tail.get(),
+            )
+        };
+        let standing = self.table.get().is_some_and(|laid| {
+            laid.act == act
+                && laid.rows == rows
+                && laid.contraction == contraction
+                && laid.counters >= counters
+        });
+        if !standing {
+            self.table.set(Some(Laid {
+                act,
+                rows,
+                contraction,
+                counters,
+            }));
+        }
+        Some((room, standing))
+    }
+
+    /// The register tile's input table room for `value`, laid by the op that
+    /// writes `value` (with the counters its widest register projection may
+    /// take zeroed), when a projection of it runs on the register tile:
+    /// recorded as standing, so the projections read it.
+    pub(crate) fn producer_table(&self, value: ValueId) -> Option<(Tensor, u32)> {
+        self.laid_table(value, self.register_readers(value)?)
+    }
+
+    /// [`Run::producer_table`] for a producer that knows its projection's
+    /// counters (a fused MLP's swiglu, whose down the same node runs).
+    pub(crate) fn laid_table(&self, value: ValueId, counters: u32) -> Option<(Tensor, u32)> {
+        let width = self.tensor(value).width;
+        let rows = (17 * width + 4 * counters).div_ceil(2 * width);
+        let (table, _) = self.register_table(value, rows, width, counters)?;
+        Some((table, counters))
+    }
+
     pub(crate) fn partials(&self, rows: u32, width: u32) -> Option<Tensor> {
+        if !self.scratch.partials_clear_of_precast() {
+            self.table.set(None);
+        }
         Some(
             self.scratch
                 .partials(self.handles, rows, width)?

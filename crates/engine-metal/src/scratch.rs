@@ -397,6 +397,17 @@ impl Scratch {
         })())
     }
 
+    /// Whether the partials room lies past the precast room, so a split
+    /// matmul writing its partials leaves a table laid in the precast room
+    /// standing.
+    #[must_use]
+    pub fn partials_clear_of_precast(&self) -> bool {
+        match (self.precast, self.partials) {
+            (Some(precast), Some(partials)) => partials.at >= precast.at + precast.bytes(),
+            _ => true,
+        }
+    }
+
     pub fn partials(&self, handles: &Handles, rows: u32, width: u32) -> Option<Result<Tensor>> {
         let room = self.partials?;
         if u64::from(rows) * u64::from(width) > room.bytes() / 4 {
