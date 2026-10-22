@@ -30,7 +30,6 @@ pub mod sched_prefill;
 
 pub mod selector;
 
-
 use crate::error::Error;
 use dtype::Dtype;
 

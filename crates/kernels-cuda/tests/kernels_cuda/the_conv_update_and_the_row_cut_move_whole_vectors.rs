@@ -2,8 +2,8 @@
 
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::ssm;
 use kernels_cuda::layout;
+use kernels_cuda::ssm;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
 /// The causal conv update answers the convolution and shifts each lane's

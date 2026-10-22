@@ -2,8 +2,8 @@
 
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::ssm;
 use kernels_cuda::linear::{moe, rel_bias};
+use kernels_cuda::ssm;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
 #[test]

@@ -9,8 +9,8 @@ mod common;
 
 use common::{Gpu, STATE, bf16s, values};
 use dtype::Dtype;
-use kernels_rocm::ssm;
 use kernels_rocm::layout;
+use kernels_rocm::ssm;
 use kernels_rocm::{RecurrentPool, Tensor};
 
 struct Geo {

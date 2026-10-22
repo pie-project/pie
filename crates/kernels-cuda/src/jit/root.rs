@@ -145,7 +145,9 @@ impl Root {
     #[must_use]
     pub fn of(file: &'static str) -> Option<Self> {
         let text = source::text_of(file)?;
-        let name = file.strip_suffix(".cuh").or_else(|| file.strip_suffix(".cu"))?;
+        let name = file
+            .strip_suffix(".cuh")
+            .or_else(|| file.strip_suffix(".cu"))?;
         let (options, headers, floor) = configured_for(file);
         let (specific, floor) = specific_for(file).map_or((false, floor), |floor| (true, floor));
         let tcgen05_twin = TCGEN05_TWIN.contains(&file);

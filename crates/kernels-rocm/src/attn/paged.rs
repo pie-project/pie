@@ -454,10 +454,7 @@ fn prefill_walk(
         ctx.fire(
             op,
             Fire::at(FILE, entry).apply(launch),
-            &[
-                ArgValue::of(&args),
-                ArgValue::of(&sel),
-            ],
+            &[ArgValue::of(&args), ArgValue::of(&sel)],
         )?;
     } else {
         let kernel = if matches!(shape.head_dim, 128 | 256) {
@@ -469,7 +466,11 @@ fn prefill_walk(
             "::pie::attn::{kernel}<{}, {hnd}, {causal}, {fp8}>",
             shape.head_dim
         ));
-        ctx.fire(op, Fire::at(FILE, entry).apply(launch), &[ArgValue::of(&args)])?;
+        ctx.fire(
+            op,
+            Fire::at(FILE, entry).apply(launch),
+            &[ArgValue::of(&args)],
+        )?;
     }
     match split {
         Some(parts) => merge(ctx, op, &parts),
