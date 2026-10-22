@@ -62,7 +62,8 @@ pub(crate) fn dense_batch_bf16(
     let (mu, nu, ku) = (m.unsigned_abs(), n.unsigned_abs(), k.unsigned_abs());
     let mt = item_rows(mu);
     let items = mu.div_ceil(mt);
-    let tiles = nu.div_ceil(TILE);
+    // A SwiGLU tile's 64 bank rows are 32 gate rows and their up rows.
+    let tiles = nu.div_ceil(if swiglu { TILE / 2 } else { TILE });
     // A stage is 128 elements of a row short of 32 rows an item, 64 from
     // (the fused SwiGLU slices as its bank's matmul does).
     let stages = ku.div_ceil(if mt >= 32 { 64 } else { 128 });

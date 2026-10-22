@@ -298,15 +298,31 @@ __global__ __launch_bounds__(64) void moe_topk_sigmoid_sink(const T* __restrict_
 
 // y[n][h] = Σ_k weights[n][k] · routed[n·top_k + k][h], in rank order;
 // given `shared`, rounded and then shared[n][h]·sigmoid(gate[n·gate_stride])
-// added, as `moe_sigmoid_gate_add` would. VEC elements a thread (8: hidden
-// a multiple of 8, the rows 16-byte aligned).
+// added, as `moe_sigmoid_gate_add` would. Given `gate_w` (one row of k), the
+// gate is act[n] · gate_w, rounded, the block's own. VEC elements a thread
+// (8: hidden a multiple of 8, the rows 16-byte aligned).
 template <class T, int VEC>
 __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src, const float* __restrict__ weights,
                                  int top_k, int hidden, const T* __restrict__ shared, const T* __restrict__ gate,
-                                 int gate_stride, const u32* __restrict__ win) {
+                                 int gate_stride, const u32* __restrict__ win, const T* __restrict__ gate_w,
+                                 const T* __restrict__ act, int k) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long n = window.plane(blockIdx.x);
+    float logit = 0.f;
+    if (gate_w != nullptr) {
+        __shared__ float red[kWave];
+        float dot = 0.f;
+        for (int c = static_cast<int>(threadIdx.x) * 8; c < k; c += static_cast<int>(blockDim.x) * 8) {
+            const Pack8<T> a = *reinterpret_cast<const Pack8<T>*>(act + n * k + c);
+            const Pack8<T> w = *reinterpret_cast<const Pack8<T>*>(gate_w + c);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dot = fmaf(to_f32(a.v[j]), to_f32(w.v[j]), dot);
+        }
+        logit = to_f32(from_f32<T>(block_sum(dot, red)));
+    } else if (shared != nullptr) {
+        logit = to_f32(gate[n * gate_stride]);
+    }
     const int h = (blockIdx.y * blockDim.x + threadIdx.x) * VEC;
     if (h >= hidden) return;
     const long long base = n * top_k;
@@ -322,7 +338,7 @@ __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src,
             acc[0] += w * to_f32(row[0]);
         }
     }
-    const float s = shared != nullptr ? 1.f / (1.f + __expf(-to_f32(gate[n * gate_stride]))) : 0.f;
+    const float s = shared != nullptr ? 1.f / (1.f + __expf(-logit)) : 0.f;
     T o[VEC];
 #pragma unroll
     for (int j = 0; j < VEC; ++j) {
@@ -741,34 +757,52 @@ __global__ __launch_bounds__(WAVES* kWave) void moe_matmul_select_grouped_tall(
 }
 
 // The batch dense leg (decode batches): one work item of up to MT routes a
-// block, 64·NBW weight rows (grid (work cap, ⌈n / (64·NBW)⌉), 256 threads),
-// a stage 128 elements of a row.
+// block, 64·NBW weight rows (grid (shared items + work cap, ⌈n / (64·NBW)⌉),
+// 256 threads), a stage 128 elements of a row. A shared expert (`shared` a
+// dense bank every one of `shared_rows` rows takes) runs as the first
+// ⌈shared_rows / MT⌉ items, from `shared_act` into `shared_out` by row.
 template <class T, int MT, int NBW>
 __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
-    int num_experts) {
+    int num_experts, const T* __restrict__ shared, const T* __restrict__ shared_act, T* __restrict__ shared_out,
+    int shared_rows) {
+    constexpr int SBY = MT >= 32 ? 128 : 256;
+    const int items = (shared_rows + MT - 1) / MT, b = static_cast<int>(blockIdx.x);
+    if (b < items) {
+        batch_tile<BatchDense<T, SBY>, T, MT, NBW, 3>(shared_act, nullptr, b * MT, min(MT, shared_rows - b * MT),
+                                                      {shared}, nullptr, shared_out, 1, n, k, blockIdx.y);
+        return;
+    }
     GroupItem item;
-    if (!group_item(offsets, work, num_experts, MT, item)) return;
+    if (!group_item(offsets, work, num_experts, MT, item, b - items)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
-    batch_tile<BatchDense<T, MT >= 32 ? 128 : 256>, T, MT, NBW, 3>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n,
-                                                  k, blockIdx.y);
+    batch_tile<BatchDense<T, SBY>, T, MT, NBW, 3>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n, k,
+                                                  blockIdx.y);
 }
 
 
 // The gate-up leg's batch with its swiglu: h[route] = silu(G·x)·(U·x) over
-// a packed [gate | up] bank of 2n rows, a wave 16 gate rows and their up
-// rows (grid (work cap, ⌈n / 64⌉), 256 threads).
+// a packed [gate | up] bank of 2n rows, as batch_tile's SWIGLU (grid
+// (shared items + work cap, ⌈n / 32⌉), 256 threads); a shared
+// expert as moe_matmul_select_dense_batch's, from the token rows `act`.
 template <class T, int MT>
 __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch_swiglu(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ h, int act_div, int n, int k,
-    int num_experts) {
+    int num_experts, const T* __restrict__ shared, T* __restrict__ shared_h, int shared_rows) {
+    constexpr int SBY = MT >= 32 ? 128 : 256;
+    const int items = (shared_rows + MT - 1) / MT, b = static_cast<int>(blockIdx.x);
+    if (b < items) {
+        batch_tile<BatchDense<T, SBY>, T, MT, 1, 3, true>(act, nullptr, b * MT, min(MT, shared_rows - b * MT),
+                                                          {shared}, nullptr, shared_h, 1, n, k, blockIdx.y);
+        return;
+    }
     GroupItem item;
-    if (!group_item(offsets, work, num_experts, MT, item)) return;
+    if (!group_item(offsets, work, num_experts, MT, item, b - items)) return;
     const T* w = bank + static_cast<long long>(item.expert) * 2 * n * k;
-    batch_tile<BatchDense<T, MT >= 32 ? 128 : 256>, T, MT, 2, 3, true>(act, order, item.begin, item.count, {w}, nullptr,
-                                                                     h, act_div, n, k, blockIdx.y);
+    batch_tile<BatchDense<T, SBY>, T, MT, 1, 3, true>(act, order, item.begin, item.count, {w}, nullptr, h, act_div, n,
+                                                      k, blockIdx.y);
 }
 
 // The wide dense leg (wide decode batches): one work item of up to 4·MW
@@ -791,7 +825,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_wide(
 }
 
 // A dense projection as one expert every row routes to (SWIGLU: a packed
-// [gate | up] bank), MT rows an item, 64 output rows a block, tiles dealt
+// [gate | up] bank), MT rows an item, 64 output rows (SwiGLU: 32) a block, tiles dealt
 // round the eight XCDs so a tile's items share one L2. SPLIT lands each K
 // slice's f32 partial for `mgemm_finalize`.
 template <int MT, bool SWIGLU, bool SPLIT, bool NT>
@@ -805,7 +839,7 @@ __global__ __launch_bounds__(256) void dense_batch_bf16(const bf16* __restrict__
     if (tile >= tiles) return;
     const int begin = item * MT;
     float* slice = SPLIT ? part + static_cast<long long>(split) * m * (SWIGLU ? 2 * n : n) : nullptr;
-    batch_tile<BatchDense<bf16, SBY>, bf16, MT, SWIGLU ? 2 : 1, 3, SWIGLU, NT>(
+    batch_tile<BatchDense<bf16, SBY>, bf16, MT, 1, 3, SWIGLU, NT>(
         act, nullptr, begin, min(MT, m - begin), {w}, nullptr, y, 1, n, k, tile, split * per, (split + 1) * per,
         slice);
 }
