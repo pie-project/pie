@@ -253,7 +253,7 @@ impl Run<'_> {
                     w: *w,
                     y: *y,
                 })?;
-                kernels_cuda::layout::split_rows(
+                kernels_cuda::gather::split_rows(
                     self.ctx(),
                     self.tensor(*y),
                     *width,

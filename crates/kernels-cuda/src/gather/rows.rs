@@ -1,12 +1,11 @@
 use crate::error::Error;
-use dtype::Dtype;
-
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::tensor::Tensor;
+use dtype::Dtype;
 
-const FILE: &str = "layout/layout.cuh";
+const FILE: &str = "gather/rows.cu";
 
 const BLOCK: u32 = 256;
 
@@ -25,106 +24,6 @@ fn route_rows(rows: u32, width: u32) -> Launch {
             .saturating_mul(WARP)
             .min(MAX_BLOCK),
     )
-}
-
-fn vectorisable(hidden: u32, table: u64, y: u64) -> bool {
-    hidden.is_multiple_of(VEC_WIDTH) && aligned16(table) && aligned16(y)
-}
-
-pub fn embed(
-    ctx: &Ctx,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
-    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
-    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
-    debug_assert_eq!(
-        ids.rows, y.rows,
-        "the token ids handed over are the rows this gather lands"
-    );
-    let vocab = stated(OP, nonzero(OP, "the embedding table's row count", vocab)?)?;
-    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
-    let rows = stated(OP, nonzero(OP, "rows", y.rows)?)?;
-
-    let vec = vectorisable(y.width, table.ptr, y.ptr);
-    let per_row = if vec { y.width / VEC_WIDTH } else { y.width };
-    let total = u64::from(y.rows) * u64::from(per_row);
-    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
-        .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
-    let instantiation = if vec {
-        "::pie::layout::embed<::pie::true_type::value>"
-    } else {
-        "::pie::layout::embed<::pie::false_type::value>"
-    };
-    ctx.fire(
-        OP,
-        Fire::at(FILE, instantiation).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
-        &[
-            ids.arg(),
-            table.arg(),
-            y.arg(),
-            hidden.arg(),
-            vocab.arg(),
-            rows.arg(),
-            stated(OP, per_row)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn embed_vocab_shard(
-    ctx: &Ctx,
-    ids: Tensor,
-    table: Tensor,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "layout.embed_vocab_shard";
-    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
-    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
-    debug_assert_eq!(ids.rows, y.rows, "the ids handed over are the rows landed");
-    let local = nonzero(OP, "this rank's band of the embedding table", table.rows)?;
-    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
-    let rows = nonzero(OP, "rows", y.rows)?;
-    let rank = comm_rank(ctx, OP)?;
-    ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::layout::embed_vocab_shard<::pie::bf16>")
-            .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
-        &[
-            ids.arg(),
-            table.arg(),
-            y.arg(),
-            hidden.arg(),
-            stated(OP, local)?.arg(),
-            stated(OP, rank.saturating_mul(local))?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub(crate) fn comm_rank(ctx: &Ctx, op: &'static str) -> Result<u32, Error> {
-    if let Some(rank) = ctx.rank() {
-        return Ok(rank);
-    }
-    let comm = ctx.comm(op)?;
-    #[cfg(feature = "cuda")]
-    {
-        use cudarc::nccl::sys as nccl;
-        let mut rank: i32 = 0;
-        // SAFETY: `comm` is the live communicator this context fires its
-        // collectives on; the out-parameter is a stack i32.
-        let code = unsafe { nccl::ncclCommUserRank(comm.cast(), &mut rank) };
-        crate::collective::answered(op, "ncclCommUserRank", code)?;
-        Ok(u32::try_from(rank).unwrap_or(0))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = comm;
-        Err(crate::jit::runtimeless(op))
-    }
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -154,7 +53,7 @@ pub(crate) fn gather_width_concat(
         .map_err(|_| refuse(OP, format!("{total} lanes do not fit a 32-bit grid")))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::gather_width_concat<::pie::bf16>")
+        Fire::at(FILE, "::pie::gather::gather_width_concat<::pie::bf16>")
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(src),
@@ -162,124 +61,6 @@ pub(crate) fn gather_width_concat(
             stated(OP, rows)?.arg(),
             stated(OP, shard)?.arg(),
             stated(OP, world)?.arg(),
-        ],
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn embed_scale_add(
-    ctx: &Ctx,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    e: &mut Tensor,
-    embed_scale: f32,
-    e_scaled: &mut Tensor,
-    y: &mut Tensor,
-    out_scale: f32,
-    y_scaled: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "layout.embed_scale_add";
-    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
-    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
-    debug_assert!(
-        ids.rows == y.rows && e.rows == y.rows && e.width == y.width,
-        "the token ids and every row plane share the fire's rows"
-    );
-    let vocab = stated(OP, nonzero(OP, "the embedding table's row count", vocab)?)?;
-    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
-    let rows = stated(OP, nonzero(OP, "rows", y.rows)?)?;
-    let total = u64::from(y.rows) * u64::from(y.width);
-    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
-        .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
-    ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::layout::embed_scale_add")
-            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
-        &[
-            ids.arg(),
-            table.arg(),
-            e.arg(),
-            embed_scale.arg(),
-            e_scaled.arg(),
-            y.arg(),
-            out_scale.arg(),
-            y_scaled.arg(),
-            hidden.arg(),
-            vocab.arg(),
-            rows.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn embed_scale_add_select(
-    ctx: &Ctx,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    e: &mut Tensor,
-    embed_scale: f32,
-    e_scaled: &mut Tensor,
-    stacked: Tensor,
-    layer: u32,
-    width: u32,
-    y_out: &mut Tensor,
-    out_scale: f32,
-    y_scaled: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "layout.embed_scale_add_select";
-    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
-    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
-    debug_assert!(
-        ids.rows == y_out.rows && e.rows == y_out.rows && e.width == y_out.width,
-        "the token ids and every row plane share the fire's rows"
-    );
-    let col = layer.checked_mul(width).ok_or_else(|| {
-        refuse(
-            OP,
-            format!("layer {layer}'s slice starts beyond any column: {layer} x {width}"),
-        )
-    })?;
-    if width != y_out.width || col.checked_add(width).is_none_or(|end| end > stacked.width) {
-        return Err(refuse(
-            OP,
-            format!(
-                "layer {layer}'s {width}-wide slice does not sit in a {}-wide stacked row landing a \
-                 {}-wide row",
-                stacked.width, y_out.width
-            ),
-        ));
-    }
-    let vocab = stated(OP, nonzero(OP, "the embedding table's row count", vocab)?)?;
-    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y_out.width)?)?;
-    let rows = stated(OP, nonzero(OP, "rows", y_out.rows)?)?;
-    let stacked_width = stated(OP, stacked.width)?;
-    let col = stated(OP, col)?;
-    let total = u64::from(y_out.rows) * u64::from(y_out.width);
-    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
-        .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
-    ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::layout::embed_scale_add_select")
-            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
-        &[
-            ids.arg(),
-            table.arg(),
-            e.arg(),
-            embed_scale.arg(),
-            e_scaled.arg(),
-            stacked.arg(),
-            stacked_width.arg(),
-            col.arg(),
-            y_out.arg(),
-            out_scale.arg(),
-            y_scaled.arg(),
-            hidden.arg(),
-            vocab.arg(),
-            rows.arg(),
-            ctx.stage(),
         ],
     )
 }
@@ -316,7 +97,7 @@ pub fn split_qkv_padded(
     let out8 = (heads[0] + 2 * heads[1]) * head_dim / 8;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_qkv_padded_vec8").apply(Launch::grid(
+        Fire::at(FILE, "::pie::gather::split_qkv_padded_vec8").apply(Launch::grid(
             [q.rows, out8.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -372,7 +153,7 @@ pub fn split_qkv(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::layout::{entry}<::pie::bf16>")),
+            symbol(&format!("::pie::gather::{entry}<::pie::bf16>")),
         )
         .apply(Launch::grid(
             [q.rows, width.div_ceil(BLOCK), 1],
@@ -422,7 +203,7 @@ pub fn split_q_gate(
             .map_err(|_| refuse(OP, format!("{total} runs overflow a grid")))?;
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::layout::split_q_gate_vec8<::pie::bf16>")
+            Fire::at(FILE, "::pie::gather::split_q_gate_vec8<::pie::bf16>")
                 .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
             &[
                 packed.arg(),
@@ -438,7 +219,7 @@ pub fn split_q_gate(
     let block = if head_dim < 128 { 64 } else { 128 };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_q_gate<::pie::bf16>")
+        Fire::at(FILE, "::pie::gather::split_q_gate<::pie::bf16>")
             .apply(Launch::grid([q.rows, heads, 1], [block, 1, 1])),
         &[
             packed.arg(),
@@ -480,7 +261,7 @@ pub fn split_rows(
         && aligned16(right.ptr);
     let (entrypoint, launch) = if vectors {
         (
-            "::pie::layout::split_rows_vec8<::pie::bf16>".to_string(),
+            "::pie::gather::split_rows_vec8<::pie::bf16>".to_string(),
             Launch::grid(
                 [left.rows, (x.width / VEC_WIDTH).div_ceil(BLOCK), 1],
                 [BLOCK, 1, 1],
@@ -489,7 +270,7 @@ pub fn split_rows(
         )
     } else {
         (
-            format!("::pie::layout::split_rows<{t}>"),
+            format!("::pie::gather::split_rows<{t}>"),
             route_rows(left.rows, left.width),
         )
     };
@@ -541,7 +322,7 @@ pub fn select(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::select<{t}>")))
+        Fire::at(FILE, symbol(&format!("::pie::gather::select<{t}>")))
             .apply(route_rows(y.rows, width)),
         &[
             table.arg(),
@@ -614,7 +395,7 @@ fn move_rows(
     let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{unit}>")))
+        Fire::at(FILE, symbol(&format!("::pie::gather::{entry}<{unit}>")))
             .apply(route_rows(rows, per_row)),
         &[
             args[0].arg(),
@@ -703,7 +484,7 @@ fn permute_rows(
     let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{unit}>")))
+        Fire::at(FILE, symbol(&format!("::pie::gather::{entry}<{unit}>")))
             .apply(route_rows(rows, per_row)),
         &[
             x.arg(),
@@ -721,4 +502,221 @@ pub fn pack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(
 
 pub fn unpack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
     permute_rows(ctx, "layout.unpack_rows", "unpack_rows", x, perm, o)
+}
+
+// `layout.concat_cols`: inputs side by side, a row each's columns after
+// the one before's.
+
+/// `xs` side by side into `y`: each a row's columns after the one before's.
+pub fn concat_cols(ctx: &Ctx, xs: &[Tensor], y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.concat_cols";
+    let elem = y.dtype.bits();
+    if !elem.is_multiple_of(8) {
+        return Err(refuse(OP, "an element of whole bytes"));
+    }
+    let elem = elem / 8;
+    let stride = u64::from(y.width) * elem;
+    let int = |v: u64| i32::try_from(v).map_err(|_| refuse(OP, "a row past 32-bit offsets"));
+    let mut at = 0u64;
+    for x in xs {
+        if x.dtype != y.dtype || x.rows != y.rows {
+            return Err(refuse(OP, "the inputs share the output's element and rows"));
+        }
+        let width = u64::from(x.width) * elem;
+        let wide = width.is_multiple_of(16)
+            && stride.is_multiple_of(16)
+            && at.is_multiple_of(16)
+            && x.ptr % 16 == 0
+            && y.ptr.is_multiple_of(16);
+        let per = if wide { width / 16 } else { width };
+        let threads = u32::try_from(u64::from(y.rows) * per)
+            .map_err(|_| refuse(OP, "the rows pass a 32-bit launch"))?;
+        if threads > 0 {
+            ctx.fire(
+                OP,
+                Fire::at(FILE, "::pie::gather::concat_cols").apply(Launch::flat(threads, BLOCK)),
+                &[
+                    x.arg(),
+                    y.arg(),
+                    int(u64::from(y.rows))?.arg(),
+                    int(width)?.arg(),
+                    int(stride)?.arg(),
+                    int(at)?.arg(),
+                    i32::from(wide).arg(),
+                ],
+            )?;
+        }
+        at += width;
+    }
+    if at != stride {
+        return Err(refuse(
+            OP,
+            format!("the inputs fill {at} bytes of a {stride}-byte row"),
+        ));
+    }
+    Ok(())
+}
+
+const MAX_BLOCK: u32 = 1024;
+
+pub fn scatter_live_rows(
+    ctx: &Ctx,
+    src: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.scatter_live_rows";
+    let unit = dtype_dispatch!(OP, src.dtype, {
+        Bf16 => "::pie::bf16",
+        F16 => "::pie::f16",
+        F32 => "float"
+    });
+    if routes.dtype != Dtype::I32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the destination rows this merge is handed are {:?}, and it reads an i32 row map",
+                routes.dtype
+            ),
+        ));
+    }
+    if routes.rows != src.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} rows to place and {} destinations named",
+                src.rows, routes.rows
+            ),
+        ));
+    }
+    if y.dtype != src.dtype || y.width != src.width {
+        return Err(refuse(
+            OP,
+            format!(
+                "the token rectangle is {} x {:?} and the tower's is {} x {:?}; a row copy \
+                 does not reshape",
+                y.width, y.dtype, src.width, src.dtype
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows to place", src.rows)?;
+    let units = stated(OP, nonzero(OP, "the placed row's width", src.width)?)?;
+    let threads = src
+        .width
+        .div_ceil(WARP)
+        .max(1)
+        .saturating_mul(WARP)
+        .min(MAX_BLOCK);
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::gather::scatter_live_rows<{unit}>")),
+        )
+        .apply(Launch::per_row(rows, threads)),
+        &[src.arg(), y.arg(), routes.arg(), units.arg(), ctx.stage()],
+    )
+}
+
+pub fn pool_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.pool_rows";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(y.dtype, x.dtype, "`{OP}` pools into the element it reads");
+
+    let (block, out) = fold_extent(OP, x, side)?;
+    let width = stated(OP, x.width)?;
+    if y.width != x.width {
+        return Err(refuse(
+            OP,
+            format!(
+                "the source rows are {} wide and the destination's are {}; a pool folds rows \
+                 and never a row",
+                x.width, y.width
+            ),
+        ));
+    }
+    if y.rows < out {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} source rows fold into {out} pooled rows and the destination holds {}",
+                x.rows, y.rows
+            ),
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::gather::pool_rows<{t}>")))
+            .apply(Launch::per_row(out, BLOCK)),
+        &[x.arg(), y.arg(), width.arg(), stated(OP, block)?.arg()],
+    )
+}
+
+pub fn merge_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.merge_rows";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(y.dtype, x.dtype, "`{OP}` merges into the element it reads");
+
+    let (block, out) = fold_extent(OP, x, side)?;
+    let merged = block.checked_mul(x.width).ok_or_else(|| {
+        refuse(
+            OP,
+            format!(
+                "{block} rows of {} do not concatenate into a row that fits a u32",
+                x.width
+            ),
+        )
+    })?;
+    if y.width != merged {
+        return Err(refuse(
+            OP,
+            format!(
+                "{block} rows of {} concatenate into {merged}, and the destination's rows are {} \
+                 wide",
+                x.width, y.width
+            ),
+        ));
+    }
+    if y.rows < out {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} source rows fold into {out} merged rows and the destination holds {}",
+                x.rows, y.rows
+            ),
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::gather::merge_rows<{t}>")))
+            .apply(Launch::per_row(out, BLOCK)),
+        &[
+            x.arg(),
+            y.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, block)?.arg(),
+        ],
+    )
+}
+
+fn fold_extent(op: &'static str, x: Tensor, side: u32) -> Result<(u32, u32), Error> {
+    nonzero(op, "the folding square's side", side)?;
+    nonzero(op, "the folded row's width", x.width)?;
+    let block = side.checked_mul(side).ok_or_else(|| {
+        refuse(
+            op,
+            format!("a {side}-wide folding square has no row count that fits a u32"),
+        )
+    })?;
+    if x.rows < block {
+        return Err(refuse(
+            op,
+            format!(
+                "{} rows do not fill one {side}x{side} fold, and a fold with no whole block \
+                 would leave the destination unwritten",
+                x.rows
+            ),
+        ));
+    }
+    Ok((block, x.rows / block))
 }

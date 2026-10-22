@@ -9,7 +9,7 @@ mod common;
 
 use common::{Gpu, STATE, bf16s, values};
 use dtype::Dtype;
-use kernels_rocm::layout;
+use kernels_rocm::gather;
 use kernels_rocm::ssm;
 use kernels_rocm::{RecurrentPool, Tensor};
 
@@ -108,7 +108,7 @@ fn run(
     } else {
         let mut conv = gpu.zeros(stated, c, Dtype::Bf16);
         let mut gates = gpu.zeros(stated, 2 * g.v_heads, Dtype::F32);
-        layout::split_rows(&ctx, qkvz, c, &mut qkv, &mut z).unwrap();
+        gather::split_rows(&ctx, qkvz, c, &mut qkv, &mut z).unwrap();
         ssm::causal_conv1d(&ctx, qkv, conv_w, None, &conv_pool, g.conv, 1, &mut conv).unwrap();
         ssm::gdn_prep(&ctx, ba, dt_bias, a_log, &mut gates).unwrap();
         ssm::gated_delta(

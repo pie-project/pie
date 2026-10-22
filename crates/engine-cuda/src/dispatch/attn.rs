@@ -942,7 +942,7 @@ impl Run<'_> {
                 heads_per_ngram,
                 map,
                 ngram_ids,
-            } => kernels_cuda::attn_ple::ngram_ids(
+            } => kernels_cuda::gather::ngram_ids(
                 self.ctx(),
                 self.tensor(*ids),
                 &self.recurrent(*state),
@@ -1058,7 +1058,7 @@ impl Run<'_> {
                 ngram_ids,
             } => {
                 let tail = self.recurrent_tail_absolute(*state);
-                kernels_cuda::attn_ple::ngram_ids_chunked(
+                kernels_cuda::gather::ngram_ids_chunked(
                     self.ctx(),
                     self.ragged_lanes(*ids),
                     &self.recurrent_absolute(*state),
@@ -1071,7 +1071,7 @@ impl Run<'_> {
                     &mut self.tensor(*ngram_ids),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
-                kernels_cuda::attn_ple::ngram_ids_chunked(
+                kernels_cuda::gather::ngram_ids_chunked(
                     self.ctx(),
                     self.ragged_lanes(*ids),
                     &tail,

@@ -1,4 +1,4 @@
-use kernels_cuda::layout;
+use kernels_cuda::gather;
 use poem_exec::{DispatchLayout, KernelError};
 use poem_ir::Layout;
 
@@ -32,25 +32,23 @@ impl Run<'_> {
                             .to_string(),
                     })
                 }
-                Some((codes, scales, biases, seat)) => {
-                    kernels_cuda::layout_embed_concat::embed_mlx_affine(
-                        self.ctx(),
-                        self.tensor(*ids),
-                        codes,
-                        scales,
-                        biases,
-                        *vocab,
-                        seat,
-                        &mut self.tensor(*y),
-                    )
-                }
-                None if self.tensor(*table).rows < *vocab => layout::embed_vocab_shard(
+                Some((codes, scales, biases, seat)) => kernels_cuda::gather::embed_mlx_affine(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    codes,
+                    scales,
+                    biases,
+                    *vocab,
+                    seat,
+                    &mut self.tensor(*y),
+                ),
+                None if self.tensor(*table).rows < *vocab => gather::embed_vocab_shard(
                     self.ctx(),
                     self.tensor(*ids),
                     self.tensor(*table),
                     &mut self.tensor(*y),
                 ),
-                None => layout::embed(
+                None => gather::embed(
                     self.ctx(),
                     self.tensor(*ids),
                     self.tensor(*table),
@@ -64,7 +62,7 @@ impl Run<'_> {
                 scales: Some(scales),
                 vocab,
                 y,
-            } => kernels_cuda::layout_embed_e4m3::embed_concat_mxfp8(
+            } => kernels_cuda::gather::embed_concat_mxfp8(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*table),
@@ -90,7 +88,7 @@ impl Run<'_> {
                 }
                 #[cfg(not(feature = "rocm"))]
                 Some((codes, scales, _, _)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
-                    kernels_cuda::layout_embed_e4m3::embed_concat_e4m3(
+                    kernels_cuda::gather::embed_concat_e4m3(
                         self.ctx(),
                         self.tensor(*ids),
                         codes,
@@ -99,19 +97,17 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )
                 }
-                Some((codes, scales, biases, seat)) => {
-                    kernels_cuda::layout_embed_concat::embed_concat_mlxu4(
-                        self.ctx(),
-                        self.tensor(*ids),
-                        codes,
-                        scales,
-                        biases,
-                        *vocab,
-                        seat,
-                        &mut self.tensor(*y),
-                    )
-                }
-                None => kernels_cuda::layout_embed_concat::embed_concat(
+                Some((codes, scales, biases, seat)) => kernels_cuda::gather::embed_concat_mlxu4(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    codes,
+                    scales,
+                    biases,
+                    *vocab,
+                    seat,
+                    &mut self.tensor(*y),
+                ),
+                None => kernels_cuda::gather::embed_concat(
                     self.ctx(),
                     self.tensor(*ids),
                     self.tensor(*table),
@@ -126,7 +122,7 @@ impl Run<'_> {
                 q,
                 k,
                 v,
-            } => layout::split_qkv(
+            } => gather::split_qkv(
                 self.ctx(),
                 self.tensor(*packed),
                 *q_width,
@@ -143,7 +139,7 @@ impl Run<'_> {
                 q,
                 k,
                 v,
-            } => layout::split_qkv_padded(
+            } => gather::split_qkv_padded(
                 self.ctx(),
                 self.tensor(*packed),
                 *heads,
@@ -158,7 +154,7 @@ impl Run<'_> {
                 head_dim,
                 q,
                 gate,
-            } => layout::split_q_gate(
+            } => gather::split_q_gate(
                 self.ctx(),
                 self.tensor(*packed),
                 *head_dim,
@@ -170,7 +166,7 @@ impl Run<'_> {
                 width,
                 left,
                 right,
-            } => layout::split_rows(
+            } => gather::split_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *width,
@@ -183,7 +179,7 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
-            } => kernels_cuda::layout_embed_weighted::embed_weighted(
+            } => kernels_cuda::gather::embed_weighted(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*weights),
@@ -191,13 +187,13 @@ impl Run<'_> {
                 *vocab,
                 &mut self.tensor(*y),
             ),
-            Layout::PoolRows { x, side, y } => kernels_cuda::layout_fold::pool_rows(
+            Layout::PoolRows { x, side, y } => kernels_cuda::gather::pool_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *side,
                 &mut self.tensor(*y),
             ),
-            Layout::MergeRows { x, side, y } => kernels_cuda::layout_fold::merge_rows(
+            Layout::MergeRows { x, side, y } => kernels_cuda::gather::merge_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *side,
@@ -211,7 +207,7 @@ impl Run<'_> {
                 order,
                 temporal,
                 y,
-            } => kernels_cuda::layout_pixels::pixels(
+            } => kernels_cuda::gather::pixels(
                 self.ctx(),
                 self.tensor(*x),
                 *patch,
@@ -223,7 +219,7 @@ impl Run<'_> {
             ),
             Layout::ConcatCols { xs, y } => {
                 let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
-                kernels_cuda::layout_concat_cols::concat_cols(self.ctx(), &xs, &mut self.tensor(*y))
+                kernels_cuda::gather::concat_cols(self.ctx(), &xs, &mut self.tensor(*y))
             }
             Layout::GridTaps {
                 positions,
@@ -233,7 +229,7 @@ impl Run<'_> {
                 side,
                 ids,
                 weights,
-            } => kernels_cuda::layout_pixels::grid_taps(
+            } => kernels_cuda::gather::grid_taps(
                 self.ctx(),
                 self.tensor(*positions),
                 self.tensor(*grids),
@@ -248,7 +244,7 @@ impl Run<'_> {
                 routes,
                 y,
                 y_out: _,
-            } => kernels_cuda::layout_scatter_live::scatter_live_rows(
+            } => kernels_cuda::gather::scatter_live_rows(
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
@@ -259,13 +255,13 @@ impl Run<'_> {
                 routes,
                 y,
                 y_out: _,
-            } => layout::scatter_rows(
+            } => gather::scatter_rows(
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
                 &mut self.fire_wide(*y),
             ),
-            Layout::PackRows { x, perm, y } => layout::pack_rows(
+            Layout::PackRows { x, perm, y } => gather::pack_rows(
                 self.ctx(),
                 self.fire_wide(*x),
                 self.tensor(*perm),
@@ -274,7 +270,7 @@ impl Run<'_> {
             Layout::UnpackRows { x, perm, y } => {
                 let packed = self.tensor(*x);
                 let whole = self.fire_wide(*y);
-                layout::unpack_rows(
+                gather::unpack_rows(
                     self.ctx(),
                     packed,
                     self.tensor(*perm),
@@ -309,7 +305,7 @@ impl Run<'_> {
                 }
                 Ok(())
             }
-            Layout::GatherRows { x, rows, y } => layout::gather_rows(
+            Layout::GatherRows { x, rows, y } => gather::gather_rows(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*rows),
@@ -320,7 +316,7 @@ impl Run<'_> {
                 layer,
                 width,
                 y,
-            } => layout::select(
+            } => gather::select(
                 self.ctx(),
                 self.tensor(*table),
                 *layer,

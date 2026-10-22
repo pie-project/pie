@@ -254,7 +254,7 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             nccl::ncclAllGather(send, stage, count, dtype, comm.cast(), ctx.stream().cast())
         };
         answered(OP, "ncclAllGather", code)?;
-        crate::layout::gather_width_concat(ctx, stage as usize as u64, y, x.width, world)
+        crate::gather::gather_width_concat(ctx, stage as usize as u64, y, x.width, world)
     }
     #[cfg(not(feature = "cuda"))]
     {

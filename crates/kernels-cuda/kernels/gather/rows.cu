@@ -1,133 +1,10 @@
-#pragma once
-
+#include <cstdint>
 #include "prim/device.cuh"
 
-namespace pie::layout {
+namespace pie::gather {
 
 template <class T>
 using Elem = ::pie::Elem<T>;
-
-__global__ void embed_scale_add(
-    const i32* __restrict__ token_ids,
-    const bf16* __restrict__ weight,
-    bf16* __restrict__ e,
-    float a,
-    bf16* __restrict__ e_scaled,
-    bf16* __restrict__ y,
-    float b,
-    bf16* __restrict__ y_scaled,
-    int hidden, int vocab, int num_tokens,
-    const u32* __restrict__ win)
-{
-    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= num_tokens * hidden) return;
-    const int n = idx / hidden;
-    const int h = idx % hidden;
-    if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
-    const i32 tid_raw = token_ids[plane_row];
-    const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
-    const long long at = static_cast<long long>(plane_row) * hidden + h;
-    const bf16 ev = weight[static_cast<long long>(tid) * hidden + h];
-    e[at] = ev;
-    const float a_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(a));
-    const bf16 es = Elem<bf16>::from_f32(Elem<bf16>::to_f32(ev) * a_rounded);
-    e_scaled[at] = es;
-    const bf16 yv = Elem<bf16>::from_f32(Elem<bf16>::to_f32(y[at]) + Elem<bf16>::to_f32(es));
-    y[at] = yv;
-    const float b_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(b));
-    y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
-}
-
-__global__ void embed_scale_add_select(
-    const i32* __restrict__ token_ids,
-    const bf16* __restrict__ weight,
-    bf16* __restrict__ e,
-    float a,
-    bf16* __restrict__ e_scaled,
-    const bf16* __restrict__ stacked,
-    int stacked_width,
-    int col,
-    bf16* __restrict__ y_out,
-    float b,
-    bf16* __restrict__ y_scaled,
-    int hidden, int vocab, int num_tokens,
-    const u32* __restrict__ win)
-{
-    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= num_tokens * hidden) return;
-    const int n = idx / hidden;
-    const int h = idx % hidden;
-    if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
-    const i32 tid_raw = token_ids[plane_row];
-    const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
-    const long long at = static_cast<long long>(plane_row) * hidden + h;
-    const bf16 ev = weight[static_cast<long long>(tid) * hidden + h];
-    e[at] = ev;
-    const float a_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(a));
-    const bf16 es = Elem<bf16>::from_f32(Elem<bf16>::to_f32(ev) * a_rounded);
-    e_scaled[at] = es;
-    const bf16 y0 = stacked[static_cast<long long>(plane_row) * stacked_width + col + h];
-    const bf16 yv = Elem<bf16>::from_f32(Elem<bf16>::to_f32(y0) + Elem<bf16>::to_f32(es));
-    y_out[at] = yv;
-    const float b_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(b));
-    y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
-}
-
-template <bool VEC>
-__global__ void embed(
-    const i32* __restrict__ token_ids,
-    const bf16* __restrict__ weight,
-    bf16* __restrict__ y,
-    int hidden, int vocab, int num_tokens, int per_row,
-    const u32* __restrict__ win)
-{
-    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= num_tokens * per_row) return;
-    const int n = idx / per_row;
-    const int h = idx % per_row;
-
-    if (win != nullptr && n >= static_cast<int>(win[0])) return;
-
-    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
-
-    const i32 tid_raw = token_ids[plane_row];
-    const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
-    const bf16* row = weight + static_cast<long long>(tid) * hidden;
-    bf16* out = y + static_cast<long long>(plane_row) * hidden;
-
-    if constexpr (VEC) {
-        reinterpret_cast<float4*>(out)[h] =
-            reinterpret_cast<const float4*>(row)[h];
-    } else {
-        out[h] = row[h];
-    }
-}
-
-template <class T>
-__global__ void embed_vocab_shard(
-    const i32* __restrict__ token_ids,
-    const T* __restrict__ weight,
-    T* __restrict__ y,
-    int hidden, int local_vocab, int vocab_offset,
-    const u32* __restrict__ win)
-{
-    const int n = blockIdx.x;
-    if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
-
-    const i32 tid_raw = token_ids[plane_row];
-    const int local_tid = tid_raw - vocab_offset;
-    const bool in_shard = local_tid >= 0 && local_tid < local_vocab;
-    const T* row =
-        weight + static_cast<long long>(in_shard ? local_tid : 0) * hidden;
-    T* out = y + static_cast<long long>(plane_row) * hidden;
-
-    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-        out[h] = in_shard ? row[h] : Elem<T>::from_f32(0.0f);
-    }
-}
 
 template <class T>
 __global__ void gather_width_concat(
@@ -452,6 +329,88 @@ __global__ void unpack_rows(
     U* dst = o + static_cast<long long>(perm[row]) * units;
     for (int i = static_cast<int>(threadIdx.x); i < units;
          i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
+// One input of a column concat: its rows' `width` bytes into `out`'s rows
+// at byte `at` of each (`stride` bytes a row), 16 bytes a thread where the
+// widths allow, else a byte.
+__global__ void concat_cols(const unsigned char* __restrict__ x, unsigned char* __restrict__ out,
+                            int rows, int width, int stride, int at, int wide) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (wide) {
+        const int per = width / 16;
+        if (i >= static_cast<long long>(rows) * per) return;
+        const int r = static_cast<int>(i / per), c = static_cast<int>(i % per) * 16;
+        *reinterpret_cast<uint4*>(out + static_cast<long long>(r) * stride + at + c) =
+            *reinterpret_cast<const uint4*>(x + static_cast<long long>(r) * width + c);
+    } else {
+        if (i >= static_cast<long long>(rows) * width) return;
+        const int r = static_cast<int>(i / width), c = static_cast<int>(i % width);
+        out[static_cast<long long>(r) * stride + at + c] = x[static_cast<long long>(r) * width + c];
+    }
+}
+
+template <class U>
+__global__ void scatter_live_rows(
+    const U* __restrict__ tight,
+    U* __restrict__ wide,
+    const i32* __restrict__ index,
+    int units,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const i32 at = index[row];
+    if (at < 0) return;
+
+    const U* src = tight + static_cast<long long>(row) * units;
+    U* dst = wide + static_cast<long long>(at) * units;
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
+template <class T>
+__global__ void pool_rows(
+    const T* __restrict__ x,
+    T* __restrict__ y,
+    int width,
+    int block)
+{
+    const int out = blockIdx.x;
+    const long long base = static_cast<long long>(out) * block * width;
+
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        float acc = 0.f;
+        for (int r = 0; r < block; ++r) {
+            acc += Elem<T>::to_f32(x[base + static_cast<long long>(r) * width + i]);
+        }
+        y[static_cast<long long>(out) * width + i] =
+            Elem<T>::from_f32(acc / static_cast<float>(block));
+    }
+}
+
+
+template <class T>
+__global__ void merge_rows(
+    const T* __restrict__ x,
+    T* __restrict__ y,
+    int width,
+    int block)
+{
+    const int out = blockIdx.x;
+    const long long units = static_cast<long long>(block) * width;
+    const T* src = x + static_cast<long long>(out) * units;
+    T* dst = y + static_cast<long long>(out) * units;
+
+    for (long long i = threadIdx.x; i < units; i += blockDim.x) {
         dst[i] = src[i];
     }
 }

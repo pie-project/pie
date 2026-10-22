@@ -400,8 +400,7 @@ fn the_column_concat_lands_what_the_host_lands() {
             .map(|(p, w)| t(gpu.up(p), w))
             .collect();
         let y_at = gpu.zeros(rows * total * 2);
-        let concat =
-            kernels_cuda::layout_concat_cols::concat_cols(&gpu.ctx(), &xs, &mut t(y_at, total));
+        let concat = kernels_cuda::gather::concat_cols(&gpu.ctx(), &xs, &mut t(y_at, total));
         concat.expect("the concat fires");
         gpu.sync();
         let got: Vec<u16> = gpu.down(y_at, rows * total);

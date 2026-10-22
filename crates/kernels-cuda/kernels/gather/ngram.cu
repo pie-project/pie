@@ -1,9 +1,6 @@
-#pragma once
-
 #include "prim/device.cuh"
 
-namespace pie::attn {
-
+namespace pie::gather {
 
 constexpr int PLE_MAX_NGRAM = 4;
 constexpr int PLE_MAX_HEADS = 32;
@@ -55,7 +52,7 @@ __device__ __forceinline__ void ple_map_window(
     for (int p = 0; p < h.ngram; ++p) window[p] = (int)map[window[p]];
 }
 
-__global__ void ple_ngram_ids_update(
+__global__ void ngram_ids_update(
     const int* __restrict__ ids,
     int* __restrict__ state_base,
     const int* __restrict__ slot_ids,
@@ -96,7 +93,7 @@ __global__ void ple_ngram_ids_update(
     state[span - 1] = ids[r_row] + 1;
 }
 
-__global__ void ple_ngram_ids_chunked(
+__global__ void ngram_ids_chunked(
     const int* __restrict__ ids,
     int* __restrict__ state_base,
     const int* __restrict__ slot_ids,

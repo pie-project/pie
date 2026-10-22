@@ -912,7 +912,7 @@ impl Run<'_> {
                 append,
             );
         }
-        kernels_cuda::layout::split_q_gate(
+        kernels_cuda::gather::split_q_gate(
             self.ctx(),
             self.tensor(*qg),
             *head_dim,
@@ -1015,7 +1015,7 @@ impl Run<'_> {
                 append,
             );
         }
-        kernels_cuda::layout::split_qkv(
+        kernels_cuda::gather::split_qkv(
             self.ctx(),
             self.tensor(*packed),
             *q_width,

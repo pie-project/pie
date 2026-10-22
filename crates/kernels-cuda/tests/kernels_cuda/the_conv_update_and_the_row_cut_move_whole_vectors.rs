@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::layout;
+use kernels_cuda::gather;
 use kernels_cuda::ssm;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
@@ -120,7 +120,7 @@ fn row_cut(rows: u32, probes: &[usize]) {
     let r_at = gpu.zeros(rows as usize * right_w * 2);
     let mut left = Tensor::new(l_at, rows, left_w as u32, Dtype::Bf16);
     let mut right = Tensor::new(r_at, rows, right_w as u32, Dtype::Bf16);
-    layout::split_rows(
+    gather::split_rows(
         &gpu.ctx(),
         Tensor::new(x_at, rows, total as u32, Dtype::Bf16),
         left_w as u32,

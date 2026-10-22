@@ -4,9 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const PIXELS: &str = "layout/pixels.cuh";
-
-const GRID_TAPS: &str = "layout/grid_taps.cuh";
+const FILE: &str = "gather/pixels.cu";
 
 const BLOCK: u32 = 256;
 
@@ -52,7 +50,7 @@ pub fn pixels(
     let order: i32 = if channel_major { 0 } else { 1 };
     ctx.fire(
         OP,
-        Fire::at(PIXELS, symbol(&format!("::pie::layout::pixels<{t}>")))
+        Fire::at(FILE, symbol(&format!("::pie::gather::pixels<{t}>")))
             .apply(Launch::per_row(x.rows, BLOCK)),
         &[
             x.arg(),
@@ -115,7 +113,7 @@ pub fn grid_taps(
     let kind: i32 = if bilinear { 0 } else { 1 };
     ctx.fire(
         OP,
-        Fire::at(GRID_TAPS, symbol("::pie::layout::grid_taps"))
+        Fire::at(FILE, symbol("::pie::gather::grid_taps"))
             .apply(Launch::flat(positions.rows, BLOCK)),
         &[
             positions.arg(),

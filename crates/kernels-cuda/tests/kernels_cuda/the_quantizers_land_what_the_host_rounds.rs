@@ -175,7 +175,7 @@ fn the_routed_glus_land_the_clamped_swiglu_and_its_read_back() {
 
 #[test]
 fn the_e4m3_table_gathers_widen_only_their_rows() {
-    use kernels_cuda::layout_embed_e4m3::{embed_concat_e4m3, embed_concat_mxfp8};
+    use kernels_cuda::gather::{embed_concat_e4m3, embed_concat_mxfp8};
     // e4m3 rows under one scale, 16-byte runs a thread (160) and a code a
     // thread (24); DeepSeek-V4.1's Engram MXFP8 rows (256, eight exponents).
     for (width, mx) in [(160, false), (24, false), (256, true)] {

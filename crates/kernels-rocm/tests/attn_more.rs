@@ -843,7 +843,7 @@ fn ple_ngram_ids_hash_windows_across_the_state() {
             ..STATE
         };
         let mut out = gpu.upload(&[-1i32; 4 * 4], 4, 4, Dtype::I32);
-        kernels_rocm::attn_ple::ngram_ids(
+        kernels_rocm::gather::ngram_ids(
             &ctx,
             gpu.column(&ids),
             &pool,
@@ -898,7 +898,7 @@ fn ple_ngram_ids_hash_windows_across_the_state() {
             data: gpu.column(&tok),
             indptr: gpu.column(&qo),
         };
-        kernels_rocm::attn_ple::ngram_ids_chunked(
+        kernels_rocm::gather::ngram_ids_chunked(
             &ctx, x, &pool, EOS as u32, &MULTS, &PRIMES, &OFFSETS, 2, map_t, &mut out,
         )
         .unwrap();

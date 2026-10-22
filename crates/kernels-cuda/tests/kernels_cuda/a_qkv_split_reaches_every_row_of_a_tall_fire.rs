@@ -4,7 +4,7 @@ use crate::common;
 
 use common::{Gpu, Lcg};
 use dtype::Dtype;
-use kernels_cuda::layout;
+use kernels_cuda::gather;
 use kernels_cuda::tensor::Tensor;
 
 const TALL: u32 = 65_536;
@@ -33,7 +33,7 @@ fn split_every_row(q_width: u32, kv_width: u32) {
     let mut q = Tensor::new(q_at, TALL, q_width, Dtype::Bf16);
     let mut k = Tensor::new(k_at, TALL, kv_width, Dtype::Bf16);
     let mut v = Tensor::new(v_at, TALL, kv_width, Dtype::Bf16);
-    layout::split_qkv(&gpu.ctx(), src, q_width, kv_width, &mut q, &mut k, &mut v)
+    gather::split_qkv(&gpu.ctx(), src, q_width, kv_width, &mut q, &mut k, &mut v)
         .expect("a tall split is a split");
     gpu.sync();
 
@@ -75,7 +75,7 @@ fn a_padded_qkv_split_lays_each_head_out() {
     let outs = [2usize, 1, 1].map(|h| gpu.up(&vec![0xffffu16; rows * h * d]));
     let t = |at: u64, w: usize| Tensor::new(at, rows as u32, w as u32, Dtype::Bf16);
     let (mut q, mut k, mut v) = (t(outs[0], 2 * d), t(outs[1], d), t(outs[2], d));
-    layout::split_qkv_padded(
+    gather::split_qkv_padded(
         &gpu.ctx(),
         t(packed_at, stride),
         [2, 1],

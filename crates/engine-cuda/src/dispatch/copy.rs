@@ -1,4 +1,4 @@
-use kernels_cuda::{Tensor, layout};
+use kernels_cuda::{Tensor, gather};
 use poem_compiler::Region;
 use poem_exec::KernelError;
 use poem_exec::fire::Serve;
@@ -147,9 +147,9 @@ impl Run<'_> {
             let mut wide = slot.wide;
             let mut tight = slot.tight;
             if out {
-                layout::scatter_rows(self.ctx(), tight, index, &mut wide)?;
+                gather::scatter_rows(self.ctx(), tight, index, &mut wide)?;
             } else {
-                layout::gather_rows(self.ctx(), wide, index, &mut tight)?;
+                gather::gather_rows(self.ctx(), wide, index, &mut tight)?;
             }
         }
         self.set_copy(plan);

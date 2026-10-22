@@ -287,8 +287,8 @@ fn envelope_update_appended(
     ctx.fire(
         op,
         Fire::at(
-            "layout/envelope.cuh",
-            "::pie::layout::update_appended<::pie::bf16>",
+            "attn/kv_envelope.cu",
+            "::pie::attn::envelope::update_appended<::pie::bf16>",
         )
         .apply(Launch::grid(
             [max_touched.unsigned_abs(), kv_heads.unsigned_abs(), 1],

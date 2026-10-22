@@ -4,8 +4,8 @@ use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
 use kernels_cuda::elemwise::modulate::{self, NormKind};
 use kernels_cuda::elemwise::{RopeForm, activation, binary, rope_axes, sinusoid};
+use kernels_cuda::gather;
 use kernels_cuda::jit::Ctx;
-use kernels_cuda::layout;
 use kernels_cuda::tensor::Tensor;
 
 const BASE: u32 = 2;
@@ -265,9 +265,9 @@ fn the_row_permutations_retire_their_padded_rows() {
             let map = Tensor::new(map, rows, 1, Dtype::I32);
             let mut o = bf16(dst, shift, rows, WIDTH);
             if pack {
-                layout::pack_rows(&ctx, x, map, &mut o)
+                gather::pack_rows(&ctx, x, map, &mut o)
             } else {
-                layout::unpack_rows(&ctx, x, map, &mut o)
+                gather::unpack_rows(&ctx, x, map, &mut o)
             }
             .expect("fires");
         };

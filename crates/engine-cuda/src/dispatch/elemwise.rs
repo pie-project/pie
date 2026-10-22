@@ -164,7 +164,7 @@ impl Run<'_> {
                 y_out: _,
                 out_scale,
                 y_scaled,
-            } => kernels_cuda::layout::embed_scale_add(
+            } => kernels_cuda::gather::embed_scale_add(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*table),
@@ -189,7 +189,7 @@ impl Run<'_> {
                 y_out,
                 out_scale,
                 y_scaled,
-            } => kernels_cuda::layout::embed_scale_add_select(
+            } => kernels_cuda::gather::embed_scale_add_select(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*table),
