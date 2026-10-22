@@ -617,6 +617,8 @@ async def cli_pie_client(args: argparse.Namespace):
     def should_surface_server_line(txt: str) -> bool:
         return (
             txt.startswith("ane: ")
+            or txt.startswith("kernels: ")
+            or " launch(es) " in txt
             or "panicked at" in txt
             or txt.startswith("[fire ")
             or txt.startswith("[pie-fire-timing] ")
