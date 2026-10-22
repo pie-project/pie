@@ -6,7 +6,7 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "spatial/conv.slang";
 
-const OP: &str = "spatial.conv3d";
+const OP: &str = "conv.conv3d";
 
 const THREADS: u32 = 128;
 

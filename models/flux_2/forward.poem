@@ -14,7 +14,7 @@ def chunks(x, widths):
     whatever remains."""
     out = []
     for width in widths[:-1]:
-        head, x = ops.layout.split_rows(x, width)
+        head, x = ops.gather.split_rows(x, width)
         out.append(head)
     out.append(x)
     return out
@@ -27,16 +27,16 @@ def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
     """`q`'s rows attending `k` and `v`'s, each side grouped by its own
     `perm` and `csr`."""
     o = ops.attn.ragged(
-        ops.layout.pack_rows(q, rows.perm),
-        ops.layout.pack_rows(k, over.perm),
-        ops.layout.pack_rows(v, over.perm),
+        ops.gather.pack_rows(q, rows.perm),
+        ops.gather.pack_rows(k, over.perm),
+        ops.gather.pack_rows(v, over.perm),
         rows.csr,
         over.csr,
         head_dim,
         sm_scale,
         mask,
     )
-    return ops.layout.unpack_rows(o, rows.perm)
+    return ops.gather.unpack_rows(o, rows.perm)
 
 GN_GROUPS = 32
 
@@ -46,10 +46,10 @@ RGB = 3
 
 def convolve(x, grid, c):
     shape = conv([1, 1], [1, 1], [0, 0]) if c.taps == 1 else conv([3, 3], [1, 1], [1, 1])
-    return ops.spatial.conv3d(x, grid, c.w, c.bias, shape, None)[0]
+    return ops.conv.conv3d(x, grid, c.w, c.bias, shape, None)[0]
 
 def group_norm(x, grid, n, silu):
-    return ops.spatial.group_norm(x, grid, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+    return ops.conv.group_norm(x, grid, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
 
 def resnet(x, grid, r):
     h = group_norm(x, grid, r.norm1, True)
@@ -64,7 +64,7 @@ def attention(x, grid, a):
     q = linear(a.q, h)
     k = linear(a.k, h)
     v = linear(a.v, h)
-    o = ops.spatial.attention(q, k, v, grid, f32(1.0 / f32(sqrt(a.width))))
+    o = ops.attn.voxel(q, k, v, grid, f32(1.0 / f32(sqrt(a.width))))
     return ops.elemwise.add(x, linear(a.out, o))
 
 def mid(x, grid, m):
@@ -81,7 +81,7 @@ def vae_decode(vae, z, grid):
         for res in block.resnets:
             h = resnet(h, grid, res)
         if block.upsample != None:
-            up, grid = ops.spatial.upsample_nearest(h, grid, [1, 2, 2], False)
+            up, grid = ops.conv.upsample_nearest(h, grid, [1, 2, 2], False)
             h = convolve(up, grid, block.upsample)
     h = group_norm(h, grid, d.norm_out, True)
     y = convolve(h, grid, d.conv_out)
@@ -99,7 +99,7 @@ def vae_encode(vae, arm):
             h = resnet(h, grid, res)
         if block.downsample != None:
             c = block.downsample
-            h, grid = ops.spatial.conv3d(h, grid, c.w, c.bias, conv([3, 3], [2, 2], [0, 0], pad_back = [0, 1, 1]), None)
+            h, grid = ops.conv.conv3d(h, grid, c.w, c.bias, conv([3, 3], [2, 2], [0, 0], pad_back = [0, 1, 1]), None)
     h = mid(h, grid, e.mid)
     h = group_norm(h, grid, e.norm_out, True)
     return convolve(h, grid, e.conv_out), grid
@@ -117,7 +117,7 @@ def qwen3_encode(arm, te, tap = None):
     plan = ops.attn.plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None)
     ids = arm.tokens()
     positions = arm.positions()
-    y = ops.layout.embed(ids, te.embed, te.vocab)
+    y = ops.gather.embed(ids, te.embed, te.vocab)
     last = len(te.layers) - 1
 
     def layer(l, w, y):
@@ -218,7 +218,7 @@ def denoise(arm, m):
 
     def heads(x, attn, mods, lanes, positions):
         h = norm_modulate(x, mods.scale_shift, lanes, NORM_EPS)
-        q, k, v = ops.layout.split_qkv(ops.linear.matmul(h, attn.qkv), dim, dim)
+        q, k, v = ops.gather.split_qkv(ops.linear.matmul(h, attn.qkv), dim, dim)
         return (turn(q, attn.q_norm, positions, hd), turn(k, attn.k_norm, positions, hd), v)
 
     def ff_sublayer(x, ff, mods, lanes):
@@ -247,7 +247,7 @@ def denoise(arm, m):
     else:
         c = txt_in.context(0, dim)
         perm = txt_in.row_permutation()
-        txt = ops.layout.unpack_rows(ops.layout.pack_rows(c, perm), perm)
+        txt = ops.gather.unpack_rows(ops.gather.pack_rows(c, perm), perm)
     img = ops.linear.matmul(img_in.latents(0, m.in_channels, dtype.bf16), dit.x_embed)
 
     def double(l, block, carried):
@@ -277,8 +277,8 @@ def denoise(arm, m):
     def single(l, block, x):
         h = norm_modulate(x, mod_single.scale_shift, lanes, NORM_EPS)
         proj = ops.linear.matmul(h, block.in_proj)
-        qkv, mlp = ops.layout.split_rows(proj, 3 * dim)
-        q, k, v = ops.layout.split_qkv(qkv, dim, dim)
+        qkv, mlp = ops.gather.split_rows(proj, 3 * dim)
+        q, k, v = ops.gather.split_qkv(qkv, dim, dim)
         o = attention(turn(q, block.q_norm, positions, hd), turn(k, block.k_norm, positions, hd), v)
         a = ops.linear.matmul(o, block.out_attn)
         f = ops.linear.matmul(ops.linear.mlp_swiglu(mlp, d.inter), block.out_mlp)
@@ -302,10 +302,10 @@ def decode(arm, m):
     z = arm.voxels(0, m.in_channels, dtype.bf16)
     # The standardize below folds in place, and may not write the input:
     # a unit upsample is the decode's fresh copy of it.
-    z, grid = ops.spatial.upsample_nearest(z, grid, [1, 1, 1], False)
+    z, grid = ops.conv.upsample_nearest(z, grid, [1, 1, 1], False)
     z = ops.elemwise.standardize(z, lat.bn_zero, lat.bn_scale)
     z = ops.elemwise.add_bias(lat.bn_mean, z)
-    z, grid = ops.spatial.pixel_shuffle(z, grid, [1, m.pack, m.pack])
+    z, grid = ops.conv.pixel_shuffle(z, grid, [1, m.pack, m.pack])
     z = convolve(z, grid, lat.post_quant_conv)
     return vae_decode(m.vae, z, grid)
 
@@ -313,7 +313,7 @@ def encode(arm, m):
     lat = m.vae.latent
     h, grid = vae_encode(m.vae, arm)
     mean = convolve(h, grid, lat.quant_conv)
-    packed, grid = ops.spatial.pixel_unshuffle(mean, grid, [1, m.pack, m.pack])
+    packed, grid = ops.conv.pixel_unshuffle(mean, grid, [1, m.pack, m.pack])
     z = ops.elemwise.standardize(packed, lat.bn_mean, lat.bn_rscale)
     seam.at(seam.PIXELS, [z, grid])
     return z

@@ -5,34 +5,37 @@ use crate::value::ValueId;
 
 pub mod attn;
 pub mod collective;
+pub mod conv;
 pub mod elemwise;
 pub mod fused;
-pub mod layout;
+pub mod gather;
 pub mod linear;
 pub mod sampling;
-pub mod spatial;
+pub mod ssm;
 
 pub use attn::{Attention, IndexScore, RaggedMask};
 pub use collective::Collective;
+pub use conv::{Conv, GridRule, TimePad, VoxelSegment};
 pub use elemwise::{
     Elementwise, GateActivation, ModulateForm, MropeForm, NormNext, RopeForm, RopeFreqs,
 };
 pub use fused::{Fused, NormKind};
-pub use layout::{Layout, PixelOrder, TapKind};
+pub use gather::{Gather, PixelOrder, TapKind};
 pub use linear::{ActQuant, Linear};
 pub use sampling::Sampling;
-pub use spatial::{GridRule, Spatial, TimePad, VoxelSegment};
+pub use ssm::Ssm;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Attention(Attention),
     Linear(Linear),
     Elementwise(Elementwise),
-    Layout(Layout),
+    Gather(Gather),
     Collective(Collective),
     Sampling(Sampling),
+    Ssm(Ssm),
     Fused(Fused),
-    Spatial(Spatial),
+    Conv(Conv),
 }
 
 impl Operation {
@@ -41,11 +44,12 @@ impl Operation {
             Self::Attention(op) => op,
             Self::Linear(op) => op,
             Self::Elementwise(op) => op,
-            Self::Layout(op) => op,
+            Self::Gather(op) => op,
             Self::Collective(op) => op,
             Self::Sampling(op) => op,
+            Self::Ssm(op) => op,
             Self::Fused(op) => op,
-            Self::Spatial(op) => op,
+            Self::Conv(op) => op,
         }
     }
 }
@@ -83,9 +87,9 @@ impl From<Elementwise> for Operation {
         Self::Elementwise(op)
     }
 }
-impl From<Layout> for Operation {
-    fn from(op: Layout) -> Self {
-        Self::Layout(op)
+impl From<Gather> for Operation {
+    fn from(op: Gather) -> Self {
+        Self::Gather(op)
     }
 }
 impl From<Collective> for Operation {
@@ -98,13 +102,18 @@ impl From<Sampling> for Operation {
         Self::Sampling(op)
     }
 }
+impl From<Ssm> for Operation {
+    fn from(op: Ssm) -> Self {
+        Self::Ssm(op)
+    }
+}
 impl From<Fused> for Operation {
     fn from(op: Fused) -> Self {
         Self::Fused(op)
     }
 }
-impl From<Spatial> for Operation {
-    fn from(op: Spatial) -> Self {
-        Self::Spatial(op)
+impl From<Conv> for Operation {
+    fn from(op: Conv) -> Self {
+        Self::Conv(op)
     }
 }

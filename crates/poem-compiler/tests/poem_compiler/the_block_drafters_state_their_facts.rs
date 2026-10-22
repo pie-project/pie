@@ -1,4 +1,5 @@
 use poem::{Attention, BlockDrafter, Dtype, Operation, Platform, Sampling, Trace};
+use poem_ir::Ssm;
 
 const PLATFORMS: [Platform; 2] = [Platform::Metal, Platform::Cuda];
 
@@ -20,7 +21,7 @@ fn non_causal(op: &Operation) -> bool {
 }
 
 fn block_dyn_conv(op: &Operation) -> bool {
-    matches!(op, Operation::Attention(Attention::BlockDynConv { .. }))
+    matches!(op, Operation::Ssm(Ssm::DynConv { .. }))
 }
 
 fn top_k(op: &Operation) -> bool {

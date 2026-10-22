@@ -17,7 +17,7 @@ pub fn embed(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "embed_bf16" });
     nonzero(OP, "the row count this embedding table states", vocab)?;
@@ -78,7 +78,7 @@ pub fn embed_concat(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "embed_concat_bf16" });
     nonzero(OP, "the row count this embedding table states", vocab)?;
@@ -129,7 +129,7 @@ pub fn embed_concat_mb_4bit(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let (slices, width) = concat_slices(OP, ids, y)?;
     gather_mb_4bit(ctx, OP, ids, table, vocab, y, slices, width)
@@ -144,7 +144,7 @@ pub fn split_qkv(
     k: Tensor,
     v: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_qkv";
+    const OP: &str = "gather.split_qkv";
     let entry =
         dtype_dispatch!(OP, packed.dtype, { Bf16 => "split_qkv_bf16", F32 => "split_qkv_f32" });
     if q_width.saturating_add(kv_width.saturating_mul(2)) != packed.width {
@@ -179,7 +179,7 @@ pub fn split_q_gate(
     q: Tensor,
     gate: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_q_gate";
+    const OP: &str = "gather.split_q_gate";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "q_gate_split_bf16" });
     nonzero(OP, "the head width this cut walks", head_dim)?;
     if q.width == 0 || !q.width.is_multiple_of(head_dim) {
@@ -218,7 +218,7 @@ pub fn split_rows(
     left: Tensor,
     right: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_rows";
+    const OP: &str = "gather.split_rows";
     let entry =
         dtype_dispatch!(OP, x.dtype, { Bf16 => "split_rows_bf16", F32 => "split_rows_f32" });
     nonzero(OP, "the left half of this cut", left.width)?;
@@ -258,7 +258,7 @@ pub fn select(
     width: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.select";
+    const OP: &str = "gather.select";
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "select_slice_bf16" });
     nonzero(OP, "the slice width this select states", width)?;
     debug_assert_eq!(
@@ -305,7 +305,7 @@ pub fn embed_gather_mb_4bit(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(
         ids.rows, y.rows,
         "the token ids handed over are the rows this gather lands"
@@ -430,7 +430,7 @@ fn move_rows(
 }
 
 pub fn gather_rows(ctx: &Ctx<'_>, wide: Tensor, index: Tensor, tight: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.gather_rows";
+    const OP: &str = "gather.rows";
     let entry = dtype_dispatch!(OP, tight.dtype, {
         Bf16 => "row_gather_bf16",
         F32 => "row_gather_f32",
@@ -445,7 +445,7 @@ pub fn scatter_rows(
     index: Tensor,
     wide: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_rows";
+    const OP: &str = "gather.scatter_rows";
     let entry = dtype_dispatch!(OP, tight.dtype, {
         Bf16 => "row_scatter_bf16",
         F32 => "row_scatter_f32",
@@ -476,7 +476,7 @@ fn fold_extent(op: &'static str, x: Tensor, side: u32) -> Result<(u32, u32), Err
 }
 
 pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.pool_rows";
+    const OP: &str = "gather.pool_rows";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "pool_rows_bf16" });
     debug_assert_eq!(y.dtype, x.dtype, "`{OP}` pools into the element it reads");
     let (block, out) = fold_extent(OP, x, side)?;
@@ -513,7 +513,7 @@ pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), E
 }
 
 pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.merge_rows";
+    const OP: &str = "gather.merge_rows";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "merge_rows_bf16" });
     debug_assert_eq!(y.dtype, x.dtype, "`{OP}` merges into the element it reads");
     let (block, out) = fold_extent(OP, x, side)?;
@@ -566,7 +566,7 @@ pub fn pixels(
     temporal: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.pixels";
+    const OP: &str = "gather.pixels";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "pixels_bf16" });
     if x.dtype != Dtype::U8 {
         return Err(refuse(
@@ -621,7 +621,7 @@ pub fn grid_taps(
     ids: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.grid_taps";
+    const OP: &str = "gather.grid_taps";
     let taps: u32 = if bilinear { 4 } else { 2 };
     if positions.dtype != Dtype::I32 || grids.dtype != Dtype::I32 || segments.dtype != Dtype::I32 {
         return Err(refuse(OP, "positions, grids and segments are i32"));
@@ -666,7 +666,7 @@ pub fn scatter_live_rows(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_live_rows";
+    const OP: &str = "gather.scatter_live_rows";
     let entry = dtype_dispatch!(OP, src.dtype, {
         Bf16 => "row_scatter_live_bf16",
         F32 => "row_scatter_live_f32",
@@ -682,7 +682,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_weighted";
+    const OP: &str = "gather.embed_weighted";
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "embed_weighted_bf16" });
     debug_assert_eq!(
         y.dtype, table.dtype,
@@ -746,7 +746,7 @@ pub fn embed_weighted(
 }
 
 pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result<(), Error> {
-    const OP: &str = "layout.rs_copy";
+    const OP: &str = "gather.rs_copy";
     if bytes == 0 {
         return Ok(());
     }
@@ -769,12 +769,12 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
 }
 
 pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
-    let index = permutation("layout.pack_rows", perm, o.rows)?;
+    let index = permutation("gather.pack_rows", perm, o.rows)?;
     gather_rows(ctx, x, index, o)
 }
 
 pub fn unpack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
-    let index = permutation("layout.unpack_rows", perm, x.rows)?;
+    let index = permutation("gather.unpack_rows", perm, x.rows)?;
     scatter_rows(ctx, x, index, o)
 }
 

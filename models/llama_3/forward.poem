@@ -25,7 +25,7 @@ def forward(m, inputs):
         "high_freq_factor": m.rope.high_freq_factor,
         "original_max_position_embeddings": m.rope.original_max_position,
     })
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
@@ -40,13 +40,13 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def attention(x, inputs, m, plans, mask, positions, scaling, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.layout.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
     seam.at(seam.ATTN_QV, [q, v])
     q, k = ops.elemwise.rope_full(q, k, positions, d, m.theta, False, scaling = scaling)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))

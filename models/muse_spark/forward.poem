@@ -45,7 +45,7 @@ def forward(m, inputs):
     positions = inputs.positions()
 
     y = ops.elemwise.rmsnorm_no_scale(
-        ops.layout.embed(inputs.tokens(), m.embed, m.vocab),
+        ops.gather.embed(inputs.tokens(), m.embed, m.vocab),
         m.hidden,
         m.norm_eps,
     )
@@ -59,8 +59,8 @@ def forward(m, inputs):
         win = windows[reading]
         pages = inputs.kv(w.kv)
 
-        qkv, gate = ops.layout.split_rows(ops.linear.matmul(normed, w.qkvg), (m.q_heads + 2 * m.kv_heads) * d)
-        q, k, v = ops.layout.split_qkv(qkv, m.q_heads * d, m.kv_heads * d)
+        qkv, gate = ops.gather.split_rows(ops.linear.matmul(normed, w.qkvg), (m.q_heads + 2 * m.kv_heads) * d)
+        q, k, v = ops.gather.split_qkv(qkv, m.q_heads * d, m.kv_heads * d)
         q = ops.elemwise.rmsnorm_no_scale(q, d, m.norm_eps)
         k = ops.elemwise.rmsnorm_no_scale(k, d, m.norm_eps)
         if not w.full:
@@ -96,5 +96,5 @@ def forward(m, inputs):
 
     first = ops.elemwise.rmsnorm_plus_one(y, m.layers[0].attn_norm, m.norm_eps)
     _, x = inputs.fold_layers(m.layers, (y, first), block)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.attn.logit_softcap(ops.linear.lm_head(x, m.lm_head), m.softcap)

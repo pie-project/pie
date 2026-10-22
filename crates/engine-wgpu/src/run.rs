@@ -747,7 +747,7 @@ impl<'c> Run<'c> {
         };
         rows.stage(self.handles, host, bank, ids)
             .map_err(|why| kernels_wgpu::Error::Backend {
-                op: "layout.embed_concat",
+                op: "gather.embed_concat",
                 detail: why.to_string(),
             })
     }

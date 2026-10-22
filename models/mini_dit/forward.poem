@@ -15,7 +15,7 @@ def chunks(x, widths):
     whatever remains."""
     out = []
     for width in widths[:-1]:
-        head, x = ops.layout.split_rows(x, width)
+        head, x = ops.gather.split_rows(x, width)
         out.append(head)
     out.append(x)
     return out
@@ -28,16 +28,16 @@ def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
     """`q`'s rows attending `k` and `v`'s, each side grouped by its own
     `perm` and `csr`."""
     o = ops.attn.ragged(
-        ops.layout.pack_rows(q, rows.perm),
-        ops.layout.pack_rows(k, over.perm),
-        ops.layout.pack_rows(v, over.perm),
+        ops.gather.pack_rows(q, rows.perm),
+        ops.gather.pack_rows(k, over.perm),
+        ops.gather.pack_rows(v, over.perm),
         rows.csr,
         over.csr,
         head_dim,
         sm_scale,
         mask,
     )
-    return ops.layout.unpack_rows(o, rows.perm)
+    return ops.gather.unpack_rows(o, rows.perm)
 
 TIMESTEP_DIM = 256
 ROPE_DIMS = [16, 24, 24, 0]
@@ -62,7 +62,7 @@ def heads(m, at, stem, x, attn, mods, lanes, positions):
     h = norm_modulate(x, mods, lanes, LN_EPS)
     if tap("norm1_out", h):
         return None
-    q, k, v = ops.layout.split_qkv(linear(attn.qkv, h), m.hidden, m.hidden)
+    q, k, v = ops.gather.split_qkv(linear(attn.qkv, h), m.hidden, m.hidden)
     hp = "self_" if stem == "b2" else ""
     for tail, value in [("q_raw", q), ("k_raw", k), ("v", v)]:
         if tap(hp + tail, value):
@@ -204,7 +204,7 @@ def forward(m, inputs):
     cq = ops.elemwise.rmsnorm_per_head(linear(cross.q, hc), cross.q_norm, m.head_dim, RMS_EPS)
     if at("b2.cross_q", cq):
         return cq
-    ck, cv = ops.layout.split_rows(linear(cross.kv, ctx_rows), m.hidden)
+    ck, cv = ops.gather.split_rows(linear(cross.kv, ctx_rows), m.hidden)
     ck = ops.elemwise.rmsnorm_per_head(ck, cross.k_norm, m.head_dim, RMS_EPS)
     ctx_group = struct(perm = ctx.row_permutation(), csr = ctx.group_indptr())
     ca = attend(cq, ck, cv, img_rows, ctx_group, m.head_dim, m.sm_scale, group_block_diagonal())

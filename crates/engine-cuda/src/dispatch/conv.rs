@@ -1,21 +1,13 @@
-use kernels_cuda::attn::voxel;
 use kernels_cuda::conv;
 use kernels_cuda::tensor::Tensor;
-use poem_exec::{DispatchSpatial, KernelError};
-use poem_ir::{GridRule, Spatial, TimePad, VoxelSegment};
+use poem_exec::{DispatchConv, KernelError};
+use poem_ir::{Conv, GridRule, TimePad};
 
 use crate::run::Run;
 
-impl DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
-        self.spatial(op).map_err(crate::error::kernel)
-    }
-}
-
-fn segment(segment: VoxelSegment) -> voxel::Segment {
-    match segment {
-        VoxelSegment::Clip => voxel::Segment::Lane,
-        VoxelSegment::Frames(n) => voxel::Segment::Frames(n),
+impl DispatchConv for Run<'_> {
+    fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError> {
+        self.conv(op).map_err(crate::error::kernel)
     }
 }
 
@@ -52,15 +44,15 @@ fn rule(rule: GridRule) -> kernels_cuda::elemwise::posenc::GridRule {
 }
 
 impl Run<'_> {
-    fn spatial(&mut self, op: &Spatial) -> Result<(), kernels_cuda::Error> {
+    fn conv(&mut self, op: &Conv) -> Result<(), kernels_cuda::Error> {
         match op {
-            Spatial::Grid { grid, rule: how, y } => kernels_cuda::elemwise::posenc::derive_grid(
+            Conv::Grid { grid, rule: how, y } => kernels_cuda::elemwise::posenc::derive_grid(
                 self.ctx(),
                 self.tensor(*grid),
                 rule(*how),
                 &mut self.tensor(*y),
             ),
-            Spatial::Conv3d {
+            Conv::Conv3d {
                 x,
                 grid,
                 w,
@@ -107,7 +99,7 @@ impl Run<'_> {
                 let slot_ids = self
                     .clip_slots()
                     .ok_or_else(|| kernels_cuda::Error::Backend {
-                        op: "spatial.conv3d",
+                        op: "conv.conv3d",
                         detail:
                             "a causal convolution with a frame cache needs the fire's clip slot \
                              table, which no lane of it staged"
@@ -116,8 +108,8 @@ impl Run<'_> {
                 let rows = x.rows.saturating_mul(frames);
                 let bytes = u64::from(rows) * u64::from(x.width) * 2;
                 let scratch = self.ctx().scratch(
-                    "spatial.conv3d",
-                    "spatial.conv3d.frame_cache",
+                    "conv.conv3d",
+                    "conv.conv3d.frame_cache",
                     usize::try_from(bytes).unwrap_or(usize::MAX),
                 )? as u64;
                 let mut frame_cache = Tensor::new(scratch, rows, x.width, x.dtype);
@@ -151,7 +143,7 @@ impl Run<'_> {
                     &mut slab,
                 )
             }
-            Spatial::GroupNorm {
+            Conv::GroupNorm {
                 x,
                 grid,
                 groups,
@@ -171,25 +163,7 @@ impl Run<'_> {
                 *silu,
                 &mut self.tensor(*y),
             ),
-            Spatial::Attention {
-                q,
-                k,
-                v,
-                grid,
-                segment: how,
-                sm_scale,
-                y,
-            } => voxel::attention(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                segment(*how),
-                *sm_scale,
-                &mut self.tensor(*y),
-            ),
-            Spatial::UpsampleNearest {
+            Conv::Upsample {
                 x,
                 grid,
                 factor,
@@ -205,7 +179,7 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::PixelShuffle {
+            Conv::PixelShuffle {
                 x,
                 grid,
                 r,
@@ -221,7 +195,7 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::PixelUnshuffle {
+            Conv::PixelUnshuffle {
                 x,
                 grid,
                 r,
@@ -235,7 +209,7 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::AvgDown {
+            Conv::AvgDown {
                 x,
                 grid,
                 factor,
@@ -251,7 +225,7 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::CacheStore {
+            Conv::CacheStore {
                 x,
                 grid,
                 frames,
@@ -264,7 +238,7 @@ impl Run<'_> {
                 let slot_ids = self
                     .clip_slots()
                     .ok_or_else(|| kernels_cuda::Error::Backend {
-                        op: "spatial.cache_store",
+                        op: "conv.cache_store",
                         detail:
                             "a frame-cache store needs the fire's clip slot table, which no lane                              of it staged"
                                 .to_string(),
@@ -272,7 +246,7 @@ impl Run<'_> {
                 let mut slab = pool.slab;
                 conv::cache_store(self.ctx(), x, x, slot_ids, grid, *frames, &mut slab)
             }
-            Spatial::Patchify {
+            Conv::Patchify {
                 x,
                 grid,
                 p,
@@ -286,7 +260,7 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*tgrid),
             ),
-            Spatial::Unpatchify {
+            Conv::Unpatchify {
                 x,
                 tgrid,
                 p,

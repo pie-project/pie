@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
 use crate::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused, DispatchLayout,
-    DispatchLinear, DispatchSampling, DispatchSpatial,
+    DispatchAttention, DispatchCollective, DispatchConv, DispatchElementwise, DispatchFused,
+    DispatchGather, DispatchLinear, DispatchSampling, DispatchSsm,
 };
 use crate::error::KernelError;
 use poem_compiler::{Lowering, Region};
 use poem_ir::ops::{Attention, Collective, Elementwise};
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Fused, Guard, Layout, Linear, Node, Operands, Operation, Platform,
-    RuntimeInput, Sampling, Seam, Spatial, StructKind, Trace, Ty, ValueDecl, ValueId,
+    CacheRow, Conv, Def, Dim, Dtype, Fused, Gather, Guard, Linear, Node, Operands, Operation,
+    Platform, RuntimeInput, Sampling, Seam, Ssm, StructKind, Trace, Ty, ValueDecl, ValueId,
 };
 
 use crate::fire::sink::{EventId, Sink};
@@ -215,11 +215,12 @@ fn payload(op: &Operation) -> usize {
         Operation::Attention(op) => address(op),
         Operation::Linear(op) => address(op),
         Operation::Elementwise(op) => address(op),
-        Operation::Layout(op) => address(op),
+        Operation::Gather(op) => address(op),
         Operation::Collective(op) => address(op),
         Operation::Sampling(op) => address(op),
+        Operation::Ssm(op) => address(op),
         Operation::Fused(op) => address(op),
-        Operation::Spatial(op) => address(op),
+        Operation::Conv(op) => address(op),
     }
 }
 
@@ -241,14 +242,20 @@ impl DispatchElementwise for MockDispatch<'_> {
     }
 }
 
-impl DispatchLayout for MockDispatch<'_> {
-    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError> {
+impl DispatchGather for MockDispatch<'_> {
+    fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError> {
         self.note(op)
     }
 }
 
 impl DispatchCollective for MockDispatch<'_> {
     fn dispatch(&mut self, op: &Collective) -> Result<(), KernelError> {
+        self.note(op)
+    }
+}
+
+impl DispatchSsm for MockDispatch<'_> {
+    fn dispatch(&mut self, op: &Ssm) -> Result<(), KernelError> {
         self.note(op)
     }
 }
@@ -265,8 +272,8 @@ impl DispatchFused for MockDispatch<'_> {
     }
 }
 
-impl DispatchSpatial for MockDispatch<'_> {
-    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
+impl DispatchConv for MockDispatch<'_> {
+    fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError> {
         self.note(op)
     }
 }

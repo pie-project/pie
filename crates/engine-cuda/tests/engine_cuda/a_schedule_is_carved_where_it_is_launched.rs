@@ -43,7 +43,7 @@ impl ForwardHybrid for TokensAndLatents {
         };
 
         let table = Weight::sym("embed", [u64::from(VOCAB), u64::from(WIDTH)], Dtype::Bf16);
-        let x = ops::layout::embed(&txt.tokens(), &table, VOCAB);
+        let x = ops::gather::embed(&txt.tokens(), &table, VOCAB);
         let q = ops::linear::matmul(&x, &w("txt.q", HEAD_DIM, WIDTH));
         let k = ops::linear::matmul(&x, &w("txt.k", HEAD_DIM, WIDTH));
         let v = ops::linear::matmul(&x, &w("txt.v", HEAD_DIM, WIDTH));

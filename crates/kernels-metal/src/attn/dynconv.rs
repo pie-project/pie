@@ -64,7 +64,7 @@ fn convolve(
     y: Tensor,
     table: Option<(Tensor, u32)>,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.block_dyn_conv";
+    const OP: &str = "ssm.dyn_conv";
     let entry = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "block_dyn_conv_bfloat16" });
     if coeff.dtype != x.data.dtype || base.dtype != x.data.dtype || y.dtype != x.data.dtype {
         return Err(refuse(

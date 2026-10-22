@@ -19,7 +19,7 @@ pub fn dyn_conv(
     group: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.block_dyn_conv";
+    const OP: &str = "ssm.dyn_conv";
     let t = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "::pie::bf16" });
     if coeff.dtype != x.data.dtype || base.dtype != x.data.dtype || y.dtype != x.data.dtype {
         return Err(refuse(

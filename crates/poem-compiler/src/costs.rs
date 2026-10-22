@@ -24,11 +24,12 @@ micros! {
     AttentionUs = "compiler.cost.attention_us", 60.0, "An attention op, in microseconds.";
     LinearUs = "compiler.cost.linear_us", 40.0, "A matmul, in microseconds.";
     ElementwiseUs = "compiler.cost.elementwise_us", 4.0, "An elementwise op, in microseconds.";
-    LayoutUs = "compiler.cost.layout_us", 4.0, "A layout op, in microseconds.";
+    GatherUs = "compiler.cost.gather_us", 4.0, "A gather op, in microseconds.";
     CollectiveUs = "compiler.cost.collective_us", 50.0, "A collective, in microseconds.";
     SamplingUs = "compiler.cost.sampling_us", 4.0, "A sampling op, in microseconds.";
+    SsmUs = "compiler.cost.ssm_us", 60.0, "A recurrent (ssm) op, in microseconds.";
     CustomUs = "compiler.cost.custom_us", 20.0, "A custom fused op, in microseconds.";
-    SpatialUs = "compiler.cost.spatial_us", 40.0, "A spatial op, in microseconds.";
+    ConvUs = "compiler.cost.conv_us", 40.0, "A conv op, in microseconds.";
 }
 
 /// Side streams the compiler may fork independent regions onto.
@@ -85,11 +86,12 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
         .add::<AttentionUs>()
         .add::<LinearUs>()
         .add::<ElementwiseUs>()
-        .add::<LayoutUs>()
+        .add::<GatherUs>()
         .add::<CollectiveUs>()
         .add::<SamplingUs>()
+        .add::<SsmUs>()
         .add::<CustomUs>()
-        .add::<SpatialUs>()
+        .add::<ConvUs>()
         .add::<Branches>()
         .add::<DagStreams>()
         .add::<DagStreamsUntil>()
@@ -119,11 +121,12 @@ impl DeviceProfile {
                 attention: us(profile.get::<AttentionUs>().0),
                 linear: us(profile.get::<LinearUs>().0),
                 elementwise: us(profile.get::<ElementwiseUs>().0),
-                layout: us(profile.get::<LayoutUs>().0),
+                gather: us(profile.get::<GatherUs>().0),
                 collective: us(profile.get::<CollectiveUs>().0),
                 sampling: us(profile.get::<SamplingUs>().0),
+                ssm: us(profile.get::<SsmUs>().0),
                 custom: us(profile.get::<CustomUs>().0),
-                spatial: us(profile.get::<SpatialUs>().0),
+                conv: us(profile.get::<ConvUs>().0),
             },
             exclusive: exclusive.iter().map(|s| (*s).to_string()).collect(),
             grouped: grouped.iter().map(|s| (*s).to_string()).collect(),

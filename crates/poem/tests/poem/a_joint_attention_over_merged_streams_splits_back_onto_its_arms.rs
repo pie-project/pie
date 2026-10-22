@@ -37,16 +37,16 @@ impl ForwardHybrid for DoubleBlock {
         let perm = inputs.row_permutation();
         let indptr = inputs.group_indptr();
         let o = ops::attn::ragged(
-            &ops::layout::pack_rows(&q, &perm),
-            &ops::layout::pack_rows(&k, &perm),
-            &ops::layout::pack_rows(&v, &perm),
+            &ops::gather::pack_rows(&q, &perm),
+            &ops::gather::pack_rows(&k, &perm),
+            &ops::gather::pack_rows(&v, &perm),
             &indptr,
             &indptr,
             HEAD_DIM,
             0.35,
             RaggedMask::GroupBlockDiagonal,
         );
-        let o = ops::layout::unpack_rows(&o, &perm);
+        let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (
             o.on(fact::stream(Stream::Text)),
             o.on(!fact::stream(Stream::Text)),

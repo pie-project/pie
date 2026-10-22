@@ -578,6 +578,6 @@ pub fn layernorm(
 
 crate::error::unsupported! {
     #[allow(clippy::too_many_arguments)]
-    group_norm = "spatial.group_norm" (x: Tensor, grid: Tensor, groups: u32, weight: Tensor,
+    group_norm = "conv.group_norm" (x: Tensor, grid: Tensor, groups: u32, weight: Tensor,
         bias: Tensor, eps: f32, silu: bool, o: &mut Tensor);
 }

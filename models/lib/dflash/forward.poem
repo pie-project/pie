@@ -46,12 +46,12 @@ def conv_prepare(x, c):
     if c == None:
         return x, None
     coeff = ops.linear.matmul(x, c.proj)
-    return ops.attn.block_dyn_conv(x, coeff, c.base, 0, c.taps, c.group), coeff
+    return ops.ssm.dyn_conv(x, coeff, c.base, 0, c.taps, c.group), coeff
 
 def conv_finish(y, c, coeff):
     if c == None or coeff == None:
         return y
-    return ops.attn.block_dyn_conv(y, coeff, c.base, 1, c.taps, c.group)
+    return ops.ssm.dyn_conv(y, coeff, c.base, 1, c.taps, c.group)
 
 def arm(d, inputs, fused, h_block, mask, block_draft):
     """The drafted block's hidden rows, from the trunk's `fused` taps and
@@ -115,11 +115,11 @@ def plant_readout(d, logits, inputs, read, block_draft):
     seam.at(seam.MTP, [dlogits])
     sel = d.selector
     if sel != None:
-        unary, cand = ops.layout.topk(dlogits, sel.top_k)
+        unary, cand = ops.sampling.top_k(dlogits, sel.top_k)
         hb = read.on(block_draft)
         hp = ops.linear.matmul(hb, sel.hidden_projection) if sel.hidden_projection != None else None
-        toks = ops.layout.gather_rows(inputs.tokens(), inputs.readout_rows()).on(block_draft)
-        picks = ops.attn.selector_walk(cand, unary, hp, toks, sel.pred, sel.succ, d.proposals_from)
+        toks = ops.gather.gather_rows(inputs.tokens(), inputs.readout_rows()).on(block_draft)
+        picks = ops.sampling.selector_walk(cand, unary, hp, toks, sel.pred, sel.succ, d.proposals_from)
     else:
-        picks = ops.layout.argmax([dlogits])
+        picks = ops.sampling.argmax([dlogits])
     seam.at(seam.MTP_DRAFTS, [picks])

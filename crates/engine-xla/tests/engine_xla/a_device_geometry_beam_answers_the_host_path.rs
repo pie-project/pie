@@ -48,7 +48,7 @@ impl ForwardHybrid for Tiny {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
         let table = Weight::sym("embed", [u64::from(VOCAB), u64::from(WIDTH)], Dtype::Bf16);
-        let x = ops::layout::embed(&inputs.tokens(), &table, VOCAB);
+        let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
         let q = ops::linear::matmul(&x, &w("q", HEAD_DIM, WIDTH));
         let k = ops::linear::matmul(&x, &w("k", HEAD_DIM, WIDTH));
         let v = ops::linear::matmul(&x, &w("v", HEAD_DIM, WIDTH));

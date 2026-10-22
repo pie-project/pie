@@ -34,10 +34,10 @@ const REFUSED: &[Refusal] = &[
         needle: "op: \"collective.reduce_scatter\"",
     },
     Refusal {
-        op: "spatial.patchify",
+        op: "conv.patchify",
         why: "voxels to patch tokens has no arm here; no catalog row reaches it",
         file: "src/dispatch/custom.rs",
-        needle: "Spatial::Patchify { .. } | Spatial::Unpatchify { .. }",
+        needle: "Conv::Patchify { .. } | Conv::Unpatchify { .. }",
     },
 ];
 

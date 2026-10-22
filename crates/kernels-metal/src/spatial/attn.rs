@@ -6,7 +6,7 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "spatial/attn.metal";
 
-const OP: &str = "spatial.attention";
+const OP: &str = "attention.voxel";
 
 const THREADS: u32 = 128;
 

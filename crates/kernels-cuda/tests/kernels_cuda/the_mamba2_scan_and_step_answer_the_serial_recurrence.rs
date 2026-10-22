@@ -171,7 +171,7 @@ fn the_mamba2_scan_and_step_answer_the_serial_recurrence() {
     );
 
     let steps = LENS.len() as u32;
-    ssm::mamba2_step(
+    ssm::mamba2(
         &gpu.ctx(),
         Tensor::new(at(xbc_at, prompt, WIDTH), steps, WIDTH as u32, Dtype::Bf16),
         Tensor::new(at(dt_at, prompt, HEADS), steps, HEADS as u32, Dtype::Bf16),

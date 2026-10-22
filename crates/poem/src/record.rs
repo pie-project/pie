@@ -33,10 +33,11 @@ primitive!(
     poem_ir::Attention,
     poem_ir::Linear,
     poem_ir::Sampling,
+    poem_ir::Ssm,
     poem_ir::Elementwise,
-    poem_ir::Layout,
+    poem_ir::Gather,
     poem_ir::Collective,
-    poem_ir::Spatial
+    poem_ir::Conv
 );
 
 #[derive(Clone)]

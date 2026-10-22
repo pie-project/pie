@@ -311,7 +311,7 @@ impl Run<'_> {
                 last = at;
             } else {
                 match op(at) {
-                    Some(Operation::Layout(poem_ir::Layout::SplitQGate {
+                    Some(Operation::Gather(poem_ir::Gather::SplitQGate {
                         packed,
                         q,
                         gate,
@@ -352,7 +352,7 @@ impl Run<'_> {
                 .iter()
                 .copied()
                 .find_map(|at| match op(at) {
-                    Some(Operation::Layout(poem_ir::Layout::SplitRows {
+                    Some(Operation::Gather(poem_ir::Gather::SplitRows {
                         x,
                         width,
                         left,

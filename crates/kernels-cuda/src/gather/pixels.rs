@@ -19,7 +19,7 @@ pub fn pixels(
     temporal: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.pixels";
+    const OP: &str = "gather.pixels";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16" });
     if x.dtype != Dtype::U8 {
         return Err(refuse(
@@ -79,7 +79,7 @@ pub fn grid_taps(
     ids: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.grid_taps";
+    const OP: &str = "gather.grid_taps";
     let taps: u32 = if bilinear { 4 } else { 2 };
     if positions.dtype != Dtype::I32 || grids.dtype != Dtype::I32 || segments.dtype != Dtype::I32 {
         return Err(refuse(OP, "positions, grids and segments are i32"));

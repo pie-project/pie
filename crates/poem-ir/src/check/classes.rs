@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
-use crate::ops::{Attention, Fused, Layout, Spatial};
+use crate::ops::{Attention, Conv, Fused, Gather, Ssm};
 use crate::{Def, Guard, Operands, Operation, Trace, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,7 +393,7 @@ fn spans_classes(op: &Operation) -> bool {
     matches!(
         op,
         Operation::Attention(Attention::Ragged { .. })
-            | Operation::Layout(Layout::PackRows { .. } | Layout::UnpackRows { .. })
+            | Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
     )
 }
 
@@ -406,18 +406,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::IndexKvAppend { .. }
             | Attention::PoolKvAppend { .. }
             | Attention::PoolStateWrite { .. } => true,
-            Attention::SsmCausalConv1d { .. }
-            | Attention::SsmCausalConv1dChunked { .. }
-            | Attention::ShortConv { .. }
-            | Attention::ShortConvChunked { .. }
-            | Attention::SsmGatedDelta { .. }
-            | Attention::SsmGatedDeltaChunked { .. }
-            | Attention::SsmKdaStep { .. }
-            | Attention::SsmKdaChunked { .. }
-            | Attention::SsmMamba2 { .. }
-            | Attention::PleNgramIds { .. }
-            | Attention::PleNgramIdsChunked { .. }
-            | Attention::ReplayFloor { .. } => true,
+            Attention::ReplayFloor { .. } => true,
             Attention::PlanDecode { .. }
             | Attention::PlanPrefill { .. }
             | Attention::Decode { .. }
@@ -428,6 +417,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::MaskedLse { .. }
             | Attention::Dense { .. }
             | Attention::Ragged { .. }
+            | Attention::Voxel { .. }
             | Attention::DecodeLse { .. }
             | Attention::PrefillLse { .. }
             | Attention::DecodeSelected { .. }
@@ -445,8 +435,6 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::MlaPrefill { .. }
             | Attention::MlaDecodeSelected { .. }
             | Attention::MlaPrefillSelected { .. }
-            | Attention::SsmGdnPrep { .. }
-            | Attention::BlockDynConv { .. }
             | Attention::KvEnds { .. }
             | Attention::WindowSink { .. }
             | Attention::IndexLayernormRope { .. }
@@ -470,24 +458,18 @@ fn writes_cache(op: &Operation) -> bool {
                 | Fused::SplitRopeYarnAppend { .. }
                 | Fused::QgQknormRopeAppend { .. }
         ),
-        Operation::Spatial(op) => match op {
-            Spatial::Conv3d { cache, .. } => cache.is_some(),
-            Spatial::CacheStore { .. } => true,
-            Spatial::Grid { .. }
-            | Spatial::GroupNorm { .. }
-            | Spatial::Attention { .. }
-            | Spatial::UpsampleNearest { .. }
-            | Spatial::PixelShuffle { .. }
-            | Spatial::PixelUnshuffle { .. }
-            | Spatial::AvgDown { .. }
-            | Spatial::Patchify { .. }
-            | Spatial::Unpatchify { .. } => false,
+        Operation::Conv(op) => match op {
+            Conv::Conv3d { cache, .. } => cache.is_some(),
+            Conv::CacheStore { .. } => true,
+            _ => false,
         },
+        Operation::Gather(Gather::NgramIds { .. } | Gather::NgramIdsChunked { .. }) => true,
         Operation::Linear(_)
         | Operation::Elementwise(_)
-        | Operation::Layout(_)
+        | Operation::Gather(_)
         | Operation::Collective(_)
         | Operation::Sampling(_) => false,
+        Operation::Ssm(op) => !matches!(op, Ssm::DynConv { .. } | Ssm::GdnGates { .. }),
     }
 }
 

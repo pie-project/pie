@@ -1,19 +1,121 @@
+use kernels_metal::attn;
 use kernels_metal::layout;
-use poem_exec::{DispatchLayout, KernelError};
-use poem_ir::Layout;
+use poem_exec::{DispatchGather, KernelError};
+use poem_ir::Gather;
+use poem_ir::Operands;
 
 use crate::run::Run;
 
-impl DispatchLayout for Run<'_> {
-    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError> {
-        self.layout(op).map_err(crate::error::kernel)
+impl DispatchGather for Run<'_> {
+    fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError> {
+        self.gather(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn layout(&mut self, op: &Layout) -> Result<(), kernels_metal::Error> {
+    fn gather(&mut self, op: &Gather) -> Result<(), kernels_metal::Error> {
         match op {
-            Layout::Embed {
+            Gather::NgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            }
+            | Gather::NgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "gather.ngram_ids_committed";
+                let seat = self.rs_seat().expect("guarded");
+                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                    return Err(kernels_metal::Error::Unsupported { op: op.name() });
+                };
+                let ext_ids = self.rs_extend(OP, &seat, *ids)?;
+                attn::ple::ngram_ids_committed(
+                    self.ctx(),
+                    ext_ids,
+                    self.qo_indptr(),
+                    &self.rs_committed(&seat),
+                    &self.recurrent(*state),
+                    hash,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
+                    self.tensor(*ngram_ids),
+                )
+            }
+            Gather::NgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => {
+                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                    return Err(kernels_metal::Error::Unsupported { op: op.name() });
+                };
+                attn::ple::ngram_ids(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    &self.recurrent(*state),
+                    hash,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
+                    self.tensor(*ngram_ids),
+                )
+            }
+            Gather::NgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => {
+                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                    return Err(kernels_metal::Error::Unsupported { op: op.name() });
+                };
+                attn::ple::ngram_ids_chunked(
+                    self.ctx(),
+                    self.ragged(*ids),
+                    &self.recurrent(*state),
+                    hash,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
+                    self.tensor(*ngram_ids),
+                )
+            }
+            Gather::Embed {
                 ids,
                 table,
                 vocab,
@@ -34,12 +136,12 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Layout::EmbedConcat {
+            Gather::EmbedConcat {
                 scales: Some(_), ..
             } => Err(kernels_metal::Error::Unsupported {
-                op: "layout.embed_concat(mxfp8)",
+                op: "gather.embed_concat(mxfp8)",
             }),
-            Layout::EmbedConcat {
+            Gather::EmbedConcat {
                 ids,
                 table,
                 scales: None,
@@ -68,7 +170,7 @@ impl Run<'_> {
                     )
                 }
             },
-            Layout::SplitQkv {
+            Gather::SplitQkv {
                 packed,
                 q_width,
                 kv_width,
@@ -84,7 +186,7 @@ impl Run<'_> {
                 self.tensor(*k),
                 self.tensor(*v),
             ),
-            Layout::SplitQGate {
+            Gather::SplitQGate {
                 packed,
                 head_dim,
                 q,
@@ -97,8 +199,8 @@ impl Run<'_> {
                 self.tensor(*gate),
             ),
             // A segment launch of the projection it splits landed both halves.
-            Layout::SplitRows { left, .. } if self.landed_ahead(*left) => Ok(()),
-            Layout::SplitRows {
+            Gather::SplitRows { left, .. } if self.landed_ahead(*left) => Ok(()),
+            Gather::SplitRows {
                 x,
                 width,
                 left,
@@ -110,13 +212,13 @@ impl Run<'_> {
                 self.tensor(*left),
                 self.tensor(*right),
             ),
-            Layout::PoolRows { x, side, y } => {
+            Gather::PoolRows { x, side, y } => {
                 layout::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
-            Layout::MergeRows { x, side, y } => {
+            Gather::MergeRows { x, side, y } => {
                 layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
-            Layout::Pixels {
+            Gather::Pixels {
                 x,
                 patch,
                 mean,
@@ -135,13 +237,13 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
             // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
-            Layout::ConcatCols { .. } => Err(kernels_metal::Error::Unsupported {
-                op: "layout.concat_cols",
+            Gather::ConcatCols { .. } => Err(kernels_metal::Error::Unsupported {
+                op: "gather.concat_cols",
             }),
-            Layout::SplitQkvPadded { .. } => Err(kernels_metal::Error::Unsupported {
-                op: "layout.split_qkv_padded",
+            Gather::SplitQkvPadded { .. } => Err(kernels_metal::Error::Unsupported {
+                op: "gather.split_qkv_padded",
             }),
-            Layout::GridTaps {
+            Gather::GridTaps {
                 positions,
                 grids,
                 segments,
@@ -159,7 +261,7 @@ impl Run<'_> {
                 self.tensor(*ids),
                 self.tensor(*weights),
             ),
-            Layout::ScatterLiveRows {
+            Gather::ScatterLiveRows {
                 src,
                 routes,
                 y,
@@ -170,7 +272,7 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.uncut(*y),
             ),
-            Layout::EmbedWeighted {
+            Gather::EmbedWeighted {
                 ids,
                 weights,
                 table,
@@ -184,7 +286,7 @@ impl Run<'_> {
                 *vocab,
                 self.tensor(*y),
             ),
-            Layout::ScatterRows {
+            Gather::ScatterRows {
                 src,
                 routes,
                 y,
@@ -195,25 +297,25 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.uncut(*y),
             ),
-            Layout::PackRows { x, perm, y } => layout::pack_rows(
+            Gather::PackRows { x, perm, y } => layout::pack_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*perm),
                 self.tensor(*y),
             ),
-            Layout::UnpackRows { x, perm, y } => layout::unpack_rows(
+            Gather::UnpackRows { x, perm, y } => layout::unpack_rows(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*perm),
                 self.uncut(*y),
             ),
-            Layout::GatherRows { x, rows, y } => layout::gather_rows(
+            Gather::Rows { x, rows, y } => layout::gather_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*rows),
                 self.tensor(*y),
             ),
-            Layout::Select {
+            Gather::Select {
                 table,
                 layer,
                 width,

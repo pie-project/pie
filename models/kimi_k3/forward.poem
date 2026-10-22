@@ -16,8 +16,8 @@ def kda(x, inputs, k):
     seam.at(seam.RECURRENT, [qkv])
 
     one = fact.single_token()
-    step = ops.attn.ssm_kda_step(
-        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
+    step = ops.ssm.kda(
+        ops.ssm.causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
         f.on(one),
         b.on(one),
         k.dt_bias,
@@ -28,8 +28,8 @@ def kda(x, inputs, k):
         k.norm_eps,
         k.gate_floor,
     )
-    chunked = ops.attn.ssm_kda_chunked(
-        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
+    chunked = ops.ssm.kda_chunked(
+        ops.ssm.causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
         f.on(~one),
         b.on(~one),
         k.dt_bias,
@@ -107,7 +107,7 @@ def opens_block(m, l):
 
 def forward(m, inputs):
     plan = plans(inputs, m.mla_heads, m.kv_lora_rank)
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     every = m.attn_res == "every"
     routes = inputs.adapter_routes()
 
@@ -155,7 +155,7 @@ def forward(m, inputs):
     if r != None and blocks:
         y = ops.elemwise.res_blend(y, blocks, r.norm, r.norm_eps, r.proj)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def mlp(x, f):

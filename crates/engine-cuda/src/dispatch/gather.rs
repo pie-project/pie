@@ -1,19 +1,79 @@
 use kernels_cuda::gather;
-use poem_exec::{DispatchLayout, KernelError};
-use poem_ir::Layout;
+use poem_exec::{DispatchGather, KernelError};
+use poem_ir::Gather;
 
 use crate::run::Run;
 
-impl DispatchLayout for Run<'_> {
-    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError> {
-        self.layout(op).map_err(crate::error::kernel)
+impl DispatchGather for Run<'_> {
+    fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError> {
+        self.gather(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn layout(&mut self, op: &Layout) -> Result<(), kernels_cuda::Error> {
+    fn gather(&mut self, op: &Gather) -> Result<(), kernels_cuda::Error> {
         match op {
-            Layout::Embed {
+            Gather::NgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => kernels_cuda::gather::ngram_ids(
+                self.ctx(),
+                self.tensor(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                map.map(|id| self.tensor(id)),
+                &mut self.tensor(*ngram_ids),
+            ),
+            Gather::NgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => {
+                let tail = self.recurrent_tail_absolute(*state);
+                kernels_cuda::gather::ngram_ids_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*ids),
+                    &self.recurrent_absolute(*state),
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
+                    &mut self.tensor(*ngram_ids),
+                )?;
+                let Some(tail) = tail else { return Ok(()) };
+                kernels_cuda::gather::ngram_ids_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*ids),
+                    &tail,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
+                    &mut self.tensor(*ngram_ids),
+                )
+            }
+            Gather::Embed {
                 ids,
                 table,
                 vocab,
@@ -26,7 +86,7 @@ impl Run<'_> {
                     ) =>
                 {
                     Err(kernels_cuda::Error::Backend {
-                        op: "layout.embed",
+                        op: "gather.embed",
                         detail: "an nvfp4 table has no cuda gather; its rows are read as \
                                  bf16 or affine codes"
                             .to_string(),
@@ -56,7 +116,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 ),
             },
-            Layout::EmbedConcat {
+            Gather::EmbedConcat {
                 ids,
                 table,
                 scales: Some(scales),
@@ -70,7 +130,7 @@ impl Run<'_> {
                 *vocab,
                 &mut self.tensor(*y),
             ),
-            Layout::EmbedConcat {
+            Gather::EmbedConcat {
                 ids,
                 table,
                 scales: None,
@@ -80,7 +140,7 @@ impl Run<'_> {
                 #[cfg(not(feature = "rocm"))]
                 Some((codes, ..)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
                     Err(kernels_cuda::Error::Backend {
-                        op: "layout.embed_concat",
+                        op: "gather.embed_concat",
                         detail: "an nvfp4 table has no cuda gather; its rows are read as \
                                  bf16 or affine codes"
                             .to_string(),
@@ -115,7 +175,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 ),
             },
-            Layout::SplitQkv {
+            Gather::SplitQkv {
                 packed,
                 q_width,
                 kv_width,
@@ -131,7 +191,7 @@ impl Run<'_> {
                 &mut self.tensor(*k),
                 &mut self.tensor(*v),
             ),
-            Layout::SplitQkvPadded {
+            Gather::SplitQkvPadded {
                 packed,
                 heads,
                 widths,
@@ -149,7 +209,7 @@ impl Run<'_> {
                 &mut self.tensor(*k),
                 &mut self.tensor(*v),
             ),
-            Layout::SplitQGate {
+            Gather::SplitQGate {
                 packed,
                 head_dim,
                 q,
@@ -161,7 +221,7 @@ impl Run<'_> {
                 &mut self.tensor(*q),
                 &mut self.tensor(*gate),
             ),
-            Layout::SplitRows {
+            Gather::SplitRows {
                 x,
                 width,
                 left,
@@ -173,7 +233,7 @@ impl Run<'_> {
                 &mut self.tensor(*left),
                 &mut self.tensor(*right),
             ),
-            Layout::EmbedWeighted {
+            Gather::EmbedWeighted {
                 ids,
                 weights,
                 table,
@@ -187,19 +247,19 @@ impl Run<'_> {
                 *vocab,
                 &mut self.tensor(*y),
             ),
-            Layout::PoolRows { x, side, y } => kernels_cuda::gather::pool_rows(
+            Gather::PoolRows { x, side, y } => kernels_cuda::gather::pool_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *side,
                 &mut self.tensor(*y),
             ),
-            Layout::MergeRows { x, side, y } => kernels_cuda::gather::merge_rows(
+            Gather::MergeRows { x, side, y } => kernels_cuda::gather::merge_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *side,
                 &mut self.tensor(*y),
             ),
-            Layout::Pixels {
+            Gather::Pixels {
                 x,
                 patch,
                 mean,
@@ -217,11 +277,11 @@ impl Run<'_> {
                 *temporal,
                 &mut self.tensor(*y),
             ),
-            Layout::ConcatCols { xs, y } => {
+            Gather::ConcatCols { xs, y } => {
                 let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
                 kernels_cuda::gather::concat_cols(self.ctx(), &xs, &mut self.tensor(*y))
             }
-            Layout::GridTaps {
+            Gather::GridTaps {
                 positions,
                 grids,
                 segments,
@@ -239,7 +299,7 @@ impl Run<'_> {
                 &mut self.tensor(*ids),
                 &mut self.tensor(*weights),
             ),
-            Layout::ScatterLiveRows {
+            Gather::ScatterLiveRows {
                 src,
                 routes,
                 y,
@@ -250,7 +310,7 @@ impl Run<'_> {
                 self.tensor(*routes),
                 &mut self.fire_wide(*y),
             ),
-            Layout::ScatterRows {
+            Gather::ScatterRows {
                 src,
                 routes,
                 y,
@@ -261,13 +321,13 @@ impl Run<'_> {
                 self.tensor(*routes),
                 &mut self.fire_wide(*y),
             ),
-            Layout::PackRows { x, perm, y } => gather::pack_rows(
+            Gather::PackRows { x, perm, y } => gather::pack_rows(
                 self.ctx(),
                 self.fire_wide(*x),
                 self.tensor(*perm),
                 &mut self.tensor(*y),
             ),
-            Layout::UnpackRows { x, perm, y } => {
+            Gather::UnpackRows { x, perm, y } => {
                 let packed = self.tensor(*x);
                 let whole = self.fire_wide(*y);
                 gather::unpack_rows(
@@ -282,13 +342,13 @@ impl Run<'_> {
                     ),
                 )
             }
-            Layout::GatherRows { x, rows, y } => gather::gather_rows(
+            Gather::Rows { x, rows, y } => gather::gather_rows(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*rows),
                 &mut self.tensor(*y),
             ),
-            Layout::Select {
+            Gather::Select {
                 table,
                 layer,
                 width,

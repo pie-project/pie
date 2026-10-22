@@ -32,7 +32,7 @@ def caches(m, c):
     pass
 
 def forward(m, inputs):
-    return ops.linear.lm_head(ops.layout.embed(inputs.tokens(), m.embed, 16), m.head)
+    return ops.linear.lm_head(ops.gather.embed(inputs.tokens(), m.embed, 16), m.head)
 "#;
 
 fn toy() -> Package {

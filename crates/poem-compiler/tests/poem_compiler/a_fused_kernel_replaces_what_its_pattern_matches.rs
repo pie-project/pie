@@ -1,4 +1,4 @@
-use poem::ops::{attn, elemwise, layout, linear};
+use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, template};
 use poem_compiler::fuse::fuse;
 use poem_ir::{Operands, Trace};
@@ -128,7 +128,7 @@ fn qkv_write(p: &Pattern, q_eps: f32, k_eps: f32) {
 
 fn qkv_write_scaled(p: &Pattern, q_eps: f32, k_eps: f32, scaling: Option<poem::rope::RopeScaling>) {
     let positions = p.indices("positions");
-    let (q, k, v) = layout::split_qkv(&p.rows("packed", 512), 256, 128);
+    let (q, k, v) = gather::split_qkv(&p.rows("packed", 512), 256, 128);
     let v = elemwise::rmsnorm_no_scale(&v, 64, q_eps);
     let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, q_eps);
     let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [64]), 64, k_eps);
@@ -191,7 +191,7 @@ fn a_scaled_rotation_keeps_the_qkv_write_apart() {
 fn the_scaleless_unturned_qkv_write_folds() {
     let fused = fuse(
         trace(|p| {
-            let (q, k, v) = layout::split_qkv(&p.rows("packed", 512), 256, 128);
+            let (q, k, v) = gather::split_qkv(&p.rows("packed", 512), 256, 128);
             let q = elemwise::rmsnorm_no_scale(&q, 64, 1e-5);
             let k = elemwise::rmsnorm_no_scale(&k, 64, 1e-5);
             let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
@@ -222,9 +222,9 @@ fn the_unnormed_partly_turned_qkv_write_folds() {
             trace(|p| {
                 let packed = p.rows("packed", 1024);
                 let (q, k, v) = if padded {
-                    layout::split_qkv_padded(&packed, [2, 1], [192, 128], 256)
+                    gather::split_qkv_padded(&packed, [2, 1], [192, 128], 256)
                 } else {
-                    layout::split_qkv(&packed, 512, 256)
+                    gather::split_qkv(&packed, 512, 256)
                 };
                 let v = elemwise::mul_scalar(0.707, &v);
                 let positions = p.indices("positions");
@@ -328,7 +328,7 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
         trace(move |p| {
             let positions = p.indices("positions");
             let packed = p.rows("packed", 768);
-            let (q, k, v) = layout::split_qkv(&packed, 512, 128);
+            let (q, k, v) = gather::split_qkv(&packed, 512, 128);
             let (qr, kr) = elemwise::rope_yarn(
                 &q,
                 &k,
@@ -393,7 +393,7 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
     assert_eq!(
         ops(&fused),
         [
-            "layout.split_qkv",
+            "gather.split_qkv",
             "elementwise.rope_yarn_append",
             "elementwise.silu",
             "elementwise.silu"
@@ -531,7 +531,7 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
 #[test]
 fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
     let t = trace(|p| {
-        let (left, right) = layout::split_rows(&biased(p), 40);
+        let (left, right) = gather::split_rows(&biased(p), 40);
         elemwise::silu(&left);
         elemwise::silu(&right);
     });
@@ -549,7 +549,7 @@ fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
 fn qwens_attention_prologue_lands_as_one_fused_op() {
     let t = trace(|p| {
         let d = 64;
-        let (q, gate) = layout::split_q_gate(&p.rows("qg", 4 * 64), d);
+        let (q, gate) = gather::split_q_gate(&p.rows("qg", 4 * 64), d);
         let q = elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [64]), d, 1e-6);
         let k = elemwise::rmsnorm_per_head_plus_one(
             &p.rows("k", 64),
@@ -919,7 +919,7 @@ fn a_matmul_and_the_split_of_its_row_fold_into_one_op() {
     let fused = fuse(
         trace(|p| {
             let y = linear::matmul(&p.rows("act", 64), &p.weight("w", [96, 64]));
-            let (left, right) = layout::split_rows(&y, 32);
+            let (left, right) = gather::split_rows(&y, 32);
             elemwise::silu(&left);
             elemwise::silu(&right);
         }),
@@ -938,7 +938,7 @@ fn a_matmul_and_the_split_of_its_row_fold_into_one_op() {
 #[test]
 #[should_panic(expected = "the split is past the row")]
 fn a_split_past_its_row_is_refused() {
-    trace(|p| drop(layout::split_rows(&p.rows("x", 64), 96)));
+    trace(|p| drop(gather::split_rows(&p.rows("x", 64), 96)));
 }
 
 fn mhc_mixes(p: &Pattern) -> (poem::Value, poem::Value) {
@@ -986,20 +986,20 @@ fn an_mhc_norm_read_elsewhere_stays_written() {
 /// conv's output handed to `read` as well when it is given.
 fn gdn_step(p: &Pattern, read_conv: bool) -> poem::Value {
     let qkvz = p.rows("qkvz", 6 * 128);
-    let (qkv, z) = layout::split_rows(&qkvz, 4 * 128);
-    let conv = attn::ssm_causal_conv1d(
+    let (qkv, z) = gather::split_rows(&qkvz, 4 * 128);
+    let conv = ssm::causal_conv1d(
         &qkv,
         &p.weight("conv", [4 * 128, 4]),
         None,
         p.cache("conv_state"),
         4,
     );
-    let gates = attn::ssm_gdn_prep(
+    let gates = ssm::gdn_gates(
         &p.rows("ba", 4),
         &p.weight("dt_bias", [2]),
         &p.weight("a_log", [2]),
     );
-    let y = attn::ssm_gated_delta(&conv, &z, &gates, p.cache("state"), 1, 2, 128, 128);
+    let y = ssm::gated_delta(&conv, &z, &gates, p.cache("state"), 1, 2, 128, 128);
     if read_conv {
         elemwise::silu(&conv);
     }
@@ -1037,10 +1037,10 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
     assert_eq!(
         ops(&fused),
         [
-            "layout.split_rows",
-            "attention.ssm_causal_conv1d",
-            "attention.ssm_gdn_prep",
-            "attention.ssm_gated_delta",
+            "gather.split_rows",
+            "ssm.causal_conv1d",
+            "ssm.gdn_gates",
+            "ssm.gated_delta",
             "elementwise.silu"
         ]
     );

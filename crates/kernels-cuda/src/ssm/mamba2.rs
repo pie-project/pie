@@ -69,7 +69,7 @@ impl Mamba2 {
 /// One Mamba-2 step a request over the convolved `xbc` rows: lands
 /// `(C S + D x) * silu(z)`, group-normed, in `y`.
 #[allow(clippy::too_many_arguments)]
-pub fn mamba2_step(
+pub fn mamba2(
     ctx: &Ctx,
     xbc: Tensor,
     dt: Tensor,
@@ -122,7 +122,7 @@ pub fn mamba2_chunked(
     state_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_mamba2_chunked";
+    const OP: &str = "ssm.mamba2_chunked";
     // `M2_SCAN_SMEM`: two stages of C, B, x and dt, the bf16 state, `dt x`
     // twice, `P`, and the chunk's steps and decay sums.
     const CH: u32 = 16;

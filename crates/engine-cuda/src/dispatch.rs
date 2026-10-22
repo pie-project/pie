@@ -1,5 +1,6 @@
 mod attn;
 mod collective;
+mod conv;
 pub(crate) mod copy;
 #[cfg(not(feature = "rocm"))]
 mod custom;
@@ -7,7 +8,7 @@ mod custom;
 #[path = "dispatch/hip/custom.rs"]
 mod custom;
 mod elemwise;
-mod layout;
+mod gather;
 #[cfg(not(feature = "rocm"))]
 mod linear;
 #[cfg(feature = "rocm")]
@@ -15,4 +16,4 @@ mod linear;
 mod linear;
 mod probe;
 mod sampling;
-mod spatial;
+mod ssm;

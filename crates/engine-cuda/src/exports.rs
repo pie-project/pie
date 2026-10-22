@@ -275,8 +275,8 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir:
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            poem_ir::Operation::Layout(
-                poem_ir::Layout::ScatterRows { .. } | poem_ir::Layout::ScatterLiveRows { .. }
+            poem_ir::Operation::Gather(
+                poem_ir::Gather::ScatterRows { .. } | poem_ir::Gather::ScatterLiveRows { .. }
             )
         )
     })

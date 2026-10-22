@@ -235,7 +235,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 .nodes
                 .get(region.nodes.start as usize)
                 .map_or("?", |node| poem_ir::Operands::name(&node.op));
-            if op.starts_with("attention.") {
+            if op.starts_with("attention.") || op.starts_with("ssm.") {
                 streams.entry(region.stream).or_default().push(format!(
                     "r{at}:{}:{:?}",
                     op.trim_start_matches("attention."),
@@ -805,7 +805,7 @@ impl Shell {
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                poem_ir::Operation::Layout(poem_ir::Layout::ScatterLiveRows { .. })
+                poem_ir::Operation::Gather(poem_ir::Gather::ScatterLiveRows { .. })
             )
         });
         if let Some(value) = feeds.unlanded.first() {
@@ -1343,7 +1343,7 @@ fn decoded_weight_planes(
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))
                 }
-                poem_ir::Operation::Attention(_) => true,
+                poem_ir::Operation::Attention(_) | poem_ir::Operation::Ssm(_) => true,
                 _ => continue,
             };
             inputs.clear();
@@ -1423,8 +1423,8 @@ fn patch_fold(trace: &poem_ir::Trace) -> u32 {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            poem_ir::Operation::Layout(
-                poem_ir::Layout::MergeRows { side, .. } | poem_ir::Layout::PoolRows { side, .. },
+            poem_ir::Operation::Gather(
+                poem_ir::Gather::MergeRows { side, .. } | poem_ir::Gather::PoolRows { side, .. },
             ) => Some(side.saturating_mul(*side)),
             _ => None,
         })
@@ -1455,10 +1455,9 @@ fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            poem_ir::Operation::Attention(poem_ir::Attention::SsmGatedDeltaChunked {
-                v_heads,
-                ..
-            }) => Some(*v_heads),
+            poem_ir::Operation::Ssm(poem_ir::Ssm::GatedDeltaChunked { v_heads, .. }) => {
+                Some(*v_heads)
+            }
             _ => None,
         })
         .max()?;

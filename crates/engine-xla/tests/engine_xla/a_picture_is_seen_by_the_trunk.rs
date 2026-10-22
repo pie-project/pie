@@ -237,7 +237,7 @@ fn a_solid_square_is_named_by_its_colour() {
         if node.op.name() == "elementwise.residual_add" && probes.is_empty() {
             probes.extend(outs.first().copied());
         }
-        if node.op.name() == "layout.scatter_live_rows" {
+        if node.op.name() == "gather.scatter_live_rows" {
             probes.push(ins[0]);
             break;
         }

@@ -120,7 +120,7 @@ pub fn embed(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
+    const OP: &str = "gather.embed";
     i32_ids(OP, "token ids", ids)?;
     same_dtype(OP, table, y)?;
     nonzero(OP, "the row count this embedding table states", vocab)?;
@@ -154,7 +154,7 @@ pub fn embed_vocab_shard(
     rank: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_vocab_shard";
+    const OP: &str = "gather.embed_vocab_shard";
     i32_ids(OP, "token ids", ids)?;
     same_dtype(OP, table, y)?;
     let local = nonzero(OP, "this rank's band of the embedding table", table.rows)?;
@@ -215,7 +215,7 @@ pub fn embed_concat(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     i32_ids(OP, "token ids", ids)?;
     same_dtype(OP, table, y)?;
     nonzero(OP, "the row count this embedding table states", vocab)?;
@@ -518,7 +518,7 @@ pub fn embed_gather_mb_4bit(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
+    const OP: &str = "gather.embed";
     gather_affine(ctx, OP, ids, table, vocab, y, y.rows, y.width)
 }
 
@@ -529,7 +529,7 @@ pub fn embed_concat_mb_4bit(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     let (heads, width) = concat_shape(OP, ids, y)?;
     gather_affine(ctx, OP, ids, table, vocab, y, y.rows * heads, width)
 }
@@ -544,7 +544,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_weighted";
+    const OP: &str = "gather.embed_weighted";
     i32_ids(OP, "taps", ids)?;
     same_dtype(OP, table, y)?;
     if weights.dtype != Dtype::F32 {
@@ -609,7 +609,7 @@ pub fn split_qkv(
     k: Tensor,
     v: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_qkv";
+    const OP: &str = "gather.split_qkv";
     if u64::from(q_width) + 2 * u64::from(kv_width) != u64::from(packed.width) {
         return Err(refuse(
             OP,
@@ -651,7 +651,7 @@ pub fn split_q_gate(
     q: Tensor,
     gate: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_q_gate";
+    const OP: &str = "gather.split_q_gate";
     nonzero(OP, "the head width this cut walks", head_dim)?;
     if q.width == 0 || !q.width.is_multiple_of(head_dim) {
         return Err(refuse(
@@ -698,7 +698,7 @@ pub fn split_rows(
     left: Tensor,
     right: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_rows";
+    const OP: &str = "gather.split_rows";
     nonzero(OP, "the left half of this cut", left.width)?;
     nonzero(OP, "the right half of this cut", right.width)?;
     if left.width != width {
@@ -746,7 +746,7 @@ pub fn select(
     width: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.select";
+    const OP: &str = "gather.select";
     nonzero(OP, "the slice width this select states", width)?;
     same_dtype(OP, table, y)?;
     if y.width != width {
@@ -812,7 +812,7 @@ fn move_shape(op: &'static str, wide: Tensor, tight: Tensor, index: Tensor) -> R
 /// `tight[i] = wide[index[i]]`. An index outside `wide` is clamped into it
 /// (XLA's gather rule); the GPU reads past the plane there.
 pub fn gather_rows(ctx: &Ctx<'_>, wide: Tensor, index: Tensor, tight: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.gather_rows";
+    const OP: &str = "gather.rows";
     move_shape(OP, wide, tight, index)?;
     ctx.emit(&mut |cx| {
         let ids = index_vec(cx, OP, index, tight.rows)?;
@@ -855,7 +855,7 @@ pub fn scatter_rows(
     index: Tensor,
     wide: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_rows";
+    const OP: &str = "gather.scatter_rows";
     move_shape(OP, wide, tight, index)?;
     ctx.emit(&mut |cx| scatter_into(cx, OP, tight, index, wide, false))
 }
@@ -867,7 +867,7 @@ pub fn scatter_live_rows(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_live_rows";
+    const OP: &str = "gather.scatter_live_rows";
     move_shape(OP, y, src, routes)?;
     ctx.emit(&mut |cx| scatter_into(cx, OP, src, routes, y, true))
 }
@@ -875,7 +875,7 @@ pub fn scatter_live_rows(
 /// `y[i] = x[perm[i]]` for every row of `y`. Read from kernels-metal
 /// `layout::pack_rows` (`row_gather.metal`).
 pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.pack_rows";
+    const OP: &str = "gather.pack_rows";
     move_shape(OP, x, y, perm)?;
     nonzero(OP, "rows to move", y.rows)?;
     ctx.emit(&mut |cx| {
@@ -889,7 +889,7 @@ pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, y: Tensor) -> Result<()
 /// `y[perm[i]] = x[i]` for every row of `x`; `y`'s other rows keep what they
 /// held. Read from kernels-metal `layout::unpack_rows` (`row_scatter`).
 pub fn unpack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.unpack_rows";
+    const OP: &str = "gather.unpack_rows";
     move_shape(OP, y, x, perm)?;
     nonzero(OP, "rows to move", x.rows)?;
     ctx.emit(&mut |cx| scatter_into(cx, OP, x, perm, y, false))
@@ -915,7 +915,7 @@ fn fold_extent(op: &'static str, x: Tensor, side: u32) -> Result<(u32, u32), Err
 /// `y[o] = mean(x[o * side² .. (o + 1) * side²])`, in f32; `y`'s rows past the
 /// pooled count keep what they held.
 pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.pool_rows";
+    const OP: &str = "gather.pool_rows";
     same_dtype(OP, x, y)?;
     let (block, out) = fold_extent(OP, x, side)?;
     if y.width != x.width || y.rows < out {
@@ -940,7 +940,7 @@ pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), E
 
 /// `y[o] = x[o * side²] ‖ … ‖ x[(o + 1) * side² - 1]`.
 pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.merge_rows";
+    const OP: &str = "gather.merge_rows";
     same_dtype(OP, x, y)?;
     let (block, out) = fold_extent(OP, x, side)?;
     let merged = u64::from(block) * u64::from(x.width);
@@ -975,7 +975,7 @@ pub fn pixels(
     temporal: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.pixels";
+    const OP: &str = "gather.pixels";
     if !matches!(y.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
         return Err(Error::DtypeUnsupported {
             op: OP,
@@ -1053,7 +1053,7 @@ pub fn grid_taps(
     ids: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.grid_taps";
+    const OP: &str = "gather.grid_taps";
     let taps: u32 = if bilinear { 4 } else { 2 };
     if positions.dtype != Dtype::I32 || grids.dtype != Dtype::I32 || segments.dtype != Dtype::I32 {
         return Err(refuse(OP, "positions, grids and segments are i32"));

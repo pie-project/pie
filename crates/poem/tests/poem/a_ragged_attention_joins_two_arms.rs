@@ -3,7 +3,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request, Selection,
     Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
-use poem_ir::{Attention, Def, GeomKind, Guard, Layout, Operation, RuntimeInput};
+use poem_ir::{Attention, Def, Gather, GeomKind, Guard, Operation, RuntimeInput};
 
 const AUDIO_WIDTH: u32 = 32;
 const VIDEO_WIDTH: u32 = 48;
@@ -43,9 +43,9 @@ impl ForwardHybrid for CrossAttention {
 
         let xa = audio.latents(0, AUDIO_WIDTH, Dtype::Bf16);
         let xv = video.latents(1, VIDEO_WIDTH, Dtype::Bf16);
-        let q = ops::layout::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
-        let k = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
-        let v = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
+        let q = ops::gather::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
+        let k = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
+        let v = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
         let o = ops::attn::ragged(
             &q,
             &k,
@@ -56,7 +56,7 @@ impl ForwardHybrid for CrossAttention {
             0.25,
             RaggedMask::None,
         );
-        let o = ops::layout::unpack_rows(&o, &audio.row_permutation());
+        let o = ops::gather::unpack_rows(&o, &audio.row_permutation());
         let out = ops::linear::matmul(&o, &wo);
         seam::at(seam::VELOCITY, &[&out]);
         out
@@ -117,7 +117,7 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &T
 
     let unpack = trace.nodes[at + 1..]
         .iter()
-        .find(|node| matches!(node.op, Operation::Layout(Layout::UnpackRows { .. })))
+        .find(|node| matches!(node.op, Operation::Gather(Gather::UnpackRows { .. })))
         .expect("the answer is unpacked onto the audio rows");
     assert!(
         unpack.guard.equivalent(&audio),

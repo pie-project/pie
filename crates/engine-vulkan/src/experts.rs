@@ -770,17 +770,17 @@ impl Plan {
         let mut gathered = BTreeMap::new();
         let mut rows_per_token = 0u32;
         for node in &trace.nodes {
-            if let Operation::Layout(poem_ir::Layout::EmbedConcat { ids, table, .. }) = &node.op
+            if let Operation::Gather(poem_ir::Gather::EmbedConcat { ids, table, .. }) = &node.op
                 && let Ok(at) = weight_of(trace, *table)
             {
                 gathered.insert(at, ids.0);
             }
 
-            if let Operation::Attention(
-                poem_ir::Attention::PleNgramIds {
+            if let Operation::Gather(
+                poem_ir::Gather::NgramIds {
                     heads_per_ngram, ..
                 }
-                | poem_ir::Attention::PleNgramIdsChunked {
+                | poem_ir::Gather::NgramIdsChunked {
                     heads_per_ngram, ..
                 },
             ) = &node.op

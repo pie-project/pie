@@ -128,7 +128,7 @@ pub fn ngram_ids(
     map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids";
+    const OP: &str = "gather.ngram_ids";
     if ids.dtype != Dtype::I32 || ngram_ids.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
@@ -183,7 +183,7 @@ pub fn ngram_ids_chunked(
     map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_chunked";
+    const OP: &str = "gather.ngram_ids_chunked";
     if ids.data.dtype != Dtype::I32 || ngram_ids.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
@@ -373,7 +373,7 @@ pub fn ngram_ids_committed(
     map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_committed";
+    const OP: &str = "gather.ngram_ids_committed";
     if ids.dtype != Dtype::I32 || ngram_ids.dtype != Dtype::I32 || indptr.dtype != Dtype::I32 {
         return Err(refuse(
             OP,

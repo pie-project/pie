@@ -229,7 +229,7 @@ fn bind(gpu: &Gpu, g: Geo, inp: &Inputs, rows: usize, seats: &Seats) -> Bound {
 }
 
 fn step(gpu: &Gpu, ctx: &Ctx, g: Geo, bd: &mut Bound) {
-    ssm::kda_step(
+    ssm::kda(
         ctx,
         bd.mixed,
         bd.f,

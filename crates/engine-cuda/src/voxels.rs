@@ -318,7 +318,7 @@ pub(crate) fn host_grid(
     port_grid: &[i32],
     grid: poem_ir::ValueId,
 ) -> Option<Vec<i32>> {
-    use poem_ir::{Def, Operation, RuntimeInput, Spatial};
+    use poem_ir::{Conv, Def, Operation, RuntimeInput};
 
     let mut rules = Vec::new();
     let mut at = grid;
@@ -330,7 +330,7 @@ pub(crate) fn host_grid(
             break;
         }
         let step = trace.nodes.iter().find_map(|node| match &node.op {
-            Operation::Spatial(Spatial::Grid { grid, rule, y }) if *y == at => Some((*grid, *rule)),
+            Operation::Conv(Conv::Grid { grid, rule, y }) if *y == at => Some((*grid, *rule)),
             _ => None,
         })?;
         rules.push(step.1);

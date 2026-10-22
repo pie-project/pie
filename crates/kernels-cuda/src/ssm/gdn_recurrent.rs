@@ -15,7 +15,7 @@ pub fn gated_delta(
     v_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta";
+    const OP: &str = "ssm.gated_delta";
 
     const SMEM_ARM_WIDTH: u32 = 128;
 

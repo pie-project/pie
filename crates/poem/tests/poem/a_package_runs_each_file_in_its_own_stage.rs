@@ -38,7 +38,7 @@ fn a_forward_traces_the_ops_it_calls() {
     let forward = format!(
         "{CACHES}
 def forward(m, inputs):
-    x = ops.layout.embed(inputs.tokens(), m.embed, 16)
+    x = ops.gather.embed(inputs.tokens(), m.embed, 16)
     return ops.linear.lm_head(x, m.head)
 "
     );
@@ -54,7 +54,7 @@ def forward(m, inputs):
             n.op.name()
         })
         .collect();
-    assert_eq!(ops, ["layout.embed", "linear.lm_head"], "{ops:?}");
+    assert_eq!(ops, ["gather.embed", "linear.lm_head"], "{ops:?}");
     assert_eq!(trace.params.len(), 2);
 }
 
@@ -81,7 +81,7 @@ fn a_misused_op_is_an_error_at_the_scripts_line() {
     let forward = format!(
         "{CACHES}
 def forward(m, inputs):
-    x = ops.layout.embed(inputs.tokens(), m.embed, 16)
+    x = ops.gather.embed(inputs.tokens(), m.embed, 16)
     y = ops.elemwise.residual_add(x.on(fact.drafts()), x.on(~fact.drafts()))
     return ops.linear.lm_head(y, m.head)
 "
@@ -124,7 +124,7 @@ def caches(m, c):
     pass
 
 def forward(m, inputs):
-    return read_out(m, ops.layout.embed(inputs.tokens(), m.embed, 16))
+    return read_out(m, ops.gather.embed(inputs.tokens(), m.embed, 16))
 "#;
     let library = r#"
 def read_out(m, x):

@@ -8,7 +8,7 @@ const FILE: &str = "layout/fold.hip";
 const BLOCK: u32 = 256;
 
 pub fn pool_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.pool_rows";
+    const OP: &str = "gather.pool_rows";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(y.dtype, x.dtype, "`{OP}` pools into the element it reads");
 
@@ -42,7 +42,7 @@ pub fn pool_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), 
 }
 
 pub fn merge_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.merge_rows";
+    const OP: &str = "gather.merge_rows";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(y.dtype, x.dtype, "`{OP}` merges into the element it reads");
 

@@ -54,7 +54,7 @@ pub fn cache_gather(
     frames: u32,
     cache: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.cache_gather";
+    const OP: &str = "conv.cache_gather";
     let (lanes, frames, c, stride, total, blocks) =
         check(OP, slab, slot_ids, grid, *cache, frames)?;
     ctx.fire(
@@ -84,7 +84,7 @@ pub fn cache_store(
     frames: u32,
     slab: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.cache_store";
+    const OP: &str = "conv.cache_store";
     let (lanes, frames, c, stride, total, blocks) =
         check(OP, *slab, slot_ids, grid, cache, frames)?;
     if x.dtype != Dtype::Bf16 || x.width != cache.width {

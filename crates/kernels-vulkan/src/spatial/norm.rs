@@ -6,7 +6,7 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "spatial/norm.slang";
 
-const OP: &str = "spatial.group_norm";
+const OP: &str = "conv.group_norm";
 
 const STATS_THREADS: u32 = 256;
 

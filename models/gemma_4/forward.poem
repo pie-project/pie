@@ -70,17 +70,17 @@ def forward(m, inputs):
 
     ids = inputs.tokens()
     root = f32(sqrt(m.hidden))
-    y = ops.layout.embed(ids, m.embed, m.vocab) * root
+    y = ops.gather.embed(ids, m.embed, m.vocab) * root
 
     if towered != None:
         imaged = y.on(fact.has(fact.Media))
-        y = ops.layout.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
+        y = ops.gather.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
 
     if m.self_cond != None:
         sc = m.self_cond
         den, enc = y.on(fact.bidirectional()), y.on(~fact.bidirectional())
         input_den = inputs.on(fact.bidirectional())
-        soft = ops.layout.embed_weighted(
+        soft = ops.gather.embed_weighted(
             input_den.self_cond_rows(sc.taps),
             input_den.self_cond_weights(sc.taps),
             m.embed,
@@ -114,13 +114,13 @@ def forward(m, inputs):
         input_r = trunk_inputs.on(read)
         rows_r = input_r.readout_rows()
         plan_r = plans(m, input_r, ops.attn.plan_decode)
-        gathered = lambda v: ops.layout.gather_rows(v.on(read), rows_r)
+        gathered = lambda v: ops.gather.gather_rows(v.on(read), rows_r)
         adapted_r = read & fact.has(fact.Adapter)
         ro = struct(
             positions = gathered(positions),
             ids = gathered(ids),
             relay = gathered(relay) if relay != None else None,
-            routes = ops.layout.gather_rows(routes.on(adapted_r), input_r.on(fact.has(fact.Adapter)).readout_rows()),
+            routes = ops.gather.gather_rows(routes.on(adapted_r), input_r.on(fact.has(fact.Adapter)).readout_rows()),
             plans = plan_r,
         )
 
@@ -199,8 +199,8 @@ def forward(m, inputs):
             ple = m.ple
             lp = ple.per_layer[l]
             layer_ids, layer_relay = (ro.ids, ro.relay) if readouts else (ids, relay)
-            table = ops.layout.embed(layer_ids, lp.table, m.vocab) * f32(sqrt(ple.dim))
-            mixed = ops.elemwise.residual_add(table, ops.layout.select(layer_relay, l, ple.dim)) * FRAC_1_SQRT_2
+            table = ops.gather.embed(layer_ids, lp.table, m.vocab) * f32(sqrt(ple.dim))
+            mixed = ops.elemwise.residual_add(table, ops.gather.select(layer_relay, l, ple.dim)) * FRAC_1_SQRT_2
             gated = ops.linear.mlp_geglu_tanh(ops.linear.matmul(y, lp.gate), mixed)
             out = ops.linear.matmul(gated, lp.proj)
             out = ops.elemwise.rmsnorm(out, lp.norm, lp.norm_eps)
@@ -224,14 +224,14 @@ def forward(m, inputs):
     y, tapped = inputs.fold_layers(m.layers, (y, None), block)
 
     if tail != None:
-        y = merge([ops.layout.gather_rows(y.whole, trunk_inputs.on(~read).readout_rows()), y.readouts])
+        y = merge([ops.gather.gather_rows(y.whole, trunk_inputs.on(~read).readout_rows()), y.readouts])
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
         hb = arm(dr, inputs, tapped, h_block, mask, block_rows(dr))
         x = merge([hb, x])
     if tail == None:
-        x = ops.layout.gather_rows(x, inputs.readout_rows())
+        x = ops.gather.gather_rows(x, inputs.readout_rows())
     logits = ops.attn.logit_softcap(ops.linear.lm_head(x, m.embed), m.softcap)
     if dr != None:
         plant_readout(dr, logits, inputs, x, block_rows(dr))
@@ -250,8 +250,8 @@ def eagle_draft(m, inputs, x, logits, root):
     plan_draft = ops.attn.plan_prefill(input_draft, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None)
     dx = x.on(fact.drafts())
     dlogits = logits.on(fact.drafts())
-    chosen = ops.layout.argmax([dlogits])
-    e = ops.layout.embed(chosen, m.embed, m.vocab) * root
+    chosen = ops.sampling.argmax([dlogits])
+    e = ops.gather.embed(chosen, m.embed, m.vocab) * root
     dy = ops.elemwise.residual_add(ops.linear.matmul(e, a.fc_embed), ops.linear.matmul(dx, a.fc_hidden))
 
     normed = ops.elemwise.rmsnorm(dy, a.attn_norm, a.norm_eps)
@@ -270,7 +270,7 @@ def eagle_draft(m, inputs, x, logits, root):
 
     draft = ops.attn.logit_softcap(ops.linear.lm_head(ops.elemwise.rmsnorm(dy, m.final_norm, m.final_norm_eps), m.embed), m.softcap)
     seam.at(seam.MTP, [draft])
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([draft])])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([draft])])
 
 def assistant_draft(m, inputs, positions, x, logits, root):
     """The MTP assistant (`m.assistant`) proposes one token from the trunk's
@@ -282,8 +282,8 @@ def assistant_draft(m, inputs, positions, x, logits, root):
     plan_draft = plans(m, input_draft, ops.attn.plan_prefill)
     dx = x.on(fact.drafts())
     dlogits = logits.on(fact.drafts())
-    token = ops.layout.argmax([dlogits])
-    e = ops.layout.embed(token, m.embed, m.vocab) * root
+    token = ops.sampling.argmax([dlogits])
+    e = ops.gather.embed(token, m.embed, m.vocab) * root
     y = ops.elemwise.residual_add(ops.linear.matmul(e, a.pre_embed), ops.linear.matmul(dx, a.pre_hidden))
     for w in a.layers:
         at = w.attn
@@ -301,7 +301,7 @@ def assistant_draft(m, inputs, positions, x, logits, root):
         y = ops.elemwise.scale(w.scalar, y)
     draft = ops.linear.lm_head(ops.elemwise.rmsnorm(y, a.norm, a.norm_eps), a.embed)
     seam.at(seam.MTP, [draft])
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([draft])])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([draft])])
 
 def clipped(x, c):
     if c.clip == None:
@@ -312,13 +312,13 @@ def clipped(x, c):
 
 def tower(inputs, t):
     d = t.head_dim
-    x = ops.layout.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "hwc", 1)
+    x = ops.gather.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "hwc", 1)
     segments = inputs.patch_segments()
     grid = inputs.patch_positions()
 
     y = ops.linear.matmul(x, t.patch_embed)
-    ids, weights = ops.layout.grid_taps(grid, inputs.image_grids(), segments, "axes", t.grid_side)
-    pos = ops.layout.embed_weighted(ids, weights, t.pos_embed, t.positions)
+    ids, weights = ops.gather.grid_taps(grid, inputs.image_grids(), segments, "axes", t.grid_side)
+    pos = ops.gather.embed_weighted(ids, weights, t.pos_embed, t.positions)
     y = ops.elemwise.residual_add(pos, y)
 
     for b in t.blocks:
@@ -334,7 +334,7 @@ def tower(inputs, t):
         act = ops.linear.mlp_geglu_tanh(clipped(n, b.gate), clipped(n, b.up))
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(clipped(act, b.down), b.post_ffw_norm, t.norm_eps), y)
 
-    pooled = ops.layout.pool_rows(y, t.pool) * f32(sqrt(t.hidden))
+    pooled = ops.gather.pool_rows(y, t.pool) * f32(sqrt(t.hidden))
     if t.std != None:
         pooled = ops.elemwise.standardize(pooled, t.std.bias, t.std.scale)
     return ops.linear.matmul(pooled, t.projection)
@@ -342,7 +342,7 @@ def tower(inputs, t):
 def qkv_unfused(x, pos, inputs, m, at, d, kv_heads, qkv, k_norm, k_norm_eps, pages):
     write_page = inputs.write_page(at.kv)
     write_offset = inputs.write_offset(at.kv)
-    q, k, v = ops.layout.split_qkv(ops.linear.matmul(x, qkv), m.q_heads * d, kv_heads * d)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, qkv), m.q_heads * d, kv_heads * d)
     v = ops.elemwise.rmsnorm_no_scale(v, d, at.q_norm_eps)
     q = ops.elemwise.rmsnorm_per_head(q, at.q_norm, d, at.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head(k, k_norm, d, k_norm_eps)

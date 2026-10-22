@@ -108,5 +108,5 @@ crate::error::unsupported! {
 }
 
 crate::error::unsupported! {
-    derive_grid = "spatial.derive_grid" (grid: Tensor, rule: GridRule, o_grid: &mut Tensor);
+    derive_grid = "conv.derive_grid" (grid: Tensor, rule: GridRule, o_grid: &mut Tensor);
 }

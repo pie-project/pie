@@ -4,7 +4,7 @@ use kernels_vulkan::linear::moe::{self, RoutedScratch};
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attention, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -231,7 +231,7 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Spatial(poem_ir::Spatial::GroupNorm { groups, .. }) => Some(*groups),
+                Operation::Conv(poem_ir::Conv::GroupNorm { groups, .. }) => Some(*groups),
                 _ => None,
             })
             .max()
@@ -267,14 +267,14 @@ impl Scratch {
 
         let mut ple: Vec<PleHash> = Vec::new();
         for node in &trace.nodes {
-            let Operation::Attention(
-                Attention::PleNgramIds {
+            let Operation::Gather(
+                Gather::NgramIds {
                     mults,
                     primes,
                     offsets,
                     ..
                 }
-                | Attention::PleNgramIdsChunked {
+                | Gather::NgramIdsChunked {
                     mults,
                     primes,
                     offsets,

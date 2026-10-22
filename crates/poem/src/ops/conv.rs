@@ -1,5 +1,5 @@
 use super::*;
-use poem_ir::{GridRule, ParamLayout, RowAxis, Spatial, TimePad, VoxelSegment};
+use poem_ir::{Conv, GridRule, ParamLayout, RowAxis, TimePad};
 
 fn grid_ty() -> Ty {
     Ty::Tensor {
@@ -8,7 +8,7 @@ fn grid_ty() -> Ty {
     }
 }
 
-fn expect_grid(what: &str, grid: &Value) {
+pub(super) fn expect_grid(what: &str, grid: &Value) {
     assert!(
         grid.rows() == Dim::Clips && grid.width() == 4 && grid.dtype() == Dtype::I32,
         "{what} must be a `[Clips, 4]` i32 grid table, not {:?}",
@@ -16,7 +16,7 @@ fn expect_grid(what: &str, grid: &Value) {
     );
 }
 
-fn expect_voxels(what: &str, x: &Value) {
+pub(super) fn expect_voxels(what: &str, x: &Value) {
     assert!(
         x.rows().axis() == Some(RowAxis::Voxels),
         "{what} must live on the voxel axis, not {:?}",
@@ -46,7 +46,7 @@ fn volume(r: [u32; 3]) -> u32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Conv {
+pub struct ConvShape {
     pub k: [u32; 3],
     pub stride: [u32; 3],
     pub pad: [u32; 3],
@@ -55,10 +55,10 @@ pub struct Conv {
     pub time_pad: TimePad,
 }
 
-impl Conv {
+impl ConvShape {
     #[must_use]
-    pub const fn conv2d(k: [u32; 2], stride: [u32; 2], pad: [u32; 2]) -> Conv {
-        Conv {
+    pub const fn conv2d(k: [u32; 2], stride: [u32; 2], pad: [u32; 2]) -> ConvShape {
+        ConvShape {
             k: [1, k[0], k[1]],
             stride: [1, stride[0], stride[1]],
             pad: [0, pad[0], pad[1]],
@@ -69,8 +69,8 @@ impl Conv {
     }
 
     #[must_use]
-    pub const fn conv3d(k: [u32; 3], stride: [u32; 3], pad: [u32; 3]) -> Conv {
-        Conv {
+    pub const fn conv3d(k: [u32; 3], stride: [u32; 3], pad: [u32; 3]) -> ConvShape {
+        ConvShape {
             k,
             stride,
             pad,
@@ -81,18 +81,18 @@ impl Conv {
     }
 
     #[must_use]
-    pub const fn pad_back(mut self, back: [u32; 3]) -> Conv {
+    pub const fn pad_back(mut self, back: [u32; 3]) -> ConvShape {
         self.pad_back = back;
         self
     }
 
     #[must_use]
-    pub const fn same3() -> Conv {
-        Conv::conv3d([3, 3, 3], [1, 1, 1], [1, 1, 1])
+    pub const fn same3() -> ConvShape {
+        ConvShape::conv3d([3, 3, 3], [1, 1, 1], [1, 1, 1])
     }
 
     #[must_use]
-    pub const fn causal(mut self, time_pad: TimePad) -> Conv {
+    pub const fn causal(mut self, time_pad: TimePad) -> ConvShape {
         self.causal_t = true;
         self.pad[0] = self.k[0] - 1;
         self.pad_back[0] = 0;
@@ -101,7 +101,7 @@ impl Conv {
     }
 
     #[must_use]
-    pub const fn replicate_time(mut self) -> Conv {
+    pub const fn replicate_time(mut self) -> ConvShape {
         self.time_pad = TimePad::Replicate;
         self
     }
@@ -125,11 +125,11 @@ impl Conv {
 
 #[must_use]
 pub fn grid(grid: &Value, rule: GridRule) -> Value {
-    expect_grid("`spatial::grid`'s input", grid);
+    expect_grid("`conv::grid`'s input", grid);
     let r = grid.rec();
     let y = r.fresh(grid_ty());
     r.push(
-        Spatial::Grid {
+        Conv::Grid {
             grid: grid.id(),
             rule,
             y: y.id(),
@@ -145,12 +145,12 @@ pub fn conv3d(
     grid: &Value,
     w: &Weight,
     bias: Option<&Weight>,
-    conv: Conv,
+    conv: ConvShape,
     cache: Option<ValueId>,
 ) -> (Value, Value) {
-    expect_voxels("`spatial::conv3d`'s input", x);
-    expect_grid("`spatial::conv3d`'s grid", grid);
-    assert_eq!(x.dtype(), Dtype::Bf16, "`spatial::conv3d` reads bf16 rows");
+    expect_voxels("`conv::conv3d`'s input", x);
+    expect_grid("`conv::conv3d`'s grid", grid);
+    assert_eq!(x.dtype(), Dtype::Bf16, "`conv::conv3d` reads bf16 rows");
     let taps = conv.taps();
     assert!(
         w.layout
@@ -188,7 +188,7 @@ pub fn conv3d(
     let y_grid = self::grid(grid, conv.rule());
     let y = r.fresh(tensor(x.rows(), w.dim(0), x.dtype()));
     r.push(
-        Spatial::Conv3d {
+        Conv::Conv3d {
             x: x.id(),
             grid: grid.id(),
             w: r.weight(w),
@@ -218,8 +218,8 @@ pub fn group_norm(
     eps: f32,
     silu: bool,
 ) -> Value {
-    expect_voxels("`spatial::group_norm`'s input", x);
-    expect_grid("`spatial::group_norm`'s grid", grid);
+    expect_voxels("`conv::group_norm`'s input", x);
+    expect_grid("`conv::group_norm`'s grid", grid);
     assert!(
         groups > 0 && x.width().is_multiple_of(u64::from(groups)),
         "{} channels do not split into {groups} groups",
@@ -238,7 +238,7 @@ pub fn group_norm(
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Spatial::GroupNorm {
+        Conv::GroupNorm {
             x: x.id(),
             grid: grid.id(),
             groups,
@@ -254,63 +254,14 @@ pub fn group_norm(
 }
 
 #[must_use]
-pub fn attention(q: &Value, k: &Value, v: &Value, grid: &Value, sm_scale: f32) -> Value {
-    attention_over(q, k, v, grid, VoxelSegment::Clip, sm_scale)
-}
-
-#[must_use]
-pub fn attention_over(
-    q: &Value,
-    k: &Value,
-    v: &Value,
-    grid: &Value,
-    segment: VoxelSegment,
-    sm_scale: f32,
-) -> Value {
-    expect_voxels("`spatial::attention`'s query", q);
-    expect_grid("`spatial::attention`'s grid", grid);
-    assert!(
-        q.ty() == k.ty() && q.ty() == v.ty(),
-        "`spatial::attention` reads q, k and v at one type; got {:?}, {:?}, {:?}",
-        q.ty(),
-        k.ty(),
-        v.ty()
-    );
-    assert_eq!(
-        q.dtype(),
-        Dtype::Bf16,
-        "`spatial::attention` reads bf16 rows"
-    );
-    assert!(
-        segment != VoxelSegment::Frames(0),
-        "`spatial::attention` over `Frames(0)` is a block with no rows in it"
-    );
-    let r = q.rec();
-    let y = r.fresh(q.ty().clone());
-    r.push(
-        Spatial::Attention {
-            q: q.id(),
-            k: k.id(),
-            v: v.id(),
-            grid: grid.id(),
-            segment,
-            sm_scale,
-            y: y.id(),
-        },
-        &[q, k, v, grid],
-    );
-    y
-}
-
-#[must_use]
 pub fn upsample_nearest(
     x: &Value,
     grid: &Value,
     factor: [u32; 3],
     keep_first_frame: bool,
 ) -> (Value, Value) {
-    expect_voxels("`spatial::upsample_nearest`'s input", x);
-    expect_grid("`spatial::upsample_nearest`'s grid", grid);
+    expect_voxels("`conv::upsample_nearest`'s input", x);
+    expect_grid("`conv::upsample_nearest`'s grid", grid);
     assert!(
         volume(factor) > 0,
         "an upsample factor of {factor:?} is empty"
@@ -323,7 +274,7 @@ pub fn upsample_nearest(
     let y_grid = self::grid(grid, rule);
     let y = r.fresh(tensor(grown(x.rows(), rule.growth()), x.width(), x.dtype()));
     r.push(
-        Spatial::UpsampleNearest {
+        Conv::Upsample {
             x: x.id(),
             grid: grid.id(),
             factor,
@@ -343,8 +294,8 @@ pub fn pixel_shuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
 
 #[must_use]
 pub fn pixel_shuffle_trimming(x: &Value, grid: &Value, r: [u32; 3], trim_t: u32) -> (Value, Value) {
-    expect_voxels("`spatial::pixel_shuffle`'s input", x);
-    expect_grid("`spatial::pixel_shuffle`'s grid", grid);
+    expect_voxels("`conv::pixel_shuffle`'s input", x);
+    expect_grid("`conv::pixel_shuffle`'s grid", grid);
     let vol = volume(r);
     assert!(
         vol > 0 && x.width().is_multiple_of(u64::from(vol)),
@@ -360,7 +311,7 @@ pub fn pixel_shuffle_trimming(x: &Value, grid: &Value, r: [u32; 3], trim_t: u32)
         x.dtype(),
     ));
     rec.push(
-        Spatial::PixelShuffle {
+        Conv::PixelShuffle {
             x: x.id(),
             grid: grid.id(),
             r,
@@ -375,8 +326,8 @@ pub fn pixel_shuffle_trimming(x: &Value, grid: &Value, r: [u32; 3], trim_t: u32)
 
 #[must_use]
 pub fn pixel_unshuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
-    expect_voxels("`spatial::pixel_unshuffle`'s input", x);
-    expect_grid("`spatial::pixel_unshuffle`'s grid", grid);
+    expect_voxels("`conv::pixel_unshuffle`'s input", x);
+    expect_grid("`conv::pixel_unshuffle`'s grid", grid);
     let vol = volume(r);
     assert!(vol > 0, "an unshuffle block of {r:?} is empty");
     let rule = GridRule::Unshuffle { r };
@@ -388,7 +339,7 @@ pub fn pixel_unshuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
         x.dtype(),
     ));
     rec.push(
-        Spatial::PixelUnshuffle {
+        Conv::PixelUnshuffle {
             x: x.id(),
             grid: grid.id(),
             r,
@@ -402,8 +353,8 @@ pub fn pixel_unshuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
 
 #[must_use]
 pub fn avg_down(x: &Value, grid: &Value, factor: [u32; 3], group: u32) -> (Value, Value) {
-    expect_voxels("`spatial::avg_down`'s input", x);
-    expect_grid("`spatial::avg_down`'s grid", grid);
+    expect_voxels("`conv::avg_down`'s input", x);
+    expect_grid("`conv::avg_down`'s grid", grid);
     let vol = volume(factor);
     assert!(vol > 0, "an avg-down block of {factor:?} is empty");
     let widened = x.width() * u64::from(vol);
@@ -416,7 +367,7 @@ pub fn avg_down(x: &Value, grid: &Value, factor: [u32; 3], group: u32) -> (Value
     let y_grid = self::grid(grid, rule);
     let y = rec.fresh(tensor(x.rows(), widened / u64::from(group), x.dtype()));
     rec.push(
-        Spatial::AvgDown {
+        Conv::AvgDown {
             x: x.id(),
             grid: grid.id(),
             factor,
@@ -431,13 +382,13 @@ pub fn avg_down(x: &Value, grid: &Value, factor: [u32; 3], group: u32) -> (Value
 
 #[must_use]
 pub fn store_frames(x: &Value, grid: &Value, cache: ValueId, frames: u32) -> Value {
-    expect_voxels("`spatial::store_frames`'s input", x);
-    expect_grid("`spatial::store_frames`'s grid", grid);
+    expect_voxels("`conv::store_frames`'s input", x);
+    expect_grid("`conv::store_frames`'s grid", grid);
     assert!(frames > 0, "a cache of no frames is no cache");
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Spatial::CacheStore {
+        Conv::CacheStore {
             x: x.id(),
             grid: grid.id(),
             frames,
@@ -451,15 +402,15 @@ pub fn store_frames(x: &Value, grid: &Value, cache: ValueId, frames: u32) -> Val
 
 #[must_use]
 pub fn patchify(x: &Value, grid: &Value, p: [u32; 3], tgrid: &Value) -> Value {
-    expect_voxels("`spatial::patchify`'s input", x);
-    expect_grid("`spatial::patchify`'s grid", grid);
-    expect_grid("`spatial::patchify`'s token grid", tgrid);
+    expect_voxels("`conv::patchify`'s input", x);
+    expect_grid("`conv::patchify`'s grid", grid);
+    expect_grid("`conv::patchify`'s token grid", tgrid);
     let vol = volume(p);
     assert!(vol > 0, "a patch of {p:?} is empty");
     let r = x.rec();
     let y = r.fresh(tensor(Dim::Tokens, x.width() * u64::from(vol), x.dtype()));
     r.push(
-        Spatial::Patchify {
+        Conv::Patchify {
             x: x.id(),
             grid: grid.id(),
             p,
@@ -475,11 +426,11 @@ pub fn patchify(x: &Value, grid: &Value, p: [u32; 3], tgrid: &Value) -> Value {
 pub fn unpatchify(x: &Value, tgrid: &Value, p: [u32; 3], grid: &Value) -> Value {
     assert!(
         x.rows().axis() == Some(RowAxis::Tokens),
-        "`spatial::unpatchify` reads token rows, not {:?}",
+        "`conv::unpatchify` reads token rows, not {:?}",
         x.rows()
     );
-    expect_grid("`spatial::unpatchify`'s token grid", tgrid);
-    expect_grid("`spatial::unpatchify`'s grid", grid);
+    expect_grid("`conv::unpatchify`'s token grid", tgrid);
+    expect_grid("`conv::unpatchify`'s grid", grid);
     let vol = volume(p);
     assert!(
         vol > 0 && x.width().is_multiple_of(u64::from(vol)),
@@ -489,7 +440,7 @@ pub fn unpatchify(x: &Value, tgrid: &Value, p: [u32; 3], grid: &Value) -> Value 
     let r = x.rec();
     let y = r.fresh(tensor(Dim::Voxels, x.width() / u64::from(vol), x.dtype()));
     r.push(
-        Spatial::Unpatchify {
+        Conv::Unpatchify {
             x: x.id(),
             tgrid: tgrid.id(),
             p,

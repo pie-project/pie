@@ -11,7 +11,7 @@ import pathlib
 import re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-MODULES = ["attn", "collective", "elemwise", "layout", "linear", "spatial"]
+MODULES = ["attn", "collective", "conv", "elemwise", "gather", "linear", "sampling", "ssm"]
 
 # Rust parameter type -> (the type it is unpacked as, how it is passed on)
 PARAMS = {

@@ -15,7 +15,7 @@ def chunks(x, widths):
     whatever remains."""
     out = []
     for width in widths[:-1]:
-        head, x = ops.layout.split_rows(x, width)
+        head, x = ops.gather.split_rows(x, width)
         out.append(head)
     out.append(x)
     return out
@@ -24,16 +24,16 @@ def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
     """`q`'s rows attending `k` and `v`'s, each side grouped by its own
     `perm` and `csr`."""
     o = ops.attn.ragged(
-        ops.layout.pack_rows(q, rows.perm),
-        ops.layout.pack_rows(k, over.perm),
-        ops.layout.pack_rows(v, over.perm),
+        ops.gather.pack_rows(q, rows.perm),
+        ops.gather.pack_rows(k, over.perm),
+        ops.gather.pack_rows(v, over.perm),
         rows.csr,
         over.csr,
         head_dim,
         sm_scale,
         mask,
     )
-    return ops.layout.unpack_rows(o, rows.perm)
+    return ops.gather.unpack_rows(o, rows.perm)
 
 def qwen3_caches(te, c, kv):
     space = c.kv_space(kv)
@@ -48,7 +48,7 @@ def qwen3_encode(arm, te, tap = None):
     plan = ops.attn.plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None)
     ids = arm.tokens()
     positions = arm.positions()
-    y = ops.layout.embed(ids, te.embed, te.vocab)
+    y = ops.gather.embed(ids, te.embed, te.vocab)
     last = len(te.layers) - 1
 
     def layer(l, w, y):
@@ -104,7 +104,7 @@ def attention(x, a, m, g, positions):
             return x
         return ops.elemwise.rope_axes(x, positions, m.rope_dims, [ROPE_THETA] * 4, "neox", m.rotary_dim, hd)
 
-    q, k, v = ops.layout.split_qkv(ops.linear.matmul(x, a.qkv), inner, inner)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, a.qkv), inner, inner)
     q = norm(q, a.q_norm)
     k = norm(k, a.k_norm)
     o = attend(q, k, v, g, g, hd, m.sm_scale, g.mask)
@@ -132,10 +132,10 @@ def refine(arm, m):
     arm.fold_layers(m.dit.refine, x, block)
 
 def column(v, slot, total):
-    tail = v if slot == 0 else ops.layout.split_rows(v, slot)[1]
+    tail = v if slot == 0 else ops.gather.split_rows(v, slot)[1]
     if slot + 1 == total:
         return tail
-    return ops.layout.split_rows(tail, 1)[0]
+    return ops.gather.split_rows(tail, 1)[0]
 
 def denoise(arm, m):
     d = m.dims
@@ -163,7 +163,7 @@ def denoise(arm, m):
 
     ctx = text.latents(3, d.dim, dtype.bf16)
     ctx_perm = text.row_permutation()
-    text_rows = ops.layout.unpack_rows(ops.layout.pack_rows(ctx, ctx_perm), ctx_perm)
+    text_rows = ops.gather.unpack_rows(ops.gather.pack_rows(ctx, ctx_perm), ctx_perm)
     video_rows = linear(dit.video_patch, video.latents(0, m.video_features, dtype.bf16))
     audio_rows = linear(dit.audio_patch, audio.latents(2, m.audio_channels, dtype.bf16))
     reference_rows = linear(dit.video_patch, reference.latents(1, m.video_features, dtype.bf16))

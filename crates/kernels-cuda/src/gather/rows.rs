@@ -34,7 +34,7 @@ pub(crate) fn gather_width_concat(
     shard_width: u32,
     world: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.gather_width_concat";
+    const OP: &str = "gather.gather_width_concat";
     dtype_dispatch!(OP, y.dtype, { Bf16 => () });
     let rows = nonzero(OP, "rows", y.rows)?;
     let shard = nonzero(OP, "the shard width", shard_width)?;
@@ -79,7 +79,7 @@ pub fn split_qkv_padded(
     k: &mut Tensor,
     v: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_qkv_padded";
+    const OP: &str = "gather.split_qkv_padded";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let runs = [widths[0], widths[1], head_dim]
         .iter()
@@ -125,7 +125,7 @@ pub fn split_qkv(
     k: &mut Tensor,
     v: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_qkv";
+    const OP: &str = "gather.split_qkv";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     debug_assert_eq!(q.width, q_width, "the q half is the width this cut states");
     debug_assert_eq!(
@@ -178,7 +178,7 @@ pub fn split_q_gate(
     q: &mut Tensor,
     gate: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_q_gate";
+    const OP: &str = "gather.split_q_gate";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     nonzero(OP, "the head width this cut walks", head_dim)?;
     if q.width == 0 || !q.width.is_multiple_of(head_dim) {
@@ -240,7 +240,7 @@ pub fn split_rows(
     left: &mut Tensor,
     right: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_rows";
+    const OP: &str = "gather.split_rows";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
     debug_assert_eq!(
         left.width, width,
@@ -295,7 +295,7 @@ pub fn select(
     width: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.select";
+    const OP: &str = "gather.select";
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "the slice width this select states", width)?;
     debug_assert_eq!(
@@ -412,7 +412,7 @@ pub fn gather_rows(
     index: Tensor,
     tight: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.gather_rows";
+    const OP: &str = "gather.rows";
     move_rows(
         ctx,
         OP,
@@ -430,7 +430,7 @@ pub fn scatter_rows(
     index: Tensor,
     wide: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_rows";
+    const OP: &str = "gather.scatter_rows";
     move_rows(
         ctx,
         OP,
@@ -497,11 +497,11 @@ fn permute_rows(
 }
 
 pub fn pack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    permute_rows(ctx, "layout.pack_rows", "pack_rows", x, perm, o)
+    permute_rows(ctx, "gather.pack_rows", "pack_rows", x, perm, o)
 }
 
 pub fn unpack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    permute_rows(ctx, "layout.unpack_rows", "unpack_rows", x, perm, o)
+    permute_rows(ctx, "gather.unpack_rows", "unpack_rows", x, perm, o)
 }
 
 // `layout.concat_cols`: inputs side by side, a row each's columns after
@@ -509,7 +509,7 @@ pub fn unpack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result
 
 /// `xs` side by side into `y`: each a row's columns after the one before's.
 pub fn concat_cols(ctx: &Ctx, xs: &[Tensor], y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.concat_cols";
+    const OP: &str = "gather.concat_cols";
     let elem = y.dtype.bits();
     if !elem.is_multiple_of(8) {
         return Err(refuse(OP, "an element of whole bytes"));
@@ -565,7 +565,7 @@ pub fn scatter_live_rows(
     routes: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_live_rows";
+    const OP: &str = "gather.scatter_live_rows";
     let unit = dtype_dispatch!(OP, src.dtype, {
         Bf16 => "::pie::bf16",
         F16 => "::pie::f16",
@@ -619,7 +619,7 @@ pub fn scatter_live_rows(
 }
 
 pub fn pool_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.pool_rows";
+    const OP: &str = "gather.pool_rows";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(y.dtype, x.dtype, "`{OP}` pools into the element it reads");
 
@@ -653,7 +653,7 @@ pub fn pool_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), 
 }
 
 pub fn merge_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.merge_rows";
+    const OP: &str = "gather.merge_rows";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(y.dtype, x.dtype, "`{OP}` merges into the element it reads");
 

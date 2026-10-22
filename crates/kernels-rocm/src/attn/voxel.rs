@@ -11,6 +11,6 @@ pub enum Segment {
 
 crate::error::unsupported! {
     #[allow(clippy::too_many_arguments)]
-    attention = "spatial.attention" (q: Tensor, k: Tensor, v: Tensor, grid: Tensor,
+    attention = "attention.voxel" (q: Tensor, k: Tensor, v: Tensor, grid: Tensor,
         segment: Segment, sm_scale: f32, o: &mut Tensor);
 }

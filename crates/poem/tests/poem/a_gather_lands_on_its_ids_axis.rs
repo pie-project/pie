@@ -1,5 +1,5 @@
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
-use poem_ir::{Dim, Layout, Operation, TapKind, Trace, Ty};
+use poem_ir::{Dim, Gather, Operation, TapKind, Trace, Ty};
 
 #[derive(Clone, Copy)]
 enum Axis {
@@ -8,14 +8,14 @@ enum Axis {
 }
 
 #[derive(Clone, Copy)]
-enum Gather {
+enum Lookup {
     Plain,
     Weighted,
 }
 
 struct OneGather {
     axis: Axis,
-    gather: Gather,
+    gather: Lookup,
 }
 
 const HIDDEN: u64 = 64;
@@ -30,7 +30,7 @@ impl ForwardHybrid for OneGather {
     fn forward(&self, inputs: Input) -> Value {
         let table = Weight::sym("pos_embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
         let taps = |inputs: &Input| {
-            ops::layout::grid_taps(
+            ops::gather::grid_taps(
                 &inputs.patch_positions(),
                 &inputs.image_grids(),
                 &inputs.patch_segments(),
@@ -39,31 +39,31 @@ impl ForwardHybrid for OneGather {
             )
         };
         match (self.axis, self.gather) {
-            (Axis::Tokens, Gather::Plain) => ops::layout::embed(&inputs.tokens(), &table, VOCAB),
-            (Axis::Patches, Gather::Plain) => {
-                ops::layout::embed(&inputs.patch_routes(), &table, VOCAB)
+            (Axis::Tokens, Lookup::Plain) => ops::gather::embed(&inputs.tokens(), &table, VOCAB),
+            (Axis::Patches, Lookup::Plain) => {
+                ops::gather::embed(&inputs.patch_routes(), &table, VOCAB)
             }
-            (Axis::Tokens, Gather::Weighted) => ops::layout::embed_weighted(
+            (Axis::Tokens, Lookup::Weighted) => ops::gather::embed_weighted(
                 &inputs.mrope_positions(),
                 &inputs.axis_positions(0, 3),
                 &table,
                 VOCAB,
             ),
-            (Axis::Patches, Gather::Weighted) => {
+            (Axis::Patches, Lookup::Weighted) => {
                 let (ids, weights) = taps(&inputs);
-                ops::layout::embed_weighted(&ids, &weights, &table, VOCAB)
+                ops::gather::embed_weighted(&ids, &weights, &table, VOCAB)
             }
         }
     }
 }
 
-fn gathered(axis: Axis, gather: Gather) -> Ty {
+fn gathered(axis: Axis, gather: Lookup) -> Ty {
     let trace: Trace = trace_hybrid("one_gather", &OneGather { axis, gather }, Platform::Cuda);
     let out = trace
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Layout(Layout::Embed { y, .. } | Layout::EmbedWeighted { y, .. }) => {
+            Operation::Gather(Gather::Embed { y, .. } | Gather::EmbedWeighted { y, .. }) => {
                 Some(*y)
             }
             _ => None,
@@ -87,7 +87,7 @@ fn a_gather_lands_on_its_ids_axis_every_case() {
 }
 
 fn the_plain_gather_follows_its_ids_onto_either_axis() {
-    let tokens = gathered(Axis::Tokens, Gather::Plain);
+    let tokens = gathered(Axis::Tokens, Lookup::Plain);
     assert_eq!(
         leading(&tokens),
         Dim::Tokens,
@@ -95,7 +95,7 @@ fn the_plain_gather_follows_its_ids_onto_either_axis() {
          as a token rectangle"
     );
 
-    let patches = gathered(Axis::Patches, Gather::Plain);
+    let patches = gathered(Axis::Patches, Lookup::Plain);
     assert_eq!(
         leading(&patches),
         Dim::Patches,
@@ -116,10 +116,10 @@ fn the_plain_gather_follows_its_ids_onto_either_axis() {
 
 fn the_interpolating_gather_follows_its_ids_too() {
     assert_eq!(
-        leading(&gathered(Axis::Tokens, Gather::Weighted)),
+        leading(&gathered(Axis::Tokens, Lookup::Weighted)),
         Dim::Tokens
     );
-    let patches = gathered(Axis::Patches, Gather::Weighted);
+    let patches = gathered(Axis::Patches, Lookup::Weighted);
     assert_eq!(
         leading(&patches),
         Dim::Patches,
@@ -133,18 +133,18 @@ fn the_axis_is_not_how_a_text_picks_the_op() {
             "one_gather",
             &OneGather {
                 axis,
-                gather: Gather::Plain,
+                gather: Lookup::Plain,
             },
             Platform::Cuda,
         );
         let gathers = trace
             .nodes
             .iter()
-            .filter(|node| matches!(node.op, Operation::Layout(Layout::Embed { .. })))
+            .filter(|node| matches!(node.op, Operation::Gather(Gather::Embed { .. })))
             .count();
         assert_eq!(
             gathers, 1,
-            "a gather on either axis is one `layout.embed` node and not an axis-specific arm"
+            "a gather on either axis is one `gather.embed` node and not an axis-specific arm"
         );
     }
 }

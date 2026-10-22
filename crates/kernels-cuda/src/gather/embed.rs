@@ -20,7 +20,7 @@ pub fn embed(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
+    const OP: &str = "gather.embed";
     dtype_dispatch!(OP, table.dtype, { Bf16 => () });
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     debug_assert_eq!(
@@ -63,7 +63,7 @@ pub fn embed_vocab_shard(
     table: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_vocab_shard";
+    const OP: &str = "gather.embed_vocab_shard";
     dtype_dispatch!(OP, table.dtype, { Bf16 => () });
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     debug_assert_eq!(ids.rows, y.rows, "the ids handed over are the rows landed");
@@ -122,7 +122,7 @@ pub fn embed_scale_add(
     out_scale: f32,
     y_scaled: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_scale_add";
+    const OP: &str = "gather.embed_scale_add";
     dtype_dispatch!(OP, table.dtype, { Bf16 => () });
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     debug_assert!(
@@ -172,7 +172,7 @@ pub fn embed_scale_add_select(
     out_scale: f32,
     y_scaled: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_scale_add_select";
+    const OP: &str = "gather.embed_scale_add_select";
     dtype_dispatch!(OP, table.dtype, { Bf16 => () });
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     debug_assert!(
@@ -236,7 +236,7 @@ pub fn embed_concat(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = nonzero(OP, "the hashed head count", ids.width)?;
@@ -283,7 +283,7 @@ pub fn embed_concat_mlxu4(
     seat: crate::linear::moe::GroupSeat,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let Some(biases) = biases else {
@@ -362,7 +362,7 @@ pub fn embed_mlx_affine(
     seat: crate::linear::moe::GroupSeat,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let Some(biases) = biases else {
@@ -515,7 +515,7 @@ pub fn embed_concat_e4m3(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     let (heads, width) = head_width(OP, ids, y)?;
     let held = u64::from(codes.rows) * u64::from(codes.width);
     if held != u64::from(vocab) * u64::from(width) || scale.rows * scale.width != 4 {
@@ -559,7 +559,7 @@ pub fn embed_concat_mxfp8(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     let (heads, width) = head_width(OP, ids, y)?;
     if !width.is_multiple_of(32) || !codes.ptr.is_multiple_of(16) {
         return Err(refuse(
@@ -603,7 +603,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_weighted";
+    const OP: &str = "gather.embed_weighted";
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
         y.dtype, table.dtype,

@@ -17,7 +17,7 @@ pub fn scatter_live_rows(
     routes: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_live_rows";
+    const OP: &str = "gather.scatter_live_rows";
     let unit = dtype_dispatch!(OP, src.dtype, {
         Bf16 => "::pie::bf16",
         F16 => "::pie::f16",

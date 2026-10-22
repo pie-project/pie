@@ -8,7 +8,7 @@ pub fn embed_concat(ids: &Value, table: &Weight, vocab: u32) -> Value {
         table.compute_dtype(),
     ));
     r.push(
-        Layout::EmbedConcat {
+        Gather::EmbedConcat {
             ids: ids.id(),
             table: r.weight(table),
             scales: (table.dtype == Dtype::Mxfp8).then(|| r.weight_plane(table, poem_ir::SCALES)),
@@ -24,7 +24,7 @@ pub fn embed(ids: &Value, table: &Weight, vocab: u32) -> Value {
     let r = ids.rec();
     let y = r.fresh(tensor(ids.rows(), table.dim(1), table.compute_dtype()));
     r.push(
-        Layout::Embed {
+        Gather::Embed {
             ids: ids.id(),
             table: r.weight(table),
             vocab,
@@ -39,7 +39,7 @@ pub fn embed_weighted(ids: &Value, weights: &Value, table: &Weight, vocab: u32) 
     let r = ids.rec();
     let y = r.fresh(tensor(ids.rows(), table.dim(1), table.compute_dtype()));
     r.push(
-        Layout::EmbedWeighted {
+        Gather::EmbedWeighted {
             ids: ids.id(),
             weights: weights.id(),
             table: r.weight(table),
@@ -57,7 +57,7 @@ pub fn split_qkv(packed: &Value, q_width: u32, kv_width: u32) -> (Value, Value, 
     let k = r.fresh(tensor(packed.rows(), kv_width, packed.dtype()));
     let v = r.fresh(tensor(packed.rows(), kv_width, packed.dtype()));
     r.push(
-        Layout::SplitQkv {
+        Gather::SplitQkv {
             packed: packed.id(),
             q_width,
             kv_width,
@@ -89,7 +89,7 @@ pub fn split_qkv_padded(
     let k = r.fresh(tensor(packed.rows(), kv_width, packed.dtype()));
     let v = r.fresh(tensor(packed.rows(), kv_width, packed.dtype()));
     r.push(
-        Layout::SplitQkvPadded {
+        Gather::SplitQkvPadded {
             packed: packed.id(),
             heads,
             widths,
@@ -110,7 +110,7 @@ pub fn split_q_gate(packed: &Value, head_dim: u32) -> (Value, Value) {
     let q = r.fresh(tensor(packed.rows(), half, packed.dtype()));
     let gate = r.fresh(tensor(packed.rows(), half, packed.dtype()));
     r.push(
-        Layout::SplitQGate {
+        Gather::SplitQGate {
             packed: packed.id(),
             head_dim,
             q: q.id(),
@@ -132,7 +132,7 @@ pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     let left = r.fresh(tensor(x.rows(), width, x.dtype()));
     let right = r.fresh(tensor(x.rows(), rest, x.dtype()));
     r.push(
-        Layout::SplitRows {
+        Gather::SplitRows {
             x: x.id(),
             width,
             left: left.id(),
@@ -155,7 +155,7 @@ pub fn gather_rows(x: &Value, rows: &Value) -> Value {
         _ => tensor(Dim::Readouts, x.width(), x.dtype()),
     });
     r.push(
-        Layout::GatherRows {
+        Gather::Rows {
             x: x.id(),
             rows: rows.id(),
             y: y.id(),
@@ -169,7 +169,7 @@ pub fn select(table: &Value, layer: u32, width: u32) -> Value {
     let r = table.rec();
     let y = r.fresh(tensor(table.rows(), width, table.dtype()));
     r.push(
-        Layout::Select {
+        Gather::Select {
             table: table.id(),
             layer,
             width,
@@ -184,7 +184,7 @@ pub fn pool_rows(x: &Value, side: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Layout::PoolRows {
+        Gather::PoolRows {
             x: x.id(),
             side,
             y: y.id(),
@@ -202,7 +202,7 @@ pub fn merge_rows(x: &Value, side: u32) -> Value {
         x.dtype(),
     ));
     r.push(
-        Layout::MergeRows {
+        Gather::MergeRows {
             x: x.id(),
             side,
             y: y.id(),
@@ -219,7 +219,7 @@ pub fn concat_cols(xs: &[&Value]) -> Value {
     let width: u64 = xs.iter().map(|x| x.width()).sum();
     let y = r.fresh(tensor(first.rows(), width, first.dtype()));
     r.push(
-        Layout::ConcatCols {
+        Gather::ConcatCols {
             xs: xs.iter().map(|x| x.id()).collect(),
             y: y.id(),
         },
@@ -232,7 +232,7 @@ pub fn scatter_live_rows(src: &Value, routes: &Value, y: &Value) -> Value {
     let r = y.rec();
     let y_out = r.fresh(y.ty().clone());
     r.push(
-        Layout::ScatterLiveRows {
+        Gather::ScatterLiveRows {
             src: src.id(),
             routes: routes.id(),
             y: y.id(),
@@ -247,7 +247,7 @@ pub fn scatter_rows(src: &Value, routes: &Value, y: &Value) -> Value {
     let r = y.rec();
     let y_out = r.fresh(y.ty().clone());
     r.push(
-        Layout::ScatterRows {
+        Gather::ScatterRows {
             src: src.id(),
             routes: routes.id(),
             y: y.id(),
@@ -267,7 +267,7 @@ pub fn pack_rows(x: &Value, perm: &Value) -> Value {
     );
     let y = r.fresh(x.ty().clone());
     r.push(
-        Layout::PackRows {
+        Gather::PackRows {
             x: x.id(),
             perm: perm.id(),
             y: y.id(),
@@ -286,7 +286,7 @@ pub fn unpack_rows(x: &Value, perm: &Value) -> Value {
     );
     let y = r.fresh(x.ty().clone());
     r.push(
-        Layout::UnpackRows {
+        Gather::UnpackRows {
             x: x.id(),
             perm: perm.id(),
             y: y.id(),
@@ -309,7 +309,7 @@ pub fn pixels(x: &Value, mean: [f32; 3], std: [f32; 3], order: PixelOrder, tempo
     );
     let y = r.fresh(tensor(x.rows(), u64::from(temporal) * width, Dtype::Bf16));
     r.push(
-        Layout::Pixels {
+        Gather::Pixels {
             x: x.id(),
             patch: patch as u32,
             mean,
@@ -337,7 +337,7 @@ pub fn grid_taps(
     let ids = r.fresh(tensor(positions.rows(), taps, Dtype::I32));
     let weights = r.fresh(tensor(positions.rows(), taps, Dtype::F32));
     r.push(
-        Layout::GridTaps {
+        Gather::GridTaps {
             positions: positions.id(),
             grids: grids.id(),
             segments: segments.id(),
@@ -349,4 +349,64 @@ pub fn grid_taps(
         &[positions, grids, segments],
     );
     (ids, weights)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ngram_ids(
+    ids: &Value,
+    state: ValueId,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+    map: Option<&Weight>,
+) -> Value {
+    let r = ids.rec();
+    let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
+    r.push(
+        Gather::NgramIds {
+            ids: ids.id(),
+            state,
+            eos,
+            mults: mults.to_vec(),
+            primes: primes.to_vec(),
+            offsets: offsets.to_vec(),
+            heads_per_ngram,
+            map: map.map(|w| r.weight(w)),
+            ngram_ids: ngram_ids.id(),
+        },
+        &[ids],
+    );
+    ngram_ids
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ngram_ids_chunked(
+    ids: &Value,
+    state: ValueId,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+    map: Option<&Weight>,
+) -> Value {
+    let r = ids.rec();
+    let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
+    r.push(
+        Gather::NgramIdsChunked {
+            ids: ids.id(),
+            state,
+            eos,
+            mults: mults.to_vec(),
+            primes: primes.to_vec(),
+            offsets: offsets.to_vec(),
+            heads_per_ngram,
+            map: map.map(|w| r.weight(w)),
+            ngram_ids: ngram_ids.id(),
+        },
+        &[ids],
+    );
+    ngram_ids
 }

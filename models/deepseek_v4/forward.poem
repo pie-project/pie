@@ -11,7 +11,7 @@ def mixes(normed, mix, hy):
     projection, or with none the leading rows of the streams."""
     if mix.dynamic != None:
         return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
-    head, _ = ops.layout.split_rows(normed, mix.base.shape[0])
+    head, _ = ops.gather.split_rows(normed, mix.base.shape[0])
     return head
 
 def gate(streams, mix, hy):
@@ -37,9 +37,9 @@ def collapse(streams, head, hy):
 
 def summed(streams, hidden, count):
     """The `count` streams, each `hidden` wide, added into one row."""
-    y, rest = ops.layout.split_rows(streams, hidden)
+    y, rest = ops.gather.split_rows(streams, hidden)
     for _ in range(1, count - 1):
-        stream, rest = ops.layout.split_rows(rest, hidden)
+        stream, rest = ops.gather.split_rows(rest, hidden)
         y = ops.elemwise.residual_add(stream, y)
     return ops.elemwise.residual_add(rest, y)
 
@@ -182,7 +182,7 @@ def forward(m, inputs):
     ids = inputs.tokens()
     if ds != None:
         ids = ids.on(~fact.block_draft())
-    streams = ops.elemwise.hc_expand(ops.layout.embed(ids, m.embed, m.vocab), hy.streams)
+    streams = ops.elemwise.hc_expand(ops.gather.embed(ids, m.embed, m.vocab), hy.streams)
     adapters = inputs.adapter_routes()
     floor = None
     replay_plan = None
@@ -223,7 +223,7 @@ def forward(m, inputs):
         # that ends at the block's last, however its rows are laid out.
         ends = ops.attn.kv_ends(inputs.request_of_token(), inputs.kv(ds.stages[0].attn.kv))
         x = merge([dspark_block(m, inputs, rows, ends), x])
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, m.head if m.head != None else m.embed)
     if m.mtp != None:
         draft(m, rows, streams, logits)
@@ -238,7 +238,7 @@ def dspark_keys(m, rows, taps):
     ds = m.dspark
     hy = m.hyper
     inputs = rows.inputs
-    main = ops.linear.matmul(ops.layout.concat_cols(taps), ds.main_proj)
+    main = ops.linear.matmul(ops.gather.concat_cols(taps), ds.main_proj)
     main = ops.elemwise.rmsnorm(main, ds.main_norm, hy.norm_eps)
     for st in ds.stages:
         at = st.attn
@@ -254,7 +254,7 @@ def dspark_block(m, whole, rows, ends):
     hy = m.hyper
     drafted = whole.on(fact.block_draft())
     ids = drafted.tokens()
-    streams = ops.elemwise.hc_expand(ops.layout.embed(ids, m.embed, m.vocab), hy.streams)
+    streams = ops.elemwise.hc_expand(ops.gather.embed(ids, m.embed, m.vocab), hy.streams)
     block_rows = struct(
         inputs = drafted,
         plan = None,
@@ -285,8 +285,8 @@ def dspark_readout(m, inputs, logits, ends):
         bidirectional = False,
         proposals_from = 0,
     )
-    read = lambda x: ops.layout.gather_rows(x, inputs.readout_rows()).on(drafting)
-    biased, picks = ops.attn.markov_walk(logits.on(drafting), read(inputs.tokens()), read(inputs.positions()),
+    read = lambda x: ops.gather.gather_rows(x, inputs.readout_rows()).on(drafting)
+    biased, picks = ops.sampling.markov_walk(logits.on(drafting), read(inputs.tokens()), read(inputs.positions()),
                                          read(ends), ds.markov_embed, ds.markov_head, ds.block)
     seam.at(seam.MTP, [biased])
     seam.at(seam.MTP_DRAFTS, [picks])
@@ -300,11 +300,11 @@ def draft(m, rows, streams, logits):
     inputs = rows.inputs
     drafted = inputs.on(fact.drafts())
     plan = ops.attn.plan_prefill(drafted, m.heads, rows.kv_heads, m.head_dim, m.window)
-    hidden = ops.layout.gather_rows(streams, inputs.readout_rows()).on(fact.drafts())
+    hidden = ops.gather.gather_rows(streams, inputs.readout_rows()).on(fact.drafts())
     positions = rows.positions.on(fact.drafts())
-    token = ops.layout.argmax([logits.on(fact.drafts())])
+    token = ops.sampling.argmax([logits.on(fact.drafts())])
 
-    e = ops.layout.embed(token, m.embed, m.vocab)
+    e = ops.gather.embed(token, m.embed, m.vocab)
     e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
     e = ops.elemwise.hc_expand(ops.linear.matmul(e, mtp.e_proj), hy.streams)
     h = ops.elemwise.rmsnorm_per_head(hidden, mtp.hnorm, m.hidden, mtp.norm_eps)
@@ -326,7 +326,7 @@ def draft(m, rows, streams, logits):
     y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
     proposal = ops.linear.lm_head(y, m.head)
     seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
 
 def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
     if scaling != None:
@@ -513,7 +513,7 @@ def premix(streams, prev, m):
         x, _, _ = ops.elemwise.hc_gates(prev.mixes, streams, prev.scale, prev.base, hy.streams,
                                         hy.gate_eps, hy.alpha, hy.sinkhorn)
         return x
-    return ops.layout.split_rows(streams, m.hidden)[0]
+    return ops.gather.split_rows(streams, m.hidden)[0]
 
 def engram(streams, ids, inputs, m, e):
     hy = m.hyper
@@ -521,15 +521,15 @@ def engram(streams, ids, inputs, m, e):
     one = fact.single_token()
     ids_d, ids_p = ids.on(one), ids.on(~one)
     grams = merge([
-        ops.attn.ple_ngram_ids(ids_d, state, e.pad, e.mults, e.primes, e.offsets, e.heads_per_ngram, m.token_map),
-        ops.attn.ple_ngram_ids_chunked(ids_p, state, e.pad, e.mults, e.primes, e.offsets, e.heads_per_ngram, m.token_map),
+        ops.gather.ngram_ids(ids_d, state, e.pad, e.mults, e.primes, e.offsets, e.heads_per_ngram, m.token_map),
+        ops.gather.ngram_ids_chunked(ids_p, state, e.pad, e.mults, e.primes, e.offsets, e.heads_per_ngram, m.token_map),
     ])
     rows = 0
     for p in e.primes:
         rows += p
-    fetched = ops.layout.embed_concat(grams, e.table, rows)
+    fetched = ops.gather.embed_concat(grams, e.table, rows)
     kv = ops.linear.matmul(fetched, e.wkv)
-    key, value = ops.layout.split_rows(kv, hy.streams * m.hidden)
+    key, value = ops.gather.split_rows(kv, hy.streams * m.hidden)
     key = ops.elemwise.rmsnorm_grouped_plus_one(key, e.k_weight, m.hidden, e.eps)
     query = ops.elemwise.rmsnorm_grouped_plus_one(streams, e.q_weight, m.hidden, e.eps)
     gated = ops.elemwise.ple_gate(key, query, value, hy.streams)

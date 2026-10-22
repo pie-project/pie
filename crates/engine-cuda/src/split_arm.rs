@@ -1,4 +1,4 @@
-//! A gated-delta mixer cuts its packed projection (`layout.split_rows`)
+//! A gated-delta mixer cuts its packed projection (`gather.split_rows`)
 //! before the switch between its one-token step and its chunked walk, so
 //! the split runs under no guard while the step's ops run under the arm's,
 //! and `attention.ssm_gdn_step` (whose ops share one guard) never forms.
@@ -7,8 +7,7 @@
 //! runs the fused step and no split.
 
 use poem_ir::{
-    Attention, Def, Elementwise, Guard, Layout, Node, Operands, Operation, Trace, ValueDecl,
-    ValueId,
+    Def, Elementwise, Gather, Guard, Node, Operands, Operation, Ssm, Trace, ValueDecl, ValueId,
 };
 
 /// The rewrite over every such split.
@@ -33,8 +32,8 @@ fn redirect(op: &mut Operation, from: ValueId, to: ValueId) -> bool {
         }
     };
     match op {
-        Operation::Attention(Attention::SsmCausalConv1d { x, .. }) => swap(x),
-        Operation::Attention(Attention::SsmGatedDelta { qkv, z, .. }) => {
+        Operation::Ssm(Ssm::CausalConv1d { x, .. }) => swap(x),
+        Operation::Ssm(Ssm::GatedDelta { qkv, z, .. }) => {
             swap(qkv);
             swap(z);
         }
@@ -50,7 +49,7 @@ fn redirect(op: &mut Operation, from: ValueId, to: ValueId) -> bool {
 /// Splits node `at` into its arms when it is an unguarded split whose rows
 /// a guarded one-token conv reads; the index to resume from.
 fn split_one(trace: &mut Trace, at: usize) -> Option<usize> {
-    let Operation::Layout(Layout::SplitRows {
+    let Operation::Gather(Gather::SplitRows {
         x,
         width,
         left,
@@ -72,7 +71,7 @@ fn split_one(trace: &mut Trace, at: usize) -> Option<usize> {
         .collect();
     let arm = readers.iter().find_map(|&i| match &trace.nodes[i] {
         Node {
-            op: Operation::Attention(Attention::SsmCausalConv1d { x, .. }),
+            op: Operation::Ssm(Ssm::CausalConv1d { x, .. }),
             guard,
             ..
         } if *x == left && *guard != Guard::Always => Some(guard.clone()),
@@ -127,7 +126,7 @@ fn split_one(trace: &mut Trace, at: usize) -> Option<usize> {
     trace.nodes.insert(
         born,
         Node {
-            op: Operation::Layout(Layout::SplitRows {
+            op: Operation::Gather(Gather::SplitRows {
                 x,
                 width,
                 left: l2,

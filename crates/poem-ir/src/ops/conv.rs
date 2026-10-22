@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::operands::Operands;
+use crate::Op;
 use crate::value::ValueId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -141,17 +141,27 @@ impl GridRule {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Spatial {
+/// Ops over voxel rows: each clip's rows are a `t x h x w` grid that a
+/// `grid` value (i32, four a clip: extent and row offset) describes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
+#[op(group = "conv")]
+pub enum Conv {
+    /// The grid `rule` makes of `grid`.
     Grid {
+        #[input(I32)]
         grid: ValueId,
         rule: GridRule,
+        #[output(I32)]
         y: ValueId,
     },
     Conv3d {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
+        #[input]
         w: ValueId,
+        #[input]
         bias: Option<ValueId>,
         k: [u32; 3],
         stride: [u32; 3],
@@ -159,171 +169,111 @@ pub enum Spatial {
         pad_back: [u32; 3],
         causal_t: bool,
         time_pad: TimePad,
+        /// The frames a causal conv carries over from the last fire.
+        #[input]
         cache: Option<ValueId>,
+        #[input]
         y_grid: ValueId,
+        #[output]
         y: ValueId,
     },
     GroupNorm {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
         groups: u32,
+        #[input(F32)]
         weight: ValueId,
+        #[input(F32)]
         bias: ValueId,
         eps: f32,
         silu: bool,
+        #[output]
         y: ValueId,
     },
-    Attention {
-        q: ValueId,
-        k: ValueId,
-        v: ValueId,
-        grid: ValueId,
-        segment: VoxelSegment,
-        sm_scale: f32,
-        y: ValueId,
-    },
-    UpsampleNearest {
+    /// Nearest-neighbour upsampling by `factor` an axis.
+    Upsample {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
         factor: [u32; 3],
         keep_first_frame: bool,
+        #[input(I32)]
         y_grid: ValueId,
+        #[output]
         y: ValueId,
     },
     PixelShuffle {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
         r: [u32; 3],
         trim_t: u32,
+        #[input(I32)]
         y_grid: ValueId,
+        #[output]
         y: ValueId,
     },
     PixelUnshuffle {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
         r: [u32; 3],
+        #[input(I32)]
         y_grid: ValueId,
+        #[output]
         y: ValueId,
     },
     AvgDown {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
         factor: [u32; 3],
         group: u32,
+        #[input(I32)]
         y_grid: ValueId,
+        #[output]
         y: ValueId,
     },
+    /// The last `frames` frames of each clip, kept for the next fire.
     CacheStore {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
         frames: u32,
+        #[input]
         cache: ValueId,
+        #[output(alias = x)]
         x_out: ValueId,
     },
     Patchify {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         grid: ValueId,
         p: [u32; 3],
+        #[input(I32)]
         tgrid: ValueId,
+        #[output]
         y: ValueId,
     },
     Unpatchify {
+        #[input]
         x: ValueId,
+        #[input(I32)]
         tgrid: ValueId,
         p: [u32; 3],
+        #[input(I32)]
         grid: ValueId,
+        #[output]
         y: ValueId,
     },
-}
-
-impl Operands for Spatial {
-    fn inputs(&self, sink: &mut Vec<ValueId>) {
-        match self {
-            Self::Grid { grid, .. } => sink.push(*grid),
-            Self::Conv3d {
-                x,
-                grid,
-                w,
-                bias,
-                cache,
-                y_grid,
-                ..
-            } => {
-                sink.extend([*x, *grid, *w]);
-                sink.extend(bias.iter().copied());
-                sink.extend(cache.iter().copied());
-                sink.push(*y_grid);
-            }
-            Self::GroupNorm {
-                x,
-                grid,
-                weight,
-                bias,
-                ..
-            } => sink.extend([*x, *grid, *weight, *bias]),
-            Self::Attention { q, k, v, grid, .. } => sink.extend([*q, *k, *v, *grid]),
-            Self::UpsampleNearest {
-                x, grid, y_grid, ..
-            }
-            | Self::PixelShuffle {
-                x, grid, y_grid, ..
-            }
-            | Self::PixelUnshuffle {
-                x, grid, y_grid, ..
-            }
-            | Self::AvgDown {
-                x, grid, y_grid, ..
-            } => sink.extend([*x, *grid, *y_grid]),
-            Self::CacheStore { x, grid, cache, .. } => sink.extend([*x, *grid, *cache]),
-            Self::Patchify { x, grid, tgrid, .. } => sink.extend([*x, *grid, *tgrid]),
-            Self::Unpatchify { x, tgrid, grid, .. } => sink.extend([*x, *tgrid, *grid]),
-        }
-    }
-    fn outputs(&self, sink: &mut Vec<ValueId>) {
-        match self {
-            Self::Grid { y, .. }
-            | Self::Conv3d { y, .. }
-            | Self::GroupNorm { y, .. }
-            | Self::Attention { y, .. }
-            | Self::UpsampleNearest { y, .. }
-            | Self::PixelShuffle { y, .. }
-            | Self::PixelUnshuffle { y, .. }
-            | Self::AvgDown { y, .. }
-            | Self::Patchify { y, .. }
-            | Self::Unpatchify { y, .. } => sink.push(*y),
-            Self::CacheStore { x_out, .. } => sink.push(*x_out),
-        }
-    }
-    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
-        match self {
-            Self::Grid { .. }
-            | Self::Conv3d { .. }
-            | Self::GroupNorm { .. }
-            | Self::Attention { .. }
-            | Self::UpsampleNearest { .. }
-            | Self::PixelShuffle { .. }
-            | Self::PixelUnshuffle { .. }
-            | Self::AvgDown { .. }
-            | Self::Patchify { .. }
-            | Self::Unpatchify { .. } => {}
-            Self::CacheStore { x_out, x, .. } => sink.push((*x_out, *x)),
-        }
-    }
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Grid { .. } => "spatial.grid",
-            Self::Conv3d { .. } => "spatial.conv3d",
-            Self::GroupNorm { .. } => "spatial.group_norm",
-            Self::Attention { .. } => "spatial.attention",
-            Self::UpsampleNearest { .. } => "spatial.upsample_nearest",
-            Self::PixelShuffle { .. } => "spatial.pixel_shuffle",
-            Self::PixelUnshuffle { .. } => "spatial.pixel_unshuffle",
-            Self::AvgDown { .. } => "spatial.avg_down",
-            Self::CacheStore { .. } => "spatial.cache_store",
-            Self::Patchify { .. } => "spatial.patchify",
-            Self::Unpatchify { .. } => "spatial.unpatchify",
-        }
-    }
 }
 
 #[cfg(test)]
@@ -331,7 +281,7 @@ mod tests {
     use super::{GridRule, VoxelSegment};
 
     #[test]
-    fn spatial_every_case() {
+    fn conv_every_case() {
         a_grid_rule_maps_boxes_the_way_torch_does();
         a_trimmed_shuffle_drops_its_anchor_frames_from_the_box();
         an_avg_down_pads_its_time_axis_to_the_block();

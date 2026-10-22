@@ -699,7 +699,7 @@ pub fn layernorm(
     )
 }
 
-const OP: &str = "spatial.group_norm";
+const OP: &str = "conv.group_norm";
 
 const STATS_BLOCK: u32 = 1024;
 
@@ -759,8 +759,8 @@ pub fn group_norm(
         .and_then(|l| l.checked_mul(splits as usize))
         .and_then(|n| n.checked_mul(groups.unsigned_abs() as usize))
         .ok_or_else(|| refuse(OP, "the moments table overflows"))?;
-    let partials = ctx.scratch(OP, "spatial.group_norm.partials", cells * 16)? as u64;
-    let stats = ctx.scratch(OP, "spatial.group_norm.stats", cells * 8)? as u64;
+    let partials = ctx.scratch(OP, "conv.group_norm.partials", cells * 16)? as u64;
+    let stats = ctx.scratch(OP, "conv.group_norm.stats", cells * 8)? as u64;
     let splits = stated(OP, splits)?;
 
     ctx.fire(

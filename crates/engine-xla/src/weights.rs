@@ -682,7 +682,7 @@ fn gather_only(
     codes: &std::collections::BTreeSet<usize>,
     engine: &Engine,
 ) -> std::collections::BTreeSet<usize> {
-    use poem_ir::{Def, Layout, Operands, Operation};
+    use poem_ir::{Def, Gather, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
     if !engine.embed_fold {
         return out;
@@ -697,7 +697,7 @@ fn gather_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let table = match &node.op {
-            Operation::Layout(Layout::Embed { table, .. } | Layout::EmbedConcat { table, .. }) => {
+            Operation::Gather(Gather::Embed { table, .. } | Gather::EmbedConcat { table, .. }) => {
                 Some(*table)
             }
             _ => None,

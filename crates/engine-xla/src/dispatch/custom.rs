@@ -1,6 +1,6 @@
 use kernels_xla::spatial;
-use poem_exec::{DispatchFused, DispatchProbe, DispatchSpatial, KernelError};
-use poem_ir::{Fused, GridRule, Spatial, TimePad, VoxelSegment};
+use poem_exec::{DispatchConv, DispatchFused, DispatchProbe, KernelError};
+use poem_ir::{Conv, Fused, GridRule, TimePad};
 
 use poem_ir::Operands;
 
@@ -13,8 +13,8 @@ impl DispatchFused for Run<'_> {
     }
 }
 
-impl DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
+impl DispatchConv for Run<'_> {
+    fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
         self.spatial(op).map_err(crate::error::kernel)
     }
@@ -45,13 +45,6 @@ impl DispatchProbe for Run<'_> {
                 self.record_probe(value, read);
             }
         }
-    }
-}
-
-fn segment(segment: VoxelSegment) -> spatial::Segment {
-    match segment {
-        VoxelSegment::Clip => spatial::Segment::Lane,
-        VoxelSegment::Frames(n) => spatial::Segment::Frames(n),
     }
 }
 
@@ -100,7 +93,7 @@ impl Run<'_> {
         }
         if u64::from(w.width) != u64::from(c_in) * u64::from(taps) {
             return Err(kernels_xla::Error::Backend {
-                op: "spatial.conv3d",
+                op: "conv.conv3d",
                 detail: format!(
                     "a weight {} wide does not hold {c_in} input channels by {taps} taps",
                     w.width
@@ -132,12 +125,12 @@ impl Run<'_> {
     /// are device data, so a convolution runs the table-as-data
     /// `spatial::conv3d`; `conv3d_boxed` (clip boxes as static attributes)
     /// needs the boxes on the host, which the walk does not hold.
-    fn spatial(&mut self, op: &Spatial) -> Result<(), kernels_xla::Error> {
+    fn spatial(&mut self, op: &Conv) -> Result<(), kernels_xla::Error> {
         match op {
-            Spatial::Grid { grid, rule: how, y } => {
+            Conv::Grid { grid, rule: how, y } => {
                 spatial::derive_grid(self.ctx(), self.tensor(*grid), rule(*how), self.tensor(*y))
             }
-            Spatial::Conv3d {
+            Conv::Conv3d {
                 x,
                 grid,
                 w,
@@ -185,7 +178,7 @@ impl Run<'_> {
                 // back over them.
                 let frames = conv.pad[0];
                 let slab = self.recurrent(*state).state;
-                let slot_ids = self.clip_slot_table("spatial.conv3d")?;
+                let slot_ids = self.clip_slot_table("conv.conv3d")?;
                 let frame_cache = self.temp(x.rows.saturating_mul(frames), x.width, x.dtype);
                 spatial::cache_gather(self.ctx(), slab, slot_ids, grid, frames, frame_cache)?;
                 spatial::conv3d(
@@ -201,7 +194,7 @@ impl Run<'_> {
                 )?;
                 spatial::cache_store(self.ctx(), x, frame_cache, slot_ids, grid, frames, slab)
             }
-            Spatial::GroupNorm {
+            Conv::GroupNorm {
                 x,
                 grid,
                 groups,
@@ -221,25 +214,7 @@ impl Run<'_> {
                 *silu,
                 self.tensor(*y),
             ),
-            Spatial::Attention {
-                q,
-                k,
-                v,
-                grid,
-                segment: how,
-                sm_scale,
-                y,
-            } => spatial::attention(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                segment(*how),
-                *sm_scale,
-                self.tensor(*y),
-            ),
-            Spatial::UpsampleNearest {
+            Conv::Upsample {
                 x,
                 grid,
                 factor,
@@ -255,7 +230,7 @@ impl Run<'_> {
                 self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::PixelShuffle {
+            Conv::PixelShuffle {
                 x,
                 grid,
                 r,
@@ -271,7 +246,7 @@ impl Run<'_> {
                 self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::PixelUnshuffle {
+            Conv::PixelUnshuffle {
                 x,
                 grid,
                 r,
@@ -285,7 +260,7 @@ impl Run<'_> {
                 self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::AvgDown {
+            Conv::AvgDown {
                 x,
                 grid,
                 factor,
@@ -301,7 +276,7 @@ impl Run<'_> {
                 self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            Spatial::CacheStore {
+            Conv::CacheStore {
                 x,
                 grid,
                 frames,
@@ -310,7 +285,7 @@ impl Run<'_> {
             } => {
                 let x = self.tensor(*x);
                 let slab = self.recurrent(*cache).state;
-                let slot_ids = self.clip_slot_table("spatial.cache_store")?;
+                let slot_ids = self.clip_slot_table("conv.cache_store")?;
                 spatial::cache_store(
                     self.ctx(),
                     x,
@@ -321,7 +296,7 @@ impl Run<'_> {
                     slab,
                 )
             }
-            Spatial::Patchify {
+            Conv::Patchify {
                 x,
                 grid,
                 p,
@@ -335,7 +310,7 @@ impl Run<'_> {
                 self.tensor(*y),
                 self.tensor(*tgrid),
             ),
-            Spatial::Unpatchify {
+            Conv::Unpatchify {
                 x,
                 tgrid,
                 p,

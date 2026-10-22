@@ -22,8 +22,8 @@ use spelled::*;
 
 /// The types an op's parameters are spelled in.
 pub(crate) mod spelled {
+    pub(crate) use crate::ops::conv::ConvShape;
     pub(crate) use crate::ops::elemwise::{RopeScaling, Yarn};
-    pub(crate) use crate::ops::spatial::Conv;
     pub(crate) use crate::{
         Dtype, GateActivation, IndexScore, Input, ModulateForm, MropeForm, PixelOrder, RaggedMask,
         RopeForm, TapKind, Value, ValueId, VoxelSegment, Weight,
@@ -342,7 +342,7 @@ pub(crate) struct Whole(#[allocative(skip)] pub(crate) Held);
 
 #[derive(Debug, Clone)]
 pub(crate) enum Held {
-    Conv(Conv),
+    ConvShape(ConvShape),
     Yarn(Yarn),
     Scaling(RopeScaling),
     Mask(RaggedMask),
@@ -374,7 +374,7 @@ macro_rules! whole {
     };
 }
 
-whole!(Conv, Conv, "a conv");
+whole!(ConvShape, ConvShape, "a conv");
 whole!(Yarn, Yarn, "a yarn scaling");
 whole!(RopeScaling, Scaling, "a rope scaling");
 whole!(RaggedMask, Mask, "a ragged mask");
@@ -580,20 +580,20 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
             axes("pad", Vec::arg(Some(pad))?)?,
         );
         let mut conv = if two {
-            Conv::conv2d([k[1], k[2]], [stride[1], stride[2]], [pad[1], pad[2]])
+            ConvShape::conv2d([k[1], k[2]], [stride[1], stride[2]], [pad[1], pad[2]])
         } else {
-            Conv::conv3d(k, stride, pad)
+            ConvShape::conv3d(k, stride, pad)
         };
         if let Some(back) = pad_back.into_option() {
             conv = conv.pad_back(axes("pad_back", Vec::arg(Some(back))?)?);
         }
         conv = match causal.into_option() {
             None => conv,
-            Some("zero") => conv.causal(poem_ir::ops::spatial::TimePad::Zero),
-            Some("replicate") => conv.causal(poem_ir::ops::spatial::TimePad::Replicate),
+            Some("zero") => conv.causal(poem_ir::ops::conv::TimePad::Zero),
+            Some("replicate") => conv.causal(poem_ir::ops::conv::TimePad::Replicate),
             Some(other) => anyhow::bail!("a causal conv pads with zero or replicate, not {other}"),
         };
-        Ok(Whole(Held::Conv(conv)))
+        Ok(Whole(Held::ConvShape(conv)))
     }
 
     /// A ragged attention's mask that lets each row attend only rows of its
@@ -618,15 +618,15 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         #[starlark(require = named, default = false)] causal_t: bool,
         #[starlark(require = named, default = "zero")] time_pad: &str,
     ) -> anyhow::Result<Whole> {
-        Ok(Whole(Held::Conv(Conv {
+        Ok(Whole(Held::ConvShape(ConvShape {
             k: <[u32; 3]>::arg(Some(k))?,
             stride: <[u32; 3]>::arg(Some(stride))?,
             pad: <[u32; 3]>::arg(Some(pad))?,
             pad_back: <[u32; 3]>::arg(Some(pad_back))?,
             causal_t,
             time_pad: match time_pad {
-                "zero" => poem_ir::ops::spatial::TimePad::Zero,
-                "replicate" => poem_ir::ops::spatial::TimePad::Replicate,
+                "zero" => poem_ir::ops::conv::TimePad::Zero,
+                "replicate" => poem_ir::ops::conv::TimePad::Replicate,
                 other => anyhow::bail!("a conv pads time with zero or replicate, not {other}"),
             },
         })))

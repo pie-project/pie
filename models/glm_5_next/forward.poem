@@ -11,7 +11,7 @@ def mixes(normed, mix, hy):
     projection, or with none the leading rows of the streams."""
     if mix.dynamic != None:
         return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
-    head, _ = ops.layout.split_rows(normed, mix.base.shape[0])
+    head, _ = ops.gather.split_rows(normed, mix.base.shape[0])
     return head
 
 def gate(streams, mix, hy):
@@ -33,9 +33,9 @@ def summed(streams, hidden, count):
     """The mean of the `count` streams, each `hidden` wide: the unweighted
     collapse the head reads (a sum would read the final norm's epsilon a
     `count` squared smaller)."""
-    y, rest = ops.layout.split_rows(streams, hidden)
+    y, rest = ops.gather.split_rows(streams, hidden)
     for _ in range(1, count - 1):
-        stream, rest = ops.layout.split_rows(rest, hidden)
+        stream, rest = ops.gather.split_rows(rest, hidden)
         y = ops.elemwise.residual_add(stream, y)
     return ops.elemwise.residual_add(rest, y) * f32(1.0 / count)
 
@@ -62,8 +62,8 @@ def kda(x, inputs, k):
     seam.at(seam.RECURRENT, [qkv])
 
     one = fact.single_token()
-    step = ops.attn.ssm_kda_step(
-        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
+    step = ops.ssm.kda(
+        ops.ssm.causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
         f.on(one),
         b.on(one),
         k.dt_bias,
@@ -74,8 +74,8 @@ def kda(x, inputs, k):
         k.norm_eps,
         k.gate_floor,
     )
-    chunked = ops.attn.ssm_kda_chunked(
-        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
+    chunked = ops.ssm.kda_chunked(
+        ops.ssm.causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
         f.on(~one),
         b.on(~one),
         k.dt_bias,
@@ -216,10 +216,10 @@ def forward(m, inputs):
     plan = plans(inputs, m.heads, m.kv_lora_rank)
     positions = inputs.positions()
     towered = tower(inputs, m.tower) if m.tower != None else None
-    narrow = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    narrow = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     if towered != None:
         imaged = narrow.on(fact.has(fact.Media))
-        narrow = ops.layout.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
+        narrow = ops.gather.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
     streams = ops.elemwise.hc_expand(narrow, hy.streams)
     routes = inputs.adapter_routes()
 
@@ -245,7 +245,7 @@ def forward(m, inputs):
     streams = inputs.fold_layers(m.layers, streams, block)
 
     y = summed(streams, m.hidden, hy.streams)
-    y = ops.layout.gather_rows(y, inputs.readout_rows())
+    y = ops.gather.gather_rows(y, inputs.readout_rows())
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     logits = ops.linear.lm_head(x, m.head)
 
@@ -261,9 +261,9 @@ def draft(m, inputs, y, positions, logits):
     plan = whole(drafted, m.heads, m.kv_lora_rank)
     hidden = y.on(fact.drafts())
     positions = positions.on(fact.drafts())
-    token = ops.layout.argmax([logits.on(fact.drafts())])
+    token = ops.sampling.argmax([logits.on(fact.drafts())])
 
-    e = ops.layout.embed(token, m.embed, m.vocab)
+    e = ops.gather.embed(token, m.embed, m.vocab)
     e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
     h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
     fused = ops.elemwise.residual_add(
@@ -277,7 +277,7 @@ def draft(m, inputs, y, positions, logits):
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp, None), r)
     proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
     seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
 
 def predict_next(streams, following, hy):
     if following == None or not following.mlp.routed:
@@ -370,13 +370,13 @@ def index_select(x, q_a, inputs, positions, act, ix, split):
 
 def tower(inputs, t):
     d = t.head_dim
-    x = ops.layout.pixels(inputs.pixels(3 * t.patch * t.patch), [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711], "chw", t.temporal)
+    x = ops.gather.pixels(inputs.pixels(3 * t.patch * t.patch), [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711], "chw", t.temporal)
     segments = inputs.patch_segments()
     grid = inputs.patch_positions()
     y = ops.elemwise.add_bias(t.patch_embed_bias, ops.linear.matmul(x, t.patch_embed))
     for b in t.blocks:
         n = ops.elemwise.rmsnorm(y, b.norm1, t.norm_eps)
-        q, k, v = ops.layout.split_qkv(
+        q, k, v = ops.gather.split_qkv(
             ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)),
             t.hidden,
             t.hidden,
@@ -397,7 +397,7 @@ def tower(inputs, t):
             y,
         )
     y = ops.elemwise.rmsnorm(y, t.post_norm, t.norm_eps)
-    folded = ops.layout.merge_rows(y, t.merge)
+    folded = ops.gather.merge_rows(y, t.merge)
     y = ops.elemwise.add_bias(t.downsample_bias, ops.linear.matmul(folded, t.downsample))
     mg = t.merger
     p = ops.linear.matmul(y, mg.proj)

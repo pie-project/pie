@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::ltx_2_dims::{self as model, VAE_DECODE};
 use poem::generative::{PortKind, ReadoutKind};
 use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
-use poem_ir::{GridRule, Spatial, TimePad};
+use poem_ir::{Conv, GridRule, TimePad};
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const MINI: &str = "ltx25-mini-bf16-kv-bf16";
@@ -80,7 +80,7 @@ fn the_shapes_are_the_ltx_decoders() {
     let mut rms_eps: BTreeSet<String> = BTreeSet::new();
     for node in &plan.nodes {
         match &node.op {
-            Operation::Spatial(Spatial::Conv3d {
+            Operation::Conv(Conv::Conv3d {
                 k,
                 stride,
                 pad,
@@ -103,14 +103,14 @@ fn the_shapes_are_the_ltx_decoders() {
                 );
                 assert!(cache.is_none(), "no frame cache on a one-fire decoder");
             }
-            Operation::Spatial(Spatial::PixelShuffle { r, trim_t, .. }) => {
+            Operation::Conv(Conv::PixelShuffle { r, trim_t, .. }) => {
                 shuffles.push((*r, *trim_t));
             }
-            Operation::Spatial(Spatial::Grid { rule, .. }) => match rule {
+            Operation::Conv(Conv::Grid { rule, .. }) => match rule {
                 GridRule::Conv { .. } | GridRule::Shuffle { .. } => {}
                 other => panic!("a grid rule this decoder never states: {other:?}"),
             },
-            Operation::Spatial(other) => {
+            Operation::Conv(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }
             Operation::Elementwise(poem::Elementwise::RmsnormNoScale { eps, .. }) => {

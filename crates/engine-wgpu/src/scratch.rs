@@ -4,7 +4,7 @@ use kernels_wgpu::linear::moe::{self, RoutedScratch};
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attention, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -254,14 +254,14 @@ impl Scratch {
 
         let mut ple: Vec<PleHash> = Vec::new();
         for node in &trace.nodes {
-            let Operation::Attention(
-                Attention::PleNgramIds {
+            let Operation::Gather(
+                Gather::NgramIds {
                     mults,
                     primes,
                     offsets,
                     ..
                 }
-                | Attention::PleNgramIdsChunked {
+                | Gather::NgramIdsChunked {
                     mults,
                     primes,
                     offsets,

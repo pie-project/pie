@@ -2,11 +2,11 @@
 //! runs before one that forms a piece of it.
 
 use poem::declare::Precision;
-use poem::ops::{attn, elemwise, layout, linear};
+use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::PostNorm;
 use poem_ir::{
-    ActQuant, Dim, Dtype, Elementwise, Fused, Layout, ModulateForm, NormKind, Operation,
+    ActQuant, Dim, Dtype, Elementwise, Fused, Gather, ModulateForm, NormKind, Operation,
     StructKind, Ty,
 };
 
@@ -434,7 +434,7 @@ fn qg_qknorm_rope_append() -> Rule {
         let v = p.rows("v", W);
         let positions = p.indices("positions");
         let d = p.u32("d");
-        let (q, gate) = layout::split_q_gate(&qg, d);
+        let (q, gate) = gather::split_q_gate(&qg, d);
         p.name("q_split", &q);
         p.export("gate", &gate);
         let qn =
@@ -493,7 +493,7 @@ fn qg_qknorm_rope_append() -> Rule {
 fn split_rope_yarn_append() -> Rule {
     let pattern = template(|p| {
         let packed = p.rows("packed", 3 * W);
-        let (q, k, v) = layout::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
+        let (q, k, v) = gather::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
         p.name("k_split", &k);
         p.name("v_split", &v);
         let positions = p.indices("positions");
@@ -681,7 +681,7 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             let packed = if split {
                 // Any cut matches: the replacement reads the trace's own.
                 let full = p.rows("full", 4 * W);
-                let (packed, rest) = layout::split_rows(&full, W as u32 / 2);
+                let (packed, rest) = gather::split_rows(&full, W as u32 / 2);
                 p.free("width");
                 p.name("packed", &packed);
                 p.export("rest", &rest);
@@ -693,9 +693,9 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             let d = p.u32("d");
             let (q, k, v) = if rope == 4 {
                 let heads = [p.u32("q_heads"), p.u32("kv_heads")];
-                layout::split_qkv_padded(&packed, heads, [p.u32("qk"), p.u32("vw")], d)
+                gather::split_qkv_padded(&packed, heads, [p.u32("qk"), p.u32("vw")], d)
             } else {
-                layout::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"))
+                gather::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"))
             };
             if rope >= 3 {
                 let v = elemwise::mul_scalar(p.f32("v_scale"), &v);
@@ -852,12 +852,12 @@ fn rmsnorm_residual_add() -> Rule {
 fn embed_chain(select: bool) -> Template {
     template(|p| {
         let ids = p.indices("ids");
-        let e = layout::embed(&ids, &p.weight("table", [W, W]), p.u32("vocab"));
+        let e = gather::embed(&ids, &p.weight("table", [W, W]), p.u32("vocab"));
         p.export("e", &e);
         let e_scaled = elemwise::mul_scalar(p.f32("embed_scale"), &e);
         p.export("e_scaled", &e_scaled);
         let y = if select {
-            let y = layout::select(&p.rows("stacked", 4 * W), p.u32("layer"), p.u32("width"));
+            let y = gather::select(&p.rows("stacked", 4 * W), p.u32("layer"), p.u32("width"));
             p.name("y", &y);
             y
         } else {
@@ -1286,13 +1286,13 @@ fn matmul_split_rows() -> Rule {
         p.name("y", &y);
         // Any cut matches: the pattern cuts at a width its rows hold, and
         // the replacement reads the trace's own.
-        let (left, right) = layout::split_rows(&y, W as u32 / 2);
+        let (left, right) = gather::split_rows(&y, W as u32 / 2);
         p.free("width");
         p.export("left", &left);
         p.export("right", &right);
     });
     Rule::new("linear.matmul_split_rows", [pattern], |m| {
-        let Operation::Layout(Layout::SplitRows { width, .. }) = m.op("left") else {
+        let Operation::Gather(Gather::SplitRows { width, .. }) = m.op("left") else {
             panic!("`left` comes from a row split");
         };
         Fused::MatmulSplitRows {
@@ -1836,11 +1836,11 @@ fn hc_norm_project() -> Rule {
 fn ssm_gdn_step() -> Rule {
     let pattern = template(|p| {
         let qkvz = p.rows("qkvz", 1 << 40);
-        let (qkv, z) = layout::split_rows(&qkvz, p.u32("width"));
+        let (qkv, z) = gather::split_rows(&qkvz, p.u32("width"));
         p.export("qkv", &qkv);
         p.export("z", &z);
         let conv_state = p.cache("conv_state");
-        let conv = attn::ssm_causal_conv1d_dilated(
+        let conv = ssm::causal_conv1d_dilated(
             &qkv,
             &p.weight("conv_weight", [W, W]),
             None,
@@ -1849,13 +1849,13 @@ fn ssm_gdn_step() -> Rule {
             p.u32("dilation"),
         );
         p.name("conv", &conv);
-        let gates = attn::ssm_gdn_prep(
+        let gates = ssm::gdn_gates(
             &p.rows("ba", W),
             &p.weight("dt_bias", [W]),
             &p.weight("a_log", [W]),
         );
         p.name("gates", &gates);
-        let y = attn::ssm_gated_delta(
+        let y = ssm::gated_delta(
             &conv,
             &z,
             &gates,
@@ -1895,7 +1895,7 @@ fn ssm_gdn_step() -> Rule {
 fn q_gate_k_norm_rope_append() -> Rule {
     let pattern = template(|p| {
         let d = p.u32("d");
-        let (q, gate) = layout::split_q_gate(&p.rows("qg", 2 * W), d);
+        let (q, gate) = gather::split_q_gate(&p.rows("qg", 2 * W), d);
         // The split q is a seam's (`ATTN_QV`), so it still lands.
         p.export("q", &q);
         p.export("gate", &gate);

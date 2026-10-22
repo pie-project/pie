@@ -46,16 +46,16 @@ impl ForwardHybrid for Encoder {
             let k = ops::linear::matmul(&h, &w(&format!("l{l}.k"), HEADS * HEAD_DIM, WIDTH));
             let v = ops::linear::matmul(&h, &w(&format!("l{l}.v"), HEADS * HEAD_DIM, WIDTH));
             let o = ops::attn::ragged(
-                &ops::layout::pack_rows(&q, &perm),
-                &ops::layout::pack_rows(&k, &perm),
-                &ops::layout::pack_rows(&v, &perm),
+                &ops::gather::pack_rows(&q, &perm),
+                &ops::gather::pack_rows(&k, &perm),
+                &ops::gather::pack_rows(&v, &perm),
                 &indptr,
                 &indptr,
                 HEAD_DIM,
                 1.0,
                 ops::attn::relative_bias(&table, MAX_LEN),
             );
-            let o = ops::layout::unpack_rows(&o, &perm);
+            let o = ops::gather::unpack_rows(&o, &perm);
             let y = ops::linear::matmul(&o, &w(&format!("l{l}.o"), WIDTH, HEADS * HEAD_DIM));
             x = ops::elemwise::residual_add(&x, &y);
             let h = ops::elemwise::rmsnorm(&x, &ln("mlp_norm"), 1e-6);

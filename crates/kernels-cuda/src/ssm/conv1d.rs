@@ -55,7 +55,7 @@ pub fn causal_conv1d(
     dilation: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_causal_conv1d";
+    const OP: &str = "ssm.causal_conv1d";
     conv1d_update(
         ctx,
         OP,
@@ -78,7 +78,7 @@ pub fn short_conv(
     conv_width: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.short_conv";
+    const OP: &str = "ssm.short_conv";
     conv1d_update(
         ctx,
         OP,
@@ -167,7 +167,7 @@ pub fn causal_conv1d_chunked(
     dilation: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_causal_conv1d_chunked";
+    const OP: &str = "ssm.causal_conv1d_chunked";
     conv1d_chunked(
         ctx,
         OP,
@@ -190,7 +190,7 @@ pub fn short_conv_chunked(
     conv_width: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.short_conv_chunked";
+    const OP: &str = "ssm.short_conv_chunked";
     conv1d_chunked(
         ctx,
         OP,

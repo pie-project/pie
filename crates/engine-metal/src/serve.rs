@@ -9,7 +9,7 @@ use poem_compiler::{
 use poem_exec::fire::{
     At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
 };
-use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
+use poem_ir::{Dtype, Gather, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
 use crate::device::ctx::Frame;
@@ -101,7 +101,7 @@ fn patch_fold(trace: &Trace) -> u32 {
         .nodes
         .iter()
         .filter_map(|node| match node.op {
-            Operation::Layout(Layout::PoolRows { side, .. } | Layout::MergeRows { side, .. }) => {
+            Operation::Gather(Gather::PoolRows { side, .. } | Gather::MergeRows { side, .. }) => {
                 Some(side.saturating_mul(side))
             }
             _ => None,
@@ -767,7 +767,7 @@ impl PreparedLoad<'_> {
             .trace
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Layout(Layout::ScatterLiveRows { .. })));
+            .any(|node| matches!(node.op, Operation::Gather(Gather::ScatterLiveRows { .. })));
         let feeds = crate::feeds::Feeds::of(&boot.trace, &compiled);
         if let Some(unlanded) = feeds.unlanded.first() {
             return Err(Fault::Program {
@@ -842,9 +842,7 @@ impl PreparedLoad<'_> {
                     return Some(rules);
                 }
                 let step = boot.trace.nodes.iter().find_map(|node| match &node.op {
-                    poem_ir::Operation::Spatial(poem_ir::Spatial::Grid { grid, rule, y })
-                        if *y == at =>
-                    {
+                    poem_ir::Operation::Conv(poem_ir::Conv::Grid { grid, rule, y }) if *y == at => {
                         Some((*grid, *rule))
                     }
                     _ => None,
@@ -1974,7 +1972,7 @@ impl Shell {
                 at: "serve::enqueue",
                 why: format!(
                     "lane {lane}'s pixels start past the plane's first row, and this load \
-                     could not walk the `spatial.grid` chain from the port grid to the \
+                     could not walk the `conv.grid` chain from the port grid to the \
                      plane's — so where they start is not a thing this fire can state"
                 ),
             });
@@ -2000,7 +1998,7 @@ impl Shell {
             return Err(Fault::Program {
                 at: "serve::enqueue",
                 why: format!(
-                    "replaying this plane's `spatial.grid` chain over the fire's own port \
+                    "replaying this plane's `conv.grid` chain over the fire's own port \
                      grid lands {out_voxels} voxels and the carve gave the plane {} rows; \
                      the chain walked at load is not the one this fire runs",
                     rect.rows

@@ -19,7 +19,7 @@ def forward(m, inputs):
     )
     mask = inputs.mask()
     positions = inputs.positions()
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
@@ -33,7 +33,7 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def moe(x, m, w):
@@ -51,7 +51,7 @@ def moe(x, m, w):
 def attention(x, inputs, m, plans, mask, positions, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.layout.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
     seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
     k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)

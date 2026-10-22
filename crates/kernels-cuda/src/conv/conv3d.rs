@@ -8,7 +8,7 @@ use dtype::Dtype;
 
 const FILE: &str = "conv/conv3d.cu";
 
-const OP: &str = "spatial.conv3d";
+const OP: &str = "conv.conv3d";
 
 const DIRECT_TILE: [u32; 2] = [64, 64];
 
@@ -282,7 +282,7 @@ pub fn conv_weight_taps_major(
     taps: u32,
     dst: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.conv_weight_taps_major";
+    const OP: &str = "conv.conv_weight_taps_major";
     const BLOCK: u32 = 256;
     dtype_dispatch!(OP, src.dtype, { Bf16 => () });
     debug_assert_eq!(dst.dtype, Dtype::Bf16, "`{OP}` lands bf16");

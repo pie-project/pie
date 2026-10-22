@@ -4,15 +4,15 @@ use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, Lowering, Region, compile};
 use poem_exec::KernelError;
 use poem_exec::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused, DispatchLayout,
-    DispatchLinear, DispatchSampling, DispatchSpatial,
+    DispatchAttention, DispatchCollective, DispatchConv, DispatchElementwise, DispatchFused,
+    DispatchGather, DispatchLinear, DispatchSampling, DispatchSsm,
 };
 use poem_exec::fire::{
     EventId, Filter, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk,
 };
 use poem_ir::{
-    Attention, Collective, Elementwise, Fused, Layout, Linear, Operands, Operation, Sampling,
-    Spatial, Trace,
+    Attention, Collective, Conv, Elementwise, Fused, Gather, Linear, Operands, Operation, Sampling,
+    Ssm, Trace,
 };
 
 const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -78,11 +78,12 @@ fn payload(op: &Operation) -> usize {
         Operation::Attention(op) => address(op),
         Operation::Linear(op) => address(op),
         Operation::Elementwise(op) => address(op),
-        Operation::Layout(op) => address(op),
+        Operation::Gather(op) => address(op),
         Operation::Collective(op) => address(op),
         Operation::Sampling(op) => address(op),
+        Operation::Ssm(op) => address(op),
         Operation::Fused(op) => address(op),
-        Operation::Spatial(op) => address(op),
+        Operation::Conv(op) => address(op),
     }
 }
 
@@ -101,11 +102,17 @@ impl DispatchElementwise for MockDispatch {
         self.note(op)
     }
 }
-impl DispatchLayout for MockDispatch {
-    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError> {
+impl DispatchGather for MockDispatch {
+    fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError> {
         self.note(op)
     }
 }
+impl DispatchSsm for MockDispatch {
+    fn dispatch(&mut self, op: &Ssm) -> Result<(), KernelError> {
+        self.note(op)
+    }
+}
+
 impl DispatchSampling for MockDispatch {
     fn dispatch(&mut self, op: &Sampling) -> Result<(), KernelError> {
         self.note(op)
@@ -123,8 +130,8 @@ impl DispatchFused for MockDispatch {
     }
 }
 
-impl DispatchSpatial for MockDispatch {
-    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
+impl DispatchConv for MockDispatch {
+    fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError> {
         self.note(op)
     }
 }

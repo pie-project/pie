@@ -425,7 +425,7 @@ fn zero_invalid(f: &mut Func, x: Val, valid: Val) -> Result<Val, Error> {
 /// Derives the output lane table of `rule` from `grid`: each clip's box
 /// mapped, a box the rule cannot map zeroed, offsets packed in lane order.
 pub fn derive_grid(ctx: &Ctx<'_>, grid: Tensor, rule: GridRule, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "spatial.grid";
+    const OP: &str = "conv.grid";
     lane_pair(OP, grid, y)?;
     ctx.emit(&mut |cx| {
         let g = cx.read(grid)?;
@@ -642,7 +642,7 @@ pub fn conv3d(
     y: Tensor,
     y_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.conv3d";
+    const OP: &str = "conv.conv3d";
     lane_pair(OP, grid, y_grid)?;
     conv_checks(OP, x, w, bias, &conv, cache, y)?;
     let taps = conv.taps() as usize;
@@ -772,7 +772,7 @@ pub fn conv3d_boxed(
     y: Tensor,
     y_clips: &[[u32; 4]],
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.conv3d";
+    const OP: &str = "conv.conv3d";
     conv_checks(OP, x, w, bias, &conv, cache, y)?;
     if clips.len() != y_clips.len() || clips.is_empty() {
         return Err(refuse(
@@ -984,7 +984,7 @@ pub fn cache_gather(
     frames: u32,
     cache: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.cache_gather";
+    const OP: &str = "conv.cache_gather";
     let lanes = cache_checks(OP, slab, slot_ids, grid, cache, frames)?;
     ctx.emit(&mut |cx| {
         let (rows, c) = (i64::from(cache.rows), i64::from(cache.width));
@@ -1025,7 +1025,7 @@ pub fn cache_store(
     frames: u32,
     slab: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.cache_store";
+    const OP: &str = "conv.cache_store";
     let lanes = cache_checks(OP, slab, slot_ids, grid, cache, frames)?;
     if x.dtype != Dtype::Bf16 || x.width != cache.width {
         return Err(refuse(OP, "the input is not `[rows, C_in]` bf16"));
@@ -1121,7 +1121,7 @@ pub fn group_norm(
     silu: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.group_norm";
+    const OP: &str = "conv.group_norm";
     if x.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {
             op: OP,
@@ -1223,7 +1223,7 @@ pub fn attention(
     sm_scale: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.attention";
+    const OP: &str = "attention.voxel";
     if q.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {
             op: OP,
@@ -1337,7 +1337,7 @@ pub fn upsample_nearest(
     y: Tensor,
     y_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.upsample_nearest";
+    const OP: &str = "conv.upsample";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
     volume(OP, factor)?;
@@ -1400,7 +1400,7 @@ pub fn pixel_shuffle(
     y: Tensor,
     y_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.pixel_shuffle";
+    const OP: &str = "conv.pixel_shuffle";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
     let vol = volume(OP, r)?;
@@ -1454,7 +1454,7 @@ pub fn pixel_unshuffle(
     y: Tensor,
     y_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.pixel_unshuffle";
+    const OP: &str = "conv.pixel_unshuffle";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
     let vol = volume(OP, r)?;
@@ -1553,7 +1553,7 @@ pub fn avg_down(
     y: Tensor,
     y_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.avg_down";
+    const OP: &str = "conv.avg_down";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
     let vol = volume(OP, r)?;

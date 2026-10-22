@@ -29,7 +29,7 @@ def plans(inputs, m):
 def forward(m, inputs):
     plan = plans(inputs, m)
     mask = inputs.mask()
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm_plus_one(y, w.attn_norm, m.norm_eps)
@@ -41,7 +41,7 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm_plus_one(y, m.final_norm, m.norm_eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def swiglu_oai(x, f):

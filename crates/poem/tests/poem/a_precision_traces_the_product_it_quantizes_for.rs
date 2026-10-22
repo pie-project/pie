@@ -16,7 +16,7 @@ impl ForwardHybrid for OneProduct {
 
     fn forward(&self, inputs: Input) -> Value {
         let table = Weight::sym("embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
-        let x = ops::layout::embed(&inputs.tokens(), &table, VOCAB);
+        let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
         let w = Weight::at("proj", [384, HIDDEN], self.0);
         ops::linear::matmul(&x, &w)
     }

@@ -14,7 +14,7 @@ def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
     pages = inputs.kv(a.kv)
     write_page = inputs.write_page(a.kv)
     write_offset = inputs.write_offset(a.kv)
-    q, gate = ops.layout.split_q_gate(ops.linear.matmul(x, a.qg_proj), d)
+    q, gate = ops.gather.split_q_gate(ops.linear.matmul(x, a.qg_proj), d)
     k = ops.linear.matmul(x, a.k_proj)
     v = ops.linear.matmul(x, a.v_proj)
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.q_norm_eps)
@@ -56,18 +56,18 @@ def rope(q, k, positions, vision, rotary_dim, head_dim, theta, scaling = None):
 def tower(inputs, t):
     """The tower's merged rows for the request's patches."""
     d = t.head_dim
-    x = ops.layout.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "chw", t.temporal)
+    x = ops.gather.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "chw", t.temporal)
     segments = inputs.patch_segments()
     grid = inputs.patch_positions()
 
     y = ops.elemwise.add_bias(t.patch_embed_bias, ops.linear.matmul(x, t.patch_embed))
-    ids, weights = ops.layout.grid_taps(grid, inputs.image_grids(), segments, "bilinear", t.grid_side)
-    pos = ops.layout.embed_weighted(ids, weights, t.pos_embed, t.positions)
+    ids, weights = ops.gather.grid_taps(grid, inputs.image_grids(), segments, "bilinear", t.grid_side)
+    pos = ops.gather.embed_weighted(ids, weights, t.pos_embed, t.positions)
     y = ops.elemwise.residual_add(pos, y)
 
     for b in t.blocks:
         n = ops.elemwise.layernorm(y, b.norm1, b.norm1_bias, t.norm_eps)
-        q, k, v = ops.layout.split_qkv(ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)), t.hidden, t.hidden)
+        q, k, v = ops.gather.split_qkv(ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)), t.hidden, t.hidden)
         q, k = ops.elemwise.rope_mrope(q, k, grid, [0, d // 4, d // 4], "blocked", d, d, t.theta)
         o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
         y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.proj_bias, ops.linear.matmul(o, b.proj)), y)
@@ -79,7 +79,7 @@ def tower(inputs, t):
 
     mg = t.merger
     n = ops.elemwise.layernorm(y, mg.norm, mg.norm_bias, t.norm_eps)
-    folded = ops.layout.merge_rows(n, t.merge)
+    folded = ops.gather.merge_rows(n, t.merge)
     h = ops.elemwise.add_bias(mg.fc1_bias, ops.linear.matmul(folded, mg.fc1))
     a = ops.linear.mlp_gelu_tanh(h)
     return ops.elemwise.add_bias(mg.fc2_bias, ops.linear.matmul(a, mg.fc2))
@@ -87,7 +87,7 @@ def tower(inputs, t):
 def scatter(y, towered, inputs):
     """`y` with the tower's rows in place of its media tokens' embeddings."""
     imaged = y.on(fact.has(fact.Media))
-    return ops.layout.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
+    return ops.gather.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
 
 BONSAI_BLOCK = 1024
 
@@ -129,7 +129,7 @@ def forward(m, inputs):
     towered = tower(inputs, m.tower) if m.tower != None else None
 
     ids = inputs.tokens()
-    y = ops.layout.embed(ids, m.embed, m.vocab)
+    y = ops.gather.embed(ids, m.embed, m.vocab)
 
     # Bonsai's token embedding is stored rotated (`H·S·row`), and the residual
     # stream wants `S·(H·row)`: three plain-or-signed Hadamards make that
@@ -174,7 +174,7 @@ def forward(m, inputs):
     if dr != None:
         hb = arm(dr, inputs, fused, h_block, mask, block_rows(dr))
         x = merge([hb, x])
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     # Bonsai's output head is stored rotated: its input turns with it.
     head_in = rot_copy(x, m.bonsai.hidden) if m.bonsai != None else x
     logits = ops.linear.lm_head(head_in, head)
@@ -198,8 +198,8 @@ def draft(m, inputs, x, logits, head):
     mtp = m.mtp
     plan = ops.attn.plan_prefill(inputs.on(fact.drafts()), m.q_heads, m.kv_heads, m.head_dim, None)
     hidden = x.on(fact.drafts())
-    chosen = ops.layout.argmax([logits.on(fact.drafts())])
-    e = ops.layout.embed(chosen, m.embed, m.vocab)
+    chosen = ops.sampling.argmax([logits.on(fact.drafts())])
+    e = ops.gather.embed(chosen, m.embed, m.vocab)
     if mtp.pre_fc != None:
         pre = mtp.pre_fc
         e = ops.elemwise.rmsnorm_plus_one(e, pre.embedding, pre.eps)
@@ -218,7 +218,7 @@ def draft(m, inputs, x, logits, head):
     read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
     proposal = ops.linear.lm_head(read, head)
     seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
 
 def rotate(q, k, inputs, m, a):
     vision = m.tower != None
@@ -232,7 +232,7 @@ def attn_mixer(x, inputs, m, plans, mask, a):
     # Bonsai: q (with its gate), k and v all read one rotated copy of the
     # residual; the LoRA correction still reads it unrotated.
     qkv_in = rot_copy(x, m.bonsai.hidden) if m.bonsai != None else x
-    q, gate = ops.layout.split_q_gate(ops.linear.matmul(qkv_in, a.qg_proj), d)
+    q, gate = ops.gather.split_q_gate(ops.linear.matmul(qkv_in, a.qg_proj), d)
     k = ops.linear.matmul(qkv_in, a.k_proj)
     v = ops.linear.matmul(qkv_in, a.v_proj)
     seam.at(seam.ATTN_QV, [q, v])
@@ -278,20 +278,20 @@ def gdn_mixer(x, inputs, g, bonsai):
 
     # The cut before the switch: a backend may land qkv and z from the
     # projection's two weight slices, the packed rows never written.
-    qkv, z = ops.layout.split_rows(qkvz, width)
+    qkv, z = ops.gather.split_rows(qkvz, width)
 
     def step(qkv):
-        qkv = ops.attn.ssm_causal_conv1d(qkv, g.conv, conv_state, g.conv_kernel)
-        gates = ops.attn.ssm_gdn_prep(ba.on(fact.single_token()), g.dt_bias, g.a_log)
+        qkv = ops.ssm.causal_conv1d(qkv, g.conv, conv_state, g.conv_kernel)
+        gates = ops.ssm.gdn_gates(ba.on(fact.single_token()), g.dt_bias, g.a_log)
         z1 = z.on(fact.single_token())
-        core = ops.attn.ssm_gated_delta(qkv, z1, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
+        core = ops.ssm.gated_delta(qkv, z1, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
         return ops.elemwise.rmsnorm_gated(core, z1, g.norm, g.v_dim, g.norm_eps, "silu")
 
     def chunked(qkv):
-        qkv = ops.attn.ssm_causal_conv1d_chunked(qkv, g.conv, conv_state, g.conv_kernel)
-        gates = ops.attn.ssm_gdn_prep(ba.on(~fact.single_token()), g.dt_bias, g.a_log)
+        qkv = ops.ssm.causal_conv1d_chunked(qkv, g.conv, conv_state, g.conv_kernel)
+        gates = ops.ssm.gdn_gates(ba.on(~fact.single_token()), g.dt_bias, g.a_log)
         zc = z.on(~fact.single_token())
-        core = ops.attn.ssm_gated_delta_chunked(qkv, zc, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
+        core = ops.ssm.gated_delta_chunked(qkv, zc, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
         # The gated norm inside the arm: a backend may land the walk's
         # output narrower for it.
         return ops.elemwise.rmsnorm_gated(core, zc, g.norm, g.v_dim, g.norm_eps, "silu")

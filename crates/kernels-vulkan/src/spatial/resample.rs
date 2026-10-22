@@ -20,7 +20,7 @@ pub fn upsample_nearest(
     o_grid: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.upsample_nearest";
+    const OP: &str = "conv.upsample";
     let entry = dtype_dispatch!(OP, y.dtype, {
         Bf16 => "spatial_upsample_nearest_bf16",
         F32 => "spatial_upsample_nearest_f32",
@@ -64,7 +64,7 @@ pub fn pixel_shuffle(
     o_grid: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.pixel_shuffle";
+    const OP: &str = "conv.pixel_shuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
         Bf16 => "spatial_pixel_shuffle_bf16",
         F32 => "spatial_pixel_shuffle_f32",
@@ -114,7 +114,7 @@ pub fn pixel_unshuffle(
     o_grid: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.pixel_unshuffle";
+    const OP: &str = "conv.pixel_unshuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
         Bf16 => "spatial_pixel_unshuffle_bf16",
         F32 => "spatial_pixel_unshuffle_f32",
@@ -164,7 +164,7 @@ pub fn avg_down(
     o_grid: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.avg_down";
+    const OP: &str = "conv.avg_down";
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {
             op: OP,
@@ -218,7 +218,7 @@ pub fn cache_gather(
     frames: u32,
     cache: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.cache_gather";
+    const OP: &str = "conv.cache_gather";
     for t in [slab, cache] {
         if t.dtype != Dtype::Bf16 {
             return Err(Error::DtypeUnsupported {
@@ -282,7 +282,7 @@ pub fn cache_store(
     frames: u32,
     slab: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.cache_store";
+    const OP: &str = "conv.cache_store";
     for t in [x, cache, slab] {
         if t.dtype != Dtype::Bf16 {
             return Err(Error::DtypeUnsupported {

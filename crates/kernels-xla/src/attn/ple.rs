@@ -384,7 +384,7 @@ pub fn ngram_ids(
     map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids";
+    const OP: &str = "gather.ngram_ids";
     let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     ngram(ctx, OP, ids, PleLanes::Decode, state, &h, map, ngram_ids)
 }
@@ -402,7 +402,7 @@ pub fn ngram_ids_chunked(
     map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_chunked";
+    const OP: &str = "gather.ngram_ids_chunked";
     let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     ngram(
         ctx,
@@ -433,7 +433,7 @@ pub fn ngram_ids_committed(
     map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_committed";
+    const OP: &str = "gather.ngram_ids_committed";
     let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     ngram(
         ctx,

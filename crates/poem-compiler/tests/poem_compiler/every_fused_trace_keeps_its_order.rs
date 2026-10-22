@@ -47,13 +47,13 @@ fn catalog_models_fold_their_patterns_on_every_layer() {
     for (deployment, unfused, kernels, landed) in [
         (
             "gemma4-31b-bf16-kv-bf16",
-            "layout.split_qkv",
+            "gather.split_qkv",
             &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"][..],
             "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
         ),
         (
             "gptoss-120b-bf16-mxfp4-kv-bf16",
-            "layout.split_qkv",
+            "gather.split_qkv",
             &[
                 "elementwise.split_rope_yarn_append",
                 "elementwise.rope_yarn_append",

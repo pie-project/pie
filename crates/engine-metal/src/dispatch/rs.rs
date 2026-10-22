@@ -1,6 +1,6 @@
 use kernels_metal::attn::{self, ssm::Committed};
 use kernels_metal::{Error, Tensor, layout};
-use poem_ir::{Attention, Operation, ValueId};
+use poem_ir::{Operation, Ssm, ValueId};
 
 use crate::rs::{Convolved, Seat};
 use crate::run::Run;
@@ -249,9 +249,9 @@ impl Run<'_> {
     pub(crate) fn read_only_by_scan(&self, gates: ValueId) -> bool {
         matches!(
             self.sole_reader(gates).map(|node| &node.op),
-            Some(Operation::Attention(
-                Attention::SsmGatedDelta { gates: read, .. }
-                    | Attention::SsmGatedDeltaChunked { gates: read, .. }
+            Some(Operation::Ssm(
+                Ssm::GatedDelta { gates: read, .. }
+                    | Ssm::GatedDeltaChunked { gates: read, .. }
             )) if *read == gates
         )
     }
@@ -264,7 +264,7 @@ impl Run<'_> {
         (ba, dt_bias, a_log): (ValueId, Tensor, Tensor),
         gates: ValueId,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.ssm_gdn_prep";
+        const OP: &str = "ssm.gdn_gates";
         let ext_ba = self.rs_extend(OP, seat, ba)?;
         let ext_gates = self.rs_out(OP, seat, gates)?;
         attn::ssm::gdn_prep(self.ctx(), ext_ba, dt_bias, a_log, ext_gates)?;
@@ -279,7 +279,7 @@ impl Run<'_> {
         conv: &Convolved,
         y: ValueId,
     ) -> Result<Tensor, Error> {
-        const OP: &str = "attention.ssm_causal_conv1d_committed";
+        const OP: &str = "ssm.causal_conv1d_committed";
         let ext_y = self.rs_out(OP, seat, y)?;
         // The verify conv lands the window's own rows itself, and through the
         // page table reads and lands the buffer's too.

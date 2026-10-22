@@ -9,18 +9,18 @@ impl DispatchFused for Run<'_> {
     }
 }
 
-impl poem_exec::DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &poem_ir::Spatial) -> Result<(), KernelError> {
+impl poem_exec::DispatchConv for Run<'_> {
+    fn dispatch(&mut self, op: &poem_ir::Conv) -> Result<(), KernelError> {
         self.spatial(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn spatial(&mut self, op: &poem_ir::Spatial) -> Result<(), kernels_vulkan::Error> {
+    fn spatial(&mut self, op: &poem_ir::Conv) -> Result<(), kernels_vulkan::Error> {
         use kernels_vulkan::spatial;
-        use poem_ir::Spatial;
+        use poem_ir::Conv;
         match op {
-            Spatial::Grid { grid, rule, y } => spatial::rule::derive_grid(
+            Conv::Grid { grid, rule, y } => spatial::rule::derive_grid(
                 self.ctx(),
                 self.tensor(*grid),
                 match *rule {
@@ -54,7 +54,7 @@ impl Run<'_> {
                 },
                 self.tensor(*y),
             ),
-            Spatial::Conv3d {
+            Conv::Conv3d {
                 x,
                 grid,
                 w,
@@ -71,7 +71,7 @@ impl Run<'_> {
             } => {
                 if cache.is_some() {
                     return Err(kernels_vulkan::Error::Unsupported {
-                        op: "spatial.conv3d (with a frame cache)",
+                        op: "conv.conv3d (with a frame cache)",
                     });
                 }
                 spatial::conv::conv3d(
@@ -96,7 +96,7 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
-            Spatial::GroupNorm {
+            Conv::GroupNorm {
                 x,
                 grid,
                 groups,
@@ -109,7 +109,7 @@ impl Run<'_> {
                 let clips = self.tensor(*grid).rows;
                 let (partials, stats) = self.spatial_moments(clips, *groups).ok_or_else(|| {
                     kernels_vulkan::Error::Backend {
-                        op: "spatial.group_norm",
+                        op: "conv.group_norm",
                         detail: format!(
                             "this load reserved no moment plane for {clips} clip(s) at \
                              {groups} group(s)"
@@ -130,28 +130,7 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
-            Spatial::Attention {
-                q,
-                k,
-                v,
-                grid,
-                segment,
-                sm_scale,
-                y,
-            } => spatial::attn::attention(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                match segment {
-                    poem_ir::VoxelSegment::Clip => spatial::attn::Segment::Clip,
-                    poem_ir::VoxelSegment::Frames(n) => spatial::attn::Segment::Frames(*n),
-                },
-                *sm_scale,
-                self.tensor(*y),
-            ),
-            Spatial::UpsampleNearest {
+            Conv::Upsample {
                 x,
                 grid,
                 factor,
@@ -167,7 +146,7 @@ impl Run<'_> {
                 self.tensor(*y_grid),
                 self.tensor(*y),
             ),
-            Spatial::PixelShuffle {
+            Conv::PixelShuffle {
                 x,
                 grid,
                 r,
@@ -183,7 +162,7 @@ impl Run<'_> {
                 self.tensor(*y_grid),
                 self.tensor(*y),
             ),
-            Spatial::PixelUnshuffle {
+            Conv::PixelUnshuffle {
                 x,
                 grid,
                 r,
@@ -197,7 +176,7 @@ impl Run<'_> {
                 self.tensor(*y_grid),
                 self.tensor(*y),
             ),
-            Spatial::AvgDown {
+            Conv::AvgDown {
                 x,
                 grid,
                 factor,
@@ -213,10 +192,10 @@ impl Run<'_> {
                 self.tensor(*y_grid),
                 self.tensor(*y),
             ),
-            Spatial::CacheStore { .. } => Err(kernels_vulkan::Error::Unsupported {
-                op: "spatial.cache_store",
+            Conv::CacheStore { .. } => Err(kernels_vulkan::Error::Unsupported {
+                op: "conv.cache_store",
             }),
-            Spatial::Patchify { .. } | Spatial::Unpatchify { .. } => {
+            Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
         }

@@ -237,7 +237,7 @@ impl<'c> Run<'c> {
         let Some(layer) = node.layer else {
             if matches!(
                 node.op,
-                poem_ir::Operation::Spatial(poem_ir::Spatial::Conv3d { .. })
+                poem_ir::Operation::Conv(poem_ir::Conv::Conv3d { .. })
             ) && let Err(fault) = crate::probe::flush()
             {
                 tracing::warn!(%fault, "submitting a convolution of a split step");
@@ -860,7 +860,7 @@ impl<'c> Run<'c> {
         };
         rows.stage(self.handles, host, bank, ids)
             .map_err(|why| kernels_vulkan::Error::Backend {
-                op: "layout.embed_concat",
+                op: "gather.embed_concat",
                 detail: why.to_string(),
             })
     }

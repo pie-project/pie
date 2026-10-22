@@ -91,7 +91,7 @@ pub fn embed(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed";
+    const OP: &str = "gather.embed";
     expect(OP, ids, &[Dtype::I32])?;
     if table.dtype != y.dtype {
         return Err(refuse(
@@ -165,7 +165,7 @@ pub fn split_q_gate(
     q: Tensor,
     gate: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_q_gate";
+    const OP: &str = "gather.split_q_gate";
     expect(OP, packed, &[Dtype::Bf16, Dtype::F32])?;
     if head_dim == 0 || !packed.width.is_multiple_of(2 * head_dim) {
         return Err(refuse(
@@ -241,7 +241,7 @@ pub fn split_rows(
     left: Tensor,
     right: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_rows";
+    const OP: &str = "gather.split_rows";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     if width == 0 || width >= x.width {
         return Err(refuse(OP, format!("cut at {width} of {} columns", x.width)));
@@ -304,7 +304,7 @@ pub fn split_rows(
 
 /// `tight[i] = wide[index[i]]`; an index outside `wide` is clamped into it.
 pub fn gather_rows(ctx: &Ctx<'_>, wide: Tensor, index: Tensor, tight: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.gather_rows";
+    const OP: &str = "gather.rows";
     expect(OP, wide, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, index, &[Dtype::I32])?;
     if tight.dtype != wide.dtype
@@ -351,7 +351,7 @@ pub fn scatter_live_rows(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.scatter_live_rows";
+    const OP: &str = "gather.scatter_live_rows";
     expect(OP, src, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, routes, &[Dtype::I32])?;
     if y.dtype != src.dtype || y.width != src.width || routes.elements() < u64::from(src.rows) {
@@ -390,7 +390,7 @@ pub fn scatter_live_rows(
 
 /// `y[o] = x[o * side²] ‖ … ‖ x[(o + 1) * side² - 1]`; leftover rows drop.
 pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.merge_rows";
+    const OP: &str = "gather.merge_rows";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     // `side²` rows of `x` become one row of `y`; `y`'s rows past the merged
     // count keep what they held.
@@ -433,7 +433,7 @@ pub fn embed_concat(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     expect(OP, ids, &[Dtype::I32])?;
     if table.dtype != y.dtype {
         return Err(refuse(
@@ -758,7 +758,7 @@ pub fn split_qkv(
     k: Tensor,
     v: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.split_qkv";
+    const OP: &str = "gather.split_qkv";
     expect(OP, packed, &[Dtype::Bf16, Dtype::F32])?;
     if q_width == 0 || kv_width == 0 || packed.width != q_width + 2 * kv_width {
         return Err(refuse(
@@ -838,7 +838,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_weighted";
+    const OP: &str = "gather.embed_weighted";
     expect(OP, ids, &[Dtype::I32])?;
     expect(OP, weights, &[Dtype::Bf16, Dtype::F32])?;
     if table.dtype != y.dtype || table.width != y.width {

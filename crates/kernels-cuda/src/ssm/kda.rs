@@ -185,7 +185,7 @@ impl Kda {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn kda_step(
+pub fn kda(
     ctx: &Ctx,
     mixed: Tensor,
     f: Tensor,
@@ -199,7 +199,7 @@ pub fn kda_step(
     gate_floor: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_step";
+    const OP: &str = "ssm.kda";
 
     const STEP_BLOCK: u32 = 256;
 
@@ -421,7 +421,7 @@ pub fn kda_chunked(
     gate_floor: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_chunked";
+    const OP: &str = "ssm.kda_chunked";
 
     const PREFILL_MAX_WARPS: u32 = 32;
 

@@ -9,8 +9,8 @@ impl DispatchFused for Run<'_> {
     }
 }
 
-impl poem_exec::DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &poem_ir::Spatial) -> Result<(), KernelError> {
+impl poem_exec::DispatchConv for Run<'_> {
+    fn dispatch(&mut self, op: &poem_ir::Conv) -> Result<(), KernelError> {
         Err(KernelError::Unsupported { op: op.name() })
     }
 }

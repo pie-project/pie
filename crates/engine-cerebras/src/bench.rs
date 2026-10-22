@@ -158,11 +158,11 @@ impl Bench {
             }
             let pdir = root.join(format!("phase{at}"));
             std::fs::create_dir_all(&pdir).map_err(|e| e.to_string())?;
-            std::fs::write(pdir.join("layout.csl"), &r.layout).map_err(|e| e.to_string())?;
+            std::fs::write(pdir.join("gather.csl"), &r.layout).map_err(|e| e.to_string())?;
             std::fs::write(pdir.join("pe.csl"), &r.pe).map_err(|e| e.to_string())?;
             let out = pdir.join("out");
             let (w, h) = r.manifest.rect;
-            let compile = Compile::memcpy(Arch::Wse3, pdir.join("layout.csl"), w, h, &out);
+            let compile = Compile::memcpy(Arch::Wse3, pdir.join("gather.csl"), w, h, &out);
             cslc.compile(&compile)
                 .map_err(|e| format!("{e}\n--- layout.csl\n{}\n--- pe.csl\n{}", r.layout, r.pe))?;
             compiled.push((out, r.manifest.clone()));

@@ -9,7 +9,7 @@ use poem_compiler::{
 use poem_exec::fire::{
     At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
 };
-use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
+use poem_ir::{Dtype, Gather, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
 use crate::device::ctx::Frame;
@@ -103,7 +103,7 @@ fn patch_fold(trace: &Trace) -> u32 {
         .nodes
         .iter()
         .filter_map(|node| match node.op {
-            Operation::Layout(Layout::PoolRows { side, .. } | Layout::MergeRows { side, .. }) => {
+            Operation::Gather(Gather::PoolRows { side, .. } | Gather::MergeRows { side, .. }) => {
                 Some(side.saturating_mul(side))
             }
             _ => None,
@@ -567,7 +567,7 @@ impl Shell {
             .trace
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Layout(Layout::ScatterLiveRows { .. })));
+            .any(|node| matches!(node.op, Operation::Gather(Gather::ScatterLiveRows { .. })));
         let feeds = crate::feeds::Feeds::of(&boot.trace, &compiled);
         if let Some(value) = feeds.unlanded.first() {
             return Err(Fault::Program {

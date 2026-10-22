@@ -659,7 +659,7 @@ pub fn causal_conv1d(
 ) -> Result<(), Error> {
     conv(
         ctx,
-        "attention.ssm_causal_conv1d",
+        "ssm.causal_conv1d",
         x,
         ConvLanes::Decode,
         weight,
@@ -684,7 +684,7 @@ pub fn causal_conv1d_chunked(
 ) -> Result<(), Error> {
     conv(
         ctx,
-        "attention.ssm_causal_conv1d_chunked",
+        "ssm.causal_conv1d_chunked",
         x.data,
         ConvLanes::Ragged(x.indptr),
         weight,
@@ -711,7 +711,7 @@ pub fn causal_conv1d_committed(
 ) -> Result<(), Error> {
     conv(
         ctx,
-        "attention.ssm_causal_conv1d_committed",
+        "ssm.causal_conv1d_committed",
         x,
         ConvLanes::Committed(indptr, *committed),
         weight,
@@ -735,7 +735,7 @@ pub fn short_conv(
 ) -> Result<(), Error> {
     conv(
         ctx,
-        "attention.short_conv",
+        "ssm.short_conv",
         x,
         ConvLanes::Decode,
         weight,
@@ -759,7 +759,7 @@ pub fn short_conv_chunked(
 ) -> Result<(), Error> {
     conv(
         ctx,
-        "attention.short_conv_chunked",
+        "ssm.short_conv_chunked",
         x.data,
         ConvLanes::Ragged(x.indptr),
         weight,
@@ -782,7 +782,7 @@ pub fn gdn_prep(
     a_log: Tensor,
     gates: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gdn_prep";
+    const OP: &str = "ssm.gdn_gates";
     expect(OP, ba, &[Dtype::Bf16])?;
     if ba.width == 0 || !ba.width.is_multiple_of(2) {
         return Err(refuse(
@@ -1672,7 +1672,7 @@ pub fn gated_delta(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta";
+    const OP: &str = "ssm.gated_delta";
     let _ = z;
     let input = gdn_in(OP, qkv, gates, k_heads, v_heads, k_dim, v_dim)?;
     delta(ctx, OP, input, DeltaLanes::Decode, state, y)
@@ -1691,7 +1691,7 @@ pub fn gated_delta_chunked(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta_chunked";
+    const OP: &str = "ssm.gated_delta_chunked";
     let _ = z;
     let input = gdn_in(OP, qkv.data, gates, k_heads, v_heads, k_dim, v_dim)?;
     delta(ctx, OP, input, DeltaLanes::Ragged(qkv.indptr), state, y)
@@ -1713,7 +1713,7 @@ pub fn gated_delta_committed(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta_committed";
+    const OP: &str = "ssm.gated_delta_committed";
     let input = gdn_in(OP, qkv, gates, k_heads, v_heads, k_dim, v_dim)?;
     delta(
         ctx,
@@ -1793,7 +1793,7 @@ pub fn kda_step(
     gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_step";
+    const OP: &str = "ssm.kda";
     let input = kda_in(
         OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
     )?;
@@ -1815,7 +1815,7 @@ pub fn kda_chunked(
     gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_chunked";
+    const OP: &str = "ssm.kda_chunked";
     let input = kda_in(
         OP, mixed.data, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
     )?;
@@ -1840,7 +1840,7 @@ pub fn kda_committed(
     gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_committed";
+    const OP: &str = "ssm.kda_committed";
     let input = kda_in(
         OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
     )?;
@@ -1870,7 +1870,7 @@ pub fn block_dyn_conv(
     group: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.block_dyn_conv";
+    const OP: &str = "ssm.dyn_conv";
     expect(OP, x.data, &[Dtype::Bf16])?;
     csr_lanes(OP, x.indptr)?;
     let channels = nonzero(OP, "the convolution's channel count", x.data.width)?;

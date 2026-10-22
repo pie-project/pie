@@ -486,7 +486,7 @@ pub fn gated_delta_chunked(
     v_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta_chunked";
+    const OP: &str = "ssm.gated_delta_chunked";
 
     const BK_MAX_FLA: u32 = 128;
 

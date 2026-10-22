@@ -1,19 +1,67 @@
-use kernels_vulkan::layout;
-use poem_exec::{DispatchLayout, KernelError};
-use poem_ir::Layout;
+use kernels_xla::attn;
+use kernels_xla::layout;
+use poem_exec::{DispatchGather, KernelError};
+use poem_ir::Gather;
+
+use poem_ir::Operands;
 
 use crate::run::Run;
 
-impl DispatchLayout for Run<'_> {
-    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError> {
-        self.layout(op).map_err(crate::error::kernel)
+impl DispatchGather for Run<'_> {
+    fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError> {
+        self.ctx().scope(op.name());
+        self.gather(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn layout(&mut self, op: &Layout) -> Result<(), kernels_vulkan::Error> {
+    fn gather(&mut self, op: &Gather) -> Result<(), kernels_xla::Error> {
         match op {
-            Layout::Embed {
+            Gather::NgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => attn::ple::ngram_ids(
+                self.ctx(),
+                self.tensor(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                map.map(|m| self.tensor(m)),
+                self.tensor(*ngram_ids),
+            ),
+            Gather::NgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => attn::ple::ngram_ids_chunked(
+                self.ctx(),
+                self.ragged(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                map.map(|m| self.tensor(m)),
+                self.tensor(*ngram_ids),
+            ),
+            Gather::Embed {
                 ids,
                 table,
                 vocab,
@@ -26,6 +74,13 @@ impl Run<'_> {
                     *vocab,
                     self.tensor(*y),
                 ),
+                None if self.tensor(*table).rows < *vocab => layout::embed_vocab_shard(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    self.tensor(*table),
+                    self.rank(),
+                    self.tensor(*y),
+                ),
                 None => layout::embed(
                     self.ctx(),
                     self.tensor(*ids),
@@ -35,12 +90,12 @@ impl Run<'_> {
                 ),
             },
 
-            Layout::EmbedConcat {
+            Gather::EmbedConcat {
                 scales: Some(_), ..
-            } => Err(kernels_vulkan::Error::Unsupported {
-                op: "layout.embed_concat(mxfp8)",
+            } => Err(kernels_xla::Error::Unsupported {
+                op: "gather.embed_concat(mxfp8)",
             }),
-            Layout::EmbedConcat {
+            Gather::EmbedConcat {
                 ids,
                 table,
                 scales: None,
@@ -48,11 +103,9 @@ impl Run<'_> {
                 y,
             } => match self.banked(*table) {
                 Some(bank) => {
-                    let (bank, ids) = match self.gathered_table(bank, self.tensor(*ids))? {
-                        Some(seated) => seated,
-                        None => (bank, self.tensor(*ids)),
-                    };
-                    let guard = bank.codes.rows.min(*vocab);
+                    let ids = self.tensor(*ids);
+                    let width = self.tensor(*y).width / ids.width.max(1);
+                    let guard = layout::table_rows(&bank, width).min(*vocab);
                     layout::embed_concat_mb_4bit(self.ctx(), ids, bank, guard, self.tensor(*y))
                 }
                 None => {
@@ -67,7 +120,7 @@ impl Run<'_> {
                     )
                 }
             },
-            Layout::SplitQkv {
+            Gather::SplitQkv {
                 packed,
                 q_width,
                 kv_width,
@@ -83,7 +136,7 @@ impl Run<'_> {
                 self.tensor(*k),
                 self.tensor(*v),
             ),
-            Layout::SplitQGate {
+            Gather::SplitQGate {
                 packed,
                 head_dim,
                 q,
@@ -95,7 +148,7 @@ impl Run<'_> {
                 self.tensor(*q),
                 self.tensor(*gate),
             ),
-            Layout::SplitRows {
+            Gather::SplitRows {
                 x,
                 width,
                 left,
@@ -108,15 +161,15 @@ impl Run<'_> {
                 self.tensor(*right),
             ),
 
-            Layout::PoolRows { x, side, y } => {
+            Gather::PoolRows { x, side, y } => {
                 layout::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
 
-            Layout::MergeRows { x, side, y } => {
+            Gather::MergeRows { x, side, y } => {
                 layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
 
-            Layout::Pixels {
+            Gather::Pixels {
                 x,
                 patch,
                 mean,
@@ -135,14 +188,10 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
-            // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
-            Layout::ConcatCols { .. } => Err(kernels_vulkan::Error::Unsupported {
-                op: "layout.concat_cols",
-            }),
-            Layout::SplitQkvPadded { .. } => Err(kernels_vulkan::Error::Unsupported {
-                op: "layout.split_qkv_padded",
-            }),
-            Layout::GridTaps {
+            Gather::ConcatCols { .. } | Gather::SplitQkvPadded { .. } => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
+            Gather::GridTaps {
                 positions,
                 grids,
                 segments,
@@ -161,7 +210,7 @@ impl Run<'_> {
                 self.tensor(*weights),
             ),
 
-            Layout::ScatterLiveRows {
+            Gather::ScatterLiveRows {
                 src,
                 routes,
                 y,
@@ -173,7 +222,7 @@ impl Run<'_> {
                 self.uncut(*y),
             ),
 
-            Layout::EmbedWeighted {
+            Gather::EmbedWeighted {
                 ids,
                 weights,
                 table,
@@ -188,7 +237,7 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
-            Layout::ScatterRows {
+            Gather::ScatterRows {
                 src,
                 routes,
                 y,
@@ -200,25 +249,25 @@ impl Run<'_> {
                 self.uncut(*y),
             ),
 
-            Layout::PackRows { x, perm, y } => layout::pack_rows(
+            Gather::PackRows { x, perm, y } => layout::pack_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*perm),
                 self.tensor(*y),
             ),
-            Layout::UnpackRows { x, perm, y } => layout::unpack_rows(
+            Gather::UnpackRows { x, perm, y } => layout::unpack_rows(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*perm),
                 self.uncut(*y),
             ),
-            Layout::GatherRows { x, rows, y } => layout::gather_rows(
+            Gather::Rows { x, rows, y } => layout::gather_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*rows),
                 self.tensor(*y),
             ),
-            Layout::Select {
+            Gather::Select {
                 table,
                 layer,
                 width,

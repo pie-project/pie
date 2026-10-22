@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use engine::rs::{LanePlan, Run};
 use kernels_vulkan::Tensor;
-use poem_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
+use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
@@ -161,36 +161,37 @@ impl Layout {
             };
 
         for node in &trace.nodes {
-            let Operation::Attention(op) = &node.op else {
-                continue;
-            };
-            match op {
-                Attention::SsmCausalConv1d { x, state, y, .. }
-                | Attention::SsmCausalConv1dChunked { x, state, y, .. } => {
+            match &node.op {
+                Operation::Ssm(
+                    Ssm::CausalConv1d { x, state, y, .. }
+                    | Ssm::CausalConv1dChunked { x, state, y, .. },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::ConvX, *x)?;
                     region(&mut layout, cache, "conv", *y)?;
                 }
-                Attention::SsmGatedDelta {
-                    gates,
-                    state,
-                    k_heads,
-                    v_heads,
-                    k_dim,
-                    v_dim,
-                    y,
-                    ..
-                }
-                | Attention::SsmGatedDeltaChunked {
-                    gates,
-                    state,
-                    k_heads,
-                    v_heads,
-                    k_dim,
-                    v_dim,
-                    y,
-                    ..
-                } => {
+                Operation::Ssm(
+                    Ssm::GatedDelta {
+                        gates,
+                        state,
+                        k_heads,
+                        v_heads,
+                        k_dim,
+                        v_dim,
+                        y,
+                        ..
+                    }
+                    | Ssm::GatedDeltaChunked {
+                        gates,
+                        state,
+                        k_heads,
+                        v_heads,
+                        k_dim,
+                        v_dim,
+                        y,
+                        ..
+                    },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     let _ = k_heads;
                     gates_cache.insert(gates.0, cache);
@@ -199,24 +200,26 @@ impl Layout {
                         .work_elems
                         .max(u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim));
                 }
-                Attention::SsmKdaStep {
-                    f,
-                    b,
-                    state,
-                    heads,
-                    head_dim,
-                    y,
-                    ..
-                }
-                | Attention::SsmKdaChunked {
-                    f,
-                    b,
-                    state,
-                    heads,
-                    head_dim,
-                    y,
-                    ..
-                } => {
+                Operation::Ssm(
+                    Ssm::Kda {
+                        f,
+                        b,
+                        state,
+                        heads,
+                        head_dim,
+                        y,
+                        ..
+                    }
+                    | Ssm::KdaChunked {
+                        f,
+                        b,
+                        state,
+                        heads,
+                        head_dim,
+                        y,
+                        ..
+                    },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::KdaF, *f)?;
                     plane(&mut layout, cache, Role::KdaB, *b)?;
@@ -225,18 +228,20 @@ impl Layout {
                         .work_elems
                         .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
                 }
-                Attention::PleNgramIds {
-                    ids,
-                    state,
-                    ngram_ids,
-                    ..
-                }
-                | Attention::PleNgramIdsChunked {
-                    ids,
-                    state,
-                    ngram_ids,
-                    ..
-                } => {
+                Operation::Gather(
+                    Gather::NgramIds {
+                        ids,
+                        state,
+                        ngram_ids,
+                        ..
+                    }
+                    | Gather::NgramIdsChunked {
+                        ids,
+                        state,
+                        ngram_ids,
+                        ..
+                    },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::Ids, *ids)?;
                     region(&mut layout, cache, "ngram", *ngram_ids)?;
@@ -245,12 +250,12 @@ impl Layout {
             }
         }
         for node in &trace.nodes {
-            let Operation::Attention(Attention::SsmGdnPrep { ba, gates, .. }) = &node.op else {
+            let Operation::Ssm(Ssm::GdnGates { ba, gates, .. }) = &node.op else {
                 continue;
             };
             let cache = *gates_cache.get(&gates.0).ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "the gates value {} `attention.ssm_gdn_prep` lands, which no delta scan reads",
+                    "the gates value {} `ssm.gdn_gates` lands, which no delta scan reads",
                     gates.0
                 ),
             })?;

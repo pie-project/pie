@@ -2,7 +2,7 @@
 //! reader is a gated norm (the gate not its own output, no seam holding it)
 //! lands that output in bf16. Every other walk keeps f32.
 
-use poem_ir::{Attention, Dtype, Elementwise, Operands, Operation, Trace, Ty};
+use poem_ir::{Dtype, Elementwise, Operands, Operation, Ssm, Trace, Ty};
 
 /// The rewrite, or the trace as it was when `on` is false.
 #[must_use]
@@ -35,7 +35,7 @@ pub fn gdn_out_bf16(mut trace: Trace, on: bool) -> Trace {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Attention(Attention::SsmGatedDeltaChunked { y, .. }) => Some(y.0 as usize),
+            Operation::Ssm(Ssm::GatedDeltaChunked { y, .. }) => Some(y.0 as usize),
             _ => None,
         })
         .filter(|&y| readers[y] == 1 && normed[y] && !held[y])

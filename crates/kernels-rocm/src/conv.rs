@@ -27,26 +27,26 @@ impl Conv3d {
 }
 
 crate::error::unsupported! {
-    cache_gather = "spatial.cache_gather" (slab: Tensor, slot_ids: Tensor, grid: Tensor,
+    cache_gather = "conv.cache_gather" (slab: Tensor, slot_ids: Tensor, grid: Tensor,
         frames: u32, cache: &mut Tensor);
     #[allow(clippy::too_many_arguments)]
-    cache_store = "spatial.cache_store" (x: Tensor, cache: Tensor, slot_ids: Tensor,
+    cache_store = "conv.cache_store" (x: Tensor, cache: Tensor, slot_ids: Tensor,
         grid: Tensor, frames: u32, slab: &mut Tensor);
     #[allow(clippy::too_many_arguments)]
-    conv3d = "spatial.conv3d" (x: Tensor, grid: Tensor, w: Tensor, bias: Option<Tensor>,
+    conv3d = "conv.conv3d" (x: Tensor, grid: Tensor, w: Tensor, bias: Option<Tensor>,
         conv: Conv3d, cache: Option<Tensor>, o: &mut Tensor, o_grid: Tensor);
-    conv_weight_taps_major = "spatial.conv_weight_taps_major" (src: Tensor, c_in: u32,
+    conv_weight_taps_major = "conv.conv_weight_taps_major" (src: Tensor, c_in: u32,
         taps: u32, dst: &mut Tensor);
-    upsample_nearest = "spatial.upsample_nearest" (x: Tensor, grid: Tensor, factor: [u32; 3],
+    upsample_nearest = "conv.upsample" (x: Tensor, grid: Tensor, factor: [u32; 3],
         keep_first_frame: bool, o: &mut Tensor, o_grid: Tensor);
-    pixel_shuffle = "spatial.pixel_shuffle" (x: Tensor, grid: Tensor, r: [u32; 3], trim_t: u32,
+    pixel_shuffle = "conv.pixel_shuffle" (x: Tensor, grid: Tensor, r: [u32; 3], trim_t: u32,
         o: &mut Tensor, o_grid: Tensor);
-    pixel_unshuffle = "spatial.pixel_unshuffle" (x: Tensor, grid: Tensor, r: [u32; 3],
+    pixel_unshuffle = "conv.pixel_unshuffle" (x: Tensor, grid: Tensor, r: [u32; 3],
         o: &mut Tensor, o_grid: Tensor);
-    avg_down = "spatial.avg_down" (x: Tensor, grid: Tensor, r: [u32; 3], group: u32,
+    avg_down = "conv.avg_down" (x: Tensor, grid: Tensor, r: [u32; 3], group: u32,
         o: &mut Tensor, o_grid: Tensor);
-    patchify = "spatial.patchify" (x: Tensor, grid: Tensor, p: [u32; 3], o: &mut Tensor,
+    patchify = "conv.patchify" (x: Tensor, grid: Tensor, p: [u32; 3], o: &mut Tensor,
         o_grid: Tensor);
-    unpatchify = "spatial.unpatchify" (x: Tensor, grid: Tensor, p: [u32; 3], o: &mut Tensor,
+    unpatchify = "conv.unpatchify" (x: Tensor, grid: Tensor, p: [u32; 3], o: &mut Tensor,
         o_grid: Tensor);
 }

@@ -5,7 +5,7 @@ pub use classes::{fact_width, resolve_classes};
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
-use crate::ops::{Attention, Elementwise, Fused, Layout, Linear, RaggedMask, Spatial};
+use crate::ops::{Attention, Elementwise, Fused, Linear, RaggedMask};
 use crate::{Def, Dim, Dtype, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,6 +663,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 ..
             } => &[(In(3), I32), (In(4), I32), (In(5), F32)],
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
+            Attention::Voxel { .. } => &[(In(3), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { floor: Some(_), .. } => &[
                 (In(1), PREFILL_PLAN),
@@ -708,17 +709,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::MlaDecodeSelected { .. } | Attention::MlaPrefillSelected { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), I32), (In(4), CACHE)]
             }
-            Attention::SsmCausalConv1d { .. }
-            | Attention::SsmCausalConv1dChunked { .. }
-            | Attention::ShortConv { .. }
-            | Attention::ShortConvChunked { .. } => &[(In(2), CACHE)],
-            Attention::BlockDynConv { .. } => &[],
-            Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
-            Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. } => {
-                &[(In(3), CACHE)]
-            }
-            Attention::SsmKdaStep { .. } | Attention::SsmKdaChunked { .. } => &[(In(5), CACHE)],
-            Attention::SsmMamba2 { .. } => &[(In(7), CACHE)],
             Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
             Attention::IndexTopk { .. } => &[(In(1), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
@@ -754,9 +744,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 (In(4), CACHE),
                 (Out(1), F32),
             ],
-            Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
-                &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
-            }
             Attention::ReplayFloor { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
             Attention::KvEnds { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
             Attention::WindowSink { .. } => &[(In(1), I32), (In(2), I32), (In(3), CACHE)],
@@ -866,29 +853,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::Hadamard { .. }
             | Elementwise::Mul { .. }
             | Elementwise::Add { .. } => &[],
-        },
-        Operation::Layout(op) => match op {
-            Layout::Embed { .. } | Layout::EmbedConcat { .. } => &[(In(0), I32)],
-            Layout::GatherRows { .. } => &[(In(1), I32)],
-            Layout::EmbedWeighted { .. } => &[(In(0), I32), (In(1), F32)],
-            Layout::ScatterRows { .. } | Layout::ScatterLiveRows { .. } => &[(In(1), I32)],
-            Layout::SplitQkv { .. }
-            | Layout::SplitQkvPadded { .. }
-            | Layout::SplitQGate { .. }
-            | Layout::SplitRows { .. }
-            | Layout::Select { .. }
-            | Layout::PoolRows { .. }
-            | Layout::MergeRows { .. } => &[],
-            Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
-            Layout::Pixels { .. } => &[(In(0), U8)],
-            Layout::ConcatCols { .. } => &[],
-            Layout::GridTaps { .. } => &[
-                (In(0), I32),
-                (In(1), I32),
-                (In(2), I32),
-                (Out(0), I32),
-                (Out(1), F32),
-            ],
         },
         Operation::Fused(op) => match op {
             Fused::NormModulate {
@@ -1057,20 +1021,11 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 _ => &[(In(2), I32), (In(3), F32)],
             },
         },
-        Operation::Collective(_) | Operation::Sampling(_) => &[],
-        Operation::Spatial(op) => match op {
-            Spatial::Grid { .. } => &[(In(0), I32), (Out(0), I32)],
-            Spatial::Conv3d { .. } => &[(In(1), I32)],
-            Spatial::GroupNorm { .. } => &[(In(1), I32), (In(2), F32), (In(3), F32)],
-            Spatial::Attention { .. } => &[(In(3), I32)],
-            Spatial::UpsampleNearest { .. }
-            | Spatial::PixelShuffle { .. }
-            | Spatial::PixelUnshuffle { .. }
-            | Spatial::AvgDown { .. }
-            | Spatial::Patchify { .. }
-            | Spatial::Unpatchify { .. } => &[(In(1), I32), (In(2), I32)],
-            Spatial::CacheStore { .. } => &[(In(1), I32)],
-        },
+        Operation::Collective(_)
+        | Operation::Sampling(_)
+        | Operation::Ssm(_)
+        | Operation::Conv(_)
+        | Operation::Gather(_) => &[],
     }
 }
 

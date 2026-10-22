@@ -593,14 +593,14 @@ impl Device {
                 std::fs::create_dir_all(&dir).map_err(|e| Fault::Unbound {
                     what: format!("the program cache at {}: {e}", dir.display()),
                 })?;
-                std::fs::write(dir.join("layout.csl"), &rendered.layout)
+                std::fs::write(dir.join("gather.csl"), &rendered.layout)
                     .map_err(|e| io_fault(&dir, e))?;
                 std::fs::write(dir.join("pe.csl"), &rendered.pe).map_err(|e| io_fault(&dir, e))?;
                 let started = std::time::Instant::now();
                 let (w, h) = rendered.manifest.rect;
                 let compile = Compile::memcpy(
                     Arch::from(self.platform.target()),
-                    dir.join("layout.csl"),
+                    dir.join("gather.csl"),
                     w,
                     h,
                     &out,

@@ -92,7 +92,7 @@ pub fn ngram_ids(
     map: Option<Tensor>,
     ngram_ids: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids";
+    const OP: &str = "gather.ngram_ids";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` reads i32 token ids");
     id_map(OP, map.as_ref())?;
     debug_assert_eq!(ngram_ids.dtype, Dtype::I32, "`{OP}` lands i32 table rows");
@@ -150,7 +150,7 @@ pub fn ngram_ids_chunked(
     map: Option<Tensor>,
     ngram_ids: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_chunked";
+    const OP: &str = "gather.ngram_ids_chunked";
     debug_assert_eq!(ids.data.dtype, Dtype::I32, "`{OP}` reads i32 token ids");
     id_map(OP, map.as_ref())?;
     debug_assert_eq!(ngram_ids.dtype, Dtype::I32, "`{OP}` lands i32 table rows");

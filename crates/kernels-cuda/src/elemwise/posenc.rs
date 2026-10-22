@@ -220,7 +220,7 @@ pub fn rel_bias(
     )
 }
 
-const OP: &str = "spatial.grid";
+const OP: &str = "conv.grid";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridRule {

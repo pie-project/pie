@@ -192,7 +192,7 @@ pub fn ngram_ids(
 ) -> Result<(), Error> {
     ngram(
         ctx,
-        "attention.ple_ngram_ids",
+        "gather.ngram_ids",
         ids,
         None,
         state,
@@ -221,7 +221,7 @@ pub fn ngram_ids_chunked(
 ) -> Result<(), Error> {
     ngram(
         ctx,
-        "attention.ple_ngram_ids_chunked",
+        "gather.ngram_ids_chunked",
         ids.data,
         Some(ids.indptr),
         state,

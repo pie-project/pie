@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use poem_compiler::CompiledModel;
 use poem_exec::fire::MaskSpan;
-use poem_ir::ops::{Attention, Layout};
+use poem_ir::ops::Gather;
 use poem_ir::{Def, Operation, Trace, ValueId};
 
 use crate::device::Handles;
@@ -65,12 +65,11 @@ impl Plan {
 
         let mut heads: Option<usize> = None;
         for node in &trace.nodes {
-            let Operation::Attention(op) = &node.op else {
+            let Operation::Gather(op) = &node.op else {
                 continue;
             };
             let primes = match op {
-                Attention::PleNgramIds { primes, .. }
-                | Attention::PleNgramIdsChunked { primes, .. } => primes,
+                Gather::NgramIds { primes, .. } | Gather::NgramIdsChunked { primes, .. } => primes,
                 _ => continue,
             };
             heads = Some(heads.map_or(primes.len(), |held: usize| held.max(primes.len())));
@@ -78,7 +77,7 @@ impl Plan {
 
         let mut found: Option<Table> = None;
         for node in &trace.nodes {
-            let Operation::Layout(Layout::EmbedConcat { table, .. }) = &node.op else {
+            let Operation::Gather(Gather::EmbedConcat { table, .. }) = &node.op else {
                 continue;
             };
             let codes = weight_of(trace, *table)?;
@@ -244,12 +243,13 @@ pub fn cuts(trace: &Trace, compiled: &CompiledModel) -> Result<Vec<Option<ValueI
             let Some(node) = trace.nodes.get(node as usize) else {
                 continue;
             };
-            let Operation::Attention(op) = &node.op else {
+            let Operation::Gather(op) = &node.op else {
                 continue;
             };
             let ids = match op {
-                Attention::PleNgramIds { ngram_ids, .. }
-                | Attention::PleNgramIdsChunked { ngram_ids, .. } => *ngram_ids,
+                Gather::NgramIds { ngram_ids, .. } | Gather::NgramIdsChunked { ngram_ids, .. } => {
+                    *ngram_ids
+                }
                 _ => continue,
             };
             if let Some(first) = here {

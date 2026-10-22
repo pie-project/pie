@@ -31,7 +31,7 @@ def forward(m, inputs):
     plan_s = plans(input_s, ops.attn.plan_prefill)
     plan_d = plans(input_d, ops.attn.plan_decode)
     plan_p = plans(input_p, ops.attn.plan_prefill)
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     h_block = None
     if dr != None:
         h_block = y.on(block_rows(dr))
@@ -46,7 +46,7 @@ def forward(m, inputs):
         write_offset = inputs.write_offset(at.kv)
 
         x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
-        q, k, v = ops.layout.split_qkv(
+        q, k, v = ops.gather.split_qkv(
             ops.elemwise.add_bias(at.qkv_bias, ops.linear.matmul(x, at.qkv)),
             m.q_heads * d,
             m.kv_heads * d,
@@ -106,7 +106,7 @@ def forward(m, inputs):
     if dr != None:
         hb = arm(dr, inputs, tapped, h_block, mask, block_rows(dr))
         x = merge([hb, x])
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, m.head)
     if dr != None:
         plant_readout(dr, logits, inputs, x, block_rows(dr))

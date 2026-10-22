@@ -1,5 +1,7 @@
+use super::conv::{expect_grid, expect_voxels};
 use super::*;
 use crate::forward::Input;
+use poem_ir::VoxelSegment;
 
 pub fn plan_decode(
     inputs: &Input,
@@ -490,133 +492,6 @@ pub fn kv_append_shared(plane: &Value, pages: ValueId, write_page: &Value, write
     );
 }
 
-pub fn ssm_causal_conv1d(
-    x: &Value,
-    weight: &Weight,
-    bias: Option<&Weight>,
-    state: ValueId,
-    conv_width: u32,
-) -> Value {
-    ssm_causal_conv1d_dilated(x, weight, bias, state, conv_width, 1)
-}
-
-pub fn ssm_causal_conv1d_dilated(
-    x: &Value,
-    weight: &Weight,
-    bias: Option<&Weight>,
-    state: ValueId,
-    conv_width: u32,
-    dilation: u32,
-) -> Value {
-    let r = x.rec();
-    let y = r.fresh(x.ty().clone());
-    r.push(
-        Attention::SsmCausalConv1d {
-            x: x.id(),
-            weight: r.weight(weight),
-            bias: bias.map(|b| r.weight(b)),
-            state,
-            conv_width,
-            dilation,
-            y: y.id(),
-        },
-        &[x],
-    );
-    y
-}
-
-pub fn ssm_causal_conv1d_chunked(
-    x: &Value,
-    weight: &Weight,
-    bias: Option<&Weight>,
-    state: ValueId,
-    conv_width: u32,
-) -> Value {
-    ssm_causal_conv1d_chunked_dilated(x, weight, bias, state, conv_width, 1)
-}
-
-pub fn ssm_causal_conv1d_chunked_dilated(
-    x: &Value,
-    weight: &Weight,
-    bias: Option<&Weight>,
-    state: ValueId,
-    conv_width: u32,
-    dilation: u32,
-) -> Value {
-    let r = x.rec();
-    let y = r.fresh(x.ty().clone());
-    r.push(
-        Attention::SsmCausalConv1dChunked {
-            x: x.id(),
-            weight: r.weight(weight),
-            bias: bias.map(|b| r.weight(b)),
-            state,
-            conv_width,
-            dilation,
-            y: y.id(),
-        },
-        &[x],
-    );
-    y
-}
-
-pub fn short_conv(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
-    let r = x.rec();
-    let y = r.fresh(x.ty().clone());
-    r.push(
-        Attention::ShortConv {
-            x: x.id(),
-            weight: r.weight(weight),
-            state,
-            conv_width,
-            y: y.id(),
-        },
-        &[x],
-    );
-    y
-}
-
-pub fn short_conv_chunked(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
-    let r = x.rec();
-    let y = r.fresh(x.ty().clone());
-    r.push(
-        Attention::ShortConvChunked {
-            x: x.id(),
-            weight: r.weight(weight),
-            state,
-            conv_width,
-            y: y.id(),
-        },
-        &[x],
-    );
-    y
-}
-
-pub fn block_dyn_conv(
-    x: &Value,
-    coeff: &Value,
-    base: &Weight,
-    side: u32,
-    taps: u32,
-    group: u32,
-) -> Value {
-    let r = x.rec();
-    let y = r.fresh(x.ty().clone());
-    r.push(
-        Attention::BlockDynConv {
-            x: x.id(),
-            coeff: coeff.id(),
-            base: r.weight(base),
-            side,
-            taps,
-            group,
-            y: y.id(),
-        },
-        &[x, coeff],
-    );
-    y
-}
-
 /// Each row's lane's last key position in `pages` (`attention.kv_ends`).
 pub fn kv_ends(request_of_token: &Value, pages: ValueId) -> Value {
     let r = request_of_token.rec();
@@ -662,252 +537,6 @@ pub fn window_sink(
         &[q, positions, request_of_token],
     );
     o
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn ple_ngram_ids(
-    ids: &Value,
-    state: ValueId,
-    eos: u32,
-    mults: &[u64],
-    primes: &[u64],
-    offsets: &[u64],
-    heads_per_ngram: u32,
-    map: Option<&Weight>,
-) -> Value {
-    let r = ids.rec();
-    let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
-    r.push(
-        Attention::PleNgramIds {
-            ids: ids.id(),
-            state,
-            eos,
-            mults: mults.to_vec(),
-            primes: primes.to_vec(),
-            offsets: offsets.to_vec(),
-            heads_per_ngram,
-            map: map.map(|w| r.weight(w)),
-            ngram_ids: ngram_ids.id(),
-        },
-        &[ids],
-    );
-    ngram_ids
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn ple_ngram_ids_chunked(
-    ids: &Value,
-    state: ValueId,
-    eos: u32,
-    mults: &[u64],
-    primes: &[u64],
-    offsets: &[u64],
-    heads_per_ngram: u32,
-    map: Option<&Weight>,
-) -> Value {
-    let r = ids.rec();
-    let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
-    r.push(
-        Attention::PleNgramIdsChunked {
-            ids: ids.id(),
-            state,
-            eos,
-            mults: mults.to_vec(),
-            primes: primes.to_vec(),
-            offsets: offsets.to_vec(),
-            heads_per_ngram,
-            map: map.map(|w| r.weight(w)),
-            ngram_ids: ngram_ids.id(),
-        },
-        &[ids],
-    );
-    ngram_ids
-}
-
-pub fn ssm_gdn_prep(ba: &Value, dt_bias: &Weight, a_log: &Weight) -> Value {
-    let r = ba.rec();
-    let gates = r.fresh(tensor(ba.rows(), ba.width(), Dtype::F32));
-    r.push(
-        Attention::SsmGdnPrep {
-            ba: ba.id(),
-            dt_bias: r.weight(dt_bias),
-            a_log: r.weight(a_log),
-            gates: gates.id(),
-        },
-        &[ba],
-    );
-    gates
-}
-
-pub fn ssm_gated_delta(
-    qkv: &Value,
-    z: &Value,
-    gates: &Value,
-    state: ValueId,
-    k_heads: u32,
-    v_heads: u32,
-    k_dim: u32,
-    v_dim: u32,
-) -> Value {
-    let r = qkv.rec();
-    let width = u64::from(v_heads) * u64::from(v_dim);
-    let y = r.fresh(tensor(qkv.rows(), width, Dtype::F32));
-    r.push(
-        Attention::SsmGatedDelta {
-            qkv: qkv.id(),
-            z: z.id(),
-            gates: gates.id(),
-            state,
-            k_heads,
-            v_heads,
-            k_dim,
-            v_dim,
-            y: y.id(),
-        },
-        &[qkv, z, gates],
-    );
-    y
-}
-
-pub fn ssm_gated_delta_chunked(
-    qkv: &Value,
-    z: &Value,
-    gates: &Value,
-    state: ValueId,
-    k_heads: u32,
-    v_heads: u32,
-    k_dim: u32,
-    v_dim: u32,
-) -> Value {
-    let r = qkv.rec();
-    let width = u64::from(v_heads) * u64::from(v_dim);
-    let y = r.fresh(tensor(qkv.rows(), width, Dtype::F32));
-    r.push(
-        Attention::SsmGatedDeltaChunked {
-            qkv: qkv.id(),
-            z: z.id(),
-            gates: gates.id(),
-            state,
-            k_heads,
-            v_heads,
-            k_dim,
-            v_dim,
-            y: y.id(),
-        },
-        &[qkv, z, gates],
-    );
-    y
-}
-
-pub fn ssm_kda_step(
-    mixed: &Value,
-    f: &Value,
-    b: &Value,
-    dt_bias: &Weight,
-    a_log: &Weight,
-    state: ValueId,
-    heads: u32,
-    head_dim: u32,
-    norm_eps: f32,
-    gate_floor: f32,
-) -> Value {
-    let r = mixed.rec();
-    let width = u64::from(heads) * u64::from(head_dim);
-    let y = r.fresh(tensor(mixed.rows(), width, Dtype::F32));
-    r.push(
-        Attention::SsmKdaStep {
-            mixed: mixed.id(),
-            f: f.id(),
-            b: b.id(),
-            dt_bias: r.weight(dt_bias),
-            a_log: r.weight(a_log),
-            state,
-            heads,
-            head_dim,
-            norm_eps,
-            gate_floor,
-            y: y.id(),
-        },
-        &[mixed, f, b],
-    );
-    y
-}
-
-/// Mamba-2's scan over the convolved `xbc` rows, gated by `silu(z)` and
-/// RMS-normed a group; bf16 rows `z` wide. `chunked` walks prompts, else one
-/// step a request.
-#[allow(clippy::too_many_arguments)]
-pub fn ssm_mamba2(
-    xbc: &Value,
-    dt: &Value,
-    z: &Value,
-    a_log: &Weight,
-    dt_bias: &Weight,
-    d: &Weight,
-    norm: &Weight,
-    eps: f32,
-    state: ValueId,
-    heads: u32,
-    groups: u32,
-    state_dim: u32,
-    chunked: bool,
-) -> Value {
-    let r = xbc.rec();
-    let y = r.fresh(tensor(xbc.rows(), z.width(), Dtype::Bf16));
-    r.push(
-        Attention::SsmMamba2 {
-            xbc: xbc.id(),
-            dt: dt.id(),
-            z: z.id(),
-            a_log: r.weight(a_log),
-            dt_bias: r.weight(dt_bias),
-            d: r.weight(d),
-            norm: r.weight(norm),
-            eps,
-            state,
-            heads,
-            groups,
-            state_dim,
-            chunked,
-            y: y.id(),
-        },
-        &[xbc, dt, z],
-    );
-    y
-}
-
-pub fn ssm_kda_chunked(
-    mixed: &Value,
-    f: &Value,
-    b: &Value,
-    dt_bias: &Weight,
-    a_log: &Weight,
-    state: ValueId,
-    heads: u32,
-    head_dim: u32,
-    norm_eps: f32,
-    gate_floor: f32,
-) -> Value {
-    let r = mixed.rec();
-    let width = u64::from(heads) * u64::from(head_dim);
-    let y = r.fresh(tensor(mixed.rows(), width, Dtype::F32));
-    r.push(
-        Attention::SsmKdaChunked {
-            mixed: mixed.id(),
-            f: f.id(),
-            b: b.id(),
-            dt_bias: r.weight(dt_bias),
-            a_log: r.weight(a_log),
-            state,
-            heads,
-            head_dim,
-            norm_eps,
-            gate_floor,
-            y: y.id(),
-        },
-        &[mixed, f, b],
-    );
-    y
 }
 
 pub fn mla_plan(inputs: &Input, heads: u32, kv_lora_rank: u32) -> Value {
@@ -1814,6 +1443,51 @@ pub fn dense(
             o: o.id(),
         },
         &[q, k, v, segments],
+    );
+    o
+}
+
+#[must_use]
+pub fn voxel(q: &Value, k: &Value, v: &Value, grid: &Value, sm_scale: f32) -> Value {
+    voxel_over(q, k, v, grid, VoxelSegment::Clip, sm_scale)
+}
+
+#[must_use]
+pub fn voxel_over(
+    q: &Value,
+    k: &Value,
+    v: &Value,
+    grid: &Value,
+    segment: VoxelSegment,
+    sm_scale: f32,
+) -> Value {
+    expect_voxels("`attn::voxel`'s query", q);
+    expect_grid("`attn::voxel`'s grid", grid);
+    assert!(
+        q.ty() == k.ty() && q.ty() == v.ty(),
+        "`attn::voxel` reads q, k and v at one type; got {:?}, {:?}, {:?}",
+        q.ty(),
+        k.ty(),
+        v.ty()
+    );
+    assert_eq!(q.dtype(), Dtype::Bf16, "`attn::voxel` reads bf16 rows");
+    assert!(
+        segment != VoxelSegment::Frames(0),
+        "`attn::voxel` over `Frames(0)` is a block with no rows in it"
+    );
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::Voxel {
+            q: q.id(),
+            k: k.id(),
+            v: v.id(),
+            grid: grid.id(),
+            segment,
+            sm_scale,
+            o: o.id(),
+        },
+        &[q, k, v, grid],
     );
     o
 }

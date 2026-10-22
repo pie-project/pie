@@ -298,8 +298,8 @@ impl Run<'_> {
     /// A fused op as the primitives it replaced, each over the values the
     /// fused op keeps.
     fn primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchLayout, DispatchLinear};
-        use poem_ir::{Attention, Elementwise, Layout, Linear};
+        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchGather, DispatchLinear};
+        use poem_ir::{Attention, Elementwise, Gather, Linear};
         match op {
             Fused::MatmulSwiglu {
                 act,
@@ -341,9 +341,9 @@ impl Run<'_> {
                         y: *y,
                     },
                 )?;
-                DispatchLayout::dispatch(
+                DispatchGather::dispatch(
                     self,
-                    &Layout::SplitRows {
+                    &Gather::SplitRows {
                         x: *y,
                         width: *width,
                         left: *left,
@@ -477,9 +477,9 @@ impl Run<'_> {
                 v_out,
             } => {
                 // The split lands q where the rotation leaves it.
-                DispatchLayout::dispatch(
+                DispatchGather::dispatch(
                     self,
-                    &Layout::SplitQkv {
+                    &Gather::SplitQkv {
                         packed: *packed,
                         q_width: *q_width,
                         kv_width: *kv_width,
@@ -526,7 +526,7 @@ impl Run<'_> {
     /// The gated-delta decode step whole where the kernel covers it, else
     /// its primitives over the values the fused op keeps.
     fn gdn_step(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttention, DispatchLayout};
+        use poem_exec::{DispatchGather, DispatchSsm};
         let Fused::GdnStep {
             qkvz,
             width,
@@ -573,25 +573,25 @@ impl Run<'_> {
             )
             .map_err(crate::error::kernel)?;
             if done {
-                self.rs_move("attention.ssm_causal_conv1d", qkv, self.tensor(qkv))
+                self.rs_move("ssm.causal_conv1d", qkv, self.tensor(qkv))
                     .map_err(crate::error::kernel)?;
                 return self
-                    .rs_move("attention.ssm_gdn_prep", ba, self.tensor(ba))
+                    .rs_move("ssm.gdn_gates", ba, self.tensor(ba))
                     .map_err(crate::error::kernel);
             }
         }
-        DispatchLayout::dispatch(
+        DispatchGather::dispatch(
             self,
-            &poem_ir::Layout::SplitRows {
+            &poem_ir::Gather::SplitRows {
                 x: qkvz,
                 width,
                 left: qkv,
                 right: z,
             },
         )?;
-        DispatchAttention::dispatch(
+        DispatchSsm::dispatch(
             self,
-            &poem_ir::Attention::SsmCausalConv1d {
+            &poem_ir::Ssm::CausalConv1d {
                 x: qkv,
                 weight: conv_weight,
                 bias: None,
@@ -601,18 +601,18 @@ impl Run<'_> {
                 y: conv,
             },
         )?;
-        DispatchAttention::dispatch(
+        DispatchSsm::dispatch(
             self,
-            &poem_ir::Attention::SsmGdnPrep {
+            &poem_ir::Ssm::GdnGates {
                 ba,
                 dt_bias,
                 a_log,
                 gates,
             },
         )?;
-        DispatchAttention::dispatch(
+        DispatchSsm::dispatch(
             self,
-            &poem_ir::Attention::SsmGatedDelta {
+            &poem_ir::Ssm::GatedDelta {
                 qkv: conv,
                 z,
                 gates,
@@ -629,7 +629,7 @@ impl Run<'_> {
     /// Qwen's gated attention prologue in one launch where the kernel takes
     /// it, else its primitives over the values the fused op keeps.
     fn q_gate_append(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchLayout};
+        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchGather};
         let Fused::QGateNormRopeAppend {
             qg,
             head_dim,
@@ -681,9 +681,9 @@ impl Run<'_> {
         {
             return Ok(());
         }
-        DispatchLayout::dispatch(
+        DispatchGather::dispatch(
             self,
-            &poem_ir::Layout::SplitQGate {
+            &poem_ir::Gather::SplitQGate {
                 packed: qg,
                 head_dim,
                 q,

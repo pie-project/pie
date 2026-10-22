@@ -19,7 +19,7 @@ def forward(m, inputs):
     )
     mask = inputs.mask()
     positions = inputs.positions()
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
     scaling = rope_scaling(m.rope)
 
@@ -35,7 +35,7 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.embed if m.head == None else m.head)
 
 def attention(x, inputs, m, plans, mask, positions, w, scaling):

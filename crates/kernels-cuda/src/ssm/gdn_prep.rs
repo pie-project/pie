@@ -1,13 +1,13 @@
 use super::*;
 
-pub fn gdn_prep(
+pub fn gdn_gates(
     ctx: &Ctx,
     ba: Tensor,
     dt_bias: Tensor,
     a_log: Tensor,
     gates: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gdn_prep";
+    const OP: &str = "ssm.gdn_gates";
     dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");

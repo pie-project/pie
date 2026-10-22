@@ -48,9 +48,9 @@ fn main() {
         "  @export_name(\"buf\", [*]f32, true);\n  @export_name(\"run\", fn()void);\n}\n",
     );
     std::fs::write(dir.join("pe.csl"), pe).expect("pe.csl");
-    std::fs::write(dir.join("layout.csl"), layout).expect("layout.csl");
+    std::fs::write(dir.join("gather.csl"), layout).expect("gather.csl");
     let out = dir.join("out");
-    let mut compile = Compile::memcpy(Arch::Wse3, dir.join("layout.csl"), w, h, &out);
+    let mut compile = Compile::memcpy(Arch::Wse3, dir.join("gather.csl"), w, h, &out);
     compile.channels = channels;
     let t = Instant::now();
     Cslc::find()

@@ -21,7 +21,7 @@ pub fn upsample_nearest(
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.upsample_nearest";
+    const OP: &str = "conv.upsample";
     let t = element(OP, x.dtype)?;
     debug_assert!(
         o.width == x.width && o.dtype == x.dtype,
@@ -82,7 +82,7 @@ pub fn pixel_shuffle(
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.pixel_shuffle";
+    const OP: &str = "conv.pixel_shuffle";
     let t = element(OP, x.dtype)?;
     debug_assert_eq!(o.dtype, x.dtype, "`{OP}` keeps the element");
     let lanes = lane_pair(OP, grid, o_grid)?;
@@ -130,7 +130,7 @@ pub fn pixel_unshuffle(
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.pixel_unshuffle";
+    const OP: &str = "conv.pixel_unshuffle";
     let t = element(OP, x.dtype)?;
     debug_assert_eq!(o.dtype, x.dtype, "`{OP}` keeps the element");
     let lanes = lane_pair(OP, grid, o_grid)?;
@@ -178,7 +178,7 @@ pub fn avg_down(
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "spatial.avg_down";
+    const OP: &str = "conv.avg_down";
     let t = element(OP, x.dtype)?;
     debug_assert_eq!(o.dtype, x.dtype, "`{OP}` keeps the element");
     let lanes = lane_pair(OP, grid, o_grid)?;

@@ -74,7 +74,7 @@ def caches(m, c):
 def forward(m, inputs):
     full = plans(inputs, m.full.heads, m.full.kv_lora_rank)
     sliding = plans(inputs, m.sliding.heads, m.sliding.kv_lora_rank)
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
@@ -93,7 +93,7 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def mlp(x, f):

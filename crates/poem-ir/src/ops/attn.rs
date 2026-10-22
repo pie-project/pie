@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
+use crate::ops::conv::VoxelSegment;
 use crate::value::ValueId;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +118,17 @@ pub enum Attention {
         kv_heads: u32,
         sm_scale: f32,
         mask: RaggedMask,
+        o: ValueId,
+    },
+    /// Bidirectional attention within each clip's voxel rows (or blocks of
+    /// its frames), as `grid` (i32) lays them out.
+    Voxel {
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        grid: ValueId,
+        segment: VoxelSegment,
+        sm_scale: f32,
         o: ValueId,
     },
     DecodeLse {
@@ -325,125 +337,6 @@ pub enum Attention {
         lse: Option<ValueId>,
     },
 
-    SsmCausalConv1d {
-        x: ValueId,
-        weight: ValueId,
-        /// A bias a channel, added before the activation (Mamba-2's).
-        bias: Option<ValueId>,
-        state: ValueId,
-        conv_width: u32,
-        dilation: u32,
-        y: ValueId,
-    },
-    ShortConv {
-        x: ValueId,
-        weight: ValueId,
-        state: ValueId,
-        conv_width: u32,
-        y: ValueId,
-    },
-    ShortConvChunked {
-        x: ValueId,
-        weight: ValueId,
-        state: ValueId,
-        conv_width: u32,
-        y: ValueId,
-    },
-    SsmCausalConv1dChunked {
-        x: ValueId,
-        weight: ValueId,
-        bias: Option<ValueId>,
-        state: ValueId,
-        conv_width: u32,
-        dilation: u32,
-        y: ValueId,
-    },
-    BlockDynConv {
-        x: ValueId,
-        coeff: ValueId,
-        base: ValueId,
-        side: u32,
-        taps: u32,
-        group: u32,
-        y: ValueId,
-    },
-    SsmGdnPrep {
-        ba: ValueId,
-        dt_bias: ValueId,
-        a_log: ValueId,
-        gates: ValueId,
-    },
-    SsmGatedDelta {
-        qkv: ValueId,
-        z: ValueId,
-        gates: ValueId,
-        state: ValueId,
-        k_heads: u32,
-        v_heads: u32,
-        k_dim: u32,
-        v_dim: u32,
-        y: ValueId,
-    },
-    SsmGatedDeltaChunked {
-        qkv: ValueId,
-        z: ValueId,
-        gates: ValueId,
-        state: ValueId,
-        k_heads: u32,
-        v_heads: u32,
-        k_dim: u32,
-        v_dim: u32,
-        y: ValueId,
-    },
-    SsmKdaStep {
-        mixed: ValueId,
-        f: ValueId,
-        b: ValueId,
-        dt_bias: ValueId,
-        a_log: ValueId,
-        state: ValueId,
-        heads: u32,
-        head_dim: u32,
-        norm_eps: f32,
-        gate_floor: f32,
-        y: ValueId,
-    },
-    SsmKdaChunked {
-        mixed: ValueId,
-        f: ValueId,
-        b: ValueId,
-        dt_bias: ValueId,
-        a_log: ValueId,
-        state: ValueId,
-        heads: u32,
-        head_dim: u32,
-        norm_eps: f32,
-        gate_floor: f32,
-        y: ValueId,
-    },
-    /// Mamba-2's selective scan over the convolved rows `xbc` (`x`, then
-    /// `groups` of `B`, then of `C`, each `state_dim` wide): per head, `dt =
-    /// softplus(dt + dt_bias)`, `S = exp(-exp(a_log) dt) S + dt x B^T`, and
-    /// `(C S + d x) * silu(z)`, RMS-normed a group of heads and scaled by
-    /// `norm`, landed bf16. `chunked` walks a prompt's rows; else each row is
-    /// a request's one step.
-    SsmMamba2 {
-        xbc: ValueId,
-        dt: ValueId,
-        z: ValueId,
-        a_log: ValueId,
-        dt_bias: ValueId,
-        d: ValueId,
-        norm: ValueId,
-        eps: f32,
-        state: ValueId,
-        heads: u32,
-        groups: u32,
-        state_dim: u32,
-        chunked: bool,
-        y: ValueId,
-    },
-
     IndexLayernormRope {
         k: ValueId,
         positions: ValueId,
@@ -559,30 +452,6 @@ pub enum Attention {
         lse: ValueId,
     },
 
-    PleNgramIds {
-        ids: ValueId,
-        state: ValueId,
-        eos: u32,
-        mults: Vec<u64>,
-        primes: Vec<u64>,
-        offsets: Vec<u64>,
-        heads_per_ngram: u32,
-        /// An i64 table the ids are mapped through before hashing (Engram's
-        /// tokenizer-compressed ids); the window keeps raw ids.
-        map: Option<ValueId>,
-        ngram_ids: ValueId,
-    },
-    PleNgramIdsChunked {
-        ids: ValueId,
-        state: ValueId,
-        eos: u32,
-        mults: Vec<u64>,
-        primes: Vec<u64>,
-        offsets: Vec<u64>,
-        heads_per_ngram: u32,
-        map: Option<ValueId>,
-        ngram_ids: ValueId,
-    },
     /// Bounded replay's floor, a lane's least position whose window keys a
     /// replaying layer holds: with `mark` the rows are ones it skips and the
     /// lane's state moves past them; without, each row reads its lane's floor
@@ -645,6 +514,7 @@ pub enum RaggedMask {
 impl Operands for Attention {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
+            Self::Voxel { q, k, v, grid, .. } => sink.extend([*q, *k, *v, *grid]),
             Self::PlanDecode {
                 kv_indptr,
                 kv_indices,
@@ -838,89 +708,6 @@ impl Operands for Attention {
             } => {
                 sink.extend([*q, *plan, *q_pe, *selection, *cache]);
             }
-            Self::SsmCausalConv1d {
-                x,
-                weight,
-                bias,
-                state,
-                ..
-            } => {
-                sink.extend([*x, *weight, *state]);
-                sink.extend(*bias);
-            }
-            Self::ShortConv {
-                x, weight, state, ..
-            } => sink.extend([*x, *weight, *state]),
-            Self::ShortConvChunked {
-                x, weight, state, ..
-            } => sink.extend([*x, *weight, *state]),
-            Self::SsmCausalConv1dChunked {
-                x,
-                weight,
-                bias,
-                state,
-                ..
-            } => {
-                sink.extend([*x, *weight, *state]);
-                sink.extend(*bias);
-            }
-            Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
-            Self::SsmGdnPrep {
-                ba, dt_bias, a_log, ..
-            } => sink.extend([*ba, *dt_bias, *a_log]),
-            Self::SsmGatedDelta {
-                qkv,
-                z,
-                gates,
-                state,
-                ..
-            } => {
-                sink.extend([*qkv, *z, *gates, *state]);
-            }
-            Self::SsmGatedDeltaChunked {
-                qkv,
-                z,
-                gates,
-                state,
-                ..
-            } => {
-                sink.extend([*qkv, *z, *gates, *state]);
-            }
-            Self::SsmKdaStep {
-                mixed,
-                f,
-                b,
-                dt_bias,
-                a_log,
-                state,
-                ..
-            } => {
-                sink.extend([*mixed, *f, *b, *dt_bias, *a_log, *state]);
-            }
-            Self::SsmKdaChunked {
-                mixed,
-                f,
-                b,
-                dt_bias,
-                a_log,
-                state,
-                ..
-            } => {
-                sink.extend([*mixed, *f, *b, *dt_bias, *a_log, *state]);
-            }
-            Self::SsmMamba2 {
-                xbc,
-                dt,
-                z,
-                a_log,
-                dt_bias,
-                d,
-                norm,
-                state,
-                ..
-            } => {
-                sink.extend([*xbc, *dt, *z, *a_log, *dt_bias, *d, *norm, *state]);
-            }
             Self::IndexLayernormRope {
                 k,
                 positions,
@@ -1021,15 +808,6 @@ impl Operands for Attention {
             } => {
                 sink.extend([*q, *positions, *request_of_token, *selection, *entries]);
             }
-            Self::PleNgramIds {
-                ids, state, map, ..
-            }
-            | Self::PleNgramIdsChunked {
-                ids, state, map, ..
-            } => {
-                sink.extend([*ids, *state]);
-                sink.extend(*map);
-            }
             Self::ReplayFloor {
                 positions, state, ..
             } => sink.extend([*positions, *state]),
@@ -1050,6 +828,7 @@ impl Operands for Attention {
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
         match self {
+            Self::Voxel { o, .. } => sink.push(*o),
             Self::PlanDecode { plan, .. } => sink.push(*plan),
             Self::PlanPrefill { plan, .. } => sink.push(*plan),
             Self::Decode { o, .. } => sink.push(*o),
@@ -1091,17 +870,6 @@ impl Operands for Attention {
                 sink.push(*o);
                 sink.extend(*lse);
             }
-            Self::SsmCausalConv1d { y, .. } => sink.push(*y),
-            Self::ShortConv { y, .. } => sink.push(*y),
-            Self::ShortConvChunked { y, .. } => sink.push(*y),
-            Self::SsmCausalConv1dChunked { y, .. } => sink.push(*y),
-            Self::BlockDynConv { y, .. } => sink.push(*y),
-            Self::SsmGdnPrep { gates, .. } => sink.push(*gates),
-            Self::SsmGatedDelta { y, .. } => sink.push(*y),
-            Self::SsmGatedDeltaChunked { y, .. } => sink.push(*y),
-            Self::SsmKdaStep { y, .. } => sink.push(*y),
-            Self::SsmKdaChunked { y, .. } => sink.push(*y),
-            Self::SsmMamba2 { y, .. } => sink.push(*y),
             Self::IndexLayernormRope { k_out, .. } => sink.push(*k_out),
             Self::IndexRope { q_out, .. } => sink.push(*q_out),
             Self::IndexTopk { selection, .. } => sink.push(*selection),
@@ -1128,8 +896,6 @@ impl Operands for Attention {
             Self::PoolKvAppend { .. } => {}
             Self::PoolLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PoolLseSelected { o, lse, .. } => sink.extend([*o, *lse]),
-            Self::PleNgramIds { ngram_ids, .. } => sink.push(*ngram_ids),
-            Self::PleNgramIdsChunked { ngram_ids, .. } => sink.push(*ngram_ids),
             Self::ReplayFloor { floor, .. } => sink.push(*floor),
             Self::KvEnds { ends, .. } => sink.push(*ends),
             Self::WindowSink { o, .. } => sink.push(*o),
@@ -1137,6 +903,7 @@ impl Operands for Attention {
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
         match self {
+            Self::Voxel { .. } => {}
             Self::PlanDecode { .. } => {}
             Self::PlanPrefill { .. } => {}
             Self::Decode { .. } => {}
@@ -1166,17 +933,6 @@ impl Operands for Attention {
             Self::MlaPrefill { .. } => {}
             Self::MlaDecodeSelected { .. } => {}
             Self::MlaPrefillSelected { .. } => {}
-            Self::SsmCausalConv1d { .. } => {}
-            Self::SsmCausalConv1dChunked { .. } => {}
-            Self::ShortConv { .. } => {}
-            Self::ShortConvChunked { .. } => {}
-            Self::BlockDynConv { .. } => {}
-            Self::SsmGdnPrep { .. } => {}
-            Self::SsmGatedDelta { .. } => {}
-            Self::SsmGatedDeltaChunked { .. } => {}
-            Self::SsmKdaStep { .. } => {}
-            Self::SsmKdaChunked { .. } => {}
-            Self::SsmMamba2 { .. } => {}
             Self::IndexLayernormRope { k_out, k, .. } => sink.push((*k_out, *k)),
             Self::IndexRope { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::IndexTopk { .. } => {}
@@ -1189,14 +945,13 @@ impl Operands for Attention {
             Self::PoolKvAppend { .. } => {}
             Self::PoolLse { .. } => {}
             Self::PoolLseSelected { .. } => {}
-            Self::PleNgramIds { .. } => {}
-            Self::PleNgramIdsChunked { .. } => {}
             Self::ReplayFloor { .. } => {}
             Self::KvEnds { .. } | Self::WindowSink { .. } => {}
         }
     }
     fn name(&self) -> &'static str {
         match self {
+            Self::Voxel { .. } => "attention.voxel",
             Self::PlanDecode { .. } => "attention.plan_decode",
             Self::PlanPrefill { .. } => "attention.plan_prefill",
             Self::Decode { .. } => "attention.decode",
@@ -1227,18 +982,6 @@ impl Operands for Attention {
             Self::MlaPrefill { .. } => "attention.mla_prefill",
             Self::MlaDecodeSelected { .. } => "attention.mla_decode_selected",
             Self::MlaPrefillSelected { .. } => "attention.mla_prefill_selected",
-            Self::SsmCausalConv1d { .. } => "attention.ssm_causal_conv1d",
-            Self::SsmCausalConv1dChunked { .. } => "attention.ssm_causal_conv1d_chunked",
-            Self::ShortConv { .. } => "attention.short_conv",
-            Self::ShortConvChunked { .. } => "attention.short_conv_chunked",
-            Self::BlockDynConv { .. } => "attention.block_dyn_conv",
-            Self::SsmGdnPrep { .. } => "attention.ssm_gdn_prep",
-            Self::SsmGatedDelta { .. } => "attention.ssm_gated_delta",
-            Self::SsmGatedDeltaChunked { .. } => "attention.ssm_gated_delta_chunked",
-            Self::SsmKdaStep { .. } => "attention.ssm_kda_step",
-            Self::SsmKdaChunked { .. } => "attention.ssm_kda_chunked",
-            Self::SsmMamba2 { chunked: false, .. } => "attention.ssm_mamba2_step",
-            Self::SsmMamba2 { chunked: true, .. } => "attention.ssm_mamba2_chunked",
             Self::IndexLayernormRope { .. } => "attention.index_layernorm_rope",
             Self::IndexRope { .. } => "attention.index_rope",
             Self::IndexTopk { .. } => "attention.index_topk",
@@ -1251,8 +994,6 @@ impl Operands for Attention {
             Self::PoolKvAppend { .. } => "attention.pool_kv_append",
             Self::PoolLse { .. } => "attention.pool_lse",
             Self::PoolLseSelected { .. } => "attention.pool_lse_selected",
-            Self::PleNgramIds { .. } => "attention.ple_ngram_ids",
-            Self::PleNgramIdsChunked { .. } => "attention.ple_ngram_ids_chunked",
             Self::ReplayFloor { .. } => "attention.replay_floor",
             Self::KvEnds { .. } => "attention.kv_ends",
             Self::WindowSink { .. } => "attention.window_sink",

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use poem_ir::{Attention, Dim, Dtype, Operands, Operation, Trace, Ty, ValueId};
+use poem_ir::{Dim, Dtype, Operands, Operation, Ssm, Trace, Ty, ValueId};
 
 use crate::device::Buffer;
 use crate::device::elastic::Arena;
@@ -100,27 +100,27 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
     let mut widest = 0u64;
     for node in &trace.nodes {
         let total = match &node.op {
-            Operation::Attention(Attention::SsmGatedDeltaChunked {
+            Operation::Ssm(Ssm::GatedDeltaChunked {
                 qkv, z, gates, y, ..
             }) => {
                 let mut total =
                     row_bytes(*qkv)? + row_bytes(*z)? + row_bytes(*gates)? + row_bytes(*y)?;
-                if let Some(Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. })) =
+                if let Some(Operation::Ssm(Ssm::CausalConv1dChunked { x, .. })) =
                     defined.get(&qkv.0).map(|n| &trace.nodes[*n].op)
                 {
                     total += row_bytes(*x)?;
                 }
-                if let Some(Operation::Attention(Attention::SsmGdnPrep { ba, .. })) =
+                if let Some(Operation::Ssm(Ssm::GdnGates { ba, .. })) =
                     defined.get(&gates.0).map(|n| &trace.nodes[*n].op)
                 {
                     total += row_bytes(*ba)?;
                 }
                 total
             }
-            Operation::Attention(Attention::SsmKdaChunked { mixed, f, b, y, .. }) => {
+            Operation::Ssm(Ssm::KdaChunked { mixed, f, b, y, .. }) => {
                 let mut total =
                     row_bytes(*mixed)? + row_bytes(*f)? + row_bytes(*b)? + row_bytes(*y)?;
-                if let Some(Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. })) =
+                if let Some(Operation::Ssm(Ssm::CausalConv1dChunked { x, .. })) =
                     defined.get(&mixed.0).map(|n| &trace.nodes[*n].op)
                 {
                     total += row_bytes(*x)?;
@@ -205,21 +205,21 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                 continue;
             }
             let (reads, chunked) = match &node.op {
-                Operation::Attention(Attention::SsmGatedDeltaChunked { qkv, gates, .. }) => (
+                Operation::Ssm(Ssm::GatedDeltaChunked { qkv, gates, .. }) => (
                     Reads::GatedDelta {
                         qkv: *qkv,
                         gates: *gates,
                     },
                     true,
                 ),
-                Operation::Attention(Attention::SsmGatedDelta { qkv, gates, .. }) => (
+                Operation::Ssm(Ssm::GatedDelta { qkv, gates, .. }) => (
                     Reads::GatedDelta {
                         qkv: *qkv,
                         gates: *gates,
                     },
                     false,
                 ),
-                Operation::Attention(Attention::SsmKdaChunked { mixed, f, b, .. }) => (
+                Operation::Ssm(Ssm::KdaChunked { mixed, f, b, .. }) => (
                     Reads::Kda {
                         mixed: *mixed,
                         f: *f,
@@ -227,7 +227,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                     },
                     true,
                 ),
-                Operation::Attention(Attention::SsmKdaStep { mixed, f, b, .. }) => (
+                Operation::Ssm(Ssm::Kda { mixed, f, b, .. }) => (
                     Reads::Kda {
                         mixed: *mixed,
                         f: *f,
@@ -242,12 +242,8 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                 Reads::GatedDelta { qkv, .. } | Reads::Kda { mixed: qkv, .. } => written(qkv),
             }
             .and_then(|(n, op)| match op {
-                Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. }) if chunked => {
-                    Some((n, *x))
-                }
-                Operation::Attention(Attention::SsmCausalConv1d { x, .. }) if !chunked => {
-                    Some((n, *x))
-                }
+                Operation::Ssm(Ssm::CausalConv1dChunked { x, .. }) if chunked => Some((n, *x)),
+                Operation::Ssm(Ssm::CausalConv1d { x, .. }) if !chunked => Some((n, *x)),
                 _ => None,
             });
             // The planes read beside the conv's rows, each with the node that
@@ -255,7 +251,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
             // scan's forget and beta projections.
             let others: Option<Vec<(&str, ValueId, Option<usize>)>> = match reads {
                 Reads::GatedDelta { gates, .. } => written(gates).and_then(|(n, op)| match op {
-                    Operation::Attention(Attention::SsmGdnPrep { ba, .. }) => {
+                    Operation::Ssm(Ssm::GdnGates { ba, .. }) => {
                         Some(vec![("the gate prep's `[b | a]`", *ba, Some(n))])
                     }
                     _ => None,
@@ -508,17 +504,17 @@ pub fn snapshots(trace: &Trace, gdn_lands: impl Fn(u32) -> bool) -> u32 {
 fn lands_snapshots(op: &Operation, _gdn_lands: &impl Fn(u32) -> bool) -> bool {
     matches!(
         op,
-        Operation::Attention(
-            Attention::SsmCausalConv1d { .. }
-                | Attention::SsmCausalConv1dChunked { .. }
-                | Attention::ShortConv { .. }
-                | Attention::ShortConvChunked { .. }
-                | Attention::SsmGatedDelta { .. }
-                | Attention::SsmGatedDeltaChunked { .. }
-                | Attention::SsmKdaStep { .. }
-                | Attention::SsmKdaChunked { .. }
-                | Attention::PleNgramIds { .. }
-                | Attention::PleNgramIdsChunked { .. }
+        Operation::Ssm(
+            Ssm::CausalConv1d { .. }
+                | Ssm::CausalConv1dChunked { .. }
+                | Ssm::ShortConv { .. }
+                | Ssm::ShortConvChunked { .. }
+                | Ssm::GatedDelta { .. }
+                | Ssm::GatedDeltaChunked { .. }
+                | Ssm::Kda { .. }
+                | Ssm::KdaChunked { .. }
+        ) | Operation::Gather(
+            poem_ir::Gather::NgramIds { .. } | poem_ir::Gather::NgramIdsChunked { .. }
         ) | Operation::Fused(poem_ir::Fused::GdnStep { .. })
     )
 }
@@ -528,17 +524,15 @@ fn lands_snapshots(op: &Operation, _gdn_lands: &impl Fn(u32) -> bool) -> bool {
 #[cfg(not(feature = "rocm"))]
 fn lands_snapshots(op: &Operation, gdn_lands: &impl Fn(u32) -> bool) -> bool {
     match op {
-        Operation::Attention(Attention::SsmCausalConv1dChunked {
+        Operation::Ssm(Ssm::CausalConv1dChunked {
             conv_width,
             dilation,
             ..
         }) => conv_width.saturating_sub(1).saturating_mul(*dilation) <= 32,
-        Operation::Attention(Attention::SsmGatedDeltaChunked { k_dim, v_dim, .. }) => {
+        Operation::Ssm(Ssm::GatedDeltaChunked { k_dim, v_dim, .. }) => {
             *k_dim == 128 && *v_dim == 128 && gdn_lands(*k_dim)
         }
-        Operation::Attention(
-            Attention::SsmCausalConv1d { .. } | Attention::SsmGatedDelta { .. },
-        )
+        Operation::Ssm(Ssm::CausalConv1d { .. } | Ssm::GatedDelta { .. })
         | Operation::Fused(poem_ir::Fused::GdnStep { .. }) => true,
         _ => false,
     }
@@ -756,7 +750,7 @@ mod tests {
     }
 
     fn kda_chunked(mixed: u32) -> Operation {
-        Operation::Attention(Attention::SsmKdaChunked {
+        Operation::Ssm(Ssm::KdaChunked {
             mixed: ValueId(mixed),
             f: ValueId(4),
             b: ValueId(5),
@@ -801,7 +795,7 @@ mod tests {
         let trace = plan(
             kda_values(),
             vec![
-                Operation::Attention(Attention::SsmCausalConv1dChunked {
+                Operation::Ssm(Ssm::CausalConv1dChunked {
                     x: ValueId(0),
                     weight: ValueId(1),
                     bias: None,

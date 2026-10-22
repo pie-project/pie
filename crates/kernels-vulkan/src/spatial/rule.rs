@@ -4,7 +4,7 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "spatial/rule.slang";
 
-const OP: &str = "spatial.grid";
+const OP: &str = "conv.grid";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridRule {

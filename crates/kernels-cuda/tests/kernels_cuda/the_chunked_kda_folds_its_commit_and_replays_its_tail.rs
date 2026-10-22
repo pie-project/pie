@@ -353,7 +353,7 @@ fn the_kda_decode_step_lands_the_serial_walk() {
         let tuning = crate::common::attn_ref::tuned(|t| t.ssm_kda_chunked = false);
         let ctx = gpu.ctx().with_tuning(tuning);
         if step {
-            ssm::kda_step(
+            ssm::kda(
                 &ctx, mixed_t, f_t, b_t, dt_t, a_t, &pool, H, D, 1e-6, 0.0, &mut y,
             )
             .expect("the KDA step fires");

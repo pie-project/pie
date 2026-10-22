@@ -36,12 +36,12 @@ fn compiles(cslc: &Cslc, words: u32, arrays: u32) -> Result<(), String> {
         .prefix("pie-cerebras-probe-")
         .tempdir()
         .map_err(|e| e.to_string())?;
-    std::fs::write(dir.path().join("layout.csl"), &r.layout).map_err(|e| e.to_string())?;
+    std::fs::write(dir.path().join("gather.csl"), &r.layout).map_err(|e| e.to_string())?;
     std::fs::write(dir.path().join("pe.csl"), &r.pe).map_err(|e| e.to_string())?;
     let out = dir.path().join("out");
     cslc.compile(&Compile::memcpy(
         Arch::Wse3,
-        dir.path().join("layout.csl"),
+        dir.path().join("gather.csl"),
         1,
         1,
         &out,

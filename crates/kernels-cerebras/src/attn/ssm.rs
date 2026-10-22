@@ -332,7 +332,7 @@ pub fn causal_conv1d(
 ) -> Result<(), Error> {
     conv(
         ctx,
-        "attention.ssm_causal_conv1d",
+        "ssm.causal_conv1d",
         x,
         Lanes::PerRow,
         weight,
@@ -354,14 +354,10 @@ pub fn causal_conv1d_chunked(
     dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    expect(
-        "attention.ssm_causal_conv1d_chunked",
-        x.indptr,
-        &[Dtype::I32],
-    )?;
+    expect("ssm.causal_conv1d_chunked", x.indptr, &[Dtype::I32])?;
     conv(
         ctx,
-        "attention.ssm_causal_conv1d_chunked",
+        "ssm.causal_conv1d_chunked",
         x.data,
         Lanes::Ragged(x.indptr),
         weight,
@@ -381,7 +377,7 @@ pub fn gdn_prep(
     a_log: Tensor,
     gates: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gdn_prep";
+    const OP: &str = "ssm.gdn_gates";
     expect(OP, ba, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, dt_bias, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, a_log, &[Dtype::Bf16, Dtype::F32])?;
@@ -660,7 +656,7 @@ pub fn gated_delta(
     let _ = z;
     delta(
         ctx,
-        "attention.ssm_gated_delta",
+        "ssm.gated_delta",
         qkv,
         Lanes::PerRow,
         gates,
@@ -687,14 +683,10 @@ pub fn gated_delta_chunked(
     y: Tensor,
 ) -> Result<(), Error> {
     let _ = z;
-    expect(
-        "attention.ssm_gated_delta_chunked",
-        qkv.indptr,
-        &[Dtype::I32],
-    )?;
+    expect("ssm.gated_delta_chunked", qkv.indptr, &[Dtype::I32])?;
     delta(
         ctx,
-        "attention.ssm_gated_delta_chunked",
+        "ssm.gated_delta_chunked",
         qkv.data,
         Lanes::Ragged(qkv.indptr),
         gates,

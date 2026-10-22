@@ -18,7 +18,7 @@ impl ForwardHybrid for Ranked {
 
     fn forward(&self, inputs: Input) -> Value {
         let table = Weight::sym("embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
-        let x = ops::layout::embed(&inputs.tokens(), &table, VOCAB);
+        let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
         let (values, _) = ops::sampling::top_k(&x, 4);
         values
     }

@@ -7,7 +7,7 @@ use checkpoint::contract::{Expr, Partition, TensorType};
 use crate::z_image_dims::{self as model, vae};
 use poem::generative::{PortKind, ReadoutKind};
 use poem::{Def, Dim, Dtype, Operation, Platform, Stream, Trace, Ty, seam};
-use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
+use poem_ir::{Attention, Conv, GridRule, ParamLayout, Seam};
 
 const TURBO: &str = "z-image-turbo-bf16-kv-bf16";
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
@@ -163,11 +163,8 @@ fn the_shapes_are_the_flux_vaes() {
     let (mut attentions, mut upsamples, mut strided, mut convs, mut norms) = (0, 0, 0, 0, 0);
     let mut silu_off = 0;
     for node in &plan.nodes {
-        let Operation::Spatial(op) = &node.op else {
-            continue;
-        };
-        match op {
-            Spatial::Attention { sm_scale, q, .. } => {
+        match &node.op {
+            Operation::Attention(Attention::Voxel { sm_scale, q, .. }) => {
                 attentions += 1;
                 assert_eq!(
                     plan.values[q.0 as usize].ty.clone(),
@@ -178,15 +175,15 @@ fn the_shapes_are_the_flux_vaes() {
                 );
                 assert!((sm_scale - 512f32.sqrt().recip()).abs() < 1e-9);
             }
-            Spatial::UpsampleNearest {
+            Operation::Conv(Conv::Upsample {
                 factor,
                 keep_first_frame,
                 ..
-            } => {
+            }) => {
                 upsamples += 1;
                 assert_eq!((*factor, *keep_first_frame), ([1, 2, 2], false));
             }
-            Spatial::Conv3d {
+            Operation::Conv(Conv::Conv3d {
                 x,
                 w,
                 k,
@@ -196,7 +193,7 @@ fn the_shapes_are_the_flux_vaes() {
                 causal_t,
                 cache,
                 ..
-            } => {
+            }) => {
                 convs += 1;
                 assert!(!causal_t && cache.is_none() && k[0] == 1 && stride[0] == 1);
                 let c_in = match &plan.values[x.0 as usize].ty {
@@ -227,19 +224,19 @@ fn the_shapes_are_the_flux_vaes() {
                     assert!(matches!((k[1], pad[1]), (3, 1) | (1, 0)));
                 }
             }
-            Spatial::GroupNorm {
+            Operation::Conv(Conv::GroupNorm {
                 groups, eps, silu, ..
-            } => {
+            }) => {
                 norms += 1;
                 assert_eq!((*groups, *eps), (vae::GN_GROUPS, vae::GN_EPS));
                 if !silu {
                     silu_off += 1;
                 }
             }
-            Spatial::Grid {
+            Operation::Conv(Conv::Grid {
                 rule: GridRule::Conv { pad, pad_back, .. },
                 ..
-            } => {
+            }) => {
                 assert!(pad == pad_back || *pad_back == [0, 1, 1]);
             }
             _ => {}

@@ -209,11 +209,12 @@ pub struct FamilyCosts {
     pub attention: f32,
     pub linear: f32,
     pub elementwise: f32,
-    pub layout: f32,
+    pub gather: f32,
     pub collective: f32,
     pub sampling: f32,
+    pub ssm: f32,
     pub custom: f32,
-    pub spatial: f32,
+    pub conv: f32,
 }
 
 impl FamilyCosts {
@@ -223,9 +224,10 @@ impl FamilyCosts {
             poem_ir::Operation::Attention(_) => self.attention,
             poem_ir::Operation::Linear(_) => self.linear,
             poem_ir::Operation::Elementwise(_) => self.elementwise,
-            poem_ir::Operation::Layout(_) => self.layout,
+            poem_ir::Operation::Gather(_) => self.gather,
             poem_ir::Operation::Collective(_) => self.collective,
             poem_ir::Operation::Sampling(_) => self.sampling,
+            poem_ir::Operation::Ssm(_) => self.ssm,
             poem_ir::Operation::Fused(op) => match op {
                 poem_ir::Fused::LseSink { .. }
                 | poem_ir::Fused::PoolAttention { .. }
@@ -263,7 +265,7 @@ impl FamilyCosts {
                 | poem_ir::Fused::HcPre { .. }
                 | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elementwise,
             },
-            poem_ir::Operation::Spatial(_) => self.spatial,
+            poem_ir::Operation::Conv(_) => self.conv,
         }
     }
 }
@@ -274,11 +276,12 @@ impl Default for FamilyCosts {
             attention: 60.0,
             linear: 40.0,
             elementwise: 4.0,
-            layout: 4.0,
+            gather: 4.0,
             collective: 50.0,
             sampling: 4.0,
+            ssm: 60.0,
             custom: 20.0,
-            spatial: 40.0,
+            conv: 40.0,
         }
     }
 }

@@ -35,7 +35,7 @@ def forward(m, inputs):
         for kv_heads, win in geometry
     ]
 
-    y = ops.elemwise.rmsnorm(ops.layout.embed(inputs.tokens(), m.embed, m.vocab), m.embed_norm, m.norm_eps)
+    y = ops.elemwise.rmsnorm(ops.gather.embed(inputs.tokens(), m.embed, m.vocab), m.embed_norm, m.norm_eps)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
@@ -78,7 +78,7 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.norm_eps) * m.head_scale
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.unembed)
 
 def mlp(x, f):
@@ -102,6 +102,6 @@ def conv(v, weight, state, inputs, m):
     slab = inputs.state(state)
     one = fact.single_token()
     return merge([
-        ops.attn.short_conv(v.on(one), weight, slab, m.conv_width),
-        ops.attn.short_conv_chunked(v.on(~one), weight, slab, m.conv_width),
+        ops.ssm.short_conv(v.on(one), weight, slab, m.conv_width),
+        ops.ssm.short_conv_chunked(v.on(~one), weight, slab, m.conv_width),
     ])

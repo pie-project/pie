@@ -155,7 +155,7 @@ pub fn causal_conv1d(
     dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_causal_conv1d";
+    const OP: &str = "ssm.causal_conv1d";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_bf16" });
     let channels = nonzero(OP, "the conv's channel count", x.width)?;
     let rows = nonzero(OP, "rows", x.rows)?;
@@ -190,7 +190,7 @@ pub fn causal_conv1d_chunked(
     dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_causal_conv1d_chunked";
+    const OP: &str = "ssm.causal_conv1d_chunked";
     let entry = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "causal_conv1d_chunked_bf16" });
     let channels = nonzero(OP, "the conv's channel count", x.data.width)?;
     nonzero(OP, "rows", x.data.rows)?;
@@ -225,7 +225,7 @@ pub fn gdn_prep(
     a_log: Tensor,
     gates: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gdn_prep";
+    const OP: &str = "ssm.gdn_gates";
     let entry = dtype_dispatch!(OP, ba.dtype, { Bf16 => "gdn_ba_gates_bf16" });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");
@@ -269,7 +269,7 @@ pub fn gated_delta(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta";
+    const OP: &str = "ssm.gated_delta";
     let entry = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_bf16" });
 
     let entry = if k_dim == 128 && v_dim <= 128 {
@@ -309,7 +309,7 @@ pub fn gated_delta_chunked(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta_chunked";
+    const OP: &str = "ssm.gated_delta_chunked";
     let entry = dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => "gated_delta_chunked_bf16" });
 
     let entry = if k_dim == 128 && v_dim <= 128 {
@@ -392,7 +392,7 @@ pub fn kda_step(
     gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_step";
+    const OP: &str = "ssm.kda";
     let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "kda_step_bf16" });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
@@ -432,7 +432,7 @@ pub fn kda_chunked(
     gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_chunked";
+    const OP: &str = "ssm.kda_chunked";
     let entry = dtype_dispatch!(OP, mixed.data.dtype, { Bf16 => "kda_chunked_bf16" });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
@@ -476,7 +476,7 @@ pub fn kda_committed(
     gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_committed";
+    const OP: &str = "ssm.kda_committed";
     let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "kda_committed_bf16" });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
@@ -549,7 +549,7 @@ pub fn causal_conv1d_committed(
     dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_causal_conv1d_committed";
+    const OP: &str = "ssm.causal_conv1d_committed";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_committed_bf16" });
     let channels = nonzero(OP, "the conv's channel count", x.width)?;
     nonzero(OP, "extended rows", x.rows)?;
@@ -591,7 +591,7 @@ pub fn gated_delta_committed(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta_committed";
+    const OP: &str = "ssm.gated_delta_committed";
     let entry = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_committed_bf16" });
 
     let entry = if k_dim == 128 && v_dim <= 128 {

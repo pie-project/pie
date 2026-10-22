@@ -28,7 +28,7 @@ pub fn block_dyn_conv(
     group: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.block_dyn_conv";
+    const OP: &str = "ssm.dyn_conv";
     expect(OP, x.data, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, x.indptr, &[Dtype::I32])?;
     expect(OP, coeff, &[Dtype::Bf16, Dtype::F32])?;

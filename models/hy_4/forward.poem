@@ -172,7 +172,7 @@ def forward(m, inputs):
     hy = m.hyper
     plan = plans(inputs, m.heads, m.kv_lora_rank)
     positions = inputs.positions()
-    streams = ops.elemwise.hc_expand(ops.layout.embed(inputs.tokens(), m.embed, m.vocab), hy.streams)
+    streams = ops.elemwise.hc_expand(ops.gather.embed(inputs.tokens(), m.embed, m.vocab), hy.streams)
     routes = inputs.adapter_routes()
 
     def block(l, w, carried):
@@ -192,7 +192,7 @@ def forward(m, inputs):
     streams, _ = inputs.fold_layers(m.layers, (streams, None), block)
 
     y = collapse(streams, m.hc_head, hy)
-    y = ops.layout.gather_rows(y, inputs.readout_rows())
+    y = ops.gather.gather_rows(y, inputs.readout_rows())
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     logits = ops.linear.lm_head(x, m.head)
 
@@ -209,9 +209,9 @@ def draft(m, inputs, hidden, positions, logits):
     plan = whole(drafted, m.heads, m.kv_lora_rank)
     hidden = hidden.on(fact.drafts())
     positions = positions.on(fact.drafts())
-    token = ops.layout.argmax([logits.on(fact.drafts())])
+    token = ops.sampling.argmax([logits.on(fact.drafts())])
 
-    e = ops.layout.embed(token, m.embed, m.vocab)
+    e = ops.gather.embed(token, m.embed, m.vocab)
     e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
     h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
     fused = ops.elemwise.residual_add(
@@ -225,4 +225,4 @@ def draft(m, inputs, hidden, positions, logits):
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
     proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
     seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])

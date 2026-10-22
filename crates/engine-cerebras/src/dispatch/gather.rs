@@ -1,20 +1,65 @@
+use kernels_cerebras::attn;
 use kernels_cerebras::layout;
-use poem_exec::{DispatchLayout, KernelError};
-use poem_ir::{Layout, Operands};
+use poem_exec::{DispatchGather, KernelError};
+use poem_ir::{Gather, Operands};
 
 use crate::run::Run;
 
-impl DispatchLayout for Run<'_> {
-    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError> {
+impl DispatchGather for Run<'_> {
+    fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
-        self.layout(op).map_err(crate::error::kernel)
+        self.gather(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn layout(&mut self, op: &Layout) -> Result<(), kernels_cerebras::Error> {
+    fn gather(&mut self, op: &Gather) -> Result<(), kernels_cerebras::Error> {
         match op {
-            Layout::EmbedConcat {
+            Gather::NgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => attn::ple::ngram_ids(
+                self.ctx(),
+                self.tensor(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                map.map(|m| self.tensor(m)),
+                self.tensor(*ngram_ids),
+            ),
+            Gather::NgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } => attn::ple::ngram_ids_chunked(
+                self.ctx(),
+                self.ragged(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                map.map(|m| self.tensor(m)),
+                self.tensor(*ngram_ids),
+            ),
+            Gather::EmbedConcat {
                 ids,
                 table,
                 scales: None,
@@ -27,7 +72,7 @@ impl Run<'_> {
                 *vocab,
                 self.tensor(*y),
             ),
-            Layout::Embed {
+            Gather::Embed {
                 ids,
                 table,
                 vocab,
@@ -39,7 +84,7 @@ impl Run<'_> {
                 *vocab,
                 self.tensor(*y),
             ),
-            Layout::SplitQGate {
+            Gather::SplitQGate {
                 packed,
                 head_dim,
                 q,
@@ -51,7 +96,7 @@ impl Run<'_> {
                 self.tensor(*q),
                 self.tensor(*gate),
             ),
-            Layout::SplitRows {
+            Gather::SplitRows {
                 x,
                 width,
                 left,
@@ -63,10 +108,10 @@ impl Run<'_> {
                 self.tensor(*left),
                 self.tensor(*right),
             ),
-            Layout::MergeRows { x, side, y } => {
+            Gather::MergeRows { x, side, y } => {
                 layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
-            Layout::ScatterLiveRows {
+            Gather::ScatterLiveRows {
                 src,
                 routes,
                 y,
@@ -77,13 +122,13 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.uncut(*y),
             ),
-            Layout::GatherRows { x, rows, y } => layout::gather_rows(
+            Gather::Rows { x, rows, y } => layout::gather_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*rows),
                 self.tensor(*y),
             ),
-            Layout::SplitQkv {
+            Gather::SplitQkv {
                 packed,
                 q_width,
                 kv_width,
@@ -99,7 +144,7 @@ impl Run<'_> {
                 self.tensor(*k),
                 self.tensor(*v),
             ),
-            Layout::EmbedWeighted {
+            Gather::EmbedWeighted {
                 ids,
                 weights,
                 table,

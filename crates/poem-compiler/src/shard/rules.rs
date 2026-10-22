@@ -106,9 +106,9 @@ fn heads(name: &str) -> Option<Heads> {
         | "elementwise.rmsnorm_per_head_plus_one"
         | "elementwise.rmsnorm_no_scale"
         | "elementwise.rope_axes"
-        | "layout.gather_rows"
-        | "layout.pack_rows"
-        | "layout.unpack_rows"
+        | "gather.rows"
+        | "gather.pack_rows"
+        | "gather.unpack_rows"
         | "linear.mlp_gelu_tanh" => Heads::of(&["x"], &[]),
         "elementwise.mul" => Heads::of(&["x", "y"], &[]),
         "elementwise.gate_sigmoid_mul"
@@ -121,9 +121,9 @@ fn heads(name: &str) -> Option<Heads> {
         | "elementwise.rope_mrope" => Heads::of(&["q", "k"], &[]),
         "elementwise.rope_partial_q" | "elementwise.rope_partial_last" => Heads::of(&["q"], &[]),
         "elementwise.add_bias" => Heads::of(&["out"], &[]),
-        "layout.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
-        "layout.split_q_gate" => Heads::of(&["packed"], &[]),
-        "layout.split_rows" => Heads::of(&["x"], &["width"]),
+        "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
+        "gather.split_q_gate" => Heads::of(&["packed"], &[]),
+        "gather.split_rows" => Heads::of(&["x"], &["width"]),
         "linear.mlp_swiglu"
         | "linear.mlp_swiglu_clamp"
         | "linear.mlp_swiglu_clamp_alpha"
@@ -158,14 +158,14 @@ fn heads(name: &str) -> Option<Heads> {
         | "attention.mla_prefill"
         | "attention.mla_decode_selected"
         | "attention.mla_prefill_selected" => Heads::of(&["q", "q_pe"], &["heads"]),
-        "attention.ssm_causal_conv1d" | "attention.ssm_causal_conv1d_chunked" => {
+        "ssm.causal_conv1d" | "ssm.causal_conv1d_chunked" => {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
-        "attention.ssm_gdn_prep" => Heads::of(&["ba"], &[]),
-        "attention.ssm_gated_delta" | "attention.ssm_gated_delta_chunked" => {
+        "ssm.gdn_gates" => Heads::of(&["ba"], &[]),
+        "ssm.gated_delta" | "ssm.gated_delta_chunked" => {
             Heads::of(&["qkv", "z", "gates"], &["k_heads", "v_heads"]).cache(Cache::Split)
         }
-        "attention.ssm_kda_step" | "attention.ssm_kda_chunked" => {
+        "ssm.kda" | "ssm.kda_chunked" => {
             Heads::of(&["mixed", "f", "b"], &["heads"]).cache(Cache::Split)
         }
         _ => return None,
@@ -197,7 +197,7 @@ fn rule(name: &str) -> Rule {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
             follow: &["routed", "shared"],
         },
-        "layout.embed" => Rule::Lookup { table: "table" },
+        "gather.embed" => Rule::Lookup { table: "table" },
         "attention.plan_prefill" | "attention.plan_decode" => Rule::Plan {
             scale: &["q_heads", KV_HEADS],
         },

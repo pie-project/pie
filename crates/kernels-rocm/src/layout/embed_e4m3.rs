@@ -18,7 +18,7 @@ pub fn embed_concat_mxfp8(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_concat";
+    const OP: &str = "gather.embed_concat";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = nonzero(OP, "the hashed head count", ids.width)?;

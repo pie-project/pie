@@ -668,9 +668,9 @@ impl Shell {
             .nodes
             .iter()
             .filter_map(|node| match node.op {
-                poem_ir::Operation::Layout(
-                    poem_ir::Layout::PoolRows { side, .. }
-                    | poem_ir::Layout::MergeRows { side, .. },
+                poem_ir::Operation::Gather(
+                    poem_ir::Gather::PoolRows { side, .. }
+                    | poem_ir::Gather::MergeRows { side, .. },
                 ) => Some(side.saturating_mul(side)),
                 _ => None,
             })
@@ -679,7 +679,7 @@ impl Shell {
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                poem_ir::Operation::Layout(poem_ir::Layout::ScatterLiveRows { .. })
+                poem_ir::Operation::Gather(poem_ir::Gather::ScatterLiveRows { .. })
             )
         });
         let states_mrope = declared_width(&boot.trace, poem_ir::RuntimeInput::MropePositions) > 0;

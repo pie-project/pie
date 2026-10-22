@@ -19,10 +19,10 @@ mod mamba2;
 pub use conv1d::{causal_conv1d, causal_conv1d_chunked, short_conv, short_conv_chunked};
 pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
-pub use gdn_prep::gdn_prep;
+pub use gdn_prep::gdn_gates;
 pub use gdn_recurrent::gated_delta;
-pub use kda::{kda_chunked, kda_step};
-pub use mamba2::{Mamba2, mamba2_chunked, mamba2_step};
+pub use kda::{kda, kda_chunked};
+pub use mamba2::{Mamba2, mamba2, mamba2_chunked};
 
 const BLOCK: u32 = 256;
 

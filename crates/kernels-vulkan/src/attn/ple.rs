@@ -138,7 +138,7 @@ pub fn ngram_ids(
     heads_per_ngram: u32,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids";
+    const OP: &str = "gather.ngram_ids";
     id_planes(OP, ids, ngram_ids)?;
     let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     hash_plane(OP, hash, &shape)?;
@@ -181,7 +181,7 @@ pub fn ngram_ids_chunked(
     heads_per_ngram: u32,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_chunked";
+    const OP: &str = "gather.ngram_ids_chunked";
     id_planes(OP, ids.data, ngram_ids)?;
     let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     hash_plane(OP, hash, &shape)?;
@@ -349,7 +349,7 @@ pub fn ngram_ids_committed(
     heads_per_ngram: u32,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_committed";
+    const OP: &str = "gather.ngram_ids_committed";
     id_planes(OP, ids, ngram_ids)?;
     let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     hash_plane(OP, hash, &shape)?;

@@ -19,7 +19,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "layout.embed_weighted";
+    const OP: &str = "gather.embed_weighted";
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
         y.dtype, table.dtype,

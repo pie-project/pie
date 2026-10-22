@@ -167,7 +167,7 @@ pub fn causal_conv1d(
     dilation: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_causal_conv1d";
+    const OP: &str = "ssm.causal_conv1d";
     conv1d_update(
         ctx,
         OP,
@@ -190,7 +190,7 @@ pub fn short_conv(
     conv_width: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.short_conv";
+    const OP: &str = "ssm.short_conv";
     conv1d_update(
         ctx,
         OP,
@@ -266,7 +266,7 @@ pub fn causal_conv1d_chunked(
     dilation: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_causal_conv1d_chunked";
+    const OP: &str = "ssm.causal_conv1d_chunked";
     conv1d_chunked(
         ctx,
         OP,
@@ -289,7 +289,7 @@ pub fn short_conv_chunked(
     conv_width: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.short_conv_chunked";
+    const OP: &str = "ssm.short_conv_chunked";
     conv1d_chunked(
         ctx,
         OP,
@@ -438,14 +438,14 @@ fn conv1d_chunked(
     )
 }
 
-pub fn gdn_prep(
+pub fn gdn_gates(
     ctx: &Ctx,
     ba: Tensor,
     dt_bias: Tensor,
     a_log: Tensor,
     gates: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gdn_prep";
+    const OP: &str = "ssm.gdn_gates";
     dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");
@@ -629,7 +629,7 @@ pub fn gated_delta(
     v_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta";
+    const OP: &str = "ssm.gated_delta";
 
     let _ = z;
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
@@ -892,7 +892,7 @@ pub fn gated_delta_chunked(
     v_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_gated_delta_chunked";
+    const OP: &str = "ssm.gated_delta_chunked";
 
     /// State columns a scan block owns.
     const SCAN_BV: u32 = 128;
@@ -1316,7 +1316,7 @@ fn kda_head(op: &'static str, head_dim: u32) -> Result<(), Error> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn kda_step(
+pub fn kda(
     ctx: &Ctx,
     mixed: Tensor,
     f: Tensor,
@@ -1330,7 +1330,7 @@ pub fn kda_step(
     gate_floor: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_step";
+    const OP: &str = "ssm.kda";
 
     const STEP_BLOCK: u32 = 256;
 
@@ -1421,7 +1421,7 @@ pub fn kda_chunked(
     gate_floor: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_kda_chunked";
+    const OP: &str = "ssm.kda_chunked";
 
     dtype_dispatch!(OP, mixed.data.dtype, { Bf16 => () });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
@@ -1643,7 +1643,7 @@ impl Mamba2 {
 /// One Mamba-2 step a request over the convolved `xbc` rows: lands
 /// `(C S + D x) * silu(z)`, group-normed, in `y`.
 #[allow(clippy::too_many_arguments)]
-pub fn mamba2_step(
+pub fn mamba2(
     ctx: &Ctx,
     xbc: Tensor,
     dt: Tensor,
@@ -1653,7 +1653,7 @@ pub fn mamba2_step(
     state_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_mamba2_step";
+    const OP: &str = "ssm.mamba2";
     m.check(OP, xbc, dt, z, y, state_dim)?;
     f32_state(OP, state)?;
     seated(OP, state, "ssm_mamba2_step", true, false, false)?;
@@ -1696,7 +1696,7 @@ pub fn mamba2_chunked(
     state_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ssm_mamba2_chunked";
+    const OP: &str = "ssm.mamba2_chunked";
     m.check(OP, xbc.data, dt, z, y, state_dim)?;
     let lanes = requests(OP, xbc)?;
     f32_state(OP, state)?;
