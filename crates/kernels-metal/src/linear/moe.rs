@@ -637,11 +637,21 @@ pub fn matmul_select_quant(
     if entry == "affine_qmv_routed_bfloat16_gs_64_b_4" && std::env::var_os("PIE_GROUPED").is_some() {
         entry = "affine_qmv_routed_grouped_bfloat16_gs_64_b_4";
     }
+    let by_rank = entry == "affine_qmv_routed_bfloat16_gs_64_b_4"
+        && std::env::var_os("PIE_RANKED").is_some()
+        && routes.rows * routes.width <= 64;
+    if by_rank {
+        entry = "affine_qmv_routed_ranked_bfloat16_gs_64_b_4";
+    }
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
     ctx.fire(
         Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
-            routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
+            if by_rank {
+                [routes.rows * routes.width * 32, y.width.div_ceil(4), 1]
+            } else {
+                routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?
+            },
             QMV_GROUP,
         )),
         &[

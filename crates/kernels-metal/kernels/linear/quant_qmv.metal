@@ -582,6 +582,60 @@ qmv_routed_grouped<bfloat, 64, 2>(
     const device bfloat*, const device int*, const constant int&, const constant int&,
     const constant int&, uint3, uint3, uint, uint);
 
+// The per-pair routed 4-bit matmul with its threadgroups in expert order:
+// threadgroup x takes the pair of rank x among the fire's (at most 64) pairs
+// sorted by expert, so the threadgroups that run together read one expert's
+// codes, which the first of them brings in for the rest. Each pair's result
+// is the per-pair kernel's bit for bit.
+template <typename T, int PPT>
+[[kernel]] void qmv_routed_ranked(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& in_vec_size  [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const device T* bias       [[buffer(7)]],
+    const device int* expert_ids [[buffer(8)]],
+    const constant int& x_slot_stride [[buffer(9)]],
+    const constant int& x_row_stride  [[buffer(10)]],
+    const constant int& slots_per_row [[buffer(11)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tgs       [[threadgroups_per_grid]],
+    uint lid        [[thread_index_in_threadgroup]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  threadgroup int ids[64];
+  threadgroup int picked;
+  const int pairs = int(tgs.x);
+  const int me = int(lid);
+  const int e = me < pairs ? expert_ids[me] : INT_MAX;
+  ids[me] = e;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  int rank = 0;
+  for (int j = 0; j < pairs; j++) {
+    const int o = ids[j];
+    rank += (o < e || (o == e && j < me)) ? 1 : 0;
+  }
+  if (me < pairs && rank == int(tid.x)) {
+    picked = me;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int sel = picked;
+  qmv_gptoss_impl<T, AffineU4<T>, false, true, PPT>(
+      w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,
+      x_slot_stride, x_row_stride, slots_per_row,
+      uint3(uint(sel / slots_per_row), tid.y, uint(sel % slots_per_row)), simd_gid, simd_lid);
+}
+
+template [[host_name("affine_qmv_routed_ranked_bfloat16_gs_64_b_4")]] [[kernel]] void
+qmv_routed_ranked<bfloat, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&, const constant int&,
+    const device bfloat*, const device int*, const constant int&, const constant int&,
+    const constant int&, uint3, uint3, uint, uint, uint);
+
 #define gptoss_qmv_kernel(name, BIASED, ROUTED, PPT)                                \
   template <typename T, template <typename> class Codec>                       \
   [[kernel]] void name(                                                        \

@@ -218,9 +218,10 @@ fn the_eight_row_routed_tactics_price() {
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let (experts, tokens, top_k, layers) = (256u32, 8u32, 8u32, 40u32);
     let pairs = tokens * top_k;
-    let tactics: [(&str, &str); 7] = [
+    let tactics: [(&str, &str); 8] = [
         ("qmv", ""),
         ("grouped", ""),
+        ("ranked", ""),
         ("tiled8", "[kernel]\nmoe.path = \"tiled\"\nmoe.tile_rows = [{ value = 8 }]"),
         ("tiled16", "[kernel]\nmoe.path = \"tiled\"\nmoe.tile_rows = [{ value = 16 }]"),
         ("mpp8", "[kernel]\nmoe.path = \"mpp\"\nmoe.tile_rows = [{ value = 8 }]"),
@@ -297,11 +298,13 @@ fn the_eight_row_routed_tactics_price() {
                 .map(|b| Tensor::new(bind(b), tokens, top_k, Dtype::I32))
                 .collect();
             let mut outs = Vec::new();
-            for grouped in [false, true] {
-                if grouped {
+            for variant in 0..3 {
+                unsafe { std::env::remove_var("PIE_GROUPED") };
+                unsafe { std::env::remove_var("PIE_RANKED") };
+                if variant == 1 {
                     unsafe { std::env::set_var("PIE_GROUPED", "1") };
-                } else {
-                    unsafe { std::env::remove_var("PIE_GROUPED") };
+                } else if variant == 2 {
+                    unsafe { std::env::set_var("PIE_RANKED", "1") };
                 }
                 let mut got = Vec::new();
                 for r in &routes[..3] {
@@ -314,6 +317,7 @@ fn the_eight_row_routed_tactics_price() {
                 outs.push(got);
             }
             assert!(outs[0] == outs[1], "the grouped kernel lands other bits at K={k} distinct {distinct}");
+            assert!(outs[0] == outs[2], "the ranked kernel lands other bits at K={k} distinct {distinct}");
             let mut line = format!("K={k:>4} N={n:>4} distinct {distinct:>2}:");
             for (name, overrides) in &tactics {
                 let tuning = engine_metal::chip::tuning(overrides, false);
@@ -328,7 +332,12 @@ fn the_eight_row_routed_tactics_price() {
                         } else {
                             unsafe { std::env::remove_var("PIE_GROUPED") };
                         }
-                        let ran = if *name == "qmv" || *name == "grouped" {
+                        if *name == "ranked" {
+                            unsafe { std::env::set_var("PIE_RANKED", "1") };
+                        } else {
+                            unsafe { std::env::remove_var("PIE_RANKED") };
+                        }
+                        let ran = if *name == "qmv" || *name == "grouped" || *name == "ranked" {
                             moe::matmul_select_quant(&sink, x, bank, *r, y).map(|()| true)
                         } else {
                             moe::matmul_select_batched(
