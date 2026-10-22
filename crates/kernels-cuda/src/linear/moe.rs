@@ -2957,6 +2957,12 @@ const FP8_GEMM_FROM: u32 = 8192;
 #[cfg(feature = "cuda")]
 const BF16_GEMM_FROM: u32 = 256;
 
+/// The fewest routes an expert averages that Hopper's warp-specialized
+/// wgmma GEMM (`moe_select_bf16_wsgemm`) takes a tiled bf16 select at:
+/// a prefill's, in slices of 128.
+#[cfg(feature = "cuda")]
+const BF16_WSGEMM_FROM: u32 = 64;
+
 /// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync
 /// (`linear/moe_w8.cuh`): the register-held `moe_select_bf16_held`, each
 /// expert's rows streamed once a slice of its routes, or from
@@ -2991,6 +2997,61 @@ pub fn select_bf16_held(
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+    // A prefill's routes on Hopper's warp-specialized wgmma GEMM, an
+    // expert's slice 128 of them by 256 weight rows (128 gate and their up
+    // rows with a GLU), the GLU in its epilogue.
+    if hopper_wgmma()
+        && fan.route_count >= BF16_GEMM_FROM
+        && fan.route_count.div_ceil(experts) >= BF16_WSGEMM_FROM
+        && x.width.is_multiple_of(64)
+        && (0..=5).contains(&code)
+    {
+        const STAGES: u32 = 4;
+        let order = route_order_sliced(
+            ctx,
+            op,
+            routes,
+            &fan,
+            experts,
+            128,
+            true,
+            if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
+                Share::Keep
+            } else {
+                Share::Take
+            },
+        )?;
+        let cols = if glu.is_some() { 128 } else { 256 };
+        ctx.fire(
+            op,
+            Fire::at(
+                "linear/moe_wgmma.cuh",
+                symbol(&format!(
+                    "::pie::linear::moe_select_bf16_wsgemm<{STAGES}, {code}>"
+                )),
+            )
+            .apply(
+                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
+                    .smem(STAGES * 49152 + 1024 + 128),
+            ),
+            &[
+                x.arg(),
+                ArgValue::Ptr(order.order),
+                ArgValue::Ptr(order.offsets),
+                ArgValue::Ptr(order.work),
+                ArgValue::Ptr(bank),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                k.arg(),
+                stated(op, experts)?.arg(),
+                inter.arg(),
+                limit.arg(),
+                alpha.arg(),
+            ],
+        )?;
+        return Ok(true);
+    }
     let SelectPlan {
         nb,
         tiled,
