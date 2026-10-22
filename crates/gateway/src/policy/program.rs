@@ -416,6 +416,7 @@ fn edge_name(edge: &Edge) -> &'static str {
         Edge::LinkChanged(_) => "link-changed",
         Edge::PlacementChanged(_) => "placement-changed",
         Edge::ReplicationChanged(_) => "replication-changed",
+        Edge::RetentionChanged(_) => "retention-changed",
         Edge::Published(_) => "published",
         Edge::Started(_) => "started",
         Edge::Paused(_) => "paused",

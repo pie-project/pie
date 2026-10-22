@@ -35,6 +35,7 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `cache-aware` | cluster | sends a launch to the worker holding the most of its prompt (as the gateway routed it) if that is at least 0.3 of it, else to the least loaded; load wins when one worker runs 8 more turns than another and 1.5 times as many (after SGLang's router) | `worker` |
 | `session-affinity` | cluster | sends a session's processes where its last one went | the session |
 | `pool-replicate` | cluster | keeps every run some worker caches in every pool too, so it outlives the worker | |
+| `retain-all` | cluster | retains every run some worker caches (key 1), so the gateway keeps a copy of each in a pool and the last worker letting it go does not lose it; with no pool it does nothing | |
 | `replicate` | cluster | keeps every run some worker caches on two decode workers (the two a hash of the run picks), in their host tier, so losing a worker leaves its runs on another | |
 | `disaggregate` | cluster | names the prefill workers as every process's executors, so its passes are prefilled there: those on the host another program's committed placement (`placement/worker`) put the process first, then the least loaded; it writes executors alone, so `cache-aware` places processes beside it | |
 | `relocate` | cluster | places a launch by `worker`, then moves it to `move-to` once it has run `move-after-ms`, where it runs again from the start; a turn that has sent output is refused and stays | `worker`, `move-to`, `move-after-ms` |
@@ -50,10 +51,11 @@ alike.
 Cluster policies running side by side see each other through the host:
 what their calls committed reads as attrs (a process's `placement/worker`,
 `placement/executors` and `placement/props/<name>`, a group's
-`replication/sites`), and a policy granted `publish` says a value for the
-others as `published/<its name>/<name>`. A change reaches the others as an
-edge (`placement-changed`, `replication-changed`, `published`) on their
-next call; see `crates/policy/wit`.
+`replication/sites` and `retention/key`), and a policy granted `publish`
+says a value for the others as `published/<its name>/<name>`. A change
+reaches the others as an edge (`placement-changed`, `replication-changed`,
+`retention-changed`, `published`) on their next call; see
+`crates/policy/wit`.
 
 `test-*` policies misbehave on purpose and are built only for the hosts'
 own tests.
