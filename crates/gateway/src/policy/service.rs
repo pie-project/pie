@@ -2310,15 +2310,16 @@ mod tests {
 
     #[test]
     fn a_retained_group_no_pool_holds_is_asked_of_a_pool_highest_key_first() {
-        let mut registry = Registry::default();
-        registry.groups = HashMap::from([
-            ("a".to_string(), group(&[1])),
-            ("b".to_string(), group(&[1])),
-            ("held".to_string(), group(&[1, 9])),
-            ("zero".to_string(), group(&[1])),
-        ]);
-        registry.retention =
-            retention(&[("a", 1), ("b", 5), ("held", 3), ("zero", 0), ("gone", 9)]);
+        let mut registry = Registry {
+            groups: HashMap::from([
+                ("a".to_string(), group(&[1])),
+                ("b".to_string(), group(&[1])),
+                ("held".to_string(), group(&[1, 9])),
+                ("zero".to_string(), group(&[1])),
+            ]),
+            retention: retention(&[("a", 1), ("b", 5), ("held", 3), ("zero", 0), ("gone", 9)]),
+            ..Default::default()
+        };
         assert!(
             registry.retained().is_empty(),
             "with no pool, the table is taken and nothing is asked"
@@ -2340,15 +2341,17 @@ mod tests {
         let run = vec![[1; 32], [2; 32]];
         directory.report(WorkerId(9), Some("p:9".into()), run.clone(), vec![], true);
         directory.report_runs(WorkerId(9), vec![run], vec![], true, true);
-        let mut registry = Registry::default();
-        registry.groups = directory
-            .groups()
-            .into_iter()
-            .map(|(last, group)| (hex(&last), group))
-            .collect();
-        registry.pools = vec!["9".into()];
         let id = hex(&[2; 32]);
-        registry.retention = retention(&[(&id, 1)]);
+        let registry = Registry {
+            groups: directory
+                .groups()
+                .into_iter()
+                .map(|(last, group)| (hex(&last), group))
+                .collect(),
+            pools: vec!["9".into()],
+            retention: retention(&[(&id, 1)]),
+            ..Default::default()
+        };
         assert!(registry.retained().is_empty(), "the pool holds it");
         let plane = registry.snapshot(&table(0), &Tables::default());
         assert!(
@@ -2376,9 +2379,11 @@ mod tests {
     #[test]
     fn a_retention_table_is_committed_with_its_call_and_withdrawn_with_its_program() {
         let shared = shared();
-        let mut registry = Registry::default();
-        registry.groups = HashMap::from([("g".to_string(), group(&[1]))]);
-        registry.pools = vec!["9".into()];
+        let mut registry = Registry {
+            groups: HashMap::from([("g".to_string(), group(&[1]))]),
+            pools: vec!["9".into()],
+            ..Default::default()
+        };
         let commit = Commit {
             state: super::super::StateCommit {
                 retention: Some(retention(&[("g", 4)])),
