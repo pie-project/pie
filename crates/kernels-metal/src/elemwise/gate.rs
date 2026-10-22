@@ -65,3 +65,46 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
         &[x.arg_mut(), gate.arg(), stated(OP, x.width)?.arg()],
     )
 }
+
+/// [`sigmoid_mul`] over at most eight rows that also lays the register tile's
+/// input table of the gated rows in `table`, with `counters` arrival counters
+/// zeroed: the table `linear::quant`'s register matmul lays over `x`, bit for
+/// bit, so the out projection runs no table pass.
+pub fn sigmoid_mul_table(
+    ctx: &Ctx<'_>,
+    gate: Tensor,
+    x: Tensor,
+    table: Tensor,
+    counters: u32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.gate_sigmoid_mul";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    debug_assert!(
+        gate.rows == x.rows && gate.width == x.width && gate.dtype == x.dtype,
+        "the gate plane rides the rectangle it gates"
+    );
+    if x.rows > 8 || !x.width.is_multiple_of(64) || x.width > 8192 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a register table holds at most 8 rows of whole 64-input groups, and this \
+                 one stages at most 8192, not {} x {}",
+                x.rows, x.width
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at("elemwise/gate.metal", "gate_table_bfloat16").apply(Grid::of(
+            [x.width.min(1024), 8, 1],
+            [x.width.min(1024), 1, 1],
+        )),
+        &[
+            x.arg_mut(),
+            gate.arg(),
+            stated(OP, x.width)?.arg(),
+            table.arg_mut(),
+            x.rows.arg(),
+            counters.arg(),
+        ],
+    )
+}

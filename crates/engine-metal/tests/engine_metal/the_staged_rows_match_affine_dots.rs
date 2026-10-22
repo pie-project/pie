@@ -108,6 +108,7 @@ fn every_staged_row_answers_an_affine_reference() {
                     quant::Scratch {
                         precast: &precast,
                         partials: &partials,
+                        table: None,
                     },
                     cap,
                 )
