@@ -21,10 +21,10 @@ impl poem_exec::DispatchConv for Run<'_> {
 
 impl Run<'_> {
     fn spatial(&mut self, op: &poem_ir::Conv) -> Result<(), kernels_metal::Error> {
-        use kernels_metal::spatial;
+        use kernels_metal::conv;
         use poem_ir::Conv;
         match op {
-            Conv::Grid { grid, rule, y } => spatial::rule::derive_grid(
+            Conv::Grid { grid, rule, y } => conv::rule::derive_grid(
                 self.ctx(),
                 self.tensor(*grid),
                 match *rule {
@@ -34,7 +34,7 @@ impl Run<'_> {
                         pad,
                         pad_back,
                         causal_t,
-                    } => spatial::rule::GridRule::Conv {
+                    } => conv::rule::GridRule::Conv {
                         k,
                         stride,
                         pad,
@@ -44,16 +44,16 @@ impl Run<'_> {
                     poem_ir::GridRule::Upsample {
                         factor,
                         keep_first_frame,
-                    } => spatial::rule::GridRule::Upsample {
+                    } => conv::rule::GridRule::Upsample {
                         factor,
                         keep_first_frame,
                     },
                     poem_ir::GridRule::Shuffle { r, trim_t } => {
-                        spatial::rule::GridRule::Shuffle { r, trim_t }
+                        conv::rule::GridRule::Shuffle { r, trim_t }
                     }
-                    poem_ir::GridRule::Unshuffle { r } => spatial::rule::GridRule::Unshuffle { r },
+                    poem_ir::GridRule::Unshuffle { r } => conv::rule::GridRule::Unshuffle { r },
                     poem_ir::GridRule::AvgDown { factor } => {
-                        spatial::rule::GridRule::AvgDown { factor }
+                        conv::rule::GridRule::AvgDown { factor }
                     }
                 },
                 self.tensor(*y),
@@ -78,22 +78,22 @@ impl Run<'_> {
                         op: "conv.conv3d (with a frame cache)",
                     });
                 }
-                spatial::conv::conv3d(
+                conv::conv3d::conv3d(
                     self.ctx(),
                     self.tensor(*x),
                     self.tensor(*grid),
                     self.tensor(*w),
                     bias.map(|bias| self.tensor(bias)),
                     None,
-                    spatial::conv::Conv3d {
+                    conv::conv3d::Conv3d {
                         k: *k,
                         stride: *stride,
                         pad: *pad,
                         pad_back: *pad_back,
                         causal_t: *causal_t,
                         time_pad: match time_pad {
-                            poem_ir::TimePad::Zero => spatial::conv::TimePad::Zero,
-                            poem_ir::TimePad::Replicate => spatial::conv::TimePad::Replicate,
+                            poem_ir::TimePad::Zero => conv::conv3d::TimePad::Zero,
+                            poem_ir::TimePad::Replicate => conv::conv3d::TimePad::Replicate,
                         },
                     },
                     self.tensor(*y_grid),
@@ -120,7 +120,7 @@ impl Run<'_> {
                         ),
                     }
                 })?;
-                spatial::norm::group_norm(
+                conv::group_norm::group_norm(
                     self.ctx(),
                     self.tensor(*x),
                     self.tensor(*grid),
@@ -141,7 +141,7 @@ impl Run<'_> {
                 keep_first_frame,
                 y_grid,
                 y,
-            } => spatial::resample::upsample_nearest(
+            } => conv::resample::upsample_nearest(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -157,7 +157,7 @@ impl Run<'_> {
                 trim_t,
                 y_grid,
                 y,
-            } => spatial::resample::pixel_shuffle(
+            } => conv::resample::pixel_shuffle(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -172,7 +172,7 @@ impl Run<'_> {
                 r,
                 y_grid,
                 y,
-            } => spatial::resample::pixel_unshuffle(
+            } => conv::resample::pixel_unshuffle(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -187,7 +187,7 @@ impl Run<'_> {
                 group,
                 y_grid,
                 y,
-            } => spatial::resample::avg_down(
+            } => conv::resample::avg_down(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -212,7 +212,7 @@ impl Run<'_> {
                              lane of it staged"
                         .to_string(),
                 })?;
-                spatial::resample::cache_store(self.ctx(), x, x, slots, grid, *frames, pool.state)
+                conv::resample::cache_store(self.ctx(), x, x, slots, grid, *frames, pool.state)
             }
             Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
@@ -243,7 +243,7 @@ impl poem_exec::DispatchProbe for Run<'_> {
             ) {
                 continue;
             }
-            let _ = kernels_metal::tripwire::nan_check(
+            let _ = kernels_metal::runtime::nan_check::nan_check(
                 self.ctx(),
                 t,
                 flags,

@@ -1,5 +1,5 @@
 use kernels_metal::Tensor;
-use kernels_metal::attn::ple;
+use kernels_metal::gather::ngram;
 use kernels_metal::linear::moe::{self, RoutedScratch};
 use kernels_metal::linear::quant;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
@@ -264,7 +264,7 @@ impl Scratch {
             .filter(|groups| *groups > 0)
             .map(|groups| {
                 let clips = budgets.max_clips().max(1);
-                let floats = kernels_metal::spatial::norm::scratch_floats(clips, groups);
+                let floats = kernels_metal::conv::group_norm::scratch_floats(clips, groups);
                 let mut at = 0u64;
                 Room::lay(&mut at, floats.div_ceil(4).max(1), 4, Dtype::F32)
             });
@@ -301,7 +301,7 @@ impl Scratch {
             else {
                 continue;
             };
-            let key: Box<[u64]> = ple::hash_constants(mults, primes, offsets).into();
+            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
             if key.is_empty() || ple.iter().any(|held| held.key == key) {
                 continue;
             }
@@ -371,7 +371,7 @@ impl Scratch {
         groups: u32,
     ) -> Option<Result<(Tensor, Tensor)>> {
         let room = self.spatial?;
-        let splits = kernels_metal::spatial::norm::SPLITS;
+        let splits = kernels_metal::conv::group_norm::SPLITS;
         let partial_floats = u64::from(clips) * u64::from(splits) * u64::from(groups) * 4;
         let stat_floats = u64::from(clips) * u64::from(groups) * 2;
         if partial_floats + stat_floats > u64::from(room.rows) * u64::from(room.width) {
@@ -458,7 +458,7 @@ impl Scratch {
         primes: &[u64],
         offsets: &[u64],
     ) -> Option<Result<Tensor>> {
-        let want = ple::hash_constants(mults, primes, offsets);
+        let want = ngram::hash_constants(mults, primes, offsets);
         let held = self.ple.iter().find(|h| *h.key == *want)?;
         Some(held.room.bind(handles, &self.plane))
     }

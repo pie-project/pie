@@ -2786,7 +2786,7 @@ impl Shell {
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
-        // own and then those slots (`kernels_metal::attn::ssm::Snapshots`).
+        // own and then those slots (`kernels_metal::ssm::Snapshots`).
         let mut rs_snaps: Vec<i32> = Vec::new();
         let mut snap_slots = 0u32;
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2922,7 +2922,7 @@ impl Shell {
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let at_lane = slot_ids.len() as i32 - 1;
             {
-                const MAX: usize = kernels_metal::attn::ssm::RS_SNAPSHOTS as usize;
+                const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
                 let snaps = seated.rs_snapshots;
                 if snaps.len() > MAX
                     || (!snaps.is_empty() && row.rows as usize != lane.tokens.len())

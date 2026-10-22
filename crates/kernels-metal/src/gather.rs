@@ -2,10 +2,11 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, head_group, nonzero, refuse,
-    stated,
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated,
 };
 use crate::tensor::{Bank, Tensor};
+
+pub mod ngram;
 
 pub fn embed(
     ctx: &Ctx<'_>,
@@ -33,38 +34,6 @@ pub fn embed(
             y.arg_mut(),
             stated(OP, y.width)?.arg(),
             stated(OP, vocab)?.arg(),
-        ],
-    )
-}
-
-pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "sampling.argmax";
-    debug_assert_eq!(y.dtype, Dtype::I32, "`{OP}` writes i32 column indices");
-    let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "argmax_rows_bfloat16",
-        F32 => "argmax_rows_float32",
-    });
-    let rows = nonzero(OP, "rows", x.rows)?;
-    nonzero(OP, "width", x.width)?;
-    if column >= y.width {
-        return Err(refuse(
-            OP,
-            format!(
-                "column {column} is outside the {}-wide plane it writes",
-                y.width
-            ),
-        ));
-    }
-    debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
-    ctx.fire(
-        Fire::at("sampling/argmax_rows.metal", entry)
-            .apply(Grid::of([1024, rows, 1], [1024, 1, 1])),
-        &[
-            x.arg(),
-            y.arg_mut(),
-            stated(OP, x.width)?.arg(),
-            stated(OP, y.width)?.arg(),
-            stated(OP, column)?.arg(),
         ],
     )
 }
@@ -154,39 +123,6 @@ pub fn split_qkv(
             v.arg_mut(),
             q_width.arg(),
             kv_width.arg(),
-        ],
-    )
-}
-
-pub fn split_q_gate(
-    ctx: &Ctx<'_>,
-    packed: Tensor,
-    head_dim: u32,
-    q: Tensor,
-    gate: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "gather.split_q_gate";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "q_gate_split_bfloat16" });
-    nonzero(OP, "the head width this cut walks", head_dim)?;
-    if q.width == 0 || !q.width.is_multiple_of(head_dim) {
-        return Err(refuse(
-            OP,
-            format!(
-                "the {}-wide query half does not divide by the stated head width {head_dim}",
-                q.width
-            ),
-        ));
-    }
-    let lanes = head_grid(OP, head_dim, q.width / head_dim, packed.rows)?;
-    ctx.fire(
-        Fire::at("elemwise/gate.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
-        &[
-            packed.arg(),
-            q.arg_mut(),
-            gate.arg_mut(),
-            stated(OP, head_dim)?.arg(),
-            stated(OP, packed.width)?.arg(),
-            stated(OP, q.width)?.arg(),
         ],
     )
 }
@@ -798,146 +734,6 @@ pub fn embed_weighted(
     )
 }
 
-pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result<(), Error> {
-    const OP: &str = "gather.rs_copy";
-    if bytes == 0 {
-        return Ok(());
-    }
-    if !bytes.is_multiple_of(4) {
-        return Err(refuse(
-            OP,
-            format!("{bytes} bytes is not a whole number of 32-bit words"),
-        ));
-    }
-    let words = u32::try_from(bytes / 4).map_err(|_| {
-        refuse(
-            OP,
-            format!("{bytes} bytes is more than one launch addresses"),
-        )
-    })?;
-    ctx.fire(
-        Fire::at("runtime/blit.metal", "rs_copy_words")
-            .apply(Grid::of([words, 1, 1], [words.min(256), 1, 1])),
-        &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
-    )
-}
-
-/// Up to four word copies in one launch, `(src, dst, bytes)` each; the
-/// copies must not overlap one another, since they run side by side.
-pub fn copy_words_batch(ctx: &Ctx<'_>, copies: &[(Tensor, Tensor, u64)]) -> Result<(), Error> {
-    const OP: &str = "gather.rs_copy";
-    let copies: Vec<&(Tensor, Tensor, u64)> = copies.iter().filter(|c| c.2 > 0).collect();
-    match copies.as_slice() {
-        [] => return Ok(()),
-        [(src, dst, bytes)] => return copy_words(ctx, *src, *dst, *bytes),
-        _ => {}
-    }
-    if copies.len() > 4 {
-        return Err(refuse(
-            OP,
-            format!("{} copies is more than one launch takes", copies.len()),
-        ));
-    }
-    let mut words = [0u32; 4];
-    let mut args = Vec::with_capacity(12);
-    for (at, word) in words.iter_mut().enumerate() {
-        match copies.get(at) {
-            Some((src, dst, bytes)) => {
-                if !bytes.is_multiple_of(4) {
-                    return Err(refuse(
-                        OP,
-                        format!("{bytes} bytes is not a whole number of 32-bit words"),
-                    ));
-                }
-                *word = u32::try_from(bytes / 4).map_err(|_| {
-                    refuse(
-                        OP,
-                        format!("{bytes} bytes is more than one launch addresses"),
-                    )
-                })?;
-                args.push(src.arg());
-                args.push(dst.arg_mut());
-            }
-            None => {
-                args.push(ctx.absent()?);
-                args.push(ctx.absent()?);
-            }
-        }
-    }
-    let widest = words.iter().copied().max().unwrap_or(1).max(1);
-    args.extend(words.iter().map(|w| w.arg()));
-    ctx.fire(
-        Fire::at("runtime/blit.metal", "rs_copy_words4").apply(Grid::of(
-            [widest, copies.len() as u32, 1],
-            [widest.min(256), 1, 1],
-        )),
-        &args,
-    )
-}
-
-const TOPK_THREADS: u32 = 128;
-/// A row this wide is a vocabulary: one 128-thread group a row left the
-/// device a few cores' worth of work for a draft block's eight rows.
-const TOPK_WIDE_FROM: u32 = 16_384;
-const TOPK_WIDE_THREADS: u32 = 1024;
-
-pub fn topk(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    k: u32,
-    values: Tensor,
-    indices: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "sampling.top_k";
-    let wide = x.width >= TOPK_WIDE_FROM;
-    let entry = match (x.dtype, k, wide) {
-        (Dtype::Bf16, 8, false) => "topk_rows_bfloat16_k_8",
-        (Dtype::Bf16, 16, false) => "topk_rows_bfloat16_k_16",
-        (Dtype::F32, 8, false) => "topk_rows_float32_k_8",
-        (Dtype::F32, 16, false) => "topk_rows_float32_k_16",
-        (Dtype::Bf16, 8, true) => "topk_rows_wide_bfloat16_k_8",
-        (Dtype::Bf16, 16, true) => "topk_rows_wide_bfloat16_k_16",
-        (Dtype::F32, 8, true) => "topk_rows_wide_float32_k_8",
-        (Dtype::F32, 16, true) => "topk_rows_wide_float32_k_16",
-        (dtype, k, _) => {
-            return Err(refuse(
-                OP,
-                format!(
-                    "no point is stamped for {dtype:?} rows at k = {k}; the plane stamps bf16 and f32 at 8 and 16"
-                ),
-            ));
-        }
-    };
-    let rows = nonzero(OP, "rows", x.rows)?;
-    nonzero(OP, "width", x.width)?;
-    if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
-        return Err(refuse(
-            OP,
-            format!("the values plane is not [{rows}, {k}] f32"),
-        ));
-    }
-    if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
-        return Err(refuse(
-            OP,
-            format!("the indices plane is not [{rows}, {k}] i32"),
-        ));
-    }
-    let threads = if wide {
-        TOPK_WIDE_THREADS
-    } else {
-        TOPK_THREADS
-    };
-    ctx.fire(
-        Fire::at("sampling/topk.metal", entry).apply(Grid::of([threads, rows, 1], [threads, 1, 1])),
-        &[
-            x.arg(),
-            values.arg_mut(),
-            indices.arg_mut(),
-            stated(OP, x.width)?.arg(),
-        ],
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_every_case() {
+    fn gather_every_case() {
         a_banked_table_of_no_rows_is_refused_by_name();
         a_row_map_that_is_not_an_i32_vector_is_refused_by_name();
         a_map_that_names_a_different_number_of_rows_is_refused_by_name();

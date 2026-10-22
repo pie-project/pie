@@ -362,7 +362,7 @@ pub fn ngram_ids_committed(
     ctx: &Ctx<'_>,
     ids: Tensor,
     indptr: Tensor,
-    committed: &crate::attn::ssm::Committed,
+    committed: &crate::ssm::Committed,
     state: &RecurrentPool,
     hash: Tensor,
     eos: u32,

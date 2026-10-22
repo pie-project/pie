@@ -1,5 +1,4 @@
 use kernels_metal::attn;
-use kernels_metal::spatial;
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::{Attn, IndexScore, Operands, RaggedMask, StructKind};
 
@@ -65,15 +64,15 @@ impl Run<'_> {
                 segment,
                 sm_scale,
                 o,
-            } => spatial::attn::attention(
+            } => attn::voxel::attention(
                 self.ctx(),
                 self.tensor(*q),
                 self.tensor(*k),
                 self.tensor(*v),
                 self.tensor(*grid),
                 match segment {
-                    poem_ir::VoxelSegment::Clip => spatial::attn::Segment::Clip,
-                    poem_ir::VoxelSegment::Frames(n) => spatial::attn::Segment::Frames(*n),
+                    poem_ir::VoxelSegment::Clip => attn::voxel::Segment::Clip,
+                    poem_ir::VoxelSegment::Frames(n) => attn::voxel::Segment::Frames(*n),
                 },
                 *sm_scale,
                 self.tensor(*o),

@@ -1,22 +1,12 @@
 pub mod arbiter;
-pub mod q8;
-pub mod split;
-
 pub mod dense;
-
+pub mod kv_codec;
 pub mod merge;
-
-pub mod ple;
-
-pub mod score;
-
-pub mod ssm;
-
-pub mod dynconv;
-
-pub mod selector;
-
+pub mod q8;
 pub mod ragged;
+pub mod score;
+pub mod split;
+pub mod voxel;
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -1002,7 +992,7 @@ fn append_paged(
                         format!(
                             "the packed KV codec has no write shader stamped at head width \
                              {other}; it packs whole {:?}-element heads",
-                            crate::linear::kv_codec::BLOCKS
+                            crate::attn::kv_codec::BLOCKS
                         ),
                     ));
                 }

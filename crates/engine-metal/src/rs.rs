@@ -46,7 +46,7 @@ pub struct Layout {
 }
 
 /// The snapshot rows one lane lands in a fire (`Lane::rs_snapshots`):
-/// [`kernels_metal::attn::ssm::RS_SNAPSHOTS`] where every op that reads a
+/// [`kernels_metal::ssm::RS_SNAPSHOTS`] where every op that reads a
 /// state slot is a conv or gated-delta scan, whose prompt arms land them;
 /// else none, and a pass is cut at each.
 #[must_use]
@@ -79,7 +79,7 @@ pub fn snapshots(trace: &Trace) -> u32 {
         )
     });
     if lands && any {
-        kernels_metal::attn::ssm::RS_SNAPSHOTS
+        kernels_metal::ssm::RS_SNAPSHOTS
     } else {
         0
     }
@@ -378,7 +378,7 @@ impl Buffers {
 /// buffer through: the in-page token of the lane's first extended row, or
 /// -1 for a lane that buffers nothing, then the slab slots of the pages its
 /// extended rows touch.
-pub const PAGE_INTS: u32 = kernels_metal::attn::ssm::RS_PAGE_INTS;
+pub const PAGE_INTS: u32 = kernels_metal::ssm::RS_PAGE_INTS;
 
 /// The page table of `lanes`, one [`PAGE_INTS`] row a lane, where every
 /// lane's replayed and own rows fit the row's pages; else `None`, and the
@@ -550,17 +550,13 @@ impl Seat {
 
     /// The buffer of the plane `value` is read into, as a verify arm reads
     /// it through the page table; `None` without a page table or a plane.
-    pub fn paged(
-        &self,
-        handles: &Handles,
-        value: ValueId,
-    ) -> Option<kernels_metal::attn::ssm::Paged> {
+    pub fn paged(&self, handles: &Handles, value: ValueId) -> Option<kernels_metal::ssm::Paged> {
         let pages = self.pages?;
         let plane = *self.layout.in_of.get(&value.0)?;
         let at = self.plane_at[plane];
         let slab = self.page_bytes.checked_mul(u64::from(self.pool_slots))?;
         let view = handles.cut(self.pool, at, slab.checked_sub(at)?).ok()?;
-        Some(kernels_metal::attn::ssm::Paged {
+        Some(kernels_metal::ssm::Paged {
             slab: Tensor::new(view, 1, 1, Dtype::U8),
             pages,
             page_tokens: self.page_tokens,

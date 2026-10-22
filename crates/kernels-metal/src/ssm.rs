@@ -5,6 +5,8 @@ use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, state
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 use crate::tuning::GdnScan;
 
+pub mod dyn_conv;
+
 const CONV_GROUP: u32 = 256;
 
 /// The rows one thread of a prompt's conv runs in turn. One thread a channel

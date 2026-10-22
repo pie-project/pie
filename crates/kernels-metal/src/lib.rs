@@ -2,20 +2,19 @@
 pub mod ane;
 pub mod attn;
 pub mod collective;
+pub mod conv;
 pub mod elemwise;
 pub mod encode;
 pub mod error;
-pub mod icb;
-pub mod layout;
+pub mod gather;
 pub mod ledger;
 pub mod linear;
+pub mod runtime;
+pub mod sampling;
+pub mod ssm;
 
 #[cfg(test)]
 pub(crate) mod probe;
-
-pub mod tripwire;
-
-pub mod spatial;
 
 pub mod sources;
 pub mod tensor;

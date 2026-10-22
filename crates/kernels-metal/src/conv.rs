@@ -1,6 +1,5 @@
-pub mod attn;
-pub mod conv;
-pub mod norm;
+pub mod conv3d;
+pub mod group_norm;
 pub mod resample;
 pub mod rule;
 

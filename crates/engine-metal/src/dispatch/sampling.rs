@@ -1,4 +1,4 @@
-use kernels_metal::{attn, layout};
+use kernels_metal::sampling;
 use poem_exec::{DispatchSampling, KernelError};
 use poem_ir::{Operands, Sampling};
 
@@ -18,7 +18,7 @@ impl Run<'_> {
                 k,
                 values,
                 indices,
-            } => layout::topk(
+            } => sampling::topk(
                 self.ctx(),
                 self.tensor(*x),
                 *k,
@@ -27,7 +27,7 @@ impl Run<'_> {
             ),
             Sampling::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
-                    layout::argmax(
+                    sampling::argmax(
                         self.ctx(),
                         self.tensor(*x),
                         u32::try_from(column).expect("a draft depth inside u32"),
@@ -45,7 +45,7 @@ impl Run<'_> {
                 succ,
                 first,
                 picks,
-            } => attn::selector::walk(
+            } => sampling::selector_walk::walk(
                 self.ctx(),
                 self.ragged(*cand),
                 self.tensor(*unary),

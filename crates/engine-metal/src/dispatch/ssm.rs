@@ -1,5 +1,5 @@
 use crate::run::Run;
-use kernels_metal::attn;
+use kernels_metal::ssm;
 use poem_exec::{DispatchSsm, KernelError};
 use poem_ir::{Operands, Ssm};
 
@@ -86,19 +86,19 @@ impl Run<'_> {
                 let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
                 let prepped = seat.prepped.borrow_mut().remove(&gates.0);
                 if let Some((ba, dt_bias, a_log)) = prepped
-                    && attn::ssm::gated_delta_verify_fits(*k_dim, *v_dim)
+                    && ssm::gated_delta_verify_fits(*k_dim, *v_dim)
                 {
                     let paged = seat.paged(self.handles(), ba);
                     let ba = match paged {
                         Some(_) => self.tensor(ba),
                         None => self.rs_extend(OP, &seat, ba)?,
                     };
-                    return attn::ssm::gated_delta_verify(
+                    return ssm::gated_delta_verify(
                         self.ctx(),
                         ext_qkv,
                         self.qo_indptr(),
                         &self.rs_committed(&seat),
-                        &attn::ssm::VerifyGates {
+                        &ssm::VerifyGates {
                             ba,
                             dt_bias,
                             a_log,
@@ -121,7 +121,7 @@ impl Run<'_> {
                 }
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::gated_delta_committed_landing(
+                ssm::gated_delta_committed_landing(
                     self.ctx(),
                     self.tuning(),
                     ext_qkv,
@@ -147,7 +147,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } => attn::ssm::causal_conv1d(
+            } => ssm::causal_conv1d(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
@@ -164,7 +164,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } => attn::ssm::causal_conv1d_chunked_landing(
+            } => ssm::causal_conv1d_chunked_landing(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
@@ -195,7 +195,7 @@ impl Run<'_> {
                     self.tensor(*y),
                 );
                 match self.producer_table(*y) {
-                    Some((table, counters)) => attn::dynconv::block_dyn_conv_table(
+                    Some((table, counters)) => ssm::dyn_conv::block_dyn_conv_table(
                         self.ctx(),
                         x,
                         coeff,
@@ -207,7 +207,7 @@ impl Run<'_> {
                         table,
                         counters,
                     ),
-                    None => attn::dynconv::block_dyn_conv(
+                    None => ssm::dyn_conv::block_dyn_conv(
                         self.ctx(),
                         x,
                         coeff,
@@ -224,7 +224,7 @@ impl Run<'_> {
                 dt_bias,
                 a_log,
                 gates,
-            } => attn::ssm::gdn_prep(
+            } => ssm::gdn_prep(
                 self.ctx(),
                 self.tensor(*ba),
                 self.tensor(*dt_bias),
@@ -241,7 +241,7 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta(
+            } => ssm::gated_delta(
                 self.ctx(),
                 self.tuning(),
                 self.tensor(*qkv),
@@ -264,7 +264,7 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta_chunked_landing(
+            } => ssm::gated_delta_chunked_landing(
                 self.ctx(),
                 self.tuning(),
                 self.ragged(*qkv),
@@ -310,7 +310,7 @@ impl Run<'_> {
                 let ext_f = self.rs_extend(OP, &seat, *f)?;
                 let ext_b = self.rs_extend(OP, &seat, *b)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::kda_committed(
+                ssm::kda_committed(
                     self.ctx(),
                     ext_mixed,
                     self.qo_indptr(),
@@ -341,7 +341,7 @@ impl Run<'_> {
                 norm_eps,
                 gate_floor,
                 y,
-            } => attn::ssm::kda_step(
+            } => ssm::kda_step(
                 self.ctx(),
                 self.tensor(*mixed),
                 self.tensor(*f),
@@ -367,7 +367,7 @@ impl Run<'_> {
                 norm_eps,
                 gate_floor,
                 y,
-            } => attn::ssm::kda_chunked(
+            } => ssm::kda_chunked(
                 self.ctx(),
                 self.ragged(*mixed),
                 self.tensor(*f),

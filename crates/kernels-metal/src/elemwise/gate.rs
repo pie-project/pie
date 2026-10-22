@@ -1,7 +1,8 @@
 use crate::error::Error;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated,
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, head_group, nonzero, refuse,
+    stated,
 };
 use crate::tensor::Tensor;
 
@@ -105,6 +106,39 @@ pub fn sigmoid_mul_table(
             table.arg_mut(),
             x.rows.arg(),
             counters.arg(),
+        ],
+    )
+}
+
+pub fn split_q_gate(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    head_dim: u32,
+    q: Tensor,
+    gate: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.split_q_gate";
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "q_gate_split_bfloat16" });
+    nonzero(OP, "the head width this cut walks", head_dim)?;
+    if q.width == 0 || !q.width.is_multiple_of(head_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide query half does not divide by the stated head width {head_dim}",
+                q.width
+            ),
+        ));
+    }
+    let lanes = head_grid(OP, head_dim, q.width / head_dim, packed.rows)?;
+    ctx.fire(
+        Fire::at("elemwise/gate.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
+        &[
+            packed.arg(),
+            q.arg_mut(),
+            gate.arg_mut(),
+            stated(OP, head_dim)?.arg(),
+            stated(OP, packed.width)?.arg(),
+            stated(OP, q.width)?.arg(),
         ],
     )
 }

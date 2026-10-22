@@ -50,7 +50,7 @@ pub fn attention(
             });
         }
     }
-    let clips = super::clips_of(OP, grid)?;
+    let clips = crate::conv::clips_of(OP, grid)?;
     let channels = q.width;
     if k.width != channels || v.width != channels || y.width != channels {
         return Err(refuse(

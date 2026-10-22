@@ -3,8 +3,8 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::attn::ssm::{self, Committed};
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
+use kernels_metal::ssm::{self, Committed};
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use poem_ir::Dtype;
 
