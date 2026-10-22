@@ -47,8 +47,13 @@ impl Control for ControlServer {
         self.handle.watch_gateway_poll(since).await
     }
 
-    async fn desire_scale(self, _: tarpc::context::Context, entries: Vec<ScaleEntry>) {
-        self.handle.desire_scale(entries).await;
+    async fn desire_scale(
+        self,
+        _: tarpc::context::Context,
+        gateway: GatewayId,
+        entries: Vec<ScaleEntry>,
+    ) {
+        self.handle.desire_scale(gateway, entries).await;
     }
 
     async fn scale_status(self, _: tarpc::context::Context) -> Vec<ScaleStatus> {

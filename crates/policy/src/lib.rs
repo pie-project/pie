@@ -200,6 +200,7 @@ pub mod worker {
                 | Edge::LinkChanged(_)
                 | Edge::PlacementChanged(_)
                 | Edge::ReplicationChanged(_)
+                | Edge::RetentionChanged(_)
                 | Edge::Published(_) => {}
             }
         }
@@ -243,6 +244,10 @@ pub mod cluster {
         /// call, or its death), since this program's last call (attr
         /// `replication/sites`).
         fn on_replication_changed(&mut self, _group: &Id) {}
+        /// Another program changed this group's committed retention key (a
+        /// call, or its death), since this program's last call (attr
+        /// `retention/key`).
+        fn on_retention_changed(&mut self, _group: &Id) {}
         /// Another program published or withdrew a value about this subject
         /// (a call, or its death), since this program's last call (attrs
         /// `published/<program>/<name>`).
@@ -271,6 +276,7 @@ pub mod cluster {
                 Edge::LinkChanged(link) => policy.on_link_changed(link),
                 Edge::PlacementChanged(process) => policy.on_placement_changed(process),
                 Edge::ReplicationChanged(group) => policy.on_replication_changed(group),
+                Edge::RetentionChanged(group) => policy.on_retention_changed(group),
                 Edge::Published(subject) => policy.on_published(subject),
                 Edge::Timer => policy.on_timer(),
                 // Worker edges: a cluster host does not send them.

@@ -305,8 +305,11 @@ fn start(
 ) -> Result<(Store<HostState>, bindings::Worker), String> {
     let mut store = Store::new(pre.engine(), HostState::new(name, manifest));
     store.limiter(|state| &mut state.limits);
-    // A component's initializers are guest code, bounded like any call.
-    store.set_epoch_deadline(ticks(manifest.deadline_ms));
+    // A component's initializers are guest code, bounded like any call;
+    // but instantiating also lays out its memory on the host against the
+    // same wall-clock ticks, so it is held to the longest deadline a
+    // manifest may state, not this one's.
+    store.set_epoch_deadline(ticks(super::manifest::MAX_DEADLINE_MS));
     let instance = block_on(pre.instantiate_async(&mut store)).map_err(|e| format!("{e:#}"))?;
     Ok((store, instance))
 }
@@ -406,6 +409,7 @@ fn edge_name(edge: &Edge) -> &'static str {
         Edge::LinkChanged(_) => "link-changed",
         Edge::PlacementChanged(_) => "placement-changed",
         Edge::ReplicationChanged(_) => "replication-changed",
+        Edge::RetentionChanged(_) => "retention-changed",
         Edge::Published(_) => "published",
         Edge::Offloaded(_) => "offloaded",
         Edge::OffloadFailed(_) => "offload-failed",

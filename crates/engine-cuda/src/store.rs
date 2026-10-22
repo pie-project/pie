@@ -519,17 +519,20 @@ pub struct Pools {
     /// never trimmed since.
     whole: bool,
     /// The moves to or from the host tier still on the swap stream, and
-    /// the read-outs on the tap stream, each with the device pages it holds.
+    /// the read-outs on the tap stream, each with the device pages and the
+    /// host slots it holds.
     swaps: Vec<Swap>,
 }
 
-/// A move between the device and the host tier, on the swap stream: its
-/// paged and windowed device pages, and the event it lands at.
+/// A move between the device and the host tier, on the swap stream, or a
+/// tap's read-out: its paged and windowed device pages, the paged host
+/// slots it reads or writes, and the event it lands at.
 #[derive(Debug)]
 struct Swap {
     landed: crate::device::graph::Event,
     paged: Vec<u32>,
     windowed: Vec<u32>,
+    host: Vec<u32>,
 }
 
 /// The slot file kv is suspended into below host memory, and the pinned
@@ -1923,20 +1926,41 @@ impl Pools {
             landed,
             paged: device.to_vec(),
             windowed: windowed.iter().map(|&(page, _)| page).collect(),
+            host: host.to_vec(),
         });
         Ok(())
     }
 
-    /// `paged` device pages are read on `stream` by what it has enqueued:
-    /// a fire that names one waits for it, as for a move.
-    pub fn hold_until(&mut self, stream: *mut core::ffi::c_void, paged: Vec<u32>) -> Result<()> {
+    /// `paged` device pages are read, and `host` slots written, on `stream`
+    /// by what it has enqueued: a fire that names one of the pages waits for
+    /// it, as for a move, and so does the host before it touches a slot.
+    pub fn hold_until(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        paged: Vec<u32>,
+        host: Vec<u32>,
+    ) -> Result<()> {
         let landed = crate::device::graph::Event::new()?;
         landed.record(stream)?;
         self.swaps.push(Swap {
             landed,
             paged,
             windowed: Vec::new(),
+            host,
         });
+        Ok(())
+    }
+
+    /// Waits, on the host, for the moves and read-outs still landing that
+    /// read or write any of the paged host `slots`: the host reads or
+    /// writes them next, and nothing else on the device touches them.
+    pub fn settle_host_slots(&mut self, slots: &[u32]) -> Result<()> {
+        self.prune_swaps()?;
+        for swap in &self.swaps {
+            if swap.host.iter().any(|slot| slots.contains(slot)) {
+                swap.landed.settle()?;
+            }
+        }
         Ok(())
     }
 

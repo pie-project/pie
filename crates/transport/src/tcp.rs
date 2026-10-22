@@ -12,9 +12,10 @@
 //! slots (below), and the bytes; 1 then u32 length and a UTF-8 reason. A
 //! source that fails mid-answer closes the stream short.
 //!
-//! A put (to a pool) is `PIEP`, u32 version, u32 key count, the keys, u64
-//! bytes per page, u32 length and the layout, the slots, then the bytes;
-//! the answer is a status as above.
+//! A put (to a pool) names a run as a request does, `PIEP`, u32 version,
+//! u32 key count, the keys from token 0, u32 first page; then the pages
+//! from that one on: u64 bytes per page, u32 length and the layout, the
+//! slots, then the bytes. The answer is a status as above.
 //!
 //! Slots: u32 per page (0 when the source has none), then that many 32-byte
 //! hashes a page, page after page: each token's chained hash. A page's key
@@ -42,7 +43,7 @@ use tokio::sync::mpsc;
 const MAGIC: &[u8; 4] = b"PIEB";
 /// A put: pages to keep, by key.
 const PUT: &[u8; 4] = b"PIEP";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// More keys than one sequence could hold is not a request.
 const MAX_KEYS: u32 = 1 << 20;
 /// More groups, spans a group or slots a page than a model's layers and
@@ -287,12 +288,13 @@ pub type Answer = Pin<Box<dyn Future<Output = Result<Stream, String>> + Send>>;
 pub type Taken = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 /// What a worker serves: the bytes of pages `keys[from..]`; and, where it
-/// keeps what others send it, pages to keep.
+/// keeps what others send it, the run `keys` (from token 0) with its pages
+/// `keys[from..]` to keep.
 pub trait Source: Send + Sync + 'static {
     fn read(&self, keys: Vec<Key>, from: u32) -> Answer;
 
-    fn write(&self, keys: Vec<Key>, pages: Pages) -> Taken {
-        let _ = (keys, pages);
+    fn write(&self, keys: Vec<Key>, from: u32, pages: Pages) -> Taken {
+        let _ = (keys, from, pages);
         Box::pin(async { Err("this worker keeps no pages it is sent".to_string()) })
     }
 }
@@ -409,17 +411,21 @@ async fn answer(mut stream: TcpStream, source: &dyn Source) -> std::io::Result<(
         for key in &mut keys {
             stream.read_exact(key).await?;
         }
+        let from = stream.read_u32_le().await?;
         if put {
+            let Some(count) = keys.len().checked_sub(from as usize) else {
+                return Err(std::io::Error::other("a put past its run"));
+            };
             let page_bytes = stream.read_u64_le().await? as usize;
             let mut meta = vec![0u8; stream.read_u32_le().await? as usize];
             stream.read_exact(&mut meta).await?;
-            let count = keys.len();
             let slots = read_slots(&mut stream, count).await?;
             let mut data = vec![0u8; page_bytes * count];
             stream.read_exact(&mut data).await?;
             let taken = source
                 .write(
                     keys,
+                    from,
                     Pages {
                         data,
                         count,
@@ -441,7 +447,6 @@ async fn answer(mut stream: TcpStream, source: &dyn Source) -> std::io::Result<(
             stream.flush().await?;
             continue;
         }
-        let from = stream.read_u32_le().await?;
         match source.read(keys, from).await {
             Ok(mut answer) => {
                 let mut head = Vec::with_capacity(17 + answer.meta.len());
@@ -582,10 +587,15 @@ pub async fn fetch_stream(addr: &str, keys: &[Key], from: u32) -> Result<Stream,
     })
 }
 
-/// Sends `pages`, one per key, to be kept by the worker serving `addr`.
-pub async fn put(addr: &str, keys: &[Key], pages: &Pages) -> Result<(), String> {
-    if keys.len() != pages.count {
-        return Err(format!("{} keys for {} pages", keys.len(), pages.count));
+/// Sends the run `keys` (from token 0) and its pages `keys[from..]` to be
+/// kept by the worker serving `addr`.
+pub async fn put(addr: &str, keys: &[Key], from: u32, pages: &Pages) -> Result<(), String> {
+    if keys.len().checked_sub(from as usize) != Some(pages.count) {
+        return Err(format!(
+            "{} keys from {from} for {} pages",
+            keys.len(),
+            pages.count
+        ));
     }
     let io = |e: std::io::Error| format!("{addr}: {e}");
     let mut stream = TcpStream::connect(addr).await.map_err(io)?;
@@ -597,6 +607,7 @@ pub async fn put(addr: &str, keys: &[Key], pages: &Pages) -> Result<(), String> 
     for key in keys {
         head.extend_from_slice(key);
     }
+    head.extend_from_slice(&from.to_le_bytes());
     head.extend_from_slice(&(pages.page_bytes() as u64).to_le_bytes());
     head.extend_from_slice(&(pages.meta.len() as u32).to_le_bytes());
     head.extend_from_slice(&pages.meta);
@@ -725,7 +736,7 @@ mod tests {
             meta: Vec::new(),
             slots: vec![[9u8; 32]; 4],
         };
-        let refused = put(&addr, &[[1u8; 32], [2u8; 32]], &pages)
+        let refused = put(&addr, &[[0u8; 32], [1u8; 32], [2u8; 32]], 1, &pages)
             .await
             .unwrap_err();
         assert!(refused.contains("keeps no pages"), "{refused}");

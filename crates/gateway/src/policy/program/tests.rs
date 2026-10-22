@@ -7,6 +7,7 @@ struct Fake {
     processes: Vec<(String, Vec<(String, Value)>)>,
     attrs: Vec<(String, String, Value)>,
     workers: Vec<String>,
+    groups: Vec<String>,
 }
 
 impl Fake {
@@ -38,6 +39,7 @@ impl Plane for Fake {
         match kind {
             SubjectKind::Process => self.processes.iter().map(|(id, _)| id.clone()).collect(),
             SubjectKind::Worker => self.workers.clone(),
+            SubjectKind::Group => self.groups.clone(),
             _ => Vec::new(),
         }
     }
@@ -128,6 +130,26 @@ fn test_route_orders_holds_and_places_by_its_clients_props() {
         placement["a"].props.as_slice(),
         [(name, Value::Text(from))] if name == "from" && from == "a"
     ));
+}
+
+#[test]
+fn retain_all_retains_every_group_above_key_0() {
+    let mut program = load("retain-all").unwrap();
+    let plane = Fake {
+        groups: vec!["g1".into(), "g2".into()],
+        ..Fake::default()
+    };
+    let copied = Edge::Copied(types::Residency {
+        group: "g1".into(),
+        site: types::Site {
+            worker: "1".into(),
+            tier: types::Tier::Device,
+        },
+    });
+    let commit = program.react(Box::new(plane), vec![copied], 0).unwrap();
+    let retention = commit.state.retention.expect("a retention table");
+    assert_eq!((retention.key("g1"), retention.key("g2")), (1, 1));
+    assert_eq!(retention.keys.len(), 2);
 }
 
 #[test]

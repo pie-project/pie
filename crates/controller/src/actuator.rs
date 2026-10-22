@@ -13,14 +13,21 @@
 //! is the host's choice for now, not a policy's: one that does not serve
 //! first, then the most recently launched.
 //!
-//! A launch that never registers holds its slot until its process exits. A
-//! worker a previous controller launched, registered again after that
-//! controller died, is not adopted: it counts as serving and keeps its slot
-//! taken, and this controller never stops it.
+//! A launch that never registers holds its slot until its process exits.
+//!
+//! A launch's token names its slot: a digest of the slot's entry and its
+//! index, then what makes the launch its own. A controller restarted with
+//! the same slots knows a worker its predecessor launched by that prefix
+//! when it registers again, and adopts it into its slot, signalling it by
+//! the pid it registered with. Not its child, it is not waited on: it has
+//! exited once no registered worker carries its token (it left, or its
+//! heartbeats lapsed and it was evicted). A restarted controller knows of
+//! no worker until it registers again, which a live one does within a
+//! heartbeat timeout, so it launches nothing for that long after it starts.
 
 use std::collections::{HashMap, HashSet};
 use std::process::{Child, Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use controller_api::{Health, LAUNCH_ENV, ScaleEntry, ScaleStatus};
 use ids::WorkerId;
@@ -61,7 +68,9 @@ fn taking_turns(worker: &Worker) -> bool {
 }
 
 struct Launched {
-    child: Child,
+    /// None: adopted, a previous controller's launch.
+    child: Option<Child>,
+    pid: u32,
     token: String,
     since: Instant,
     stopping: bool,
@@ -69,6 +78,8 @@ struct Launched {
 
 pub struct Actuator {
     slots: Vec<Slot>,
+    /// Each slot's token prefix: its entry's digest and its index.
+    keys: Vec<String>,
     launched: Vec<Option<Launched>>,
     desired: Vec<ScaleEntry>,
     /// Shapes told unreachable, so each is told once until it is not.
@@ -82,14 +93,41 @@ pub struct Actuator {
     /// Makes this controller's tokens its own, apart from another's.
     epoch: String,
     next_token: u64,
+    /// No launch before this: the workers alive already have registered.
+    settled: Instant,
+}
+
+/// A slot's token prefix: an FNV-1a digest of its entry, and its index. The
+/// same config gives the same prefix to the controller restarted on it.
+fn slot_key(at: usize, slot: &Slot) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let model = slot.model.as_deref().map_or(&[0xff][..], str::as_bytes);
+    let fields = [model, slot.engine.as_bytes()]
+        .into_iter()
+        .chain(slot.command.iter().map(|arg| arg.as_bytes()));
+    for field in fields {
+        for &byte in field.iter().chain(&[0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}-{at}")
 }
 
 impl Actuator {
+    /// Launches wait `settle` (the heartbeat timeout), so the workers a
+    /// predecessor launched have registered again and are adopted first.
     #[must_use]
-    pub fn new(slots: Vec<Slot>) -> Self {
+    pub fn new(slots: Vec<Slot>, settle: Duration) -> Self {
         let launched = slots.iter().map(|_| None).collect();
+        let keys = slots
+            .iter()
+            .enumerate()
+            .map(|(at, slot)| slot_key(at, slot))
+            .collect();
         Self {
             slots,
+            keys,
             launched,
             desired: Vec::new(),
             short: HashSet::new(),
@@ -102,6 +140,7 @@ impl Actuator {
                     .map_or(0, |d| d.as_nanos())
             ),
             next_token: 0,
+            settled: Instant::now() + settle,
         }
     }
 
@@ -125,8 +164,11 @@ impl Actuator {
             let status = self.count(&shape, entry.workers, workers);
             let have = status.serving + status.launching;
             if have < entry.workers {
+                if Instant::now() < self.settled {
+                    continue;
+                }
                 let want = entry.workers - have;
-                let launched = self.launch(&shape, want, workers);
+                let launched = self.launch(&shape, want);
                 if launched < want {
                     if self.short.insert(shape.clone()) {
                         tracing::warn!(
@@ -160,12 +202,33 @@ impl Actuator {
 
     /// A worker registered: one that came of a launch is checked against
     /// its slot's shape, which a table counts it under only when they agree.
-    pub fn registered(&self, worker: &Worker) {
+    /// One a previous controller launched into a slot of this config that
+    /// is free here is adopted into it.
+    pub fn registered(&mut self, worker: &Worker) {
         let Some(token) = worker.launch.as_deref() else {
             return;
         };
-        let Some(at) = self.ours(token) else {
-            return;
+        let at = match self.ours(token) {
+            Some(at) => at,
+            None => {
+                let Some(at) = self.slot_of(token) else {
+                    tracing::warn!(%token, "a worker registered with a launch token no slot of this controller's config gave; it is not this controller's to stop");
+                    return;
+                };
+                let (Some(pid), None) = (worker.pid, &self.launched[at]) else {
+                    tracing::warn!(slot = at, %token, pid = ?worker.pid, "a previous launch of a slot registered, but the slot is taken or it told no pid; not adopted");
+                    return;
+                };
+                tracing::info!(slot = at, pid, %token, "adopted a worker a previous controller launched");
+                self.launched[at] = Some(Launched {
+                    child: None,
+                    pid,
+                    token: token.to_string(),
+                    since: Instant::now(),
+                    stopping: false,
+                });
+                at
+            }
         };
         let shape = shape_of(&self.slots[at]);
         if !serves(worker, &shape) {
@@ -184,7 +247,7 @@ impl Actuator {
     pub fn stop_all(&mut self) {
         for launched in self.launched.iter_mut().flatten() {
             if !launched.stopping {
-                launched.stopping = terminate(&launched.child);
+                launched.stopping = terminate(launched.pid);
             }
         }
     }
@@ -196,15 +259,14 @@ impl Actuator {
             .position(|l| l.as_ref().is_some_and(|l| l.token == token))
     }
 
-    /// Slots a previous controller's launch, registered here, still holds.
-    fn orphaned(&self, workers: &HashMap<WorkerId, Worker>) -> HashSet<usize> {
-        let prefix = format!("{}-", self.epoch);
-        workers
-            .values()
-            .filter_map(|w| w.launch.as_deref())
-            .filter(|t| !t.starts_with(&prefix) && !self.gone.contains(*t))
-            .filter_map(|t| t.split('-').nth(1)?.parse().ok())
-            .collect()
+    /// The slot whose prefix `token` carries: a launch into it, by this
+    /// controller or one before it on the same config.
+    fn slot_of(&self, token: &str) -> Option<usize> {
+        self.keys.iter().position(|key| {
+            token
+                .strip_prefix(key.as_str())
+                .is_some_and(|rest| rest.starts_with('-'))
+        })
     }
 
     fn count(
@@ -233,18 +295,15 @@ impl Actuator {
                     .is_none_or(|t| !stopping_tokens.contains(t) && !self.gone.contains(t))
             })
             .count() as u32;
-        let orphaned = self.orphaned(workers);
         let ours = self
             .slots
             .iter()
             .zip(&self.launched)
-            .enumerate()
-            .filter(|(_, (slot, _))| shape_of(slot) == *shape);
+            .filter(|(slot, _)| shape_of(slot) == *shape);
         let (mut launching, mut stopping, mut free) = (0, 0, 0);
-        for (at, (_, launched)) in ours {
+        for (_, launched) in ours {
             match launched {
-                None if !orphaned.contains(&at) => free += 1,
-                None => {}
+                None => free += 1,
                 Some(l) if l.stopping => stopping += 1,
                 Some(l) if !registered.contains(l.token.as_str()) => launching += 1,
                 Some(_) => {}
@@ -263,17 +322,13 @@ impl Actuator {
 
     /// Launches up to `want` workers of `shape` into free slots; how many
     /// it did.
-    fn launch(&mut self, shape: &Shape, want: u32, workers: &HashMap<WorkerId, Worker>) -> u32 {
-        let orphaned = self.orphaned(workers);
+    fn launch(&mut self, shape: &Shape, want: u32) -> u32 {
         let mut done = 0;
         for at in 0..self.slots.len() {
             if done == want {
                 break;
             }
-            if self.launched[at].is_some()
-                || orphaned.contains(&at)
-                || shape_of(&self.slots[at]) != *shape
-            {
+            if self.launched[at].is_some() || shape_of(&self.slots[at]) != *shape {
                 continue;
             }
             let slot = &self.slots[at];
@@ -281,7 +336,7 @@ impl Actuator {
                 continue;
             };
             self.next_token += 1;
-            let token = format!("{}-{at}-{}", self.epoch, self.next_token);
+            let token = format!("{}-{}.{}", self.keys[at], self.epoch, self.next_token);
             match Command::new(program)
                 .args(args)
                 .env(LAUNCH_ENV, &token)
@@ -292,7 +347,8 @@ impl Actuator {
                     tracing::info!(slot = at, pid = child.id(), %token, model = ?shape.0, engine = %shape.1, "launched a worker to meet the scale table");
                     self.failing.remove(&at);
                     self.launched[at] = Some(Launched {
-                        child,
+                        pid: child.id(),
+                        child: Some(child),
                         token,
                         since: Instant::now(),
                         stopping: false,
@@ -329,28 +385,33 @@ impl Actuator {
         });
         for at in ours.into_iter().take(count as usize) {
             if let Some(launched) = self.launched[at].as_mut() {
-                tracing::info!(slot = at, pid = launched.child.id(), token = %launched.token, "stopping a worker the scale table no longer wants; it drains first");
-                launched.stopping = terminate(&launched.child);
+                tracing::info!(slot = at, pid = launched.pid, token = %launched.token, "stopping a worker the scale table no longer wants; it drains first");
+                launched.stopping = terminate(launched.pid);
             }
         }
     }
 
     /// Frees the slots whose worker exited, and forgets the tokens of exits
-    /// no worker is registered under any more.
+    /// no worker is registered under any more. A child exited when it can be
+    /// waited on; an adopted worker, once no registered worker carries its
+    /// token.
     fn reap(&mut self, workers: &HashMap<WorkerId, Worker>) {
-        for (at, slot) in self.launched.iter_mut().enumerate() {
-            let exited = slot
-                .as_mut()
-                .is_some_and(|l| !matches!(l.child.try_wait(), Ok(None)));
-            if exited && let Some(l) = slot.take() {
-                tracing::info!(slot = at, token = %l.token, "a launched worker exited; its slot is free");
-                self.gone.insert(l.token);
-            }
-        }
         let registered: HashSet<&str> = workers
             .values()
             .filter_map(|w| w.launch.as_deref())
             .collect();
+        for (at, slot) in self.launched.iter_mut().enumerate() {
+            let exited = slot.as_mut().is_some_and(|l| match l.child.as_mut() {
+                Some(child) => !matches!(child.try_wait(), Ok(None)),
+                None => !registered.contains(l.token.as_str()),
+            });
+            if exited && let Some(l) = slot.take() {
+                tracing::info!(slot = at, token = %l.token, "a launched worker exited; its slot is free");
+                if l.child.is_some() {
+                    self.gone.insert(l.token);
+                }
+            }
+        }
         self.gone.retain(|t| registered.contains(t.as_str()));
     }
 }
@@ -361,37 +422,43 @@ impl Actuator {
 impl Drop for Actuator {
     fn drop(&mut self) {
         self.stop_all();
-        for launched in self.launched.iter_mut().flatten() {
-            let _ = launched.child.try_wait();
+        for child in self
+            .launched
+            .iter_mut()
+            .flatten()
+            .filter_map(|l| l.child.as_mut())
+        {
+            let _ = child.try_wait();
         }
     }
 }
 
-/// SIGTERM to `child`, so the worker drains before it goes; whether it was
-/// sent. Unsent, the worker is stopped again on the next step.
+/// SIGTERM to `pid`, a child or an adopted worker, so the worker drains
+/// before it goes; whether it was sent. Unsent, the worker is stopped again
+/// on the next step.
 #[cfg(unix)]
-fn terminate(child: &Child) -> bool {
-    let sent = i32::try_from(child.id())
+fn terminate(pid: u32) -> bool {
+    let sent = i32::try_from(pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
         .map(|pid| rustix::process::kill_process(pid, rustix::process::Signal::TERM));
     match sent {
         Some(Ok(())) => true,
         Some(Err(error)) => {
-            tracing::warn!(pid = child.id(), %error, "SIGTERM refused; trying again next step");
+            tracing::warn!(pid, %error, "SIGTERM refused; trying again next step");
             false
         }
         None => {
-            tracing::warn!(pid = child.id(), "no pid to signal");
+            tracing::warn!(pid, "no pid to signal");
             false
         }
     }
 }
 
 #[cfg(not(unix))]
-fn terminate(child: &Child) -> bool {
+fn terminate(pid: u32) -> bool {
     tracing::warn!(
-        pid = child.id(),
+        pid,
         "stopping a worker needs a signal it can drain on; this host has none"
     );
     false
@@ -421,8 +488,10 @@ mod tests {
     /// Kills what the test launched, past the drain a stop would wait for.
     fn kill_all(actuator: &mut Actuator) {
         for launched in actuator.launched.iter_mut().flatten() {
-            let _ = launched.child.kill();
-            let _ = launched.child.wait();
+            if let Some(child) = launched.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
         actuator.launched.iter_mut().for_each(|l| *l = None);
     }
@@ -442,6 +511,7 @@ mod tests {
             engine: "cuda_native".into(),
             addr: String::new(),
             launch,
+            pid: None,
             last_hb: Instant::now(),
             load: WorkerStatus::default(),
             health: Health::Healthy,
@@ -458,7 +528,7 @@ mod tests {
 
     #[test]
     fn it_launches_to_the_table_and_stops_what_it_launched_past_it() {
-        let mut actuator = Actuator::new(vec![slot("m"), slot("m"), slot("m")]);
+        let mut actuator = Actuator::new(vec![slot("m"), slot("m"), slot("m")], Duration::ZERO);
         let mut workers = HashMap::new();
         // A worker it did not launch serves the shape already.
         workers.insert(WorkerId(9), worker("m", None));
@@ -505,10 +575,13 @@ mod tests {
 
     #[test]
     fn a_slot_whose_worker_exited_is_free_again() {
-        let mut actuator = Actuator::new(vec![Slot {
-            command: vec!["true".into()],
-            ..slot("m")
-        }]);
+        let mut actuator = Actuator::new(
+            vec![Slot {
+                command: vec!["true".into()],
+                ..slot("m")
+            }],
+            Duration::ZERO,
+        );
         actuator.desire(vec![entry("m", 1)]);
         actuator.converge(&HashMap::new());
         assert!(actuator.launched[0].is_some());
@@ -525,7 +598,7 @@ mod tests {
 
     #[test]
     fn a_shape_past_its_slots_is_unreachable_and_one_not_named_keeps_what_it_has() {
-        let mut actuator = Actuator::new(vec![slot("m"), slot("n")]);
+        let mut actuator = Actuator::new(vec![slot("m"), slot("n")], Duration::ZERO);
         let mut workers = HashMap::new();
         workers.insert(WorkerId(1), worker("n", None));
         workers.insert(WorkerId(2), worker("n", None));
@@ -551,13 +624,16 @@ mod tests {
     fn a_stopped_worker_still_registered_after_it_exited_does_not_count() {
         // One kept, one stopped: the stopped one exits on its signal, and
         // stays registered until its heartbeats lapse.
-        let mut actuator = Actuator::new(vec![
-            slot("m"),
-            Slot {
-                command: vec!["sleep".into(), "1000".into()],
-                ..slot("m")
-            },
-        ]);
+        let mut actuator = Actuator::new(
+            vec![
+                slot("m"),
+                Slot {
+                    command: vec!["sleep".into(), "1000".into()],
+                    ..slot("m")
+                },
+            ],
+            Duration::ZERO,
+        );
         actuator.desire(vec![entry("m", 2)]);
         actuator.converge(&HashMap::new());
         let mut workers = HashMap::new();
@@ -581,7 +657,7 @@ mod tests {
 
     #[test]
     fn a_draining_worker_does_not_count_as_serving() {
-        let mut actuator = Actuator::new(vec![slot("m")]);
+        let mut actuator = Actuator::new(vec![slot("m")], Duration::ZERO);
         let mut workers = HashMap::new();
         let mut draining = worker("m", None);
         draining.load.draining = true;
@@ -598,16 +674,16 @@ mod tests {
 
     #[test]
     fn a_stop_whose_signal_missed_is_not_held_as_stopping() {
-        let mut actuator = Actuator::new(vec![slot("m")]);
+        let mut actuator = Actuator::new(vec![slot("m")], Duration::ZERO);
         actuator.desire(vec![entry("m", 1)]);
         actuator.converge(&HashMap::new());
         let token = tokens(&actuator)[0].clone().expect("launched");
         let mut workers = HashMap::new();
         workers.insert(WorkerId(1), worker("m", Some(token)));
         // Its process is gone behind the actuator's back: no signal lands.
-        if let Some(l) = actuator.launched[0].as_mut() {
-            let _ = l.child.kill();
-            let _ = l.child.wait();
+        if let Some(child) = actuator.launched[0].as_mut().and_then(|l| l.child.as_mut()) {
+            let _ = child.kill();
+            let _ = child.wait();
         }
         let shape = (Some("m".to_string()), "cuda_native".to_string());
         actuator.stop(&shape, 1, &workers);
@@ -626,30 +702,98 @@ mod tests {
         );
     }
 
+    /// A worker a previous controller launched into slot `at` of `slots`,
+    /// still running as `child`, registered again with its token and pid.
+    fn relaunched(slots: &[Slot], at: usize, child: &Child) -> Worker {
+        let token = format!("{}-dead.7", slot_key(at, &slots[at]));
+        Worker {
+            pid: Some(child.id()),
+            ..worker("m", Some(token))
+        }
+    }
+
     #[test]
-    fn a_previous_controllers_launch_keeps_its_slot_and_is_never_stopped() {
-        let mut actuator = Actuator::new(vec![slot("m"), slot("m")]);
+    fn a_previous_controllers_launch_is_adopted_into_its_slot_and_stopped_by_its_pid() {
+        let slots = vec![slot("m"), slot("m")];
+        // The previous controller's launch into slot 1, not this one's child.
+        let mut theirs = Command::new("sleep").arg("1000").spawn().expect("spawn");
+        let mut actuator = Actuator::new(slots.clone(), Duration::ZERO);
         let mut workers = HashMap::new();
-        workers.insert(WorkerId(1), worker("m", Some("dead-0-7".into())));
+        let adopted = relaunched(&slots, 1, &theirs);
+        actuator.registered(&adopted);
+        workers.insert(WorkerId(1), adopted);
+        assert!(
+            actuator.launched[1]
+                .as_ref()
+                .is_some_and(|l| l.child.is_none() && l.pid == theirs.id()),
+            "adopted into slot 1, by its pid"
+        );
+
+        // Two wanted: slot 0 is launched, slot 1 is the adopted one's.
         actuator.desire(vec![entry("m", 2)]);
         actuator.converge(&workers);
-        assert!(actuator.launched[0].is_none(), "slot 0 is the orphan's");
-        assert!(actuator.launched[1].is_some(), "slot 1 meets the table");
+        assert!(
+            actuator.launched[0]
+                .as_ref()
+                .is_some_and(|l| l.child.is_some())
+        );
         let status = actuator.status(&workers);
-        assert_eq!((status[0].serving, status[0].free), (1, 0));
+        assert_eq!(
+            (status[0].serving, status[0].launching, status[0].free),
+            (1, 1, 0)
+        );
+
+        // Down to none: the adopted one is signalled too, and drains.
         actuator.desire(vec![entry("m", 0)]);
         actuator.converge(&workers);
-        assert_eq!(
-            actuator.status(&workers)[0].serving,
-            1,
-            "the orphan is not stopped"
+        assert_eq!(actuator.status(&workers)[0].stopping, 2);
+        let exit = theirs.wait().expect("wait");
+        assert!(
+            !exit.success(),
+            "SIGTERM reached a process it did not spawn"
         );
+
+        // It leaves: no worker carries its token, so its slot is free.
+        workers.clear();
+        actuator.converge(&workers);
+        assert!(actuator.launched[1].is_none(), "its slot is free again");
         kill_all(&mut actuator);
     }
 
     #[test]
+    fn only_a_free_slot_of_the_same_config_adopts() {
+        let slots = vec![slot("m")];
+        let mut theirs = Command::new("sleep").arg("1000").spawn().expect("spawn");
+        // Another config: the slot's entry differs, so its digest does.
+        let other = vec![Slot {
+            command: vec!["other".into()],
+            ..slot("m")
+        }];
+        let mut actuator = Actuator::new(other.clone(), Duration::ZERO);
+        actuator.registered(&relaunched(&slots, 0, &theirs));
+        assert!(actuator.launched[0].is_none(), "not this config's launch");
+
+        // The same config, the slot taken by its own launch: not adopted.
+        let mut actuator = Actuator::new(slots.clone(), Duration::ZERO);
+        actuator.desire(vec![entry("m", 1)]);
+        actuator.converge(&HashMap::new());
+        let own = actuator.launched[0].as_ref().map(|l| l.token.clone());
+        actuator.registered(&relaunched(&slots, 0, &theirs));
+        assert_eq!(actuator.launched[0].as_ref().map(|l| l.token.clone()), own);
+        kill_all(&mut actuator);
+
+        // A restarted controller launches nothing while workers come back.
+        let mut actuator = Actuator::new(slots, Duration::from_secs(60));
+        actuator.desire(vec![entry("m", 1)]);
+        actuator.converge(&HashMap::new());
+        assert!(actuator.launched[0].is_none(), "settling: no launch yet");
+        let _ = theirs.kill();
+        let _ = theirs.wait();
+    }
+
+    #[test]
     fn a_stop_takes_a_launch_that_does_not_serve_first() {
-        let mut actuator = Actuator::new(vec![slot("m"), slot("m")]);
+        let mut actuator = Actuator::new(vec![slot("m"), slot("m")], Duration::ZERO);
         actuator.desire(vec![entry("m", 2)]);
         actuator.converge(&HashMap::new());
         let launched: Vec<String> = tokens(&actuator).into_iter().flatten().collect();

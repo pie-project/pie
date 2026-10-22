@@ -134,6 +134,9 @@ interface types {
         /// The committed replication of this group changed (attr
         /// `replication/sites`).
         replication-changed(id),
+        /// The committed retention key of this group changed (attr
+        /// `retention/key`).
+        retention-changed(id),
         /// A value a cluster program published about this subject changed
         /// (attrs `published/<program>/<name>`).
         published(subject),

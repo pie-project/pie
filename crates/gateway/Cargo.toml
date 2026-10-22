@@ -54,6 +54,7 @@ wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p3"
 [dev-dependencies]
 builtins = { path = "../builtins", features = ["test-policies"] }
 tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true
