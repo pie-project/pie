@@ -68,7 +68,7 @@ struct Input {
     /// Every round drafts, and verifies the rows its draft's confidence pays
     /// for at the rows' measured prices; see `budget`. Overrides `priced`,
     /// `auto_width` and the yield floor; `verify_rows` still caps the block.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     verify_budget: bool,
     #[serde(default = "default_drafter")]
     drafter: String,
