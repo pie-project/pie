@@ -3,6 +3,37 @@ pub mod conditional;
 pub mod ctx;
 pub mod elastic;
 pub mod graph;
+#[cfg(feature = "device")]
+pub mod held;
+/// Without a device runtime nothing is kept: no shape pools.
+#[cfg(not(feature = "device"))]
+pub mod held {
+    pub mod pool {
+        use crate::device::{Buffer, Pinned};
+
+        pub type Held = (Pinned, Pinned, Option<Buffer>);
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub struct PoolKey;
+
+        #[must_use]
+        pub fn key(_device_only: bool, _cells: usize) -> Option<PoolKey> {
+            None
+        }
+
+        #[must_use]
+        pub fn commit_key(_bytes: usize) -> Option<PoolKey> {
+            None
+        }
+
+        #[must_use]
+        pub fn take(_key: PoolKey) -> Option<Held> {
+            None
+        }
+
+        pub fn give(_key: PoolKey, _held: Held) {}
+    }
+}
 #[cfg(feature = "rocm")]
 pub mod hip;
 
@@ -14,8 +45,8 @@ pub use cudarc::{cublas::sys as blas, driver::sys as dr, nccl::sys as nccl, runt
 pub use hip::{blas, dr, nccl, rt};
 
 pub use alloc::{
-    Buffer, Pinned, Pinning, copy_any, copy_d2d, copy_d2h, free_bytes, stage_raw, zero_span,
-    zero_span_on,
+    Buffer, Pinned, Pinning, copy_any, copy_batch, copy_d2d, copy_d2h, free_bytes, stage_raw,
+    zero_span, zero_span_on,
 };
 pub use ctx::{Context, count, present};
 pub use elastic::{Arena, PhysicalPool};

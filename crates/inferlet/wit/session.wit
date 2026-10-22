@@ -75,5 +75,4 @@ interface session {
     /// This process's own token counts, for the scheduling policy: report
     /// `prompt` as soon as it is tokenized.
     set-tokens: func(prompt: u32, generated: u32);
-
 }

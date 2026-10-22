@@ -44,10 +44,21 @@ mod tests {
 
     #[test]
     fn a_data_url_decodes_and_a_remote_one_is_refused() {
-        assert_eq!(data_url("data:image/png;base64,aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(
+            data_url("data:image/png;base64,aGVsbG8=").unwrap(),
+            b"hello"
+        );
         assert_eq!(base64("aGVs\nbG8").unwrap(), b"hello");
-        assert!(data_url("https://example.com/a.png").unwrap_err().contains("remote"));
-        assert!(data_url("data:image/png,raw").unwrap_err().contains("base64"));
+        assert!(
+            data_url("https://example.com/a.png")
+                .unwrap_err()
+                .contains("remote")
+        );
+        assert!(
+            data_url("data:image/png,raw")
+                .unwrap_err()
+                .contains("base64")
+        );
         assert!(data_url("data:image/png;base64,a*b").is_err());
     }
 }

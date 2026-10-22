@@ -98,6 +98,57 @@ fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize>
 }
 
 impl Shell {
+    /// The taps the fire's lanes ask for, a group a layer, each with every
+    /// tapped lane's copies and landings.
+    fn tapping(
+        &mut self,
+        lanes: &[super::lanes::Seated<'_>],
+    ) -> Result<Option<crate::tap::Tapping>> {
+        let taps: Vec<&engine::fire::Tap> = lanes.iter().filter_map(|seated| seated.tap).collect();
+        if taps.is_empty() {
+            return Ok(None);
+        }
+        let (Some(plan), Some(sink)) = (self.kv_taps.as_ref(), self.tap_sink.clone()) else {
+            return Err(Fault::Unsupported(
+                "a lane asks for a tap, and this load reads no layer out as it goes".to_string(),
+            ));
+        };
+        if let Some(tap) = taps.iter().find(|tap| tap.pages.len() != tap.slots.len()) {
+            return Err(Fault::program(
+                "serve::tap",
+                format!(
+                    "a tap names {} pages and {} host slots",
+                    tap.pages.len(),
+                    tap.slots.len()
+                ),
+            ));
+        }
+        let mut groups = Vec::with_capacity(plan.len());
+        for (index, group) in plan.iter().enumerate() {
+            let mut copies = Vec::new();
+            let mut lands = Vec::with_capacity(taps.len());
+            for tap in &taps {
+                let spans = self
+                    .pools
+                    .tap_spans(&group.planes, &tap.pages, &tap.slots)?;
+                copies.extend(spans.copies);
+                lands.push((tap.tag, spans.lands));
+            }
+            groups.push(crate::tap::Group {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                layer: group.layer,
+                copies,
+                lands,
+            });
+        }
+        Ok(Some(crate::tap::Tapping::new(
+            groups,
+            self.device.stream(),
+            self.device.tap_stream(),
+            sink,
+        )))
+    }
+
     pub(super) fn enqueue_on(
         &mut self,
         p: &mut Prepared<'_>,
@@ -139,7 +190,9 @@ impl Shell {
             .rs_scratch
             .as_ref()
             .map(|have| (have.ptr(), have.bytes() as u64));
+        let tapping = self.tapping(p.lanes)?;
         let mut fire = FireCtx {
+            tapping: tapping.as_ref(),
             device: &self.device,
             trace: &self.trace,
             compiled: &self.compiled,
@@ -183,12 +236,25 @@ impl Shell {
         super::btrace::mark("route");
         let readback = fire.readback(p, &staged)?;
         super::btrace::mark("readback");
+        if tapping.is_some() {
+            // The read-outs hold the tapped pages until they land: a later
+            // fire that writes one waits for them (`Pools::fence_swaps`).
+            let pages: Vec<u32> = p
+                .lanes
+                .iter()
+                .filter_map(|seated| seated.tap)
+                .flat_map(|tap| tap.pages.iter().copied())
+                .collect();
+            self.pools.hold_until(self.device.tap_stream(), pages)?;
+        }
         super::btrace::flush(seq);
         Ok((p.windows.launches(), readback))
     }
 }
 
 struct FireCtx<'a> {
+    /// The fire's taps, when a lane asks for one.
+    tapping: Option<&'a crate::tap::Tapping>,
     device: &'a Context,
     trace: &'a Trace,
     compiled: &'a CompiledModel,
@@ -565,7 +631,6 @@ impl FireCtx<'_> {
                 commit_len,
             )
             .splitting(commit_len);
-        #[cfg(feature = "rocm")]
         let seats = seats.snapshotting(
             self.predicate
                 .snapshots(self.device.stream(), &p.rs.snapshots)?,
@@ -680,8 +745,8 @@ impl FireCtx<'_> {
             },
             scores: self
                 .scores
-                .filter(|_| p.lanes.iter().any(|seated| seated.captures_scores))
-                .map(Scores::seat),
+                .zip(handles.score_seats)
+                .map(|(slab, seat_of)| slab.seat(seat_of)),
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
@@ -762,7 +827,8 @@ impl FireCtx<'_> {
         .across(&side_ctx, &stream)
         .ceilings(ceilings)
         .decoded_tiles(self.decoded_tiles)
-        .unread(self.unread);
+        .unread(self.unread)
+        .tapping(self.tapping);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
@@ -850,6 +916,12 @@ impl FireCtx<'_> {
             .map_err(Fault::from)
         };
         drop(run);
+        if let Some(tapping) = self.tapping {
+            match &walked {
+                Ok(()) => tapping.finish(),
+                Err(error) => tapping.fail(&error.to_string()),
+            }
+        }
         self.device.ctx().disarm();
         self.device.ctx().disarm_stage();
         self.device.ctx().disarm_region();
@@ -1051,12 +1123,10 @@ impl FireCtx<'_> {
         // a tensor-parallel rank captured only its band of each layer's heads;
         // the epilogue reads the model's planes, so the bands are gathered
         // first (every rank fires the same frame, so every rank gathers the
-        // same lanes)
+        // same seats)
         if let Some(slab) = self.scores {
-            for (lane, seated) in p.lanes.iter().enumerate() {
-                if seated.captures_scores {
-                    slab.gather(self.device.ctx(), lane as u32)?;
-                }
+            for seat in p.score_seat_of.iter().flatten() {
+                slab.gather(self.device.ctx(), *seat)?;
             }
         }
         let mut epilogues = AirborneFires::default();
@@ -1230,18 +1300,12 @@ impl FireCtx<'_> {
                     0,
                 )?;
             }
-            if let Some(slab) = self.scores.filter(|_| {
-                p.lanes
+            if let Some((slab, seat)) = self.scores.zip(
+                p.score_seat_of
                     .get(attached.lane as usize)
-                    .is_some_and(|seated| seated.captures_scores)
-            }) {
-                if attached.lane >= slab.lanes() {
-                    return Err(Fault::Ceiling {
-                        what: "fire lanes the score slab seats",
-                        need: u64::from(attached.lane) + 1,
-                        have: u64::from(slab.lanes()),
-                    });
-                }
+                    .copied()
+                    .flatten(),
+            ) {
                 let declared = self.programs.declared_score_planes(attached.instance);
                 if let Some(declared) = declared
                     && declared > slab.planes()
@@ -1255,7 +1319,7 @@ impl FireCtx<'_> {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::AttnScore,
-                    slab.lane_base(attached.lane),
+                    slab.seat_base(seat),
                     crate::program::launch::INTRINSIC_STORAGE_F32,
                     crate::scores::KV_MAX,
                     crate::scores::KV_MAX,

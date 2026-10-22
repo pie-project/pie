@@ -29,6 +29,18 @@ __device__ __forceinline__ bool folds(
     return write_state && row_persists(mask, r);
 }
 
+// A lane's state snapshots: entries snap[rl]..snap[rl + 1] of snap_rows (rows
+// inside the lane, ascending) and snap_slots, each the state after that many
+// rows landed in a slot of its own. None where snap is null.
+struct Snaps {
+    int e0;
+    int e1;
+};
+
+__device__ __forceinline__ Snaps snaps_of(const int* snap, int rl) {
+    return snap == nullptr ? Snaps{0, 0} : Snaps{snap[rl], snap[rl + 1]};
+}
+
 template <bool SILU, bool RESIDUAL>
 __device__ __forceinline__ float conv_out(float acc, float x_t) {
     if constexpr (RESIDUAL) {
@@ -650,6 +662,9 @@ __global__ void ssm_causal_conv1d_state_commit(
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
     const int* begin_at,
+    const int* __restrict__ snap,
+    const int* __restrict__ snap_rows,
+    const int* __restrict__ snap_slots,
     const u32* __restrict__ win,
     int lanes_stated)
 {
@@ -678,6 +693,17 @@ __global__ void ssm_causal_conv1d_state_commit(
     const int span = (K - 1) * dil + 1;
     const T* x_r = x + static_cast<long long>(t0 + row0) * C;
     T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+    // Each snapshot's window, from the rows and the window the lane started
+    // with, before the lane's own overwrites it.
+    const Snaps sn = snaps_of(snap, rl);
+    for (int e = sn.e0; e < sn.e1 && snap_rows[e] < Nr; ++e) {
+        T* at = state_out_base + static_cast<long long>(snap_slots[e]) * slot_stride_elems;
+        for (int s = 0; s < span; ++s) {
+            const int src_t = snap_rows[e] - span + s;
+            at[s * C + c] = src_t < 0 ? state[(span + src_t) * C + c]
+                                      : x_r[static_cast<long long>(src_t) * C + c];
+        }
+    }
     for (int s = 0; s < span; ++s) {
         const int src_t = Nr - span + s;
         const float v = (src_t < 0)
@@ -2497,6 +2523,9 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
     const u8* __restrict__ write_state_mask,
     const int* __restrict__ begin_at,
     bool fused_decay,
+    const int* __restrict__ snap,
+    const int* __restrict__ snap_rows,
+    const int* __restrict__ snap_slots,
     const u32* __restrict__ win)
 {
 
@@ -2551,6 +2580,7 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
     }
 
     const bool single_round = fused_decay;
+    Snaps sn = snaps_of(snap, rl);
 
     for (int t = 0; t < T; ++t) {
         const long long bh = (long long)(t0 + t) * V_h + h;
@@ -2604,6 +2634,25 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
         }
 
         out[((long long)(t0 + t + row0) * V_h + h) * V_d + v_idx] = out_v;
+        // A snapshot lands the state the walk carries, as a pass cut there
+        // stores it.
+        if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
+            if (write_state && row_persists(write_state_mask, rl)) {
+                StateT* sat = state_base
+                    + (long long)snap_slots[sn.e0] * slot_stride_elems
+                    + (long long)h * K_d * V_d;
+                #pragma unroll
+                for (int j = 0; j < BK_MAX / 2; ++j) {
+                    const int k0 = 2 * j;
+                    if (k0 >= K_d) break;
+                    const int k1 = k0 + 1;
+                    const float2 sv = __bfloat1622float2(bh_state[j]);
+                    state_store(sat + (long long)k0 * V_d + v_idx, sv.x);
+                    if (k1 < K_d) state_store(sat + (long long)k1 * V_d + v_idx, sv.y);
+                }
+            }
+            ++sn.e0;
+        }
         __syncthreads();
     }
 
@@ -3459,6 +3508,73 @@ __device__ __forceinline__ int gdn_slot_lane(
     return lo;
 }
 
+// A snapshot row is a chunk boundary: the rows between two are chunked from
+// the first, as a pass cut there would chunk them, so a request takes at most
+// one more chunk slot a snapshot (`snap[rl]` of them before lane `rl`'s).
+__device__ __forceinline__ int gdn_chunk_base_snap(
+    int r,
+    const u32* __restrict__ qo_indptr,
+    const int* __restrict__ begin_at,
+    const int* __restrict__ snap,
+    const u32* __restrict__ win)
+{
+    const int base = gdn_chunk_base(r, qo_indptr, begin_at, win);
+    if (snap == nullptr) return base;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    return base + snap[rl];
+}
+
+__device__ __forceinline__ int gdn_slot_lane_snap(
+    int s, int lanes,
+    const u32* __restrict__ qo_indptr,
+    const int* __restrict__ begin_at,
+    const int* __restrict__ snap,
+    const u32* __restrict__ win)
+{
+    int lo = 0, hi = lanes - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (gdn_chunk_base_snap(mid, qo_indptr, begin_at, snap, win) <= s) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+// Chunk j of a lane: its first row, its rows (none past the last chunk),
+// and the snapshot its end lands (-1: none).
+struct GdnChunk {
+    int ta;
+    int L;
+    int snap;
+};
+
+__device__ __forceinline__ GdnChunk gdn_chunk(
+    const GdnLane& ln, Snaps sn, int j, const int* __restrict__ snap_rows)
+{
+    int a = 0;
+    for (int e = sn.e0; e < sn.e1; ++e) {
+        const int b = snap_rows[e];
+        if (b >= ln.T) break;
+        const int n = (b - a + GDN_CH - 1) / GDN_CH;
+        if (j < n) {
+            return {ln.t0 + a + j * GDN_CH, min(GDN_CH, b - a - j * GDN_CH), j == n - 1 ? e : -1};
+        }
+        j -= n;
+        a = b;
+    }
+    return {ln.t0 + a + j * GDN_CH, min(GDN_CH, ln.T - a - j * GDN_CH), -1};
+}
+
+__device__ __forceinline__ int gdn_chunks(
+    const GdnLane& ln, Snaps sn, const int* __restrict__ snap_rows)
+{
+    int a = 0, n = 0;
+    for (int e = sn.e0; e < sn.e1 && snap_rows[e] < ln.T; ++e) {
+        n += (snap_rows[e] - a + GDN_CH - 1) / GDN_CH;
+        a = snap_rows[e];
+    }
+    return n + (ln.T - a + GDN_CH - 1) / GDN_CH;
+}
+
 // The chunked scan's tensor-core pieces: a bf16 `m16n8k16` with f32
 // accumulators and `ldmatrix` fragment loads, plain and transposed.
 __device__ __forceinline__ void gdn_mma(
@@ -3536,6 +3652,8 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
     bf16* __restrict__ p_out,
     int lanes, int K_h, int V_h, int conv_dim,
     float q_scale,
+    const int* __restrict__ snap,
+    const int* __restrict__ snap_rows,
     const u32* __restrict__ win)
 {
     static_assert(BK == 128 && BV == 128, "a lane carries four of a 128-wide row");
@@ -3553,13 +3671,15 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
     const int s = blockIdx.y;
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0) return;
-    const int r = gdn_slot_lane(s, lanes, qo_indptr, begin_at, win);
+    const int r = gdn_slot_lane_snap(s, lanes, qo_indptr, begin_at, snap, win);
     const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
-    const int j = s - (lane.t0 / GDN_CH + r);
-    if (j < 0 || j * GDN_CH >= lane.T) return;
-    const int ta = lane.t0 + j * GDN_CH;
-    const int L = min(GDN_CH, lane.t0 + lane.T - ta);
+    const int j = s - gdn_chunk_base_snap(r, qo_indptr, begin_at, snap, win);
+    if (j < 0) return;
+    const GdnChunk ck = gdn_chunk(lane, snaps_of(snap, lane.rl), j, snap_rows);
+    if (ck.L <= 0) return;
+    const int ta = ck.ta;
+    const int L = ck.L;
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int group = V_h / K_h;
     const int hk = h / group;
@@ -3859,6 +3979,9 @@ __global__ void __launch_bounds__(256) ssm_chunk_scan(
     const u8* __restrict__ write_state_mask,
     float* __restrict__ out,
     int lanes, int K_h, int V_h,
+    const int* __restrict__ snap,
+    const int* __restrict__ snap_rows,
+    const int* __restrict__ snap_slots,
     const u32* __restrict__ win)
 {
     constexpr int BK = 128;
@@ -3895,7 +4018,9 @@ __global__ void __launch_bounds__(256) ssm_chunk_scan(
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int hk = h / (V_h / K_h);
     const int v0 = vt * BV;
-    const int base = lane.t0 / GDN_CH + r;
+    const int base = gdn_chunk_base_snap(r, qo_indptr, begin_at, snap, win);
+    const Snaps sn = snaps_of(snap, lane.rl);
+    const bool lands = write_state && row_persists(write_state_mask, lane.rl);
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int l = tid & 31;
@@ -3926,10 +4051,11 @@ __global__ void __launch_bounds__(256) ssm_chunk_scan(
         }
     }
 
-    const int nchunks = (lane.T + GDN_CH - 1) / GDN_CH;
+    const int nchunks = gdn_chunks(lane, sn, snap_rows);
     auto span = [&](int jc, int& ta, int& L) {
-        ta = lane.t0 + jc * GDN_CH;
-        L = min(GDN_CH, lane.t0 + lane.T - ta);
+        const GdnChunk ck = gdn_chunk(lane, sn, jc, snap_rows);
+        ta = ck.ta;
+        L = ck.L;
     };
     auto load_k = [&](int jc) {
         int ta, L;
@@ -4122,18 +4248,33 @@ __global__ void __launch_bounds__(256) ssm_chunk_scan(
                 }
             }
         }
+        // A snapshot lands the state as stored and the walk carries on from
+        // it rounded, as a pass cut there reloads it.
+        const int at_snap = sn.e0 < sn.e1 ? gdn_chunk(lane, sn, jc, snap_rows).snap : -1;
         #pragma unroll
         for (int q = 0; q < NT; ++q) {
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                *reinterpret_cast<unsigned*>(hs + h_row(q, half) * LDV + h_col(q)) =
-                    gdn_pack(hacc[q][2 * half], hacc[q][2 * half + 1]);
+                const unsigned packed = gdn_pack(hacc[q][2 * half], hacc[q][2 * half + 1]);
+                *reinterpret_cast<unsigned*>(hs + h_row(q, half) * LDV + h_col(q)) = packed;
+                if (at_snap >= 0) {
+                    const float2 f = gdn_unpack(packed);
+                    hacc[q][2 * half] = f.x;
+                    hacc[q][2 * half + 1] = f.y;
+                    if (lands) {
+                        State* sat = static_cast<State*>(state_base)
+                            + static_cast<long long>(snap_slots[at_snap]) * slot_stride_elems
+                            + static_cast<long long>(h) * BK * V;
+                        *reinterpret_cast<unsigned*>(
+                            sat + static_cast<long long>(h_row(q, half)) * V + v0 + h_col(q)) = packed;
+                    }
+                }
             }
         }
     }
     gdn_cp_wait_all();
 
-    if (write_state && row_persists(write_state_mask, lane.rl)) {
+    if (lands) {
         #pragma unroll
         for (int q = 0; q < NT; ++q) {
             #pragma unroll

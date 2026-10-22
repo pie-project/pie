@@ -164,6 +164,8 @@ wgpu = ["worker/wgpu"]
 xla = ["worker/xla"]
 cerebras = ["worker/cerebras"]
 profile-fire = ["worker/profile-fire"]
+# Reads peers' kv in place over NIXL (needs NIXL_PREFIX at build).
+nixl = ["worker/nixl"]
 
 [dependencies]
 dirs = "7.0"

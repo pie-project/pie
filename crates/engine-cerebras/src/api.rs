@@ -463,6 +463,7 @@ impl Engine for Cerebras {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                max_scoring_lanes: 0,
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY

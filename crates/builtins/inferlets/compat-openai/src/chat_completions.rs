@@ -112,7 +112,9 @@ fn content_parts(content: Option<Value>, param: &str) -> Result<(String, Vec<Vec
                             .and_then(|u| u.get("url").or(Some(u)))
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        images.push(compat::image::data_url(url).map_err(|e| invalid(e, Some(param)))?);
+                        images.push(
+                            compat::image::data_url(url).map_err(|e| invalid(e, Some(param)))?,
+                        );
                     }
                     Some(other) => {
                         return Err(invalid(
@@ -398,8 +400,9 @@ async fn choice(req: &Request, index: u32, ids: &Ids) -> Result<compat::Outcome,
     let asked = req.sampling.logprobs.is_some();
     // The role rides on the first delta, as the open servers send it: an
     // empty role chunk ahead of the prefill would read as the first token. A
-    // turn resumed here after a move sent it before the move.
-    let mut role = (!compat::resume::resuming()).then_some("assistant");
+    // turn the gateway continues builds and drops that delta again, with the
+    // frames the client already has.
+    let mut role = Some("assistant");
     let mut delta = |mut v: Value| {
         if let Some(r) = role.take() {
             v["role"] = json!(r);

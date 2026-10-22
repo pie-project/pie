@@ -557,16 +557,6 @@ def _rewrite_muse_glimmer(cfg: dict, plan: Plan) -> None:
             tc[key] = _slice_list(tc[key], plan.src_layers)
 
 
-def _rewrite_nemotron_h(cfg: dict, plan: Plan) -> None:
-    _rewrite_common(cfg, plan)
-    # `hybrid_override_pattern` names each layer's mixer by position (`M`
-    # Mamba-2, `*` attention, `E` MoE); the cut keeps the kept layers' letters.
-    tc = _text_cfg(cfg, plan)
-    pattern = tc.get("hybrid_override_pattern")
-    if isinstance(pattern, str):
-        tc["hybrid_override_pattern"] = "".join(pattern[i] for i in plan.src_layers)
-
-
 def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     tc = _text_cfg(cfg, plan)
@@ -587,17 +577,20 @@ def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
 def _rewrite_minimax_m3(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     tc = _text_cfg(cfg, plan)
-    # Its MTP modules are dropped with the layers past the block.
-    tc["num_mtp_modules"] = 0
-    tc["num_nextn_predict_layers"] = 0
-    # Which layers are routed and which index their keys, one entry a layer.
+    # Both per-layer plans are lists of 0/1 by source layer: `moe_layer_freq`
+    # says dense vs routed MLP, `sparse_attention_freq` dense vs indexed
+    # attention (and `sparse_disable_index_value` rides with it).
     if isinstance(tc.get("moe_layer_freq"), list):
         tc["moe_layer_freq"] = _slice_list(tc["moe_layer_freq"], plan.src_layers)
-    sac = tc.get("sparse_attention_config")
-    if isinstance(sac, dict):
-        for key in ("sparse_disable_index_value", "sparse_attention_freq"):
-            if isinstance(sac.get(key), list):
-                sac[key] = _slice_list(sac[key], plan.src_layers)
+    sparse = tc.get("sparse_attention_config")
+    if isinstance(sparse, dict):
+        for key in ("sparse_attention_freq", "sparse_disable_index_value"):
+            if isinstance(sparse.get(key), list):
+                sparse[key] = _slice_list(sparse[key], plan.src_layers)
+    # The draft modules are not shipped; nothing may claim them.
+    if "num_mtp_modules" in tc:
+        tc["num_mtp_modules"] = 0
+    tc["num_nextn_predict_layers"] = 0
 
 
 def _rewrite_hy_v4(cfg: dict, plan: Plan) -> None:
@@ -605,6 +598,17 @@ def _rewrite_hy_v4(cfg: dict, plan: Plan) -> None:
     # The miniature's indexer keeps sixteen keys, so the ranking is read at
     # probe lengths (`hy4-mini`'s `index_top_k`).
     cfg["index_topk"] = min(cfg.get("index_topk", 16), 16)
+
+
+def _rewrite_nemotron_h(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # `hybrid_override_pattern` is a character a source layer: M Mamba-2,
+    # E routed MoE, * attention.
+    pat = cfg.get("hybrid_override_pattern")
+    if isinstance(pat, str):
+        cfg["hybrid_override_pattern"] = "".join(pat[i] for i in plan.src_layers)
+    # The draft head is not shipped; nothing may claim it.
+    cfg.pop("mtp_hybrid_override_pattern", None)
 
 
 def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
@@ -1486,17 +1490,6 @@ FAMILIES: dict[str, dict[str, Any]] = {
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^model\.visual\."),),
     ),
-    # Nemotron-3 (Nano): Mamba-2, attention and MoE mixers named by
-    # `hybrid_override_pattern`, each expert apart; the router and its score
-    # bias slice with the bank. Six layers hold every mixer kind.
-    "nemotron_h": dict(
-        layer_prefix="backbone.layers.",
-        expert_re=re.compile(r"\.mixer\.experts\.(\d+)\."),
-        router_suffixes=("mixer.gate.weight", "mixer.gate.e_score_correction_bias"),
-        globals_keep=("backbone.embeddings.weight", "backbone.norm_f.weight", "lm_head.weight"),
-        default_layers="0-5",
-        config_rewrite=_rewrite_nemotron_h,
-    ),
     # Qwen3-Next: GDN and gated attention at 3:1, every layer routed, each
     # expert apart beside a gated shared expert. Eight layers are two
     # periods.
@@ -1530,11 +1523,27 @@ FAMILIES: dict[str, dict[str, Any]] = {
         globals_keep=("language_model.model.embed_tokens.weight",
                       "language_model.model.norm.weight",
                       "language_model.lm_head.weight"),
+        # Layers 0-2 are dense attention over a dense MLP, 3 on indexed
+        # attention over routed experts: 0-5 is every kind, the second three
+        # times.
         default_layers="0-5",
         config_rewrite=_rewrite_minimax_m3,
         text_cfg_key="text_config",
+        # The tower is kept so the miniature loads unmodified as
+        # `MiniMaxM3SparseForConditionalGeneration`.
         keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^multi_modal_projector\."),
                   re.compile(r"^patch_merge_mlp\.")),
+    ),
+    "nemotron_h": dict(
+        layer_prefix="backbone.layers.",
+        expert_re=re.compile(r"\.mixer\.experts\.(\d+)\."),
+        router_suffixes=("mixer.gate.weight", "mixer.gate.e_score_correction_bias"),
+        globals_keep=("backbone.embeddings.weight", "backbone.norm_f.weight", "lm_head.weight"),
+        # Super's MEMEMEM*E: four Mamba-2 mixers, four routed MoE layers and
+        # one attention, every kind the model has (Nano's six-layer
+        # miniature: `--layers 0-5`).
+        default_layers="0-8",
+        config_rewrite=_rewrite_nemotron_h,
     ),
     # Hy4-preview (bf16, or the FP8 release, modelopt's MXFP8: e4m3 planes
     # beside `.weight_scale` e8m0 bytes, kept as released): the routed bank

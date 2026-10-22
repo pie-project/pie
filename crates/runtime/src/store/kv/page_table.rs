@@ -1716,6 +1716,16 @@ impl KvPageTable {
         freed
     }
 
+    /// The tokens' hashes of the page at `location`.
+    pub fn token_hashes_at(&self, location: &TriePageLocation) -> Option<&[Option<Hash256>]> {
+        match &self.nodes.get(location.node)?.pages {
+            Pages::Owned { token_hashes, .. } => {
+                token_hashes.get(location.local as usize).map(Vec::as_slice)
+            }
+            Pages::ParentSelection { .. } => None,
+        }
+    }
+
     pub fn backing_at(&self, location: &TriePageLocation) -> Result<KvPageBacking, KvTableError> {
         let node = self
             .nodes

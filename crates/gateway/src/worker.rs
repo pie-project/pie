@@ -271,6 +271,9 @@ impl GatewayInbound for InboundServer {
             );
         }
         let directory = self.registry.directory();
+        if let Some(link) = report.link {
+            directory.report_link(worker_id, link);
+        }
         directory.report(
             worker_id,
             report.peer,
@@ -288,6 +291,10 @@ impl GatewayInbound for InboundServer {
         if let Some(published) = report.published {
             directory.report_published(worker_id, published);
         }
+    }
+
+    async fn link(self, _: tarpc::context::Context, worker: WorkerId) -> Option<String> {
+        self.registry.directory().link(worker)
     }
 
     async fn locate(

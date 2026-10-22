@@ -842,6 +842,7 @@ dependencies = [
  "controller-api",
  "futures",
  "ids",
+ "rustix",
  "serde",
  "tarpc",
  "tokio",

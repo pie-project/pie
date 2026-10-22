@@ -53,9 +53,8 @@ pub struct Session {
     /// A commit slot (two words the device writes) for each fire airborne
     /// at once, reused as they settle.
     commits: Vec<Pinned>,
-    /// On ROCm, the pool the commit slots return to.
-    #[cfg(feature = "rocm")]
-    commit_key: Option<crate::device::hip::held::pool::PoolKey>,
+    /// The pool the commit slots return to.
+    commit_key: Option<crate::device::held::pool::PoolKey>,
     /// The fires minted and not yet settled, oldest first: each mints
     /// against the cursors the ones ahead of it predicted.
     pending: std::collections::VecDeque<Minted>,
@@ -99,8 +98,7 @@ impl Session {
         let rings = Rings::allocate(&shapes, endpoints, stream)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
-        #[cfg(feature = "rocm")]
-        let commit_key = crate::device::hip::held::pool::commit_key(2 * size_of::<u32>());
+        let commit_key = crate::device::held::pool::commit_key(2 * size_of::<u32>());
 
         let mut session = Session {
             rings,
@@ -112,7 +110,6 @@ impl Session {
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
-            #[cfg(feature = "rocm")]
             commit_key,
             pending: std::collections::VecDeque::new(),
             cascading: false,
@@ -238,16 +235,10 @@ impl Session {
         if let Some(slot) = (0..self.commits.len()).find(|&slot| !held(slot)) {
             return Ok(slot);
         }
-        #[cfg(feature = "rocm")]
-        let commit = match self
-            .commit_key
-            .and_then(crate::device::hip::held::pool::take)
-        {
+        let commit = match self.commit_key.and_then(crate::device::held::pool::take) {
             Some((commit, _, _)) => commit,
             None => Pinned::mapped(2 * size_of::<u32>())?,
         };
-        #[cfg(not(feature = "rocm"))]
-        let commit = Pinned::mapped(2 * size_of::<u32>())?;
         self.commits.push(commit);
         Ok(self.commits.len() - 1)
     }
@@ -955,6 +946,17 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
     Ok(())
 }
 
+/// The commit slot goes back to the pool for the next session.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(key) = self.commit_key {
+            for commit in self.commits.drain(..) {
+                crate::device::held::pool::give(key, (commit, Pinned::empty(), None));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -969,17 +971,5 @@ mod tests {
             text.contains("scratch") || text.contains("descriptors"),
             "and what would go wrong: {text}"
         );
-    }
-}
-
-/// On ROCm the commit slot goes back to the pool for the next session.
-#[cfg(feature = "rocm")]
-impl Drop for Session {
-    fn drop(&mut self) {
-        if let Some(key) = self.commit_key {
-            for commit in self.commits.drain(..) {
-                crate::device::hip::held::pool::give(key, (commit, Pinned::empty(), None));
-            }
-        }
     }
 }

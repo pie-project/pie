@@ -18,9 +18,13 @@ members = [
     "drain-migrate",
     "relocate",
     "pool-replicate",
+    "replicate",
+    "disaggregate",
+    "scale-by-prop",
     "test-spin",
     "test-trap",
     "test-route",
+    "test-share",
 ]
 
 [profile.release]

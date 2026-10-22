@@ -39,6 +39,7 @@ fn the_short_conv_adds_the_input_back_and_shifts_the_window() {
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
+        snapshots: kernels_cuda::Snapshots::NONE,
     };
     let mut y = Tensor::new(y_at, rows, channels as u32, Dtype::Bf16);
     ssm::short_conv(

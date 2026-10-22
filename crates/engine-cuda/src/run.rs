@@ -578,6 +578,9 @@ pub struct Run<'c> {
 
     stood: Cell<Option<(u32, u32, Standing)>>,
 
+    /// The fire's taps, told of each node's layer as it is enqueued.
+    tapping: Option<&'c crate::tap::Tapping>,
+
     /// Rows this walk quantized for the FP8 products, by value, staged
     /// window and context, with the region and hold they sit in: their codes
     /// and scales, for the later products of the same rows.
@@ -646,6 +649,7 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
+            tapping: None,
             #[cfg(feature = "rocm")]
             fp8_rows: Vec::new(),
             #[cfg(feature = "rocm")]
@@ -714,6 +718,19 @@ impl<'c> Run<'c> {
     pub fn ceilings(mut self, ceilings: Ceilings<'c>) -> Self {
         self.ceilings = ceilings;
         self
+    }
+
+    #[must_use]
+    pub fn tapping(mut self, tapping: Option<&'c crate::tap::Tapping>) -> Self {
+        self.tapping = tapping;
+        self
+    }
+
+    /// The walk has enqueued `node`.
+    pub(crate) fn walked(&self, node: &poem_ir::Node) {
+        if let Some(tapping) = self.tapping {
+            tapping.saw(node.layer);
+        }
     }
 
     fn standing(&self) -> Standing {
@@ -2010,7 +2027,6 @@ impl<'c> Run<'c> {
         Some(RecurrentPool {
             write_state: false,
             commit_len: Tensor::ABSENT,
-            #[cfg(feature = "rocm")]
             snapshots: kernels_cuda::Snapshots::NONE,
             ..cut
         })
@@ -2044,7 +2060,6 @@ impl<'c> Run<'c> {
                         lanes(pool.commit_len)
                     },
                     begin_at: lanes(pool.begin_at),
-                    #[cfg(feature = "rocm")]
                     snapshots: kernels_cuda::Snapshots {
                         indptr: lanes(pool.snapshots.indptr),
                         ..pool.snapshots

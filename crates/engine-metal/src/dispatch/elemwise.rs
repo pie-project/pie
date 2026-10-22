@@ -21,28 +21,64 @@ impl Run<'_> {
                 plus_one,
                 eps,
                 out,
-            } => elemwise::norm::residual_add_rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*weight),
-                *plus_one,
-                *eps,
-                self.tensor(*out),
-            ),
+            } => {
+                // The normed rows' projections on the register tile read
+                // their input table as this norm lays it.
+                if let Some((table, counters)) = self.producer_table(*out) {
+                    return elemwise::norm::residual_add_rmsnorm_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*y),
+                        self.tensor(*weight),
+                        *plus_one,
+                        *eps,
+                        self.tensor(*out),
+                        table,
+                        counters,
+                    );
+                }
+                elemwise::norm::residual_add_rmsnorm(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*y),
+                    self.tensor(*weight),
+                    *plus_one,
+                    *eps,
+                    self.tensor(*out),
+                )
+            }
             _ => Err(kernels_metal::Error::Unsupported { op: op.name() }),
         }
     }
 
     fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_metal::Error> {
         match op {
-            Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            Elementwise::Rmsnorm { x, weight, eps, y } => {
+                // The normed rows' projections on the register tile read
+                // their input table as this norm lays it.
+                match (self.tensor(*x).width == self.tensor(*y).width)
+                    .then(|| self.producer_table(*y))
+                    .flatten()
+                {
+                    Some((table, counters)) => elemwise::norm::rmsnorm_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        false,
+                        *eps,
+                        self.tensor(*y),
+                        table,
+                        counters,
+                    ),
+                    None => elemwise::norm::rmsnorm(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        *eps,
+                        self.tensor(*y),
+                    ),
+                }
+            }
             Elementwise::RmsnormPerHead {
                 x,
                 weight,
@@ -57,13 +93,31 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::RmsnormPlusOne { x, weight, eps, y } => elemwise::norm::rmsnorm_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            Elementwise::RmsnormPlusOne { x, weight, eps, y } => {
+                // As `Rmsnorm`: the projections read the table this lays.
+                match (self.tensor(*x).width == self.tensor(*y).width)
+                    .then(|| self.producer_table(*y))
+                    .flatten()
+                {
+                    Some((table, counters)) => elemwise::norm::rmsnorm_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        true,
+                        *eps,
+                        self.tensor(*y),
+                        table,
+                        counters,
+                    ),
+                    None => elemwise::norm::rmsnorm_plus_one(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        *eps,
+                        self.tensor(*y),
+                    ),
+                }
+            }
             Elementwise::RmsnormPerHeadPlusOne {
                 x,
                 weight,
@@ -637,8 +691,21 @@ impl Run<'_> {
                 *interleaved,
             ),
 
-            Elementwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
+            Elementwise::GateSigmoidMul { x, gate, x_out } => {
+                // The gated rows' projection on the register tile reads its
+                // input table as the gate lays it.
+                match self.producer_table(*x_out) {
+                    Some((table, counters)) => elemwise::gate::sigmoid_mul_table(
+                        self.ctx(),
+                        self.tensor(*gate),
+                        self.tensor(*x),
+                        table,
+                        counters,
+                    ),
+                    None => {
+                        elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
+                    }
+                }
             }
 
             Elementwise::HcExpand { x, streams, y } => {

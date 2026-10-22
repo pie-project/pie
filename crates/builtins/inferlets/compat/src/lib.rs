@@ -19,6 +19,7 @@
 //!
 //! An adapter is then a translation in both directions and nothing else.
 
+mod continuation;
 pub mod demux;
 pub mod emit;
 pub mod envelope;
@@ -28,7 +29,6 @@ pub mod holdback;
 pub mod image;
 pub mod prompt;
 pub mod request;
-pub mod resume;
 pub mod run;
 mod speculative;
 
@@ -72,8 +72,8 @@ pub async fn join_all<T>(
 /// A short id unique to this process: the instance id's leading characters.
 /// Every response id an adapter mints is built on it.
 pub fn short_id() -> String {
-    if let Some(resume) = resume::get() {
-        return resume.id;
+    if let Some(continued) = continuation::get() {
+        return continued.id;
     }
     inferlet::runtime::instance_id()
         .chars()

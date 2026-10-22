@@ -626,8 +626,14 @@ mod tests {
     fn an_image_by_file_id_or_url_or_off_a_user_turn_is_refused() {
         for (role, part) in [
             ("user", json!({"type": "input_image", "file_id": "file-1"})),
-            ("user", json!({"type": "input_image", "image_url": "https://example.com/a.png"})),
-            ("assistant", json!({"type": "input_image", "image_url": "data:image/png;base64,aGk="})),
+            (
+                "user",
+                json!({"type": "input_image", "image_url": "https://example.com/a.png"}),
+            ),
+            (
+                "assistant",
+                json!({"type": "input_image", "image_url": "data:image/png;base64,aGk="}),
+            ),
         ] {
             let why = turn(role, json!([part])).err().expect("refused");
             assert_eq!(why.status, 400, "{}", why.body);

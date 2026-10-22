@@ -12,6 +12,13 @@
 //! - `error` — `{"status": n, "body": …}` becomes exactly that response;
 //!   any other error text is a 500.
 //!
+//! A streamed reply whose worker is lost after the client had output goes
+//! on elsewhere: each frame names, under `continuation`, the tokens it
+//! covers (taken off before the client sees it), and the request is
+//! launched again with them, the new run dropping the frames the client
+//! has. These APIs alone are continued, because their meaning is known
+//! here; any other program's turn ends and its client retries.
+//!
 //! These routes carry no authentication: pie is an offline, single-user
 //! server, and every compat request runs as tenant `default` unless an
 //! `x-plex-tenant` header names another.
@@ -203,6 +210,93 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The one request a relayed turn sends: its launch, answered under this id.
+const CORR: u32 = 1;
+
+/// What a turn is launched with, kept so it can be launched again.
+struct Launch {
+    state: GatewayState,
+    identity: Identity,
+    inferlet: String,
+    input: Value,
+    props: Props,
+    session: Option<String>,
+}
+
+impl Launch {
+    /// The turn, or (`continuation`) the same request again, going on after
+    /// what the client was sent ([`Kept`]).
+    async fn start(
+        &self,
+        continuation: Option<Value>,
+    ) -> Result<(SessionHandle, TokenRx), SessionError> {
+        let mut input = self.input.clone();
+        if let Some(continuation) = continuation {
+            input["continuation"] = continuation;
+        }
+        let turn = TurnInput {
+            message: ClientMessage::LaunchProcess {
+                corr_id: CORR,
+                inferlet: self.inferlet.clone(),
+                input: input.to_string(),
+                capture_outputs: true,
+                props: self.props.clone(),
+                session: self.session.clone(),
+                cluster_props: Props::new(),
+                executors: Vec::new(),
+            },
+            blobs: Vec::new(),
+            priority: Priority::Normal,
+        };
+        self.state
+            .sessions
+            .create(self.identity.clone(), turn, Affinity::Ephemeral)
+            .await
+    }
+}
+
+/// What the client has been sent of a streamed reply, as the frames named it
+/// under `continuation` (the built-in inferlets' `compat::continuation`): the
+/// response id, the tokens the frames covered, and how many frames there
+/// were. A turn whose worker is lost after output goes on from it elsewhere.
+#[derive(Default)]
+struct Kept {
+    id: Option<String>,
+    tokens: Vec<u64>,
+    frames: u64,
+}
+
+impl Kept {
+    /// One frame, its `continuation` taken off and kept: what the client sees.
+    fn frame(&mut self, value: &str) -> Event {
+        self.frames += 1;
+        let Ok(mut v) = serde_json::from_str::<Value>(value) else {
+            return frame(value);
+        };
+        if let Some(covers) = v.as_object_mut().and_then(|o| o.remove("continuation")) {
+            if let Some(id) = covers.get("id").and_then(Value::as_str) {
+                self.id = Some(id.to_string());
+            }
+            self.tokens.extend(
+                covers
+                    .get("tokens")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_u64),
+            );
+            return frame(&v.to_string());
+        }
+        frame(value)
+    }
+
+    /// The input's `continuation`, once a frame has named the id.
+    fn continuation(&self) -> Option<Value> {
+        let id = self.id.as_ref()?;
+        Some(json!({"id": id, "tokens": self.tokens, "frames": self.frames}))
+    }
+}
+
 /// Relay one request to `inferlet` and answer with what it emits. The
 /// session handle lives as long as the response does: dropping it cancels
 /// the turn, which is what a client going away mid-stream does.
@@ -223,33 +317,27 @@ async fn relay(
         }
     };
     let props = props(&headers, &body);
-    let input = json!({
-        "path": uri.path(),
-        "query": query,
-        "body": body,
-        "time": unix_now(),
-    });
-    let turn = TurnInput {
-        message: ClientMessage::LaunchProcess {
-            corr_id: 1,
-            inferlet: inferlet.to_string(),
-            input: input.to_string(),
-            capture_outputs: true,
-            props,
-            session: headers
-                .get(SESSION_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string),
-            cluster_props: Props::new(),
-        },
-        blobs: Vec::new(),
-        priority: Priority::Normal,
+    let launch = Launch {
+        state,
+        identity: identity(&headers),
+        inferlet: inferlet.to_string(),
+        // `continuable`: frames name what they cover, which this relay
+        // keeps and takes off ([`Kept`]); a program launched any other way
+        // sends its frames plain.
+        input: json!({
+            "path": uri.path(),
+            "query": query,
+            "body": body,
+            "time": unix_now(),
+            "continuable": true,
+        }),
+        props,
+        session: headers
+            .get(SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
     };
-    let (handle, mut rx) = match state
-        .sessions
-        .create(identity(&headers), turn, Affinity::Ephemeral)
-        .await
-    {
+    let (mut handle, mut rx) = match launch.start(None).await {
         Ok(pair) => pair,
         Err(e @ SessionError::Launch(_)) => {
             return error_body(StatusCode::BAD_REQUEST, e.to_string());
@@ -277,28 +365,48 @@ async fn relay(
                     };
                     return error_body(status, format!("{inferlet}: {result}"));
                 }
+                continue;
             }
             Some(Tokens::Chunk(ServerMessage::ProcessEvent { event, value, .. })) => {
                 match event.as_str() {
                     "message" => {
-                        return Sse::new(frames(value, rx, handle))
+                        return Sse::new(frames(launch, value, rx, handle))
                             .keep_alive(KeepAlive::default())
                             .into_response();
                     }
                     "return" => return body_response(&value),
+                    // The session counts stdout and stderr as output, but
+                    // this relay drops them: the client has had nothing, so
+                    // the request runs again from the start.
+                    "error" if rx.lost() => {}
                     "error" => return error_response(&value),
-                    _ => {} // stdout / stderr: the inferlet's own noise
+                    _ => continue, // stdout / stderr: the inferlet's own noise
                 }
             }
-            Some(Tokens::Chunk(ServerMessage::File { .. })) => {}
+            Some(Tokens::Chunk(ServerMessage::File { .. })) => continue,
             Some(Tokens::Eos) => {
                 return error_body(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("{inferlet} ended without answering"),
                 );
             }
+            None if rx.lost() => {}
             None => return error_body(StatusCode::BAD_GATEWAY, "stream aborted"),
         }
+        tracing::info!(
+            inferlet,
+            "running a request again: its worker was lost before it answered"
+        );
+        (handle, rx) = match launch.start(None).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(inferlet, error = %e, "a request whose worker was lost did not launch again");
+                return error_body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    crate::session::LOST_AFTER_OUTPUT,
+                );
+            }
+        };
     }
 }
 
@@ -352,19 +460,30 @@ fn frame(value: &str) -> Event {
     }
 }
 
+/// A streamed reply, frame by frame. If its worker is lost after the client
+/// had output, the turn goes on elsewhere from what the client was sent
+/// ([`Kept`]): the new run drops the frames the client has, so the stream
+/// goes on as it stood.
 fn frames(
+    launch: Launch,
     first: String,
     rx: TokenRx,
     handle: SessionHandle,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    let rest = futures::stream::unfold(Some((rx, handle)), |st| async move {
-        let (mut rx, handle) = st?;
+    let mut kept = Kept::default();
+    let first = kept.frame(&first);
+    let rest = futures::stream::unfold(Some((rx, handle, kept, launch)), |st| async move {
+        let (mut rx, mut handle, mut kept, launch) = st?;
         loop {
-            match rx.recv().await {
+            let lost = match rx.recv().await {
                 Some(Tokens::Chunk(ServerMessage::ProcessEvent { event, value, .. })) => {
                     match event.as_str() {
-                        "message" => return Some((Ok(frame(&value)), Some((rx, handle)))),
+                        "message" => {
+                            let event = kept.frame(&value);
+                            return Some((Ok(event), Some((rx, handle, kept, launch))));
+                        }
                         "return" => return None,
+                        "error" if rx.lost() => true,
                         "error" => {
                             let data = match serde_json::from_str::<Value>(&value) {
                                 Ok(v) => v.get("body").cloned().unwrap_or(v).to_string(),
@@ -375,21 +494,59 @@ fn frames(
                             };
                             return Some((Ok(Event::default().event("error").data(data)), None));
                         }
-                        _ => {}
+                        _ => false,
                     }
                 }
-                Some(Tokens::Chunk(_)) => {}
+                Some(Tokens::Chunk(ServerMessage::Response {
+                    ok: false, result, ..
+                })) => {
+                    let data = json!({"error": {"message": result, "type": "server_error"}});
+                    return Some((
+                        Ok(Event::default().event("error").data(data.to_string())),
+                        None,
+                    ));
+                }
+                Some(Tokens::Chunk(_)) => false,
                 Some(Tokens::Eos) => return None,
+                None if rx.lost() => true,
                 None => {
                     return Some((
                         Ok(Event::default().event("error").data("stream aborted")),
                         None,
                     ));
                 }
+            };
+            if !lost {
+                continue;
             }
+            // The worker is gone after the client had output: the request
+            // runs again elsewhere, going on after what the client has.
+            let again = match kept.continuation() {
+                Some(continuation) => match launch.start(Some(continuation)).await {
+                    Ok(pair) => Some(pair),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "a reply its worker lost did not launch again");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let Some((next_handle, next_rx)) = again else {
+                let data = json!({
+                    "error": {"message": crate::session::LOST_AFTER_OUTPUT, "type": "server_error"}
+                })
+                .to_string();
+                return Some((Ok(Event::default().event("error").data(data)), None));
+            };
+            tracing::info!(
+                frames = kept.frames,
+                tokens = kept.tokens.len(),
+                "continuing a reply its worker lost"
+            );
+            (handle, rx) = (next_handle, next_rx);
         }
     });
-    futures::stream::once(async move { Ok(frame(&first)) }).chain(rest)
+    futures::stream::once(async move { Ok(first) }).chain(rest)
 }
 
 /// `GET /v1/models`: the loaded model, in the OpenAI list shape. Answered
@@ -398,7 +555,7 @@ fn frames(
 pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
     let turn = TurnInput {
         message: ClientMessage::Query {
-            corr_id: 1,
+            corr_id: CORR,
             subject: client_api::message::QUERY_MODEL_STATUS.to_string(),
             record: String::new(),
         },
@@ -447,6 +604,24 @@ pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_keeps_what_its_frames_covered_and_the_client_never_sees_it() {
+        let mut kept = Kept::default();
+        assert_eq!(kept.continuation(), None, "nothing named yet");
+        let first = kept.frame(r#"{"data":{"x":1},"continuation":{"id":"1a2b","tokens":[]}}"#);
+        let _ = kept.frame(r#"{"event":"delta","data":{"x":2},"continuation":{"tokens":[5,6]}}"#);
+        let _ = kept.frame(r#"{"data":"[DONE]","continuation":{"tokens":[7]}}"#);
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{:?}", frame(r#"{"data":{"x":1}}"#)),
+            "the client's frame is the frame without its continuation"
+        );
+        assert_eq!(
+            kept.continuation(),
+            Some(json!({"id": "1a2b", "tokens": [5, 6, 7], "frames": 3}))
+        );
+    }
 
     #[test]
     fn a_frame_is_its_event_and_data() {

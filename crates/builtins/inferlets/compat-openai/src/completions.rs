@@ -195,7 +195,7 @@ async fn choice(
 ) -> Result<(compat::Outcome, String), String> {
     let stream = req.stream;
     let asked = req.sampling.logprobs.is_some();
-    if stream && parsed.echo && !compat::resume::resuming() {
+    if stream && parsed.echo {
         emit::send(&ids.chunk(index, &parsed.prompt, None, Value::Null));
     }
     let mut text = String::new();

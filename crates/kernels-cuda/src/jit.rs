@@ -8,6 +8,13 @@ mod launch;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod device;
+/// Without a device runtime there is no card to ask.
+#[cfg(not(feature = "cuda"))]
+pub(crate) mod device {
+    pub(crate) fn compute_capability_major() -> Option<u32> {
+        None
+    }
+}
 #[cfg(feature = "cuda")]
 pub mod nvrtc;
 mod root;
@@ -18,10 +25,9 @@ pub use root::{Features, Headers, Root, Toolchain, specific_of};
 
 use crate::error::Error;
 
-/// The current device's compute capability major, or `None` where the crate
-/// builds without CUDA (a kernel choice keyed on it then takes its default).
+/// The device's compute capability major, `None` without the device half.
 #[must_use]
-pub(crate) fn cc_major() -> Option<u32> {
+pub(crate) fn compute_capability_major() -> Option<u32> {
     #[cfg(feature = "cuda")]
     {
         device::compute_capability_major()

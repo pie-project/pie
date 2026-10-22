@@ -423,9 +423,28 @@ pub async fn generate(
     }
 
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    // Unconstrained, the prompt's last fire samples its token straight into
+    // the decode pass's channels, as each decode fire does for the next: the
+    // decode fires queue behind the prompt with no turn through the host,
+    // which reads the prompt's token once they are on their way. A grammar
+    // advances on the host before the next mask exists, so it waits; so do
+    // logprobs, which the host reads beside each token.
+    let carried_on = (matcher.is_none() && sampling.logprobs.is_none()).then(|| {
+        (
+            Channel::new([1], dtype::i32).named("tok_in").queued(),
+            penalized.then(|| {
+                (
+                    Channel::new([vocab], dtype::f32).named("counts").queued(),
+                    Channel::new([vocab], dtype::f32).named("present").queued(),
+                )
+            }),
+        )
+    });
     let mut g0 = 0i32;
+    let mut g0_later: Option<Channel> = None;
     let mut lp0 = None;
     for (k, &(base, end)) in spans.iter().enumerate() {
+        let onward = carried_on.filter(|_| k + 1 == spans.len());
         let len = end - base;
         let lag: u32 = runs.iter().filter(|r| r.1 <= base).map(|r| r.2).sum();
         let carried = images.iter().position(|(start, _)| *start == base);
@@ -463,18 +482,26 @@ pub async fn generate(
             let r = rng.take();
             let taken = hist.map(|(c, p)| (c.take(), p.take()));
             let m = mask.map(|m| m.take());
-            let (token, _, landed) = sample(
+            let (token, counts_next, landed) = sample(
                 vocab,
                 &knobs.read(),
                 &r,
                 taken.as_ref().map(|(c, p)| (c, p)),
                 m.as_ref(),
             );
-            g0_ch.put(reshape(token, [1]));
+            let token = reshape(token, [1]);
+            g0_ch.put(&token);
             if let (Some(landed), Some((values, ids))) = (landed, lp_dev) {
                 values.put(&landed.logprobs);
                 if let (Some(landed), Some(ids)) = (landed.ids, ids) {
                     ids.put(&landed);
+                }
+            }
+            if let Some((tok_in, hist)) = onward {
+                tok_in.put(&token);
+                if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
+                    c.put(&next);
+                    p.put(&present);
                 }
             }
         });
@@ -485,29 +512,44 @@ pub async fn generate(
         fwd.checkpoints(ends)?;
         fwd.submit(&pipe)
             .with_context(|| format!("prefill submit @{base}"))?;
-        g0 = g0_ch
-            .take_host::<i32>()
-            .await
-            .with_context(|| format!("prefill drain @{base}"))?;
-        lp0 = take_logprob(&lp_ch).await?;
+        if max_tokens == 1 && k + 1 == spans.len() {
+            // Nothing follows the prompt's token: the pipeline ends before
+            // it is read, as a decode's does once its budget is submitted.
+            pipe.close();
+        }
+        if onward.is_some() {
+            g0_later = Some(g0_ch);
+        } else {
+            g0 = g0_ch
+                .take_host::<i32>()
+                .await
+                .with_context(|| format!("prefill drain @{base}"))?;
+            lp0 = take_logprob(&lp_ch).await?;
+        }
     }
     let cached = ws.cached_tokens();
 
-    let mut sampled = 1usize;
-    if let Some(matcher) = matcher {
-        matcher
-            .accept_tokens(&[g0 as u32])
-            .context("advance grammar")?;
-    }
-    if on_token(g0 as u32, lp0).is_break()
-        || max_tokens == 1
-        || matcher.is_some_and(|m| m.is_terminated())
-    {
-        pipe.close();
-        return Ok((sampled, cached as usize));
+    let mut sampled = 0usize;
+    if carried_on.is_none() {
+        sampled = 1;
+        if let Some(matcher) = matcher {
+            matcher
+                .accept_tokens(&[g0 as u32])
+                .context("advance grammar")?;
+        }
+        if on_token(g0 as u32, lp0).is_break()
+            || max_tokens == 1
+            || matcher.is_some_and(|m| m.is_terminated())
+        {
+            pipe.close();
+            return Ok((sampled, cached as usize));
+        }
     }
 
-    let tok_in = Channel::from([g0]).named("tok_in");
+    let (tok_in, carried_hist) = match carried_on {
+        Some((tok_in, hist)) => (tok_in, Some(hist)),
+        None => (Channel::from([g0]).named("tok_in"), None),
+    };
     let pos = (rope_delta > 0).then(|| {
         (
             Channel::from([n - rope_delta]).named("pos"),
@@ -522,17 +564,19 @@ pub async fn generate(
     let lp_ch = logprob_channels(sampling.logprobs, "", channel_capacity() as u32);
     let lp_dev = lp_ch;
     let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
-    let hist = penalized.then(|| {
-        let mut counts0 = vec![0.0f32; vocab as usize];
-        if let Ok(g0) = usize::try_from(g0)
-            && g0 < counts0.len()
-        {
-            counts0[g0] = 1.0;
-        }
-        (
-            Channel::from(counts0).named("counts"),
-            Channel::from(present.clone()).named("present"),
-        )
+    let hist = carried_hist.unwrap_or_else(|| {
+        penalized.then(|| {
+            let mut counts0 = vec![0.0f32; vocab as usize];
+            if let Ok(g0) = usize::try_from(g0)
+                && g0 < counts0.len()
+            {
+                counts0[g0] = 1.0;
+            }
+            (
+                Channel::from(counts0).named("counts"),
+                Channel::from(present.clone()).named("present"),
+            )
+        })
     });
     let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask"));
 
@@ -600,14 +644,37 @@ pub async fn generate(
             }
         }
         _ => {
-            run_ahead(&pipe, &fwd, budget, async || {
-                let t = out.take_host::<Vec<i32>>().await?;
+            // A sampled token off `ch` to `on_token`: the prompt's, read once
+            // the decode fires are queued, then each decode fire's off `out`
+            // (with its logprobs where asked; a carried prompt token has none).
+            let mut take = async |ch: Channel,
+                                  lp: Option<&(Channel, Option<Channel>)>|
+                   -> std::result::Result<ControlFlow<()>, String> {
+                let t = ch.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
-                let lp = take_logprob(&lp_ch).await?;
+                let lp = match lp {
+                    Some(lp) => take_logprob(&Some(*lp)).await?,
+                    None => None,
+                };
                 sampled += 1;
                 Ok(on_token(token, lp))
-            })
-            .await?;
+            };
+            if budget == 0 {
+                // The prompt's token is the only one, whatever it says.
+                if let Some(g0_ch) = g0_later.take() {
+                    let _ = take(g0_ch, None).await?;
+                }
+            } else {
+                run_ahead(&pipe, &fwd, budget, async || {
+                    if let Some(g0_ch) = g0_later.take()
+                        && take(g0_ch, None).await?.is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    take(out, lp_ch.as_ref()).await
+                })
+                .await?;
+            }
         }
     }
     pipe.close();

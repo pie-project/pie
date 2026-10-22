@@ -12,6 +12,10 @@ transport = { path = "../transport", features = ["tcp"] }
 tokio = { version = "1.53", features = ["sync", "rt"] }
 tracing = "0.1"
 
+[features]
+# Keeps pages in an object store a NIXL storage plugin fronts.
+nixl = ["transport/nixl"]
+
 [dev-dependencies]
 tokio = { version = "1.53", features = ["sync", "rt", "macros", "rt-multi-thread"] }
 

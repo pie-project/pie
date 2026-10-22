@@ -120,6 +120,23 @@ interface types {
         /// A worker's tier crossed a pressure band; its attrs say which.
         tier-pressure(id),
         link-changed(id),
+
+        // Cluster plane: what the other programs decided and said. Each is
+        // delivered to every subscriber but the program that caused it (by
+        // a call, or by its death withdrawing what it wrote), on its next
+        // call, and only when the committed value changed. A program that
+        // ran later in the same round may get one for a change it already
+        // read. Two programs that keep answering each other's change can
+        // still go on forever; that is theirs to avoid.
+        /// The committed placement of this process changed: its worker, its
+        /// executors or its props (attrs `placement/*`).
+        placement-changed(id),
+        /// The committed replication of this group changed (attr
+        /// `replication/sites`).
+        replication-changed(id),
+        /// A value a cluster program published about this subject changed
+        /// (attrs `published/<program>/<name>`).
+        published(subject),
     }
 
     /// A key on a working-set's first `upto` tokens, or on all of it. A block
@@ -133,10 +150,13 @@ interface types {
     record placement {
         process: id,
         /// None leaves the worker to the gateway's default choice. A running
-        /// process given another worker migrates there (`placement.migrate`).
+        /// process given another worker migrates there (`placement.migrate`)
+        /// while it has sent its client no output; one that has stays.
         worker: option<id>,
         /// Workers its passes may run on, best first. Empty leaves them
-        /// to the worker plane's host.
+        /// to the worker plane's host. Written under the `executors` grant;
+        /// `worker` and `props` under `placement`, so two programs may each
+        /// write their part.
         executors: list<id>,
         /// Passed on with the process; the worker plane sees each as
         /// prop `cluster/<name>`.
@@ -150,7 +170,8 @@ interface types {
     record scale {
         /// None: workers that load no model, holding state only.
         model: option<id>,
-        /// An engine kind the host names, such as `cuda` or `cpu`.
+        /// An engine kind as workers' configs spell it, such as
+        /// `cuda_native` (a worker's attr `engine`).
         engine: id,
         workers: u32,
     }

@@ -38,6 +38,7 @@ pub struct Seated<'a> {
     pub ports: &'a [PortFeed],
     pub attn_classes: Option<&'a AttnClasses>,
     pub reports: u64,
+    pub tap: Option<&'a engine::fire::Tap>,
 }
 
 impl<'a> Seated<'a> {
@@ -69,6 +70,7 @@ impl<'a> Seated<'a> {
             ports: &[],
             attn_classes: None,
             reports: 0,
+            tap: None,
         }
     }
 

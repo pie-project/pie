@@ -1,10 +1,12 @@
-# The weights of Nemotron-3 Super and Nano: per layer an RMS norm and one
-# mixer, a Mamba-2 (`M`), a NoPE GQA attention (`*`) or an MoE (`E`) of relu2
-# experts beside a relu2 shared expert (Super's reading the residual squeezed
-# to a latent width, Nano's reading it whole); the token embedding, a final
-# norm and the head.
+# The weights of Nemotron-3 Super, Ultra and Nano: per layer an RMS norm and
+# one mixer, a Mamba-2 (`M`), a NoPE GQA attention (`*`) or an MoE (`E`) of
+# relu2 experts beside a relu2 shared expert (Super's and Ultra's reading the
+# residual squeezed to a latent width, Nano's reading it whole); the token
+# embedding, a final norm and the head.
 
-PATTERN = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+# Super's `hybrid_override_pattern`; Ultra's `layers_block_type`, one letter a layer.
+SUPER = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+ULTRA = "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
 
 NANO_PATTERN = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
 
@@ -31,25 +33,27 @@ def nano(layers, experts, pattern = NANO_PATTERN):
         eps = 1e-5,
     )
 
-def dims(layers):
+def dims(layers, pattern = SUPER, wide = 1):
+    """Super's widths, or Ultra's (`wide = 2`): twice the residual, heads,
+    Mamba heads, latent and expert widths, the same experts and fan-out."""
     return struct(
-        pattern = PATTERN,
         layers = layers,
-        hidden = 4096,
+        pattern = pattern,
+        hidden = 4096 * wide,
         vocab = 131072,
-        heads = 32,
+        heads = 32 * wide,
         kv_heads = 2,
         head_dim = 128,
-        mamba_heads = 128,
+        mamba_heads = 128 * wide,
         mamba_head_dim = 64,
         groups = 8,
         state_dim = 128,
         conv_kernel = 4,
         experts = 512,
         top_k = 22,
-        latent = 1024,
-        moe_inter = 2688,
-        shared_inter = 5376,
+        latent = 1024 * wide,
+        moe_inter = 2688 if wide == 1 else 5120,
+        shared_inter = 5376 if wide == 1 else 10240,
         scaling = 5.0,
         eps = 1e-5,
     )
@@ -57,6 +61,7 @@ def dims(layers):
 DIMS = {
     "nemotron3-super": dims(88),
     "nemotron3-super-mini": dims(9),
+    "nemotron3-ultra": dims(108, ULTRA, 2),
     "nemotron3-nano": nano(52, 128),
     # Its first six layers: every mixer kind, the attention last.
     "nemotron3-nano-mini": nano(6, 16),
@@ -81,17 +86,22 @@ FP8_AT = {
 def layout(id, deploy):
     if DIMS[id].latent == None:
         return nano_layout(id, deploy)
-    if deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8] or deploy.drafter != None or deploy.parts:
-        fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
-    w, experts, f8 = deploy.weights
     d = DIMS[id]
+    if deploy.drafter != None or deploy.parts:
+        fail("{} has no draft head or parts here; not {}".format(id, deploy))
+    plain = deploy.weights == [dtype.bf16]
+    if d.pattern == ULTRA and not plain:
+        fail("{} ships as released: every weight bf16; not {}".format(id, deploy))
+    if d.pattern == SUPER and deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]:
+        fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
+    w, experts, f8 = (dtype.bf16, dtype.bf16, dtype.bf16) if plain else deploy.weights
     norms = compute(w)
     hidden = d.hidden
     inner = d.mamba_heads * d.mamba_head_dim
     conv_dim = inner + 2 * d.groups * d.state_dim
 
     def proj(name, kind, l, shape):
-        kept = l in BF16_AT[kind] if kind in BF16_AT else l not in FP8_AT[kind]
+        kept = plain or (l in BF16_AT[kind] if kind in BF16_AT else l not in FP8_AT[kind])
         return weight(name, shape, w if kept else f8)
 
     def mamba(l):

@@ -8,8 +8,11 @@ use ids::{GatewayId, NodeId, WorkerId};
 pub struct Worker {
     pub role: Role,
     pub model: String,
+    /// Its engine kind, as its config spells it.
+    pub engine: String,
     pub addr: String,
-    pub neighbors: Vec<WorkerId>,
+    /// The token the actuator launched it with, if it did.
+    pub launch: Option<String>,
     pub last_hb: Instant,
     pub load: WorkerStatus,
     /// Unreachable once its heartbeats have lagged for half the eviction
@@ -29,6 +32,8 @@ pub struct Cluster {
     pub gateway_epoch: u64,
     pub workers: HashMap<WorkerId, Worker>,
     pub gateways: HashMap<GatewayId, Gateway>,
+    /// The actuator has slots to launch workers into.
+    pub scales: bool,
     next_worker_id: u64,
     next_gateway_id: u64,
 }
@@ -76,8 +81,9 @@ impl Cluster {
             Worker {
                 role,
                 model,
+                engine: String::new(),
                 addr,
-                neighbors: Vec::new(),
+                launch: None,
                 last_hb: now,
                 health: Health::Healthy,
                 load: WorkerStatus::default(),

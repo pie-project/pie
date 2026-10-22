@@ -174,6 +174,9 @@ pub struct Handles {
     pub mask: Option<Tensor>,
     pub mask_indptr: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
+    /// Each lane's seat in the score slab, -1 where it captures nothing;
+    /// staged when a lane of the fire captures.
+    pub score_seats: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub class_table: Option<(Tensor, u32)>,
     pub lane_of_row: Tensor,
@@ -295,6 +298,8 @@ pub struct Fire<'a> {
     pub lane_of_row: &'a [i32],
     pub lane_reach: u32,
     pub group_of_lane: &'a [i32],
+    /// Empty when no lane of the fire captures scores.
+    pub score_seats: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
     pub class_table: Option<(&'a [u8], u32)>,
 }
@@ -382,6 +387,7 @@ pub struct Staged {
     space_indices: Vec<u32>,
     space_lanes: u32,
     packed: bool,
+    scored: bool,
     class_count: Option<u32>,
 }
 
@@ -494,6 +500,7 @@ pub struct Inputs {
     ports: Vec<PortAt>,
     lane_of_row: u64,
     group_of_lane: u64,
+    score_seats: u64,
     packings: Vec<PackingAt>,
     spaces: Vec<SpaceAt>,
     max_lanes: u32,
@@ -572,6 +579,7 @@ impl Inputs {
             .collect();
         let lane_of_row = take(rows * 4);
         let group_of_lane = take(lanes * 4);
+        let score_seats = take(lanes * 4);
         let packings: Vec<PackingAt> = (0..selections)
             .map(|_| PackingAt {
                 group_indptr: take((lanes + 1) * 4),
@@ -680,6 +688,7 @@ impl Inputs {
             ports,
             lane_of_row,
             group_of_lane,
+            score_seats,
             packings,
             spaces,
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
@@ -944,6 +953,13 @@ impl Inputs {
             }
         };
 
+        let scored = !fire.score_seats.is_empty();
+        if scored {
+            let mut seats = fire.score_seats.to_vec();
+            seats.resize(space_lanes as usize, -1);
+            put(self.score_seats, bytes_of(&seats), "staged score seats")?;
+        }
+
         let packed = !fire.group_of_lane.is_empty();
         if packed {
             if fire.packings.len() != self.packings.len() {
@@ -1048,6 +1064,7 @@ impl Inputs {
             space_indices,
             space_lanes,
             packed,
+            scored,
             class_count,
         })
     }
@@ -1230,6 +1247,7 @@ impl Inputs {
             space_indices,
             space_lanes,
             packed,
+            scored,
             class_count,
         } = staged;
         let readouts = *readouts;
@@ -1250,6 +1268,8 @@ impl Inputs {
         let places: Vec<SpaceAt> = self.spaces.clone();
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
+        let at_score_seats = self.score_seats;
+        let scored = *scored;
         let packing_places: Vec<PackingAt> = self.packings.clone();
         let stream = device.stream();
         let Inputs {
@@ -1289,6 +1309,9 @@ impl Inputs {
         }
         if let Some(count) = class_count {
             copy(at_class_table, (count as usize) * (count as usize))?;
+        }
+        if scored {
+            copy(at_score_seats, space_lanes as usize * 4)?;
         }
         let mut packings = Vec::with_capacity(packing_places.len());
         if packed {
@@ -1348,6 +1371,7 @@ impl Inputs {
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
             mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
+            score_seats: scored.then(|| i32s(base + at_score_seats, space_lanes)),
             packings,
             class_table: class_count.map(|count| {
                 (
@@ -1386,7 +1410,6 @@ impl Inputs {
             write_state_mask: Tensor::ABSENT,
             commit_len: Tensor::ABSENT,
             begin_at: Tensor::ABSENT,
-            #[cfg(feature = "rocm")]
             snapshots: kernels_cuda::Snapshots::NONE,
         }
     }

@@ -29,7 +29,9 @@ pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
 pub use channel::{
     ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel, Ticket,
 };
-pub use engine::{CompletionSink, Engine, KvWrites, StepDone, StepOutcome};
+pub use engine::{
+    CompletionSink, Engine, KvWrites, StepDone, StepOutcome, TapGroups, TapSink, Tapped,
+};
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, Boundary, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket,

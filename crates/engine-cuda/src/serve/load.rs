@@ -301,13 +301,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// The token and lane budgets fitted to what the card has with the weights
 /// resident. What a fire's working set takes at those budgets (the
 /// activation arena, the attention workspaces, the decoded-weight tiles, the
-/// guests' programs, the score planes and the readout indices) is held to
-/// half of the card past the weights, the half `bake` sizes the token budget
-/// against before the weights are down, and to what leaves one sequence and
-/// the bodies' floor beside it. The tile yields first, held to the widest
-/// plane fired at token rows (a plane past it is served by the fused-dequant
-/// arm), then the token budget halves toward its floor, then the lanes
-/// halve toward one; `Pools::fit_the_card` still refuses past that.
+/// guests' programs, the capturing lanes' score planes and the readout
+/// indices) is held to half of the card past the weights, the half `bake`
+/// sizes the token budget against before the weights are down, and to what
+/// leaves one sequence and the bodies' floor beside it. The tile yields
+/// first, held to the widest plane fired at token rows (a plane past it is
+/// served by the fused-dequant arm), then the token budget halves toward its
+/// floor, then the lanes halve toward one; `Pools::fit_the_card` still
+/// refuses past that.
 #[allow(clippy::too_many_arguments)]
 fn refit(
     boot: &mut Boot<'_>,
@@ -401,7 +402,7 @@ fn refit(
             .saturating_add(crate::scores::bytes_for(
                 &score_values,
                 score_heads,
-                lanes,
+                engine.scoring_lanes.min(lanes),
                 boot.world,
             ))
             .saturating_add(
@@ -735,7 +736,17 @@ impl Shell {
         arena.ensure(&mut pools, arena_bytes)?;
         let predicate = crate::store::rs::Predicate::reserve(
             boot.budget.max_lanes,
-            crate::store::rs::snapshots(&boot.trace) > 0,
+            crate::store::rs::snapshots(&boot.trace, |k_dim| {
+                #[cfg(not(feature = "rocm"))]
+                {
+                    kernels_cuda::attn::ssm::gdn_lands_snapshots(device.ctx(), k_dim)
+                }
+                #[cfg(feature = "rocm")]
+                {
+                    let _ = k_dim;
+                    true
+                }
+            }) > 0,
         )?;
         let spaces = boot
             .trace
@@ -842,7 +853,7 @@ impl Shell {
         let scores = crate::scores::Scores::reserve(
             &score_values,
             score_heads,
-            boot.budget.max_lanes,
+            engine.scoring_lanes.min(boot.budget.max_lanes),
             boot.world,
         )?;
 
@@ -863,6 +874,11 @@ impl Shell {
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
+        // A tensor-parallel rank holds its band of every page's heads, not
+        // the page: it reads nothing out.
+        let kv_taps = (boot.world.size <= 1)
+            .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
+            .flatten();
         let mut shell = Shell {
             device,
             accounting,
@@ -930,6 +946,8 @@ impl Shell {
             )),
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
+            kv_taps,
+            tap_sink: None,
             airborne,
             owed: super::Owed::new(),
             spare_events: Vec::new(),
@@ -1290,6 +1308,18 @@ fn decoded_weight_planes(
                 ) if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) => {
                     continue;
                 }
+                // A routed select reads its bank's codes as they are, whatever
+                // the arm (the register-dequant and staged kernels, the
+                // grouped and per-route ones): it decodes no bf16 tile.
+                #[cfg(not(feature = "rocm"))]
+                poem_ir::Operation::Linear(
+                    poem_ir::Linear::MoeMatmulSelect { .. }
+                    | poem_ir::Linear::MoeMatmulSelectBias { .. }
+                    | poem_ir::Linear::MoeMatmulSelectQuant { .. },
+                )
+                | poem_ir::Operation::Fused(
+                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
+                ) => continue,
                 // A fused projection runs its matmul when no fused kernel
                 // takes it, and decodes the same plane that matmul would.
                 poem_ir::Operation::Linear(_)
@@ -1299,9 +1329,15 @@ fn decoded_weight_planes(
                     | poem_ir::Fused::MlpSwiglu { .. }
                     | poem_ir::Fused::MatmulBias { .. }
                     | poem_ir::Fused::MatmulSplitRows { .. }
-                    | poem_ir::Fused::LmHeadSoftcap { .. }
-                    | poem_ir::Fused::MoeSelectGlu { .. }
-                    | poem_ir::Fused::MoeExperts { .. },
+                    | poem_ir::Fused::LmHeadSoftcap { .. },
+                ) => {
+                    outputs.clear();
+                    node.op.outputs(&mut outputs);
+                    outputs.iter().any(|id| token_rows(*id))
+                }
+                #[cfg(feature = "rocm")]
+                poem_ir::Operation::Fused(
+                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
                 ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);

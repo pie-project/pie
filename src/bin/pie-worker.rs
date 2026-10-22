@@ -45,6 +45,20 @@ async fn main() -> anyhow::Result<ExitCode> {
     cfg.validate()?;
 
     let handle = worker::run(cfg, &pie::paths::pie_home()).await?;
+    // SIGHUP swaps the worker policy for the file's `[runtime] policy`;
+    // nothing else in it is read again, and the worker serves on.
+    ctx.on_hangup(|config| async move {
+        match worker::Config::parse(&config) {
+            Ok(config) => {
+                if let Err(e) = worker::reload_policy(&config).await {
+                    tracing::error!("SIGHUP: {e:#}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("SIGHUP: the config does not parse, so the policy stands: {e:#}")
+            }
+        }
+    });
     Ok(ctx
         .run_until_signal(async move {
             // A signal drains first: no new turns, and the cluster policy may

@@ -23,7 +23,7 @@ pub use manifest::{Manifest, ManifestError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use program::{Commit, Fault, LoadError, Offloads, Plane, Program, Retention, Table};
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::start;
+pub use service::{reload, start};
 
 use client_api::Props;
 
@@ -87,6 +87,12 @@ pub(crate) enum Event {
     /// The session id is `<tenant>/<session>`.
     SessionProps(String, Props),
     SessionClosed(String),
+    /// Swap the policy for this one (name, component), or for none, loaded
+    /// whole first: the answer is why it did not load.
+    Reload(
+        Option<(String, Vec<u8>)>,
+        std::sync::mpsc::SyncSender<Result<(), String>>,
+    ),
 }
 
 /// What the worker policy published for the cluster plane, by subject
@@ -94,6 +100,11 @@ pub(crate) enum Event {
 static PUBLISHED: std::sync::LazyLock<
     std::sync::RwLock<std::collections::BTreeMap<(String, String), serde_json::Value>>,
 > = std::sync::LazyLock::new(Default::default);
+
+/// What a policy that stopped published is withdrawn.
+pub(crate) fn withdraw_published() {
+    PUBLISHED.write().unwrap().clear();
+}
 
 pub(crate) fn publish(of: String, name: String, value: Option<serde_json::Value>) {
     let mut published = PUBLISHED.write().unwrap();
