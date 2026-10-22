@@ -19,6 +19,51 @@ pub fn block_dyn_conv(
     group: u32,
     y: Tensor,
 ) -> Result<(), Error> {
+    convolve(ctx, x, coeff, base, side, taps, group, y, None)
+}
+
+/// [`block_dyn_conv`] over at most eight rows that lays the register tile's
+/// input table for the projections of `y` in `table` as it writes them, with
+/// `counters` arrival counters zeroed: bit for bit the table the tile lays
+/// over `y`.
+#[allow(clippy::too_many_arguments)]
+pub fn block_dyn_conv_table(
+    ctx: &Ctx<'_>,
+    x: RaggedTensor,
+    coeff: Tensor,
+    base: Tensor,
+    side: u32,
+    taps: u32,
+    group: u32,
+    y: Tensor,
+    table: Tensor,
+    counters: u32,
+) -> Result<(), Error> {
+    convolve(
+        ctx,
+        x,
+        coeff,
+        base,
+        side,
+        taps,
+        group,
+        y,
+        Some((table, counters)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convolve(
+    ctx: &Ctx<'_>,
+    x: RaggedTensor,
+    coeff: Tensor,
+    base: Tensor,
+    side: u32,
+    taps: u32,
+    group: u32,
+    y: Tensor,
+    table: Option<(Tensor, u32)>,
+) -> Result<(), Error> {
     const OP: &str = "attention.block_dyn_conv";
     let entry = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "block_dyn_conv_bfloat16" });
     if coeff.dtype != x.data.dtype || base.dtype != x.data.dtype || y.dtype != x.data.dtype {
@@ -91,18 +136,45 @@ pub fn block_dyn_conv(
         y.rows == x.data.rows && y.width == x.data.width,
         "the convolution lands the rows it convolves"
     );
-    ctx.fire(
-        Fire::at(FILE, entry).apply(Grid::of([channels, lanes, 1], [channels.min(GROUP), 1, 1])),
-        &[
-            x.data.arg(),
-            x.indptr.arg(),
-            coeff.arg(),
-            base.arg(),
-            y.arg_mut(),
-            stated(OP, channels)?.arg(),
-            stated(OP, side)?.arg(),
-            stated(OP, taps_n)?.arg(),
-            stated(OP, group_n)?.arg(),
-        ],
-    )
+    let rows = nonzero(OP, "the rows the convolution walks", x.data.rows)?;
+    let args = [
+        x.data.arg(),
+        x.indptr.arg(),
+        coeff.arg(),
+        base.arg(),
+        y.arg_mut(),
+        stated(OP, channels)?.arg(),
+        stated(OP, side)?.arg(),
+        stated(OP, taps_n)?.arg(),
+        stated(OP, group_n)?.arg(),
+        stated(OP, lanes)?.arg(),
+    ];
+    match table {
+        // A threadgroup a row of the table, which stages at most 8192 channels.
+        Some((table, counters)) => {
+            if rows > 8 || channels % 64 != 0 || channels > 8192 {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "a register table holds at most 8 rows of whole 64-input groups, and \
+                         this one stages at most 8192, not {rows} x {channels}"
+                    ),
+                ));
+            }
+            let mut args = args.to_vec();
+            args.extend([table.arg_mut(), rows.arg(), counters.arg()]);
+            ctx.fire(
+                Fire::at(FILE, "block_dyn_conv_table").apply(Grid::of(
+                    [channels.min(1024), 8, 1],
+                    [channels.min(1024), 1, 1],
+                )),
+                &args,
+            )
+        }
+        // A thread per channel and row, so a lane's rows convolve side by side.
+        None => ctx.fire(
+            Fire::at(FILE, entry).apply(Grid::of([channels, rows, 1], [channels.min(GROUP), 1, 1])),
+            &args,
+        ),
+    }
 }

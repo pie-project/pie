@@ -1086,6 +1086,137 @@ pub fn register_split(cols: i32, k: i32, cores: Option<u32>) -> i32 {
     split
 }
 
+/// Lays the register tile's input table for the `m` rows of `act` (`k`
+/// wide) in `table`, with its first `counters` arrival counters zeroed.
+pub fn register_table(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    table: Tensor,
+    m: i32,
+    k: i32,
+    counters: i32,
+) -> Result<(), Error> {
+    ctx.fire(
+        Fire::at(REGISTER_FILE, "qmm_sg_table")
+            .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
+        &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
+    )
+}
+
+/// One projection of a register-tile segment launch: the columns of bank
+/// `w` from its row `first`, the output it lands them in whole (its width
+/// the row stride and the columns' count) and its contraction's partitions.
+#[derive(Clone, Copy, Debug)]
+pub struct Segment {
+    pub w: Bank,
+    pub first: u32,
+    pub y: Tensor,
+    pub split: i32,
+}
+
+/// The arrival counters and partial sums (f32) a segment launch takes: one
+/// counter per 64 columns and `split` rows of sums per row of every split
+/// segment.
+#[must_use]
+pub fn segments_scratch(segments: &[Segment], m: u32) -> (u32, u32) {
+    segments
+        .iter()
+        .filter(|s| s.split > 1)
+        .fold((0, 0), |(counters, floats), s| {
+            (
+                counters + s.y.width / REGISTER_COLUMNS.unsigned_abs(),
+                floats + s.split.unsigned_abs() * m * s.y.width,
+            )
+        })
+}
+
+/// Two or three register-tile matmuls of one laid input `table` (the `m`
+/// rows of a `k`-wide activation) in one launch, each segment's columns
+/// summed as its bank's own register matmul at the segment's split sums
+/// them, so they land that matmul's bits. `partials` holds
+/// [`segments_scratch`]'s sums and the table its counters.
+pub fn register_segments(
+    ctx: &Ctx<'_>,
+    segments: &[Segment],
+    table: Tensor,
+    m: i32,
+    k: i32,
+    partials: Option<Tensor>,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_segments";
+    if !(2..=3).contains(&segments.len()) {
+        return Err(refuse(OP, "a segment launch takes two or three matmuls"));
+    }
+    if m <= 0 || m > 8 || k % REGISTER_SPAN != 0 {
+        return Err(refuse(
+            OP,
+            "the register tile takes up to 8 rows of whole 256-input units",
+        ));
+    }
+    let mut groups = 0u32;
+    let mut args = Vec::with_capacity(28);
+    for s in segments {
+        let Some(biases) = s.w.biases else {
+            return Err(refuse(OP, "a segment's bank holds no biases"));
+        };
+        let cols = stated(OP, s.y.width)?;
+        let ld = stated(OP, s.w.ld)?;
+        if s.w.bits != 4
+            || s.w.group != 64
+            || cols % REGISTER_COLUMNS != 0
+            || s.first % REGISTER_COLUMNS.unsigned_abs() != 0
+            || s.first + s.y.width > s.w.codes.rows
+            || ld % REGISTER_SPAN != 0
+            || ld < k
+            || s.y.rows != m.unsigned_abs()
+            || !(1..=8).contains(&s.split)
+            || (s.split > 1 && partials.is_none())
+        {
+            return Err(refuse(OP, "a segment the register tile does not walk"));
+        }
+        groups += (cols / REGISTER_COLUMNS).unsigned_abs() * s.split.unsigned_abs();
+        args.extend([
+            s.w.codes.arg(),
+            s.w.scales.arg(),
+            biases.arg(),
+            s.y.arg_mut(),
+        ]);
+    }
+    for _ in segments.len()..3 {
+        let absent = ctx.absent()?;
+        args.extend([absent; 4]);
+    }
+    args.extend([
+        table.arg(),
+        match partials {
+            Some(partials) => partials.arg_mut(),
+            None => ctx.absent()?,
+        },
+        k.arg(),
+        m.arg(),
+    ]);
+    let at = |i: usize, of: &dyn Fn(&Segment) -> i32| segments.get(i).map_or(0, of);
+    for of in [
+        &(|s: &Segment| s.y.width.cast_signed()) as &dyn Fn(&Segment) -> i32,
+        &|s: &Segment| s.split,
+        &|s: &Segment| s.w.ld.cast_signed(),
+        &|s: &Segment| s.first.cast_signed(),
+    ] {
+        for i in 0..3 {
+            args.push(at(i, of).arg());
+        }
+    }
+    let count = segments.len();
+    let entry = symbol(&format!("affine_qmm_sg_segments_s{count}"));
+    let stamp = symbol(&format!("PIE_SG_SEGMENTS(\"{entry}\",{count})"));
+    ctx.fire(
+        Fire::at(REGISTER_FILE, entry)
+            .stamp(stamp)
+            .apply(Grid::of([128 * groups, 1, 1], [128, 1, 1])),
+        &args,
+    )
+}
+
 const STAGED_SPLIT_WIDE: i32 = 8;
 
 const STAGED_SPLIT: i32 = 4;

@@ -248,3 +248,200 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
       device bfloat *, constant int &, constant int &, device float *, constant int &,             \
       constant int &, uint2, uint, uint);
+
+// Up to three matmuls of one table in one launch (a layer's projections of its normed rows: a
+// GDN in-projection and its gates; a query, key and value), each segment s the columns of its own
+// bank from column `offsets[s]` (o0, o1, o2; the bank's row stride `strides[s]`, d0, d1, d2) into
+// its own output, rows of `columns[s]` (c0, c1, c2), in `splits[s]` partitions (p0, p1, p2): each
+// column summed as `affine_qmm_sg` at that split sums it. The grid is one row of threadgroups:
+// segment s takes columns[s] / 64 x splits[s] of them, partition-major, after the segments before
+// it; a split segment's partials follow those of the split segments before it in `partials`, and
+// its tiles' arrival counters theirs in the table.
+template <int S>
+[[kernel]] void
+affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat *s0 [[buffer(1)]],
+                       const device bfloat *b0 [[buffer(2)]], device bfloat *y0 [[buffer(3)]],
+                       const device uint *w1 [[buffer(4)]], const device bfloat *s1 [[buffer(5)]],
+                       const device bfloat *b1 [[buffer(6)]], device bfloat *y1 [[buffer(7)]],
+                       const device uint *w2 [[buffer(8)]], const device bfloat *s2 [[buffer(9)]],
+                       const device bfloat *b2 [[buffer(10)]], device bfloat *y2 [[buffer(11)]],
+                       const device bfloat *table [[buffer(12)]], device float *partials [[buffer(13)]],
+                       constant int &width [[buffer(14)]], constant int &rows [[buffer(15)]],
+                       constant int &c0 [[buffer(16)]], constant int &c1 [[buffer(17)]],
+                       constant int &c2 [[buffer(18)]], constant int &p0 [[buffer(19)]],
+                       constant int &p1 [[buffer(20)]], constant int &p2 [[buffer(21)]],
+                       constant int &d0 [[buffer(22)]], constant int &d1 [[buffer(23)]],
+                       constant int &d2 [[buffer(24)]], constant int &o0 [[buffer(25)]],
+                       constant int &o1 [[buffer(26)]], constant int &o2 [[buffer(27)]],
+                       uint position [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint simd [[simdgroup_index_in_threadgroup]]) {
+  using namespace qmm_sg;
+  constexpr int NF = 2; // 8-column fragments a simdgroup holds
+  const int seg_columns[3] = {c0, c1, c2}, splits[3] = {p0, p1, p2}, strides[3] = {d0, d1, d2};
+  const int offsets[3] = {o0, o1, o2};
+  // The segment this threadgroup falls in, and the threadgroups, counters and partials before it.
+  int s = 0;
+  uint before = 0, tiles_before = 0;
+  ulong floats_before = 0;
+#pragma unroll
+  for (int t = 0; t < S - 1; ++t) {
+    const uint tiles = uint(seg_columns[t]) / 64, tgs = tiles * uint(splits[t]);
+    if (s == t && position >= before + tgs) {
+      s = t + 1;
+      before += tgs;
+      if (splits[t] > 1) {
+        tiles_before += tiles;
+        floats_before += ulong(splits[t]) * ulong(rows) * ulong(seg_columns[t]);
+      }
+    }
+  }
+  const device uint *weights = s == 0 ? w0 : s == 1 ? w1 : w2;
+  const device bfloat *scales = s == 0 ? s0 : s == 1 ? s1 : s2;
+  const device bfloat *biases = s == 0 ? b0 : s == 1 ? b1 : b2;
+  device bfloat *output = s == 0 ? y0 : s == 1 ? y1 : y2;
+  const int columns = seg_columns[s], split = splits[s], stride = strides[s];
+  const uint tiles = uint(columns) / 64, local = position - before;
+  const uint tile = local % tiles, part = local / tiles;
+  const uint qid = lane >> 2;
+  const uint fm = (qid & 4) | ((lane >> 1) & 3);
+  const uint fn = ((qid & 2) << 1) | ((lane & 1) << 1);
+  const uint c = fn >> 1;
+  const uint column = tile * 32 * NF + simd * 8 * NF + fm;
+  const uint wcolumn = uint(offsets[s]) + column;
+  const ulong words = ulong(stride) / 8, groups = ulong(stride) / 64;
+  const device uint2 *wp = reinterpret_cast<const device uint2 *>(weights + ulong(wcolumn) * words) + c;
+  const ulong apart = 8 * words / 2; // uint2s between the two fragments
+  const device bfloat *sp = scales + ulong(wcolumn) * groups, *bp = biases + ulong(wcolumn) * groups;
+  const device vec<bfloat, 16> *xt =
+      reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
+  const device float *sums = reinterpret_cast<const device float *>(table + 8 * ulong(width));
+  // Partition `part` takes 256-input units as `affine_qmm_sg`'s partition y does.
+  const int units = width / kSpan;
+  const int first = int(part) * units / split * 4, last = (int(part) + 1) * units / split * 4;
+  constexpr int U = 2;
+  float2 acc[NF];
+  uint2 q[U][NF];
+  float qs[U][NF], qb[U][NF];
+#pragma unroll
+  for (int f = 0; f < NF; ++f)
+    acc[f] = float2(0.0f);
+#pragma unroll
+  for (int u = 0; u < U; ++u)
+#pragma unroll
+    for (int f = 0; f < NF; ++f) {
+      q[u][f] = wp[f * apart + ulong(first + u) * 4];
+      qs[u][f] = float(sp[8 * f * groups + first + u]);
+      qb[u][f] = float(bp[8 * f * groups + first + u]);
+    }
+  for (int h0 = first; h0 < last; h0 += U) {
+    uint2 cw[U][NF];
+    float2 ck[U][NF];
+#pragma unroll
+    for (int u = 0; u < U; ++u)
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        cw[u][f] = q[u][f];
+        ck[u][f] = float2(qs[u][f], fma(-128.0f, qs[u][f], qb[u][f]));
+      }
+    if (h0 + U < last) {
+#pragma unroll
+      for (int u = 0; u < U; ++u)
+#pragma unroll
+        for (int f = 0; f < NF; ++f) {
+          q[u][f] = wp[f * apart + ulong(h0 + U + u) * 4];
+          qs[u][f] = float(sp[8 * f * groups + h0 + U + u]);
+          qb[u][f] = float(bp[8 * f * groups + h0 + U + u]);
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int h = h0 + u;
+      const vec<bfloat, 16> x = xt[ulong(h) * 32];
+      float2 d[NF];
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
+        d[f] = float2(0.0f);
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (uint p = 0; p < 4; ++p) {
+          const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
+#pragma unroll
+          for (int f = 0; f < NF; ++f)
+            mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
+        }
+      const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
+                        *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        acc[f] = fma(d[f], ck[u][f].x, acc[f]);
+        acc[f] = fma(sm, ck[u][f].y, acc[f]);
+      }
+    }
+  }
+  threadgroup uint arrival;
+  if (split > 1) {
+    device coherent(device) float *plane = partials + floats_before;
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
+        plane[ulong(part) * rows * columns + o + 8 * f] = acc[f][i];
+    }
+    device atomic_uint *count = reinterpret_cast<device atomic_uint *>(
+                                    const_cast<device bfloat *>(table) + 8 * ulong(width)) +
+                                width / 4 + tiles_before + tile;
+    const uint me = simd * 32 + lane;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (me == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      arrival = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (arrival != uint(split) - 1)
+      return;
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        float total = 0.0f;
+        for (int t = 0; t < split; ++t)
+          total += t == int(part) ? acc[f][i] : plane[ulong(t) * rows * columns + o + 8 * f];
+        output[o + 8 * f] = bfloat(total);
+      }
+    }
+    if (me == 0)
+      atomic_store_explicit(count, 0u, memory_order_relaxed);
+  } else {
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
+        output[o + 8 * f] = bfloat(acc[f][i]);
+    }
+  }
+}
+
+#define PIE_SG_SEGMENTS(name, s)                                                                   \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_sg_segments<s>(                          \
+      const device uint *, const device bfloat *, const device bfloat *, device bfloat *,          \
+      const device uint *, const device bfloat *, const device bfloat *, device bfloat *,          \
+      const device uint *, const device bfloat *, const device bfloat *, device bfloat *,          \
+      const device bfloat *, device float *, constant int &, constant int &, constant int &,       \
+      constant int &, constant int &, constant int &, constant int &, constant int &,              \
+      constant int &, constant int &, constant int &, constant int &, constant int &,              \
+      constant int &, uint, uint, uint);
