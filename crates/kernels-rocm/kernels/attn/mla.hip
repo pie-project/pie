@@ -218,10 +218,14 @@ __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restri
                               const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices,
                               const i32* __restrict__ page_indptr, const i32* __restrict__ last_page_lens,
                               const u8* __restrict__ row_valid, int requests, int page_size, int rank,
-                              int rope) {
+                              int rope, const u32* __restrict__ win) {
+    const Window window{win};
     const int t = blockIdx.x;
+    if (!window.live(t)) return;
+    requests = window.lanes(requests);
     if (requests <= 0 || t >= qo_indptr[requests]) return;
-    if (row_valid != nullptr && row_valid[t] == 0) return;
+    const long long row = window.plane(t);
+    if (row_valid != nullptr && row_valid[row] == 0) return;
     const int r = request_of(qo_indptr, requests, t);
     const int kv_len = paged_len(page_indptr, last_page_lens, r, page_size);
     const int pos = kv_len - (qo_indptr[r + 1] - qo_indptr[r]) + (t - qo_indptr[r]);
@@ -232,8 +236,7 @@ __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restri
         const int w = rank + (kpe != nullptr ? rope : 0);
         u8* dst = reinterpret_cast<u8*>(ckv_pages) + slot * w;
         for (int i = 8 * threadIdx.x; i < w; i += 8 * blockDim.x) {
-            const bf16* src = i < rank ? ckv + static_cast<long long>(t) * rank + i
-                                       : kpe + static_cast<long long>(t) * rope + (i - rank);
+            const bf16* src = i < rank ? ckv + row * rank + i : kpe + row * rope + (i - rank);
             const Pack8<bf16> x = *reinterpret_cast<const Pack8<bf16>*>(src);
             *reinterpret_cast<u64*>(dst + i) =
                 u64{e4m3x4(to_f32(x.v[0]), to_f32(x.v[1]), to_f32(x.v[2]), to_f32(x.v[3]))} |
@@ -241,9 +244,8 @@ __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restri
         }
         return;
     }
-    copy_row(ckv + static_cast<long long>(t) * rank, ckv_pages + slot * rank, rank);
-    if (kpe != nullptr && rope > 0)
-        copy_row(kpe + static_cast<long long>(t) * rope, kpe_pages + slot * rope, rope);
+    copy_row(ckv + row * rank, ckv_pages + slot * rank, rank);
+    if (kpe != nullptr && rope > 0) copy_row(kpe + row * rope, kpe_pages + slot * rope, rope);
 }
 
 // ---------------------------------------------------------------- keys --

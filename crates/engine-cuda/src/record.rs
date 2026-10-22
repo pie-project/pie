@@ -1313,6 +1313,10 @@ fn walk_capture_units(
     units: Units,
     regions: Regions,
 ) -> Result<()> {
+    // Each pass launches its own quantizations: a capture that reused the
+    // warm pass's rows would replay their codes, not the fire's.
+    #[cfg(feature = "rocm")]
+    run.forget_fp8_rows();
     let serial_capture = crate::serve::diag::on().capture_serial;
     let mut cursor = match (streams, at.lanes) {
         (Streams::Forked | Streams::Warm, Some(lanes)) if !serial_capture => {

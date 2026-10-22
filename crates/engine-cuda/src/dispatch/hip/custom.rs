@@ -2,7 +2,8 @@ use kernels_cuda::custom;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::{Fused, Operands};
 
-use crate::run::Run;
+use crate::run::{HeldGate, HeldShared, Run};
+use poem_ir::ValueId;
 
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
@@ -64,19 +65,16 @@ impl DispatchFused for Run<'_> {
 
 impl Run<'_> {
     /// A routed swiglu MLP over dense bf16 banks (selects through the plain
-    /// banks, a swiglu or its clamp, the weighted sum) as one
-    /// `linear::moe::decode_mlp` (which may fold `gate_add` in too) or
-    /// `linear::moe::mlp_swiglu`, which keeps the routes in expert order
-    /// across both matmuls. `None` where it left
-    /// the legs to the caller, else whether it folded the gate add.
-    fn moe_experts_ordered(
+    /// banks, a swiglu or its clamp, the weighted sum) as the routed MLP
+    /// `linear::moe` takes, with the value it sums into; `None` where the legs
+    /// stay the caller's.
+    fn routed_mlp(
         &mut self,
         select: &poem_ir::Linear,
         glu: &poem_ir::Linear,
         down: &poem_ir::Linear,
         sum: &poem_ir::Linear,
-        gate_add: Option<&poem_ir::Linear>,
-    ) -> Result<Option<bool>, kernels_cuda::Error> {
+    ) -> Option<(kernels_cuda::linear::moe::RoutedMlp, ValueId)> {
         use poem_ir::Linear;
         let (
             Linear::MoeMatmulSelect {
@@ -98,7 +96,7 @@ impl Run<'_> {
             },
         ) = (select, down, sum)
         else {
-            return Ok(None);
+            return None;
         };
         let (intermediate, limit, glu_in, glu_out) = match glu {
             Linear::MlpSwiglu {
@@ -112,14 +110,14 @@ impl Run<'_> {
                 limit,
                 y,
             } => (*intermediate, Some(*limit), *packed, *y),
-            _ => return Ok(None),
+            _ => return None,
         };
         if routes != down_routes || glu_in != *packed || glu_out != *h || summed != routed {
-            return Ok(None);
+            return None;
         }
         // Banks in the matrix core's order run as their legs.
         if self.ordered_bank(*gate_up).is_some() || self.ordered_bank(*down_bank).is_some() {
-            return Ok(None);
+            return None;
         }
         let (gate_up, gate_up_experts) = self.expert_bank(*gate_up);
         let (down, down_experts) = self.expert_bank(*down_bank);
@@ -138,23 +136,162 @@ impl Run<'_> {
             h: self.tensor(*h),
             routed: self.tensor(*routed),
         };
-        let shared = match gate_add {
-            Some(&Linear::MoeSigmoidGateAdd {
+        Some((p, *y))
+    }
+
+    /// The shared expert's gated add `gate_add` lands after the routed sum
+    /// into `y`, with what was held back for it.
+    fn shared_gate(
+        &self,
+        gate_add: Option<&poem_ir::Linear>,
+        y: ValueId,
+        banks: Option<HeldShared>,
+        gate_w: Option<HeldGate>,
+    ) -> Option<kernels_cuda::linear::moe::SharedGate> {
+        match gate_add {
+            Some(&poem_ir::Linear::MoeSigmoidGateAdd {
                 routed,
                 shared,
                 gate,
                 y: out,
-            }) if routed == *y => Some(kernels_cuda::linear::moe::SharedGate {
+            }) if routed == y => Some(kernels_cuda::linear::moe::SharedGate {
                 shared: self.tensor(shared),
                 gate: self.tensor(gate),
                 y: self.tensor(out),
+                banks: banks.filter(|b| b.y == shared).map(|b| {
+                    kernels_cuda::linear::moe::SharedBanks {
+                        gate_up: self.tensor(b.gate_up),
+                        down: self.tensor(b.down),
+                    }
+                }),
+                gate_w: gate_w.filter(|g| g.gate == gate).map(|g| self.tensor(g.w)),
             }),
             _ => None,
+        }
+    }
+
+    /// The routed MLP that is `v`'s one reader, in `v`'s region and reading
+    /// `act`, with what it sums into and its gated add.
+    fn routed_reader(
+        &mut self,
+        v: ValueId,
+        act: ValueId,
+    ) -> Option<(
+        kernels_cuda::linear::moe::RoutedMlp,
+        ValueId,
+        poem_ir::Linear,
+    )> {
+        use poem_ir::{Linear, Operands as _, Operation};
+        let poem_ir::Def::Op(at) = self.values()[v.0 as usize].def else {
+            return None;
         };
-        if kernels_cuda::linear::moe::decode_mlp(self.ctx(), &p, shared, &mut self.tensor(*y))? {
+        let nodes = self.nodes();
+        let mut inputs = Vec::new();
+        let mut readers = nodes
+            .iter()
+            .enumerate()
+            .skip(at as usize + 1)
+            .filter(|(_, node)| {
+                inputs.clear();
+                node.op.inputs(&mut inputs);
+                inputs.contains(&v)
+            });
+        let (Some((reader_at, reader)), None) = (readers.next(), readers.next()) else {
+            return None;
+        };
+        if !self.one_region(at, reader_at as u32) {
+            return None;
+        }
+        let Operation::Fused(Fused::MoeExperts {
+            select,
+            glu,
+            down,
+            norm: None,
+            sum,
+            gate_add: Some(gate_add),
+        }) = &reader.op
+        else {
+            return None;
+        };
+        if !matches!(**select, Linear::MoeMatmulSelect { x, .. } if x == act) {
+            return None;
+        }
+        let (p, y) = self.routed_mlp(select, glu, down, sum)?;
+        Some((p, y, (**gate_add).clone()))
+    }
+
+    /// Whether the shared expert MLP `act` → `held.y` is held back for the
+    /// routed MLP that folds it in: that MLP is its one reader, reads `act`,
+    /// and lands the shared expert as items of its own legs
+    /// (`linear::moe::absorbs_shared`).
+    pub(super) fn holds_shared(&mut self, act: ValueId, held: HeldShared) -> bool {
+        if !self.dense_weight(held.gate_up) || !self.dense_weight(held.down) {
+            return false;
+        }
+        let Some((p, y, gate_add)) = self.routed_reader(held.y, act) else {
+            return false;
+        };
+        self.shared_gate(Some(&gate_add), y, Some(held), None)
+            .filter(|s| s.banks.is_some())
+            .is_some_and(|s| {
+                kernels_cuda::linear::moe::absorbs_shared(self.ctx(), &p, s, self.tensor(y).width)
+            })
+    }
+
+    /// Whether the shared expert's gate `act` · `held.w` is held back for
+    /// the routed MLP's fold, as [`Run::holds_shared`].
+    pub(super) fn holds_gate(&mut self, act: ValueId, held: HeldGate) -> bool {
+        if !self.dense_weight(held.w) || self.tensor(held.w).rows != 1 {
+            return false;
+        }
+        let Some((p, y, gate_add)) = self.routed_reader(held.gate, act) else {
+            return false;
+        };
+        self.shared_gate(Some(&gate_add), y, None, Some(held))
+            .filter(|s| s.gate_w.is_some())
+            .is_some_and(|s| {
+                kernels_cuda::linear::moe::absorbs_shared(self.ctx(), &p, s, self.tensor(y).width)
+            })
+    }
+
+    /// A routed swiglu MLP over dense bf16 banks as one
+    /// `linear::moe::decode_mlp` (which may fold `gate_add` in too, and land
+    /// a shared expert held back for it) or `linear::moe::mlp_swiglu`, which
+    /// keeps the routes in expert order across both matmuls. `None` where it
+    /// left the legs to the caller, else whether it folded the gate add.
+    fn moe_experts_ordered(
+        &mut self,
+        select: &poem_ir::Linear,
+        glu: &poem_ir::Linear,
+        down: &poem_ir::Linear,
+        sum: &poem_ir::Linear,
+        gate_add: Option<&poem_ir::Linear>,
+    ) -> Result<Option<bool>, kernels_cuda::Error> {
+        let held = self.shared_mlp.take();
+        let held_gate = self.shared_gate_w.take();
+        let routed = self.routed_mlp(select, glu, down, sum);
+        let shared = routed.and_then(|(_, y)| self.shared_gate(gate_add, y, held, held_gate));
+        let lands = shared.is_some_and(|s| {
+            s.banks.is_some() == held.is_some() && s.gate_w.is_some() == held_gate.is_some()
+        });
+        let lost = || kernels_cuda::Error::Backend {
+            op: "linear.moe_decode_mlp",
+            detail: "a shared expert held back for a routed MLP that does not land it".into(),
+        };
+        let holds = held.is_some() || held_gate.is_some();
+        if holds && !lands {
+            return Err(lost());
+        }
+        let Some((p, y)) = routed else {
+            return Ok(None);
+        };
+        if kernels_cuda::linear::moe::decode_mlp(self.ctx(), &p, shared, &mut self.tensor(y))? {
             return Ok(Some(shared.is_some()));
         }
-        kernels_cuda::linear::moe::mlp_swiglu(self.ctx(), &p, &mut self.tensor(*y))?;
+        if holds {
+            return Err(lost());
+        }
+        kernels_cuda::linear::moe::mlp_swiglu(self.ctx(), &p, &mut self.tensor(y))?;
         Ok(Some(false))
     }
 
