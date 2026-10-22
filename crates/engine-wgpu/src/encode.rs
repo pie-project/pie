@@ -286,6 +286,16 @@ pub fn slang_tensor(t: kernels_wgpu::Tensor) -> kernels_slang::Tensor {
     kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
 }
 
+pub fn slang_bank(b: kernels_wgpu::Bank) -> kernels_slang::Bank {
+    kernels_slang::Bank {
+        codes: slang_tensor(b.codes),
+        scales: slang_tensor(b.scales),
+        biases: b.biases.map(slang_tensor),
+        group: b.group,
+        bits: b.bits,
+    }
+}
+
 fn slang_error(e: Error) -> kernels_slang::Error {
     match e {
         Error::Backend { op, detail } => kernels_slang::Error::Backend { op, detail },

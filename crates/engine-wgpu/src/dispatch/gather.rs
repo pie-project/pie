@@ -82,20 +82,22 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.banked(*table) {
-                Some(bank) => layout::embed_gather_mb_4bit(
-                    self.ctx(),
-                    self.tensor(*ids),
-                    bank,
+                Some(bank) => kernels_slang::gather::embed::embed_banked(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*ids)),
+                    crate::encode::slang_bank(bank),
                     *vocab,
-                    self.tensor(*y),
-                ),
-                None => layout::embed(
-                    self.ctx(),
-                    self.tensor(*ids),
-                    self.tensor(*table),
+                    crate::encode::slang_tensor(self.tensor(*y)),
+                )
+                .map_err(crate::encode::from_slang),
+                None => kernels_slang::gather::embed::embed(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*ids)),
+                    crate::encode::slang_tensor(self.tensor(*table)),
                     *vocab,
-                    self.tensor(*y),
-                ),
+                    crate::encode::slang_tensor(self.tensor(*y)),
+                )
+                .map_err(crate::encode::from_slang),
             },
 
             Gather::EmbedConcat {
@@ -116,18 +118,26 @@ impl Run<'_> {
                         None => (bank, self.tensor(*ids)),
                     };
                     let guard = bank.codes.rows.min(*vocab);
-                    layout::embed_concat_mb_4bit(self.ctx(), ids, bank, guard, self.tensor(*y))
+                    kernels_slang::gather::embed::embed_concat_banked(
+                        &self.slang(),
+                        crate::encode::slang_tensor(ids),
+                        crate::encode::slang_bank(bank),
+                        guard,
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang)
                 }
                 None => {
                     let plane = self.tensor(*table);
                     let guard = plane.rows.min(*vocab);
-                    layout::embed_concat(
-                        self.ctx(),
-                        self.tensor(*ids),
-                        plane,
+                    kernels_slang::gather::embed::embed_concat(
+                        &self.slang(),
+                        crate::encode::slang_tensor(self.tensor(*ids)),
+                        crate::encode::slang_tensor(plane),
                         guard,
-                        self.tensor(*y),
+                        crate::encode::slang_tensor(self.tensor(*y)),
                     )
+                    .map_err(crate::encode::from_slang)
                 }
             },
             Gather::SplitQkv {
@@ -239,14 +249,15 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
-            } => layout::embed_weighted(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*weights),
-                self.tensor(*table),
+            } => kernels_slang::gather::embed::embed_weighted(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*ids)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+                crate::encode::slang_tensor(self.tensor(*table)),
                 *vocab,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Gather::ScatterRows {
                 src,

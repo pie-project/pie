@@ -78,6 +78,16 @@ impl Gpu {
         handle
     }
 
+    /// `values` as raw 32-bit words.
+    pub fn up_u32(&mut self, values: &[u32]) -> u32 {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut buf = Buffer::zeroed(&self.device, bytes.len() as u64).expect("a buffer");
+        buf.write(0, &bytes).expect("written");
+        let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
+        self.held.push(buf);
+        handle
+    }
+
     pub fn zeros(&mut self, n: usize) -> u32 {
         let buf = Buffer::zeroed(&self.device, (n * 2) as u64).expect("a buffer");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");

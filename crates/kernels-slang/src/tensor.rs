@@ -34,3 +34,18 @@ impl Tensor {
         ArgValue::BufferMut(self.buf)
     }
 }
+
+/// A quantized weight bank: codes, a scale per group, and a bias per group
+/// when the bank is affine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Bank {
+    pub codes: Tensor,
+
+    pub scales: Tensor,
+
+    pub biases: Option<Tensor>,
+
+    pub group: u32,
+
+    pub bits: u32,
+}
