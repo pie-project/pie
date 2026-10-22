@@ -176,14 +176,24 @@ fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     for &(k, intermediate) in &[(1024u32, 6144u32), (5120, 6400)] {
         let (n, groups) = (2 * intermediate, k / 64);
-        let codes = upload(&(0..u64::from(k) * u64::from(n) / 2).map(noise).collect::<Vec<_>>());
+        let codes = upload(
+            &(0..u64::from(k) * u64::from(n) / 2)
+                .map(noise)
+                .collect::<Vec<_>>(),
+        );
         let factor = |at: u32, salt: u64, base: f32, step: f32| {
             bf16(base + (f32::from(noise(u64::from(at) ^ salt)) - 127.0) * step)
         };
-        let scales =
-            upload(&(0..n * groups).flat_map(|at| factor(at, 0x11, 0.004, 0.00002)).collect::<Vec<_>>());
-        let biases =
-            upload(&(0..n * groups).flat_map(|at| factor(at, 0x22, 0.0, 0.0002)).collect::<Vec<_>>());
+        let scales = upload(
+            &(0..n * groups)
+                .flat_map(|at| factor(at, 0x11, 0.004, 0.00002))
+                .collect::<Vec<_>>(),
+        );
+        let biases = upload(
+            &(0..n * groups)
+                .flat_map(|at| factor(at, 0x22, 0.0, 0.0002))
+                .collect::<Vec<_>>(),
+        );
         let bank = Bank {
             mpp_codes: None,
             codes: Tensor::new(bind(&codes), n, k, Dtype::U4g64),
@@ -237,7 +247,10 @@ fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
                 handles.read(two.buf, bytes).expect("read"),
                 handles.read(one.buf, bytes + 64).expect("read"),
             );
-            assert!(got[bytes as usize..].iter().all(|&b| b == 0xa5), "a write past h");
+            assert!(
+                got[bytes as usize..].iter().all(|&b| b == 0xa5),
+                "a write past h"
+            );
             assert!(
                 want == got[..bytes as usize],
                 "M={m} K={k} I={intermediate}: the fused tile differs from the two launches"
@@ -269,7 +282,9 @@ fn the_coop_segments_are_their_matmuls() {
     let mut planes = Vec::new();
     for (b, &(n, _, _)) in banks.iter().enumerate() {
         let salt = b as u64 * 0x1000;
-        let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) / 2).map(|at| noise(at ^ salt)).collect();
+        let codes: Vec<u8> = (0..u64::from(k) * u64::from(n) / 2)
+            .map(|at| noise(at ^ salt))
+            .collect();
         let scales: Vec<f32> = (0..n * groups)
             .map(|at| {
                 let v = 0.004 + (f32::from(noise(u64::from(at) ^ salt ^ 0x11)) - 127.0) * 0.00002;
@@ -337,23 +352,29 @@ fn the_coop_segments_are_their_matmuls() {
             whole_t,
             (m as i32, 6144, k as i32, 6144, k as i32),
             1,
+            2,
         )
         .expect("alone");
         frame.commit().expect("commit");
-        let whole = handles.read(whole_t.buf, u64::from(m * 6144) * 2).expect("read");
+        let whole = handles
+            .read(whole_t.buf, u64::from(m * 6144) * 2)
+            .expect("read");
         for (s, &(_, first, w)) in segments.iter().zip(&banks).take(2) {
             let got = handles.read(s.y.buf, u64::from(m * w) * 2).expect("read");
             for row in 0..m as usize {
                 let at = (row * 6144 + first as usize) * 2;
                 assert!(
-                    got[row * w as usize * 2..(row + 1) * w as usize * 2] == whole[at..at + w as usize * 2],
+                    got[row * w as usize * 2..(row + 1) * w as usize * 2]
+                        == whole[at..at + w as usize * 2],
                     "M={m}: the half from {first} differs from the unsplit tile's"
                 );
             }
         }
         // the narrow segment against an fp64 dot of its dequantized weights
         let (_, codes, scales, biases) = &planes[2];
-        let got = handles.read(segments[2].y.buf, u64::from(m * 96) * 2).expect("read");
+        let got = handles
+            .read(segments[2].y.buf, u64::from(m * 96) * 2)
+            .expect("read");
         for row in 0..m {
             for col in 0..96u32 {
                 let (mut want, mut absolute) = (0.0f64, 0.0f64);
@@ -367,7 +388,9 @@ fn the_coop_segments_are_their_matmuls() {
                     absolute += p.abs();
                 }
                 let o = ((row * 96 + col) * 2) as usize;
-                let actual = f64::from(f32::from_bits(u32::from(u16::from_le_bytes([got[o], got[o + 1]])) << 16));
+                let actual = f64::from(f32::from_bits(
+                    u32::from(u16::from_le_bytes([got[o], got[o + 1]])) << 16,
+                ));
                 let allowance = 0.00002 + 0.001 * absolute / f64::from(k).sqrt();
                 assert!(
                     (actual - want).abs() <= 0.004 * want.abs() + allowance,

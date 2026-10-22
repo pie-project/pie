@@ -20,10 +20,7 @@ use poem_ir::Dtype;
 const FRAMES: usize = 15;
 const ROWS: u32 = 8;
 /// The weight bytes each projection's layers hold together, past any cache.
-const STREAM: u64 = match option_env!("PIE_COOP_BENCH_STREAM_MB") {
-    Some(_) => 3072 << 20,
-    None => 768 << 20,
-};
+const STREAM: u64 = 768 << 20;
 
 fn fill(seed: u64, bytes: u64) -> Vec<u8> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -162,10 +159,7 @@ fn the_coop_tiles_price_their_matmuls() {
             .map(|_| Tensor::new(b.zeroed(u64::from(ROWS * n) * 2), ROWS, n, Dtype::Bf16))
             .collect();
         let mut line = format!("{what:13} K={k:5} N={n:6} x{layers:2}");
-        for split in [1, 2, 4, 8] {
-            if (k / 256) % split != 0 {
-                continue;
-            }
+        for (split, wide) in [(1, 2), (1, 1), (2, 2), (2, 1), (4, 2), (4, 1), (8, 1)] {
             let run = |ctx: &Sink<'_>| {
                 for (w, y) in banks.iter().zip(&ys) {
                     quant::coop_matmul(
@@ -175,7 +169,8 @@ fn the_coop_tiles_price_their_matmuls() {
                         w.biases.expect("biases"),
                         *y,
                         (ROWS as i32, n as i32, k as i32, n as i32, k as i32),
-                        split as i32,
+                        split,
+                        wide,
                     )
                     .expect("matmul");
                 }
@@ -185,7 +180,7 @@ fn the_coop_tiles_price_their_matmuls() {
                 .iter()
                 .fold(0u64, |h, y| h.rotate_left(5) ^ hash(&b.read(*y)));
             line += &format!(
-                "  k{split} {us:7.1}us {:5.0}GB/s #{:04x}",
+                "  k{split}w{wide} {us:6.1}us {:4.0}GB/s #{:04x}",
                 bytes as f64 / us / 1e3,
                 h & 0xffff
             );
@@ -242,8 +237,15 @@ fn the_coop_tiles_price_their_matmuls() {
                     *w,
                     w.biases.expect("biases"),
                     packed,
-                    (ROWS as i32, (2 * intermediate) as i32, k as i32, (2 * intermediate) as i32, k as i32),
+                    (
+                        ROWS as i32,
+                        (2 * intermediate) as i32,
+                        k as i32,
+                        (2 * intermediate) as i32,
+                        k as i32,
+                    ),
                     1,
+                    2,
                 )
                 .expect("matmul");
                 kernels_metal::linear::mlp::swiglu(ctx, packed, intermediate, *h).expect("swiglu");
@@ -262,204 +264,4 @@ fn the_coop_tiles_price_their_matmuls() {
         );
     }
     eprintln!("{line}");
-}
-
-// EXPERIMENT: the tile's loads alone, its matmuls alone, longer runs of loads, wider threadgroups.
-#[test]
-#[ignore = "a microbenchmark"]
-fn the_coop_variants_price_their_matmuls() {
-    let Ok(device) = Context::bind() else { return };
-    let handles = Handles::new();
-    let pipelines = Pipelines::new();
-    let b = Bench {
-        device: &device,
-        handles: &handles,
-        pipelines: &pipelines,
-        keep: RefCell::new(Vec::new()),
-    };
-    let divisor: u32 = std::env::var("PIE_COOP_BENCH_DIVISOR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    let plane = Buffer::zeroed(&device, 64 << 20).expect("partials");
-    let partials = Tensor::new(
-        handles.bind(&plane, 0, plane.bytes()).expect("bind"),
-        1,
-        16 << 20,
-        Dtype::F32,
-    );
-    for (what, k, n, split) in [
-        ("down", 17408u32, 5120u32, 4i32),
-        ("gdn/attn out", 6144, 5120, 4),
-        ("gate_up", 5120, 34816, 1),
-        ("gdn in_proj", 5120, 16384, 1),
-    ] {
-        let n = n / divisor;
-        let bytes = u64::from(k) * u64::from(n) * 9 / 16;
-        let layers = STREAM.div_ceil(bytes).clamp(2, 64) as u32;
-        let banks: Vec<Bank> = (0..layers)
-            .map(|l| b.bank(u64::from(l) * 7919 + u64::from(n), k, n))
-            .collect();
-        let x: Vec<u8> = fill(u64::from(k) ^ 0xabcd, u64::from(ROWS) * u64::from(k) * 2)
-            .chunks(2)
-            .flat_map(|c| bf16((f32::from(c[0]) - 127.5) / 256.0))
-            .collect();
-        let act = Tensor::new(b.upload(&x), ROWS, k, Dtype::Bf16);
-        let ys: Vec<Tensor> = (0..layers)
-            .map(|_| Tensor::new(b.zeroed(u64::from(ROWS * n) * 2), ROWS, n, Dtype::Bf16))
-            .collect();
-        let shape = (ROWS as i32, n as i32, k as i32, n as i32, k as i32);
-        let mut line = format!("{what:13} K={k:5} N={n:6} x{layers:2} k{split}");
-        let base = b.time(&|ctx| {
-            for (w, y) in banks.iter().zip(&ys) {
-                quant::coop_matmul(ctx, act, *w, w.biases.expect("b"), *y, shape, split)
-                    .expect("matmul");
-            }
-        }) / f64::from(layers);
-        let want = ys.iter().fold(0u64, |h, y| h.rotate_left(5) ^ hash(&b.read(*y)));
-        line += &format!("  base {base:6.1}us {:4.0}GB/s", bytes as f64 / base / 1e3);
-        for variant in [(0, 1, 2), (1, 1, 2), (3, 1, 2), (2, 1, 2), (0, 1, 4), (0, 1, 1)] {
-            let us = b.time(&|ctx| {
-                for (w, y) in banks.iter().zip(&ys) {
-                    quant::coop_matmul_x(ctx, act, *w, *y, shape, split, (split > 1).then_some(partials), variant)
-                        .expect("variant");
-                }
-            }) / f64::from(layers);
-            let same = variant.0 != 0
-                || ys.iter().fold(0u64, |h, y| h.rotate_left(5) ^ hash(&b.read(*y))) == want;
-            line += &format!(
-                "  m{}r{}s{} {us:6.1}us {:4.0}GB/s{}",
-                variant.0,
-                variant.1,
-                variant.2,
-                bytes as f64 / us / 1e3,
-                if same { "" } else { "!" }
-            );
-        }
-        eprintln!("{line}");
-        b.keep.borrow_mut().clear();
-    }
-}
-
-// EXPERIMENT: square projections each on its own input, and each on the last one's output.
-#[test]
-#[ignore = "a microbenchmark"]
-fn the_coop_chain_prices_its_drains() {
-    let Ok(device) = Context::bind() else { return };
-    let handles = Handles::new();
-    let pipelines = Pipelines::new();
-    let b = Bench {
-        device: &device,
-        handles: &handles,
-        pipelines: &pipelines,
-        keep: RefCell::new(Vec::new()),
-    };
-    let divisor: u32 = std::env::var("PIE_COOP_BENCH_DIVISOR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    for (k, split) in [(5120u32 / divisor.min(2), 4i32), (5120 / divisor.min(2), 1)] {
-        let n = k;
-        let layers = 48u32;
-        let banks: Vec<Bank> = (0..layers)
-            .map(|l| b.bank(u64::from(l) * 7919 + 5, k, n))
-            .collect();
-        let x: Vec<u8> = fill(0x77, u64::from(ROWS) * u64::from(k) * 2)
-            .chunks(2)
-            .flat_map(|c| bf16((f32::from(c[0]) - 127.5) / 256.0))
-            .collect();
-        let first = Tensor::new(b.upload(&x), ROWS, k, Dtype::Bf16);
-        let ys: Vec<Tensor> = (0..layers)
-            .map(|_| Tensor::new(b.zeroed(u64::from(ROWS * n) * 2), ROWS, n, Dtype::Bf16))
-            .collect();
-        let shape = (ROWS as i32, n as i32, k as i32, n as i32, k as i32);
-        let mut line = format!("chain K=N={k} k{split} x{layers}");
-        for chained in [false, true] {
-            let us = b.time(&|ctx| {
-                for (i, (w, y)) in banks.iter().zip(&ys).enumerate() {
-                    let act = if chained && i > 0 { ys[i - 1] } else { first };
-                    quant::coop_matmul(ctx, act, *w, w.biases.expect("b"), *y, shape, split)
-                        .expect("matmul");
-                }
-            }) / f64::from(layers);
-            line += &format!("  {} {us:6.1}us", if chained { "chained" } else { "apart" });
-        }
-        eprintln!("{line}");
-        b.keep.borrow_mut().clear();
-    }
-}
-
-// EXPERIMENT: the same banks' codes in Metal's own allocations and as windows of a mapped file.
-#[test]
-#[ignore = "a microbenchmark"]
-fn the_coop_tile_prices_mapped_codes() {
-    let Ok(device) = Context::bind() else { return };
-    let handles = Handles::new();
-    let pipelines = Pipelines::new();
-    let b = Bench {
-        device: &device,
-        handles: &handles,
-        pipelines: &pipelines,
-        keep: RefCell::new(Vec::new()),
-    };
-    let divisor: u32 = std::env::var("PIE_COOP_BENCH_DIVISOR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    let dir = std::env::var("PIE_COOP_BENCH_DIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string());
-    for (what, k, n, split) in [("down", 17408u32, 5120u32, 4i32), ("gate_up", 5120, 34816, 1)] {
-        let n = n / divisor;
-        let code_bytes = u64::from(k) * u64::from(n) / 2;
-        let layers = STREAM.div_ceil(code_bytes * 9 / 8).clamp(2, 512) as u32;
-        let banks: Vec<Bank> = (0..layers)
-            .map(|l| b.bank(u64::from(l) * 7919 + u64::from(n), k, n))
-            .collect();
-        // the same codes, laid end to end in a file
-        let path = std::path::Path::new(&dir).join(format!("coop-bench-{what}.bin"));
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&path).expect("create");
-            for bank in &banks {
-                f.write_all(&handles.read(bank.codes.buf, code_bytes).expect("read")).expect("write");
-            }
-        }
-        let map = engine_metal::mapping::Mapping::of(&path).expect("map");
-        let mapped = Buffer::mapped(&device, map).expect("mapped");
-        let mapped_banks: Vec<Bank> = banks
-            .iter()
-            .enumerate()
-            .map(|(l, bank)| Bank {
-                codes: Tensor::new(
-                    handles.bind(&mapped, l as u64 * code_bytes, code_bytes).expect("bind"),
-                    n,
-                    k,
-                    Dtype::U4g64,
-                ),
-                ..*bank
-            })
-            .collect();
-        let x: Vec<u8> = fill(u64::from(k) ^ 0xabcd, u64::from(ROWS) * u64::from(k) * 2)
-            .chunks(2)
-            .flat_map(|c| bf16((f32::from(c[0]) - 127.5) / 256.0))
-            .collect();
-        let act = Tensor::new(b.upload(&x), ROWS, k, Dtype::Bf16);
-        let ys: Vec<Tensor> = (0..layers)
-            .map(|_| Tensor::new(b.zeroed(u64::from(ROWS * n) * 2), ROWS, n, Dtype::Bf16))
-            .collect();
-        let shape = (ROWS as i32, n as i32, k as i32, n as i32, k as i32);
-        let mut line = format!("{what:8} K={k:5} N={n:6} x{layers:2} k{split}");
-        for (label, set) in [("owned", &banks), ("mapped", &mapped_banks), ("owned", &banks), ("mapped", &mapped_banks)] {
-            let us = b.time(&|ctx| {
-                for (w, y) in set.iter().zip(&ys) {
-                    quant::coop_matmul(ctx, act, *w, w.biases.expect("b"), *y, shape, split)
-                        .expect("matmul");
-                }
-            }) / f64::from(layers);
-            line += &format!("  {label} {us:6.1}us {:4.0}GB/s", (code_bytes * 9 / 8) as f64 / us / 1e3);
-        }
-        eprintln!("{line}");
-        drop(mapped);
-        b.keep.borrow_mut().clear();
-        let _ = std::fs::remove_file(&path);
-    }
 }

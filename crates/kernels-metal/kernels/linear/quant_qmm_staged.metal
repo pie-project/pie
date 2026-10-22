@@ -197,137 +197,12 @@ METAL_FUNC void coop_walk(const device uint *weights, const device bfloat *scale
 }
 #endif
 
-#if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
-// EXPERIMENT: MODE 0 the walk, 1 its loads alone, 2 its matmuls alone; RUN spans a step's loads;
-// SGS simdgroups of 32 columns a threadgroup.
-template <int SPLIT, int MODE, int RUN, int SGS>
-[[kernel]] void
-affine_qmm_coop_x(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
-                  const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
-                  device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
-                  constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
-                  constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
-                  uint2 position [[threadgroup_position_in_grid]],
-                  uint lane [[thread_index_in_simdgroup]],
-                  uint simd [[simdgroup_index_in_threadgroup]]) {
-  const uint column = position.x * 32 * SGS + simd * 32;
-  const int spans = width / 256 / SPLIT;
-  const int first = int(position.y) * spans, last = first + spans;
-  PIE_COOP_MULTIPLY;
-  auto total = multiply.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-#pragma unroll
-  for (ushort i = 0; i < total.get_capacity(); ++i)
-    total[i] = 0.0f;
-#pragma unroll
-  for (ushort i = 0; i < a.get_capacity(); ++i)
-    a[i] = bfloat(0.0f);
-  const ushort q = (lane & 1) + 2 * ((lane >> 3) & 1);
-  const ushort sub = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-  const ulong words = ulong(stride) / 32, groups = ulong(stride) / 64;
-  const bool live = int(sub) < rows;
-  const device uint4 *codes =
-      reinterpret_cast<const device uint4 *>(weights) + ulong(column + sub) * words + 2 * q;
-  const device bfloat *scale = scales + ulong(column + sub) * groups + q;
-  const device bfloat *bias = biases + ulong(column + sub) * groups + q;
-  const device uint4 *x = reinterpret_cast<const device uint4 *>(
-                              input + ulong(min(int(sub), rows - 1)) * width) + 8 * q;
-  uint folded = 0;
-  for (int base = first; base < last; base += RUN) {
-    uint4 w[RUN][2][4];
-    half2 s[RUN][4], z[RUN][4];
-#pragma unroll
-    for (int r = 0; r < RUN; ++r)
-#pragma unroll
-      for (ushort j = 0; j < 4; ++j) {
-        const int span = base + r;
-        if (MODE == 3) {
-          // the same bytes a simdgroup reads, as one contiguous run of its 32 rows' block
-          const device uint4 *block = reinterpret_cast<const device uint4 *>(weights) +
-                                      ulong(column) * words + ulong(position.y) * (32 * words / SPLIT);
-          s[r][j] = half2(half(float(scale[8 * j * groups + span * 4])));
-          z[r][j] = half2(half(float(bias[8 * j * groups + span * 4])));
-          w[r][0][j] = block[ulong(span - first) * 256 + j * 32 + lane];
-          w[r][1][j] = block[ulong(span - first) * 256 + (4 + j) * 32 + lane];
-        } else if (MODE == 2) {
-          s[r][j] = half2(half(0.01h * float(j + 1)));
-          z[r][j] = half2(half(-0.02h));
-          w[r][0][j] = uint4(lane * 0x01234567u + j + span);
-          w[r][1][j] = uint4(lane * 0x07654321u + j + span);
-        } else {
-          s[r][j] = half2(half(float(scale[8 * j * groups + span * 4])));
-          z[r][j] = half2(half(float(bias[8 * j * groups + span * 4])));
-          w[r][0][j] = codes[8 * j * words + span * 8];
-          w[r][1][j] = codes[8 * j * words + span * 8 + 1];
-        }
-      }
-#pragma unroll
-    for (int r = 0; r < RUN; ++r) {
-      const int span = base + r;
-      if (MODE == 1 || MODE == 3) {
-#pragma unroll
-        for (ushort j = 0; j < 4; ++j)
-          folded ^= w[r][0][j].x ^ w[r][0][j].y ^ w[r][0][j].z ^ w[r][0][j].w ^ w[r][1][j].x ^
-                    w[r][1][j].y ^ w[r][1][j].z ^ w[r][1][j].w ^ as_type<uint>(s[r][j]) ^
-                    as_type<uint>(z[r][j]);
-        continue;
-      }
-#pragma unroll
-      for (ushort h = 0; h < 2; ++h)
-#pragma unroll
-        for (ushort cc = 0; cc < 4; ++cc) {
-          const uint4 xv = x[span * 32 + h * 4 + cc];
-#pragma unroll
-          for (ushort t = 0; t < 2; ++t)
-#pragma unroll
-            for (ushort rr = 0; rr < 4; ++rr)
-              a[8 * t + rr] = live ? as_type<bfloat2>(xv[2 * t + rr / 2])[rr % 2] : bfloat(0.0f);
-#pragma unroll
-          for (ushort j = 0; j < 4; ++j) {
-            const uint word = w[r][h][j][cc];
-#pragma unroll
-            for (ushort rr = 0; rr < 4; ++rr) {
-              half2 v = as_type<half2>(((word >> (4 * rr)) & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);
-              v = fma(v, s[r][j], z[r][j]);
-              b[4 * j + rr] = v.x;
-              b[16 + 4 * j + rr] = v.y;
-            }
-          }
-          multiply.run(a, b, total);
-        }
-    }
-  }
-  if (MODE == 1 || MODE == 3) {
-    if (folded == 0x9e3779b9u)
-      output[lane] = bfloat(1.0f);
-    return;
-  }
-#pragma unroll
-  for (ushort i = 0; i < total.get_capacity(); ++i) {
-    if (!total.is_valid_element(i))
-      continue;
-    const auto at = total.get_multidimensional_index(i);
-    const uint row = at[1];
-    if (row >= uint(rows) || row >= 8)
-      continue;
-    const ulong o = ulong(row) * columns + column + at[0];
-    if constexpr (SPLIT > 1)
-      partials[ulong(position.y) * rows * columns + o] = total[i];
-    else
-      output[o] = bfloat(total[i]);
-  }
-}
-#define PIE_COOP_X_POINT(name, split, mode, run, sgs)                                              \
-  template [[host_name(name)]] [[kernel]] void affine_qmm_coop_x<split, mode, run, sgs>(           \
-      const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
-      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
-      constant int &, uint2, uint, uint);
-#endif
-
-// A threadgroup holds 64 columns as two simdgroups, and `SPLIT` partitions of the contraction
-// as that many such pairs: simdgroup `2p + c` walks partition `p` of columns `32c` on. Each
+// A threadgroup holds `32 * WIDE` columns as `WIDE` simdgroups, and `SPLIT` partitions of the
+// contraction as that many such rows of simdgroups: simdgroup `WIDE * p + c` walks partition `p`
+// (its share of the 256-input spans, as the register tile cuts them) of columns `32c` on. Each
 // partition past the first hands its sums over in threadgroup memory, and the first adds them
 // in partition order from zero, as the split reduction of the partials would.
-template <int SPLIT>
+template <int SPLIT, int WIDE>
 [[kernel]] void
 affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
                 const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
@@ -338,15 +213,15 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
                 uint lane [[thread_index_in_simdgroup]],
                 uint simd [[simdgroup_index_in_threadgroup]]) {
 #if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
-  const uint part = simd / 2, column = position.x * 64 + (simd % 2) * 32;
-  const int spans = width / 256 / SPLIT;
-  const int first = int(part) * spans;
+  const uint part = simd / WIDE, column = position.x * 32 * WIDE + (simd % WIDE) * 32;
+  const int spans = width / 256;
+  const int first = int(part) * spans / SPLIT, last = (int(part) + 1) * spans / SPLIT;
   auto total = coop_destination();
-  coop_walk(weights, scales, biases, input, width, rows, stride, column, first, first + spans,
-            lane, total);
+  coop_walk(weights, scales, biases, input, width, rows, stride, column, first, last, lane,
+            total);
   // The eight live rows of a lane's elements, in element order.
-  threadgroup float handed[SPLIT > 1 ? (SPLIT - 1) * 2 * 8 * 32 : 1];
-  threadgroup float *mine = handed + (simd % 2) * 8 * 32 + lane;
+  threadgroup float handed[SPLIT > 1 ? (SPLIT - 1) * WIDE * 8 * 32 : 1];
+  threadgroup float *mine = handed + (simd % WIDE) * 8 * 32 + lane;
   if constexpr (SPLIT > 1) {
     if (part > 0) {
       ushort slot = 0;
@@ -354,7 +229,7 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
       for (ushort i = 0; i < total.get_capacity(); ++i) {
         if (!total.is_valid_element(i) || total.get_multidimensional_index(i)[1] >= 8)
           continue;
-        mine[((part - 1) * 2 * 8 + slot++) * 32] = total[i];
+        mine[((part - 1) * WIDE * 8 + slot++) * 32] = total[i];
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -374,20 +249,21 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
     if constexpr (SPLIT > 1) {
       sum = 0.0f + sum;
       for (int p = 1; p < SPLIT; ++p)
-        sum += mine[((p - 1) * 2 * 8 + slot) * 32];
+        sum += mine[((p - 1) * WIDE * 8 + slot) * 32];
     }
     ++slot;
     if (row < uint(rows))
       output[ulong(row) * columns + column + at[0]] = bfloat(sum);
   }
 #else
-  // The first pair walks the whole contraction alone.
+  // The first row of simdgroups walks the whole contraction alone, as the staged tile's halves.
   threadgroup half stages[2 * 2 * 32 * 32];
   threadgroup uint4 pairs[2 * 2 * 32];
-  if (simd >= 2)
+  if (simd >= WIDE)
     return;
   staged_tile<8, 1>(weights, scales, biases, input, output, width, columns, nullptr, rows,
-                    stride, position, lane, simd, stages, pairs);
+                    stride, uint2(position.x * WIDE + simd, 0) / 2, lane, (position.x * WIDE + simd) % 2,
+                    stages, pairs);
 #endif
 }
 
@@ -524,8 +400,8 @@ affine_qmm_coop_swiglu(const device uint *weights [[buffer(0)]], const device bf
 #endif
 }
 
-#define PIE_COOP_POINT(name, split)                                                                \
-  template [[host_name(name)]] [[kernel]] void affine_qmm_coop<split>(                             \
+#define PIE_COOP_POINT(name, split, wide)                                                          \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_coop<split, wide>(                             \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
       device bfloat *, constant int &, constant int &, constant int &, constant int &, uint2,      \
       uint, uint);

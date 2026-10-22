@@ -1304,7 +1304,7 @@ fn staged(
         } else {
             COOP_SPLIT
         };
-        return coop_matmul(ctx, act, w, biases, y, (m, n, k, cols, ld), split);
+        return coop_matmul(ctx, act, w, biases, y, (m, n, k, cols, ld), split, 2);
     }
     let mut split = if k >= STAGED_DEEP || tiles < STAGED_FEW_TILES {
         STAGED_SPLIT_WIDE
@@ -1353,8 +1353,8 @@ fn staged(
 
 /// One register-fed (Apple10 cooperative) tile matmul of `act` into `y`: `(m, n, k, cols, ld)`
 /// its rows, row stride, contraction, columns computed and the bank's row stride; `split`
-/// partitions of the contraction, each a pair of simdgroups of the column tile's threadgroup,
-/// which sums them in place.
+/// partitions of the contraction, each a row of `wide` simdgroups (32 columns each) of the
+/// column tile's threadgroup, which sums them in place.
 #[allow(clippy::too_many_arguments)]
 pub fn coop_matmul(
     ctx: &Ctx<'_>,
@@ -1364,11 +1364,12 @@ pub fn coop_matmul(
     y: Tensor,
     (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
     split: i32,
+    wide: i32,
 ) -> Result<(), Error> {
-    let tiles = (cols / 64).unsigned_abs();
-    let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
-    let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
-    let threads = 64 * split.unsigned_abs();
+    let tiles = (cols / (32 * wide)).unsigned_abs();
+    let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}_w{wide}"));
+    let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split},{wide})"));
+    let threads = (32 * wide * split).unsigned_abs();
     ctx.fire(
         Fire::at(STAGED_FILE, entry)
             .stamp(stamp)
@@ -1536,51 +1537,6 @@ pub fn coop_swiglu(
         ],
     )?;
     Ok(true)
-}
-
-/// EXPERIMENT: a variant of [`coop_matmul`]; `(mode, run, sgs)` as the kernel names them.
-#[allow(clippy::too_many_arguments)]
-pub fn coop_matmul_x(
-    ctx: &Ctx<'_>,
-    act: Tensor,
-    w: Bank,
-    y: Tensor,
-    (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
-    split: i32,
-    partial: Option<Tensor>,
-    (mode, run, sgs): (i32, i32, i32),
-) -> Result<(), Error> {
-    let entry = symbol(&format!("affine_qmm_coop_x_k{split}_m{mode}_r{run}_s{sgs}"));
-    let stamp = symbol(&format!(
-        "PIE_COOP_X_POINT(\"{entry}\",{split},{mode},{run},{sgs})"
-    ));
-    ctx.fire(
-        Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
-            [(32 * sgs) * (cols / (32 * sgs)).unsigned_abs() as i32, split, 1].map(|v| v.unsigned_abs()),
-            [(32 * sgs).unsigned_abs(), 1, 1],
-        )),
-        &[
-            w.codes.arg(),
-            w.scales.arg(),
-            w.biases.expect("biases").arg(),
-            act.arg(),
-            y.arg_mut(),
-            k.arg(),
-            n.arg(),
-            match partial {
-                Some(partial) => partial.arg_mut(),
-                None => ctx.absent()?,
-            },
-            m.arg(),
-            ld.arg(),
-        ],
-    )?;
-    match partial {
-        Some(partial) if split > 1 && mode != 1 && mode != 3 => {
-            splitk_reduce(ctx, "bench", y, partial, (m, n, cols), split)
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Folds the `split` stacked f32 partials of an `m x n` product into `y`, over `cols` columns.
