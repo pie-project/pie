@@ -30,19 +30,19 @@ headers they need. Changed from upstream:
 A diff against upstream v0.6.15 is the exact record of every change.
 
 
-TensorRT-LLM and vLLM, via FlashInfer
--------------------------------------
+vLLM, via FlashInfer
+--------------------
 
     Copyright:  Copyright (c) 2023-2025 by FlashInfer team;
-                TensorRT-LLM: Copyright (c) NVIDIA CORPORATION & AFFILIATES;
                 vLLM: Copyright contributors to the vLLM project
     Licence:    Apache License 2.0
-    Derived:    kernels/collective/trtllm_allreduce_fusion.cuh
-                kernels/collective/vllm_custom_all_reduce.cuh
+    Derived:    kernels/collective/p2p.cuh
 
-The peer all-reduce pieces FlashInfer adapts from TensorRT-LLM and vLLM, used
-by `kernels/collective/all_reduce.cu`. Changed as FlashInfer above (path,
-namespace, macros, unused kernels deleted).
+The peer all-reduce pieces FlashInfer adapts from vLLM, used by
+`kernels/collective/all_reduce.cu`. Changed as FlashInfer above (path,
+namespace `pie::collective::p2p`, macros, unused kernels deleted). The
+TensorRT-LLM fused all-reduce header carried beside it was used by nothing
+and is gone.
 
 
 CUDA toolkit and CCCL headers

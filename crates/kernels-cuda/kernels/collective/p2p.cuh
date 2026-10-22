@@ -25,7 +25,7 @@
 #include <type_traits>
 
 
-namespace vllm {
+namespace pie::collective::p2p {
 
 constexpr int kMaxBlocks = 36;
 

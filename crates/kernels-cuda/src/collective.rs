@@ -7,10 +7,10 @@ const FILE: &str = "collective/all_reduce.cu";
 
 const THREADS: u32 = 512;
 
-/// `vllm::kMaxBlocks`: the signal block holds one flag row per block.
+/// `p2p::kMaxBlocks`: the signal block holds one flag row per block.
 const MAX_BLOCKS: u64 = 36;
 
-/// Bytes of one `vllm::Signal`, rounded up to what a rank allocates.
+/// Bytes of one `p2p::Signal`, rounded up to what a rank allocates.
 pub const SIGNAL_BYTES: u64 = 4096;
 
 /// A rank's view of a group whose ranks map one another's memory; its
@@ -22,9 +22,9 @@ pub struct Peers {
     pub stage: u64,
     pub stage_bytes: u64,
     pub signal: u64,
-    /// `vllm::RankData`: every rank's stage, in rank order.
+    /// `p2p::RankData`: every rank's stage, in rank order.
     pub stages: u64,
-    /// `vllm::RankSignals`: every rank's signal block, in rank order.
+    /// `p2p::RankSignals`: every rank's signal block, in rank order.
     pub signals: u64,
 }
 

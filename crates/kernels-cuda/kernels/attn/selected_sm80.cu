@@ -5,8 +5,8 @@ namespace pie::attn::selected {
 constexpr int kMaxPer = 16;
 
 // Paged GQA attention over the blocks a selection names, plus the open block
-// that runs to the query. `attention.decode`/`attention.prefill` are FlashInfer
-// and take no per-row selection, so this walk is written out: the reduction is
+// that runs to the query. `attn.decode`/`attn.prefill` run `attn/fa2` and take
+// no per-row selection, so this walk is written out: the reduction is
 // `mla_naive_paged_kernel`'s, and only the key loop and the K/V addressing
 // differ (two planes at `(slot * n_kv_heads + kv_head) * D`, V accumulated
 // rather than K). With `per_head` the selection row holds one run of `top_k`
