@@ -249,6 +249,11 @@ fn the_routed_selects_answer_the_routed_dot() {
         // Hopper's wgmma slice below the staged kernel's 32 routes an expert.
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
         (K::MxBias, mma, [8, 32, 4, 192, 2048], t, alpha, 0),
+        // A K of whole 64s on Hopper's wgmma slice (gpt-oss's 2880): a
+        // prefill's routes, its GLU, NVFP4's.
+        (K::MxBias, mma, [32, 541, 4, 384, 2880], t, None, 0),
+        (K::MxBias, mma, [8, 40, 4, 192, 2880], t, alpha, 0),
+        (K::Nv, nv_mma, [16, 120, 10, 256, 2880], t, None, 0),
         (K::Mx, cvt, [8, 1, 4, 200, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 40, 4, 576, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 3, 4, 576, 2880], f, None, 2),

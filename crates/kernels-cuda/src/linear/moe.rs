@@ -1218,7 +1218,7 @@ pub fn select_glu(
         scales,
         bias,
     } = bank
-        && mxfp4_mma_spans(ctx, fan.route_count)
+        && mxfp4_mma_spans(ctx, fan.route_count, codes.rows)
         && !experts.streams()
         && x.dtype == Dtype::Bf16
         && x.width > 0
@@ -1369,7 +1369,7 @@ pub fn experts(
     let routed = Tensor::new(0, count, y.width, Dtype::Bf16);
     // An mxfp4 fire the register-dequant kernel takes stays on it.
     let mma = |bank: GluBank| match bank {
-        GluBank::Mxfp4 { .. } => mxfp4_mma_spans(ctx, count),
+        GluBank::Mxfp4 { codes, .. } => mxfp4_mma_spans(ctx, count, codes.rows),
         GluBank::Nvfp4 { .. } => nvfp4_mma_spans(ctx, count),
         _ => false,
     };
@@ -2436,12 +2436,15 @@ fn route_order_sliced(
     Ok(laid)
 }
 
-/// Whether the register-dequant MMA kernel takes a fire of `routes` routes:
-/// `kernel.moe.mxfp4_mma_from ..= kernel.moe.mxfp4_mma_until`.
+/// Whether the register-dequant MMA kernel takes a fire of `routes` routes
+/// over `experts`: `kernel.moe.mxfp4_mma_from ..= kernel.moe.mxfp4_mma_until`,
+/// its experts averaging `kernel.moe.mxfp4_mma_per_from` routes or more.
 #[cfg(feature = "cuda")]
-fn mxfp4_mma_spans(ctx: &Ctx, routes: u32) -> bool {
+fn mxfp4_mma_spans(ctx: &Ctx, routes: u32, experts: u32) -> bool {
     let t = ctx.tuning();
-    t.mxfp4_mma_from <= routes && routes <= t.mxfp4_mma_until
+    t.mxfp4_mma_from <= routes
+        && routes <= t.mxfp4_mma_until
+        && routes.div_ceil(experts.clamp(1, EXPERT_CAP)) >= t.mxfp4_mma_per_from
 }
 
 #[cfg(feature = "cuda")]
@@ -2515,8 +2518,9 @@ pub(crate) fn mxfp4_mma_worth(
     y: &Tensor,
     seat: GroupSeat,
     fan: &Selected,
+    experts: u32,
 ) -> bool {
-    mxfp4_mma_spans(ctx, fan.route_count)
+    mxfp4_mma_spans(ctx, fan.route_count, experts)
         && !seat.streams()
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
@@ -2612,7 +2616,7 @@ fn select_mxfp4_mma(
     // 32-route block is ALU-bound past 16 routes.
     let staged = !cvt
         && (per > STAGED_FROM
-            || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(128)));
+            || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
     let nb: u32 = match per {
         _ if staged => 8,
         0..=4 => 1,
@@ -2674,10 +2678,11 @@ fn select_mxfp4_mma(
                 .smem(nb * win * 4096)
                 .cluster(ksplit),
         )
-    } else if staged && hopper_wgmma() && x.width.is_multiple_of(128) {
+    } else if staged && hopper_wgmma() && x.width.is_multiple_of(64) {
         // Hopper: the staged slice on wgmma (`moe_select_fp4_wgmma`), the
         // codes dequantized to its A registers, a warpgroup's 128 rows (64
-        // GLU columns) a CTA. Two stages where the fire's slices fill the
+        // GLU columns) a CTA; a K of whole 64s (gpt-oss's 2880) steps its
+        // last chunk's half. Two stages where the fire's slices fill the
         // card three CTAs an SM deep (their shared memory), else three.
         let nv = tensor_scales.is_some();
         let sms = ctx.multiprocessors().unwrap_or(132);
@@ -3123,7 +3128,7 @@ fn matmul_select_mxfp4(
     let fan = selected(op, x, routes, y)?;
     // A launch that fails falls back to the arms below.
     #[cfg(feature = "cuda")]
-    if mxfp4_mma_worth(ctx, x, y, seat, &fan)
+    if mxfp4_mma_worth(ctx, x, y, seat, &fan, codes.rows)
         && select_mxfp4_mma(
             ctx, op, x, codes, scales, bias, routes, y, &fan, None, None, false,
         )
