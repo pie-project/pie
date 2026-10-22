@@ -703,3 +703,106 @@ fn fp8_select_rate() {
         );
     }
 }
+
+/// A prefill's bf16 select on Hopper's warp-specialized wgmma GEMM (slices of
+/// 128 routes), with and without the GLU in its epilogue, against the host
+/// product; the column counts leave tails past whole tiles.
+#[test]
+fn the_bf16_prefill_selects_answer_the_routed_dot() {
+    if kernels_cuda::jit::cache::arch() != Some("sm_90") {
+        return;
+    }
+    let (ex, tokens, top, k) = (8usize, 256usize, 4usize, 512usize);
+    for glu in [None, Some(Glu::GegluTanh), Some(Glu::Swiglu)] {
+        let inter = 192usize;
+        let n = if glu.is_some() { inter } else { 384 };
+        let rows = if glu.is_some() { 2 * inter } else { n };
+        let what = format!("bf16 prefill select {ex}x{tokens}x{top} {n}x{k} {glu:?}");
+        let mut b = Bench::new(0xbf1 ^ (n + k) as u64);
+        let count = tokens * top;
+        let routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let (x, xv) = b.bf16(tokens * k);
+        let (bank, wv) = b.bf16(ex * rows * k);
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let took = moe::select_bf16_held(
+            &ctx,
+            "test",
+            t(x, tokens, k, Bf16),
+            bank,
+            ex as u32,
+            t(b.up(&routes), tokens, top, I32),
+            &mut y,
+            glu,
+        )
+        .expect("the select fires");
+        assert!(took, "{what}: the select takes the fire");
+        let row = |r: usize, c: usize| (routes[r] as usize * rows + c) * k;
+        let want = match glu {
+            None => dot(
+                [count, n, k],
+                |r, i| xv[r / top * k + i],
+                |r, c, i| wv[row(r, c) + i],
+            ),
+            Some(f) => {
+                let g = dot(
+                    [count, n, k],
+                    |r, i| xv[r / top * k + i],
+                    |r, c, i| wv[row(r, c) + i],
+                );
+                let u = dot(
+                    [count, n, k],
+                    |r, i| xv[r / top * k + i],
+                    |r, c, i| wv[row(r, inter + c) + i],
+                );
+                g.into_iter()
+                    .zip(u)
+                    .map(|(g, u)| glu_want(f, g, u))
+                    .collect()
+            }
+        };
+        b.check(y.ptr, &want, TOL, &what);
+    }
+}
+
+#[test]
+#[ignore = "a rate bench: cargo test ... -- --ignored bf16_prefill_rate --nocapture"]
+fn bf16_prefill_rate() {
+    // Gemma 4 26B-A4B's experts at a prefill fire: 128 experts, top 8, 4096 tokens.
+    let (ex, tokens, top, hidden, inter) = (128usize, 4096usize, 8usize, 2816usize, 704usize);
+    for glu in [Some(Glu::GegluTanh), None] {
+        let (n, k) = if glu.is_some() {
+            (inter, hidden)
+        } else {
+            (hidden, inter)
+        };
+        let rows = if glu.is_some() { 2 * n } else { n };
+        let mut b = Bench::new(3);
+        let count = tokens * top;
+        let routes = tab(count, |r| ((r / top * 13 + r % top * 29) % ex) as i32);
+        let (x, _) = b.bf16(tokens * k);
+        let bank = b.up(&tab(ex * rows * k, |i| {
+            crate::common::to_bf16(((i * 37 % 251) as f32 - 125.0) / 2000.0)
+        }));
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let r = t(b.up(&routes), tokens, top, I32);
+        let x = t(x, tokens, k, Bf16);
+        let fire = |y: &mut _| moe::select_bf16_held(&ctx, "bench", x, bank, ex as u32, r, y, glu);
+        assert!(fire(&mut y).expect("fires"));
+        b.sync();
+        let reps = 10;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        let flops = 2.0 * count as f64 * rows as f64 * k as f64;
+        eprintln!(
+            "bf16 prefill select glu={} {rows}x{k}: {us:.0} us, {:.0} TFLOP/s",
+            glu.is_some(),
+            flops / us / 1e6
+        );
+    }
+}
