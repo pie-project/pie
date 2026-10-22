@@ -278,7 +278,7 @@ impl<'c> Run<'c> {
     }
 
     /// The single node that reads `value`, if exactly one does.
-    fn sole_reader(&self, value: ValueId) -> Option<&'c Node> {
+    pub(crate) fn sole_reader(&self, value: ValueId) -> Option<&'c Node> {
         match self.readers_of(value) {
             &[only] => self.nodes.get(only as usize),
             _ => None,
