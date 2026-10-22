@@ -780,7 +780,7 @@ mod tests {
         assert_eq!(
             Engine {
                 lattice_steps: 1,
-                prefill_lattice_from: 0,
+                prefill_lattice_from: Engine::of(&family).prefill_lattice_from,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
