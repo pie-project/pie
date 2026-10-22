@@ -9,7 +9,7 @@
 use crate::common::attn_ref::tuned;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::rope;
+use kernels_cuda::elemwise::norm_rope;
 use kernels_cuda::tensor::Tensor;
 
 fn check(
@@ -41,7 +41,7 @@ fn check(
         ctx.arm_stage(win_at);
     }
     let mut y = Tensor::new(y_at, rows, width as u32, Dtype::Bf16);
-    rope::rmsnorm_rope_partial_q(
+    norm_rope::rmsnorm_rope_partial_q(
         &ctx,
         Tensor::new(x_at, rows, width as u32, Dtype::Bf16),
         Tensor::new(w_at, head_dim as u32, 1, Dtype::Bf16),

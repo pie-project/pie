@@ -135,7 +135,7 @@ impl Run<'_> {
                     w: *w,
                     y: *y,
                 })?;
-                kernels_cuda::elemwise::norm::add_bias(
+                kernels_cuda::elemwise::pointwise::add_bias(
                     self.ctx(),
                     self.tensor(*bias),
                     &mut self.tensor(*y),
@@ -535,7 +535,7 @@ impl Run<'_> {
                 d_rel,
                 extent,
                 y,
-            } => linear::rel_bias::rel_bias(
+            } => kernels_cuda::elemwise::posenc::rel_bias(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*w),

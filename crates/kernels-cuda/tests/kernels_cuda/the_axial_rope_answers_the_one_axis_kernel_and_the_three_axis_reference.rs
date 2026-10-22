@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::{RopeForm, rope, rope_axes};
+use kernels_cuda::elemwise::rope::{self, RopeForm, rope_axes};
 use kernels_cuda::tensor::Tensor;
 
 const ROWS: usize = 12;

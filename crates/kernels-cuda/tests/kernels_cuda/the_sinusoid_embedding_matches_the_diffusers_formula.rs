@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
-use kernels_cuda::elemwise::sinusoid;
+use kernels_cuda::elemwise::posenc::sinusoid;
 use kernels_cuda::tensor::Tensor;
 
 const TOLERANCE: f32 = 2e-6;

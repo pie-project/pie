@@ -11,7 +11,7 @@
 use crate::common::attn_ref::tuned;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::norm::{self, Keep, PostNorm};
+use kernels_cuda::elemwise::norm_residual::{self, Keep, PostNorm};
 use kernels_cuda::tensor::Tensor;
 
 struct Landed {
@@ -57,7 +57,7 @@ fn land(
     let mut yt = plane(y_at);
     let mut sc = plane(scaled_at);
     let mut out = plane(out_at);
-    norm::rmsnorm_residual_add_keeping(
+    norm_residual::rmsnorm_residual_add_keeping(
         &ctx,
         plane(x_at),
         Tensor::new(w0_at, width as u32, 1, Dtype::Bf16),

@@ -9,7 +9,7 @@ mod common;
 
 use common::{Gpu, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::elemwise::{rope, rope_mrope};
+use kernels_rocm::elemwise::{norm_rope, rope};
 
 /// theta^(-i/span), as the device takes it.
 fn freq(theta: f32, i: usize, span: usize) -> f32 {
@@ -301,7 +301,7 @@ fn rmsnorm_rope_partial_q() {
         if let Some(s) = &staged {
             ctx.arm_stage(s.ptr);
         }
-        rope::rmsnorm_rope_partial_q(
+        norm_rope::rmsnorm_rope_partial_q(
             &ctx,
             x,
             w,
@@ -432,9 +432,9 @@ fn rope_mrope_forms() {
             ctx.arm_stage(s.ptr);
         }
         let f = match form {
-            Form::Interleaved => rope_mrope::interleaved,
-            Form::Blocked => rope_mrope::blocked,
-            Form::Split => rope_mrope::split,
+            Form::Interleaved => rope::interleaved,
+            Form::Blocked => rope::blocked,
+            Form::Split => rope::split,
         };
         f(
             &ctx,

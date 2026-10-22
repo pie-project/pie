@@ -2,7 +2,8 @@
 
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::linear::{moe, rel_bias};
+use kernels_cuda::elemwise::posenc;
+use kernels_cuda::linear::moe;
 use kernels_cuda::ssm;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
@@ -100,7 +101,7 @@ fn the_relative_profile_is_the_features_through_the_bank() {
     let p_at = gpu.up(&p_raw);
     let b_at = gpu.zeros((rows * heads * extent) as usize * 4);
     let mut bias = Tensor::new(b_at, rows, heads * extent, Dtype::F32);
-    rel_bias::rel_bias(
+    posenc::rel_bias(
         &gpu.ctx(),
         Tensor::new(r_at, rows, heads * d_rel, Dtype::Bf16),
         Tensor::new(p_at, d_rel, extent, Dtype::Bf16),

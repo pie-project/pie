@@ -220,7 +220,7 @@ impl Run<'_> {
         {
             let blocks: Vec<kernels_cuda::tensor::Tensor> =
                 blocks.iter().map(|b| self.tensor(*b)).collect();
-            if kernels_cuda::elemwise::norm::res_blend_norm(
+            if kernels_cuda::elemwise::modulate::res_blend_norm(
                 self.ctx(),
                 self.tensor(*prefix),
                 &blocks,
@@ -855,7 +855,7 @@ impl Run<'_> {
     /// Qwen3.5's attention prologue in one launch up to
     /// `kernel.elemwise.qg_prologue_until` rows on a bf16 NHD pool, else as traced.
     fn qg_qknorm_rope_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
-        use kernels_cuda::elemwise::{norm, rope};
+        use kernels_cuda::elemwise::{norm, norm_rope, rope};
         let Fused::QgQknormRopeAppend {
             qg,
             k,
@@ -894,7 +894,7 @@ impl Run<'_> {
             && (*head_dim == 128 || *head_dim == 256)
             && span.is_multiple_of(*head_dim / 32)
         {
-            return rope::qg_qknorm_rope_append(
+            return norm_rope::qg_qknorm_rope_append(
                 self.ctx(),
                 self.tensor(*qg),
                 self.tensor(*k),
@@ -1038,7 +1038,7 @@ impl Run<'_> {
     /// DeepSeek-V4's compressor at its boundaries in one launch where the profile
     /// says (`kernel.elemwise.rows_vec`) and the shape fits, else unfused.
     fn pool_compress(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
-        use kernels_cuda::elemwise::rope;
+        use kernels_cuda::elemwise::{norm_rope, rope};
         let Fused::PoolCompress {
             gather,
             weight,
@@ -1142,7 +1142,7 @@ impl Run<'_> {
             self.attention(state)?;
         }
         self.attention(gather)?;
-        rope::norm_rope_last(
+        norm_rope::norm_rope_last(
             self.ctx(),
             self.tensor(*entries),
             Some(self.tensor(*weight)),
@@ -1227,7 +1227,7 @@ impl Run<'_> {
     /// as its fp8 row there, or after to a bf16 pool) under `kernel.elemwise.rows_vec`
     /// where the shape fits; else each as its own fused op.
     fn norm_rope_pair(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
-        use kernels_cuda::elemwise::rope;
+        use kernels_cuda::elemwise::{norm_rope, rope};
         let Fused::NormRopePair { q, kv } = op else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
@@ -1283,15 +1283,15 @@ impl Run<'_> {
                 beta_slow: y.beta_slow,
                 original_max_position: y.original_max_position,
             });
-            let landed = rope::norm_rope_pair(
+            let landed = norm_rope::norm_rope_pair(
                 self.ctx(),
-                rope::Side {
+                norm_rope::Side {
                     x: self.tensor(*qx),
                     head_dim: *q_dim,
                     eps: *q_eps,
                     y: &mut self.tensor(*qy),
                 },
-                rope::Side {
+                norm_rope::Side {
                     x: self.tensor(*kx),
                     head_dim: *kv_dim,
                     eps: *kv_eps,
@@ -1302,7 +1302,7 @@ impl Run<'_> {
                 *rotary_dim,
                 *theta,
                 yarn,
-                fp8.then_some(rope::Append {
+                fp8.then_some(norm_rope::Append {
                     pool: &pool,
                     write_page: self.tensor(*write_page),
                     write_offset: self.tensor(*write_offset),
@@ -1338,7 +1338,7 @@ impl Run<'_> {
     /// DeepSeek-V4's kv plane normed, rotated and written in one launch into a pool
     /// of DeepSeek's fp8 rows (under `kernel.elemwise.rows_vec`); else unfused.
     fn norm_rope_last_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
-        use kernels_cuda::elemwise::rope;
+        use kernels_cuda::elemwise::{norm_rope, rope};
         let Fused::NormRopeLastAppend {
             x,
             weight,
@@ -1366,7 +1366,7 @@ impl Run<'_> {
             original_max_position: y.original_max_position,
         });
         let fp8 = kernels_cuda::attn::dsv4::fp8_ds(&pool);
-        let landed = rope::norm_rope_last_append(
+        let landed = norm_rope::norm_rope_last_append(
             self.ctx(),
             self.tensor(*x),
             self.tensor(*weight),
@@ -1379,7 +1379,7 @@ impl Run<'_> {
             *inverse,
             yarn,
             &mut self.tensor(*y),
-            fp8.then_some(rope::Append {
+            fp8.then_some(norm_rope::Append {
                 pool: &pool,
                 write_page: self.tensor(*write_page),
                 write_offset: self.tensor(*write_offset),
@@ -1388,7 +1388,7 @@ impl Run<'_> {
         if landed {
             return Ok(());
         }
-        rope::norm_rope_last(
+        norm_rope::norm_rope_last(
             self.ctx(),
             self.tensor(*x),
             Some(self.tensor(*weight)),

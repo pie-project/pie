@@ -1,25 +1,17 @@
+use super::*;
 use crate::error::Error;
-use dtype::Dtype;
-
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::tensor::Tensor;
+use crate::voxels::{flat_elements, lanes_of};
+use dtype::Dtype;
 
 const NORM: &str = "elemwise/norm.cu";
-const POINTWISE: &str = "elemwise/pointwise.cu";
-
-const BLOCK: u32 = 256;
-
-const WARP: u32 = 32;
-
-const VEC_WIDTH: u32 = 8;
 
 const ABSOLUTE_BANK: &str = "rmsnorm";
 
 const OFFSET_BANK: &str = "rmsnorm_plus_one";
-const MODULATE: &str = "elemwise/modulate.cu";
-const NORM_RESIDUAL: &str = "elemwise/norm_residual.cu";
 
 fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
@@ -47,31 +39,6 @@ fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Resu
 const fn per_head_split(width: u32, head_dim: u32) -> u32 {
     #[allow(clippy::manual_checked_ops)]
     if head_dim == 0 { 1 } else { width / head_dim }
-}
-
-fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
-    let n = t.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the element count", lanes)?;
-    Ok((Launch::flat(lanes, BLOCK), n))
-}
-
-fn route_rows(rows: u32, width: u32) -> Launch {
-    const MAX_BLOCK: u32 = 1024;
-
-    Launch::per_row(
-        rows,
-        width
-            .div_ceil(WARP)
-            .max(1)
-            .saturating_mul(WARP)
-            .min(MAX_BLOCK),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -300,87 +267,6 @@ pub struct Next {
     pub eps: f32,
     pub plus_one: bool,
     pub y: Tensor,
-}
-
-/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`): a
-/// row's `x` times `scale` (rounded), RMS-normed unscaled (rounded), and with
-/// `res` and its f32 `gate` the residual's gated sum; with `next`, the next
-/// sublayer's input norm over it in the same pass.
-#[allow(clippy::too_many_arguments)]
-pub fn norm_gate(
-    ctx: &Ctx,
-    x: Tensor,
-    scale: Option<Tensor>,
-    res: Option<Tensor>,
-    gate: Option<Tensor>,
-    eps: f32,
-    temperature: f32,
-    fan: u32,
-    next: Option<Next>,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.norm_gate";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    if res.is_some() != gate.is_some() || gate.is_some_and(|g| g.dtype != Dtype::F32) {
-        return Err(refuse(OP, "a residual comes with its f32 gate"));
-    }
-    let rows = nonzero(OP, "rows", y.rows)?;
-    let absent = |t: Option<Tensor>| t.map_or(crate::jit::ArgValue::ABSENT, |t| t.arg());
-    // A 16-byte run a thread, the row in the block's registers.
-    let threads = y.width / 8;
-    let planes = [
-        Some(x),
-        scale,
-        res,
-        gate,
-        Some(*y),
-        next.map(|n| n.weight),
-        next.map(|n| n.y),
-    ];
-    if !y.width.is_multiple_of(8)
-        || !threads.is_power_of_two()
-        || !(32..=1024).contains(&threads)
-        || !planes.into_iter().flatten().all(|t| aligned16(t.ptr))
-    {
-        return Err(refuse(
-            OP,
-            "a row of 256 to 8192 elements, a power of two, 16-byte aligned",
-        ));
-    }
-    let tail = next.is_some();
-    // A long fire's block walks sixteen rows; a short one's keeps a row.
-    const WALK: u32 = 16;
-    let walk = rows >= 8192;
-    let (entry, launch) = if walk {
-        (
-            format!("::pie::elemwise::norm_gate_rows<{t}, {threads}, {tail}, {WALK}>"),
-            Launch::per_row(rows.div_ceil(WALK), threads),
-        )
-    } else {
-        (
-            format!("::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"),
-            Launch::per_row(rows, threads),
-        )
-    };
-    let mut args = vec![
-        x.arg(),
-        absent(scale),
-        absent(res),
-        absent(gate),
-        y.arg(),
-        eps.arg(),
-        temperature.arg(),
-        stated(OP, fan)?.arg(),
-        absent(next.map(|n| n.weight)),
-        next.map_or(0.0, |n| n.eps).arg(),
-        i32::from(next.is_some_and(|n| n.plus_one)).arg(),
-        absent(next.map(|n| n.y)),
-    ];
-    if walk {
-        args.push(stated(OP, rows)?.arg());
-    }
-    args.push(ctx.stage());
-    ctx.fire(OP, Fire::at(MODULATE, symbol(&entry)).apply(launch), &args)
 }
 
 pub fn rmsnorm_no_scale(
@@ -729,281 +615,6 @@ pub fn rmsnorm_gated_by(
     )
 }
 
-pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add";
-    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let (launch, n) = elementwise(OP, *y)?;
-    // Rows of whole 16-byte groups add eight lanes a thread.
-    if y.dtype == Dtype::Bf16 && y.width.is_multiple_of(8) && (y.ptr | x.ptr).is_multiple_of(16) {
-        let lanes = u32::try_from(n / 8).unwrap_or(u32::MAX);
-        return ctx.fire(
-            OP,
-            Fire::at(POINTWISE, "::pie::elemwise::residual_add_vec8")
-                .apply(Launch::flat(lanes, BLOCK).programmatic(ctx.tuning().pdl)),
-            &[
-                y.arg(),
-                x.arg(),
-                (n / 8).arg(),
-                stated(OP, y.width / 8)?.arg(),
-                ctx.stage(),
-            ],
-        );
-    }
-    ctx.fire(
-        OP,
-        Fire::at(
-            POINTWISE,
-            symbol(&format!("::pie::elemwise::residual_add<{t}>")),
-        )
-        .apply(launch),
-        &[
-            y.arg(),
-            x.arg(),
-            n.arg(),
-            stated(OP, y.width)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn residual_add_rmsnorm(
-    ctx: &Ctx,
-    x: Tensor,
-    y: &mut Tensor,
-    weight: Tensor,
-    plus_one: bool,
-    eps: f32,
-    out: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add_rmsnorm";
-    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert!(
-        x.rows == y.rows && x.width == y.width && out.rows == y.rows && out.width == y.width,
-        "the residual, the stream and the normed row share one shape"
-    );
-    let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
-    let rows = nonzero(OP, "rows", y.rows)?;
-    let plus = if plus_one { "true" } else { "false" };
-    let vectors = y.dtype == Dtype::Bf16
-        && y.width.is_multiple_of(VEC_WIDTH)
-        && [x.ptr, y.ptr, weight.ptr, out.ptr]
-            .iter()
-            .all(|&at| aligned16(at));
-    let per = (y.width / VEC_WIDTH).div_ceil(BLOCK);
-    let (entrypoint, block) = if vectors && ctx.tuning().rows_vec && (1..=4).contains(&per) {
-        (
-            format!("::pie::elemwise::residual_add_rmsnorm_reg<{per}, {plus}>"),
-            BLOCK,
-        )
-    } else if vectors {
-        let block = (y.width / VEC_WIDTH).clamp(WARP, BLOCK).next_power_of_two();
-        (
-            format!("::pie::elemwise::residual_add_rmsnorm_vec8<{block}, {plus}>"),
-            block,
-        )
-    } else {
-        (
-            format!("::pie::elemwise::residual_add_rmsnorm<{t}, 256, {plus}>"),
-            BLOCK,
-        )
-    };
-    ctx.fire(
-        OP,
-        // The register kernel waits on its producer in-kernel (`kernel.pdl`).
-        Fire::at(NORM_RESIDUAL, symbol(&entrypoint)).apply(
-            Launch::per_row(rows, block)
-                .programmatic(ctx.tuning().pdl && entrypoint.contains("_reg<")),
-        ),
-        &[
-            x.arg(),
-            y.arg(),
-            weight.arg(),
-            out.arg(),
-            hidden.arg(),
-            eps.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub struct PostNorm<'a> {
-    pub weight: Tensor,
-    pub plus_one: bool,
-    pub eps: f32,
-    pub out: &'a mut Tensor,
-}
-
-/// The fewest rows a fused norm-and-fold takes at `kernel.elemwise.norm_fold_block`.
-const FOLD_BLOCK_FROM: u32 = 1024;
-
-/// Which of a fused norm-and-fold's rows land: the normed row `t` and the
-/// stream `y` it folds into in place. A row nothing reads past the chain need
-/// not be written; the 16-byte form honours it, the element form writes all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Keep {
-    pub t: bool,
-    pub y: bool,
-}
-
-impl Keep {
-    pub const ALL: Keep = Keep { t: true, y: true };
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn rmsnorm_residual_add(
-    ctx: &Ctx,
-    x: Tensor,
-    w0: Tensor,
-    eps0: f32,
-    t: &mut Tensor,
-    y: &mut Tensor,
-    scale: Option<(Tensor, &mut Tensor)>,
-    post: Option<PostNorm<'_>>,
-) -> Result<(), Error> {
-    rmsnorm_residual_add_keeping(ctx, x, w0, eps0, t, y, scale, post, Keep::ALL)
-}
-
-/// [`rmsnorm_residual_add`] landing only the rows `keep` names (of `t` and
-/// `y`; `scaled` and the post-norm's `out` always land).
-#[allow(clippy::too_many_arguments)]
-pub fn rmsnorm_residual_add_keeping(
-    ctx: &Ctx,
-    x: Tensor,
-    w0: Tensor,
-    eps0: f32,
-    t: &mut Tensor,
-    y: &mut Tensor,
-    scale: Option<(Tensor, &mut Tensor)>,
-    post: Option<PostNorm<'_>>,
-    keep: Keep,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_residual_add";
-    let per_thread = [8u32, 16, 32]
-        .into_iter()
-        .find(|per| y.width <= BLOCK * per)
-        .ok_or_else(|| {
-            refuse(
-                OP,
-                format!(
-                    "a {}-wide row is wider than the fused chain seats ({})",
-                    y.width,
-                    BLOCK * 32
-                ),
-            )
-        })?;
-    let ty = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert!(
-        x.rows == y.rows && x.width == y.width && t.rows == y.rows && t.width == y.width,
-        "the normed row, its scaled copy and the stream share one shape"
-    );
-    let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
-    let rows = nonzero(OP, "rows", y.rows)?;
-    let (s_arg, scaled_arg, has_scale) = match &scale {
-        Some((s, scaled)) => (s.arg(), scaled.arg(), "true"),
-        None => (
-            crate::jit::ArgValue::ABSENT,
-            crate::jit::ArgValue::ABSENT,
-            "false",
-        ),
-    };
-    let (w1_arg, out_arg, eps1, has_post, plus) = match &post {
-        Some(post) => (
-            post.weight.arg(),
-            post.out.arg(),
-            post.eps,
-            "true",
-            if post.plus_one { "true" } else { "false" },
-        ),
-        None => (
-            crate::jit::ArgValue::ABSENT,
-            crate::jit::ArgValue::ABSENT,
-            0.0,
-            "false",
-            "false",
-        ),
-    };
-    let mut aligned = vec![x.ptr, w0.ptr, t.ptr, y.ptr];
-    if let Some((_, scaled)) = &scale {
-        aligned.push(scaled.ptr);
-    }
-    if let Some(post) = &post {
-        aligned.extend([post.weight.ptr, post.out.ptr]);
-    }
-    let vectors = y.dtype == Dtype::Bf16
-        && y.width.is_multiple_of(VEC_WIDTH)
-        && aligned.iter().all(|&at| aligned16(at));
-    let (entrypoint, block) = if vectors {
-        let nvec = y.width / VEC_WIDTH;
-        let block = match ctx.tuning().norm_fold_block {
-            // a prefill's many rows seat more an SM at a smaller block, several
-            // runs a thread (at most 16: a 32-thread block takes a 4096-wide
-            // row); a decode's few finish sooner a run a thread
-            stated if stated > 0 && y.rows >= FOLD_BLOCK_FROM => {
-                stated.max(nvec.div_ceil(16).next_power_of_two()).min(512)
-            }
-            _ => nvec.clamp(WARP, 512).next_power_of_two(),
-        };
-        let chunks = nvec.div_ceil(block);
-        // a row nothing reads goes unwritten; with both kept the name is the
-        // one every chip has always instantiated
-        let keeping = if keep == Keep::ALL {
-            String::new()
-        } else {
-            format!(", {}, {}", keep.t, keep.y)
-        };
-        (
-            format!(
-                "::pie::elemwise::rmsnorm_residual_add_vec8<{block}, {chunks}, {has_scale}, {has_post}, {plus}{keeping}>"
-            ),
-            block,
-        )
-    } else {
-        (
-            format!(
-                "::pie::elemwise::rmsnorm_residual_add<{ty}, {BLOCK}, {per_thread}, {has_scale}, {has_post}, {plus}>"
-            ),
-            BLOCK,
-        )
-    };
-    ctx.fire(
-        OP,
-        // The vec8 form waits on its producer in-kernel (`kernel.pdl`).
-        Fire::at(NORM_RESIDUAL, symbol(&entrypoint))
-            .apply(Launch::per_row(rows, block).programmatic(ctx.tuning().pdl && vectors)),
-        &[
-            x.arg(),
-            w0.arg(),
-            t.arg(),
-            y.arg(),
-            s_arg,
-            scaled_arg,
-            w1_arg,
-            out_arg,
-            hidden.arg(),
-            eps0.arg(),
-            eps1.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add_bias";
-    let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
-    let tb = dtype_dispatch!(OP, bias.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
-    nonzero(OP, "rows", out.rows)?;
-    let width = stated(OP, nonzero(OP, "the biased row's width", out.width)?)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            POINTWISE,
-            symbol(&format!("::pie::elemwise::add_bias<{t}, {tb}>")),
-        )
-        .apply(route_rows(out.rows, out.width)),
-        &[out.arg(), bias.arg(), width.arg(), ctx.stage()],
-    )
-}
-
 pub fn standardize(ctx: &Ctx, bias: Tensor, scale: Tensor, out: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.standardize";
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -1039,93 +650,171 @@ pub fn standardize(ctx: &Ctx, bias: Tensor, scale: Tensor, out: &mut Tensor) -> 
     )
 }
 
-pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu_scaled";
+const BLOCK: u32 = 256;
+
+pub fn layernorm_no_scale(ctx: &Ctx, x: Tensor, eps: f32, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.layernorm_no_scale";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let (launch, n) = elementwise(OP, *x)?;
+    let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
+    let rows = nonzero(OP, "rows", y.rows)?;
     ctx.fire(
         OP,
         Fire::at(
-            POINTWISE,
-            symbol(&format!("::pie::elemwise::silu_scaled<{t}>")),
+            NORM,
+            symbol(&format!("::pie::elemwise::layernorm_no_scale<{t}, 256>")),
         )
-        .apply(launch),
-        &[
-            x.arg(),
-            s.arg(),
-            n.arg(),
-            stated(OP, x.width)?.arg(),
-            ctx.stage(),
-        ],
+        .apply(Launch::per_row(rows, BLOCK)),
+        &[x.arg(), y.arg(), hidden.arg(), eps.arg(), ctx.stage()],
     )
 }
 
-pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul_scalar";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
-    let (launch, n) = elementwise(OP, *x)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            POINTWISE,
-            symbol(&format!("::pie::elemwise::mul_scalar<{t}>")),
-        )
-        .apply(launch),
-        &[
-            x.arg(),
-            s.arg(),
-            n.arg(),
-            stated(OP, x.width)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.scale";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let (launch, n) = elementwise(OP, *x)?;
-    ctx.fire(
-        OP,
-        Fire::at(POINTWISE, symbol(&format!("::pie::elemwise::scale<{t}>")))
-            .apply(launch.programmatic(ctx.tuning().pdl)),
-        &[
-            x.arg(),
-            s.arg(),
-            n.arg(),
-            stated(OP, x.width)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn res_blend(
+pub fn layernorm(
     ctx: &Ctx,
-    prefix: Tensor,
-    blocks: &[Tensor],
+    x: Tensor,
     weight: Tensor,
+    bias: Tensor,
     eps: f32,
-    proj: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    crate::attn::res_blend(ctx, prefix, blocks, weight, eps, proj, y)
+    const OP: &str = "elementwise.layernorm";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
+    let rows = nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            NORM,
+            symbol(&format!("::pie::elemwise::layernorm<{t}, 256>")),
+        )
+        .apply(Launch::per_row(rows, BLOCK)),
+        &[
+            x.arg(),
+            weight.arg(),
+            bias.arg(),
+            y.arg(),
+            hidden.arg(),
+            eps.arg(),
+            ctx.stage(),
+        ],
+    )
 }
 
-/// [`res_blend`] with the RMS norm of the blended row in one pass; see
-/// [`crate::attn::res_blend_norm`].
+const OP: &str = "spatial.group_norm";
+
+const STATS_BLOCK: u32 = 1024;
+
+const APPLY_BLOCK: u32 = 256;
+
+const MAX_SPLITS: u32 = 512;
+
+const ROWS_PER_SPLIT: u32 = 256;
+
 #[allow(clippy::too_many_arguments)]
-pub fn res_blend_norm(
+pub fn group_norm(
     ctx: &Ctx,
-    prefix: Tensor,
-    blocks: &[Tensor],
+    x: Tensor,
+    grid: Tensor,
+    groups: u32,
     weight: Tensor,
+    bias: Tensor,
     eps: f32,
-    proj: Tensor,
-    out_weight: Tensor,
-    out_eps: f32,
-    y: &mut Tensor,
-) -> Result<bool, Error> {
-    crate::attn::res_blend_norm(
-        ctx, prefix, blocks, weight, eps, proj, out_weight, out_eps, y,
+    silu: bool,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    debug_assert!(
+        o.rows == x.rows && o.width == x.width && o.dtype == x.dtype,
+        "`{OP}` lands one row per input row"
+    );
+    let lanes = lanes_of(OP, "input", grid)?;
+    let c = count(OP, "the channel count", x.width)?;
+    let groups = count(OP, "the group count", groups)?;
+    if x.width > STATS_BLOCK || !x.width.is_multiple_of(groups.unsigned_abs()) {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} channels in {groups} groups: the width must divide by the groups and fit {STATS_BLOCK} threads",
+                x.width
+            ),
+        ));
+    }
+    for (what, t) in [("weight", weight), ("bias", bias)] {
+        if t.dtype != Dtype::F32 || t.elements() != u64::from(x.width) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {what} is {}x{} {:?}; expected {} f32",
+                    t.rows, t.width, t.dtype, x.width
+                ),
+            ));
+        }
+    }
+    let rows = count(OP, "rows", x.rows)?;
+    let splits = rows
+        .unsigned_abs()
+        .div_ceil(ROWS_PER_SPLIT)
+        .clamp(1, MAX_SPLITS);
+    let cells = usize::try_from(lanes)
+        .ok()
+        .and_then(|l| l.checked_mul(splits as usize))
+        .and_then(|n| n.checked_mul(groups.unsigned_abs() as usize))
+        .ok_or_else(|| refuse(OP, "the moments table overflows"))?;
+    let partials = ctx.scratch(OP, "spatial.group_norm.partials", cells * 16)? as u64;
+    let stats = ctx.scratch(OP, "spatial.group_norm.stats", cells * 8)? as u64;
+    let splits = stated(OP, splits)?;
+
+    ctx.fire(
+        OP,
+        Fire::at(NORM, "::pie::elemwise::group_norm_stats<1024>").apply(Launch::grid(
+            [splits.unsigned_abs(), lanes.unsigned_abs(), 1],
+            [STATS_BLOCK, 1, 1],
+        )),
+        &[
+            x.arg(),
+            grid.arg(),
+            partials.arg(),
+            c.arg(),
+            groups.arg(),
+            splits.arg(),
+        ],
+    )?;
+    ctx.fire(
+        OP,
+        Fire::at(NORM, "::pie::elemwise::group_norm_finalize").apply(Launch::grid(
+            [groups.unsigned_abs(), lanes.unsigned_abs(), 1],
+            [32, 1, 1],
+        )),
+        &[
+            partials.arg(),
+            stats.arg(),
+            groups.arg(),
+            splits.arg(),
+            eps.arg(),
+        ],
+    )?;
+    let (blocks, total) = flat_elements(OP, x, APPLY_BLOCK)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            NORM,
+            if silu {
+                "::pie::elemwise::group_norm_apply<true>"
+            } else {
+                "::pie::elemwise::group_norm_apply<false>"
+            },
+        )
+        .apply(Launch::grid([blocks, 1, 1], [APPLY_BLOCK, 1, 1])),
+        &[
+            x.arg(),
+            grid.arg(),
+            stats.arg(),
+            weight.arg(),
+            bias.arg(),
+            o.arg(),
+            c.arg(),
+            groups.arg(),
+            lanes.arg(),
+            total.arg(),
+        ],
     )
 }

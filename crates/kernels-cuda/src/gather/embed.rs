@@ -442,19 +442,6 @@ fn affine_band_group(vocab: u32, band: u32, width: u32, per_row: u32) -> Option<
     (whole_or_band && per_row != 0 && width.is_multiple_of(per_row)).then(|| width / per_row)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::affine_band_group;
-
-    #[test]
-    fn a_tp2_vocab_band_groups_its_half_of_the_table() {
-        assert_eq!(affine_band_group(262_144, 262_144, 5376, 84), Some(64));
-        assert_eq!(affine_band_group(262_144, 131_072, 5376, 84), Some(64));
-        assert_eq!(affine_band_group(262_144, 100_000, 5376, 84), None);
-        assert_eq!(affine_band_group(262_144, 131_072, 5376, 0), None);
-    }
-}
-
 // A hashed table stored e4m3 under one f32 scale (`Dtype::E4m3tensor`) or
 // one ue8m0 exponent a 32 of each row (`Dtype::Mxfp8`), gathered and
 // widened only at the rows its ids name, so the table stays at a byte a
@@ -685,4 +672,17 @@ pub fn embed_weighted(
             ctx.stage(),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::affine_band_group;
+
+    #[test]
+    fn a_tp2_vocab_band_groups_its_half_of_the_table() {
+        assert_eq!(affine_band_group(262_144, 262_144, 5376, 84), Some(64));
+        assert_eq!(affine_band_group(262_144, 131_072, 5376, 84), Some(64));
+        assert_eq!(affine_band_group(262_144, 100_000, 5376, 84), None);
+        assert_eq!(affine_band_group(262_144, 131_072, 5376, 0), None);
+    }
 }

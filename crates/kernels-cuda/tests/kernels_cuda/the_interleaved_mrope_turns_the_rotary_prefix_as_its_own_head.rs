@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::rope_mrope;
+use kernels_cuda::elemwise::rope;
 use kernels_cuda::tensor::Tensor;
 
 /// Upstream's interleaved mrope (Qwen3-VL, Qwen3.5): pair `i` of the first
@@ -46,11 +46,11 @@ fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, se
     let ctx = gpu.ctx();
     let mut q = Tensor::new(q_at, rows as u32, q_width as u32, Dtype::Bf16);
     let mut k = Tensor::new(k_at, rows as u32, k_width as u32, Dtype::Bf16);
-    rope_mrope::interleaved(
+    rope::interleaved(
         &ctx,
         &mut q,
         &mut k,
-        Tensor::new(p_at, rows as u32, rope_mrope::AXES, Dtype::I32),
+        Tensor::new(p_at, rows as u32, rope::AXES, Dtype::I32),
         sections,
         rotary_dim as u32,
         head_dim as u32,

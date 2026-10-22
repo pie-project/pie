@@ -5,7 +5,7 @@
 
 use crate::common::{Gpu, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::relative_bucket_bias;
+use kernels_cuda::elemwise::posenc::relative_bucket_bias;
 use kernels_cuda::tensor::Tensor;
 
 fn bucket(d: i64, bidirectional: bool, mut num_buckets: i64, max_distance: f32) -> i64 {

@@ -5,7 +5,7 @@ use crate::common;
 use common::spatial::{Box3, group_norm_ref, near, table};
 use common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::spatial::group_norm;
+use kernels_cuda::elemwise::norm::group_norm;
 use kernels_cuda::tensor::Tensor;
 
 fn check(boxes: &[Box3], c: usize, groups: usize, silu: bool) {

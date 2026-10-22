@@ -9,7 +9,7 @@ mod common;
 use common::{Gpu, close_abs, close_bf16, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
-use kernels_rocm::elemwise::{layernorm, norm};
+use kernels_rocm::elemwise::{modulate, norm, norm_residual, pointwise};
 
 fn bf16s(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     values(n, seed, scale).into_iter().map(round_bf16).collect()
@@ -162,7 +162,7 @@ fn rmsnorm_residual_add() {
             let mut y = gpu.tensor(&ys, rows, width, Dtype::Bf16);
             let mut scaled = gpu.zeros(rows, width, Dtype::Bf16);
             let mut out = gpu.zeros(rows, width, Dtype::Bf16);
-            norm::rmsnorm_residual_add(
+            norm_residual::rmsnorm_residual_add(
                 &ctx,
                 x,
                 w0,
@@ -170,7 +170,7 @@ fn rmsnorm_residual_add() {
                 &mut t,
                 &mut y,
                 scale.then_some((sv, &mut scaled)),
-                post.then_some(norm::PostNorm {
+                post.then_some(norm_residual::PostNorm {
                     weight: w1,
                     plus_one,
                     eps: 1e-5,
@@ -238,7 +238,7 @@ fn rmsnorm_residual_add() {
         let mut y = gpu.zeros(rows, width, Dtype::Bf16);
         let win = gpu.ints(&[2, 2, 0, 0]);
         ctx.arm_stage(win.ptr);
-        norm::rmsnorm_residual_add(&ctx, x, w0, 1e-6, &mut t, &mut y, None, None).unwrap();
+        norm_residual::rmsnorm_residual_add(&ctx, x, w0, 1e-6, &mut t, &mut y, None, None).unwrap();
         ctx.disarm_stage();
         let got = gpu.read(&t);
         for row in 2..4 {
@@ -275,12 +275,12 @@ fn layernorm() {
             r.iter().map(|v| (v - mean) * inv).collect()
         };
         let mut y = gpu.zeros(rows, width, Dtype::Bf16);
-        layernorm::layernorm_no_scale(&ctx, x, 1e-6, &mut y).unwrap();
+        norm::layernorm_no_scale(&ctx, x, 1e-6, &mut y).unwrap();
         let want: Vec<f32> = xs.chunks(wd).flat_map(normed).collect();
         close_bf16("layernorm_no_scale", &gpu.read(&y), &want, 1.0);
 
         let mut y = gpu.zeros(rows, width, Dtype::Bf16);
-        layernorm::layernorm(&ctx, x, w, b, 1e-6, &mut y).unwrap();
+        norm::layernorm(&ctx, x, w, b, 1e-6, &mut y).unwrap();
         let want: Vec<f32> = xs
             .chunks(wd)
             .flat_map(|r| {
@@ -304,7 +304,7 @@ fn layernorm() {
     let mut y = gpu.zeros(rows, width, Dtype::Bf16);
     let win = gpu.ints(&[1, 1, 0, 0]);
     ctx.arm_stage(win.ptr);
-    layernorm::layernorm_no_scale(&ctx, x, 1e-6, &mut y).unwrap();
+    norm::layernorm_no_scale(&ctx, x, 1e-6, &mut y).unwrap();
     ctx.disarm_stage();
     let got = gpu.read(&y);
     let r = &xs[wd..2 * wd];
@@ -339,7 +339,7 @@ fn standardize_and_scalars() {
         close_bf16("standardize", &gpu.read(&out), &want, 0.5);
 
         let mut x = gpu.tensor(&xs, rows, width, Dtype::Bf16);
-        norm::silu_scaled(&ctx, 1.7, &mut x).unwrap();
+        pointwise::silu_scaled(&ctx, 1.7, &mut x).unwrap();
         let want: Vec<f32> = xs
             .iter()
             .map(|v| {
@@ -352,7 +352,7 @@ fn standardize_and_scalars() {
         let f = round_bf16(-0.3);
         let fs = gpu.tensor(&[f], 1, 1, Dtype::Bf16);
         let mut x = gpu.tensor(&xs, rows, width, Dtype::Bf16);
-        norm::scale(&ctx, fs, &mut x).unwrap();
+        pointwise::scale(&ctx, fs, &mut x).unwrap();
         let want: Vec<f32> = xs.iter().map(|v| v * f).collect();
         close_bf16("scale", &gpu.read(&x), &want, 0.5);
     }
@@ -364,7 +364,7 @@ fn standardize_and_scalars() {
     let mut x = gpu.tensor(&xs, rows, width, Dtype::Bf16);
     let win = gpu.ints(&[2, 1, 0, 0]);
     ctx.arm_stage(win.ptr);
-    norm::silu_scaled(&ctx, 0.5, &mut x).unwrap();
+    pointwise::silu_scaled(&ctx, 0.5, &mut x).unwrap();
     ctx.disarm_stage();
     let got = gpu.read(&x);
     for (i, (h, v)) in got.iter().zip(&xs).enumerate() {
@@ -433,7 +433,7 @@ fn res_blend() {
             .map(|b| gpu.tensor(b, rows, hidden, Dtype::Bf16))
             .collect();
         let mut y = gpu.zeros(rows, hidden, Dtype::Bf16);
-        norm::res_blend(&ctx, prefix, &scattered, norm_w, 1e-6, proj, &mut y).unwrap();
+        modulate::res_blend(&ctx, prefix, &scattered, norm_w, 1e-6, proj, &mut y).unwrap();
         close_abs("res_blend scattered", &gpu.read(&y), &want, 2e-2);
 
         // ... and blocks already stacked side by side.
@@ -445,7 +445,7 @@ fn res_blend() {
                 .map(|j| Tensor::new(stack.ptr + j * plane, rows, hidden, Dtype::Bf16))
                 .collect();
             let mut y = gpu.zeros(rows, hidden, Dtype::Bf16);
-            norm::res_blend(&ctx, prefix, &stacked, norm_w, 1e-6, proj, &mut y).unwrap();
+            modulate::res_blend(&ctx, prefix, &stacked, norm_w, 1e-6, proj, &mut y).unwrap();
             close_abs("res_blend stacked", &gpu.read(&y), &want, 2e-2);
         }
     }
@@ -469,7 +469,7 @@ fn res_blend() {
     let mut y = gpu.zeros(rows, hidden, Dtype::Bf16);
     let win = gpu.ints(&[1, 1, 0, 0]);
     ctx.arm_stage(win.ptr);
-    norm::res_blend(&ctx, prefix, &blocks, norm_w, 1e-6, proj, &mut y).unwrap();
+    modulate::res_blend(&ctx, prefix, &blocks, norm_w, 1e-6, proj, &mut y).unwrap();
     ctx.disarm_stage();
     let got = gpu.read(&y);
     let cands: [&[f32]; 3] = [
@@ -486,7 +486,7 @@ fn res_blend() {
     untouched("windowed res_blend", &got, hd, 1..2);
 }
 
-/// Muse Spark's norm and residual gate (`norm::norm_gate`), both norms, on
+/// Muse Spark's norm and residual gate (`modulate::norm_gate`), both norms, on
 /// rows of whole eights (the packed walk) and a ragged one, one row a token
 /// and two (a routed plane).
 #[test]
@@ -522,7 +522,7 @@ fn norm_gate() {
         } else {
             (None, None)
         };
-        norm::norm_gate(
+        modulate::norm_gate(
             &ctx,
             x,
             Some(scale),

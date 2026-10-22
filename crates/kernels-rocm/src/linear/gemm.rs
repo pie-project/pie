@@ -153,7 +153,7 @@ pub fn act_x_wt(
             return Ok(());
         }
         match bias {
-            Some(bias) => crate::elemwise::norm::add_bias(ctx, bias, y),
+            Some(bias) => crate::elemwise::pointwise::add_bias(ctx, bias, y),
             None => Ok(()),
         }
     }

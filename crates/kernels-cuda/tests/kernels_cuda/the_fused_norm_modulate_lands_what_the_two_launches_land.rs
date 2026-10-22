@@ -3,7 +3,7 @@
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::modulate::{self, NormKind};
-use kernels_cuda::elemwise::{layernorm, norm};
+use kernels_cuda::elemwise::norm;
 use kernels_cuda::tensor::Tensor;
 
 const ROWS: usize = 24;
@@ -58,9 +58,7 @@ fn check(which: Which, name: &str) {
     };
 
     match which {
-        Which::LayerNorm => {
-            layernorm::layernorm_no_scale(&ctx, rect(r_still), EPS, &mut rect(normed))
-        }
+        Which::LayerNorm => norm::layernorm_no_scale(&ctx, rect(r_still), EPS, &mut rect(normed)),
         Which::RmsNoScale => norm::rmsnorm_no_scale(&ctx, rect(r_still), 0, EPS, &mut rect(normed)),
         Which::RmsWeighted => norm::rmsnorm(&ctx, rect(r_still), weight, EPS, &mut rect(normed)),
     }

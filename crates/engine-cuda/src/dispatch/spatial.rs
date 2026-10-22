@@ -18,7 +18,7 @@ fn segment(segment: VoxelSegment) -> spatial::Segment {
     }
 }
 
-fn rule(rule: GridRule) -> spatial::GridRule {
+fn rule(rule: GridRule) -> kernels_cuda::elemwise::posenc::GridRule {
     match rule {
         GridRule::Conv {
             k,
@@ -26,7 +26,7 @@ fn rule(rule: GridRule) -> spatial::GridRule {
             pad,
             pad_back,
             causal_t,
-        } => spatial::GridRule::Conv {
+        } => kernels_cuda::elemwise::posenc::GridRule::Conv {
             k,
             stride,
             pad,
@@ -36,20 +36,24 @@ fn rule(rule: GridRule) -> spatial::GridRule {
         GridRule::Upsample {
             factor,
             keep_first_frame,
-        } => spatial::GridRule::Upsample {
+        } => kernels_cuda::elemwise::posenc::GridRule::Upsample {
             factor,
             keep_first_frame,
         },
-        GridRule::Shuffle { r, trim_t } => spatial::GridRule::Shuffle { r, trim_t },
-        GridRule::Unshuffle { r } => spatial::GridRule::Unshuffle { r },
-        GridRule::AvgDown { factor } => spatial::GridRule::AvgDown { factor },
+        GridRule::Shuffle { r, trim_t } => {
+            kernels_cuda::elemwise::posenc::GridRule::Shuffle { r, trim_t }
+        }
+        GridRule::Unshuffle { r } => kernels_cuda::elemwise::posenc::GridRule::Unshuffle { r },
+        GridRule::AvgDown { factor } => {
+            kernels_cuda::elemwise::posenc::GridRule::AvgDown { factor }
+        }
     }
 }
 
 impl Run<'_> {
     fn spatial(&mut self, op: &Spatial) -> Result<(), kernels_cuda::Error> {
         match op {
-            Spatial::Grid { grid, rule: how, y } => spatial::derive_grid(
+            Spatial::Grid { grid, rule: how, y } => kernels_cuda::elemwise::posenc::derive_grid(
                 self.ctx(),
                 self.tensor(*grid),
                 rule(*how),
@@ -155,7 +159,7 @@ impl Run<'_> {
                 eps,
                 silu,
                 y,
-            } => spatial::group_norm(
+            } => kernels_cuda::elemwise::norm::group_norm(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),

@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::rope_table::{Freqs, Pairs, rope};
+use kernels_cuda::elemwise::rope::{Freqs, Pairs, rope};
 use kernels_cuda::tensor::Tensor;
 
 /// The host's turn of one head: pair `i` is `(i, i + span)`, or `(2i, 2i+1)`

@@ -7,8 +7,9 @@ mod common;
 
 use common::{Gpu, close_abs, close_bf16, round_bf16, values};
 use dtype::Dtype;
+use kernels_rocm::elemwise::posenc;
+use kernels_rocm::linear::lane_gemm;
 use kernels_rocm::linear::lora::{self, Segments};
-use kernels_rocm::linear::{lane_gemm, rel_bias};
 
 fn bf16s(n: u32, seed: u64, scale: f32) -> Vec<f32> {
     values(n as usize, seed, scale)
@@ -142,14 +143,14 @@ fn linear_rel_bias() {
         })
         .collect();
     let mut bias = gpu.zeros(rows, heads * extent, Dtype::F32);
-    rel_bias::rel_bias(&ctx, xt, wt, heads, d_rel, extent, &mut bias).unwrap();
+    posenc::rel_bias(&ctx, xt, wt, heads, d_rel, extent, &mut bias).unwrap();
     close_abs("rel_bias", &gpu.read(&bias), &want, 1e-4);
 
     // A window over rows 2..4.
     let win = gpu.ints(&[2, 2, 0, 0]);
     let mut bias = gpu.zeros(rows, heads * extent, Dtype::F32);
     ctx.arm_stage(win.ptr);
-    rel_bias::rel_bias(&ctx, xt, wt, heads, d_rel, extent, &mut bias).unwrap();
+    posenc::rel_bias(&ctx, xt, wt, heads, d_rel, extent, &mut bias).unwrap();
     ctx.disarm_stage();
     let got = gpu.read(&bias);
     let width = h_ * e_;

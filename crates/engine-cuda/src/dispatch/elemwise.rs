@@ -39,7 +39,7 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         match norm {
             NormKind::Layernorm { eps } => {
-                elemwise::layernorm::layernorm_no_scale(self.ctx(), x, eps, normed)
+                elemwise::norm::layernorm_no_scale(self.ctx(), x, eps, normed)
             }
             NormKind::Rmsnorm { head_dim, eps } => {
                 elemwise::norm::rmsnorm_no_scale(self.ctx(), x, head_dim, eps, normed)
@@ -76,7 +76,7 @@ impl Run<'_> {
                 plus_one,
                 eps,
                 out,
-            } => elemwise::norm::residual_add_rmsnorm(
+            } => elemwise::norm_residual::residual_add_rmsnorm(
                 self.ctx(),
                 self.tensor(*x),
                 &mut self.tensor(*y),
@@ -103,12 +103,12 @@ impl Run<'_> {
                 // copy and the next norm go on.
                 #[cfg(feature = "cuda")]
                 let keep = if self.ctx().tuning().skip_unread {
-                    elemwise::norm::Keep {
+                    elemwise::norm_residual::Keep {
                         t: !self.is_unread(*t),
                         y: !self.is_unread(*y_out),
                     }
                 } else {
-                    elemwise::norm::Keep::ALL
+                    elemwise::norm_residual::Keep::ALL
                 };
                 #[cfg(not(feature = "cuda"))]
                 let _ = y_out;
@@ -119,7 +119,7 @@ impl Run<'_> {
                     _ => None,
                 };
                 let post = match (post, out.as_mut()) {
-                    (Some(post), Some(out)) => Some(elemwise::norm::PostNorm {
+                    (Some(post), Some(out)) => Some(elemwise::norm_residual::PostNorm {
                         weight: self.tensor(post.weight),
                         plus_one: post.plus_one,
                         eps: post.eps,
@@ -129,7 +129,7 @@ impl Run<'_> {
                 };
                 let (x, weight) = (self.tensor(*x), self.tensor(*weight));
                 #[cfg(feature = "cuda")]
-                let landed = elemwise::norm::rmsnorm_residual_add_keeping(
+                let landed = elemwise::norm_residual::rmsnorm_residual_add_keeping(
                     self.ctx(),
                     x,
                     weight,
@@ -141,7 +141,7 @@ impl Run<'_> {
                     keep,
                 );
                 #[cfg(not(feature = "cuda"))]
-                let landed = elemwise::norm::rmsnorm_residual_add(
+                let landed = elemwise::norm_residual::rmsnorm_residual_add(
                     self.ctx(),
                     x,
                     weight,
@@ -215,7 +215,7 @@ impl Run<'_> {
                 span,
                 y,
                 q_out: _,
-            } => elemwise::rope::rmsnorm_rope_partial_q(
+            } => elemwise::norm_rope::rmsnorm_rope_partial_q(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
@@ -255,7 +255,7 @@ impl Run<'_> {
                 yarn,
                 y,
                 q_out: _,
-            } => elemwise::rope::norm_rope_last(
+            } => elemwise::norm_rope::norm_rope_last(
                 self.ctx(),
                 self.tensor(*x),
                 weight.map(|w| self.tensor(w)),
@@ -391,19 +391,19 @@ impl Run<'_> {
             || Tensor::new(q.ptr, q.rows, 0, q.dtype),
             |k| self.tensor(k),
         );
-        elemwise::rope_table::rope(
+        elemwise::rope::rope(
             self.ctx(),
             op,
             &mut q,
             &mut k,
             self.tensor(positions),
-            elemwise::rope_table::Pairs {
+            elemwise::rope::Pairs {
                 head_dim,
                 span,
                 interleaved,
                 sections,
             },
-            elemwise::rope_table::Freqs {
+            elemwise::rope::Freqs {
                 inv_freq: &freqs.inv_freq,
                 mscale: freqs.mscale,
             },
@@ -489,7 +489,7 @@ impl Run<'_> {
                 temperature,
                 next,
                 y,
-            } => elemwise::norm::norm_gate(
+            } => elemwise::modulate::norm_gate(
                 self.ctx(),
                 self.tensor(*x),
                 scale.map(|s| self.tensor(s)),
@@ -506,7 +506,7 @@ impl Run<'_> {
                 }),
                 &mut self.tensor(*y),
             ),
-            Elementwise::LayernormNoScale { x, eps, y } => elemwise::layernorm::layernorm_no_scale(
+            Elementwise::LayernormNoScale { x, eps, y } => elemwise::norm::layernorm_no_scale(
                 self.ctx(),
                 self.tensor(*x),
                 *eps,
@@ -518,7 +518,7 @@ impl Run<'_> {
                 bias,
                 eps,
                 y,
-            } => elemwise::layernorm::layernorm(
+            } => elemwise::norm::layernorm(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
@@ -531,13 +531,13 @@ impl Run<'_> {
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp(self.ctx(), *lo, *hi, &mut self.tensor(*x)),
+            } => elemwise::pointwise::clamp(self.ctx(), *lo, *hi, &mut self.tensor(*x)),
             Elementwise::ClampLearned {
                 x,
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp_learned(
+            } => elemwise::pointwise::clamp_learned(
                 self.ctx(),
                 self.tensor(*lo),
                 self.tensor(*hi),
@@ -578,13 +578,17 @@ impl Run<'_> {
                 &mut self.tensor(*y),
             ),
             Elementwise::ResidualAdd { x, y, y_out: _ } => {
-                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), &mut self.tensor(*y))
+                elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), &mut self.tensor(*y))
             }
             Elementwise::AddBias {
                 bias,
                 out,
                 out_out: _,
-            } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), &mut self.tensor(*out)),
+            } => elemwise::pointwise::add_bias(
+                self.ctx(),
+                self.tensor(*bias),
+                &mut self.tensor(*out),
+            ),
             Elementwise::Standardize {
                 x,
                 bias,
@@ -597,10 +601,10 @@ impl Run<'_> {
                 &mut self.tensor(*x),
             ),
             Elementwise::MulScalar { s, x, x_out: _ } => {
-                elemwise::norm::mul_scalar(self.ctx(), *s, &mut self.tensor(*x))
+                elemwise::pointwise::mul_scalar(self.ctx(), *s, &mut self.tensor(*x))
             }
             Elementwise::Scale { s, x, x_out: _ } => {
-                elemwise::norm::scale(self.ctx(), self.tensor(*s), &mut self.tensor(*x))
+                elemwise::pointwise::scale(self.ctx(), self.tensor(*s), &mut self.tensor(*x))
             }
             Elementwise::ResBlend {
                 prefix,
@@ -611,7 +615,7 @@ impl Run<'_> {
                 y,
             } => {
                 let blocks: Vec<Tensor> = blocks.iter().map(|b| self.tensor(*b)).collect();
-                elemwise::norm::res_blend(
+                elemwise::modulate::res_blend(
                     self.ctx(),
                     self.tensor(*prefix),
                     &blocks,
@@ -744,10 +748,10 @@ impl Run<'_> {
                 q_out: _,
                 k_out: _,
             } => (match form {
-                MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
-                MropeForm::Blocked => elemwise::rope_mrope::blocked,
+                MropeForm::Interleaved => elemwise::rope::interleaved,
+                MropeForm::Blocked => elemwise::rope::blocked,
                 #[cfg(feature = "rocm")]
-                MropeForm::Split => elemwise::rope_mrope::split,
+                MropeForm::Split => elemwise::rope::split,
                 #[cfg(not(feature = "rocm"))]
                 MropeForm::Split => {
                     return Err(kernels_cuda::Error::Unsupported {
@@ -882,7 +886,7 @@ impl Run<'_> {
                 &mut self.tensor(*y),
             ),
             Elementwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::norm::silu_scaled(self.ctx(), *s, &mut self.tensor(*x))
+                elemwise::pointwise::silu_scaled(self.ctx(), *s, &mut self.tensor(*x))
             }
             Elementwise::HcMix {
                 gates,
@@ -943,7 +947,7 @@ impl Run<'_> {
                 flip_sin_cos,
                 scale,
                 y,
-            } => elemwise::sinusoid(
+            } => elemwise::posenc::sinusoid(
                 self.ctx(),
                 self.tensor(*t),
                 *dim,
@@ -959,7 +963,7 @@ impl Run<'_> {
                 max_distance,
                 bidirectional,
                 y,
-            } => elemwise::relative_bucket_bias(
+            } => elemwise::posenc::relative_bucket_bias(
                 self.ctx(),
                 self.tensor(*embedding),
                 *max_len,
@@ -969,7 +973,7 @@ impl Run<'_> {
                 &mut self.tensor(*y),
             ),
             Elementwise::Silu { x, x_out: _ } => {
-                elemwise::activation::silu(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
+                elemwise::pointwise::silu(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
             }
             Elementwise::Gelu { x, tanh, x_out: _ } => {
                 if !*tanh {
@@ -980,19 +984,19 @@ impl Run<'_> {
                             .to_string(),
                     });
                 }
-                elemwise::activation::gelu_tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
+                elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
             }
             Elementwise::Tanh { x, x_out: _ } => {
-                elemwise::activation::tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
+                elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
             }
             Elementwise::Hadamard { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Elementwise::Mul { x, y, z } => elemwise::binary::mul(
+            Elementwise::Mul { x, y, z } => elemwise::pointwise::mul(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
                 &mut self.tensor(*z),
             ),
-            Elementwise::Add { x, y, z } => elemwise::binary::add(
+            Elementwise::Add { x, y, z } => elemwise::pointwise::add(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
@@ -1007,17 +1011,17 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 x_out: _,
-            } => elemwise::rope_axes::rope_axes(
+            } => elemwise::rope::rope_axes(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*positions),
                 *dims,
                 *thetas,
                 match form {
-                    RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
-                    RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
-                    RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
-                    RopeForm::SplitLadder => elemwise::rope_axes::RopeForm::SplitLadder,
+                    RopeForm::Interleaved => elemwise::rope::RopeForm::Interleaved,
+                    RopeForm::Neox => elemwise::rope::RopeForm::Neox,
+                    RopeForm::Split => elemwise::rope::RopeForm::Split,
+                    RopeForm::SplitLadder => elemwise::rope::RopeForm::SplitLadder,
                 },
                 *rotary_dim,
                 *head_dim,

@@ -25,8 +25,6 @@ pub mod moe;
 
 pub mod moe_route;
 
-pub mod rel_bias;
-
 pub mod quant;
 
 pub mod tiled;

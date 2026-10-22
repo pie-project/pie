@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::{activation, binary, norm};
+use kernels_cuda::elemwise::pointwise;
 use kernels_cuda::tensor::Tensor;
 
 const ROWS: usize = 9;
@@ -43,14 +43,14 @@ fn the_bare_ops_answer_the_reference() {
     let ctx = gpu.ctx();
     let rect = |at: u64| Tensor::new(at, ROWS as u32, WIDTH as u32, Dtype::Bf16);
 
-    binary::add(&ctx, rect(x_at), rect(y_at), &mut rect(out[0])).expect("fires");
-    binary::mul(&ctx, rect(x_at), rect(y_at), &mut rect(out[1])).expect("fires");
-    activation::silu(&ctx, rect(x_at), &mut rect(out[2])).expect("fires");
-    activation::gelu_tanh(&ctx, rect(x_at), &mut rect(out[3])).expect("fires");
-    activation::tanh(&ctx, rect(x_at), &mut rect(out[4])).expect("fires");
+    pointwise::add(&ctx, rect(x_at), rect(y_at), &mut rect(out[0])).expect("fires");
+    pointwise::mul(&ctx, rect(x_at), rect(y_at), &mut rect(out[1])).expect("fires");
+    pointwise::silu(&ctx, rect(x_at), &mut rect(out[2])).expect("fires");
+    pointwise::gelu_tanh(&ctx, rect(x_at), &mut rect(out[3])).expect("fires");
+    pointwise::tanh(&ctx, rect(x_at), &mut rect(out[4])).expect("fires");
     // The residual add into the stream it reads, eight lanes a thread.
     let acc = gpu.up(&y_raw);
-    norm::residual_add(&ctx, rect(x_at), &mut rect(acc)).expect("fires");
+    pointwise::residual_add(&ctx, rect(x_at), &mut rect(acc)).expect("fires");
     gpu.sync();
 
     let got: Vec<Vec<u16>> = out.iter().map(|&at| gpu.down(at, N)).collect();
@@ -77,8 +77,8 @@ fn each_may_write_the_rectangle_it_read() {
     let ctx = gpu.ctx();
     let rect = |at: u64| Tensor::new(at, ROWS as u32, WIDTH as u32, Dtype::Bf16);
 
-    binary::add(&ctx, rect(sum), rect(y_at), &mut rect(sum)).expect("fires");
-    activation::tanh(&ctx, rect(gated), &mut rect(gated)).expect("fires");
+    pointwise::add(&ctx, rect(sum), rect(y_at), &mut rect(sum)).expect("fires");
+    pointwise::tanh(&ctx, rect(gated), &mut rect(gated)).expect("fires");
     gpu.sync();
 
     let got_sum: Vec<u16> = gpu.down(sum, N);

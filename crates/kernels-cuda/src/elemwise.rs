@@ -1,31 +1,78 @@
-pub mod activation;
-
-pub mod binary;
-
-pub mod clip;
-
 pub mod gate;
-
 pub mod hc;
-
-pub mod layernorm;
-
 pub mod modulate;
-
 pub mod norm;
-
+pub mod norm_residual;
+pub mod norm_rope;
+pub mod pointwise;
+pub mod posenc;
 pub mod rope;
 
-pub mod rope_axes;
+use dtype::Dtype;
 
-pub mod rope_mrope;
+use crate::error::Error;
+use crate::jit::{Launch, nonzero, refuse};
+use crate::tensor::Tensor;
 
-pub mod rope_table;
+const BLOCK: u32 = 256;
 
-pub mod relative_bucket_bias;
+const WARP: u32 = 32;
 
-pub mod sinusoid;
+fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
+    let n = t.elements();
+    let lanes = u32::try_from(n).map_err(|_| {
+        refuse(
+            op,
+            format!("{n} elements do not fit a 32-bit launch extent"),
+        )
+    })?;
+    nonzero(op, "the element count", lanes)?;
+    Ok((Launch::flat(lanes, BLOCK), n))
+}
 
-pub use relative_bucket_bias::relative_bucket_bias;
-pub use rope_axes::{RopeForm, rope_axes};
-pub use sinusoid::sinusoid;
+fn route_rows(rows: u32, width: u32) -> Launch {
+    const MAX_BLOCK: u32 = 1024;
+
+    Launch::per_row(
+        rows,
+        width
+            .div_ceil(WARP)
+            .max(1)
+            .saturating_mul(WARP)
+            .min(MAX_BLOCK),
+    )
+}
+
+const UNSCALED: f32 = 1.0;
+
+fn heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
+    nonzero(op, "the head width this rotation states", head_dim)?;
+    if !width.is_multiple_of(head_dim) {
+        return Err(refuse(
+            op,
+            format!("the {width}-wide row is not a whole number of {head_dim}-wide heads"),
+        ));
+    }
+    Ok(width / head_dim)
+}
+
+fn q_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
+    nonzero(op, "the q region's width", width)?;
+    heads(op, width, head_dim)
+}
+
+fn positions_stream(op: &'static str, positions: Tensor, x: &Tensor) {
+    debug_assert_eq!(
+        positions.dtype,
+        Dtype::I32,
+        "`{op}` reads an i32 position stream"
+    );
+    // A staged window rotates its live rows of a plane whose every row has a
+    // position, so the stream may be longer than the rows rotated.
+    debug_assert!(
+        positions.rows >= x.rows,
+        "the position stream has {} entries for {} rotated rows",
+        positions.rows,
+        x.rows
+    );
+}

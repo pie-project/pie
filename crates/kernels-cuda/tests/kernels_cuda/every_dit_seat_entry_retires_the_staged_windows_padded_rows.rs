@@ -3,7 +3,9 @@
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
 use kernels_cuda::elemwise::modulate::{self, NormKind};
-use kernels_cuda::elemwise::{RopeForm, activation, binary, rope_axes, sinusoid};
+use kernels_cuda::elemwise::pointwise;
+use kernels_cuda::elemwise::posenc::sinusoid;
+use kernels_cuda::elemwise::rope::{RopeForm, rope_axes};
 use kernels_cuda::gather;
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::tensor::Tensor;
@@ -302,11 +304,11 @@ fn the_bare_pointwise_ops_retire_their_padded_rows() {
             let y = bf16(y, shift, rows, WIDTH);
             let mut o = bf16(dst, shift, rows, WIDTH);
             match which {
-                0 => binary::add(&ctx, x, y, &mut o),
-                1 => binary::mul(&ctx, x, y, &mut o),
-                2 => activation::silu(&ctx, x, &mut o),
-                3 => activation::gelu_tanh(&ctx, x, &mut o),
-                _ => activation::tanh(&ctx, x, &mut o),
+                0 => pointwise::add(&ctx, x, y, &mut o),
+                1 => pointwise::mul(&ctx, x, y, &mut o),
+                2 => pointwise::silu(&ctx, x, &mut o),
+                3 => pointwise::gelu_tanh(&ctx, x, &mut o),
+                _ => pointwise::tanh(&ctx, x, &mut o),
             }
             .expect("fires");
         };

@@ -106,7 +106,7 @@ fn the_biased_projection_lands_the_dot_and_its_bias() {
 
 #[test]
 fn the_lane_projection_and_the_scalar_multiply_land_each_dtype() {
-    use kernels_cuda::elemwise::norm::mul_scalar;
+    use kernels_cuda::elemwise::pointwise::mul_scalar;
     use kernels_cuda::linear::lane_gemm::act_x_wt;
     let (rows, k, n, s) = (5usize, 96usize, 40usize, 1000.0f32 / 3.0);
     for dtype in [F32, Bf16] {

@@ -1,13 +1,13 @@
 #![cfg(feature = "cuda")]
 
 //! Norm and rotation launchers against the host: `rope::partial_last`,
-//! `rope::norm_rope_last` (on a staged window), the gated RMS norm and
+//! `norm_rope::norm_rope_last` (on a staged window), the gated RMS norm and
 //! Kimi-K3's AttnRes blend.
 
 use crate::common::attn_ref::{YARN, dot, landed, plane, rmsnorm, ten, turn, wide};
 use crate::common::{Gpu, Lcg, host::upload_to, to_bf16};
 use dtype::Dtype::{Bf16, F32, I32};
-use kernels_cuda::elemwise::{norm, rope};
+use kernels_cuda::elemwise::{modulate, norm, norm_rope, rope};
 
 /// 37 rows of `heads` heads of `d`, normed first where `normed` (`Some(true)`:
 /// scaled), the last 64 dims turned; on rows `base..` where `base` is not 0.
@@ -48,7 +48,7 @@ fn tail(
     let fired = match normed {
         Some(scaled) => {
             let w_t = scaled.then(|| ten(w_at, d, 1, Bf16));
-            rope::norm_rope_last(
+            norm_rope::norm_rope_last(
                 &ctx, x_t, w_t, d32, 1e-6, pos_t, 64, 1e4, rot.0, rot.1, yarn, y,
             )
         }
@@ -201,9 +201,10 @@ fn attn_res_blends_what_the_host_blends() {
             &mut ten(y_at, tokens, hidden, Bf16),
             &mut ten(z_at, tokens, hidden, Bf16),
         );
-        norm::res_blend(&ctx, prefix, &closed, norm_t, 1e-5, proj_t, y).expect("the blend fires");
+        modulate::res_blend(&ctx, prefix, &closed, norm_t, 1e-5, proj_t, y)
+            .expect("the blend fires");
         let fused =
-            norm::res_blend_norm(&ctx, prefix, &closed, norm_t, 1e-5, proj_t, out_t, 1e-6, z);
+            modulate::res_blend_norm(&ctx, prefix, &closed, norm_t, 1e-5, proj_t, out_t, 1e-6, z);
         let what = format!("{tokens} x {hidden}, {blocks} blocks");
         landed(&gpu, y_at, &want, 3e-2, 1.0, &what);
         if fused.expect("the fused blend fires") {

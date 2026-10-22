@@ -1,10 +1,9 @@
 use crate::error::Error;
-use dtype::Dtype;
-
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
+use dtype::Dtype;
 
-const POSENC: &str = "elemwise/posenc.cu";
+const REL_BIAS_UNIT: &str = "linear/rel_bias.hip";
 
 const BLOCK: u32 = 256;
 
@@ -52,7 +51,11 @@ pub fn rel_bias(
     }
     ctx.fire(
         OP,
-        Fire::at(POSENC, symbol(&format!("::pie::elemwise::rel_bias<{t}>"))).apply(Launch::grid(
+        Fire::at(
+            REL_BIAS_UNIT,
+            symbol(&format!("::pie::linear::rel_bias<{t}>")),
+        )
+        .apply(Launch::grid(
             [extent.div_ceil(BLOCK), heads, rows],
             [BLOCK, 1, 1],
         )),
@@ -67,4 +70,43 @@ pub fn rel_bias(
             ctx.stage(),
         ],
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridRule {
+    Conv {
+        k: [u32; 3],
+        stride: [u32; 3],
+        pad: [u32; 3],
+        pad_back: [u32; 3],
+        causal_t: bool,
+    },
+    Upsample {
+        factor: [u32; 3],
+        keep_first_frame: bool,
+    },
+    Shuffle {
+        r: [u32; 3],
+        trim_t: u32,
+    },
+    Unshuffle {
+        r: [u32; 3],
+    },
+    AvgDown {
+        factor: [u32; 3],
+    },
+}
+
+crate::error::unsupported! {
+    sinusoid = "elementwise.sinusoid" (t: Tensor, dim: u32, max_period: f32,
+        flip_sin_cos: bool, scale: f32, o: &mut Tensor);
+}
+
+crate::error::unsupported! {
+    relative_bucket_bias = "elementwise.relative_bucket_bias" (embedding: Tensor, max_len: u32,
+        num_buckets: u32, max_distance: f32, bidirectional: bool, y: &mut Tensor);
+}
+
+crate::error::unsupported! {
+    derive_grid = "spatial.derive_grid" (grid: Tensor, rule: GridRule, o_grid: &mut Tensor);
 }
