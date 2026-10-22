@@ -6,6 +6,7 @@ use crate::error::Result;
 
 pub struct KeepAlive {
     last: Arc<AtomicU64>,
+    busy: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     epoch: std::time::Instant,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -28,6 +29,18 @@ impl KeepAlive {
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
+    /// A fire the device runs from its encoding to its harvest: the spin
+    /// stands aside meanwhile, so it fills the device's idle gaps only.
+    pub fn begin(&self) {
+        self.busy.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn end(&self) {
+        let _ = self
+            .busy
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
     #[cfg(target_vendor = "apple")]
     pub fn start(device: &Context) -> Result<KeepAlive> {
         use kernels_metal::encode::{Fire, Grid};
@@ -38,6 +51,7 @@ impl KeepAlive {
 
         let epoch = std::time::Instant::now();
         let last = Arc::new(AtomicU64::new(u64::MAX / 2));
+        let busy = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let queue = device
             .device()
@@ -52,7 +66,7 @@ impl KeepAlive {
         let pipeline = pipelines.at(device.device(), fire)?;
         let sink = crate::device::Buffer::zeroed(device, 256)?;
         let iters: u32 = crate::diag::on().keepalive_iters.unwrap_or(DEFAULT_ITERS);
-        let (last_t, stop_t) = (Arc::clone(&last), Arc::clone(&stop));
+        let (last_t, stop_t, busy_t) = (Arc::clone(&last), Arc::clone(&stop), Arc::clone(&busy));
         let carry = Carry {
             queue,
             pipeline,
@@ -70,6 +84,10 @@ impl KeepAlive {
                     let last = last_t.load(Ordering::Relaxed);
                     if now.saturating_sub(last) > LINGER_MS {
                         std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    if busy_t.load(Ordering::Relaxed) > 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(20));
                         continue;
                     }
                     let spun = objc2::rc::autoreleasepool(|_| {
@@ -118,6 +136,7 @@ impl KeepAlive {
             })?;
         Ok(KeepAlive {
             last,
+            busy,
             stop,
             epoch,
             thread: Some(thread),
