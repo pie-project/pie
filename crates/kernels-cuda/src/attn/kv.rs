@@ -439,7 +439,8 @@ pub(crate) fn dequant_active(
     num_kv_heads: i32,
     head_dim: i32,
 ) -> Result<(), Error> {
-    if native_bf16(pool) {
+    // Pages attention reads as they are: nothing to widen.
+    if native_bf16(pool) || native_e4m3(pool) {
         return Ok(());
     }
     let (logical_n, page_elems, launch) =
