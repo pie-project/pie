@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
 use poem_compiler::{
@@ -294,6 +295,8 @@ pub struct Shell {
     inflight: VecDeque<Flight>,
     /// Fires' host and device times, under the `fire-timeline` diagnostic.
     timeline: crate::timeline::Timeline,
+    /// Steps staged so far.
+    staged: u64,
     grafted: Option<Pending>,
     landed: BTreeMap<u64, Vec<Vec<f32>>>,
     host_rows: bool,
@@ -1099,6 +1102,7 @@ impl PreparedLoad<'_> {
             airborne: Airborne::new(),
             inflight: VecDeque::new(),
             timeline: crate::timeline::Timeline::default(),
+            staged: 0,
             grafted: None,
             landed: BTreeMap::new(),
             host_rows: crate::diag::on().host_rows,
@@ -1826,13 +1830,15 @@ impl Shell {
         if crate::diag::on().fire_timeline
             && waited.is_ok()
             && let Some(lines) = self.timeline.land(
-                (flight.rows, flight.dispatches),
-                &flight.pending.timeline(),
-                crate::device::ctx::host_seconds(),
+                (flight.variant, flight.rows, flight.dispatches),
+                &flight.pending.timeline(
+                    flight.staged,
+                    f64::from_bits(flight.handled.load(std::sync::atomic::Ordering::Relaxed)),
+                ),
             )
         {
             for line in lines {
-                eprintln!("{line}");
+                println!("{line}");
             }
         }
         fire_trace(|| {
@@ -2526,6 +2532,7 @@ impl Shell {
             clips,
             done,
         } = step;
+        let handed = crate::device::ctx::host_seconds();
 
         while self.inflight.len() >= self.arms.depth() {
             self.harvest_one()?;
@@ -3749,7 +3756,10 @@ impl Shell {
             },
         };
 
+        self.staged += 1;
         Ok(Prepared {
+            staged: handed,
+            variant: u8::from((self.staged / 20) % 2 == 1),
             lanes,
             self_cond_feeds,
             port_feeds,
@@ -3983,7 +3993,8 @@ impl Shell {
                 #[cfg(target_vendor = "apple")]
                 let sink = sink
                     .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                    .flushing_after(HEAD_LAUNCHES);
+                    .flushing_after(HEAD_LAUNCHES)
+                    .flushing_every(if p.variant == 1 { 128 } else { 0 });
                 Encoded::Live(sink)
             }
             Mode::Record | Mode::Replay => {
@@ -4324,6 +4335,10 @@ pub struct Clips<'a> {
 }
 
 pub struct Prepared<'a> {
+    /// When the step reached the engine, on the device's host clock.
+    staged: f64,
+    /// The encode variant an A/B of the fire timeline runs this fire in.
+    variant: u8,
     lanes: &'a [Seated<'a>],
     self_cond_feeds: Vec<(u64, u64, u64, u64)>,
     port_feeds: Vec<PortFeedPlan>,
@@ -4359,6 +4374,9 @@ pub struct Enqueued<'a> {
     launches: u32,
     rows: u32,
     dispatches: u32,
+    staged: f64,
+    variant: u8,
+    handled: Arc<std::sync::atomic::AtomicU64>,
     attached: Vec<u64>,
     step: PhantomData<&'a ()>,
 }
@@ -4401,6 +4419,10 @@ struct Flight {
     lanes: usize,
     rows: u32,
     dispatches: u32,
+    staged: f64,
+    variant: u8,
+    /// When the fire's completion handler ran, as `f64` bits.
+    handled: Arc<std::sync::atomic::AtomicU64>,
     pending: Pending,
     attached: Vec<u64>,
 }
@@ -4607,7 +4629,13 @@ impl engine::frame::Shell for Shell {
         let counts = self.airborne.clone();
         let done = prepared.done.take();
         let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
+        let handled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let heard = Arc::clone(&handled);
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
+            heard.store(
+                crate::device::ctx::host_seconds().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             counts.leave();
             let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
@@ -4640,6 +4668,9 @@ impl engine::frame::Shell for Shell {
             launches: walked.launches,
             rows: prepared.descriptor.rows,
             dispatches: walked.dispatches,
+            staged: prepared.staged,
+            variant: prepared.variant,
+            handled,
             attached,
             step: PhantomData,
         })
@@ -4657,6 +4688,9 @@ impl engine::frame::Shell for Shell {
             launches,
             rows,
             dispatches,
+            staged,
+            variant,
+            handled,
             attached,
             step: _,
         } = enqueued;
@@ -4668,6 +4702,9 @@ impl engine::frame::Shell for Shell {
             lanes,
             rows,
             dispatches,
+            staged,
+            variant,
+            handled,
             pending,
             attached,
         });

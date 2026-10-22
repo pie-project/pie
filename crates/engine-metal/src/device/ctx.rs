@@ -905,9 +905,11 @@ impl Pending {
 
     /// When the frame opened, and each of its buffers' commit, device start
     /// and device end, in the order the queue ran them, all in seconds on
-    /// the host clock. Read once the frame has landed.
+    /// the host clock, beside when its step was `staged` and its landing
+    /// `handled`. Read once the frame has landed.
     #[must_use]
-    pub fn timeline(&self) -> crate::timeline::Fire {
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    pub fn timeline(&self, staged: f64, handled: f64) -> crate::timeline::Fire {
         #[cfg(target_vendor = "apple")]
         {
             let buffers = self
@@ -922,7 +924,9 @@ impl Pending {
                 })
                 .collect();
             crate::timeline::Fire {
+                staged,
                 opened: self.opened,
+                handled,
                 buffers,
             }
         }

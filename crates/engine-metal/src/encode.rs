@@ -49,6 +49,9 @@ pub struct Sink<'a> {
     /// Launches left before the borrowed frame commits its head and goes on
     /// in a fresh buffer; zero never.
     flush_in: std::cell::Cell<u32>,
+    /// Launches between commits after the head; zero commits the rest
+    /// whole.
+    flush_every: u32,
     /// Launches encoded so far.
     dispatched: std::cell::Cell<u32>,
 }
@@ -118,6 +121,7 @@ impl<'a> Sink<'a> {
             #[cfg(target_vendor = "apple")]
             handoff: None,
             flush_in: std::cell::Cell::new(0),
+            flush_every: 0,
             dispatched: std::cell::Cell::new(0),
         }
     }
@@ -139,6 +143,7 @@ impl<'a> Sink<'a> {
             #[cfg(target_vendor = "apple")]
             handoff: None,
             flush_in: std::cell::Cell::new(0),
+            flush_every: 0,
             dispatched: std::cell::Cell::new(0),
         }
     }
@@ -397,6 +402,7 @@ impl Encode for Sink<'_> {
                 self.flush_in.set(left - 1);
                 if left == 1 {
                     frame.flush().map_err(|fault| Sink::refuse(fire, fault))?;
+                    self.flush_in.set(self.flush_every);
                 }
             }
             if profiling()
@@ -457,6 +463,15 @@ impl<'a> Sink<'a> {
     #[must_use]
     pub fn flushing_after(self, launches: u32) -> Self {
         self.flush_in.set(launches);
+        self
+    }
+
+    /// Commits again every `launches` after the head, so the device never
+    /// waits on more than that many launches' encoding; zero commits the
+    /// rest whole.
+    #[must_use]
+    pub fn flushing_every(mut self, launches: u32) -> Self {
+        self.flush_every = launches;
         self
     }
 
