@@ -91,9 +91,13 @@ fn positions_stream(op: &'static str, positions: Tensor, x: &Tensor) {
         Dtype::I32,
         "`{op}` reads an i32 position stream"
     );
-    debug_assert_eq!(
-        positions.rows, x.rows,
-        "the position stream is one entry per rotated row"
+    // A staged window rotates its live rows of a plane whose every row has a
+    // position, so the stream may be longer than the rows rotated.
+    debug_assert!(
+        positions.rows >= x.rows,
+        "the position stream has {} entries for {} rotated rows",
+        positions.rows,
+        x.rows
     );
 }
 
