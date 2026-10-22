@@ -1309,33 +1309,17 @@ fn staged(
             None
         };
         if split == 1 || partial.is_some() {
-            let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
-            let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
-            ctx.fire(
-                Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
-                    [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
-                    [64, 1, 1],
-                )),
-                &[
-                    w.codes.arg(),
-                    w.scales.arg(),
-                    biases.arg(),
-                    act.arg(),
-                    y.arg_mut(),
-                    k.arg(),
-                    n.arg(),
-                    match partial {
-                        Some(partial) => partial.arg_mut(),
-                        None => ctx.absent()?,
-                    },
-                    m.arg(),
-                    ld.arg(),
-                ],
-            )?;
-            return match partial {
-                Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
-                None => Ok(()),
-            };
+            return coop_matmul(
+                ctx,
+                op,
+                act,
+                w,
+                biases,
+                y,
+                (m, n, k, cols, ld),
+                if partial.is_some() { split } else { 1 },
+                partial,
+            );
         }
     }
     let mut split = if k >= STAGED_DEEP || tiles < STAGED_FEW_TILES {
@@ -1380,6 +1364,168 @@ fn staged(
     match partial {
         Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
         None => Ok(()),
+    }
+}
+
+/// One register-fed (Apple10 cooperative) tile matmul of `act` into `y`: `(m, n, k, cols, ld)`
+/// its rows, row stride, contraction, columns computed and the bank's row stride; `split`
+/// partitions of the contraction, whose sums go to `partial` when there are more than one.
+#[allow(clippy::too_many_arguments)]
+pub fn coop_matmul(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Bank,
+    biases: Tensor,
+    y: Tensor,
+    (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
+    split: i32,
+    partial: Option<Tensor>,
+) -> Result<(), Error> {
+    let tiles = cols / 64;
+    let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
+    let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
+    ctx.fire(
+        Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
+            [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
+            [64, 1, 1],
+        )),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            biases.arg(),
+            act.arg(),
+            y.arg_mut(),
+            k.arg(),
+            n.arg(),
+            match partial {
+                Some(partial) => partial.arg_mut(),
+                None => ctx.absent()?,
+            },
+            m.arg(),
+            ld.arg(),
+        ],
+    )?;
+    match partial {
+        Some(partial) if split > 1 => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
+        _ => Ok(()),
+    }
+}
+
+/// The gate and up of a packed `[gate | up]` bank and their swiglu into `h` in one
+/// register-fed (Apple10 cooperative) launch, where the matmul of `act` by the whole bank
+/// takes that tile with no contraction split: `h` lands as [`matmul`] then
+/// [`super::mlp::swiglu`] land it, bit for bit, without the packed plane between them.
+/// `Ok(false)`, and nothing fired, where the matmul takes another tile.
+pub fn coop_swiglu(
+    ctx: &Ctx<'_>,
+    tuning: &Tuning,
+    act: Tensor,
+    w: Bank,
+    intermediate: u32,
+    h: Tensor,
+    capacity_rows: u32,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.mlp_swiglu";
+    let Some(biases) = w.biases else {
+        return Ok(false);
+    };
+    let (rows, k) = (act.rows, act.width);
+    let cols = intermediate.saturating_mul(2);
+    if act.dtype != Dtype::Bf16
+        || h.dtype != Dtype::Bf16
+        || w.codes.dtype != Dtype::U4g64
+        || w.bits != 4
+        || w.group != 64
+        || h.rows != rows
+        || h.width != intermediate
+        || w.codes.rows < cols
+        || w.codes.width != k
+        || rows == 0
+        || !intermediate.is_multiple_of(32)
+        || !k.is_multiple_of(COOP_SPAN.unsigned_abs())
+        || !w.ld.is_multiple_of(64)
+        || w.ld < k
+        || STAGED_TILE.unsigned_abs() > capacity_rows
+    {
+        return Ok(false);
+    }
+    let at = tuning.qmm_at(rows, cols, k, w.bits, w.group);
+    let (m, k, ld, n) = (
+        stated(OP, rows)?,
+        stated(OP, k)?,
+        stated(OP, w.ld)?,
+        stated(OP, intermediate)?,
+    );
+    // The matmul's own choice: the staged rung first, and on it the whole cooperative tile.
+    if tuning.qmm(&at).first() != Some(&Qmm::Staged)
+        || m > STAGED_TILE
+        || 2 * n < COOP_LEAST_COLUMNS
+        || (2 * n < COOP_WHOLE_COLUMNS && (k / COOP_SPAN) % COOP_SPLIT == 0)
+    {
+        return Ok(false);
+    }
+    ctx.fire(
+        Fire::at(STAGED_FILE, "affine_qmm_coop_swiglu")
+            .apply(Grid::of([64 * (intermediate / 32), 1, 1], [64, 1, 1])),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            biases.arg(),
+            act.arg(),
+            h.arg_mut(),
+            k.arg(),
+            n.arg(),
+            ctx.absent()?,
+            m.arg(),
+            ld.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// EXPERIMENT: a variant of [`coop_matmul`]; `(mode, run, sgs)` as the kernel names them.
+#[allow(clippy::too_many_arguments)]
+pub fn coop_matmul_x(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    w: Bank,
+    y: Tensor,
+    (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
+    split: i32,
+    partial: Option<Tensor>,
+    (mode, run, sgs): (i32, i32, i32),
+) -> Result<(), Error> {
+    let entry = symbol(&format!("affine_qmm_coop_x_k{split}_m{mode}_r{run}_s{sgs}"));
+    let stamp = symbol(&format!(
+        "PIE_COOP_X_POINT(\"{entry}\",{split},{mode},{run},{sgs})"
+    ));
+    ctx.fire(
+        Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
+            [(32 * sgs) * (cols / (32 * sgs)).unsigned_abs() as i32, split, 1].map(|v| v.unsigned_abs()),
+            [(32 * sgs).unsigned_abs(), 1, 1],
+        )),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            w.biases.expect("biases").arg(),
+            act.arg(),
+            y.arg_mut(),
+            k.arg(),
+            n.arg(),
+            match partial {
+                Some(partial) => partial.arg_mut(),
+                None => ctx.absent()?,
+            },
+            m.arg(),
+            ld.arg(),
+        ],
+    )?;
+    match partial {
+        Some(partial) if split > 1 && mode != 1 && mode != 3 => {
+            splitk_reduce(ctx, "bench", y, partial, (m, n, cols), split)
+        }
+        _ => Ok(()),
     }
 }
 

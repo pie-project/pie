@@ -115,28 +115,33 @@ affine_qmm_staged(const device uint *weights [[buffer(0)]], const device bfloat 
 // of k is permuted alike for both operands, so a lane's share of a column is one whole
 // quant group (one scale, one bias): logical k = 4q + 16t + r of run `cc` is physical
 // 64q + 8cc + 4t + r. Cooperative inputs need the 26.2 tensor ops; an older system
-// compiles this point as the staged tile it replaces. `SPLIT` is the grid's y extent.
-template <int SPLIT>
-[[kernel]] void
-affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
-                const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
-                device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
-                constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
-                constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
-                uint2 position [[threadgroup_position_in_grid]],
-                uint lane [[thread_index_in_simdgroup]],
-                uint simd [[simdgroup_index_in_threadgroup]]) {
+// compiles these points as the staged tile they replace.
 #if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
-  constexpr int N = 32;
-  constexpr auto descriptor = matmul2d_descriptor(16, N, 32, false, true, false,
-                                                  matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroup> multiply;
-  auto a = multiply.get_left_input_cooperative_tensor<bfloat, half, float>();
-  auto b = multiply.get_right_input_cooperative_tensor<bfloat, half, float>();
+#define PIE_COOP_MULTIPLY                                                                          \
+  constexpr auto descriptor = matmul2d_descriptor(16, 32, 32, false, true, false,                 \
+                                                  matmul2d_descriptor::mode::multiply_accumulate); \
+  matmul2d<descriptor, execution_simdgroup> multiply;                                              \
+  auto a = multiply.get_left_input_cooperative_tensor<bfloat, half, float>();                      \
+  auto b = multiply.get_right_input_cooperative_tensor<bfloat, half, float>()
+
+// A simdgroup's 32 columns from `column`, zeroed: the destination `coop_walk` adds to.
+inline auto coop_destination() {
+  PIE_COOP_MULTIPLY;
   auto total = multiply.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
 #pragma unroll
   for (ushort i = 0; i < total.get_capacity(); ++i)
     total[i] = 0.0f;
+  return total;
+}
+
+// Adds the products of spans [first, last) of the contraction, for the bank's 32 columns from
+// `column`, to `total`.
+template <class Acc>
+METAL_FUNC void coop_walk(const device uint *weights, const device bfloat *scales,
+                          const device bfloat *biases, const device bfloat *input, int width,
+                          int rows, int stride, uint column, int first, int last, uint lane,
+                          thread Acc &total) {
+  PIE_COOP_MULTIPLY;
 #pragma unroll
   for (ushort i = 0; i < a.get_capacity(); ++i)
     a[i] = bfloat(0.0f);
@@ -144,9 +149,6 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
   // activations) or column (of the weights, plus 8j) `sub`, both as they lay it out.
   const ushort q = (lane & 1) + 2 * ((lane >> 3) & 1);
   const ushort sub = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-  const uint column = position.x * 2 * N + simd * N;
-  const int spans = width / 256 / SPLIT;
-  const int first = int(position.y) * spans, last = first + spans;
   const ulong words = ulong(stride) / 32, groups = ulong(stride) / 64;
   const bool live = int(sub) < rows;
   const device uint4 *codes =
@@ -192,6 +194,153 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
       }
     }
   }
+}
+#endif
+
+#if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
+// EXPERIMENT: MODE 0 the walk, 1 its loads alone, 2 its matmuls alone; RUN spans a step's loads;
+// SGS simdgroups of 32 columns a threadgroup.
+template <int SPLIT, int MODE, int RUN, int SGS>
+[[kernel]] void
+affine_qmm_coop_x(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
+                  const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
+                  device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+                  constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
+                  constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+                  uint2 position [[threadgroup_position_in_grid]],
+                  uint lane [[thread_index_in_simdgroup]],
+                  uint simd [[simdgroup_index_in_threadgroup]]) {
+  const uint column = position.x * 32 * SGS + simd * 32;
+  const int spans = width / 256 / SPLIT;
+  const int first = int(position.y) * spans, last = first + spans;
+  PIE_COOP_MULTIPLY;
+  auto total = multiply.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+#pragma unroll
+  for (ushort i = 0; i < total.get_capacity(); ++i)
+    total[i] = 0.0f;
+#pragma unroll
+  for (ushort i = 0; i < a.get_capacity(); ++i)
+    a[i] = bfloat(0.0f);
+  const ushort q = (lane & 1) + 2 * ((lane >> 3) & 1);
+  const ushort sub = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
+  const ulong words = ulong(stride) / 32, groups = ulong(stride) / 64;
+  const bool live = int(sub) < rows;
+  const device uint4 *codes =
+      reinterpret_cast<const device uint4 *>(weights) + ulong(column + sub) * words + 2 * q;
+  const device bfloat *scale = scales + ulong(column + sub) * groups + q;
+  const device bfloat *bias = biases + ulong(column + sub) * groups + q;
+  const device uint4 *x = reinterpret_cast<const device uint4 *>(
+                              input + ulong(min(int(sub), rows - 1)) * width) + 8 * q;
+  uint folded = 0;
+  for (int base = first; base < last; base += RUN) {
+    uint4 w[RUN][2][4];
+    half2 s[RUN][4], z[RUN][4];
+#pragma unroll
+    for (int r = 0; r < RUN; ++r)
+#pragma unroll
+      for (ushort j = 0; j < 4; ++j) {
+        const int span = base + r;
+        if (MODE == 3) {
+          // the same bytes a simdgroup reads, as one contiguous run of its 32 rows' block
+          const device uint4 *block = reinterpret_cast<const device uint4 *>(weights) +
+                                      ulong(column) * words + ulong(position.y) * (32 * words / SPLIT);
+          s[r][j] = half2(half(float(scale[8 * j * groups + span * 4])));
+          z[r][j] = half2(half(float(bias[8 * j * groups + span * 4])));
+          w[r][0][j] = block[ulong(span - first) * 256 + j * 32 + lane];
+          w[r][1][j] = block[ulong(span - first) * 256 + (4 + j) * 32 + lane];
+        } else if (MODE == 2) {
+          s[r][j] = half2(half(0.01h * float(j + 1)));
+          z[r][j] = half2(half(-0.02h));
+          w[r][0][j] = uint4(lane * 0x01234567u + j + span);
+          w[r][1][j] = uint4(lane * 0x07654321u + j + span);
+        } else {
+          s[r][j] = half2(half(float(scale[8 * j * groups + span * 4])));
+          z[r][j] = half2(half(float(bias[8 * j * groups + span * 4])));
+          w[r][0][j] = codes[8 * j * words + span * 8];
+          w[r][1][j] = codes[8 * j * words + span * 8 + 1];
+        }
+      }
+#pragma unroll
+    for (int r = 0; r < RUN; ++r) {
+      const int span = base + r;
+      if (MODE == 1 || MODE == 3) {
+#pragma unroll
+        for (ushort j = 0; j < 4; ++j)
+          folded ^= w[r][0][j].x ^ w[r][0][j].y ^ w[r][0][j].z ^ w[r][0][j].w ^ w[r][1][j].x ^
+                    w[r][1][j].y ^ w[r][1][j].z ^ w[r][1][j].w ^ as_type<uint>(s[r][j]) ^
+                    as_type<uint>(z[r][j]);
+        continue;
+      }
+#pragma unroll
+      for (ushort h = 0; h < 2; ++h)
+#pragma unroll
+        for (ushort cc = 0; cc < 4; ++cc) {
+          const uint4 xv = x[span * 32 + h * 4 + cc];
+#pragma unroll
+          for (ushort t = 0; t < 2; ++t)
+#pragma unroll
+            for (ushort rr = 0; rr < 4; ++rr)
+              a[8 * t + rr] = live ? as_type<bfloat2>(xv[2 * t + rr / 2])[rr % 2] : bfloat(0.0f);
+#pragma unroll
+          for (ushort j = 0; j < 4; ++j) {
+            const uint word = w[r][h][j][cc];
+#pragma unroll
+            for (ushort rr = 0; rr < 4; ++rr) {
+              half2 v = as_type<half2>(((word >> (4 * rr)) & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);
+              v = fma(v, s[r][j], z[r][j]);
+              b[4 * j + rr] = v.x;
+              b[16 + 4 * j + rr] = v.y;
+            }
+          }
+          multiply.run(a, b, total);
+        }
+    }
+  }
+  if (MODE == 1 || MODE == 3) {
+    if (folded == 0x9e3779b9u)
+      output[lane] = bfloat(1.0f);
+    return;
+  }
+#pragma unroll
+  for (ushort i = 0; i < total.get_capacity(); ++i) {
+    if (!total.is_valid_element(i))
+      continue;
+    const auto at = total.get_multidimensional_index(i);
+    const uint row = at[1];
+    if (row >= uint(rows) || row >= 8)
+      continue;
+    const ulong o = ulong(row) * columns + column + at[0];
+    if constexpr (SPLIT > 1)
+      partials[ulong(position.y) * rows * columns + o] = total[i];
+    else
+      output[o] = bfloat(total[i]);
+  }
+}
+#define PIE_COOP_X_POINT(name, split, mode, run, sgs)                                              \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_coop_x<split, mode, run, sgs>(           \
+      const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
+      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
+      constant int &, uint2, uint, uint);
+#endif
+
+// `SPLIT` is the grid's y extent: each partition publishes its sums to `partials`.
+template <int SPLIT>
+[[kernel]] void
+affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
+                const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
+                device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+                constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
+                constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+                uint2 position [[threadgroup_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simd [[simdgroup_index_in_threadgroup]]) {
+#if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
+  const uint column = position.x * 64 + simd * 32;
+  const int spans = width / 256 / SPLIT;
+  const int first = int(position.y) * spans;
+  auto total = coop_destination();
+  coop_walk(weights, scales, biases, input, width, rows, stride, column, first, first + spans,
+            lane, total);
 #pragma unroll
   for (ushort i = 0; i < total.get_capacity(); ++i) {
     if (!total.is_valid_element(i))
@@ -211,6 +360,73 @@ affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *s
   threadgroup uint4 pairs[2 * 2 * 32];
   staged_tile<8, SPLIT>(weights, scales, biases, input, output, width, columns, partials, rows,
                         stride, position, lane, simd, stages, pairs);
+#endif
+}
+
+// A packed `[gate | up]` bank's gate and up columns into their swiglu, `output` rows of
+// `intermediate`: a threadgroup's first simdgroup walks the gate's 32 columns from 32x, its
+// second the up's same columns, which it hands over rounded to bf16, so each output is
+// `packed_swiglu` of the gate and up the plain tile lands, bit for bit.
+[[kernel]] void
+affine_qmm_coop_swiglu(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
+                       const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
+                       device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+                       constant int &intermediate [[buffer(6)]], constant int &rows [[buffer(8)]],
+                       constant int &stride [[buffer(9)]],
+                       uint2 position [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint simd [[simdgroup_index_in_threadgroup]]) {
+#if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
+  threadgroup bfloat up[16 * 32];
+  const uint column = position.x * 32;
+  auto total = coop_destination();
+  coop_walk(weights, scales, biases, input, width, rows, stride, column + simd * intermediate, 0,
+            width / 256, lane, total);
+  if (simd == 1) {
+#pragma unroll
+    for (ushort i = 0; i < total.get_capacity(); ++i)
+      up[i * 32 + lane] = bfloat(total[i]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd == 1)
+    return;
+#pragma unroll
+  for (ushort i = 0; i < total.get_capacity(); ++i) {
+    if (!total.is_valid_element(i))
+      continue;
+    const auto at = total.get_multidimensional_index(i);
+    const uint row = at[1];
+    if (row >= uint(rows) || row >= 8)
+      continue;
+    const float g = float(bfloat(total[i]));
+    const float u = float(up[i * 32 + lane]);
+    output[ulong(row) * intermediate + column + at[0]] = bfloat((g / (1.0f + metal::exp(-g))) * u);
+  }
+#else
+  // Without the tensor ops a thread sums its outputs' dot products alone: correct, not quick.
+  const uint column = position.x * 32;
+  const ulong groups = ulong(stride) / 64;
+  for (uint at = simd * 32 + lane; at < 8 * 32; at += 64) {
+    const uint row = at / 32, c = column + at % 32;
+    if (row >= uint(rows))
+      continue;
+    float sums[2];
+    for (uint half_ = 0; half_ < 2; ++half_) {
+      const uint n = c + half_ * intermediate;
+      const device uint *codes = weights + ulong(n) * (stride / 8);
+      float sum = 0.0f;
+      for (int k = 0; k < width; ++k) {
+        const float code = float((codes[k / 8] >> (4 * (k % 8))) & 15);
+        const float w = float(half(fma(half(code), half(float(scales[n * groups + k / 64])),
+                                       half(float(biases[n * groups + k / 64])))));
+        sum += float(input[ulong(row) * width + k]) * w;
+      }
+      sums[half_] = sum;
+    }
+    const float g = float(bfloat(sums[0]));
+    const float u = float(bfloat(sums[1]));
+    output[ulong(row) * intermediate + c] = bfloat((g / (1.0f + metal::exp(-g))) * u);
+  }
 #endif
 }
 

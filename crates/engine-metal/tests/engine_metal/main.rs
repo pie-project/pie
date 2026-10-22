@@ -22,6 +22,7 @@ mod the_block_dyn_conv_matches_its_reference;
 mod the_bonsai_27b_perplexity_matches_the_fork;
 mod the_bonsai_27b_serves_and_matches_the_fork_oracle;
 mod the_conditioning_ops_answer_their_host_reference;
+mod the_coop_tiles_price_their_matmuls;
 mod the_folded_qmv_answers_the_reference;
 mod the_full_two_bit_dsv4_serves_from_its_artifact;
 mod the_gated_delta_scans_agree;
