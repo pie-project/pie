@@ -800,7 +800,10 @@ fn act_x_wt_over(
             Qmm::Register => {
                 if cols % REGISTER_COLUMNS == 0 && m <= 8 {
                     // Without room for the partials it runs whole.
-                    let split = register_split(cols, k, tuning.cores());
+                    let split = std::env::var("PIE_SG_SPLIT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| register_split(cols, k, tuning.cores()));
                     let partial = (split > 1)
                         .then(|| {
                             (scratch.partials)(

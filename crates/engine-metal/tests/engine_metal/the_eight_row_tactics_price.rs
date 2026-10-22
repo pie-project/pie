@@ -35,6 +35,10 @@ fn the_eight_row_tactics_price() {
     let tactics = [
         ("register", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
         ("reg-packed", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-s1", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-s2", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-s4", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
+        ("reg-s8", "[kernel]\nqmm = [\"register\", \"qmv\"]"),
         ("staged", "[kernel]\nqmm = [\"staged\", \"qmv\"]"),
         ("tiled96", "[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 96 }, \"qmv\"]"),
         ("qmv", "[kernel]\nqmm = [{ use = \"qmv\", rows_max = 8, packs = 1, crossover_tg = 96 }]"),
@@ -143,6 +147,10 @@ fn the_eight_row_tactics_price() {
                     unsafe { std::env::remove_var("PIE_SG_PACKED") };
                 }
                 let banks_now = if use_packed { &packed_banks } else { &banks };
+                match name.strip_prefix("reg-s") {
+                    Some(sp) => unsafe { std::env::set_var("PIE_SG_SPLIT", sp) },
+                    None => unsafe { std::env::remove_var("PIE_SG_SPLIT") },
+                }
                 let mut times = Vec::new();
                 let mut failed = false;
                 for i in 0..12 {
