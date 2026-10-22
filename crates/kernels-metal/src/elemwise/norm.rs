@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, nonzero, refuse, stated,
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 
@@ -82,7 +82,7 @@ fn rms_row(
     });
     let grid = rms_grid(op, x.width, axis, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -113,7 +113,7 @@ pub fn residual_add_rmsnorm(
     );
     let grid = rms_grid(OP, y.width, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             y.arg_mut(),
@@ -158,7 +158,7 @@ pub fn residual_add_rmsnorm_table(
     }
     let grid = rms_grid(OP, y.width, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", "residual_add_rms_table_bfloat16").apply(grid),
+        Fire::at("elemwise/norm.metal", "residual_add_rms_table_bfloat16").apply(grid),
         &[
             x.arg(),
             y.arg_mut(),
@@ -219,7 +219,7 @@ pub fn rmsnorm_table(
     }
     let grid = rms_grid(OP, x.width, x.width, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", "rms_table_bfloat16").apply(grid),
+        Fire::at("elemwise/norm.metal", "rms_table_bfloat16").apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -336,7 +336,7 @@ pub fn rmsnorm_per_head_plus_one_pair(
     };
     let (first, second) = (groups(x)?, groups(x2)?);
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", "rms_single_row_pair_bfloat16").apply(Grid::of(
+        Fire::at("elemwise/norm.metal", "rms_single_row_pair_bfloat16").apply(Grid::of(
             [threads * (first + second), 1, 1],
             [threads, 1, 1],
         )),
@@ -390,7 +390,7 @@ pub fn rmsnorm_grouped_plus_one(
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "rms_grouped_row_bfloat16" });
     let grid = rms_grid(OP, x.width, axis, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -416,7 +416,7 @@ pub fn rmsnorm_no_scale(
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "vnorm_single_row_bfloat16" });
     let grid = rms_grid(OP, x.width, head_dim, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_vector.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[x.arg(), y.arg_mut(), eps.arg(), stated(OP, head_dim)?.arg()],
     )
 }
@@ -452,7 +452,7 @@ pub fn rmsnorm_gated(
     }
     let lanes = head_row_grid(OP, vd, x.width / vd, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_gated_rms.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
+        Fire::at("elemwise/norm.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
         &[
             x.arg(),
             gate.arg(),
@@ -497,11 +497,8 @@ pub fn rmsnorm_gated_table(
     }
     let lanes = head_row_grid(OP, vd, x.width / vd, x.rows)?;
     ctx.fire(
-        Fire::at(
-            "elemwise/norm_gated_rms.metal",
-            "gated_rms_table_f32_bfloat16",
-        )
-        .apply(Grid::of(lanes, [vd, 1, 1])),
+        Fire::at("elemwise/norm.metal", "gated_rms_table_f32_bfloat16")
+            .apply(Grid::of(lanes, [vd, 1, 1])),
         &[
             x.arg(),
             gate.arg(),
@@ -542,7 +539,7 @@ pub fn rmsnorm_gated_by(
     let vd = head_width(OP, x.width / heads)?;
     let lanes = head_row_grid(OP, vd, heads, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_gated_rms.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
+        Fire::at("elemwise/norm.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
         &[
             x.arg(),
             gate.arg(),
@@ -551,40 +548,6 @@ pub fn rmsnorm_gated_by(
             eps.arg(),
             stated(OP, vd)?.arg(),
         ],
-    )
-}
-
-pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.residual_add";
-    let entry = dtype_dispatch!(OP, y.dtype, {
-        Bf16 => "residual_add_bfloat16",
-        F32 => "residual_add_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_residual_add.metal", entry)
-            .apply(Grid::of(elementwise(OP, y.width, y.rows)?, [256, 1, 1])),
-        &[x.arg(), y.arg(), y.arg_mut()],
-    )
-}
-
-pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.add_bias";
-    let entry = match (out.dtype, bias.dtype) {
-        (Dtype::Bf16, Dtype::Bf16) => "add_bias_bfloat16",
-        (Dtype::F32, Dtype::F32) => "add_bias_float32",
-        (Dtype::F32, Dtype::Bf16) => "add_bias_float32_bf16",
-        (row, bank) => {
-            return Err(refuse(
-                OP,
-                format!("no point adds a {bank:?} bias to a {row:?} row"),
-            ));
-        }
-    };
-    let lanes = elementwise_rows(OP, out.width, out.rows)?;
-    ctx.fire(
-        Fire::at("elemwise/norm_add_bias.metal", entry)
-            .apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
-        &[out.arg_mut(), bias.arg(), stated(OP, out.width)?.arg()],
     )
 }
 
@@ -600,7 +563,7 @@ pub fn layernorm(
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layernorm_bfloat16" });
     let grid = rms_grid(OP, x.width, x.width, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_layernorm.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -624,7 +587,7 @@ pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Resu
     );
     let grid = rms_grid(OP, x.width, x.width, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_layernorm.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[x.arg(), y.arg_mut(), eps.arg(), x.width.arg()],
     )
 }
@@ -656,53 +619,13 @@ pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> R
         }
     }
     ctx.fire(
-        Fire::at("elemwise/norm_standardize.metal", entry)
-            .apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
+        Fire::at("elemwise/norm.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
         &[
             out.arg_mut(),
             bias.arg(),
             scale.arg(),
             stated(OP, out.width)?.arg(),
         ],
-    )
-}
-
-pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.mul_scalar";
-    let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "layer_scalar_mul_stated_bfloat16",
-        F32 => "layer_scalar_mul_stated_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_layer_scalar.metal", entry)
-            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
-        &[x.arg(), s.arg(), x.arg_mut()],
-    )
-}
-
-pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.silu_scaled";
-    let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "silu_scaled_bfloat16",
-        F32 => "silu_scaled_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_layer_scalar.metal", entry)
-            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
-        &[x.arg_mut(), s.arg()],
-    )
-}
-
-pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.scale";
-    let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "layer_scalar_mul_bfloat16",
-        F32 => "layer_scalar_mul_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_layer_scalar.metal", entry)
-            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
-        &[x.arg(), s.arg(), x.arg_mut()],
     )
 }
 

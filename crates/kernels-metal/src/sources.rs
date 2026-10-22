@@ -109,36 +109,8 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/elemwise/modulate.metal")),
     ),
     (
-        "elemwise/norm_add_bias.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_add_bias.metal")),
-    ),
-    (
-        "elemwise/norm_gated_rms.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_gated_rms.metal")),
-    ),
-    (
-        "elemwise/norm_layer_scalar.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_layer_scalar.metal")),
-    ),
-    (
-        "elemwise/norm_layernorm.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_layernorm.metal")),
-    ),
-    (
-        "elemwise/norm_residual_add.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_residual_add.metal")),
-    ),
-    (
-        "elemwise/norm_rms.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_rms.metal")),
-    ),
-    (
-        "elemwise/norm_standardize.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_standardize.metal")),
-    ),
-    (
-        "elemwise/norm_vector.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_vector.metal")),
+        "elemwise/norm.metal",
+        include_str!(concat!(source_root!(), "/elemwise/norm.metal")),
     ),
     (
         "elemwise/pointwise.metal",
