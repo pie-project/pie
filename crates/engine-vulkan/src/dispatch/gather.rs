@@ -1,4 +1,3 @@
-use kernels_vulkan::attn;
 use poem_exec::{DispatchGather, KernelError};
 use poem_ir::Gather;
 use poem_ir::Operands;
@@ -32,18 +31,21 @@ impl Run<'_> {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
                 };
-                attn::ple::ngram_ids(
-                    self.ctx(),
-                    self.tensor(*ids),
-                    &self.recurrent(*state),
-                    hash,
+                let pool = self.recurrent(*state);
+                kernels_slang::gather::ngram::ngram_ids(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*ids)),
+                    crate::encode::slang_tensor(pool.state),
+                    crate::encode::slang_tensor(pool.slots),
+                    crate::encode::slang_tensor(hash),
                     *eos,
                     mults,
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    self.tensor(*ngram_ids),
+                    crate::encode::slang_tensor(self.tensor(*ngram_ids)),
                 )
+                .map_err(crate::encode::from_slang)
             }
             Gather::NgramIdsChunked {
                 ids,
@@ -63,18 +65,23 @@ impl Run<'_> {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
                 };
-                attn::ple::ngram_ids_chunked(
-                    self.ctx(),
-                    self.ragged(*ids),
-                    &self.recurrent(*state),
-                    hash,
+                let ids = self.ragged(*ids);
+                let pool = self.recurrent(*state);
+                kernels_slang::gather::ngram::ngram_ids_chunked(
+                    &self.slang(),
+                    crate::encode::slang_tensor(ids.data),
+                    crate::encode::slang_tensor(ids.indptr),
+                    crate::encode::slang_tensor(pool.state),
+                    crate::encode::slang_tensor(pool.slots),
+                    crate::encode::slang_tensor(hash),
                     *eos,
                     mults,
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    self.tensor(*ngram_ids),
+                    crate::encode::slang_tensor(self.tensor(*ngram_ids)),
                 )
+                .map_err(crate::encode::from_slang)
             }
             Gather::Embed {
                 ids,

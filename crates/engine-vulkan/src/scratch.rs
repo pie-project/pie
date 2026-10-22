@@ -1,5 +1,5 @@
+use kernels_slang::gather::ngram;
 use kernels_vulkan::Tensor;
-use kernels_vulkan::attn::ple;
 use kernels_vulkan::linear::moe::{self, RoutedScratch};
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
@@ -283,7 +283,7 @@ impl Scratch {
             else {
                 continue;
             };
-            let key: Box<[u64]> = ple::hash_constants(mults, primes, offsets).into();
+            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
             if key.is_empty() || ple.iter().any(|held| held.key == key) {
                 continue;
             }
@@ -414,7 +414,7 @@ impl Scratch {
         primes: &[u64],
         offsets: &[u64],
     ) -> Option<Result<Tensor>> {
-        let want = ple::hash_constants(mults, primes, offsets);
+        let want = ngram::hash_constants(mults, primes, offsets);
         let held = self.ple.iter().find(|h| *h.key == *want)?;
         Some(held.room.bind(handles, &self.plane))
     }
