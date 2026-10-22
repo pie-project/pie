@@ -178,13 +178,18 @@ pub const READOUTS_PER_LANE: u32 = 16;
 pub const READOUTS_FLOOR: u32 = 4;
 
 /// The logit rows a lane may read out in one fire under `trace`: a block
-/// drafter's verified block, or an MTP head's drafts and the anchor they
+/// drafter's verified block (and its anchor where proposals start at row 0),
+/// or an MTP head's drafts and the anchor they
 /// follow, never under [`READOUTS_FLOOR`]. On a vocab-wide head each row a
 /// lane is the vocab's width again in every readout plane (two 1.9 GiB
 /// planes at 16 rows a lane on Qwen3.6-27B's 248k vocab, 256 lanes).
 #[must_use]
 pub fn readouts_per_lane(trace: &Trace) -> u32 {
-    let block = trace.drafter.as_ref().map_or(0, |drafter| drafter.rows);
+    // A block drafter's verify reads its block, and the anchor before it
+    // where its proposals start at row 0.
+    let block = trace.drafter.as_ref().map_or(0, |drafter| {
+        drafter.rows + u32::from(drafter.proposals_from == 0)
+    });
     let mtp = trace
         .seams
         .iter()
