@@ -1,7 +1,7 @@
 api = 1
 
 [target]
-device = "NVIDIA A100 80GB PCIe"
+match = { name_contains = ["A100"] }
 
 # Each line's measured win is in the commit that set it.
 # cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV, row kernels 16

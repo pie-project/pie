@@ -192,7 +192,7 @@ macro_rules! shelved {
 shelved!(
     cuda: [
         "sm80.toml",
-        "sm80/nvidia-a100-80gb-pcie.toml",
+        "sm80/nvidia-a100.toml",
         "sm86.toml",
         "sm87.toml",
         "sm89.toml",
