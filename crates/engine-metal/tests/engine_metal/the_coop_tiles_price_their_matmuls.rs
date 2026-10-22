@@ -263,3 +263,122 @@ fn the_coop_tiles_price_their_matmuls() {
     }
     eprintln!("{line}");
 }
+
+// EXPERIMENT: a verify's dense layers as one chained frame, against each projection alone.
+#[test]
+#[ignore = "a microbenchmark"]
+fn the_coop_layers_sustain_their_chain() {
+    let Ok(device) = Context::bind() else { return };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let b = Bench {
+        device: &device,
+        handles: &handles,
+        pipelines: &pipelines,
+        keep: RefCell::new(Vec::new()),
+    };
+    // a whole verify's 64 layers where the machine holds them
+    let memory: u64 = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let layers: usize = std::env::var("PIE_COOP_BENCH_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if memory >= 48 << 30 { 64 } else { 8 });
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"staged\", \"qmv\"]", false);
+    let (hidden, inner, gdn, out) = (5120u32, 17408u32, 16384u32, 6144u32);
+    let banks: Vec<[Bank; 4]> = (0..layers as u64)
+        .map(|l| {
+            [
+                b.bank(l * 4 + 1, hidden, gdn),
+                b.bank(l * 4 + 2, out, hidden),
+                b.bank(l * 4 + 3, hidden, 2 * inner),
+                b.bank(l * 4 + 4, inner, hidden),
+            ]
+        })
+        .collect();
+    let plane = |width: u32| {
+        Tensor::new(
+            b.zeroed(u64::from(ROWS * width) * 2),
+            ROWS,
+            width,
+            Dtype::Bf16,
+        )
+    };
+    let x: Vec<u8> = fill(0x99, u64::from(ROWS * hidden) * 2)
+        .chunks(2)
+        .flat_map(|c| bf16((f32::from(c[0]) - 127.5) / 256.0))
+        .collect();
+    let (x, qkv, o_in, mid, h, y) = (
+        Tensor::new(b.upload(&x), ROWS, hidden, Dtype::Bf16),
+        plane(gdn),
+        plane(out),
+        plane(hidden),
+        plane(inner),
+        plane(hidden),
+    );
+    let one = |ctx: &Sink<'_>, which: usize, w: &[Bank; 4]| {
+        match which {
+            0 => quant::coop_matmul(
+                ctx,
+                x,
+                w[0],
+                w[0].biases.unwrap(),
+                qkv,
+                (8, gdn as i32, hidden as i32, gdn as i32, hidden as i32),
+                1,
+            ),
+            1 => quant::coop_matmul(
+                ctx,
+                o_in,
+                w[1],
+                w[1].biases.unwrap(),
+                mid,
+                (8, hidden as i32, out as i32, hidden as i32, out as i32),
+                4,
+            ),
+            2 => quant::coop_swiglu(ctx, &tuning, mid, w[2], inner, h, 8).map(|_| ()),
+            _ => quant::coop_matmul(
+                ctx,
+                h,
+                w[3],
+                w[3].biases.unwrap(),
+                y,
+                (8, hidden as i32, inner as i32, hidden as i32, inner as i32),
+                4,
+            ),
+        }
+        .expect("projection")
+    };
+    let chain = |ctx: &Sink<'_>| {
+        for w in &banks {
+            for which in 0..4 {
+                one(ctx, which, w);
+            }
+        }
+    };
+    // 30 s of back-to-back chains, each window's median frame
+    let began = std::time::Instant::now();
+    let mut window = Vec::new();
+    let mut mark = 0u64;
+    while began.elapsed().as_secs() < 30 {
+        let frame = b.device.frame().expect("frame");
+        let sink = Sink::new(b.device, &frame, b.pipelines, b.handles);
+        chain(&sink);
+        window.push(frame.commit_timed().expect("commit") * 1e3);
+        let at = began.elapsed().as_secs() / 3;
+        if at != mark {
+            let n = window.len();
+            eprintln!(
+                "sustained x{layers} t={:2}s frame {:6.2}ms ({n} frames)",
+                mark * 3 + 3,
+                median(std::mem::take(&mut window))
+            );
+            mark = at;
+        }
+    }
+}
