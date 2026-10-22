@@ -170,16 +170,54 @@ pub struct FireRows {
     pub readouts: u64,
 }
 
-pub const READOUTS_PER_LANE: u64 = 16;
+/// A budget's logit rows a lane where nothing sizes them to a trace.
+pub const READOUTS_PER_LANE: u32 = 16;
+
+/// The fewest logit rows a lane reads out under [`readouts_per_lane`]: room
+/// beside a batch for a lone request reading a few rows of its own.
+pub const READOUTS_FLOOR: u32 = 4;
+
+/// The logit rows a lane may read out in one fire under `trace`: a block
+/// drafter's verified block (and its anchor where proposals start at row 0),
+/// or an MTP head's drafts and the anchor they
+/// follow, never under [`READOUTS_FLOOR`]. On a vocab-wide head each row a
+/// lane is the vocab's width again in every readout plane (two 1.9 GiB
+/// planes at 16 rows a lane on Qwen3.6-27B's 248k vocab, 256 lanes).
+#[must_use]
+pub fn readouts_per_lane(trace: &Trace) -> u32 {
+    // A block drafter's verify reads its block, and the anchor before it
+    // where its proposals start at row 0.
+    let block = trace.drafter.as_ref().map_or(0, |drafter| {
+        drafter.rows + u32::from(drafter.proposals_from == 0)
+    });
+    let mtp = trace
+        .seams
+        .iter()
+        .filter(|seam| seam.seam == EXPORTS[3].seam)
+        .flat_map(|seam| seam.values.iter())
+        .filter_map(|value| match &trace.values.get(value.0 as usize)?.ty {
+            Ty::Tensor { shape, .. } => {
+                shape.iter().skip(1).try_fold(1u32, |width, dim| match dim {
+                    Dim::Const(n) => width.checked_mul(u32::try_from(*n).ok()?),
+                    _ => None,
+                })
+            }
+            Ty::Struct(_) => None,
+        })
+        .max()
+        .map_or(0, |drafts| drafts.saturating_add(1));
+    READOUTS_FLOOR.max(block).max(mtp)
+}
 
 /// A readout plane whose row is at most this wide (a velocity or hidden
 /// export) is carved for every token; a wider one (vocab-wide logits) for
-/// `READOUTS_PER_LANE` rows a lane.
+/// the budget's `readouts_per_lane` rows a lane.
 pub const NARROW_READOUT_ROW_BYTES: u64 = 64 << 10;
 
 #[must_use]
 pub fn readouts_ceiling(budget: &crate::Budget) -> u64 {
-    (u64::from(budget.max_lanes) * READOUTS_PER_LANE).min(u64::from(budget.max_tokens))
+    (u64::from(budget.max_lanes) * u64::from(budget.readouts_per_lane.max(1)))
+        .min(u64::from(budget.max_tokens))
 }
 
 #[must_use]

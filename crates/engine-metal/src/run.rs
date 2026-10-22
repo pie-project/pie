@@ -185,6 +185,23 @@ pub struct Run<'c> {
 
     /// The register tile's input table the precast room holds, if one does.
     table: std::cell::Cell<Option<Laid>>,
+
+    /// The outputs a segment launch landed ahead of the nodes that write them.
+    landed: std::cell::Cell<Option<Landed>>,
+
+    /// The compiled regions the walk's place indexes, when the encode names
+    /// them: a segment launch takes only nodes of the region it runs in.
+    regions: Option<&'c [poem_compiler::Region]>,
+}
+
+/// The values a segment launch landed at `rows` of region `region` ahead of
+/// the nodes that write them (a later matmul's output, a split's left half):
+/// each of those nodes, reached at the same place, has nothing left to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Landed {
+    ys: [Option<ValueId>; 3],
+    region: u32,
+    rows: Rows,
 }
 
 /// A register-tile input table standing in the precast room: `act`'s rows as
@@ -274,6 +291,8 @@ impl<'c> Run<'c> {
             chain: std::cell::Cell::new(None),
             readers: std::cell::OnceCell::new(),
             table: std::cell::Cell::new(None),
+            landed: std::cell::Cell::new(None),
+            regions: None,
         }
     }
 
@@ -286,7 +305,7 @@ impl<'c> Run<'c> {
     }
 
     /// The nodes that read `value`, in trace order.
-    fn readers_of(&self, value: ValueId) -> &[u32] {
+    pub(crate) fn readers_of(&self, value: ValueId) -> &[u32] {
         use poem_ir::Operands as _;
         let readers = self.readers.get_or_init(|| {
             let mut readers = vec![Vec::new(); self.values.len()];
@@ -332,7 +351,75 @@ impl<'c> Run<'c> {
                 }
                 _ => None,
             })
-            .max()
+            .reduce(|a, b| a + b)
+    }
+
+    /// The per-head norm the trace places right after the one of `x` into `y`,
+    /// in the region the walk is in, over the same head width and epsilon and
+    /// bf16 rows of its own (a layer's key heads after its query heads): its
+    /// input, weight and output, when its rows stand apart from the first's,
+    /// so one launch lands both.
+    pub(crate) fn norm_pair(
+        &self,
+        x: ValueId,
+        y: ValueId,
+        head_dim: u32,
+        eps: f32,
+    ) -> Option<(ValueId, ValueId, ValueId)> {
+        use poem_ir::{Elementwise, Operation};
+        let (nodes, _) = self.region_nodes()?;
+        let at = self.readers_of(x).iter().copied().find(|&at| {
+            matches!(&self.nodes.get(at as usize).map(|n| &n.op),
+                Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne { x: a, y: b, .. }))
+                    if *a == x && *b == y)
+        })?;
+        let Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne {
+            x: x2,
+            weight: w2,
+            head_dim: d2,
+            eps: e2,
+            y: y2,
+        })) = self.nodes.get(at as usize + 1).map(|n| &n.op)
+        else {
+            return None;
+        };
+        if !nodes.contains(&at)
+            || !nodes.contains(&(at + 1))
+            || *d2 != head_dim
+            || *e2 != eps
+            || *x2 == y
+        {
+            return None;
+        }
+        let span = |v: ValueId| {
+            let t = self.tensor(v);
+            (t.dtype == poem_ir::Dtype::Bf16)
+                .then(|| self.address(t.buf))
+                .flatten()
+                .map(|(slab, at)| (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2))
+        };
+        let spans = [span(x)?, span(y)?, span(*x2)?, span(*y2)?];
+        let apart = |a: (u64, u64, u64), b: (u64, u64, u64)| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1;
+        // The second's rows land apart from everything the first reads and writes, and the
+        // first's apart from what the second reads.
+        (apart(spans[3], spans[0]) && apart(spans[3], spans[1]) && apart(spans[1], spans[2]))
+            .then_some((*x2, *w2, *y2))
+    }
+
+    /// The merge of the arms `value` is one of, when the merge's rows here are
+    /// the very bytes `value` lands in: the merge's readers then read what the
+    /// arm writes, in place.
+    pub(crate) fn merged_into(&self, value: ValueId) -> Option<ValueId> {
+        let at = self.values.iter().position(|decl| {
+            matches!(&decl.def, poem_ir::Def::Merge(arms) if arms.iter().any(|(v, _)| *v == value))
+        })?;
+        let merged = ValueId(u32::try_from(at).ok()?);
+        let (arm, whole) = (self.tensor(value), self.tensor(merged));
+        (arm.rows == whole.rows
+            && arm.width == whole.width
+            && arm.dtype == whole.dtype
+            && self.address(arm.buf) == self.address(whole.buf))
+        .then_some(merged)
     }
 
     /// When the projection of `act` by bank `w` into `columns` columns runs on
@@ -541,6 +628,25 @@ impl<'c> Run<'c> {
     pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>) -> Self {
         self.ane = ane;
         self
+    }
+
+    /// The compiled regions the walk's place indexes.
+    #[must_use]
+    pub(crate) fn with_regions(mut self, regions: &'c [poem_compiler::Region]) -> Self {
+        self.regions = Some(regions);
+        self
+    }
+
+    /// The nodes of the region the walk is in, and whether its rows run in one
+    /// pass over one window (no gathered copy, no tail cut), so every node of
+    /// it reads the same rows: `None` where the encode names no regions.
+    pub(crate) fn region_nodes(&self) -> Option<(std::ops::Range<u32>, bool)> {
+        let region = self.regions?.get(self.place.region.get() as usize)?;
+        let window = self.window();
+        Some((
+            region.nodes.clone(),
+            window.gathered.is_none() && window.passes <= 1,
+        ))
     }
 
     pub(crate) fn ane(&self) -> Option<&'c crate::ane::Ane> {
@@ -1168,6 +1274,54 @@ impl<'c> Run<'c> {
         Some((room, standing))
     }
 
+    /// The rows of a value the walk's place reads ([`Rows`]).
+    fn rows_here(&self) -> Rows {
+        let window = self.window();
+        if window.gathered.is_some() || window.passes > 1 {
+            Rows::Region(
+                self.place.region.get(),
+                self.place.run.get(),
+                self.place.tail.get(),
+            )
+        } else {
+            Rows::Span(
+                [window.span, window.patch, window.voxel],
+                window.pass,
+                self.place.tail.get(),
+            )
+        }
+    }
+
+    /// Records that a segment launch here landed `ys` ahead of the nodes that
+    /// write them.
+    pub(crate) fn land_ahead(&self, ys: [Option<ValueId>; 3]) {
+        self.landed.set(Some(Landed {
+            ys,
+            region: self.place.region.get(),
+            rows: self.rows_here(),
+        }));
+    }
+
+    /// Whether a segment launch at this place already landed `y`; it is then
+    /// struck off, and the node writing it has nothing to do. Anywhere else
+    /// a matmul runs again, which lands the same values.
+    pub(crate) fn landed_ahead(&self, y: ValueId) -> bool {
+        let Some(mut landed) = self.landed.get() else {
+            return false;
+        };
+        if landed.region != self.place.region.get() || landed.rows != self.rows_here() {
+            self.landed.set(None);
+            return false;
+        }
+        let Some(at) = landed.ys.iter().position(|&v| v == Some(y)) else {
+            return false;
+        };
+        landed.ys[at] = None;
+        self.landed
+            .set(landed.ys.iter().any(Option::is_some).then_some(landed));
+        true
+    }
+
     /// The register tile's input table room for `value`, laid by the op that
     /// writes `value` (with the counters its widest register projection may
     /// take zeroed), when a projection of it runs on the register tile:
@@ -1180,6 +1334,10 @@ impl<'c> Run<'c> {
     /// counters (a fused MLP's swiglu, whose down the same node runs).
     pub(crate) fn laid_table(&self, value: ValueId, counters: u32) -> Option<(Tensor, u32)> {
         let width = self.tensor(value).width;
+        // The swiglu, gate and convolution producers stage at most 8192 of a row's inputs.
+        if width > 8192 {
+            return None;
+        }
         let rows = (17 * width + 4 * counters).div_ceil(2 * width);
         let (table, _) = self.register_table(value, rows, width, counters)?;
         Some((table, counters))

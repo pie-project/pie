@@ -38,6 +38,7 @@ fn budget(lanes: u32) -> Budget {
         max_tokens: ROWS,
         buckets: LATTICE.to_vec(),
         max_adapters: 8,
+        readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
     }
 }
 

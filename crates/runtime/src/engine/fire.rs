@@ -37,6 +37,20 @@ impl FireRequest {
         self.lanes.iter().map(|lane| lane.tokens.len().max(1)).sum()
     }
 
+    /// The rows the fire reads out: a lane's last row, the rows it names,
+    /// or none.
+    #[must_use]
+    pub fn readouts(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| match &lane.readout {
+                engine::fire::Readout::Last => 1,
+                engine::fire::Readout::Rows(rows) => rows.len(),
+                engine::fire::Readout::None => 0,
+            })
+            .sum()
+    }
+
     pub fn pages(&self) -> impl Iterator<Item = u32> + '_ {
         self.lanes
             .iter()

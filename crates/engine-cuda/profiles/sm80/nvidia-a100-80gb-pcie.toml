@@ -4,19 +4,27 @@ api = 1
 device = "NVIDIA A100 80GB PCIe"
 
 # Each line's measured win is in the commit that set it.
-# cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV, row kernels 16
+# cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV split across warps
+# at every width (Nemotron-3 Ultra's decode +3.7%), row kernels 16
 # bytes a lane, a split attention's partials folded a warp a row;
 # a block-FP8 projection's two rows or fewer on the GEMV over bf16 rows;
+# bf16 selects of 16 routes or more on the grouped MMA under a graph (a
+# 16-128 request decode 2.3-6x on Qwen3-30B-A3B and Gemma 4, whose
+# tiled GEMM waits for 12 routes an expert);
 # MXFP4 selects of 17 routes or more on the register-dequant MMA (fewer stay
-# on the per-route kernel, which streams a decode's bank faster); Qwen3.5's
+# on the per-route kernel, which streams a decode's bank faster) whatever
+# their experts average (the L40S's grouped wmma below 33 cost gpt-oss-20b
+# and -120b 17% of a 256-request decode here); Qwen3.5's
 # gated delta on the fused scan; DeepSeek-V4.1's bounded replay, as B200's.
 [kernel]
 gemm.fp8_gemv_until = 2
 gemm.skinny_rows = 0
 gemv.bf16 = "narrow"
+gemv.splitk_max_n = 1048576
 gemm.narrow_n = 8
 gemm.fp8_shadow = true
 gemm.grouped_gemv = true
+gemm.affine_mma = true
 elemwise.rows_vec = true
 sdpa.merge_warp = true
 sdpa.decode.grouped_prefill_from = 8
@@ -38,9 +46,12 @@ mla.expanded_from = 256
 attn_res.fused_norm = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
+moe.mxfp4_mma_per_from = 0
 moe.mxfp4_select_lean = true
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
 sdpa.dsv4_replay = true
 ssm.gdn_fused_scan = true
 ssm.conv_vec4 = true
@@ -49,10 +60,11 @@ ssm.kda_chunked = true
 ssm.kda_step_fused = true
 ssm.gdn_step_blocks = 3
 
-# A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
+# A prefill's fire on eight buckets a doubling from 256 rows (its GEMMs run
 # its bucket's rows), and a bucket between powers of two below.
 [engine]
 prefill_lattice_from = 256
+prefill_lattice_steps = 8
 lattice_steps = 2
 
 # Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
@@ -67,9 +79,11 @@ measured = [
   "kernel.gemm.fp8_gemv_until",
   "kernel.gemm.skinny_rows",
   "kernel.gemv.bf16",
+  "kernel.gemv.splitk_max_n",
   "kernel.gemm.narrow_n",
   "kernel.gemm.fp8_shadow",
   "kernel.gemm.grouped_gemv",
+  "kernel.gemm.affine_mma",
   "kernel.elemwise.rows_vec",
   "kernel.sdpa.merge_warp",
   "kernel.sdpa.decode.grouped_prefill_from",
@@ -82,9 +96,12 @@ measured = [
   "kernel.sdpa.selected_mma",
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
+  "kernel.moe.mxfp4_mma_per_from",
   "kernel.moe.mxfp4_select_lean",
   "kernel.moe.nvfp4_mma_from",
   "kernel.moe.nvfp4_mma_until",
+  "kernel.moe.bf16_mma_from",
+  "kernel.moe.bf16_mma_until",
   "kernel.ssm.gdn_fused_scan",
   "kernel.ssm.gdn_step_blocks",
   "kernel.ssm.conv_vec4",

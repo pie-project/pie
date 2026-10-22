@@ -1,7 +1,9 @@
 //! Single-token rows of a wide head group read the cache through the prefill
 //! kernel where the profile says (`kernel.sdpa.decode.grouped_prefill_from`):
 //! its tensor cores take the group's rows as one tile. The trace is rewritten
-//! before anything reads its plans' kinds; at 0 (the default) it is untouched.
+//! before anything reads its plans' kinds; at 0 (the default) only a group the
+//! decode kernel is not stamped at (`fa2::DECODE_GROUPS`; Nemotron-3 Ultra's
+//! 32) is rewritten.
 //!
 //! A decode landing its log-sum-exp (gpt-oss's sinks) joins under
 //! `kernel.sdpa.decode.grouped_prefill_lse` unless windowed (too few keys a
@@ -25,9 +27,7 @@ pub fn rewrite(trace: Trace, from: u32) -> Trace {
 /// cluster.
 #[must_use]
 pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xqa: Gate) -> Trace {
-    if from == 0 {
-        return trace;
-    }
+    let unstamped = |group: u32| !kernels_cuda::attn::fa2::DECODE_GROUPS.contains(&group);
     // Decode plans wide enough, by plan value: their KV heads, and whether
     // they slide.
     let mut wide: BTreeMap<ValueId, (u32, bool)> = trace
@@ -41,7 +41,9 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
                 window,
                 plan,
                 ..
-            }) if *kv_heads > 0 && q_heads / kv_heads >= from => {
+            }) if *kv_heads > 0
+                && ((from > 0 && q_heads / kv_heads >= from) || unstamped(q_heads / kv_heads)) =>
+            {
                 // A plan a cluster reads stays a decode: the cluster folds
                 // its own slices, with no split to merge.
                 let left = window.map_or(-1, |w| i32::try_from(w).unwrap_or(i32::MAX) - 1);
@@ -198,6 +200,32 @@ mod tests {
         for trace in [plain, fused] {
             regroups(&trace);
         }
+    }
+
+    /// Nemotron-3 Ultra's 32 query heads a KV head are past the decode
+    /// kernel's stamps: its attention reads as a prefill with the profile
+    /// silent, and Super's 16 stays a decode.
+    #[test]
+    fn a_group_the_decode_kernel_is_not_stamped_at_takes_the_prefill() {
+        let plans = |id: &str| {
+            let trace = poem_compiler::catalog::deployment(id)
+                .expect("nemotron is in the catalog")
+                .trace(poem::Platform::Cuda);
+            let rewritten = rewrite(trace, 0);
+            poem_ir::check(&rewritten).expect("the rewritten trace types");
+            rewritten
+                .nodes
+                .iter()
+                .fold((0, 0), |(decodes, prefills), node| match &node.op {
+                    Operation::Attention(Attention::PlanDecode { .. }) => (decodes + 1, prefills),
+                    Operation::Attention(Attention::PlanPrefill { .. }) => (decodes, prefills + 1),
+                    _ => (decodes, prefills),
+                })
+        };
+        let (decodes, _) = plans("nemotron3-ultra-mini-bf16-kv-bf16");
+        assert_eq!(decodes, 0, "no group-32 plan stays a decode");
+        let (decodes, _) = plans("nemotron3-super-mini-bf16-nvfp4a4-e4m3tile128a8-kv-bf16");
+        assert!(decodes > 0, "Super's group of 16 stays a decode");
     }
 
     fn regroups(trace: &Trace) {
