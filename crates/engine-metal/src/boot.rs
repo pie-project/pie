@@ -32,7 +32,10 @@ fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
         .and_then(toml::Value::as_table)
         .and_then(|metal| metal.get("diagnostics"))
     else {
-        return Ok(crate::diag::Diagnostics::default());
+        return Ok(crate::diag::Diagnostics {
+            fire_timeline: true,
+            ..crate::diag::Diagnostics::default()
+        });
     };
     let words = words.as_str().ok_or_else(|| {
         format!("[metal] diagnostics is a comma-separated word list, not {words}")
