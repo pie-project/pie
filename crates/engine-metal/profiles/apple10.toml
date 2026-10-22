@@ -21,8 +21,3 @@ moe.tile_rows   = [
 sdpa.prefill    = "mpp"
 sdpa.split_bf16 = true
 gdn.scan        = { use = "staged", min_rows = 32 }
-
-[engine]
-# From 32 cores the device serves at its power limit, where the spin's draw costs the fires
-# their clocks: a Qwen3.8-27B DFlash2 verify round on the M5 Max ran 1% sooner without it.
-keepalive = [{ when = "cores >= 32", use = "idle" }, { use = "spin" }]
