@@ -178,7 +178,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             tokens,
             engine.lattice_steps,
             engine.prefill_lattice_from,
-        engine.prefill_lattice_steps,
+            engine.prefill_lattice_steps,
         );
         budget
     };
@@ -348,7 +348,7 @@ fn refit(
             tokens,
             engine.lattice_steps,
             engine.prefill_lattice_from,
-        engine.prefill_lattice_steps,
+            engine.prefill_lattice_steps,
         );
         budget
     };

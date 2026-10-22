@@ -20,16 +20,44 @@ fn the_tiled_decode_point_lands_alike_on_the_tensor_cores() {
             let (x, xv) = b.bf16(rows * k);
             let (s, f, z) = affine(&mut b.lcg, [n, k, 64, 4]);
             let (c, f, z) = (b.up(&s.bytes), b.up(&f), b.up(&z));
-            let (tc, tf, tz) = (b.zeros(np * k / 2), b.zeros(np * k / 32), b.zeros(np * k / 32));
-            let ctx = b.ctx().with_tuning(Tuning { qmm_gemv_mma_from: from, ..SM100 });
-            let (mut oc, mut of, mut oz) = (t(tc, np, k / 2, U8), t(tf, np, k / 32, U8), t(tz, np, k / 32, U8));
+            let (tc, tf, tz) = (
+                b.zeros(np * k / 2),
+                b.zeros(np * k / 32),
+                b.zeros(np * k / 32),
+            );
+            let ctx = b.ctx().with_tuning(Tuning {
+                qmm_gemv_mma_from: from,
+                ..SM100
+            });
+            let (mut oc, mut of, mut oz) = (
+                t(tc, np, k / 2, U8),
+                t(tf, np, k / 32, U8),
+                t(tz, np, k / 32, U8),
+            );
             let (c, f, z) = (t(c, n, k / 2, U8), t(f, n, k / 32, U8), t(z, n, k / 32, U8));
             repack(&ctx, c, f, z, &mut oc, &mut of, &mut oz).expect("repacks");
             let mut y = b.out(rows, n);
-            matmul_gemv(&ctx, t(x, rows, k, Bf16), oc, of, oz, &mut y, GroupSeat::RESIDENT)
-                .expect("fires");
-            let want = dot([rows, n, k], |r, i| xv[r * k + i], |_, c, i| f64::from(s.values[c * k + i]));
-            b.check(y.ptr, &want, TOL, &format!("{rows} rows, tensor cores from {from}"));
+            matmul_gemv(
+                &ctx,
+                t(x, rows, k, Bf16),
+                oc,
+                of,
+                oz,
+                &mut y,
+                GroupSeat::RESIDENT,
+            )
+            .expect("fires");
+            let want = dot(
+                [rows, n, k],
+                |r, i| xv[r * k + i],
+                |_, c, i| f64::from(s.values[c * k + i]),
+            );
+            b.check(
+                y.ptr,
+                &want,
+                TOL,
+                &format!("{rows} rows, tensor cores from {from}"),
+            );
         }
     }
 }
