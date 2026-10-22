@@ -118,20 +118,39 @@ impl Run<'_> {
                     ),
                 }
             }
+            // The pair launch of the norm before it landed these rows.
+            Elementwise::RmsnormPerHeadPlusOne { y, .. } if self.landed_ahead(*y) => Ok(()),
             Elementwise::RmsnormPerHeadPlusOne {
                 x,
                 weight,
                 head_dim,
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_per_head_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => match self.norm_pair(*x, *y, *head_dim, *eps) {
+                Some((x2, weight2, y2)) => {
+                    elemwise::norm::rmsnorm_per_head_plus_one_pair(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        self.tensor(*y),
+                        self.tensor(x2),
+                        self.tensor(weight2),
+                        self.tensor(y2),
+                        *head_dim,
+                        *eps,
+                    )?;
+                    self.land_ahead([Some(y2), None, None]);
+                    Ok(())
+                }
+                None => elemwise::norm::rmsnorm_per_head_plus_one(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*weight),
+                    *head_dim,
+                    *eps,
+                    self.tensor(*y),
+                ),
+            },
             // Muse Spark's post-norm gate is served on CUDA.
             Elementwise::NormGate { .. } => Err(kernels_metal::Error::Unsupported {
                 op: "elementwise.norm_gate",
@@ -401,16 +420,40 @@ impl Run<'_> {
                 eps,
                 act,
                 y,
-            } => elemwise::norm::rmsnorm_gated(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                matches!(act, poem_ir::GateActivation::Sigmoid),
-                self.tensor(*y),
-            ),
+            } => {
+                let sigmoid = matches!(act, poem_ir::GateActivation::Sigmoid);
+                // The out projection on the register tile reads its input
+                // table as the norm lays it: a GDN layer's projection reads
+                // the merge of its scan's arms, which this arm's rows land in.
+                let laid = (!sigmoid
+                    && self.tensor(*x).dtype == poem_ir::Dtype::F32
+                    && head_dim.is_multiple_of(32))
+                .then(|| self.producer_table(self.merged_into(*y).unwrap_or(*y)))
+                .flatten();
+                match laid {
+                    Some((table, counters)) => elemwise::norm::rmsnorm_gated_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*gate),
+                        self.tensor(*weight),
+                        *head_dim,
+                        *eps,
+                        self.tensor(*y),
+                        table,
+                        counters,
+                    ),
+                    None => elemwise::norm::rmsnorm_gated(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*gate),
+                        self.tensor(*weight),
+                        *head_dim,
+                        *eps,
+                        sigmoid,
+                        self.tensor(*y),
+                    ),
+                }
+            }
             Elementwise::RmsnormGatedBy {
                 x,
                 gate,
