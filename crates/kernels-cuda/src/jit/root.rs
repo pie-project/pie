@@ -108,7 +108,7 @@ const SPECIFIC: &[(&str, Toolchain)] = &[
     ("attn/dsv4_sparse.cuh", Toolchain::new(12, 9)),
     ("attn/index_tc5.cuh", Toolchain::new(12, 9)),
     ("attn/mla_sparse.cuh", Toolchain::new(12, 9)),
-    ("attn/gdn_tc5.cuh", Toolchain::new(12, 9)),
+    ("ssm/gdn_chunk_sm100.cu", Toolchain::new(12, 9)),
     ("linear/moe_w4_cvt.cuh", Toolchain::new(12, 9)),
     ("linear/moe_wgmma.cuh", Toolchain::ANY),
 ];
@@ -145,7 +145,7 @@ impl Root {
     #[must_use]
     pub fn of(file: &'static str) -> Option<Self> {
         let text = source::text_of(file)?;
-        let name = file.strip_suffix(".cuh")?;
+        let name = file.strip_suffix(".cuh").or_else(|| file.strip_suffix(".cu"))?;
         let (options, headers, floor) = configured_for(file);
         let (specific, floor) = specific_for(file).map_or((false, floor), |floor| (true, floor));
         let tcgen05_twin = TCGEN05_TWIN.contains(&file);

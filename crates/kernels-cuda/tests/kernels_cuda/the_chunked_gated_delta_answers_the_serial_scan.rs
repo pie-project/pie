@@ -7,7 +7,7 @@ use crate::common;
 
 use common::{Gpu, Lcg};
 use dtype::Dtype;
-use kernels_cuda::attn::ssm;
+use kernels_cuda::ssm;
 use kernels_cuda::tensor::{RaggedTensor, RecurrentPool, Tensor};
 use kernels_cuda::tuning::Tuning;
 

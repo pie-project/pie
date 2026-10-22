@@ -52,6 +52,7 @@ pub mod linear;
 pub mod seat;
 pub mod source;
 pub mod spatial;
+pub mod ssm;
 pub mod tensor;
 
 pub use error::Error;

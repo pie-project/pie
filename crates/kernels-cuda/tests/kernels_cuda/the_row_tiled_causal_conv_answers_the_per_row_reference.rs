@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::attn::ssm;
+use kernels_cuda::ssm;
 use kernels_cuda::tensor::{RaggedTensor, RecurrentPool, Tensor};
 use kernels_cuda::tuning::Tuning;
 

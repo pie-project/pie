@@ -8,7 +8,7 @@ mod common;
 
 use common::{Gpu, STATE, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm;
+use kernels_rocm::ssm;
 use kernels_rocm::{RaggedTensor, RecurrentPool, Snapshots, Tensor};
 
 const D: u32 = 128;

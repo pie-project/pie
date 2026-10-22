@@ -552,7 +552,7 @@ impl Run<'_> {
             unreachable!("only the gated-delta step comes here");
         };
         if !self.rs_extended() {
-            let done = kernels_cuda::attn::ssm::gdn_step_fused(
+            let done = kernels_cuda::ssm::gdn_step_fused(
                 self.ctx(),
                 self.tensor(qkvz),
                 self.tensor(conv_weight),

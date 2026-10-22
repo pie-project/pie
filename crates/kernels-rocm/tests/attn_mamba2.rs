@@ -7,7 +7,7 @@ mod common;
 
 use common::{Gpu, STATE, bf16s, close_abs, indptr_of, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm::{self, Mamba2};
+use kernels_rocm::ssm::{self, Mamba2};
 use kernels_rocm::{RaggedTensor, RecurrentPool, Tensor};
 
 const H: usize = 4;

@@ -10,7 +10,7 @@ mod common;
 
 use common::{Gpu, STATE, round_bf16, sigmoid, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm;
+use kernels_rocm::ssm;
 use kernels_rocm::{Ctx, RaggedTensor, RecurrentPool, Tensor};
 
 /// The fires share the context's named scratch planes, so the tests in this

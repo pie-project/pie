@@ -30,7 +30,6 @@ pub mod sched_prefill;
 
 pub mod selector;
 
-pub mod ssm;
 
 pub mod xqa;
 

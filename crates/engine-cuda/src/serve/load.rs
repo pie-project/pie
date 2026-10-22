@@ -739,7 +739,7 @@ impl Shell {
             crate::store::rs::snapshots(&boot.trace, |k_dim| {
                 #[cfg(not(feature = "rocm"))]
                 {
-                    kernels_cuda::attn::ssm::gdn_lands_snapshots(device.ctx(), k_dim)
+                    kernels_cuda::ssm::gdn_lands_snapshots(device.ctx(), k_dim)
                 }
                 #[cfg(feature = "rocm")]
                 {

@@ -835,7 +835,7 @@ impl Run<'_> {
                     );
                 }
                 self.rs_move("attention.ssm_causal_conv1d", *x, self.tensor(*x))?;
-                attn::ssm::causal_conv1d(
+                kernels_cuda::ssm::causal_conv1d(
                     self.ctx(),
                     self.tensor(*x),
                     self.tensor(*weight),
@@ -852,7 +852,7 @@ impl Run<'_> {
                 state,
                 conv_width,
                 y,
-            } => attn::ssm::short_conv(
+            } => kernels_cuda::ssm::short_conv(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
@@ -869,7 +869,7 @@ impl Run<'_> {
             } => {
                 self.rs_move("attention.short_conv_chunked", *x, self.tensor(*x))?;
                 let tail = self.recurrent_tail_absolute(*state);
-                attn::ssm::short_conv_chunked(
+                kernels_cuda::ssm::short_conv_chunked(
                     self.ctx(),
                     self.ragged_lanes(*x),
                     self.tensor(*weight),
@@ -878,7 +878,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
-                attn::ssm::short_conv_chunked(
+                kernels_cuda::ssm::short_conv_chunked(
                     self.ctx(),
                     self.ragged_lanes(*x),
                     self.tensor(*weight),
@@ -910,7 +910,7 @@ impl Run<'_> {
                 }
                 self.rs_move("attention.ssm_causal_conv1d_chunked", *x, self.tensor(*x))?;
                 let tail = self.recurrent_tail_absolute(*state);
-                attn::ssm::causal_conv1d_chunked(
+                kernels_cuda::ssm::causal_conv1d_chunked(
                     self.ctx(),
                     self.ragged_lanes(*x),
                     self.tensor(*weight),
@@ -921,7 +921,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
-                attn::ssm::causal_conv1d_chunked(
+                kernels_cuda::ssm::causal_conv1d_chunked(
                     self.ctx(),
                     self.ragged_lanes(*x),
                     self.tensor(*weight),
@@ -1094,7 +1094,7 @@ impl Run<'_> {
                     const OP: &str = "attention.ssm_gdn_prep";
                     let ba_ext = self.rs_extend(OP, *ba, true)?;
                     let mut gates_ext = self.rs_out(OP, *gates)?;
-                    attn::ssm::gdn_prep(
+                    kernels_cuda::ssm::gdn_prep(
                         self.ctx(),
                         ba_ext,
                         self.tensor(*dt_bias),
@@ -1104,7 +1104,7 @@ impl Run<'_> {
                     return self.rs_land(OP, gates_ext, *gates);
                 }
                 self.rs_move("attention.ssm_gdn_prep", *ba, self.tensor(*ba))?;
-                attn::ssm::gdn_prep(
+                kernels_cuda::ssm::gdn_prep(
                     self.ctx(),
                     self.tensor(*ba),
                     self.tensor(*dt_bias),
@@ -1137,7 +1137,7 @@ impl Run<'_> {
                         *y,
                     );
                 }
-                attn::ssm::gated_delta(
+                kernels_cuda::ssm::gated_delta(
                     self.ctx(),
                     self.tensor(*qkv),
                     self.tensor(*z),
@@ -1176,7 +1176,7 @@ impl Run<'_> {
                     );
                 }
                 let tail = self.recurrent_tail_absolute(*state);
-                attn::ssm::gated_delta_chunked(
+                kernels_cuda::ssm::gated_delta_chunked(
                     self.ctx(),
                     self.ragged_lanes(*qkv),
                     self.tensor(*z),
@@ -1189,7 +1189,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
-                attn::ssm::gated_delta_chunked(
+                kernels_cuda::ssm::gated_delta_chunked(
                     self.ctx(),
                     self.ragged_lanes(*qkv),
                     self.tensor(*z),
@@ -1233,7 +1233,7 @@ impl Run<'_> {
                 }
                 self.rs_move("attention.ssm_kda_step", *f, self.tensor(*f))?;
                 self.rs_move("attention.ssm_kda_step", *b, self.tensor(*b))?;
-                attn::ssm::kda_step(
+                kernels_cuda::ssm::kda_step(
                     self.ctx(),
                     self.tensor(*mixed),
                     self.tensor(*f),
@@ -1268,7 +1268,7 @@ impl Run<'_> {
                 if self.rs_extended() {
                     return Err(kernels_cuda::Error::Unsupported { op: OP });
                 }
-                let m = attn::ssm::Mamba2 {
+                let m = kernels_cuda::ssm::Mamba2 {
                     a_log: self.tensor(*a_log),
                     dt_bias: self.tensor(*dt_bias),
                     d: self.tensor(*d),
@@ -1279,7 +1279,7 @@ impl Run<'_> {
                 };
                 let (dt, z) = (self.tensor(*dt), self.tensor(*z));
                 if !chunked {
-                    return attn::ssm::mamba2_step(
+                    return kernels_cuda::ssm::mamba2_step(
                         self.ctx(),
                         self.tensor(*xbc),
                         dt,
@@ -1291,7 +1291,7 @@ impl Run<'_> {
                     );
                 }
                 let tail = self.recurrent_tail_absolute(*state);
-                attn::ssm::mamba2_chunked(
+                kernels_cuda::ssm::mamba2_chunked(
                     self.ctx(),
                     self.ragged_lanes(*xbc),
                     dt,
@@ -1302,7 +1302,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
-                attn::ssm::mamba2_chunked(
+                kernels_cuda::ssm::mamba2_chunked(
                     self.ctx(),
                     self.ragged_lanes(*xbc),
                     dt,
@@ -1345,7 +1345,7 @@ impl Run<'_> {
                 self.rs_move("attention.ssm_kda_chunked", *f, self.tensor(*f))?;
                 self.rs_move("attention.ssm_kda_chunked", *b, self.tensor(*b))?;
                 let tail = self.recurrent_tail_absolute(*state);
-                attn::ssm::kda_chunked(
+                kernels_cuda::ssm::kda_chunked(
                     self.ctx(),
                     self.ragged_lanes(*mixed),
                     self.tensor(*f),
@@ -1360,7 +1360,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
-                attn::ssm::kda_chunked(
+                kernels_cuda::ssm::kda_chunked(
                     self.ctx(),
                     self.ragged_lanes(*mixed),
                     self.tensor(*f),
@@ -1868,7 +1868,7 @@ impl Run<'_> {
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
-        attn::ssm::causal_conv1d_chunked(
+        kernels_cuda::ssm::causal_conv1d_chunked(
             self.ctx(),
             RaggedTensor {
                 data: x_ext,
@@ -1882,7 +1882,7 @@ impl Run<'_> {
             &mut y_ext,
         )?;
         if let Some(tail) = tail {
-            attn::ssm::causal_conv1d_chunked(
+            kernels_cuda::ssm::causal_conv1d_chunked(
                 self.ctx(),
                 RaggedTensor {
                     data: x_ext,
@@ -1919,7 +1919,7 @@ impl Run<'_> {
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
-        attn::ssm::gated_delta_chunked(
+        kernels_cuda::ssm::gated_delta_chunked(
             self.ctx(),
             RaggedTensor {
                 data: qkv_ext,
@@ -1935,7 +1935,7 @@ impl Run<'_> {
             &mut y_ext,
         )?;
         if let Some(tail) = tail {
-            attn::ssm::gated_delta_chunked(
+            kernels_cuda::ssm::gated_delta_chunked(
                 self.ctx(),
                 RaggedTensor {
                     data: qkv_ext,
@@ -1978,7 +1978,7 @@ impl Run<'_> {
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
-        attn::ssm::kda_chunked(
+        kernels_cuda::ssm::kda_chunked(
             self.ctx(),
             RaggedTensor {
                 data: mixed_ext,
@@ -1996,7 +1996,7 @@ impl Run<'_> {
             &mut y_ext,
         )?;
         if let Some(tail) = tail {
-            attn::ssm::kda_chunked(
+            kernels_cuda::ssm::kda_chunked(
                 self.ctx(),
                 RaggedTensor {
                     data: mixed_ext,
