@@ -8,6 +8,7 @@ pub mod norm;
 pub mod res_blend;
 pub mod residual_add;
 pub mod rope;
+pub mod rope_mrope;
 pub mod scale;
 pub mod sigmoid_mul;
 pub mod silu_scaled;

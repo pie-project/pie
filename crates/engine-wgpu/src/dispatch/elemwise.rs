@@ -411,16 +411,17 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::interleaved(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope_mrope::interleaved(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *sections,
                 *rotary_dim,
                 *head_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::RopeMrope {
                 q,
@@ -434,16 +435,17 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::split(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope_mrope::split(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *sections,
                 *rotary_dim,
                 *head_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
 
             Elemwise::RopeMrope {
                 q,
@@ -457,16 +459,17 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::blocked(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+            } => kernels_slang::elemwise::rope_mrope::blocked(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *sections,
                 *rotary_dim,
                 *head_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Elemwise::RopePartialQ {
                 q,
                 positions,
