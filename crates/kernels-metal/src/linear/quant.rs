@@ -834,6 +834,9 @@ fn act_x_wt_over(
                             &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
                         )?;
                     }
+                    if m > 1 {
+                        return Ok(());
+                    }
                     let entry = symbol(&format!("affine_qmm_sg_k{split}"));
                     let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})"));
                     return ctx.fire(
@@ -1207,6 +1210,9 @@ pub fn register_segments(
         }
     }
     let count = segments.len();
+    if m > 1 {
+        return Ok(());
+    }
     let entry = symbol(&format!("affine_qmm_sg_segments_s{count}"));
     let stamp = symbol(&format!("PIE_SG_SEGMENTS(\"{entry}\",{count})"));
     ctx.fire(
