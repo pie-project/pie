@@ -226,6 +226,13 @@ pub struct GemmBiasEpilogue;
 #[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct MoeMxfp4MmaFrom(pub u32);
 
+/// The fewest routes an expert averages that a routed mxfp4 select runs on
+/// the register-dequant MMA kernel with, past `kernel.moe.mxfp4_mma_from`;
+/// fewer keep the grouped kernel (0 any).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_mma_per_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4MmaPerFrom(pub u32);
+
 /// The fewest routes a routed bf16 select runs on the graph-safe grouped
 /// mma.sync kernel with (`moe_select_bf16_mma`), rather than the per-route
 /// GEMV. Bf16 experts have no tcgen05 or cuBLAS grouped path under a
@@ -752,6 +759,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
+        .add::<MoeMxfp4MmaPerFrom>()
         .add::<MoeBf16MmaFrom>()
         .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
@@ -881,6 +889,7 @@ tuning! {
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
+    mxfp4_mma_per_from: u32 = 0, get MoeMxfp4MmaPerFrom;
     bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
     bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;

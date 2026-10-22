@@ -41,10 +41,11 @@ gemm.rows_m = 8
 gemm.skinny_rows = 0
 # AttnRes's blend and its row's norm in one pass.
 attn_res.fused_norm = true
-# MXFP4 selects on the register-dequant mma.sync from 28 to 1024 routes,
-# W4A16 NVFP4 ones from 32 to 8192.
+# MXFP4 selects on the register-dequant mma.sync from 28 routes up (a
+# prefill's on the wgmma slice: gpt-oss-20b's TTFT 24% shorter than on the
+# grouped wmma past 1024), W4A16 NVFP4 ones from 32 to 8192.
 moe.mxfp4_mma_from = 28
-moe.mxfp4_mma_until = 1024
+moe.mxfp4_mma_until = 16777216
 moe.nvfp4_mma_from = 32
 moe.nvfp4_mma_until = 8192
 # Bf16 routed experts (Hy4, GLM-5.3-Flash served bf16): the graph-safe grouped
