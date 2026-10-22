@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The kernel lint: rules every `kernels-*` crate's device tree keeps.
 
-Two checks so far, the ones the rest of the convention leans on:
+Two checks so far, the ones the rest of the convention leans on, for the
+CUDA tree and the Metal one:
 
   * every entry point in a crate's kernel tree is named by its host code;
   * every launch the host writes with a literal symbol names, by namespace
@@ -16,11 +17,18 @@ reaches `act_quant_e4m3` and `act_quant_e4m3_v8`; a symbol that is nothing
 but a placeholder (`"::pie::layout::{entry}"`) reaches nothing by itself,
 and the names it is given must appear as literals elsewhere.
 
+A Metal entry is what the shader compiler exports after the preprocessor
+runs: a `[[host_name("...")]]` a macro stamps out of a template, or a plain
+`kernel void`. The host names it in a string literal, the same way, and a
+launch is `Fire::at("<unit>", "<entry>")`, the unit a path under `kernels/`
+or a `const FILE` naming one.
+
 Exit status is the number of findings, capped at 1.
 """
 
 import pathlib
 import re
+import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -30,6 +38,14 @@ CRATES = {
     "kernels-cuda": (
         "crates/kernels-cuda/kernels",
         ["crates/kernels-cuda/src", "crates/engine-cuda/src"],
+    ),
+}
+
+# crate -> (kernel tree, host trees), for the Metal checks.
+METAL = {
+    "kernels-metal": (
+        "crates/kernels-metal/kernels",
+        ["crates/kernels-metal/src", "crates/engine-metal/src"],
     ),
 }
 
@@ -228,12 +244,106 @@ def stray_symbols(crate):
     return found
 
 
+METAL_HOST_NAME = re.compile(r'host_name\(\s*((?:"[^"]*"\s*)+)\)')
+METAL_PLAIN = re.compile(r"(?m)^\s*(?:\[\[kernel\]\]|kernel)\s+void\s+(\w+)\s*\(")
+METAL_FILE = re.compile(r'const ([A-Z_0-9]+): &str = "([a-z_0-9/]+\.metal)";')
+METAL_LAUNCH = re.compile(r'Fire::at\(\s*(?:"([^"]+)"|([A-Z_0-9]+))\s*,\s*"([^"]+)"')
+
+
+def metal_entries(tree, unit, cache={}):
+    """What `unit` exports: its text with quoted includes spliced (from the
+    including file's directory, as `sources::resolve` does) and its macros
+    expanded."""
+    if unit in cache:
+        return cache[unit]
+    path = tree / unit
+
+    def splice(at, text, depth=0):
+        def one(m):
+            target = (at / m.group(1)).resolve()
+            return splice(target.parent, target.read_text(), depth + 1) if target.exists() else ""
+
+        return re.sub(r'(?m)^\s*#include\s*"([^"]+)"\s*$', one, text) if depth < 8 else text
+
+    text = splice(path.parent, path.read_text())
+    text = re.sub(r"(?m)^\s*#include\s*<[^>]+>\s*$", "", text)
+    text = subprocess.run(
+        ["gcc", "-E", "-P", "-x", "c", "-"], input=text, capture_output=True, text=True
+    ).stdout
+    names = {"".join(re.findall(r'"([^"]*)"', g)) for g in METAL_HOST_NAME.findall(text)}
+    for m in METAL_PLAIN.finditer(text):
+        head = text[: m.start()]
+        if "template" not in head[max(head.rfind(";"), head.rfind("}")) + 1 :]:
+            names.add(m.group(1))
+    cache[unit] = names
+    return names
+
+
+def metal_units(tree):
+    return sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*.metal"))
+
+
+def metal_named(host):
+    """The words the host's literals spell, and a pattern per literal that
+    splices a `format!` placeholder into a name."""
+    words = set(re.findall(r"\w+", host))
+    spliced = []
+    for lit in re.findall(r'"([^"\\]*\{[^"\\]*)"', host):
+        if re.fullmatch(r"[\w{}:]+", lit) and re.search(r"\w\{|\}\w", lit):
+            parts = re.split(r"\{[^}]*\}", lit)
+            spliced.append(re.compile(r"\w*".join(map(re.escape, parts))))
+    return words, spliced
+
+
+def metal_unnamed_entries(crate):
+    tree, hosts = METAL[crate]
+    tree = REPO / tree
+    words, spliced = metal_named(host_text(hosts))
+    found = []
+    for unit in metal_units(tree):
+        for name in sorted(metal_entries(tree, unit)):
+            if name in words or any(p.fullmatch(name) for p in spliced):
+                continue
+            found.append(f"{METAL[crate][0]}/{unit}: `{name}` is named by no host code")
+    return found
+
+
+def metal_misdirected_launches(crate):
+    tree, hosts = METAL[crate]
+    tree = REPO / tree
+    found = []
+    for path in sorted(p for t in hosts for p in (REPO / t).rglob("*.rs")):
+        text = path.read_text()
+        consts = dict(METAL_FILE.findall(text))
+        for m in METAL_LAUNCH.finditer(text):
+            unit = m.group(1) or consts.get(m.group(2))
+            if unit is None:
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            rel = path.relative_to(REPO)
+            if not (tree / unit).exists():
+                found.append(f"{rel}:{line}: `{unit}` is no unit under {METAL[crate][0]}")
+                continue
+            # `.stamp("MACRO(\"name\", ...)")` instantiates the entry at run time.
+            stamp = re.match(r'\s*\.stamp\(\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text[m.end() + 1 :])
+            if stamp and f'\\"{m.group(3)}\\"' in stamp.group(1):
+                macro = stamp.group(1).split("(", 1)[0]
+                if re.search(rf"#define\s+{macro}\b", (tree / unit).read_text()):
+                    continue
+            if m.group(3) not in metal_entries(tree, unit):
+                found.append(f"{rel}:{line}: `{m.group(3)}` is defined in none of ['{unit}']")
+    return found
+
+
 def main():
     findings = []
     for crate in CRATES:
         findings += unnamed_entries(crate)
         findings += misdirected_launches(crate)
         findings += stray_symbols(crate)
+    for crate in METAL:
+        findings += metal_unnamed_entries(crate)
+        findings += metal_misdirected_launches(crate)
     for f in findings:
         print(f)
     print(f"kernel-lint: {len(findings)} finding(s)", file=sys.stderr)
