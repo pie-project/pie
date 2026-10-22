@@ -520,74 +520,32 @@ METAL_FUNC void qmv_grouped_impl(
              0xffffffffUL)
         << 32;
     while (mask != 0) {
-      int members[chunk];
-      int count = 0;
-#pragma unroll
-      for (int m = 0; m < chunk; m++) {
-        if (mask != 0) {
-          members[m] = window + int(ctz(mask));
-          mask &= mask - 1;
-          count = m + 1;
-        } else {
-          members[m] = members[0];
-        }
-      }
+      const int pair = window + int(ctz(mask));
+      mask &= mask - 1;
+      const device T* x_row = x + (pair / slots_per_row) * x_row_stride +
+          (pair % slots_per_row) * x_slot_stride;
       thread U x_thread[values_per_thread];
-      thread U result[chunk][results_per_simdgroup] = {{0}};
+      thread U result[results_per_simdgroup] = {0};
       for (int k = 0; k < in_vec_size; k += block_size) {
         const int base = k + int(simd_lid) * values_per_thread;
         if (base + values_per_thread <= in_vec_size) {
           const device uint8_t* wl =
               ws_row + size_t(base) * size_t(bytes_per_pack) / size_t(pack_factor);
+          U sum = load_vector<T, U, values_per_thread, bits>(x_row + base, x_thread);
           const int g = base / group_size;
-          uint16_t wt[results_per_simdgroup][values_per_thread / 4];
-          U s[results_per_simdgroup];
-          U b[results_per_simdgroup];
-#pragma unroll
           for (int row = 0; row < results_per_simdgroup; row++) {
-            const device uint16_t* wr = (const device uint16_t*)(wl + row * in_vec_size_w);
-#pragma unroll
-            for (int i = 0; i < values_per_thread / 4; i++) {
-              wt[row][i] = wr[i];
-            }
-            s[row] = U(sc_row[row * in_vec_size_g + g]);
-            b[row] = U(bi_row[row * in_vec_size_g + g]);
-          }
-#pragma unroll
-          for (int m = 0; m < chunk; m++) {
-            if (m < count) {
-              const int pair = members[m];
-              const device T* x_row = x + (pair / slots_per_row) * x_row_stride +
-                  (pair % slots_per_row) * x_slot_stride;
-              U sum = load_vector<T, U, values_per_thread, bits>(x_row + base, x_thread);
-#pragma unroll
-              for (int row = 0; row < results_per_simdgroup; row++) {
-                U accum = 0;
-#pragma unroll
-                for (int i = 0; i < (values_per_thread / 4); i++) {
-                  accum +=
-                      (x_thread[4 * i] * (wt[row][i] & 0x000f) +
-                       x_thread[4 * i + 1] * (wt[row][i] & 0x00f0) +
-                       x_thread[4 * i + 2] * (wt[row][i] & 0x0f00) +
-                       x_thread[4 * i + 3] * (wt[row][i] & 0xf000));
-                }
-                result[m][row] += s[row] * accum + sum * b[row];
-              }
-            }
+            const device uint8_t* wr = wl + row * in_vec_size_w;
+            U s = U(sc_row[row * in_vec_size_g + g]);
+            U b = U(bi_row[row * in_vec_size_g + g]);
+            result[row] += qdot<U, values_per_thread, bits>(wr, x_thread, s, b, sum);
           }
         }
       }
-#pragma unroll
-      for (int m = 0; m < chunk; m++) {
-        if (m < count) {
-          device T* y_row = y + members[m] * out_vec_size + out_row;
-#pragma unroll
-          for (int row = 0; row < results_per_simdgroup; row++) {
-            U v = simd_sum(result[m][row]);
-            if (simd_lid == 0 && out_row + row < out_vec_size) {
-              y_row[row] = static_cast<T>(v);
-            }
-          }
+      device T* y_row = y + pair * out_vec_size + out_row;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        U v = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_vec_size) {
+          y_row[row] = static_cast<T>(v);
         }
       }
     }
