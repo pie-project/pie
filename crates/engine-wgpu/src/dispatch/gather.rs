@@ -1,5 +1,4 @@
 use kernels_wgpu::attn;
-use kernels_wgpu::layout;
 use poem_exec::{DispatchGather, KernelError};
 use poem_ir::{Gather, Operands};
 
@@ -208,16 +207,17 @@ impl Run<'_> {
                 order,
                 temporal,
                 y,
-            } => layout::pixels(
-                self.ctx(),
-                self.tensor(*x),
+            } => kernels_slang::gather::pixels::pixels(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
                 *patch,
                 *mean,
                 *std,
                 *order == poem_ir::PixelOrder::Chw,
                 *temporal,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
             Gather::ConcatCols { .. } | Gather::SplitQkvPadded { .. } => {
@@ -231,16 +231,17 @@ impl Run<'_> {
                 side,
                 ids,
                 weights,
-            } => layout::grid_taps(
-                self.ctx(),
-                self.tensor(*positions),
-                self.tensor(*grids),
-                self.tensor(*segments),
+            } => kernels_slang::gather::pixels::grid_taps(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*positions)),
+                crate::encode::slang_tensor(self.tensor(*grids)),
+                crate::encode::slang_tensor(self.tensor(*segments)),
                 *kind == poem_ir::TapKind::Bilinear,
                 *side,
-                self.tensor(*ids),
-                self.tensor(*weights),
-            ),
+                crate::encode::slang_tensor(self.tensor(*ids)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Gather::ScatterLiveRows {
                 src,
