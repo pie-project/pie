@@ -3993,8 +3993,8 @@ impl Shell {
                 #[cfg(target_vendor = "apple")]
                 let sink = sink
                     .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                    .flushing_after(HEAD_LAUNCHES)
-                    .flushing_every(if p.variant == 1 { 128 } else { 0 });
+                    .flushing_after(if p.variant == 1 { 8 } else { HEAD_LAUNCHES })
+                    .flushing_every(if p.variant == 1 { 64 } else { 0 });
                 Encoded::Live(sink)
             }
             Mode::Record | Mode::Replay => {

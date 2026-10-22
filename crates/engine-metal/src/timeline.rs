@@ -36,8 +36,11 @@ pub struct Account {
     /// The previous fire's device end to this one's: the fire's share of
     /// the device's wall time.
     pub period: f64,
-    /// The device running the fire's buffers.
-    pub busy: f64,
+    /// The device's first start to its last end on the fire. A buffer's
+    /// start is stamped once the queue schedules it, which may be while the
+    /// one ahead still runs, so the buffers' own spans overlap and do not
+    /// sum to this.
+    pub span: f64,
     /// Step handed over to frame open: the host staging the fire.
     pub stage: f64,
     /// Frame open to the last commit: the host encoding the fire.
@@ -89,9 +92,7 @@ impl Account {
             period: last.end - previous.map_or(first.start, |(end, _)| end),
             ..Account::default()
         };
-        for buffer in &fire.buffers {
-            account.busy += (buffer.end - buffer.start).max(0.0);
-        }
+        account.span = (last.end - first.start).max(0.0);
         for pair in fire.buffers.windows(2) {
             let gap = (pair[1].start - pair[0].end).max(0.0);
             account.inner += gap;
@@ -134,7 +135,7 @@ impl Account {
     fn fields_mut(&mut self) -> [(&'static str, &mut f64); 10] {
         [
             ("period", &mut self.period),
-            ("device busy", &mut self.busy),
+            ("device span", &mut self.span),
             ("host encode", &mut self.encode),
             ("device idle inside", &mut self.inner),
             ("device idle before", &mut self.before),
@@ -253,7 +254,7 @@ mod tests {
         };
         let account = Account::of(&fire, Some((10.0, 10.1))).expect("two buffers");
         assert!(close(account.period, 2.0));
-        assert!(close(account.busy, 0.2 + 0.9));
+        assert!(close(account.span, 1.4));
         assert!(close(account.stage, 0.1));
         assert!(close(account.encode, 0.6));
         assert!(close(account.inner, 0.3));
@@ -319,7 +320,7 @@ mod tests {
                 assert!(
                     lines
                         .iter()
-                        .any(|l| l.contains("v0 r16 d1000: device busy"))
+                        .any(|l| l.contains("v0 r16 d1000: device span"))
                 );
             }
         }
