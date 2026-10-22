@@ -4,6 +4,11 @@ pub struct Budget {
     pub max_tokens: u32,
     pub buckets: Vec<u32>,
     pub max_adapters: u32,
+    /// The vocab-wide logit rows a lane may read out in one fire: the
+    /// readout planes are carved for `max_lanes` of them, and a fire that
+    /// reads more is refused. [`crate::arena::readouts_per_lane`] sizes it
+    /// to what a trace's drafting asks.
+    pub readouts_per_lane: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +162,7 @@ impl Budget {
             max_tokens,
             buckets: Vec::new(),
             max_adapters: 0,
+            readouts_per_lane: crate::arena::READOUTS_PER_LANE,
         }
     }
 }

@@ -136,6 +136,7 @@ fn one(
                 max_tokens: budgets.max_tokens,
                 buckets: Vec::new(),
                 max_adapters: budgets.max_adapters,
+                readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
             },
             patches,
             page_size: budgets.page_size,

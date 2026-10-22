@@ -1029,7 +1029,8 @@ impl BatchScheduler {
             limits.max_forward_requests,
             limits.max_forward_tokens,
             Some(Arc::clone(&stats)),
-        );
+        )
+        .with_max_wave_readouts(limits.max_readouts);
         frame_policy
             .preload_free_slots(crate::inferlet::process::execution_slot_capacity().unwrap_or(0));
         let mut stall_since: Option<crate::rt::Instant> = None;
@@ -1547,12 +1548,13 @@ impl BatchScheduler {
                                 crate::pipeline::instance::cohort_key(lane.group, lane.peer)
                             })
                             .zip(launch.request.cohort);
-                        frame_policy.on_fire_enqueued(
+                        frame_policy.on_fire_reading(
                             stamp,
                             launch.process_id,
                             launch.logical_fire_id,
                             launch.request.tokens(),
                             launch.wire_row_count(),
+                            launch.request.readouts(),
                             cohort,
                         );
                     }
