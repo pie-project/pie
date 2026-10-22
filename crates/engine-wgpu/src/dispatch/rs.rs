@@ -1,5 +1,5 @@
 use kernels_wgpu::attn::ssm::Committed;
-use kernels_wgpu::{Error, Tensor, layout};
+use kernels_wgpu::{Error, Tensor};
 use poem_ir::ValueId;
 
 use crate::rs::Seat;
@@ -54,12 +54,13 @@ impl Run<'_> {
             .handles()
             .cut(dst.0, dst.1, bytes)
             .map_err(|fault| Self::kernel(fault, op))?;
-        layout::copy_words(
-            self.ctx(),
-            Tensor::new(src, 1, 1, poem_ir::Dtype::U32),
-            Tensor::new(dst, 1, 1, poem_ir::Dtype::U32),
+        kernels_slang::gather::rows::copy_words(
+            &self.slang(),
+            crate::encode::slang_tensor(Tensor::new(src, 1, 1, poem_ir::Dtype::U32)),
+            crate::encode::slang_tensor(Tensor::new(dst, 1, 1, poem_ir::Dtype::U32)),
             bytes,
         )
+        .map_err(crate::encode::from_slang)
     }
 
     #[allow(clippy::too_many_arguments)]

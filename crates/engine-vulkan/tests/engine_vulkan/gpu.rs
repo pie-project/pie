@@ -153,3 +153,33 @@ pub fn close(got: &[f32], want: &[f64], what: &str) {
     }
     eprintln!("{what}: worst {worst:.3} of tolerance");
 }
+
+/// A landed output: its buffer, its element count, and whether it is f32.
+pub type Out = (u32, usize, bool);
+
+/// Fires a kernel into the outputs it is handed.
+pub type Fires<'a> = &'a dyn Fn(&Gpu, &[Out]);
+
+/// Run `hand` and `slang` on fresh copies of the outputs `fresh` makes, and
+/// compare each landed output with its reference.
+pub fn both(
+    gpu: &mut Gpu,
+    what: &str,
+    fresh: &dyn Fn(&mut Gpu) -> Vec<Out>,
+    want: &[Vec<f64>],
+    hand: Fires<'_>,
+    slang: Fires<'_>,
+) {
+    for (who, run) in [("", hand), ("slang ", slang)] {
+        let outs = fresh(gpu);
+        run(gpu, &outs);
+        for ((buf, n, f32), want) in outs.iter().zip(want) {
+            let got = if *f32 {
+                gpu.down_f32(*buf, *n)
+            } else {
+                gpu.down(*buf, *n)
+            };
+            close(&got, want, &format!("{who}{what}"));
+        }
+    }
+}
