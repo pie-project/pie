@@ -1,7 +1,7 @@
-//! The tensor-core paged decode (`attn/xqa.cuh`): a whole GQA group's rows
+//! The tensor-core paged decode (`attn/decode_gqa_sm80.cu`): a whole GQA group's rows
 //! as one MMA column tile, read off the FA2 decode plan and landing what the
 //! FA2 decode kernel lands, so the same fold follows it. Taken where the
-//! profile says (`kernel.sdpa.decode.xqa`), for groups of at most eight
+//! profile says (`kernel.sdpa.decode.gqa`), for groups of at most eight
 //! query heads over a plain bf16 NHD pool, at the head widths it is stamped
 //! for.
 
@@ -32,7 +32,7 @@ impl Stamp {
     /// keeps one tile in flight a warp beside the one it reads, so several
     /// blocks share an SM: Gemma 4's 256-wide sliding layers (two query heads
     /// a KV head) and gpt-oss's 64-wide groups of eight (from
-    /// `kernel.sdpa.decode.xqa_from_64` requests: narrower, the FA2 decode
+    /// `kernel.sdpa.decode.gqa_from_64` requests: narrower, the FA2 decode
     /// reads them faster). Gemma's 512-wide global layers read faster
     /// through the prefill kernel.
     #[must_use]
@@ -53,7 +53,7 @@ impl Stamp {
 
     /// The 64-wide stamp three tiles deep a warp, its key rows swizzled so
     /// four blocks still share an SM: a decode's two or three tiles a warp
-    /// all in flight at once (`kernel.sdpa.decode.xqa_deep_64`).
+    /// all in flight at once (`kernel.sdpa.decode.gqa_deep_64`).
     pub const DEEP_64: Self = Self {
         head_dim: 64,
         mt: 1,
@@ -107,7 +107,7 @@ pub struct Gate {
     /// plan splits it).
     pub cluster: u32,
     /// 64-wide heads over a bf16 pool take [`Stamp::DEEP_64`]
-    /// (`kernel.sdpa.decode.xqa_deep_64`).
+    /// (`kernel.sdpa.decode.gqa_deep_64`).
     pub deep_64: bool,
 }
 
@@ -115,11 +115,11 @@ impl Gate {
     #[must_use]
     pub const fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            on: tuning.decode_xqa,
-            from_64: tuning.decode_xqa_from_64,
-            whole_window: tuning.decode_xqa_whole_window,
-            cluster: tuning.decode_xqa_cluster,
-            deep_64: tuning.decode_xqa_deep_64,
+            on: tuning.decode_gqa,
+            from_64: tuning.decode_gqa_from_64,
+            whole_window: tuning.decode_gqa_whole_window,
+            cluster: tuning.decode_gqa_cluster,
+            deep_64: tuning.decode_gqa_deep_64,
         }
     }
 
@@ -253,12 +253,12 @@ pub fn decode(
     // held to the four blocks its shared memory lets share an SM.
     let entry = if stamp.swizzle {
         format!(
-            "::pie::attn::xqa::decode_deep<{head_dim}, {}, {}, {}, 4, {sink_ty}>",
+            "::pie::attn::decode_deep<{head_dim}, {}, {}, {}, 4, {sink_ty}>",
             stamp.mt, stamp.warps, stamp.stages
         )
     } else {
         format!(
-            "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}{pages}>",
+            "::pie::attn::decode<{head_dim}, {}, {}, {}, {sink_ty}{pages}>",
             stamp.mt, stamp.warps, stamp.stages
         )
     };
@@ -304,7 +304,7 @@ mod tests {
 
     /// Each stamp fits a B200 block, the 64-wide an sm_86 one too, and only
     /// the stamped widths, groups of at most eight and, at 64 wide, batches of
-    /// `xqa_from_64` requests take the kernel.
+    /// `gqa_from_64` requests take the kernel.
     #[test]
     fn each_stamp_states_what_its_block_holds() {
         assert!(Stamp::of(64).expect("stamped").smem() <= 101_376);

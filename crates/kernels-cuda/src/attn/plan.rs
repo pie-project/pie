@@ -255,7 +255,7 @@ pub struct Toggles {
 
     pub static_max_requests: u32,
 
-    pub xqa: crate::attn::xqa::Gate,
+    pub decode_gqa: crate::attn::decode_gqa::Gate,
 }
 
 impl Toggles {
@@ -267,7 +267,7 @@ impl Toggles {
             chunk_floor_128: tuning.decode_chunk_floor_128,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
-            xqa: crate::attn::xqa::Gate::of(tuning),
+            decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
     }
 }
@@ -338,10 +338,10 @@ pub fn plan_decode(
 
     // The tensor-core decode's block holds a whole stamp of key tiles; its
     // split fills the SMs once, not the FA2 kernel's occupancy.
-    let max_grid_size = match toggles.xqa.stamp(shape.head_dim, false) {
+    let max_grid_size = match toggles.decode_gqa.stamp(shape.head_dim, false) {
         Some(stamp)
             if toggles
-                .xqa
+                .decode_gqa
                 .takes(shape.head_dim, shape.group_size(), shape.num_requests) =>
         {
             stamp.grid(device)
@@ -350,8 +350,8 @@ pub fn plan_decode(
     };
     // A cluster folds through distributed shared memory, sm_90 on; it fills
     // the SMs once with the stamp's blocks.
-    let ranks = match toggles.xqa.stamp(shape.head_dim, false) {
-        Some(stamp) if device.cc_major >= 9 => toggles.xqa.ranks(
+    let ranks = match toggles.decode_gqa.stamp(shape.head_dim, false) {
+        Some(stamp) if device.cc_major >= 9 => toggles.decode_gqa.ranks(
             shape.head_dim,
             shape.group_size(),
             shape.num_requests,
@@ -387,7 +387,7 @@ pub fn plan_decode(
             window_left: u32::try_from(window_left).ok(),
             whole: ranks > 0
                 || toggles
-                    .xqa
+                    .decode_gqa
                     .whole(shape.head_dim, shape.group_size(), window_left),
         };
         sched_decode::plan(
@@ -601,10 +601,10 @@ pub struct DecodePlanInfo {
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
     /// Each request one work item over its whole window, which the
-    /// tensor-core decode lands unsplit (`xqa::Gate::whole`).
+    /// tensor-core decode lands unsplit (`decode_gqa::Gate::whole`).
     pub whole: bool,
     /// The blocks a cluster reads each (request, kv head) of a whole plan
-    /// with, folding their slices itself (`xqa::Gate::ranks`); 0 for none.
+    /// with, folding their slices itself (`decode_gqa::Gate::ranks`); 0 for none.
     pub ranks: u32,
 }
 

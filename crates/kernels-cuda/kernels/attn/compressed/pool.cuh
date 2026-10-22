@@ -5,7 +5,7 @@
 
 #include "prim/kv_rows.cuh"
 
-namespace pie::attn {
+namespace pie::attn::compressed {
 
 __device__ __forceinline__ long long paged_slot(
     const u32* __restrict__ kv_page_indices,

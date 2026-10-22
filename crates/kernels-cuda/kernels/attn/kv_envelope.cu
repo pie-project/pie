@@ -1,6 +1,6 @@
 #include "prim/device.cuh"
 
-namespace pie::attn::envelope {
+namespace pie::attn {
 
 __device__ __forceinline__ float envelope_dot_thread_partial(
     const float* __restrict__ q,

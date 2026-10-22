@@ -7,12 +7,12 @@
 //!
 //! A decode landing its log-sum-exp (gpt-oss's sinks) joins under
 //! `kernel.sdpa.decode.grouped_prefill_lse` unless windowed (too few keys a
-//! tile). A plan read across a cluster (`kernel.sdpa.decode.xqa_cluster`)
+//! tile). A plan read across a cluster (`kernel.sdpa.decode.gqa_cluster`)
 //! stays a decode: the cluster folds its own split.
 
 use std::collections::BTreeMap;
 
-use kernels_cuda::attn::xqa::Gate;
+use kernels_cuda::attn::decode_gqa::Gate;
 use poem_ir::{Attn, Fused, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 /// `trace` with every decode plan of `from` or more query heads a KV head
@@ -23,10 +23,10 @@ pub fn rewrite(trace: Trace, from: u32) -> Trace {
 }
 
 /// [`rewrite`], and where `lse` holds, the plans without a window that
-/// log-sum-exp decodes read as well, but for those `xqa` reads across a
+/// log-sum-exp decodes read as well, but for those the GQA decode reads across a
 /// cluster.
 #[must_use]
-pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xqa: Gate) -> Trace {
+pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, gate: Gate) -> Trace {
     let unstamped = |group: u32| !kernels_cuda::attn::fa2::DECODE_GROUPS.contains(&group);
     // Decode plans wide enough, by plan value: their KV heads, and whether
     // they slide.
@@ -48,7 +48,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
                 // its own slices, with no split to merge.
                 let left = window.map_or(-1, |w| i32::try_from(w).unwrap_or(i32::MAX) - 1);
                 let clustered =
-                    xqa.ranks(*head_dim, q_heads / kv_heads, 1, *kv_heads, left, u32::MAX) > 0;
+                    gate.ranks(*head_dim, q_heads / kv_heads, 1, *kv_heads, left, u32::MAX) > 0;
                 (!clustered).then_some((*plan, (*kv_heads, window.is_some())))
             }
             _ => None,

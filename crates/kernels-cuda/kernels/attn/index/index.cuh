@@ -6,7 +6,7 @@
 #include "prim/device.cuh"
 #include "prim/rope.cuh"
 
-namespace pie::attn {
+namespace pie::attn::index {
 
 constexpr int kBlock = 256;
 

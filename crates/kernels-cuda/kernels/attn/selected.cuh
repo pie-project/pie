@@ -10,7 +10,7 @@
 
 #include "prim/device.cuh"
 
-namespace pie::attn::sdpa_selected {
+namespace pie::attn::selected {
 
 constexpr int kBlock = 256;
 

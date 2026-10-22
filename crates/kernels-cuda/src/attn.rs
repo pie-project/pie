@@ -28,7 +28,7 @@ pub mod sched_mla;
 
 pub mod sched_prefill;
 
-pub mod xqa;
+pub mod decode_gqa;
 
 #[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
@@ -219,7 +219,7 @@ fn fa2_decode_with(
         num_kv_heads: plan.shape.num_kv_heads,
         device: plan.device,
     };
-    let tensor_cores = xqa::takes(ctx, plan, pool, rel.is_some());
+    let tensor_cores = decode_gqa::takes(ctx, plan, pool, rel.is_some());
     match rel {
         // A whole-window plan's block reads its request's window entire and
         // lands the request's rows (sinks folded) itself: no partial, no fold.
@@ -230,11 +230,11 @@ fn fa2_decode_with(
                 partition_kv: false,
                 ..params
             };
-            xqa::decode(ctx, op, plan, &direct, sinks, kv::native_e4m3(pool))?;
+            decode_gqa::decode(ctx, op, plan, &direct, sinks, kv::native_e4m3(pool))?;
             return Ok(sinks.is_some());
         }
         None if tensor_cores => {
-            xqa::decode(ctx, op, plan, &params, sinks, kv::native_e4m3(pool))?;
+            decode_gqa::decode(ctx, op, plan, &params, sinks, kv::native_e4m3(pool))?;
             if !plan.info.split_kv {
                 return Ok(sinks.is_some());
             }

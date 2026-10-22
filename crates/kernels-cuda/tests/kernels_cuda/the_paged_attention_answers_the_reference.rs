@@ -17,10 +17,10 @@ const PAGE: usize = 16;
 
 /// A decode read: the warp merge, the tensor-core decode, its whole window
 /// and its cluster.
-fn read(warp: bool, xqa: bool, whole: u32, cluster: u32) -> Tuning {
+fn read(warp: bool, gqa: bool, whole: u32, cluster: u32) -> Tuning {
     tuned(|t| {
-        (t.merge_warp, t.decode_xqa) = (warp, xqa);
-        (t.decode_xqa_whole_window, t.decode_xqa_cluster) = (whole, cluster);
+        (t.merge_warp, t.decode_gqa) = (warp, gqa);
+        (t.decode_gqa_whole_window, t.decode_gqa_cluster) = (whole, cluster);
     })
 }
 
@@ -28,7 +28,7 @@ fn read(warp: bool, xqa: bool, whole: u32, cluster: u32) -> Tuning {
 /// PDL where `pdl`.
 fn deep(t: Tuning, pdl: bool) -> Tuning {
     Tuning {
-        decode_xqa_deep_64: true,
+        decode_gqa_deep_64: true,
         pdl,
         ..t
     }

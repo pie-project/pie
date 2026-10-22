@@ -710,31 +710,31 @@ pub struct DecodeGroupedPrefillWindow;
 pub struct Fa2Live;
 
 /// Whether a paged decode of a group of at most eight query heads reads its
-/// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
+/// cache on tensor cores (`attn/decode_gqa_sm80.cu`, the group's rows one MMA tile)
 /// rather than the FA2 decode kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa", flag, default = false, tune = search)]
-pub struct DecodeXqa;
+#[decision(id = "kernel.sdpa.decode.gqa", flag, default = false, tune = search)]
+pub struct DecodeGqa;
 
 /// The fewest requests a 64-wide decode takes the tensor-core kernel at;
 /// narrower, the FA2 decode reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_from_64", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct DecodeXqaFrom64(pub u32);
+#[decision(id = "kernel.sdpa.decode.gqa_from_64", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeGqaFrom64(pub u32);
 
 /// The widest sliding window (keys a query row sees) the tensor-core decode
 /// reads whole, a block a (request, kv head) landing its rows and sinks
 /// itself, with no split to fold; 0 splits every window as the plan sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_whole_window", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct DecodeXqaWholeWindow(pub u32);
+#[decision(id = "kernel.sdpa.decode.gqa_whole_window", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeGqaWholeWindow(pub u32);
 
 /// The most blocks a cluster splits an unwindowed tensor-core decode row's
 /// keys across, folding them through distributed shared memory in place of
 /// the plan's split and its fold launch; 0 leaves the split to the plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
-pub struct DecodeXqaCluster(pub u32);
+#[decision(id = "kernel.sdpa.decode.gqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
+pub struct DecodeGqaCluster(pub u32);
 
 /// Whether a 64-wide tensor-core decode over a bf16 pool keeps three key
 /// tiles in flight a warp rather than two, its key rows swizzled rather than
@@ -742,8 +742,8 @@ pub struct DecodeXqaCluster(pub u32);
 /// warp load at once, one memory latency rather than two. The same products,
 /// so the same bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_deep_64", flag, default = false, tune = search)]
-pub struct DecodeXqaDeep64;
+#[decision(id = "kernel.sdpa.decode.gqa_deep_64", flag, default = false, tune = search)]
+pub struct DecodeGqaDeep64;
 
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
@@ -839,11 +839,11 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeGroupedPrefillWindow>()
         .add::<Fa2Live>()
-        .add::<DecodeXqa>()
-        .add::<DecodeXqaFrom64>()
-        .add::<DecodeXqaWholeWindow>()
-        .add::<DecodeXqaCluster>()
-        .add::<DecodeXqaDeep64>()
+        .add::<DecodeGqa>()
+        .add::<DecodeGqaFrom64>()
+        .add::<DecodeGqaWholeWindow>()
+        .add::<DecodeGqaCluster>()
+        .add::<DecodeGqaDeep64>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
@@ -974,11 +974,11 @@ tuning! {
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
     fa2_live: bool = false, on Fa2Live;
-    decode_xqa: bool = false, on DecodeXqa;
-    decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
-    decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
-    decode_xqa_cluster: u32 = 0, get DecodeXqaCluster;
-    decode_xqa_deep_64: bool = false, on DecodeXqaDeep64;
+    decode_gqa: bool = false, on DecodeGqa;
+    decode_gqa_from_64: u32 = 0, get DecodeGqaFrom64;
+    decode_gqa_whole_window: u32 = 0, get DecodeGqaWholeWindow;
+    decode_gqa_cluster: u32 = 0, get DecodeGqaCluster;
+    decode_gqa_deep_64: bool = false, on DecodeGqaDeep64;
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;

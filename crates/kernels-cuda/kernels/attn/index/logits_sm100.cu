@@ -22,7 +22,7 @@
 // Warps 0-7 run the epilogue (0-3 the even tiles, 4-7 the odd), warp 8
 // issues the tiles' loads, warp 9 owns TMEM and issues the MMAs, warps 10-11
 // load the queries.
-namespace pie::attn::index_tc5 {
+namespace pie::attn::index {
 
 using tc5::u32;
 using tc5::u64;
@@ -492,4 +492,4 @@ __global__ void __launch_bounds__(kBlock) index_select_rows(const Params p, i32*
     }
 }
 
-}  // namespace pie::attn::index_tc5
+}  // namespace pie::attn::index

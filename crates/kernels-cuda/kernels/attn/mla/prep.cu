@@ -7,7 +7,7 @@
 #include "prim/device.cuh"
 #include "prim/rope.cuh"
 
-namespace pie::attn {
+namespace pie::attn::mla {
 
 template <class T>
 __global__ void mla_split_q_b(

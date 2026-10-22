@@ -1,7 +1,7 @@
 #include "attn/index/index.cuh"
 #include "prim/mma.cuh"
 
-namespace pie::attn {
+namespace pie::attn::index {
 
 // DeepSeek-V4.1's FP4 index keys: a position's 128 dims as e2m1 pairs (64
 // bytes, the lower dim in the low nibble) under one ue8m0 exponent a 32 (4

@@ -29,7 +29,7 @@
 // Warps 0-3 run the softmax and store O (and the base-2 log-sum-exp where
 // asked); warp 11 lists a tile's keys; warps 4 and 6-10 issue its gathers;
 // warp 5 owns TMEM and issues every MMA.
-namespace pie::attn::mlas {
+namespace pie::attn::mla {
 
 using tc5::u32;
 using tc5::u64;
@@ -324,7 +324,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     asm volatile("griddepcontrol.launch_dependents;");
 
     Row* shared_rows = reinterpret_cast<Row*>(row_free + 2);
-    auto take_row = [&](int n) { return mlas::take_row(shared_rows, row_full, row_free, n, lane); };
+    auto take_row = [&](int n) { return mla::take_row(shared_rows, row_full, row_free, n, lane); };
 
     if (warp == 11) {
         int J = 0;
@@ -937,7 +937,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
     const u32 tmem = *tmem_slot;
 
     Row* shared_rows = reinterpret_cast<Row*>(tmem_slot + 4);
-    auto take_row = [&](int n) { return mlas::take_row(shared_rows, row_full, row_free, n, lane); };
+    auto take_row = [&](int n) { return mla::take_row(shared_rows, row_full, row_free, n, lane); };
 
     if (warp == 5) {
         int J = 0, n = 0;
@@ -1325,4 +1325,4 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
     }
 }
 
-}  // namespace pie::attn::mlas
+}  // namespace pie::attn::mla

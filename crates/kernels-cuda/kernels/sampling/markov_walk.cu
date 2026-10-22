@@ -14,7 +14,7 @@
 // the depth's embeddings on mma.sync a chunk at a time, and lands each
 // chunk's biased rows a readout row at a time, coalesced, folding its
 // argmax into the readout's key.
-namespace pie::sampling::markov {
+namespace pie::sampling {
 
 constexpr int kRank = 256;
 constexpr int kTileV = 128;   // vocab rows a CTA
@@ -300,4 +300,4 @@ __global__ void picks(const unsigned long long* __restrict__ keys, int* __restri
     if (r < readouts) picks[r] = pick_of(keys[r]);
 }
 
-}  // namespace pie::sampling::markov
+}  // namespace pie::sampling

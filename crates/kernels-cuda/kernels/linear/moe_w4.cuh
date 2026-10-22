@@ -60,7 +60,7 @@ __device__ __forceinline__ unsigned ld_scale(const u8* p) {
     return v;
 }
 
-using ::pie::glu_fn::glu;
+using ::pie::act::glu;
 
 // A K-split CTA's later groups' sums (`part` past 0) folded through shared
 // memory into its first group's, a lane its own: false for the threads that

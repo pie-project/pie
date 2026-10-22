@@ -16,9 +16,9 @@
 #include "attn/compressed/pool.cuh"
 #include "attn/selected.cuh"
 
-namespace pie::attn::pool_mma {
+namespace pie::attn::compressed {
 
-using namespace pie::attn::sdpa_selected::mma;
+using namespace pie::attn::selected::mma;
 
 constexpr int kPoolWarps = 4;
 constexpr int kPoolThreads = kPoolWarps * 32;
@@ -273,4 +273,4 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
     }
 }
 
-}  // namespace pie::attn::pool_mma
+}  // namespace pie::attn::compressed

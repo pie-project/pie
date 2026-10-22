@@ -9,7 +9,7 @@
 // `nope` key part, then the value); and the key rows packed as that part
 // beside the row's rope part, which every head shares.
 
-namespace pie::attn::mla_expand {
+namespace pie::attn::mla {
 
 typedef unsigned int u32;
 
@@ -110,4 +110,4 @@ __global__ void pack_queries(
     *reinterpret_cast<uint4*>(q + row * width + d) = x;
 }
 
-}  // namespace pie::attn::mla_expand
+}  // namespace pie::attn::mla

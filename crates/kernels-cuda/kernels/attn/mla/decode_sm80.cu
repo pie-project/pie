@@ -10,7 +10,7 @@
 #include "attn/fa2/mla.cuh"
 #include "attn/fa2/mla_params.cuh"
 
-namespace pie::attn {
+namespace pie::attn::mla {
 
 constexpr int kMaxRopePairs = 128;
 

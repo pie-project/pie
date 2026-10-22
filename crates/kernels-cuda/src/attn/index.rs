@@ -74,10 +74,13 @@ pub fn layernorm_rope(
         OP,
         // A warp a row where the profile says (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(INDEX, "::pie::attn::index_knorm_rope_warp<::pie::bf16>")
-                .apply(Launch::per_row(k.rows, 32))
+            Fire::at(
+                INDEX,
+                "::pie::attn::index::index_knorm_rope_warp<::pie::bf16>",
+            )
+            .apply(Launch::per_row(k.rows, 32))
         } else {
-            Fire::at(INDEX, "::pie::attn::index_knorm_rope<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index::index_knorm_rope<::pie::bf16>")
                 .apply(Launch::per_row(k.rows, K_BLOCK))
         },
         &[
@@ -114,10 +117,10 @@ pub fn rope(
         // A thread a (head, pair) where the profile says
         // (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(INDEX, "::pie::attn::index_q_rope_pairs<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index::index_q_rope_pairs<::pie::bf16>")
                 .apply(Launch::per_row(q.rows, K_BLOCK))
         } else {
-            Fire::at(INDEX, "::pie::attn::index_q_rope<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index::index_q_rope<::pie::bf16>")
                 .apply(Launch::per_row(q.rows, q_rope_block(n_heads)))
         },
         &[
@@ -171,7 +174,7 @@ pub fn store_fp4(
     let div = crate::attn::compressed::pool::packing(OP, keys, i64::from(FP4_ROW))?;
     ctx.fire(
         OP,
-        Fire::at(INDEX, "::pie::attn::index_store_fp4")
+        Fire::at(INDEX, "::pie::attn::index::index_store_fp4")
             .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             entries.arg(),
@@ -202,7 +205,7 @@ fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTen
         let lanes = u32::try_from(runs).map_err(|_| refuse(op, "the queries overflow a launch"))?;
         ctx.fire(
             op,
-            Fire::at(INDEX, "::pie::attn::index_q_fp4").apply(Launch::flat(lanes, 256)),
+            Fire::at(INDEX, "::pie::attn::index::index_q_fp4").apply(Launch::flat(lanes, 256)),
             &[
                 q.data.arg(),
                 ArgValue::Ptr(out),
@@ -235,7 +238,7 @@ fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error
     if pages > 0 {
         ctx.fire(
             op,
-            Fire::at(INDEX, "::pie::attn::index_stage_fp4")
+            Fire::at(INDEX, "::pie::attn::index::index_stage_fp4")
                 .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
             &[
                 keys.keys.arg(),
@@ -310,8 +313,11 @@ pub fn block_mean(
     let rows = count(OP, "rows", boundary_pos.rows)?;
     ctx.fire(
         OP,
-        Fire::at(POOL, "::pie::attn::index_block_mean_paged<::pie::bf16>")
-            .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
+        Fire::at(
+            POOL,
+            "::pie::attn::compressed::index_block_mean_paged<::pie::bf16>",
+        )
+        .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
         &[
             keys.keys.arg(),
             entries.arg(),
@@ -438,7 +444,7 @@ pub fn topk_tokens(
     let num_requests = kv::lanes_of(OP, q.indptr)?;
     ctx.fire(
         OP,
-        Fire::at(INDEX, "::pie::attn::index_pool_tokens")
+        Fire::at(INDEX, "::pie::attn::index::index_pool_tokens")
             .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             ArgValue::Ptr(blocks_at),
@@ -603,7 +609,9 @@ fn ranked(
                 _ => 4,
             };
             (
-                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}, {fp4}>"),
+                format!(
+                    "::pie::attn::index::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}, {fp4}>"
+                ),
                 // The query, 16 rows a tile, and each warp's two chunks of 16
                 // keys, at 128 + 8 bf16 a row.
                 (16 * tiles + 2 * (K_BLOCK / 32) * 16) * (128 + 8) * 2,
@@ -611,7 +619,7 @@ fn ranked(
         }
         _ if turn.is_some() => return Ok(false),
         _ => (
-            format!("::pie::attn::index_topk_paged<::pie::bf16, {radix}>"),
+            format!("::pie::attn::index::index_topk_paged<::pie::bf16, {radix}>"),
             0,
         ),
     };
@@ -765,8 +773,11 @@ pub fn topk_block_max(
 
     ctx.fire(
         OP,
-        Fire::at(INDEX, "::pie::attn::index_topk_block_max<::pie::bf16>")
-            .apply(Launch::per_row(selection.rows, K_BLOCK)),
+        Fire::at(
+            INDEX,
+            "::pie::attn::index::index_topk_block_max<::pie::bf16>",
+        )
+        .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             q.data.arg(),
             keys.keys.arg(),
@@ -793,7 +804,7 @@ pub fn topk_block_max(
 #[cfg(feature = "cuda")]
 const TC5_FROM: u32 = 512;
 
-/// `pie::attn::index_tc5::Params`, field for field.
+/// `pie::attn::index::Params`, field for field.
 #[cfg(feature = "cuda")]
 #[repr(C)]
 struct Tc5Params {
@@ -822,7 +833,7 @@ struct Tc5Params {
     sub: i32,
 }
 
-/// `pie::attn::index_tc5::smem_bytes`: two Q buffers and three key tiles of
+/// `pie::attn::index::smem_bytes`: two Q buffers and three key tiles of
 /// 32 KB, the warps' sums, the weights, barriers and the alignment.
 #[cfg(feature = "cuda")]
 const TC5_SMEM: u32 = (2 + 3) * 32768 + 8 * 128 * 4 + 2 * 128 * 4 + 256 + 1024;
@@ -943,7 +954,7 @@ fn ranked_tc5(
         OP,
         Fire::at(
             LOGITS_SM100,
-            symbol(&format!("::pie::attn::index_tc5::index_logits_tc5<{h}>")),
+            symbol(&format!("::pie::attn::index::index_logits_tc5<{h}>")),
         )
         .apply(
             Launch::grid(
@@ -959,9 +970,7 @@ fn ranked_tc5(
         OP,
         Fire::at(
             LOGITS_SM100,
-            symbol(&format!(
-                "::pie::attn::index_tc5::index_select_rows<{radix}>"
-            )),
+            symbol(&format!("::pie::attn::index::index_select_rows<{radix}>")),
         )
         .apply(Launch::grid([selection.rows, 1, 1], [K_BLOCK, 1, 1])),
         &[bytes, selection.arg()],

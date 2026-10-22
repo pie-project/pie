@@ -1,6 +1,6 @@
 #include "attn/selected.cuh"
 
-namespace pie::attn::sdpa_selected {
+namespace pie::attn::selected {
 
 constexpr int kMaxPer = 16;
 

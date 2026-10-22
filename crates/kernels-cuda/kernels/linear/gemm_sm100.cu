@@ -66,7 +66,7 @@ struct Epi {
 
 namespace tc5k {
 
-using ::pie::glu_fn::glu;
+using ::pie::act::glu;
 
 // DeepSeek's 1x128 ue8m0 scale for a block whose largest magnitude is
 // amax: 2^ceil(log2(max(amax, 1e-4) / 448)), as its exponent.

@@ -10,7 +10,7 @@ const SELECTED_SM80: &str = "attn/selected_sm80.cu";
 
 const FILE: &str = "attn/selected_sm80.cu";
 
-const ENTRY: &str = "::pie::attn::sdpa_selected::sdpa_paged_selected_kernel<::pie::bf16>";
+const ENTRY: &str = "::pie::attn::selected::sdpa_paged_selected_kernel<::pie::bf16>";
 
 #[must_use]
 const fn smem_bytes(head_dim: i32) -> u32 {
@@ -169,7 +169,7 @@ fn selected(
             Fire::at(
                 SELECTED_SM80,
                 symbol(&format!(
-                    "::pie::attn::sdpa_selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"
+                    "::pie::attn::selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"
                 )),
             )
             .apply(launch),
@@ -208,7 +208,7 @@ fn selected(
             Fire::at(
                 SELECTED_SM80,
                 symbol(&format!(
-                    "::pie::attn::sdpa_selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"
+                    "::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"
                 )),
             )
             .apply(launch),

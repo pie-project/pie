@@ -2,7 +2,7 @@
 
 #include "prim/device.cuh"
 
-namespace pie::custom {
+namespace pie::attn {
 
 // A head norm's weight at `i`, or 1 for a scaleless norm.
 __device__ __forceinline__ float norm_weight(const bf16* __restrict__ w, int i) {

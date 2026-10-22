@@ -21,7 +21,7 @@
 // lands its share of the rows, sinks and all, with no partial plane and no
 // fold launch after it.
 
-namespace pie::attn::xqa {
+namespace pie::attn {
 
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kLn2 = 0.69314718055994530942f;

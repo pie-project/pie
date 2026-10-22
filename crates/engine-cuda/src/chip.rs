@@ -515,7 +515,7 @@ mod tests {
                 assert_eq!(tuning.qg_prologue_until, if b200 { 64 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
                 assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
-                assert_eq!(tuning.decode_xqa, b200, "{gpu}");
+                assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.mla_sparse, major == 10 && minor == 0, "{gpu}");
@@ -557,17 +557,17 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.decode_xqa_from_64,
+                    tuning.decode_gqa_from_64,
                     if b200 { 16 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.decode_xqa_whole_window,
+                    tuning.decode_gqa_whole_window,
                     if b200 { 128 } else { 0 },
                     "{gpu}"
                 );
-                assert_eq!(tuning.decode_xqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
-                assert_eq!(tuning.decode_xqa_deep_64, b200, "{gpu}");
+                assert_eq!(tuning.decode_gqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
+                assert_eq!(tuning.decode_gqa_deep_64, b200, "{gpu}");
                 // B200 alone runs Gemma 4's q norm a warp a head and its
                 // norm-and-fold 128 threads a row, skipping unread rows.
                 assert_eq!(tuning.q_norm_rope_warp, b200, "{gpu}");
@@ -613,11 +613,11 @@ mod tests {
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
                         decode_grouped_prefill_lse: false,
-                        decode_xqa: false,
-                        decode_xqa_from_64: 0,
-                        decode_xqa_whole_window: 0,
-                        decode_xqa_cluster: 0,
-                        decode_xqa_deep_64: false,
+                        decode_gqa: false,
+                        decode_gqa_from_64: 0,
+                        decode_gqa_whole_window: 0,
+                        decode_gqa_cluster: 0,
+                        decode_gqa_deep_64: false,
                         pool_mma: false,
                         compressed_prefill_from: 0,
                         index_radix: false,

@@ -728,8 +728,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
             for (int j = 0; j < 16; ++j) {
                 const int col = col0 + 8 * j + 2 * c;
                 if (col >= inter) continue;
-                const float o0 = glu_fn::glu<kGlu>(acc[4 * j + 2 * h], acc[4 * (j + 16) + 2 * h], limit, galpha);
-                const float o1 = glu_fn::glu<kGlu>(acc[4 * j + 2 * h + 1], acc[4 * (j + 16) + 2 * h + 1], limit, galpha);
+                const float o0 = act::glu<kGlu>(acc[4 * j + 2 * h], acc[4 * (j + 16) + 2 * h], limit, galpha);
+                const float o1 = act::glu<kGlu>(acc[4 * j + 2 * h + 1], acc[4 * (j + 16) + 2 * h + 1], limit, galpha);
                 bf16* o = out + route * inter + col;
                 if (col + 1 < inter) {
                     *reinterpret_cast<unsigned*>(o) = pack_bf16x2(o0, o1);

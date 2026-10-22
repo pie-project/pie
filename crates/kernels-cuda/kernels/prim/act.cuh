@@ -7,7 +7,7 @@
 // division would pace a fused epilogue (an overflowing exp divides to 0,
 // its limit).
 
-namespace pie::glu_fn {
+namespace pie::act {
 
 template <int kGlu>
 __device__ __forceinline__ float glu(float g, float u, float limit, float galpha) {
@@ -45,4 +45,4 @@ __device__ __forceinline__ float glu(float g, float u, float limit, float galpha
     }
 }
 
-}  // namespace pie::glu_fn
+}  // namespace pie::act

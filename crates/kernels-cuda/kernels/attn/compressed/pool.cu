@@ -1,6 +1,6 @@
 #include "attn/compressed/pool.cuh"
 
-namespace pie::attn {
+namespace pie::attn::compressed {
 
 constexpr int ATTN_BLOCK = 128;
 

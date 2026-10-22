@@ -150,9 +150,9 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         let e = if word { 8 } else { head_dim / 32 };
         if stage {
             let kv = if pages.is_empty() { "::pie::bf16" } else { "__nv_fp8_e4m3" };
-            format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}), {kv}, true>")
+            format!("::pie::attn::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}), {kv}, true>")
         } else {
-            format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}){pages}>")
+            format!("::pie::attn::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}){pages}>")
         }
     });
     let smem = if stage { packed.width * 2 + 16 } else { 0 };
@@ -203,7 +203,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     }
 
     let warped = matches!(head_dim, 64 | 128 | 256).then(|| {
-        format!("::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false{pages}>")
+        format!("::pie::attn::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false{pages}>")
     });
     if let Some(instantiation) = warped {
         let units = packed.rows.saturating_mul(heads);
@@ -266,7 +266,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         Fire::at(
             QKV_APPEND,
             symbol(&format!(
-                "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false{pages}>"
+                "::pie::attn::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false{pages}>"
             )),
         )
         .apply(Launch::grid([packed.rows, heads, 1], [DECODE_BLOCK, 1, 1])),

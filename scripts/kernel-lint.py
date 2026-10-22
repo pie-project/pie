@@ -5,6 +5,7 @@ Two checks so far, the ones the rest of the convention leans on:
 
   * every entry point in a crate's kernel tree is named by its host code;
   * every launch the host writes with a literal symbol names, by namespace
+    (and every `::pie::` scope in it, template arguments too, exists)
     and name, a kernel its unit (or a header the unit includes) defines.
 
 A CUDA entry is a `__global__` function; the host names it in a symbol
@@ -120,6 +121,44 @@ def unit_kernels(tree, unit, seen):
     return found
 
 
+def unit_scopes(tree, unit, seen):
+    """Every namespace path a unit and its headers open, and every type they
+    declare (by bare name)."""
+    path = tree / unit
+    if unit in seen or not path.exists():
+        return set(), set()
+    seen.add(unit)
+    text = path.read_text()
+    spaces, types = set(), set()
+    for m in re.finditer(r"namespace ([\w:]+) \{", text):
+        outer = namespace_at(text, m.start())
+        full = f"{outer}::{m.group(1)}" if outer else m.group(1)
+        parts = full.split("::")
+        spaces |= {"::".join(parts[: i + 1]) for i in range(len(parts))}
+    types |= set(re.findall(r"\b(?:struct|class|union)\s+(\w+)", text))
+    types |= set(re.findall(r"\busing\s+(\w+)\s*=", text))
+    for inc in re.findall(r'#include "([^"]+)"', text):
+        a, b = unit_scopes(tree, inc, seen)
+        spaces |= a
+        types |= b
+    return spaces, types
+
+
+def stray_qualifiers(literal, spaces, types):
+    """The `::pie::...::` qualifiers in a launched symbol, template arguments
+    included, that name neither a namespace nor a type the unit holds."""
+    bad = []
+    for m in re.finditer(r"::((?:\w+::)+)", literal):
+        path = m.group(1).rstrip(":")
+        parts = path.split("::")
+        if path in spaces or not parts[0] == "pie":
+            continue
+        if "::".join(parts[:-1]) in spaces and parts[-1] in types:
+            continue
+        bad.append(path)
+    return bad
+
+
 def misdirected_launches(crate):
     tree = REPO / CRATES[crate][0]
     src = tree.parent / "src"
@@ -143,6 +182,49 @@ def misdirected_launches(crate):
                 line = text.count("\n", 0, m.start()) + 1
                 rel = path.relative_to(REPO)
                 found.append(f"{rel}:{line}: `{ns}::{name}` is defined in none of {units}")
+            # The whole literal: a template argument names its own scope.
+            q = text.find('"::', m.start())
+            literal = text[q + 1 : text.find('"', q + 1)]
+            spaces, types = set(), set()
+            for u in units:
+                a, b = unit_scopes(tree, u, set())
+                spaces |= a
+                types |= b
+            for stray in stray_qualifiers(literal, spaces, types):
+                line = text.count("\n", 0, m.start()) + 1
+                rel = path.relative_to(REPO)
+                found.append(f"{rel}:{line}: `{stray}` in `{literal}` is no scope of {units}")
+    return found
+
+
+def stray_symbols(crate):
+    """Every `"::pie::..."` literal in a host file (a launch's, or a table's
+    it fires from) whose scopes no unit the file names holds."""
+    tree = REPO / CRATES[crate][0]
+    src = tree.parent / "src"
+    found = []
+    for path in sorted(src.rglob("*.rs")):
+        text = path.read_text()
+        parent = path.parent.with_suffix(".rs")
+        consts = dict(UNIT_CONST.findall(text))
+        if parent.exists():
+            consts.update(UNIT_CONST.findall(parent.read_text()))
+        units = set(consts.values()) | set(re.findall(r'Fire::at\(\s*"([^"]+)"', text))
+        if not units:
+            continue
+        spaces, types = set(), set()
+        for u in units:
+            a, b = unit_scopes(tree, u, set())
+            spaces |= a
+            types |= b
+        if not spaces:
+            continue
+        for m in re.finditer(r'"(::pie::(?:[^"\\]|\\.|\\\n)*)"', text):
+            literal = re.sub(r"\\\n\s*", "", m.group(1))
+            for stray in stray_qualifiers(literal, spaces, types):
+                line = text.count("\n", 0, m.start()) + 1
+                rel = path.relative_to(REPO)
+                found.append(f"{rel}:{line}: `{stray}` in a symbol is no scope of {sorted(units)}")
     return found
 
 
@@ -151,6 +233,7 @@ def main():
     for crate in CRATES:
         findings += unnamed_entries(crate)
         findings += misdirected_launches(crate)
+        findings += stray_symbols(crate)
     for f in findings:
         print(f)
     print(f"kernel-lint: {len(findings)} finding(s)", file=sys.stderr)

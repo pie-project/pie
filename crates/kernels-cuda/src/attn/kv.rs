@@ -289,11 +289,7 @@ fn envelope_update_appended(
 
     ctx.fire(
         op,
-        Fire::at(
-            KV_ENVELOPE,
-            "::pie::attn::envelope::update_appended<::pie::bf16>",
-        )
-        .apply(Launch::grid(
+        Fire::at(KV_ENVELOPE, "::pie::attn::update_appended<::pie::bf16>").apply(Launch::grid(
             [max_touched.unsigned_abs(), kv_heads.unsigned_abs(), 1],
             [threads_for(head_dim), 1, 1],
         )),
@@ -561,7 +557,7 @@ pub(crate) fn write_mla_fp8_rows(
     let num_requests = lanes_of(op, indptr)?;
     ctx.fire(
         op,
-        Fire::at(PREP, "::pie::attn::mla_kv_append_fp8").apply(Launch::per_row(ckv.rows, 160)),
+        Fire::at(PREP, "::pie::attn::mla::mla_kv_append_fp8").apply(Launch::per_row(ckv.rows, 160)),
         &[
             ckv.arg(),
             kpe.arg(),
@@ -596,7 +592,7 @@ pub(crate) fn write_mla_to_pages(
     let num_requests = lanes_of(op, indptr)?;
     ctx.fire(
         op,
-        Fire::at(PREP, "::pie::attn::mla_kv_append")
+        Fire::at(PREP, "::pie::attn::mla::mla_kv_append")
             .apply(Launch::per_row(ckv.rows, MLA_WRITE_BLOCK)),
         &[
             ckv.arg(),

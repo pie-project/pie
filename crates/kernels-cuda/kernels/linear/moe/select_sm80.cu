@@ -680,7 +680,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
                     for (int e = 0; e < 2; ++e) {
                         const int col = c0 + (kWRows / 2) * wn + 8 * j + 2 * t + e;
                         if (col < inter)
-                            out[route * inter + col] = f32_to_bf16(glu_fn::glu<kGlu>(
+                            out[route * inter + col] = f32_to_bf16(act::glu<kGlu>(
                                 acc[mt][j][2 * hh + e], acc[mt][j + kNT / 2][2 * hh + e], limit, galpha));
                     }
             } else {
@@ -915,7 +915,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_fp8_gemm(
                     for (int e = 0; e < 2; ++e) {
                         const int col = c0 + (kWRows / 2) * wn + 8 * j + 2 * t + e;
                         if (col < inter)
-                            out[route * inter + col] = f32_to_bf16(glu_fn::glu<kGlu>(
+                            out[route * inter + col] = f32_to_bf16(act::glu<kGlu>(
                                 acc[mt][j][2 * hh + e], acc[mt][j + kNT / 2][2 * hh + e], limit, galpha));
                     }
             } else {

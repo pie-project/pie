@@ -118,7 +118,7 @@ fn split_kv_a_norm(
         op,
         Fire::at(
             PREP,
-            crate::jit::symbol(&format!("::pie::attn::mla_latents<{t}, 256>")),
+            crate::jit::symbol(&format!("::pie::attn::mla::mla_latents<{t}, 256>")),
         )
         .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl)),
         &[
@@ -209,7 +209,7 @@ pub fn split_q_b(
             OP,
             Fire::at(
                 PREP,
-                crate::jit::symbol(&format!("::pie::attn::mla_split_q_b_vec8<{t}>")),
+                crate::jit::symbol(&format!("::pie::attn::mla::mla_split_q_b_vec8<{t}>")),
             )
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
             &[
@@ -235,7 +235,7 @@ pub fn split_q_b(
         OP,
         Fire::at(
             PREP,
-            crate::jit::symbol(&format!("::pie::attn::mla_split_q_b<{t}>")),
+            crate::jit::symbol(&format!("::pie::attn::mla::mla_split_q_b<{t}>")),
         )
         .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
         &[
@@ -595,7 +595,7 @@ pub(crate) mod naive {
                 Fire::at(
                     DECODE_SM80,
                     crate::jit::symbol(&format!(
-                        "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel<{}{}>",
+                        "::pie::attn::mla::mla_naive::mma_detail::mla_mma_paged_kernel<{}{}>",
                         shape.rope_dim,
                         if shape.fp8 { ", true" } else { "" }
                     )),
@@ -632,7 +632,7 @@ pub(crate) mod naive {
                 op,
                 Fire::at(
                     DECODE_SM80,
-                    "::pie::attn::mla_naive::mma_detail::mla_mma_fold",
+                    "::pie::attn::mla::mla_naive::mma_detail::mla_mma_fold",
                 )
                 .apply(Launch::grid([rows, heads, 1], [128, 1, 1])),
                 &[
@@ -692,9 +692,9 @@ pub(crate) mod naive {
             Fire::at(
                 DECODE_SM80,
                 if ckv / 32 > 16 {
-                    "::pie::attn::mla_naive::mla_naive_paged_kernel<32>"
+                    "::pie::attn::mla::mla_naive::mla_naive_paged_kernel<32>"
                 } else {
-                    "::pie::attn::mla_naive::mla_naive_paged_kernel<16>"
+                    "::pie::attn::mla::mla_naive::mla_naive_paged_kernel<16>"
                 },
             )
             .apply(launch),
@@ -736,7 +736,7 @@ mod sparse {
     use crate::linear::gemm_sm100::supported;
     use dtype::Dtype;
 
-    /// `pie::attn::mlas::Params`, field for field.
+    /// `pie::attn::mla::Params`, field for field.
     #[repr(C)]
     struct Params {
         o: u64,
@@ -767,7 +767,7 @@ mod sparse {
         kv_width: i32,
     }
 
-    /// `pie::attn::mlas::Layout<kRope, kE4>::kSmem`: the ring (two slots of
+    /// `pie::attn::mla::Layout<kRope, kE4>::kSmem`: the ring (two slots of
     /// 64 keys' bf16 latent and rotated dims twice, or four of their e4m3
     /// codes, five without rotated dims), P twice, the score exchange, six key lists, barriers, and the
     /// 1024-byte alignment.
@@ -1153,7 +1153,7 @@ mod sparse {
                 op,
                 Fire::at(
                     SPARSE_SM100,
-                    symbol(&format!("::pie::attn::mlas::mla_sparse_e4<{}>", s.rope)),
+                    symbol(&format!("::pie::attn::mla::mla_sparse_e4<{}>", s.rope)),
                 )
                 .apply(Launch::grid([rows.min(sms), 1, 1], [384, 1, 1]).smem(smem)),
                 &[ArgValue::of(&params)],
@@ -1163,7 +1163,7 @@ mod sparse {
             op,
             Fire::at(
                 SPARSE_SM100,
-                symbol(&format!("::pie::attn::mlas::mla_sparse<{}, {fp8}>", s.rope)),
+                symbol(&format!("::pie::attn::mla::mla_sparse<{}, {fp8}>", s.rope)),
             )
             .apply(
                 Launch::grid([(rows * splits).min(sms), 1, 1], [384, 1, 1]).smem(smem(s.rope, fp8)),
@@ -1180,7 +1180,7 @@ mod sparse {
         }
         ctx.fire(
             op,
-            Fire::at(SPARSE_SM100, "::pie::attn::mlas::mla_sparse_fold")
+            Fire::at(SPARSE_SM100, "::pie::attn::mla::mla_sparse_fold")
                 .apply(Launch::grid([rows, 64, 1], [128, 1, 1]).programmatic(ctx.tuning().pdl)),
             &[
                 ArgValue::Ptr(part_o),
@@ -1205,27 +1205,27 @@ mod mla_fa2 {
     pub const INST: [[&str; 2]; 3] = [
         [
             "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<false, 2u, true, 64u>, \
-             ::pie::attn::mla_fa2::Params>",
+             <::pie::attn::mla::mla_fa2::Traits<false, 2u, true, 64u>, \
+             ::pie::attn::mla::mla_fa2::Params>",
             "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<true, 2u, true, 64u>, \
-             ::pie::attn::mla_fa2::Params>",
+             <::pie::attn::mla::mla_fa2::Traits<true, 2u, true, 64u>, \
+             ::pie::attn::mla::mla_fa2::Params>",
         ],
         [
             "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<false, 2u, true, 32u>, \
-             ::pie::attn::mla_fa2::Params>",
+             <::pie::attn::mla::mla_fa2::Traits<false, 2u, true, 32u>, \
+             ::pie::attn::mla::mla_fa2::Params>",
             "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<true, 2u, true, 32u>, \
-             ::pie::attn::mla_fa2::Params>",
+             <::pie::attn::mla::mla_fa2::Traits<true, 2u, true, 32u>, \
+             ::pie::attn::mla::mla_fa2::Params>",
         ],
         [
             "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<false, 1u, false, 16u>, \
-             ::pie::attn::mla_fa2::Params>",
+             <::pie::attn::mla::mla_fa2::Traits<false, 1u, false, 16u>, \
+             ::pie::attn::mla::mla_fa2::Params>",
             "::pie::attn::fa2::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<true, 1u, false, 16u>, \
-             ::pie::attn::mla_fa2::Params>",
+             <::pie::attn::mla::mla_fa2::Traits<true, 1u, false, 16u>, \
+             ::pie::attn::mla::mla_fa2::Params>",
         ],
     ];
 
@@ -1875,7 +1875,7 @@ pub fn prefill_expanded(
         let int = |v: u32| ArgValue::I32(i32::try_from(v).unwrap_or(i32::MAX));
         ctx.fire(
             OP,
-            Fire::at(EXPAND, "::pie::attn::mla_expand::gather").apply(Launch::flat(threads, BLOCK)),
+            Fire::at(EXPAND, "::pie::attn::mla::gather").apply(Launch::flat(threads, BLOCK)),
             &[
                 ArgValue::Ptr(pool.keys.ptr),
                 ArgValue::Ptr(pool.values.ptr),
@@ -1904,7 +1904,7 @@ pub fn prefill_expanded(
         let key_runs = cells * u64::from(h.heads) * u64::from(dqk / 8);
         ctx.fire(
             OP,
-            Fire::at(EXPAND, "::pie::attn::mla_expand::pack_keys").apply(Launch::flat(
+            Fire::at(EXPAND, "::pie::attn::mla::pack_keys").apply(Launch::flat(
                 u32::try_from(key_runs)
                     .map_err(|_| refuse(OP, "the key pack overflows a launch"))?,
                 BLOCK,
@@ -1934,7 +1934,7 @@ pub fn prefill_expanded(
                 let q_runs = u64::from(rows) * u64::from(h.heads) * u64::from(dqk / 8);
                 ctx.fire(
                     OP,
-                    Fire::at(EXPAND, "::pie::attn::mla_expand::pack_queries").apply(Launch::flat(
+                    Fire::at(EXPAND, "::pie::attn::mla::pack_queries").apply(Launch::flat(
                         u32::try_from(q_runs)
                             .map_err(|_| refuse(OP, "the query pack overflows a launch"))?,
                         BLOCK,

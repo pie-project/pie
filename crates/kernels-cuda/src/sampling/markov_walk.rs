@@ -77,8 +77,7 @@ pub fn markov_walk(
     let keys = ctx.scratch_stream(OP, "markov.keys", r * 8)? as u64;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::sampling::markov::plan")
-            .apply(Launch::grid([1, 1, 1], [1024, 1, 1])),
+        Fire::at(FILE, "::pie::sampling::plan").apply(Launch::grid([1, 1, 1], [1024, 1, 1])),
         &[
             positions.arg(),
             ends.arg(),
@@ -96,7 +95,7 @@ pub fn markov_walk(
         // The depth's embeddings, a warp a readout, then its tiles.
         ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::sampling::markov::gather")
+            Fire::at(FILE, "::pie::sampling::gather")
                 .apply(Launch::grid([readouts.div_ceil(8), 1, 1], [256, 1, 1])),
             &[
                 tokens.arg(),
@@ -112,7 +111,7 @@ pub fn markov_walk(
         )?;
         ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&format!("::pie::sampling::markov::step<{t}>")))
+            Fire::at(FILE, symbol(&format!("::pie::sampling::step<{t}>")))
                 .apply(Launch::grid([tiles, 1, 1], [256, 1, 1]).smem(STEP_SMEM)),
             &[
                 logits.arg(),
@@ -130,7 +129,7 @@ pub fn markov_walk(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::sampling::markov::picks").apply(Launch::flat(readouts, 128)),
+        Fire::at(FILE, "::pie::sampling::picks").apply(Launch::flat(readouts, 128)),
         &[ArgValue::Ptr(keys), picks.arg(), int(readouts).arg()],
     )
 }
