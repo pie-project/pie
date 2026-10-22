@@ -236,15 +236,15 @@ impl Shell {
         let readback = fire.readback(p, &staged)?;
         super::btrace::mark("readback");
         if tapping.is_some() {
-            // The read-outs hold the tapped pages until they land: a later
-            // fire that writes one waits for them (`Pools::fence_swaps`).
-            let pages: Vec<u32> = p
-                .lanes
-                .iter()
-                .filter_map(|seated| seated.tap)
-                .flat_map(|tap| tap.pages.iter().copied())
-                .collect();
-            self.pools.hold_until(self.device.tap_stream(), pages)?;
+            // The read-outs hold the tapped pages and the host slots they
+            // fill until they land: a later fire that writes a page waits for
+            // them (`Pools::fence_swaps`), and so does the host before it
+            // touches a slot (`Pools::settle_host_slots`).
+            let taps = || p.lanes.iter().filter_map(|seated| seated.tap);
+            let pages: Vec<u32> = taps().flat_map(|tap| tap.pages.iter().copied()).collect();
+            let slots: Vec<u32> = taps().flat_map(|tap| tap.slots.iter().copied()).collect();
+            self.pools
+                .hold_until(self.device.tap_stream(), pages, slots)?;
         }
         super::btrace::flush(seq);
         Ok((p.windows.launches(), readback))
