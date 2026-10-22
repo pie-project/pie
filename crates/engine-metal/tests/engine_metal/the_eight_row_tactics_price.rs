@@ -150,3 +150,146 @@ fn the_eight_row_tactics_price() {
         }
     }
 }
+
+/// An 8-row verify's routed matmuls of the 35B (256 experts, top 8): the vector
+/// kernel a pair at a time against the sorted tiles, over routes that touch
+/// `distinct` experts, each of 40 layers its own experts.
+#[test]
+#[ignore = "a microbenchmark"]
+fn the_eight_row_routed_tactics_price() {
+    use kernels_metal::linear::moe::{self, RoutedScratch};
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let (experts, tokens, top_k, layers) = (256u32, 8u32, 8u32, 40u32);
+    let pairs = tokens * top_k;
+    let tactics: [(&str, &str); 6] = [
+        ("qmv", ""),
+        ("tiled8", "[kernel]\nmoe.path = \"tiled\"\nmoe.tile_rows = [{ value = 8 }]"),
+        ("tiled16", "[kernel]\nmoe.path = \"tiled\"\nmoe.tile_rows = [{ value = 16 }]"),
+        ("mpp8", "[kernel]\nmoe.path = \"mpp\"\nmoe.tile_rows = [{ value = 8 }]"),
+        ("mpp16", "[kernel]\nmoe.path = \"mpp\"\nmoe.tile_rows = [{ value = 16 }]"),
+        ("tiled8nofp16", "[kernel]\nqmm_fp16 = false\nmoe.path = \"tiled\"\nmoe.tile_rows = [{ value = 8 }]"),
+    ];
+    // gate-up (K 2048 -> N 1024 a token) and down (K 512 a pair -> N 2048)
+    for &(k, n, per_pair) in &[(2048u32, 1024u32, false), (512, 2048, true)] {
+        let groups = k / 64;
+        let columns = experts * n;
+        let bank_bytes = u64::from(k) * u64::from(columns) / 2;
+        let codes: Vec<u8> = (0..bank_bytes).map(noise).collect();
+        let scales: Vec<u8> = (0..columns * groups)
+            .flat_map(|at| bf16(0.0031 + f32::from(noise(u64::from(at) ^ 0x11)) * 0.000173))
+            .collect();
+        let biases: Vec<u8> = (0..columns * groups)
+            .flat_map(|at| bf16(-0.2 + f32::from(noise(u64::from(at) ^ 0x5678)) * 0.00157))
+            .collect();
+        let p = [upload(&codes), upload(&scales), upload(&biases)];
+        let bank = Bank {
+            mpp_codes: None,
+            codes: Tensor::new(bind(&p[0]), columns, k, Dtype::U4g64),
+            scales: Tensor::new(bind(&p[1]), columns, groups, Dtype::Bf16),
+            biases: Some(Tensor::new(bind(&p[2]), columns, groups, Dtype::Bf16)),
+            group: 64,
+            bits: 4,
+            ld: k,
+        };
+        let x_rows = if per_pair { pairs } else { tokens };
+        let inputs: Vec<u8> = (0..x_rows * k)
+            .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0xabcd)) - 127.0) * 0.0197))
+            .collect();
+        let x_b = upload(&inputs);
+        let x = Tensor::new(bind(&x_b), x_rows, k, Dtype::Bf16);
+        let y_b = upload(&vec![0u8; (pairs * n * 2) as usize]);
+        let y = Tensor::new(bind(&y_b), pairs, n, Dtype::Bf16);
+        let sorted = 1024u32;
+        let scratch_b = [
+            Buffer::zeroed(&device, u64::from(sorted) * 4).expect("perm"),
+            Buffer::zeroed(&device, u64::from(sorted) * 4).expect("row experts"),
+            Buffer::zeroed(&device, u64::from(sorted) * 4).expect("tile experts"),
+            Buffer::zeroed(&device, u64::from(pairs) * 4).expect("inverse"),
+            Buffer::zeroed(&device, u64::from(sorted) * u64::from(k) * 2).expect("sorted x"),
+            Buffer::zeroed(&device, u64::from(sorted) * u64::from(n) * 2).expect("sorted y"),
+            Buffer::zeroed(&device, u64::from(sorted) * u64::from(groups) * 4).expect("sums"),
+        ];
+        let scratch = RoutedScratch {
+            perm: Tensor::new(bind(&scratch_b[0]), 1, sorted, Dtype::I32),
+            row_expert: Tensor::new(bind(&scratch_b[1]), 1, sorted, Dtype::I32),
+            tile_expert: Tensor::new(bind(&scratch_b[2]), 1, sorted, Dtype::I32),
+            inv: Tensor::new(bind(&scratch_b[3]), 1, pairs, Dtype::I32),
+            x: Tensor::new(bind(&scratch_b[4]), sorted, k, Dtype::Bf16),
+            y: Tensor::new(bind(&scratch_b[5]), sorted, n, Dtype::Bf16),
+            sums: Tensor::new(bind(&scratch_b[6]), sorted, groups, Dtype::F32),
+        };
+        for distinct in [64u32, 40, 24] {
+            // each layer's routes: `distinct` experts of its own, each token's eight distinct
+            let mut route_b = Vec::new();
+            for l in 0..layers {
+                let base = l * 61;
+                let routes: Vec<u8> = (0..tokens)
+                    .flat_map(|t| {
+                        (0..top_k).flat_map(move |s| {
+                            let local = (t * top_k + s) % distinct;
+                            let local = if distinct >= top_k { (local / top_k) * top_k + (local + t) % top_k } else { local };
+                            (((base + local) % experts) as i32).to_le_bytes()
+                        })
+                    })
+                    .collect();
+                route_b.push(upload(&routes));
+            }
+            let routes: Vec<Tensor> = route_b
+                .iter()
+                .map(|b| Tensor::new(bind(b), tokens, top_k, Dtype::I32))
+                .collect();
+            let mut line = format!("K={k:>4} N={n:>4} distinct {distinct:>2}:");
+            for (name, overrides) in &tactics {
+                let tuning = engine_metal::chip::tuning(overrides, false);
+                let mut times = Vec::new();
+                let mut note = "";
+                for i in 0..12 {
+                    let frame = device.frame().expect("frame");
+                    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                    for r in &routes {
+                        let ran = if *name == "qmv" {
+                            moe::matmul_select_quant(&sink, x, bank, *r, y).map(|()| true)
+                        } else {
+                            moe::matmul_select_batched(
+                                &sink,
+                                "price",
+                                x,
+                                bank,
+                                None,
+                                *r,
+                                experts,
+                                scratch,
+                                y,
+                                &tuning,
+                                moe::Sorted::default(),
+                            )
+                        };
+                        match ran {
+                            Ok(true) => {}
+                            Ok(false) => note = " (unbatched)",
+                            Err(_) => note = " (refused)",
+                        }
+                    }
+                    let s = frame.commit_timed().expect("commit");
+                    if i >= 2 {
+                        times.push(s * 1e6 / f64::from(layers));
+                    }
+                }
+                times.sort_by(f64::total_cmp);
+                let us = times[times.len() / 2];
+                line += &format!("  {name} {us:.1}us{note}");
+            }
+            eprintln!("{line}");
+        }
+    }
+}
