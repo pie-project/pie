@@ -1,0 +1,7 @@
+# Retains every run some worker caches above key 0, so the gateway keeps
+# its last copy in a pool: a level-triggered retention table, written anew
+# as runs come and go.
+plane = "cluster"
+subscribe = ["copied", "dropped"]
+grants = ["retention"]
+uses = ["state.retain"]

@@ -29,6 +29,7 @@ const EDGES: &[&str] = &[
     "link-changed",
     "placement-changed",
     "replication-changed",
+    "retention-changed",
     "published",
 ];
 
