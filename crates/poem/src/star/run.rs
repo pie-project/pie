@@ -304,15 +304,15 @@ impl Package {
 
 /// Whether some rotation of `trace` turns at stated frequencies.
 fn stretched(trace: &Trace) -> bool {
-    use poem_ir::{Elementwise, Operation};
+    use poem_ir::{Elemwise, Operation};
     trace.nodes.iter().any(|node| {
         matches!(
             &node.op,
-            Operation::Elementwise(
-                Elementwise::RopeFull { freqs: Some(_), .. }
-                    | Elementwise::RopePartial { freqs: Some(_), .. }
-                    | Elementwise::RopePartialQ { freqs: Some(_), .. }
-                    | Elementwise::RopeMrope { freqs: Some(_), .. }
+            Operation::Elemwise(
+                Elemwise::RopeFull { freqs: Some(_), .. }
+                    | Elemwise::RopePartial { freqs: Some(_), .. }
+                    | Elemwise::RopePartialQ { freqs: Some(_), .. }
+                    | Elemwise::RopeMrope { freqs: Some(_), .. }
             )
         )
     })

@@ -8,7 +8,7 @@
 #include "prim/device.cuh"
 #include "prim/rope.cuh"
 
-namespace pie::attn::dsv4 {
+namespace pie::kv_rows {
 
 constexpr int kDsDim = 512;
 

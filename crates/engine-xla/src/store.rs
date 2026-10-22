@@ -861,7 +861,7 @@ impl engine::frame::Supply for Pools {
 fn compressor_spaces(trace: &Trace) -> Vec<(u32, u64)> {
     let mut spaces: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
-        let poem_ir::Operation::Attention(poem_ir::Attention::PoolGather {
+        let poem_ir::Operation::Attn(poem_ir::Attn::PoolGather {
             pages,
             head_dim,
             ratio,

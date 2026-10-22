@@ -259,7 +259,7 @@ pub fn decode(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.decode";
+    const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None,
@@ -278,7 +278,7 @@ pub fn decode_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.decode_lse";
+    const OP: &str = "attn.decode_lse";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx,
@@ -307,7 +307,7 @@ pub fn prefill(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    const OP: &str = "attn.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None,
@@ -336,7 +336,7 @@ pub fn prefill_selected_tiled(
     per_head: bool,
     o: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "attention.prefill_selected";
+    const OP: &str = "attn.prefill_selected";
     if window.is_some()
         || q.data.dtype != Dtype::Bf16
         || pool.keys.dtype != Dtype::Bf16
@@ -396,7 +396,7 @@ pub fn prefill_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    const OP: &str = "attn.prefill_lse";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx,
@@ -426,7 +426,7 @@ pub fn masked(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
+    const OP: &str = "attn.masked";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
     let Some(mask_indptr) = plan.mask_indptr else {
@@ -464,7 +464,7 @@ pub fn masked_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked_lse";
+    const OP: &str = "attn.masked_lse";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
     let Some(mask_indptr) = plan.mask_indptr else {
@@ -500,7 +500,7 @@ pub struct RelBias {
 impl RelBias {
     /// The bias as the matrix-core walks take it.
     fn walked(self, rows: u32, heads: u32) -> Result<paged::Rel, Error> {
-        const OP: &str = "attention.rel_bias";
+        const OP: &str = "attn.rel_bias";
         if self.bias.dtype != Dtype::F32
             || self.bias.ptr == 0
             || self.bias.rows != rows
@@ -535,7 +535,7 @@ pub fn decode_rel(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.decode_rel";
+    const OP: &str = "attn.decode_rel";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx,
@@ -565,7 +565,7 @@ pub fn prefill_rel(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_rel";
+    const OP: &str = "attn.prefill_rel";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx,
@@ -590,7 +590,7 @@ pub fn sink(
     sink: Tensor,
     head_dim: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.sink";
+    const OP: &str = "attn.sink";
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     // The sinks are the scores' own element, or f32 as a checkpoint keeps them.
     let s = match sink.dtype {
@@ -638,7 +638,7 @@ pub fn merge_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.merge_lse";
+    const OP: &str = "attn.merge_lse";
 
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
@@ -671,7 +671,7 @@ pub fn merge_lse(
 }
 
 pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attention.logit_softcap";
+    const OP: &str = "attn.logit_softcap";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     if cap.is_nan() || cap <= 0.0 {
         return Err(refuse(OP, format!("{cap} is not a logit soft cap")));
@@ -703,7 +703,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.kv_append";
+    const OP: &str = "attn.kv_append";
     dtype_dispatch!(OP, k.data.dtype, { Bf16 => () });
     debug_assert!(
         v.rows == k.data.rows && v.width == k.data.width && v.dtype == k.data.dtype,
@@ -719,7 +719,7 @@ pub fn kv_append_shared(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.kv_append_shared";
+    const OP: &str = "attn.kv_append_shared";
     dtype_dispatch!(OP, plane.data.dtype, { Bf16 => () });
     kv::write_kv_to_pages(
         ctx,
@@ -742,7 +742,7 @@ pub fn res_blend(
     proj: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.res_blend";
+    const OP: &str = "elemwise.res_blend";
 
     const MAX_BLOCKS: usize = 32;
 

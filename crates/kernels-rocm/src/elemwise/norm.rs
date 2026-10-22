@@ -143,16 +143,7 @@ pub fn rmsnorm(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm",
-        ABSOLUTE_BANK,
-        x,
-        weight,
-        y,
-        0,
-        eps,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", ABSOLUTE_BANK, x, weight, y, 0, eps)
 }
 
 pub fn rmsnorm_per_head(
@@ -165,7 +156,7 @@ pub fn rmsnorm_per_head(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_per_head",
+        "elemwise.rmsnorm",
         ABSOLUTE_BANK,
         x,
         weight,
@@ -182,16 +173,7 @@ pub fn rmsnorm_plus_one(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_plus_one",
-        OFFSET_BANK,
-        x,
-        weight,
-        y,
-        0,
-        eps,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", OFFSET_BANK, x, weight, y, 0, eps)
 }
 
 pub fn rmsnorm_per_head_plus_one(
@@ -204,7 +186,7 @@ pub fn rmsnorm_per_head_plus_one(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_per_head_plus_one",
+        "elemwise.rmsnorm",
         OFFSET_BANK,
         x,
         weight,
@@ -221,7 +203,7 @@ pub fn rmsnorm_no_scale(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_no_scale";
+    const OP: &str = "elemwise.rmsnorm";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let hidden = stated(
         OP,
@@ -283,7 +265,7 @@ pub fn rmsnorm_gated(
     sigmoid_gate: bool,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated";
+    const OP: &str = "elemwise.rmsnorm_gated";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert!(
         weight.is_none_or(|w| w.dtype == Dtype::F32),
@@ -357,16 +339,7 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    rmsnorm_grouped(
-        ctx,
-        "elementwise.rmsnorm_grouped_plus_one",
-        x,
-        weight,
-        group,
-        eps,
-        true,
-        y,
-    )
+    rmsnorm_grouped(ctx, "elemwise.rmsnorm", x, weight, group, eps, true, y)
 }
 
 /// Each `group`-wide run of `x`'s rows RMS-normed into `y` and scaled by
@@ -430,7 +403,7 @@ pub fn rmsnorm_gated_by(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated_by";
+    const OP: &str = "elemwise.rmsnorm_gated_by";
 
     const KDA_BLOCK_MIN: u32 = WARP;
 
@@ -480,7 +453,7 @@ pub fn rmsnorm_gated_by(
 }
 
 pub fn standardize(ctx: &Ctx, bias: Tensor, scale: Tensor, out: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.standardize";
+    const OP: &str = "elemwise.standardize";
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "rows", out.rows)?;
     let width = stated(OP, nonzero(OP, "the standardized row's width", out.width)?)?;
@@ -530,7 +503,7 @@ const LAYERNORM_UNIT: &str = "elemwise/layernorm.hip";
 const BLOCK: u32 = 256;
 
 pub fn layernorm_no_scale(ctx: &Ctx, x: Tensor, eps: f32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm_no_scale";
+    const OP: &str = "elemwise.layernorm";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;
@@ -553,7 +526,7 @@ pub fn layernorm(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm";
+    const OP: &str = "elemwise.layernorm";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;

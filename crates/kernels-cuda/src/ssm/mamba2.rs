@@ -79,7 +79,7 @@ pub fn mamba2(
     state_dim: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mamba2_step";
+    const OP: &str = "attn.mamba2_step";
     m.check(OP, xbc, dt, z, y, state_dim)?;
     f32_state(OP, state)?;
     seated(OP, state, "mamba2_step", true, false, false)?;

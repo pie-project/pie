@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ltx_2_dims::{self as model, DENOISE, Dims, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
-    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, RaggedMask,
-    Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask, Request,
+    RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
@@ -290,7 +290,7 @@ fn the_attentions_pair_as_the_architecture_says() {
         let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         let mut connector_reads = 0usize;
         for node in &plan.nodes {
-            let Operation::Attention(Attention::Ragged {
+            let Operation::Attn(Attn::Ragged {
                 q_indptr,
                 kv_indptr,
                 head_dim,
@@ -367,7 +367,7 @@ fn every_rope_is_one_ladder_across_the_row() {
         let d = dims(deployment);
         let mut seen: BTreeMap<([u32; 4], u32), usize> = BTreeMap::new();
         for node in &plan.nodes {
-            let Operation::Elementwise(Elementwise::RopeAxes {
+            let Operation::Elemwise(Elemwise::RopeAxes {
                 dims,
                 thetas,
                 form,
@@ -417,9 +417,9 @@ fn every_rope_is_one_ladder_across_the_row() {
         let no_other = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elementwise(Elementwise::RopeFull { .. })
-                    | Operation::Elementwise(Elementwise::RopePartial { .. })
-                    | Operation::Elementwise(Elementwise::RopeMrope { .. })
+                Operation::Elemwise(Elemwise::RopeFull { .. })
+                    | Operation::Elemwise(Elemwise::RopePartial { .. })
+                    | Operation::Elemwise(Elemwise::RopeMrope { .. })
             )
         });
         assert!(!no_other, "{deployment}: this text turns one kind of rope");
@@ -509,7 +509,7 @@ fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
         };
         let mut folded = 0usize;
         for node in &plan.nodes {
-            let Operation::Elementwise(Elementwise::AddBias { out, .. }) = &node.op else {
+            let Operation::Elemwise(Elemwise::AddBias { out, .. }) = &node.op else {
                 continue;
             };
             if !lane_shaped(*out) {
@@ -548,7 +548,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
         let ty = |id: ValueId| plan.values[id.0 as usize].ty.clone();
         let mut modulates = 0usize;
         for node in &plan.nodes {
-            let Operation::Elementwise(Elementwise::Modulate {
+            let Operation::Elemwise(Elemwise::Modulate {
                 x, m, lane_of_row, ..
             }) = &node.op
             else {
@@ -589,7 +589,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
         let mut gates = 0usize;
         for node in &plan.nodes {
             match &node.op {
-                Operation::Elementwise(Elementwise::GatedResidualAdd { .. }) => {
+                Operation::Elemwise(Elemwise::GatedResidualAdd { .. }) => {
                     let mut pairs = Vec::new();
                     node.op.aliases(&mut pairs);
                     assert_eq!(
@@ -598,10 +598,8 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
                         "{deployment}: a gated fold is in place on its residual"
                     );
                 }
-                Operation::Elementwise(Elementwise::GateSigmoidMulHeads {
-                    head_dim,
-                    scale,
-                    ..
+                Operation::Elemwise(Elemwise::GateSigmoidMulHeads {
+                    head_dim, scale, ..
                 }) => {
                     gates += 1;
                     assert_eq!(

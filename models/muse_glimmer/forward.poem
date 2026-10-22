@@ -71,7 +71,7 @@ def forward(m, inputs):
             y,
         )
         mlp_in = ops.elemwise.rmsnorm_plus_one(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
-        act = ops.linear.mlp_swiglu(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
+        act = ops.linear.swiglu(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
         f = ops.linear.matmul(act, w.down)
         return ops.elemwise.residual_add(
             ops.elemwise.rmsnorm_plus_one(f, w.post_ffw_norm, w.post_ffw_norm_eps),

@@ -131,7 +131,7 @@ pub fn latents(
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents";
+    const OP: &str = "attn.mla_latents";
     debug_assert_eq!(
         kv_c.width, kv_lora_rank,
         "the latent output is the stated rank wide"
@@ -152,7 +152,7 @@ pub fn latents_rope(
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents_rope";
+    const OP: &str = "attn.mla_latents_rope";
     dtype_dispatch!(OP, kv_a.dtype, { Bf16 => () });
     debug_assert_eq!(
         kv_c.width, kv_lora_rank,
@@ -179,7 +179,7 @@ pub fn split_q_b(
     q_nope: &mut Tensor,
     q_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_split_q_b";
+    const OP: &str = "attn.mla_split_q_b";
     let t = dtype_dispatch!(OP, q_b.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = count(OP, "the head count this cut states", heads)?;
     let nope = stated(OP, nope_dim)?;
@@ -225,7 +225,7 @@ pub fn absorb_q(
     v_head_dim: u32,
     q_latent: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_q";
+    const OP: &str = "attn.mla_absorb_q";
     dtype_dispatch!(OP, q_nope.dtype, { Bf16 => () });
     if q_nope.rows <= ctx.tuning().mla_absorb_q_until {
         return absorb_native(
@@ -288,7 +288,7 @@ pub fn absorb_out(
     nope_dim: u32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_out";
+    const OP: &str = "attn.mla_absorb_out";
     dtype_dispatch!(OP, latent.dtype, { Bf16 => () });
     let t = ctx.tuning();
     if (t.mla_absorb_out_from..=t.mla_absorb_out_until).contains(&latent.rows) {
@@ -460,7 +460,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_kv_append";
+    const OP: &str = "attn.mla_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, kv_c.data.dtype, { Bf16 => () });
     debug_assert_eq!(
@@ -1085,7 +1085,7 @@ pub fn attention_decode(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_decode";
+    const OP: &str = "attn.mla_decode";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
@@ -1110,7 +1110,7 @@ pub fn attention_prefill(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_prefill";
+    const OP: &str = "attn.mla_prefill";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
@@ -1236,7 +1236,7 @@ pub fn attention_decode_selected(
     let _ = plan;
     selected(
         ctx,
-        "attention.mla_decode_selected",
+        "attn.mla_decode_selected",
         q,
         q_pe,
         selection,
@@ -1267,7 +1267,7 @@ pub fn attention_prefill_selected(
     let _ = plan;
     selected(
         ctx,
-        "attention.mla_prefill_selected",
+        "attn.mla_prefill_selected",
         q,
         q_pe,
         selection,

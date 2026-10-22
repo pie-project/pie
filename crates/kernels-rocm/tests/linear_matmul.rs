@@ -136,7 +136,7 @@ fn the_fused_swiglu_is_the_matmul_then_the_swiglu() {
         let mut packed = gpu.zeros(m, 2 * i, Dtype::Bf16);
         gemm::matmul(&ctx, at, wt, &mut packed).unwrap();
         let mut h2 = gpu.zeros(m, i, Dtype::Bf16);
-        kernels_rocm::linear::mlp::swiglu(&ctx, packed, i, 1, &mut h2).unwrap();
+        kernels_rocm::linear::glu::swiglu(&ctx, packed, i, 1, &mut h2).unwrap();
         let (got, want) = (gpu.read(&h), gpu.read(&h2));
         let diff = got
             .iter()
@@ -205,7 +205,7 @@ fn the_batch_engine_projection() {
         let mut packed = gpu.zeros(m, 2 * i, Dtype::Bf16);
         gemm::matmul(&ctx, at, wt, &mut packed).unwrap();
         let mut h2 = gpu.zeros(m, i, Dtype::Bf16);
-        kernels_rocm::linear::mlp::swiglu(&ctx, packed, i, 1, &mut h2).unwrap();
+        kernels_rocm::linear::glu::swiglu(&ctx, packed, i, 1, &mut h2).unwrap();
         let (got, want) = (gpu.read(&h), gpu.read(&h2));
         let diff = got
             .iter()
@@ -266,7 +266,7 @@ fn the_turned_projection() {
             "turned {m}x{i}x{k} fused"
         );
         let mut h2 = gpu.zeros(m, i, Dtype::Bf16);
-        kernels_rocm::linear::mlp::swiglu(&ctx, y, i, 1, &mut h2).unwrap();
+        kernels_rocm::linear::glu::swiglu(&ctx, y, i, 1, &mut h2).unwrap();
         let diff = gpu
             .read(&h)
             .iter()

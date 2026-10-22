@@ -76,7 +76,7 @@ pub fn boundary_decode(
     boundary_req: &mut Tensor,
     boundary_rope: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_boundary_decode";
+    const OP: &str = "attn.pool_boundary_decode";
     boundary_tables(OP, boundary_pos, boundary_req);
     boundary_rope_table(OP, boundary_pos, boundary_rope);
     let ratio = pooling_ratio(OP, ratio)?;
@@ -107,7 +107,7 @@ pub fn boundary_prefill(
     boundary_req: &mut Tensor,
     boundary_rope: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_boundary_prefill";
+    const OP: &str = "attn.pool_boundary_prefill";
     boundary_tables(OP, boundary_pos, boundary_req);
     boundary_rope_table(OP, boundary_pos, boundary_rope);
     let ratio = pooling_ratio(OP, ratio)?;
@@ -144,7 +144,7 @@ pub fn state_write(
     state_kv: Tensor,
     state_score: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_state_write";
+    const OP: &str = "attn.pool_state_write";
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
     let ratio = pooling_ratio(OP, ratio)?;
     let head_dim = count(OP, "the head width this compressor states", head_dim)?;
@@ -197,7 +197,7 @@ pub fn gather(
     ape: Tensor,
     entries: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_gather";
+    const OP: &str = "attn.pool_gather";
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
     boundary_tables(OP, &boundary_pos, &boundary_req);
     if entries.width != head_dim {
@@ -332,7 +332,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
     boundary_tables(OP, &boundary_pos, &boundary_req);
@@ -371,7 +371,7 @@ pub fn attention_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_lse";
+    const OP: &str = "attn.pool_lse";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(
         lse.dtype,
@@ -457,7 +457,7 @@ pub fn attention_lse_selected(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_lse_selected";
+    const OP: &str = "attn.pool_lse_selected";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(
         lse.dtype,
@@ -467,7 +467,7 @@ pub fn attention_lse_selected(
     debug_assert_eq!(
         selection.dtype,
         Dtype::I32,
-        "`{OP}` walks the i32 compressed-row ids `attention.index_topk` published"
+        "`{OP}` walks the i32 compressed-row ids `attn.index_topk` published"
     );
     debug_assert_eq!(
         request_of_token.dtype,
@@ -631,7 +631,7 @@ fn pool_mma(
 /// (`pool_compress`): the gather `gather` fires, the entry's RMS norm times
 /// `weight`, its tail rotated forward (interleaved) at `rope_pos`, and the
 /// rotated entry written into `out` as `kv_append` (or, an fp8 pool,
-/// `dsv4::store_entries`) writes it. Whether it fired: only under
+/// `compressed::store_entries`) writes it. Whether it fired: only under
 /// `kernel.elemwise.rows_vec`, for the shapes the one pass is built for;
 /// nothing is fired where it did not.
 #[allow(clippy::too_many_arguments)]
@@ -655,7 +655,7 @@ pub fn compress(
     out: &KvPool,
     state: Option<StateRows>,
 ) -> Result<bool, Error> {
-    const OP: &str = "attention.pool_compress";
+    const OP: &str = "fused.pool_compress";
     // V4's fp8 rows, or a bf16 pool; either a row a position or compact.
     let fp8 = crate::attn::compressed::decode::rows_packed(out)
         .is_some_and(|(rows, _)| rows == crate::attn::compressed::decode::Rows::Ds);

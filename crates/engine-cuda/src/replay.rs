@@ -5,7 +5,7 @@
 //! the step with each prompt cut to its last window.
 
 use engine::fire::{Readout, RsReset, RsVerb, Step};
-use poem_ir::{Attention, Fact, Fused, Operation, Request};
+use poem_ir::{Attn, Fact, Fused, Operation, Request};
 
 use crate::serve::Shell;
 
@@ -19,10 +19,10 @@ pub struct Replay {
 
 impl Replay {
     /// The load's replay, where its profile turns it on
-    /// (`kernel.sdpa.dsv4_replay`) and its trace reads the floor.
+    /// (`kernel.sdpa.compressed_replay`) and its trace reads the floor.
     #[must_use]
     pub fn of(shell: &Shell) -> Option<Replay> {
-        if !shell.tuning().dsv4_replay {
+        if !shell.tuning().compressed_replay {
             return None;
         }
         Replay::in_trace(shell.trace())
@@ -37,8 +37,8 @@ impl Replay {
             .table
             .iter()
             .position(|fact| *fact == Fact::Flag(Request::ENCODE.to_string()))?;
-        let floored = |attn: &Attention| match attn {
-            Attention::PrefillLse {
+        let floored = |attn: &Attn| match attn {
+            Attn::PrefillLse {
                 floor: Some(_),
                 window,
                 ..
@@ -46,7 +46,7 @@ impl Replay {
             _ => None,
         };
         let window = trace.nodes.iter().find_map(|node| match &node.op {
-            Operation::Attention(attn) => floored(attn),
+            Operation::Attn(attn) => floored(attn),
             Operation::Fused(Fused::PoolAttention { window, .. }) => floored(window),
             _ => None,
         })?;

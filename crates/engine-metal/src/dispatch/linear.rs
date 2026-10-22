@@ -58,7 +58,7 @@ impl Run<'_> {
                             table,
                             counters,
                         )?,
-                        None => self.linear(&Linear::MlpSwiglu {
+                        None => self.linear(&Linear::Swiglu {
                             packed: *packed,
                             intermediate: *intermediate,
                             y: *h,
@@ -473,7 +473,7 @@ impl Run<'_> {
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
-            Linear::MlpRelu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            Linear::Relu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y }
                 if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() =>
             {
@@ -551,7 +551,7 @@ impl Run<'_> {
                 ),
             },
 
-            Linear::MlpSwiglu {
+            Linear::Swiglu {
                 packed,
                 intermediate,
                 y,
@@ -586,7 +586,7 @@ impl Run<'_> {
                     }
                 }
             },
-            Linear::MlpSwigluClamp {
+            Linear::SwigluClamp {
                 packed,
                 intermediate,
                 limit,
@@ -598,7 +598,7 @@ impl Run<'_> {
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::MlpSwigluClampAlpha {
+            Linear::SwigluClampAlpha {
                 packed,
                 intermediate,
                 limit,
@@ -623,20 +623,20 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+            Linear::SwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::MlpGegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
+            Linear::GegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 self.tensor(*y),
             ),
-            Linear::MlpGeluTanh { x, y } => {
+            Linear::GeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
             // A product that quantizes its activations runs only on CUDA's
@@ -645,10 +645,10 @@ impl Run<'_> {
             | Linear::MoeTopkSigmoidSink { .. }
             | Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
-            | Linear::MlpSwigluClampSplitRouted { .. }
-            | Linear::MlpSwigluClampRouted { .. }
+            | Linear::SwigluClampSplitRouted { .. }
+            | Linear::SwigluClampRouted { .. }
             | Linear::MoeSumAdd { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            Linear::MlpGegluTanhPacked {
+            Linear::GegluTanhPacked {
                 packed,
                 intermediate,
                 y,
@@ -678,7 +678,7 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Linear::MlpSitu {
+            Linear::Situ {
                 packed,
                 intermediate,
                 beta,

@@ -66,7 +66,7 @@ pub fn prefill(
     o: Tensor,
     _requests: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let c = call(
         OP,
@@ -95,7 +95,7 @@ pub fn prefill_lse(
     lse: Tensor,
     _requests: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    const OP: &str = "attn.prefill_lse";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let c = call(
         OP,
@@ -128,7 +128,7 @@ pub fn masked(
     o: Tensor,
     _requests: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
+    const OP: &str = "attn.masked";
     u8_mask(OP, mask)?;
     let tables = Tables::prefill(plan).with_mask(mask);
     let c = call(OP, q, tables, window, causal, head_dim, sm_scale, o, None);
@@ -149,7 +149,7 @@ pub fn masked_lse(
     lse: Tensor,
     _requests: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked_lse";
+    const OP: &str = "attn.masked_lse";
     u8_mask(OP, mask)?;
     let tables = Tables::prefill(plan).with_mask(mask);
     let c = call(

@@ -5,6 +5,7 @@ use kernels_metal::{
 };
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use poem_ir::{NormAxis, NormWeight};
 
 use crate::device::Handles;
 use crate::dispatch::copy::CopyPlan;
@@ -366,17 +367,17 @@ impl<'c> Run<'c> {
         head_dim: u32,
         eps: f32,
     ) -> Option<(ValueId, ValueId, ValueId)> {
-        use poem_ir::{Elementwise, Operation};
+        use poem_ir::{Elemwise, Operation};
         let (nodes, _) = self.region_nodes()?;
         let at = self.readers_of(x).iter().copied().find(|&at| {
             matches!(&self.nodes.get(at as usize).map(|n| &n.op),
-                Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne { x: a, y: b, .. }))
+                Some(Operation::Elemwise(Elemwise::Rmsnorm { x: a, y: b, weight: NormWeight::PlusOne(_), axis: NormAxis::Head(_), .. }))
                     if *a == x && *b == y)
         })?;
-        let Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne {
+        let Some(Operation::Elemwise(Elemwise::Rmsnorm {
             x: x2,
-            weight: w2,
-            head_dim: d2,
+            weight: NormWeight::PlusOne(w2),
+            axis: NormAxis::Head(d2),
             eps: e2,
             y: y2,
         })) = self.nodes.get(at as usize + 1).map(|n| &n.op)
@@ -489,13 +490,13 @@ impl<'c> Run<'c> {
         self.chain.set(None);
         let (packed, hidden) = match self.sole_reader(y).map(|n| &n.op) {
             Some(Operation::Linear(
-                Linear::MlpSwiglu {
+                Linear::Swiglu {
                     packed, y: hidden, ..
                 }
-                | Linear::MlpSwigluClampAlpha {
+                | Linear::SwigluClampAlpha {
                     packed, y: hidden, ..
                 }
-                | Linear::MlpGegluTanhPacked {
+                | Linear::GegluTanhPacked {
                     packed, y: hidden, ..
                 },
             )) => (packed, hidden),

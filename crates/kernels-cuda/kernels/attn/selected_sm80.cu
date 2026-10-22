@@ -102,10 +102,7 @@ __global__ void sdpa_paged_selected_kernel(
         for (int i = 0; i < per; ++i) {
             pd += qreg[i] * Elem<T>::to_f32(kj[lane + i * 32]);
         }
-        #pragma unroll
-        for (int sh = 16; sh > 0; sh >>= 1) {
-            pd += __shfl_xor_sync(0xffffffffu, pd, sh);
-        }
+        pd = ::pie::warp_sum(pd);
         const float m_new = fmaxf(m, pd);
         const float corr = __expf(m - m_new);
         const float p = __expf(pd - m_new);

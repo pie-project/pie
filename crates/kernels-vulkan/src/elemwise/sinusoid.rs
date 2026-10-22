@@ -17,7 +17,7 @@ pub fn sinusoid(
     scale: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.sinusoid";
+    const OP: &str = "elemwise.sinusoid";
     if t.dtype != Dtype::F32 || y.dtype != Dtype::F32 {
         return Err(refuse(
             OP,

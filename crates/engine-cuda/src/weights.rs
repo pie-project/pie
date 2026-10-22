@@ -1089,7 +1089,7 @@ impl Weights {
             {
                 continue;
             }
-            let atom_bytes = kernels_cuda::linear::tc5::atom_bytes(rows, k, 128);
+            let atom_bytes = kernels_cuda::linear::gemm_sm100::atom_bytes(rows, k, 128);
             let staged = Buffer::zeroed(rows * k + atom_bytes)?;
             kernels_cuda::linear::moe::quantize_fp8b128(
                 &ctx,
@@ -1697,7 +1697,7 @@ fn lay_atoms(
     // Where there are no tcgen05 GEMMs its products read bf16 activations
     // (W4A16, W8A16), and its 4-bit banks keep their row-major scales for
     // the selects that read them so.
-    if !kernels_cuda::linear::tc5::supported() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
         return Ok(());
     }
     let mut temp: Option<Buffer> = None;
@@ -1814,7 +1814,8 @@ fn lay_tile_banks(
             continue;
         }
         let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
-        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, gran as usize);
+        let bytes =
+            kernels_cuda::linear::gemm_sm100::atom_bytes(rows as usize, k as usize, gran as usize);
         let laid = Buffer::zeroed(bytes)?;
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
@@ -1923,7 +1924,7 @@ fn lay_block_atoms(
         };
         let (rows, cols) = (n, k.div_ceil(block));
         let bytes =
-            kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, block as usize);
+            kernels_cuda::linear::gemm_sm100::atom_bytes(rows as usize, k as usize, block as usize);
         let atoms = Buffer::zeroed(bytes)?;
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };

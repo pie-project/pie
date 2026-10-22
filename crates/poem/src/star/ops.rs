@@ -1715,7 +1715,7 @@ pub(crate) static OPS: &[Op] = &[
             let sm_scale: f32 = a.next()?;
             result(
                 heap,
-                dsl("attention.voxel", || {
+                dsl("attn.voxel", || {
                     ops::attn::voxel(&q, &k, &v, &grid, sm_scale)
                 })?,
             )
@@ -3349,22 +3349,22 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu",
+        name: "swiglu",
         params: &["packed", "intermediate"],
         call: |a, heap| {
             let packed: Value = a.next()?;
             let intermediate: u32 = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_swiglu", || {
-                    ops::linear::mlp_swiglu(&packed, intermediate)
+                dsl("linear.swiglu", || {
+                    ops::linear::swiglu(&packed, intermediate)
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu_clamp",
+        name: "swiglu_clamp",
         params: &["packed", "intermediate", "limit"],
         call: |a, heap| {
             let packed: Value = a.next()?;
@@ -3372,15 +3372,15 @@ pub(crate) static OPS: &[Op] = &[
             let limit: f32 = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_swiglu_clamp", || {
-                    ops::linear::mlp_swiglu_clamp(&packed, intermediate, limit)
+                dsl("linear.swiglu_clamp", || {
+                    ops::linear::swiglu_clamp(&packed, intermediate, limit)
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu_clamp_alpha",
+        name: "swiglu_clamp_alpha",
         params: &["packed", "intermediate", "limit", "alpha"],
         call: |a, heap| {
             let packed: Value = a.next()?;
@@ -3389,15 +3389,15 @@ pub(crate) static OPS: &[Op] = &[
             let alpha: f32 = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_swiglu_clamp_alpha", || {
-                    ops::linear::mlp_swiglu_clamp_alpha(&packed, intermediate, limit, alpha)
+                dsl("linear.swiglu_clamp_alpha", || {
+                    ops::linear::swiglu_clamp_alpha(&packed, intermediate, limit, alpha)
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu_clamp_split",
+        name: "swiglu_clamp_split",
         params: &["gate", "up", "limit"],
         call: |a, heap| {
             let gate: Value = a.next()?;
@@ -3405,15 +3405,15 @@ pub(crate) static OPS: &[Op] = &[
             let limit: f32 = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_swiglu_clamp_split", || {
-                    ops::linear::mlp_swiglu_clamp_split(&gate, &up, limit)
+                dsl("linear.swiglu_clamp_split", || {
+                    ops::linear::swiglu_clamp_split(&gate, &up, limit)
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu_clamp_split_routed",
+        name: "swiglu_clamp_split_routed",
         params: &["gate", "up", "weights", "limit"],
         call: |a, heap| {
             let gate: Value = a.next()?;
@@ -3422,15 +3422,15 @@ pub(crate) static OPS: &[Op] = &[
             let limit: f32 = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_swiglu_clamp_split_routed", || {
-                    ops::linear::mlp_swiglu_clamp_split_routed(&gate, &up, &weights, limit)
+                dsl("linear.swiglu_clamp_split_routed", || {
+                    ops::linear::swiglu_clamp_split_routed(&gate, &up, &weights, limit)
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu_clamp_routed",
+        name: "swiglu_clamp_routed",
         params: &["packed", "intermediate", "weights", "limit"],
         call: |a, heap| {
             let packed: Value = a.next()?;
@@ -3439,69 +3439,64 @@ pub(crate) static OPS: &[Op] = &[
             let limit: f32 = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_swiglu_clamp_routed", || {
-                    ops::linear::mlp_swiglu_clamp_routed(&packed, intermediate, &weights, limit)
+                dsl("linear.swiglu_clamp_routed", || {
+                    ops::linear::swiglu_clamp_routed(&packed, intermediate, &weights, limit)
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_geglu_tanh",
+        name: "geglu_tanh",
         params: &["gate", "up"],
         call: |a, heap| {
             let gate: Value = a.next()?;
             let up: Value = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_geglu_tanh", || {
-                    ops::linear::mlp_geglu_tanh(&gate, &up)
-                })?,
+                dsl("linear.geglu_tanh", || ops::linear::geglu_tanh(&gate, &up))?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_gelu_tanh",
+        name: "gelu_tanh",
         params: &["x"],
         call: |a, heap| {
             let x: Value = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_gelu_tanh", || ops::linear::mlp_gelu_tanh(&x))?,
+                dsl("linear.gelu_tanh", || ops::linear::gelu_tanh(&x))?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_relu2",
+        name: "relu2",
         params: &["x"],
         call: |a, heap| {
             let x: Value = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_relu2", || ops::linear::mlp_relu2(&x))?,
-            )
+            result(heap, dsl("linear.relu2", || ops::linear::relu2(&x))?)
         },
     },
     Op {
         module: "linear",
-        name: "mlp_geglu_tanh_packed",
+        name: "geglu_tanh_packed",
         params: &["packed", "intermediate"],
         call: |a, heap| {
             let packed: Value = a.next()?;
             let intermediate: u32 = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_geglu_tanh_packed", || {
-                    ops::linear::mlp_geglu_tanh_packed(&packed, intermediate)
+                dsl("linear.geglu_tanh_packed", || {
+                    ops::linear::geglu_tanh_packed(&packed, intermediate)
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_situ",
+        name: "situ",
         params: &["packed", "intermediate", "beta", "up_cap"],
         call: |a, heap| {
             let packed: Value = a.next()?;
@@ -3510,8 +3505,8 @@ pub(crate) static OPS: &[Op] = &[
             let up_cap: Option<f32> = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_situ", || {
-                    ops::linear::mlp_situ(&packed, intermediate, beta, up_cap)
+                dsl("linear.situ", || {
+                    ops::linear::situ(&packed, intermediate, beta, up_cap)
                 })?,
             )
         },

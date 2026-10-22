@@ -28,7 +28,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     widths: [u32; 2],
     q: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
+    const OP: &str = "fused.qkv_fused_qknorm_rope_vnorm_write";
 
     // The `_warp` entry runs one wavefront of 64 lanes per head, a block of
     // them over one row's heads; a row's rotation is computed once a block.
@@ -259,7 +259,7 @@ pub fn q_gate_k_norm_rope_append(
     gate: &mut Tensor,
     q_split: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "attention.q_gate_k_norm_rope_append";
+    const OP: &str = "fused.q_gate_norm_rope_append";
     const WAVES: u32 = 4;
     let covered = matches!(head_dim, 64 | 128 | 256 | 512)
         && qg.dtype == Dtype::Bf16

@@ -87,7 +87,7 @@ def forward(m, inputs):
             m.vocab,
         ) * root
         normed = ops.elemwise.rmsnorm(soft, sc.pre_norm, sc.norm_eps)
-        act = ops.linear.mlp_geglu_tanh_packed(ops.linear.matmul(normed, sc.gate_up), sc.inter)
+        act = ops.linear.geglu_tanh_packed(ops.linear.matmul(normed, sc.gate_up), sc.inter)
         signal = ops.linear.matmul(act, sc.down)
         den = ops.elemwise.rmsnorm_no_scale(ops.elemwise.residual_add(den, signal), m.hidden, sc.norm_eps)
         y = merge([den, enc])
@@ -177,7 +177,7 @@ def forward(m, inputs):
 
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
-        act = ops.linear.mlp_geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
+        act = ops.linear.geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
         f = ops.linear.matmul(act, w.down)
         if w.moe != None:
             x = w.moe
@@ -189,7 +189,7 @@ def forward(m, inputs):
                 x.top_k,
             )
             moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
-            hidden = ops.linear.mlp_geglu_tanh_packed(select(moe_in, x.gate_up, experts, x.top_k), x.inter)
+            hidden = ops.linear.geglu_tanh_packed(select(moe_in, x.gate_up, experts, x.top_k), x.inter)
             routed = ops.linear.moe_weighted_sum(select(hidden, x.down, experts, x.top_k), weights)
             h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
             f = ops.elemwise.residual_add(h1, h2)
@@ -201,7 +201,7 @@ def forward(m, inputs):
             layer_ids, layer_relay = (ro.ids, ro.relay) if readouts else (ids, relay)
             table = ops.gather.embed(layer_ids, lp.table, m.vocab) * f32(sqrt(ple.dim))
             mixed = ops.elemwise.residual_add(table, ops.gather.select(layer_relay, l, ple.dim)) * FRAC_1_SQRT_2
-            gated = ops.linear.mlp_geglu_tanh(ops.linear.matmul(y, lp.gate), mixed)
+            gated = ops.linear.geglu_tanh(ops.linear.matmul(y, lp.gate), mixed)
             out = ops.linear.matmul(gated, lp.proj)
             out = ops.elemwise.rmsnorm(out, lp.norm, lp.norm_eps)
             y = ops.elemwise.scale(lp.scalar, ops.elemwise.residual_add(out, y))
@@ -264,7 +264,7 @@ def eagle_draft(m, inputs, x, logits, root):
     o = ops.linear.matmul(o, a.o_proj)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, a.post_attn_norm, a.norm_eps), dy)
     mlp_in = ops.elemwise.rmsnorm(dy, a.pre_ffw_norm, a.norm_eps)
-    act = ops.linear.mlp_geglu_tanh_packed(ops.linear.matmul(mlp_in, a.gate_up), a.inter)
+    act = ops.linear.geglu_tanh_packed(ops.linear.matmul(mlp_in, a.gate_up), a.inter)
     f = ops.linear.matmul(act, a.down)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, a.post_ffw_norm, a.norm_eps), dy)
 
@@ -295,7 +295,7 @@ def assistant_draft(m, inputs, positions, x, logits, root):
         o = ops.linear.matmul(o, w.o_proj)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, a.norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, a.norm_eps)
-        act = ops.linear.mlp_geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
+        act = ops.linear.geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
         f = ops.linear.matmul(act, w.down)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
         y = ops.elemwise.scale(w.scalar, y)
@@ -331,7 +331,7 @@ def tower(inputs, t):
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(clipped(o, b.o), b.post_attn_norm, t.norm_eps), y)
 
         n = ops.elemwise.rmsnorm(y, b.pre_ffw_norm, t.norm_eps)
-        act = ops.linear.mlp_geglu_tanh(clipped(n, b.gate), clipped(n, b.up))
+        act = ops.linear.geglu_tanh(clipped(n, b.gate), clipped(n, b.up))
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(clipped(act, b.down), b.post_ffw_norm, t.norm_eps), y)
 
     pooled = ops.gather.pool_rows(y, t.pool) * f32(sqrt(t.hidden))

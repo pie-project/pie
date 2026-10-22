@@ -132,8 +132,7 @@ __global__ void kda_qkv_prep_heads(
         const float x = Elem<ElemT>::to_f32(src[d]);
         acc += x * x;
     }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    acc = ::pie::warp_sum(acc);
     const float q_scale = (plane == 0) ? rsqrtf(static_cast<float>(head_dim)) : 1.f;
     const float inv = rsqrtf(acc + eps);
     for (int d = lane; d < head_dim; d += 32) dst[d] = Elem<ElemT>::to_f32(src[d]) * inv * q_scale;
@@ -179,10 +178,7 @@ __global__ void kda_qkv_prep(
                 const float x = Elem<ElemT>::to_f32(src[h * head_dim + d]);
                 acc += x * x;
             }
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                acc += __shfl_xor_sync(0xffffffffu, acc, off);
-            }
+            acc = ::pie::warp_sum(acc);
             if (lane == 0) sums[h] = acc;
         }
     }
@@ -272,10 +268,7 @@ __global__ void kda_step_fused(
             const float x = Elem<ElemT>::to_f32(src[d]);
             acc += x * x;
         }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            acc += __shfl_xor_sync(0xffffffffu, acc, off);
-        }
+        acc = ::pie::warp_sum(acc);
         if (lane == 0) norms[warp] = acc;
     }
     if (threadIdx.x == 0) {

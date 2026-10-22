@@ -1,4 +1,4 @@
-use poem::{Attention, Operation, Platform, seam};
+use poem::{Attn, Operation, Platform, seam};
 
 const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -12,8 +12,8 @@ fn count(trace: &poem::Trace, wanted: impl Fn(&Operation) -> bool) -> usize {
 }
 
 // A gpt-oss attention layer folds its sink into every arm, so the masked arm
-// needs the log-sum-exp the plain `attention.masked` never returns; this is
-// why the family went without one. Each layer now reads `attention.masked_lse`
+// needs the log-sum-exp the plain `attn.masked` never returns; this is
+// why the family went without one. Each layer now reads `attn.masked_lse`
 // once, and the full-attention layers export their prefill scores for the
 // eviction programs (`attn_score`).
 #[test]
@@ -26,17 +26,14 @@ fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
         for platform in PLATFORMS {
             let trace = row.trace(platform);
             let sinks = count(&trace, |op| {
-                matches!(op, Operation::Attention(Attention::Sink { .. }))
+                matches!(op, Operation::Attn(Attn::Sink { .. }))
             });
             let masked = count(&trace, |op| {
-                matches!(
-                    op,
-                    Operation::Attention(Attention::MaskedLse { causal: true, .. })
-                )
+                matches!(op, Operation::Attn(Attn::MaskedLse { causal: true, .. }))
             });
             assert!(
                 masked > 0 && sinks == 4 * masked,
-                "{} on {platform:?}: {masked} causal `attention.masked_lse` arm(s) against \
+                "{} on {platform:?}: {masked} causal `attn.masked_lse` arm(s) against \
                  {sinks} sink(s); every layer has four sunk arms (masked, scored, decode, \
                  prefill)",
                 row.name

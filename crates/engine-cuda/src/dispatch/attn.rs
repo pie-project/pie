@@ -6,9 +6,9 @@ use kernels_cuda::attn::fa2;
 use kernels_cuda::attn::paged;
 use kernels_cuda::attn::voxel;
 use kernels_cuda::attn::{self, index, mla, plan, selected};
-use poem_exec::{DispatchAttention, KernelError};
+use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::VoxelSegment;
-use poem_ir::{Attention, IndexScore, Operation, StructKind};
+use poem_ir::{Attn, IndexScore, Operation, StructKind};
 
 use crate::run::{Run, StructSlot};
 
@@ -19,8 +19,8 @@ fn segment(segment: VoxelSegment) -> voxel::Segment {
     }
 }
 
-impl DispatchAttention for Run<'_> {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+impl DispatchAttn for Run<'_> {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.attention(op).map_err(crate::error::kernel)
     }
 }
@@ -67,9 +67,9 @@ impl Run<'_> {
         )
     }
 
-    pub(super) fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {
+    pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
-            Attention::Voxel {
+            Attn::Voxel {
                 q,
                 k,
                 v,
@@ -87,7 +87,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            Attention::PlanDecode {
+            Attn::PlanDecode {
                 kv_indptr,
                 kv_indices: _,
                 last_page_len: _,
@@ -140,7 +140,7 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
             }
-            Attention::PlanPrefill {
+            Attn::PlanPrefill {
                 kv_indptr,
                 kv_indices: _,
                 last_page_len: _,
@@ -201,7 +201,7 @@ impl Run<'_> {
                             StructSlot::Prefill(built)
                         }
                         other => panic!(
-                            "`attention.plan_prefill` defines a {other:?}, which is no \
+                            "`attn.plan_prefill` defines a {other:?}, which is no \
                              prefill plan kind"
                         ),
                     }
@@ -209,7 +209,7 @@ impl Run<'_> {
                 self.put(*plan, built);
                 Ok(())
             }
-            Attention::Decode {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -227,7 +227,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            Attention::DecodeSelected {
+            Attn::DecodeSelected {
                 q,
                 plan: _,
                 selection,
@@ -250,7 +250,7 @@ impl Run<'_> {
                 *per_head,
                 &mut self.tensor(*o),
             ),
-            Attention::PrefillSelected {
+            Attn::PrefillSelected {
                 q,
                 plan,
                 selection,
@@ -301,7 +301,7 @@ impl Run<'_> {
                     &mut self.tensor(*o),
                 )
             }
-            Attention::DecodeRel {
+            Attn::DecodeRel {
                 q,
                 plan,
                 cache,
@@ -329,7 +329,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            Attention::PrefillRel {
+            Attn::PrefillRel {
                 q,
                 plan,
                 cache,
@@ -359,7 +359,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            Attention::Prefill {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -379,7 +379,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            Attention::Masked {
+            Attn::Masked {
                 kv_heads: _,
                 causal: _,
                 q,
@@ -401,7 +401,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            Attention::MaskedLse {
+            Attn::MaskedLse {
                 kv_heads: _,
                 causal: _,
                 q,
@@ -425,7 +425,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attention::Dense {
+            Attn::Dense {
                 q,
                 k,
                 v,
@@ -443,7 +443,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            Attention::DecodeLse {
+            Attn::DecodeLse {
                 q,
                 plan,
                 cache,
@@ -463,7 +463,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attention::PrefillLse {
+            Attn::PrefillLse {
                 q,
                 plan,
                 cache,
@@ -477,19 +477,19 @@ impl Run<'_> {
             } => {
                 // A floor stays 0 unless the profile turns bounded replay on;
                 // then only the fused kernels read it.
-                if floor.is_some() && self.ctx().tuning().dsv4_replay {
+                if floor.is_some() && self.ctx().tuning().compressed_replay {
                     return Err(kernels_cuda::Error::Backend {
-                        op: "attention.prefill_lse",
+                        op: "attn.prefill_lse",
                         detail: "the window is held above a replay floor, which only the fused \
-                                 `attention.pool_attention` reads"
+                                 `fused.pool_attention` reads"
                             .to_string(),
                     });
                 }
                 if attn::compressed::decode::ds_rows(&self.pool(*cache)) {
                     return Err(kernels_cuda::Error::Backend {
-                        op: "attention.prefill_lse",
+                        op: "attn.prefill_lse",
                         detail: "the cache holds DeepSeek's quantized rows, which only the fused \
-                                 `attention.pool_attention` and `attention.lse_sink` read"
+                                 `fused.pool_attention` and `fused.lse_sink` read"
                             .to_string(),
                     });
                 }
@@ -509,7 +509,7 @@ impl Run<'_> {
                     *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
                 )
             }
-            Attention::Sink {
+            Attn::Sink {
                 o,
                 lse,
                 sink,
@@ -522,7 +522,7 @@ impl Run<'_> {
                 self.tensor(*sink),
                 *head_dim,
             ),
-            Attention::MergeLse {
+            Attn::MergeLse {
                 o1,
                 lse1,
                 o2,
@@ -542,10 +542,10 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attention::LogitSoftcap { x, cap, x_out: _ } => {
+            Attn::LogitSoftcap { x, cap, x_out: _ } => {
                 attn::logit_softcap(self.ctx(), &mut self.tensor(*x), *cap)
             }
-            Attention::KvAppend {
+            Attn::KvAppend {
                 k,
                 v,
                 cache,
@@ -559,7 +559,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::KvAppendShared {
+            Attn::KvAppendShared {
                 plane,
                 cache,
                 write_page,
@@ -585,7 +585,7 @@ impl Run<'_> {
                     )
                 }
             }
-            Attention::MlaPlan {
+            Attn::MlaPlan {
                 kv_indptr,
                 kv_indices: _,
                 last_page_len: _,
@@ -617,9 +617,9 @@ impl Run<'_> {
                 let read = self.nodes().iter().any(|node| {
                     matches!(
                         &node.op,
-                        Operation::Attention(
-                            Attention::MlaDecode { plan: read, .. }
-                                | Attention::MlaPrefill { plan: read, .. }
+                        Operation::Attn(
+                            Attn::MlaDecode { plan: read, .. }
+                                | Attn::MlaPrefill { plan: read, .. }
                         ) if read == plan
                     )
                 });
@@ -629,7 +629,7 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Mla(built));
                 Ok(())
             }
-            Attention::MlaLatents {
+            Attn::MlaLatents {
                 kv_a,
                 weight,
                 eps,
@@ -645,7 +645,7 @@ impl Run<'_> {
                 &mut self.tensor(*kv_c),
                 &mut self.tensor(*k_pe),
             ),
-            Attention::MlaLatentsRope {
+            Attn::MlaLatentsRope {
                 kv_a,
                 positions,
                 weight,
@@ -667,7 +667,7 @@ impl Run<'_> {
                 &mut self.tensor(*kv_c),
                 &mut self.tensor(*k_pe),
             ),
-            Attention::MlaSplitQB {
+            Attn::MlaSplitQB {
                 q_b,
                 heads,
                 nope_dim,
@@ -683,7 +683,7 @@ impl Run<'_> {
                 &mut self.tensor(*q_nope),
                 &mut self.tensor(*q_pe),
             ),
-            Attention::MlaAbsorbQ {
+            Attn::MlaAbsorbQ {
                 q_nope,
                 kv_b,
                 heads,
@@ -695,7 +695,7 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*q_nope),
                 self.dense_or_decoded(
-                    "attention.mla_absorb_q",
+                    "attn.mla_absorb_q",
                     *kv_b,
                     heads * (nope_dim + v_head_dim),
                     *kv_lora_rank,
@@ -706,7 +706,7 @@ impl Run<'_> {
                 *v_head_dim,
                 &mut self.tensor(*q_latent),
             ),
-            Attention::MlaAbsorbOut {
+            Attn::MlaAbsorbOut {
                 latent,
                 kv_b,
                 heads,
@@ -718,7 +718,7 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*latent),
                 self.dense_or_decoded(
-                    "attention.mla_absorb_out",
+                    "attn.mla_absorb_out",
                     *kv_b,
                     heads * (nope_dim + v_head_dim),
                     *kv_lora_rank,
@@ -729,7 +729,7 @@ impl Run<'_> {
                 *nope_dim,
                 &mut self.tensor(*o),
             ),
-            Attention::MlaKvAppend {
+            Attn::MlaKvAppend {
                 kv_c,
                 k_pe,
                 cache,
@@ -743,7 +743,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::MlaDecode {
+            Attn::MlaDecode {
                 q,
                 plan,
                 q_pe,
@@ -767,7 +767,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
-            Attention::MlaPrefill {
+            Attn::MlaPrefill {
                 q,
                 plan,
                 q_pe,
@@ -791,7 +791,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
-            Attention::MlaDecodeSelected {
+            Attn::MlaDecodeSelected {
                 q,
                 plan,
                 q_pe,
@@ -815,7 +815,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
-            Attention::MlaPrefillSelected {
+            Attn::MlaPrefillSelected {
                 q,
                 plan,
                 q_pe,
@@ -839,7 +839,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
-            Attention::ReplayFloor {
+            Attn::ReplayFloor {
                 positions,
                 state,
                 mark,
@@ -851,7 +851,7 @@ impl Run<'_> {
                 *mark,
                 &mut self.tensor(*floor),
             ),
-            Attention::KvEnds {
+            Attn::KvEnds {
                 request_of_token,
                 cache,
                 ends,
@@ -861,7 +861,7 @@ impl Run<'_> {
                 let pool = self
                     .pool_whole(*cache)
                     .ok_or_else(|| kernels_cuda::Error::Backend {
-                        op: "attention.kv_ends",
+                        op: "attn.kv_ends",
                         detail: "a cache over gathered seats".to_string(),
                     })?;
                 kernels_cuda::attn::kv_window::kv_ends(
@@ -871,7 +871,7 @@ impl Run<'_> {
                     &mut self.tensor(*ends),
                 )
             }
-            Attention::WindowSink {
+            Attn::WindowSink {
                 q,
                 positions,
                 request_of_token,
@@ -882,7 +882,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
             } => {
-                const OP: &str = "attention.window_sink";
+                const OP: &str = "attn.window_sink";
                 // Each row reads its request's pages against the whole
                 // fire's tables, as DeepSeek's fused decode does.
                 let pool = self
@@ -909,7 +909,7 @@ impl Run<'_> {
                     &mut self.tensor(*o),
                 )
             }
-            Attention::IndexLayernormRope {
+            Attn::IndexLayernormRope {
                 k,
                 positions,
                 weight,
@@ -928,7 +928,7 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
-            Attention::IndexRope {
+            Attn::IndexRope {
                 q,
                 positions,
                 heads,
@@ -945,7 +945,7 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
-            Attention::IndexTopk {
+            Attn::IndexTopk {
                 q,
                 weights,
                 keys,
@@ -966,7 +966,7 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*selection),
             ),
-            Attention::IndexTopk {
+            Attn::IndexTopk {
                 q,
                 weights,
                 keys,
@@ -987,7 +987,7 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*selection),
             ),
-            Attention::IndexTopk {
+            Attn::IndexTopk {
                 q,
                 weights,
                 keys,
@@ -1000,7 +1000,7 @@ impl Run<'_> {
             } => {
                 if weights.is_some() {
                     return Err(kernels_cuda::Error::Unsupported {
-                        op: "attention.index_topk",
+                        op: "attn.index_topk",
                     });
                 }
                 index::topk_block_max(
@@ -1014,7 +1014,7 @@ impl Run<'_> {
                     &mut self.tensor(*selection),
                 )
             }
-            Attention::IndexKvAppend {
+            Attn::IndexKvAppend {
                 k,
                 keys,
                 write_page,
@@ -1026,7 +1026,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::IndexBlockMean {
+            Attn::IndexBlockMean {
                 boundary_pos,
                 boundary_req,
                 keys,
@@ -1042,7 +1042,7 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*entries),
             ),
-            Attention::PoolBoundaryDecode {
+            Attn::PoolBoundaryDecode {
                 positions,
                 row_valid,
                 ratio,
@@ -1058,7 +1058,7 @@ impl Run<'_> {
                 &mut self.tensor(*boundary_req),
                 &mut self.tensor(*boundary_rope),
             ),
-            Attention::PoolBoundaryPrefill {
+            Attn::PoolBoundaryPrefill {
                 positions,
                 row_valid,
                 ratio,
@@ -1074,7 +1074,7 @@ impl Run<'_> {
                 &mut self.tensor(*boundary_req),
                 &mut self.tensor(*boundary_rope),
             ),
-            Attention::PoolGather {
+            Attn::PoolGather {
                 boundary_pos,
                 boundary_req,
                 pages,
@@ -1097,7 +1097,7 @@ impl Run<'_> {
                     &mut self.tensor(*entries),
                 )
             }
-            Attention::PoolStateWrite {
+            Attn::PoolStateWrite {
                 kv,
                 score,
                 pages,
@@ -1120,7 +1120,7 @@ impl Run<'_> {
                     slabs.state_score,
                 )
             }
-            Attention::PoolKvAppend {
+            Attn::PoolKvAppend {
                 entries,
                 boundary_pos,
                 boundary_req,
@@ -1158,7 +1158,7 @@ impl Run<'_> {
                     )
                 }
             }
-            Attention::PoolLse {
+            Attn::PoolLse {
                 q,
                 positions,
                 request_of_token,
@@ -1182,7 +1182,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attention::PoolLseSelected {
+            Attn::PoolLseSelected {
                 q,
                 positions,
                 request_of_token,
@@ -1210,7 +1210,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attention::Ragged {
+            Attn::Ragged {
                 q,
                 k,
                 v,
@@ -1239,7 +1239,7 @@ impl Run<'_> {
                                 ..
                             }) => Ok(self.packing(id.0 as usize, select).attn_class),
                             _ => Err(kernels_cuda::Error::Backend {
-                                op: "attention.ragged",
+                                op: "attn.ragged",
                                 detail: format!(
                                     "a lane states attention classes and this attention's \
                                          {what} rows are not packed by a group selection, so \
@@ -1262,7 +1262,7 @@ impl Run<'_> {
                         if self.class_table().is_some() =>
                     {
                         return Err(kernels_cuda::Error::Backend {
-                            op: "attention.ragged",
+                            op: "attn.ragged",
                             detail: "a lane states attention classes over an attention the \
                                   model already masks (reference tags or a relative bias); \
                                   the two do not compose"

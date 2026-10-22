@@ -234,7 +234,7 @@ fn a_solid_square_is_named_by_its_colour() {
         let mut outs = Vec::new();
         node.op.inputs(&mut ins);
         node.op.outputs(&mut outs);
-        if node.op.name() == "elementwise.residual_add" && probes.is_empty() {
+        if node.op.name() == "elemwise.residual_add" && probes.is_empty() {
             probes.extend(outs.first().copied());
         }
         if node.op.name() == "gather.scatter_live_rows" {

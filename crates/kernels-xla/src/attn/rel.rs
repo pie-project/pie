@@ -38,7 +38,7 @@ pub fn decode_rel(
     o: Tensor,
 ) -> Result<(), Error> {
     let call = rel_call(
-        "attention.decode_rel",
+        "attn.decode_rel",
         q,
         Tables::decode(plan),
         rel,
@@ -63,7 +63,7 @@ pub fn prefill_rel(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_rel";
+    const OP: &str = "attn.prefill_rel";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = rel_call(
         OP,

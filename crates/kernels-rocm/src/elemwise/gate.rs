@@ -6,7 +6,7 @@ use crate::tensor::Tensor;
 const BLOCK: u32 = 256;
 
 pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(gate.dtype, x.dtype, "the gate rides the rectangle's dtype");
     debug_assert!(
@@ -54,7 +54,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul_heads";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(gate.dtype, x.dtype, "the gate rides the rectangle's dtype");
     let rows = nonzero(OP, "rows", x.rows)?;

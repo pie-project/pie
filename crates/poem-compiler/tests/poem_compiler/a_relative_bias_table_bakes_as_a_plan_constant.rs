@@ -2,7 +2,7 @@ use crate::common;
 
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam, trace_hybrid};
 use poem_compiler::Placement;
-use poem_ir::{Attention, Elementwise, Operation, RaggedMask};
+use poem_ir::{Attn, Elemwise, Operation, RaggedMask};
 
 const WIDTH: u32 = 64;
 const HEADS: u32 = 4;
@@ -77,7 +77,7 @@ fn the_tables_are_fixed_rectangles_alive_through_their_attention() {
 
         let mut seen = 0;
         for (at, node) in trace.nodes.iter().enumerate() {
-            let Operation::Elementwise(Elementwise::RelativeBucketBias { y, .. }) = &node.op else {
+            let Operation::Elemwise(Elemwise::RelativeBucketBias { y, .. }) = &node.op else {
                 continue;
             };
             seen += 1;
@@ -99,7 +99,7 @@ fn the_tables_are_fixed_rectangles_alive_through_their_attention() {
                 .position(|node| {
                     matches!(
                         &node.op,
-                        Operation::Attention(Attention::Ragged {
+                        Operation::Attn(Attn::Ragged {
                             mask: RaggedMask::RelativeBias { table, .. },
                             ..
                         }) if table == y

@@ -54,10 +54,7 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
         for (int k = begin + static_cast<int>(lane); k < end; k += 32) {
             m = fmaxf(m, s[static_cast<long long>(k) * num_heads + head]);
         }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-        }
+        m = ::pie::warp_max(m);
         float acc[PER];
 #pragma unroll
         for (int j = 0; j < PER; ++j) acc[j] = 0.f;

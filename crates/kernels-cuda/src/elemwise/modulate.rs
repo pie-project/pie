@@ -9,7 +9,7 @@ use dtype::Dtype;
 
 const MODULATE: &str = "elemwise/modulate.cu";
 
-/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`): a
+/// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`): a
 /// row's `x` times `scale` (rounded), RMS-normed unscaled (rounded), and with
 /// `res` and its f32 `gate` the residual's gated sum; with `next`, the next
 /// sublayer's input norm over it in the same pass.
@@ -26,7 +26,7 @@ pub fn norm_gate(
     next: Option<Next>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.norm_gate";
+    const OP: &str = "elemwise.norm_gate";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     if res.is_some() != gate.is_some() || gate.is_some_and(|g| g.dtype != Dtype::F32) {
         return Err(refuse(OP, "a residual comes with its f32 gate"));
@@ -265,7 +265,7 @@ pub fn scale_shift(
 ) -> Result<(), Error> {
     fire(
         ctx,
-        "elementwise.modulate",
+        "elemwise.modulate",
         Form::ScaleShift,
         x,
         m,
@@ -283,7 +283,7 @@ pub fn tanh_gate(
 ) -> Result<(), Error> {
     fire(
         ctx,
-        "elementwise.modulate",
+        "elemwise.modulate",
         Form::TanhGate,
         x,
         m,
@@ -300,7 +300,7 @@ pub fn gated_residual_add(
     lane_of_row: Option<Tensor>,
     r_out: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gated_residual_add";
+    const OP: &str = "elemwise.gated_residual_add";
     let t = dtype_dispatch!(OP, r.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
         r.rows == y.rows && r.width == y.width && r.rows == r_out.rows && r.width == r_out.width,
@@ -342,7 +342,7 @@ pub fn norm_modulate(
     norm: NormKind,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.norm_modulate";
+    const OP: &str = "fused.norm_modulate";
     let (t, tm, width, rows) = fused_shapes(OP, x, m, lane_of_row, norm, o)?;
     ctx.fire(
         OP,
@@ -380,7 +380,7 @@ pub fn gated_residual_norm_modulate(
     r_out: &mut Tensor,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gated_residual_norm_modulate";
+    const OP: &str = "fused.gated_residual_norm_modulate";
     let (t, tm, width, rows) = fused_shapes(OP, r, m, lane_of_row, norm, o)?;
     debug_assert!(
         r.rows == y.rows && r.width == y.width && r.rows == r_out.rows && r.width == r_out.width,
@@ -474,15 +474,7 @@ pub fn scale(
     lane_of_row: Option<Tensor>,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    fire(
-        ctx,
-        "elementwise.modulate",
-        Form::Scale,
-        x,
-        m,
-        lane_of_row,
-        o,
-    )
+    fire(ctx, "elemwise.modulate", Form::Scale, x, m, lane_of_row, o)
 }
 
 pub fn res_blend(
@@ -494,7 +486,7 @@ pub fn res_blend(
     proj: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.res_blend";
+    const OP: &str = "elemwise.res_blend";
 
     const MAX_BLOCKS: usize = 32;
 
@@ -561,7 +553,7 @@ pub fn res_blend_norm(
     out_eps: f32,
     y: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "elementwise.res_blend_rmsnorm";
+    const OP: &str = "fused.res_blend_rmsnorm";
     const MAX_BLOCKS: usize = 32;
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let hidden = y.width;

@@ -60,7 +60,7 @@ fn flat(cx: &mut Cx<'_>, t: Tensor, n: i64) -> Result<Val, Error> {
 
 /// `y[n, s·H + h] = x[n, h]` for each of `streams` streams.
 pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_expand";
+    const OP: &str = "elemwise.hc_expand";
     let fan = stream_fan(OP, y.width, x.width)?;
     stated_fan(OP, fan, streams)?;
     if y.rows != x.rows {
@@ -76,7 +76,7 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
 
 /// `y = x / rms(x)` over each whole row, widened to f32.
 pub fn rmsnorm_f32(ctx: &Ctx<'_>, streams: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_rmsnorm_f32";
+    const OP: &str = "elemwise.hc_rmsnorm_f32";
     expect(OP, y, &[Dtype::F32])?;
     if y.rows != streams.rows || y.width != streams.width {
         return Err(refuse(OP, "the normed rectangle is the stream rectangle"));
@@ -96,7 +96,7 @@ pub fn project(
     stream_count: u32,
     mixes: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_project";
+    const OP: &str = "elemwise.hc_project";
     expect(OP, mixes, &[Dtype::F32])?;
     if hc_fn.width != normed.width || normed.width == 0 {
         return Err(refuse(
@@ -149,7 +149,7 @@ pub fn gates(
     post_mix: Tensor,
     comb_mix: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_gates";
+    const OP: &str = "elemwise.hc_gates";
     expect(OP, streams, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, streams.width, x.width)?;
     stated_fan(OP, fan, stream_count)?;
@@ -225,7 +225,7 @@ pub fn fold(
     comb_mix: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_fold";
+    const OP: &str = "elemwise.hc_fold";
     expect(OP, y, &[Dtype::Bf16])?;
     if y.rows != streams.rows || y.width != streams.width {
         return Err(refuse(OP, "the fold lands the stream rectangle it mixes"));
@@ -262,7 +262,7 @@ pub fn collapse(
     hc_eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_collapse";
+    const OP: &str = "elemwise.hc_collapse";
     expect(OP, streams, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, streams.width, y.width)?;
     stated_fan(OP, fan, stream_count)?;
@@ -303,7 +303,7 @@ pub fn mix(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_mix";
+    const OP: &str = "elemwise.hc_mix";
     expect(OP, y, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, normed.width, y.width)?;
     stated_fan(OP, fan, streams)?;
@@ -332,7 +332,7 @@ pub fn inject(
     streams: u32,
     hyper: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_inject";
+    const OP: &str = "elemwise.hc_inject";
     expect(OP, hyper, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, hyper.width, o.width)?;
     stated_fan(OP, fan, streams)?;
@@ -369,7 +369,7 @@ pub fn ple_gate(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.ple_gate";
+    const OP: &str = "elemwise.ple_gate";
     expect(OP, y, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, y.width, value.width)?;
     stated_fan(OP, fan, streams)?;

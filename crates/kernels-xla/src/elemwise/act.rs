@@ -46,24 +46,24 @@ fn unary(
 
 /// `o = x·σ(x)`. Reference: kernels-metal `act_silu`.
 pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elementwise.silu", x, o, |cx, v| Ok(cx.silu(v)?))
+    unary(ctx, "elemwise.silu", x, o, |cx, v| Ok(cx.silu(v)?))
 }
 
 /// `o = tanh(x)`. Reference: kernels-metal `act_tanh`.
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elementwise.tanh", x, o, |cx, v| Ok(cx.tanh(v)))
+    unary(ctx, "elemwise.tanh", x, o, |cx, v| Ok(cx.tanh(v)))
 }
 
 /// `o = ½x(1 + tanh(√(2/π)(x + 0.044715x³)))`. Reference: kernels-metal
 /// `act_gelu_tanh`.
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elementwise.gelu", x, o, |cx, v| Ok(cx.gelu_tanh(v)?))
+    unary(ctx, "elemwise.gelu", x, o, |cx, v| Ok(cx.gelu_tanh(v)?))
 }
 
 /// `o = ½x(1 + erf(x/√2))`, erf to 1.5e-7 (A&S 7.1.26), well under bf16.
 /// The GPUs refuse `Gelu { tanh: false }`; this serves it.
 pub fn gelu_erf(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elementwise.gelu", x, o, |cx, v| Ok(cx.gelu_erf(v)?))
+    unary(ctx, "elemwise.gelu", x, o, |cx, v| Ok(cx.gelu_erf(v)?))
 }
 
 fn binary(
@@ -87,12 +87,12 @@ fn binary(
 
 /// `z = x + y`. Reference: kernels-metal `binary_add`.
 pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    binary(ctx, "elementwise.add", x, y, z, false)
+    binary(ctx, "elemwise.add", x, y, z, false)
 }
 
 /// `z = x · y`. Reference: kernels-metal `binary_mul`.
 pub fn mul(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    binary(ctx, "elementwise.mul", x, y, z, true)
+    binary(ctx, "elemwise.mul", x, y, z, true)
 }
 
 // ------------------------------------------------------------- modulation
@@ -212,7 +212,7 @@ pub fn modulate(
     lane_of_row: Option<Tensor>,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.modulate";
+    const OP: &str = "elemwise.modulate";
     expect(OP, x, FLOATS)?;
     same_shape(OP, x, y)?;
     modulation(OP, m, lane_of_row, x, form.vectors())?;
@@ -233,7 +233,7 @@ pub fn gated_residual_add(
     lane_of_row: Option<Tensor>,
     r_out: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gated_residual_add";
+    const OP: &str = "elemwise.gated_residual_add";
     expect(OP, r, FLOATS)?;
     same_shape(OP, r, y)?;
     same_shape(OP, r, r_out)?;
@@ -273,7 +273,7 @@ pub fn sinusoid(
     scale: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.sinusoid";
+    const OP: &str = "elemwise.sinusoid";
     if t.dtype != Dtype::F32 || y.dtype != Dtype::F32 {
         return Err(refuse(
             OP,
@@ -355,7 +355,7 @@ pub fn relative_bucket_bias(
     bidirectional: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.relative_bucket_bias";
+    const OP: &str = "elemwise.relative_bucket_bias";
     expect(OP, embedding, &[Dtype::Bf16, Dtype::F32])?;
     let heads = y.rows;
     if heads == 0 || max_len == 0 {
@@ -458,7 +458,7 @@ pub fn rope_axes(
     head_dim: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_axes";
+    const OP: &str = "elemwise.rope_axes";
     expect(OP, o, FLOATS)?;
     same_shape(OP, x, o)?;
     if positions.dtype != Dtype::F32 {

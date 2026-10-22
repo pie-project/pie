@@ -1,4 +1,5 @@
 #include <cstdint>
+#include "prim/mma.cuh"
 #include <cstring>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -117,10 +118,7 @@ __global__ void mla_naive_paged_kernel(
         for (int i = 0; i < pper; ++i) {
             pd += qp_r[i] * __bfloat162float(kpe_j[lane + i * 32]);
         }
-        #pragma unroll
-        for (int sh = 16; sh > 0; sh >>= 1) {
-            pd += __shfl_xor_sync(0xffffffffu, pd, sh);
-        }
+        pd = ::pie::warp_sum(pd);
         const float score = pd * sm_scale;
         const float m_new = fmaxf(m, score);
         const float corr = __expf(m - m_new);
@@ -201,15 +199,6 @@ __device__ __forceinline__ std::uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 h
     std::memcpy(&l, &lo, 2);
     std::memcpy(&h, &hi, 2);
     return (l & 0xffffu) | ((h & 0xffffu) << 16);
-}
-
-__device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const std::uint32_t (&a)[4],
-                                             const std::uint32_t (&b)[2]) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
 __device__ __forceinline__ void ld_a(std::uint32_t (&a)[4], const __nv_bfloat16* base,
@@ -586,12 +575,10 @@ __global__ __launch_bounds__(128) void mla_mma_fold(
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const float mine = lane < splits ? part_lse[(unit0 + lane) * H + h] : -CUDART_INF_F;
     float top = mine;
-    #pragma unroll
-    for (int m = 16; m > 0; m >>= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, m));
+    top = ::pie::warp_max(top);
     const float e = mine > -CUDART_INF_F ? exp2f(mine - top) : 0.f;
     float sum = e;
-    #pragma unroll
-    for (int m = 16; m > 0; m >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, m);
+    sum = ::pie::warp_sum(sum);
     const float share = sum > 0.f ? e / sum : 0.f;
     const int d = static_cast<int>(threadIdx.x) * 4;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};

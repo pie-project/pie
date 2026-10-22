@@ -2,7 +2,7 @@ use crate::error::Error;
 use crate::jit::Ctx;
 use crate::tensor::Tensor;
 
-const OP: &str = "attention.ragged";
+const OP: &str = "attn.ragged";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedMask {

@@ -1,4 +1,4 @@
-use poem::{Attention, BlockDrafter, Dtype, Operation, Platform, Sampling, Trace};
+use poem::{Attn, BlockDrafter, Dtype, Operation, Platform, Sampling, Trace};
 use poem_ir::Ssm;
 
 const PLATFORMS: [Platform; 2] = [Platform::Metal, Platform::Cuda];
@@ -14,10 +14,7 @@ fn count(trace: &Trace, op: impl Fn(&Operation) -> bool) -> usize {
 }
 
 fn non_causal(op: &Operation) -> bool {
-    matches!(
-        op,
-        Operation::Attention(Attention::Masked { causal: false, .. })
-    )
+    matches!(op, Operation::Attn(Attn::Masked { causal: false, .. }))
 }
 
 fn block_dyn_conv(op: &Operation) -> bool {

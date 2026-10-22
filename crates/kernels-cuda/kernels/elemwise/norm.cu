@@ -177,8 +177,7 @@ __global__ void __launch_bounds__(256) rmsnorm_in_warp(
         xf[u] = Elem<T>::to_f32(xv[u]);
         local += xf[u] * xf[u];
     }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    local = ::pie::warp_sum(local);
     const float inv_rms = rsqrtf(local / static_cast<float>(hidden) + eps);
 
     T out[PER];
@@ -301,12 +300,10 @@ __global__ void __launch_bounds__(256) rmsnorm_no_scale_warp(
             v[w][r] = Elem<T>::to_f32(xr[w * 32 + lane + r * 256]);
             local = fmaf(v[w][r], v[w][r], local);
         }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+        local = ::pie::warp_sum(local);
         if (lane == w) block = local;
     }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) block += __shfl_xor_sync(0xffffffffu, block, off);
+    block = ::pie::warp_sum(block);
     const float inv_rms = rsqrtf(block / static_cast<float>(hidden) + eps);
 #pragma unroll
     for (int w = 0; w < 8; ++w)
@@ -556,8 +553,7 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_by(
             if (!in[p]) continue;
             const float x[4] = {v[p].x, v[p].y, v[p].z, v[p].w};
             float acc = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+            acc = ::pie::warp_sum(acc);
             const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
             const ElemT* g4 = reinterpret_cast<const ElemT*>(&gw[p]);
             uint2 ow;
@@ -581,8 +577,7 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_by(
 #pragma unroll
         for (int i = 0; i < 8; ++i)
             if (i < per) acc += x[i] * x[i];
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        acc = ::pie::warp_sum(acc);
         const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {

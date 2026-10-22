@@ -12,7 +12,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul_heads";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_sigmoid_mul_heads_bfloat16" });
     let head_dim = nonzero(OP, "the head width", head_dim)?;
     if !x.width.is_multiple_of(head_dim) {
@@ -51,7 +51,7 @@ pub fn sigmoid_mul_heads(
 }
 
 pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_bfloat16" });
     debug_assert!(
         gate.rows == x.rows && gate.width == x.width && gate.dtype == x.dtype,
@@ -77,7 +77,7 @@ pub fn sigmoid_mul_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert!(
         gate.rows == x.rows && gate.width == x.width && gate.dtype == x.dtype,

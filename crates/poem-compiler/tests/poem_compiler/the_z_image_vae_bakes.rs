@@ -7,7 +7,7 @@ use checkpoint::contract::{Expr, Partition, TensorType};
 use crate::z_image_dims::{self as model, vae};
 use poem::generative::{PortKind, ReadoutKind};
 use poem::{Def, Dim, Dtype, Operation, Platform, Stream, Trace, Ty, seam};
-use poem_ir::{Attention, Conv, GridRule, ParamLayout, Seam};
+use poem_ir::{Attn, Conv, GridRule, ParamLayout, Seam};
 
 const TURBO: &str = "z-image-turbo-bf16-kv-bf16";
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
@@ -164,7 +164,7 @@ fn the_shapes_are_the_flux_vaes() {
     let mut silu_off = 0;
     for node in &plan.nodes {
         match &node.op {
-            Operation::Attention(Attention::Voxel { sm_scale, q, .. }) => {
+            Operation::Attn(Attn::Voxel { sm_scale, q, .. }) => {
                 attentions += 1;
                 assert_eq!(
                     plan.values[q.0 as usize].ty.clone(),

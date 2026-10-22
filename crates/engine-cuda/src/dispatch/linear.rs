@@ -53,7 +53,7 @@ impl Run<'_> {
                     );
                     let read_back = match (&**glu, &**down) {
                         (
-                            Linear::MlpSwigluClampRouted { y: rows, .. },
+                            Linear::SwigluClampRouted { y: rows, .. },
                             Linear::MoeMatmulSelectActQuant {
                                 x,
                                 quant: ActQuant::E4m3 { gran: 128 },
@@ -84,7 +84,7 @@ impl Run<'_> {
                     self.linear(down)?;
                 }
                 if let Some(norm) = norm {
-                    self.elementwise(norm)?;
+                    self.elemwise(norm)?;
                 }
                 self.linear(sum)?;
                 match gate_add {
@@ -104,7 +104,7 @@ impl Run<'_> {
                     w: *w,
                     y: *packed,
                 })?;
-                self.linear(&Linear::MlpSwiglu {
+                self.linear(&Linear::Swiglu {
                     packed: *packed,
                     intermediate: *intermediate,
                     y: *y,
@@ -151,7 +151,7 @@ impl Run<'_> {
                     w: *w,
                     y: *packed,
                 })?;
-                self.linear(&Linear::MlpGegluTanhPacked {
+                self.linear(&Linear::GegluTanhPacked {
                     packed: *packed,
                     intermediate: *intermediate,
                     y: *y,
@@ -173,7 +173,7 @@ impl Run<'_> {
                     w: *gate_up,
                     y: *packed,
                 })?;
-                self.linear(&Linear::MlpSwiglu {
+                self.linear(&Linear::Swiglu {
                     packed: *packed,
                     intermediate: *intermediate,
                     y: *h,
@@ -341,9 +341,9 @@ impl Run<'_> {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
-                        linear::tiled::matmul
+                        linear::affine::matmul
                     } else {
-                        linear::tiled::matmul_gemv
+                        linear::affine::matmul_gemv
                     };
                     entry(
                         self.ctx(),
@@ -361,9 +361,9 @@ impl Run<'_> {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
-                        linear::tiled::lm_head
+                        linear::affine::lm_head
                     } else {
-                        linear::tiled::lm_head_gemv
+                        linear::affine::lm_head_gemv
                     };
                     entry(
                         self.ctx(),
@@ -377,13 +377,13 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
-            Linear::MlpSwiglu {
+            Linear::Swiglu {
                 packed,
                 intermediate,
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu(
+                linear::glu::swiglu(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -391,14 +391,14 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClamp {
+            Linear::SwigluClamp {
                 packed,
                 intermediate,
                 limit,
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp(
+                linear::glu::swiglu_clamp(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -407,7 +407,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampAlpha {
+            Linear::SwigluClampAlpha {
                 packed,
                 intermediate,
                 limit,
@@ -415,7 +415,7 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp_alpha(
+                linear::glu::swiglu_clamp_alpha(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -425,7 +425,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampSplitRouted {
+            Linear::SwigluClampSplitRouted {
                 gate,
                 up,
                 weights,
@@ -433,7 +433,7 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp_split_routed(
+                linear::glu::swiglu_clamp_split_routed(
                     self.ctx(),
                     self.tensor(*gate),
                     self.tensor(*up),
@@ -443,7 +443,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampRouted {
+            Linear::SwigluClampRouted {
                 packed,
                 intermediate,
                 weights,
@@ -455,7 +455,7 @@ impl Run<'_> {
                 // would read it back.
                 #[cfg(feature = "cuda")]
                 if self.lands_read_back(*y)
-                    && linear::mlp::swiglu_clamp_routed_e4m3(
+                    && linear::glu::swiglu_clamp_routed_e4m3(
                         self.ctx(),
                         self.tensor(*packed),
                         *intermediate,
@@ -467,7 +467,7 @@ impl Run<'_> {
                 {
                     return Ok(());
                 }
-                linear::mlp::swiglu_clamp_routed(
+                linear::glu::swiglu_clamp_routed(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -483,9 +483,9 @@ impl Run<'_> {
                 self.tensor(*shared),
                 &mut self.tensor(*y),
             ),
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
+            Linear::SwigluClampSplit { gate, up, limit, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp_split(
+                linear::glu::swiglu_clamp_split(
                     self.ctx(),
                     self.tensor(*gate),
                     self.tensor(*up),
@@ -494,9 +494,9 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpGegluTanh { gate, up, y } => {
+            Linear::GegluTanh { gate, up, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::geglu_tanh(
+                linear::glu::geglu_tanh(
                     self.ctx(),
                     self.tensor(*gate),
                     self.tensor(*up),
@@ -504,21 +504,21 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpGeluTanh { x, y } => {
+            Linear::GeluTanh { x, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
+                linear::glu::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
-            Linear::MlpRelu2 { x, y } => {
+            Linear::Relu2 { x, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
+                linear::glu::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
-            Linear::MlpGegluTanhPacked {
+            Linear::GegluTanhPacked {
                 packed,
                 intermediate,
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::geglu_tanh_packed(
+                linear::glu::geglu_tanh_packed(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -526,7 +526,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSitu {
+            Linear::Situ {
                 packed,
                 intermediate,
                 beta,
@@ -534,7 +534,7 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::situ(
+                linear::glu::situ(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -746,7 +746,7 @@ impl Run<'_> {
                                 experts: *groups,
                                 n,
                                 k,
-                                elem: linear::tc5::Elem::E4m3,
+                                elem: linear::gemm_sm100::Elem::E4m3,
                                 gran: 128,
                                 alpha_e: 0,
                                 alpha_from: None,
@@ -957,24 +957,24 @@ impl Run<'_> {
     /// fire takes it; `false` leaves the two to run apart.
     #[cfg(feature = "cuda")]
     fn select_glu(&mut self, select: &Linear, glu: &Linear) -> Result<bool, kernels_cuda::Error> {
-        use linear::tc5::Glu;
+        use linear::gemm_sm100::Glu;
         // The device and the profile first: nothing resolved off tcgen05.
-        if !self.ctx().tuning().moe_tc5 || !linear::tc5::supported() {
+        if !self.ctx().tuning().moe_tc5 || !linear::gemm_sm100::supported() {
             return Ok(false);
         }
         let (packed, y, glu) = match *glu {
-            Linear::MlpSwiglu { packed, y, .. } => (packed, y, Glu::Swiglu),
-            Linear::MlpSwigluClamp {
+            Linear::Swiglu { packed, y, .. } => (packed, y, Glu::Swiglu),
+            Linear::SwigluClamp {
                 packed, y, limit, ..
             } => (packed, y, Glu::SwigluClamp { limit }),
-            Linear::MlpSwigluClampAlpha {
+            Linear::SwigluClampAlpha {
                 packed,
                 y,
                 limit,
                 alpha,
                 ..
             } => (packed, y, Glu::SwigluClampAlpha { limit, alpha }),
-            Linear::MlpGegluTanhPacked { packed, y, .. } => (packed, y, Glu::GegluTanh),
+            Linear::GegluTanhPacked { packed, y, .. } => (packed, y, Glu::GegluTanh),
             _ => return Ok(false),
         };
         let Some((x, routes, sy, bank, experts)) = self.routed_bank(select) else {
@@ -1149,19 +1149,19 @@ impl Run<'_> {
         select: &Linear,
         glu: &Linear,
         down: &Linear,
-        norm: Option<&poem_ir::Elementwise>,
+        norm: Option<&poem_ir::Elemwise>,
         sum: &Linear,
         gate_add: Option<&Linear>,
     ) -> Result<bool, kernels_cuda::Error> {
-        use linear::tc5::Glu;
-        if !self.ctx().tuning().moe_tc5 || !linear::tc5::supported() {
+        use linear::gemm_sm100::Glu;
+        if !self.ctx().tuning().moe_tc5 || !linear::gemm_sm100::supported() {
             return Ok(false);
         }
         // The routes' norm: a scale, no residual, the down rows in, the sum's
         // rows out.
         let normed = match norm {
             None => None,
-            Some(&poem_ir::Elementwise::NormGate {
+            Some(&poem_ir::Elemwise::NormGate {
                 x,
                 scale: Some(scale),
                 res: None,
@@ -1176,7 +1176,7 @@ impl Run<'_> {
         // DeepSeek's form: the route weights scale the GLU's rows before the
         // down leg, and the routes sum plainly with the shared row added.
         if let (
-            Linear::MlpSwigluClampRouted {
+            Linear::SwigluClampRouted {
                 packed,
                 intermediate,
                 weights,
@@ -1215,18 +1215,18 @@ impl Run<'_> {
             return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out);
         }
         let (packed, hidden, intermediate, glu) = match *glu {
-            Linear::MlpSwiglu {
+            Linear::Swiglu {
                 packed,
                 y,
                 intermediate,
             } => (packed, y, intermediate, Glu::Swiglu),
-            Linear::MlpSwigluClamp {
+            Linear::SwigluClamp {
                 packed,
                 y,
                 intermediate,
                 limit,
             } => (packed, y, intermediate, Glu::SwigluClamp { limit }),
-            Linear::MlpSwigluClampAlpha {
+            Linear::SwigluClampAlpha {
                 packed,
                 y,
                 intermediate,
@@ -1238,12 +1238,12 @@ impl Run<'_> {
                 intermediate,
                 Glu::SwigluClampAlpha { limit, alpha },
             ),
-            Linear::MlpGegluTanhPacked {
+            Linear::GegluTanhPacked {
                 packed,
                 y,
                 intermediate,
             } => (packed, y, intermediate, Glu::GegluTanh),
-            Linear::MlpSitu {
+            Linear::Situ {
                 packed,
                 y,
                 intermediate,
@@ -1258,7 +1258,7 @@ impl Run<'_> {
                     cap: up_cap.unwrap_or(0.0),
                 },
             ),
-            Linear::MlpRelu2 { x, y } => (x, y, self.tensor(y).width, Glu::Relu2),
+            Linear::Relu2 { x, y } => (x, y, self.tensor(y).width, Glu::Relu2),
             _ => return Ok(false),
         };
         let Linear::MoeWeightedSum {
@@ -1404,7 +1404,7 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.moe_matmul_select_act_quant";
-        if !linear::tc5::supported() {
+        if !linear::gemm_sm100::supported() {
             return self.select_a16(OP, x, bank, routes, y);
         }
         let (codes, scales, biases, seat) = self.planes(bank);
@@ -1445,7 +1445,7 @@ impl Run<'_> {
                 };
                 (
                     act_quant::Format::Nvfp4,
-                    linear::tc5::Elem::E2m1,
+                    linear::gemm_sm100::Elem::E2m1,
                     16,
                     alpha,
                     Some(from),
@@ -1455,7 +1455,7 @@ impl Run<'_> {
             // with e4m3 activations.
             (Dtype::Mxfp4 | Dtype::U8, ActQuant::E4m3 { gran }) => (
                 act_quant::Format::E4m3 { gran },
-                linear::tc5::Elem::E2m1,
+                linear::gemm_sm100::Elem::E2m1,
                 32,
                 0,
                 None,
@@ -1468,7 +1468,7 @@ impl Run<'_> {
             // scale covers.
             (Dtype::E4m3, ActQuant::E4m3 { gran }) if fp8_bank_gran(scales, k) == Some(gran) => (
                 act_quant::Format::E4m3 { gran },
-                linear::tc5::Elem::E4m3,
+                linear::gemm_sm100::Elem::E4m3,
                 gran,
                 0,
                 None,
@@ -1491,12 +1491,12 @@ impl Run<'_> {
         // to bf16 (exact) on the register-dequant kernel, which streams the bank far
         // faster than the grouped GEMM at a handful of rows an expert.
         if let act_quant::Format::E4m3 { .. } = fmt
-            && elem == linear::tc5::Elem::E2m1
+            && elem == linear::gemm_sm100::Elem::E2m1
             && kernels_cuda::linear::moe::select_mxfp4_atoms_takes(self.ctx(), route_t, x)
         {
             // A routed GLU's rows land read back already.
             let back = if self.lands_read_back(x_id)
-                && linear::mlp::routed_e4m3_spans(&x)
+                && linear::glu::routed_e4m3_spans(&x)
                 && fmt == (act_quant::Format::E4m3 { gran: 128 })
             {
                 x
@@ -1555,7 +1555,7 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.matmul_act_quant";
-        if !linear::tc5::supported() {
+        if !linear::gemm_sm100::supported() {
             return self.matmul_a16(OP, act, w, block_scales, y);
         }
         if let Some(block_scales) = block_scales {
@@ -1586,7 +1586,7 @@ impl Run<'_> {
                 scales: scales.ptr,
                 n,
                 k,
-                elem: linear::tc5::Elem::E2m1,
+                elem: linear::gemm_sm100::Elem::E2m1,
                 gran: 32,
                 laid: true,
             };
@@ -1603,7 +1603,7 @@ impl Run<'_> {
                     scales: scales.ptr,
                     n,
                     k,
-                    elem: linear::tc5::Elem::E2m1,
+                    elem: linear::gemm_sm100::Elem::E2m1,
                     gran: 32,
                     laid: true,
                 },
@@ -1811,7 +1811,7 @@ impl Run<'_> {
             scales: atoms.ptr,
             n,
             k,
-            elem: linear::tc5::Elem::E4m3,
+            elem: linear::gemm_sm100::Elem::E4m3,
             gran: block,
             laid: true,
         };

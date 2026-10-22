@@ -253,8 +253,8 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            poem_ir::Operation::Attention(
-                poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
+            poem_ir::Operation::Attn(
+                poem_ir::Attn::Masked { .. } | poem_ir::Attn::MaskedLse { .. }
             )
         )
     })
@@ -380,8 +380,8 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
 /// against a later fire's tables would read past what it staged.
 #[must_use]
 pub(crate) fn regions_staging(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
-    let quantized = |attn: &poem_ir::Attention| match attn {
-        poem_ir::Attention::PrefillLse { cache, .. } => matches!(
+    let quantized = |attn: &poem_ir::Attn| match attn {
+        poem_ir::Attn::PrefillLse { cache, .. } => matches!(
             trace.values.get(cache.0 as usize).map(|decl| &decl.def),
             Some(poem_ir::Def::Cache(row)) if matches!(
                 trace.caches.get(*row as usize),

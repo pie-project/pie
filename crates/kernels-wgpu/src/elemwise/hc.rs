@@ -56,7 +56,7 @@ fn per_row(op: &'static str, rows: u32) -> Result<Grid, Error> {
 }
 
 pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_expand";
+    const OP: &str = "elemwise.hc_expand";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "hc_expand_bf16" });
     debug_assert_eq!(y.rows, x.rows, "the expansion lands one wide row per row");
     let fan = stream_fan(OP, y.width, x.width)?;
@@ -81,7 +81,7 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
 }
 
 pub fn rmsnorm_f32(ctx: &Ctx<'_>, streams: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_rmsnorm_f32";
+    const OP: &str = "elemwise.hc_rmsnorm_f32";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_rmsnorm_f32_bf16" });
     debug_assert_eq!(y.dtype, dtype::Dtype::F32, "`{OP}` widens to f32");
     debug_assert!(
@@ -106,7 +106,7 @@ pub fn project(
     stream_count: u32,
     mixes: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_project";
+    const OP: &str = "elemwise.hc_project";
     debug_assert!(
         normed.dtype == dtype::Dtype::F32
             && hc_fn.dtype == dtype::Dtype::F32
@@ -182,7 +182,7 @@ pub fn gates(
     post_mix: Tensor,
     comb_mix: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_gates";
+    const OP: &str = "elemwise.hc_gates";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_gates_bf16" });
     debug_assert_eq!(
         normed.dtype,
@@ -236,7 +236,7 @@ pub fn fold(
     comb_mix: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_fold";
+    const OP: &str = "elemwise.hc_fold";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "hc_fold_bf16" });
     debug_assert!(
         y.rows == streams.rows && y.width == streams.width,
@@ -276,7 +276,7 @@ pub fn collapse(
     hc_eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_collapse";
+    const OP: &str = "elemwise.hc_collapse";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_collapse_bf16" });
     debug_assert_eq!(
         mixes.dtype,
@@ -327,7 +327,7 @@ pub fn mix(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_mix";
+    const OP: &str = "elemwise.hc_mix";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "hc_mix_bf16" });
     let fan = stream_fan(OP, normed.width, y.width)?;
     if fan != streams {
@@ -364,7 +364,7 @@ pub fn inject(
     streams: u32,
     hyper: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_inject";
+    const OP: &str = "elemwise.hc_inject";
     let entry = dtype_dispatch!(OP, hyper.dtype, { Bf16 => "hc_inject_bf16" });
     let fan = stream_fan(OP, hyper.width, o.width)?;
     if fan != streams {
@@ -402,7 +402,7 @@ pub fn ple_gate(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.ple_gate";
+    const OP: &str = "elemwise.ple_gate";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "ple_gate_bf16" });
     let fan = stream_fan(OP, y.width, value.width)?;
     if fan != streams {

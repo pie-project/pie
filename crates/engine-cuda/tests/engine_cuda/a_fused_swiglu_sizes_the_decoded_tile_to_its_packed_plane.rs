@@ -42,7 +42,7 @@ impl ForwardHybrid for Micro {
 
     fn forward(&self, inputs: Input) -> Value {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
-        let act = ops::linear::mlp_swiglu(&ops::linear::matmul(&x, &self.gate_up), INTER);
+        let act = ops::linear::swiglu(&ops::linear::matmul(&x, &self.gate_up), INTER);
         let h = ops::linear::matmul(&act, &self.down);
         ops::linear::lm_head(&h, &self.head)
     }
@@ -227,7 +227,7 @@ fn a_fused_swiglu_sizes_the_decoded_tile_to_its_packed_plane() {
     }
     let fixture = fixture();
 
-    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["linear.matmul_swiglu"]);
+    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["fused.matmul_swiglu"]);
     assert!(
         fused
             .nodes

@@ -5,7 +5,7 @@ use crate::voxels::lanes_of;
 
 const FILE: &str = "attn/dense.cu";
 
-const OP: &str = "attention.voxel";
+const OP: &str = "attn.voxel";
 
 const BLOCK: u32 = 128;
 

@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use kernels_cuda::attn::xqa::Gate;
-use poem_ir::{Attention, Fused, Operands, Operation, StructKind, Trace, Ty, ValueId};
+use poem_ir::{Attn, Fused, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 /// `trace` with every decode plan of `from` or more query heads a KV head
 /// that only plain decodes read planned and read as a prefill.
@@ -34,7 +34,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Attention(Attention::PlanDecode {
+            Operation::Attn(Attn::PlanDecode {
                 q_heads,
                 kv_heads,
                 head_dim,
@@ -59,13 +59,13 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
     let mut inputs = Vec::new();
     for node in &trace.nodes {
         let attention = match &node.op {
-            Operation::Attention(op) => Some(op),
+            Operation::Attn(op) => Some(op),
             Operation::Fused(Fused::LseSink { attn, .. }) => Some(&**attn),
             _ => None,
         };
         match attention {
-            Some(Attention::PlanDecode { .. } | Attention::Decode { .. }) => continue,
-            Some(Attention::DecodeLse { plan, .. })
+            Some(Attn::PlanDecode { .. } | Attn::Decode { .. }) => continue,
+            Some(Attn::DecodeLse { plan, .. })
                 if lse
                     && wide
                         .get(plan)
@@ -83,12 +83,12 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
     }
     for node in &mut trace.nodes {
         let op = match &mut node.op {
-            Operation::Attention(op) => op,
+            Operation::Attn(op) => op,
             Operation::Fused(Fused::LseSink { attn, .. }) => &mut **attn,
             _ => continue,
         };
         *op = match op.clone() {
-            Attention::PlanDecode {
+            Attn::PlanDecode {
                 kv_indptr,
                 kv_indices,
                 last_page_len,
@@ -98,7 +98,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
                 head_dim,
                 window,
                 plan,
-            } if wide.contains_key(&plan) => Attention::PlanPrefill {
+            } if wide.contains_key(&plan) => Attn::PlanPrefill {
                 kv_indptr,
                 kv_indices,
                 last_page_len,
@@ -109,7 +109,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
                 window,
                 plan,
             },
-            Attention::Decode {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -117,7 +117,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
                 head_dim,
                 sm_scale,
                 o,
-            } if wide.contains_key(&plan) => Attention::Prefill {
+            } if wide.contains_key(&plan) => Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -127,7 +127,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
                 sm_scale,
                 o,
             },
-            Attention::DecodeLse {
+            Attn::DecodeLse {
                 q,
                 plan,
                 cache,
@@ -136,7 +136,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xq
                 sm_scale,
                 o,
                 lse,
-            } if wide.contains_key(&plan) => Attention::PrefillLse {
+            } if wide.contains_key(&plan) => Attn::PrefillLse {
                 q,
                 plan,
                 cache,
@@ -165,16 +165,16 @@ mod tests {
         let mut counts = (0, 0, 0);
         for node in &trace.nodes {
             let op = match &node.op {
-                Operation::Attention(op) => op,
+                Operation::Attn(op) => op,
                 Operation::Fused(Fused::LseSink { attn, .. }) => &**attn,
                 _ => continue,
             };
             match op {
-                Attention::DecodeLse { window: None, .. } => counts.0 += 1,
-                Attention::DecodeLse {
+                Attn::DecodeLse { window: None, .. } => counts.0 += 1,
+                Attn::DecodeLse {
                     window: Some(_), ..
                 } => counts.1 += 1,
-                Attention::PrefillLse { .. } => counts.2 += 1,
+                Attn::PrefillLse { .. } => counts.2 += 1,
                 _ => {}
             }
         }
@@ -189,7 +189,7 @@ mod tests {
         let row = poem_compiler::catalog::deployment("gptoss-120b-bf16-mxfp4-kv-bf16")
             .expect("gpt-oss is in the catalog");
         let plain = row.trace(poem::Platform::Cuda);
-        let fused = poem_compiler::fuse::fuse(plain.clone(), &["attention.lse_sink"]);
+        let fused = poem_compiler::fuse::fuse(plain.clone(), &["fused.lse_sink"]);
         assert!(
             fused
                 .nodes
@@ -217,8 +217,8 @@ mod tests {
                 .nodes
                 .iter()
                 .fold((0, 0), |(decodes, prefills), node| match &node.op {
-                    Operation::Attention(Attention::PlanDecode { .. }) => (decodes + 1, prefills),
-                    Operation::Attention(Attention::PlanPrefill { .. }) => (decodes, prefills + 1),
+                    Operation::Attn(Attn::PlanDecode { .. }) => (decodes + 1, prefills),
+                    Operation::Attn(Attn::PlanPrefill { .. }) => (decodes, prefills + 1),
                     _ => (decodes, prefills),
                 })
         };

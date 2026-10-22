@@ -7,7 +7,7 @@
 use crate::common::linear_ref::glu;
 use crate::common::tc5::{e2m1, e4m3, side};
 use crate::common::{Gpu, Lcg};
-use kernels_cuda::linear::tc5::{
+use kernels_cuda::linear::gemm_sm100::{
     Elem, Epilogue, Glu, Operand, Out, Plan, atom_bytes, atom_offset, gemm_epi_with, supported,
 };
 

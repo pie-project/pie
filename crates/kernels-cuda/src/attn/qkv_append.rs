@@ -33,7 +33,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     rest: Option<Tensor>,
     q: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
+    const OP: &str = "fused.qkv_fused_qknorm_rope_vnorm_write";
 
     const WARP_BLOCK: u32 = 256;
 

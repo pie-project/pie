@@ -695,7 +695,7 @@ pub fn gdn_step_fused(
     z: &mut Tensor,
     y: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "attention.ssm_gdn_step";
+    const OP: &str = "fused.gdn_step";
     let channels = 2 * k_heads * k_dim + v_heads * v_dim;
     let covered = k_dim == CHUNK_HEAD
         && v_dim == CHUNK_HEAD

@@ -14,13 +14,13 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_xla::Error> {
         match op {
-            Linear::MlpRelu2 { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Linear::Relu2 { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
             Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
-            | Linear::MlpSwigluClampSplitRouted { .. }
-            | Linear::MlpSwigluClampRouted { .. }
+            | Linear::SwigluClampSplitRouted { .. }
+            | Linear::SwigluClampRouted { .. }
             | Linear::MoeSumAdd { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => {
@@ -63,7 +63,7 @@ impl Run<'_> {
                 },
             },
 
-            Linear::MlpSwiglu {
+            Linear::Swiglu {
                 packed,
                 intermediate,
                 y,
@@ -73,7 +73,7 @@ impl Run<'_> {
                 *intermediate,
                 self.tensor(*y),
             ),
-            Linear::MlpSwigluClamp {
+            Linear::SwigluClamp {
                 packed,
                 intermediate,
                 limit,
@@ -85,7 +85,7 @@ impl Run<'_> {
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::MlpSwigluClampAlpha {
+            Linear::SwigluClampAlpha {
                 packed,
                 intermediate,
                 limit,
@@ -100,20 +100,20 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+            Linear::SwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::MlpGegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
+            Linear::GegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 self.tensor(*y),
             ),
-            Linear::MlpGeluTanh { x, y } => {
+            Linear::GeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
             Linear::RelBias {
@@ -154,7 +154,7 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            Linear::MlpGegluTanhPacked {
+            Linear::GegluTanhPacked {
                 packed,
                 intermediate,
                 y,
@@ -164,7 +164,7 @@ impl Run<'_> {
                 *intermediate,
                 self.tensor(*y),
             ),
-            Linear::MlpSitu {
+            Linear::Situ {
                 packed,
                 intermediate,
                 beta,

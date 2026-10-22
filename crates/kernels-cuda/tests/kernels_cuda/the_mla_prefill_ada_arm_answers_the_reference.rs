@@ -199,7 +199,7 @@ fn prefill(gpu: &mut Gpu, case: &Case, raw: &Raw, device: &Device) -> Vec<u16> {
         &mut o,
         None,
     )
-    .expect("attention.mla_prefill enqueues");
+    .expect("attn.mla_prefill enqueues");
     gpu.sync();
     gpu.down::<u16>(out, case.tokens() * HEADS * RANK)
 }

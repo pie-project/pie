@@ -105,7 +105,7 @@ pub fn modulate(
     lane_of_row: Option<Tensor>,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.modulate";
+    const OP: &str = "elemwise.modulate";
     debug_assert!(
         x.rows == o.rows && x.width == o.width,
         "`{OP}` writes the rectangle it reads"
@@ -148,7 +148,7 @@ pub fn gated_residual_add(
     lane_of_row: Option<Tensor>,
     r_out: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gated_residual_add";
+    const OP: &str = "elemwise.gated_residual_add";
     debug_assert!(
         r.rows == r_out.rows && r.width == r_out.width && y.rows == r.rows && y.width == r.width,
         "`{OP}` folds one rectangle"

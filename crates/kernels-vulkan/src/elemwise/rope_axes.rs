@@ -39,7 +39,7 @@ pub fn rope_axes(
     head_dim: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_axes";
+    const OP: &str = "elemwise.rope_axes";
     if positions.dtype != Dtype::F32 {
         return Err(refuse(
             OP,

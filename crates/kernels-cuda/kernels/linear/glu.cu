@@ -4,13 +4,13 @@
 
 namespace pie::linear {
 
-// `mlp_swiglu_clamp_routed` landing its rows as the e4m3 read-back
+// `linear.swiglu_clamp_routed` landing its rows as the e4m3 read-back
 // (`act_quant_e4m3_v8`'s values mode) of the bf16 rows it would land: eight
 // columns a lane, a 128-wide block's 16 lanes adjacent. A select reading
 // them back again lands the same values (each block's values sit on its
 // scale's grid, or on the grid one below where the rounding lowered its
 // amax), so it may read them as they are. `width` whole blocks.
-__global__ void mlp_swiglu_clamp_routed_e4m3(
+__global__ void swiglu_clamp_routed_e4m3(
     const bf16* __restrict__ packed,
     const float* __restrict__ weights,
     bf16* __restrict__ y,
@@ -69,7 +69,7 @@ __global__ void mlp_swiglu_clamp_routed_e4m3(
 }
 
 template <class T>
-__global__ void mlp_geglu_tanh(
+__global__ void geglu_tanh(
     const T* __restrict__ gate,
     const T* __restrict__ up,
     T* __restrict__ y,
@@ -97,7 +97,7 @@ __global__ void mlp_geglu_tanh(
 
 // `gelu_tanh(x)` (`RELU2` false) or `relu(x)^2`, element for element.
 template <class T, bool RELU2>
-__global__ void mlp_act(
+__global__ void act(
     const T* __restrict__ x,
     T* __restrict__ y,
     i32 n,
@@ -216,7 +216,7 @@ __device__ __forceinline__ i32 up_offset(i32 i, i32 I) {
 }
 
 template <class T, bool GateSecond>
-__device__ __forceinline__ void mlp_swiglu_body(
+__device__ __forceinline__ void swiglu_body(
     const T* __restrict__ packed,
     T* __restrict__ y,
     i32 I,
@@ -240,15 +240,15 @@ __device__ __forceinline__ void mlp_swiglu_body(
 }
 
 template <class T>
-__global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 I,
+__global__ void swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 I,
                            i32 fan, const u32* __restrict__ win) {
-    mlp_swiglu_body<T, false>(packed, y, I, fan, win);
+    swiglu_body<T, false>(packed, y, I, fan, win);
 }
 
-// `mlp_swiglu` eight columns a thread, read and written 16 bytes at a time:
+// `swiglu` eight columns a thread, read and written 16 bytes at a time:
 // the same value for every element.
 template <class T>
-__global__ void mlp_swiglu_vec8(const T* __restrict__ packed, T* __restrict__ y, i32 I,
+__global__ void swiglu_vec8(const T* __restrict__ packed, T* __restrict__ y, i32 I,
                                 i32 fan, const u32* __restrict__ win) {
     // A programmatic dependent (`kernel.pdl`) touches nothing until its
     // producer is done; its own dependents may launch from here.
@@ -278,7 +278,7 @@ __global__ void mlp_swiglu_vec8(const T* __restrict__ packed, T* __restrict__ y,
 }
 
 template <class T, bool GateSecond>
-__device__ __forceinline__ void mlp_situ_body(
+__device__ __forceinline__ void situ_body(
     const T* __restrict__ packed,
     T* __restrict__ y,
     i32 I, float beta, float linear_beta,
@@ -305,16 +305,16 @@ __device__ __forceinline__ void mlp_situ_body(
 }
 
 template <class T>
-__global__ void mlp_situ(
+__global__ void situ(
     const T* __restrict__ packed, T* __restrict__ y,
     i32 I, float beta, float linear_beta,
     i32 fan, const u32* __restrict__ win)
 {
-    mlp_situ_body<T, false>(packed, y, I, beta, linear_beta, fan, win);
+    situ_body<T, false>(packed, y, I, beta, linear_beta, fan, win);
 }
 
 template <class T, bool GateSecond>
-__device__ __forceinline__ void mlp_geglu_tanh_packed_body(
+__device__ __forceinline__ void geglu_tanh_packed_body(
     const T* __restrict__ packed,
     T* __restrict__ y,
     i32 I,
@@ -340,17 +340,17 @@ __device__ __forceinline__ void mlp_geglu_tanh_packed_body(
 }
 
 template <class T>
-__global__ void mlp_geglu_tanh_packed(
+__global__ void geglu_tanh_packed(
     const T* __restrict__ packed, T* __restrict__ y, i32 I,
     i32 fan, const u32* __restrict__ win)
 {
-    mlp_geglu_tanh_packed_body<T, false>(packed, y, I, fan, win);
+    geglu_tanh_packed_body<T, false>(packed, y, I, fan, win);
 }
 
-// `mlp_geglu_tanh_packed` eight columns a thread, read and written 16 bytes
+// `geglu_tanh_packed` eight columns a thread, read and written 16 bytes
 // at a time: the same value for every element.
 template <class T>
-__global__ void mlp_geglu_tanh_packed_vec8(
+__global__ void geglu_tanh_packed_vec8(
     const T* __restrict__ packed, T* __restrict__ y, i32 I,
     i32 fan, const u32* __restrict__ win)
 {
@@ -384,7 +384,7 @@ __global__ void mlp_geglu_tanh_packed_vec8(
 }
 
 template <class T>
-__global__ void mlp_swiglu_clamp(
+__global__ void swiglu_clamp(
     const T* __restrict__ packed,
     T* __restrict__ y,
     i32 I, float limit,
@@ -412,12 +412,12 @@ __global__ void mlp_swiglu_clamp(
     y[row + i] = Elem<T>::from_f32((g / (1.f + expf(-g))) * u);
 }
 
-// `mlp_swiglu_clamp` element `at` of a gate and an up plane held apart, or
+// `swiglu_clamp` element `at` of a gate and an up plane held apart, or
 // of packed rows (`PACKED`: row r's `width` gate columns at 2 r width, its up
 // columns after them); under `ROUTED` each row times its route's weight
 // before it rounds.
 template <class T, bool PACKED, bool ROUTED>
-__global__ void mlp_swiglu_clamp_lanes(
+__global__ void swiglu_clamp_lanes(
     const T* __restrict__ gate,
     const T* __restrict__ up,
     const float* __restrict__ weights,
@@ -454,7 +454,7 @@ __global__ void mlp_swiglu_clamp_lanes(
 }
 
 template <class T>
-__global__ void mlp_swiglu_clamp_alpha(
+__global__ void swiglu_clamp_alpha(
     const T* __restrict__ packed,
     T* __restrict__ y,
     i32 I, float limit, float alpha,

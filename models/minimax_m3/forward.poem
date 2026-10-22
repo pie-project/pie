@@ -45,7 +45,7 @@ def forward(m, inputs):
     return ops.linear.lm_head(x, m.head)
 
 def swiglu_oai(x, f):
-    act = ops.linear.mlp_swiglu_clamp_alpha(ops.linear.matmul(x, f.gate_up), f.inter, f.limit, f.alpha)
+    act = ops.linear.swiglu_clamp_alpha(ops.linear.matmul(x, f.gate_up), f.inter, f.limit, f.alpha)
     return ops.linear.matmul(act, f.down)
 
 def moe(x, f):
@@ -64,7 +64,7 @@ def moe(x, f):
             return ops.linear.moe_matmul_select(act, bank, experts, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, experts, f.top_k)
 
-    act = ops.linear.mlp_swiglu_clamp_alpha(select(x, f.gate_up), f.inter, f.limit, f.alpha)
+    act = ops.linear.swiglu_clamp_alpha(select(x, f.gate_up), f.inter, f.limit, f.alpha)
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     return ops.elemwise.residual_add(swiglu_oai(x, f.shared), routed)
 

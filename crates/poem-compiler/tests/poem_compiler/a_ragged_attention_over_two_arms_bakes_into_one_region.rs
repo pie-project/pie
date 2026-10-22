@@ -6,7 +6,7 @@ use poem::{
     trace_hybrid,
 };
 use poem_compiler::Placement;
-use poem_ir::{Attention, Def, Gather, Linear, Operation, RuntimeInput};
+use poem_ir::{Attn, Def, Gather, Linear, Operation, RuntimeInput};
 
 const AUDIO: u64 = 32;
 const VIDEO: u64 = 48;
@@ -93,7 +93,7 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .nodes
             .iter()
             .enumerate()
-            .find(|(_, node)| matches!(node.op, Operation::Attention(Attention::Ragged { .. })))
+            .find(|(_, node)| matches!(node.op, Operation::Attn(Attn::Ragged { .. })))
             .expect("one ragged attention");
         let ragged = region_of(ragged_at);
         assert!(

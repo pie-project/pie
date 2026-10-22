@@ -45,7 +45,7 @@ def moe(x, m, w):
             return ops.linear.moe_matmul_select(act, bank, experts, m.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, experts, m.top_k)
 
-    hidden = ops.linear.mlp_swiglu(select(x, w.gate_up), m.inter)
+    hidden = ops.linear.swiglu(select(x, w.gate_up), m.inter)
     return ops.linear.moe_weighted_sum(select(hidden, w.down), weights)
 
 def attention(x, inputs, m, plans, mask, positions, w):

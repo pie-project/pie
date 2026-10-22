@@ -1,19 +1,19 @@
 use poem_ir::{
-    Attention, Collective, Conv, Elementwise, Fused, Gather, Linear, Node, Operation, Sampling, Ssm,
+    Attn, Collective, Conv, Elemwise, Fused, Gather, Linear, Node, Operation, Sampling, Ssm,
 };
 
 use crate::error::KernelError;
 
-pub trait DispatchAttention {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError>;
+pub trait DispatchAttn {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError>;
 }
 
 pub trait DispatchLinear {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError>;
 }
 
-pub trait DispatchElementwise {
-    fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError>;
+pub trait DispatchElemwise {
+    fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError>;
 }
 
 pub trait DispatchGather {
@@ -45,9 +45,9 @@ pub trait DispatchProbe {
 }
 
 pub trait Dispatch:
-    DispatchAttention
+    DispatchAttn
     + DispatchLinear
-    + DispatchElementwise
+    + DispatchElemwise
     + DispatchGather
     + DispatchCollective
     + DispatchSampling
@@ -58,9 +58,9 @@ pub trait Dispatch:
 {
     fn exec(&mut self, node: &Node) -> Result<(), KernelError> {
         let outcome = match &node.op {
-            Operation::Attention(op) => DispatchAttention::dispatch(self, op),
+            Operation::Attn(op) => DispatchAttn::dispatch(self, op),
             Operation::Linear(op) => DispatchLinear::dispatch(self, op),
-            Operation::Elementwise(op) => DispatchElementwise::dispatch(self, op),
+            Operation::Elemwise(op) => DispatchElemwise::dispatch(self, op),
             Operation::Gather(op) => DispatchGather::dispatch(self, op),
             Operation::Collective(op) => DispatchCollective::dispatch(self, op),
             Operation::Sampling(op) => DispatchSampling::dispatch(self, op),
@@ -76,9 +76,9 @@ pub trait Dispatch:
 }
 
 impl<T> Dispatch for T where
-    T: DispatchAttention
+    T: DispatchAttn
         + DispatchLinear
-        + DispatchElementwise
+        + DispatchElemwise
         + DispatchGather
         + DispatchCollective
         + DispatchSampling

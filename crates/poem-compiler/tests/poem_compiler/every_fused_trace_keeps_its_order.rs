@@ -48,29 +48,26 @@ fn catalog_models_fold_their_patterns_on_every_layer() {
         (
             "gemma4-31b-bf16-kv-bf16",
             "gather.split_qkv",
-            &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"][..],
-            "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+            &["fused.qkv_fused_qknorm_rope_vnorm_write"][..],
+            "fused.qkv_fused_qknorm_rope_vnorm_write",
         ),
         (
             "gptoss-120b-bf16-mxfp4-kv-bf16",
             "gather.split_qkv",
-            &[
-                "elementwise.split_rope_yarn_append",
-                "elementwise.rope_yarn_append",
-            ][..],
-            "elementwise.split_rope_yarn_append",
+            &["fused.split_rope_yarn_append", "fused.rope_yarn_append"][..],
+            "fused.split_rope_yarn_append",
         ),
         (
             "kimik3-l4-bf16-mxfp4a8-kv-bf16",
-            "attention.mla_prefill",
-            &["attention.mla_prefill_expanded"][..],
-            "attention.mla_prefill_expanded",
+            "attn.mla_prefill",
+            &["fused.mla_prefill_expanded"][..],
+            "fused.mla_prefill_expanded",
         ),
         (
             "kimik3-l4-bf16-mxfp4a8-kv-bf16",
-            "elementwise.res_blend",
-            &["elementwise.res_blend_rmsnorm"][..],
-            "elementwise.res_blend_rmsnorm",
+            "elemwise.res_blend",
+            &["fused.res_blend_rmsnorm"][..],
+            "fused.res_blend_rmsnorm",
         ),
     ] {
         let trace = poem_compiler::catalog::deployment(deployment)

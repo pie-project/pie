@@ -65,7 +65,7 @@ def qwen3_encode(arm, te, tap = None):
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, w.gate_up), te.inter), w.down)
+        f = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, w.gate_up), te.inter), w.down)
         y = ops.elemwise.residual_add(f, y)
         if tap != None:
             tap(l, y)
@@ -111,7 +111,7 @@ def attention(x, a, m, g, positions):
     return ops.linear.matmul(o, a.out)
 
 def mlp(x, f, d):
-    return ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, f.fc1), d.inter), f.fc2)
+    return ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, f.fc1), d.inter), f.fc2)
 
 def refine(arm, m):
     d = m.dims

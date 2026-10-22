@@ -53,7 +53,7 @@ fn tile(rows: u32, cols: u32, segments: u32) -> Shard {
 
 /// `y[n, s·H + h] = x[n, h]` for each of `streams` streams.
 pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_expand";
+    const OP: &str = "elemwise.hc_expand";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
     let m = stream_fan(OP, y.width, x.width, streams)?;
@@ -95,7 +95,7 @@ pub fn mix(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_mix";
+    const OP: &str = "elemwise.hc_mix";
     expect(OP, gates, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, normed, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
@@ -144,7 +144,7 @@ pub fn inject(
     streams: u32,
     hyper: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_inject";
+    const OP: &str = "elemwise.hc_inject";
     expect(OP, o, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, gates, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, hyper, &[Dtype::Bf16, Dtype::F32])?;
@@ -208,7 +208,7 @@ pub fn ple_gate(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.ple_gate";
+    const OP: &str = "elemwise.ple_gate";
     for t in [key, query, value, y] {
         expect(OP, t, &[Dtype::Bf16, Dtype::F32])?;
     }

@@ -147,14 +147,15 @@ pub(super) fn select_mxfp4_mma(
     routes: Tensor,
     y: &mut Tensor,
     fan: &Selected,
-    glu: Option<crate::linear::tc5::Glu>,
+    glu: Option<crate::linear::gemm_sm100::Glu>,
     tensor_scales: Option<Tensor>,
     scale_atoms: bool,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
     // The converts read e8m0 scales a 32 codes and no tensor scale, so an
     // NVFP4 bank (e4m3 a 16 codes, a tensor scale a row) keeps the bf16 path.
-    let cvt = ctx.tuning().mxfp4_cvt && crate::linear::tc5::supported() && tensor_scales.is_none();
+    let cvt =
+        ctx.tuning().mxfp4_cvt && crate::linear::gemm_sm100::supported() && tensor_scales.is_none();
     if scale_atoms && !cvt {
         return Err(refuse(
             op,
@@ -324,7 +325,7 @@ pub fn select_mxfp4_atoms_takes(ctx: &Ctx, routes: Tensor, x: Tensor) -> bool {
     let t = ctx.tuning();
     let count = routes.rows * routes.width;
     t.mxfp4_cvt
-        && crate::linear::tc5::supported()
+        && crate::linear::gemm_sm100::supported()
         && t.mxfp4_a8_from <= count
         && count <= t.mxfp4_a8_until
         && x.width > 0
@@ -399,18 +400,18 @@ pub(super) fn matmul_select_mxfp4(
             fan.route_count,
         )
     {
-        use crate::linear::tc5;
+        use crate::linear::gemm_sm100;
         return select_tc5(
             ctx,
             op,
             x,
-            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, MXFP4_BLOCK),
+            gemm_sm100::Operand::scaled(codes.ptr, gemm_sm100::Elem::E2m1, scales.ptr, MXFP4_BLOCK),
             codes.rows,
             routes,
             y,
-            tc5::Epilogue {
+            gemm_sm100::Epilogue {
                 bias: bias.map_or(0, |b| b.ptr),
-                ..tc5::Epilogue::STORE
+                ..gemm_sm100::Epilogue::STORE
             },
         );
     }
@@ -554,16 +555,16 @@ pub(super) fn matmul_select_mlxu4(
             fan.route_count,
         )
     {
-        use crate::linear::tc5;
+        use crate::linear::gemm_sm100;
         return select_tc5(
             ctx,
             op,
             x,
-            tc5::Operand::affine(codes.ptr, scales.ptr, biases.ptr, group),
+            gemm_sm100::Operand::affine(codes.ptr, scales.ptr, biases.ptr, group),
             codes.rows,
             routes,
             y,
-            tc5::Epilogue::STORE,
+            gemm_sm100::Epilogue::STORE,
         );
     }
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;

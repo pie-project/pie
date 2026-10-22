@@ -92,11 +92,11 @@ pub fn lm_head(act: &Value, w: &Weight) -> Value {
     y
 }
 
-pub fn mlp_swiglu(packed: &Value, intermediate: u32) -> Value {
+pub fn swiglu(packed: &Value, intermediate: u32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::MlpSwiglu {
+        Linear::Swiglu {
             packed: packed.id(),
             intermediate,
             y: y.id(),
@@ -106,11 +106,11 @@ pub fn mlp_swiglu(packed: &Value, intermediate: u32) -> Value {
     y
 }
 
-pub fn mlp_swiglu_clamp(packed: &Value, intermediate: u32, limit: f32) -> Value {
+pub fn swiglu_clamp(packed: &Value, intermediate: u32, limit: f32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::MlpSwigluClamp {
+        Linear::SwigluClamp {
             packed: packed.id(),
             intermediate,
             limit,
@@ -121,11 +121,11 @@ pub fn mlp_swiglu_clamp(packed: &Value, intermediate: u32, limit: f32) -> Value 
     y
 }
 
-pub fn mlp_swiglu_clamp_alpha(packed: &Value, intermediate: u32, limit: f32, alpha: f32) -> Value {
+pub fn swiglu_clamp_alpha(packed: &Value, intermediate: u32, limit: f32, alpha: f32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::MlpSwigluClampAlpha {
+        Linear::SwigluClampAlpha {
             packed: packed.id(),
             intermediate,
             limit,
@@ -137,11 +137,11 @@ pub fn mlp_swiglu_clamp_alpha(packed: &Value, intermediate: u32, limit: f32, alp
     y
 }
 
-pub fn mlp_swiglu_clamp_split(gate: &Value, up: &Value, limit: f32) -> Value {
+pub fn swiglu_clamp_split(gate: &Value, up: &Value, limit: f32) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Linear::MlpSwigluClampSplit {
+        Linear::SwigluClampSplit {
             gate: gate.id(),
             up: up.id(),
             limit,
@@ -152,18 +152,13 @@ pub fn mlp_swiglu_clamp_split(gate: &Value, up: &Value, limit: f32) -> Value {
     y
 }
 
-/// `mlp_swiglu_clamp_split` of routed rows, each times its route's weight
+/// `swiglu_clamp_split` of routed rows, each times its route's weight
 /// before it rounds.
-pub fn mlp_swiglu_clamp_split_routed(
-    gate: &Value,
-    up: &Value,
-    weights: &Value,
-    limit: f32,
-) -> Value {
+pub fn swiglu_clamp_split_routed(gate: &Value, up: &Value, weights: &Value, limit: f32) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Linear::MlpSwigluClampSplitRouted {
+        Linear::SwigluClampSplitRouted {
             gate: gate.id(),
             up: up.id(),
             weights: weights.id(),
@@ -175,9 +170,9 @@ pub fn mlp_swiglu_clamp_split_routed(
     y
 }
 
-/// `mlp_swiglu_clamp` of routed rows (`packed` each row's gate columns,
+/// `swiglu_clamp` of routed rows (`packed` each row's gate columns,
 /// then its up columns), each times its route's weight before it rounds.
-pub fn mlp_swiglu_clamp_routed(
+pub fn swiglu_clamp_routed(
     packed: &Value,
     intermediate: u32,
     weights: &Value,
@@ -186,7 +181,7 @@ pub fn mlp_swiglu_clamp_routed(
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::MlpSwigluClampRouted {
+        Linear::SwigluClampRouted {
             packed: packed.id(),
             intermediate,
             weights: weights.id(),
@@ -198,11 +193,11 @@ pub fn mlp_swiglu_clamp_routed(
     y
 }
 
-pub fn mlp_geglu_tanh(gate: &Value, up: &Value) -> Value {
+pub fn geglu_tanh(gate: &Value, up: &Value) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Linear::MlpGegluTanh {
+        Linear::GegluTanh {
             gate: gate.id(),
             up: up.id(),
             y: y.id(),
@@ -212,11 +207,11 @@ pub fn mlp_geglu_tanh(gate: &Value, up: &Value) -> Value {
     y
 }
 
-pub fn mlp_gelu_tanh(x: &Value) -> Value {
+pub fn gelu_tanh(x: &Value) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Linear::MlpGeluTanh {
+        Linear::GeluTanh {
             x: x.id(),
             y: y.id(),
         },
@@ -225,11 +220,11 @@ pub fn mlp_gelu_tanh(x: &Value) -> Value {
     y
 }
 
-pub fn mlp_relu2(x: &Value) -> Value {
+pub fn relu2(x: &Value) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Linear::MlpRelu2 {
+        Linear::Relu2 {
             x: x.id(),
             y: y.id(),
         },
@@ -238,11 +233,11 @@ pub fn mlp_relu2(x: &Value) -> Value {
     y
 }
 
-pub fn mlp_geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
+pub fn geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::MlpGegluTanhPacked {
+        Linear::GegluTanhPacked {
             packed: packed.id(),
             intermediate,
             y: y.id(),
@@ -252,11 +247,11 @@ pub fn mlp_geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
     y
 }
 
-pub fn mlp_situ(packed: &Value, intermediate: u32, beta: f32, up_cap: Option<f32>) -> Value {
+pub fn situ(packed: &Value, intermediate: u32, beta: f32, up_cap: Option<f32>) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::MlpSitu {
+        Linear::Situ {
             packed: packed.id(),
             intermediate,
             beta,

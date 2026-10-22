@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
-use crate::ops::attn::Attention;
-use crate::ops::elemwise::{Elementwise, ModulateForm, Yarn};
+use crate::ops::attn::Attn;
+use crate::ops::elemwise::{Elemwise, ModulateForm, NormAxis, NormWeight, Yarn};
 use crate::ops::linear::Linear;
 use crate::value::ValueId;
 
@@ -121,8 +121,8 @@ pub enum Fused {
     /// rotated just before it (`rotate`, a `RopePartialLast` of the queries
     /// the ranking alone reads): a backend may turn them as it loads them.
     IndexTopkRope {
-        rotate: Box<Elementwise>,
-        rank: Box<Attention>,
+        rotate: Box<Elemwise>,
+        rank: Box<Attn>,
     },
     /// DeepSeek-V4's q (`NormRopeLast`, scale-free) and its kv plane
     /// (`NormRopeLastAppend`) of one layer, landed together.
@@ -133,13 +133,13 @@ pub enum Fused {
     /// rows are read by nothing else. `state`, if set, also lands the fire's
     /// compressor state written just before (a `PoolStateWrite`).
     PoolCompress {
-        gather: Box<Attention>,
+        gather: Box<Attn>,
         weight: ValueId,
         eps: f32,
         latent: ValueId,
-        rotate: Box<Elementwise>,
-        append: Box<Attention>,
-        state: Option<Box<Attention>>,
+        rotate: Box<Elemwise>,
+        append: Box<Attn>,
+        state: Option<Box<Attn>>,
     },
     NormModulate {
         x: ValueId,
@@ -292,7 +292,7 @@ pub enum Fused {
     /// (`Sink`), the sinked output landed in `o_out`. The attention's `o`
     /// (read by nothing else) and `lse` are still outputs.
     LseSink {
-        attn: Box<Attention>,
+        attn: Box<Attn>,
         sink: ValueId,
         head_dim: u32,
         o_out: ValueId,
@@ -302,32 +302,32 @@ pub enum Fused {
     /// gates (`gates`, an `HcGates`) and the pre-mixed row's `rmsnorm`. The
     /// intermediates are still outputs, read by nothing else.
     HcPre {
-        norm: Box<Elementwise>,
-        project: Box<Elementwise>,
-        gates: Box<Elementwise>,
-        rmsnorm: Box<Elementwise>,
+        norm: Box<Elemwise>,
+        project: Box<Elemwise>,
+        gates: Box<Elemwise>,
+        rmsnorm: Box<Elemwise>,
     },
     /// The combined hyper-connection gates (`gates`, an `HcGates`) and the RMS
     /// norm of the row they pre-mix (`norm`), landable in one pass. The
     /// pre-mixed row is still an output, read by nothing else.
     HcGatesNorm {
-        gates: Box<Elementwise>,
-        norm: Box<Elementwise>,
+        gates: Box<Elemwise>,
+        norm: Box<Elemwise>,
     },
     /// AttnRes's blend (`blend`, a `ResBlend`) and the RMS norm of its row
     /// (`norm`), landable in one pass. The blended row is still an output,
     /// read by nothing else.
     ResBlendRmsnorm {
-        blend: Box<Elementwise>,
-        norm: Box<Elementwise>,
+        blend: Box<Elemwise>,
+        norm: Box<Elemwise>,
     },
     /// A hyper-connection stream norm (`norm`, an `HcRmsnormF32`) and the mix
     /// projection it feeds (`project`, an `HcProject`), landable in one pass
     /// with the norm's per-row scale taken out of the dot. The normed rows are
     /// still an output, read by nothing else.
     HcPrenormProject {
-        norm: Box<Elementwise>,
-        project: Box<Elementwise>,
+        norm: Box<Elemwise>,
+        project: Box<Elemwise>,
     },
     /// DeepSeek-V4's whole attention: windowed (`window`, a `PrefillLse`) and
     /// compressed-pool (`pool`, a `PoolLse` or `PoolLseSelected`) attention
@@ -335,13 +335,13 @@ pub enum Fused {
     /// `o_out`; every intermediate is still an output, read by nothing else.
     /// `rotate` (the inverse rotation of `o_out`'s tail) lands too.
     PoolAttention {
-        window: Box<Attention>,
-        pool: Box<Attention>,
-        merge: Box<Attention>,
+        window: Box<Attn>,
+        pool: Box<Attn>,
+        merge: Box<Attn>,
         sink: ValueId,
         head_dim: u32,
         o_out: ValueId,
-        rotate: Option<Box<Elementwise>>,
+        rotate: Option<Box<Elemwise>>,
     },
     /// A latent attention's whole prefill: the optional cut of `q_b`'s rows
     /// (`split`, an `MlaSplitQB`), query absorb (`absorb_q`), scoring over
@@ -350,10 +350,10 @@ pub enum Fused {
     /// head a q head). Every intermediate is still an output, read by nothing
     /// else.
     MlaPrefillExpanded {
-        split: Option<Box<Attention>>,
-        absorb_q: Box<Attention>,
-        prefill: Box<Attention>,
-        absorb_out: Box<Attention>,
+        split: Option<Box<Attn>>,
+        absorb_q: Box<Attn>,
+        prefill: Box<Attn>,
+        absorb_out: Box<Attn>,
     },
     /// YaRN over q and k, and the rotated k with its v landed in the paged
     /// cache at each row's page and offset (`kv_append`); `k_out` is read by
@@ -437,7 +437,7 @@ pub enum Fused {
         select: Box<Linear>,
         glu: Box<Linear>,
         down: Box<Linear>,
-        norm: Option<Box<Elementwise>>,
+        norm: Option<Box<Elemwise>>,
         sum: Box<Linear>,
         gate_add: Option<Box<Linear>>,
     },
@@ -534,7 +534,7 @@ impl Operands for Fused {
             // and head weights.
             Self::IndexTopkRope { rotate, rank } => {
                 rotate.inputs(sink);
-                if let Attention::IndexTopk { keys, weights, .. } = **rank {
+                if let Attn::IndexTopk { keys, weights, .. } = **rank {
                     sink.push(keys);
                     sink.extend(weights);
                 }
@@ -550,7 +550,7 @@ impl Operands for Fused {
                 state,
                 ..
             } => {
-                if let Attention::PoolGather {
+                if let Attn::PoolGather {
                     boundary_pos,
                     boundary_req,
                     pages,
@@ -560,10 +560,10 @@ impl Operands for Fused {
                     sink.extend([boundary_pos, boundary_req, pages]);
                 }
                 sink.push(*weight);
-                if let Elementwise::RopePartialLast { positions, .. } = **rotate {
+                if let Elemwise::RopePartialLast { positions, .. } = **rotate {
                     sink.push(positions);
                 }
-                if let Attention::PoolKvAppend {
+                if let Attn::PoolKvAppend {
                     pool,
                     write_page,
                     write_offset,
@@ -572,11 +572,11 @@ impl Operands for Fused {
                 {
                     sink.extend([pool, write_page, write_offset]);
                 }
-                if let Attention::PoolGather { ape: Some(ape), .. } = **gather {
+                if let Attn::PoolGather { ape: Some(ape), .. } = **gather {
                     sink.push(ape);
                 }
                 if let Some(state) = state
-                    && let Attention::PoolStateWrite {
+                    && let Attn::PoolStateWrite {
                         kv,
                         score,
                         write_page,
@@ -712,31 +712,46 @@ impl Operands for Fused {
                 rmsnorm,
             } => {
                 norm.inputs(sink);
-                if let Elementwise::HcProject { weight, .. } = **project {
+                if let Elemwise::HcProject { weight, .. } = **project {
                     sink.push(weight);
                 }
-                if let Elementwise::HcGates { scale, base, .. } = **gates {
+                if let Elemwise::HcGates { scale, base, .. } = **gates {
                     sink.extend([scale, base]);
                 }
-                if let Elementwise::Rmsnorm { weight, .. } = **rmsnorm {
+                if let Elemwise::Rmsnorm {
+                    weight: NormWeight::Scale(weight),
+                    axis: NormAxis::Row,
+                    ..
+                } = **rmsnorm
+                {
                     sink.push(weight);
                 }
             }
             Self::ResBlendRmsnorm { blend, norm } => {
                 blend.inputs(sink);
-                if let Elementwise::Rmsnorm { weight, .. } = **norm {
+                if let Elemwise::Rmsnorm {
+                    weight: NormWeight::Scale(weight),
+                    axis: NormAxis::Row,
+                    ..
+                } = **norm
+                {
                     sink.push(weight);
                 }
             }
             Self::HcGatesNorm { gates, norm } => {
                 gates.inputs(sink);
-                if let Elementwise::Rmsnorm { weight, .. } = **norm {
+                if let Elemwise::Rmsnorm {
+                    weight: NormWeight::Scale(weight),
+                    axis: NormAxis::Row,
+                    ..
+                } = **norm
+                {
                     sink.push(weight);
                 }
             }
             Self::HcPrenormProject { norm, project } => {
                 norm.inputs(sink);
-                if let Elementwise::HcProject { weight, .. } = **project {
+                if let Elemwise::HcProject { weight, .. } = **project {
                     sink.push(weight);
                 }
             }
@@ -763,13 +778,13 @@ impl Operands for Fused {
             } => {
                 if let Some(split) = split {
                     split.inputs(sink);
-                } else if let Attention::MlaAbsorbQ { q_nope, .. } = **absorb_q {
+                } else if let Attn::MlaAbsorbQ { q_nope, .. } = **absorb_q {
                     sink.push(q_nope);
                 }
-                if let Attention::MlaAbsorbQ { kv_b, .. } = **absorb_q {
+                if let Attn::MlaAbsorbQ { kv_b, .. } = **absorb_q {
                     sink.push(kv_b);
                 }
-                if let Attention::MlaPrefill {
+                if let Attn::MlaPrefill {
                     plan, q_pe, cache, ..
                 } = **prefill
                 {
@@ -795,7 +810,7 @@ impl Operands for Fused {
                 select.inputs(sink);
                 if let Linear::MoeWeightedSum { weights, .. } = **sum {
                     sink.push(weights);
-                } else if let Linear::MlpSwigluClampRouted { weights, .. } = **glu {
+                } else if let Linear::SwigluClampRouted { weights, .. } = **glu {
                     sink.push(weights);
                 }
                 match **down {
@@ -813,7 +828,7 @@ impl Operands for Fused {
                     _ => {}
                 }
                 // Then the routes' norm scale.
-                if let Some(Elementwise::NormGate { scale, .. }) = norm.as_deref() {
+                if let Some(Elemwise::NormGate { scale, .. }) = norm.as_deref() {
                     sink.extend(*scale);
                 }
                 // Then the gated shared expert's row and its gate, or the
@@ -1054,7 +1069,7 @@ impl Operands for Fused {
                 window.aliases(sink);
                 pool.aliases(sink);
                 merge.aliases(sink);
-                if let Attention::MergeLse { o, .. } = **merge {
+                if let Attn::MergeLse { o, .. } = **merge {
                     sink.push((*o_out, o));
                 }
                 if let Some(rotate) = rotate {
@@ -1114,43 +1129,41 @@ impl Operands for Fused {
     // the family that kernel ships in.
     fn name(&self) -> &'static str {
         match self {
-            Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
-            Self::RmsnormResidualAdd { .. } => "elementwise.rmsnorm_residual_add",
-            Self::EmbedScaleAdd { .. } => "elementwise.embed_scale_add",
-            Self::EmbedScaleAddSelect { .. } => "elementwise.embed_scale_add_select",
-            Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
-            Self::NormRopeLast { .. } => "elementwise.norm_rope_last",
-            Self::NormRopeLastAppend { .. } => "elementwise.norm_rope_last_append",
-            Self::PoolCompress { .. } => "attention.pool_compress",
-            Self::NormRopePair { .. } => "elementwise.norm_rope_pair",
-            Self::IndexTopkRope { .. } => "attention.index_topk_rope",
-            Self::NormModulate { .. } => "elementwise.norm_modulate",
-            Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
-            Self::HcNormProject { .. } => "elementwise.hc_norm_project",
-            Self::GdnStep { .. } => "attention.ssm_gdn_step",
-            Self::QGateNormRopeAppend { .. } => "attention.q_gate_k_norm_rope_append",
-            Self::MatmulGeglu { .. } => "linear.matmul_geglu",
-            Self::MatmulSwiglu { .. } => "linear.matmul_swiglu",
-            Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
-            Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
-            Self::MatmulBias { .. } => "linear.matmul_bias",
-            Self::MatmulSplitRows { .. } => "linear.matmul_split_rows",
-            Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
-            Self::RopeYarnAppend { .. } => "elementwise.rope_yarn_append",
-            Self::SplitRopeYarnAppend { .. } => "elementwise.split_rope_yarn_append",
-            Self::QgQknormRopeAppend { .. } => "elementwise.qg_qknorm_rope_append",
-            Self::LseSink { .. } => "attention.lse_sink",
-            Self::PoolAttention { .. } => "attention.pool_attention",
-            Self::MlaPrefillExpanded { .. } => "attention.mla_prefill_expanded",
-            Self::HcPrenormProject { .. } => "elementwise.hc_prenorm_project",
-            Self::HcGatesNorm { .. } => "elementwise.hc_gates_norm",
-            Self::ResBlendRmsnorm { .. } => "elementwise.res_blend_rmsnorm",
-            Self::HcPre { .. } => "elementwise.hc_pre",
-            Self::MoeExperts { .. } => "linear.moe_experts",
-            Self::QkvFusedQknormRopeVnormWrite { .. } => {
-                "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"
-            }
-            Self::SplitQkvFused { .. } => "custom_cuda.split_qkv_fused",
+            Self::ResidualAddRmsnorm { .. } => "fused.residual_add_rmsnorm",
+            Self::RmsnormResidualAdd { .. } => "fused.rmsnorm_residual_add",
+            Self::EmbedScaleAdd { .. } => "fused.embed_scale_add",
+            Self::EmbedScaleAddSelect { .. } => "fused.embed_scale_add_select",
+            Self::RmsnormRopePartialQ { .. } => "fused.rmsnorm_rope_partial_q",
+            Self::NormRopeLast { .. } => "fused.norm_rope_last",
+            Self::NormRopeLastAppend { .. } => "fused.norm_rope_last_append",
+            Self::PoolCompress { .. } => "fused.pool_compress",
+            Self::NormRopePair { .. } => "fused.norm_rope_pair",
+            Self::IndexTopkRope { .. } => "fused.index_topk_rope",
+            Self::NormModulate { .. } => "fused.norm_modulate",
+            Self::GatedResidualNormModulate { .. } => "fused.gated_residual_norm_modulate",
+            Self::HcNormProject { .. } => "fused.hc_norm_project",
+            Self::GdnStep { .. } => "fused.gdn_step",
+            Self::QGateNormRopeAppend { .. } => "fused.q_gate_norm_rope_append",
+            Self::MatmulGeglu { .. } => "fused.matmul_geglu",
+            Self::MatmulSwiglu { .. } => "fused.matmul_swiglu",
+            Self::MlpSwiglu { .. } => "fused.mlp_swiglu",
+            Self::LmHeadSoftcap { .. } => "fused.lm_head_softcap",
+            Self::MatmulBias { .. } => "fused.matmul_bias",
+            Self::MatmulSplitRows { .. } => "fused.matmul_split_rows",
+            Self::MoeSelectGlu { .. } => "fused.moe_select_glu",
+            Self::RopeYarnAppend { .. } => "fused.rope_yarn_append",
+            Self::SplitRopeYarnAppend { .. } => "fused.split_rope_yarn_append",
+            Self::QgQknormRopeAppend { .. } => "fused.qg_qknorm_rope_append",
+            Self::LseSink { .. } => "fused.lse_sink",
+            Self::PoolAttention { .. } => "fused.pool_attention",
+            Self::MlaPrefillExpanded { .. } => "fused.mla_prefill_expanded",
+            Self::HcPrenormProject { .. } => "fused.hc_prenorm_project",
+            Self::HcGatesNorm { .. } => "fused.hc_gates_norm",
+            Self::ResBlendRmsnorm { .. } => "fused.res_blend_rmsnorm",
+            Self::HcPre { .. } => "fused.hc_pre",
+            Self::MoeExperts { .. } => "fused.moe_experts",
+            Self::QkvFusedQknormRopeVnormWrite { .. } => "fused.qkv_fused_qknorm_rope_vnorm_write",
+            Self::SplitQkvFused { .. } => "fused.split_qkv_fused",
         }
     }
 }

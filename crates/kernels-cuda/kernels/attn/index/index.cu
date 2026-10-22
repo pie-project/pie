@@ -1,4 +1,5 @@
 #include "attn/index/index.cuh"
+#include "prim/mma.cuh"
 
 namespace pie::attn {
 
@@ -39,8 +40,8 @@ __device__ __forceinline__ uint4 load8(const std::uint8_t* plane, long long slot
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const unsigned byte = (nib >> (8 * i)) & 0xffu;
-        const __nv_bfloat162 b = __floats2bfloat162_rn(dsv4::e2m1_value(byte & 0xfu) * s,
-                                                       dsv4::e2m1_value(byte >> 4) * s);
+        const __nv_bfloat162 b = __floats2bfloat162_rn(kv_rows::e2m1_value(byte & 0xfu) * s,
+                                                       kv_rows::e2m1_value(byte >> 4) * s);
         o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
     }
     return out;
@@ -92,7 +93,7 @@ __global__ __launch_bounds__(128) void index_store_fp4(
     const float inv = __uint_as_float(static_cast<unsigned>(254 - e) << 23);
     unsigned code[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) code[i] = dsv4::e2m1_code(fminf(fmaxf(v[i] * inv, -6.f), 6.f));
+    for (int i = 0; i < 4; ++i) code[i] = kv_rows::e2m1_code(fminf(fmaxf(v[i] * inv, -6.f), 6.f));
     std::uint8_t* base = pages + page * page_size * kRow;
     *reinterpret_cast<std::uint16_t*>(base + off * kData + lane * 2) =
         static_cast<std::uint16_t>(code[0] | (code[1] << 4) | (code[2] << 8) | (code[3] << 12));
@@ -135,8 +136,8 @@ __global__ __launch_bounds__(256) void index_q_fp4(
     std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&o);
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const float a = dsv4::e2m1_value(dsv4::e2m1_code(fminf(fmaxf(v[2 * k] * inv, -6.f), 6.f))) * s;
-        const float b = dsv4::e2m1_value(dsv4::e2m1_code(fminf(fmaxf(v[2 * k + 1] * inv, -6.f), 6.f))) * s;
+        const float a = kv_rows::e2m1_value(kv_rows::e2m1_code(fminf(fmaxf(v[2 * k] * inv, -6.f), 6.f))) * s;
+        const float b = kv_rows::e2m1_value(kv_rows::e2m1_code(fminf(fmaxf(v[2 * k + 1] * inv, -6.f), 6.f))) * s;
         const __nv_bfloat162 pr = __floats2bfloat162_rn(a, b);
         o32[k] = *reinterpret_cast<const std::uint32_t*>(&pr);
     }
@@ -269,16 +270,14 @@ __global__ void index_knorm_rope_warp(
     T* row = idx_k + static_cast<long long>(n_row) * head_dim;
     float s = 0.f;
     for (int d = lane; d < head_dim; d += 32) s += Elem<T>::to_f32(row[d]);
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    s = ::pie::warp_sum(s);
     const float mean = s / head_dim;
     float vv = 0.f;
     for (int d = lane; d < head_dim; d += 32) {
         const float x = Elem<T>::to_f32(row[d]) - mean;
         vv += x * x;
     }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) vv += __shfl_xor_sync(0xffffffffu, vv, o);
+    vv = ::pie::warp_sum(vv);
     const float inv = rsqrtf(vv / head_dim + eps);
     __syncwarp();
     for (int d = lane; d < head_dim; d += 32) {
@@ -478,15 +477,6 @@ constexpr int kNt = kKeys / 8;  // a chunk's 8-key mma column tiles
 
 __device__ __forceinline__ std::uint32_t smem_addr(const void* p) {
     return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
-}
-
-__device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const std::uint32_t (&a)[4],
-                                             const std::uint32_t (&b)[2]) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
 }
@@ -793,10 +783,7 @@ __global__ void index_topk_block_max(
             for (int h = 0; h < H; ++h) {
                 float pd = 0.f;
                 for (int i = 0; i < per; ++i) pd += qreg[h][i] * kv[i];
-                #pragma unroll
-                for (int sh = 16; sh > 0; sh >>= 1) {
-                    pd += __shfl_xor_sync(0xffffffffu, pd, sh);
-                }
+                pd = ::pie::warp_sum(pd);
                 best[h] = fmaxf(best[h], pd);
             }
         }

@@ -1,10 +1,10 @@
 //! DeepSeek-V4's attention at decode widths in one launch
-//! (`attn/dsv4_decode.cuh`): a row's sliding window of the shared key/value
+//! (`attn/compressed/decode.cu`): a row's sliding window of the shared key/value
 //! plane, its compressed rows (all it sees, or the ones an indexer picked),
 //! the two folded and the sinks applied, as `prefill_lse`, `pool_lse` (or
 //! `pool_lse_selected`), `merge_lse` and `sink` land them in four.
 //!
-//! And DeepSeek's fp8 key/value rows (`attn/dsv4_kv.cuh`), FlashMLA's
+//! And DeepSeek's fp8 key/value rows (`prim/kv_rows.cuh`), FlashMLA's
 //! `fp8_ds_mla` as vLLM serves V4: a page of `ps` positions is `ps` rows of
 //! [`DS_DATA`] bytes (448 e4m3 codes, then the 64 rotated dims in bf16), then
 //! `ps` rows of [`DS_SCALES`] bytes (seven ue8m0 exponents, one a 64 codes,
@@ -67,7 +67,7 @@ impl Rows {
         }
     }
 
-    /// The kernels' format constant (`attn/dsv4_kv.cuh`).
+    /// The kernels' format constant (`prim/kv_rows.cuh`).
     #[must_use]
     pub const fn code(self) -> u32 {
         match self {
@@ -208,7 +208,7 @@ fn shaped(heads: u32, head_dim: u32, window: &KvPool, pooled: Option<&Pooled<'_>
 /// groups fill the chip, a power of two up to [`MAX_RANKS`].
 fn ranks(ctx: &Ctx, rows: u32) -> u32 {
     // Thread block clusters arrive with sm_90; below it the kernel folds
-    // nothing across ranks (`dsv4_decode.cuh`), so a block holds every key.
+    // nothing across ranks (`attn/compressed/decode.cu`), so a block holds every key.
     if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
         return 1;
     }
@@ -225,7 +225,7 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     let ld = HEAD_DIM + 8;
     let tile = KEYS * ld * 2;
     // Tiles in flight: six of quantized rows (five below sm_90, as
-    // `dsv4_decode.cuh` lays them) and the one they widen into, four of
+    // `attn/compressed/decode.cu` lays them) and the one they widen into, four of
     // bf16. A raw key holds the wider format's data and scales.
     let stages = if crate::jit::compute_capability_major().is_some_and(|major| major < 9) {
         5
@@ -257,7 +257,7 @@ pub struct Turn {
     pub yarn: Option<crate::elemwise::rope::Yarn>,
 }
 
-/// `pie::attn::dsv4::Turn`, field for field.
+/// `pie::kv_rows::Turn`, field for field.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct TurnArgs {
@@ -324,7 +324,7 @@ pub fn decode(
     turn: Option<Turn>,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.dsv4_decode";
+    const OP: &str = "attn.compressed_decode";
     let turn = TurnArgs::of(turn);
     if !takes(ctx, heads, head_dim, window_pool, pooled.as_ref()) {
         return Err(refuse(
@@ -396,7 +396,7 @@ pub fn decode(
         Fire::at(
             DECODE,
             symbol(&format!(
-                "::pie::attn::dsv4::decode<{HEAD_DIM}, {sink_ty}, {ranks}, {wf}, {pf}>"
+                "::pie::attn::compressed::decode<{HEAD_DIM}, {sink_ty}, {ranks}, {wf}, {pf}>"
             )),
         )
         .apply(launch),
@@ -451,7 +451,7 @@ pub fn append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.kv_append_shared";
+    const OP: &str = "attn.kv_append_shared";
     let (fmt, div) = ds_pool(OP, pool)?;
     if div != 1 {
         return Err(refuse(OP, "the window's plane holds a row a position"));
@@ -488,7 +488,7 @@ pub fn store_entries(
     boundary_req: Tensor,
     pool: &KvPool,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     let (fmt, div) = ds_pool(OP, pool)?;
     if entries.dtype != Dtype::Bf16 || entries.width != HEAD_DIM {
         return Err(refuse(OP, "an fp8 row is written from a bf16 row of 512"));
@@ -516,5 +516,8 @@ pub fn store_entries(
 
 /// A row writer's symbol: the format's instance of the generic one.
 fn rows_symbol(what: &str, fmt: Rows) -> &'static str {
-    symbol(&format!("::pie::attn::dsv4::rows_{what}<{}>", fmt.code()))
+    symbol(&format!(
+        "::pie::attn::compressed::rows_{what}<{}>",
+        fmt.code()
+    ))
 }

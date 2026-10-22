@@ -1,18 +1,18 @@
 use kernels_cerebras::attn;
-use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, Operands, StructKind};
+use poem_exec::{DispatchAttn, KernelError};
+use poem_ir::{Attn, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
-impl DispatchAttention for Run<'_> {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+impl DispatchAttn for Run<'_> {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
         self.attention(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn attention(&mut self, op: &Attention) -> Result<(), kernels_cerebras::Error> {
+    fn attention(&mut self, op: &Attn) -> Result<(), kernels_cerebras::Error> {
         if self.rs_seat().is_some() {
             return Err(kernels_cerebras::Error::Backend {
                 op: op.name(),
@@ -21,11 +21,11 @@ impl Run<'_> {
             });
         }
         match op {
-            Attention::PlanDecode { kv_len, plan, .. } => {
+            Attn::PlanDecode { kv_len, plan, .. } => {
                 match self.declared(*plan) {
                     StructKind::AttnDecodePlan => {}
                     other => panic!(
-                        "`attention.plan_decode` defines a {other:?}, which is no decode plan kind"
+                        "`attn.plan_decode` defines a {other:?}, which is no decode plan kind"
                     ),
                 }
                 let kv_len = self.tensor(*kv_len);
@@ -43,11 +43,11 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
             }
-            Attention::PlanPrefill { kv_len, plan, .. } => {
+            Attn::PlanPrefill { kv_len, plan, .. } => {
                 match self.declared(*plan) {
                     StructKind::AttnPrefillPlan => {}
                     other => panic!(
-                        "`attention.plan_prefill` defines a {other:?}, which is no prefill plan kind"
+                        "`attn.plan_prefill` defines a {other:?}, which is no prefill plan kind"
                     ),
                 }
                 let kv_len = self.tensor(*kv_len);
@@ -65,7 +65,7 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
             }
-            Attention::Decode {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -83,7 +83,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::DecodeLse {
+            Attn::DecodeLse {
                 q,
                 plan,
                 cache,
@@ -103,7 +103,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attention::Prefill {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -123,7 +123,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::PrefillLse {
+            Attn::PrefillLse {
                 q,
                 plan,
                 cache,
@@ -146,7 +146,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attention::Masked {
+            Attn::Masked {
                 q,
                 plan,
                 mask,
@@ -172,7 +172,7 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attention::MaskedLse {
+            Attn::MaskedLse {
                 q,
                 plan,
                 mask,
@@ -200,7 +200,7 @@ impl Run<'_> {
                     self.tensor(*lse),
                 )
             }
-            Attention::KvAppend {
+            Attn::KvAppend {
                 k,
                 v,
                 cache,
@@ -214,7 +214,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::KvAppendShared {
+            Attn::KvAppendShared {
                 plane,
                 cache,
                 write_page,
@@ -226,7 +226,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::Dense {
+            Attn::Dense {
                 q,
                 k,
                 v,
@@ -244,7 +244,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::DecodeSelected {
+            Attn::DecodeSelected {
                 q,
                 plan,
                 selection,
@@ -267,7 +267,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*o),
             ),
-            Attention::PrefillSelected {
+            Attn::PrefillSelected {
                 q,
                 plan,
                 selection,
@@ -292,7 +292,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*o),
             ),
-            Attention::IndexKvAppend {
+            Attn::IndexKvAppend {
                 k,
                 keys,
                 write_page,
@@ -304,7 +304,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::IndexBlockMean {
+            Attn::IndexBlockMean {
                 boundary_pos,
                 boundary_req,
                 keys,
@@ -320,7 +320,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*entries),
             ),
-            Attention::IndexTopk {
+            Attn::IndexTopk {
                 q,
                 weights,
                 keys,
@@ -347,7 +347,7 @@ impl Run<'_> {
                     self.tensor(*selection),
                 )
             }
-            Attention::PoolBoundaryDecode {
+            Attn::PoolBoundaryDecode {
                 positions,
                 row_valid,
                 ratio,
@@ -364,7 +364,7 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attention::PoolBoundaryPrefill {
+            Attn::PoolBoundaryPrefill {
                 positions,
                 row_valid,
                 ratio,
@@ -381,7 +381,7 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attention::PoolKvAppend {
+            Attn::PoolKvAppend {
                 entries,
                 boundary_pos,
                 boundary_req,

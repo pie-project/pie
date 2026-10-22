@@ -1,6 +1,7 @@
 use kernels_cuda::attn::qkv_append;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::{Fused, Operands};
+use poem_ir::{NormAxis, NormWeight};
 
 use crate::run::Run;
 
@@ -49,9 +50,9 @@ impl DispatchFused for Run<'_> {
                 let mut outputs = Vec::new();
                 op.outputs(&mut outputs);
                 if outputs.first().is_some_and(|out| self.lane_shaped(*out)) {
-                    self.unseated(|| self.fused_elementwise(op))
+                    self.unseated(|| self.fused_elemwise(op))
                 } else {
-                    self.fused_elementwise(op)
+                    self.fused_elemwise(op)
                 }
             }
         }
@@ -92,8 +93,8 @@ impl Run<'_> {
         // norm apart, whose 16-byte forms stream a long fire faster than the
         // block-a-row pre-mix.
         if self.ctx().tuning().hc_tile
-            && let poem_ir::Elementwise::HcRmsnormF32 { streams, eps, .. } = &**norm
-            && let poem_ir::Elementwise::HcProject {
+            && let poem_ir::Elemwise::HcRmsnormF32 { streams, eps, .. } = &**norm
+            && let poem_ir::Elemwise::HcProject {
                 weight,
                 stream_count,
                 mixes,
@@ -109,13 +110,19 @@ impl Run<'_> {
                 &mut self.tensor(*mixes),
             )?
         {
-            self.elementwise(gates)?;
+            self.elemwise(gates)?;
             // The normed row lands its e4m3 1x128 operand beside it for the
             // GEMMs that read it next, where the profile says
             // (`kernel.elemwise.norm_emit`).
             #[cfg(feature = "cuda")]
             if self.ctx().tuning().norm_emit
-                && let poem_ir::Elementwise::Rmsnorm { x, weight, eps, y } = &**rmsnorm
+                && let poem_ir::Elemwise::Rmsnorm {
+                    x,
+                    weight: NormWeight::Scale(weight),
+                    eps,
+                    y,
+                    axis: NormAxis::Row,
+                } = &**rmsnorm
                 && self.tensor(*y).width == 4096
             {
                 let planes = self.hold_e4m3(*y)?;
@@ -131,22 +138,22 @@ impl Run<'_> {
                 }
                 self.drop_held();
             }
-            return self.elementwise(rmsnorm);
+            return self.elemwise(rmsnorm);
         }
         if self.ctx().tuning().hc_tile
             && let (
-                poem_ir::Elementwise::HcRmsnormF32 {
+                poem_ir::Elemwise::HcRmsnormF32 {
                     streams,
                     eps: mix_eps,
                     ..
                 },
-                poem_ir::Elementwise::HcProject {
+                poem_ir::Elemwise::HcProject {
                     weight: plane,
                     stream_count,
                     mixes,
                     ..
                 },
-                poem_ir::Elementwise::HcGates {
+                poem_ir::Elemwise::HcGates {
                     scale,
                     base,
                     gate_eps,
@@ -157,7 +164,13 @@ impl Run<'_> {
                     comb_mix,
                     ..
                 },
-                poem_ir::Elementwise::Rmsnorm { weight, eps, y, .. },
+                poem_ir::Elemwise::Rmsnorm {
+                    weight: NormWeight::Scale(weight),
+                    eps,
+                    y,
+                    axis: NormAxis::Row,
+                    ..
+                },
             ) = (&**norm, &**project, &**gates, &**rmsnorm)
             && let emits = kernels_cuda::elemwise::hc::pre_emits(
                 &self.tensor(*streams),
@@ -192,10 +205,10 @@ impl Run<'_> {
         {
             return Ok(());
         }
-        self.elementwise(norm)?;
-        self.elementwise(project)?;
-        self.elementwise(gates)?;
-        self.elementwise(rmsnorm)
+        self.elemwise(norm)?;
+        self.elemwise(project)?;
+        self.elemwise(gates)?;
+        self.elemwise(rmsnorm)
     }
 
     /// AttnRes's blend and the norm of its row: in one pass where the
@@ -206,7 +219,7 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         if let (
-            poem_ir::Elementwise::ResBlend {
+            poem_ir::Elemwise::ResBlend {
                 prefix,
                 blocks,
                 weight: blend_weight,
@@ -214,7 +227,13 @@ impl Run<'_> {
                 proj,
                 ..
             },
-            poem_ir::Elementwise::Rmsnorm { weight, eps, y, .. },
+            poem_ir::Elemwise::Rmsnorm {
+                weight: NormWeight::Scale(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+                ..
+            },
         ) = (&**blend, &**norm)
             && self.ctx().tuning().attn_res_fused_norm
         {
@@ -234,8 +253,8 @@ impl Run<'_> {
                 return Ok(());
             }
         }
-        self.elementwise(blend)?;
-        self.elementwise(norm)
+        self.elemwise(blend)?;
+        self.elemwise(norm)
     }
 
     fn hc_gates_norm(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
@@ -243,7 +262,7 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         let (
-            poem_ir::Elementwise::HcGates {
+            poem_ir::Elemwise::HcGates {
                 normed,
                 streams,
                 scale,
@@ -257,11 +276,17 @@ impl Run<'_> {
                 comb_mix,
                 ..
             },
-            poem_ir::Elementwise::Rmsnorm { weight, eps, y, .. },
+            poem_ir::Elemwise::Rmsnorm {
+                weight: NormWeight::Scale(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+                ..
+            },
         ) = (&**gates, &**norm)
         else {
-            self.elementwise(gates)?;
-            return self.elementwise(norm);
+            self.elemwise(gates)?;
+            return self.elemwise(norm);
         };
         if self.ctx().tuning().hc_tile {
             let landed = kernels_cuda::elemwise::hc::gates_norm(
@@ -286,8 +311,8 @@ impl Run<'_> {
                 return Ok(());
             }
         }
-        self.elementwise(gates)?;
-        self.elementwise(norm)
+        self.elemwise(gates)?;
+        self.elemwise(norm)
     }
 
     /// A stream norm and the mix projection over it: one pass where the profile's
@@ -297,8 +322,8 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         let (
-            poem_ir::Elementwise::HcRmsnormF32 { streams, eps, .. },
-            poem_ir::Elementwise::HcProject {
+            poem_ir::Elemwise::HcRmsnormF32 { streams, eps, .. },
+            poem_ir::Elemwise::HcProject {
                 weight,
                 stream_count,
                 mixes,
@@ -321,8 +346,8 @@ impl Run<'_> {
                 return Ok(());
             }
         }
-        self.elementwise(norm)?;
-        self.elementwise(project)
+        self.elemwise(norm)?;
+        self.elemwise(project)
     }
 
     /// A latent attention's prefill, expanded (a KV head a query head, as vLLM's
@@ -339,7 +364,7 @@ impl Run<'_> {
         };
         #[cfg(feature = "cuda")]
         if let (
-            poem_ir::Attention::MlaAbsorbQ {
+            poem_ir::Attn::MlaAbsorbQ {
                 q_nope,
                 kv_b,
                 heads,
@@ -348,7 +373,7 @@ impl Run<'_> {
                 v_head_dim,
                 ..
             },
-            poem_ir::Attention::MlaPrefill {
+            poem_ir::Attn::MlaPrefill {
                 q,
                 q_pe,
                 cache,
@@ -357,7 +382,7 @@ impl Run<'_> {
                 lse: None,
                 ..
             },
-            poem_ir::Attention::MlaAbsorbOut { o, .. },
+            poem_ir::Attn::MlaAbsorbOut { o, .. },
         ) = (&**absorb_q, &**prefill, &**absorb_out)
         {
             use kernels_cuda::attn::mla::{self, ExpandedQ, Heads};
@@ -372,7 +397,7 @@ impl Run<'_> {
             };
             if out.rows >= self.ctx().tuning().mla_expanded_from && mla::expanded_takes(&h) {
                 let queries = match split.as_deref() {
-                    Some(poem_ir::Attention::MlaSplitQB { q_b, .. }) => {
+                    Some(poem_ir::Attn::MlaSplitQB { q_b, .. }) => {
                         ExpandedQ::Packed(self.tensor(*q_b))
                     }
                     _ => ExpandedQ::Split {
@@ -381,7 +406,7 @@ impl Run<'_> {
                     },
                 };
                 let kv_b = self.dense_or_decoded(
-                    "attention.mla_prefill_expanded",
+                    "fused.mla_prefill_expanded",
                     *kv_b,
                     heads * (nope_dim + v_head_dim),
                     *kv_lora_rank,
@@ -420,7 +445,7 @@ impl Run<'_> {
         } = op
             && !turned
         {
-            self.elementwise(rotate)?;
+            self.elemwise(rotate)?;
         }
         Ok(())
     }
@@ -441,14 +466,14 @@ impl Run<'_> {
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
-        let poem_ir::Attention::MergeLse { o, lse, .. } = **merge else {
+        let poem_ir::Attn::MergeLse { o, lse, .. } = **merge else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         // The output's tail turned back with the output where the turn is
         // DeepSeek-V4's (interleaved, inverse, at the pool's positions).
         let turn = match (rotate.as_deref(), &**pool) {
             (
-                Some(poem_ir::Elementwise::RopePartialLast {
+                Some(poem_ir::Elemwise::RopePartialLast {
                     q,
                     positions: at,
                     rotary_dim,
@@ -459,8 +484,8 @@ impl Run<'_> {
                     yarn,
                     ..
                 }),
-                poem_ir::Attention::PoolLse { positions, .. }
-                | poem_ir::Attention::PoolLseSelected { positions, .. },
+                poem_ir::Attn::PoolLse { positions, .. }
+                | poem_ir::Attn::PoolLseSelected { positions, .. },
             ) if q == o_out && at == positions && d == head_dim => {
                 Some(kernels_cuda::attn::compressed::decode::Turn {
                     dim: *rotary_dim,
@@ -476,29 +501,26 @@ impl Run<'_> {
             _ => None,
         };
         // A window held above a replay floor the profile may raise
-        // (`kernel.sdpa.dsv4_replay`): only the fused kernels read the floor.
-        let floored = self.ctx().tuning().dsv4_replay
-            && matches!(
-                **window,
-                poem_ir::Attention::PrefillLse { floor: Some(_), .. }
-            );
+        // (`kernel.sdpa.compressed_replay`): only the fused kernels read the floor.
+        let floored = self.ctx().tuning().compressed_replay
+            && matches!(**window, poem_ir::Attn::PrefillLse { floor: Some(_), .. });
         // A decode's rows, up to what the profile says
-        // (`kernel.sdpa.dsv4_decode_until`): the four in one launch.
+        // (`kernel.sdpa.compressed_decode_until`): the four in one launch.
         let rows = self.tensor(*o_out).rows;
         // V4.1's FP4 cache from the rows the profile says
-        // (`kernel.sdpa.dsv4_fp4_pass_from`): the tcgen05 pass.
+        // (`kernel.sdpa.compressed_fp4_pass_from`): the tcgen05 pass.
         let fp4_pass = self.fp4_pass(window, rows);
-        if rows <= self.ctx().tuning().dsv4_decode_until
+        if rows <= self.ctx().tuning().compressed_decode_until
             && !fp4_pass
             && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out, turn)
         {
             return landed.map(|()| turn.is_some());
         }
         // A prefill's rows, where the profile says
-        // (`kernel.sdpa.dsv4_prefill_from`): the four in one tcgen05 pass.
+        // (`kernel.sdpa.compressed_prefill_from`): the four in one tcgen05 pass.
         #[cfg(feature = "cuda")]
         if let (
-            poem_ir::Attention::PrefillLse {
+            poem_ir::Attn::PrefillLse {
                 q,
                 cache,
                 window: span,
@@ -507,7 +529,7 @@ impl Run<'_> {
                 floor,
                 ..
             },
-            poem_ir::Attention::PoolLse {
+            poem_ir::Attn::PoolLse {
                 positions,
                 request_of_token,
                 entries,
@@ -515,7 +537,7 @@ impl Run<'_> {
                 heads,
                 ..
             }
-            | poem_ir::Attention::PoolLseSelected {
+            | poem_ir::Attn::PoolLseSelected {
                 positions,
                 request_of_token,
                 entries,
@@ -526,7 +548,7 @@ impl Run<'_> {
         ) = (&**window, &**pool)
         {
             use kernels_cuda::attn::compressed::prefill::{self, Pooled};
-            let from = self.ctx().tuning().dsv4_prefill_from;
+            let from = self.ctx().tuning().compressed_prefill_from;
             let mut out = self.tensor(*o_out);
             // Its request ids index the whole fire's page tables too.
             if (fp4_pass || from > 0 && out.rows >= from)
@@ -534,7 +556,7 @@ impl Run<'_> {
                     (self.pool_whole(*cache), self.pool_whole(*entries))
             {
                 let selection = match &**pool {
-                    poem_ir::Attention::PoolLseSelected {
+                    poem_ir::Attn::PoolLseSelected {
                         selection, top_k, ..
                     } => Some((self.tensor(*selection), *top_k)),
                     _ => None,
@@ -576,7 +598,7 @@ impl Run<'_> {
         self.attention(window)?;
         self.attention(pool)?;
         self.attention(merge)?;
-        self.attention(&poem_ir::Attention::Sink {
+        self.attention(&poem_ir::Attn::Sink {
             o,
             lse,
             sink: *sink,
@@ -587,20 +609,20 @@ impl Run<'_> {
     }
 
     /// Whether `window` reads V4.1's FP4 cache at `rows` the profile sends
-    /// to the tcgen05 pass (`kernel.sdpa.dsv4_fp4_pass_from`).
-    fn fp4_pass(&self, window: &poem_ir::Attention, rows: u32) -> bool {
-        let from = self.ctx().tuning().dsv4_fp4_pass_from;
+    /// to the tcgen05 pass (`kernel.sdpa.compressed_fp4_pass_from`).
+    fn fp4_pass(&self, window: &poem_ir::Attn, rows: u32) -> bool {
+        let from = self.ctx().tuning().compressed_fp4_pass_from;
         from > 0
             && rows >= from
-            && matches!(*window, poem_ir::Attention::PrefillLse { cache, .. }
+            && matches!(*window, poem_ir::Attn::PrefillLse { cache, .. }
                 if matches!(kernels_cuda::attn::compressed::decode::rows_of(&self.pool(cache)),
                     Some(kernels_cuda::attn::compressed::decode::Rows::Mx8)))
     }
 
     /// Whether `window`'s cache holds DeepSeek's quantized rows.
-    fn fp8_rows(&self, window: &poem_ir::Attention) -> bool {
+    fn fp8_rows(&self, window: &poem_ir::Attn) -> bool {
         match *window {
-            poem_ir::Attention::PrefillLse { cache, .. } => {
+            poem_ir::Attn::PrefillLse { cache, .. } => {
                 kernels_cuda::attn::compressed::decode::ds_rows(&self.pool(cache))
             }
             _ => false,
@@ -620,14 +642,14 @@ impl Run<'_> {
     /// shape doesn't fit or the region reads gathered seats.
     fn dsv4_decode(
         &mut self,
-        window: &poem_ir::Attention,
-        pool: Option<&poem_ir::Attention>,
+        window: &poem_ir::Attn,
+        pool: Option<&poem_ir::Attn>,
         sink: poem_ir::ValueId,
         o_out: poem_ir::ValueId,
         turn: Option<kernels_cuda::attn::compressed::decode::Turn>,
     ) -> Option<Result<(), kernels_cuda::Error>> {
         use kernels_cuda::attn::compressed::decode;
-        let poem_ir::Attention::PrefillLse {
+        let poem_ir::Attn::PrefillLse {
             q,
             cache,
             window: Some(span),
@@ -641,14 +663,14 @@ impl Run<'_> {
         };
         let (positions, request_of_token, pooled) = match pool {
             Some(
-                poem_ir::Attention::PoolLse {
+                poem_ir::Attn::PoolLse {
                     positions,
                     request_of_token,
                     entries,
                     ratio,
                     ..
                 }
-                | poem_ir::Attention::PoolLseSelected {
+                | poem_ir::Attn::PoolLseSelected {
                     positions,
                     request_of_token,
                     entries,
@@ -657,7 +679,7 @@ impl Run<'_> {
                 },
             ) => {
                 let selection = match pool {
-                    Some(poem_ir::Attention::PoolLseSelected {
+                    Some(poem_ir::Attn::PoolLseSelected {
                         selection, top_k, ..
                     }) => Some((self.tensor(*selection), *top_k)),
                     _ => None,
@@ -719,12 +741,12 @@ impl Run<'_> {
     fn dsv4_window_prefill(
         &mut self,
         name: &'static str,
-        window: &poem_ir::Attention,
+        window: &poem_ir::Attn,
         sink: poem_ir::ValueId,
         o_out: poem_ir::ValueId,
     ) -> Option<Result<(), kernels_cuda::Error>> {
         use kernels_cuda::attn::compressed::prefill;
-        let poem_ir::Attention::PrefillLse {
+        let poem_ir::Attn::PrefillLse {
             q,
             cache,
             window: span,
@@ -735,7 +757,7 @@ impl Run<'_> {
         else {
             return None;
         };
-        let from = self.ctx().tuning().dsv4_prefill_from;
+        let from = self.ctx().tuning().compressed_prefill_from;
         let mut out = self.tensor(o_out);
         if from == 0 || out.rows < from {
             return None;
@@ -778,9 +800,9 @@ impl Run<'_> {
         // DeepSeek-V4's window and sinks (its layers without a pool, its
         // draft head): the one launch at a decode's rows; over fp8 rows that
         // or a refusal, never the FA2 kernels reading them as bf16.
-        if let poem_ir::Attention::PrefillLse { .. } = **attn {
+        if let poem_ir::Attn::PrefillLse { .. } = **attn {
             // A prefill's rows, where the profile says
-            // (`kernel.sdpa.dsv4_prefill_from`): the window in the tcgen05 pass.
+            // (`kernel.sdpa.compressed_prefill_from`): the window in the tcgen05 pass.
             #[cfg(feature = "cuda")]
             if let Some(landed) = self.dsv4_window_prefill(op.name(), attn, *sink, *o_out) {
                 return landed;
@@ -791,7 +813,7 @@ impl Run<'_> {
                     .unwrap_or_else(|| Err(fp8_unread(op.name())));
             }
             let rows = self.tensor(*o_out).rows;
-            if rows <= self.ctx().tuning().dsv4_decode_until
+            if rows <= self.ctx().tuning().compressed_decode_until
                 && let Some(landed) = self.dsv4_decode(attn, None, *sink, *o_out, None)
             {
                 return landed;
@@ -799,7 +821,7 @@ impl Run<'_> {
         }
         let sinks = self.tensor(*sink);
         match **attn {
-            poem_ir::Attention::DecodeLse {
+            poem_ir::Attn::DecodeLse {
                 q,
                 plan,
                 cache,
@@ -820,7 +842,7 @@ impl Run<'_> {
                 &mut self.tensor(lse),
                 sinks,
             ),
-            poem_ir::Attention::PrefillLse {
+            poem_ir::Attn::PrefillLse {
                 q,
                 plan,
                 cache,
@@ -1063,7 +1085,7 @@ impl Run<'_> {
                     .all(|lane| lane[1] - lane[0] <= 1)
         };
         let state_rows = match state_op.as_deref() {
-            Some(poem_ir::Attention::PoolStateWrite {
+            Some(poem_ir::Attn::PoolStateWrite {
                 kv,
                 score,
                 write_page,
@@ -1082,7 +1104,7 @@ impl Run<'_> {
             self.attention(state)?;
         }
         let (
-            poem_ir::Attention::PoolGather {
+            poem_ir::Attn::PoolGather {
                 boundary_pos,
                 boundary_req,
                 pages,
@@ -1091,7 +1113,7 @@ impl Run<'_> {
                 ratio,
                 entries,
             },
-            poem_ir::Elementwise::RopePartialLast {
+            poem_ir::Elemwise::RopePartialLast {
                 positions,
                 rotary_dim,
                 theta,
@@ -1100,7 +1122,7 @@ impl Run<'_> {
                 yarn,
                 ..
             },
-            poem_ir::Attention::PoolKvAppend { pool: into, .. },
+            poem_ir::Attn::PoolKvAppend { pool: into, .. },
         ) = (&**gather, &**rotate, &**append)
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
@@ -1167,7 +1189,7 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         if let (
-            poem_ir::Elementwise::RopePartialLast {
+            poem_ir::Elemwise::RopePartialLast {
                 q,
                 positions,
                 rotary_dim,
@@ -1178,7 +1200,7 @@ impl Run<'_> {
                 yarn,
                 ..
             },
-            poem_ir::Attention::IndexTopk {
+            poem_ir::Attn::IndexTopk {
                 weights,
                 keys,
                 heads,
@@ -1219,7 +1241,7 @@ impl Run<'_> {
                 return Ok(());
             }
         }
-        self.elementwise(rotate)?;
+        self.elemwise(rotate)?;
         self.attention(rank)
     }
 
@@ -1331,7 +1353,7 @@ impl Run<'_> {
                 );
             }
         }
-        self.fused_elementwise(q)?;
+        self.fused_elemwise(q)?;
         self.norm_rope_last_append(kv)
     }
 

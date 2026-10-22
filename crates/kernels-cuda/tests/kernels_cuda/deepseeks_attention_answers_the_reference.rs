@@ -115,7 +115,7 @@ fn check(
     let sink_t = col(&mut gpu, &sinks, F32);
     let floor_t = floored.then(|| col(&mut gpu, &floors, I32));
     let selection = (top_k > 0).then(|| (ten(gpu.up(&sel), n, top_k, I32), top_k as u32));
-    let (ctx, op, ratio) = (gpu.ctx(), "attention.pool_attention", ratio as u32);
+    let (ctx, op, ratio) = (gpu.ctx(), "fused.pool_attention", ratio as u32);
     let pooled = (ratio > 0).then_some(Pooled {
         entries: &ent,
         ratio,
@@ -148,7 +148,9 @@ fn check(
             ),
             // The prefill and window-only kernels are tcgen05's: elsewhere
             // their passes have no kernel to answer.
-            Pass::Prefill(_) | Pass::Window if !kernels_cuda::linear::tc5::supported() => continue,
+            Pass::Prefill(_) | Pass::Window if !kernels_cuda::linear::gemm_sm100::supported() => {
+                continue;
+            }
             Pass::Prefill(safe) => {
                 let takes = pre::takes(64, 512, Some(128), &win, &staged);
                 assert!(takes, "V4-Flash's shape");
@@ -208,7 +210,7 @@ fn deepseeks_attention_answers_the_reference() {
 #[test]
 fn a_recorded_pass_reads_the_page_tables_its_replay_states() {
     // The pass is the tcgen05 prefill's.
-    if !kernels_cuda::linear::tc5::supported() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
         return;
     }
     for fmts in [[Rows::Ds; 2], [Rows::Mx8, Rows::Nv4]] {
@@ -236,7 +238,7 @@ fn a_recorded_pass_reads_the_page_tables_its_replay_states() {
             page_indptr,
             ..p
         };
-        let (win, ent, op) = (view(win), view(ent), "attention.pool_attention");
+        let (win, ent, op) = (view(win), view(ent), "fused.pool_attention");
         let staged = pre::Pooled {
             entries: &ent,
             ratio: 4,

@@ -20,7 +20,7 @@ fn clip(cx: &mut Cx<'_>, x: Val, lo: Val, hi: Val) -> Result<Val, Error> {
 /// first, as kernels-wgpu `norm/clip.wgsl` lands them (an f32 `x` clamps at
 /// the f32 bounds, as kernels-metal does).
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp";
+    const OP: &str = "elemwise.clamp";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     if !matches!(lo.partial_cmp(&hi), Some(Ordering::Less | Ordering::Equal)) {
         return Err(refuse(
@@ -50,7 +50,7 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
 /// `x = min(max(x, lo[0]), hi[0])` with one-scalar bound planes in `x`'s
 /// element. Reference: kernels-wgpu `clamp_learned_bf16`.
 pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp_learned";
+    const OP: &str = "elemwise.clamp_learned";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     for (what, bound) in [("lower", lo), ("upper", hi)] {
         if bound.dtype != x.dtype {

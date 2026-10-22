@@ -493,8 +493,8 @@ impl Shell {
         let masked = classes_running(&boot.trace, &compiled, |op| {
             matches!(
                 op,
-                poem_ir::Operation::Attention(
-                    poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
+                poem_ir::Operation::Attn(
+                    poem_ir::Attn::Masked { .. } | poem_ir::Attn::MaskedLse { .. }
                 )
             )
         });
@@ -662,7 +662,7 @@ impl Shell {
             use poem_ir::Operands;
             let mut outs = Vec::new();
             match op {
-                poem_ir::Operation::Attention(a) => a.outputs(&mut outs),
+                poem_ir::Operation::Attn(a) => a.outputs(&mut outs),
                 _ => return false,
             }
             outs.iter().any(|v| scores.iter().any(|(_, s)| s == v))

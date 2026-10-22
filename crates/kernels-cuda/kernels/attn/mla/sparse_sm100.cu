@@ -2,7 +2,7 @@
 
 // A DeepSeek-sparse MLA's attention on tcgen05, a block a row (GLM-5.3's
 // DSA: 64 absorbed heads over one 512-wide latent, plus a 64-wide rotated
-// part or none, the keys a row's index selected): `attn/dsv4_sparse.cuh`'s
+// part or none, the keys a row's index selected): `attn/compressed/sparse_sm100.cuh`'s
 // pass with no window and no sinks, the selected token ids its stream (in
 // any order, a negative one anywhere skipped).
 //
@@ -38,14 +38,14 @@ using fmha::ex2;
 using fmha::neg_inf;
 using fmha::pack_bf16;
 using fmha::sdesc_sw128_mn;
-using dsv4s::atom_at;
-using dsv4s::gather4;
-using dsv4s::mma_ws;
-using dsv4s::mma_ws_ts;
-using dsv4s::pair_sync;
-using dsv4s::row_in;
-using dsv4s::tile_pv;
-using dsv4s::tile_softmax;
+using compressed::sm100::atom_at;
+using compressed::sm100::gather4;
+using compressed::sm100::mma_ws;
+using compressed::sm100::mma_ws_ts;
+using compressed::sm100::pair_sync;
+using compressed::sm100::row_in;
+using compressed::sm100::tile_pv;
+using compressed::sm100::tile_softmax;
 
 struct Params {
     u16* o;
@@ -144,7 +144,7 @@ __device__ __forceinline__ void mma_ws_f8(u32 d, u64 a, u64 b, u32 idesc, bool a
 // Two words of bf16 pairs (four values, the first low) as one word of e4m3
 // codes, saturating.
 __device__ __forceinline__ u32 bf16x4_e4m3(u32 x, u32 y) {
-    return dsv4s::e4m3x4(__uint_as_float(x << 16), __uint_as_float(x & 0xffff0000u),
+    return compressed::sm100::e4m3x4(__uint_as_float(x << 16), __uint_as_float(x & 0xffff0000u),
                          __uint_as_float(y << 16), __uint_as_float(y & 0xffff0000u));
 }
 
@@ -761,12 +761,10 @@ __global__ __launch_bounds__(128) void mla_sparse_fold(
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const float mine = lane < splits ? l[lane * 64] : neg_inf();
     float top = mine;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, o));
+    top = ::pie::warp_max(top);
     const float e = mine > neg_inf() ? ex2(mine - top) : 0.f;
     float sum = e;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    sum = ::pie::warp_sum(sum);
     const float share = sum > 0.f ? e / sum : 0.f;
     u16* dst = o + static_cast<long long>(row) * o_stride + head * kD;
     const u16* base_o = part_o + (static_cast<long long>(row) * splits * 64 + head) * kD;
@@ -1254,7 +1252,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                     const float e0 = ex2(s[i] - bse), e1 = ex2(s[i + 1] - bse);
                     const float e2 = ex2(s[i + 2] - bse), e3 = ex2(s[i + 3] - bse);
                     sum += (e0 + e1) + (e2 + e3);
-                    pk[i / 4] = dsv4s::e4m3x4(e0, e1, e2, e3);
+                    pk[i / 4] = compressed::sm100::e4m3x4(e0, e1, e2, e3);
                 }
                 l = l * alpha + sum;
                 m_used = m_new;

@@ -57,7 +57,7 @@ impl Run<'_> {
                     w: *w,
                     y: *packed,
                 })?;
-                self.linear(&Linear::MlpGegluTanhPacked {
+                self.linear(&Linear::GegluTanhPacked {
                     packed: *packed,
                     intermediate: *intermediate,
                     y: *y,
@@ -103,7 +103,7 @@ impl Run<'_> {
                     w: *gate_up,
                     y: *packed,
                 })?;
-                self.linear(&Linear::MlpSwiglu {
+                self.linear(&Linear::Swiglu {
                     packed: *packed,
                     intermediate: *intermediate,
                     y: *h,
@@ -222,11 +222,11 @@ impl Run<'_> {
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
-                        || act.rows > linear::tiled::GEMV_ROWS
+                        || act.rows > linear::affine::GEMV_ROWS
                     {
-                        linear::tiled::matmul
+                        linear::affine::matmul
                     } else {
-                        linear::tiled::matmul_gemv
+                        linear::affine::matmul_gemv
                     };
                     entry(
                         self.ctx(),
@@ -246,11 +246,11 @@ impl Run<'_> {
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
-                        || act.rows > linear::tiled::GEMV_ROWS
+                        || act.rows > linear::affine::GEMV_ROWS
                     {
-                        linear::tiled::lm_head
+                        linear::affine::lm_head
                     } else {
-                        linear::tiled::lm_head_gemv
+                        linear::affine::lm_head_gemv
                     };
                     entry(
                         self.ctx(),
@@ -264,13 +264,13 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
-            Linear::MlpSwiglu {
+            Linear::Swiglu {
                 packed,
                 intermediate,
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu(
+                linear::glu::swiglu(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -278,14 +278,14 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClamp {
+            Linear::SwigluClamp {
                 packed,
                 intermediate,
                 limit,
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp(
+                linear::glu::swiglu_clamp(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -294,7 +294,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampAlpha {
+            Linear::SwigluClampAlpha {
                 packed,
                 intermediate,
                 limit,
@@ -302,7 +302,7 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp_alpha(
+                linear::glu::swiglu_clamp_alpha(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -312,7 +312,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampSplitRouted {
+            Linear::SwigluClampSplitRouted {
                 gate,
                 up,
                 weights,
@@ -320,7 +320,7 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp_split_routed(
+                linear::glu::swiglu_clamp_split_routed(
                     self.ctx(),
                     self.tensor(*gate),
                     self.tensor(*up),
@@ -330,7 +330,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampRouted {
+            Linear::SwigluClampRouted {
                 packed,
                 intermediate,
                 weights,
@@ -338,7 +338,7 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::swiglu_clamp_routed(
+                linear::glu::swiglu_clamp_routed(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -398,16 +398,16 @@ impl Run<'_> {
                     poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
                 }
             }
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+            Linear::SwigluClampSplit { gate, up, limit, y } => linear::glu::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 *limit,
                 &mut self.tensor(*y),
             ),
-            Linear::MlpGegluTanh { gate, up, y } => {
+            Linear::GegluTanh { gate, up, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::geglu_tanh(
+                linear::glu::geglu_tanh(
                     self.ctx(),
                     self.tensor(*gate),
                     self.tensor(*up),
@@ -415,21 +415,21 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpGeluTanh { x, y } => {
+            Linear::GeluTanh { x, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
+                linear::glu::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
-            Linear::MlpRelu2 { x, y } => {
+            Linear::Relu2 { x, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
+                linear::glu::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
-            Linear::MlpGegluTanhPacked {
+            Linear::GegluTanhPacked {
                 packed,
                 intermediate,
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::geglu_tanh_packed(
+                linear::glu::geglu_tanh_packed(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,
@@ -437,7 +437,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSitu {
+            Linear::Situ {
                 packed,
                 intermediate,
                 beta,
@@ -445,7 +445,7 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
-                linear::mlp::situ(
+                linear::glu::situ(
                     self.ctx(),
                     self.tensor(*packed),
                     *intermediate,

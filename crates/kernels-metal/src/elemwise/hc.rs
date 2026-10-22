@@ -47,7 +47,7 @@ fn per_row(op: &'static str, rows: u32) -> Result<Grid, Error> {
 }
 
 pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_expand";
+    const OP: &str = "elemwise.hc_expand";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "hc_expand_bfloat16" });
     debug_assert_eq!(y.rows, x.rows, "the expansion lands one wide row per row");
     let fan = stream_fan(OP, y.width, x.width)?;
@@ -71,7 +71,7 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
 }
 
 pub fn rmsnorm_f32(ctx: &Ctx<'_>, streams: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_rmsnorm_f32";
+    const OP: &str = "elemwise.hc_rmsnorm_f32";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_rmsnorm_f32_bfloat16" });
     debug_assert_eq!(y.dtype, dtype::Dtype::F32, "`{OP}` widens to f32");
     debug_assert!(
@@ -96,7 +96,7 @@ pub fn project(
     stream_count: u32,
     mixes: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_project";
+    const OP: &str = "elemwise.hc_project";
     debug_assert!(
         normed.dtype == dtype::Dtype::F32
             && hc_fn.dtype == dtype::Dtype::F32
@@ -175,7 +175,7 @@ pub fn gates(
     post_mix: Tensor,
     comb_mix: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_gates";
+    const OP: &str = "elemwise.hc_gates";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_gates_bfloat16" });
     debug_assert_eq!(
         normed.dtype,
@@ -236,7 +236,7 @@ pub fn fold(
     comb_mix: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_fold";
+    const OP: &str = "elemwise.hc_fold";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "hc_fold_bfloat16" });
     debug_assert!(
         y.rows == streams.rows && y.width == streams.width,
@@ -276,7 +276,7 @@ pub fn collapse(
     hc_eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_collapse";
+    const OP: &str = "elemwise.hc_collapse";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_collapse_bfloat16" });
     debug_assert_eq!(
         mixes.dtype,
@@ -326,7 +326,7 @@ pub fn mix(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_mix";
+    const OP: &str = "elemwise.hc_mix";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "hc_mix_bfloat16" });
     let fan = stream_fan(OP, normed.width, y.width)?;
     if fan != streams {
@@ -362,7 +362,7 @@ pub fn inject(
     streams: u32,
     hyper: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_inject";
+    const OP: &str = "elemwise.hc_inject";
     let entry = dtype_dispatch!(OP, hyper.dtype, { Bf16 => "hc_inject_bfloat16" });
     let fan = stream_fan(OP, hyper.width, o.width)?;
     if fan != streams {
@@ -399,7 +399,7 @@ pub fn ple_gate(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.ple_gate";
+    const OP: &str = "elemwise.ple_gate";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "ple_gate_bfloat16" });
     let fan = stream_fan(OP, y.width, value.width)?;
     if fan != streams {
@@ -630,7 +630,7 @@ mod tests {
             .expect_err("nine streams do not fit the mixers");
         match err {
             Error::Backend { op, detail } => {
-                assert_eq!(op, "elementwise.hc_expand");
+                assert_eq!(op, "elemwise.hc_expand");
                 assert!(detail.contains("stream count is 9"), "{detail}");
             }
             other => panic!("expected a backend refusal, got {other:?}"),
@@ -649,7 +649,7 @@ mod tests {
             bf16(5, ROWS, M * H + 1),
         )
         .expect_err("a ragged wide row has no fan");
-        assert!(matches!(err, Error::Backend { op, .. } if op == "elementwise.hc_fold"));
+        assert!(matches!(err, Error::Backend { op, .. } if op == "elemwise.hc_fold"));
     }
 
     fn an_unstamped_dtype_is_refused_by_name() {
@@ -663,7 +663,7 @@ mod tests {
         .expect_err("f16 is unstamped here");
         assert!(matches!(
             err,
-            Error::DtypeUnsupported { op, dtype } if op == "elementwise.hc_expand" && dtype == Dtype::F16
+            Error::DtypeUnsupported { op, dtype } if op == "elemwise.hc_expand" && dtype == Dtype::F16
         ));
     }
 }

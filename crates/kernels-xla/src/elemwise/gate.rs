@@ -9,7 +9,7 @@ const FLOATS: &[Dtype] = &[Dtype::Bf16, Dtype::F16, Dtype::F32];
 /// `x *= σ(gate)`, element for element. Reference: kernels-wgpu
 /// `norm/gate.wgsl`.
 pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     expect(OP, x, FLOATS)?;
     if gate.rows != x.rows || gate.width != x.width {
         return Err(refuse(OP, "the gate plane rides the rectangle it gates"));
@@ -33,7 +33,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul_heads";
     expect(OP, x, FLOATS)?;
     if head_dim == 0 || x.width == 0 || !x.width.is_multiple_of(head_dim) {
         return Err(refuse(

@@ -9,7 +9,7 @@ use crate::attn::kv;
 use crate::attn::plan::PrefillPlan;
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
-use crate::linear::tc5::supported;
+use crate::linear::gemm_sm100::supported;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const PREFILL_SM100: &str = "attn/prefill_sm100.cu";

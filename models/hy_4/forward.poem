@@ -134,7 +134,7 @@ def index_select(x, q_a, inputs, positions, ix):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
+        return ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
     routes, weights = ops.linear.moe_topk_sigmoid_biased(
         ops.linear.matmul(x, f.router),
         f.bias,
@@ -149,10 +149,10 @@ def mlp(x, f):
             return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
 
-    act = ops.linear.mlp_swiglu_clamp(select(x, f.gate_up), f.inter, f.limit)
+    act = ops.linear.swiglu_clamp(select(x, f.gate_up), f.inter, f.limit)
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     s = f.shared
-    act = ops.linear.mlp_swiglu(ops.linear.matmul(x, s.gate_up), s.inter)
+    act = ops.linear.swiglu(ops.linear.matmul(x, s.gate_up), s.inter)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def caches(m, c):

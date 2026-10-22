@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::wan_2_dims::{self as model, Dims};
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
-    Attention, CacheRow, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
-    RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    Attn, CacheRow, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask,
+    Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
@@ -294,7 +294,7 @@ fn the_attentions_pair_as_the_architecture_says() {
         let context = word(&plan, denoise, Stream::Context);
         let (mut self_paired, mut crossed, mut encoder) = (0usize, 0usize, 0usize);
         for node in &plan.nodes {
-            let Operation::Attention(Attention::Ragged {
+            let Operation::Attn(Attn::Ragged {
                 q_indptr,
                 kv_indptr,
                 head_dim,
@@ -373,7 +373,7 @@ fn every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Elementwise(Elementwise::RopeAxes {
+                Operation::Elemwise(Elemwise::RopeAxes {
                     dims,
                     thetas,
                     form,
@@ -406,8 +406,8 @@ fn every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved() {
         let neox = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elementwise(Elementwise::RopeFull { .. })
-                    | Operation::Elementwise(Elementwise::RopePartial { .. })
+                Operation::Elemwise(Elemwise::RopeFull { .. })
+                    | Operation::Elemwise(Elemwise::RopePartial { .. })
             )
         });
         assert!(!neox, "{deployment}: umT5 has no rotary embedding");
@@ -499,7 +499,7 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
         let ty = |id: ValueId| plan.values[id.0 as usize].ty.clone();
         let mut seen = 0usize;
         for node in &plan.nodes {
-            let Operation::Elementwise(Elementwise::Modulate {
+            let Operation::Elemwise(Elemwise::Modulate {
                 x, m, lane_of_row, ..
             }) = &node.op
             else {
@@ -537,7 +537,7 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
         for node in &plan.nodes {
             if !matches!(
                 &node.op,
-                Operation::Elementwise(Elementwise::GatedResidualAdd { .. })
+                Operation::Elemwise(Elemwise::GatedResidualAdd { .. })
             ) {
                 continue;
             }

@@ -21,7 +21,7 @@ fn refuses_split_mrope(op: &poem_ir::ops::Operation) -> bool {
     !cfg!(feature = "rocm")
         && matches!(
             op,
-            poem_ir::ops::Operation::Elementwise(poem_ir::ops::Elementwise::RopeMrope {
+            poem_ir::ops::Operation::Elemwise(poem_ir::ops::Elemwise::RopeMrope {
                 form: poem_ir::ops::MropeForm::Split,
                 ..
             })
@@ -52,7 +52,7 @@ fn ops_of(deployment: &str) -> BTreeSet<String> {
         .collect()
 }
 
-const SPLIT_MROPE: &str = "elementwise.rope_mrope(form=Split)";
+const SPLIT_MROPE: &str = "elemwise.rope_mrope(form=Split)";
 
 fn refused() -> BTreeMap<&'static str, &'static Refusal> {
     let mut refused: BTreeMap<&'static str, &'static Refusal> =

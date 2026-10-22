@@ -98,12 +98,12 @@ pub enum GridRule {
 }
 
 crate::error::unsupported! {
-    sinusoid = "elementwise.sinusoid" (t: Tensor, dim: u32, max_period: f32,
+    sinusoid = "elemwise.sinusoid" (t: Tensor, dim: u32, max_period: f32,
         flip_sin_cos: bool, scale: f32, o: &mut Tensor);
 }
 
 crate::error::unsupported! {
-    relative_bucket_bias = "elementwise.relative_bucket_bias" (embedding: Tensor, max_len: u32,
+    relative_bucket_bias = "elemwise.relative_bucket_bias" (embedding: Tensor, max_len: u32,
         num_buckets: u32, max_distance: f32, bidirectional: bool, y: &mut Tensor);
 }
 

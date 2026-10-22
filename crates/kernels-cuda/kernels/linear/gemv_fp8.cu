@@ -157,8 +157,7 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
     for (int i = 0; i < kRows; ++i) {
 #pragma unroll
         for (int j = 0; j < kM; ++j) {
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) acc[i][j] += __shfl_xor_sync(0xffffffffu, acc[i][j], off);
+            acc[i][j] = ::pie::warp_sum(acc[i][j]);
         }
     }
     __shared__ float part[kWarps][kRows * kM];

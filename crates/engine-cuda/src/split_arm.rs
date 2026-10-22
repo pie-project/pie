@@ -7,7 +7,7 @@
 //! runs the fused step and no split.
 
 use poem_ir::{
-    Def, Elementwise, Gather, Guard, Node, Operands, Operation, Ssm, Trace, ValueDecl, ValueId,
+    Def, Elemwise, Gather, Guard, Node, Operands, Operation, Ssm, Trace, ValueDecl, ValueId,
 };
 
 /// The rewrite over every such split.
@@ -37,7 +37,7 @@ fn redirect(op: &mut Operation, from: ValueId, to: ValueId) -> bool {
             swap(qkv);
             swap(z);
         }
-        Operation::Elementwise(Elementwise::RmsnormGated { x, gate, .. }) => {
+        Operation::Elemwise(Elemwise::RmsnormGated { x, gate, .. }) => {
             swap(x);
             swap(gate);
         }

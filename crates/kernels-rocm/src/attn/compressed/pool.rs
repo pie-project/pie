@@ -74,7 +74,7 @@ pub fn boundary_decode(
     boundary_req: &mut Tensor,
     boundary_rope: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_boundary_decode";
+    const OP: &str = "attn.pool_boundary_decode";
     boundary_tables(OP, boundary_pos, boundary_req);
     boundary_rope_table(OP, boundary_pos, boundary_rope);
     let ratio = pooling_ratio(OP, ratio)?;
@@ -105,7 +105,7 @@ pub fn boundary_prefill(
     boundary_req: &mut Tensor,
     boundary_rope: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_boundary_prefill";
+    const OP: &str = "attn.pool_boundary_prefill";
     boundary_tables(OP, boundary_pos, boundary_req);
     boundary_rope_table(OP, boundary_pos, boundary_rope);
     let ratio = pooling_ratio(OP, ratio)?;
@@ -142,7 +142,7 @@ pub fn state_write(
     state_kv: Tensor,
     state_score: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_state_write";
+    const OP: &str = "attn.pool_state_write";
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
     let ratio = pooling_ratio(OP, ratio)?;
     let head_dim = count(OP, "the head width this compressor states", head_dim)?;
@@ -195,7 +195,7 @@ pub fn gather(
     ape: Tensor,
     entries: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_gather";
+    const OP: &str = "attn.pool_gather";
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
     boundary_tables(OP, &boundary_pos, &boundary_req);
     if entries.width != head_dim {
@@ -291,7 +291,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
     boundary_tables(OP, &boundary_pos, &boundary_req);
@@ -466,7 +466,7 @@ pub fn attention_lse(
 ) -> Result<(), Error> {
     attend_pool(
         ctx,
-        "attention.pool_lse",
+        "attn.pool_lse",
         &PoolRead {
             q,
             positions,
@@ -485,7 +485,7 @@ pub fn attention_lse(
 
 /// The attention over the pool entries an indexer selected: row t reads
 /// the entries its selection row lists (−1 and entries it cannot see yet
-/// skipped), as `attention.pool_lse` reads all it sees.
+/// skipped), as `attn.pool_lse` reads all it sees.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_lse_selected(
     ctx: &Ctx,
@@ -502,11 +502,11 @@ pub fn attention_lse_selected(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_lse_selected";
+    const OP: &str = "attn.pool_lse_selected";
     debug_assert_eq!(
         selection.dtype,
         Dtype::I32,
-        "`{OP}` walks the i32 compressed-row ids `attention.index_topk` published"
+        "`{OP}` walks the i32 compressed-row ids `attn.index_topk` published"
     );
     if selection.ptr == 0 {
         return Err(refuse(OP, "the selection this attention reads is null"));

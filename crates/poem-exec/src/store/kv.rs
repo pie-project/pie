@@ -1,4 +1,4 @@
-use poem_ir::{Attention, CacheRow, Def, Dim, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, CacheRow, Def, Dim, Operation, Trace, Ty, ValueId};
 
 use crate::store::{Fault, Result};
 
@@ -24,13 +24,13 @@ pub struct Reader {
 pub fn reads(op: &Operation) -> Option<Reader> {
     // A sinked attention reads its cache as the attention inside it does.
     if let Operation::Fused(poem_ir::Fused::LseSink { attn, .. }) = op {
-        return reads(&Operation::Attention((**attn).clone()));
+        return reads(&Operation::Attn((**attn).clone()));
     }
-    let Operation::Attention(op) = op else {
+    let Operation::Attn(op) = op else {
         return None;
     };
     match op {
-        Attention::Decode {
+        Attn::Decode {
             q,
             plan,
             cache,
@@ -38,7 +38,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             head_dim,
             ..
         }
-        | Attention::DecodeLse {
+        | Attn::DecodeLse {
             q,
             plan,
             cache,
@@ -46,7 +46,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             head_dim,
             ..
         }
-        | Attention::DecodeRel {
+        | Attn::DecodeRel {
             q,
             plan,
             cache,
@@ -54,7 +54,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             head_dim,
             ..
         }
-        | Attention::DecodeSelected {
+        | Attn::DecodeSelected {
             q,
             plan,
             cache,
@@ -69,7 +69,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads: None,
             window: *window,
         }),
-        Attention::Masked {
+        Attn::Masked {
             q,
             plan,
             cache,
@@ -78,7 +78,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads,
             ..
         }
-        | Attention::MaskedLse {
+        | Attn::MaskedLse {
             q,
             plan,
             cache,
@@ -94,7 +94,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads: Some(*kv_heads),
             window: *window,
         }),
-        Attention::Prefill {
+        Attn::Prefill {
             q,
             plan,
             cache,
@@ -103,7 +103,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads,
             ..
         }
-        | Attention::PrefillLse {
+        | Attn::PrefillLse {
             q,
             plan,
             cache,
@@ -112,7 +112,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads,
             ..
         }
-        | Attention::PrefillRel {
+        | Attn::PrefillRel {
             q,
             plan,
             cache,
@@ -121,7 +121,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads,
             ..
         }
-        | Attention::PrefillSelected {
+        | Attn::PrefillSelected {
             q,
             plan,
             cache,

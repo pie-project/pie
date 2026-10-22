@@ -5,7 +5,7 @@
 #include "prim/kv_rows.cuh"
 #include "attn/fmha_sm100.cuh"
 
-namespace pie::attn::dsv4s {
+namespace pie::attn::compressed::sm100 {
 
 using tc5::u32;
 
@@ -51,7 +51,7 @@ struct Params {
     int q_stride;
     int o_stride;
     float scale_log2;
-    dsv4::Turn turn;
+    kv_rows::Turn turn;
 };
 
 constexpr int kD = 512;

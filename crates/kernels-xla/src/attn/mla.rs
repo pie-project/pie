@@ -47,7 +47,7 @@ pub fn latents(
     kv_c: Tensor,
     k_pe: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents";
+    const OP: &str = "attn.mla_latents";
     split_checks(OP, kv_a, weight, kv_lora_rank, kv_c, k_pe)?;
     ctx.emit(&mut |cx| {
         let pe = split_kv_a(cx, OP, kv_a, weight, eps, kv_lora_rank, kv_c, k_pe)?;
@@ -73,7 +73,7 @@ pub fn latents_rope(
     kv_c: Tensor,
     k_pe: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents_rope";
+    const OP: &str = "attn.mla_latents_rope";
     split_checks(OP, kv_a, weight, kv_lora_rank, kv_c, k_pe)?;
     nonzero(OP, "the rope width", rope_dim)?;
     if k_pe.width != rope_dim || !rope_dim.is_multiple_of(2) {
@@ -202,7 +202,7 @@ pub fn split_q_b(
     q_nope: Tensor,
     q_pe: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_split_q_b";
+    const OP: &str = "attn.mla_split_q_b";
     expect(OP, q_b, &[Dtype::Bf16])?;
     let heads = nonzero(OP, "heads", heads)?;
     let per = nope_dim + rope_dim;
@@ -273,7 +273,7 @@ pub fn absorb_q(
     v_head_dim: u32,
     q_latent: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_q";
+    const OP: &str = "attn.mla_absorb_q";
     expect(OP, q_nope, &[Dtype::Bf16])?;
     nonzero(OP, "heads", heads)?;
     nonzero(OP, "the latent rank", kv_lora_rank)?;
@@ -318,7 +318,7 @@ pub fn absorb_out(
     nope_dim: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_out";
+    const OP: &str = "attn.mla_absorb_out";
     expect(OP, latent, &[Dtype::Bf16])?;
     nonzero(OP, "heads", heads)?;
     nonzero(OP, "the latent rank", kv_lora_rank)?;
@@ -361,7 +361,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_kv_append";
+    const OP: &str = "attn.mla_kv_append";
     expect(OP, kv_c, &[Dtype::Bf16])?;
     if pool.page_size <= 0 {
         return Err(refuse(OP, "the kv page size is zero"));
@@ -544,7 +544,7 @@ pub fn attention_decode(
 ) -> Result<(), Error> {
     flash(
         ctx,
-        "attention.mla_decode",
+        "attn.mla_decode",
         q,
         q_pe,
         None,
@@ -573,7 +573,7 @@ pub fn attention_prefill(
 ) -> Result<(), Error> {
     flash(
         ctx,
-        "attention.mla_prefill",
+        "attn.mla_prefill",
         q.data,
         q_pe,
         None,
@@ -605,7 +605,7 @@ pub fn attention_decode_selected(
 ) -> Result<(), Error> {
     flash(
         ctx,
-        "attention.mla_decode_selected",
+        "attn.mla_decode_selected",
         q,
         q_pe,
         Some(selection),
@@ -635,7 +635,7 @@ pub fn attention_prefill_selected(
 ) -> Result<(), Error> {
     flash(
         ctx,
-        "attention.mla_prefill_selected",
+        "attn.mla_prefill_selected",
         q.data,
         q_pe,
         Some(selection),

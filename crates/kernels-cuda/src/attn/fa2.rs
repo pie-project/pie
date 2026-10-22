@@ -64,7 +64,7 @@ fn decode_symbol(
         DecodeArm::RelBiasWindow => ("VariantRelBiasWindow", "DecodeRelParams"),
     };
     // An e4m3 pool's pages read as they are: every arm, over the same params
-    // with e4m3 pages (`attention.cuh`'s `*8` spellings).
+    // with e4m3 pages (`attn.cuh`'s `*8` spellings).
     let width = if kv == KvWidth::E4M3 { "8" } else { "" };
     Ok(symbol(&format!(
         "::pie::attn::fa2::BatchDecodeWithPagedKVCacheKernel<\
@@ -102,7 +102,7 @@ fn prefill_symbol(
         PrefillArm::CausalRelBiasWindow => ("kCausal", "VariantRelBiasWindow", "PrefillRelParams"),
     };
     // An e4m3 pool's pages read as they are: every arm, over the same params
-    // with e4m3 pages (`attention.cuh`'s `*8` spellings).
+    // with e4m3 pages (`attn.cuh`'s `*8` spellings).
     let (params, pages) = if kv == KvWidth::E4M3 {
         let params = symbol(&format!("{params}8"));
         (
@@ -534,7 +534,7 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> 
 fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32) -> Option<u32> {
     use cudarc::driver::sys as dr;
 
-    const OP: &str = "attention.plan_decode";
+    const OP: &str = "attn.plan_decode";
     let geometry = DecodeGeometry::derive(OP, head_dim, group_size, KvWidth::BF16).ok()?;
     let entrypoint = decode_symbol(OP, &geometry, DecodeArm::Full, KvWidth::BF16).ok()?;
     let root = crate::jit::Root::of(FILE)?;

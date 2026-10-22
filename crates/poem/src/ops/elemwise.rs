@@ -1,4 +1,5 @@
 use super::*;
+use poem_ir::{NormAxis, NormWeight};
 
 pub use poem_ir::ops::elemwise::Yarn;
 
@@ -10,11 +11,12 @@ pub fn rmsnorm(x: &Value, weight: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Rmsnorm {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
+            weight: NormWeight::Scale(r.weight(weight)),
             eps,
             y: y.id(),
+            axis: NormAxis::Row,
         },
         &[x],
     );
@@ -25,10 +27,10 @@ pub fn rmsnorm_per_head(x: &Value, weight: &Weight, head_dim: u32, eps: f32) -> 
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormPerHead {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
-            head_dim,
+            weight: NormWeight::Scale(r.weight(weight)),
+            axis: NormAxis::Head(head_dim),
             eps,
             y: y.id(),
         },
@@ -41,11 +43,12 @@ pub fn rmsnorm_plus_one(x: &Value, weight: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormPlusOne {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
+            weight: NormWeight::PlusOne(r.weight(weight)),
             eps,
             y: y.id(),
+            axis: NormAxis::Row,
         },
         &[x],
     );
@@ -56,10 +59,10 @@ pub fn rmsnorm_per_head_plus_one(x: &Value, weight: &Weight, head_dim: u32, eps:
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormPerHeadPlusOne {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
-            head_dim,
+            weight: NormWeight::PlusOne(r.weight(weight)),
+            axis: NormAxis::Head(head_dim),
             eps,
             y: y.id(),
         },
@@ -72,11 +75,12 @@ pub fn rmsnorm_no_scale(x: &Value, head_dim: u32, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormNoScale {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            head_dim,
+            axis: NormAxis::Head(head_dim),
             eps,
             y: y.id(),
+            weight: NormWeight::None,
         },
         &[x],
     );
@@ -87,10 +91,12 @@ pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::LayernormNoScale {
+        Elemwise::Layernorm {
             x: x.id(),
             eps,
             y: y.id(),
+            weight: None,
+            bias: None,
         },
         &[x],
     );
@@ -101,10 +107,10 @@ pub fn layernorm(x: &Value, weight: &Weight, bias: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Layernorm {
+        Elemwise::Layernorm {
             x: x.id(),
-            weight: r.weight(weight),
-            bias: r.weight(bias),
+            weight: Some(r.weight(weight)),
+            bias: Some(r.weight(bias)),
             eps,
             y: y.id(),
         },
@@ -117,7 +123,7 @@ pub fn clamp_learned(x: &Value, lo: &Weight, hi: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::ClampLearned {
+        Elemwise::ClampLearned {
             x: x.id(),
             lo: r.weight(lo),
             hi: r.weight(hi),
@@ -132,7 +138,7 @@ pub fn clamp(x: &Value, lo: f32, hi: f32) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Clamp {
+        Elemwise::Clamp {
             x: x.id(),
             lo,
             hi,
@@ -154,7 +160,7 @@ pub fn rmsnorm_gated(
     let r = x.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Elementwise::RmsnormGated {
+        Elemwise::RmsnormGated {
             x: x.id(),
             gate: gate.id(),
             weight: weight.map(|w| r.weight(w)),
@@ -172,7 +178,7 @@ pub fn rmsnorm_gated_by(x: &Value, gate: &Value, weight: &Weight, heads: u32, ep
     let r = x.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Elementwise::RmsnormGatedBy {
+        Elemwise::RmsnormGatedBy {
             x: x.id(),
             gate: gate.id(),
             weight: r.weight(weight),
@@ -189,10 +195,10 @@ pub fn rmsnorm_grouped_plus_one(x: &Value, weight: &Weight, group: u32, eps: f32
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormGroupedPlusOne {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
-            group,
+            weight: NormWeight::PlusOne(r.weight(weight)),
+            axis: NormAxis::Group(group),
             eps,
             y: y.id(),
         },
@@ -205,7 +211,7 @@ pub fn residual_add(x: &Value, y: &Value) -> Value {
     let r = x.rec();
     let y_out = r.fresh(y.ty().clone());
     r.push(
-        Elementwise::ResidualAdd {
+        Elemwise::ResidualAdd {
             x: x.id(),
             y: y.id(),
             y_out: y_out.id(),
@@ -223,7 +229,7 @@ pub fn add_bias(bias: &Weight, out: &Value) -> Value {
     let r = out.rec();
     let out_out = r.fresh(out.ty().clone());
     r.push(
-        Elementwise::AddBias {
+        Elemwise::AddBias {
             bias: r.weight(bias),
             out: out.id(),
             out_out: out_out.id(),
@@ -237,7 +243,7 @@ pub fn standardize(x: &Value, bias: &Weight, scale: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Standardize {
+        Elemwise::Standardize {
             x: x.id(),
             bias: r.weight(bias),
             scale: r.weight(scale),
@@ -252,7 +258,7 @@ pub fn mul_scalar(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::MulScalar {
+        Elemwise::MulScalar {
             s,
             x: x.id(),
             x_out: x_out.id(),
@@ -266,7 +272,7 @@ pub fn silu_scaled(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::SiluScaled {
+        Elemwise::SiluScaled {
             s,
             x: x.id(),
             x_out: x_out.id(),
@@ -280,7 +286,7 @@ pub fn scale(s: &Weight, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Scale {
+        Elemwise::Scale {
             s: r.weight(s),
             x: x.id(),
             x_out: x_out.id(),
@@ -303,7 +309,7 @@ pub fn res_blend(
     ins.push(prefix);
     ins.extend(blocks);
     r.push(
-        Elementwise::ResBlend {
+        Elemwise::ResBlend {
             prefix: prefix.id(),
             blocks: blocks.iter().map(Value::id).collect(),
             weight: r.weight(norm),
@@ -332,7 +338,7 @@ pub fn rope_full(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elementwise::RopeFull {
+        Elemwise::RopeFull {
             q: q.id(),
             k: k.id(),
             positions: positions.id(),
@@ -378,7 +384,7 @@ pub fn rope_partial(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elementwise::RopePartial {
+        Elemwise::RopePartial {
             q: q.id(),
             k: k.id(),
             positions: positions.id(),
@@ -410,7 +416,7 @@ pub fn rope_partial_q(
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     r.push(
-        Elementwise::RopePartialQ {
+        Elemwise::RopePartialQ {
             q: q.id(),
             positions: positions.id(),
             rotary_dim,
@@ -459,7 +465,7 @@ pub fn rope_partial_last_yarn(
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     r.push(
-        Elementwise::RopePartialLast {
+        Elemwise::RopePartialLast {
             q: q.id(),
             positions: positions.id(),
             rotary_dim,
@@ -492,7 +498,7 @@ pub fn rope_yarn(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elementwise::RopeYarn {
+        Elemwise::RopeYarn {
             q: q.id(),
             k: k.id(),
             positions: positions.id(),
@@ -516,7 +522,7 @@ pub fn gate_sigmoid_mul(x: &Value, gate: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::GateSigmoidMul {
+        Elemwise::GateSigmoidMul {
             x: x.id(),
             gate: gate.id(),
             x_out: x_out.id(),
@@ -547,7 +553,7 @@ pub fn gate_sigmoid_mul_heads(x: &Value, gate: &Value, head_dim: u32, scale: f32
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::GateSigmoidMulHeads {
+        Elemwise::GateSigmoidMulHeads {
             x: x.id(),
             gate: gate.id(),
             head_dim,
@@ -563,7 +569,7 @@ pub fn hc_expand(x: &Value, streams: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(x.rows(), x.width() * u64::from(streams), x.dtype()));
     r.push(
-        Elementwise::HcExpand {
+        Elemwise::HcExpand {
             x: x.id(),
             streams,
             y: y.id(),
@@ -577,7 +583,7 @@ pub fn hc_rmsnorm_f32(streams: &Value, eps: f32) -> Value {
     let r = streams.rec();
     let y = r.fresh(tensor(streams.rows(), streams.width(), Dtype::F32));
     r.push(
-        Elementwise::HcRmsnormF32 {
+        Elemwise::HcRmsnormF32 {
             streams: streams.id(),
             eps,
             y: y.id(),
@@ -601,7 +607,7 @@ pub fn hc_project(normed: &Value, dynamic: &Weight, stream_count: u32) -> Value 
     );
     let mixes = r.fresh(tensor(normed.rows(), dynamic.dim(0), Dtype::F32));
     r.push(
-        Elementwise::HcProject {
+        Elemwise::HcProject {
             normed: normed.id(),
             weight: r.weight(dynamic),
             stream_count,
@@ -683,7 +689,7 @@ fn gates(
     let post_mix = r.fresh(tensor(streams.rows(), count, Dtype::F32));
     let comb_mix = r.fresh(tensor(streams.rows(), count * count, Dtype::F32));
     r.push(
-        Elementwise::HcGates {
+        Elemwise::HcGates {
             normed: normed.id(),
             streams: streams.id(),
             scale: r.weight(scale),
@@ -718,7 +724,7 @@ pub fn hc_collapse(
         streams.dtype(),
     ));
     r.push(
-        Elementwise::HcCollapse {
+        Elemwise::HcCollapse {
             mixes: mixes.id(),
             streams: streams.id(),
             scale: r.weight(scale),
@@ -736,7 +742,7 @@ pub fn hc_fold(x: &Value, streams: &Value, post_mix: &Value, comb_mix: &Value) -
     let r = x.rec();
     let y = r.fresh(streams.ty().clone());
     r.push(
-        Elementwise::HcFold {
+        Elemwise::HcFold {
             x: x.id(),
             streams: streams.id(),
             post_mix: post_mix.id(),
@@ -756,7 +762,7 @@ pub fn hc_mix(gates: &Value, normed: &Value, streams: u32) -> Value {
         normed.dtype(),
     ));
     r.push(
-        Elementwise::HcMix {
+        Elemwise::HcMix {
             gates: gates.id(),
             normed: normed.id(),
             streams,
@@ -771,7 +777,7 @@ pub fn hc_inject(o: &Value, gates: &Value, streams: u32, hyper: &Value) -> Value
     let r = o.rec();
     let hyper_out = r.fresh(hyper.ty().clone());
     r.push(
-        Elementwise::HcInject {
+        Elemwise::HcInject {
             o: o.id(),
             gates: gates.id(),
             streams,
@@ -787,7 +793,7 @@ pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Valu
     let r = key.rec();
     let y = r.fresh(key.ty().clone());
     r.push(
-        Elementwise::PleGate {
+        Elemwise::PleGate {
             key: key.id(),
             query: query.id(),
             value: value.id(),
@@ -819,7 +825,7 @@ pub fn rope_mrope(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elementwise::RopeMrope {
+        Elemwise::RopeMrope {
             q: q.id(),
             k: k.id(),
             positions: positions.id(),
@@ -866,7 +872,7 @@ pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: Modulat
     let mut ins = vec![x, m];
     ins.extend(lane_of_row);
     r.push(
-        Elementwise::Modulate {
+        Elemwise::Modulate {
             x: x.id(),
             m: m.id(),
             lane_of_row: lane_of_row.map(Value::id),
@@ -910,7 +916,7 @@ pub fn gated_residual_add(
     let mut ins = vec![r_in, g, y];
     ins.extend(lane_of_row);
     r.push(
-        Elementwise::GatedResidualAdd {
+        Elemwise::GatedResidualAdd {
             r: r_in.id(),
             g: g.id(),
             y: y.id(),
@@ -932,7 +938,7 @@ pub fn sinusoid(t: &Value, dim: u32, max_period: f32, flip_sin_cos: bool, scale:
     );
     let y = r.fresh(tensor(t.rows(), dim, Dtype::F32));
     r.push(
-        Elementwise::Sinusoid {
+        Elemwise::Sinusoid {
             t: t.id(),
             dim,
             max_period,
@@ -983,7 +989,7 @@ pub fn relative_bucket_bias(
         dtype: Dtype::F32,
     });
     r.push(
-        Elementwise::RelativeBucketBias {
+        Elemwise::RelativeBucketBias {
             embedding: r.weight(embedding),
             max_len,
             num_buckets,
@@ -1000,7 +1006,7 @@ pub fn silu(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Silu {
+        Elemwise::Silu {
             x: x.id(),
             x_out: x_out.id(),
         },
@@ -1013,7 +1019,7 @@ pub fn gelu(x: &Value, tanh: bool) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Gelu {
+        Elemwise::Gelu {
             x: x.id(),
             tanh,
             x_out: x_out.id(),
@@ -1027,7 +1033,7 @@ pub fn tanh(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Tanh {
+        Elemwise::Tanh {
             x: x.id(),
             x_out: x_out.id(),
         },
@@ -1050,7 +1056,7 @@ pub fn hadamard(x: &Value, block: u32, signs: Option<&Value>) -> Value {
         ins.push(s);
     }
     r.push(
-        Elementwise::Hadamard {
+        Elemwise::Hadamard {
             x: x.id(),
             x_out: x_out.id(),
             block,
@@ -1080,7 +1086,7 @@ pub fn hadamard_signed(x: &Value, block: u32, signs: &Weight) -> Value {
     let signs_id = r.weight(signs);
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Hadamard {
+        Elemwise::Hadamard {
             x: x.id(),
             x_out: x_out.id(),
             block,
@@ -1091,7 +1097,7 @@ pub fn hadamard_signed(x: &Value, block: u32, signs: &Weight) -> Value {
     x_out
 }
 
-/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`):
+/// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`):
 /// `x` times `scale` (rounded), RMS-normed unscaled, and with `res` and its
 /// `gate` the residual's gated sum; else the norm alone.
 /// With `next` (`weight, eps, plus_one`), also the norm the next sublayer
@@ -1117,7 +1123,7 @@ pub fn norm_gate(
         ins.push(stream);
     }
     r.push(
-        Elementwise::NormGate {
+        Elemwise::NormGate {
             x: x.id(),
             scale: scale.map(|s| r.weight(s)),
             res: res.map(|(stream, _)| stream.id()),
@@ -1144,7 +1150,7 @@ pub fn mul(x: &Value, y: &Value) -> Value {
     assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
     let z = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Mul {
+        Elemwise::Mul {
             x: x.id(),
             y: y.id(),
             z: z.id(),
@@ -1159,7 +1165,7 @@ pub fn add(x: &Value, y: &Value) -> Value {
     assert_eq!(x.ty(), y.ty(), "a sum's operands share a type");
     let z = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Add {
+        Elemwise::Add {
             x: x.id(),
             y: y.id(),
             z: z.id(),
@@ -1232,7 +1238,7 @@ pub fn rope_axes(
     }
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RopeAxes {
+        Elemwise::RopeAxes {
             x: x.id(),
             positions: positions.id(),
             dims,

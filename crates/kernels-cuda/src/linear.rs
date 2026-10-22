@@ -13,7 +13,7 @@ pub mod skinny;
 
 pub mod lora;
 
-pub mod mlp;
+pub mod glu;
 
 pub mod nvfp4;
 
@@ -23,10 +23,10 @@ pub mod kquant;
 
 pub mod quant;
 
-pub mod tiled;
+pub mod affine;
 
 #[cfg(feature = "cuda")]
-pub mod tc5;
+pub mod gemm_sm100;
 
 #[cfg(feature = "cuda")]
 pub mod act_quant;

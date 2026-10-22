@@ -51,7 +51,7 @@ pub fn matmul_bias(
     bias: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul_bias", act, w, Some(bias), y)
+    act_x_wt(ctx, "fused.matmul_bias", act, w, Some(bias), y)
 }
 
 /// `h = silu(act · gateᵀ) · (act · upᵀ)` over a packed `[gate | up]` bank in
@@ -64,7 +64,7 @@ pub fn matmul_swiglu(
     gate_up: Tensor,
     h: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "linear.matmul_swiglu";
+    const OP: &str = "fused.matmul_swiglu";
     dtype_dispatch!(OP, act.dtype, { Bf16 => () });
     if gate_up.dtype != dtype::Dtype::Bf16 || gate_up.rows != 2 * h.width || h.rows == 0 {
         return Ok(false);

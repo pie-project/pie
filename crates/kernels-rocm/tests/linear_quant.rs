@@ -10,9 +10,9 @@ mod common;
 use common::{Gpu, f16, from_f16, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
+use kernels_rocm::linear::affine;
 use kernels_rocm::linear::moe::GroupSeat;
 use kernels_rocm::linear::quant::{self, OffsetKind};
-use kernels_rocm::linear::tiled;
 
 /// The activation and factor element type.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -524,7 +524,7 @@ fn linear_quant_tiled() {
         let w = Weight::new(4, group, OffsetKind::Post, n, k, e, 41);
         let (codes, scales, offs) = w.planes(&gpu, e);
         let biases = offs.unwrap();
-        let n_pad = tiled::repacked_rows(n);
+        let n_pad = affine::repacked_rows(n);
         let mut tc = gpu.upload(
             &vec![0u8; (n_pad * k / 2) as usize],
             n_pad,
@@ -543,7 +543,7 @@ fn linear_quant_tiled() {
             scales.width,
             Dtype::U8,
         );
-        tiled::repack(&ctx, codes, scales, biases, &mut tc, &mut ts, &mut tb).unwrap();
+        affine::repack(&ctx, codes, scales, biases, &mut tc, &mut ts, &mut tb).unwrap();
         let have: Vec<u32> = gpu.read_as(&tc);
         assert_eq!(have, tile_codes(&w), "the repacked codes, g{group} {n}x{k}");
         let have: Vec<u16> = gpu.read_as(&ts);
@@ -577,9 +577,9 @@ fn linear_quant_tiled() {
                 ctx.arm_stage(s.ptr);
             }
             let entry = if rows > 16 {
-                tiled::matmul
+                affine::matmul
             } else {
-                tiled::matmul_gemv
+                affine::matmul_gemv
             };
             entry(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT).unwrap();
             ctx.disarm_stage();
@@ -599,7 +599,7 @@ fn linear_quant_tiled() {
             );
         }
         // Both GEMM tiles at a row count the gemv also takes.
-        for tuple in [tiled::LONG, tiled::SHORT] {
+        for tuple in [affine::LONG, affine::SHORT] {
             let rows = 16;
             let x: Vec<f32> = values((rows * k) as usize, 43, 1.0)
                 .into_iter()
@@ -607,7 +607,7 @@ fn linear_quant_tiled() {
                 .collect();
             let xt = gpu.tensor(&x, rows, k, e.dtype());
             let mut y = gpu.zeros(rows, n, e.dtype());
-            tiled::matmul_with(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT, tuple).unwrap();
+            affine::matmul_with(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT, tuple).unwrap();
             let (want, scale) = reference(&x, &w, rows as usize);
             check(
                 &format!("tiled {tuple:?} g{group}"),

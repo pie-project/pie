@@ -88,7 +88,7 @@ pub fn modulate(
     lane_of_row: Option<Tensor>,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.modulate";
+    const OP: &str = "elemwise.modulate";
     let width = nonzero(OP, "the modulated width", o.width)?;
     let rows = nonzero(OP, "rows", o.rows)?;
     let entry = modulation(OP, "modulate", x.dtype, m, form.vectors() * width)?;
@@ -122,7 +122,7 @@ pub fn gated_residual_add(
     lane_of_row: Option<Tensor>,
     r_out: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gated_residual_add";
+    const OP: &str = "elemwise.gated_residual_add";
     let width = nonzero(OP, "the folded width", r_out.width)?;
     let rows = nonzero(OP, "rows", r_out.rows)?;
     let entry = modulation(OP, "gated_residual_add", r.dtype, g, width)?;

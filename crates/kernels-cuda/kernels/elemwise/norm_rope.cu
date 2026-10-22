@@ -79,8 +79,7 @@ __global__ __launch_bounds__(256) void qg_qknorm_rope_append(
         const float t = bf16_to_f32(xv[u]);
         local += t * t;
     }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    local = ::pie::warp_sum(local);
     const float inv_rms = rsqrtf(local / static_cast<float>(D) + eps);
     float y[PER];
 #pragma unroll
@@ -158,10 +157,7 @@ __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
         const float v = bf16_to_f32(xr[i]);
         local += v * v;
     }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        local += __shfl_xor_sync(0xffffffffu, local, off);
-    }
+    local = ::pie::warp_sum(local);
     __shared__ float partial[kWarps + 1];
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -169,10 +165,7 @@ __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     __syncthreads();
     if (warp == 0) {
         float v = threadIdx.x < kWarps ? partial[threadIdx.x] : 0.f;
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_xor_sync(0xffffffffu, v, off);
-        }
+        v = ::pie::warp_sum(v);
         if (lane == 0) partial[kWarps] = v;
     }
     __syncthreads();
@@ -266,10 +259,7 @@ __global__ __launch_bounds__(WARPS * 32) void q_rmsnorm_rope_partial_warp(
                 }
             }
         }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            local += __shfl_xor_sync(0xffffffffu, local, off);
-        }
+        local = ::pie::warp_sum(local);
         __syncwarp();
         const float inv_rms = rsqrtf(local / static_cast<float>(head_dim) + eps);
         const float pos = static_cast<float>(positions[row]);
@@ -415,8 +405,7 @@ __device__ __forceinline__ void norm_rope_unit(
             const float f = bf16_to_f32(v[r][u]);
             local = fmaf(f, f, local);
         }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    local = ::pie::warp_sum(local);
     const float inv_rms = rsqrtf(local / static_cast<float>(head_dim) + eps);
 #pragma unroll
     for (int r = 0; r < RUNS; ++r)
@@ -458,7 +447,7 @@ __device__ __forceinline__ void norm_rope_unit(
         }
     }
     if constexpr (APPEND) {
-        namespace ds = ::pie::attn::dsv4;
+        namespace ds = ::pie::kv_rows;
         if (row_valid != nullptr && row_valid[plane_row] == 0) return;
         const int page = static_cast<int>(w_page[plane_row]);
         const int off = static_cast<int>(w_off[plane_row]);

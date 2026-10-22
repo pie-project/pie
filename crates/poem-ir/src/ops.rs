@@ -13,11 +13,12 @@ pub mod linear;
 pub mod sampling;
 pub mod ssm;
 
-pub use attn::{Attention, IndexScore, RaggedMask};
+pub use attn::{Attn, IndexScore, RaggedMask};
 pub use collective::Collective;
 pub use conv::{Conv, GridRule, TimePad, VoxelSegment};
 pub use elemwise::{
-    Elementwise, GateActivation, ModulateForm, MropeForm, NormNext, RopeForm, RopeFreqs,
+    Elemwise, GateActivation, ModulateForm, MropeForm, NormAxis, NormNext, NormWeight, RopeForm,
+    RopeFreqs,
 };
 pub use fused::{Fused, NormKind};
 pub use gather::{Gather, PixelOrder, TapKind};
@@ -27,9 +28,9 @@ pub use ssm::Ssm;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
-    Attention(Attention),
+    Attn(Attn),
     Linear(Linear),
-    Elementwise(Elementwise),
+    Elemwise(Elemwise),
     Gather(Gather),
     Collective(Collective),
     Sampling(Sampling),
@@ -41,9 +42,9 @@ pub enum Operation {
 impl Operation {
     fn operands(&self) -> &dyn Operands {
         match self {
-            Self::Attention(op) => op,
+            Self::Attn(op) => op,
             Self::Linear(op) => op,
-            Self::Elementwise(op) => op,
+            Self::Elemwise(op) => op,
             Self::Gather(op) => op,
             Self::Collective(op) => op,
             Self::Sampling(op) => op,
@@ -72,9 +73,9 @@ impl Operands for Operation {
     }
 }
 
-impl From<Attention> for Operation {
-    fn from(op: Attention) -> Self {
-        Self::Attention(op)
+impl From<Attn> for Operation {
+    fn from(op: Attn) -> Self {
+        Self::Attn(op)
     }
 }
 impl From<Linear> for Operation {
@@ -82,9 +83,9 @@ impl From<Linear> for Operation {
         Self::Linear(op)
     }
 }
-impl From<Elementwise> for Operation {
-    fn from(op: Elementwise) -> Self {
-        Self::Elementwise(op)
+impl From<Elemwise> for Operation {
+    fn from(op: Elemwise) -> Self {
+        Self::Elemwise(op)
     }
 }
 impl From<Gather> for Operation {

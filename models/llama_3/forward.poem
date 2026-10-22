@@ -35,7 +35,7 @@ def forward(m, inputs):
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, w.gate_up), m.inter), w.down)
+        f = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, w.gate_up), m.inter), w.down)
         return ops.elemwise.residual_add(f, y)
 
     y = inputs.fold_layers(m.layers, y, block)

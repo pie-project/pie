@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::z_image_dims::{self as model, Dims};
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
-    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request, RopeForm,
+    Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operation, Platform, Request, RopeForm,
     RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
 
@@ -260,7 +260,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Elementwise(Elementwise::Sinusoid {
+                Operation::Elemwise(Elemwise::Sinusoid {
                     dim,
                     max_period,
                     flip_sin_cos,
@@ -321,7 +321,7 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Attention(Attention::Ragged {
+                Operation::Attn(Attn::Ragged {
                     q_indptr,
                     kv_indptr,
                     head_dim,
@@ -388,7 +388,7 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
         let prefills = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Attention(Attention::Prefill { .. })))
+            .filter(|node| matches!(&node.op, Operation::Attn(Attn::Prefill { .. })))
             .count();
         let want = if deployment == TURBO {
             model::TE_LAYERS as usize
@@ -407,7 +407,7 @@ fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Elementwise(Elementwise::RopeAxes {
+                Operation::Elemwise(Elemwise::RopeAxes {
                     dims,
                     thetas,
                     form,
@@ -438,7 +438,7 @@ fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Elementwise(Elementwise::RopeFull {
+                Operation::Elemwise(Elemwise::RopeFull {
                     head_dim,
                     theta,
                     interleaved,
@@ -463,7 +463,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
         let ty = |id: ValueId| plan.values[id.0 as usize].ty.clone();
         let (mut lane_scales, mut row_pads) = (0usize, 0usize);
         for node in &plan.nodes {
-            let Operation::Elementwise(Elementwise::Modulate {
+            let Operation::Elemwise(Elemwise::Modulate {
                 x,
                 m,
                 lane_of_row,
@@ -524,7 +524,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
         for node in &plan.nodes {
             if !matches!(
                 &node.op,
-                Operation::Elementwise(Elementwise::GatedResidualAdd { .. })
+                Operation::Elemwise(Elemwise::GatedResidualAdd { .. })
             ) {
                 continue;
             }

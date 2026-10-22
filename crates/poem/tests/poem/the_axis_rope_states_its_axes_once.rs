@@ -1,7 +1,7 @@
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RopeForm, Value, ops, seam, trace_hybrid,
 };
-use poem_ir::{Def, Dim, Elementwise, Operands, Operation, RuntimeInput, Ty};
+use poem_ir::{Def, Dim, Elemwise, Operands, Operation, RuntimeInput, Ty};
 
 struct OneRope {
     axes: u8,
@@ -66,14 +66,9 @@ fn three_axes_over_a_whole_head_trace_in_place() {
     let node = trace
         .nodes
         .iter()
-        .find(|node| {
-            matches!(
-                node.op,
-                Operation::Elementwise(Elementwise::RopeAxes { .. })
-            )
-        })
+        .find(|node| matches!(node.op, Operation::Elemwise(Elemwise::RopeAxes { .. })))
         .expect("one rope");
-    let Operation::Elementwise(Elementwise::RopeAxes {
+    let Operation::Elemwise(Elemwise::RopeAxes {
         x,
         positions,
         dims,
@@ -121,7 +116,7 @@ fn a_partial_rotation_leaves_the_tail_of_the_head_alone() {
     );
     assert!(trace.nodes.iter().any(|node| matches!(
         node.op,
-        Operation::Elementwise(Elementwise::RopeAxes {
+        Operation::Elemwise(Elemwise::RopeAxes {
             rotary_dim: 96,
             head_dim: 128,
             ..

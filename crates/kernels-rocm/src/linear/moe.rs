@@ -2929,9 +2929,9 @@ pub fn mlp_swiglu(ctx: &Ctx, p: &RoutedMlp, y: &mut Tensor) -> Result<(), Error>
         )?;
         match p.limit {
             Some(limit) => {
-                crate::linear::mlp::swiglu_clamp(ctx, packed, p.intermediate, p.fan, limit, &mut h)?
+                crate::linear::glu::swiglu_clamp(ctx, packed, p.intermediate, p.fan, limit, &mut h)?
             }
-            None => crate::linear::mlp::swiglu(ctx, packed, p.intermediate, p.fan, &mut h)?,
+            None => crate::linear::glu::swiglu(ctx, packed, p.intermediate, p.fan, &mut h)?,
         }
         matmul_select(ctx, h, p.down, p.routes, &mut routed, p.down_experts)?;
         Ok(())

@@ -83,7 +83,7 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter)
+        act = ops.linear.swiglu(ops.linear.matmul(x, f.gate_up), f.inter)
         return ops.elemwise.scale(f.scale, ops.linear.matmul(act, f.down))
     fan = f.top_k + f.sink
     routes, weights = ops.linear.moe_topk_sigmoid_sink(
@@ -95,7 +95,7 @@ def mlp(x, f):
         f.sink,
         f.scaling,
     )
-    hidden = ops.linear.mlp_swiglu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), f.inter)
+    hidden = ops.linear.swiglu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), f.inter)
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, routes, fan), weights)
 
 def conv(v, weight, state, inputs, m):

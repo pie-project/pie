@@ -156,10 +156,7 @@ __global__ void act_quant_e4m3(
         v[i] = bf16_to_f32(src[i]);
         amax = fmaxf(amax, fabsf(v[i]));
     }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-    }
+    amax = ::pie::warp_max(amax);
     const int e = e4m3_block_exp(amax);
     const float s = __uint_as_float(static_cast<unsigned>(e + 127) << 23);
     u8 q[kEach];
@@ -573,8 +570,7 @@ __global__ void __launch_bounds__(256) rmsnorm_act_quant_e4m3(
 #pragma unroll
         for (int i = 0; i < 16; ++i) ss = fmaf(v[i], v[i], ss);
     }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    ss = ::pie::warp_sum(ss);
     __shared__ float warp_ss[8];
     if (lane == 0) warp_ss[tid >> 5] = ss;
     __syncthreads();

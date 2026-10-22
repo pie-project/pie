@@ -12,9 +12,9 @@ use dtype::Dtype;
 
 const RAGGED: &str = "attn/ragged.cu";
 
-const OP: &str = "attention.ragged";
+const OP: &str = "attn.ragged";
 
-const SCRATCH: &str = "attention.ragged.schedule";
+const SCRATCH: &str = "attn.ragged.schedule";
 
 const SCHEDULE_BLOCK: u32 = 1024;
 

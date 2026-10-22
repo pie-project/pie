@@ -8,9 +8,9 @@ use crate::common::tc5::ue8m0;
 use crate::common::{SM100, TC5, from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, E4m3, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{AlphaFrom, Bank, Format, Source, read_back, select};
+use kernels_cuda::linear::gemm_sm100::{Elem, Glu, supported};
 use kernels_cuda::linear::moe::{self, ExpertTable, GluBank, GroupSeat};
 use kernels_cuda::linear::nvfp4;
-use kernels_cuda::linear::tc5::{Elem, Glu, supported};
 use kernels_cuda::tuning::Tuning;
 
 const RES: ExpertTable = ExpertTable::RESIDENT;
@@ -667,8 +667,8 @@ fn nvfp4_select_rate() {
 #[test]
 #[ignore = "a rate, not an answer"]
 fn fp8_select_rate() {
+    use kernels_cuda::linear::gemm_sm100::atom_bytes;
     use kernels_cuda::linear::moe::select_fp8_w8a8;
-    use kernels_cuda::linear::tc5::atom_bytes;
     let (experts, tokens, top) = (32usize, 64usize, 8usize);
     for (n, k, by_token) in [(4096usize, 4096usize, true), (4096, 2048, false)] {
         let mut b = Bench::new(11);

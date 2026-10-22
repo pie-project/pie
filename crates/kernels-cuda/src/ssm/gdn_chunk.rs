@@ -80,7 +80,7 @@ fn gated_delta_chunked_tc5(
     state: &RecurrentPool,
     y: &mut Tensor,
 ) -> Result<bool, Error> {
-    use crate::linear::tc5::{Map, encode, supported};
+    use crate::linear::gemm_sm100::{Map, encode, supported};
     use cudarc::driver::sys as dr;
     const GDN_CHUNK_SM100: &str = "ssm/gdn_chunk_sm100.cu";
     /// `pie::ssm::sm100::smem_bytes()`.

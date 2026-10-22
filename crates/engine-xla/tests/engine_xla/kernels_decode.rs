@@ -133,7 +133,7 @@ fn a_bank_decodes_to_the_plane_its_codes_and_factors_state() {
     let ran = b
         .run(|ctx| {
             for (bank, out, _, _) in &cases {
-                decode::decoded_plane(ctx, "attention.mla_absorb_q", *bank, *out)?;
+                decode::decoded_plane(ctx, "attn.mla_absorb_q", *bank, *out)?;
             }
             Ok(())
         })

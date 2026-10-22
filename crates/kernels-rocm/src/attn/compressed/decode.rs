@@ -80,7 +80,7 @@ pub fn decode(
     _o: &mut Tensor,
 ) -> Result<(), Error> {
     Err(Error::Unsupported {
-        op: "attention.window_sink",
+        op: "attn.window_sink",
     })
 }
 
@@ -92,7 +92,7 @@ pub fn append(
     _write_offset: Tensor,
 ) -> Result<(), Error> {
     Err(Error::Unsupported {
-        op: "attention.kv_append_shared",
+        op: "attn.kv_append_shared",
     })
 }
 
@@ -104,6 +104,6 @@ pub fn store_entries(
     _pool: &KvPool,
 ) -> Result<(), Error> {
     Err(Error::Unsupported {
-        op: "attention.pool_kv_append",
+        op: "attn.pool_kv_append",
     })
 }

@@ -34,8 +34,7 @@ __device__ __forceinline__ void route_row_sums(float (&v)[K], float* part)
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 #pragma unroll
     for (int k = 0; k < K; ++k) {
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) v[k] += __shfl_xor_sync(0xffffffffu, v[k], off);
+        v[k] = ::pie::warp_sum(v[k]);
         if (lane == 0) part[warp * K + k] = v[k];
     }
     __syncthreads();
@@ -43,8 +42,7 @@ __device__ __forceinline__ void route_row_sums(float (&v)[K], float* part)
 #pragma unroll
         for (int k = 0; k < K; ++k) {
             float w = lane < static_cast<int>(blockDim.x >> 5) ? part[lane * K + k] : 0.f;
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) w += __shfl_xor_sync(0xffffffffu, w, off);
+            w = ::pie::warp_sum(w);
             if (lane == 0) part[32 * K + k] = w;
         }
     }

@@ -68,7 +68,7 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
 }
 
 pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_expand";
+    const OP: &str = "elemwise.hc_expand";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(y.rows, x.rows, "the expansion lands one wide row per row");
     let fan = stream_fan(OP, y.width, x.width)?;
@@ -91,7 +91,7 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
 }
 
 pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_rmsnorm_f32";
+    const OP: &str = "elemwise.hc_rmsnorm_f32";
     dtype_dispatch!(OP, streams.dtype, { Bf16 => () });
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` widens to f32");
     debug_assert!(
@@ -199,7 +199,7 @@ impl Slicing {
         }
         let bytes = self.slices as usize * rows as usize * width as usize * 4;
         Ok(ArgValue::Ptr(
-            ctx.scratch(op, "elementwise.hc_project_part", bytes)? as usize as u64,
+            ctx.scratch(op, "elemwise.hc_project_part", bytes)? as usize as u64,
         ))
     }
 }
@@ -211,7 +211,7 @@ pub fn project(
     stream_count: u32,
     mixes: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_project";
+    const OP: &str = "elemwise.hc_project";
     debug_assert!(
         normed.dtype == Dtype::F32 && hc_fn.dtype == Dtype::F32 && mixes.dtype == Dtype::F32,
         "`{OP}` projects an f32 row through an f32 plane into an f32 row"
@@ -322,7 +322,7 @@ pub fn norm_project(
     stream_count: u32,
     mixes: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_norm_project";
+    const OP: &str = "fused.hc_norm_project";
     let t = dtype_dispatch!(OP, streams.dtype, { Bf16 => "::pie::bf16" });
     debug_assert!(
         hc_fn.dtype == Dtype::F32 && mixes.dtype == Dtype::F32,
@@ -342,7 +342,7 @@ pub fn norm_project(
     if !tiled {
         // The primitives, over a normed row of scratch.
         let bytes = rows as usize * fan as usize * 4;
-        let normed = ctx.scratch(OP, "elementwise.hc_norm_project_normed", bytes)? as usize as u64;
+        let normed = ctx.scratch(OP, "elemwise.hc_norm_project_normed", bytes)? as usize as u64;
         let mut normed = Tensor::new(normed, streams.rows, fan, Dtype::F32);
         rmsnorm_f32(ctx, streams, eps, &mut normed)?;
         return project(ctx, normed, hc_fn, stream_count, mixes);
@@ -422,7 +422,7 @@ pub fn gates(
     post_mix: &mut Tensor,
     comb_mix: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_gates";
+    const OP: &str = "elemwise.hc_gates";
     let t = dtype_dispatch!(OP, streams.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(normed.dtype, Dtype::F32, "`{OP}` reads an f32 mix row");
     debug_assert_eq!(scale.dtype, Dtype::F32, "`{OP}` reads f32 mix scales");
@@ -487,7 +487,7 @@ pub fn fold(
     comb_mix: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_fold";
+    const OP: &str = "elemwise.hc_fold";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
         y.rows == streams.rows && y.width == streams.width,
@@ -531,7 +531,7 @@ pub fn collapse(
     hc_eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_collapse";
+    const OP: &str = "elemwise.hc_collapse";
     let t = dtype_dispatch!(OP, streams.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(mixes.dtype, Dtype::F32, "`{OP}` reads an f32 mix row");
     debug_assert_eq!(scale.dtype, Dtype::F32, "`{OP}` reads an f32 mix scale");
@@ -581,7 +581,7 @@ pub fn mix(
     streams: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_mix";
+    const OP: &str = "elemwise.hc_mix";
     let t = dtype_dispatch!(OP, normed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = stream_fan(OP, normed.width, y.width)?;
     debug_assert_eq!(
@@ -620,7 +620,7 @@ pub fn inject(
     streams: u32,
     hyper: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_inject";
+    const OP: &str = "elemwise.hc_inject";
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = stream_fan(OP, hyper.width, o.width)?;
     debug_assert_eq!(
@@ -659,7 +659,7 @@ pub fn ple_gate(
     streams: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.ple_gate";
+    const OP: &str = "elemwise.ple_gate";
     let t = dtype_dispatch!(OP, key.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = stream_fan(OP, key.width, value.width)?;
     debug_assert_eq!(

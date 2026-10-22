@@ -104,10 +104,7 @@ __global__ void score_capture(
                 }
             }
 
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                dot += __shfl_xor_sync(0xffffffffu, dot, off);
-            }
+            dot = ::pie::warp_sum(dot);
             const float score = dot * sm_scale;
             const float widened = fmaxf(running_max, score);
             running_sum = running_sum * __expf(running_max - widened) +
@@ -149,10 +146,7 @@ __global__ void score_capture(
                     dot += q_s[d] * bf16_to_f32(k_row[d]);
                 }
             }
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                dot += __shfl_xor_sync(0xffffffffu, dot, off);
-            }
+            dot = ::pie::warp_sum(dot);
 
             if (lane == 0 && j < kv_max) {
                 out[j] += __expf(dot * sm_scale - folded_max) * inv * inv_rows;

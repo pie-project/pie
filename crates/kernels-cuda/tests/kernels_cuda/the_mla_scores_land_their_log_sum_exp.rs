@@ -266,7 +266,7 @@ fn score(
             &mut o,
             Some(&mut lse),
         )
-        .expect("attention.mla_prefill_selected enqueues");
+        .expect("attn.mla_prefill_selected enqueues");
     } else {
         mla::attention_prefill(
             &ctx,
@@ -281,7 +281,7 @@ fn score(
             &mut o,
             Some(&mut lse),
         )
-        .expect("attention.mla_prefill enqueues");
+        .expect("attn.mla_prefill enqueues");
     }
     gpu.sync();
     (

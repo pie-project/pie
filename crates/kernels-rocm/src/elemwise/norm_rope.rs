@@ -19,7 +19,7 @@ pub fn rmsnorm_rope_partial_q(
     span: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_rope_partial_q";
+    const OP: &str = "fused.rmsnorm_rope_partial_q";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     positions_stream(OP, positions, &x);
     if head_dim == 0
@@ -64,7 +64,7 @@ pub fn rmsnorm_rope_partial_q(
 }
 
 /// A head's norm and its tail's rotation in one pass, which is CUDA's
-/// (`elementwise.norm_rope_last`, outside ROCm's fused kernels).
+/// (`fused.norm_rope_last`, outside ROCm's fused kernels).
 #[allow(clippy::too_many_arguments)]
 pub fn norm_rope_last(
     _ctx: &Ctx,
@@ -81,6 +81,6 @@ pub fn norm_rope_last(
     _y: &mut Tensor,
 ) -> Result<(), Error> {
     Err(Error::Unsupported {
-        op: "elementwise.norm_rope_last",
+        op: "fused.norm_rope_last",
     })
 }

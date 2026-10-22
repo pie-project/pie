@@ -1223,7 +1223,7 @@ pub fn attention(
     sm_scale: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.voxel";
+    const OP: &str = "attn.voxel";
     if q.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {
             op: OP,

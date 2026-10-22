@@ -20,7 +20,7 @@ pub fn merge_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.merge_lse";
+    const OP: &str = "attn.merge_lse";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "merge_lse_combine_bf16" });
     debug_assert!(
         o1.dtype == o.dtype && o2.dtype == o.dtype,

@@ -297,7 +297,7 @@ def predict_next(streams, following, hy):
 def mlp(x, f, hint):
     if not f.routed:
         return ops.linear.matmul(
-            ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit),
+            ops.linear.swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit),
             f.down,
         )
     # The release routes at f32: its logits are never rounded to bf16.
@@ -311,10 +311,10 @@ def mlp(x, f, hint):
         hint,
     )
     packed = select(x, f.gate_up, routes, f.top_k)
-    act = ops.linear.mlp_swiglu_clamp(packed, f.inter, f.limit)
+    act = ops.linear.swiglu_clamp(packed, f.inter, f.limit)
     routed = ops.linear.moe_weighted_sum(select(act, f.down, routes, f.top_k), weights)
     s = f.shared
-    act = ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, s.gate_up), s.inter, f.limit)
+    act = ops.linear.swiglu_clamp(ops.linear.matmul(x, s.gate_up), s.inter, f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def mla_mixer(x, inputs, plan, positions, act, a):
@@ -391,7 +391,7 @@ def tower(inputs, t):
         )
         n = ops.elemwise.rmsnorm(y, b.norm2, t.norm_eps)
         h = ops.elemwise.add_bias(b.gate_up_bias, ops.linear.matmul(n, b.gate_up))
-        a = ops.linear.mlp_swiglu_clamp(h, t.inter, t.limit)
+        a = ops.linear.swiglu_clamp(h, t.inter, t.limit)
         y = ops.elemwise.residual_add(
             ops.elemwise.add_bias(b.down_bias, ops.linear.matmul(a, b.down)),
             y,
@@ -402,9 +402,9 @@ def tower(inputs, t):
     mg = t.merger
     p = ops.linear.matmul(y, mg.proj)
     n = ops.elemwise.layernorm(p, mg.norm, mg.norm_bias, t.norm_eps)
-    g = ops.linear.mlp_gelu_tanh(n)
+    g = ops.linear.gelu_tanh(n)
     h = ops.linear.matmul(g, mg.gate_up)
-    a = ops.linear.mlp_swiglu_clamp(h, t.merger_inter, t.limit)
+    a = ops.linear.swiglu_clamp(h, t.merger_inter, t.limit)
     return ops.linear.matmul(a, mg.down)
 
 def select(x, bank, routes, top_k):

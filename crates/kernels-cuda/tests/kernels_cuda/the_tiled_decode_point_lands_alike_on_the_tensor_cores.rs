@@ -4,8 +4,8 @@
 use crate::common::SM100;
 use crate::common::linear_ref::{Bench, TOL, affine, dot, t};
 use dtype::Dtype::{Bf16, U8};
+use kernels_cuda::linear::affine::{matmul_gemv, repack, repacked_rows};
 use kernels_cuda::linear::moe::GroupSeat;
-use kernels_cuda::linear::tiled::{matmul_gemv, repack, repacked_rows};
 use kernels_cuda::tuning::Tuning;
 
 #[test]

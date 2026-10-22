@@ -1,3 +1,4 @@
+use poem_ir::{NormAxis, NormWeight};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -113,7 +114,12 @@ fn the_shapes_are_the_ltx_decoders() {
             Operation::Conv(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }
-            Operation::Elementwise(poem::Elementwise::RmsnormNoScale { eps, .. }) => {
+            Operation::Elemwise(poem::Elemwise::Rmsnorm {
+                eps,
+                axis: NormAxis::Head(_),
+                weight: NormWeight::None,
+                ..
+            }) => {
                 rms_eps.insert(format!("{eps:e}"));
             }
             _ => {}

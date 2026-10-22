@@ -2,7 +2,7 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{Operands, Operation, Shard, ValueId};
+use poem_ir::{Elemwise, NormAxis, Operands, Operation, Shard, ValueId};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -96,68 +96,63 @@ const KV_HEADS: &str = "kv_heads";
 /// How op `name` splits by head or channel, if it does.
 fn heads(name: &str) -> Option<Heads> {
     Some(match name {
-        "elementwise.silu"
-        | "elementwise.gelu"
-        | "elementwise.tanh"
-        | "elementwise.mul_scalar"
-        | "elementwise.silu_scaled"
-        | "elementwise.scale"
-        | "elementwise.rmsnorm_per_head"
-        | "elementwise.rmsnorm_per_head_plus_one"
-        | "elementwise.rmsnorm_no_scale"
-        | "elementwise.rope_axes"
+        "elemwise.silu"
+        | "elemwise.gelu"
+        | "elemwise.tanh"
+        | "elemwise.mul_scalar"
+        | "elemwise.silu_scaled"
+        | "elemwise.scale"
+        | "elemwise.rope_axes"
         | "gather.rows"
         | "gather.pack_rows"
         | "gather.unpack_rows"
-        | "linear.mlp_gelu_tanh" => Heads::of(&["x"], &[]),
-        "elementwise.mul" => Heads::of(&["x", "y"], &[]),
-        "elementwise.gate_sigmoid_mul"
-        | "elementwise.gate_sigmoid_mul_heads"
-        | "elementwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
-        "elementwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
-        "elementwise.rope_full"
-        | "elementwise.rope_partial"
-        | "elementwise.rope_yarn"
-        | "elementwise.rope_mrope" => Heads::of(&["q", "k"], &[]),
-        "elementwise.rope_partial_q" | "elementwise.rope_partial_last" => Heads::of(&["q"], &[]),
-        "elementwise.add_bias" => Heads::of(&["out"], &[]),
+        | "linear.gelu_tanh" => Heads::of(&["x"], &[]),
+        "elemwise.mul" => Heads::of(&["x", "y"], &[]),
+        "elemwise.gate_sigmoid_mul"
+        | "elemwise.gate_sigmoid_mul_heads"
+        | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
+        "elemwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
+        "elemwise.rope_full"
+        | "elemwise.rope_partial"
+        | "elemwise.rope_yarn"
+        | "elemwise.rope_mrope" => Heads::of(&["q", "k"], &[]),
+        "elemwise.rope_partial_q" | "elemwise.rope_partial_last" => Heads::of(&["q"], &[]),
+        "elemwise.add_bias" => Heads::of(&["out"], &[]),
         "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
-        "linear.mlp_swiglu"
-        | "linear.mlp_swiglu_clamp"
-        | "linear.mlp_swiglu_clamp_alpha"
-        | "linear.mlp_geglu_tanh_packed"
-        | "linear.mlp_situ" => Heads::of(&["packed"], &["intermediate"]),
-        "linear.mlp_swiglu_clamp_split" | "linear.mlp_geglu_tanh" => {
-            Heads::of(&["gate", "up"], &[])
-        }
+        "linear.swiglu"
+        | "linear.swiglu_clamp"
+        | "linear.swiglu_clamp_alpha"
+        | "linear.geglu_tanh_packed"
+        | "linear.situ" => Heads::of(&["packed"], &["intermediate"]),
+        "linear.swiglu_clamp_split" | "linear.geglu_tanh" => Heads::of(&["gate", "up"], &[]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
-        "attention.decode" | "attention.decode_lse" | "attention.decode_selected" => {
+        "attn.decode" | "attn.decode_lse" | "attn.decode_selected" => {
             Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)
         }
-        "attention.prefill"
-        | "attention.prefill_lse"
-        | "attention.masked"
-        | "attention.masked_lse"
-        | "attention.prefill_selected" => Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole),
-        "attention.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
-        "attention.sink" => Heads::of(&["o", "lse"], &[]),
-        "attention.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
-        "attention.pool_lse" | "attention.pool_lse_selected" => Heads::of(&["q"], &["heads"]),
-        "attention.kv_append" => Heads::of(&["k", "v"], &[])
+        "attn.prefill"
+        | "attn.prefill_lse"
+        | "attn.masked"
+        | "attn.masked_lse"
+        | "attn.prefill_selected" => Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole),
+        "attn.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
+        "attn.sink" => Heads::of(&["o", "lse"], &[]),
+        "attn.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
+        "attn.pool_lse" | "attn.pool_lse_selected" => Heads::of(&["q"], &["heads"]),
+        "attn.kv_append" => Heads::of(&["k", "v"], &[])
             .cache(Cache::Split)
             .kv(&["k", "v"]),
-        "attention.kv_append_shared" => Heads::of(&["plane"], &[])
+        "attn.kv_append_shared" => Heads::of(&["plane"], &[])
             .cache(Cache::Split)
             .kv(&["plane"]),
-        "attention.mla_split_q_b" => Heads::of(&["q_b"], &["heads"]),
-        "attention.mla_absorb_q" => Heads::of(&["q_nope"], &["heads"]),
-        "attention.mla_absorb_out" => Heads::of(&["latent"], &["heads"]),
-        "attention.mla_decode"
-        | "attention.mla_prefill"
-        | "attention.mla_decode_selected"
-        | "attention.mla_prefill_selected" => Heads::of(&["q", "q_pe"], &["heads"]),
+        "attn.mla_split_q_b" => Heads::of(&["q_b"], &["heads"]),
+        "attn.mla_absorb_q" => Heads::of(&["q_nope"], &["heads"]),
+        "attn.mla_absorb_out" => Heads::of(&["latent"], &["heads"]),
+        "attn.mla_decode"
+        | "attn.mla_prefill"
+        | "attn.mla_decode_selected"
+        | "attn.mla_prefill_selected" => Heads::of(&["q", "q_pe"], &["heads"]),
         "ssm.causal_conv1d" | "ssm.causal_conv1d_chunked" => {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
@@ -172,7 +167,17 @@ fn heads(name: &str) -> Option<Heads> {
     })
 }
 
-fn rule(name: &str) -> Rule {
+fn rule(op: &Operation) -> Rule {
+    // A norm splits by its axis: a whole row's weight against the row's
+    // blocks, a head's like any per-head op, a group's not at all.
+    if let Operation::Elemwise(Elemwise::Rmsnorm { axis, .. }) = op {
+        return match axis {
+            NormAxis::Row => Rule::Norm,
+            NormAxis::Head(_) => Rule::Heads(Heads::of(&["x"], &[])),
+            NormAxis::Group(_) => Rule::Whole,
+        };
+    }
+    let name = op.name();
     match name {
         "linear.matmul" | "linear.lm_head" => Rule::Contract {
             act: "act",
@@ -191,18 +196,17 @@ fn rule(name: &str) -> Rule {
         "linear.moe_weighted_sum" => Rule::Linear {
             follow: &["routed"],
         },
-        "elementwise.residual_add" | "elementwise.add" => Rule::Linear {
+        "elemwise.residual_add" | "elemwise.add" => Rule::Linear {
             follow: &["x", "y"],
         },
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
             follow: &["routed", "shared"],
         },
         "gather.embed" => Rule::Lookup { table: "table" },
-        "attention.plan_prefill" | "attention.plan_decode" => Rule::Plan {
+        "attn.plan_prefill" | "attn.plan_decode" => Rule::Plan {
             scale: &["q_heads", KV_HEADS],
         },
-        "attention.mla_plan" => Rule::Plan { scale: &["heads"] },
-        "elementwise.rmsnorm" | "elementwise.rmsnorm_plus_one" => Rule::Norm,
+        "attn.mla_plan" => Rule::Plan { scale: &["heads"] },
         "linear.group_routes" => Rule::Groups,
         _ => heads(name).map_or(Rule::Whole, Rule::Heads),
     }
@@ -219,7 +223,7 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
     };
     let mut outs = Vec::new();
     op.outputs(&mut outs);
-    let dists = match rule(at.name) {
+    let dists = match rule(op) {
         Rule::Whole => {
             at.whole_except(pass, &[])?;
             at.check_state(pass, false, Cache::Whole)?;

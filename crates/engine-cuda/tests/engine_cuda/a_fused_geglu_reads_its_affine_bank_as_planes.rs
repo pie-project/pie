@@ -40,8 +40,7 @@ impl ForwardHybrid for Micro {
 
     fn forward(&self, inputs: Input) -> Value {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
-        let act =
-            ops::linear::mlp_geglu_tanh_packed(&ops::linear::matmul(&x, &self.gate_up), INTER);
+        let act = ops::linear::geglu_tanh_packed(&ops::linear::matmul(&x, &self.gate_up), INTER);
         let h = ops::linear::matmul(&act, &self.down);
         ops::linear::lm_head(&h, &self.head)
     }
@@ -222,7 +221,7 @@ fn a_fused_geglu_reads_its_affine_bank_as_planes() {
     }
     let fixture = fixture();
 
-    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["linear.matmul_geglu"]);
+    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["fused.matmul_geglu"]);
     assert!(
         fused
             .nodes

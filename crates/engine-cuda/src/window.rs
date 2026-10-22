@@ -704,7 +704,7 @@ impl Windows {
 
 /// The regions whose DeepSeek attention stages its quantized rows
 /// (`exports::regions_staging`), and the rows from which it does
-/// (`kernel.sdpa.dsv4_prefill_from`; 0: none does).
+/// (`kernel.sdpa.compressed_prefill_from`; 0: none does).
 #[derive(Debug, Clone, Copy)]
 pub struct Staging<'a> {
     pub regions: &'a [bool],

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
-    Attention, Def, Dim, Dtype, Elementwise, Operation, Platform, RaggedMask, Request, RopeForm,
+    Attn, Def, Dim, Dtype, Elemwise, Operation, Platform, RaggedMask, Request, RopeForm,
     RuntimeInput, Stream, Trace, Ty, seam,
 };
 
@@ -249,7 +249,7 @@ fn ragged(plan: &Trace) -> Vec<RaggedMask> {
     plan.nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Attention(Attention::Ragged { mask, .. }) => Some(*mask),
+            Operation::Attn(Attn::Ragged { mask, .. }) => Some(*mask),
             _ => None,
         })
         .collect()
@@ -279,7 +279,7 @@ fn one_joint_read_per_block_and_one_lane_read_per_refiner() {
         let prefill = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Attention(Attention::Prefill { .. })))
+            .filter(|node| matches!(&node.op, Operation::Attn(Attn::Prefill { .. })))
             .count();
         assert_eq!(
             prefill,
@@ -299,7 +299,7 @@ fn the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing() {
         let plan = trace(deployment, Platform::Cuda);
         let mut turns = 0usize;
         for node in &plan.nodes {
-            let Operation::Elementwise(Elementwise::RopeAxes {
+            let Operation::Elemwise(Elemwise::RopeAxes {
                 dims,
                 thetas,
                 form,
@@ -508,7 +508,7 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
         let mut folds = 0usize;
         for node in &plan.nodes {
             match &node.op {
-                Operation::Elementwise(Elementwise::Modulate { m, lane_of_row, .. }) => {
+                Operation::Elemwise(Elemwise::Modulate { m, lane_of_row, .. }) => {
                     modulates += 1;
                     assert!(
                         lane_of_row.is_some(),
@@ -521,7 +521,7 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
                         "`{deployment}`: a lane-vector chain lands `[Lanes, ·]` f32, not {ty:?}"
                     );
                 }
-                Operation::Elementwise(Elementwise::GatedResidualAdd { r, r_out, .. }) => {
+                Operation::Elemwise(Elemwise::GatedResidualAdd { r, r_out, .. }) => {
                     folds += 1;
                     assert_eq!(
                         plan.values[r.0 as usize].ty, plan.values[r_out.0 as usize].ty,

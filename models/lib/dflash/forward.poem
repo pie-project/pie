@@ -93,7 +93,7 @@ def arm(d, inputs, fused, h_block, mask, block_draft):
 
         x = ops.elemwise.rmsnorm_plus_one(h, b.mlp_norm, b.mlp_norm_eps)
         x, mlp_coeff = conv_prepare(x, b.mlp_conv)
-        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, b.mlp.gate_up), b.mlp.inter), b.mlp.down)
+        f = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, b.mlp.gate_up), b.mlp.inter), b.mlp.down)
         f = conv_finish(f, b.mlp_conv, mlp_coeff)
         h = ops.elemwise.residual_add(f, h)
     return ops.elemwise.rmsnorm_plus_one(h, d.norm, d.norm_eps)

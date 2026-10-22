@@ -38,18 +38,12 @@ __device__ __forceinline__ float block_reduce_sum_fast(float local, float* buf)
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        local += __shfl_xor_sync(0xffffffffu, local, off);
-    }
+    local = ::pie::warp_sum(local);
     if (lane == 0) buf[warp] = local;
     __syncthreads();
     if (warp == 0) {
         float v = tid < kWarps ? buf[tid] : 0.f;
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_xor_sync(0xffffffffu, v, off);
-        }
+        v = ::pie::warp_sum(v);
         if (lane == 0) buf[kWarps] = v;
     }
     __syncthreads();

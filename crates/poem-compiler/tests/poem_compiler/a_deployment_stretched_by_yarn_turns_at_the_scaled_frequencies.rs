@@ -1,5 +1,5 @@
 use poem::Platform;
-use poem_ir::{Elementwise, Operation, RopeFreqs};
+use poem_ir::{Elemwise, Operation, RopeFreqs};
 
 /// Every stated table a trace turns at.
 fn tables(trace: &poem_ir::Trace) -> Vec<&RopeFreqs> {
@@ -7,11 +7,11 @@ fn tables(trace: &poem_ir::Trace) -> Vec<&RopeFreqs> {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Elementwise(
-                Elementwise::RopeFull { freqs, .. }
-                | Elementwise::RopePartial { freqs, .. }
-                | Elementwise::RopePartialQ { freqs, .. }
-                | Elementwise::RopeMrope { freqs, .. },
+            Operation::Elemwise(
+                Elemwise::RopeFull { freqs, .. }
+                | Elemwise::RopePartial { freqs, .. }
+                | Elemwise::RopePartialQ { freqs, .. }
+                | Elemwise::RopeMrope { freqs, .. },
             ) => freqs.as_ref(),
             _ => None,
         })
@@ -52,12 +52,12 @@ fn stated_forms(trace: &poem_ir::Trace) -> Vec<&'static str> {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Elementwise(Elementwise::RopeFull { freqs: Some(_), .. }) => Some("full"),
-            Operation::Elementwise(
-                Elementwise::RopePartial { freqs: Some(_), .. }
-                | Elementwise::RopePartialQ { freqs: Some(_), .. },
+            Operation::Elemwise(Elemwise::RopeFull { freqs: Some(_), .. }) => Some("full"),
+            Operation::Elemwise(
+                Elemwise::RopePartial { freqs: Some(_), .. }
+                | Elemwise::RopePartialQ { freqs: Some(_), .. },
             ) => Some("partial"),
-            Operation::Elementwise(Elementwise::RopeMrope { freqs: Some(_), .. }) => Some("mrope"),
+            Operation::Elemwise(Elemwise::RopeMrope { freqs: Some(_), .. }) => Some("mrope"),
             _ => None,
         })
         .collect()

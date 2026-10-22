@@ -63,7 +63,7 @@ pub fn bidirectional(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.dense";
+    const OP: &str = "attn.dense";
     for t in [q, k, v, o] {
         expect(OP, t, &[Dtype::Bf16])?;
     }

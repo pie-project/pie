@@ -95,7 +95,7 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter)
+        act = ops.linear.swiglu(ops.linear.matmul(x, f.gate_up), f.inter)
         return ops.linear.matmul(act, f.down)
     routes, weights = ops.linear.moe_topk_sigmoid_biased(
         ops.linear.matmul(x, f.router),
@@ -106,5 +106,5 @@ def mlp(x, f):
         1.0,
     )
     packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
-    act = ops.linear.mlp_swiglu(packed, f.inter)
+    act = ops.linear.swiglu(packed, f.inter)
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k), weights)

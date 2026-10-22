@@ -7,7 +7,7 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             Fused::MlpSwiglu { .. } => self.fused_linear(op),
-            _ => self.fused_elementwise(op),
+            _ => self.fused_elemwise(op),
         }
         .map_err(crate::error::kernel)
     }

@@ -1,12 +1,13 @@
+use poem_ir::{NormAxis, NormWeight};
 use std::collections::HashMap;
 
 use crate::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchConv, DispatchElementwise, DispatchFused,
+    DispatchAttn, DispatchCollective, DispatchConv, DispatchElemwise, DispatchFused,
     DispatchGather, DispatchLinear, DispatchSampling, DispatchSsm,
 };
 use crate::error::KernelError;
 use poem_compiler::{Lowering, Region};
-use poem_ir::ops::{Attention, Collective, Elementwise};
+use poem_ir::ops::{Attn, Collective, Elemwise};
 use poem_ir::{
     CacheRow, Conv, Def, Dim, Dtype, Fused, Gather, Guard, Linear, Node, Operands, Operation,
     Platform, RuntimeInput, Sampling, Seam, Ssm, StructKind, Trace, Ty, ValueDecl, ValueId,
@@ -74,11 +75,12 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act(width));
         self.push(
-            Elementwise::RmsnormNoScale {
+            Elemwise::Rmsnorm {
                 x,
-                head_dim: 1,
+                axis: NormAxis::Head(1),
                 eps: 1e-6,
                 y,
+                weight: NormWeight::None,
             }
             .into(),
             guard,
@@ -94,7 +96,7 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let plan = self.value(Def::Op(node), Ty::Struct(StructKind::AttnDecodePlan));
         self.push(
-            Attention::PlanDecode {
+            Attn::PlanDecode {
                 kv_indptr,
                 kv_indices,
                 last_page_len,
@@ -116,7 +118,7 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let o = self.value(Def::Op(node), act(4));
         self.push(
-            Attention::Decode {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -212,9 +214,9 @@ fn address<T>(value: &T) -> usize {
 
 fn payload(op: &Operation) -> usize {
     match op {
-        Operation::Attention(op) => address(op),
+        Operation::Attn(op) => address(op),
         Operation::Linear(op) => address(op),
-        Operation::Elementwise(op) => address(op),
+        Operation::Elemwise(op) => address(op),
         Operation::Gather(op) => address(op),
         Operation::Collective(op) => address(op),
         Operation::Sampling(op) => address(op),
@@ -224,8 +226,8 @@ fn payload(op: &Operation) -> usize {
     }
 }
 
-impl DispatchAttention for MockDispatch<'_> {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+impl DispatchAttn for MockDispatch<'_> {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.note(op)
     }
 }
@@ -236,8 +238,8 @@ impl DispatchLinear for MockDispatch<'_> {
     }
 }
 
-impl DispatchElementwise for MockDispatch<'_> {
-    fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
+impl DispatchElemwise for MockDispatch<'_> {
+    fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError> {
         self.note(op)
     }
 }

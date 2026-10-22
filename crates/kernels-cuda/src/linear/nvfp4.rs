@@ -142,19 +142,19 @@ pub fn matmul_select(
             fan.route_count,
         )
     {
-        use crate::linear::tc5;
+        use crate::linear::gemm_sm100;
         // A tcgen05 launch that fails falls back to the arm below.
         if crate::linear::moe::select_tc5(
             ctx,
             OP,
             x,
-            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 16),
+            gemm_sm100::Operand::scaled(codes.ptr, gemm_sm100::Elem::E2m1, scales.ptr, 16),
             codes.rows,
             routes,
             y,
-            tc5::Epilogue {
+            gemm_sm100::Epilogue {
                 weight_scale: tensor_scales.ptr,
-                ..tc5::Epilogue::STORE
+                ..gemm_sm100::Epilogue::STORE
             },
         )
         .is_ok()

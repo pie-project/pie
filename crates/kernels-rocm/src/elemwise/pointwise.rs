@@ -16,7 +16,7 @@ pub(crate) fn sweep(n: u64, per: u64) -> Launch {
 }
 
 pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add";
+    const OP: &str = "elemwise.residual_add";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (_, n) = elementwise(OP, *y)?;
     let packed = y.width.is_multiple_of(8) && x.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16);
@@ -38,7 +38,7 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
 }
 
 pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add_bias";
+    const OP: &str = "elemwise.add_bias";
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     let tb = dtype_dispatch!(OP, bias.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     nonzero(OP, "rows", out.rows)?;
@@ -55,7 +55,7 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
 }
 
 pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu_scaled";
+    const OP: &str = "elemwise.silu_scaled";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
@@ -76,7 +76,7 @@ pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
 }
 
 pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul_scalar";
+    const OP: &str = "elemwise.mul_scalar";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
@@ -97,7 +97,7 @@ pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
 }
 
 pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.scale";
+    const OP: &str = "elemwise.scale";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
@@ -118,15 +118,15 @@ const ACTIVATION_UNIT: &str = "elemwise/pointwise.hip";
 const BLOCK: u32 = 256;
 
 pub fn silu(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    fire_unary(ctx, "elementwise.silu", "0", x, o)
+    fire_unary(ctx, "elemwise.silu", "0", x, o)
 }
 
 pub fn tanh(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    fire_unary(ctx, "elementwise.tanh", "1", x, o)
+    fire_unary(ctx, "elemwise.tanh", "1", x, o)
 }
 
 pub fn gelu_tanh(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    crate::linear::mlp::gelu_tanh(ctx, x, 1, o)
+    crate::linear::glu::gelu_tanh(ctx, x, 1, o)
 }
 
 fn fire_unary(
@@ -175,11 +175,11 @@ fn fire_unary(
 const BINARY_UNIT: &str = "elemwise/pointwise.hip";
 
 pub fn add(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    fire_binary(ctx, "elementwise.add", "0", x, y, o)
+    fire_binary(ctx, "elemwise.add", "0", x, y, o)
 }
 
 pub fn mul(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    fire_binary(ctx, "elementwise.mul", "1", x, y, o)
+    fire_binary(ctx, "elemwise.mul", "1", x, y, o)
 }
 
 fn fire_binary(
@@ -232,7 +232,7 @@ fn fire_binary(
 const CLIP_UNIT: &str = "elemwise/clip.hip";
 
 pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp";
+    const OP: &str = "elemwise.clamp";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(lo <= hi) {
@@ -267,7 +267,7 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
 }
 
 pub fn clamp_learned(ctx: &Ctx, lo: Tensor, hi: Tensor, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp_learned";
+    const OP: &str = "elemwise.clamp_learned";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     for (what, bound) in [("lower", lo), ("upper", hi)] {
         if bound.dtype != x.dtype {

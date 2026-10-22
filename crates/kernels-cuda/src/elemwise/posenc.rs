@@ -19,7 +19,7 @@ pub fn sinusoid(
     scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.sinusoid";
+    const OP: &str = "elemwise.sinusoid";
     let rows = nonzero(OP, "rows", o.rows)?;
     nonzero(OP, "the embedding width", dim)?;
     for (what, plane) in [("timestep", t), ("embedding", *o)] {
@@ -83,7 +83,7 @@ pub fn relative_bucket_bias(
     bidirectional: bool,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.relative_bucket_bias";
+    const OP: &str = "elemwise.relative_bucket_bias";
     let t = dtype_dispatch!(OP, embedding.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
     let heads = nonzero(OP, "heads", y.rows)?;
     nonzero(OP, "max_len", max_len)?;

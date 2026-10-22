@@ -559,7 +559,7 @@ fn pool_state_gather_and_store() {
     }
 }
 
-/// Attention over a pool of `d`-wide entries (one every `ratio` tokens) for
+/// Attn over a pool of `d`-wide entries (one every `ratio` tokens) for
 /// tokens at `positions` of requests `req`, all entries they see or the
 /// ones `top_k`-wide selections list.
 fn run_pool_lse(
@@ -836,7 +836,7 @@ fn block_max_ranks_each_heads_blocks() {
     run_block_max(8, 64, 8, 5, &[1, 20], &[300, 70]);
 }
 
-/// A selection row as `attention.index_topk` writes it: every visible
+/// A selection row as `attn.index_topk` writes it: every visible
 /// position when they fit the budget, else a budget's worth of distinct ones,
 /// ascending either way, `-1` past them.
 fn topk_row(visible: usize, top_k: usize, seed: u64) -> Vec<i32> {

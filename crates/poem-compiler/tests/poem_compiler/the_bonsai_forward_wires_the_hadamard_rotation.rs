@@ -3,7 +3,7 @@
 //! non-Bonsai deployment is byte-unchanged (no Hadamard appears).
 //!
 //! This is a GRAPH-STRUCTURE oracle: it traces the real forward and counts the
-//! `elementwise.hadamard` nodes and the sign bank each one references, then
+//! `elemwise.hadamard` nodes and the sign bank each one references, then
 //! asserts the per-width usage matches the fork's own counts from the reference
 //! oracle (`wiki/quantize-coding/bonsai-oracle.md` §6):
 //!
@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem::{Def, Dtype, Elementwise, Linear, Operation, Platform, Trace, ValueId};
+use poem::{Def, Dtype, Elemwise, Linear, Operation, Platform, Trace, ValueId};
 use poem_compiler::catalog::trace_of;
 
 /// The width of the sign bank a Hadamard node references, or `None` for a plain
@@ -53,7 +53,7 @@ fn tally(trace: &Trace) -> (usize, usize, (usize, usize, usize)) {
     let (mut total, mut signed) = (0, 0);
     let (mut w5120, mut w6144, mut w17408) = (0, 0, 0);
     for node in &trace.nodes {
-        let Operation::Elementwise(Elementwise::Hadamard { signs, block, .. }) = &node.op else {
+        let Operation::Elemwise(Elemwise::Hadamard { signs, block, .. }) = &node.op else {
             continue;
         };
         assert_eq!(*block, 1024, "the Bonsai transform is block-1024");
@@ -99,7 +99,7 @@ fn the_attention_q_k_v_share_the_one_rotated_input() {
         .nodes
         .iter()
         .filter_map(|n| match &n.op {
-            Operation::Elementwise(Elementwise::Hadamard { x_out, .. }) => Some(x_out.0),
+            Operation::Elemwise(Elemwise::Hadamard { x_out, .. }) => Some(x_out.0),
             _ => None,
         })
         .collect();

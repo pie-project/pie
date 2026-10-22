@@ -163,6 +163,14 @@ __device__ __forceinline__ float block_sum(float local, float* smem) {
     return smem[0];
 }
 
+// Every lane's sum of `v` over its warp, offsets 16, 8, 4, 2, 1: the
+// butterfly the kernels walked by hand, so the result is bit for bit theirs.
+template <class T>
+__device__ __forceinline__ T warp_sum(T v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
 __device__ __forceinline__ float flt_max() { return __int_as_float(0x7f7fffffu); }
 __device__ __forceinline__ float pos_inf() { return __int_as_float(0x7f800000u); }
 __device__ __forceinline__ float neg_inf() { return __int_as_float(0xff800000u); }

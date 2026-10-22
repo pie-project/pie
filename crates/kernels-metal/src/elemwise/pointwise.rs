@@ -25,7 +25,7 @@ fn binary(
 }
 
 pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add";
+    const OP: &str = "elemwise.add";
     let entry = dtype_dispatch!(OP, z.dtype, {
         Bf16 => "binary_add_bfloat16",
         F32 => "binary_add_float32",
@@ -34,7 +34,7 @@ pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
 }
 
 pub fn mul(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul";
+    const OP: &str = "elemwise.mul";
     let entry = dtype_dispatch!(OP, z.dtype, {
         Bf16 => "binary_mul_bfloat16",
         F32 => "binary_mul_float32",
@@ -60,7 +60,7 @@ fn activation(
 }
 
 pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu";
+    const OP: &str = "elemwise.silu";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_silu_bfloat16",
         F32 => "act_silu_float32",
@@ -69,7 +69,7 @@ pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.tanh";
+    const OP: &str = "elemwise.tanh";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_tanh_bfloat16",
         F32 => "act_tanh_float32",
@@ -78,7 +78,7 @@ pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gelu";
+    const OP: &str = "elemwise.gelu";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_gelu_tanh_bfloat16",
         F32 => "act_gelu_tanh_float32",
@@ -126,7 +126,7 @@ fn fwht_point(
 /// multiply the activation on load, before the butterfly (the Randomized
 /// Hadamard `H·S`); the sign vector repeats block-wise if wider than `block`.
 pub fn hadamard(ctx: &Ctx<'_>, x: Tensor, block: u32, signs: Option<Tensor>) -> Result<(), Error> {
-    const OP: &str = "elementwise.hadamard";
+    const OP: &str = "elemwise.hadamard";
     let (entry, threads) = fwht_point(OP, block, x.dtype)?;
     if !x.width.is_multiple_of(block) {
         return Err(refuse(
@@ -179,7 +179,7 @@ pub fn hadamard(ctx: &Ctx<'_>, x: Tensor, block: u32, signs: Option<Tensor>) -> 
 
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp";
+    const OP: &str = "elemwise.clamp";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "clamp_bounds_bfloat16",
         F32 => "clamp_bounds_float32",
@@ -197,7 +197,7 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp_learned";
+    const OP: &str = "elemwise.clamp_learned";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "clamp_learned_bfloat16",
         F32 => "clamp_learned_float32",
@@ -230,7 +230,7 @@ pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result
 }
 
 pub fn cast_f32_to_bf16(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.cast_f32_to_bf16";
+    const OP: &str = "elemwise.cast_f32_to_bf16";
     if x.dtype != dtype::Dtype::F32 || o.dtype != dtype::Dtype::Bf16 {
         return Err(refuse(
             OP,
@@ -252,7 +252,7 @@ pub fn relative_bucket_bias(
     bidirectional: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.relative_bucket_bias";
+    const OP: &str = "elemwise.relative_bucket_bias";
     let entry = dtype_dispatch!(OP, embedding.dtype, {
         Bf16 => "relative_bucket_bias_bfloat16",
         F32 => "relative_bucket_bias_float32",

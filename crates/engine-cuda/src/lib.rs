@@ -47,70 +47,70 @@ pub const EXCLUSIVE: [&str; 0] = [];
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
 /// The fused kernels this backend ships; the compiler forms only these. A
-/// rule it does not list (`linear.mlp_swiglu`, which Metal splits across
+/// rule it does not list (`fused.mlp_swiglu`, which Metal splits across
 /// engines) leaves its primitives alone here.
 #[cfg(not(feature = "rocm"))]
 pub const FUSED: [&str; 31] = [
-    "custom_cuda.split_qkv_fused",
-    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
-    "elementwise.rmsnorm_residual_add",
-    "elementwise.embed_scale_add_select",
-    "elementwise.embed_scale_add",
-    "elementwise.residual_add_rmsnorm",
-    "linear.matmul_geglu",
-    "linear.moe_experts",
-    "linear.moe_select_glu",
-    "linear.matmul_swiglu",
-    "linear.lm_head_softcap",
-    "linear.matmul_bias",
-    "linear.matmul_split_rows",
-    "elementwise.gated_residual_norm_modulate",
-    "elementwise.norm_modulate",
-    "elementwise.rmsnorm_rope_partial_q",
-    "elementwise.norm_rope_last",
-    "elementwise.norm_rope_last_append",
-    "elementwise.split_rope_yarn_append",
-    "elementwise.rope_yarn_append",
-    "elementwise.qg_qknorm_rope_append",
-    "attention.lse_sink",
-    "attention.pool_attention",
-    "attention.pool_compress",
-    "attention.mla_prefill_expanded",
-    "elementwise.norm_rope_pair",
-    "attention.index_topk_rope",
-    "elementwise.hc_prenorm_project",
-    "elementwise.hc_gates_norm",
-    "elementwise.res_blend_rmsnorm",
-    "elementwise.hc_pre",
+    "fused.split_qkv_fused",
+    "fused.qkv_fused_qknorm_rope_vnorm_write",
+    "fused.rmsnorm_residual_add",
+    "fused.embed_scale_add_select",
+    "fused.embed_scale_add",
+    "fused.residual_add_rmsnorm",
+    "fused.matmul_geglu",
+    "fused.moe_experts",
+    "fused.moe_select_glu",
+    "fused.matmul_swiglu",
+    "fused.lm_head_softcap",
+    "fused.matmul_bias",
+    "fused.matmul_split_rows",
+    "fused.gated_residual_norm_modulate",
+    "fused.norm_modulate",
+    "fused.rmsnorm_rope_partial_q",
+    "fused.norm_rope_last",
+    "fused.norm_rope_last_append",
+    "fused.split_rope_yarn_append",
+    "fused.rope_yarn_append",
+    "fused.qg_qknorm_rope_append",
+    "fused.lse_sink",
+    "fused.pool_attention",
+    "fused.pool_compress",
+    "fused.mla_prefill_expanded",
+    "fused.norm_rope_pair",
+    "fused.index_topk_rope",
+    "fused.hc_prenorm_project",
+    "fused.hc_gates_norm",
+    "fused.res_blend_rmsnorm",
+    "fused.hc_pre",
 ];
 #[cfg(feature = "rocm")]
 pub const FUSED: [&str; 16] = [
-    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
-    "elementwise.rmsnorm_residual_add",
-    "elementwise.embed_scale_add_select",
-    "elementwise.embed_scale_add",
-    "elementwise.residual_add_rmsnorm",
-    "linear.matmul_geglu",
-    "linear.lm_head_softcap",
-    "linear.matmul_bias",
-    "linear.mlp_swiglu",
-    "linear.moe_experts",
-    "elementwise.gated_residual_norm_modulate",
-    "elementwise.norm_modulate",
-    "elementwise.rmsnorm_rope_partial_q",
-    "elementwise.hc_norm_project",
-    "attention.ssm_gdn_step",
-    "attention.q_gate_k_norm_rope_append",
+    "fused.qkv_fused_qknorm_rope_vnorm_write",
+    "fused.rmsnorm_residual_add",
+    "fused.embed_scale_add_select",
+    "fused.embed_scale_add",
+    "fused.residual_add_rmsnorm",
+    "fused.matmul_geglu",
+    "fused.lm_head_softcap",
+    "fused.matmul_bias",
+    "fused.mlp_swiglu",
+    "fused.moe_experts",
+    "fused.gated_residual_norm_modulate",
+    "fused.norm_modulate",
+    "fused.rmsnorm_rope_partial_q",
+    "fused.hc_norm_project",
+    "fused.gdn_step",
+    "fused.q_gate_norm_rope_append",
 ];
 
 /// The fused kernels left on with `fuse-chains=off`.
 #[cfg(not(feature = "rocm"))]
 pub const UNCHAINED: [&str; 2] = [
-    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
-    "elementwise.residual_add_rmsnorm",
+    "fused.qkv_fused_qknorm_rope_vnorm_write",
+    "fused.residual_add_rmsnorm",
 ];
 #[cfg(feature = "rocm")]
-pub const UNCHAINED: [&str; 1] = ["elementwise.residual_add_rmsnorm"];
+pub const UNCHAINED: [&str; 1] = ["fused.residual_add_rmsnorm"];
 
 #[must_use]
 pub fn shifted(op: &str) -> bool {
@@ -120,7 +120,7 @@ pub fn shifted(op: &str) -> bool {
     )
 }
 
-pub const PLANNED: [&str; 2] = ["attention.plan_decode", "attention.plan_prefill"];
+pub const PLANNED: [&str; 2] = ["attn.plan_decode", "attn.plan_prefill"];
 
 #[must_use]
 pub fn lane_shifted(op: &str) -> bool {

@@ -549,12 +549,12 @@ def predict_next(streams, following, hy):
 
 def mlp(x, ids, f, streams, following, hy):
     if f.kind == "dense":
-        return ops.linear.matmul(ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit), f.down)
+        return ops.linear.matmul(ops.linear.swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit), f.down)
     if f.kind == "routed":
         routes, weights = ops.linear.moe_topk_sqrt_softplus(
             ops.linear.matmul(x, f.router), f.bias, f.experts, f.top_k, f.renorm, f.scaling)
         hidden = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
-        act = ops.linear.mlp_swiglu_clamp(hidden, f.inter, f.limit)
+        act = ops.linear.swiglu_clamp(hidden, f.inter, f.limit)
         return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     if f.gate.kind == "bias":
         hint = predict_next(streams, following, hy)
@@ -565,7 +565,7 @@ def mlp(x, ids, f, streams, following, hy):
         routes, weights = ops.linear.moe_hash_route(
             ids, f.gate.tid2eid, ops.linear.matmul(x, f.router), vocab, f.experts, f.top_k, f.renorm, f.scaling)
     shared = ops.linear.matmul(
-        ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter, f.limit),
+        ops.linear.swiglu_clamp(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter, f.limit),
         f.shared_down,
     )
 
@@ -577,19 +577,19 @@ def mlp(x, ids, f, streams, following, hy):
     if f.down.precision != f.down.dtype and f.gate_up.fused != None:
         # The same over one packed gate-up bank: each expert's gate rows,
         # then its up rows.
-        act = ops.linear.mlp_swiglu_clamp_routed(
+        act = ops.linear.swiglu_clamp_routed(
             select(x, f.gate_up.fused), f.inter, weights, f.limit)
         return ops.linear.moe_sum_add(select(act, f.down), shared)
     if f.down.precision != f.down.dtype and f.gate_up.fused == None:
         # DeepSeek's expert weighs its activations before its down leg
         # quantizes them, and sums its routes and the shared expert in f32.
-        act = ops.linear.mlp_swiglu_clamp_split_routed(
+        act = ops.linear.swiglu_clamp_split_routed(
             select(x, f.gate_up.gate), select(x, f.gate_up.up), weights, f.limit)
         return ops.linear.moe_sum_add(select(act, f.down), shared)
     if f.gate_up.fused != None:
-        act = ops.linear.mlp_swiglu_clamp(select(x, f.gate_up.fused), f.inter, f.limit)
+        act = ops.linear.swiglu_clamp(select(x, f.gate_up.fused), f.inter, f.limit)
     else:
-        act = ops.linear.mlp_swiglu_clamp_split(select(x, f.gate_up.gate), select(x, f.gate_up.up), f.limit)
+        act = ops.linear.swiglu_clamp_split(select(x, f.gate_up.gate), select(x, f.gate_up.up), f.limit)
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     return ops.elemwise.residual_add(shared, routed)
 

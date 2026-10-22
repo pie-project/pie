@@ -1,17 +1,18 @@
 use kernels_metal::{Tensor, elemwise};
-use poem_exec::{DispatchElementwise, KernelError};
-use poem_ir::{Elementwise, Fused, ModulateForm, MropeForm, Operands, RopeForm};
+use poem_exec::{DispatchElemwise, KernelError};
+use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, Operands, RopeForm};
+use poem_ir::{NormAxis, NormWeight};
 
 use crate::run::Run;
 
-impl DispatchElementwise for Run<'_> {
-    fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
-        self.elementwise(op).map_err(crate::error::kernel)
+impl DispatchElemwise for Run<'_> {
+    fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError> {
+        self.elemwise(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    pub(super) fn fused_elementwise(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
+    pub(super) fn fused_elemwise(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
         match op {
             Fused::ResidualAddRmsnorm {
                 x,
@@ -51,9 +52,15 @@ impl Run<'_> {
         }
     }
 
-    fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_metal::Error> {
+    fn elemwise(&mut self, op: &Elemwise) -> Result<(), kernels_metal::Error> {
         match op {
-            Elementwise::Rmsnorm { x, weight, eps, y } => {
+            Elemwise::Rmsnorm {
+                x,
+                weight: NormWeight::Scale(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+            } => {
                 // The normed rows' projections on the register tile read
                 // their input table as this norm lays it.
                 match (self.tensor(*x).width == self.tensor(*y).width)
@@ -79,10 +86,10 @@ impl Run<'_> {
                     ),
                 }
             }
-            Elementwise::RmsnormPerHead {
+            Elemwise::Rmsnorm {
                 x,
-                weight,
-                head_dim,
+                weight: NormWeight::Scale(weight),
+                axis: NormAxis::Head(head_dim),
                 eps,
                 y,
             } => elemwise::norm::rmsnorm_per_head(
@@ -93,7 +100,13 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::RmsnormPlusOne { x, weight, eps, y } => {
+            Elemwise::Rmsnorm {
+                x,
+                weight: NormWeight::PlusOne(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+            } => {
                 // As `Rmsnorm`: the projections read the table this lays.
                 match (self.tensor(*x).width == self.tensor(*y).width)
                     .then(|| self.producer_table(*y))
@@ -119,11 +132,16 @@ impl Run<'_> {
                 }
             }
             // The pair launch of the norm before it landed these rows.
-            Elementwise::RmsnormPerHeadPlusOne { y, .. } if self.landed_ahead(*y) => Ok(()),
-            Elementwise::RmsnormPerHeadPlusOne {
+            Elemwise::Rmsnorm {
+                y,
+                weight: NormWeight::PlusOne(_),
+                axis: NormAxis::Head(_),
+                ..
+            } if self.landed_ahead(*y) => Ok(()),
+            Elemwise::Rmsnorm {
                 x,
-                weight,
-                head_dim,
+                weight: NormWeight::PlusOne(weight),
+                axis: NormAxis::Head(head_dim),
                 eps,
                 y,
             } => match self.norm_pair(*x, *y, *head_dim, *eps) {
@@ -152,22 +170,23 @@ impl Run<'_> {
                 ),
             },
             // Muse Spark's post-norm gate is served on CUDA.
-            Elementwise::NormGate { .. } => Err(kernels_metal::Error::Unsupported {
-                op: "elementwise.norm_gate",
+            Elemwise::NormGate { .. } => Err(kernels_metal::Error::Unsupported {
+                op: "elemwise.norm_gate",
             }),
             // A rotation at its own frequencies (a checkpoint's rope scaling) is
             // served on CUDA.
-            Elementwise::RopeFull { freqs: Some(_), .. }
-            | Elementwise::RopePartial { freqs: Some(_), .. }
-            | Elementwise::RopePartialQ { freqs: Some(_), .. }
-            | Elementwise::RopeMrope { freqs: Some(_), .. } => {
+            Elemwise::RopeFull { freqs: Some(_), .. }
+            | Elemwise::RopePartial { freqs: Some(_), .. }
+            | Elemwise::RopePartialQ { freqs: Some(_), .. }
+            | Elemwise::RopeMrope { freqs: Some(_), .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
-            Elementwise::RmsnormNoScale {
+            Elemwise::Rmsnorm {
                 x,
-                head_dim,
+                axis: NormAxis::Head(head_dim),
                 eps,
                 y,
+                weight: NormWeight::None,
             } => elemwise::norm::rmsnorm_no_scale(
                 self.ctx(),
                 self.tensor(*x),
@@ -175,10 +194,10 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::Layernorm {
+            Elemwise::Layernorm {
                 x,
-                weight,
-                bias,
+                weight: Some(weight),
+                bias: Some(bias),
                 eps,
                 y,
             } => elemwise::norm::layernorm(
@@ -189,19 +208,25 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::LayernormNoScale { x, eps, y } => elemwise::norm::layernorm_no_scale(
+            Elemwise::Layernorm {
+                x,
+                eps,
+                y,
+                weight: None,
+                bias: None,
+            } => elemwise::norm::layernorm_no_scale(
                 self.ctx(),
                 self.tensor(*x),
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::Clamp {
+            Elemwise::Clamp {
                 x,
                 lo,
                 hi,
                 x_out: _,
             } => elemwise::pointwise::clamp(self.ctx(), *lo, *hi, self.tensor(*x)),
-            Elementwise::Modulate {
+            Elemwise::Modulate {
                 x,
                 m,
                 lane_of_row,
@@ -222,7 +247,7 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 self.tensor(*y),
             ),
-            Elementwise::GatedResidualAdd {
+            Elemwise::GatedResidualAdd {
                 r,
                 g,
                 y,
@@ -239,7 +264,7 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 self.tensor(*r),
             ),
-            Elementwise::Sinusoid {
+            Elemwise::Sinusoid {
                 t,
                 dim,
                 max_period,
@@ -255,13 +280,13 @@ impl Run<'_> {
                 *scale,
                 self.tensor(*y),
             ),
-            Elementwise::Silu { x, x_out: _ } => {
+            Elemwise::Silu { x, x_out: _ } => {
                 elemwise::pointwise::silu(self.ctx(), self.tensor(*x), self.tensor(*x))
             }
-            Elementwise::Gelu { x, tanh, x_out: _ } => {
+            Elemwise::Gelu { x, tanh, x_out: _ } => {
                 if !*tanh {
                     return Err(kernels_metal::Error::Backend {
-                        op: "elementwise.gelu",
+                        op: "elemwise.gelu",
                         detail: "the erf gelu has no shader here; the tanh approximation \
                                  (`gelu(x, tanh = true)`) is what every DiT under study runs"
                             .to_string(),
@@ -269,10 +294,10 @@ impl Run<'_> {
                 }
                 elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
             }
-            Elementwise::Tanh { x, x_out: _ } => {
+            Elemwise::Tanh { x, x_out: _ } => {
                 elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
             }
-            Elementwise::Hadamard {
+            Elemwise::Hadamard {
                 x,
                 x_out: _,
                 block,
@@ -283,19 +308,19 @@ impl Run<'_> {
                 *block,
                 signs.as_ref().map(|s| self.tensor(*s)),
             ),
-            Elementwise::Mul { x, y, z } => elemwise::pointwise::mul(
+            Elemwise::Mul { x, y, z } => elemwise::pointwise::mul(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
                 self.tensor(*z),
             ),
-            Elementwise::Add { x, y, z } => elemwise::pointwise::add(
+            Elemwise::Add { x, y, z } => elemwise::pointwise::add(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
                 self.tensor(*z),
             ),
-            Elementwise::RopeAxes {
+            Elemwise::RopeAxes {
                 x,
                 positions,
                 dims,
@@ -320,7 +345,7 @@ impl Run<'_> {
                 *head_dim,
                 self.tensor(*x),
             ),
-            Elementwise::RelativeBucketBias {
+            Elemwise::RelativeBucketBias {
                 embedding,
                 max_len,
                 num_buckets,
@@ -336,7 +361,7 @@ impl Run<'_> {
                 *bidirectional,
                 self.tensor(*y),
             ),
-            Elementwise::GateSigmoidMulHeads {
+            Elemwise::GateSigmoidMulHeads {
                 x,
                 gate,
                 head_dim,
@@ -349,7 +374,7 @@ impl Run<'_> {
                 *scale,
                 self.tensor(*x),
             ),
-            Elementwise::ClampLearned {
+            Elemwise::ClampLearned {
                 x,
                 lo,
                 hi,
@@ -360,10 +385,10 @@ impl Run<'_> {
                 self.tensor(*hi),
                 self.tensor(*x),
             ),
-            Elementwise::RmsnormGroupedPlusOne {
+            Elemwise::Rmsnorm {
                 x,
-                weight,
-                group,
+                weight: NormWeight::PlusOne(weight),
+                axis: NormAxis::Group(group),
                 eps,
                 y,
             } => elemwise::norm::rmsnorm_grouped_plus_one(
@@ -374,10 +399,10 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::SiluScaled { s, x, x_out: _ } => {
+            Elemwise::SiluScaled { s, x, x_out: _ } => {
                 elemwise::norm::silu_scaled(self.ctx(), *s, self.tensor(*x))
             }
-            Elementwise::HcMix {
+            Elemwise::HcMix {
                 gates,
                 normed,
                 streams,
@@ -389,7 +414,7 @@ impl Run<'_> {
                 *streams,
                 self.tensor(*y),
             ),
-            Elementwise::HcInject {
+            Elemwise::HcInject {
                 o,
                 gates,
                 streams,
@@ -402,7 +427,7 @@ impl Run<'_> {
                 *streams,
                 self.tensor(*hyper),
             ),
-            Elementwise::PleGate {
+            Elemwise::PleGate {
                 key,
                 query,
                 value,
@@ -417,10 +442,10 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
             // A scaleless gated norm runs on CUDA alone (Muse Spark's).
-            Elementwise::RmsnormGated { weight: None, .. } => {
+            Elemwise::RmsnormGated { weight: None, .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
-            Elementwise::RmsnormGated {
+            Elemwise::RmsnormGated {
                 x,
                 gate,
                 weight: Some(weight),
@@ -462,7 +487,7 @@ impl Run<'_> {
                     ),
                 }
             }
-            Elementwise::RmsnormGatedBy {
+            Elemwise::RmsnormGatedBy {
                 x,
                 gate,
                 weight,
@@ -478,15 +503,15 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::ResidualAdd { x, y, y_out: _ } => {
+            Elemwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
-            Elementwise::AddBias {
+            Elemwise::AddBias {
                 bias,
                 out,
                 out_out: _,
             } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
-            Elementwise::Standardize {
+            Elemwise::Standardize {
                 x,
                 bias,
                 scale,
@@ -497,13 +522,13 @@ impl Run<'_> {
                 self.tensor(*scale),
                 self.tensor(*x),
             ),
-            Elementwise::MulScalar { s, x, x_out: _ } => {
+            Elemwise::MulScalar { s, x, x_out: _ } => {
                 elemwise::norm::mul_scalar(self.ctx(), *s, self.tensor(*x))
             }
-            Elementwise::Scale { s, x, x_out: _ } => {
+            Elemwise::Scale { s, x, x_out: _ } => {
                 elemwise::norm::scale(self.ctx(), self.tensor(*s), self.tensor(*x))
             }
-            Elementwise::ResBlend {
+            Elemwise::ResBlend {
                 prefix,
                 blocks,
                 weight,
@@ -514,7 +539,7 @@ impl Run<'_> {
                 let planes: Vec<Tensor> = blocks.iter().map(|b| self.tensor(*b)).collect();
                 let Some(first) = planes.first().copied() else {
                     return Err(kernels_metal::Error::Backend {
-                        op: "elementwise.res_blend",
+                        op: "elemwise.res_blend",
                         detail: "a blend of no candidate blocks".to_string(),
                     });
                 };
@@ -526,7 +551,7 @@ impl Run<'_> {
                     let at = self.handles().get(plane.buf).map(|row| row.offset());
                     if at != want || plane.rows != first.rows || plane.width != first.width {
                         return Err(kernels_metal::Error::Backend {
-                            op: "elementwise.res_blend",
+                            op: "elemwise.res_blend",
                             detail: "the candidate blocks do not land as one stacked run; \
                                      the kernel walks `blocks + (j · rows + t) · hidden` and \
                                      cannot gather scattered slots"
@@ -555,7 +580,7 @@ impl Run<'_> {
                 )
             }
 
-            Elementwise::RopeFull {
+            Elemwise::RopeFull {
                 q,
                 k,
                 positions,
@@ -574,7 +599,7 @@ impl Run<'_> {
                 *theta,
                 *interleaved,
             ),
-            Elementwise::RopePartial {
+            Elemwise::RopePartial {
                 q,
                 k,
                 positions,
@@ -595,7 +620,7 @@ impl Run<'_> {
                 *theta,
                 *span,
             ),
-            Elementwise::RopeMrope {
+            Elemwise::RopeMrope {
                 q,
                 k,
                 positions,
@@ -617,7 +642,7 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elementwise::RopeMrope {
+            Elemwise::RopeMrope {
                 q,
                 k,
                 positions,
@@ -639,7 +664,7 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elementwise::RopeMrope {
+            Elemwise::RopeMrope {
                 q,
                 k,
                 positions,
@@ -661,7 +686,7 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elementwise::RopePartialQ {
+            Elemwise::RopePartialQ {
                 q,
                 positions,
                 rotary_dim,
@@ -679,7 +704,7 @@ impl Run<'_> {
                 *theta,
                 *span,
             ),
-            Elementwise::RopePartialLast {
+            Elemwise::RopePartialLast {
                 q,
                 positions,
                 rotary_dim,
@@ -705,7 +730,7 @@ impl Run<'_> {
                     original_max_position: y.original_max_position,
                 }),
             ),
-            Elementwise::RopeYarn {
+            Elemwise::RopeYarn {
                 q,
                 k,
                 positions,
@@ -734,7 +759,7 @@ impl Run<'_> {
                 *interleaved,
             ),
 
-            Elementwise::GateSigmoidMul { x, gate, x_out } => {
+            Elemwise::GateSigmoidMul { x, gate, x_out } => {
                 // The gated rows' projection on the register tile reads its
                 // input table as the gate lays it.
                 match self.producer_table(*x_out) {
@@ -751,13 +776,13 @@ impl Run<'_> {
                 }
             }
 
-            Elementwise::HcExpand { x, streams, y } => {
+            Elemwise::HcExpand { x, streams, y } => {
                 elemwise::hc::expand(self.ctx(), self.tensor(*x), *streams, self.tensor(*y))
             }
-            Elementwise::HcRmsnormF32 { streams, eps, y } => {
+            Elemwise::HcRmsnormF32 { streams, eps, y } => {
                 elemwise::hc::rmsnorm_f32(self.ctx(), self.tensor(*streams), *eps, self.tensor(*y))
             }
-            Elementwise::HcProject {
+            Elemwise::HcProject {
                 normed,
                 weight,
                 stream_count,
@@ -770,10 +795,10 @@ impl Run<'_> {
                 self.tensor(*mixes),
             ),
             // The independent form (no combine) is landed on CUDA alone.
-            Elementwise::HcGates { comb: false, .. } => {
+            Elemwise::HcGates { comb: false, .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
-            Elementwise::HcGates {
+            Elemwise::HcGates {
                 normed,
                 streams,
                 scale,
@@ -800,7 +825,7 @@ impl Run<'_> {
                 self.tensor(*post_mix),
                 self.tensor(*comb_mix),
             ),
-            Elementwise::HcCollapse {
+            Elemwise::HcCollapse {
                 mixes,
                 streams,
                 scale,
@@ -818,7 +843,7 @@ impl Run<'_> {
                 *hc_eps,
                 self.tensor(*y),
             ),
-            Elementwise::HcFold {
+            Elemwise::HcFold {
                 x,
                 streams,
                 post_mix,
@@ -832,6 +857,10 @@ impl Run<'_> {
                 self.tensor(*comb_mix),
                 self.tensor(*y),
             ),
+            // A weight and axis no builder pairs.
+            Elemwise::Rmsnorm { .. } | Elemwise::Layernorm { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
         }
     }
 }

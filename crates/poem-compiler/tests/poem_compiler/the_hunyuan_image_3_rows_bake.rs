@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
-    Attention, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput,
-    Stream, Trace, seam,
+    Attn, Def, Elemwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput, Stream,
+    Trace, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
@@ -256,7 +256,7 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Elementwise(Elementwise::RopeAxes {
+                Operation::Elemwise(Elemwise::RopeAxes {
                     dims,
                     thetas,
                     form,
@@ -295,8 +295,8 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
         let neox = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elementwise(Elementwise::RopeFull { .. })
-                    | Operation::Elementwise(Elementwise::RopePartial { .. })
+                Operation::Elemwise(Elemwise::RopeFull { .. })
+                    | Operation::Elemwise(Elemwise::RopePartial { .. })
             )
         });
         assert!(
@@ -317,7 +317,7 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
         let (mut masked, mut prefill, mut decode, mut appends) = (0usize, 0usize, 0usize, 0usize);
         for node in &plan.nodes {
             match &node.op {
-                Operation::Attention(Attention::Masked {
+                Operation::Attn(Attn::Masked {
                     causal,
                     head_dim,
                     sm_scale,
@@ -331,9 +331,9 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
                     assert_eq!(*head_dim, d.head_dim);
                     assert!((sm_scale - d.sm_scale()).abs() < 1e-7);
                 }
-                Operation::Attention(Attention::Prefill { .. }) => prefill += 1,
-                Operation::Attention(Attention::Decode { .. }) => decode += 1,
-                Operation::Attention(Attention::KvAppend { .. }) => appends += 1,
+                Operation::Attn(Attn::Prefill { .. }) => prefill += 1,
+                Operation::Attn(Attn::Decode { .. }) => decode += 1,
+                Operation::Attn(Attn::KvAppend { .. }) => appends += 1,
                 _ => {}
             }
         }
@@ -387,7 +387,7 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         let swiglus = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Linear(Linear::MlpSwiglu { .. })))
+            .filter(|node| matches!(&node.op, Operation::Linear(Linear::Swiglu { .. })))
             .count();
         assert_eq!(
             swiglus,

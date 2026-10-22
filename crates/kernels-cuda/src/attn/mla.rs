@@ -144,7 +144,7 @@ pub fn latents(
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents";
+    const OP: &str = "attn.mla_latents";
     debug_assert_eq!(
         kv_c.width, kv_lora_rank,
         "the latent output is the stated rank wide"
@@ -165,7 +165,7 @@ pub fn latents_rope(
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents_rope";
+    const OP: &str = "attn.mla_latents_rope";
     dtype_dispatch!(OP, kv_a.dtype, { Bf16 => () });
     debug_assert_eq!(
         kv_c.width, kv_lora_rank,
@@ -192,7 +192,7 @@ pub fn split_q_b(
     q_nope: &mut Tensor,
     q_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_split_q_b";
+    const OP: &str = "attn.mla_split_q_b";
     let t = dtype_dispatch!(OP, q_b.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = count(OP, "the head count this cut states", heads)?;
     let nope = stated(OP, nope_dim)?;
@@ -262,7 +262,7 @@ pub fn absorb_q(
     v_head_dim: u32,
     q_latent: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_q";
+    const OP: &str = "attn.mla_absorb_q";
     dtype_dispatch!(OP, q_nope.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this absorb states", heads)?;
     let nope = stated(OP, nope_dim)?;
@@ -310,7 +310,7 @@ pub fn absorb_out(
     nope_dim: u32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_out";
+    const OP: &str = "attn.mla_absorb_out";
     dtype_dispatch!(OP, latent.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this absorb states", heads)?;
     let nope = stated(OP, nope_dim)?;
@@ -428,7 +428,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_kv_append";
+    const OP: &str = "attn.mla_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, kv_c.data.dtype, { Bf16 => () });
     #[cfg(feature = "cuda")]
@@ -733,7 +733,7 @@ mod sparse {
 
     use super::{Ctx, Error, KvPool, Tensor};
     use crate::jit::{Arg, ArgValue, Fire, Launch, aligned16, symbol};
-    use crate::linear::tc5::supported;
+    use crate::linear::gemm_sm100::supported;
     use dtype::Dtype;
 
     /// `pie::attn::mlas::Params`, field for field.
@@ -1070,7 +1070,7 @@ mod sparse {
         // fp8 rows: one u8 view of the plane, 128 codes a box, stands for
         // every map (the rotated codes come from the same rows).
         let (map_ckv, map_ckv_run, map_kpe) = if fp8 {
-            use crate::linear::tc5::{Map, encode};
+            use crate::linear::gemm_sm100::{Map, encode};
             use cudarc::driver::sys as dr;
             let u8_map = |box_rows: u32| {
                 encode(Map {
@@ -1559,7 +1559,7 @@ pub fn attention_decode(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_decode";
+    const OP: &str = "attn.mla_decode";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
@@ -1596,7 +1596,7 @@ pub fn attention_prefill(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_prefill";
+    const OP: &str = "attn.mla_prefill";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
@@ -1724,7 +1724,7 @@ pub fn attention_decode_selected(
     let _ = plan;
     selected(
         ctx,
-        "attention.mla_decode_selected",
+        "attn.mla_decode_selected",
         q,
         q_pe,
         selection,
@@ -1755,7 +1755,7 @@ pub fn attention_prefill_selected(
     let _ = plan;
     selected(
         ctx,
-        "attention.mla_prefill_selected",
+        "attn.mla_prefill_selected",
         q,
         q_pe,
         selection,
@@ -1830,14 +1830,14 @@ pub fn prefill_expanded(
     #[cfg(feature = "cuda")]
     {
         use crate::attn::tc5_fmha::{Planes, prefill_planes};
-        const OP: &str = "attention.mla_prefill_expanded";
-        const LAT: &str = "attention.mla_expand_latents";
-        const KPE: &str = "attention.mla_expand_rope";
-        const IDENT: &str = "attention.mla_expand_pages";
-        const LIVE: &str = "attention.mla_expand_live";
-        const EXP: &str = "attention.mla_expand_rows";
-        const KEYS: &str = "attention.mla_expand_keys";
-        const QS: &str = "attention.mla_expand_queries";
+        const OP: &str = "fused.mla_prefill_expanded";
+        const LAT: &str = "attn.mla_expand_latents";
+        const KPE: &str = "attn.mla_expand_rope";
+        const IDENT: &str = "attn.mla_expand_pages";
+        const LIVE: &str = "attn.mla_expand_live";
+        const EXP: &str = "attn.mla_expand_rows";
+        const KEYS: &str = "attn.mla_expand_keys";
+        const QS: &str = "attn.mla_expand_queries";
         let width = h.heads * (h.nope + h.v);
         let dqk = h.nope + h.rope;
         let rows = o.rows;

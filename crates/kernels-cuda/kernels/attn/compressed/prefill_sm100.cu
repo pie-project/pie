@@ -31,7 +31,7 @@
 // masked. A layer with no pool reads its window alone (a ratio no position
 // closes).
 
-namespace pie::attn::dsv4s {
+namespace pie::attn::compressed::sm100 {
 
 constexpr int kWindow = 128;
 
@@ -55,14 +55,14 @@ struct AtomBytes {
 
 template <int F>
 __device__ __forceinline__ void load_atom(const std::uint8_t* plane, u32 cell, int ps, int a, AtomBytes& b) {
-    const dsv4::DsRow r = dsv4::rows_at<F>(const_cast<std::uint8_t*>(plane), cell / ps,
+    const kv_rows::DsRow r = kv_rows::rows_at<F>(const_cast<std::uint8_t*>(plane), cell / ps,
                                            static_cast<int>(cell % ps), ps);
-    if constexpr (F == dsv4::kMx8) {
+    if constexpr (F == kv_rows::kMx8) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 64)[i];
         b.sc = *reinterpret_cast<const std::uint16_t*>(r.scales + a * 2);
-    } else if constexpr (F == dsv4::kV4) {
-        if (a * 64 < dsv4::kDsNope) {
+    } else if constexpr (F == kv_rows::kV4) {
+        if (a * 64 < kv_rows::kDsNope) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 64)[i];
             b.sc = r.scales[a];
@@ -107,7 +107,7 @@ __device__ __forceinline__ uint4 nv4_widen8_fast(std::uint32_t nib, std::uint32_
 #else
     const std::uint32_t s = scale2 & 0xffffu;
     const __half hs = *reinterpret_cast<const __half*>(&s);
-    return dsv4::nv4_widen8(nib, __float2bfloat162_rn(__half2float(hs)));
+    return kv_rows::nv4_widen8(nib, __float2bfloat162_rn(__half2float(hs)));
 #endif
 }
 
@@ -122,22 +122,22 @@ __device__ __forceinline__ std::uint32_t e4m3_f16x2(std::uint32_t byte) {
 // The loaded atom widened to eight 16-byte pieces of bf16.
 template <int F>
 __device__ __forceinline__ void widen_atom(const AtomBytes& b, uint4 (&v)[8]) {
-    if constexpr (F == dsv4::kV4) {
-        const float s = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc));
+    if constexpr (F == kv_rows::kV4) {
+        const float s = kv_rows::ue8m0(static_cast<std::uint8_t>(b.sc));
 #pragma unroll
         for (int c = 0; c < 8; ++c) {
             const uint4& d = b.d[c / 2];
             const uint2 codes = (c & 1) ? make_uint2(d.z, d.w) : make_uint2(d.x, d.y);
-            v[c] = dsv4::mx8_widen8(codes, s);
+            v[c] = kv_rows::mx8_widen8(codes, s);
         }
-    } else if constexpr (F == dsv4::kMx8) {
-        const float s0 = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc));
-        const float s1 = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc >> 8));
+    } else if constexpr (F == kv_rows::kMx8) {
+        const float s0 = kv_rows::ue8m0(static_cast<std::uint8_t>(b.sc));
+        const float s1 = kv_rows::ue8m0(static_cast<std::uint8_t>(b.sc >> 8));
 #pragma unroll
         for (int c = 0; c < 8; ++c) {
             const uint4& d = b.d[c / 2];
             const uint2 codes = (c & 1) ? make_uint2(d.z, d.w) : make_uint2(d.x, d.y);
-            v[c] = dsv4::mx8_widen8(codes, c < 4 ? s0 : s1);
+            v[c] = kv_rows::mx8_widen8(codes, c < 4 ? s0 : s1);
         }
     } else {
         std::uint32_t s2[4];
@@ -160,10 +160,10 @@ __device__ __forceinline__ void widen_atom(const AtomBytes& b, uint4 (&v)[8]) {
 // them; every unit's bytes are in flight before any is widened.
 // V4's rotated dims (its last atom), bf16 as the row holds them.
 __device__ __forceinline__ void rope_atom(const std::uint8_t* plane, u32 cell, int ps, uint4 (&v)[8]) {
-    const dsv4::DsRow r = dsv4::rows_at<dsv4::kV4>(const_cast<std::uint8_t*>(plane), cell / ps,
+    const kv_rows::DsRow r = kv_rows::rows_at<kv_rows::kV4>(const_cast<std::uint8_t*>(plane), cell / ps,
                                                    static_cast<int>(cell % ps), ps);
 #pragma unroll
-    for (int c = 0; c < 8; ++c) v[c] = reinterpret_cast<const uint4*>(r.data + dsv4::kDsNope)[c];
+    for (int c = 0; c < 8; ++c) v[c] = reinterpret_cast<const uint4*>(r.data + kv_rows::kDsNope)[c];
 }
 
 template <int WF, int PF>
@@ -193,7 +193,7 @@ __device__ __forceinline__ void widen_tile(unsigned char* tile, const u32* l, co
         if ((e[k] & kSlotMask) == kSlotMask) {
 #pragma unroll
             for (int c = 0; c < 8; ++c) v[c] = make_uint4(0u, 0u, 0u, 0u);
-        } else if (WF == dsv4::kV4 && (u / kBK) * 64 >= dsv4::kDsNope) {
+        } else if (WF == kv_rows::kV4 && (u / kBK) * 64 >= kv_rows::kDsNope) {
             // (V4's rows are both planes'.)
             const bool pool = (e[k] & kPool) != 0;
             rope_atom(pool ? p.ent_raw : p.win_raw, e[k] & kSlotMask, pool ? p.ent_page : p.win_page, v);
@@ -208,12 +208,12 @@ __device__ __forceinline__ void widen_tile(unsigned char* tile, const u32* l, co
     }
 }
 
-// With kWF and kPF (`attn/dsv4_kv.cuh`; 0 is bf16) the window's and the
+// With kWF and kPF (`prim/kv_rows.cuh`; 0 is bf16) the window's and the
 // entries' planes are DeepSeek's quantized rows (V4.1's MXFP8 window over
 // NVFP4 entries): the issuers load a key's bytes and widen them into the
 // tile's swizzled bf16 rows themselves, in place of the TMA gathers.
 template <bool kSelected, int kWF = 0, int kPF = 0>
-__global__ __launch_bounds__(384, 1) void dsv4_sparse(
+__global__ __launch_bounds__(384, 1) void sparse(
     const __grid_constant__ tc5::TmaMap map_win, const __grid_constant__ tc5::TmaMap map_ent,
     const __grid_constant__ tc5::TmaMap map_win_run, const __grid_constant__ tc5::TmaMap map_ent_run,
     const __grid_constant__ tc5::TmaMap map_q, const Params p) {
@@ -514,7 +514,7 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         // The turn's frequency of pair `lane` (at most 32 pairs), worked once:
         // a tail pair reads it from its lane.
         const float lane_freq =
-            static_cast<int>(lane) < p.turn.dim / 2 ? dsv4::turn_freq(static_cast<int>(lane), p.turn) : 0.f;
+            static_cast<int>(lane) < p.turn.dim / 2 ? kv_rows::turn_freq(static_cast<int>(lane), p.turn) : 0.f;
         // The head's sink, read once.
         const float sink =
             p.sinks_f32 ? static_cast<const float*>(p.sinks)[head]
@@ -616,7 +616,7 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     }
 }
 
-// DeepSeek's quantized rows (`attn/dsv4_kv.cuh`, format F) widened for the
+// DeepSeek's quantized rows (`prim/kv_rows.cuh`, format F) widened for the
 // pass above, a page at a time: page i of `out` is page indices[i] of the
 // quantized plane, and out_indices[i] = i, so the pass reads the staged
 // plane through the same page_indptr. A warp a row, a lane two 8-dim runs.
@@ -635,11 +635,11 @@ __global__ __launch_bounds__(256) void stage_pages(
     const long long src = indices[i];
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     for (int r = warp; r < page; r += 8) {
-        const dsv4::DsRow row = dsv4::rows_at<F>(const_cast<std::uint8_t*>(fp8), src, r, page);
+        const kv_rows::DsRow row = kv_rows::rows_at<F>(const_cast<std::uint8_t*>(fp8), src, r, page);
         bf16* dst = out + (static_cast<long long>(i) * page + r) * kD;
 #pragma unroll
         for (int c = lane; c < kD / 8; c += 32) {
-            *reinterpret_cast<uint4*>(dst + c * 8) = dsv4::rows_load8<F>(row.data, row.scales, c * 8);
+            *reinterpret_cast<uint4*>(dst + c * 8) = kv_rows::rows_load8<F>(row.data, row.scales, c * 8);
         }
     }
 }

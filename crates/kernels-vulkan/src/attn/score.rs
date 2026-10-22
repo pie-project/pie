@@ -43,7 +43,7 @@ pub fn capture(
     requests: u32,
     scores: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.score_capture";
+    const OP: &str = "attn.score_capture";
     if window.is_some() {
         return Err(refuse(
             OP,

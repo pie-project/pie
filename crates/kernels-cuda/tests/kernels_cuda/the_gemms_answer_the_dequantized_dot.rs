@@ -6,8 +6,8 @@ use crate::common::linear_ref::{pick, t, tab};
 use crate::common::{SM100, from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{self, Format, Source, Weight};
+use kernels_cuda::linear::gemm_sm100::{Elem, Glu, atom_bytes, supported};
 use kernels_cuda::linear::moe::GroupSeat;
-use kernels_cuda::linear::tc5::{Elem, Glu, atom_bytes, supported};
 use kernels_cuda::tuning::Tuning;
 
 #[rustfmt::skip]

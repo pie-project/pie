@@ -1,4 +1,4 @@
-//! Attention over the paged KV cache on AMD: the launches of
+//! Attn over the paged KV cache on AMD: the launches of
 //! `kernels/attn/paged.hip`, fed by the work list a decode or prefill plan
 //! staged. A split plan writes f32 partials per kv chunk, and
 //! [`merge`] folds them into the output rows.

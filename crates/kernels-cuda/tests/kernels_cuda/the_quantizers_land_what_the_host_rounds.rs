@@ -6,8 +6,8 @@ use crate::common::tc5::{e2m1, e4m3, ue8m0};
 use crate::common::{from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, E4m3, E4m3tensor, E8m0, F32, I32, U8};
 use kernels_cuda::linear::act_quant::{Format, Source, quantize, read_back};
-use kernels_cuda::linear::mlp;
-use kernels_cuda::linear::tc5::{Glu, atom_bytes, atom_offset};
+use kernels_cuda::linear::gemm_sm100::{Glu, atom_bytes, atom_offset};
+use kernels_cuda::linear::glu;
 
 #[test]
 fn the_activation_quantizers_land_what_the_host_rounds() {
@@ -147,9 +147,9 @@ fn the_routed_glus_land_the_clamped_swiglu_and_its_read_back() {
         let pt = t(b.up(&packed), rows, 2 * inter, Bf16);
         let wt = t(b.up(&weights), rows, 1, F32);
         let (mut ys, ctx) = ([(); 3].map(|_| b.out(rows, inter)), b.ctx());
-        mlp::swiglu_clamp_split_routed(&ctx, gate, up, wt, 1, limit, &mut ys[0]).expect("fires");
-        mlp::swiglu_clamp_routed(&ctx, pt, n, wt, 1, limit, &mut ys[1]).expect("fires");
-        let took = mlp::swiglu_clamp_routed_e4m3(&ctx, pt, n, wt, 1, limit, &mut ys[2]);
+        glu::swiglu_clamp_split_routed(&ctx, gate, up, wt, 1, limit, &mut ys[0]).expect("fires");
+        glu::swiglu_clamp_routed(&ctx, pt, n, wt, 1, limit, &mut ys[1]).expect("fires");
+        let took = glu::swiglu_clamp_routed_e4m3(&ctx, pt, n, wt, 1, limit, &mut ys[2]);
         let whole = took.expect("fires") == (inter % 128 == 0);
         assert!(whole, "{rows}x{inter}: whole blocks take the read-back");
         let v = |i: usize, o: usize| f64::from(from_bf16(packed[at(i, o)]));

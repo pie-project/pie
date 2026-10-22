@@ -100,7 +100,7 @@ def mlp_sublayer(m, at, stem, x, mlp, mods, gate, lanes):
     h = norm_modulate(x, mods, lanes, LN_EPS)
     if tap("norm3_out" if stem == "b2" else "norm2_out", h):
         return None
-    y = linear(mlp.down, ops.linear.mlp_swiglu(linear(mlp.gate_up, h), m.inter))
+    y = linear(mlp.down, ops.linear.swiglu(linear(mlp.gate_up, h), m.inter))
     if tap("mlp_out", y):
         return None
     return ops.elemwise.gated_residual_add(x, gate, y, lanes)

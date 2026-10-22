@@ -29,7 +29,7 @@ pub fn forward(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ragged";
+    const OP: &str = "attn.ragged";
     nonzero(OP, "the head width", head_dim)?;
     let q_heads = row_heads(OP, "query", q.width, head_dim)?;
     let kv_heads = nonzero(OP, "kv heads", kv_heads)?;

@@ -75,8 +75,7 @@ __global__ void __launch_bounds__(256) mamba2_step(
     }
     #pragma unroll
     for (int q = 0; q < ROWS; ++q) {
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) acc[q] += __shfl_xor_sync(0xffffffffu, acc[q], off);
+        acc[q] = ::pie::warp_sum(acc[q]);
     }
     if (l < ROWS) {
         float mine = acc[0];

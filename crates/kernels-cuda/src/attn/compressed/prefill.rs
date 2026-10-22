@@ -1,5 +1,5 @@
 //! DeepSeek-V4's attention at prefill widths on tcgen05, a block a row
-//! (`attn/dsv4_sparse.cuh`): the window, the compressed pool (every visible
+//! (`attn/compressed/sparse_sm100.cuh`): the window, the compressed pool (every visible
 //! entry or those an index selected), their merge and the sinks in one pass,
 //! for the shape the kernel is built for: 64 query heads of 512 over one
 //! latent, a 128-key window, bf16 NHD pools. Anything else is the caller's to
@@ -8,13 +8,13 @@
 use crate::attn::compressed::decode::Rows;
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
-use crate::linear::tc5::supported;
+use crate::linear::gemm_sm100::supported;
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
 
 const PREFILL_SM100: &str = "attn/compressed/prefill_sm100.cu";
 
-/// `pie::attn::dsv4s::Params`, field for field.
+/// `pie::attn::compressed::sm100::Params`, field for field.
 #[repr(C)]
 struct SparseParams {
     o: u64,
@@ -45,7 +45,7 @@ struct SparseParams {
     turn: crate::attn::compressed::decode::TurnArgs,
 }
 
-/// `pie::attn::dsv4s::smem_bytes` (a block a multiprocessor, walking rows):
+/// `pie::attn::compressed::sm100::smem_bytes` (a block a multiprocessor, walking rows):
 /// three 64-key tiles, P twice, the score
 /// exchange, three key lists, barriers, and the 1024-byte alignment.
 const SPARSE_SMEM: u32 = 3 * 65536 + 2 * 8192 + 16384 + 6 * 64 * 4 + 512 + 1024;
@@ -167,14 +167,14 @@ pub fn prefill(
     }
     let (ent_view, ent_compact) = entries_of(pooled);
     // V4.1's rows (an MXFP8 window over NVFP4 entries, or the window alone)
-    // below a prefill's width (`kernel.sdpa.dsv4_prefill_from`): the pass
+    // below a prefill's width (`kernel.sdpa.compressed_prefill_from`): the pass
     // widens them itself, no plane staged. A prefill's many rows a tile
     // read the staged bf16 pages faster.
     //
     // A pass a CUDA graph records (`graph_safe`) reads every quantized row
     // so, V4's too: the staged planes are sized by the page tables a fire
     // states, which a replay's fire outgrows.
-    let from = ctx.tuning().dsv4_prefill_from;
+    let from = ctx.tuning().compressed_prefill_from;
     let wf = crate::attn::compressed::decode::rows_of(window_pool);
     if let Some(wf @ (Rows::Mx8 | Rows::Ds)) = wf
         && (graph_safe || wf == Rows::Mx8 && (from == 0 || rows < from))
@@ -355,7 +355,7 @@ fn sparse(
     };
     let selected = pooled.selection.is_some();
     {
-        // A block a row (`attn/dsv4_sparse.cuh`): Q in TMEM, whole 64-key
+        // A block a row (`attn/compressed/sparse_sm100.cuh`): Q in TMEM, whole 64-key
         // tiles, V the tile K brought.
         let sparse = SparseParams {
             o: o.ptr,
@@ -399,11 +399,11 @@ fn sparse(
                 PREFILL_SM100,
                 symbol(&match quantized {
                     Some((wf, pf)) => format!(
-                        "::pie::attn::dsv4s::dsv4_sparse<{selected}, {}, {}>",
+                        "::pie::attn::compressed::sm100::sparse<{selected}, {}, {}>",
                         wf.code(),
                         pf.code()
                     ),
-                    None => format!("::pie::attn::dsv4s::dsv4_sparse<{selected}>"),
+                    None => format!("::pie::attn::compressed::sm100::sparse<{selected}>"),
                 }),
             )
             .apply(
@@ -483,8 +483,8 @@ fn stage(
     fmt: crate::attn::compressed::decode::Rows,
 ) -> Result<KvPool, Error> {
     let (plane_name, table_name) = match which {
-        Staged::Window => ("dsv4.stage.window", "dsv4.stage.window_table"),
-        Staged::Entries => ("dsv4.stage.entries", "dsv4.stage.entries_table"),
+        Staged::Window => ("compressed.stage.window", "compressed.stage.window_table"),
+        Staged::Entries => ("compressed.stage.entries", "compressed.stage.entries_table"),
     };
     let pages = pool.page_indices.rows;
     let page = u32::try_from(pool.page_size).unwrap_or(0);
@@ -497,7 +497,10 @@ fn stage(
             op,
             Fire::at(
                 PREFILL_SM100,
-                symbol(&format!("::pie::attn::dsv4s::stage_pages<{}>", fmt.code())),
+                symbol(&format!(
+                    "::pie::attn::compressed::sm100::stage_pages<{}>",
+                    fmt.code()
+                )),
             )
             .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
             &[

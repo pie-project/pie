@@ -1,4 +1,4 @@
-//! Attention over ragged (segmented) q and kv rectangles, no cache.
+//! Attn over ragged (segmented) q and kv rectangles, no cache.
 //! Reference: kernels-metal `attn::ragged` (scalar arm) and kernels-cuda
 //! `attn_ragged` (its mask variants).
 
@@ -50,7 +50,7 @@ pub fn forward(
     mask: &RaggedMask,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.ragged";
+    const OP: &str = "attn.ragged";
     for t in [q, k, v, o] {
         expect(OP, t, &[Dtype::Bf16])?;
     }

@@ -7,7 +7,9 @@
 // A code reads as `code * 2^(exponent - 127)`. The window's shared key/value
 // plane and the compressed rows are written alike.
 
-namespace pie::attn::dsv4 {
+namespace pie::attn::compressed {
+
+using namespace ::pie::kv_rows;
 
 // 2^ceil(log2(amax / 448)) as its biased exponent, from the quotient's bits
 // (the reference's `fast_round_scale`), amax at least 1e-4.

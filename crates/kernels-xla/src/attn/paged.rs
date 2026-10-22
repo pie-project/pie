@@ -412,7 +412,7 @@ pub(crate) struct Rows {
     pub rel: Option<Val>,
     /// Reference tag per row, i32.
     pub tag: Option<Val>,
-    /// Attention class per row, i32.
+    /// Attn class per row, i32.
     pub class: Option<Val>,
     /// Row index within its segment, i32 (ragged bias).
     pub qi: Option<Val>,
@@ -1311,7 +1311,7 @@ pub fn plan_decode(
 ) -> Result<DecodePlan, Error> {
     let _ = (ctx, kv_len);
     tables_agree(
-        "attention.plan_decode",
+        "attn.plan_decode",
         positions,
         request_of_token,
         mask,
@@ -1337,7 +1337,7 @@ pub fn plan_prefill(
 ) -> Result<PrefillPlan, Error> {
     let _ = (ctx, kv_len);
     tables_agree(
-        "attention.plan_prefill",
+        "attn.plan_prefill",
         positions,
         request_of_token,
         mask,
@@ -1853,7 +1853,7 @@ pub fn decode(
     o: Tensor,
 ) -> Result<(), Error> {
     let call = plain(
-        "attention.decode",
+        "attn.decode",
         q,
         Tables::decode(plan),
         window,
@@ -1878,7 +1878,7 @@ pub fn decode_lse(
     lse: Tensor,
 ) -> Result<(), Error> {
     let call = plain(
-        "attention.decode_lse",
+        "attn.decode_lse",
         q,
         Tables::decode(plan),
         window,
@@ -1902,7 +1902,7 @@ pub fn prefill(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = plain(
         OP,
@@ -1930,7 +1930,7 @@ pub fn prefill_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    const OP: &str = "attn.prefill_lse";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = plain(
         OP,
@@ -1962,7 +1962,7 @@ pub fn masked(
 ) -> Result<(), Error> {
     let tables = Tables::prefill(plan).with_mask(mask);
     let call = plain(
-        "attention.masked",
+        "attn.masked",
         q.data,
         tables,
         window,
@@ -1990,7 +1990,7 @@ pub fn decode_selected(
     o: Tensor,
 ) -> Result<(), Error> {
     let mut call = plain(
-        "attention.decode_selected",
+        "attn.decode_selected",
         q,
         Tables::decode(plan),
         window,
@@ -2017,7 +2017,7 @@ pub fn prefill_selected(
     ratio: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_selected";
+    const OP: &str = "attn.prefill_selected";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let mut call = plain(
         OP,
@@ -2043,7 +2043,7 @@ pub fn sink(
     sink: Tensor,
     head_dim: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.sink";
+    const OP: &str = "attn.sink";
     expect(OP, o, &[Dtype::Bf16])?;
     let heads = row_heads(OP, o.width, head_dim)?;
     if lse.dtype != Dtype::F32 || lse.rows != o.rows || lse.width != heads {
@@ -2093,7 +2093,7 @@ pub fn merge_lse(
 
 /// `x = cap · tanh(x / cap)`, in place.
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attention.logit_softcap";
+    const OP: &str = "attn.logit_softcap";
     expect(OP, x, &[Dtype::Bf16])?;
     if cap == 0.0 {
         return Err(refuse(OP, "the cap is zero"));
@@ -2227,15 +2227,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    append(
-        ctx,
-        "attention.kv_append",
-        k,
-        v,
-        pool,
-        write_page,
-        write_offset,
-    )
+    append(ctx, "attn.kv_append", k, v, pool, write_page, write_offset)
 }
 
 pub fn kv_append_shared(
@@ -2247,7 +2239,7 @@ pub fn kv_append_shared(
 ) -> Result<(), Error> {
     append(
         ctx,
-        "attention.kv_append_shared",
+        "attn.kv_append_shared",
         plane,
         plane,
         pool,

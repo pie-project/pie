@@ -308,7 +308,7 @@ pub fn select_fp8_w8a16(
     gran: u32,
     routes: Tensor,
     y: &mut Tensor,
-    glu: Option<crate::linear::tc5::Glu>,
+    glu: Option<crate::linear::gemm_sm100::Glu>,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
     const DEPTH: u32 = 2;

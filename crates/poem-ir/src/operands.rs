@@ -62,3 +62,49 @@ impl<T: Slot, const N: usize> Slot for [T; N] {
         self.as_slice().each(f);
     }
 }
+
+/// What a `#[part]` field holds: operands on both sides, as a sub-op does.
+pub trait Part {
+    fn inputs(&self, sink: &mut Vec<ValueId>);
+    fn outputs(&self, sink: &mut Vec<ValueId>);
+    fn aliases(&self, _sink: &mut Vec<(ValueId, ValueId)>) {}
+    fn ports(&self, _sink: &mut Vec<(&'static str, ValueId, Expect)>) {}
+}
+
+impl<T: Operands> Part for Box<T> {
+    fn inputs(&self, sink: &mut Vec<ValueId>) {
+        Operands::inputs(&**self, sink);
+    }
+    fn outputs(&self, sink: &mut Vec<ValueId>) {
+        Operands::outputs(&**self, sink);
+    }
+    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
+        Operands::aliases(&**self, sink);
+    }
+    fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
+        Operands::ports(&**self, sink);
+    }
+}
+
+impl<T: Part> Part for Option<T> {
+    fn inputs(&self, sink: &mut Vec<ValueId>) {
+        if let Some(part) = self {
+            part.inputs(sink);
+        }
+    }
+    fn outputs(&self, sink: &mut Vec<ValueId>) {
+        if let Some(part) = self {
+            part.outputs(sink);
+        }
+    }
+    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
+        if let Some(part) = self {
+            part.aliases(sink);
+        }
+    }
+    fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
+        if let Some(part) = self {
+            part.ports(sink);
+        }
+    }
+}

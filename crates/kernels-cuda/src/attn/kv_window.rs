@@ -1,4 +1,4 @@
-//! Bounded replay's floors (`attention.replay_floor`, DeepSeek-V4.1).
+//! Bounded replay's floors (`attn.replay_floor`, DeepSeek-V4.1).
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -20,7 +20,7 @@ pub fn floor(
     mark: bool,
     floors: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.replay_floor";
+    const OP: &str = "attn.replay_floor";
     debug_assert_eq!(
         positions.data.dtype,
         Dtype::I32,
@@ -56,7 +56,7 @@ pub fn kv_ends(
     pool: &KvPool,
     ends: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.kv_ends";
+    const OP: &str = "attn.kv_ends";
     debug_assert_eq!(
         request_of_token.dtype,
         Dtype::I32,

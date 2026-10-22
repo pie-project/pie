@@ -15,7 +15,7 @@ pub fn residual_add_rmsnorm(
     eps: f32,
     out: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add_rmsnorm";
+    const OP: &str = "fused.residual_add_rmsnorm";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
         x.rows == y.rows && x.width == y.width && out.rows == y.rows && out.width == y.width,
@@ -59,7 +59,7 @@ pub fn rmsnorm_residual_add(
     scale: Option<(Tensor, &mut Tensor)>,
     post: Option<PostNorm<'_>>,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_residual_add";
+    const OP: &str = "fused.rmsnorm_residual_add";
     let per_thread = [8u32, 16, 32]
         .into_iter()
         .find(|per| y.width <= BLOCK * per)

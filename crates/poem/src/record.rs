@@ -30,11 +30,11 @@ macro_rules! primitive {
 }
 
 primitive!(
-    poem_ir::Attention,
+    poem_ir::Attn,
     poem_ir::Linear,
     poem_ir::Sampling,
     poem_ir::Ssm,
-    poem_ir::Elementwise,
+    poem_ir::Elemwise,
     poem_ir::Gather,
     poem_ir::Collective,
     poem_ir::Conv
@@ -541,7 +541,7 @@ impl Mul<f32> for Value {
     fn mul(self, rhs: f32) -> Value {
         let y = self.rec.fresh(self.ty.clone());
         self.rec.push(
-            poem_ir::Elementwise::MulScalar {
+            poem_ir::Elemwise::MulScalar {
                 s: rhs,
                 x: self.id,
                 x_out: y.id(),
@@ -718,7 +718,7 @@ fn compatible(a: &Guard, b: &Guard) -> bool {
 }
 
 fn joins_arms(op: &Operation) -> bool {
-    matches!(op, Operation::Attention(poem_ir::Attention::Ragged { .. }))
+    matches!(op, Operation::Attn(poem_ir::Attn::Ragged { .. }))
 }
 
 fn join(ins: &[&Value]) -> Guard {

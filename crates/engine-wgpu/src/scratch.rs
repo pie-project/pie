@@ -4,7 +4,7 @@ use kernels_wgpu::linear::moe::{self, RoutedScratch};
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attention, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -187,7 +187,7 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Attention(Attention::IndexTopk { selection, .. }) => of(*selection),
+                Operation::Attn(Attn::IndexTopk { selection, .. }) => of(*selection),
                 _ => None,
             })
             .map(|rect| u64::from(rect.rows))
@@ -205,9 +205,8 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Attention(
-                    Attention::Decode { o, head_dim, .. }
-                    | Attention::DecodeLse { o, head_dim, .. },
+                Operation::Attn(
+                    Attn::Decode { o, head_dim, .. } | Attn::DecodeLse { o, head_dim, .. },
                 ) => of(*o).map(|rect| (rect, *head_dim)),
                 _ => None,
             })
@@ -397,7 +396,7 @@ fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {
     }
     let mut spaces: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
-        let Operation::Attention(Attention::PoolGather {
+        let Operation::Attn(Attn::PoolGather {
             pages,
             head_dim,
             ratio,

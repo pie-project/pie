@@ -13,16 +13,7 @@ use crate::tensor::Tensor;
 /// `y = rmsnorm(x) * weight`: each row of `x` scaled by
 /// `1 / sqrt(mean(x²) + eps)`, then by the gain.
 pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm",
-        x,
-        weight,
-        eps,
-        y,
-        x.width,
-        false,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", x, weight, eps, y, x.width, false)
 }
 
 /// `rmsnorm` with gain `1 + weight`.
@@ -33,16 +24,7 @@ pub fn rmsnorm_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_plus_one",
-        x,
-        weight,
-        eps,
-        y,
-        x.width,
-        true,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", x, weight, eps, y, x.width, true)
 }
 
 /// `rmsnorm_plus_one` over every `head_dim`-wide run of a row, with a
@@ -55,16 +37,7 @@ pub fn rmsnorm_per_head_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_per_head_plus_one",
-        x,
-        weight,
-        eps,
-        y,
-        head_dim,
-        true,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", x, weight, eps, y, head_dim, true)
 }
 
 /// `rmsnorm_plus_one` over every `group`-wide run of a row, the gain a
@@ -77,7 +50,7 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
+    const OP: &str = "elemwise.rmsnorm";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, weight, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
@@ -342,7 +315,7 @@ pub fn rmsnorm_gated(
     sigmoid_gate: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated";
+    const OP: &str = "elemwise.rmsnorm_gated";
     expect(OP, x, &[Dtype::F32, Dtype::Bf16])?;
     expect(OP, gate, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, weight, &[Dtype::F32, Dtype::Bf16])?;
@@ -423,7 +396,7 @@ pub fn rmsnorm_gated(
 }
 
 pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add";
+    const OP: &str = "elemwise.residual_add";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
     if x.width != y.width || x.rows > y.rows {
@@ -464,7 +437,7 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
 
 /// `out += bias` per column.
 pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add_bias";
+    const OP: &str = "elemwise.add_bias";
     expect(OP, bias, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, out, &[Dtype::Bf16, Dtype::F32])?;
     if bias.elements() != u64::from(out.width) {
@@ -535,7 +508,7 @@ pub fn layernorm(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm";
+    const OP: &str = "elemwise.layernorm";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, weight, &[Dtype::Bf16, Dtype::F32])?;

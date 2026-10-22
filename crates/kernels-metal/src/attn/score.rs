@@ -42,7 +42,7 @@ pub fn capture(
     requests: u32,
     scores: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.score_capture";
+    const OP: &str = "attn.score_capture";
     if super::q8::enabled(pool, head_dim) {
         return Err(refuse(
             OP,

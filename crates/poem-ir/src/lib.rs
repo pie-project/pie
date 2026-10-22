@@ -15,11 +15,12 @@ pub use check::classes::{
 pub use check::{Fault, check, checked};
 pub use fact::{Builtin, Fact, Facts};
 pub use guard::Guard;
-pub use operands::{Operands, Slot};
+pub use operands::{Operands, Part, Slot};
 pub use ops::{
-    ActQuant, Attention, Collective, Conv, Elementwise, Fused, GateActivation, Gather, GridRule,
-    IndexScore, Linear, ModulateForm, MropeForm, NormKind, NormNext, Operation, PixelOrder,
-    RaggedMask, RopeForm, RopeFreqs, Sampling, Ssm, TapKind, TimePad, VoxelSegment,
+    ActQuant, Attn, Collective, Conv, Elemwise, Fused, GateActivation, Gather, GridRule,
+    IndexScore, Linear, ModulateForm, MropeForm, NormAxis, NormKind, NormNext, NormWeight,
+    Operation, PixelOrder, RaggedMask, RopeForm, RopeFreqs, Sampling, Ssm, TapKind, TimePad,
+    VoxelSegment,
 };
 pub use poem_ir_macros::Op;
 pub use request::{Request, Stream};

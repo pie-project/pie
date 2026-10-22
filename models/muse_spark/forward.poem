@@ -25,7 +25,7 @@ def moe(m, w, x):
             return ops.linear.moe_matmul_select(act, bank, routes, m.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, m.top_k)
 
-    act = ops.linear.mlp_swiglu(select(h, w.gate_up), m.inter)
+    act = ops.linear.swiglu(select(h, w.gate_up), m.inter)
     out = ops.elemwise.norm_gate(select(act, w.down), w.expert_scale, None, None, m.post_norm_eps, 1.0)
     return ops.linear.matmul(ops.linear.moe_weighted_sum(out, weights), w.unpool)
 

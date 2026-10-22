@@ -1,4 +1,4 @@
-//! Attention-score capture: the mean softmax row of each request's last
+//! Attn-score capture: the mean softmax row of each request's last
 //! observed query rows, per head, into an f32 slab (eviction policies and
 //! interpretability read it).
 
@@ -39,7 +39,7 @@ pub fn capture(
     requests: u32,
     scores: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.score_capture";
+    const OP: &str = "attn.score_capture";
     if window.is_some() {
         return Err(refuse(
             OP,

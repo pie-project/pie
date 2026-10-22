@@ -65,7 +65,7 @@ pub fn layernorm_rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_layernorm_rope";
+    const OP: &str = "attn.index_layernorm_rope";
     dtype_dispatch!(OP, k.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
     let head_dim = count(OP, "the index key row's width", k.width)?;
@@ -103,7 +103,7 @@ pub fn rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_rope";
+    const OP: &str = "attn.index_rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
     let n_heads = count(OP, "the head count this rotation states", heads)?;
@@ -155,7 +155,7 @@ pub fn store_fp4(
     boundary_req: Tensor,
     keys: &KvPool,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     if !fp4_keys(keys) {
         return Err(refuse(OP, "the pool does not hold FP4 index keys"));
     }
@@ -266,7 +266,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_kv_append";
+    const OP: &str = "attn.index_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, k.data.dtype, { Bf16 => () });
     pool_pitch(OP, keys, stated(OP, k.data.width)?)?;
@@ -292,11 +292,11 @@ pub fn block_mean(
     ratio: u32,
     entries: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_block_mean";
+    const OP: &str = "attn.index_block_mean";
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
     debug_assert!(
         boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
-        "`{OP}` reads the i32 block tables `attention.pool_boundary_*` published"
+        "`{OP}` reads the i32 block tables `attn.pool_boundary_*` published"
     );
     let head_dim = count(OP, "the key width this mean states", head_dim)?;
     pool_pitch(OP, keys, head_dim)?;
@@ -389,7 +389,7 @@ pub fn topk_turned(
 
 /// [`topk`]'s blocks read back as the tokens each stands for, then the
 /// row's own open block's (`top_k * ratio + ratio - 1` a row, -1 unused):
-/// `attention.index_topk` scored `pooled_tokens`.
+/// `attn.index_topk` scored `pooled_tokens`.
 #[allow(clippy::too_many_arguments)]
 pub fn topk_tokens(
     ctx: &Ctx,
@@ -402,7 +402,7 @@ pub fn topk_tokens(
     ratio: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     let ratio = ratio.max(1);
     let width = top_k
         .checked_mul(ratio)
@@ -468,7 +468,7 @@ fn ranked(
     turn: Option<QueryTurn>,
     selection: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");
     let heads = count(OP, "the head count this ranking states", heads)?;
@@ -684,7 +684,7 @@ const MAX_BLOCK_MAX_HEADS: i32 = 8;
 
 const MAX_BLOCK_MAX_PER: i32 = 8;
 
-/// `attention.index_topk` scored block by block: each head ranks the blocks
+/// `attn.index_topk` scored block by block: each head ranks the blocks
 /// a row sees by their best key, keeps the row's own, and writes its run of
 /// `top_k` ascending into `selection`, `heads * top_k` wide.
 #[allow(clippy::too_many_arguments)]
@@ -698,7 +698,7 @@ pub fn topk_block_max(
     block: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 block ids");
     let heads = count(OP, "the head count this ranking states", heads)?;
@@ -848,9 +848,9 @@ fn ranked_tc5(
     compact: bool,
     selection: &mut Tensor,
 ) -> Result<bool, Error> {
-    use crate::linear::tc5::supported;
+    use crate::linear::gemm_sm100::supported;
 
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     let page = keys.page_size;
     let cells = keys.keys.rows;
     let per = if ratio > 0 && page % ratio == 0 {

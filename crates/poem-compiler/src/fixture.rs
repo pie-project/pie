@@ -1,8 +1,9 @@
-use poem_ir::ops::{Attention, Elementwise};
+use poem_ir::ops::{Attn, Elemwise};
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, StructKind, Trace, Ty,
     ValueDecl, ValueId,
 };
+use poem_ir::{NormAxis, NormWeight};
 
 pub(crate) struct Build {
     pub(crate) trace: Trace,
@@ -71,11 +72,12 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act(width));
         self.push(
-            Elementwise::RmsnormNoScale {
+            Elemwise::Rmsnorm {
                 x,
-                head_dim: 1,
+                axis: NormAxis::Head(1),
                 eps: 1e-6,
                 y,
+                weight: NormWeight::None,
             }
             .into(),
             guard,
@@ -87,11 +89,12 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), ty);
         self.push(
-            Elementwise::RmsnormNoScale {
+            Elemwise::Rmsnorm {
                 x,
-                head_dim: 1,
+                axis: NormAxis::Head(1),
                 eps: 1e-6,
                 y,
+                weight: NormWeight::None,
             }
             .into(),
             guard,
@@ -106,7 +109,7 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let plan = self.value(Def::Op(node), Ty::Struct(StructKind::AttnDecodePlan));
         self.push(
-            Attention::PlanDecode {
+            Attn::PlanDecode {
                 kv_indptr,
                 kv_indices,
                 last_page_len,
@@ -128,7 +131,7 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let o = self.value(Def::Op(node), act(4));
         self.push(
-            Attention::Decode {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -148,7 +151,7 @@ impl Build {
         let write_page = self.input(1);
         let write_offset = self.input(1);
         self.push(
-            Attention::KvAppendShared {
+            Attn::KvAppendShared {
                 plane: x,
                 cache,
                 write_page,

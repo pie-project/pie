@@ -98,7 +98,7 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
+        return ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
     routes, weights = ops.linear.moe_topk_sigmoid_biased(
         ops.linear.matmul(x, f.router),
         f.bias,
@@ -113,10 +113,10 @@ def mlp(x, f):
             return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
 
-    act = ops.linear.mlp_swiglu(select(x, f.gate_up), f.inter)
+    act = ops.linear.swiglu(select(x, f.gate_up), f.inter)
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     s = f.shared
-    shared = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, s.gate_up), s.inter), s.down)
+    shared = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, s.gate_up), s.inter), s.down)
     return ops.elemwise.residual_add(shared, routed)
 
 def index_select(x, q_a, inputs, ix):

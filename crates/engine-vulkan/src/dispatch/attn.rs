@@ -1,12 +1,12 @@
 use kernels_vulkan::attn;
 use kernels_vulkan::spatial;
-use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, IndexScore, Operands, StructKind};
+use poem_exec::{DispatchAttn, KernelError};
+use poem_ir::{Attn, IndexScore, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
-impl DispatchAttention for Run<'_> {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+impl DispatchAttn for Run<'_> {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.attention(op).map_err(crate::error::kernel)
     }
 }
@@ -56,9 +56,9 @@ impl Run<'_> {
         )
     }
 
-    fn attention(&mut self, op: &Attention) -> Result<(), kernels_vulkan::Error> {
+    fn attention(&mut self, op: &Attn) -> Result<(), kernels_vulkan::Error> {
         match op {
-            Attention::Voxel {
+            Attn::Voxel {
                 q,
                 k,
                 v,
@@ -79,7 +79,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::PlanDecode {
+            Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
@@ -93,7 +93,7 @@ impl Run<'_> {
                 match self.declared(*plan) {
                     StructKind::AttnDecodePlan => {}
                     other => panic!(
-                        "`attention.plan_decode` defines a {other:?}, which is no \
+                        "`attn.plan_decode` defines a {other:?}, which is no \
                          decode plan kind"
                     ),
                 }
@@ -114,7 +114,7 @@ impl Run<'_> {
                 Ok(())
             }
 
-            Attention::PlanPrefill {
+            Attn::PlanPrefill {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
@@ -128,7 +128,7 @@ impl Run<'_> {
                 match self.declared(*plan) {
                     StructKind::AttnPrefillPlan => {}
                     other => panic!(
-                        "`attention.plan_prefill` defines a {other:?}, which is no \
+                        "`attn.plan_prefill` defines a {other:?}, which is no \
                          prefill plan kind"
                     ),
                 }
@@ -148,7 +148,7 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
             }
-            Attention::Decode {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -169,7 +169,7 @@ impl Run<'_> {
                 self.split_scratch(),
             ),
 
-            Attention::Prefill {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -192,23 +192,21 @@ impl Run<'_> {
                 self.tuning(),
             ),
 
-            Attention::DecodeSelected { per_head: true, .. }
-            | Attention::PrefillSelected { per_head: true, .. }
-            | Attention::IndexTopk {
+            Attn::DecodeSelected { per_head: true, .. }
+            | Attn::PrefillSelected { per_head: true, .. }
+            | Attn::IndexTopk {
                 score: IndexScore::BlockMax,
                 ..
             }
-            | Attention::IndexTopk {
+            | Attn::IndexTopk {
                 score: IndexScore::PooledTokens,
                 ..
             } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
-            Attention::KvEnds { .. }
-            | Attention::WindowSink { .. }
-            | Attention::ReplayFloor { .. } => {
+            Attn::KvEnds { .. } | Attn::WindowSink { .. } | Attn::ReplayFloor { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
-            Attention::DecodeSelected {
+            Attn::DecodeSelected {
                 q,
                 plan,
                 selection,
@@ -232,7 +230,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*o),
             ),
-            Attention::PrefillSelected {
+            Attn::PrefillSelected {
                 q,
                 plan,
                 selection,
@@ -258,7 +256,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*o),
             ),
-            Attention::Dense {
+            Attn::Dense {
                 q,
                 k,
                 v,
@@ -276,7 +274,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::Ragged {
+            Attn::Ragged {
                 q,
                 k,
                 v,
@@ -308,14 +306,13 @@ impl Run<'_> {
                     self.uncut(*o),
                 )
             }
-            Attention::Masked { causal: false, .. }
-            | Attention::MaskedLse { causal: false, .. } => {
+            Attn::Masked { causal: false, .. } | Attn::MaskedLse { causal: false, .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
-            Attention::DecodeRel { .. } | Attention::PrefillRel { .. } => {
+            Attn::DecodeRel { .. } | Attn::PrefillRel { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
-            Attention::Masked {
+            Attn::Masked {
                 q,
                 plan,
                 mask,
@@ -339,7 +336,7 @@ impl Run<'_> {
                 self.requests(),
                 self.tuning(),
             ),
-            Attention::MaskedLse {
+            Attn::MaskedLse {
                 q,
                 plan,
                 mask,
@@ -365,7 +362,7 @@ impl Run<'_> {
                 self.requests(),
                 self.tuning(),
             ),
-            Attention::DecodeLse {
+            Attn::DecodeLse {
                 q,
                 plan,
                 cache,
@@ -387,7 +384,7 @@ impl Run<'_> {
                 self.tensor(*lse),
                 self.split_scratch(),
             ),
-            Attention::PrefillLse {
+            Attn::PrefillLse {
                 q,
                 plan,
                 cache,
@@ -419,7 +416,7 @@ impl Run<'_> {
                     *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
                 )
             }
-            Attention::Sink {
+            Attn::Sink {
                 o,
                 lse,
                 sink,
@@ -432,7 +429,7 @@ impl Run<'_> {
                 self.tensor(*sink),
                 *head_dim,
             ),
-            Attention::MergeLse {
+            Attn::MergeLse {
                 o1,
                 lse1,
                 o2,
@@ -452,10 +449,10 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attention::LogitSoftcap { x, cap, x_out: _ } => {
+            Attn::LogitSoftcap { x, cap, x_out: _ } => {
                 attn::logit_softcap(self.ctx(), self.tensor(*x), *cap)
             }
-            Attention::KvAppend {
+            Attn::KvAppend {
                 k,
                 v,
                 cache,
@@ -469,7 +466,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::KvAppendShared {
+            Attn::KvAppendShared {
                 plane,
                 cache,
                 write_page,
@@ -482,7 +479,7 @@ impl Run<'_> {
                 self.tensor(*write_offset),
             ),
 
-            Attention::MlaPlan {
+            Attn::MlaPlan {
                 kv_indptr,
                 kv_indices,
                 last_page_len,
@@ -501,7 +498,7 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Mla(built));
                 Ok(())
             }
-            Attention::MlaLatents {
+            Attn::MlaLatents {
                 kv_a,
                 weight,
                 eps,
@@ -517,7 +514,7 @@ impl Run<'_> {
                 self.tensor(*kv_c),
                 self.tensor(*k_pe),
             ),
-            Attention::MlaLatentsRope {
+            Attn::MlaLatentsRope {
                 kv_a,
                 positions,
                 weight,
@@ -539,7 +536,7 @@ impl Run<'_> {
                 self.tensor(*kv_c),
                 self.tensor(*k_pe),
             ),
-            Attention::MlaSplitQB {
+            Attn::MlaSplitQB {
                 q_b,
                 heads,
                 nope_dim,
@@ -555,7 +552,7 @@ impl Run<'_> {
                 self.tensor(*q_nope),
                 self.tensor(*q_pe),
             ),
-            Attention::MlaAbsorbQ {
+            Attn::MlaAbsorbQ {
                 q_nope,
                 kv_b,
                 heads,
@@ -573,7 +570,7 @@ impl Run<'_> {
                 *v_head_dim,
                 self.tensor(*q_latent),
             ),
-            Attention::MlaAbsorbOut {
+            Attn::MlaAbsorbOut {
                 latent,
                 kv_b,
                 heads,
@@ -591,7 +588,7 @@ impl Run<'_> {
                 *nope_dim,
                 self.tensor(*o),
             ),
-            Attention::MlaKvAppend {
+            Attn::MlaKvAppend {
                 kv_c,
                 k_pe,
                 cache,
@@ -607,19 +604,19 @@ impl Run<'_> {
             ),
 
             // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
-            Attention::MlaDecode { lse: Some(_), .. }
-            | Attention::MlaPrefill { lse: Some(_), .. }
-            | Attention::MlaDecodeSelected { lse: Some(_), .. }
-            | Attention::MlaPrefillSelected { lse: Some(_), .. } => {
+            Attn::MlaDecode { lse: Some(_), .. }
+            | Attn::MlaPrefill { lse: Some(_), .. }
+            | Attn::MlaDecodeSelected { lse: Some(_), .. }
+            | Attn::MlaPrefillSelected { lse: Some(_), .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
-            Attention::MlaDecode {
+            Attn::MlaDecode {
                 window: Some(_), ..
             }
-            | Attention::MlaPrefill {
+            | Attn::MlaPrefill {
                 window: Some(_), ..
             } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
-            Attention::MlaDecode {
+            Attn::MlaDecode {
                 q,
                 plan: _,
                 q_pe,
@@ -648,7 +645,7 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attention::MlaPrefill {
+            Attn::MlaPrefill {
                 q,
                 plan: _,
                 q_pe,
@@ -677,7 +674,7 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attention::MlaDecodeSelected {
+            Attn::MlaDecodeSelected {
                 q,
                 plan: _,
                 q_pe,
@@ -707,7 +704,7 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attention::MlaPrefillSelected {
+            Attn::MlaPrefillSelected {
                 q,
                 plan: _,
                 q_pe,
@@ -738,7 +735,7 @@ impl Run<'_> {
                 )
             }
 
-            Attention::IndexLayernormRope {
+            Attn::IndexLayernormRope {
                 k,
                 positions,
                 weight,
@@ -757,7 +754,7 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
-            Attention::IndexRope {
+            Attn::IndexRope {
                 q,
                 positions,
                 heads,
@@ -775,7 +772,7 @@ impl Run<'_> {
                 *theta,
             ),
 
-            Attention::IndexTopk {
+            Attn::IndexTopk {
                 q,
                 weights,
                 keys,
@@ -788,7 +785,7 @@ impl Run<'_> {
             } => {
                 let Some(scores) = self.index_scores() else {
                     return Err(kernels_vulkan::Error::Unsupported {
-                        op: "attention.index_topk",
+                        op: "attn.index_topk",
                     });
                 };
                 let fire = self.bindings();
@@ -808,7 +805,7 @@ impl Run<'_> {
                     self.tensor(*selection),
                 )
             }
-            Attention::IndexKvAppend {
+            Attn::IndexKvAppend {
                 k,
                 keys,
                 write_page,
@@ -821,7 +818,7 @@ impl Run<'_> {
                 self.tensor(*write_offset),
             ),
 
-            Attention::IndexBlockMean {
+            Attn::IndexBlockMean {
                 boundary_pos,
                 boundary_req,
                 keys,
@@ -837,7 +834,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*entries),
             ),
-            Attention::PoolBoundaryDecode {
+            Attn::PoolBoundaryDecode {
                 positions,
                 row_valid,
                 ratio,
@@ -854,7 +851,7 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attention::PoolBoundaryPrefill {
+            Attn::PoolBoundaryPrefill {
                 positions,
                 row_valid,
                 ratio,
@@ -872,7 +869,7 @@ impl Run<'_> {
                 self.tensor(*boundary_rope),
             ),
 
-            Attention::PoolGather {
+            Attn::PoolGather {
                 boundary_pos,
                 boundary_req,
                 pages,
@@ -883,7 +880,7 @@ impl Run<'_> {
             } => {
                 let Some(state) = self.pool_state(*pages) else {
                     return Err(kernels_vulkan::Error::Unsupported {
-                        op: "attention.pool_gather",
+                        op: "attn.pool_gather",
                     });
                 };
                 attn::pool::gather(
@@ -900,7 +897,7 @@ impl Run<'_> {
                 )
             }
 
-            Attention::PoolStateWrite {
+            Attn::PoolStateWrite {
                 kv,
                 score,
                 pages,
@@ -911,7 +908,7 @@ impl Run<'_> {
             } => {
                 let Some(state) = self.pool_state(*pages) else {
                     return Err(kernels_vulkan::Error::Unsupported {
-                        op: "attention.pool_state_write",
+                        op: "attn.pool_state_write",
                     });
                 };
                 attn::pool::state_write(
@@ -927,7 +924,7 @@ impl Run<'_> {
                     state.state_score,
                 )
             }
-            Attention::PoolKvAppend {
+            Attn::PoolKvAppend {
                 entries,
                 boundary_pos,
                 boundary_req,
@@ -943,7 +940,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::PoolLse {
+            Attn::PoolLse {
                 q,
                 positions,
                 request_of_token,
@@ -967,7 +964,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attention::PoolLseSelected {
+            Attn::PoolLseSelected {
                 q,
                 positions,
                 request_of_token,

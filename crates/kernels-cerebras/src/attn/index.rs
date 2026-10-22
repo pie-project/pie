@@ -58,7 +58,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_kv_append";
+    const OP: &str = "attn.index_kv_append";
     expect(OP, k, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, write_page, &[Dtype::I32])?;
     expect(OP, write_offset, &[Dtype::I32])?;
@@ -212,7 +212,7 @@ pub fn boundary_decode(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attention.pool_boundary_decode",
+        "attn.pool_boundary_decode",
         positions,
         request_of_token,
         row_valid,
@@ -235,7 +235,7 @@ pub fn boundary_prefill(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attention.pool_boundary_prefill",
+        "attn.pool_boundary_prefill",
         positions.data,
         request_of_token,
         row_valid,
@@ -258,7 +258,7 @@ pub fn block_mean(
     ratio: u32,
     entries: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_block_mean";
+    const OP: &str = "attn.index_block_mean";
     expect(OP, entries, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, boundary_pos, &[Dtype::I32])?;
     expect(OP, boundary_req, &[Dtype::I32])?;
@@ -345,7 +345,7 @@ pub fn pool_kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     let _ = (write_page, write_offset);
     expect(OP, entries, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, boundary_pos, &[Dtype::I32])?;
@@ -433,7 +433,7 @@ pub fn topk(
     ratio: u32,
     selection: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     expect(OP, q, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, selection, &[Dtype::I32])?;
     expect(OP, positions, &[Dtype::I32])?;

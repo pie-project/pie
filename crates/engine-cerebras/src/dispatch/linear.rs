@@ -26,7 +26,7 @@ impl Run<'_> {
                 self.tensor(*w),
                 self.tensor(*y),
             ),
-            Linear::MlpSwiglu {
+            Linear::Swiglu {
                 packed,
                 intermediate,
                 y,
@@ -51,7 +51,7 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MlpGeluTanh { x, y } => {
+            Linear::GeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
             Linear::MoeTopkSoftmax {

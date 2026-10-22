@@ -16,7 +16,7 @@ fn a_dag_schedule_orders_every_wait_after_its_close() {
         .expect("the row is in the catalog");
     let fused = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Cuda),
-        &["attention.pool_attention", "attention.lse_sink"],
+        &["fused.pool_attention", "fused.lse_sink"],
     );
     let profile = DeviceProfile {
         dag_streams: true,

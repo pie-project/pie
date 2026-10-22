@@ -113,11 +113,14 @@ pub fn matmul_select(
                 ctx,
                 OP,
                 x,
-                crate::linear::tc5::Operand::plain(bank.ptr, crate::linear::tc5::Elem::Bf16),
+                crate::linear::gemm_sm100::Operand::plain(
+                    bank.ptr,
+                    crate::linear::gemm_sm100::Elem::Bf16,
+                ),
                 bank.rows,
                 routes,
                 y,
-                crate::linear::tc5::Epilogue::STORE,
+                crate::linear::gemm_sm100::Epilogue::STORE,
             );
         }
         // Where there are no tcgen05 GEMMs, a batch whose experts fill their
@@ -129,7 +132,7 @@ pub fn matmul_select(
         let tiled = fan.route_count >= BF16_GEMM_FROM
             && x.width.is_multiple_of(64)
             && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
-        if !crate::linear::tc5::supported()
+        if !crate::linear::gemm_sm100::supported()
             && tiled
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
@@ -191,7 +194,7 @@ pub(crate) fn tc5_worth(
         && !experts.streams()
         && x.width.is_multiple_of(64)
         && y.width.is_multiple_of(64)
-        && crate::linear::tc5::supported()
+        && crate::linear::gemm_sm100::supported()
 }
 
 /// `y[route] = x[route or its token] . W[routes[route]]^T` on one grouped
@@ -203,13 +206,13 @@ pub(crate) fn select_tc5(
     ctx: &Ctx,
     op: &'static str,
     x: Tensor,
-    w: crate::linear::tc5::Operand,
+    w: crate::linear::gemm_sm100::Operand,
     experts: u32,
     routes: Tensor,
     y: &mut Tensor,
-    epi: crate::linear::tc5::Epilogue,
+    epi: crate::linear::gemm_sm100::Epilogue,
 ) -> Result<(), Error> {
-    use crate::linear::{act_quant, tc5};
+    use crate::linear::{act_quant, gemm_sm100};
     const GROUPED_X: &str = "linear.moe_tc5_x";
     const GROUPED_Y: &str = "linear.moe_tc5_y";
     let fan = selected(op, x, routes, y)?;
@@ -219,17 +222,17 @@ pub(crate) fn select_tc5(
     }
     let (n, k) = (y.width, x.width);
     // The routers this select serves name an expert once a token.
-    let layout = act_quant::lay_out(ctx, op, routes, experts, tc5::GROUP_ALIGN, true)?;
+    let layout = act_quant::lay_out(ctx, op, routes, experts, gemm_sm100::GROUP_ALIGN, true)?;
     let div = if fan.by_token { routes.width } else { 1 };
     let xs = ctx.scratch_stream(op, GROUPED_X, layout.rows as usize * k as usize * 2)? as u64;
     act_quant::scatter_rows(ctx, op, x, div, layout.pos, count, xs)?;
     let ys = ctx.scratch_stream(op, GROUPED_Y, layout.rows as usize * n as usize * 2)? as u64;
-    tc5::grouped_gemm_epi(
+    gemm_sm100::grouped_gemm_epi(
         ctx,
-        tc5::Operand::plain(xs, tc5::Elem::Bf16),
+        gemm_sm100::Operand::plain(xs, gemm_sm100::Elem::Bf16),
         w,
         ys,
-        tc5::Grouped {
+        gemm_sm100::Grouped {
             experts,
             groups: layout.groups,
             alpha_e: 0,
@@ -237,7 +240,7 @@ pub(crate) fn select_tc5(
         [n, k],
         1.0,
         // An expert's padding rows land nowhere.
-        crate::linear::tc5::Epilogue {
+        crate::linear::gemm_sm100::Epilogue {
             live_rows: layout.live_rows(),
             ..epi
         },
@@ -581,9 +584,9 @@ pub(super) const WMMA_ROUTES: u32 = 32;
 #[cfg(feature = "cuda")]
 pub(super) fn glu_code(
     op: &'static str,
-    glu: Option<crate::linear::tc5::Glu>,
+    glu: Option<crate::linear::gemm_sm100::Glu>,
 ) -> Result<(i32, f32, f32), Error> {
-    use crate::linear::tc5::Glu;
+    use crate::linear::gemm_sm100::Glu;
     Ok(match glu {
         None => (0, 0.0, 1.0),
         Some(Glu::Swiglu) => (1, 0.0, 1.0),

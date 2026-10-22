@@ -24,7 +24,7 @@ pub fn rmsnorm_rope_partial_q(
     span: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_rope_partial_q";
+    const OP: &str = "fused.rmsnorm_rope_partial_q";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     positions_stream(OP, positions, &x);
     if head_dim == 0
@@ -132,7 +132,7 @@ pub fn norm_rope_last(
     yarn: Option<Yarn>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.norm_rope_last";
+    const OP: &str = "fused.norm_rope_last";
     let tail = Tail {
         head_dim,
         eps,
@@ -190,7 +190,7 @@ pub fn norm_rope_last_append(
     y: &mut Tensor,
     append: Option<Append<'_>>,
 ) -> Result<bool, Error> {
-    const OP: &str = "elementwise.norm_rope_last_append";
+    const OP: &str = "fused.norm_rope_last_append";
     let Some(append) = append else {
         return Ok(false);
     };
@@ -358,7 +358,7 @@ pub fn qg_qknorm_rope_append(
     gate: &mut Tensor,
     append: YarnAppend<'_>,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.qg_qknorm_rope_append";
+    const OP: &str = "fused.qg_qknorm_rope_append";
     dtype_dispatch!(OP, qg.dtype, { Bf16 => () });
     positions_stream(OP, positions, q_out);
     if !append.fits()
@@ -452,7 +452,7 @@ pub fn norm_rope_pair(
     yarn: Option<Yarn>,
     append: Option<Append<'_>>,
 ) -> Result<bool, Error> {
-    const OP: &str = "elementwise.norm_rope_pair";
+    const OP: &str = "fused.norm_rope_pair";
     let qper = q.head_dim / 32;
     let fits = ctx.tuning().rows_vec
         && q.x.dtype == Dtype::Bf16

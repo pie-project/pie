@@ -1,7 +1,7 @@
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
 };
-use poem_ir::{Attention, Def, Dim, Elementwise, Guard, Operands, Operation, RaggedMask, Ty};
+use poem_ir::{Attn, Def, Dim, Elemwise, Guard, Operands, Operation, RaggedMask, Ty};
 
 const WIDTH: u32 = 64;
 const HEADS: u32 = 4;
@@ -61,7 +61,7 @@ impl ForwardHybrid for Encoder {
             let h = ops::elemwise::rmsnorm(&x, &ln("mlp_norm"), 1e-6);
             let gate = ops::linear::matmul(&h, &w(&format!("l{l}.wi_0"), INNER, WIDTH));
             let up = ops::linear::matmul(&h, &w(&format!("l{l}.wi_1"), INNER, WIDTH));
-            let act = ops::linear::mlp_geglu_tanh(&gate, &up);
+            let act = ops::linear::geglu_tanh(&gate, &up);
             let y = ops::linear::matmul(&act, &w(&format!("l{l}.wo"), WIDTH, INNER));
             x = ops::elemwise::residual_add(&x, &y);
         }
@@ -97,14 +97,14 @@ fn two_layers_trace_with_one_table_each_and_the_attention_names_it() {
         .filter(|(_, node)| {
             matches!(
                 node.op,
-                Operation::Elementwise(Elementwise::RelativeBucketBias { .. })
+                Operation::Elemwise(Elemwise::RelativeBucketBias { .. })
             )
         })
         .collect();
     assert_eq!(tables.len(), LAYERS as usize, "one table per layer");
     let mut table_ids = Vec::new();
     for (at, node) in &tables {
-        let Operation::Elementwise(Elementwise::RelativeBucketBias {
+        let Operation::Elemwise(Elemwise::RelativeBucketBias {
             embedding,
             max_len,
             num_buckets,
@@ -156,11 +156,11 @@ fn two_layers_trace_with_one_table_each_and_the_attention_names_it() {
     let ragged: Vec<&poem_ir::Node> = trace
         .nodes
         .iter()
-        .filter(|node| matches!(node.op, Operation::Attention(Attention::Ragged { .. })))
+        .filter(|node| matches!(node.op, Operation::Attn(Attn::Ragged { .. })))
         .collect();
     assert_eq!(ragged.len(), LAYERS as usize, "one attention per layer");
     for (node, table) in ragged.iter().zip(&table_ids) {
-        let Operation::Attention(Attention::Ragged {
+        let Operation::Attn(Attn::Ragged {
             mask,
             sm_scale,
             kv_heads,

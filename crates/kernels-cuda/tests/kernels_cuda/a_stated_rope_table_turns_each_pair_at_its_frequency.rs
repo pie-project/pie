@@ -56,7 +56,7 @@ fn check(pairs: Pairs, turned: usize, q_heads: usize, kv_heads: usize, mscale: f
     let mut k = Tensor::new(k_at, rows as u32, k_width as u32, Dtype::Bf16);
     rope(
         &ctx,
-        "elementwise.rope_full",
+        "elemwise.rope_full",
         &mut q,
         &mut k,
         Tensor::new(p_at, rows as u32, axes as u32, Dtype::I32),

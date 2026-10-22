@@ -728,7 +728,7 @@ fn decode_heads(
 #[test]
 fn glm_fp8_rows_score_in_e4m3() {
     // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
-    if !kernels_cuda::linear::tc5::supported() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
         return;
     }
     // Four rows split over the multiprocessors; 160 a block each on 128-key tiles.
@@ -753,7 +753,7 @@ fn glm_fp8_rows_score_in_e4m3() {
 /// staged: the same values as the bf16 rows, so the same output, bit for bit.
 #[test]
 fn fp8_rows_widen_on_the_mma_kernel() {
-    if kernels_cuda::linear::tc5::supported() {
+    if kernels_cuda::linear::gemm_sm100::supported() {
         return;
     }
     for (rows, kv, rope) in [(4, 300, 64), (4, 1000, 0), (64, 1000, 0)] {
@@ -770,7 +770,7 @@ fn fp8_rows_widen_on_the_mma_kernel() {
 #[test]
 fn glm_reads_a_short_selection_dense() {
     // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
-    if !kernels_cuda::linear::tc5::supported() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
         return;
     }
     let want = decode_short(4, 300, 64, true, false);
@@ -793,7 +793,7 @@ fn glm_reads_a_short_selection_dense() {
 #[test]
 fn fp8_rows_read_any_head_count_sixty_four_a_pass() {
     // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
-    if !kernels_cuda::linear::tc5::supported() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
         return;
     }
     for (heads, rows, kv, rope) in [

@@ -19,7 +19,7 @@ pub fn res_blend(
     crate::attn::res_blend(ctx, prefix, blocks, weight, eps, proj, y)
 }
 
-/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`): `x`
+/// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`): `x`
 /// times `scale` (rounded), RMS-normed unscaled, and with `res` and its f32
 /// `gate` the residual's gated sum; with `next`, the next sublayer's input
 /// norm over it in the same pass.
@@ -36,7 +36,7 @@ pub fn norm_gate(
     next: Option<Next>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.norm_gate";
+    const OP: &str = "elemwise.norm_gate";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     if res.is_some() != gate.is_some() || gate.is_some_and(|g| g.dtype != Dtype::F32) {
         return Err(refuse(OP, "a residual comes with its f32 gate"));
@@ -94,18 +94,18 @@ pub enum NormKind {
 }
 
 crate::error::unsupported! {
-    scale_shift = "elementwise.modulate" (x: Tensor, m: Tensor, lane_of_row: Option<Tensor>,
+    scale_shift = "elemwise.modulate" (x: Tensor, m: Tensor, lane_of_row: Option<Tensor>,
         o: &mut Tensor);
-    scale = "elementwise.modulate" (x: Tensor, m: Tensor, lane_of_row: Option<Tensor>,
+    scale = "elemwise.modulate" (x: Tensor, m: Tensor, lane_of_row: Option<Tensor>,
         o: &mut Tensor);
-    tanh_gate = "elementwise.modulate" (x: Tensor, m: Tensor, lane_of_row: Option<Tensor>,
+    tanh_gate = "elemwise.modulate" (x: Tensor, m: Tensor, lane_of_row: Option<Tensor>,
         o: &mut Tensor);
-    gated_residual_add = "elementwise.gated_residual_add" (r: Tensor, g: Tensor, y: Tensor,
+    gated_residual_add = "elemwise.gated_residual_add" (r: Tensor, g: Tensor, y: Tensor,
         lane_of_row: Option<Tensor>, r_out: &mut Tensor);
-    norm_modulate = "elementwise.norm_modulate" (x: Tensor, m: Tensor,
+    norm_modulate = "fused.norm_modulate" (x: Tensor, m: Tensor,
         lane_of_row: Option<Tensor>, norm: NormKind, o: &mut Tensor);
     #[allow(clippy::too_many_arguments)]
-    gated_residual_norm_modulate = "elementwise.gated_residual_norm_modulate" (r: Tensor,
+    gated_residual_norm_modulate = "fused.gated_residual_norm_modulate" (r: Tensor,
         g: Tensor, y: Tensor, m: Tensor, lane_of_row: Option<Tensor>, norm: NormKind,
         r_out: &mut Tensor, o: &mut Tensor);
 }

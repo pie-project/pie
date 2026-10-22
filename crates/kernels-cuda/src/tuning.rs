@@ -315,8 +315,8 @@ pub struct QgPrologueUntil(pub u32);
 /// their fold and the sinks) lands in one launch at; more run the four
 /// launches. 0 (never) but where a chip's profile says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_decode_until", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct Dsv4DecodeUntil(pub u32);
+#[decision(id = "kernel.sdpa.compressed_decode_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct CompressedDecodeUntil(pub u32);
 
 /// Whether a selected (sparse) attention runs on the tensor cores, a block a
 /// row and kv head, rather than the scalar walk. Off reads every key the
@@ -335,11 +335,11 @@ pub struct SdpaPoolMma;
 
 /// The fewest rows DeepSeek-V4's attention (`attention.pool_attention`: the
 /// window, the pool, their merge and the sinks) runs as one tcgen05 pass,
-/// a block a row (`attn/dsv4_sparse.cuh`, sm_100a: Q in TMEM, whole 64-key
+/// a block a row (`attn/compressed/sparse_sm100.cuh`, sm_100a: Q in TMEM, whole 64-key
 /// tiles, V the tile K brought) rather than its four ops. 0 never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
-pub struct SdpaDsv4PrefillFrom(pub u32);
+#[decision(id = "kernel.sdpa.compressed_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SdpaCompressedPrefillFrom(pub u32);
 
 /// Whether DeepSeek-V4.1's Causal Encoder-Decoder prefills by bounded
 /// replay, as its release describes: a long prompt's leading rows run the
@@ -350,17 +350,17 @@ pub struct SdpaDsv4PrefillFrom(pub u32);
 /// layer, as vLLM does. It changes what the model computes, so no search
 /// turns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_replay", flag, default = false, tune = never)]
-pub struct SdpaDsv4Replay;
+#[decision(id = "kernel.sdpa.compressed_replay", flag, default = false, tune = never)]
+pub struct SdpaCompressedReplay;
 
 /// The fewest rows DeepSeek-V4.1's attention over its FP4 cache (an MXFP8
 /// window over NVFP4 entries) takes the tcgen05 pass a block a row, which
 /// widens each row's keys once for all 64 heads as its tiles land, rather
 /// than the decode launch, whose four blocks a row widen them each. 0 never
-/// does below `kernel.sdpa.dsv4_prefill_from`.
+/// does below `kernel.sdpa.compressed_prefill_from`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_fp4_pass_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
-pub struct SdpaDsv4Fp4PassFrom(pub u32);
+#[decision(id = "kernel.sdpa.compressed_fp4_pass_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SdpaCompressedFp4PassFrom(pub u32);
 
 /// The most rows a grouped projection on an fp8 plane (`kernel.gemm.fp8_o_down`)
 /// runs group by group on the tcgen05 GEMM against the plane as it is, past
@@ -782,7 +782,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5From>()
         .add::<GemmSplitRowsFrom>()
         .add::<QgPrologueUntil>()
-        .add::<Dsv4DecodeUntil>()
+        .add::<CompressedDecodeUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<SsmGdnScanUntil>()
@@ -850,9 +850,9 @@ pub fn register(registry: &mut Registry) {
         .add::<ElemwiseNormEmit>()
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
-        .add::<SdpaDsv4PrefillFrom>()
-        .add::<SdpaDsv4Replay>()
-        .add::<SdpaDsv4Fp4PassFrom>()
+        .add::<SdpaCompressedPrefillFrom>()
+        .add::<SdpaCompressedReplay>()
+        .add::<SdpaCompressedFp4PassFrom>()
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
         .add::<SdpaMlaDenseShort>()
@@ -917,7 +917,7 @@ tuning! {
     moe_tc5_from: u32 = 16, get MoeTc5From;
     gemm_split_rows_from: u32 = 256, get GemmSplitRowsFrom;
     qg_prologue_until: u32 = 0, get QgPrologueUntil;
-    dsv4_decode_until: u32 = 0, get Dsv4DecodeUntil;
+    compressed_decode_until: u32 = 0, get CompressedDecodeUntil;
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
@@ -985,9 +985,9 @@ tuning! {
     norm_emit: bool = false, on ElemwiseNormEmit;
     index_radix: bool = false, on SdpaIndexRadix;
     pool_mma: bool = false, on SdpaPoolMma;
-    dsv4_prefill_from: u32 = 0, get SdpaDsv4PrefillFrom;
-    dsv4_replay: bool = false, on SdpaDsv4Replay;
-    dsv4_fp4_pass_from: u32 = 0, get SdpaDsv4Fp4PassFrom;
+    compressed_prefill_from: u32 = 0, get SdpaCompressedPrefillFrom;
+    compressed_replay: bool = false, on SdpaCompressedReplay;
+    compressed_fp4_pass_from: u32 = 0, get SdpaCompressedFp4PassFrom;
     gemm_fp8_grouped_tc5_until: u32 = 0, get GemmFp8GroupedTc5Until;
     mla_sparse: bool = false, on SdpaMlaSparse;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;

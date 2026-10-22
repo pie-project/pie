@@ -422,8 +422,7 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
             __syncthreads();
             if (warp < w) {
                 float v = red[lane][warp];
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+                v = ::pie::warp_sum(v);
                 if (lane == 0) folded[warp] = v;
             }
         } else {
@@ -431,8 +430,7 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
                 float sum = 0.f;
                 for (int s = lane; s < slices; s += 32)
                     sum += mixes[(static_cast<long long>(s) * gridDim.x + n) * w + c];
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+                sum = ::pie::warp_sum(sum);
                 if (lane == 0) folded[c] = sum;
             }
         }
@@ -488,15 +486,13 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
             const float v = xsm[tid + p * BLOCK];
             local += v * v;
         }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+        local = ::pie::warp_sum(local);
         if ((tid & 31) == 0) buf[tid >> 5] = local;
     }
     __syncthreads();
     if (tid < 32) {
         float v = tid < BLOCK / 32 ? buf[tid] : 0.f;
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+        v = ::pie::warp_sum(v);
         if (tid == 0) buf[BLOCK / 32] = v;
     }
     __syncthreads();

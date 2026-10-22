@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
-use crate::ops::{Attention, Conv, Fused, Gather, Ssm};
+use crate::ops::{Attn, Conv, Fused, Gather, Ssm};
 use crate::{Def, Guard, Operands, Operation, Trace, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,60 +392,60 @@ fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
 fn spans_classes(op: &Operation) -> bool {
     matches!(
         op,
-        Operation::Attention(Attention::Ragged { .. })
+        Operation::Attn(Attn::Ragged { .. })
             | Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
     )
 }
 
 fn writes_cache(op: &Operation) -> bool {
     match op {
-        Operation::Attention(op) => match op {
-            Attention::KvAppend { .. }
-            | Attention::KvAppendShared { .. }
-            | Attention::MlaKvAppend { .. }
-            | Attention::IndexKvAppend { .. }
-            | Attention::PoolKvAppend { .. }
-            | Attention::PoolStateWrite { .. } => true,
-            Attention::ReplayFloor { .. } => true,
-            Attention::PlanDecode { .. }
-            | Attention::PlanPrefill { .. }
-            | Attention::Decode { .. }
-            | Attention::Prefill { .. }
-            | Attention::DecodeRel { .. }
-            | Attention::PrefillRel { .. }
-            | Attention::Masked { .. }
-            | Attention::MaskedLse { .. }
-            | Attention::Dense { .. }
-            | Attention::Ragged { .. }
-            | Attention::Voxel { .. }
-            | Attention::DecodeLse { .. }
-            | Attention::PrefillLse { .. }
-            | Attention::DecodeSelected { .. }
-            | Attention::PrefillSelected { .. }
-            | Attention::Sink { .. }
-            | Attention::MergeLse { .. }
-            | Attention::LogitSoftcap { .. }
-            | Attention::MlaPlan { .. }
-            | Attention::MlaLatents { .. }
-            | Attention::MlaLatentsRope { .. }
-            | Attention::MlaSplitQB { .. }
-            | Attention::MlaAbsorbQ { .. }
-            | Attention::MlaAbsorbOut { .. }
-            | Attention::MlaDecode { .. }
-            | Attention::MlaPrefill { .. }
-            | Attention::MlaDecodeSelected { .. }
-            | Attention::MlaPrefillSelected { .. }
-            | Attention::KvEnds { .. }
-            | Attention::WindowSink { .. }
-            | Attention::IndexLayernormRope { .. }
-            | Attention::IndexRope { .. }
-            | Attention::IndexTopk { .. }
-            | Attention::IndexBlockMean { .. }
-            | Attention::PoolBoundaryDecode { .. }
-            | Attention::PoolBoundaryPrefill { .. }
-            | Attention::PoolGather { .. }
-            | Attention::PoolLse { .. }
-            | Attention::PoolLseSelected { .. } => false,
+        Operation::Attn(op) => match op {
+            Attn::KvAppend { .. }
+            | Attn::KvAppendShared { .. }
+            | Attn::MlaKvAppend { .. }
+            | Attn::IndexKvAppend { .. }
+            | Attn::PoolKvAppend { .. }
+            | Attn::PoolStateWrite { .. } => true,
+            Attn::ReplayFloor { .. } => true,
+            Attn::PlanDecode { .. }
+            | Attn::PlanPrefill { .. }
+            | Attn::Decode { .. }
+            | Attn::Prefill { .. }
+            | Attn::DecodeRel { .. }
+            | Attn::PrefillRel { .. }
+            | Attn::Masked { .. }
+            | Attn::MaskedLse { .. }
+            | Attn::Dense { .. }
+            | Attn::Ragged { .. }
+            | Attn::Voxel { .. }
+            | Attn::DecodeLse { .. }
+            | Attn::PrefillLse { .. }
+            | Attn::DecodeSelected { .. }
+            | Attn::PrefillSelected { .. }
+            | Attn::Sink { .. }
+            | Attn::MergeLse { .. }
+            | Attn::LogitSoftcap { .. }
+            | Attn::MlaPlan { .. }
+            | Attn::MlaLatents { .. }
+            | Attn::MlaLatentsRope { .. }
+            | Attn::MlaSplitQB { .. }
+            | Attn::MlaAbsorbQ { .. }
+            | Attn::MlaAbsorbOut { .. }
+            | Attn::MlaDecode { .. }
+            | Attn::MlaPrefill { .. }
+            | Attn::MlaDecodeSelected { .. }
+            | Attn::MlaPrefillSelected { .. }
+            | Attn::KvEnds { .. }
+            | Attn::WindowSink { .. }
+            | Attn::IndexLayernormRope { .. }
+            | Attn::IndexRope { .. }
+            | Attn::IndexTopk { .. }
+            | Attn::IndexBlockMean { .. }
+            | Attn::PoolBoundaryDecode { .. }
+            | Attn::PoolBoundaryPrefill { .. }
+            | Attn::PoolGather { .. }
+            | Attn::PoolLse { .. }
+            | Attn::PoolLseSelected { .. } => false,
         },
         Operation::Fused(op) => matches!(
             op,
@@ -465,7 +465,7 @@ fn writes_cache(op: &Operation) -> bool {
         },
         Operation::Gather(Gather::NgramIds { .. } | Gather::NgramIdsChunked { .. }) => true,
         Operation::Linear(_)
-        | Operation::Elementwise(_)
+        | Operation::Elemwise(_)
         | Operation::Gather(_)
         | Operation::Collective(_)
         | Operation::Sampling(_) => false,
@@ -535,7 +535,7 @@ impl ClassTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{Attention, Elementwise};
+    use crate::ops::{Attn, Elemwise};
     use crate::{Dim, Dtype, Node, RuntimeInput, Ty, ValueDecl};
 
     struct Build {
@@ -598,7 +598,7 @@ mod tests {
             let node = self.trace.nodes.len() as u32;
             let y = self.value(Def::Op(node));
             self.trace.nodes.push(Node {
-                op: Elementwise::MulScalar {
+                op: Elemwise::MulScalar {
                     s: 2.0,
                     x,
                     x_out: y,
@@ -615,7 +615,7 @@ mod tests {
             let page = self.input();
             let offset = self.input();
             self.trace.nodes.push(Node {
-                op: Attention::KvAppendShared {
+                op: Attn::KvAppendShared {
                     plane: x,
                     cache,
                     write_page: page,

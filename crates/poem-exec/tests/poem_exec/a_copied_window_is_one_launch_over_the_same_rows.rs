@@ -4,15 +4,15 @@ use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, Lowering, Region, compile};
 use poem_exec::KernelError;
 use poem_exec::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchConv, DispatchElementwise, DispatchFused,
+    DispatchAttn, DispatchCollective, DispatchConv, DispatchElemwise, DispatchFused,
     DispatchGather, DispatchLinear, DispatchSampling, DispatchSsm,
 };
 use poem_exec::fire::{
     EventId, Filter, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk,
 };
 use poem_ir::{
-    Attention, Collective, Conv, Elementwise, Fused, Gather, Linear, Operands, Operation, Sampling,
-    Ssm, Trace,
+    Attn, Collective, Conv, Elemwise, Fused, Gather, Linear, Operands, Operation, Sampling, Ssm,
+    Trace,
 };
 
 const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -75,9 +75,9 @@ fn address<T>(value: &T) -> usize {
 
 fn payload(op: &Operation) -> usize {
     match op {
-        Operation::Attention(op) => address(op),
+        Operation::Attn(op) => address(op),
         Operation::Linear(op) => address(op),
-        Operation::Elementwise(op) => address(op),
+        Operation::Elemwise(op) => address(op),
         Operation::Gather(op) => address(op),
         Operation::Collective(op) => address(op),
         Operation::Sampling(op) => address(op),
@@ -87,8 +87,8 @@ fn payload(op: &Operation) -> usize {
     }
 }
 
-impl DispatchAttention for MockDispatch {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+impl DispatchAttn for MockDispatch {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.note(op)
     }
 }
@@ -97,8 +97,8 @@ impl DispatchLinear for MockDispatch {
         self.note(op)
     }
 }
-impl DispatchElementwise for MockDispatch {
-    fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
+impl DispatchElemwise for MockDispatch {
+    fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError> {
         self.note(op)
     }
 }

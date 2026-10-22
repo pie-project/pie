@@ -94,7 +94,7 @@ pub fn layernorm_rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_layernorm_rope";
+    const OP: &str = "attn.index_layernorm_rope";
     expect(OP, k, &[Dtype::Bf16])?;
     let hd = nonzero(OP, "the index key row's width", k.width)?;
     rotated(OP, rope_dim, hd)?;
@@ -150,7 +150,7 @@ pub fn rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_rope";
+    const OP: &str = "attn.index_rope";
     expect(OP, q, &[Dtype::Bf16])?;
     let h = nonzero(OP, "the head count this rotation states", heads)?;
     let hd = nonzero(OP, "the head width this rotation states", head_dim)?;
@@ -183,7 +183,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_kv_append";
+    const OP: &str = "attn.index_kv_append";
     expect(OP, k, &[Dtype::Bf16])?;
     if keys.page_size <= 0 {
         return Err(refuse(OP, "the kv page size is zero"));
@@ -226,7 +226,7 @@ pub fn block_mean(
     ratio: u32,
     entries: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_block_mean";
+    const OP: &str = "attn.index_block_mean";
     expect(OP, entries, &[Dtype::Bf16])?;
     if keys.page_size <= 0 {
         return Err(refuse(OP, "the index cache page size is zero"));
@@ -302,7 +302,7 @@ pub fn topk(
     ratio: u32,
     selection: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     expect(OP, q, &[Dtype::Bf16])?;
     expect(OP, selection, &[Dtype::I32])?;
     let h = nonzero(OP, "the head count this ranking states", heads)?;

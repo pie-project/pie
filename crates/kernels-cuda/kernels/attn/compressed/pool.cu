@@ -550,8 +550,7 @@ __global__ void __launch_bounds__(256) pool_compress(
         row[d] = f32_to_bf16(ob);
         local += ob * ob;
     }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    local = ::pie::warp_sum(local);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = local;
     __syncthreads();
     float total = 0.f;
@@ -586,8 +585,8 @@ __global__ void __launch_bounds__(256) pool_compress(
     const int off = cell % out_rows;
     if constexpr (FP8) {
         if (threadIdx.x < 32) {
-            ::pie::attn::dsv4::ds_store_warp(
-                row, ::pie::attn::dsv4::ds_row(static_cast<std::uint8_t*>(out_pages), page, off, out_rows),
+            ::pie::kv_rows::ds_store_warp(
+                row, ::pie::kv_rows::ds_row(static_cast<std::uint8_t*>(out_pages), page, off, out_rows),
                 static_cast<int>(threadIdx.x));
         }
     } else {

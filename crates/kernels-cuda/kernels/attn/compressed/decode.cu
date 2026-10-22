@@ -12,7 +12,7 @@
 // the two halves meet in shared memory and every warp keeps the same online
 // softmax over the whole tile. For O += P V warp w takes 64 columns.
 //
-// With formats WF and PF (`attn/dsv4_kv.cuh`; 0 is bf16) the window's and
+// With formats WF and PF (`prim/kv_rows.cuh`; 0 is bf16) the window's and
 // the pool's planes are DeepSeek's quantized rows: a tile's bytes land in a
 // staging ring and are widened to bf16 before the products, as FlashMLA
 // does on sm100. V4 keeps both planes in its fp8 rows; V4.1's FP4 cache its
@@ -31,7 +31,9 @@
 #include "prim/kv_rows.cuh"
 #include "prim/device.cuh"
 
-namespace pie::attn::dsv4 {
+namespace pie::attn::compressed {
+
+using namespace ::pie::kv_rows;
 
 constexpr int kGroup = 16;   // heads a block
 constexpr int kGroups = 4;   // blocks a row's 64 heads
@@ -574,4 +576,4 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     }
 }
 
-}  // namespace pie::attn::dsv4
+}  // namespace pie::attn::compressed

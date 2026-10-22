@@ -2,7 +2,7 @@ use engine_cuda::record::{BodyKey, Tiers};
 use engine_cuda::window::{Copies, Windows};
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
 use poem_exec::fire::{Composition, Lane, compose};
-use poem_ir::ops::Elementwise;
+use poem_ir::ops::Elemwise;
 
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
@@ -66,7 +66,14 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act());
         self.trace.nodes.push(Node {
-            op: Elementwise::LayernormNoScale { x, eps: 1e-6, y }.into(),
+            op: Elemwise::Layernorm {
+                x,
+                eps: 1e-6,
+                y,
+                weight: None,
+                bias: None,
+            }
+            .into(),
             guard,
             layer: None,
         });

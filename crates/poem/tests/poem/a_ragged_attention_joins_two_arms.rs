@@ -3,7 +3,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request, Selection,
     Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
-use poem_ir::{Attention, Def, Gather, GeomKind, Guard, Operation, RuntimeInput};
+use poem_ir::{Attn, Def, Gather, GeomKind, Guard, Operation, RuntimeInput};
 
 const AUDIO_WIDTH: u32 = 32;
 const VIDEO_WIDTH: u32 = 48;
@@ -89,9 +89,9 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &T
         .nodes
         .iter()
         .enumerate()
-        .find(|(_, node)| matches!(node.op, Operation::Attention(Attention::Ragged { .. })))
+        .find(|(_, node)| matches!(node.op, Operation::Attn(Attn::Ragged { .. })))
         .expect("the text holds the one ragged attention it was written for");
-    let Operation::Attention(Attention::Ragged {
+    let Operation::Attn(Attn::Ragged {
         head_dim,
         kv_heads,
         q_indptr,
@@ -180,7 +180,7 @@ fn every_other_op_still_refuses_two_arms() {
             .unwrap_or_default(),
     };
     assert!(
-        message.contains("elementwise.add") && message.contains("different split arms"),
+        message.contains("elemwise.add") && message.contains("different split arms"),
         "the refusal names the op and the rule: {message}"
     );
 }

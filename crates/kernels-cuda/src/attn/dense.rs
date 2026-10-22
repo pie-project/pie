@@ -36,7 +36,7 @@ pub fn bidirectional(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.dense";
+    const OP: &str = "attn.dense";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` reads q, k and v in one element");
     debug_assert_eq!(v.dtype, q.dtype, "`{OP}` reads q, k and v in one element");

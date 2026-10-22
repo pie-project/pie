@@ -17,7 +17,7 @@ use dtype::Dtype;
 
 use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
-use crate::linear::tc5;
+use crate::linear::gemm_sm100;
 use crate::tensor::Tensor;
 
 const ACT_QUANT: &str = "linear/act_quant.cu";
@@ -506,7 +506,7 @@ pub struct Weight {
     pub scales: u64,
     pub n: u32,
     pub k: u32,
-    pub elem: tc5::Elem,
+    pub elem: gemm_sm100::Elem,
     pub gran: u32,
     pub laid: bool,
 }
@@ -536,7 +536,7 @@ pub fn matmul(
         return Ok(());
     }
     let codes = ctx.scratch_stream(op, ACT_CODES, m as usize * fmt.row_bytes(k) as usize)?;
-    let atom_bytes = tc5::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
+    let atom_bytes = gemm_sm100::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
     let atoms = atoms_of(ctx, op, act_atoms(fmt), atom_bytes)?;
     quantize(ctx, op, fmt, act, codes as u64, atoms, atom_bytes)?;
     product(ctx, op, fmt, [codes as u64, atoms], m, w, y, alpha)
@@ -553,7 +553,7 @@ pub fn held_planes(ctx: &Ctx, op: &'static str, rows: u32, k: u32) -> Result<[u6
     let fmt = Format::E4m3 { gran: 128 };
     fmt.check(op, k)?;
     let codes = ctx.scratch_stream(op, HELD_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
-    let atom_bytes = tc5::atom_bytes(rows as usize, k as usize, 128);
+    let atom_bytes = gemm_sm100::atom_bytes(rows as usize, k as usize, 128);
     let atoms = ctx.scratch_stream_zeroed(op, HELD_ATOMS, atom_bytes)?;
     Ok([codes as u64, atoms as u64])
 }
@@ -602,19 +602,19 @@ fn product(
     let w_atoms = if w.laid {
         w.scales
     } else {
-        let bytes = tc5::atom_bytes(w.n as usize, k as usize, w.gran as usize);
+        let bytes = gemm_sm100::atom_bytes(w.n as usize, k as usize, w.gran as usize);
         let atoms = ctx.scratch_stream(op, WEIGHT_ATOMS, bytes)? as u64;
         scales_to_atoms(ctx, op, w.scales, atoms, w.n, k / w.gran, 1)?;
         atoms
     };
     let a_elem = match fmt {
-        Format::Nvfp4 => tc5::Elem::E2m1,
-        Format::E4m3 { .. } => tc5::Elem::E4m3,
+        Format::Nvfp4 => gemm_sm100::Elem::E2m1,
+        Format::E4m3 { .. } => gemm_sm100::Elem::E4m3,
     };
-    tc5::gemm(
+    gemm_sm100::gemm(
         ctx,
-        tc5::Operand::scaled(codes, a_elem, atoms, fmt.gran()),
-        tc5::Operand::scaled(w.codes, w.elem, w_atoms, w.gran),
+        gemm_sm100::Operand::scaled(codes, a_elem, atoms, fmt.gran()),
+        gemm_sm100::Operand::scaled(w.codes, w.elem, w_atoms, w.gran),
         y.ptr,
         [m, w.n, k],
         alpha,
@@ -632,7 +632,7 @@ pub struct Bank {
     pub experts: u32,
     pub n: u32,
     pub k: u32,
-    pub elem: tc5::Elem,
+    pub elem: gemm_sm100::Elem,
     pub gran: u32,
     pub alpha_e: u64,
     /// Where `alpha_e` comes from, when the select lays it: NVFP4's input
@@ -663,7 +663,7 @@ const FAN_TOKENS: u32 = 64;
 /// A select's experts start whole 128-row scale blocks apart when its
 /// activations carry block scales (the atoms it lands are whole blocks).
 pub(crate) const BLOCK_ROWS: u32 = 128;
-const _: () = assert!(BLOCK_ROWS.is_multiple_of(tc5::GROUP_ALIGN));
+const _: () = assert!(BLOCK_ROWS.is_multiple_of(gemm_sm100::GROUP_ALIGN));
 
 const ROUTE_COUNTS: &str = "linear.act_quant.route_counts";
 const ROUTE_OFFSETS: &str = "linear.act_quant.route_offsets";
@@ -720,9 +720,9 @@ pub fn select(
     } = layout;
     let (e, gran) = (experts as usize, fmt.gran() as usize);
     let atom_bytes = if m_max > 0 {
-        tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran)
+        gemm_sm100::masked_atom_bytes(e, m_max as usize, k as usize, gran)
     } else {
-        tc5::atom_bytes(rows as usize, k as usize, gran)
+        gemm_sm100::atom_bytes(rows as usize, k as usize, gran)
     };
     let codes = ctx.scratch_stream(op, ACT_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
     let atoms = atoms_of(ctx, op, act_atoms(fmt), atom_bytes)?;
@@ -740,15 +740,15 @@ pub fn select(
     quantize(ctx, op, fmt, src, codes as u64, atoms, atom_bytes)?;
     let grouped = ctx.scratch_stream(op, GROUPED_Y, rows as usize * n as usize * 2)? as u64;
     let a_elem = match fmt {
-        Format::Nvfp4 => tc5::Elem::E2m1,
-        Format::E4m3 { .. } => tc5::Elem::E4m3,
+        Format::Nvfp4 => gemm_sm100::Elem::E2m1,
+        Format::E4m3 { .. } => gemm_sm100::Elem::E4m3,
     };
-    tc5::grouped_gemm_epi(
+    gemm_sm100::grouped_gemm_epi(
         ctx,
-        tc5::Operand::scaled(codes as u64, a_elem, atoms, fmt.gran()),
-        tc5::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
+        gemm_sm100::Operand::scaled(codes as u64, a_elem, atoms, fmt.gran()),
+        gemm_sm100::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
         grouped,
-        tc5::Grouped {
+        gemm_sm100::Grouped {
             experts,
             groups,
             alpha_e: bank.alpha_e,
@@ -756,9 +756,9 @@ pub fn select(
         [n, k],
         1.0,
         // An expert's padding rows land nowhere.
-        tc5::Epilogue {
+        gemm_sm100::Epilogue {
             live_rows: layout.live_rows(),
-            ..tc5::Epilogue::STORE
+            ..gemm_sm100::Epilogue::STORE
         },
         count,
     )?;
@@ -776,7 +776,7 @@ pub fn select(
 pub(crate) struct Layout {
     pub pos: u64,
     pub rows: u32,
-    pub groups: tc5::Groups,
+    pub groups: gemm_sm100::Groups,
     pub m_max: u32,
     /// Each expert's live rows (`i32 [experts]`), the rest of a contiguous
     /// expert's block padding.
@@ -788,8 +788,8 @@ impl Layout {
     /// counts (a masked one's tiles already stop at them).
     pub(crate) fn live_rows(&self) -> u64 {
         match self.groups {
-            tc5::Groups::Contiguous { .. } => self.counts,
-            tc5::Groups::Masked { .. } => 0,
+            gemm_sm100::Groups::Contiguous { .. } => self.counts,
+            gemm_sm100::Groups::Masked { .. } => 0,
         }
     }
 }
@@ -892,7 +892,7 @@ pub(crate) fn lay_out_quant_nvfp4(
         pos,
         rows,
         // A router names an expert once a token.
-        groups: tc5::Groups::Contiguous {
+        groups: gemm_sm100::Groups::Contiguous {
             offsets,
             rows,
             cap: routes.rows,
@@ -942,7 +942,7 @@ pub(crate) fn lay_out_with(
             Layout {
                 pos,
                 rows: experts * m_max,
-                groups: tc5::Groups::Masked { counts, m_max },
+                groups: gemm_sm100::Groups::Masked { counts, m_max },
                 m_max,
                 counts,
             }
@@ -952,7 +952,7 @@ pub(crate) fn lay_out_with(
             Layout {
                 pos,
                 rows,
-                groups: tc5::Groups::Contiguous {
+                groups: gemm_sm100::Groups::Contiguous {
                     offsets,
                     rows,
                     cap: if distinct == Some(true) { tokens } else { 0 },
@@ -1315,7 +1315,7 @@ pub fn rmsnorm_act_quant_e4m3(
     y: &mut Tensor,
     planes: [u64; 2],
 ) -> Result<bool, Error> {
-    const OP: &str = "elementwise.rmsnorm_emit";
+    const OP: &str = "elemwise.rmsnorm_emit";
     if x.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
         || weight.dtype != Dtype::Bf16

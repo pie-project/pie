@@ -9,7 +9,7 @@ const FILE: &str = "norm/clip.slang";
 const GROUP: u32 = 256;
 
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp";
+    const OP: &str = "elemwise.clamp";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "clamp_bf16" });
 
     if !matches!(lo.partial_cmp(&hi), Some(Ordering::Less | Ordering::Equal)) {
@@ -28,7 +28,7 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp_learned";
+    const OP: &str = "elemwise.clamp_learned";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "clamp_learned_bf16" });
     for (what, bound) in [("lower", lo), ("upper", hi)] {
         if bound.dtype != x.dtype {

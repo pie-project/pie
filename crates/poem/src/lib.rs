@@ -20,10 +20,10 @@ pub use declare::*;
 pub use fact::Predicate;
 pub use forward::*;
 pub use poem_ir::{
-    Attention, BlockDrafter, CacheRow, Collective, Def, Dim, Dtype, Elementwise, GateActivation,
-    Gather, GeomKind, Guard, IndexScore, Linear, ModulateForm, MropeForm, Operands, Operation,
-    Param, ParamSource, PixelOrder, Platform, RaggedMask, RopeForm, RuntimeInput, Sampling,
-    Selection, Shard, Stream, TapKind, Trace, Ty, ValueId, VoxelSegment, resolve_classes,
+    Attn, BlockDrafter, CacheRow, Collective, Def, Dim, Dtype, Elemwise, GateActivation, Gather,
+    GeomKind, Guard, IndexScore, Linear, ModulateForm, MropeForm, Operands, Operation, Param,
+    ParamSource, PixelOrder, Platform, RaggedMask, RopeForm, RuntimeInput, Sampling, Selection,
+    Shard, Stream, TapKind, Trace, Ty, ValueId, VoxelSegment, resolve_classes,
 };
 pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, switch};
 

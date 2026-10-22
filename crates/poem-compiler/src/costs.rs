@@ -21,9 +21,9 @@ micros! {
     CondPerArmUs = "compiler.cond_per_arm_us", 0.6, "Each arm a conditional node adds, in microseconds.";
     FatRegionUs = "compiler.fat_region_us", 250.0, "A region long enough to leave unsplit, in microseconds.";
     ForkFloorUs = "compiler.fork_floor_us", 20.0, "The least work a side stream is forked for, in microseconds.";
-    AttentionUs = "compiler.cost.attention_us", 60.0, "An attention op, in microseconds.";
+    AttnUs = "compiler.cost.attn_us", 60.0, "An attn op, in microseconds.";
     LinearUs = "compiler.cost.linear_us", 40.0, "A matmul, in microseconds.";
-    ElementwiseUs = "compiler.cost.elementwise_us", 4.0, "An elementwise op, in microseconds.";
+    ElemwiseUs = "compiler.cost.elemwise_us", 4.0, "An elemwise op, in microseconds.";
     GatherUs = "compiler.cost.gather_us", 4.0, "A gather op, in microseconds.";
     CollectiveUs = "compiler.cost.collective_us", 50.0, "A collective, in microseconds.";
     SamplingUs = "compiler.cost.sampling_us", 4.0, "A sampling op, in microseconds.";
@@ -83,9 +83,9 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
         .add::<CondPerArmUs>()
         .add::<FatRegionUs>()
         .add::<ForkFloorUs>()
-        .add::<AttentionUs>()
+        .add::<AttnUs>()
         .add::<LinearUs>()
-        .add::<ElementwiseUs>()
+        .add::<ElemwiseUs>()
         .add::<GatherUs>()
         .add::<CollectiveUs>()
         .add::<SamplingUs>()
@@ -118,9 +118,9 @@ impl DeviceProfile {
             dag_streams_until: profile.get::<DagStreamsUntil>().0,
 
             family_us: FamilyCosts {
-                attention: us(profile.get::<AttentionUs>().0),
+                attn: us(profile.get::<AttnUs>().0),
                 linear: us(profile.get::<LinearUs>().0),
-                elementwise: us(profile.get::<ElementwiseUs>().0),
+                elemwise: us(profile.get::<ElemwiseUs>().0),
                 gather: us(profile.get::<GatherUs>().0),
                 collective: us(profile.get::<CollectiveUs>().0),
                 sampling: us(profile.get::<SamplingUs>().0),

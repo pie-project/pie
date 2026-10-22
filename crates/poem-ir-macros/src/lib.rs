@@ -22,16 +22,19 @@
 //!   `poem_ir::check::Expect`; the validator checks it under the field's
 //!   name.
 //! - `#[output(alias = f)]` says the output is input `f` updated in place.
+//! - `#[part]` marks a field holding operands on both sides (a sub-op, or an
+//!   attribute that reads one value and lands another): it implements
+//!   `poem_ir::operands::Part`.
 //!
 //! [`Operands`]: https://docs.rs/pie-poem-ir
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, Ident, LitStr, parse_macro_input};
 
-#[proc_macro_derive(Op, attributes(op, input, output))]
+#[proc_macro_derive(Op, attributes(op, input, output, part))]
 pub fn derive_op(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand(&input) {
@@ -40,9 +43,21 @@ pub fn derive_op(input: TokenStream) -> TokenStream {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Input,
+    Output,
+    /// A field that holds operands on both sides (`poem_ir::operands::Part`):
+    /// a sub-op, or an attribute that reads one value and lands another.
+    Part,
+}
+
 struct Operand {
     field: Ident,
-    output: bool,
+    kind: Kind,
+    /// A boxed sub-op (`Box<Op>` or `Option<Box<Op>>`): its variant is a
+    /// composite, whose parts pass values among themselves.
+    sub_op: bool,
     want: Option<Ident>,
     alias: Option<Ident>,
 }
@@ -77,13 +92,25 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         for field in fields {
             let ident = field.ident.clone().expect("named field");
             for attr in &field.attrs {
+                if attr.path().is_ident("part") {
+                    let ty = field.ty.to_token_stream().to_string().replace(' ', "");
+                    operands.push(Operand {
+                        field: ident.clone(),
+                        kind: Kind::Part,
+                        sub_op: ty.starts_with("Box<") || ty.starts_with("Option<Box<"),
+                        want: None,
+                        alias: None,
+                    });
+                    continue;
+                }
                 let output = attr.path().is_ident("output");
                 if !output && !attr.path().is_ident("input") {
                     continue;
                 }
                 let mut operand = Operand {
                     field: ident.clone(),
-                    output,
+                    kind: if output { Kind::Output } else { Kind::Input },
+                    sub_op: false,
                     want: None,
                     alias: None,
                 };
@@ -111,7 +138,9 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
         for operand in &operands {
             if let Some(alias) = &operand.alias
-                && !operands.iter().any(|o| !o.output && o.field == *alias)
+                && !operands
+                    .iter()
+                    .any(|o| o.kind == Kind::Input && o.field == *alias)
             {
                 return Err(syn::Error::new(
                     alias.span(),
@@ -134,20 +163,80 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         quote! { Self::#v { #(#fields,)* .. } => { #body } }
     };
 
-    let side = |output: bool| {
+    let side = |kind: Kind| {
         variants.iter().map(move |variant| {
-            let fields: Vec<&Ident> = variant
+            let ours: Vec<&Operand> = variant
                 .operands
                 .iter()
-                .filter(|o| o.output == output)
-                .map(|o| &o.field)
+                .filter(|o| o.kind == kind || o.kind == Kind::Part)
                 .collect();
-            let body = quote! { #(::poem_ir::operands::Slot::push(#fields, sink);)* };
-            arm(variant, body, fields.clone())
+            let fields: Vec<&Ident> = ours.iter().map(|o| &o.field).collect();
+            let body = ours.iter().map(|o| {
+                let field = &o.field;
+                match (o.kind, kind) {
+                    (Kind::Part, Kind::Input) => {
+                        quote! { ::poem_ir::operands::Part::inputs(#field, sink); }
+                    }
+                    (Kind::Part, _) => {
+                        quote! { ::poem_ir::operands::Part::outputs(#field, sink); }
+                    }
+                    _ => quote! { ::poem_ir::operands::Slot::push(#field, sink); },
+                }
+            });
+            arm(variant, quote! { #(#body)* }, fields)
         })
     };
-    let inputs = side(false);
-    let outputs = side(true);
+    // A variant with parts reads, in field order, each value no earlier part
+    // or output of its own made, once: what flows between its parts stays
+    // inside it.
+    let composite_inputs = |variant: &Variant| {
+        let fields: Vec<&Ident> = variant.operands.iter().map(|o| &o.field).collect();
+        let steps = variant.operands.iter().map(|o| {
+            let field = &o.field;
+            match o.kind {
+                Kind::Input => quote! {
+                    held.clear();
+                    ::poem_ir::operands::Slot::push(#field, &mut held);
+                    for id in held.drain(..) {
+                        if !made.contains(&id) && !sink[start..].contains(&id) {
+                            sink.push(id);
+                        }
+                    }
+                },
+                Kind::Part => quote! {
+                    held.clear();
+                    ::poem_ir::operands::Part::inputs(#field, &mut held);
+                    for id in held.drain(..) {
+                        if !made.contains(&id) && !sink[start..].contains(&id) {
+                            sink.push(id);
+                        }
+                    }
+                    ::poem_ir::operands::Part::outputs(#field, &mut made);
+                },
+                Kind::Output => quote! {
+                    ::poem_ir::operands::Slot::push(#field, &mut made);
+                },
+            }
+        });
+        let body = quote! {
+            let start = sink.len();
+            let mut made: Vec<::poem_ir::ValueId> = Vec::new();
+            let mut held: Vec<::poem_ir::ValueId> = Vec::new();
+            #(#steps)*
+        };
+        arm(variant, body, fields)
+    };
+    let inputs: Vec<TokenStream2> = side(Kind::Input)
+        .zip(&variants)
+        .map(|(plain, variant)| {
+            if variant.operands.iter().any(|o| o.sub_op) {
+                composite_inputs(variant)
+            } else {
+                plain
+            }
+        })
+        .collect();
+    let outputs = side(Kind::Output);
 
     let aliases = variants.iter().map(|variant| {
         let pairs: Vec<(&Ident, &Ident)> = variant
@@ -155,8 +244,18 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             .iter()
             .filter_map(|o| o.alias.as_ref().map(|a| (&o.field, a)))
             .collect();
+        let parts: Vec<&Ident> = variant
+            .operands
+            .iter()
+            .filter(|o| o.kind == Kind::Part)
+            .map(|o| &o.field)
+            .collect();
         let mut fields: Vec<&Ident> = Vec::new();
-        for field in pairs.iter().flat_map(|(o, i)| [*o, *i]) {
+        for field in pairs
+            .iter()
+            .flat_map(|(o, i)| [*o, *i])
+            .chain(parts.iter().copied())
+        {
             if !fields.contains(&field) {
                 fields.push(field);
             }
@@ -171,7 +270,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 }
             }
         });
-        arm(variant, quote! { #(#body)* }, fields)
+        let parts = parts
+            .iter()
+            .map(|p| quote! { ::poem_ir::operands::Part::aliases(#p, sink); });
+        arm(variant, quote! { #(#body)* #(#parts)* }, fields)
     });
 
     let names = variants.iter().map(|variant| {
@@ -185,7 +287,20 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             .iter()
             .filter(|o| o.want.is_some())
             .collect();
-        let fields: Vec<&Ident> = wanted.iter().map(|o| &o.field).collect();
+        let parts: Vec<&Ident> = variant
+            .operands
+            .iter()
+            .filter(|o| o.kind == Kind::Part)
+            .map(|o| &o.field)
+            .collect();
+        let fields: Vec<&Ident> = wanted
+            .iter()
+            .map(|o| &o.field)
+            .chain(parts.iter().copied())
+            .collect();
+        let parts = parts
+            .iter()
+            .map(|p| quote! { ::poem_ir::operands::Part::ports(#p, sink); });
         let body = wanted.iter().map(|o| {
             let field = &o.field;
             let want = o.want.as_ref().expect("filtered");
@@ -196,7 +311,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 });
             }
         });
-        arm(variant, quote! { #(#body)* }, fields)
+        arm(variant, quote! { #(#body)* #(#parts)* }, fields)
     });
 
     let empty = variants.is_empty().then(|| quote! { _ => unreachable!() });

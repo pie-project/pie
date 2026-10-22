@@ -388,8 +388,8 @@ impl Shell {
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attention(
-                        poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
+                    Some(poem_ir::Operation::Attn(
+                        poem_ir::Attn::Masked { .. } | poem_ir::Attn::MaskedLse { .. }
                     ))
                 )
             });

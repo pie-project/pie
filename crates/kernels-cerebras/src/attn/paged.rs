@@ -66,7 +66,7 @@ pub fn plan_decode(
 ) -> Result<DecodePlan, Error> {
     let _ = (ctx, kv_len);
     tables(
-        "attention.plan_decode",
+        "attn.plan_decode",
         positions,
         request_of_token,
         mask,
@@ -92,7 +92,7 @@ pub fn plan_prefill(
 ) -> Result<PrefillPlan, Error> {
     let _ = (ctx, kv_len);
     tables(
-        "attention.plan_prefill",
+        "attn.plan_prefill",
         positions,
         request_of_token,
         mask,
@@ -806,7 +806,7 @@ pub fn decode(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attention.decode",
+        "attn.decode",
         q,
         &t,
         t.mask,
@@ -835,7 +835,7 @@ pub fn decode_lse(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attention.decode_lse",
+        "attn.decode_lse",
         q,
         &t,
         t.mask,
@@ -872,7 +872,7 @@ pub fn prefill(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    const OP: &str = "attn.prefill";
     heads_agree(OP, pool, head_dim, kv_heads)?;
     let t = Tables::from(plan);
     attend(
@@ -892,7 +892,7 @@ pub fn prefill_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    const OP: &str = "attn.prefill_lse";
     heads_agree(OP, pool, head_dim, kv_heads)?;
     let t = Tables::from(plan);
     attend(
@@ -930,7 +930,7 @@ pub fn masked(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attention.masked",
+        "attn.masked",
         q.data,
         &t,
         mask,
@@ -961,7 +961,7 @@ pub fn masked_lse(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attention.masked_lse",
+        "attn.masked_lse",
         q.data,
         &t,
         mask,
@@ -994,7 +994,7 @@ pub fn decode_selected(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attention.decode_selected",
+        "attn.decode_selected",
         q,
         &t,
         t.mask,
@@ -1022,7 +1022,7 @@ pub fn prefill_selected(
     ratio: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_selected";
+    const OP: &str = "attn.prefill_selected";
     heads_agree(OP, pool, head_dim, kv_heads)?;
     let t = Tables::from(plan);
     attend(
@@ -1275,15 +1275,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    append(
-        ctx,
-        "attention.kv_append",
-        k,
-        v,
-        pool,
-        write_page,
-        write_offset,
-    )
+    append(ctx, "attn.kv_append", k, v, pool, write_page, write_offset)
 }
 
 /// [`kv_append`] for a pool whose keys and values alias one plane.
@@ -1296,7 +1288,7 @@ pub fn kv_append_shared(
 ) -> Result<(), Error> {
     append(
         ctx,
-        "attention.kv_append_shared",
+        "attn.kv_append_shared",
         plane,
         plane,
         pool,

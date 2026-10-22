@@ -23,7 +23,7 @@ pub fn merge_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.merge_lse";
+    const OP: &str = "attn.merge_lse";
     expect(OP, o, &[Dtype::Bf16])?;
     if u64::from(heads) * u64::from(head_dim) != u64::from(o.width) {
         return Err(refuse(

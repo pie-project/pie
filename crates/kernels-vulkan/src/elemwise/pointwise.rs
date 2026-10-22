@@ -9,7 +9,7 @@ const FILE: &str = "elemwise/pointwise.slang";
 const GROUP: [u32; 3] = [256, 1, 1];
 
 pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add";
+    const OP: &str = "elemwise.add";
     if x.dtype != z.dtype || y.dtype != z.dtype {
         return Err(refuse(
             OP,
@@ -26,7 +26,7 @@ pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
 }
 
 pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu";
+    const OP: &str = "elemwise.silu";
     let entry =
         dtype_dispatch!(OP, o.dtype, { Bf16 => "silu_scaled_bf16", F32 => "silu_scaled_f32" });
     let lanes = elementwise(OP, o.width, o.rows)?;
@@ -37,7 +37,7 @@ pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.tanh";
+    const OP: &str = "elemwise.tanh";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "tanh_bf16", F32 => "tanh_f32" });
     let lanes = elementwise(OP, o.width, o.rows)?;
     ctx.fire(
@@ -47,7 +47,7 @@ pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn cast_f32_to_bf16(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.cast";
+    const OP: &str = "elemwise.cast";
     if x.dtype != Dtype::F32 || o.dtype != Dtype::Bf16 {
         return Err(refuse(OP, format!("{:?} into {:?}", x.dtype, o.dtype)));
     }

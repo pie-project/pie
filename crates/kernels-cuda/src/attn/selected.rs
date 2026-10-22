@@ -289,7 +289,7 @@ pub fn attention_decode_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
-        "attention.decode_selected",
+        "attn.decode_selected",
         q,
         selection,
         pool,
@@ -319,7 +319,7 @@ pub fn attention_prefill_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
-        "attention.prefill_selected",
+        "attn.prefill_selected",
         q,
         selection,
         pool,

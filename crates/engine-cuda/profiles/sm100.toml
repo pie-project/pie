@@ -18,10 +18,10 @@ gemm.fp8_mma_k_until = 5120
 # DeepSeek-V4's attention: pool on mma.sync, prefill from 512 rows and
 # decode up to 64 in one launch, V4.1's bounded replay, its FP4 pass from 32.
 sdpa.pool_mma = true
-sdpa.dsv4_prefill_from = 512
-sdpa.dsv4_replay = true
-sdpa.dsv4_fp4_pass_from = 32
-sdpa.dsv4_decode_until = 64
+sdpa.compressed_prefill_from = 512
+sdpa.compressed_replay = true
+sdpa.compressed_fp4_pass_from = 32
+sdpa.compressed_decode_until = 64
 # GLM-5.3's DSA on tcgen05; a row under its selection size read dense.
 sdpa.mla_sparse = true
 sdpa.mla_dense_short = true

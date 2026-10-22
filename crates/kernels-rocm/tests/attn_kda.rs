@@ -1,4 +1,4 @@
-//! Kimi Delta Attention against a host reference: the staging (norms, gates)
+//! Kimi Delta Attn against a host reference: the staging (norms, gates)
 //! and the serial per-channel-decay recurrence in f64. The decode step (a
 //! block a row and head, and the tiled step), the token-by-token prefill and
 //! the chunk-parallel prefill, with commits, interior begins, fold masks,

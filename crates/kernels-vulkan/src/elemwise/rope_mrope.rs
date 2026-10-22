@@ -194,7 +194,7 @@ pub fn interleaved(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_mrope";
+    const OP: &str = "elemwise.rope_mrope";
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "rope_mrope_interleaved_bf16" });
     let geom = validate(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     both(
@@ -222,7 +222,7 @@ pub fn blocked(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_mrope";
+    const OP: &str = "elemwise.rope_mrope";
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "rope_mrope_blocked_bf16" });
     let geom = validate(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;
@@ -241,7 +241,7 @@ pub fn split(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_mrope";
+    const OP: &str = "elemwise.rope_mrope";
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "rope_mrope_split_bf16" });
     let geom = validate(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;

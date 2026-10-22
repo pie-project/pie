@@ -16,7 +16,7 @@ use crate::tensor::Tensor;
 
 pub const AXES: u32 = 3;
 
-const OP: &str = "elementwise.rope_mrope";
+const OP: &str = "elemwise.rope_mrope";
 
 /// One rotated pair of a head: lanes `lo` and `hi`, position axis `axis`,
 /// frequency `freq` (the angle is `position[axis] · freq`).

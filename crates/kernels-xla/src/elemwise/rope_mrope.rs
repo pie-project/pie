@@ -12,7 +12,7 @@ use super::rope::{Turn, heads, int_positions, inv_freq, rotate_all};
 
 pub const AXES: u32 = 3;
 
-const OP: &str = "elementwise.rope_mrope";
+const OP: &str = "elemwise.rope_mrope";
 
 fn validate(
     q: Tensor,

@@ -235,10 +235,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 .nodes
                 .get(region.nodes.start as usize)
                 .map_or("?", |node| poem_ir::Operands::name(&node.op));
-            if op.starts_with("attention.") || op.starts_with("ssm.") {
+            if op.starts_with("attn.") || op.starts_with("ssm.") {
                 streams.entry(region.stream).or_default().push(format!(
                     "r{at}:{}:{:?}",
-                    op.trim_start_matches("attention."),
+                    op.trim_start_matches("attn."),
                     region.mask.iter().collect::<Vec<_>>()
                 ));
             }
@@ -568,12 +568,12 @@ impl Shell {
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::tc5::supported() {
+        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::gemm_sm100::supported() {
             weights.requantize_grouped(&boot.trace, device.stream())?;
         }
         // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::tc5::supported() {
+        if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::gemm_sm100::supported() {
             weights.shadow_fp8_dense(&boot.trace, device.stream())?;
         }
         if boot.knobs.diagnostics.arm_trace {
@@ -1343,7 +1343,7 @@ fn decoded_weight_planes(
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))
                 }
-                poem_ir::Operation::Attention(_) | poem_ir::Operation::Ssm(_) => true,
+                poem_ir::Operation::Attn(_) | poem_ir::Operation::Ssm(_) => true,
                 _ => continue,
             };
             inputs.clear();
@@ -1363,7 +1363,7 @@ fn decoded_weight_planes(
             #[cfg(feature = "rocm")]
             let decoded = true;
             #[cfg(all(feature = "cuda", not(feature = "rocm")))]
-            let decoded = !kernels_cuda::linear::tc5::supported();
+            let decoded = !kernels_cuda::linear::gemm_sm100::supported();
             #[cfg(any(feature = "rocm", feature = "cuda"))]
             if decoded
                 && let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {

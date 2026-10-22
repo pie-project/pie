@@ -87,7 +87,7 @@ fn rms_row(
 pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -109,7 +109,7 @@ pub fn rmsnorm_per_head(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_per_head",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -130,7 +130,7 @@ pub fn rmsnorm_plus_one(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_plus_one",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -152,7 +152,7 @@ pub fn rmsnorm_per_head_plus_one(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_per_head_plus_one",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -172,7 +172,7 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
+    const OP: &str = "elemwise.rmsnorm";
     let axis = nonzero(OP, "the group width", group)?;
     if !x.width.is_multiple_of(axis) {
         return Err(refuse(
@@ -219,7 +219,7 @@ pub fn rmsnorm_no_scale(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_no_scale";
+    const OP: &str = "elemwise.rmsnorm";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "vnorm_single_row_bf16" });
     let grid = rms_grid(OP, x.width, head_dim, x.rows)?;
     ctx.fire(
@@ -269,7 +269,7 @@ pub fn rmsnorm_gated(
     sigmoid_gate: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated";
+    const OP: &str = "elemwise.rmsnorm_gated";
 
     let entry = if sigmoid_gate {
         dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_sigmoid_f32_bf16" })
@@ -289,7 +289,7 @@ pub fn rmsnorm_gated_by(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated_by";
+    const OP: &str = "elemwise.rmsnorm_gated_by";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_sigmoid_f32_bf16" });
     nonzero(OP, "the stated head count", heads)?;
     if x.width == 0 || !x.width.is_multiple_of(heads) {
@@ -305,7 +305,7 @@ pub fn rmsnorm_gated_by(
 }
 
 pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add";
+    const OP: &str = "elemwise.residual_add";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_bf16" });
     let lanes = elementwise(OP, y.width, y.rows)?;
     ctx.fire(
@@ -315,7 +315,7 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
 }
 
 pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add_bias";
+    const OP: &str = "elemwise.add_bias";
     let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "add_bias_bf16" });
     let lanes = elementwise(OP, out.width, out.rows)?;
     ctx.fire(
@@ -337,7 +337,7 @@ pub fn layernorm(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm";
+    const OP: &str = "elemwise.layernorm";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layernorm_bf16" });
     let grid = rms_grid(OP, x.width, x.width, x.rows)?;
     ctx.fire(
@@ -354,7 +354,7 @@ pub fn layernorm(
 }
 
 pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.standardize";
+    const OP: &str = "elemwise.standardize";
     let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "standardize_bf16" });
     let lanes = elementwise(OP, out.width, out.rows)?;
     for (what, plane) in [("bias", bias), ("scale", scale)] {
@@ -392,7 +392,7 @@ pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> R
 }
 
 pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul_scalar";
+    const OP: &str = "elemwise.mul_scalar";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_stated_bf16" });
     let lanes = elementwise(OP, x.width, x.rows)?;
     ctx.fire(
@@ -402,7 +402,7 @@ pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu_scaled";
+    const OP: &str = "elemwise.silu_scaled";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "silu_scaled_bf16" });
     let lanes = elementwise(OP, x.width, x.rows)?;
     ctx.fire(
@@ -412,7 +412,7 @@ pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.scale";
+    const OP: &str = "elemwise.scale";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_bf16" });
     let lanes = elementwise(OP, x.width, x.rows)?;
     ctx.fire(
@@ -432,7 +432,7 @@ pub fn res_blend(
     proj: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.res_blend";
+    const OP: &str = "elemwise.res_blend";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "res_blend_bf16" });
     if blocks.len() > MAX_BLEND_BLOCKS {
         return Err(refuse(

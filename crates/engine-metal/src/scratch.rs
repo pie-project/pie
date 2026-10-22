@@ -5,7 +5,7 @@ use kernels_metal::linear::quant;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attention, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -239,7 +239,7 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Attention(Attention::IndexTopk { selection, .. }) => of(*selection),
+                Operation::Attn(Attn::IndexTopk { selection, .. }) => of(*selection),
                 _ => None,
             })
             .map(|rect| u64::from(rect.rows))

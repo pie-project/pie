@@ -87,16 +87,7 @@ fn rms_row(
 }
 
 pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm",
-        x,
-        weight,
-        y,
-        eps,
-        x.width,
-        false,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", x, weight, y, eps, x.width, false)
 }
 
 pub fn rmsnorm_per_head(
@@ -107,16 +98,7 @@ pub fn rmsnorm_per_head(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_per_head",
-        x,
-        weight,
-        y,
-        eps,
-        head_dim,
-        false,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", x, weight, y, eps, head_dim, false)
 }
 
 pub fn rmsnorm_plus_one(
@@ -126,16 +108,7 @@ pub fn rmsnorm_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_plus_one",
-        x,
-        weight,
-        y,
-        eps,
-        x.width,
-        true,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", x, weight, y, eps, x.width, true)
 }
 
 pub fn rmsnorm_per_head_plus_one(
@@ -146,16 +119,7 @@ pub fn rmsnorm_per_head_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_per_head_plus_one",
-        x,
-        weight,
-        y,
-        eps,
-        head_dim,
-        true,
-    )
+    rms_row(ctx, "elemwise.rmsnorm", x, weight, y, eps, head_dim, true)
 }
 
 /// Norms each `group`-wide run on its own, and gains the whole row by a
@@ -168,7 +132,7 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
+    const OP: &str = "elemwise.rmsnorm";
     expect(OP, x, &[Dtype::Bf16])?;
     let bank = weight.width * weight.rows.max(1);
     if bank != x.width {
@@ -197,7 +161,7 @@ pub fn rmsnorm_no_scale(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_no_scale";
+    const OP: &str = "elemwise.rmsnorm";
     expect(OP, x, &[Dtype::Bf16])?;
     ctx.emit(&mut |cx| {
         let xv = cx.read_f32(x)?;
@@ -250,7 +214,7 @@ pub fn rmsnorm_gated(
     sigmoid_gate: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated";
+    const OP: &str = "elemwise.rmsnorm_gated";
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
     gated_rms(ctx, OP, x, gate, weight, vd, eps, sigmoid_gate, y)
 }
@@ -264,7 +228,7 @@ pub fn rmsnorm_gated_by(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated_by";
+    const OP: &str = "elemwise.rmsnorm_gated_by";
     nonzero(OP, "the stated head count", heads)?;
     if x.width == 0 || !x.width.is_multiple_of(heads) {
         return Err(refuse(
@@ -280,7 +244,7 @@ pub fn rmsnorm_gated_by(
 
 /// `y += x`.
 pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add";
+    const OP: &str = "elemwise.residual_add";
     expect(OP, y, &[Dtype::Bf16])?;
     ctx.emit(&mut |cx| {
         let a = cx.read_f32(x)?;
@@ -299,7 +263,7 @@ pub(crate) fn row_of(cx: &mut Cx<'_>, t: Tensor, rows: u32, width: u32) -> Resul
 
 /// `out += bias` per column.
 pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add_bias";
+    const OP: &str = "elemwise.add_bias";
     expect(OP, out, &[Dtype::Bf16, Dtype::F32])?;
     if bias.elements() != u64::from(out.width) {
         return Err(refuse(OP, "the bias is not one value per column"));
@@ -320,7 +284,7 @@ pub fn layernorm(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm";
+    const OP: &str = "elemwise.layernorm";
     expect(OP, x, &[Dtype::Bf16])?;
     ctx.emit(&mut |cx| {
         let xv = cx.read_f32(x)?;
@@ -352,7 +316,7 @@ pub(crate) fn centered(cx: &mut Cx<'_>, x: Val, eps: f32) -> Result<Val, Error> 
 
 /// `out = (out - bias) * scale` per column.
 pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.standardize";
+    const OP: &str = "elemwise.standardize";
     expect(OP, out, &[Dtype::Bf16])?;
     for (what, plane) in [("bias", bias), ("scale", scale)] {
         if plane.elements() != u64::from(out.width) {
@@ -378,7 +342,7 @@ pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> R
 /// `x *= s`, `s` rounded to `x`'s element first, as the stated scalar
 /// lands (kernels-cuda `elemwise::mul_scalar<T>`: bf16, f16, f32).
 pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul_scalar";
+    const OP: &str = "elemwise.mul_scalar";
     expect(OP, x, &[Dtype::Bf16, Dtype::F16, Dtype::F32])?;
     let s = match x.dtype {
         Dtype::Bf16 => f32::from_bits(u32::from(crate::hlo::bf16_bits(s)) << 16),
@@ -394,7 +358,7 @@ pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 
 /// `x = silu(x * s)`.
 pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu_scaled";
+    const OP: &str = "elemwise.silu_scaled";
     expect(OP, x, &[Dtype::Bf16])?;
     ctx.emit(&mut |cx| {
         let v = cx.read_f32(x)?;
@@ -406,7 +370,7 @@ pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 
 /// `x *= s[0]`, a device scalar.
 pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.scale";
+    const OP: &str = "elemwise.scale";
     expect(OP, x, &[Dtype::Bf16])?;
     ctx.emit(&mut |cx| {
         let sv = cx.read_f32(s)?;
@@ -424,7 +388,7 @@ pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
 /// `(x - mean) / sqrt(var + eps)` per row, no gain or bias. Reference:
 /// kernels-metal / kernels-cuda `layernorm_no_scale` (wgpu refuses it).
 pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm_no_scale";
+    const OP: &str = "elemwise.layernorm";
     expect(OP, x, &[Dtype::Bf16, Dtype::F16, Dtype::F32])?;
     if x.rows != y.rows || x.width != y.width {
         return Err(refuse(OP, "the normed row lands the rectangle it reads"));
@@ -447,7 +411,7 @@ pub(crate) fn scalar_of(cx: &mut Cx<'_>, s: Tensor) -> Result<Val, Error> {
 
 pub const MAX_BLEND_BLOCKS: usize = 32;
 
-/// Attention over depth: each candidate (every block, then the prefix) is
+/// Attn over depth: each candidate (every block, then the prefix) is
 /// rms-normed, gained by `weight` and dotted with `proj` into a logit; the
 /// softmax over candidates weights their sum. `blocks` are separate
 /// `[rows, hidden]` handles (the wgpu engine hands one stacked plane instead;
@@ -462,7 +426,7 @@ pub fn res_blend(
     proj: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.res_blend";
+    const OP: &str = "elemwise.res_blend";
     expect(OP, y, &[Dtype::Bf16])?;
     if blocks.len() > MAX_BLEND_BLOCKS {
         return Err(refuse(

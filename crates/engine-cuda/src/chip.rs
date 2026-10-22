@@ -520,12 +520,12 @@ mod tests {
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.mla_sparse, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
-                    tuning.dsv4_prefill_from,
+                    tuning.compressed_prefill_from,
                     if major == 10 && minor == 0 { 512 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.dsv4_decode_until,
+                    tuning.compressed_decode_until,
                     if major == 10 && minor == 0 { 64 } else { 0 },
                     "{gpu}"
                 );
@@ -585,7 +585,7 @@ mod tests {
                         ssm_conv_vec4: false,
                         ssm_gdn_out_bf16: false,
                         qg_prologue_until: 0,
-                        dsv4_decode_until: 0,
+                        compressed_decode_until: 0,
                         merge_warp: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
@@ -619,12 +619,12 @@ mod tests {
                         decode_xqa_cluster: 0,
                         decode_xqa_deep_64: false,
                         pool_mma: false,
-                        dsv4_prefill_from: 0,
+                        compressed_prefill_from: 0,
                         index_radix: false,
                         mla_sparse: false,
                         mla_dense_short: false,
-                        dsv4_replay: defaults.dsv4_replay,
-                        dsv4_fp4_pass_from: defaults.dsv4_fp4_pass_from,
+                        compressed_replay: defaults.compressed_replay,
+                        compressed_fp4_pass_from: defaults.compressed_fp4_pass_from,
                         gemm_fp8_grouped_tc5_until: defaults.gemm_fp8_grouped_tc5_until,
                         mxfp4_cvt: false,
                         mxfp4_a8_until: 0,
@@ -659,7 +659,7 @@ mod tests {
                         qg_prologue_until: 0,
                         merge_warp: false,
                         pool_mma: false,
-                        dsv4_decode_until: 0,
+                        compressed_decode_until: 0,
                         gemm_bias_epilogue: false,
                         gemm_rows_m: 0,
                         attn_res_fused_norm: false,

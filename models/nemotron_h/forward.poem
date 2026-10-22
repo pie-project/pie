@@ -103,9 +103,9 @@ def moe(x, m, f):
     # Super's and Ultra's experts read the residual squeezed to the latent
     # width; Nano's read it whole.
     z = ops.linear.matmul(x, f.down_latent) if f.down_latent != None else x
-    hidden = ops.linear.mlp_relu2(select(z, f.up, routes, m.top_k))
+    hidden = ops.linear.relu2(select(z, f.up, routes, m.top_k))
     routed = ops.linear.moe_weighted_sum(select(hidden, f.down, routes, m.top_k), weights)
-    shared = ops.linear.matmul(ops.linear.mlp_relu2(ops.linear.matmul(x, f.shared_up)), f.shared_down)
+    shared = ops.linear.matmul(ops.linear.relu2(ops.linear.matmul(x, f.shared_up)), f.shared_down)
     if f.up_latent != None:
         routed = ops.linear.matmul(routed, f.up_latent)
     return ops.elemwise.residual_add(routed, shared)

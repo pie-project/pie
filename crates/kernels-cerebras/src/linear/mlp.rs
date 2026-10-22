@@ -9,7 +9,7 @@ use crate::program::Shard;
 use crate::tensor::Tensor;
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu";
+    const OP: &str = "linear.swiglu";
     expect(OP, packed, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
     if packed.width != 2 * intermediate || y.width != intermediate || y.rows > packed.rows {
@@ -77,7 +77,7 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
 
 /// `y = ½x(1 + tanh(√(2/π)(x + 0.044715x³)))`, element for element.
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_gelu_tanh";
+    const OP: &str = "linear.gelu_tanh";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
     if y.width != x.width || y.rows > x.rows {

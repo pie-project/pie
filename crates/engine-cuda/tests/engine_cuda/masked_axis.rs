@@ -1,5 +1,5 @@
 use poem::Platform;
-use poem_ir::{Attention, Operation, Trace};
+use poem_ir::{Attn, Operation, Trace};
 
 fn carries_a_head(deployment: &str) -> bool {
     poem_compiler::catalog::repository()
@@ -14,7 +14,7 @@ fn masked_arms(trace: &Trace) -> usize {
         .filter(|node| {
             matches!(
                 node.op,
-                Operation::Attention(Attention::Masked { .. } | Attention::MaskedLse { .. })
+                Operation::Attn(Attn::Masked { .. } | Attn::MaskedLse { .. })
             )
         })
         .count()
@@ -65,13 +65,13 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
             DECLARE.iter().any(|family| deployment.starts_with(family))
                 || carries_a_head(deployment)
         }),
-        "a family beyond gemma and qwen declares `attention.masked` from its \
+        "a family beyond gemma and qwen declares `attn.masked` from its \
          own text — not from an overlaid drafter head — and the device gates \
          in this file were written against gemma: {declaring:?}"
     );
     assert!(
         !declaring.is_empty(),
-        "no deployment declares `attention.masked` at all, and then the axis has no \
+        "no deployment declares `attn.masked` at all, and then the axis has no \
          model text to be exercised by"
     );
 
@@ -80,7 +80,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
             declaring
                 .iter()
                 .any(|(deployment, _)| deployment.starts_with(family)),
-            "no `{family}*` deployment declares `attention.masked` any more, so the \
+            "no `{family}*` deployment declares `attn.masked` any more, so the \
              axis lost a family: {declaring:?}"
         );
     }
@@ -92,7 +92,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
             .collect();
         assert!(
             grew.is_empty(),
-            "`{family}*` grew an `attention.masked` arm in its own text, and a \
+            "`{family}*` grew an `attn.masked` arm in its own text, and a \
              kernel gap was written down as the reason it could not have one — \
              the note and the text now disagree: {grew:?}"
         );
@@ -108,7 +108,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     assert!(
         maskless.iter().any(|deployment| deployment == MASKLESS_RIG),
         "`{MASKLESS_RIG}` is either gone from the catalog or bakes an \
-         `attention.masked` arm, and it is the artifact the maskless rig boots \
+         `attn.masked` arm, and it is the artifact the maskless rig boots \
          to watch a maskless model refuse a mask — pick another row that is \
          genuinely maskless and name it here: {maskless:?}"
     );

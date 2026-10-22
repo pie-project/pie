@@ -80,7 +80,7 @@ pub fn full(
     theta: f32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_full";
+    const OP: &str = "elemwise.rope_full";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -137,7 +137,7 @@ pub fn partial(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial";
+    const OP: &str = "elemwise.rope_partial";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -155,7 +155,7 @@ pub fn partial_q(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial_q";
+    const OP: &str = "elemwise.rope_partial_q";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
     let k = Tensor::new(q.ptr, q.rows, 0, q.dtype);
@@ -182,7 +182,7 @@ pub fn partial_last(
     inverse: bool,
     yarn: Option<Yarn>,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial_last";
+    const OP: &str = "elemwise.rope_partial_last";
     let (factor, low_dim, high_dim) = match yarn {
         Some(y) => {
             let max_position = nonzero(
@@ -274,7 +274,7 @@ pub fn yarn(
         attention_factor,
         interleaved,
     } = r;
-    const OP: &str = "elementwise.rope_yarn";
+    const OP: &str = "elemwise.rope_yarn";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -397,7 +397,7 @@ pub fn rope_axes(
     head_dim: u32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_axes";
+    const OP: &str = "elemwise.rope_axes";
     dtype_dispatch!(OP, x.dtype, { Bf16 => (), F16 => () });
     debug_assert!(
         x.rows == o.rows && x.width == o.width && x.dtype == o.dtype,
@@ -534,7 +534,7 @@ fn fire_axes(
     rows: u32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_axes";
+    const OP: &str = "elemwise.rope_axes";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ctx.fire(
         OP,
@@ -634,7 +634,7 @@ pub fn split(
 ) -> Result<(), Error> {
     if sections.iter().all(|&s| s == 0) {
         return Err(refuse(
-            "elementwise.rope_mrope",
+            "elemwise.rope_mrope",
             format!(
                 "the sections {sections:?} name no frequency pair, and a split rotation \
                  turns each axis by the pairs its section holds"
@@ -666,7 +666,7 @@ fn fire_mrope(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_mrope";
+    const OP: &str = "elemwise.rope_mrope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
 

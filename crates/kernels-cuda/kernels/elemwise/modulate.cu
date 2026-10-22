@@ -387,8 +387,7 @@ __device__ __forceinline__ void res_blend_body(
                 }
             }
         }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+        ss = ::pie::warp_sum(ss);
         if (lane == 0) part[warp][0] = ss;
         __syncthreads();
         float total = 0.f;

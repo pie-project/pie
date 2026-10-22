@@ -17,7 +17,7 @@ pub fn plan_decode(
     let r = kv_indptr.rec();
     let plan = r.fresh(Ty::Struct(StructKind::AttnDecodePlan));
     r.push(
-        Attention::PlanDecode {
+        Attn::PlanDecode {
             kv_indptr: kv_indptr.id(),
             kv_indices: kv_indices.id(),
             last_page_len: last_page_len.id(),
@@ -47,7 +47,7 @@ pub fn plan_prefill(
     let r = kv_indptr.rec();
     let plan = r.fresh(Ty::Struct(StructKind::AttnPrefillPlan));
     r.push(
-        Attention::PlanPrefill {
+        Attn::PlanPrefill {
             kv_indptr: kv_indptr.id(),
             kv_indices: kv_indices.id(),
             last_page_len: last_page_len.id(),
@@ -74,7 +74,7 @@ pub fn decode(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::Decode {
+        Attn::Decode {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -100,7 +100,7 @@ pub fn prefill(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::Prefill {
+        Attn::Prefill {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -130,7 +130,7 @@ pub fn decode_selected(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::DecodeSelected {
+        Attn::DecodeSelected {
             q: q.id(),
             plan: plan.id(),
             selection: selection.id(),
@@ -163,7 +163,7 @@ pub fn prefill_selected(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::PrefillSelected {
+        Attn::PrefillSelected {
             q: q.id(),
             plan: plan.id(),
             selection: selection.id(),
@@ -197,7 +197,7 @@ pub fn decode_rel(
     let o = r.fresh(q.ty().clone());
     let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
     r.push(
-        Attention::DecodeRel {
+        Attn::DecodeRel {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -232,7 +232,7 @@ pub fn prefill_rel(
     let o = r.fresh(q.ty().clone());
     let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
     r.push(
-        Attention::PrefillRel {
+        Attn::PrefillRel {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -265,7 +265,7 @@ pub fn masked(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::Masked {
+        Attn::Masked {
             q: q.id(),
             plan: plan.id(),
             mask: mask.id(),
@@ -302,7 +302,7 @@ pub fn masked_lse(
         Dtype::F32,
     ));
     r.push(
-        Attention::MaskedLse {
+        Attn::MaskedLse {
             q: q.id(),
             plan: plan.id(),
             mask: mask.id(),
@@ -336,7 +336,7 @@ pub fn decode_lse(
         Dtype::F32,
     ));
     r.push(
-        Attention::DecodeLse {
+        Attn::DecodeLse {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -370,7 +370,7 @@ pub fn prefill_lse(
         Dtype::F32,
     ));
     r.push(
-        Attention::PrefillLse {
+        Attn::PrefillLse {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -390,14 +390,14 @@ pub fn prefill_lse(
     (o, lse)
 }
 
-/// Bounded replay's floor (`attention.replay_floor`): with `mark` the rows
+/// Bounded replay's floor (`attn.replay_floor`): with `mark` the rows
 /// of `positions` are ones a replaying layer skips, and their lane's state
 /// takes the position past them; without, each row's floor from its lane's.
 pub fn replay_floor(positions: &Value, state: ValueId, mark: bool) -> Value {
     let r = positions.rec();
     let floor = r.fresh(positions.ty().clone());
     r.push(
-        Attention::ReplayFloor {
+        Attn::ReplayFloor {
             positions: positions.id(),
             state,
             mark,
@@ -412,7 +412,7 @@ pub fn sink(o: &Value, lse: &Value, sink: &Weight, head_dim: u32) -> Value {
     let r = o.rec();
     let o_out = r.fresh(o.ty().clone());
     r.push(
-        Attention::Sink {
+        Attn::Sink {
             o: o.id(),
             lse: lse.id(),
             sink: r.weight(sink),
@@ -436,7 +436,7 @@ pub fn merge_lse(
     let o = r.fresh(o1.ty().clone());
     let lse = r.fresh(lse1.ty().clone());
     r.push(
-        Attention::MergeLse {
+        Attn::MergeLse {
             o1: o1.id(),
             lse1: lse1.id(),
             o2: o2.id(),
@@ -455,7 +455,7 @@ pub fn logit_softcap(x: &Value, cap: f32) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Attention::LogitSoftcap {
+        Attn::LogitSoftcap {
             x: x.id(),
             cap,
             x_out: x_out.id(),
@@ -468,7 +468,7 @@ pub fn logit_softcap(x: &Value, cap: f32) -> Value {
 pub fn kv_append(k: &Value, v: &Value, pages: ValueId, write_page: &Value, write_offset: &Value) {
     let r = k.rec();
     r.push(
-        Attention::KvAppend {
+        Attn::KvAppend {
             k: k.id(),
             v: v.id(),
             cache: pages,
@@ -482,7 +482,7 @@ pub fn kv_append(k: &Value, v: &Value, pages: ValueId, write_page: &Value, write
 pub fn kv_append_shared(plane: &Value, pages: ValueId, write_page: &Value, write_offset: &Value) {
     let r = plane.rec();
     r.push(
-        Attention::KvAppendShared {
+        Attn::KvAppendShared {
             plane: plane.id(),
             cache: pages,
             write_page: write_page.id(),
@@ -492,12 +492,12 @@ pub fn kv_append_shared(plane: &Value, pages: ValueId, write_page: &Value, write
     );
 }
 
-/// Each row's lane's last key position in `pages` (`attention.kv_ends`).
+/// Each row's lane's last key position in `pages` (`attn.kv_ends`).
 pub fn kv_ends(request_of_token: &Value, pages: ValueId) -> Value {
     let r = request_of_token.rec();
     let ends = r.fresh(tensor(request_of_token.rows(), 1u64, Dtype::I32));
     r.push(
-        Attention::KvEnds {
+        Attn::KvEnds {
             request_of_token: request_of_token.id(),
             cache: pages,
             ends: ends.id(),
@@ -508,7 +508,7 @@ pub fn kv_ends(request_of_token: &Value, pages: ValueId) -> Value {
 }
 
 /// DeepSeek's window attention with its sinks, each row reading the
-/// `window` positions that end at its `positions` (`attention.window_sink`).
+/// `window` positions that end at its `positions` (`attn.window_sink`).
 #[allow(clippy::too_many_arguments)]
 pub fn window_sink(
     q: &Value,
@@ -523,7 +523,7 @@ pub fn window_sink(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::WindowSink {
+        Attn::WindowSink {
             q: q.id(),
             positions: positions.id(),
             request_of_token: request_of_token.id(),
@@ -547,7 +547,7 @@ pub fn mla_plan(inputs: &Input, heads: u32, kv_lora_rank: u32) -> Value {
     let r = kv_indptr.rec();
     let plan = r.fresh(Ty::Struct(StructKind::MlaPlan));
     r.push(
-        Attention::MlaPlan {
+        Attn::MlaPlan {
             kv_indptr: kv_indptr.id(),
             kv_indices: kv_indices.id(),
             last_page_len: last_page_len.id(),
@@ -582,7 +582,7 @@ pub fn mla_latents(kv_a: &Value, norm: &Weight, eps: f32, kv_lora_rank: u32) -> 
         kv_a.dtype(),
     ));
     r.push(
-        Attention::MlaLatents {
+        Attn::MlaLatents {
             kv_a: kv_a.id(),
             weight: r.weight(norm),
             eps,
@@ -612,7 +612,7 @@ pub fn mla_latents_rope(
         kv_a.dtype(),
     ));
     r.push(
-        Attention::MlaLatentsRope {
+        Attn::MlaLatentsRope {
             kv_a: kv_a.id(),
             positions: positions.id(),
             weight: r.weight(norm),
@@ -642,7 +642,7 @@ pub fn mla_split_q_b(q_b: &Value, heads: u32, nope_dim: u32, rope_dim: u32) -> (
         q_b.dtype(),
     ));
     r.push(
-        Attention::MlaSplitQB {
+        Attn::MlaSplitQB {
             q_b: q_b.id(),
             heads,
             nope_dim,
@@ -667,7 +667,7 @@ pub fn mla_absorb_q(
     let width = u64::from(heads) * u64::from(kv_lora_rank);
     let q_latent = r.fresh(tensor(q_nope.rows(), width, q_nope.dtype()));
     r.push(
-        Attention::MlaAbsorbQ {
+        Attn::MlaAbsorbQ {
             q_nope: q_nope.id(),
             kv_b: r.weight(kv_b),
             heads,
@@ -693,7 +693,7 @@ pub fn mla_absorb_out(
     let width = u64::from(heads) * u64::from(v_head_dim);
     let o = r.fresh(tensor(latent.rows(), width, latent.dtype()));
     r.push(
-        Attention::MlaAbsorbOut {
+        Attn::MlaAbsorbOut {
             latent: latent.id(),
             kv_b: r.weight(kv_b),
             heads,
@@ -716,7 +716,7 @@ pub fn mla_kv_append(
 ) {
     let r = kv_c.rec();
     r.push(
-        Attention::MlaKvAppend {
+        Attn::MlaKvAppend {
             kv_c: kv_c.id(),
             k_pe: k_pe.id(),
             cache: pages,
@@ -750,7 +750,7 @@ fn mla_scored(
     let (q_id, plan_id, q_pe_id, o_id) = (q.id(), plan.id(), q_pe.id(), o.id());
     let lse_id = lse.as_ref().map(Value::id);
     let op = match (selection, decode) {
-        (None, true) => Attention::MlaDecode {
+        (None, true) => Attn::MlaDecode {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
@@ -762,7 +762,7 @@ fn mla_scored(
             o: o_id,
             lse: lse_id,
         },
-        (None, false) => Attention::MlaPrefill {
+        (None, false) => Attn::MlaPrefill {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
@@ -774,7 +774,7 @@ fn mla_scored(
             o: o_id,
             lse: lse_id,
         },
-        (Some(selection), true) => Attention::MlaDecodeSelected {
+        (Some(selection), true) => Attn::MlaDecodeSelected {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
@@ -786,7 +786,7 @@ fn mla_scored(
             o: o_id,
             lse: lse_id,
         },
-        (Some(selection), false) => Attention::MlaPrefillSelected {
+        (Some(selection), false) => Attn::MlaPrefillSelected {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
@@ -1039,7 +1039,7 @@ pub fn index_layernorm_rope(
     let r = k.rec();
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Attention::IndexLayernormRope {
+        Attn::IndexLayernormRope {
             k: k.id(),
             positions: positions.id(),
             weight: r.weight(norm),
@@ -1065,7 +1065,7 @@ pub fn index_rope(
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     r.push(
-        Attention::IndexRope {
+        Attn::IndexRope {
             q: q.id(),
             positions: positions.id(),
             heads,
@@ -1101,7 +1101,7 @@ pub fn index_topk(
     let mut deps = vec![q];
     deps.extend(weights);
     r.push(
-        Attention::IndexTopk {
+        Attn::IndexTopk {
             q: q.id(),
             weights: weights.map(Value::id),
             keys,
@@ -1128,7 +1128,7 @@ pub fn index_block_mean(
     let r = boundary_pos.rec();
     let entries = r.fresh(tensor(boundary_pos.rows(), head_dim, dtype));
     r.push(
-        Attention::IndexBlockMean {
+        Attn::IndexBlockMean {
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
             keys,
@@ -1144,7 +1144,7 @@ pub fn index_block_mean(
 pub fn index_kv_append(k: &Value, keys: ValueId, write_page: &Value, write_offset: &Value) {
     let r = k.rec();
     r.push(
-        Attention::IndexKvAppend {
+        Attn::IndexKvAppend {
             k: k.id(),
             keys,
             write_page: write_page.id(),
@@ -1164,7 +1164,7 @@ pub fn pool_boundary_decode(
     let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     r.push(
-        Attention::PoolBoundaryDecode {
+        Attn::PoolBoundaryDecode {
             positions: positions.id(),
             row_valid: row_valid.id(),
             ratio,
@@ -1187,7 +1187,7 @@ pub fn pool_boundary_prefill(
     let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     r.push(
-        Attention::PoolBoundaryPrefill {
+        Attn::PoolBoundaryPrefill {
             positions: positions.id(),
             row_valid: row_valid.id(),
             ratio,
@@ -1212,7 +1212,7 @@ pub fn pool_gather(
     let r = boundary_pos.rec();
     let entries = r.fresh(tensor(Dim::Tokens, head_dim, dtype));
     r.push(
-        Attention::PoolGather {
+        Attn::PoolGather {
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
             pages,
@@ -1237,7 +1237,7 @@ pub fn pool_state_write(
 ) {
     let r = kv.rec();
     r.push(
-        Attention::PoolStateWrite {
+        Attn::PoolStateWrite {
             kv: kv.id(),
             score: score.id(),
             pages,
@@ -1260,7 +1260,7 @@ pub fn pool_kv_append(
 ) {
     let r = entries.rec();
     r.push(
-        Attention::PoolKvAppend {
+        Attn::PoolKvAppend {
             entries: entries.id(),
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
@@ -1292,7 +1292,7 @@ pub fn pool_lse(
     let o = r.fresh(q.ty().clone());
     let lse = r.fresh(tensor(q.rows(), heads, Dtype::F32));
     r.push(
-        Attention::PoolLse {
+        Attn::PoolLse {
             q: q.id(),
             positions: positions.id(),
             request_of_token: request_of_token.id(),
@@ -1326,7 +1326,7 @@ pub fn pool_lse_selected(
     let o = r.fresh(q.ty().clone());
     let lse = r.fresh(tensor(q.rows(), heads, Dtype::F32));
     r.push(
-        Attention::PoolLseSelected {
+        Attn::PoolLseSelected {
             q: q.id(),
             positions: positions.id(),
             request_of_token: request_of_token.id(),
@@ -1376,7 +1376,7 @@ pub fn ragged(
     assert_eq!(k.rows(), v.rows(), "k and v share a row space");
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::Ragged {
+        Attn::Ragged {
             q: q.id(),
             k: k.id(),
             v: v.id(),
@@ -1433,7 +1433,7 @@ pub fn dense(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::Dense {
+        Attn::Dense {
             q: q.id(),
             k: k.id(),
             v: v.id(),
@@ -1478,7 +1478,7 @@ pub fn voxel_over(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attention::Voxel {
+        Attn::Voxel {
             q: q.id(),
             k: k.id(),
             v: v.id(),

@@ -174,7 +174,7 @@ pub fn boundary_decode(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attention.pool_boundary_decode",
+        "attn.pool_boundary_decode",
         positions,
         request_of_token,
         row_valid,
@@ -197,7 +197,7 @@ pub fn boundary_prefill(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attention.pool_boundary_prefill",
+        "attn.pool_boundary_prefill",
         positions.data,
         request_of_token,
         row_valid,
@@ -225,7 +225,7 @@ pub fn state_write(
     state_kv: Tensor,
     state_score: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_state_write";
+    const OP: &str = "attn.pool_state_write";
     expect(OP, kv, &[Dtype::Bf16])?;
     if pages.page_size <= 0 {
         return Err(refuse(OP, "the source pool's page size is zero"));
@@ -303,7 +303,7 @@ pub fn gather(
     ape: Option<Tensor>,
     entries: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_gather";
+    const OP: &str = "attn.pool_gather";
     expect(OP, entries, &[Dtype::Bf16])?;
     let hd = nonzero(OP, "the head width this gather states", head_dim)?;
     if hd != entries.width {
@@ -464,7 +464,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     let _ = (write_page, write_offset);
     expect(OP, entries, &[Dtype::Bf16])?;
     let rows = nonzero(OP, "rows", entries.rows)?;
@@ -757,7 +757,7 @@ pub fn attention_lse(
 ) -> Result<(), Error> {
     reader(
         ctx,
-        "attention.pool_lse",
+        "attn.pool_lse",
         q,
         positions,
         request_of_token,
@@ -790,7 +790,7 @@ pub fn attention_lse_selected(
 ) -> Result<(), Error> {
     reader(
         ctx,
-        "attention.pool_lse_selected",
+        "attn.pool_lse_selected",
         q,
         positions,
         request_of_token,

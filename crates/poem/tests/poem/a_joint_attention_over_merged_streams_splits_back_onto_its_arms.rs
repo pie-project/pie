@@ -3,7 +3,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Stream, Value, Weight,
     ops, seam, trace_hybrid,
 };
-use poem_ir::{Attention, Def, Elementwise, GeomKind, Guard, Operation, RuntimeInput, Selection};
+use poem_ir::{Attn, Def, Elemwise, GeomKind, Guard, Operation, RuntimeInput, Selection};
 
 const WIDTH: u32 = 32;
 const HEAD_DIM: u32 = 8;
@@ -70,14 +70,14 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let ragged = trace
         .nodes
         .iter()
-        .find(|node| matches!(node.op, Operation::Attention(Attention::Ragged { .. })))
+        .find(|node| matches!(node.op, Operation::Attn(Attn::Ragged { .. })))
         .expect("one joint attention");
     assert!(
         ragged
             .guard
             .equivalent(&Guard::or(text.clone(), image.clone()))
     );
-    let Operation::Attention(Attention::Ragged {
+    let Operation::Attn(Attn::Ragged {
         q_indptr,
         kv_indptr,
         mask,
@@ -102,12 +102,7 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let folds: Vec<&Guard> = trace
         .nodes
         .iter()
-        .filter(|node| {
-            matches!(
-                node.op,
-                Operation::Elementwise(Elementwise::ResidualAdd { .. })
-            )
-        })
+        .filter(|node| matches!(node.op, Operation::Elemwise(Elemwise::ResidualAdd { .. })))
         .map(|node| &node.guard)
         .collect();
     assert_eq!(

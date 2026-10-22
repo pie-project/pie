@@ -7,7 +7,7 @@ use crate::common::linear_ref::{Bench, TOL, affine, check, dot, glu_want, pick, 
 use crate::common::tc5::Side;
 use crate::common::{captured, forget, replay};
 use kernels_cuda::Ctx;
-use kernels_cuda::linear::tc5::{
+use kernels_cuda::linear::gemm_sm100::{
     Elem, Epilogue, Glu, Grouped, Groups, Operand, Plan, gemm_epi_with, gemm_with,
     grouped_gemm_epi_with, supported,
 };

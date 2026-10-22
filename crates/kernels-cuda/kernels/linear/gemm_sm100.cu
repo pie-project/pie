@@ -1424,10 +1424,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         float m = live ? fabsf(h[j]) : 0.f;
-#pragma unroll
-                        for (int d = 16; d > 0; d >>= 1) {
-                            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d));
-                        }
+                        m = ::pie::warp_max(m);
                         mine = lane == static_cast<u32>(j) ? m : mine;
                     }
                     asm volatile("bar.sync 1, 128;" ::: "memory");

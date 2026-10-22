@@ -61,11 +61,11 @@ pub(super) fn bank_operand(
     x: Tensor,
     bank: GluBank,
     n: u32,
-) -> Option<(crate::linear::tc5::Operand, u32, u64, u64, Dtype)> {
-    use crate::linear::tc5;
+) -> Option<(crate::linear::gemm_sm100::Operand, u32, u64, u64, Dtype)> {
+    use crate::linear::gemm_sm100;
     Some(match bank {
         GluBank::Bf16(b) => (
-            tc5::Operand::plain(b.ptr, tc5::Elem::Bf16),
+            gemm_sm100::Operand::plain(b.ptr, gemm_sm100::Elem::Bf16),
             b.rows,
             0,
             0,
@@ -76,7 +76,7 @@ pub(super) fn bank_operand(
             scales,
             bias,
         } => (
-            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 32),
+            gemm_sm100::Operand::scaled(codes.ptr, gemm_sm100::Elem::E2m1, scales.ptr, 32),
             codes.rows,
             bias.map_or(0, |b| b.ptr),
             0,
@@ -87,7 +87,7 @@ pub(super) fn bank_operand(
             scales,
             tensor_scales,
         } => (
-            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 16),
+            gemm_sm100::Operand::scaled(codes.ptr, gemm_sm100::Elem::E2m1, scales.ptr, 16),
             codes.rows,
             0,
             tensor_scales.ptr,
@@ -100,7 +100,7 @@ pub(super) fn bank_operand(
         } => {
             let group = affine_u4_group(x, codes, scales, n)?;
             (
-                tc5::Operand::affine(codes.ptr, scales.ptr, zeros.ptr, group),
+                gemm_sm100::Operand::affine(codes.ptr, scales.ptr, zeros.ptr, group),
                 codes.rows,
                 0,
                 0,
@@ -124,11 +124,11 @@ pub fn select_glu(
     bank: GluBank,
     routes: Tensor,
     y: &mut Tensor,
-    glu: crate::linear::tc5::Glu,
+    glu: crate::linear::gemm_sm100::Glu,
     experts: ExpertTable,
 ) -> Result<bool, Error> {
-    use crate::linear::tc5;
-    const OP: &str = "linear.moe_select_glu";
+    use crate::linear::gemm_sm100;
+    const OP: &str = "fused.moe_select_glu";
     let fan = selected(OP, x, routes, y)?;
     // A narrow mxfp4 fire reads its bank faster on the register-dequant
     // kernel, which lands the GLU too.
@@ -205,11 +205,11 @@ pub fn select_glu(
         rows,
         routes,
         y,
-        tc5::Epilogue {
+        gemm_sm100::Epilogue {
             glu: Some(glu),
             bias,
             weight_scale,
-            ..tc5::Epilogue::STORE
+            ..gemm_sm100::Epilogue::STORE
         },
     )?;
     Ok(true)
@@ -222,7 +222,7 @@ pub fn select_glu(
 pub struct RoutedMlp {
     pub x: Tensor,
     pub up: GluBank,
-    pub glu: crate::linear::tc5::Glu,
+    pub glu: crate::linear::gemm_sm100::Glu,
     pub down: GluBank,
     pub routes: Tensor,
     pub weights: Tensor,
@@ -255,8 +255,8 @@ pub fn experts(
         weights,
         inter,
     } = m;
-    use crate::linear::{act_quant, tc5};
-    const OP: &str = "linear.moe_experts";
+    use crate::linear::{act_quant, gemm_sm100};
+    const OP: &str = "fused.moe_experts";
     if let Some((shared, g)) = gate
         && (shared.dtype != Dtype::Bf16
             || g.dtype != Dtype::Bf16
@@ -324,27 +324,27 @@ pub fn experts(
     }
     let experts = u.1;
     let mut run = || -> Result<(), Error> {
-        let layout = act_quant::lay_out(ctx, OP, routes, experts, tc5::GROUP_ALIGN, true)?;
+        let layout = act_quant::lay_out(ctx, OP, routes, experts, gemm_sm100::GROUP_ALIGN, true)?;
         let k = x.width;
         let rows = layout.rows as usize;
         let hs = ctx.scratch_stream(OP, GROUPED_H, rows * inter as usize * 2)? as u64;
-        let grouped = tc5::Grouped {
+        let grouped = gemm_sm100::Grouped {
             experts,
             groups: layout.groups,
             alpha_e: 0,
         };
-        let up_epi = tc5::Epilogue {
+        let up_epi = gemm_sm100::Epilogue {
             glu: Some(glu),
             bias: u.2,
             weight_scale: u.3,
             live_rows: layout.live_rows(),
-            ..tc5::Epilogue::STORE
+            ..gemm_sm100::Epilogue::STORE
         };
         let xs = ctx.scratch_stream(OP, GROUPED_X, rows * k as usize * 2)? as u64;
         act_quant::scatter_rows(ctx, OP, x, routes.width, layout.pos, count, xs)?;
-        tc5::grouped_gemm_epi(
+        gemm_sm100::grouped_gemm_epi(
             ctx,
-            tc5::Operand::plain(xs, tc5::Elem::Bf16),
+            gemm_sm100::Operand::plain(xs, gemm_sm100::Elem::Bf16),
             u.0,
             hs,
             grouped,
@@ -354,19 +354,19 @@ pub fn experts(
             count,
         )?;
         let ys = ctx.scratch_stream(OP, GROUPED_Y, rows * y.width as usize * 2)? as u64;
-        tc5::grouped_gemm_epi(
+        gemm_sm100::grouped_gemm_epi(
             ctx,
-            tc5::Operand::plain(hs, tc5::Elem::Bf16),
+            gemm_sm100::Operand::plain(hs, gemm_sm100::Elem::Bf16),
             d.0,
             ys,
             grouped,
             [y.width, inter],
             1.0,
-            tc5::Epilogue {
+            gemm_sm100::Epilogue {
                 bias: d.2,
                 weight_scale: d.3,
                 live_rows: layout.live_rows(),
-                ..tc5::Epilogue::STORE
+                ..gemm_sm100::Epilogue::STORE
             },
             count,
         )?;
@@ -407,8 +407,8 @@ pub(super) fn experts_w4a4(
         weights,
         inter,
     } = m;
-    use crate::linear::{act_quant, tc5};
-    const OP: &str = "linear.moe_experts";
+    use crate::linear::{act_quant, gemm_sm100};
+    const OP: &str = "fused.moe_experts";
     const W4A4_X: &str = "linear.moe_tc5_x4";
     const W4A4_XS: &str = "linear.moe_tc5_x4_atoms";
     const W4A4_H: &str = "linear.moe_tc5_h4";
@@ -441,9 +441,9 @@ pub(super) fn experts_w4a4(
     if count == 0
         || norm.is_some_and(|(s, _)| s.dtype != Dtype::Bf16 || s.rows * s.width != y.width)
         || tokens < ctx.tuning().moe_w4a4_fused_from
-        || !matches!(glu, tc5::Glu::Swiglu | tc5::Glu::Relu2)
+        || !matches!(glu, gemm_sm100::Glu::Swiglu | gemm_sm100::Glu::Relu2)
         || !ctx.tuning().moe_tc5
-        || !tc5::supported()
+        || !gemm_sm100::supported()
         || x.dtype != Dtype::Bf16
         || x.rows != tokens
         || down_codes.rows != experts
@@ -469,7 +469,7 @@ pub(super) fn experts_w4a4(
                 act_quant::AlphaFrom {
                     input_scales: up_is.ptr,
                     tensor_scales: up_ts.ptr,
-                    rows: if glu == tc5::Glu::Relu2 {
+                    rows: if glu == gemm_sm100::Glu::Relu2 {
                         inter
                     } else {
                         2 * inter
@@ -489,7 +489,7 @@ pub(super) fn experts_w4a4(
         // An expert's rows start on a 64-row half block: a decode's few rows
         // an expert fill half the tiles a 128-row block would pad; contiguous,
         // as the gate-up's NVFP4 epilogue lands its atoms.
-        let align = tc5::GROUP_ALIGN;
+        let align = gemm_sm100::GROUP_ALIGN;
         // A narrow fire lays its routes out and quantizes their rows in one
         // launch where the profile says (`kernel.moe.w4a4_fused_layout`).
         let fused = ctx.tuning().moe_w4a4_fused_layout
@@ -497,7 +497,7 @@ pub(super) fn experts_w4a4(
             && experts <= act_quant::FUSED_EXPERTS;
         let rows = act_quant::contiguous_rows(count, experts, align) as usize;
         let xq = ctx.scratch_stream(OP, W4A4_X, rows * k as usize / 2)? as u64;
-        let x_atom_bytes = tc5::atom_bytes(rows, k as usize, 16);
+        let x_atom_bytes = gemm_sm100::atom_bytes(rows, k as usize, 16);
         let xs = act_quant::atoms_of(ctx, OP, W4A4_XS, x_atom_bytes)?;
         let layout = if fused {
             act_quant::lay_out_quant_nvfp4(
@@ -526,8 +526,12 @@ pub(super) fn experts_w4a4(
         };
         let rows = layout.rows as usize;
         let hq = ctx.scratch_stream(OP, W4A4_H, rows * inter as usize / 2)? as u64;
-        let hs = ctx.scratch_stream(OP, W4A4_HS, tc5::atom_bytes(rows, inter as usize, 16))? as u64;
-        let grouped_up = tc5::Grouped {
+        let hs = ctx.scratch_stream(
+            OP,
+            W4A4_HS,
+            gemm_sm100::atom_bytes(rows, inter as usize, 16),
+        )? as u64;
+        let grouped_up = gemm_sm100::Grouped {
             experts,
             groups: layout.groups,
             alpha_e: up_alpha,
@@ -538,7 +542,7 @@ pub(super) fn experts_w4a4(
         let sms = ctx.multiprocessors().unwrap_or(148);
         // A Q tile of 32 rows where every expert's fit one (the fused
         // layout states its rows the fire's tokens at most), else 64.
-        let swapped = tc5::Plan {
+        let swapped = gemm_sm100::Plan {
             swap: true,
             pair: false,
             bn: if fused && routes.rows <= 32 { 32 } else { 64 },
@@ -548,31 +552,31 @@ pub(super) fn experts_w4a4(
         let plan = if count <= SWAPPED_UP_ROUTES * experts {
             swapped
         } else {
-            tc5::Plan::grouped(&grouped_up, inter, k, count, sms)
+            gemm_sm100::Plan::grouped(&grouped_up, inter, k, count, sms)
         };
-        tc5::grouped_gemm_epi_with(
+        gemm_sm100::grouped_gemm_epi_with(
             ctx,
-            tc5::Operand::scaled(xq, tc5::Elem::E2m1, xs, 16),
-            tc5::Operand::scaled(up_codes.ptr, tc5::Elem::E2m1, up_atoms.ptr, 16),
+            gemm_sm100::Operand::scaled(xq, gemm_sm100::Elem::E2m1, xs, 16),
+            gemm_sm100::Operand::scaled(up_codes.ptr, gemm_sm100::Elem::E2m1, up_atoms.ptr, 16),
             hq,
             grouped_up,
             [inter, k],
             1.0,
-            tc5::Epilogue {
+            gemm_sm100::Epilogue {
                 glu: Some(glu),
-                out: tc5::Out::Nvfp4 {
+                out: gemm_sm100::Out::Nvfp4 {
                     data: hq,
                     scales: hs,
                     gscale: 1.0,
                 },
                 live_rows: layout.live_rows(),
                 input_scales: down_is.ptr,
-                ..tc5::Epilogue::STORE
+                ..gemm_sm100::Epilogue::STORE
             },
             plan,
         )?;
         let ys = ctx.scratch_stream(OP, W4A4_Y, rows * n as usize * 2)? as u64;
-        let grouped_down = tc5::Grouped {
+        let grouped_down = gemm_sm100::Grouped {
             experts,
             groups: layout.groups,
             alpha_e: down_alpha,
@@ -580,20 +584,20 @@ pub(super) fn experts_w4a4(
         let down_plan = if count <= SWAPPED_UP_ROUTES * experts {
             swapped
         } else {
-            tc5::Plan::grouped(&grouped_down, n, inter, count, sms)
+            gemm_sm100::Plan::grouped(&grouped_down, n, inter, count, sms)
         };
-        tc5::grouped_gemm_epi_with(
+        gemm_sm100::grouped_gemm_epi_with(
             ctx,
-            tc5::Operand::scaled(hq, tc5::Elem::E2m1, hs, 16),
-            tc5::Operand::scaled(down_codes.ptr, tc5::Elem::E2m1, down_atoms.ptr, 16),
+            gemm_sm100::Operand::scaled(hq, gemm_sm100::Elem::E2m1, hs, 16),
+            gemm_sm100::Operand::scaled(down_codes.ptr, gemm_sm100::Elem::E2m1, down_atoms.ptr, 16),
             ys,
             grouped_down,
             [n, inter],
             1.0,
-            tc5::Epilogue {
+            gemm_sm100::Epilogue {
                 live_rows: layout.live_rows(),
                 weights_ahead: true,
-                ..tc5::Epilogue::STORE
+                ..gemm_sm100::Epilogue::STORE
             },
             down_plan,
         )?;
@@ -654,8 +658,8 @@ pub(super) fn experts_w4a8_as(
         weights,
         inter,
     } = m;
-    use crate::linear::{act_quant, tc5};
-    const OP: &str = "linear.moe_experts";
+    use crate::linear::{act_quant, gemm_sm100};
+    const OP: &str = "fused.moe_experts";
     const W4A8_X: &str = "linear.moe_tc5_x8";
     const W4A8_XS: &str = "linear.moe_tc5_x8_atoms";
     const W4A8_H: &str = "linear.moe_tc5_h8";
@@ -680,7 +684,7 @@ pub(super) fn experts_w4a8_as(
             up_atoms,
             down_codes,
             down_atoms,
-            tc5::Elem::E2m1,
+            gemm_sm100::Elem::E2m1,
             32,
         ),
         (
@@ -697,7 +701,7 @@ pub(super) fn experts_w4a8_as(
             up_atoms,
             down_codes,
             down_atoms,
-            tc5::Elem::E4m3,
+            gemm_sm100::Elem::E4m3,
             128,
         ),
         _ => return Ok(false),
@@ -710,16 +714,18 @@ pub(super) fn experts_w4a8_as(
     // does.
     let glu_taken = matches!(
         glu,
-        tc5::Glu::Swiglu | tc5::Glu::SwigluClamp { .. } | tc5::Glu::Situ { .. }
+        gemm_sm100::Glu::Swiglu
+            | gemm_sm100::Glu::SwigluClamp { .. }
+            | gemm_sm100::Glu::Situ { .. }
     );
     let masked = w_gran == 128
         && count <= act_quant::MASKED_FIRE
-        && glu == tc5::Glu::Swiglu
+        && glu == gemm_sm100::Glu::Swiglu
         && matches!(sum, W4a8Sum::Weighted(_));
     if (count <= act_quant::MASKED_FIRE || tokens < ctx.tuning().moe_w4a8_fused_from) && !masked
         || !glu_taken
         || !ctx.tuning().moe_tc5
-        || !tc5::supported()
+        || !gemm_sm100::supported()
         || x.dtype != Dtype::Bf16
         || x.rows != tokens
         || down_codes.rows != experts
@@ -752,9 +758,9 @@ pub(super) fn experts_w4a8_as(
         // A masked layout's scale atoms: each expert's whole 128-row blocks.
         let atoms_for = |cols: u32| {
             if m_max > 0 {
-                tc5::masked_atom_bytes(experts as usize, m_max, cols as usize, GRAN as usize)
+                gemm_sm100::masked_atom_bytes(experts as usize, m_max, cols as usize, GRAN as usize)
             } else {
-                tc5::atom_bytes(rows, cols as usize, GRAN as usize)
+                gemm_sm100::atom_bytes(rows, cols as usize, GRAN as usize)
             }
         };
         let fmt = act_quant::Format::E4m3 { gran: GRAN };
@@ -794,7 +800,7 @@ pub(super) fn experts_w4a8_as(
                 at
             }
         };
-        let grouped = tc5::Grouped {
+        let grouped = gemm_sm100::Grouped {
             experts,
             groups: layout.groups,
             alpha_e: 0,
@@ -802,15 +808,15 @@ pub(super) fn experts_w4a8_as(
         if masked {
             const W4A8_U: &str = "linear.moe_tc5_u";
             let us = ctx.scratch_stream(OP, W4A8_U, rows * 2 * inter as usize * 2)? as u64;
-            tc5::grouped_gemm_epi(
+            gemm_sm100::grouped_gemm_epi(
                 ctx,
-                tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
-                tc5::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
+                gemm_sm100::Operand::scaled(xq, gemm_sm100::Elem::E4m3, xs, GRAN),
+                gemm_sm100::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
                 us,
                 grouped,
                 [2 * inter, k],
                 1.0,
-                tc5::Epilogue::STORE,
+                gemm_sm100::Epilogue::STORE,
                 count,
             )?;
             act_quant::swiglu_quant(ctx, OP, us, layout.rows, inter, layout.m_max, hq, hs)?;
@@ -819,7 +825,7 @@ pub(super) fn experts_w4a8_as(
             // Q tiles): the same products at a quarter the MMA work.
             let sms = ctx.multiprocessors().unwrap_or(148);
             let up_plan = if count <= SWAPPED_W4A8_UP_ROUTES * experts {
-                tc5::Plan {
+                gemm_sm100::Plan {
                     swap: true,
                     pair: false,
                     bn: 64,
@@ -827,41 +833,41 @@ pub(super) fn experts_w4a8_as(
                     splits: 1,
                 }
             } else {
-                tc5::Plan::grouped(&grouped, inter, k, count, sms)
+                gemm_sm100::Plan::grouped(&grouped, inter, k, count, sms)
             };
-            tc5::grouped_gemm_epi_with(
+            gemm_sm100::grouped_gemm_epi_with(
                 ctx,
-                tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
-                tc5::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
+                gemm_sm100::Operand::scaled(xq, gemm_sm100::Elem::E4m3, xs, GRAN),
+                gemm_sm100::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
                 hq,
                 grouped,
                 [inter, k],
                 1.0,
-                tc5::Epilogue {
+                gemm_sm100::Epilogue {
                     glu: Some(glu),
-                    out: tc5::Out::Fp8Block {
+                    out: gemm_sm100::Out::Fp8Block {
                         data: hq,
                         scales: hs,
                     },
                     row_scale,
                     live_rows: layout.live_rows(),
-                    ..tc5::Epilogue::STORE
+                    ..gemm_sm100::Epilogue::STORE
                 },
                 up_plan,
             )?;
         }
         let ys = ctx.scratch_stream(OP, W4A8_Y, rows * n as usize * 2)? as u64;
-        tc5::grouped_gemm_epi(
+        gemm_sm100::grouped_gemm_epi(
             ctx,
-            tc5::Operand::scaled(hq, tc5::Elem::E4m3, hs, GRAN),
-            tc5::Operand::scaled(down_codes.ptr, w_elem, down_atoms.ptr, w_gran),
+            gemm_sm100::Operand::scaled(hq, gemm_sm100::Elem::E4m3, hs, GRAN),
+            gemm_sm100::Operand::scaled(down_codes.ptr, w_elem, down_atoms.ptr, w_gran),
             ys,
             grouped,
             [n, inter],
             1.0,
-            tc5::Epilogue {
+            gemm_sm100::Epilogue {
                 live_rows: layout.live_rows(),
-                ..tc5::Epilogue::STORE
+                ..gemm_sm100::Epilogue::STORE
             },
             count,
         )?;

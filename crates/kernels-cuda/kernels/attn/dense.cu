@@ -98,10 +98,7 @@ __global__ void dense_bidirectional(
             }
         }
 
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            dot += __shfl_xor_sync(0xffffffffu, dot, off);
-        }
+        dot = ::pie::warp_sum(dot);
 
         const float score = dot * sm_scale;
         const float widened = fmaxf(running_max, score);
@@ -171,12 +168,6 @@ __device__ __forceinline__ void unpack8(uint4 word, float out[8]) {
         out[2 * i] = __uint_as_float(u[i] << 16);
         out[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
     }
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
 }
 
 }
@@ -283,7 +274,7 @@ __global__ __launch_bounds__(128) void attention(
             float p[QPW];
 #pragma unroll
             for (int i = 0; i < QPW; ++i) {
-                s[i] = detail::warp_sum(s[i]);
+                s[i] = ::pie::warp_sum(s[i]);
                 if (active[i]) {
                     const float m_new = fmaxf(m[i], s[i]);
                     const float rescale = exp2f(m[i] - m_new);

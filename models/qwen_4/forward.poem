@@ -30,10 +30,10 @@ def moe(x, f):
             return ops.linear.moe_matmul_select(act, bank, experts, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, experts, f.top_k)
 
-    hidden = ops.linear.mlp_swiglu(select(x, f.gate_up), f.inter)
+    hidden = ops.linear.swiglu(select(x, f.gate_up), f.inter)
     routed = ops.linear.moe_weighted_sum(select(hidden, f.down), weights)
     shared = ops.linear.matmul(
-        ops.linear.mlp_swiglu(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter),
+        ops.linear.swiglu(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter),
         f.shared_down,
     )
     return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
@@ -70,14 +70,14 @@ def tower(inputs, t):
 
         n = ops.elemwise.layernorm(y, b.norm2, b.norm2_bias, t.norm_eps)
         h = ops.elemwise.add_bias(b.fc1_bias, ops.linear.matmul(n, b.fc1))
-        a = ops.linear.mlp_gelu_tanh(h)
+        a = ops.linear.gelu_tanh(h)
         y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.fc2_bias, ops.linear.matmul(a, b.fc2)), y)
 
     mg = t.merger
     n = ops.elemwise.layernorm(y, mg.norm, mg.norm_bias, t.norm_eps)
     folded = ops.gather.merge_rows(n, t.merge)
     h = ops.elemwise.add_bias(mg.fc1_bias, ops.linear.matmul(folded, mg.fc1))
-    a = ops.linear.mlp_gelu_tanh(h)
+    a = ops.linear.gelu_tanh(h)
     return ops.elemwise.add_bias(mg.fc2_bias, ops.linear.matmul(a, mg.fc2))
 
 def scatter(y, towered, inputs):
