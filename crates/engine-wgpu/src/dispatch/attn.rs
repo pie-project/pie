@@ -240,16 +240,17 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn::dense::bidirectional(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*segments),
+            } => kernels_slang::attn::dense::bidirectional(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*v)),
+                crate::encode::slang_tensor(self.tensor(*segments)),
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-            ),
+                crate::encode::slang_tensor(self.tensor(*o)),
+            )
+            .map_err(crate::encode::from_slang),
             Attn::Masked { causal: false, .. }
             | Attn::MaskedLse { causal: false, .. }
             | Attn::Ragged { .. }

@@ -3,6 +3,7 @@
 use crate::encode::{nonzero, refuse};
 use crate::error::Error;
 
+pub mod dense;
 pub mod kv_append;
 pub mod merge;
 

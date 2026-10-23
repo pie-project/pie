@@ -48,6 +48,17 @@ void pair_put(RWStructuredBuffer<uint> buf, uint i, bool both, float2 v) {
 }
 #endif
 
+// Element `i` alone.
+#ifdef PIE_ACT_F32
+float act_at(StructuredBuffer<float> buf, uint i) {
+    return buf[i];
+}
+#else
+float act_at(StructuredBuffer<uint> buf, uint i) {
+    return bf16_at(buf, i);
+}
+#endif
+
 // `v` as the activation holds it: a stated scalar rounds like a stored one.
 float act_round(float v) {
 #ifdef PIE_ACT_F32
