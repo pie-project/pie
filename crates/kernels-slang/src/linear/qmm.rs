@@ -12,6 +12,9 @@ pub enum Qmm {
     /// The vector kernel at `vecs` activation rows a workgroup; it fits
     /// every shape.
     Qmv { vecs: u32 },
+    /// The one-row kernel (SPIR-V's subgroup tier): `lanes` subgroup lanes a
+    /// column, `rows` columns a lane.
+    OneRow { lanes: u32, rows: u32 },
 }
 
 /// A matmul's operands and extents, checked once for every rung.
@@ -110,6 +113,9 @@ fn fire(
     }
     match ladder.first() {
         Some(Qmm::Qmv { vecs }) => crate::linear::qmv::fire(ctx, op, &b, *vecs),
+        Some(Qmm::OneRow { lanes, rows }) => {
+            crate::linear::qmv::fire_row(ctx, op, &b, *lanes, *rows)
+        }
         None => Err(refuse(op, "the `kernel.qmm` ladder is empty")),
     }
 }

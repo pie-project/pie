@@ -170,7 +170,9 @@ fn compile(
         .arg(kernels)
         .arg("-O2");
     if let Target::Spirv = target {
-        cmd.arg("-emit-spirv-directly");
+        // GLSL intrinsics too: the kernels that came from kernels-vulkan use
+        // `subgroupShuffleXor` and `gl_LocalInvocationIndex`.
+        cmd.arg("-emit-spirv-directly").arg("-allow-glsl");
     } else {
         cmd.arg("-DPIE_WGSL=1");
     }
