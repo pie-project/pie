@@ -357,10 +357,10 @@ fn sdpa_speed() {
                 });
             }
         };
-        // engine-vulkan's tile, and the 16-lane tile that folds by shuffles
-        // (engine-wgpu's) where a subgroup holds a row.
+        // The 32-lane tile, and the 16-lane tile that folds by shuffles,
+        // engine-vulkan's where a subgroup holds a row.
         let mut runs: Vec<Boxed<'_>> = vec![Box::new(hand), Box::new(slang(subgroup))];
-        let mut names = vec!["slang tiled"];
+        let mut names = vec!["slang tiled 32 lanes"];
         if chip.subgroup >= 16 {
             runs.push(Box::new(slang(sdpa::Tactic {
                 tile_rows: 16,
