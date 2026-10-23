@@ -371,7 +371,6 @@ pub use device::measure;
 mod device {
     use std::cell::RefCell;
 
-    use kernels_vulkan::linear::quant;
     use kernels_vulkan::{ArgValue, Encode, Error, Fire, Tensor, Tuning};
     use poem_ir::Dtype;
     use profile::{Decision as _, Profile, Source};
@@ -602,14 +601,16 @@ mod device {
                             group: bank.group,
                             bits: bank.bits,
                         };
-                        quant::matmul(
-                            sink,
-                            tuning,
-                            Tensor::new(ha, m, k, Dtype::Bf16),
-                            b,
-                            Tensor::new(ho, m, n, Dtype::Bf16),
+                        let ladder = crate::encode::qmm_ladder(tuning, m, n, k, b);
+                        kernels_slang::linear::qmm::matmul(
+                            &crate::encode::Slang(sink),
+                            &ladder,
+                            crate::encode::slang_tensor(Tensor::new(ha, m, k, Dtype::Bf16)),
+                            crate::encode::slang_bank(b),
+                            crate::encode::slang_tensor(Tensor::new(ho, m, n, Dtype::Bf16)),
                             cap,
                         )
+                        .map_err(crate::encode::from_slang)
                     };
                     let mut live: Vec<usize> = Vec::new();
                     for (c, q) in kept.iter().enumerate() {
@@ -624,7 +625,11 @@ mod device {
                             entries: RefCell::new(Vec::new()),
                         };
                         let launched = launch(&watch, t, 0).is_ok();
-                        let ran = watch.entries.borrow().iter().find_map(|e| quant::ran(e));
+                        let ran = watch
+                            .entries
+                            .borrow()
+                            .iter()
+                            .find_map(|e| kernels_slang::linear::qmm::ran(e));
                         drop(watch);
                         drop(sink);
                         frame.commit().map_err(|e| e.to_string())?;

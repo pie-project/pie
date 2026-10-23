@@ -2,7 +2,7 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::attn::index;
+use engine_xla::lower::attn::index;
 use kernels_xla::{KvPool, Tensor};
 
 const PS: usize = 4;

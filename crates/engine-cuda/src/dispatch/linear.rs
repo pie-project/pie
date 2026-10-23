@@ -2,8 +2,10 @@ use kernels_cuda::Tensor;
 use kernels_cuda::linear;
 #[cfg(feature = "cuda")]
 use kernels_cuda::linear::act_quant;
+use kernels_cuda::linear::affine::OffsetKind;
+#[cfg(feature = "cuda")]
+use kernels_cuda::linear::gemv_fp8;
 use kernels_cuda::linear::moe::GroupSeat;
-use kernels_cuda::linear::quant::OffsetKind;
 use poem_exec::{DispatchLinear, KernelError};
 use poem_ir::{ActQuant, Dtype, Fused, Linear, Operands, ValueId};
 
@@ -349,7 +351,7 @@ impl Run<'_> {
                     quant: None,
                     logits: true,
                 })?;
-                kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
+                kernels_cuda::attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
             }
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
@@ -412,9 +414,9 @@ impl Run<'_> {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
-                        linear::affine::matmul
+                        linear::affine::tiled::matmul
                     } else {
-                        linear::affine::matmul_gemv
+                        linear::affine::tiled::matmul_gemv
                     };
                     entry(
                         self.ctx(),
@@ -439,9 +441,9 @@ impl Run<'_> {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
-                        linear::affine::lm_head
+                        linear::affine::tiled::lm_head
                     } else {
-                        linear::affine::lm_head_gemv
+                        linear::affine::tiled::lm_head_gemv
                     };
                     entry(
                         self.ctx(),
@@ -1532,7 +1534,7 @@ impl Run<'_> {
                     }
                     _ => (codes, scales, tensor_scales, routes, seat),
                 };
-            return linear::nvfp4::matmul_select(
+            return linear::moe::select_nvfp4(
                 self.ctx(),
                 x,
                 codes,
@@ -1935,7 +1937,7 @@ impl Run<'_> {
         // A decode's few rows over 128- or 32-wide blocks as the GEMV over bf16
         // rows (`kernel.gemm.fp8_gemv_until`), as the tcgen05 path takes them.
         if matches!(block, 32 | 128)
-            && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, block, &mut out)?
+            && gemv_fp8::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, block, &mut out)?
         {
             return Ok(());
         }
@@ -1945,7 +1947,14 @@ impl Run<'_> {
         if block == 128
             && act.rows > linear::w8a16::MMA_UNTIL
             && linear::moe::fp8_w8a8_capable()
-            && linear::lt_fp8::matmul(self.ctx(), op, act, codes.ptr, atoms.ptr, &mut out)?
+            && linear::gemm::cublas_lt_fp8::matmul(
+                self.ctx(),
+                op,
+                act,
+                codes.ptr,
+                atoms.ptr,
+                &mut out,
+            )?
         {
             return Ok(());
         }
@@ -2033,7 +2042,7 @@ impl Run<'_> {
             }
             // Else a GEMV over the activations as they are, where the profile says
             // (`kernel.gemm.fp8_gemv_until`): ahead of the tcgen05 GEMM even on held codes.
-            if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, 128, &mut out)? {
+            if gemv_fp8::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, 128, &mut out)? {
                 return Ok(());
             }
             // Its producer landed the codes itself: no quantize launch.
@@ -2077,7 +2086,7 @@ impl Run<'_> {
         }
         match self.maybe_planes(*w) {
             Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
-                linear::nvfp4::matmul(
+                linear::dequant::nvfp4_matmul(
                     self.ctx(),
                     "linear.matmul",
                     self.tensor(*act),
@@ -2093,9 +2102,9 @@ impl Run<'_> {
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::quant::matmul_via_dense
+                        linear::dequant::matmul_via_dense
                     } else {
-                        linear::quant::matmul
+                        linear::affine::matmul
                     };
                 entry(
                     self.ctx(),
@@ -2137,7 +2146,7 @@ impl Run<'_> {
         }
         match self.maybe_planes(*w) {
             Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
-                linear::nvfp4::matmul(
+                linear::dequant::nvfp4_matmul(
                     self.ctx(),
                     "linear.matmul",
                     self.tensor(*act),
@@ -2153,9 +2162,9 @@ impl Run<'_> {
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::quant::lm_head_via_dense
+                        linear::dequant::lm_head_via_dense
                     } else {
-                        linear::quant::lm_head
+                        linear::affine::lm_head
                     };
                 entry(
                     self.ctx(),

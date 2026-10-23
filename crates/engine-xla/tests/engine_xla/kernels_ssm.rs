@@ -3,7 +3,6 @@
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use kernels_xla::lanes::Committed;
-use kernels_xla::ssm;
 use kernels_xla::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
@@ -30,6 +29,429 @@ impl Rng {
 
 fn silu(z: f32) -> f32 {
     z / (1.0 + (-z).exp())
+}
+
+/// The ssm kernels lowered the way engine-xla's dispatch lowers them: the
+/// operands read in the kernel's order, the results landed in `y` and the
+/// pool. The tests drive them through these, with handles and a pool.
+#[allow(clippy::too_many_arguments)]
+mod ssm {
+    use engine_xla::lower::{Lower, lower};
+    use kernels_xla::lanes::Committed;
+    use kernels_xla::tensor::Operand;
+    use kernels_xla::{Ctx, Error, RaggedTensor, RecurrentPool, Tensor};
+
+    pub use kernels_xla::ssm::dyn_conv;
+
+    fn seat(l: &mut Lower<'_, '_>, s: &Committed) -> Result<Committed<Operand>, Error> {
+        Ok(Committed {
+            replay: l.read(s.replay)?,
+            commit: l.read(s.commit)?,
+            slots: l.read(s.slots)?,
+            lane0: s.lane0,
+        })
+    }
+
+    pub fn short_conv(
+        ctx: &Ctx<'_>,
+        x: Tensor,
+        w: Tensor,
+        p: &RecurrentPool,
+        k: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (x, w, bank, slots) = (
+                l.read(x)?,
+                l.read(w)?,
+                l.read(p.conv_state)?,
+                l.read(p.slots)?,
+            );
+            let (yv, next) =
+                kernels_xla::ssm::short_conv(l.f(), x, w, bank, slots, k, y.landing())?;
+            l.land(y, yv)?;
+            l.land(p.new_conv_state, next)
+        })
+    }
+
+    pub fn short_conv_chunked(
+        ctx: &Ctx<'_>,
+        x: RaggedTensor,
+        w: Tensor,
+        p: &RecurrentPool,
+        k: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let data = l.read(x.data)?;
+            let w = l.read(w)?;
+            let bank = l.read(p.conv_state)?;
+            let indptr = l.read(x.indptr)?;
+            let slots = l.read(p.slots)?;
+            let (yv, next) = kernels_xla::ssm::short_conv_chunked(
+                l.f(),
+                RaggedTensor { data, indptr },
+                w,
+                bank,
+                slots,
+                k,
+                y.landing(),
+            )?;
+            l.land(y, yv)?;
+            l.land(p.new_conv_state, next)
+        })
+    }
+
+    pub fn causal_conv1d(
+        ctx: &Ctx<'_>,
+        x: Tensor,
+        w: Tensor,
+        p: &RecurrentPool,
+        k: u32,
+        dil: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (x, w, bank, slots) = (
+                l.read(x)?,
+                l.read(w)?,
+                l.read(p.conv_state)?,
+                l.read(p.slots)?,
+            );
+            let (yv, next) =
+                kernels_xla::ssm::causal_conv1d(l.f(), x, w, bank, slots, k, dil, y.landing())?;
+            l.land(y, yv)?;
+            l.land(p.new_conv_state, next)
+        })
+    }
+
+    pub fn causal_conv1d_chunked(
+        ctx: &Ctx<'_>,
+        x: RaggedTensor,
+        w: Tensor,
+        p: &RecurrentPool,
+        k: u32,
+        dil: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let data = l.read(x.data)?;
+            let w = l.read(w)?;
+            let bank = l.read(p.conv_state)?;
+            let indptr = l.read(x.indptr)?;
+            let slots = l.read(p.slots)?;
+            let (yv, next) = kernels_xla::ssm::causal_conv1d_chunked(
+                l.f(),
+                RaggedTensor { data, indptr },
+                w,
+                bank,
+                slots,
+                k,
+                dil,
+                y.landing(),
+            )?;
+            l.land(y, yv)?;
+            l.land(p.new_conv_state, next)
+        })
+    }
+
+    pub fn causal_conv1d_committed(
+        ctx: &Ctx<'_>,
+        x: Tensor,
+        indptr: Tensor,
+        committed: &Committed,
+        w: Tensor,
+        p: &RecurrentPool,
+        k: u32,
+        dil: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let x = l.read(x)?;
+            let w = l.read(w)?;
+            let bank = l.read(p.conv_state)?;
+            let indptr = l.read(indptr)?;
+            let s = seat(l, committed)?;
+            let (yv, next) = kernels_xla::ssm::causal_conv1d_committed(
+                l.f(),
+                x,
+                indptr,
+                s,
+                w,
+                bank,
+                k,
+                dil,
+                y.landing(),
+            )?;
+            l.land(y, yv)?;
+            l.land(p.new_conv_state, next)
+        })
+    }
+
+    pub fn gdn_prep(
+        ctx: &Ctx<'_>,
+        ba: Tensor,
+        dt: Tensor,
+        al: Tensor,
+        g: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (ba, dt, al) = (l.read(ba)?, l.read(dt)?, l.read(al)?);
+            let v = kernels_xla::ssm::gdn_prep(l.f(), ba, dt, al, g.landing())?;
+            l.land(g, v)
+        })
+    }
+
+    pub fn gated_delta(
+        ctx: &Ctx<'_>,
+        qkv: Tensor,
+        _z: Tensor,
+        gates: Tensor,
+        p: &RecurrentPool,
+        hk: u32,
+        hv: u32,
+        dk: u32,
+        dv: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (qkv, gates, slab, slots) = (
+                l.read(qkv)?,
+                l.read(gates)?,
+                l.read(p.state)?,
+                l.read(p.slots)?,
+            );
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::gated_delta(
+                l.f(),
+                qkv,
+                gates,
+                slab,
+                slots,
+                hk,
+                hv,
+                dk,
+                dv,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn gated_delta_chunked(
+        ctx: &Ctx<'_>,
+        qkv: RaggedTensor,
+        _z: Tensor,
+        gates: Tensor,
+        p: &RecurrentPool,
+        hk: u32,
+        hv: u32,
+        dk: u32,
+        dv: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let data = l.read(qkv.data)?;
+            let gates = l.read(gates)?;
+            let slab = l.read(p.state)?;
+            let indptr = l.read(qkv.indptr)?;
+            let slots = l.read(p.slots)?;
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::gated_delta_chunked(
+                l.f(),
+                RaggedTensor { data, indptr },
+                gates,
+                slab,
+                slots,
+                hk,
+                hv,
+                dk,
+                dv,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn gated_delta_committed(
+        ctx: &Ctx<'_>,
+        qkv: Tensor,
+        indptr: Tensor,
+        committed: &Committed,
+        gates: Tensor,
+        p: &RecurrentPool,
+        hk: u32,
+        hv: u32,
+        dk: u32,
+        dv: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let qkv = l.read(qkv)?;
+            let gates = l.read(gates)?;
+            let slab = l.read(p.state)?;
+            let indptr = l.read(indptr)?;
+            let s = seat(l, committed)?;
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::gated_delta_committed(
+                l.f(),
+                qkv,
+                indptr,
+                s,
+                gates,
+                slab,
+                hk,
+                hv,
+                dk,
+                dv,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn kda_step(
+        ctx: &Ctx<'_>,
+        mixed: Tensor,
+        f: Tensor,
+        b: Tensor,
+        dt: Tensor,
+        al: Tensor,
+        p: &RecurrentPool,
+        heads: u32,
+        d: u32,
+        eps: f32,
+        floor: f32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let mixed = l.read(mixed)?;
+            let fv = l.read(f)?;
+            let bv = l.read(b)?;
+            let dt = l.read(dt)?;
+            let al = l.read(al)?;
+            let slab = l.read(p.state)?;
+            let slots = l.read(p.slots)?;
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::kda_step(
+                l.f(),
+                mixed,
+                fv,
+                bv,
+                dt,
+                al,
+                slab,
+                slots,
+                heads,
+                d,
+                eps,
+                floor,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn kda_chunked(
+        ctx: &Ctx<'_>,
+        mixed: RaggedTensor,
+        f: Tensor,
+        b: Tensor,
+        dt: Tensor,
+        al: Tensor,
+        p: &RecurrentPool,
+        heads: u32,
+        d: u32,
+        eps: f32,
+        floor: f32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let data = l.read(mixed.data)?;
+            let fv = l.read(f)?;
+            let bv = l.read(b)?;
+            let dt = l.read(dt)?;
+            let al = l.read(al)?;
+            let slab = l.read(p.state)?;
+            let indptr = l.read(mixed.indptr)?;
+            let slots = l.read(p.slots)?;
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::kda_chunked(
+                l.f(),
+                RaggedTensor { data, indptr },
+                fv,
+                bv,
+                dt,
+                al,
+                slab,
+                slots,
+                heads,
+                d,
+                eps,
+                floor,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn kda_committed(
+        ctx: &Ctx<'_>,
+        mixed: Tensor,
+        indptr: Tensor,
+        committed: &Committed,
+        f: Tensor,
+        b: Tensor,
+        dt: Tensor,
+        al: Tensor,
+        p: &RecurrentPool,
+        heads: u32,
+        d: u32,
+        eps: f32,
+        floor: f32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let mixed = l.read(mixed)?;
+            let fv = l.read(f)?;
+            let bv = l.read(b)?;
+            let dt = l.read(dt)?;
+            let al = l.read(al)?;
+            let slab = l.read(p.state)?;
+            let indptr = l.read(indptr)?;
+            let s = seat(l, committed)?;
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::kda_committed(
+                l.f(),
+                mixed,
+                indptr,
+                s,
+                fv,
+                bv,
+                dt,
+                al,
+                slab,
+                heads,
+                d,
+                eps,
+                floor,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
 }
 
 fn pool(state: Tensor, slots: Tensor) -> RecurrentPool {
@@ -932,19 +1354,27 @@ fn the_block_dyn_conv_moves_its_taps_per_row() {
         let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
         if !b
             .run(|ctx| {
-                ssm::dyn_conv::block_dyn_conv(
-                    ctx,
-                    RaggedTensor {
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = (RaggedTensor {
                         data: x,
                         indptr: ip,
-                    },
-                    ct,
-                    bt,
-                    side as u32,
-                    taps as u32,
-                    group as u32,
-                    y,
-                )
+                    })
+                    .try_map(|t| l.read(t))?;
+                    let coeff_v = l.read(ct)?;
+                    let base_v = l.read(bt)?;
+                    let o_y = y;
+                    let v = ssm::dyn_conv::block_dyn_conv(
+                        l.f(),
+                        x_v,
+                        coeff_v,
+                        base_v,
+                        side as u32,
+                        taps as u32,
+                        group as u32,
+                        o_y.landing(),
+                    )?;
+                    l.land(o_y, v)
+                })
             })
             .unwrap()
         {

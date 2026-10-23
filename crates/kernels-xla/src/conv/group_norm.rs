@@ -1,10 +1,9 @@
 //! Group norm over each clip's voxels.
 
 use crate::conv::{boxes, k, lanes_of, nonzero, place, spread, zero_invalid};
-use crate::cx::{Ctx, Cx};
 use crate::error::{Error, refuse};
-use crate::hlo::{Combine, Elem, Fold, Val};
-use crate::tensor::Tensor;
+use crate::hlo::{Combine, Elem, Fold, Func, Val};
+use crate::tensor::{Landing, Operand};
 use dtype::Dtype;
 
 /// Group norm per clip: each clip's `(group)` moments over all its voxels
@@ -12,16 +11,16 @@ use dtype::Dtype;
 /// weight + bias` (f32 `[C]` planes), optionally `silu`; a row no lane holds
 /// lands zero. kernels-cuda `elemwise::norm::group_norm`.
 pub fn group_norm(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    grid: Tensor,
+    f: &mut Func,
+    x: Operand,
+    grid: Operand,
     groups: u32,
-    weight: Tensor,
-    bias: Tensor,
+    weight: Operand,
+    bias: Operand,
     eps: f32,
     silu: bool,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "conv.group_norm";
     if x.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {
@@ -52,54 +51,52 @@ pub fn group_norm(
             ));
         }
     }
-    ctx.emit(&mut |cx| {
-        let (rows, c, g) = (i64::from(x.rows), i64::from(x.width), i64::from(groups));
-        let cg = c / g;
-        let l = i64::from(lanes);
-        let gv = cx.read(grid)?;
-        let p = place(cx, gv, rows)?;
-        let far = k(cx, p.lane, i64::from(i32::MAX));
-        let lane = cx.select(p.valid, p.lane, far)?;
-        let bx = boxes(cx, gv)?;
-        let vox = bx.voxels(cx)?;
-        let vox = cx.convert(vox, Elem::F32);
-        let count = cx.scale(vox, cg as f64)?;
-        let count = spread(cx, count, &[l, g], &[0])?;
-        let one = cx.like_f(count, 1.0);
-        let denom = cx.max(count, one)?;
+    let (rows, c, g) = (i64::from(x.rows), i64::from(x.width), i64::from(groups));
+    let cg = c / g;
+    let l = i64::from(lanes);
+    let gv = grid.val;
+    let p = place(f, gv, rows)?;
+    let far = k(f, p.lane, i64::from(i32::MAX));
+    let lane = f.select(p.valid, p.lane, far)?;
+    let bx = boxes(f, gv)?;
+    let vox = bx.voxels(f)?;
+    let vox = f.convert(vox, Elem::F32);
+    let count = f.scale(vox, cg as f64)?;
+    let count = spread(f, count, &[l, g], &[0])?;
+    let one = f.like_f(count, 1.0);
+    let denom = f.max(count, one)?;
 
-        let xv = cx.read_f32(x)?;
-        let per_group = |cx: &mut Cx<'_>, v: Val| -> Result<Val, Error> {
-            let v = cx.reshape(v, &[rows, g, cg])?;
-            let s = cx.reduce(v, &[2], Fold::Sum)?;
-            let zero = cx.const_f(Elem::F32, 0.0, &[l, g]);
-            let s = cx.put_rows(zero, lane, s, Combine::Add)?;
-            Ok(cx.div(s, denom)?)
-        };
-        let back = |cx: &mut Cx<'_>, m: Val| -> Result<Val, Error> {
-            let m = cx.take_rows(m, p.lane)?;
-            let m = spread(cx, m, &[rows, g, cg], &[0, 1])?;
-            Ok(cx.reshape(m, &[rows, c])?)
-        };
-        let mean = per_group(cx, xv)?;
-        let mean_r = back(cx, mean)?;
-        let d = cx.sub(xv, mean_r)?;
-        let sq = cx.mul(d, d)?;
-        let var = per_group(cx, sq)?;
-        let var = cx.offset(var, f64::from(eps))?;
-        let rstd = cx.rsqrt(var);
-        let rstd_r = back(cx, rstd)?;
-        let n = cx.mul(d, rstd_r)?;
-        let wv = cx.read(weight)?;
-        let wv = cx.reshape(wv, &[c])?;
-        let wv = spread(cx, wv, &[rows, c], &[1])?;
-        let bv = cx.read(bias)?;
-        let bv = cx.reshape(bv, &[c])?;
-        let bv = spread(cx, bv, &[rows, c], &[1])?;
-        let v = cx.mul(n, wv)?;
-        let v = cx.add(v, bv)?;
-        let v = if silu { cx.silu(v)? } else { v };
-        let v = zero_invalid(cx, v, p.valid)?;
-        cx.write(y, v)
-    })
+    let xv = x.f32(f);
+    let per_group = |f: &mut Func, v: Val| -> Result<Val, Error> {
+        let v = f.reshape(v, &[rows, g, cg])?;
+        let s = f.reduce(v, &[2], Fold::Sum)?;
+        let zero = f.const_f(Elem::F32, 0.0, &[l, g]);
+        let s = f.put_rows(zero, lane, s, Combine::Add)?;
+        Ok(f.div(s, denom)?)
+    };
+    let back = |f: &mut Func, m: Val| -> Result<Val, Error> {
+        let m = f.take_rows(m, p.lane)?;
+        let m = spread(f, m, &[rows, g, cg], &[0, 1])?;
+        Ok(f.reshape(m, &[rows, c])?)
+    };
+    let mean = per_group(f, xv)?;
+    let mean_r = back(f, mean)?;
+    let d = f.sub(xv, mean_r)?;
+    let sq = f.mul(d, d)?;
+    let var = per_group(f, sq)?;
+    let var = f.offset(var, f64::from(eps))?;
+    let rstd = f.rsqrt(var);
+    let rstd_r = back(f, rstd)?;
+    let n = f.mul(d, rstd_r)?;
+    let wv = weight.val;
+    let wv = f.reshape(wv, &[c])?;
+    let wv = spread(f, wv, &[rows, c], &[1])?;
+    let bv = bias.val;
+    let bv = f.reshape(bv, &[c])?;
+    let bv = spread(f, bv, &[rows, c], &[1])?;
+    let v = f.mul(n, wv)?;
+    let v = f.add(v, bv)?;
+    let v = if silu { f.silu(v)? } else { v };
+    let v = zero_invalid(f, v, p.valid)?;
+    Ok(v)
 }

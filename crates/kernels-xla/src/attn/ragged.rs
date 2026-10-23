@@ -8,50 +8,80 @@ use dtype::Dtype;
 
 use super::dense::segment_of;
 use super::paged::{Heads, Planes, Rows, Rule, blocked, flat_i32, head, nonzero, row_heads};
-use crate::cx::{Ctx, expect};
+use crate::cx::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Elem, Func};
-use crate::tensor::Tensor;
+use crate::hlo::{Elem, Func, Val};
+use crate::tensor::{Landing, Operand, Stored, Tensor};
 
 /// What masks or biases a ragged attention besides its segments.
 #[derive(Clone, Copy, Debug)]
-pub enum RaggedMask {
+pub enum RaggedMask<T = Tensor> {
     /// Segments only (poem_ir `None` and `GroupBlockDiagonal`).
     Segments,
     /// A row with tag `t >= 0` reads only keys tagged `t`; a negative tag
     /// reads its whole segment. One i32 per query row / key row.
-    ReferenceTags { q_tags: Tensor, kv_tags: Tensor },
+    ReferenceTags { q_tags: T, kv_tags: T },
     /// `q_classes[q] < 0 || kv_classes[k] < 0 || table[q_class · count +
     /// kv_class] != 0` admits a pair (kernels-cuda's lane class table).
     ClassTable {
-        q_classes: Tensor,
-        kv_classes: Tensor,
-        table: Tensor,
+        q_classes: T,
+        kv_classes: T,
+        table: T,
         count: u32,
     },
     /// Adds `table[h, clamp(k − q + max_len − 1)]` (f32, `[q_heads, 2·max_len
     /// − 1]`) to the scaled logit, `k`/`q` indexed within the segment.
-    RelativeBias { table: Tensor, max_len: u32 },
+    RelativeBias { table: T, max_len: u32 },
+}
+
+impl<T> RaggedMask<T> {
+    /// The mask with each plane mapped by `f`, in the order [`forward`]
+    /// consumes them.
+    pub fn try_map<U, E>(self, mut f: impl FnMut(T) -> Result<U, E>) -> Result<RaggedMask<U>, E> {
+        Ok(match self {
+            Self::Segments => RaggedMask::Segments,
+            Self::ReferenceTags { q_tags, kv_tags } => RaggedMask::ReferenceTags {
+                q_tags: f(q_tags)?,
+                kv_tags: f(kv_tags)?,
+            },
+            Self::ClassTable {
+                q_classes,
+                kv_classes,
+                table,
+                count,
+            } => RaggedMask::ClassTable {
+                q_classes: f(q_classes)?,
+                kv_classes: f(kv_classes)?,
+                table: f(table)?,
+                count,
+            },
+            Self::RelativeBias { table, max_len } => RaggedMask::RelativeBias {
+                table: f(table)?,
+                max_len,
+            },
+        })
+    }
 }
 
 /// Row `r` of segment `s` (`q_indptr[s] <= r < q_indptr[s+1]`) attends to
 /// key rows `kv_indptr[s] .. kv_indptr[s+1]`, not causally; a row outside
 /// every segment, or with nothing admitted, answers zeros.
 pub fn forward(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    q_indptr: Tensor,
-    kv_indptr: Tensor,
+    f: &mut Func,
+    q: Operand,
+    k: Operand,
+    v: Operand,
+    q_indptr: Operand,
+    kv_indptr: Operand,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
-    mask: &RaggedMask,
-    o: Tensor,
-) -> Result<(), Error> {
+    mask: &RaggedMask<Operand>,
+    o: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<Val, Error> {
     const OP: &str = "attn.ragged";
-    for t in [q, k, v, o] {
+    for t in [q.shape(), k.shape(), v.shape(), o] {
         expect(OP, t, &[Dtype::Bf16])?;
     }
     let qh = row_heads(OP, q.width, head_dim)?;
@@ -134,84 +164,82 @@ pub fn forward(
     };
     let (r, nk) = (i64::from(q.rows), i64::from(k.rows));
     let mask = *mask;
-    ctx.emit(&mut |cx| {
-        let qi = cx.read(q_indptr)?;
-        let qi = flat_i32(cx, qi)?;
-        let qi = head(cx, qi, segments + 1)?;
-        let ki = cx.read(kv_indptr)?;
-        let ki = flat_i32(cx, ki)?;
-        let ki = head(cx, ki, segments + 1)?;
-        let mut rule = Rule::default();
-        let mut tags = None;
-        let mut classes = None;
-        match mask {
-            RaggedMask::Segments => {}
-            RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-                let a = cx.read(q_tags)?;
-                let a = flat_i32(cx, a)?;
-                tags = Some(head(cx, a, r)?);
-                let b = cx.read(kv_tags)?;
-                let b = flat_i32(cx, b)?;
-                rule.kv_tags = Some(head(cx, b, nk)?);
-            }
-            RaggedMask::ClassTable {
-                q_classes,
-                kv_classes,
-                table,
-                count,
-            } => {
-                let a = cx.read(q_classes)?;
-                let a = flat_i32(cx, a)?;
-                classes = Some(head(cx, a, r)?);
-                let b = cx.read(kv_classes)?;
-                let b = flat_i32(cx, b)?;
-                let b = head(cx, b, nk)?;
-                let t = cx.read(table)?;
-                let t = flat_i32(cx, t)?;
-                rule.classes = Some((b, t, i64::from(count)));
-            }
-            RaggedMask::RelativeBias { table, max_len } => {
-                let t = cx.read(table)?;
-                let n = cx.ty(t).elements();
-                let t = cx.reshape(t, &[n])?;
-                let t = head(cx, t, i64::from(qh) * span)?;
-                rule.rbias = Some((t, i64::from(max_len)));
-            }
+    let qi = q_indptr.val;
+    let qi = flat_i32(f, qi)?;
+    let qi = head(f, qi, segments + 1)?;
+    let ki = kv_indptr.val;
+    let ki = flat_i32(f, ki)?;
+    let ki = head(f, ki, segments + 1)?;
+    let mut rule = Rule::default();
+    let mut tags = None;
+    let mut classes = None;
+    match mask {
+        RaggedMask::Segments => {}
+        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
+            let a = q_tags.val;
+            let a = flat_i32(f, a)?;
+            tags = Some(head(f, a, r)?);
+            let b = kv_tags.val;
+            let b = flat_i32(f, b)?;
+            rule.kv_tags = Some(head(f, b, nk)?);
         }
-        let qv = cx.read(q)?;
-        let kv = cx.read(k)?;
-        let vv = cx.read(v)?;
-        let ch = cx.tuning().chunks;
-        let f = cx.func();
-        let (qlo, _, s) = segment_of(f, qi, segments, r)?;
-        let sc = super::paged::clamp_i(f, s, 0, segments - 1)?;
-        let inside = super::paged::cmp_i(f, crate::hlo::Cmp::Ge, s, 0)?;
-        let lo = super::paged::take(f, ki, sc)?;
-        let s1 = super::paged::with_i(f, sc, 1, Func::add)?;
-        let hi = super::paged::take(f, ki, s1)?;
-        let z = f.like_i(lo, 0);
-        let lo = f.select(inside, lo, z)?;
-        let hi = f.select(inside, hi, z)?;
-        let q4 = f.reshape(qv, &[r, heads.kvh, heads.g, heads.d])?;
-        let mut rows = Rows::new(q4, lo, hi);
-        rows.tag = tags;
-        rows.class = classes;
-        if rule.rbias.is_some() {
-            let io = f.iota(Elem::I32, &[r], 0);
-            rows.qi = Some(f.sub(io, qlo)?);
-            rows.begin = Some(lo);
+        RaggedMask::ClassTable {
+            q_classes,
+            kv_classes,
+            table,
+            count,
+        } => {
+            let a = q_classes.val;
+            let a = flat_i32(f, a)?;
+            classes = Some(head(f, a, r)?);
+            let b = kv_classes.val;
+            let b = flat_i32(f, b)?;
+            let b = head(f, b, nk)?;
+            let t = table.val;
+            let t = flat_i32(f, t)?;
+            rule.classes = Some((b, t, i64::from(count)));
         }
-        let planes = Planes::Plain { k: kv, v: vv };
-        let fl = blocked(
-            f,
-            &planes,
-            &heads,
-            &rule,
-            &rows,
-            nk,
-            f64::from(sm_scale),
-            ch,
-        )?;
-        cx.write(o, fl.o)
-    })
+        RaggedMask::RelativeBias { table, max_len } => {
+            let t = table.val;
+            let n = f.ty(t).elements();
+            let t = f.reshape(t, &[n])?;
+            let t = head(f, t, i64::from(qh) * span)?;
+            rule.rbias = Some((t, i64::from(max_len)));
+        }
+    }
+    let qv = q.val;
+    let kv = k.val;
+    let vv = v.val;
+    let ch = tuning.chunks;
+    let fq = &mut *f;
+    let (qlo, _, s) = segment_of(fq, qi, segments, r)?;
+    let sc = super::paged::clamp_i(fq, s, 0, segments - 1)?;
+    let inside = super::paged::cmp_i(fq, crate::hlo::Cmp::Ge, s, 0)?;
+    let lo = super::paged::take(fq, ki, sc)?;
+    let s1 = super::paged::with_i(fq, sc, 1, Func::add)?;
+    let hi = super::paged::take(fq, ki, s1)?;
+    let z = fq.like_i(lo, 0);
+    let lo = fq.select(inside, lo, z)?;
+    let hi = fq.select(inside, hi, z)?;
+    let q4 = fq.reshape(qv, &[r, heads.kvh, heads.g, heads.d])?;
+    let mut rows = Rows::new(q4, lo, hi);
+    rows.tag = tags;
+    rows.class = classes;
+    if rule.rbias.is_some() {
+        let io = fq.iota(Elem::I32, &[r], 0);
+        rows.qi = Some(fq.sub(io, qlo)?);
+        rows.begin = Some(lo);
+    }
+    let planes = Planes::Plain { k: kv, v: vv };
+    let fl = blocked(
+        fq,
+        &planes,
+        &heads,
+        &rule,
+        &rows,
+        nk,
+        f64::from(sm_scale),
+        ch,
+    )?;
+    Ok(fl.o)
 }

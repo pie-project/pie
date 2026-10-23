@@ -131,7 +131,7 @@ fn logit_softcap_caps_every_logit() {
     let ctx = gpu.ctx();
     let xs = bf16s(3 * 1001, 1, 90.0);
     let mut x = gpu.tensor(&xs, 3, 1001, Dtype::Bf16);
-    attn::logit_softcap(&ctx, &mut x, 30.0).unwrap();
+    attn::merge::logit_softcap(&ctx, &mut x, 30.0).unwrap();
     let inv = 1.0f32 / 30.0;
     let want: Vec<f32> = xs.iter().map(|&v| 30.0 * (v * inv).tanh()).collect();
     close_bf16("logit_softcap", &gpu.read(&x), &want, 1.0);
@@ -171,20 +171,20 @@ fn sink_rescales_by_the_sinks_share() {
         };
 
         let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
-        attn::sink(&ctx, &mut o, lse, sink, d).unwrap();
+        attn::merge::sink(&ctx, &mut o, lse, sink, d).unwrap();
         close_bf16("sink", &gpu.read(&o), &want(&|_| true), 1.0);
 
         // The sinks in f32, as a checkpoint may keep them (Hy4).
         let sink32 = gpu.tensor(&sinks, 1, heads, Dtype::F32);
         let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
-        attn::sink(&ctx, &mut o, lse, sink32, d).unwrap();
+        attn::merge::sink(&ctx, &mut o, lse, sink32, d).unwrap();
         close_bf16("f32 sink", &gpu.read(&o), &want(&|_| true), 1.0);
 
         // Staged rows 1..4 of the 5.
         let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
         let win = gpu.ints(&[3, 1, 0, 0]);
         ctx.arm_stage(win.ptr);
-        attn::sink(&ctx, &mut o, lse, sink, d).unwrap();
+        attn::merge::sink(&ctx, &mut o, lse, sink, d).unwrap();
         ctx.disarm_stage();
         close_bf16(
             "windowed sink",
@@ -220,7 +220,7 @@ fn merge_lse_combines_two_partials() {
     );
     let mut o = gpu.zeros(n, heads * d, Dtype::Bf16);
     let mut lse = gpu.zeros(n, heads, Dtype::F32);
-    attn::merge_lse(&ctx, o1, lse1, o2, lse2, heads, d, &mut o, &mut lse).unwrap();
+    attn::merge::merge_lse(&ctx, o1, lse1, o2, lse2, heads, d, &mut o, &mut lse).unwrap();
     let (mut want, mut want_lse) = (vec![0f32; o1s.len()], vec![0f32; l1s.len()]);
     for cell in 0..(n * heads) as usize {
         let (a, b) = (l1s[cell], l2s[cell]);

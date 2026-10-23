@@ -1,7 +1,7 @@
 use kernels_cuda::Tensor;
 use kernels_cuda::linear;
+use kernels_cuda::linear::affine::OffsetKind;
 use kernels_cuda::linear::moe::GroupSeat;
-use kernels_cuda::linear::quant::OffsetKind;
 use poem_exec::{DispatchLinear, KernelError};
 use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
 
@@ -212,7 +212,7 @@ impl Run<'_> {
                     quant: None,
                     logits: true,
                 })?;
-                kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
+                kernels_cuda::attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
             }
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
@@ -283,11 +283,11 @@ impl Run<'_> {
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
-                        || act.rows > linear::affine::GEMV_ROWS
+                        || act.rows > linear::affine::tiled::GEMV_ROWS
                     {
-                        linear::affine::matmul
+                        linear::affine::tiled::matmul
                     } else {
-                        linear::affine::matmul_gemv
+                        linear::affine::tiled::matmul_gemv
                     };
                     entry(
                         self.ctx(),
@@ -314,11 +314,11 @@ impl Run<'_> {
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
-                        || act.rows > linear::affine::GEMV_ROWS
+                        || act.rows > linear::affine::tiled::GEMV_ROWS
                     {
-                        linear::affine::lm_head
+                        linear::affine::tiled::lm_head
                     } else {
-                        linear::affine::lm_head_gemv
+                        linear::affine::tiled::lm_head_gemv
                     };
                     entry(
                         self.ctx(),
@@ -1117,9 +1117,9 @@ impl Run<'_> {
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::quant::matmul_via_dense
+                        linear::dequant::matmul_via_dense
                     } else {
-                        linear::quant::matmul
+                        linear::affine::matmul
                     };
                 entry(
                     self.ctx(),
@@ -1154,9 +1154,9 @@ impl Run<'_> {
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::quant::lm_head_via_dense
+                        linear::dequant::lm_head_via_dense
                     } else {
-                        linear::quant::lm_head
+                        linear::affine::lm_head
                     };
                 entry(
                     self.ctx(),

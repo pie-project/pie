@@ -6,6 +6,7 @@ pub mod index;
 pub mod kv;
 pub mod kv_window;
 
+pub mod merge;
 pub mod mla;
 
 pub mod paged;
@@ -20,7 +21,6 @@ pub mod selected;
 
 pub mod sched;
 pub mod score;
-pub mod voxel;
 
 pub mod sched_decode;
 
@@ -38,7 +38,7 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 const BLOCK: u32 = 256;
 
 #[must_use]
-const fn elementwise(n: u32) -> Launch {
+pub(crate) const fn elementwise(n: u32) -> Launch {
     Launch::flat(n, BLOCK)
 }
 
@@ -73,7 +73,7 @@ fn attention_lands(op: &'static str, q: Tensor, o: &Tensor) {
     );
 }
 
-fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
+pub(crate) fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
     debug_assert_eq!(lse.dtype, Dtype::F32, "`{op}`'s log-sum-exp plane is f32");
     debug_assert!(
         lse.rows == rows && lse.width == heads,
@@ -580,118 +580,6 @@ pub fn prefill_rel(
         None,
         None,
         Some(rel),
-    )
-}
-
-pub fn sink(
-    ctx: &Ctx,
-    o: &mut Tensor,
-    lse: Tensor,
-    sink: Tensor,
-    head_dim: u32,
-) -> Result<(), Error> {
-    const OP: &str = "attn.sink";
-    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    // The sinks are the scores' own element, or f32 as a checkpoint keeps them.
-    let s = match sink.dtype {
-        Dtype::F32 => "float",
-        held if held == o.dtype => t,
-        held => {
-            return Err(refuse(
-                OP,
-                format!("the sinks are {held:?} and the scores {:?}", o.dtype),
-            ));
-        }
-    };
-    let heads = row_heads(OP, o.width, head_dim)?;
-    lse_plane(OP, &lse, o.rows, heads);
-    let rows = count(OP, "rows", o.rows)?;
-    let (vec, launch) = per_head_elementwise(o.rows, heads, head_dim);
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/attention.hip",
-            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}, {vec}>")),
-        )
-        .apply(launch),
-        &[
-            o.arg(),
-            lse.arg(),
-            sink.arg(),
-            rows.arg(),
-            stated(OP, heads)?.arg(),
-            stated(OP, head_dim)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn merge_lse(
-    ctx: &Ctx,
-    o1: Tensor,
-    lse1: Tensor,
-    o2: Tensor,
-    lse2: Tensor,
-    heads: u32,
-    head_dim: u32,
-    o: &mut Tensor,
-    lse: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attn.merge_lse";
-
-    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert!(
-        o1.rows == o.rows && o2.rows == o.rows,
-        "the merged outputs are one row per query row"
-    );
-    lse_plane(OP, lse, o.rows, heads);
-    let (vec, launch) = per_head_elementwise(o.rows, heads, head_dim);
-    let heads = count(OP, "the head count this merge states", heads)?;
-    let head_dim = count(OP, "the head width this merge states", head_dim)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/attention.hip",
-            symbol(&format!("::pie::attn::merge_lse_combine<{t}, {vec}>")),
-        )
-        .apply(launch),
-        &[
-            o1.arg(),
-            lse1.arg(),
-            o2.arg(),
-            lse2.arg(),
-            o.arg(),
-            lse.arg(),
-            heads.arg(),
-            head_dim.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attn.logit_softcap";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    if cap.is_nan() || cap <= 0.0 {
-        return Err(refuse(OP, format!("{cap} is not a logit soft cap")));
-    }
-    let n = x.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the element count", lanes)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/attention.hip",
-            symbol(&format!("::pie::attn::logit_softcap<{t}>")),
-        )
-        .apply(elementwise(lanes)),
-        &[x.arg(), cap.arg(), n.arg()],
     )
 }
 

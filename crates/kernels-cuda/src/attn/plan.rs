@@ -1,9 +1,15 @@
-use crate::error::Error;
+//! Host-only: the work plans the FlashAttention-2 decode, prefill and MLA
+//! arms launch from (`sched` the shared allocator and splitter).
 
-use crate::attn::{sched_decode, sched_mla, sched_prefill};
+use crate::error::Error;
 
 use crate::jit::{Ctx, refuse};
 use crate::tensor::Tensor;
+
+pub(crate) mod decode;
+pub(crate) mod mla;
+pub(crate) mod prefill;
+pub(crate) mod sched;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Device {
@@ -363,9 +369,9 @@ pub fn plan_decode(
     };
     let windowed_split = toggles.window_split && window_left >= 0;
     let built = if !windowed_split
-        && sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
+        && decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
     {
-        sched_decode::static_nonsplit(
+        decode::static_nonsplit(
             OP,
             shape.num_requests,
             live,
@@ -374,7 +380,7 @@ pub fn plan_decode(
             workspace.int_bytes,
         )?
     } else {
-        let req = sched_decode::Request {
+        let req = decode::Request {
             kv_indptr,
             batch_size: shape.num_requests,
             live,
@@ -390,7 +396,7 @@ pub fn plan_decode(
                     .decode_gqa
                     .whole(shape.head_dim, shape.group_size(), window_left),
         };
-        sched_decode::plan(
+        decode::plan(
             OP,
             &req,
             max_grid_size,
@@ -437,7 +443,7 @@ pub fn plan_prefill(
     some_requests(OP, &shape)?;
     window_left(OP, window)?;
 
-    let req = sched_prefill::Request {
+    let req = prefill::Request {
         qo_indptr,
         kv_indptr,
         total_num_rows: total_tokens,
@@ -454,20 +460,15 @@ pub fn plan_prefill(
     };
 
     let (built, capturable, graph_refusal) =
-        match sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
+        match prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
             Ok(built) => (built, enable_cuda_graph, None),
             Err(declined) if enable_cuda_graph => {
-                let req = sched_prefill::Request {
+                let req = prefill::Request {
                     enable_cuda_graph: false,
                     ..req
                 };
-                let built = sched_prefill::plan(
-                    OP,
-                    &req,
-                    device,
-                    workspace.int_bytes,
-                    workspace.float_bytes,
-                )?;
+                let built =
+                    prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
                 (built, false, Some(declined.to_string()))
             }
             Err(declined) => return Err(declined),
@@ -502,7 +503,7 @@ pub fn plan_prefill(
     })
 }
 
-pub use crate::attn::sched_prefill::{
+pub use crate::attn::plan::prefill::{
     graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
 };
 
@@ -521,7 +522,7 @@ pub fn plan_mla(
     workspace: Workspace,
 ) -> Result<MlaPlan, Error> {
     const OP: &str = "attn.mla_plan";
-    let req = sched_mla::Request {
+    let req = mla::Request {
         qo_indptr,
         kv_indptr,
         kv_len_arr: kv_len,
@@ -532,7 +533,7 @@ pub fn plan_mla(
         head_dim_o,
         causal,
     };
-    let built = sched_mla::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
+    let built = mla::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
     Ok(MlaPlan {
         info: built.info,
         int_upload: built.int_upload,

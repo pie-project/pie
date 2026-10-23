@@ -101,7 +101,7 @@ impl Run<'_> {
                 ..
             } = &**project
             && self.tensor(*streams).rows >= kernels_cuda::elemwise::hc::PRE_WIDE_FROM
-            && kernels_cuda::elemwise::hc::prenorm_project(
+            && kernels_cuda::elemwise::hc_project::prenorm_project(
                 self.ctx(),
                 self.tensor(*streams),
                 *eps,
@@ -334,7 +334,7 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         if self.ctx().tuning().hc_tile {
-            let landed = kernels_cuda::elemwise::hc::prenorm_project(
+            let landed = kernels_cuda::elemwise::hc_project::prenorm_project(
                 self.ctx(),
                 self.tensor(*streams),
                 *eps,
@@ -385,7 +385,10 @@ impl Run<'_> {
             poem_ir::Attn::MlaAbsorbOut { o, .. },
         ) = (&**absorb_q, &**prefill, &**absorb_out)
         {
-            use kernels_cuda::attn::mla::{self, ExpandedQ, Heads};
+            use kernels_cuda::attn::mla::{
+                self,
+                expand::{ExpandedQ, Heads},
+            };
             let mut out = self.tensor(*o);
             let q_pe_t = self.tensor(*q_pe);
             let h = Heads {
@@ -395,7 +398,8 @@ impl Run<'_> {
                 rope: q_pe_t.width / (*heads).max(1),
                 v: *v_head_dim,
             };
-            if out.rows >= self.ctx().tuning().mla_expanded_from && mla::expanded_takes(&h) {
+            if out.rows >= self.ctx().tuning().mla_expanded_from && mla::expand::expanded_takes(&h)
+            {
                 let queries = match split.as_deref() {
                     Some(poem_ir::Attn::MlaSplitQB { q_b, .. }) => {
                         ExpandedQ::Packed(self.tensor(*q_b))
@@ -413,7 +417,7 @@ impl Run<'_> {
                 )?;
                 let qo_indptr = self.ragged(*q).indptr;
                 let pool = self.pool(*cache);
-                if mla::prefill_expanded(
+                if mla::expand::prefill_expanded(
                     self.ctx(),
                     queries,
                     qo_indptr,
@@ -1348,7 +1352,7 @@ impl Run<'_> {
                 }
                 if kernels_cuda::attn::compressed::decode::ds_rows(&pool) {
                     // V4.1's rows: the write quantizes them apart.
-                    return kernels_cuda::attn::compressed::decode::append(
+                    return kernels_cuda::attn::compressed::kv_fp8::append(
                         self.ctx(),
                         self.ragged_lanes(*ky).data,
                         &pool,
@@ -1437,7 +1441,7 @@ impl Run<'_> {
             &mut self.tensor(*y),
         )?;
         if kernels_cuda::attn::compressed::decode::ds_rows(&pool) {
-            kernels_cuda::attn::compressed::decode::append(
+            kernels_cuda::attn::compressed::kv_fp8::append(
                 self.ctx(),
                 self.ragged_lanes(*y).data,
                 &pool,

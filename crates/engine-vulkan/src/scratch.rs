@@ -237,7 +237,7 @@ impl Scratch {
             .filter(|groups| *groups > 0)
             .map(|groups| {
                 let clips = budgets.max_clips().max(1);
-                let floats = kernels_vulkan::spatial::norm::scratch_floats(clips, groups);
+                let floats = kernels_slang::conv::group_norm::scratch_floats(clips, groups);
                 let mut at = 0u64;
                 Room::lay(&mut at, floats.div_ceil(4).max(1), 4, Dtype::F32)
             });
@@ -323,7 +323,7 @@ impl Scratch {
         groups: u32,
     ) -> Option<Result<(Tensor, Tensor)>> {
         let room = self.spatial?;
-        let splits = kernels_vulkan::spatial::norm::SPLITS;
+        let splits = kernels_slang::conv::group_norm::SPLITS;
         let partial_floats = u64::from(clips) * u64::from(splits) * u64::from(groups) * 4;
         let stat_floats = u64::from(clips) * u64::from(groups) * 2;
         if partial_floats + stat_floats > u64::from(room.rows) * u64::from(room.width) {

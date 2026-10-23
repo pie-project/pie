@@ -73,6 +73,16 @@ impl<'a> Cx<'a> {
         self.env.read(self.f, t)
     }
 
+    /// `t`'s current value, as the operand a pure kernel takes.
+    pub fn operand(&mut self, t: Tensor) -> Result<crate::tensor::Operand, Error> {
+        Ok(crate::tensor::Operand {
+            val: self.read(t)?,
+            rows: t.rows,
+            width: t.width,
+            dtype: t.dtype,
+        })
+    }
+
     /// `t`'s current value converted to `elem`.
     pub fn read_as(&mut self, t: Tensor, elem: Elem) -> Result<Val, Error> {
         let v = self.read(t)?;

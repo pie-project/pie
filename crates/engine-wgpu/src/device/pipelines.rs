@@ -36,6 +36,17 @@ struct Declared {
     local: [u32; 3],
 }
 
+/// Slang's WGSL with its `enable subgroups;` dropped: Naga refuses the
+/// directive (gfx-rs/wgpu#5555) and takes the subgroup builtins under the
+/// device's `SUBGROUP` feature instead. A browser's Tint needs it, so the
+/// module keeps it everywhere else.
+fn without_subgroup_enable(wgsl: &str) -> String {
+    wgsl.lines()
+        .filter(|line| line.trim() != "enable subgroups;")
+        .flat_map(|line| [line, "\n"])
+        .collect()
+}
+
 fn promote_storage(wgsl: &str) -> String {
     let mut out = String::with_capacity(wgsl.len() + 64);
     let mut rest = wgsl;
@@ -299,7 +310,7 @@ impl Pipelines {
         let cache = self.cache(device);
         // kernels-slang's entries come compiled: one WGSL module, no tiers.
         if let Some(wgsl) = kernels_slang::wgsl(entrypoint) {
-            let wgsl = promote_storage(wgsl);
+            let wgsl = without_subgroup_enable(&promote_storage(wgsl));
             let pipeline = Arc::new(build(
                 device.core(),
                 cache.as_ref(),

@@ -8,7 +8,7 @@
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use kernels_xla::hlo::f16_bits;
-use kernels_xla::linear::{kquant, nvfp4, quant};
+use kernels_xla::linear::kquant;
 use kernels_xla::{Bank, Tensor};
 
 fn hash(i: usize, seed: u32) -> u32 {
@@ -211,14 +211,14 @@ fn affine_banks_at_every_group_and_width_answer_the_host() {
     if !b
         .run(|ctx| {
             for c in &cases {
-                quant::matmul(ctx, x, c.bank, c.y)?;
-                quant::matmul(ctx, xbig, c.bank, c.yb)?;
+                engine_xla::lower::linear::quant(ctx, false, x, c.bank, c.y)?;
+                engine_xla::lower::linear::quant(ctx, false, xbig, c.bank, c.yb)?;
             }
-            quant::matmul(ctx, xf, u4, f32s[0])?;
-            quant::matmul(ctx, xfb, u4, f32s[1])?;
-            quant::matmul(ctx, xf, mx, f32s[2])?;
-            quant::matmul(ctx, xfb, mx, f32s[3])?;
-            quant::lm_head(ctx, x, u4, lm)
+            engine_xla::lower::linear::quant(ctx, false, xf, u4, f32s[0])?;
+            engine_xla::lower::linear::quant(ctx, false, xfb, u4, f32s[1])?;
+            engine_xla::lower::linear::quant(ctx, false, xf, mx, f32s[2])?;
+            engine_xla::lower::linear::quant(ctx, false, xfb, mx, f32s[3])?;
+            engine_xla::lower::linear::quant(ctx, true, x, u4, lm)
         })
         .unwrap()
     {
@@ -475,8 +475,10 @@ fn every_k_quant_scheme_answers_the_host() {
     if !b
         .run(|ctx| {
             for c in &cases {
-                kquant::matmul(ctx, x, c.w, c.y)?;
-                let scheme = kquant::to_affine(ctx, c.w, k as u32, c.codes, c.scales, c.biases)?;
+                engine_xla::lower::linear::kquant(ctx, false, x, c.w, c.y)?;
+                let scheme = engine_xla::lower::linear::kquant_to_affine(
+                    ctx, c.w, k as u32, c.codes, c.scales, c.biases,
+                )?;
                 assert_eq!(kquant::affine_group(scheme), c.group);
                 let bank = Bank {
                     codes: c.codes,
@@ -485,10 +487,10 @@ fn every_k_quant_scheme_answers_the_host() {
                     group: c.group,
                     bits: 8,
                 };
-                quant::matmul(ctx, x, bank, c.ya)?;
-                quant::matmul(ctx, xbig, bank, c.yb)?;
+                engine_xla::lower::linear::quant(ctx, false, x, bank, c.ya)?;
+                engine_xla::lower::linear::quant(ctx, false, xbig, bank, c.yb)?;
             }
-            kquant::lm_head(ctx, x, lm_w, lm)
+            engine_xla::lower::linear::kquant(ctx, true, x, lm_w, lm)
         })
         .unwrap()
     {
@@ -573,9 +575,9 @@ fn nvfp4_answers_the_host() {
     let yb = b.zeros(Dtype::Bf16, big as u32, n as u32);
     if !b
         .run(|ctx| {
-            nvfp4::matmul(ctx, x, c, s, ts, y)?;
-            nvfp4::matmul(ctx, xbig, c, s, ts, yb)?;
-            nvfp4::lm_head(ctx, x, c, s, ts, lm)
+            engine_xla::lower::linear::nvfp4(ctx, false, x, c, s, ts, y)?;
+            engine_xla::lower::linear::nvfp4(ctx, false, xbig, c, s, ts, yb)?;
+            engine_xla::lower::linear::nvfp4(ctx, true, x, c, s, ts, lm)
         })
         .unwrap()
     {

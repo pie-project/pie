@@ -7,6 +7,14 @@ The checks, the ones the rest of the convention leans on:
   * every launch the host writes with a literal symbol names, by namespace
     (and every `::pie::` scope in it, template arguments too, exists)
     and name, a kernel its unit (or a header the unit includes) defines;
+  * kernels-cuda's `src/` mirrors `kernels/`: every unit has the host
+    module at its path (a tier suffix `_smNN` dropped; a unit named after its
+    directory, `attn/index/index.cu`, is the directory module's, and a group
+    with no host submodules keeps its units in its root), and every
+    host module under a group is a unit's, nests under one (`dense/voxel`), is
+    a form beside one (`select_bf16` beside `select`), is a directory module
+    the kernel tree also has, or says `//! Host-only:` on its first line (as
+    do its submodules, then);
   * kernels-cerebras: every `library("<group>/<name>")` the host writes is
     a unit under `kernels/`, every unit outside `prim/` is named by one, and
     every unit sits in one of the convention's groups;
@@ -420,12 +428,14 @@ def slang_tree():
 
 def slang_pattern(literal):
     """A literal's entry pattern: a `format!` placeholder stands for any
-    identifier fragment. `None` when its fixed text is too short to name a
-    kernel."""
+    identifier fragment, and a literal ending in `_` is a prefix (a host
+    that sorts entries by family). `None` when its fixed text is too short
+    to name a kernel."""
     parts = re.split(r"\{[^}]*\}", literal)
     if len(parts) > 1 and max(map(len, parts)) < 3:
         return None
-    return re.compile(r"\w*".join(map(re.escape, parts)))
+    pattern = r"\w*".join(map(re.escape, parts))
+    return re.compile(pattern + r"\w*" if literal.endswith("_") else pattern)
 
 
 def slang_host(unit):
@@ -479,6 +489,57 @@ def slang_checks():
     return findings
 
 
+# kernels-cuda's host mirror (conventions.md section 7).
+MIRROR = ("crates/kernels-cuda/kernels", "crates/kernels-cuda/src")
+MIRROR_GROUPS = ["attn", "collective", "conv", "elemwise", "gather", "linear", "runtime",
+                 "sampling", "ssm"]
+TIER = re.compile(r"_sm\d+a?$")
+
+
+def host_mirror():
+    tree, src = (REPO / d for d in MIRROR)
+    stems = set()
+    for cu in tree.rglob("*.cu"):
+        rel = cu.relative_to(tree).with_suffix("").as_posix()
+        if rel.split("/")[0] in MIRROR_GROUPS:
+            stems.add(TIER.sub("", rel))
+    dirs = {d.relative_to(tree).as_posix() for d in tree.rglob("*") if d.is_dir()}
+
+    def owner(stem):
+        # a unit named after its directory is the directory module's, and
+        # a group with no host submodules keeps its units in its root
+        head, _, leaf = stem.rpartition("/")
+        if head and head.rsplit("/", 1)[-1] == leaf:
+            return head
+        group = stem.split("/")[0]
+        if not (src / group).is_dir() and (src / f"{group}.rs").is_file():
+            return group
+        return stem
+
+    owners = {owner(s) for s in stems}
+    findings = []
+    for stem in sorted(stems):
+        if not (src / f"{owner(stem)}.rs").is_file():
+            findings.append(f"{MIRROR[0]}/{stem}.cu: no host module `src/{owner(stem)}.rs`")
+    for rs in sorted(src.rglob("*.rs")):
+        mod = rs.relative_to(src).with_suffix("").as_posix()
+        if mod.split("/")[0] not in MIRROR_GROUPS or "/" not in mod:
+            continue
+        parts = mod.split("/")
+        nested = any("/".join(parts[:i]) in owners for i in range(2, len(parts)))
+        form = any(mod.startswith(o + "_") and "/" not in mod[len(o) + 1:] for o in owners)
+        def host_only(m):
+            f = src / f"{m}.rs"
+            return f.is_file() and f.read_text().startswith("//! Host-only:")
+
+        under_host = any(host_only("/".join(parts[:i])) for i in range(2, len(parts)))
+        if mod in owners or nested or form or mod in dirs or host_only(mod) or under_host:
+            continue
+        findings.append(f"{MIRROR[1]}/{mod}.rs: owns no unit, nests under none, and says no "
+                        "`//! Host-only:`")
+    return findings
+
+
 def main():
     findings = []
     for crate in CRATES:
@@ -490,6 +551,7 @@ def main():
         findings += metal_misdirected_launches(crate)
     findings += csl_units()
     findings += slang_checks()
+    findings += host_mirror()
     for f in findings:
         print(f)
     print(f"kernel-lint: {len(findings)} finding(s)", file=sys.stderr)
