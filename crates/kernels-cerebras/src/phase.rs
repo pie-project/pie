@@ -9,7 +9,6 @@
 use dtype::Dtype;
 
 use crate::csl::{Arg, Call};
-use crate::cx::View;
 use crate::error::Error;
 use crate::library::Kernel;
 use crate::plan::{LaneSplit, Plan};
@@ -19,19 +18,24 @@ use crate::tensor::Tensor;
 /// places operand handles on buffers, declares the buffers and private
 /// arrays an entry asks for, and takes each phase when it closes.
 pub trait Sink {
-    /// The root buffer holding `t` now, and `t`'s rows in it.
-    fn read(&mut self, t: Tensor) -> Result<View, Error>;
+    /// The device array holding `t` now: its root buffer, or a row window
+    /// of the root the host cuts out before the phase (one a handle within
+    /// a phase).
+    fn read(&mut self, t: Tensor) -> Result<Buf, Error>;
 
-    /// The root buffer `t` holds from here on.
-    fn write(&mut self, t: Tensor) -> Result<View, Error>;
+    /// The device array `t` holds from here on (a root, or a row window the
+    /// host pastes back after the phase).
+    fn write(&mut self, t: Tensor) -> Result<Buf, Error>;
 
     /// `t` as a packed bf16 buffer (two halves a word), when the engine
-    /// keeps it so (a half-precision weight); `None` means read it as f32.
-    fn read_half(&mut self, t: Tensor) -> Result<Option<View>, Error>;
+    /// keeps it so (a half-precision weight read whole); `None` means read
+    /// it as f32.
+    fn read_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error>;
 
-    /// A kv pool `t` as a packed bf16 buffer under its plain name (read and
-    /// written in place), when the engine keeps pools so; `None` means f32.
-    fn pool_half(&mut self, t: Tensor) -> Result<Option<View>, Error>;
+    /// A kv pool `t` as a packed bf16 buffer under its plain name, read and
+    /// written in place, when the engine keeps pools so and `t` is the
+    /// whole pool; `None` means f32.
+    fn pool_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error>;
 
     /// A fresh identifier with `hint` in it.
     fn unique(&mut self, hint: &str) -> String;

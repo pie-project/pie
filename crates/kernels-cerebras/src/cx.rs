@@ -1,9 +1,9 @@
 //! What a kernel entry emits with.
 //!
-//! An entry asks for the device arrays behind its operand handles, writes
-//! CSL statements and kernel calls into the phase under construction, and
-//! names which handles it wrote. The engine's [`Sink`] decides what a handle
-//! is and takes the phase when it closes.
+//! An entry asks for the device arrays behind its operand handles and makes
+//! kernel calls into the phase under construction. The engine's [`Sink`]
+//! decides what a handle is (a root, a row window of one, a packed form)
+//! and takes the phase when it closes.
 
 use dtype::Dtype;
 
@@ -35,15 +35,6 @@ pub trait Emit {
 
 pub type Ctx<'a> = dyn Emit + 'a;
 
-/// A handle resolved to its root buffer: rows `[offset, offset + rows)` of
-/// `whole`.
-#[derive(Debug, Clone)]
-pub struct View {
-    pub whole: Buf,
-    pub offset: u32,
-    pub rows: u32,
-}
-
 /// A kernel's view: the phase under construction and the engine's sink.
 /// An entry emits kernel calls ([`Cx::call`]); the phase is its call list.
 pub struct Cx<'a> {
@@ -51,9 +42,6 @@ pub struct Cx<'a> {
     name: String,
     body: Vec<Statement>,
     rounds: Vec<Buf>,
-    /// Row windows this phase names, by handle: exported view buffers the
-    /// host cuts from their roots and pastes back.
-    windows: Vec<(u32, Buf)>,
     /// How many PEs the phase runs on, and how its buffers spread over them.
     pes: u32,
     shards: Vec<(String, Shard)>,
@@ -74,7 +62,6 @@ impl<'a> Cx<'a> {
             name,
             body: Vec::new(),
             rounds: Vec::new(),
-            windows: Vec::new(),
             pes: 1,
             shards: Vec::new(),
             lane: None,
@@ -181,57 +168,27 @@ impl<'a> Cx<'a> {
 
     /// The device array holding `t`, in f32.
     pub fn read(&mut self, t: Tensor) -> Result<Buf, Error> {
-        let v = self.p.read(t)?;
-        self.window(t, v, false)
+        self.p.read(t)
     }
 
     /// `t` packed two bf16 a u32 word, when the engine keeps it so and it
     /// is a whole root (no window); else `None`, and the caller reads it
     /// as f32.
     pub fn read_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error> {
-        match self.p.read_half(t)? {
-            Some(v) if v.offset == 0 && v.rows == v.whole.rows => Ok(Some(v.whole)),
-            _ => Ok(None),
-        }
+        self.p.read_half(t)
     }
 
     /// A kv pool plane packed two bf16 a word, read and written in place,
     /// when the engine keeps pools so (see [`Sink::pool_half`]).
     pub fn pool_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error> {
-        match self.p.pool_half(t)? {
-            Some(v) if v.offset == 0 && v.rows == v.whole.rows => {
-                self.p.written(&v.whole.name);
-                Ok(Some(v.whole))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// A row window of a root as its own exported buffer: the host cuts it
-    /// out of the root before the phase and pastes it back after.
-    fn window(&mut self, t: Tensor, v: View, write: bool) -> Result<Buf, Error> {
-        let _ = write;
-        if v.offset == 0 && v.rows == v.whole.rows {
-            return Ok(v.whole);
-        }
-        if let Some((_, buf)) = self.windows.iter().find(|w| w.0 == t.buf) {
-            return Ok(buf.clone());
-        }
-        let name = self.p.unique(&format!("w{}", v.whole.name));
-        let off = u64::from(v.offset) * u64::from(v.whole.width);
-        let buf = self
-            .p
-            .view(&name, &v.whole.name, off, v.rows, v.whole.width)?;
-        self.windows.push((t.buf, buf.clone()));
-        Ok(buf)
+        self.p.pool_half(t)
     }
 
     /// The device array to write `t` into. Statements the entry emits after
     /// this compute in f32; if `t` stores bf16, the values are rounded to
     /// bf16 (nearest even) when the phase ends, so the write rounds once.
     pub fn write(&mut self, t: Tensor) -> Result<Buf, Error> {
-        let v = self.p.write(t)?;
-        let b = self.window(t, v, true)?;
+        let b = self.p.write(t)?;
         match t.dtype {
             Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::U8 => {}
             Dtype::Bf16 => {

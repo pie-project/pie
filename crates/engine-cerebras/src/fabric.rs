@@ -17,7 +17,6 @@ use std::fmt::Write;
 use dtype::Dtype;
 use kernels_cerebras::Tensor;
 use kernels_cerebras::csl::{Arg, Call, Func};
-use kernels_cerebras::cx::View as Placed;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
@@ -177,6 +176,22 @@ pub fn terms() -> Fabric {
     }
 }
 
+/// A handle placed on its root buffer: rows `[offset, offset + rows)` of
+/// `whole`.
+#[derive(Debug, Clone)]
+pub struct Placed {
+    pub whole: Buf,
+    pub offset: u32,
+    pub rows: u32,
+}
+
+impl Placed {
+    /// Whether the handle is its whole root.
+    fn is_whole(&self) -> bool {
+        self.offset == 0 && self.rows == self.whole.rows
+    }
+}
+
 /// What places a fire's operand handles on the program's buffers: the
 /// tracer's handle tables, or the bench's one buffer a handle.
 pub trait Operands {
@@ -203,29 +218,79 @@ pub trait Operands {
     }
 }
 
-/// What an entry emits into: a program, the operands it places, and the
+/// What one phase emits into: a program, the operands it places, and the
 /// planner the entry asks for its splits.
 pub struct Emitting<'a> {
-    pub program: &'a mut Program,
-    pub operands: &'a mut dyn Operands,
-    pub plan: &'a dyn Plan,
+    program: &'a mut Program,
+    operands: &'a mut dyn Operands,
+    plan: &'a dyn Plan,
+    /// Row windows the phase names, by handle: exported view buffers the
+    /// host cuts from their roots before the phase and pastes back after.
+    windows: Vec<(u32, Buf)>,
+}
+
+impl<'a> Emitting<'a> {
+    pub fn new(
+        program: &'a mut Program,
+        operands: &'a mut dyn Operands,
+        plan: &'a dyn Plan,
+    ) -> Self {
+        Emitting {
+            program,
+            operands,
+            plan,
+            windows: Vec::new(),
+        }
+    }
+
+    /// The device array a placed handle is: its root, or the phase's row
+    /// window of it (one a handle).
+    fn window(&mut self, t: Tensor, at: Placed) -> Result<Buf, Error> {
+        if at.is_whole() {
+            return Ok(at.whole);
+        }
+        if let Some((_, buf)) = self.windows.iter().find(|w| w.0 == t.buf) {
+            return Ok(buf.clone());
+        }
+        let name = self.program.unique(&format!("w{}", at.whole.name));
+        let offset = u64::from(at.offset) * u64::from(at.whole.width);
+        let buf = self
+            .program
+            .view(&name, &at.whole.name, offset, at.rows, at.whole.width)?;
+        self.windows.push((t.buf, buf.clone()));
+        Ok(buf)
+    }
 }
 
 impl Sink for Emitting<'_> {
-    fn read(&mut self, t: Tensor) -> Result<Placed, Error> {
-        self.operands.read(self.program, t)
+    fn read(&mut self, t: Tensor) -> Result<Buf, Error> {
+        let at = self.operands.read(self.program, t)?;
+        self.window(t, at)
     }
 
-    fn write(&mut self, t: Tensor) -> Result<Placed, Error> {
-        self.operands.write(self.program, t)
+    fn write(&mut self, t: Tensor) -> Result<Buf, Error> {
+        let at = self.operands.write(self.program, t)?;
+        self.window(t, at)
     }
 
-    fn read_half(&mut self, t: Tensor) -> Result<Option<Placed>, Error> {
-        self.operands.read_half(self.program, t)
+    fn read_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error> {
+        Ok(self
+            .operands
+            .read_half(self.program, t)?
+            .filter(Placed::is_whole)
+            .map(|at| at.whole))
     }
 
-    fn pool_half(&mut self, t: Tensor) -> Result<Option<Placed>, Error> {
-        self.operands.pool_half(self.program, t)
+    fn pool_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error> {
+        let Some(at) = self
+            .operands
+            .pool_half(self.program, t)?
+            .filter(Placed::is_whole)
+        else {
+            return Ok(None);
+        };
+        self.program.written(&at.whole.name);
+        Ok(Some(at.whole))
     }
 
     fn unique(&mut self, hint: &str) -> String {

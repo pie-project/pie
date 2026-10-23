@@ -11,9 +11,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use dtype::Dtype;
 use kernels_cerebras::plan::Plan;
-use kernels_cerebras::{Cx, Emit, Error, Tensor, View};
+use kernels_cerebras::{Cx, Emit, Error, Tensor};
 
-use crate::fabric::{Emitting, Fabric, Operands, Planner, Program, Rendered};
+use crate::fabric::{Emitting, Fabric, Operands, Placed, Planner, Program, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Sdk};
 
 /// One simulator at a time on this box: runs are serialised across threads
@@ -218,18 +218,18 @@ pub struct Roots {
 }
 
 impl Operands for Roots {
-    fn read(&mut self, p: &mut Program, t: Tensor) -> Result<View, Error> {
+    fn read(&mut self, p: &mut Program, t: Tensor) -> Result<Placed, Error> {
         let whole = p.read("read", t)?;
-        Ok(View {
+        Ok(Placed {
             offset: 0,
             rows: whole.rows,
             whole,
         })
     }
 
-    fn write(&mut self, p: &mut Program, t: Tensor) -> Result<View, Error> {
+    fn write(&mut self, p: &mut Program, t: Tensor) -> Result<Placed, Error> {
         let whole = p.write("write", t)?;
-        Ok(View {
+        Ok(Placed {
             offset: 0,
             rows: whole.rows,
             whole,
@@ -240,24 +240,24 @@ impl Operands for Roots {
     /// standing in for the engine's weights): a weight under its own
     /// packed name, a pool (asked through `Cx::pool_half`) under its plain
     /// name, read and written.
-    fn read_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
+    fn read_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<Placed>, Error> {
         if !self.fabric.half_weights || t.dtype != Dtype::Bf16 || !t.width.is_multiple_of(2) {
             return Ok(None);
         }
         let whole = p.declare_packed(&format!("b{}h", t.buf), t.dtype, t.rows, t.width)?;
-        Ok(Some(View {
+        Ok(Some(Placed {
             offset: 0,
             rows: whole.rows,
             whole,
         }))
     }
 
-    fn pool_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
+    fn pool_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<Placed>, Error> {
         if !self.fabric.half_pool || t.dtype != Dtype::Bf16 || !t.width.is_multiple_of(2) {
             return Ok(None);
         }
         let whole = p.declare_packed(&format!("b{}", t.buf), t.dtype, t.rows, t.width)?;
-        Ok(Some(View {
+        Ok(Some(Placed {
             offset: 0,
             rows: whole.rows,
             whole,
@@ -303,11 +303,7 @@ impl Emit for Recorder {
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {
         let mut program = self.program.borrow_mut();
         let mut operands = self.operands.borrow_mut();
-        let mut sink = Emitting {
-            program: &mut program,
-            operands: operands.as_mut(),
-            plan: &self.plan,
-        };
+        let mut sink = Emitting::new(&mut program, operands.as_mut(), &self.plan);
         let mut cx = Cx::new(&mut sink, "op");
         body(&mut cx)?;
         cx.finish();

@@ -27,7 +27,7 @@ pub mod ssm;
 pub mod tensor;
 
 pub use attn::{DecodePlan, PrefillPlan};
-pub use cx::{Ctx, Cx, Emit, View, expect, shaped};
+pub use cx::{Ctx, Cx, Emit, expect, shaped};
 pub use error::Error;
 pub use phase::{Buf, Sink};
 pub use tensor::{KvPool, RaggedTensor, RecurrentPool, Tensor};

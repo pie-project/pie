@@ -20,9 +20,9 @@ use std::collections::BTreeMap;
 
 use dtype::Dtype;
 use kernels_cerebras::phase::{BankSplit, Buf, ColPlane, HostOp, HostPhase, Reduce, Segment};
-use kernels_cerebras::{Cx, Emit, Tensor, View};
+use kernels_cerebras::{Cx, Emit, Tensor};
 
-use crate::fabric::{Emitting, Operands, Program, Rendered, elem_of};
+use crate::fabric::{Emitting, Operands, Placed, Program, Rendered, elem_of};
 
 /// Where a root's value comes from when the program first reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1294,20 +1294,20 @@ impl Lens<'_> {
 }
 
 impl Operands for Lens<'_> {
-    fn read(&mut self, p: &mut Program, t: Tensor) -> Result<View, kernels_cerebras::Error> {
+    fn read(&mut self, p: &mut Program, t: Tensor) -> Result<Placed, kernels_cerebras::Error> {
         let (_, offset, whole) = self.root(p, t)?;
-        Ok(View {
+        Ok(Placed {
             whole,
             offset,
             rows: t.rows,
         })
     }
 
-    fn write(&mut self, p: &mut Program, t: Tensor) -> Result<View, kernels_cerebras::Error> {
+    fn write(&mut self, p: &mut Program, t: Tensor) -> Result<Placed, kernels_cerebras::Error> {
         let (root, offset, whole) = self.root(p, t)?;
         self.written.insert(root, ());
         p.written(&whole.name);
-        Ok(View {
+        Ok(Placed {
             whole,
             offset,
             rows: t.rows,
@@ -1320,7 +1320,7 @@ impl Operands for Lens<'_> {
         &mut self,
         p: &mut Program,
         t: Tensor,
-    ) -> Result<Option<View>, kernels_cerebras::Error> {
+    ) -> Result<Option<Placed>, kernels_cerebras::Error> {
         if !self.fabric.half_weights {
             return Ok(None);
         }
@@ -1342,7 +1342,7 @@ impl Operands for Lens<'_> {
         }
         let buf = p.declare_packed(&format!("{}h", root_name(root)), r.dtype, r.rows, r.width)?;
         p.keep(&buf.name);
-        Ok(Some(View {
+        Ok(Some(Placed {
             whole: buf,
             offset: 0,
             rows: r.rows,
@@ -1356,7 +1356,7 @@ impl Operands for Lens<'_> {
         &mut self,
         p: &mut Program,
         t: Tensor,
-    ) -> Result<Option<View>, kernels_cerebras::Error> {
+    ) -> Result<Option<Placed>, kernels_cerebras::Error> {
         if !self.fabric.half_pool {
             return Ok(None);
         }
@@ -1378,7 +1378,7 @@ impl Operands for Lens<'_> {
         // first packed run of pico lost every appended key here).
         self.written.insert(root, ());
         if let Some(b) = self.current.get(&root) {
-            return Ok(Some(View {
+            return Ok(Some(Placed {
                 whole: b.clone(),
                 offset: 0,
                 rows: r.rows,
@@ -1390,7 +1390,7 @@ impl Operands for Lens<'_> {
         }
         self.params.push((root, r.source));
         self.current.insert(root, buf.clone());
-        Ok(Some(View {
+        Ok(Some(Placed {
             whole: buf,
             offset: 0,
             rows: r.rows,
@@ -1433,11 +1433,7 @@ impl Emit for Tracer<'_> {
             views,
         };
         let scope = program.take_scope();
-        let mut sink = Emitting {
-            program,
-            operands: &mut lens,
-            plan: &self.plan,
-        };
+        let mut sink = Emitting::new(program, &mut lens, &self.plan);
         let mut cx = Cx::new(&mut sink, &scope);
         body(&mut cx)?;
         cx.finish();
