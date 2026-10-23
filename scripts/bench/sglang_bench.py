@@ -78,6 +78,8 @@ def build_engine(args: argparse.Namespace, max_running_requests: int):
         engine_kwargs["attention_backend"] = args.sglang_attention_backend
     if args.sglang_sampling_backend:
         engine_kwargs["sampling_backend"] = args.sglang_sampling_backend
+    if args.sglang_moe_runner_backend:
+        engine_kwargs["moe_runner_backend"] = args.sglang_moe_runner_backend
     if args.sglang_dsa_backend:
         engine_kwargs["dsa_prefill_backend"] = args.sglang_dsa_backend
         engine_kwargs["dsa_decode_backend"] = args.sglang_dsa_backend
