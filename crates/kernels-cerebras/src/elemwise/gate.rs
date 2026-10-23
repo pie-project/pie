@@ -5,6 +5,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::Shard;
 use crate::tensor::Tensor;
 
@@ -29,9 +30,8 @@ pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
                 },
             );
         }
-        cx.library("elemwise/silu_scaled");
         cx.call(
-            "k_silu_scaled",
+            Kernel::SiluScaled,
             vec![Arg::Ptr(xb), Arg::Int(n as i64), Arg::Float(s)],
         );
         Ok(())
@@ -72,9 +72,8 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
             cx.shard(&gb, tile);
             cx.shard(&xb, tile);
         }
-        cx.library("elemwise/sigmoid_mul");
         cx.call(
-            "k_sigmoid_mul",
+            Kernel::SigmoidMul,
             vec![Arg::Ptr(xb), Arg::Ptr(gb), Arg::Int(n as i64)],
         );
         Ok(())

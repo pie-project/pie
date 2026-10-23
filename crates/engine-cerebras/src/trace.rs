@@ -1048,7 +1048,7 @@ fn table_json(t: &kernels_cerebras::program::Table) -> serde_json::Value {
         Arg::Expr(e) => serde_json::json!({ "expr": e }),
     };
     serde_json::json!({
-        "kernels": t.kernels,
+        "kernels": t.kernels.iter().map(|k| k.name()).collect::<Vec<_>>(),
         "ops_words": t.ops_words,
         "arena_words": t.arena_words,
         "keep_chunks": t.keep_chunks,
@@ -1168,7 +1168,7 @@ fn table_of(v: &serde_json::Value) -> Option<kernels_cerebras::program::Table> {
         kernels: v["kernels"]
             .as_array()?
             .iter()
-            .map(|k| Some(k.as_str()?.to_string()))
+            .map(|k| kernels_cerebras::library::Kernel::of(k.as_str()?))
             .collect::<Option<Vec<_>>>()?,
         ops_words: v["ops_words"].as_u64()? as u32,
         ops,

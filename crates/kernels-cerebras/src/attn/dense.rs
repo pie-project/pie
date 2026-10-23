@@ -17,6 +17,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::linear::gemm::pe_words;
 use crate::program::{BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
 use crate::tensor::Tensor;
@@ -132,9 +133,8 @@ pub fn bidirectional(
             let qb = cx.window_of(&qb, c0, n)?;
             let ob = cx.window_of(&ob, c0, n)?;
             if whole {
-                cx.library("attn/attend_dense");
                 cx.call(
-                    "k_attend_dense",
+                    Kernel::AttendDense,
                     vec![
                         Arg::Ptr(qb),
                         Arg::Ptr(kb),
@@ -233,10 +233,9 @@ pub fn bidirectional(
             if merge {
                 super::paged::lse_merge(cx, &ob, &lse, o_words, l_words, ag, ag * hg);
             }
-            cx.library("attn/attend_dense");
             let h = |i| Arg::Word(hdr.name.clone(), i);
             cx.call(
-                "k_attend_dense",
+                Kernel::AttendDense,
                 vec![
                     Arg::Ptr(qb),
                     Arg::Ptr(kb),

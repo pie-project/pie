@@ -7,6 +7,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::{FabricOp, FabricStep, Guarded, HostOp, Shard};
 use crate::tensor::Tensor;
 
@@ -70,9 +71,8 @@ pub fn topk(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("sampling/topk");
         cx.call(
-            "k_topk",
+            Kernel::Topk,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(vb),
@@ -151,10 +151,8 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
                 },
             );
         }
-        cx.library("sampling/argmax_part");
-        cx.library("sampling/argmax_merge");
         cx.call(
-            "k_argmax_part",
+            Kernel::ArgmaxPart,
             vec![
                 Arg::Ptr(xb),
                 Arg::Scratch(parts.clone(), "f32"),
@@ -164,7 +162,7 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
         );
         if cg == 1 {
             cx.call(
-                "k_argmax_merge",
+                Kernel::ArgmaxMerge,
                 vec![
                     Arg::Scratch(parts.clone(), "f32"),
                     Arg::Ptr(yb),
@@ -187,7 +185,7 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
             },
         }];
         let finish = vec![Guarded::root(
-            "k_argmax_merge",
+            Kernel::ArgmaxMerge,
             vec![
                 Arg::Scratch(all.clone(), "f32"),
                 Arg::Ptr(yb.clone()),
@@ -231,9 +229,8 @@ fn argmax_host_merge(
             cx.shard(&xb, tile);
             cx.shard(&parts, tile);
         }
-        cx.library("sampling/argmax_part");
         cx.call(
-            "k_argmax_part",
+            Kernel::ArgmaxPart,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(parts),

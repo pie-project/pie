@@ -5,6 +5,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::Shard;
 use crate::tensor::Tensor;
 
@@ -61,9 +62,8 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
                 },
             );
         }
-        cx.library("linear/swiglu");
         cx.call(
-            "k_swiglu",
+            Kernel::Swiglu,
             vec![
                 Arg::Ptr(pb),
                 Arg::Ptr(yb),
@@ -106,9 +106,8 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
             cx.shard(&xb, tile);
             cx.shard(&yb, tile);
         }
-        cx.library("linear/gelu_tanh");
         cx.call(
-            "k_gelu_tanh",
+            Kernel::GeluTanh,
             vec![Arg::Ptr(xb), Arg::Ptr(yb), Arg::Int(n as i64)],
         );
         Ok(())

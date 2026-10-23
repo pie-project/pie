@@ -5,6 +5,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::{HostOp, Shard};
 use crate::tensor::Tensor;
 
@@ -162,10 +163,9 @@ fn act_x_wt(
             cx.shard(&yb, Shard::Cols(cg));
         }
         let kernel = if packed {
-            cx.library("prim/half");
-            cx.library("linear/matmul_packed")
+            Kernel::MatmulPacked
         } else {
-            cx.library("linear/matmul")
+            Kernel::Matmul
         };
         let count = u64::from(m / rg) * u64::from(n / cg);
         let out = if fabric {
@@ -276,10 +276,9 @@ fn resident_matmul(
         let yb = cx.write(y)?;
         cx.over(pes);
         let kernel = if packed {
-            cx.library("prim/half");
-            cx.library("linear/matmul_packed")
+            Kernel::MatmulPacked
         } else {
-            cx.library("linear/matmul")
+            Kernel::Matmul
         };
         if !split {
             cx.call(
@@ -299,7 +298,6 @@ fn resident_matmul(
         cx.shard(&wb, Shard::Rows(pes));
         let part = cx.scratch("part", m64 * u64::from(nl));
         let all = cx.scratch("all", y_words);
-        cx.library("linear/cols_unblock");
         cx.call(
             kernel,
             vec![
@@ -329,7 +327,7 @@ fn resident_matmul(
             },
         ];
         let finish = vec![Guarded::all(
-            "k_cols_unblock",
+            Kernel::ColsUnblock,
             vec![
                 Arg::Scratch(all.clone(), "f32"),
                 Arg::Ptr(yb.clone()),

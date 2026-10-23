@@ -16,6 +16,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Segment};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
@@ -170,7 +171,6 @@ fn conv(
         // The conv takes `l0, l1, ch0, ch1`: the block's `b` range.
         let args: Vec<&str> = range.split(", ").collect();
         let range = format!("{}, {}, {}, {}", args[0], args[1], args[4], args[5]);
-        cx.library("ssm/conv1d");
         let mut args = vec![
             Arg::Ptr(xb),
             Arg::Ptr(wb),
@@ -190,7 +190,7 @@ fn conv(
             Arg::Int(slots_rows as i64),
             Arg::Bool(shard_cols),
         ]);
-        cx.call("k_conv1d", args);
+        cx.call(Kernel::Conv1d, args);
         Ok(())
     })
 }
@@ -412,9 +412,8 @@ pub fn gdn_prep(
         let dtb = cx.read(dt_bias)?;
         let alb = cx.read(a_log)?;
         let gb = cx.write(gates)?;
-        cx.library("ssm/gdn_prep");
         cx.call(
-            "k_gdn_prep",
+            Kernel::GdnPrep,
             vec![
                 Arg::Ptr(bab),
                 Arg::Ptr(dtb),
@@ -613,7 +612,6 @@ fn delta(
             cols,
             slots_rows,
         )?;
-        cx.library("ssm/delta");
         let mut args = vec![
             Arg::Ptr(qb),
             Arg::Ptr(gb),
@@ -636,7 +634,7 @@ fn delta(
             Arg::Float(1.0 / (dk as f32).sqrt()),
             Arg::Bool(sharded),
         ]);
-        cx.call("k_delta", args);
+        cx.call(Kernel::Delta, args);
         Ok(())
     })
 }

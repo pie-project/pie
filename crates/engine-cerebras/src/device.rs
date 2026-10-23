@@ -1382,7 +1382,7 @@ fn pack_table(
         let copy = table
             .kernels
             .iter()
-            .position(|k| k == "k_copy")
+            .position(|k| *k == kernels_cerebras::library::Kernel::Copy)
             .ok_or_else(|| unbound("a page move without k_copy".to_string()))?
             as i32;
         let scratch = offset("move_scratch")

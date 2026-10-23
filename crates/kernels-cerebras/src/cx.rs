@@ -11,6 +11,7 @@ use dtype::Dtype;
 
 use crate::csl::{Block, Dsd1, Func};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::{
     Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan, PagePlan,
     PageSource, Program, Reduce, Shard,
@@ -290,6 +291,9 @@ impl<'a> Cx<'a> {
     /// `rect` rectangle, each ending in a collective along the PE's row;
     /// `finish` runs when the last lands.
     pub fn fabric(&mut self, rect: (u32, u32), steps: Vec<FabricStep>, finish: Vec<Guarded>) {
+        for g in steps.iter().flat_map(|s| &s.calls).chain(&finish) {
+            self.unit(g.call.kernel);
+        }
         self.reduce = Some(FabricReduce {
             rect,
             steps,
@@ -438,28 +442,22 @@ impl<'a> Cx<'a> {
         name
     }
 
-    /// A helper function shared by phases, declared once per `name`.
-    pub fn helper(&mut self, name: &str, source: impl Into<String>) {
-        self.p.helper(name, source)
-    }
-
-    /// The library unit at `path` (`elemwise/rmsnorm`), declared once;
-    /// returns the name it is called by (`k_rmsnorm`).
-    pub fn library(&mut self, path: &str) -> &'static str {
-        let (name, source) =
-            crate::library::unit(path).unwrap_or_else(|| panic!("no kernel library unit {path}"));
-        self.p.helper(name, source);
-        name
-    }
-
     /// A kernel call in this phase: rendered as a statement and kept
-    /// structured for the table-driven program. The kernel's library
-    /// section is registered by the caller (`library`) as before.
-    pub fn call(&mut self, kernel: &str, args: Vec<crate::csl::Arg>) {
-        self.phase.body.call(crate::csl::Call {
-            kernel: kernel.to_string(),
-            args,
-        });
+    /// structured for the table-driven program; the kernel's unit (and the
+    /// units it calls into) join the program.
+    pub fn call(&mut self, kernel: Kernel, args: Vec<crate::csl::Arg>) {
+        self.unit(kernel);
+        self.phase.body.call(crate::csl::Call { kernel, args });
+    }
+
+    /// Declares `kernel`'s unit and the units it calls into, once each; the
+    /// prelude is in every program already.
+    fn unit(&mut self, kernel: Kernel) {
+        for u in kernel.unit().with_deps() {
+            if u.path != "prim/prelude" {
+                self.p.helper(u.name, u.text);
+            }
+        }
     }
 
     /// A fresh local identifier.
@@ -530,7 +528,7 @@ impl<'a> Cx<'a> {
             }
             let n = self.local_len(&b);
             self.phase.body.call(crate::csl::Call {
-                kernel: "k_round_bf16".to_string(),
+                kernel: Kernel::RoundBf16,
                 args: vec![
                     crate::csl::Arg::Ptr(b.clone()),
                     crate::csl::Arg::Int(n as i64),

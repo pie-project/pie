@@ -9,6 +9,7 @@ use crate::csl::Arg;
 use crate::csl::f32_lit;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::Shard;
 use crate::tensor::Tensor;
 
@@ -128,7 +129,6 @@ fn rotate(
         }
         debug_assert_eq!(inv_freq.len(), half as usize);
         let table = cx.table("inv_freq", "f32", &inv_freq);
-        cx.library("elemwise/rope");
         for t in ts {
             cx.read(*t)?;
             let b = cx.write(*t)?;
@@ -143,7 +143,7 @@ fn rotate(
                 );
             }
             cx.call(
-                "k_rope",
+                Kernel::Rope,
                 vec![
                     Arg::Ptr(b),
                     Arg::Ptr(pb.clone()),

@@ -8,6 +8,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::linear::gemm::{ARRAY_WORDS, max_pes, pe_words};
 use crate::program::Shard;
 use crate::tensor::{RaggedTensor, Tensor};
@@ -117,9 +118,8 @@ pub fn block_dyn_conv(
                 },
             );
         }
-        cx.library("ssm/block_dyn_conv");
         cx.call(
-            "k_block_dyn_conv",
+            Kernel::BlockDynConv,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(cb_),

@@ -14,6 +14,7 @@ use dtype::Dtype;
 
 use crate::csl::{Arg, Call, Func};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::tensor::Tensor;
 
 mod table;
@@ -545,7 +546,7 @@ pub const MOVE_ROW_WORDS: u32 = 8;
 /// lives in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
-    pub kernels: Vec<String>,
+    pub kernels: Vec<Kernel>,
     /// Words the op table holds (the rows, padded with zeros to a unified
     /// capacity).
     pub ops_words: u32,
@@ -669,7 +670,7 @@ pub struct Unified {
 /// One row's shape under a unified whole fire.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RowShape {
-    pub kernels: Vec<String>,
+    pub kernels: Vec<Kernel>,
     pub arena_words: u64,
     pub rows: u32,
     pub ops_words: u32,
@@ -712,12 +713,12 @@ impl RowShape {
     /// The union of several tables of one row: every kernel, the largest
     /// work region, table and row.
     pub fn union<'a>(tables: impl IntoIterator<Item = &'a Table>) -> RowShape {
-        let mut kernels: Vec<String> = Vec::new();
+        let mut kernels: Vec<Kernel> = Vec::new();
         let (mut work, mut rows, mut ops_words) = (0u64, 0u32, 0u32);
         for t in tables {
             for k in &t.kernels {
                 if !kernels.contains(k) {
-                    kernels.push(k.clone());
+                    kernels.push(*k);
                 }
             }
             work = work.max(
@@ -727,8 +728,8 @@ impl RowShape {
             rows = rows.max(t.rows);
             ops_words = ops_words.max(t.ops_words);
         }
-        if keep_pools() && !kernels.iter().any(|k| k == "k_copy") {
-            kernels.push("k_copy".to_string());
+        if keep_pools() && !kernels.contains(&Kernel::Copy) {
+            kernels.push(Kernel::Copy);
         }
         RowShape {
             kernels,
@@ -893,23 +894,17 @@ pub struct Guarded {
 }
 
 impl Guarded {
-    pub fn all(kernel: &str, args: Vec<Arg>) -> Self {
+    pub fn all(kernel: Kernel, args: Vec<Arg>) -> Self {
         Guarded {
             root: false,
-            call: Call {
-                kernel: kernel.to_string(),
-                args,
-            },
+            call: Call { kernel, args },
         }
     }
 
-    pub fn root(kernel: &str, args: Vec<Arg>) -> Self {
+    pub fn root(kernel: Kernel, args: Vec<Arg>) -> Self {
         Guarded {
             root: true,
-            call: Call {
-                kernel: kernel.to_string(),
-                args,
-            },
+            call: Call { kernel, args },
         }
     }
 
@@ -2577,7 +2572,7 @@ mod tests {
     /// one slot, the larger work region, table and row.
     #[test]
     fn tables_unite_into_one_shape() {
-        let table = |kernels: &[&str], keep: &[(&str, u64)], work: u64, rows: u32, width: u32| {
+        let table = |kernels: &[Kernel], keep: &[(&str, u64)], work: u64, rows: u32, width: u32| {
             let mut arena: Vec<(String, u64, u64)> = Vec::new();
             let mut at = 0;
             for (n, w) in keep {
@@ -2588,7 +2583,7 @@ mod tests {
             let base = u64::from(keep_chunks) * ARENA_CHUNK;
             arena.push(("k_dummy".into(), base, 2));
             Table {
-                kernels: kernels.iter().map(|k| k.to_string()).collect(),
+                kernels: kernels.to_vec(),
                 ops_words: width,
                 ops: Vec::new(),
                 arena,
@@ -2601,14 +2596,14 @@ mod tests {
             }
         };
         let a = table(
-            &["k_matmul", "k_rmsnorm"],
+            &[Kernel::Matmul, Kernel::Rmsnorm],
             &[("b1", 4000), ("b2", 6000)],
             3000,
             20,
             10,
         );
         let b = table(
-            &["k_rmsnorm", "k_attend"],
+            &[Kernel::Rmsnorm, Kernel::Attend],
             &[("b2", 6000), ("b3", 100)],
             5000,
             35,
@@ -2664,8 +2659,8 @@ mod tests {
 
     #[test]
     fn classes_split_alike_under_one_partition() {
-        let row = |phases: u32, kernels: &[&str]| Table {
-            kernels: kernels.iter().map(|k| k.to_string()).collect(),
+        let row = |phases: u32, kernels: &[Kernel]| Table {
+            kernels: kernels.to_vec(),
             ops_words: 10,
             ops: Vec::new(),
             arena: vec![("k_dummy".into(), 0, 2)],
@@ -2676,22 +2671,29 @@ mod tests {
             consts: Vec::new(),
             phases,
         };
-        let prefill = vec![row(10, &["k_a"]), row(14, &["k_b"]), row(13, &["k_c"])];
-        let decode = vec![row(20, &["k_a", "k_d"]), row(17, &["k_c"])];
+        let prefill = vec![
+            row(10, &[Kernel::Matmul]),
+            row(14, &[Kernel::Rmsnorm]),
+            row(13, &[Kernel::Attend]),
+        ];
+        let decode = vec![
+            row(20, &[Kernel::Matmul, Kernel::Delta]),
+            row(17, &[Kernel::Attend]),
+        ];
         let p = Unified::partition(&[prefill.clone(), decode.clone()]).expect("same phase count");
         assert_eq!(p.row_phases, Some(vec![10, 14, 13]));
         assert!(p.rows.is_empty());
         // Rows that do not match cannot unite; alike rows do, per row.
         assert!(Unified::union_rows(&[prefill.clone(), decode]).is_none());
         let decode = vec![
-            row(10, &["k_a", "k_d"]),
-            row(14, &["k_b"]),
-            row(13, &["k_e"]),
+            row(10, &[Kernel::Matmul, Kernel::Delta]),
+            row(14, &[Kernel::Rmsnorm]),
+            row(13, &[Kernel::Rope]),
         ];
         let u = Unified::union_rows(&[prefill, decode]).expect("alike");
         assert_eq!(u.row_phases, Some(vec![10, 14, 13]));
-        assert_eq!(u.rows[0].kernels, vec!["k_a", "k_d"]);
-        assert_eq!(u.rows[2].kernels, vec!["k_c", "k_e"]);
+        assert_eq!(u.rows[0].kernels, vec![Kernel::Matmul, Kernel::Delta]);
+        assert_eq!(u.rows[2].kernels, vec![Kernel::Attend, Kernel::Rope]);
         // A fire of another length has no shared partition.
         assert!(Unified::partition(&[vec![row(5, &[])], vec![row(6, &[])]]).is_none());
     }

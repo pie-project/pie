@@ -9,6 +9,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::linear::gemm::{ARRAY_WORDS, pe_words};
 use crate::program::{
     BankSplit, BlockPlan, ColPlane, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
@@ -81,9 +82,8 @@ pub fn topk_softmax(
             cx.shard(&wb, tile);
         }
         let _ = lrows;
-        cx.library("linear/topk_softmax");
         cx.call(
-            "k_topk_softmax",
+            Kernel::TopkSoftmax,
             vec![
                 Arg::Ptr(lb),
                 Arg::Ptr(rb),
@@ -120,9 +120,8 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
             cx.over(rg);
             cx.shard(&rb, Shard::Rows(rg));
         }
-        cx.library("linear/group_routes");
         cx.call(
-            "k_group_routes",
+            Kernel::GroupRoutes,
             vec![
                 Arg::Ptr(rb),
                 Arg::Int(i64::from(rows / rg)),
@@ -326,9 +325,8 @@ fn select_impl(
             cx.read(y)?;
             let yb = cx.write(y)?;
             let yb = cx.view_as(&yb, yd.rows, yd.width)?;
-            cx.library("linear/moe_select");
             cx.call(
-                "k_moe_select",
+                Kernel::MoeSelect,
                 vec![
                     Arg::Ptr(xb),
                     Arg::Ptr(bb),
@@ -453,9 +451,8 @@ fn select_impl(
         };
         let y_words = plan.plane_words(&plan.cols[1]);
         let hdr = cx.lanes(plan)?;
-        cx.library("linear/moe_select");
         cx.call(
-            "k_moe_select",
+            Kernel::MoeSelect,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(bb),
@@ -479,7 +476,7 @@ fn select_impl(
             // group's copies are added into the group's first PE's y.
             let partial = cx.scratch("partial", y_words);
             cx.call(
-                "k_copy",
+                Kernel::Copy,
                 vec![
                     Arg::Scratch(partial.clone(), "f32"),
                     Arg::Int(0),
@@ -571,9 +568,8 @@ pub fn weighted_sum(
                 },
             );
         }
-        cx.library("linear/moe_weighted_sum");
         cx.call(
-            "k_moe_weighted_sum",
+            Kernel::MoeWeightedSum,
             vec![
                 Arg::Ptr(rb),
                 Arg::Ptr(wb),
@@ -638,9 +634,8 @@ pub fn sigmoid_gate_add(
                 },
             );
         }
-        cx.library("linear/moe_gate_add");
         cx.call(
-            "k_moe_gate_add",
+            Kernel::MoeGateAdd,
             vec![
                 Arg::Ptr(rb),
                 Arg::Ptr(sb),

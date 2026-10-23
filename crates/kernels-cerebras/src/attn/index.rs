@@ -16,6 +16,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::HostOp;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -100,9 +101,8 @@ pub fn kv_append(
             });
             return Ok(());
         }
-        cx.library("attn/index_page_write");
         cx.call(
-            "k_index_page_write",
+            Kernel::IndexPageWrite,
             vec![
                 Arg::Ptr(kb),
                 Arg::Ptr(tb),
@@ -179,9 +179,8 @@ fn boundary(
             });
             return Ok(());
         }
-        cx.library("attn/boundary");
         cx.call(
-            "k_boundary",
+            Kernel::Boundary,
             vec![
                 Arg::Ptr(p),
                 Arg::Ptr(r),
@@ -310,10 +309,8 @@ pub fn block_mean(
             });
             return Ok(());
         }
-        cx.library("attn/index_cell");
-        cx.library("attn/index_block_mean");
         cx.call(
-            "k_index_block_mean",
+            Kernel::IndexBlockMean,
             vec![
                 Arg::Ptr(bp),
                 Arg::Ptr(br),
@@ -391,10 +388,8 @@ pub fn pool_kv_append(
             });
             return Ok(());
         }
-        cx.library("attn/index_cell");
-        cx.library("attn/index_pool_write");
         cx.call(
-            "k_index_pool_write",
+            Kernel::IndexPoolWrite,
             vec![
                 Arg::Ptr(eb),
                 Arg::Ptr(bp),
@@ -518,10 +513,8 @@ pub fn topk(
             Some(w) => (Arg::Ptr(w.clone()), true),
             None => (Arg::Dummy("f32"), false),
         };
-        cx.library("attn/index_cell");
-        cx.library("attn/index_topk");
         cx.call(
-            "k_index_topk",
+            Kernel::IndexTopk,
             vec![
                 Arg::Ptr(qb),
                 w_ptr,

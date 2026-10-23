@@ -8,6 +8,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::HostOp;
 use crate::tensor::{RaggedTensor, Tensor};
 
@@ -118,9 +119,8 @@ pub fn selector_walk(
             Some(h) => (Arg::Ptr(h.clone()), true),
             None => (Arg::Dummy("f32"), false),
         };
-        cx.library("sampling/selector_walk");
         cx.call(
-            "k_selector_walk",
+            Kernel::SelectorWalk,
             vec![
                 Arg::Ptr(cb),
                 Arg::Ptr(ib),

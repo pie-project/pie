@@ -12,6 +12,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::linear::gemm::{ARRAY_WORDS, pe_words};
 use crate::program::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
 use crate::tensor::Tensor;
@@ -97,9 +98,8 @@ pub fn correct(
             cx.read(y)?;
             let yb = cx.write(y)?;
             let waist = cx.scratch("waist", u64::from(rank));
-            cx.library("linear/lora");
             cx.call(
-                "k_lora",
+                Kernel::Lora,
                 vec![
                     Arg::Ptr(xb),
                     Arg::Ptr(ab),
@@ -252,9 +252,8 @@ pub fn correct(
         };
         let w_words = plan.plane_words(&plan.cols[1]);
         let hdr = cx.lanes(plan)?;
-        cx.library("linear/lora_down");
         cx.call(
-            "k_lora_down",
+            Kernel::LoraDown,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(ab),
@@ -272,7 +271,7 @@ pub fn correct(
         if ig > 1 && fabric {
             let partial = cx.scratch("partial", w_words);
             cx.call(
-                "k_copy",
+                Kernel::Copy,
                 vec![
                     Arg::Scratch(partial.clone(), "f32"),
                     Arg::Int(0),
@@ -331,9 +330,8 @@ pub fn correct(
         };
         let y_words = plan.plane_words(&plan.cols[1]);
         let hdr = cx.lanes(plan)?;
-        cx.library("linear/lora_up");
         cx.call(
-            "k_lora_up",
+            Kernel::LoraUp,
             vec![
                 Arg::Ptr(wb),
                 Arg::Ptr(bb),
@@ -351,7 +349,7 @@ pub fn correct(
         if rg_b > 1 && fabric {
             let partial = cx.scratch("partial", y_words);
             cx.call(
-                "k_copy",
+                Kernel::Copy,
                 vec![
                     Arg::Scratch(partial.clone(), "f32"),
                     Arg::Int(0),

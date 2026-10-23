@@ -12,6 +12,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::Shard;
 use crate::tensor::Tensor;
 
@@ -72,9 +73,8 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
             cx.shard(&xb, tile(rg, cg, 1));
             cx.shard(&yb, tile(rg, cg, m));
         }
-        cx.library("elemwise/hc_expand");
         cx.call(
-            "k_hc_expand",
+            Kernel::HcExpand,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(yb),
@@ -120,9 +120,8 @@ pub fn mix(
             cx.shard(&vb, tile(rg, cg, m));
             cx.shard(&yb, tile(rg, cg, 1));
         }
-        cx.library("elemwise/hc_mix");
         cx.call(
-            "k_hc_mix",
+            Kernel::HcMix,
             vec![
                 Arg::Ptr(gb),
                 Arg::Ptr(vb),
@@ -182,9 +181,8 @@ pub fn inject(
                 },
             );
         }
-        cx.library("elemwise/hc_inject");
         cx.call(
-            "k_hc_inject",
+            Kernel::HcInject,
             vec![
                 Arg::Ptr(ob),
                 Arg::Ptr(gb),
@@ -243,9 +241,8 @@ pub fn ple_gate(
                     cx.shard(b, Shard::Rows(rg));
                 }
             }
-            cx.library("elemwise/ple_gate");
             cx.call(
-                "k_ple_gate",
+                Kernel::PleGate,
                 vec![
                     Arg::Ptr(kb),
                     Arg::Ptr(qb),
@@ -272,9 +269,8 @@ pub fn ple_gate(
         cx.shard(&kb, tile(rg, cg, m));
         cx.shard(&qb, tile(rg, cg, m));
         cx.shard(&pd, tile(rg, cg, m));
-        cx.library("elemwise/ple_dot");
         cx.call(
-            "k_ple_dot",
+            Kernel::PleDot,
             vec![
                 Arg::Ptr(kb),
                 Arg::Ptr(qb),
@@ -302,9 +298,8 @@ pub fn ple_gate(
                 period: cg,
             },
         );
-        cx.library("elemwise/ple_gate_scaled");
         cx.call(
-            "k_ple_gate_scaled",
+            Kernel::PleGateScaled,
             vec![
                 Arg::Ptr(vb),
                 Arg::Ptr(pd),

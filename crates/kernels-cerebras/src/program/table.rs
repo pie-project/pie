@@ -12,6 +12,7 @@
 //! it in `handoff_scratch`).
 
 use super::*;
+use crate::library::Param;
 
 /// One row of a table program, built before any text is emitted.
 pub(super) struct RowBuild {
@@ -21,7 +22,7 @@ pub(super) struct RowBuild {
     arena_words: u64,
     keep_chunks: u32,
     consts: Vec<(String, Vec<u32>)>,
-    kernels: Vec<String>,
+    kernels: Vec<Kernel>,
     ops: Vec<TableOp>,
     /// `ops_words` and `rows` once padded to a unified capacity.
     capacity: Option<(u32, u32)>,
@@ -730,13 +731,13 @@ impl Program {
         // The kernels: the model's list under a unified shape (a kernel off
         // it fails the whole-fire form), else this group's in order of use.
         let fixed = unified.is_some();
-        let mut kernels: Vec<String> = unified.map(|u| u.kernels.clone()).unwrap_or_default();
-        let kernel_id = |name: &str, kernels: &mut Vec<String>| -> Option<u32> {
-            match kernels.iter().position(|k| k == name) {
+        let mut kernels: Vec<Kernel> = unified.map(|u| u.kernels.clone()).unwrap_or_default();
+        let kernel_id = |kernel: Kernel, kernels: &mut Vec<Kernel>| -> Option<u32> {
+            match kernels.iter().position(|k| *k == kernel) {
                 Some(i) => Some(i as u32),
                 None if fixed => None,
                 None => {
-                    kernels.push(name.to_string());
+                    kernels.push(kernel);
                     Some((kernels.len() - 1) as u32)
                 }
             }
@@ -746,22 +747,22 @@ impl Program {
         for _ in 0..move_rows {
             ops.push(TableOp::Nop);
         }
-        if moving && !fixed && !kernels.iter().any(|k| k == "k_copy") {
-            kernels.push("k_copy".to_string());
+        if moving && !fixed && !kernels.contains(&Kernel::Copy) {
+            kernels.push(Kernel::Copy);
         }
         let push_call =
-            |g: &Guarded, ops: &mut Vec<TableOp>, kernels: &mut Vec<String>| -> Option<()> {
+            |g: &Guarded, ops: &mut Vec<TableOp>, kernels: &mut Vec<Kernel>| -> Option<()> {
                 if !g.call.args.iter().all(carried) {
                     trace_fusion(&format!(
                         "table refused: call {} not carried",
-                        g.call.kernel
+                        g.call.kernel.name()
                     ));
                     return None;
                 }
-                let Some(kernel) = kernel_id(&g.call.kernel, kernels) else {
+                let Some(kernel) = kernel_id(g.call.kernel, kernels) else {
                     trace_fusion(&format!(
                         "table refused: kernel {} off the unified list",
-                        g.call.kernel
+                        g.call.kernel.name()
                     ));
                     return None;
                 };
@@ -808,7 +809,7 @@ impl Program {
                         elem: b.elem,
                     };
                     push_call(
-                        &Guarded::all("k_round_bf16", vec![Arg::Ptr(buf), Arg::Int(*n as i64)]),
+                        &Guarded::all(Kernel::RoundBf16, vec![Arg::Ptr(buf), Arg::Int(*n as i64)]),
                         &mut ops,
                         &mut kernels,
                     )?;
@@ -859,24 +860,6 @@ impl Program {
         for r in rows {
             all_body.push_str(&r.body);
         }
-        // Every row's kernels' parameter types, for the dispatch.
-        let mut sigs: Vec<Vec<Vec<String>>> = Vec::new();
-        for r in rows {
-            let s: Option<Vec<Vec<String>>> = r
-                .kernels
-                .iter()
-                .map(|k| crate::library::signature(k))
-                .collect();
-            let Some(s) = s else {
-                trace_fusion(&format!(
-                    "table refused: a kernel without a signature among {:?}",
-                    r.kernels
-                ));
-                return None;
-            };
-            sigs.push(s);
-        }
-
         let mut pe = String::new();
         pe.push_str("param memcpy_params;\nparam pe_id: u16;\n");
         if split {
@@ -977,28 +960,28 @@ impl Program {
         // the row's own cases alone (the opcode switch wants a u16; an i32
         // switch does not compile).
         pe.push_str("fn run_call(k: u16, a: [*]i32) void {\n");
-        for (g, (r, sig)) in rows.iter().zip(&sigs).enumerate() {
+        for (g, r) in rows.iter().enumerate() {
             if split {
                 let _ = writeln!(pe, "  if (row == {g}) {{");
             }
             pe.push_str("  switch (k) {\n");
-            for (i, (k, sig)) in r.kernels.iter().zip(sig).enumerate() {
-                let args: Vec<String> = sig
+            for (i, k) in r.kernels.iter().enumerate() {
+                let args: Vec<String> = k
+                    .params()
                     .iter()
                     .enumerate()
-                    .map(|(j, t)| match t.as_str() {
-                        "[*]f32" => format!("pf(a[{j}])"),
-                        "[*]i32" => format!("pi(a[{j}])"),
-                        "[*]u32" => format!("pu(a[{j}])"),
-                        "[*]u64" => format!("pq(a[{j}])"),
-                        "i32" => format!("a[{j}]"),
-                        "u32" => format!("@bitcast(u32, a[{j}])"),
-                        "f32" => format!("@bitcast(f32, a[{j}])"),
-                        "bool" => format!("(a[{j}] != 0)"),
-                        other => format!("@as({other}, a[{j}])"),
+                    .map(|(j, p)| match p {
+                        Param::PtrF32 => format!("pf(a[{j}])"),
+                        Param::PtrI32 => format!("pi(a[{j}])"),
+                        Param::PtrU32 => format!("pu(a[{j}])"),
+                        Param::PtrU64 => format!("pq(a[{j}])"),
+                        Param::I32 => format!("a[{j}]"),
+                        Param::U32 => format!("@bitcast(u32, a[{j}])"),
+                        Param::F32 => format!("@bitcast(f32, a[{j}])"),
+                        Param::Bool => format!("(a[{j}] != 0)"),
                     })
                     .collect();
-                let _ = writeln!(pe, "    {i} => {{ {k}({}); }},", args.join(", "));
+                let _ = writeln!(pe, "    {i} => {{ {}({}); }},", k.name(), args.join(", "));
             }
             pe.push_str("    else => {},\n  }\n");
             if split {

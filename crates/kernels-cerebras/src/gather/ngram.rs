@@ -13,6 +13,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::HostOp;
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
@@ -149,9 +150,8 @@ fn ngram(
             None => (u64::from(rows), true, Arg::Dummy("i32")),
         };
         let span = mults.len() - 1;
-        cx.library("gather/ple_ngram");
         cx.call(
-            "k_ple_ngram",
+            Kernel::PleNgram,
             vec![
                 Arg::Ptr(ib),
                 indptr_ptr,

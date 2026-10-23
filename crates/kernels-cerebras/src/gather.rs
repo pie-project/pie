@@ -7,6 +7,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::{HostOp, Shard};
 use crate::tensor::Tensor;
 
@@ -141,9 +142,8 @@ pub fn embed(
         };
         let out = embed_over(cx, n, &tb, &yb, y_words);
         let share = table.rows / n;
-        cx.library("gather/embed_part");
         cx.call(
-            "k_embed_part",
+            Kernel::EmbedPart,
             vec![
                 Arg::Ptr(ib),
                 Arg::Ptr(tb),
@@ -219,9 +219,8 @@ pub fn split_q_gate(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("gather/split_q_gate");
         cx.call(
-            "k_split_q_gate",
+            Kernel::SplitQGate,
             vec![
                 Arg::Ptr(pb),
                 Arg::Ptr(qb),
@@ -288,9 +287,8 @@ pub fn split_rows(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("gather/split_rows");
         cx.call(
-            "k_split_rows",
+            Kernel::SplitRows,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(lb),
@@ -330,9 +328,8 @@ pub fn gather_rows(ctx: &Ctx<'_>, wide: Tensor, index: Tensor, tight: Tensor) ->
         let wb = cx.read(wide)?;
         let ib = cx.read(index)?;
         let tb = cx.write(tight)?;
-        cx.library("gather/gather_rows");
         cx.call(
-            "k_gather_rows",
+            Kernel::GatherRows,
             vec![
                 Arg::Ptr(wb),
                 Arg::Ptr(ib),
@@ -374,9 +371,8 @@ pub fn scatter_live_rows(
         let rb = cx.read(routes)?;
         cx.read(y)?;
         let yb = cx.write(y)?;
-        cx.library("gather/scatter_live_rows");
         cx.call(
-            "k_scatter_live_rows",
+            Kernel::ScatterLiveRows,
             vec![
                 Arg::Ptr(sb),
                 Arg::Ptr(rb),
@@ -412,7 +408,7 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
         let xb = cx.read(x)?;
         let yb = cx.write(y)?;
         cx.call(
-            "k_copy",
+            Kernel::Copy,
             vec![
                 Arg::Ptr(yb),
                 Arg::Int(0),
@@ -478,9 +474,8 @@ pub fn embed_concat(
         };
         let out = embed_over(cx, n, &tb, &yb, y_words);
         let share = table.rows / n;
-        cx.library("gather/embed_concat_part");
         cx.call(
-            "k_embed_concat_part",
+            Kernel::EmbedConcatPart,
             vec![
                 Arg::Ptr(ib),
                 Arg::Ptr(tb),
@@ -560,9 +555,8 @@ pub fn split_qkv(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("gather/split_qkv");
         cx.call(
-            "k_split_qkv",
+            Kernel::SplitQkv,
             vec![
                 Arg::Ptr(pb),
                 Arg::Ptr(qb),
@@ -633,9 +627,8 @@ pub fn embed_weighted(
         };
         let out = embed_over(cx, n, &tb, &yb, y_words);
         let share = table.rows / n;
-        cx.library("gather/embed_weighted_part");
         cx.call(
-            "k_embed_weighted_part",
+            Kernel::EmbedWeightedPart,
             vec![
                 Arg::Ptr(ib),
                 Arg::Ptr(wb),

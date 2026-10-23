@@ -61,14 +61,14 @@ impl Arg {
 /// A kernel call, kept structured beside its rendered line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
-    pub kernel: String,
+    pub kernel: crate::library::Kernel,
     pub args: Vec<Arg>,
 }
 
 impl Call {
     pub fn render(&self) -> String {
         let args: Vec<String> = self.args.iter().map(Arg::render).collect();
-        format!("{}({});", self.kernel, args.join(", "))
+        format!("{}({});", self.kernel.name(), args.join(", "))
     }
 }
 

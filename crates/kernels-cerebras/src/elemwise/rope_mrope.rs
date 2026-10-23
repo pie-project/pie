@@ -11,6 +11,7 @@ use crate::csl::Arg;
 use crate::csl::f32_lit;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::Shard;
 use crate::tensor::Tensor;
 
@@ -285,7 +286,6 @@ fn rotate(
         let hi = cx.table("mrope_hi", "i32", &list(&|p| p.hi.to_string()));
         let axis = cx.table("mrope_axis", "i32", &list(&|p| p.axis.to_string()));
         let freq = cx.table("mrope_freq", "f32", &list(&|p| f32_lit(p.freq)));
-        cx.library("elemwise/rope_table");
         for t in ts {
             cx.read(*t)?;
             let b = cx.write(*t)?;
@@ -300,7 +300,7 @@ fn rotate(
                 );
             }
             cx.call(
-                "k_rope_table",
+                Kernel::RopeTable,
                 vec![
                     Arg::Ptr(b),
                     Arg::Ptr(pb.clone()),

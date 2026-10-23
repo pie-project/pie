@@ -7,6 +7,7 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
+use crate::library::Kernel;
 use crate::program::Shard;
 use crate::tensor::Tensor;
 
@@ -112,9 +113,8 @@ pub fn rmsnorm_grouped_plus_one(
                 cx.shard(&wb, gain);
             }
         }
-        cx.library("elemwise/rmsnorm_banked");
         cx.call(
-            "k_rmsnorm_banked",
+            Kernel::RmsnormBanked,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(wb),
@@ -205,9 +205,8 @@ fn rms_row(
                 cx.shard(&xb, tile);
                 cx.shard(&yb, tile);
             }
-            cx.library("elemwise/rmsnorm");
             cx.call(
-                "k_rmsnorm",
+                Kernel::Rmsnorm,
                 vec![
                     Arg::Ptr(xb),
                     Arg::Ptr(wb),
@@ -237,9 +236,8 @@ fn rms_row(
         };
         cx.shard(&xb, tile);
         cx.shard(&ss, tile);
-        cx.library("elemwise/rowsq");
         cx.call(
-            "k_rowsq",
+            Kernel::Rowsq,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(ss),
@@ -285,9 +283,8 @@ fn rms_row(
                 period: cg,
             },
         );
-        cx.library("elemwise/rmsnorm_scaled");
         cx.call(
-            "k_rmsnorm_scaled",
+            Kernel::RmsnormScaled,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(wb),
@@ -377,9 +374,8 @@ pub fn rmsnorm_gated(
                 );
             }
         }
-        cx.library("elemwise/rmsnorm_gated");
         cx.call(
-            "k_rmsnorm_gated",
+            Kernel::RmsnormGated,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(gb),
@@ -426,9 +422,8 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
             cx.shard(&xb, tile);
             cx.shard(&yb, tile);
         }
-        cx.library("elemwise/residual_add");
         cx.call(
-            "k_residual_add",
+            Kernel::ResidualAdd,
             vec![Arg::Ptr(xb), Arg::Ptr(yb), Arg::Int(n as i64)],
         );
         Ok(())
@@ -469,9 +464,8 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
             );
             cx.shard(&bb, column_split(&bb, cg));
         }
-        cx.library("elemwise/add_bias");
         cx.call(
-            "k_add_bias",
+            Kernel::AddBias,
             vec![
                 Arg::Ptr(ob),
                 Arg::Ptr(bb),
@@ -556,9 +550,8 @@ pub fn layernorm(
                 cx.shard(&xb, tile);
                 cx.shard(&yb, tile);
             }
-            cx.library("elemwise/layernorm");
             cx.call(
-                "k_layernorm",
+                Kernel::Layernorm,
                 vec![
                     Arg::Ptr(xb),
                     Arg::Ptr(wb),
@@ -595,9 +588,8 @@ pub fn layernorm(
                 segments: 2,
             },
         );
-        cx.library("elemwise/rowstats");
         cx.call(
-            "k_rowstats",
+            Kernel::Rowstats,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(st),
@@ -632,9 +624,8 @@ pub fn layernorm(
                 period: cg,
             },
         );
-        cx.library("elemwise/layernorm_scaled");
         cx.call(
-            "k_layernorm_scaled",
+            Kernel::LayernormScaled,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(wb),
