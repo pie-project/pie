@@ -52,19 +52,13 @@ pub enum GluAct {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
 #[op(group = "linear")]
 pub enum Linear {
+    /// `act · wᵀ`. `quant` states the precision `act` is quantized to
+    /// before it meets `w`'s codes (under `input_scales`, the weight's static
+    /// global, when the format has one; `scales` the weight's block scales
+    /// when they are a plane of their own beside raw codes, `fp8b128`), else
+    /// the product runs at the activations' own precision. `logits` marks the
+    /// vocabulary's head, which backends tile and gather as its own product.
     Matmul {
-        #[input]
-        act: ValueId,
-        #[input]
-        w: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    /// `act` quantized as `quant` states (under `input_scales`, the weight's
-    /// static global, when the format has one), then multiplied by `w`'s
-    /// codes at that precision; `scales` the weight's block scales when they
-    /// are a plane of their own beside raw codes (`fp8b128`).
-    MatmulActQuant {
         #[input]
         act: ValueId,
         #[input]
@@ -73,15 +67,8 @@ pub enum Linear {
         input_scales: Option<ValueId>,
         #[input]
         scales: Option<ValueId>,
-        quant: ActQuant,
-        #[output]
-        y: ValueId,
-    },
-    LmHead {
-        #[input]
-        act: ValueId,
-        #[input]
-        w: ValueId,
+        quant: Option<ActQuant>,
+        logits: bool,
         #[output]
         y: ValueId,
     },

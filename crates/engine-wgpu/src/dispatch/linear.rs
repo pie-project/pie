@@ -20,7 +20,14 @@ impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_wgpu::Error> {
         match op {
             Linear::Relu2 { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
-            Linear::Matmul { act, w, y } => match self.banked(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } => match self.banked(*w) {
                 Some(bank) => linear::quant::matmul(
                     self.ctx(),
                     self.tuning(),
@@ -47,7 +54,14 @@ impl Run<'_> {
                     ),
                 },
             },
-            Linear::LmHead { act, w, y } => match self.banked(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            } => match self.banked(*w) {
                 Some(bank) => linear::quant::lm_head(
                     self.ctx(),
                     self.tuning(),
@@ -170,7 +184,11 @@ impl Run<'_> {
             // tcgen05 GEMMs.
             Linear::RelBias { .. }
             | Linear::MoeTopkSigmoidSink { .. }
-            | Linear::MatmulActQuant { .. }
+            | Linear::Matmul {
+                quant: Some(_),
+                logits: false,
+                ..
+            }
             | Linear::MoeMatmulSelectActQuant { .. }
             | Linear::Glu {
                 packed: None,
@@ -189,6 +207,8 @@ impl Run<'_> {
                 ..
             }
             | Linear::MoeSumAdd { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            // The forms no builder makes.
+            Linear::Matmul { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,

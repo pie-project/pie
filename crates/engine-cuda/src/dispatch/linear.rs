@@ -111,6 +111,10 @@ impl Run<'_> {
                     act: *act,
                     w: *w,
                     y: *packed,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
                 })?;
                 self.linear(&Linear::Glu {
                     packed: Some(*packed),
@@ -163,6 +167,10 @@ impl Run<'_> {
                     act: *act,
                     w: *w,
                     y: *packed,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
                 })?;
                 self.linear(&Linear::Glu {
                     packed: Some(*packed),
@@ -190,6 +198,10 @@ impl Run<'_> {
                     act: *act,
                     w: *gate_up,
                     y: *packed,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
                 })?;
                 self.linear(&Linear::Glu {
                     packed: Some(*packed),
@@ -205,6 +217,10 @@ impl Run<'_> {
                     act: *h,
                     w: *down,
                     y: *y,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
                 })
             }
             Fused::MatmulBias {
@@ -227,6 +243,10 @@ impl Run<'_> {
                     act: *act,
                     w: *w,
                     y: *y,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
                 })?;
                 kernels_cuda::elemwise::pointwise::add_bias(
                     self.ctx(),
@@ -275,6 +295,10 @@ impl Run<'_> {
                     act: *act,
                     w: *w,
                     y: *y,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
                 })?;
                 kernels_cuda::gather::split_rows(
                     self.ctx(),
@@ -316,10 +340,14 @@ impl Run<'_> {
                         );
                     }
                 }
-                self.linear(&Linear::LmHead {
+                self.linear(&Linear::Matmul {
                     act: *act,
                     w: *w,
                     y: *y,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: true,
                 })?;
                 kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
             }
@@ -329,7 +357,14 @@ impl Run<'_> {
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
         match op {
-            Linear::Matmul { act, w, y } if self.tensor(*act).dtype == Dtype::F32 => {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } if self.tensor(*act).dtype == Dtype::F32 => {
                 let weight = self.dense_or_decoded(
                     "linear.matmul",
                     *w,
@@ -344,23 +379,36 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::Matmul { act, w, y } if self.tensor(*y).dtype == Dtype::F32 => {
-                linear::gemm::matmul_f32(
-                    self.ctx(),
-                    self.tensor(*act),
-                    self.tensor(*w),
-                    &mut self.tensor(*y),
-                )
-            }
-            Linear::MatmulActQuant {
+            Linear::Matmul {
                 act,
                 w,
-                quant,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } if self.tensor(*y).dtype == Dtype::F32 => linear::gemm::matmul_f32(
+                self.ctx(),
+                self.tensor(*act),
+                self.tensor(*w),
+                &mut self.tensor(*y),
+            ),
+            Linear::Matmul {
+                act,
+                w,
+                quant: Some(quant),
                 scales,
                 y,
+                logits: false,
                 ..
             } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
-            Linear::Matmul { act, w, y } => match self.maybe_tiled_planes(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
@@ -380,7 +428,14 @@ impl Run<'_> {
                 }
                 None => self.row_major_matmul(act, w, y),
             },
-            Linear::LmHead { act, w, y } => match self.maybe_tiled_planes(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
@@ -400,6 +455,8 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
+            // The forms no builder makes.
+            Linear::Matmul { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
@@ -1503,7 +1560,7 @@ impl Run<'_> {
         _: Option<ValueId>,
         _: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        lowp("linear.matmul_act_quant")
+        lowp("linear.matmul")
     }
 
     /// A select whose activations are quantized first, on the grouped
@@ -1670,7 +1727,7 @@ impl Run<'_> {
         block_scales: Option<ValueId>,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        const OP: &str = "linear.matmul_act_quant";
+        const OP: &str = "linear.matmul";
         if !linear::gemm_sm100::supported() {
             return self.matmul_a16(OP, act, w, block_scales, y);
         }
@@ -1897,7 +1954,7 @@ impl Run<'_> {
         block_scales: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        const OP: &str = "linear.matmul_act_quant";
+        const OP: &str = "linear.matmul";
         let codes = self.tensor(w);
         let atoms = self.tensor(block_scales);
         if atoms.dtype != Dtype::U8 {
@@ -2052,17 +2109,17 @@ impl Run<'_> {
         y: &ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         if let Some((codes, ..)) = self.maybe_planes(*w) {
-            per_tensor_e4m3_is_a_table("linear.lm_head", codes)?;
+            per_tensor_e4m3_is_a_table("linear.matmul", codes)?;
         }
         match self.maybe_planes(*w) {
             Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
                 linear::nvfp4::matmul(
                     self.ctx(),
-                    "linear.lm_head",
+                    "linear.matmul",
                     self.tensor(*act),
                     codes,
                     scales,
-                    tensor_scales("linear.lm_head", biases)?,
+                    tensor_scales("linear.matmul", biases)?,
                     &mut self.tensor(*y),
                     seat,
                 )

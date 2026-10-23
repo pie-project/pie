@@ -324,6 +324,10 @@ impl Run<'_> {
                         act: *act,
                         w: *w,
                         y: *packed,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
                     },
                 )?;
                 DispatchLinear::dispatch(
@@ -354,6 +358,10 @@ impl Run<'_> {
                         act: *act,
                         w: *w,
                         y: *y,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
                     },
                 )?;
                 DispatchGather::dispatch(

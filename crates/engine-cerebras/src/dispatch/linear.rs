@@ -14,13 +14,27 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cerebras::Error> {
         match op {
-            Linear::Matmul { act, w, y } => linear::gemm::matmul(
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } => linear::gemm::matmul(
                 self.ctx(),
                 self.tensor(*act),
                 self.tensor(*w),
                 self.tensor(*y),
             ),
-            Linear::LmHead { act, w, y } => linear::gemm::lm_head(
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            } => linear::gemm::lm_head(
                 self.ctx(),
                 self.tensor(*act),
                 self.tensor(*w),

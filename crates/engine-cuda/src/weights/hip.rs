@@ -84,7 +84,7 @@ pub(super) fn canonical_fp8(
         let plane = address(tier, store, places[at].offset, at)?;
         kernels_cuda::linear::act_quant::e4m3fn_shuffle(
             &ctx,
-            "linear.matmul_act_quant",
+            "linear.matmul",
             plane,
             staging.ptr(),
             rows,
@@ -202,14 +202,15 @@ fn fp8b_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<(usize
                 reads[w] += 1;
             }
         }
-        if let Operation::Linear(Linear::MatmulActQuant {
+        if let Operation::Linear(Linear::Matmul {
             act,
             w,
-            quant: ActQuant::E4m3 {
+            quant: Some(ActQuant::E4m3 {
                 gran: side @ (32 | 128),
-            },
+            }),
             input_scales: None,
             scales: Some(scales),
+            logits: false,
             ..
         }) = &node.op
             && let (Some(w), Some(s)) = (weight(*w), weight(*scales))
@@ -311,7 +312,7 @@ pub(super) fn order_fp8b_planes(
         let plane = address(tier, store, places[at].offset, at)?;
         kernels_cuda::linear::act_quant::e4m3fn_shuffle(
             &ctx,
-            "linear.matmul_act_quant",
+            "linear.matmul",
             plane,
             staging.ptr(),
             rows,

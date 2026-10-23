@@ -337,11 +337,24 @@ impl<'c> Run<'c> {
         self.readers_of(value)
             .iter()
             .filter_map(|&at| match &self.nodes.get(at as usize)?.op {
-                Operation::Linear(Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y })
-                    if *act == value =>
-                {
-                    self.register_counters(value, *w, self.tensor(*y).width)
-                }
+                Operation::Linear(
+                    Linear::Matmul {
+                        act,
+                        w,
+                        y,
+                        quant: None,
+                        logits: false,
+                        ..
+                    }
+                    | Linear::Matmul {
+                        act,
+                        w,
+                        y,
+                        quant: None,
+                        logits: true,
+                        ..
+                    },
+                ) if *act == value => self.register_counters(value, *w, self.tensor(*y).width),
                 Operation::Fused(Fused::MlpSwiglu {
                     act,
                     gate_up,

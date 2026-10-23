@@ -180,14 +180,21 @@ fn rule(op: &Operation) -> Rule {
             (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
         };
     }
+    // A product at the activations' precision contracts with its weight's
+    // split; one that quantizes them first reads its weight whole.
+    if let Operation::Linear(Linear::Matmul { quant, .. }) = op {
+        return match quant {
+            None => Rule::Contract {
+                act: "act",
+                w: "w",
+                out: 0,
+                input: 1,
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
     let name = op.name();
     match name {
-        "linear.matmul" | "linear.lm_head" => Rule::Contract {
-            act: "act",
-            w: "w",
-            out: 0,
-            input: 1,
-        },
         "linear.moe_matmul_select"
         | "linear.moe_matmul_select_bias"
         | "linear.moe_matmul_select_quant" => Rule::Contract {

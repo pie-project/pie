@@ -17,14 +17,18 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
                 act: act.id(),
                 w: r.weight(w),
                 y: y.id(),
+                input_scales: None,
+                scales: None,
+                quant: None,
+                logits: false,
             },
             &[act],
         ),
         Some(quant) => r.push(
-            Linear::MatmulActQuant {
+            Linear::Matmul {
                 act: act.id(),
                 w: r.weight(w),
-                quant,
+                quant: Some(quant),
                 input_scales: input_scales(r, w, quant),
                 scales: matches!(
                     w.dtype,
@@ -36,6 +40,7 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
                 )
                 .then(|| r.weight_plane(w, poem_ir::SCALES)),
                 y: y.id(),
+                logits: false,
             },
             &[act],
         ),
@@ -72,6 +77,10 @@ pub fn matmul_f32(act: &Value, w: &Weight) -> Value {
             act: act.id(),
             w: r.weight(w),
             y: y.id(),
+            input_scales: None,
+            scales: None,
+            quant: None,
+            logits: false,
         },
         &[act],
     );
@@ -83,10 +92,14 @@ pub fn lm_head(act: &Value, w: &Weight) -> Value {
     let r = act.rec();
     let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
     r.push(
-        Linear::LmHead {
+        Linear::Matmul {
             act: act.id(),
             w: r.weight(w),
             y: y.id(),
+            input_scales: None,
+            scales: None,
+            quant: None,
+            logits: true,
         },
         &[act],
     );

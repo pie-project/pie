@@ -127,7 +127,14 @@ fn the_attention_q_k_v_share_the_one_rotated_input() {
     // each of q/k/v reads.
     let mut by_layer: BTreeMap<String, [Option<ValueId>; 3]> = BTreeMap::new();
     for node in &trace.nodes {
-        let Operation::Linear(Linear::Matmul { act, w, .. }) = &node.op else {
+        let Operation::Linear(Linear::Matmul {
+            act,
+            w,
+            quant: None,
+            logits: false,
+            ..
+        }) = &node.op
+        else {
             continue;
         };
         let name = weight_name(*w);

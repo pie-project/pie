@@ -54,7 +54,7 @@ def forward(m, inputs):
             n.op.name()
         })
         .collect();
-    assert_eq!(ops, ["gather.embed", "linear.lm_head"], "{ops:?}");
+    assert_eq!(ops, ["gather.embed", "linear.matmul"], "{ops:?}");
     assert_eq!(trace.params.len(), 2);
 }
 

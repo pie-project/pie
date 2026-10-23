@@ -17,7 +17,11 @@ impl Run<'_> {
             Linear::Relu2 { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
-            Linear::MatmulActQuant { .. }
+            Linear::Matmul {
+                quant: Some(_),
+                logits: false,
+                ..
+            }
             | Linear::MoeMatmulSelectActQuant { .. }
             | Linear::Glu {
                 packed: None,
@@ -36,7 +40,14 @@ impl Run<'_> {
                 ..
             }
             | Linear::MoeSumAdd { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            Linear::Matmul { act, w, y } => match self.banked(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } => match self.banked(*w) {
                 Some(bank) => {
                     linear::quant::matmul(self.ctx(), self.tensor(*act), bank, self.tensor(*y))
                 }
@@ -56,7 +67,14 @@ impl Run<'_> {
                     ),
                 },
             },
-            Linear::LmHead { act, w, y } => match self.banked(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            } => match self.banked(*w) {
                 Some(bank) => {
                     linear::quant::lm_head(self.ctx(), self.tensor(*act), bank, self.tensor(*y))
                 }
@@ -77,6 +95,8 @@ impl Run<'_> {
                 },
             },
 
+            // The forms no builder makes.
+            Linear::Matmul { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,

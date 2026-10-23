@@ -32,7 +32,20 @@ pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
     for node in &trace.nodes {
         let (act, w) = match &node.op {
             Operation::Linear(
-                poem_ir::Linear::Matmul { act, w, .. } | poem_ir::Linear::LmHead { act, w, .. },
+                poem_ir::Linear::Matmul {
+                    act,
+                    w,
+                    quant: None,
+                    logits: false,
+                    ..
+                }
+                | poem_ir::Linear::Matmul {
+                    act,
+                    w,
+                    quant: None,
+                    logits: true,
+                    ..
+                },
             ) => (*act, *w),
             _ => continue,
         };
