@@ -674,7 +674,7 @@ impl Run<'_> {
             .map(|at| poem_ir::ValueId(at as u32))
     }
 
-    /// DeepSeek-V4's window (`PrefillLse`), pool if any (`PoolLse[Selected]`) and
+    /// DeepSeek-V4's window (a `Prefill` with `lse`), pool if any (`PoolLse`) and
     /// sinks in one launch (`attn::compressed::decode::decode`) into `o_out`; `None` where the
     /// shape doesn't fit or the region reads gathered seats.
     fn compressed_decode(

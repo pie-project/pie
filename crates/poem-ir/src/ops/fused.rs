@@ -449,8 +449,8 @@ pub enum Fused {
         #[part]
         glu: Box<Linear>,
     },
-    /// A log-sum-exp attention (`DecodeLse` or `PrefillLse`) and its sinks
-    /// (`Sink`), the sinked output landed in `o_out`. The attention's `o`
+    /// A log-sum-exp attention (a `Decode` or `Prefill` with `lse`) and its
+    /// sinks (`Sink`), the sinked output landed in `o_out`. The attention's `o`
     /// (read by nothing else) and `lse` are still outputs.
     LseSink {
         #[part]
@@ -503,8 +503,8 @@ pub enum Fused {
         #[part]
         project: Box<Elemwise>,
     },
-    /// DeepSeek-V4's whole attention: windowed (`window`, a `PrefillLse`) and
-    /// compressed-pool (`pool`, a `PoolLse` or `PoolLseSelected`) attention
+    /// DeepSeek-V4's whole attention: windowed (`window`, a `Prefill` with
+    /// `lse`) and compressed-pool (`pool`, a `PoolLse`, selected or not) attention
     /// over one q, their `merge` (a `MergeLse`) and its sinks (`sink`, a
     /// `Sink` over the merged plane); every intermediate is still an output,
     /// read by nothing else. `rotate` (the inverse rotation of the sinked
