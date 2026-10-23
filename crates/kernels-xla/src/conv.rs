@@ -11,7 +11,7 @@
 //! share one fire, and a row no lane covers lands zero, as on CUDA. The only
 //! static extents are the planes' row counts (the fire's bucket).
 //!
-//! [`conv3d_boxed`] is the fast path for a table the host knows: each clip is
+//! [`conv3d::conv3d_boxed`] is the fast path for a table the host knows: each clip is
 //! cut out as a `[1, t, h, w, C]` volume and run through
 //! `stablehlo.convolution`, so the clip boxes become part of the executable's
 //! key. [`conv3d`] is the table-as-data form (an implicit GEMM: per tap, a

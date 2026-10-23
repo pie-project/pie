@@ -29,7 +29,7 @@
 //!   (`s · c + b`, rounded as a GPU qmm stages its tile) and contracted in
 //!   one dense dot.
 //!
-//! Plane layout the engine binds (see [`planes`]):
+//! Plane layout the engine binds (see `planes`):
 //! - `codes`: `rows = n`; the bank's packed dtype (read as the `U8
 //!   [n, k · bits / 8]` bytes it lands as, any width) or already that `U8`
 //!   view.
