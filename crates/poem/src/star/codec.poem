@@ -567,3 +567,51 @@ def stacked_bank(reads, w, stem, legs = None):
         mx_stacked_bank(reads, w, stem)
     else:
         nvfp4_stacked_bank(reads, w, stem, legs)
+
+# A checkpoint's names mapped onto the layout's.
+
+def at_path(m, path):
+    """The weight at `path` in the layout `m` (`layers.3.q`): each part an
+    attribute, or an index where it is a number. None where any step is."""
+    x = m
+    for part in path.split("."):
+        if x == None:
+            return None
+        x = x[int(part)] if part.isdigit() else getattr(x, part)
+    return x
+
+def mapped_row(reads, m, row, l, quantized):
+    names, path = row[0], row[1]
+    names = [names] if type(names) == "string" else names
+    w = at_path(m, path.format(l = l))
+    if w == None:
+        return
+    if any(["{e}" in name for name in names]):
+        experts = [[name.format(l = l, e = e) for name in names] for e in range(w.shape[0])]
+        bank(reads, w, experts)
+    else:
+        weight(reads, w, [name.format(l = l) for name in names], quantized = quantized)
+
+def mapped(reads, m, rows, quantized = "refuse"):
+    """The layout `m` read from a checkpoint by `rows`, each `(names, path)`:
+    the checkpoint's tensor (or tensors, joined along the weight's rows) and
+    the layout path of the weight it lands as. `{l}` in a row runs over
+    `m.layers`, a run of such rows read a layer at a time; `{e}` over a
+    bank's experts, its names each expert's legs. A path that is None is not
+    read (a tied head, an absent norm)."""
+    i = 0
+    for _ in range(len(rows)):
+        if i >= len(rows):
+            break
+        if "{l}" not in rows[i][1]:
+            mapped_row(reads, m, rows[i], None, quantized)
+            i += 1
+            continue
+        j = i
+        for _ in range(len(rows)):
+            if j < len(rows) and "{l}" in rows[j][1]:
+                j += 1
+        for l in range(len(m.layers)):
+            for row in rows[i:j]:
+                mapped_row(reads, m, row, l, quantized)
+        i = j

@@ -4,7 +4,7 @@
 # a row: RedHatAI's *-FP8-dynamic) or as modelopt exports it in NVFP4;
 # recognized by its per-head q norm and checked against its config.
 
-load("//pie/codec.poem", "weight")
+load("//pie/codec.poem", "mapped")
 
 def configured(m):
     return [
@@ -23,24 +23,22 @@ def formats(m):
     return [format(
         "transformers",
         recognizes = lambda checkpoint: has("model.embed_tokens.weight") and has("model.layers.0.self_attn.q_norm.weight") and not has("model.layers.0.mlp.experts.0.down_proj.weight"),
-        read = lambda reads: read(m, reads),
+        read = lambda reads: mapped(reads, m, TRANSFORMERS),
         states = configured(m),
     )]
 
-def read(m, reads):
-    reads.read(m.embed, "model.embed_tokens.weight")
-    reads.read(m.final_norm, "model.norm.weight")
-    if m.head != None:
-        reads.read(m.head, "lm_head.weight")
-    for l, w in enumerate(m.layers):
-        n = lambda s: "model.layers.{}.{}".format(l, s)
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        weight(reads, w.q, [n("self_attn.q_proj.weight")])
-        weight(reads, w.k, [n("self_attn.k_proj.weight")])
-        weight(reads, w.v, [n("self_attn.v_proj.weight")])
-        weight(reads, w.o, [n("self_attn.o_proj.weight")])
-        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
-        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
-        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        weight(reads, w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
-        weight(reads, w.down, [n("mlp.down_proj.weight")])
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.down"),
+]

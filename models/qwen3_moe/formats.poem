@@ -5,7 +5,7 @@
 # recognized by its per-head q norm and its first expert, and checked against
 # its config.
 
-load("//pie/codec.poem", "bank", "weight")
+load("//pie/codec.poem", "mapped")
 
 def configured(m):
     return [
@@ -26,27 +26,25 @@ def formats(m):
     return [format(
         "transformers",
         recognizes = lambda checkpoint: has("model.layers.0.self_attn.q_norm.weight") and has("model.layers.0.mlp.experts.0.down_proj.weight"),
-        read = lambda reads: read(m, reads),
+        read = lambda reads: mapped(reads, m, TRANSFORMERS),
         states = configured(m),
     )]
 
-def read(m, reads):
-    reads.read(m.embed, "model.embed_tokens.weight")
-    reads.read(m.final_norm, "model.norm.weight")
-    reads.read(m.head, "lm_head.weight")
-    for l, w in enumerate(m.layers):
-        n = lambda s: "model.layers.{}.{}".format(l, s)
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        weight(
-            reads,
-            w.qkv,
-            [n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")],
-        )
-        weight(reads, w.o, [n("self_attn.o_proj.weight")])
-        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
-        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
-        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read(w.router, n("mlp.gate.weight"))
-        leg = lambda e, name: n("mlp.experts.{}.{}.weight".format(e, name))
-        bank(reads, w.gate_up, [[leg(e, "gate_proj"), leg(e, "up_proj")] for e in range(m.experts)])
-        bank(reads, w.down, [[leg(e, "down_proj")] for e in range(m.experts)])
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.weight",
+        "model.layers.{l}.self_attn.k_proj.weight",
+        "model.layers.{l}.self_attn.v_proj.weight",
+    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    ("model.layers.{l}.mlp.gate.weight", "layers.{l}.router"),
+    (["model.layers.{l}.mlp.experts.{e}.gate_proj.weight", "model.layers.{l}.mlp.experts.{e}.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.experts.{e}.down_proj.weight", "layers.{l}.down"),
+]
