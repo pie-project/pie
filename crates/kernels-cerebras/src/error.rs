@@ -25,7 +25,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-pub(crate) fn refuse(op: &'static str, detail: impl Into<String>) -> Error {
+pub fn refuse(op: &'static str, detail: impl Into<String>) -> Error {
     Error::Backend {
         op,
         detail: detail.into(),

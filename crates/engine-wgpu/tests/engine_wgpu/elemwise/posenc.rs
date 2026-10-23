@@ -11,9 +11,8 @@ fn the_sinusoid_answers_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: kernels_wgpu::Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let t = |buf: u32, rows: usize, width: usize, dtype: Dtype| {
-        kernels_wgpu::Tensor::new(buf, rows as u32, width as u32, dtype)
+        kernels_slang::Tensor::new(buf, rows as u32, width as u32, dtype)
     };
     let rows = 3usize;
     let tv = [0.0f32, 0.37, 0.999];
@@ -37,21 +36,21 @@ fn the_sinusoid_answers_the_reference() {
         let shape = format!("dim {dim}, flipped {flip}");
 
         let y = gpu.zeros(2 * rows * dim);
-        gpu.run_slang(|c| {
+        gpu.run(|c| {
             kernels_slang::elemwise::posenc::sinusoid(
                 c,
-                st(tt),
+                tt,
                 dim as u32,
                 10_000.0,
                 flip,
                 1000.0,
-                st(yt(y)),
+                yt(y),
             )
         });
         close(
             &gpu.down_f32(y, rows * dim),
             &want,
-            &format!("slang sinusoid {shape}"),
+            &format!("sinusoid {shape}"),
         );
     }
 }

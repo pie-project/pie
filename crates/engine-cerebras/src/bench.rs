@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use dtype::Dtype;
-use kernels_cerebras::cx::Tracer;
-use kernels_cerebras::program::Rendered;
-use kernels_cerebras::{Error, Tensor};
+use kernels_cerebras::plan::Plan;
+use kernels_cerebras::{Cx, Emit, Error, Tensor};
 
+use crate::fabric::{Emitting, Fabric, Operands, Placed, Planner, Program, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Sdk};
 
 /// One simulator at a time on this box: runs are serialised across threads
@@ -127,9 +127,9 @@ impl Bench {
         &mut self,
         body: impl FnOnce(&kernels_cerebras::Ctx<'_>) -> Result<(), Error>,
     ) -> Result<bool, String> {
-        let tracer = Tracer::default();
-        body(&tracer).map_err(|e| e.to_string())?;
-        let program = tracer.into_program();
+        let recorder = Recorder::default();
+        body(&recorder).map_err(|e| e.to_string())?;
+        let program = recorder.into_program();
         let rendered = program.render();
         let phases = program.render_phases();
         self.last = Some(rendered);
@@ -208,5 +208,105 @@ impl Bench {
             self.last_dir = Some(kept);
         }
         Ok(true)
+    }
+}
+
+/// The bench's operands: every handle is one exported buffer, `b{handle}`.
+#[derive(Debug)]
+pub struct Roots {
+    pub fabric: Fabric,
+}
+
+impl Operands for Roots {
+    fn read(&mut self, p: &mut Program, t: Tensor) -> Result<Placed, Error> {
+        let whole = p.read("read", t)?;
+        Ok(Placed {
+            offset: 0,
+            rows: whole.rows,
+            whole,
+        })
+    }
+
+    fn write(&mut self, p: &mut Program, t: Tensor) -> Result<Placed, Error> {
+        let whole = p.write("write", t)?;
+        Ok(Placed {
+            offset: 0,
+            rows: whole.rows,
+            whole,
+        })
+    }
+
+    /// Every bf16 handle a kernel asks for packed is packed (the bench
+    /// standing in for the engine's weights): a weight under its own
+    /// packed name, a pool (asked through `Cx::pool_half`) under its plain
+    /// name, read and written.
+    fn read_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<Placed>, Error> {
+        if !self.fabric.half_weights || t.dtype != Dtype::Bf16 || !t.width.is_multiple_of(2) {
+            return Ok(None);
+        }
+        let whole = p.declare_packed(&format!("b{}h", t.buf), t.dtype, t.rows, t.width)?;
+        Ok(Some(Placed {
+            offset: 0,
+            rows: whole.rows,
+            whole,
+        }))
+    }
+
+    fn pool_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<Placed>, Error> {
+        if !self.fabric.half_pool || t.dtype != Dtype::Bf16 || !t.width.is_multiple_of(2) {
+            return Ok(None);
+        }
+        let whole = p.declare_packed(&format!("b{}", t.buf), t.dtype, t.rows, t.width)?;
+        Ok(Some(Placed {
+            offset: 0,
+            rows: whole.rows,
+            whole,
+        }))
+    }
+}
+
+/// A recording sink over one program: what a bench or a probe emits into.
+/// [`Emit::emit`] opens a phase per call.
+pub struct Recorder {
+    program: std::cell::RefCell<Program>,
+    operands: std::cell::RefCell<Box<dyn Operands>>,
+    plan: Planner,
+}
+
+impl Recorder {
+    pub fn new(operands: impl Operands + 'static, fabric: Fabric) -> Self {
+        Recorder {
+            program: std::cell::RefCell::new(Program::new()),
+            operands: std::cell::RefCell::new(Box::new(operands)),
+            plan: Planner { fabric },
+        }
+    }
+
+    pub fn into_program(self) -> Program {
+        self.program.into_inner()
+    }
+}
+
+impl Default for Recorder {
+    /// Over the bench's operands, on the terms the environment sets.
+    fn default() -> Self {
+        let fabric = crate::fabric::terms();
+        Self::new(Roots { fabric }, fabric)
+    }
+}
+
+impl Emit for Recorder {
+    fn plan(&self) -> &dyn Plan {
+        &self.plan
+    }
+
+    fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {
+        let mut program = self.program.borrow_mut();
+        let mut operands = self.operands.borrow_mut();
+        let mut sink = Emitting::new(&mut program, operands.as_mut(), &self.plan);
+        let mut cx = Cx::new(&mut sink, "op");
+        body(&mut cx)?;
+        cx.finish();
+        Ok(())
     }
 }

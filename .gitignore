@@ -238,6 +238,6 @@ tests/browser/models-tiny/
 tests/browser/inferlets/
 tests/browser/languages/
 tests/browser/tools/package*.json
-crates/kernels-wgpu/tools/wgsl/
+crates/kernels-slang/tools/wgsl/
 scripts/bench/browser/results/*.raw
 .rocprofv3/

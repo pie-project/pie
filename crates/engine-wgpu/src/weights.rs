@@ -11,7 +11,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use engine::load::{Residency, Tiers};
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::alloc::Memory;
@@ -268,7 +268,7 @@ impl Weights {
                 Ok(Tensor::new(handle, place.rows, place.width, place.dtype))
             };
             weight_table.push(Some(match pairings.get(trace.params[at].name.as_str()) {
-                Some(pairing) => WeightRow::Planes(kernels_wgpu::Bank {
+                Some(pairing) => WeightRow::Planes(kernels_slang::Bank {
                     codes: dense(place, at)?,
                     scales: dense(&places[pairing.scales], pairing.scales)?,
                     biases: pairing.biases.map(|b| dense(&places[b], b)).transpose()?,

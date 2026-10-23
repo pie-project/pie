@@ -1,10 +1,10 @@
-//! The embedding lookups on the first Vulkan device against an f64 host reference,
-//! beside the hand-written kernels: a bf16 table by id (out-of-range ids read
-//! row 0), rows side by side (out of range lands zeros), weighted taps, and
-//! affine-quantized banks.
+//! The embedding lookups on the first Vulkan device against an f64 host
+//! reference: a bf16 table by id (out-of-range ids read row 0), rows side by
+//! side (out of range lands zeros), weighted taps, and affine-quantized
+//! banks.
 
 use crate::gpu::{Gpu, close, noise};
-use kernels_vulkan::{Bank, Tensor, layout};
+use kernels_slang::{Bank, Tensor};
 use poem_ir::Dtype;
 
 const VOCAB: usize = 10;
@@ -28,11 +28,10 @@ fn the_embeddings_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let sb = |b: Bank| kernels_slang::Bank {
-        codes: st(b.codes),
-        scales: st(b.scales),
-        biases: b.biases.map(st),
+        codes: b.codes,
+        scales: b.scales,
+        biases: b.biases,
         group: b.group,
         bits: b.bits,
     };
@@ -59,19 +58,8 @@ fn the_embeddings_answer_the_reference() {
         })
         .collect();
     let y = gpu.zeros(n * hidden);
-    gpu.run(|c| layout::embed(c, it, table, VOCAB as u32, yt(y, n, hidden)));
+    gpu.run(|c| kernels_slang::gather::embed::embed(c, it, table, VOCAB as u32, yt(y, n, hidden)));
     close(&gpu.down(y, n * hidden), &want, "embed");
-    let y = gpu.zeros(n * hidden);
-    gpu.run_slang(|c| {
-        kernels_slang::gather::embed::embed(
-            c,
-            st(it),
-            st(table),
-            VOCAB as u32,
-            st(yt(y, n, hidden)),
-        )
-    });
-    close(&gpu.down(y, n * hidden), &want, "slang embed");
 
     // Side by side: three ids a row.
     let cat = Tensor::new(ids, 2, 3, Dtype::I32);
@@ -89,19 +77,16 @@ fn the_embeddings_answer_the_reference() {
         })
         .collect();
     let y = gpu.zeros(n * hidden);
-    gpu.run(|c| layout::embed_concat(c, cat, table, VOCAB as u32, yt(y, 2, 3 * hidden)));
-    close(&gpu.down(y, n * hidden), &want, "embed concat");
-    let y = gpu.zeros(n * hidden);
-    gpu.run_slang(|c| {
+    gpu.run(|c| {
         kernels_slang::gather::embed::embed_concat(
             c,
-            st(cat),
-            st(table),
+            cat,
+            table,
             VOCAB as u32,
-            st(yt(y, 2, 3 * hidden)),
+            yt(y, 2, 3 * hidden),
         )
     });
-    close(&gpu.down(y, n * hidden), &want, "slang embed concat");
+    close(&gpu.down(y, n * hidden), &want, "embed concat");
 
     // Weighted: two rows of three taps.
     let wv = [0.5f32, 0.25, 0.25, 1.0, -0.5, 2.0];
@@ -126,20 +111,17 @@ fn the_embeddings_answer_the_reference() {
         })
         .collect();
     let y = gpu.zeros(2 * hidden);
-    gpu.run(|c| layout::embed_weighted(c, cat, wt, table, VOCAB as u32, yt(y, 2, hidden)));
-    close(&gpu.down(y, 2 * hidden), &want, "embed weighted");
-    let y = gpu.zeros(2 * hidden);
-    gpu.run_slang(|c| {
+    gpu.run(|c| {
         kernels_slang::gather::embed::embed_weighted(
             c,
-            st(cat),
-            st(wt),
-            st(table),
+            cat,
+            wt,
+            table,
             VOCAB as u32,
-            st(yt(y, 2, hidden)),
+            yt(y, 2, hidden),
         )
     });
-    close(&gpu.down(y, 2 * hidden), &want, "slang embed weighted");
+    close(&gpu.down(y, 2 * hidden), &want, "embed weighted");
 
     // Affine banks, by id and side by side.
     for (group, bits) in [(32usize, 4usize), (64, 8), (128, 2)] {
@@ -183,41 +165,34 @@ fn the_embeddings_answer_the_reference() {
             .collect();
         let shape = format!("group {group}, {bits} bits");
         let y = gpu.zeros(n * hidden);
-        gpu.run(|c| layout::embed_gather_mb_4bit(c, it, bank, VOCAB as u32, yt(y, n, hidden)));
+        gpu.run(|c| {
+            kernels_slang::gather::embed::embed_banked(
+                c,
+                it,
+                sb(bank),
+                VOCAB as u32,
+                yt(y, n, hidden),
+            )
+        });
         close(
             &gpu.down(y, n * hidden),
             &want,
             &format!("embed bank {shape}"),
         );
         let y = gpu.zeros(n * hidden);
-        gpu.run_slang(|c| {
-            kernels_slang::gather::embed::embed_banked(
-                c,
-                st(it),
-                sb(bank),
-                VOCAB as u32,
-                st(yt(y, n, hidden)),
-            )
-        });
-        close(
-            &gpu.down(y, n * hidden),
-            &want,
-            &format!("slang embed bank {shape}"),
-        );
-        let y = gpu.zeros(n * hidden);
-        gpu.run_slang(|c| {
+        gpu.run(|c| {
             kernels_slang::gather::embed::embed_concat_banked(
                 c,
-                st(cat),
+                cat,
                 sb(bank),
                 VOCAB as u32,
-                st(yt(y, 2, 3 * hidden)),
+                yt(y, 2, 3 * hidden),
             )
         });
         close(
             &gpu.down(y, n * hidden),
             &want,
-            &format!("slang embed concat bank {shape}"),
+            &format!("embed concat bank {shape}"),
         );
     }
 }

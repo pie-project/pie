@@ -10,22 +10,21 @@ impl DispatchSampling for Run<'_> {
 }
 
 impl Run<'_> {
-    fn sampling(&mut self, op: &Sampling) -> Result<(), kernels_wgpu::Error> {
+    fn sampling(&mut self, op: &Sampling) -> Result<(), kernels_slang::Error> {
         match op {
             Sampling::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
                     kernels_slang::sampling::argmax::argmax(
-                        &self.slang(),
-                        crate::encode::slang_tensor(self.tensor(*x)),
+                        self.ctx,
+                        self.tensor(*x),
                         u32::try_from(column).expect("a draft depth inside u32"),
-                        crate::encode::slang_tensor(self.tensor(*y)),
-                    )
-                    .map_err(crate::encode::from_slang)?;
+                        self.tensor(*y),
+                    )?;
                 }
                 Ok(())
             }
             Sampling::TopK { .. } | Sampling::MarkovWalk { .. } | Sampling::SelectorWalk { .. } => {
-                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
         }
     }

@@ -1,6 +1,6 @@
 //! Gated MLP activations: a `[gate | up]` packed row (or two planes) in, the
 //! gated product out, computed in f32 and rounded once at the store, as
-//! kernels-wgpu `mlp/packed.wgsl` and `mlp/gated.wgsl` compute them.
+//! kernels-slang `linear/glu.slang` computes them.
 
 #![allow(clippy::too_many_arguments)]
 

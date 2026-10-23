@@ -2,10 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ash::vk;
-use kernels_vulkan::Fire;
-
 use crate::error::{Fault, Result};
+use ash::vk;
 
 use super::ctx::{Context, Core};
 use super::spirv;
@@ -62,40 +60,43 @@ impl Pipelines {
         self.compiles.get()
     }
 
-    pub fn warm(&self, device: &Context, fire: Fire) -> Result<()> {
-        self.get(device, fire).map(|_| ())
-    }
-
-    pub fn get(&self, device: &Context, fire: Fire) -> Result<Arc<Pipeline>> {
-        let entrypoint = fire.entrypoint;
-        if let Some(pipeline) = self.built.borrow().get(entrypoint) {
+    /// The pipeline of kernels-slang's module `key` (an instantiation at a
+    /// tier, `kernels_slang::key`), from `file`; built on first use.
+    pub fn get(
+        &self,
+        device: &Context,
+        file: &'static str,
+        key: &'static str,
+    ) -> Result<Arc<Pipeline>> {
+        if let Some(pipeline) = self.built.borrow().get(key) {
             return Ok(Arc::clone(pipeline));
         }
-        let code = kernels_vulkan::sources::module_for(entrypoint, device.lanes())
-            .or_else(|| kernels_slang::spirv(entrypoint))
-            .ok_or(Fault::Shader {
-                file: fire.file,
-                entrypoint,
-                why: "neither kernel table holds a compiled module by that name (built \
-                  without `kernels-vulkan/native` or `kernels-slang/spirv`, or the variant is \
-                  not instantiated)"
-                    .to_string(),
-            })?;
+        let code = kernels_slang::spirv(key).ok_or(Fault::Shader {
+            file,
+            entrypoint: key,
+            why: "kernels-slang holds no SPIR-V module by that key (built without \
+                  `kernels-slang/spirv`, or the instantiation is limited to WGSL)"
+                .to_string(),
+        })?;
         let cache = device.pipeline_cache();
-        let pipeline = Arc::new(build(device.core(), cache.handle(), fire, code)?);
+        let pipeline = Arc::new(build(device.core(), cache.handle(), file, key, code)?);
         cache.built();
         self.compiles.set(self.compiles.get() + 1);
-        self.built
-            .borrow_mut()
-            .insert(entrypoint, Arc::clone(&pipeline));
+        self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
     }
 }
 
-fn build(core: &Arc<Core>, cache: vk::PipelineCache, fire: Fire, code: &[u8]) -> Result<Pipeline> {
+fn build(
+    core: &Arc<Core>,
+    cache: vk::PipelineCache,
+    file: &'static str,
+    key: &'static str,
+    code: &[u8],
+) -> Result<Pipeline> {
     let shader = |why: spirv::Malformed| Fault::Shader {
-        file: fire.file,
-        entrypoint: fire.entrypoint,
+        file,
+        entrypoint: key,
         why: why.to_string(),
     };
     let words = spirv::words(code).map_err(shader)?;

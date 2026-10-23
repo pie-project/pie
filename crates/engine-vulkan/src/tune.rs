@@ -28,7 +28,7 @@ const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
 fn target(base: &Profile, facts: &Facts) -> profile::Target {
     let mut target = base.target().clone();
     for name in ASSUME {
-        let i = kernels_vulkan::tuning::FACTS
+        let i = crate::tuning::FACTS
             .iter()
             .position(|v| v.name == *name)
             .expect("a Vulkan fact");

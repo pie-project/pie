@@ -47,7 +47,7 @@ impl poem_exec::DispatchProbe for Run<'_> {
             };
             let t = self.tensor(id);
             let total = u64::from(t.rows) * u64::from(t.width) * elem;
-            if total == 0 || t.buf == kernels_wgpu::ABSENT {
+            if total == 0 || t.buf == kernels_slang::ABSENT {
                 continue;
             }
             let Ok(bytes) = self.handles().read(t.buf, total) else {

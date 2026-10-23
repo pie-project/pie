@@ -1,6 +1,6 @@
 //! NVFP4 projections: e2m1 codes, two per byte (low nibble first), one e4m3
-//! scale per 16 codes, one f32 tensor scale, as kernels-wgpu
-//! `quant/nvfp4.wgsl` decodes them: `y = tensor_scale · Σ x · e2m1(c) ·
+//! scale per 16 codes, one f32 tensor scale, as kernels-cuda's
+//! `linear/dequant.cu` decodes them: `y = tensor_scale · Σ x · e2m1(c) ·
 //! e4m3(s)`. The codes run through [`quant`](super::quant)'s split planes
 //! (group-batched for decode, one dense dot for prefill); a code times its
 //! e4m3 scale is exactly a bf16, so neither form rounds the weight.

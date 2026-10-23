@@ -9,9 +9,11 @@ use dtype::Dtype;
 
 use crate::csl::Arg;
 use crate::csl::f32_lit;
-use crate::cx::{Ctx, expect, tile_split};
+use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
-use crate::program::Shard;
+use crate::library::Kernel;
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 pub const AXES: u32 = 3;
@@ -255,14 +257,17 @@ fn rotate(
         let heads_gcd = ts.iter().map(|t| t.width / head_dim).fold(0, gcd).max(1);
         let unit = head_dim * (first.width / head_dim).max(1) / heads_gcd;
         let per_row: u64 = ts.iter().map(|t| u64::from(t.width)).sum::<u64>() + u64::from(AXES);
-        tile_split(
+        ctx.plan().tile(
             OP,
-            first.rows,
-            first.width,
-            per_row,
-            0,
-            4 * u64::from(n),
-            unit,
+            Footprint {
+                rows: first.rows,
+                width: first.width,
+                per_row,
+                per_col: 0,
+                whole: 4 * u64::from(n),
+                merge: 0,
+                unit,
+            },
         )?
     } else {
         (1, 1)
@@ -285,7 +290,6 @@ fn rotate(
         let hi = cx.table("mrope_hi", "i32", &list(&|p| p.hi.to_string()));
         let axis = cx.table("mrope_axis", "i32", &list(&|p| p.axis.to_string()));
         let freq = cx.table("mrope_freq", "f32", &list(&|p| f32_lit(p.freq)));
-        cx.library("elemwise/rope_table");
         for t in ts {
             cx.read(*t)?;
             let b = cx.write(*t)?;
@@ -300,7 +304,7 @@ fn rotate(
                 );
             }
             cx.call(
-                "k_rope_table",
+                Kernel::RopeTable,
                 vec![
                     Arg::Ptr(b),
                     Arg::Ptr(pb.clone()),

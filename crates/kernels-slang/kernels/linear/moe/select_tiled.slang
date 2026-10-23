@@ -10,7 +10,7 @@
 #endif
 
 // Routed matmuls over sorted expert tiles (the batched form of
-// `linear.moe_matmul_select_quant` and `_bias`): `route_sort` lays the
+// `linear.moe_select` and `_bias`): `route_sort` lays the
 // routes out a `PIE_BM`-row tile an expert, and a workgroup lands one tile's
 // `PIE_BN` columns from its expert's plane (MXFP4 or affine), the
 // contraction in 32-code blocks through workgroup memory; a tile past the

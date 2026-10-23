@@ -1,5 +1,5 @@
 //! Hyper-connections: `M` residual streams of width `H` ride one
-//! `[rows, M·H]` row. Reference: kernels-wgpu `elemwise/hc_*.wgsl`
+//! `[rows, M·H]` row. Reference: kernels-slang `elemwise/hc.slang`
 //! (Metal and CUDA compute the same).
 #![allow(clippy::too_many_arguments)]
 

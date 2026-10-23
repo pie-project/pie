@@ -1,29 +1,13 @@
-//! The sparse-attention indexer on the first Vulkan device, beside the hand-written
-//! kernels: the index keys' layer norm and rope and the query's rope against
-//! an f64 reference; the top-k scores against an f64 reference and its
-//! selection exactly against the bisection's host replica, with and without
-//! head weights, at ratio 1 and 2, a row short of its budget included.
+//! The sparse-attention indexer on the first Vulkan device: the index keys'
+//! layer norm and rope and the query's rope against an f64 reference; the
+//! top-k scores against an f64 reference and its selection exactly against
+//! the bisection's host replica, with and without head weights, at ratio 1
+//! and 2, a row short of its budget included.
 
-use kernels_vulkan::{KvPool, Tensor, attn::index};
+use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, close, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
-
-fn sp(p: &KvPool) -> kernels_slang::KvPool {
-    kernels_slang::KvPool {
-        keys: st(p.keys),
-        values: st(p.values),
-        page_indices: st(p.page_indices),
-        page_indptr: st(p.page_indptr),
-        page_size: p.page_size,
-        seq_stride: p.seq_stride,
-        head_stride: p.head_stride,
-    }
-}
+use crate::gpu::{Gpu, close, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -74,33 +58,19 @@ fn the_indexer_answers_the_reference() {
         turn(&mut y, rope, positions[r], f64::from(theta));
         want.extend(y);
     }
-    both(
+    landed(
         &mut gpu,
         "index key norm rope",
         &|g| vec![(g.up(&kv).0, rows * d, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                index::layernorm_rope(
+                kernels_slang::attn::index::layernorm_rope(
                     c,
                     b(o[0].0, rows, d),
                     i32t(pos, rows),
                     b(w, 1, d),
                     b(bb, 1, d),
-                    eps,
-                    rope as u32,
-                    theta,
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::index::layernorm_rope(
-                    c,
-                    st(b(o[0].0, rows, d)),
-                    st(i32t(pos, rows)),
-                    st(b(w, 1, d)),
-                    st(b(bb, 1, d)),
                     eps,
                     rope as u32,
                     theta,
@@ -124,30 +94,17 @@ fn the_indexer_answers_the_reference() {
             );
         }
     }
-    both(
+    landed(
         &mut gpu,
         "index q rope",
         &|g| vec![(g.up(&qv).0, rows * heads * d, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                index::rope(
+                kernels_slang::attn::index::rope(
                     c,
                     b(o[0].0, rows, heads * d),
                     i32t(pos, rows),
-                    heads as u32,
-                    d as u32,
-                    rope as u32,
-                    theta,
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::index::rope(
-                    c,
-                    st(b(o[0].0, rows, heads * d)),
-                    st(i32t(pos, rows)),
                     heads as u32,
                     d as u32,
                     rope as u32,
@@ -206,77 +163,56 @@ fn the_indexer_answers_the_reference() {
             }
         }
         let weights = weighted.then(|| b(hw, rows, heads));
-        for slang in [false, true] {
-            let sc = gpu.up_f32(&vec![0.0; rows * stride]);
-            let sel = gpu.up_i32(&vec![-9; rows * top_k]);
-            let (sct, selt) = (
-                Tensor::new(sc, rows as u32, stride as u32, Dtype::F32),
-                Tensor::new(sel, rows as u32, top_k as u32, Dtype::I32),
+        let sc = gpu.up_f32(&vec![0.0; rows * stride]);
+        let sel = gpu.up_i32(&vec![-9; rows * top_k]);
+        let (sct, selt) = (
+            Tensor::new(sc, rows as u32, stride as u32, Dtype::F32),
+            Tensor::new(sel, rows as u32, top_k as u32, Dtype::I32),
+        );
+        let qt = b(q, rows, heads * d);
+        gpu.run(|c| {
+            kernels_slang::attn::index::topk(
+                c,
+                qt,
+                weights,
+                &pool(keys),
+                i32t(pos, rows),
+                i32t(own, rows),
+                sct,
+                heads as u32,
+                d as u32,
+                top_k as u32,
+                ratio as u32,
+                selt,
+            )
+        });
+
+        let got = gpu.down_f32(sc, rows * stride);
+        let picked: Vec<f32> = want_scores
+            .iter()
+            .map(|(r, j, _)| got[r * stride + j])
+            .collect();
+        let want: Vec<f64> = want_scores.iter().map(|(_, _, s)| *s).collect();
+        close(
+            &picked,
+            &want,
+            &format!("index scores ratio {ratio} weighted {weighted}"),
+        );
+        let selected: Vec<i32> = gpu
+            .down_f32(sel, rows * top_k)
+            .iter()
+            .map(|v| v.to_bits() as i32)
+            .collect();
+        for r in 0..rows {
+            let nkeys = ((positions[r] as usize + 1) / ratio).min(stride);
+            let expect = bisect_select(&got[r * stride..][..nkeys], top_k);
+            assert_eq!(
+                &selected[r * top_k..][..top_k],
+                &expect[..],
+                "index selection ratio {ratio} row {r}"
             );
-            let qt = b(q, rows, heads * d);
-            if slang {
-                gpu.run_slang(|c| {
-                    kernels_slang::attn::index::topk(
-                        c,
-                        st(qt),
-                        weights.map(st),
-                        &sp(&pool(keys)),
-                        st(i32t(pos, rows)),
-                        st(i32t(own, rows)),
-                        st(sct),
-                        heads as u32,
-                        d as u32,
-                        top_k as u32,
-                        ratio as u32,
-                        st(selt),
-                    )
-                });
-            } else {
-                gpu.run(|c| {
-                    index::topk(
-                        c,
-                        qt,
-                        weights,
-                        &pool(keys),
-                        i32t(pos, rows),
-                        i32t(own, rows),
-                        sct,
-                        heads as u32,
-                        d as u32,
-                        top_k as u32,
-                        ratio as u32,
-                        selt,
-                    )
-                });
-            }
-            let who = if slang { "slang " } else { "" };
-            let got = gpu.down_f32(sc, rows * stride);
-            let picked: Vec<f32> = want_scores
-                .iter()
-                .map(|(r, j, _)| got[r * stride + j])
-                .collect();
-            let want: Vec<f64> = want_scores.iter().map(|(_, _, s)| *s).collect();
-            close(
-                &picked,
-                &want,
-                &format!("{who}index scores ratio {ratio} weighted {weighted}"),
-            );
-            let selected: Vec<i32> = gpu
-                .down_f32(sel, rows * top_k)
-                .iter()
-                .map(|v| v.to_bits() as i32)
-                .collect();
-            for r in 0..rows {
-                let nkeys = ((positions[r] as usize + 1) / ratio).min(stride);
-                let expect = index::bisect_select(&got[r * stride..][..nkeys], top_k);
-                assert_eq!(
-                    &selected[r * top_k..][..top_k],
-                    &expect[..],
-                    "{who}index selection ratio {ratio} row {r}"
-                );
-            }
-            eprintln!("{who}index selection ratio {ratio} weighted {weighted}: exact");
         }
+        eprintln!("index selection ratio {ratio} weighted {weighted}: exact");
     }
 
     // the append, through the MLA appender's no-rope form
@@ -289,22 +225,19 @@ fn the_indexer_answers_the_reference() {
         let slot = wpg[r] as usize * page + wof[r] as usize;
         want[slot * d..][..d].copy_from_slice(&knr[r * d..][..d]);
     }
-    both(
+    landed(
         &mut gpu,
         "index kv append",
         &|g| vec![(g.zeros(slots * d), slots * d, false)],
         &[want],
         &|g, o| {
-            g.run(|c| index::kv_append(c, b(kn, rows, d), &pool(o[0].0), u(wp, rows), u(wo, rows)))
-        },
-        &|g, o| {
-            g.run_slang(|c| {
+            g.run(|c| {
                 kernels_slang::attn::index::kv_append(
                     c,
-                    st(b(kn, rows, d)),
-                    &sp(&pool(o[0].0)),
-                    st(u(wp, rows)),
-                    st(u(wo, rows)),
+                    b(kn, rows, d),
+                    &pool(o[0].0),
+                    u(wp, rows),
+                    u(wo, rows),
                 )
             })
         },
@@ -315,4 +248,44 @@ fn the_indexer_answers_the_reference() {
 fn half_round(v: f32) -> f32 {
     let bits = v.to_bits();
     f32::from_bits(((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) << 16)
+}
+
+/// The selection the kernel's bisection lands: the threshold walked down
+/// forty halvings from the row's largest score, then the first `topk` keys
+/// at or above it in key order, padded with -1.
+fn bisect_select(scores: &[f32], topk: usize) -> Vec<i32> {
+    let nkeys = scores.len();
+    if nkeys <= topk {
+        return (0..topk)
+            .map(|n| if n < nkeys { n as i32 } else { -1 })
+            .collect();
+    }
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for s in scores {
+        lo = lo.min(*s);
+        hi = hi.max(*s);
+    }
+    let mut thr = hi;
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        let cnt = scores.iter().filter(|s| **s >= mid).count();
+        if cnt > topk {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        thr = hi;
+    }
+    let mut out = Vec::with_capacity(topk);
+    for (j, s) in scores.iter().enumerate() {
+        if out.len() == topk {
+            break;
+        }
+        if *s >= thr {
+            out.push(j as i32);
+        }
+    }
+    out.resize(topk, -1);
+    out
 }

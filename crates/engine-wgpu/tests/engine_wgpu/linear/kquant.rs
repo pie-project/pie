@@ -1,18 +1,13 @@
-//! The GGUF K-quant matmuls (Q2_K to Q6_K) on the first wgpu adapter, beside
-//! the hand-written kernels, against an f64 host reference that decodes each
-//! super-block: 33 super-blocks a row, so a lane walks two and a row of an
-//! odd scheme starts off a word; ten columns, so the last workgroup is part
-//! empty.
+//! The GGUF K-quant matmuls (Q2_K to Q6_K) on the first wgpu adapter,
+//! against an f64 host reference that decodes each super-block: 33
+//! super-blocks a row, so a lane walks two and a row of an odd scheme starts
+//! off a word; ten columns, so the last workgroup is part empty.
 
+use kernels_slang::Tensor;
 use kernels_slang::linear::kquant::{Scheme, Tactic};
-use kernels_wgpu::{Tensor, linear::kquant};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
+use crate::gpu::{Gpu, landed, noise};
 
 const SUPER: usize = 256;
 
@@ -188,20 +183,14 @@ fn the_kquants_answer_the_reference() {
                 tier: kernels_slang::Tier::Baseline,
                 slices,
             };
-            both(
+            landed(
                 &mut gpu,
                 &format!("{scheme:?} slices {slices}"),
                 &|g| vec![(g.zeros(m * n), m * n, false)],
                 std::slice::from_ref(&want),
                 &|g, o| {
                     let y = t(o[0].0, m, n, Dtype::Bf16);
-                    g.run(|cx| kquant::matmul(cx, xt, wt, y));
-                },
-                &|g, o| {
-                    let y = st(t(o[0].0, m, n, Dtype::Bf16));
-                    g.run_slang(|cx| {
-                        kernels_slang::linear::kquant::lm_head(cx, tier, st(xt), st(wt), y)
-                    });
+                    g.run(|cx| kernels_slang::linear::kquant::lm_head(cx, tier, xt, wt, y));
                 },
             );
         }

@@ -1,4 +1,4 @@
-use kernels_vulkan::collective;
+use kernels_slang::collective::band;
 use poem_exec::{DispatchCollective, KernelError};
 use poem_ir::Collective;
 
@@ -11,17 +11,12 @@ impl DispatchCollective for Run<'_> {
 }
 
 impl Run<'_> {
-    fn collective(&mut self, op: &Collective) -> Result<(), kernels_vulkan::Error> {
+    fn collective(&mut self, op: &Collective) -> Result<(), kernels_slang::Error> {
+        let t = |id| self.tensor(id);
         match op {
-            Collective::AllReduce { buf, buf_out: _ } => {
-                collective::all_reduce(self.ctx(), self.tensor(*buf))
-            }
-            Collective::AllGather { x, y } => {
-                collective::all_gather(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
-            Collective::ReduceScatter { x, y } => {
-                collective::reduce_scatter(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
+            Collective::AllReduce { buf, buf_out: _ } => band::all_reduce(self.ctx, t(*buf)),
+            Collective::AllGather { x, y } => band::all_gather(self.ctx, t(*x), t(*y)),
+            Collective::ReduceScatter { x, y } => band::reduce_scatter(self.ctx, t(*x), t(*y)),
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Collectives over the replicas of one program.
 //!
-//! The signatures are kernels-wgpu's (and kernels-cuda's): the world size is
+//! The signatures are kernels-slang's (and kernels-cuda's): the world size is
 //! read off the shapes (`all_gather` lands `[rows, width * world]`,
 //! `reduce_scatter` keeps `[rows, width / world]`, each rank its own column
 //! band, as kernels-cuda lays them), and the rank is implicit — an XLA SPMD

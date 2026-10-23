@@ -1,28 +1,12 @@
-//! Multi-head latent attention on the first Vulkan device, beside the hand-written
-//! kernels, against an f64 host reference: the latent prologue (latents,
-//! the q split, the absorbed projections, the paged append) and the paged
-//! attention over latents, causal and over a selection.
+//! Multi-head latent attention on the first Vulkan device, against an f64
+//! host reference: the latent prologue (latents, the q split, the absorbed
+//! projections, the paged append) and the paged attention over latents,
+//! causal and over a selection.
 
-use kernels_vulkan::{KvPool, RaggedTensor, Tensor, attn::mla};
+use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
-
-fn sp(p: &KvPool) -> kernels_slang::KvPool {
-    kernels_slang::KvPool {
-        keys: st(p.keys),
-        values: st(p.values),
-        page_indices: st(p.page_indices),
-        page_indptr: st(p.page_indptr),
-        page_size: p.page_size,
-        seq_stride: p.seq_stride,
-        head_stride: p.head_stride,
-    }
-}
+use crate::gpu::{Gpu, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -59,7 +43,7 @@ fn mla_answers_the_reference() {
         want_c.extend(lat.iter().zip(&wr).map(|(v, w)| v * inv * w));
         want_pe.extend_from_slice(&ar[r * width + RANK..][..ROPE]);
     }
-    both(
+    landed(
         &mut gpu,
         "mla latents",
         &|g| {
@@ -71,7 +55,7 @@ fn mla_answers_the_reference() {
         &[want_c, want_pe],
         &|g, o| {
             g.run(|c| {
-                mla::latents(
+                kernels_slang::attn::mla::latents(
                     c,
                     b(kv_a, rows, width),
                     b(wn, 1, RANK),
@@ -79,19 +63,6 @@ fn mla_answers_the_reference() {
                     RANK as u32,
                     b(o[0].0, rows, RANK),
                     b(o[1].0, rows, ROPE),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::latents(
-                    c,
-                    st(b(kv_a, rows, width)),
-                    st(b(wn, 1, RANK)),
-                    eps,
-                    RANK as u32,
-                    st(b(o[0].0, rows, RANK)),
-                    st(b(o[1].0, rows, ROPE)),
                 )
             })
         },
@@ -107,7 +78,7 @@ fn mla_answers_the_reference() {
     let want_p: Vec<f64> = (0..rows * HEADS * ROPE)
         .map(|i| qbr[(i / ROPE) * per + NOPE + i % ROPE])
         .collect();
-    both(
+    landed(
         &mut gpu,
         "mla split q",
         &|g| {
@@ -119,7 +90,7 @@ fn mla_answers_the_reference() {
         &[want_n, want_p],
         &|g, o| {
             g.run(|c| {
-                mla::split_q_b(
+                kernels_slang::attn::mla::split_q_b(
                     c,
                     b(q_b, rows, HEADS * per),
                     HEADS as u32,
@@ -127,19 +98,6 @@ fn mla_answers_the_reference() {
                     ROPE as u32,
                     b(o[0].0, rows, HEADS * NOPE),
                     b(o[1].0, rows, HEADS * ROPE),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::split_q_b(
-                    c,
-                    st(b(q_b, rows, HEADS * per)),
-                    HEADS as u32,
-                    NOPE as u32,
-                    ROPE as u32,
-                    st(b(o[0].0, rows, HEADS * NOPE)),
-                    st(b(o[1].0, rows, HEADS * ROPE)),
                 )
             })
         },
@@ -161,14 +119,14 @@ fn mla_answers_the_reference() {
                 .sum()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "mla absorb q",
         &|g| vec![(g.zeros(rows * HEADS * RANK), rows * HEADS * RANK, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                mla::absorb_q(
+                kernels_slang::attn::mla::absorb_q(
                     c,
                     b(qn, rows, HEADS * NOPE),
                     b(kv_b, 1, 1),
@@ -177,20 +135,6 @@ fn mla_answers_the_reference() {
                     NOPE as u32,
                     VDIM as u32,
                     b(o[0].0, rows, HEADS * RANK),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::absorb_q(
-                    c,
-                    st(b(qn, rows, HEADS * NOPE)),
-                    st(b(kv_b, 1, 1)),
-                    HEADS as u32,
-                    RANK as u32,
-                    NOPE as u32,
-                    VDIM as u32,
-                    st(b(o[0].0, rows, HEADS * RANK)),
                 )
             })
         },
@@ -205,14 +149,14 @@ fn mla_answers_the_reference() {
                 .sum()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "mla absorb out",
         &|g| vec![(g.zeros(rows * HEADS * VDIM), rows * HEADS * VDIM, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                mla::absorb_out(
+                kernels_slang::attn::mla::absorb_out(
                     c,
                     b(lat, rows, HEADS * RANK),
                     b(kv_b, 1, 1),
@@ -221,20 +165,6 @@ fn mla_answers_the_reference() {
                     VDIM as u32,
                     NOPE as u32,
                     b(o[0].0, rows, HEADS * VDIM),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::absorb_out(
-                    c,
-                    st(b(lat, rows, HEADS * RANK)),
-                    st(b(kv_b, 1, 1)),
-                    HEADS as u32,
-                    RANK as u32,
-                    VDIM as u32,
-                    NOPE as u32,
-                    st(b(o[0].0, rows, HEADS * VDIM)),
                 )
             })
         },
@@ -269,7 +199,7 @@ fn mla_answers_the_reference() {
         want_ckv[slot * RANK..][..RANK].copy_from_slice(&kcr[r * RANK..][..RANK]);
         want_kpe[slot * ROPE..][..ROPE].copy_from_slice(&kpr[r * ROPE..][..ROPE]);
     }
-    both(
+    landed(
         &mut gpu,
         "mla kv append",
         &|g| {
@@ -281,25 +211,13 @@ fn mla_answers_the_reference() {
         &[want_ckv, want_kpe],
         &|g, o| {
             g.run(|c| {
-                mla::kv_append(
+                kernels_slang::attn::mla::kv_append(
                     c,
                     b(kc, rows, RANK),
                     b(kp, rows, ROPE),
                     &pool(o[0].0, o[1].0),
                     u(wp, rows),
                     u(wo, rows),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::kv_append(
-                    c,
-                    st(b(kc, rows, RANK)),
-                    st(b(kp, rows, ROPE)),
-                    &sp(&pool(o[0].0, o[1].0)),
-                    st(u(wp, rows)),
-                    st(u(wo, rows)),
                 )
             })
         },
@@ -379,47 +297,38 @@ fn mla_answers_the_reference() {
         data: q_t,
         indptr: i32t(qp_i, 3, 1),
     };
-    let sragged = kernels_slang::RaggedTensor {
-        data: st(q_t),
-        indptr: st(i32t(qp_i, 3, 1)),
-    };
     let cache = pool(ckv, kpe);
     let (hs, rk, sc) = (HEADS as u32, RANK as u32, scale as f32);
-    both(
+    landed(
         &mut gpu,
         "mla decode",
         &|g| vec![(g.zeros(n), n, false)],
         std::slice::from_ref(&causal),
         &|g, o| {
             g.run(|c| {
-                mla::attention_decode(c, q_t, qpe_t, &cache, pos_t, own_t, hs, rk, sc, o_t(o[0].0))
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
                 kernels_slang::attn::mla::attention_decode(
                     c,
-                    st(q_t),
-                    st(qpe_t),
-                    &sp(&cache),
-                    st(pos_t),
-                    st(own_t),
+                    q_t,
+                    qpe_t,
+                    &cache,
+                    pos_t,
+                    own_t,
                     hs,
                     rk,
                     sc,
-                    st(o_t(o[0].0)),
+                    o_t(o[0].0),
                 )
             })
         },
     );
-    both(
+    landed(
         &mut gpu,
         "mla prefill",
         &|g| vec![(g.zeros(n), n, false)],
         &[causal],
         &|g, o| {
             g.run(|c| {
-                mla::attention_prefill(
+                kernels_slang::attn::mla::attention_prefill(
                     c,
                     ragged,
                     qpe_t,
@@ -433,31 +342,15 @@ fn mla_answers_the_reference() {
                 )
             })
         },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::attention_prefill(
-                    c,
-                    sragged,
-                    st(qpe_t),
-                    &sp(&cache),
-                    st(pos_t),
-                    st(own_t),
-                    hs,
-                    rk,
-                    sc,
-                    st(o_t(o[0].0)),
-                )
-            })
-        },
     );
-    both(
+    landed(
         &mut gpu,
         "mla decode selected",
         &|g| vec![(g.zeros(n), n, false)],
         std::slice::from_ref(&selected),
         &|g, o| {
             g.run(|c| {
-                mla::attention_decode_selected(
+                kernels_slang::attn::mla::attention_decode_selected(
                     c,
                     q_t,
                     qpe_t,
@@ -472,32 +365,15 @@ fn mla_answers_the_reference() {
                 )
             })
         },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::attention_decode_selected(
-                    c,
-                    st(q_t),
-                    st(qpe_t),
-                    st(sel_t),
-                    &sp(&cache),
-                    st(pos_t),
-                    st(own_t),
-                    hs,
-                    rk,
-                    sc,
-                    st(o_t(o[0].0)),
-                )
-            })
-        },
     );
-    both(
+    landed(
         &mut gpu,
         "mla prefill selected",
         &|g| vec![(g.zeros(n), n, false)],
         &[selected],
         &|g, o| {
             g.run(|c| {
-                mla::attention_prefill_selected(
+                kernels_slang::attn::mla::attention_prefill_selected(
                     c,
                     ragged,
                     qpe_t,
@@ -509,23 +385,6 @@ fn mla_answers_the_reference() {
                     rk,
                     sc,
                     o_t(o[0].0),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::attention_prefill_selected(
-                    c,
-                    sragged,
-                    st(qpe_t),
-                    st(sel_t),
-                    &sp(&cache),
-                    st(pos_t),
-                    st(own_t),
-                    hs,
-                    rk,
-                    sc,
-                    st(o_t(o[0].0)),
                 )
             })
         },
@@ -555,7 +414,7 @@ fn mla_answers_the_reference() {
             1.0 / (lat.iter().map(|v| v * v).sum::<f64>() / RANK as f64 + f64::from(eps)).sqrt();
         latent_want.extend(lat.iter().zip(&wr).map(|(v, w)| v * inv * w));
     }
-    both(
+    landed(
         &mut gpu,
         "mla latents rope",
         &|g| {
@@ -567,7 +426,7 @@ fn mla_answers_the_reference() {
         &[latent_want, rope_want],
         &|g, o| {
             g.run(|c| {
-                mla::latents_rope(
+                kernels_slang::attn::mla::latents_rope(
                     c,
                     b(kv_a, rows, width),
                     i32t(tpos, rows, 1),
@@ -578,22 +437,6 @@ fn mla_answers_the_reference() {
                     theta,
                     b(o[0].0, rows, RANK),
                     b(o[1].0, rows, ROPE),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::mla::latents_rope(
-                    c,
-                    st(b(kv_a, rows, width)),
-                    st(i32t(tpos, rows, 1)),
-                    st(b(wn, 1, RANK)),
-                    eps,
-                    RANK as u32,
-                    ROPE as u32,
-                    theta,
-                    st(b(o[0].0, rows, RANK)),
-                    st(b(o[1].0, rows, ROPE)),
                 )
             })
         },

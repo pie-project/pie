@@ -1,19 +1,15 @@
 //! The tiled points of the affine-quantized matmul on the first Vulkan
-//! device, beside the hand-written kernels, against an f64 host reference:
+//! device against an f64 host reference:
 //! the tiled rung at every row tile (a batch padded into its capacity
-//! included) and both column tiles, the register-tiled rung at both row
-//! tiles and both K steps, and the cooperative-matrix rung where the device
+//! included) and landed column tiles, the register-tiled rung at landed row
+//! tiles and landed K steps, and the cooperative-matrix rung where the device
 //! has cooperative matrices.
 
 use kernels_slang::linear::qmm::{self, Qmm};
-use kernels_vulkan::{Arg, Bank, Encode, Fire, Tensor};
+use kernels_slang::{Bank, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
+use crate::gpu::{Gpu, landed, noise};
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -40,9 +36,6 @@ fn half(v: f64) -> f64 {
     let quantum = 2f64.powi((v.abs().log2().floor() as i32).max(-14) - 10);
     (v / quantum).round_ties_even() * quantum
 }
-
-/// A fire of the hand-written kernel: its unit, entry, groups and workgroup.
-type Hand = (&'static str, String, [u32; 3], [u32; 3]);
 
 #[test]
 fn the_tiled_points_answer_the_reference() {
@@ -75,36 +68,18 @@ fn the_tiled_points_answer_the_reference() {
             group: group as u32,
             bits,
         };
-        let sbank = kernels_slang::Bank {
-            codes: st(bank.codes),
-            scales: st(bank.scales),
-            biases: bank.biases.map(st),
-            group: bank.group,
-            bits,
-        };
-        // (rows, capacity, the rung, the hand-written kernel it matches)
-        let gs = format!("gs_{group}_b_{bits}");
-        let mut cases: Vec<(usize, usize, Qmm, Hand)> = Vec::new();
-        for (m, cap, bm) in [
-            (8usize, 8usize, 8u32),
-            (20, 32, 16),
-            (32, 32, 32),
-            (70, 128, 64),
-        ] {
-            let padded = cap as u32;
-            for (crossover, bn) in [(1u32, 32u32), (u32::MAX, 16)] {
+        // (rows, capacity, the rung)
+        let mut cases: Vec<(usize, usize, Qmm)> = Vec::new();
+        // Row tiles of 8, 16, 32 and 64 (the second padded into its
+        // capacity), at landed column tiles.
+        for (m, cap) in [(8usize, 8usize), (20, 32), (32, 32), (70, 128)] {
+            for crossover in [1u32, u32::MAX] {
                 cases.push((
                     m,
                     cap,
                     Qmm::Tiled {
                         crossover_tg: crossover,
                     },
-                    (
-                        "quant/qmm_t.slang",
-                        format!("affine_qmm_t_bf16_{gs}_bm_{bm}_bn_{bn}"),
-                        [n as u32 / bn, padded / bm, 1],
-                        [32, 2, if bm < 16 { 1 } else { 2 }],
-                    ),
                 ));
             }
         }
@@ -114,35 +89,12 @@ fn the_tiled_points_answer_the_reference() {
             (70, 64, false),
             (70, 64, true),
         ] {
-            cases.push((
-                m,
-                m,
-                Qmm::RegisterTiled { bm, k16 },
-                (
-                    "quant/qmm_rt.slang",
-                    format!(
-                        "affine_qmm_rt{}_bf16_{gs}_bm_{bm}",
-                        if k16 { "_k16" } else { "" }
-                    ),
-                    [n as u32 / 64, (m as u32).div_ceil(bm), 1],
-                    [16, bm / 4, 1],
-                ),
-            ));
+            cases.push((m, m, Qmm::RegisterTiled { bm, k16 }));
         }
         if coopmat {
-            cases.push((
-                70,
-                70,
-                Qmm::Coopmat,
-                (
-                    "quant/qmm_t.slang",
-                    format!("affine_qmm_t_cm_bf16_{gs}"),
-                    [n as u32 / 64, 2, 1],
-                    [32, 4, 1],
-                ),
-            ));
+            cases.push((70, 70, Qmm::Coopmat));
         }
-        for (m, cap, rung, (unit, entry, groups, local)) in cases {
+        for (m, cap, rung) in cases {
             let mut xv = noise(7 + m as u64, m * k);
             xv.resize(cap * k, 0.0);
             let (x, xr) = gpu.up(&xv);
@@ -156,33 +108,14 @@ fn the_tiled_points_answer_the_reference() {
                         .sum()
                 })
                 .collect();
-            let entry: &'static str = Box::leak(entry.into_boxed_str());
-            both(
+            landed(
                 &mut gpu,
                 &format!("qmm {rung:?} {bits} bits, group {group}, {m} x {n}"),
                 &|g| vec![(g.zeros(cap * n), m * n, false)],
                 std::slice::from_ref(&want),
                 &|g, o| {
                     let y = t(o[0].0, m, n, Dtype::Bf16);
-                    g.run(|c| {
-                        c.fire(
-                            Fire::at(unit, entry).groups(groups).group(local),
-                            &[
-                                bank.codes.arg(),
-                                bank.scales.arg(),
-                                bank.biases.expect("affine").arg(),
-                                xt.arg(),
-                                y.arg_mut(),
-                                (k as i32).arg(),
-                                (n as i32).arg(),
-                                (m as i32).arg(),
-                            ],
-                        )
-                    });
-                },
-                &|g, o| {
-                    let y = st(t(o[0].0, m, n, Dtype::Bf16));
-                    g.run_slang(|c| qmm::matmul(c, &[rung], st(xt), sbank, y, cap as u32));
+                    g.run(|c| qmm::matmul(c, &[rung], xt, bank, y, cap as u32));
                 },
             );
         }

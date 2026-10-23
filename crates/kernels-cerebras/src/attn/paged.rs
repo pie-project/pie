@@ -10,7 +10,7 @@
 //! · sm_scale`, probabilities meet values as `acc = acc · α + p · v`. A row
 //! that admits no key answers zeros and a `-inf` log-sum-exp (base 2).
 //!
-//! Reference: kernels-xla `attn::paged` (semantics), kernels-wgpu `attn::`
+//! Reference: kernels-xla `attn::paged` (semantics), kernels-slang `attn::`
 //! (signatures).
 
 #![allow(clippy::too_many_arguments)]
@@ -21,9 +21,11 @@ use super::{DecodePlan, PrefillPlan};
 use crate::csl::Arg;
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
-use crate::program::{
-    BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, PagePlan, PageSource, Reduce, Segment,
+use crate::library::Kernel;
+use crate::phase::{
+    BankSplit, ColPlane, LaneKind, Lanes, PageSource, Paged, Reduce, Segment, SlotState,
 };
+use crate::plan::{LSE_GROUPS, Merge, PageSplit, PagedLanes, Pages};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn tables(
@@ -173,107 +175,11 @@ fn pool_shape(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<(u32, u3
     Ok((kv_heads, width))
 }
 
-/// The most rows one attention phase takes, when capped
-/// (`PIE_CEREBRAS_ATTN_ROWS`).
-fn rows_per_phase_cap() -> Option<u32> {
-    std::env::var("PIE_CEREBRAS_ATTN_ROWS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 0)
-}
-
-/// How a paged pool spreads over PEs.
-#[derive(Clone)]
-struct PageSplit {
-    pes: u32,
-    lanes_per_pe: u32,
-    /// A lane's pages over this many PEs.
-    page_groups: u32,
-    /// The kv heads over this many PEs (a block along the banks' heads).
-    head_groups: u32,
-    /// A page's rows over this many PEs (a block along the pages' rows):
-    /// each PE attends a strided subset of the keys, merged like page groups.
-    row_groups: u32,
-}
-
-/// How a paged pool of `elements` over `lanes` lanes spreads over PEs, or
-/// `None` when one PE holds it all (the pool plus `extra(1)`). A PE holds
-/// as many lanes' pages as fit beside `extra(head_groups)` (the phase's
-/// words besides pages, given the kv heads split that many ways); a
-/// lane's pages past that split over page groups; a page past that splits
-/// its kv heads. The fewest PEs win.
-fn page_split(
-    op: &'static str,
-    elements: u64,
-    lanes: u32,
-    page_pair: u64,
-    max_pages: u32,
-    kv_heads: u32,
-    page_rows: u32,
-    extra: impl Fn(u32) -> u64,
-) -> Result<Option<PageSplit>, Error> {
-    use crate::linear::gemm::{ARRAY_WORDS, pe_words};
-    if lanes == 0 || (elements + extra(1) <= pe_words() && elements <= ARRAY_WORDS) {
-        return Ok(None);
-    }
-    let max_pages = max_pages.max(1);
-    let mut best: Option<PageSplit> = None;
-    let page_rows = page_rows.max(1);
-    for hg in (1..=kv_heads.max(1)).filter(|g| kv_heads.max(1).is_multiple_of(*g)) {
-        for ag in (1..=page_rows).filter(|g| page_rows.is_multiple_of(*g)) {
-            // A bank plane is one array: its pages within ARRAY_WORDS too.
-            let room = pe_words().saturating_sub(extra(hg)).min(2 * ARRAY_WORDS);
-            let pair = (page_pair / u64::from(hg) / u64::from(ag)).max(1);
-            let pages_per_pe = u32::try_from(room / pair).unwrap_or(u32::MAX);
-            if pages_per_pe == 0 {
-                continue;
-            }
-            let (lanes_per_pe, page_groups) = if pages_per_pe >= max_pages {
-                ((pages_per_pe / max_pages).clamp(1, lanes), 1)
-            } else {
-                (1, max_pages.div_ceil(pages_per_pe))
-            };
-            let pes = lanes.div_ceil(lanes_per_pe) * page_groups * hg * ag;
-            if best.as_ref().is_none_or(|b| pes < b.pes) {
-                best = Some(PageSplit {
-                    pes,
-                    lanes_per_pe,
-                    page_groups,
-                    head_groups: hg,
-                    row_groups: ag,
-                });
-            }
-            break;
-        }
-    }
-    let budget = pe_words();
-    match best {
-        Some(b) => Ok(Some(b)),
-        None => Err(refuse(
-            op,
-            format!(
-                "one page's {page_pair} words and the phase's other {} words exceed a PE's {budget} even one kv head and one page row at a time",
-                extra(kv_heads.max(1))
-            ),
-        )),
-    }
-}
-
-/// The most PEs one lane block's partials spread over for the fabric to
-/// merge them (the root gathers that many lse copies).
-pub const MERGE_GROUPS: u32 = 16;
-
-/// Whether split attention merges its partials on the fabric
-/// (`PIE_CEREBRAS_FABRIC_SUM=0` leaves the merge to the host).
-pub fn fabric_sum() -> bool {
-    crate::linear::gemm::fabric_sum()
-}
-
 /// Words a PE spends on the fabric merge of its `o` (`o_words`) and lse
-/// (`l_words`) partials: the partial's copy, the gathered lse copies and
-/// the merged lse, and the collectives library.
+/// (`l_words`) partials: the partial's copy, the gathered lse copies (at
+/// most [`LSE_GROUPS`]) and the merged lse, and the collectives library.
 pub fn merge_words(o_words: u64, l_words: u64) -> u64 {
-    o_words + l_words * (u64::from(MERGE_GROUPS) + 1) + crate::linear::gemm::FABRIC_SUM_WORDS
+    o_words + l_words * (u64::from(LSE_GROUPS) + 1) + crate::linear::gemm::FABRIC_SUM_WORDS
 }
 
 /// The fabric merge of a lane block's attention partials over `group`
@@ -284,8 +190,8 @@ pub fn merge_words(o_words: u64, l_words: u64) -> u64 {
 /// first PE's `o`; the total becomes the lse.
 pub fn lse_merge(
     cx: &mut Cx<'_>,
-    o: &crate::program::Buf,
-    lse: &crate::program::Buf,
+    o: &crate::phase::Buf,
+    lse: &crate::phase::Buf,
     o_words: u64,
     l_words: u64,
     group: u32,
@@ -299,20 +205,18 @@ pub fn lse_merge(
 #[allow(clippy::too_many_arguments)]
 pub fn lse_merge_with(
     cx: &mut Cx<'_>,
-    o: &crate::program::Buf,
-    lse: &crate::program::Buf,
+    o: &crate::phase::Buf,
+    lse: &crate::phase::Buf,
     o_words: u64,
     l_words: u64,
     group: u32,
     pes: u32,
     everywhere: bool,
 ) {
-    use crate::program::{FabricOp, FabricStep, Guarded};
+    use crate::phase::{FabricOp, FabricStep, Guarded};
     let all = cx.scratch("lse_all", l_words * u64::from(group));
     let total = cx.scratch("lse_total", l_words);
     let partial = cx.scratch("partial", o_words);
-    cx.library("attn/lse_merge");
-    cx.library("attn/lse_scale");
     let d = o_words / l_words.max(1);
     let mut steps = vec![
         FabricStep {
@@ -325,7 +229,7 @@ pub fn lse_merge_with(
         },
         FabricStep {
             calls: vec![Guarded::root(
-                "k_lse_merge",
+                Kernel::LseMerge,
                 vec![
                     Arg::Scratch(all.clone(), "f32"),
                     Arg::Scratch(total.clone(), "f32"),
@@ -341,7 +245,7 @@ pub fn lse_merge_with(
         FabricStep {
             calls: vec![
                 Guarded::all(
-                    "k_lse_scale",
+                    Kernel::LseScale,
                     vec![
                         Arg::Ptr(o.clone()),
                         Arg::Ptr(lse.clone()),
@@ -351,7 +255,7 @@ pub fn lse_merge_with(
                     ],
                 ),
                 Guarded::all(
-                    "k_copy",
+                    Kernel::Copy,
                     vec![
                         Arg::Scratch(partial.clone(), "f32"),
                         Arg::Int(0),
@@ -378,7 +282,7 @@ pub fn lse_merge_with(
         });
     }
     let finish = vec![Guarded::all(
-        "k_copy",
+        Kernel::Copy,
         vec![
             Arg::Ptr(lse.clone()),
             Arg::Int(0),
@@ -387,32 +291,7 @@ pub fn lse_merge_with(
             Arg::Int(l_words as i64),
         ],
     )];
-    cx.fabric((group, pes / group), steps, finish);
-}
-
-/// The resident placement of a pool over a row of `pes` PEs: every PE runs
-/// every lane over the pages it holds (page `g` on PE `g % pes`), `None`
-/// when the share and the phase's other words do not fit a PE.
-fn resident_split(
-    pes: u32,
-    pool_pages: u32,
-    page_pair: u64,
-    lanes: u32,
-    extra: u64,
-) -> Option<(PageSplit, u32)> {
-    use crate::linear::gemm::{ARRAY_WORDS, pe_words};
-    let share = pool_pages.div_ceil(pes).max(1);
-    let words = u64::from(share) * page_pair;
-    (words / 2 <= ARRAY_WORDS && words + extra <= pe_words()).then_some((
-        PageSplit {
-            pes,
-            lanes_per_pe: lanes,
-            page_groups: 1,
-            head_groups: 1,
-            row_groups: 1,
-        },
-        share,
-    ))
+    cx.collectives((group, pes / group), steps, finish);
 }
 
 /// Attends `rows` rows of `q` (`[rows, q_heads * head_dim]`) and writes `o`
@@ -499,86 +378,47 @@ fn attend(
     // lse, the tables, the mask and the scratch, for the rows of one phase:
     // all the rows when that fits, else a window of them, halved until it
     // does, each window its own phase over views of the row-shaped buffers.
-    let packed = crate::linear::gemm::half_pool()
-        && pool.keys.dtype == Dtype::Bf16
-        && pool.keys.width.is_multiple_of(2);
+    let packed = ctx.plan().packs_pool(pool.keys);
     let page_pair = u64::from(ps) * u64::from(pool.keys.width) * 2 / if packed { 2 } else { 1 };
     let (top_k, ratio) = selection.map_or((0, 0), |(s, r)| (s.width, r));
     let sblk_words = u64::from(span.checked_div(ratio).map_or(1, |b| b + 1));
-    let fabric = fabric_sum();
-    let resident = crate::linear::gemm::resident_pes();
-    let pool_pages = pool.keys.rows / ps.max(1);
-    let extra_for = |r: u32| {
-        move |hg: u32| -> u64 {
-            let q_cols = u64::from(q.width / hg);
-            let merge = if fabric {
-                merge_words(
-                    u64::from(r) * q_cols,
-                    u64::from(r) * u64::from(q_heads / hg),
-                )
-            } else {
-                0
-            };
-            u64::from(r)
-                * (2 * q_cols + u64::from(q_heads / hg) + 3 + u64::from(mask_w) + u64::from(top_k))
-                + lanes
-                + 1
-                + u64::from(d)
-                + u64::from(mask_w)
-                + sblk_words
-                + 16
-                + merge
-        }
+    let merged = |r: u32, hg: u32| -> u64 {
+        merge_words(
+            u64::from(r) * u64::from(q.width / hg),
+            u64::from(r) * u64::from(q_heads / hg),
+        )
+    };
+    let beside = |r: u32, hg: u32| -> u64 {
+        let q_cols = u64::from(q.width / hg);
+        u64::from(r)
+            * (2 * q_cols + u64::from(q_heads / hg) + 3 + u64::from(mask_w) + u64::from(top_k))
+            + lanes
+            + 1
+            + u64::from(d)
+            + u64::from(mask_w)
+            + sblk_words
+            + 16
     };
     let pool_words = pool.keys.elements() + pool.values.elements();
-    let mut chunk = rows
-        .max(1)
-        .min(rows_per_phase_cap().unwrap_or(u32::MAX))
-        .max(1);
-    let mut strided_pages = 0;
-    let split = loop {
-        if let Some(pes) = resident {
-            // The resident row: the pool strided over it, all rows at once.
-            match resident_split(
-                pes,
-                pool_pages,
-                page_pair,
-                lanes as u32,
-                extra_for(chunk)(1),
-            ) {
-                Some((split, share)) => {
-                    strided_pages = share;
-                    break Some(split);
-                }
-                None if chunk > 1 => {
-                    chunk = chunk.div_ceil(2);
-                    continue;
-                }
-                None => {
-                    return Err(refuse(
-                        op,
-                        format!(
-                            "the resident row of {pes} PEs does not hold the pool's {pool_pages} pages beside one row's buffers"
-                        ),
-                    ));
-                }
-            }
-        }
-        match page_split(
-            op,
-            pool_words,
-            lanes as u32,
-            page_pair,
-            pool.max_pages,
-            kv_heads,
-            ps,
-            extra_for(chunk),
-        ) {
-            Ok(split) => break split,
-            Err(_) if chunk > 1 => chunk = chunk.div_ceil(2),
-            Err(e) => return Err(e),
-        }
-    };
+    let PageSplit {
+        window: chunk,
+        lanes: split,
+    } = ctx.plan().pages(
+        op,
+        &Pages {
+            elements: pool_words,
+            lanes: lanes as u32,
+            page_words: page_pair,
+            max_pages: pool.max_pages,
+            heads: kv_heads,
+            page_rows: ps,
+            pool_pages: pool.keys.rows / ps.max(1),
+            rows,
+            windows: true,
+            beside: &beside,
+            merge: &merged,
+        },
+    )?;
     let mut c0 = 0;
     while c0 < rows {
         let n = (rows - c0).min(chunk);
@@ -624,35 +464,36 @@ fn attend(
             let acc = cx.scratch("acc", u64::from(d));
             let mrow = cx.scratch_of("mrow", u64::from(mask_w.max(1)), "u32");
             let mut lse_buf = lb.clone();
-            let (rows_range, heads_range) = match split.clone() {
+            let (rows_range, heads_range) = match split {
                 None => (format!("0, {n}, 0"), format!("0, {kv_heads}, 0, {ps}")),
-                Some(PageSplit {
-                    pes,
-                    lanes_per_pe,
-                    page_groups,
-                    head_groups,
-                    row_groups,
-                }) => {
-                    let header = cx.unique("lanes");
+                Some(paged) => {
+                    let PagedLanes {
+                        pes,
+                        page_groups,
+                        row_groups,
+                        strided_pages,
+                        ..
+                    } = paged;
                     // Pages split over PEs: every PE's output is partial, merged
                     // through a per-head lse, on the fabric (the page and row
                     // groups of a lane block are consecutive PEs, one
                     // rectangle row) or by the host, which then writes the lse.
                     let mut reduce = Vec::new();
-                    let strided = resident.is_some();
+                    let strided = strided_pages.is_some();
                     // Strided: every PE holds a part of every lane's pages.
                     let merge_group = if strided {
                         pes
                     } else {
                         page_groups * row_groups
                     };
-                    let fabric =
-                        merge_group > 1 && (strided || merge_group <= MERGE_GROUPS) && fabric_sum();
+                    let fabric = cx.plan().merge(Merge::Lse {
+                        group: merge_group,
+                        row: strided,
+                    });
                     if page_groups > 1 || row_groups > 1 || strided {
                         if lse_buf.is_none() {
                             let name = cx.unique("lse");
-                            lse_buf =
-                                Some(cx.program().declare(&name, Dtype::F32, n, q_heads, true)?);
+                            lse_buf = Some(cx.declare(&name, Dtype::F32, n, q_heads, true)?);
                         }
                         let lse_name = lse_buf.as_ref().map(|b| b.name.clone()).unwrap_or_default();
                         if fabric {
@@ -671,7 +512,7 @@ fn attend(
                     }
                     // q, o and the lse travel by head block: the columns of the
                     // PE's kv heads' query heads.
-                    let plane = |b: &crate::program::Buf, per_head: u32| ColPlane {
+                    let plane = |b: &crate::phase::Buf, per_head: u32| ColPlane {
                         name: b.name.clone(),
                         rows: b.rows,
                         width: b.width,
@@ -689,32 +530,27 @@ fn attend(
                     if let Some(l) = &lse_buf {
                         cols.push(plane(l, 1));
                     }
-                    let plan = LanePlan {
-                        pes,
+                    let plan = Lanes {
                         kind: LaneKind::ByTable {
                             lane_of_row: req.name.clone(),
                             lanes: lanes as u32,
                         },
-                        header,
                         slots: req.name.clone(),
                         banks: vec![
                             (kb.name.clone(), ps * kb.width / per, BankSplit::Block),
                             (vb.name.clone(), ps * vb.width / per, BankSplit::Block),
                         ],
-                        block: Some(BlockPlan {
+                        block: Some(SlotState {
                             a: ps,
                             b: kv_heads,
                             w: d / per,
-                            a_groups: row_groups,
-                            b_groups: head_groups,
                         }),
-                        lanes_per_pe,
                         a_first: fabric && !strided,
                         row_outputs: Vec::new(),
                         cols,
                         reduce,
                         window: None,
-                        pages: Some(PagePlan {
+                        pages: Some(Paged {
                             source: PageSource::Csr {
                                 indptr: ptr.name.clone(),
                                 indices: idx.name.clone(),
@@ -722,14 +558,12 @@ fn attend(
                             page_size: ps,
                             max_pages: pool.max_pages,
                             rewritten: Vec::new(),
-                            page_groups,
-                            strided,
-                            strided_pages,
                         }),
                     };
-                    let o_words = plan.plane_words(&plan.cols[1]);
-                    let l_words = plan.cols.get(2).map_or(0, |c| plan.plane_words(c));
-                    let hdr = cx.lanes(plan)?;
+                    let at = cx.lanes(plan, paged.lanes())?;
+                    let o_words = at.planes[1];
+                    let l_words = at.planes.get(2).copied().unwrap_or(0);
+                    let hdr = at.header;
                     if let (true, Some(l)) = (fabric, &lse_buf) {
                         lse_merge_with(cx, &ob, l, o_words, l_words, merge_group, pes, strided);
                     }
@@ -744,13 +578,9 @@ fn attend(
                 .map_or(Arg::Dummy("f32"), |b| Arg::Ptr(b.clone()));
             let (kernel, vrow) = if packed {
                 let vrow = cx.scratch("vrow", u64::from(d));
-                cx.library("prim/half");
-                (
-                    cx.library("attn/attend_packed"),
-                    Some(Arg::Scratch(vrow, "f32")),
-                )
+                (Kernel::AttendPacked, Some(Arg::Scratch(vrow, "f32")))
             } else {
-                (cx.library("attn/attend"), None)
+                (Kernel::Attend, None)
             };
             let mut args = vec![Arg::Ptr(qb), Arg::Ptr(kb), Arg::Ptr(vb)];
             args.extend(vrow);
@@ -1095,7 +925,7 @@ fn append(
         let vb = cx.read(v)?;
         let pb = cx.read(write_page)?;
         let obf = cx.read(write_offset)?;
-        let packed_ok = crate::linear::gemm::half_pool() && pool.keys.dtype == Dtype::Bf16 && w.is_multiple_of(2);
+        let packed_ok = cx.plan().packs_pool(pool.keys);
         let keys = match cx.pool_half(pool.keys)? {
             Some(k) if packed_ok => k,
             _ => {
@@ -1108,7 +938,8 @@ fn append(
         let values = if shared {
             keys.clone()
         } else if packed {
-            cx.pool_half(pool.values)?.ok_or_else(|| refuse(op, "the values pool is not packed like the keys"))?
+            cx.pool_half(pool.values)?
+                .ok_or_else(|| refuse(op, "the values pool is not packed like the keys"))?
         } else {
             cx.read(pool.values)?;
             cx.write(pool.values)?
@@ -1128,51 +959,36 @@ fn append(
                 + 2 * u64::from(k.rows)
                 + 16
         };
-        let resident = crate::linear::gemm::resident_pes();
-        let mut strided_pages = 0;
-        let split = match resident {
-            Some(pes) => {
-                let pair = if shared { page_words } else { page_words * 2 };
-                match resident_split(pes, pages, pair, k.rows, extra(1)) {
-                    Some((split, share)) => {
-                        strided_pages = share;
-                        Some(split)
-                    }
-                    None => {
-                        return Err(refuse(
-                            op,
-                            format!("the resident row of {pes} PEs does not hold the pool's {pages} pages beside the rows"),
-                        ));
-                    }
-                }
-            }
-            None => page_split(
+        let split = cx
+            .plan()
+            .pages(
                 op,
-                planes,
-                k.rows,
-                if shared { page_words } else { page_words * 2 },
-                1,
-                w,
-                1,
-                extra,
-            )?,
-        };
+                &Pages {
+                    elements: planes,
+                    lanes: k.rows,
+                    page_words: if shared { page_words } else { page_words * 2 },
+                    max_pages: 1,
+                    heads: w,
+                    page_rows: 1,
+                    pool_pages: pages,
+                    rows: k.rows,
+                    windows: false,
+                    beside: &|_, hg| extra(hg),
+                    merge: &|_, _| 0,
+                },
+            )?
+            .lanes;
         let (rows_range, width) = match split {
             None => (format!("0, {}", k.rows), w.to_string()),
-            Some(PageSplit {
-                pes,
-                lanes_per_pe: rows_per_pe,
-                head_groups,
-                ..
-            }) => {
-                let header = cx.unique("lanes");
+            Some(paged) => {
+                let head_groups = paged.head_groups;
                 let mut banks = vec![(keys.name.clone(), ps * w / per, BankSplit::Block)];
                 if !shared {
                     banks.push((values.name.clone(), ps * w / per, BankSplit::Block));
                 }
                 // The k and v planes' columns follow the block's `b`, which
                 // counts words of a packed page: `per` elements a word.
-                let plane = |b: &crate::program::Buf| ColPlane {
+                let plane = |b: &crate::phase::Buf| ColPlane {
                     name: b.name.clone(),
                     rows: b.rows,
                     width: b.width,
@@ -1192,43 +1008,40 @@ fn append(
                         cols.push(plane(&vb));
                     }
                     (
-                        Some(BlockPlan {
+                        Some(SlotState {
                             a: ps,
                             b: w / per,
                             w: 1,
-                            a_groups: 1,
-                            b_groups: head_groups,
                         }),
                         cols,
                     )
                 } else {
                     (None, Vec::new())
                 };
-                let hdr = cx.lanes(LanePlan {
-                    pes,
-                    kind: LaneKind::PerRow { lanes: k.rows },
-                    header,
-                    slots: pb.name.clone(),
-                    banks,
-                    block,
-                    lanes_per_pe: rows_per_pe,
-                    a_first: false,
-                    row_outputs: Vec::new(),
-                    cols,
-                    reduce: Vec::new(),
-                    window: None,
-                    pages: Some(PagePlan {
-                        source: PageSource::Rows {
-                            table: pb.name.clone(),
+                let hdr = cx
+                    .lanes(
+                        Lanes {
+                            kind: LaneKind::PerRow { lanes: k.rows },
+                            slots: pb.name.clone(),
+                            banks,
+                            block,
+                            a_first: false,
+                            row_outputs: Vec::new(),
+                            cols,
+                            reduce: Vec::new(),
+                            window: None,
+                            pages: Some(Paged {
+                                source: PageSource::Rows {
+                                    table: pb.name.clone(),
+                                },
+                                page_size: ps,
+                                max_pages: 1,
+                                rewritten: vec![pb.name.clone()],
+                            }),
                         },
-                        page_size: ps,
-                        max_pages: 1,
-                        rewritten: vec![pb.name.clone()],
-                        page_groups: 1,
-                        strided: resident.is_some(),
-                        strided_pages,
-                    }),
-                })?;
+                        paged.lanes(),
+                    )?
+                    .header;
                 (
                     format!("{0}[7], {0}[8]", hdr.name),
                     if head_groups > 1 {
@@ -1240,10 +1053,9 @@ fn append(
             }
         };
         let kernel = if packed {
-            cx.library("prim/half");
-            cx.library("attn/kv_append_packed")
+            Kernel::KvAppendPacked
         } else {
-            cx.library("attn/kv_append")
+            Kernel::KvAppend
         };
         let mut args = vec![
             Arg::Ptr(kb),

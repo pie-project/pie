@@ -1,6 +1,6 @@
+use kernels_slang::Tensor;
 use kernels_slang::gather::ngram;
-use kernels_wgpu::Tensor;
-use kernels_wgpu::linear::moe::{self, RoutedScratch};
+use kernels_slang::linear::moe::select::RoutedScratch;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
@@ -16,10 +16,8 @@ const ALIGN: u64 = 256;
 
 #[derive(Clone, Copy, Debug)]
 struct SdpaSplit {
-    o: Room,
-    lse: Room,
-
-    keys: u32,
+    part_out: Room,
+    part_lse: Room,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -108,7 +106,7 @@ pub struct Scratch {
 }
 
 /// Partial rows a decode of `heads` heads at up to `rows` rows writes when
-/// split across `groups` workgroups (`kernels_wgpu::attn::splits_for`).
+/// split across `groups` workgroups (`kernels_slang::attn::sdpa::decode`).
 fn split_rows(groups: u32, heads: u32, rows: u32) -> u64 {
     (1..=rows)
         .take_while(|r| u64::from(*r) * u64::from(heads) < u64::from(groups))
@@ -124,7 +122,7 @@ impl Scratch {
         compiled: &CompiledModel,
         budgets: &Budgets,
         paging: Paging,
-        tuning: &kernels_wgpu::Tuning,
+        tuning: &crate::tuning::Tuning,
     ) -> Result<Scratch> {
         let budget = &budgets.tokens;
         let map = &compiled.arena;
@@ -173,10 +171,10 @@ impl Scratch {
                         continue;
                     }
 
-                    if moe::tile_rows(y.rows, experts, tuning) <= 1 {
+                    if tuning.moe_tile_rows(y.rows, experts) <= 1 {
                         continue;
                     }
-                    let rows = moe::sorted_rows(y.rows, experts, tuning);
+                    let rows = tuning.moe_sorted_rows(y.rows, experts);
                     sorted = sorted.max(u64::from(rows));
                     pairs = pairs.max(u64::from(y.rows));
                     routed_k = routed_k.max(u64::from(x.width));
@@ -223,33 +221,29 @@ impl Scratch {
             .filter_map(|node| match &node.op {
                 Operation::Attn(
                     Attn::Decode { o, head_dim, .. } | Attn::DecodeLse { o, head_dim, .. },
-                ) => of(*o).map(|rect| (rect, *head_dim)),
+                ) => of(*o).map(|rect| (rect.width, rect.rows, *head_dim)),
                 _ => None,
             })
-            .filter(|(rect, head_dim)| *head_dim > 0 && rect.rows > 0 && rect.width > 0)
-            .map(|(rect, head_dim)| {
-                let heads = (rect.width / head_dim).max(1);
-                (
-                    split_rows(tuning.sdpa_split_groups(), heads, rect.rows),
-                    u64::from(rect.width),
-                    u64::from(heads),
-                )
+            .filter(|(width, _, head_dim)| *width > 0 && *head_dim > 0 && width % head_dim == 0)
+            .map(|(width, rows, head_dim)| {
+                let heads = width / head_dim;
+                let slices = split_rows(tuning.sdpa_split_groups(), heads, rows);
+                (slices * u64::from(width), slices * u64::from(heads))
             })
-            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1), a.2.max(b.2)))
-            .filter(|(rows, ..)| *rows > 0)
-            .map(|(rows, width, heads)| {
+            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
+            .filter(|(out, _)| *out > 0)
+            .map(|(out, lse)| {
                 let mut at = 0u64;
                 SdpaSplit {
-                    o: Room::lay(&mut at, rows, width, Dtype::Bf16),
-                    lse: Room::lay(&mut at, rows, heads, Dtype::F32),
-                    keys: paging.context(),
+                    part_out: Room::lay(&mut at, 1, out, Dtype::F32),
+                    part_lse: Room::lay(&mut at, 1, lse, Dtype::F32),
                 }
             });
 
         let union = routed
             .map_or(0, |r| r.y.at + r.y.bytes())
             .max(index.map_or(0, |r| r.at + r.bytes()))
-            .max(split.map_or(0, |r| r.lse.at + r.lse.bytes()));
+            .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()));
 
         let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
             at: union.next_multiple_of(ALIGN),
@@ -355,13 +349,15 @@ impl Scratch {
         Some(self.index?.bind(handles, &self.plane))
     }
 
-    pub fn sdpa_split(&self, handles: &Handles) -> Option<Result<kernels_wgpu::attn::Split>> {
+    pub fn sdpa_split(
+        &self,
+        handles: &Handles,
+    ) -> Option<Result<kernels_slang::attn::sdpa::Split>> {
         let rooms = self.split?;
         let mint = || {
-            Ok(kernels_wgpu::attn::Split {
-                o: rooms.o.bind(handles, &self.plane)?,
-                lse: rooms.lse.bind(handles, &self.plane)?,
-                keys: rooms.keys,
+            Ok(kernels_slang::attn::sdpa::Split {
+                part_out: rooms.part_out.bind(handles, &self.plane)?,
+                part_lse: rooms.part_lse.bind(handles, &self.plane)?,
             })
         };
         Some(mint())

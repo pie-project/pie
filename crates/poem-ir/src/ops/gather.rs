@@ -163,7 +163,7 @@ pub enum Gather {
         y: ValueId,
     },
     /// Position-table taps for each patch from its grid position and its
-    /// image's grid: `ids` and `weights` for `gather.embed_weighted`.
+    /// image's grid: `ids` and `weights` for `gather.embed`.
     GridTaps {
         #[input(I32)]
         positions: ValueId,

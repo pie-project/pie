@@ -1,26 +1,19 @@
-//! Kimi delta attention on the first wgpu adapter, beside the hand-written
-//! kernels, against an f64 host reference: the decode step, the chunked walk
-//! (an empty request among them) and the committed window (replayed rows, a
-//! partial commit, a lane with no slot), with the softplus gate and the
-//! floored sigmoid gate, at the baseline tier. The f32 outputs and every slot's
-//! state are compared.
+//! Kimi delta attention on the first wgpu adapter, against an f64 host
+//! reference: the decode step, the chunked walk (an empty request among
+//! them) and the committed window (replayed rows, a partial commit, a lane
+//! with no slot), with the softplus gate and the floored sigmoid gate, at
+//! the baseline tier. The f32 outputs and every slot's state are compared.
 
 use kernels_slang::Tier;
-use kernels_wgpu::attn::ssm;
-use kernels_wgpu::tensor::RecurrentPool;
-use kernels_wgpu::{RaggedTensor, Tensor};
+use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, both, noise};
+use crate::gpu::{Gpu, Out, landed, noise};
 
 const SLOTS: usize = 3;
 const HEADS: usize = 2;
 const D: usize = 32;
 const EPS: f32 = 1e-6;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -95,10 +88,10 @@ struct Planes {
 impl Planes {
     fn gates(&self, floor: f32, f: Tensor, b: Tensor) -> kernels_slang::ssm::kda::Gates {
         kernels_slang::ssm::kda::Gates {
-            f: st(f),
-            b: st(b),
-            dt_bias: st(self.dt_bias),
-            a_log: st(self.a_log),
+            f,
+            b,
+            dt_bias: self.dt_bias,
+            a_log: self.a_log,
             heads: HEADS as u32,
             head_dim: D as u32,
             norm_eps: EPS,
@@ -147,15 +140,9 @@ fn the_kda_answers_the_reference() {
     let bank0: Vec<f32> = noise(5, SLOTS * slab).iter().map(|v| v * 0.25).collect();
     let bank64 = f64s(&bank0);
     let bank0 = &bank0;
-    let pool = |bank: u32, slots: u32, rows: usize| RecurrentPool {
-        state: t(bank, SLOTS, slab, Dtype::F32),
+    let pool = |bank: u32, slots: u32, rows: usize| kernels_slang::ssm::StatePool {
+        bank: t(bank, SLOTS, slab, Dtype::F32),
         slots: t(slots, rows, 1, Dtype::U32),
-        conv_state: t(bank, SLOTS, slab, Dtype::F32),
-        new_conv_state: t(bank, SLOTS, slab, Dtype::F32),
-    };
-    let sp = |p: &RecurrentPool| kernels_slang::ssm::StatePool {
-        bank: st(p.state),
-        slots: st(p.slots),
     };
     let fresh = |rows: usize, work: usize| {
         move |g: &mut Gpu| -> Vec<Out> {
@@ -170,7 +157,7 @@ fn the_kda_answers_the_reference() {
     for floor in [0.0f32, -5.0] {
         for tier in [Tier::Baseline] {
             let what = |form: &str| format!("kda {form}, floor {floor} at {tier:?}");
-            let (eps, fl, hd, h) = (EPS, floor, D as u32, HEADS as u32);
+            let fl = floor;
 
             // The decode step: two rows on slots 2 and 0.
             let slot_of = [2u32, 0];
@@ -182,38 +169,20 @@ fn the_kda_answers_the_reference() {
                 let s = s as usize;
                 host.token(r, &mut want_s[s * slab..][..slab], &mut want_y);
             }
-            both(
+            landed(
                 &mut gpu,
                 &what("step"),
                 &fresh(2, 0),
                 &[want_y, want_s],
                 &|g, o| {
                     g.run(|c| {
-                        ssm::kda_step(
-                            c,
-                            p.mixed,
-                            p.f,
-                            p.b,
-                            p.dt_bias,
-                            p.a_log,
-                            &pool(o[1].0, sb, 2),
-                            h,
-                            hd,
-                            eps,
-                            fl,
-                            y(o[0].0, 2),
-                        )
-                    })
-                },
-                &|g, o| {
-                    g.run_slang(|c| {
                         kernels_slang::ssm::kda::kda(
                             c,
                             tier,
-                            st(p.mixed),
+                            p.mixed,
                             &p.gates(fl, p.f, p.b),
-                            &sp(&pool(o[1].0, sb, 2)),
-                            st(y(o[0].0, 2)),
+                            &pool(o[1].0, sb, 2),
+                            y(o[0].0, 2),
                         )
                     })
                 },
@@ -237,41 +206,23 @@ fn the_kda_answers_the_reference() {
                 data: p.mixed,
                 indptr: t(ib, 4, 1, Dtype::I32),
             };
-            both(
+            landed(
                 &mut gpu,
                 &what("chunked"),
                 &fresh(rows, 0),
                 &[want_y, want_s],
                 &|g, o| {
                     g.run(|c| {
-                        ssm::kda_chunked(
-                            c,
-                            ragged,
-                            p.f,
-                            p.b,
-                            p.dt_bias,
-                            p.a_log,
-                            &pool(o[1].0, sb, rows),
-                            h,
-                            hd,
-                            eps,
-                            fl,
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-                &|g, o| {
-                    g.run_slang(|c| {
                         kernels_slang::ssm::kda::kda_chunked(
                             c,
                             tier,
                             kernels_slang::RaggedTensor {
-                                data: st(ragged.data),
-                                indptr: st(ragged.indptr),
+                                data: ragged.data,
+                                indptr: ragged.indptr,
                             },
                             &p.gates(fl, p.f, p.b),
-                            &sp(&pool(o[1].0, sb, rows)),
-                            st(y(o[0].0, rows)),
+                            &pool(o[1].0, sb, rows),
+                            y(o[0].0, rows),
                         )
                     })
                 },
@@ -309,59 +260,32 @@ fn the_kda_answers_the_reference() {
                 begin += span;
             }
             let i32s = |buf: u32, n: usize| t(buf, n, 1, Dtype::I32);
-            let committed = ssm::Committed {
+            let committed = kernels_slang::ssm::Committed {
                 replay: i32s(rb, 4),
                 commit: i32s(cb, 4),
                 slots: i32s(sb, 4),
                 lane0: lane0 as u32,
             };
-            let slang_committed = kernels_slang::ssm::Committed {
-                replay: st(committed.replay),
-                commit: st(committed.commit),
-                slots: st(committed.slots),
-                lane0: committed.lane0,
-            };
             let window = i32s(ib, 4);
             let work = 4 * slab;
             let work_t = |buf: u32| t(buf, 4, slab, Dtype::F32);
-            both(
+            landed(
                 &mut gpu,
                 &what("committed"),
                 &fresh(rows, work),
                 &[want_y, want_s],
                 &|g, o| {
                     g.run(|c| {
-                        ssm::kda_committed(
-                            c,
-                            p.mixed,
-                            window,
-                            &committed,
-                            p.f,
-                            p.b,
-                            p.dt_bias,
-                            p.a_log,
-                            &pool(o[1].0, sb, 4),
-                            work_t(o[2].0),
-                            h,
-                            hd,
-                            eps,
-                            fl,
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-                &|g, o| {
-                    g.run_slang(|c| {
                         kernels_slang::ssm::kda::kda_committed(
                             c,
                             tier,
-                            st(p.mixed),
-                            st(window),
-                            &slang_committed,
+                            p.mixed,
+                            window,
+                            &committed,
                             &p.gates(fl, p.f, p.b),
-                            &sp(&pool(o[1].0, sb, 4)),
-                            st(work_t(o[2].0)),
-                            st(y(o[0].0, rows)),
+                            &pool(o[1].0, sb, 4),
+                            work_t(o[2].0),
+                            y(o[0].0, rows),
                         )
                     })
                 },

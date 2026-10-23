@@ -1,6 +1,6 @@
 //! Multimodal rotary embeddings: each rotated pair reads one of three
 //! position axes `(t, h, w)` from an i32 `[rows, 3]` stream. Reference:
-//! kernels-wgpu `rope/mrope.wgsl` (interleaved and blocked agree with
+//! kernels-slang `elemwise/rope.slang` (interleaved and blocked agree with
 //! kernels-cuda `rope_mrope*`; CUDA refuses split).
 #![allow(clippy::too_many_arguments)]
 

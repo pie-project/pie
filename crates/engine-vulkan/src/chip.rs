@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use kernels_vulkan::tuning::{AXES, FACTS};
+use crate::tuning::{AXES, FACTS};
 use profile::{Facts, Profile, Registry, Report, Shelf};
 
 /// Rows from which a step is submitted a layer at a time rather than in one
@@ -17,7 +17,7 @@ pub struct SubmitSplitRows(pub u32);
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("vulkan", FACTS, AXES);
-    kernels_vulkan::tuning::register(&mut r);
+    crate::tuning::register(&mut r);
     r.add::<SubmitSplitRows>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     // One queue serves every region.
@@ -105,8 +105,8 @@ pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Pro
 
 #[cfg(test)]
 mod tests {
-    use kernels_vulkan::Tuning;
-    use kernels_vulkan::tuning::{Limits, Qmm};
+    use crate::tuning::Tuning;
+    use crate::tuning::{Limits, Qmm};
 
     use profile::Source;
 

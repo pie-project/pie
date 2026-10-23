@@ -1,25 +1,18 @@
-//! The gated delta recurrence on the first Vulkan device, beside the
-//! hand-written kernels, against an f64 host reference: the decode step, the
-//! chunked walk (an empty request among them) and the committed window
-//! (replayed rows, a partial commit, a commit of none, a lane with no slot),
-//! with 128-wide keys (the register-state kernels) and 32-wide ones (the
-//! state walked in memory), at both tiers. The f32 outputs and every slot's
-//! state are compared.
+//! The gated delta recurrence on the first Vulkan device, against an f64
+//! host reference: the decode step, the chunked walk (an empty request among
+//! them) and the committed window (replayed rows, a partial commit, a commit
+//! of none, a lane with no slot), with 128-wide keys (the register-state
+//! kernels) and 32-wide ones (the state walked in memory), at landed tiers.
+//! The f32 outputs and every slot's state are compared.
 
 use kernels_slang::Tier;
 use kernels_slang::ssm::gdn_recurrent::Tactic;
-use kernels_vulkan::attn::ssm;
-use kernels_vulkan::tensor::RecurrentPool;
-use kernels_vulkan::{RaggedTensor, Tensor};
+use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, both, noise};
+use crate::gpu::{Gpu, Out, landed, noise};
 
 const SLOTS: usize = 3;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[derive(Clone, Copy)]
 struct Shape {
@@ -130,15 +123,9 @@ fn the_gdn_recurrence_answers_the_reference() {
                 .collect();
             let bank64 = f64s(&bank0);
             let bank0 = &bank0;
-            let pool = |bank: u32, slots: u32, rows: usize| RecurrentPool {
-                state: t(bank, SLOTS, slab, Dtype::F32),
+            let pool = |bank: u32, slots: u32, rows: usize| kernels_slang::ssm::StatePool {
+                bank: t(bank, SLOTS, slab, Dtype::F32),
                 slots: t(slots, rows, 1, Dtype::U32),
-                conv_state: t(bank, SLOTS, slab, Dtype::F32),
-                new_conv_state: t(bank, SLOTS, slab, Dtype::F32),
-            };
-            let sp = |p: &RecurrentPool| kernels_slang::ssm::StatePool {
-                bank: st(p.state),
-                slots: st(p.slots),
             };
             let y_n = |rows: usize| rows * sh.v_heads * sh.dv;
             let fresh = |rows: usize, work: usize| {
@@ -179,16 +166,16 @@ fn the_gdn_recurrence_answers_the_reference() {
                 let s = s as usize;
                 sh.token(&qr, &gr, r, &mut want_s[s * slab..][..slab], &mut want_y);
             }
-            both(
+            landed(
                 &mut gpu,
                 &what("step"),
                 &fresh(2, 0),
                 &[want_y, want_s],
                 &|g, o| {
                     g.run(|c| {
-                        ssm::gated_delta(
+                        kernels_slang::ssm::gdn_recurrent::gated_delta(
                             c,
-                            qkv,
+                            tactic,
                             qkv,
                             gates,
                             &pool(o[1].0, sb, 2),
@@ -197,22 +184,6 @@ fn the_gdn_recurrence_answers_the_reference() {
                             dk,
                             dv,
                             y(o[0].0, 2),
-                        )
-                    })
-                },
-                &|g, o| {
-                    g.run_slang(|c| {
-                        kernels_slang::ssm::gdn_recurrent::gated_delta(
-                            c,
-                            tactic,
-                            st(qkv),
-                            st(gates),
-                            &sp(&pool(o[1].0, sb, 2)),
-                            kh,
-                            vh,
-                            dk,
-                            dv,
-                            st(y(o[0].0, 2)),
                         )
                     })
                 },
@@ -236,17 +207,20 @@ fn the_gdn_recurrence_answers_the_reference() {
                 data: qkv,
                 indptr: t(ib, 4, 1, Dtype::I32),
             };
-            both(
+            landed(
                 &mut gpu,
                 &what("chunked"),
                 &fresh(rows, 0),
                 &[want_y, want_s],
                 &|g, o| {
                     g.run(|c| {
-                        ssm::gated_delta_chunked(
+                        kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
                             c,
-                            ragged,
-                            qkv,
+                            tactic,
+                            kernels_slang::RaggedTensor {
+                                data: ragged.data,
+                                indptr: ragged.indptr,
+                            },
                             gates,
                             &pool(o[1].0, sb, rows),
                             kh,
@@ -254,25 +228,6 @@ fn the_gdn_recurrence_answers_the_reference() {
                             dk,
                             dv,
                             y(o[0].0, rows),
-                        )
-                    })
-                },
-                &|g, o| {
-                    g.run_slang(|c| {
-                        kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
-                            c,
-                            tactic,
-                            kernels_slang::RaggedTensor {
-                                data: st(ragged.data),
-                                indptr: st(ragged.indptr),
-                            },
-                            st(gates),
-                            &sp(&pool(o[1].0, sb, rows)),
-                            kh,
-                            vh,
-                            dk,
-                            dv,
-                            st(y(o[0].0, rows)),
                         )
                     })
                 },
@@ -310,30 +265,25 @@ fn the_gdn_recurrence_answers_the_reference() {
                 begin += span;
             }
             let i32s = |buf: u32, n: usize| t(buf, n, 1, Dtype::I32);
-            let committed = ssm::Committed {
+            let committed = kernels_slang::ssm::Committed {
                 replay: i32s(rb, 5),
                 commit: i32s(cb, 5),
                 slots: i32s(sb, 5),
                 lane0: lane0 as u32,
             };
-            let slang_committed = kernels_slang::ssm::Committed {
-                replay: st(committed.replay),
-                commit: st(committed.commit),
-                slots: st(committed.slots),
-                lane0: committed.lane0,
-            };
             let window = i32s(ib, 5);
             let work = 5 * slab;
             let work_t = |buf: u32| t(buf, 5, slab, Dtype::F32);
-            both(
+            landed(
                 &mut gpu,
                 &what("committed"),
                 &fresh(rows, work),
                 &[want_y, want_s],
                 &|g, o| {
                     g.run(|c| {
-                        ssm::gated_delta_committed(
+                        kernels_slang::ssm::gdn_recurrent::gated_delta_committed(
                             c,
+                            tactic,
                             qkv,
                             window,
                             &committed,
@@ -345,25 +295,6 @@ fn the_gdn_recurrence_answers_the_reference() {
                             dk,
                             dv,
                             y(o[0].0, rows),
-                        )
-                    })
-                },
-                &|g, o| {
-                    g.run_slang(|c| {
-                        kernels_slang::ssm::gdn_recurrent::gated_delta_committed(
-                            c,
-                            tactic,
-                            st(qkv),
-                            st(window),
-                            &slang_committed,
-                            st(gates),
-                            &sp(&pool(o[1].0, sb, 5)),
-                            st(work_t(o[2].0)),
-                            kh,
-                            vh,
-                            dk,
-                            dv,
-                            st(y(o[0].0, rows)),
                         )
                     })
                 },

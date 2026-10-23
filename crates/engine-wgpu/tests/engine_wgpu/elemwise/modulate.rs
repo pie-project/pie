@@ -42,9 +42,8 @@ fn the_modulations_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: kernels_wgpu::Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let t = |buf: u32, rows: usize, width: usize, dtype: Dtype| {
-        kernels_wgpu::Tensor::new(buf, rows as u32, width as u32, dtype)
+        kernels_slang::Tensor::new(buf, rows as u32, width as u32, dtype)
     };
     let (rows, width) = (4usize, 96usize);
     let n = rows * width;
@@ -87,21 +86,17 @@ fn the_modulations_answer_the_reference() {
                 ][form];
 
                 let y = gpu.zeros(2 * n);
-                gpu.run_slang(|c| {
+                gpu.run(|c| {
                     kernels_slang::elemwise::modulate::modulate(
                         c,
                         sf,
-                        st(t(x, rows, width, act)),
-                        st(mt),
-                        lt.map(st),
-                        st(t(y, rows, width, act)),
+                        t(x, rows, width, act),
+                        mt,
+                        lt,
+                        t(y, rows, width, act),
                     )
                 });
-                close(
-                    &down(&gpu, y, n, act),
-                    &want,
-                    &format!("slang modulate {shape}"),
-                );
+                close(&down(&gpu, y, n, act), &want, &format!("modulate {shape}"));
             }
         }
         for mapped in [false, true] {
@@ -125,19 +120,19 @@ fn the_modulations_answer_the_reference() {
             let shape = format!("{act:?} rows, {md:?} gate, mapped {mapped}");
 
             let r = up(&mut gpu, &rv, act);
-            gpu.run_slang(|c| {
+            gpu.run(|c| {
                 kernels_slang::elemwise::modulate::gated_residual_add(
                     c,
-                    st(t(r, rows, width, act)),
-                    st(gt),
-                    st(t(yb, rows, width, act)),
-                    lt.map(st),
+                    t(r, rows, width, act),
+                    gt,
+                    t(yb, rows, width, act),
+                    lt,
                 )
             });
             close(
                 &down(&gpu, r, n, act),
                 &want,
-                &format!("slang gated residual add {shape}"),
+                &format!("gated residual add {shape}"),
             );
         }
     }

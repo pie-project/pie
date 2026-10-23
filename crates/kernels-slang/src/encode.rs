@@ -4,6 +4,7 @@
 //! declares. An engine implements `Encode` over its own device.
 
 use crate::error::Error;
+use crate::tensor::Comm;
 
 pub const ABSENT: u32 = u32::MAX;
 
@@ -97,6 +98,17 @@ pub trait Encode {
     /// The target this engine's modules are built for: a WGSL kernel lands
     /// bf16 a word at a time, so its host refuses what a word would tear.
     fn target(&self) -> Target;
+
+    /// The communicator this device's collectives run over; a device in
+    /// no group has none.
+    fn comm(&self, op: &'static str) -> Result<Comm, Error> {
+        Err(Error::Unsupported { op })
+    }
+
+    /// Every rank's writes so far made visible to every rank.
+    fn rendezvous(&self, _op: &'static str) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub type Ctx<'a> = dyn Encode + 'a;

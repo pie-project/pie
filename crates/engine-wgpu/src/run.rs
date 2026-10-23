@@ -1,8 +1,9 @@
 use kernels_slang::attn::mla::MlaPlan;
-use kernels_wgpu::linear::moe::RoutedScratch;
-use kernels_wgpu::{
-    Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
-};
+use kernels_slang::attn::sdpa::Tables;
+use kernels_slang::linear::moe::select::RoutedScratch;
+use kernels_slang::{Bank, Ctx, KvPool, RaggedTensor, Tensor};
+
+use crate::store::RecurrentPool;
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
@@ -109,15 +110,15 @@ pub struct FireBindings {
 
 #[derive(Clone, Copy, Debug)]
 pub enum StructSlot {
-    Decode(DecodePlan),
+    Decode(Tables),
 
-    Prefill(PrefillPlan),
+    Prefill(Tables),
 
     Mla(MlaPlan),
 }
 
 pub struct Run<'c> {
-    ctx: &'c Ctx<'c>,
+    pub(crate) ctx: &'c Ctx<'c>,
 
     handles: &'c Handles,
 
@@ -155,7 +156,7 @@ pub struct Run<'c> {
 
     scratch: &'c Scratch,
 
-    tuning: &'c kernels_wgpu::Tuning,
+    tuning: &'c crate::tuning::Tuning,
 
     /// The highest kernels-slang tier the adapter runs: the subgroup tier
     /// where every subgroup is at least 32 lanes.
@@ -169,7 +170,7 @@ pub(crate) struct StageCache {
 }
 
 impl<'c> Run<'c> {
-    pub(crate) fn tuning(&self) -> &'c kernels_wgpu::Tuning {
+    pub(crate) fn tuning(&self) -> &'c crate::tuning::Tuning {
         self.tuning
     }
 
@@ -187,7 +188,7 @@ impl<'c> Run<'c> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch,
-        tuning: &'c kernels_wgpu::Tuning,
+        tuning: &'c crate::tuning::Tuning,
         tier: kernels_slang::Tier,
         seats: Option<&'c crate::experts::Seats>,
         rows: Option<&'c crate::experts::Gathered>,
@@ -315,15 +316,6 @@ impl<'c> Run<'c> {
                     panic!("the copy rectangle this load reserved does not mint: {fault}")
                 }),
         )
-    }
-
-    pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
-        self.ctx
-    }
-
-    /// The same context for kernels-slang's entries.
-    pub(crate) fn slang(&self) -> crate::encode::Slang<'c> {
-        crate::encode::Slang(self.ctx)
     }
 
     pub(crate) fn bindings(&self) -> &FireBindings {
@@ -665,7 +657,7 @@ impl<'c> Run<'c> {
         bank: Option<Bank>,
         bias: Option<Tensor>,
         routes: Tensor,
-    ) -> Result<Option<Seated>, kernels_wgpu::Error> {
+    ) -> Result<Option<Seated>, kernels_slang::Error> {
         use crate::experts::Kind;
         const OP: &str = "linear.expert_stage";
         let (Some(seats), Some(host)) = (self.seats, self.host) else {
@@ -676,7 +668,7 @@ impl<'c> Run<'c> {
         if codes.is_none() && bias_plane.is_none() {
             return Ok(None);
         }
-        let fail = |detail: String| kernels_wgpu::Error::Backend { op: OP, detail };
+        let fail = |detail: String| kernels_slang::Error::Backend { op: OP, detail };
         let key = (routes.buf, routes.rows, routes.width);
         if self.stage.borrow().key != Some(key) {
             let n = u64::from(routes.rows) * u64::from(routes.width);
@@ -756,12 +748,12 @@ impl<'c> Run<'c> {
         &self,
         bank: Bank,
         ids: Tensor,
-    ) -> Result<Option<(Bank, Tensor)>, kernels_wgpu::Error> {
+    ) -> Result<Option<(Bank, Tensor)>, kernels_slang::Error> {
         let (Some(rows), Some(host)) = (self.rows, self.host) else {
             return Ok(None);
         };
         rows.stage(self.handles, host, bank, ids)
-            .map_err(|why| kernels_wgpu::Error::Backend {
+            .map_err(|why| kernels_slang::Error::Backend {
                 op: "gather.embed",
                 detail: why.to_string(),
             })
@@ -777,7 +769,7 @@ impl<'c> Run<'c> {
         }))
     }
 
-    pub(crate) fn sdpa_split(&self) -> Option<kernels_wgpu::attn::Split> {
+    pub(crate) fn sdpa_split(&self) -> Option<kernels_slang::attn::sdpa::Split> {
         Some(
             self.scratch
                 .sdpa_split(self.handles)?
@@ -884,7 +876,7 @@ impl<'c> Run<'c> {
         self.structs[at] = Some(built);
     }
 
-    pub(crate) fn decode_plan(&self, id: ValueId) -> &DecodePlan {
+    pub(crate) fn decode_plan(&self, id: ValueId) -> &Tables {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Decode(plan)) => plan,
             Some(_) => panic!(
@@ -899,7 +891,7 @@ impl<'c> Run<'c> {
         }
     }
 
-    pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {
+    pub(crate) fn prefill_plan(&self, id: ValueId) -> &Tables {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Prefill(plan)) => plan,
             Some(_) => panic!(

@@ -10,7 +10,7 @@
 #include "prim/slot16.slang"
 #endif
 
-// Routed matmuls one route at a time (`linear.moe_matmul_select`, its bias
+// Routed matmuls one route at a time (`linear.moe_select`, its bias
 // and quantized forms): a workgroup lands eight output rows of one route,
 // a 32-lane strip a row walking the contraction in chunks, the strip folded
 // through workgroup memory or, at WGSL's subgroup tier, by shuffles (that

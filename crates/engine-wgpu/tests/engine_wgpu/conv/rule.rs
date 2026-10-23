@@ -4,17 +4,13 @@
 //! unshuffle and avg-down, over three clips one of which a rule cannot shape
 //! (it lands empty) and the running row offsets after it.
 
+use kernels_slang::Tensor;
 use kernels_slang::conv::rule as slang;
-use kernels_wgpu::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::Gpu;
 
 const CLIPS: [[i32; 3]; 3] = [[3, 4, 6], [1, 3, 3], [2, 2, 4]];
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn conv_axis(n: i32, k: i32, s: i32, front: i32, back: i32) -> Option<i32> {
     let span = n + front + back - k;
@@ -136,7 +132,7 @@ fn the_clip_rules_answer_the_reference() {
             off += ot * oh * ow;
         }
         let ob = gpu.up_i32(&[-7; 4 * CLIPS.len()]);
-        gpu.run_slang(|c| slang::derive_grid(c, st(t(gb)), rule, st(t(ob))));
-        assert_eq!(ints(&gpu, ob, 4 * CLIPS.len()), want, "slang {rule:?}");
+        gpu.run(|c| slang::derive_grid(c, t(gb), rule, t(ob)));
+        assert_eq!(ints(&gpu, ob, 4 * CLIPS.len()), want, "{rule:?}");
     }
 }

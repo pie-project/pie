@@ -54,7 +54,7 @@ pub fn latents(
 }
 
 /// [`latents`], then the neox rotation of `k_pe` (one `rope_dim`-wide head,
-/// `θ_i = pos · theta^(−2i / rope_dim)`, halves rotated), as kernels-wgpu's
+/// `θ_i = pos · theta^(−2i / rope_dim)`, halves rotated), as kernels-slang's
 /// `rope::partial_q(k_pe, positions, rope_dim, rope_dim, theta)`.
 pub fn latents_rope(
     f: &mut Func,

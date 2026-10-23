@@ -7,7 +7,9 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
-use crate::program::{FabricOp, FabricStep, Guarded, HostOp, Shard};
+use crate::library::Kernel;
+use crate::phase::{FabricOp, FabricStep, Guarded, HostOp, Shard};
+use crate::plan::{Footprint, Merge};
 use crate::tensor::Tensor;
 
 /// The `k` largest of each row of `x`, largest first: ties go to the lower
@@ -39,16 +41,21 @@ pub fn topk(
     }
     // Rows over PEs (a row whole on its PE); a row past a PE ranks on the
     // host.
-    let split = crate::cx::tile_split(
-        OP,
-        rows,
-        width,
-        u64::from(width) + 2 * u64::from(k),
-        0,
-        0,
-        width,
-    )
-    .ok();
+    let split = ctx
+        .plan()
+        .tile(
+            OP,
+            Footprint {
+                rows,
+                width,
+                per_row: u64::from(width) + 2 * u64::from(k),
+                per_col: 0,
+                whole: 0,
+                merge: 0,
+                unit: width,
+            },
+        )
+        .ok();
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
         let vb = cx.write(values)?;
@@ -70,9 +77,8 @@ pub fn topk(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("sampling/topk");
         cx.call(
-            "k_topk",
+            Kernel::Topk,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(vb),
@@ -115,16 +121,21 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     // Each column block's PE finds its greatest lane and index (a pair a
     // row); the blocks of a row group (one rectangle row) gather those on
     // the row's first PE, which picks among them into its rows of y.
-    let fabric = crate::linear::gemm::fabric_sum();
-    let whole = if fabric {
-        crate::linear::gemm::FABRIC_SUM_WORDS
-    } else {
-        0
-    };
-    let (rg, cg) = crate::cx::tile_split(OP, x.rows, x.width, u64::from(x.width) + 4, 0, whole, 1)?;
+    let (rg, cg) = ctx.plan().tile(
+        OP,
+        Footprint {
+            rows: x.rows,
+            width: x.width,
+            per_row: u64::from(x.width) + 4,
+            per_col: 0,
+            whole: 0,
+            merge: crate::linear::gemm::FABRIC_SUM_WORDS,
+            unit: 1,
+        },
+    )?;
     let (rows_local, width_local) = (x.rows / rg, x.width / cg);
     let pes = rg * cg;
-    if cg > 1 && !fabric {
+    if cg > 1 && !ctx.plan().merge(Merge::Pick { group: cg }) {
         return argmax_host_merge(ctx, x, column, y, rg, cg);
     }
     ctx.emit(&mut |cx| {
@@ -151,10 +162,8 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
                 },
             );
         }
-        cx.library("sampling/argmax_part");
-        cx.library("sampling/argmax_merge");
         cx.call(
-            "k_argmax_part",
+            Kernel::ArgmaxPart,
             vec![
                 Arg::Ptr(xb),
                 Arg::Scratch(parts.clone(), "f32"),
@@ -164,7 +173,7 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
         );
         if cg == 1 {
             cx.call(
-                "k_argmax_merge",
+                Kernel::ArgmaxMerge,
                 vec![
                     Arg::Scratch(parts.clone(), "f32"),
                     Arg::Ptr(yb),
@@ -187,7 +196,7 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
             },
         }];
         let finish = vec![Guarded::root(
-            "k_argmax_merge",
+            Kernel::ArgmaxMerge,
             vec![
                 Arg::Scratch(all.clone(), "f32"),
                 Arg::Ptr(yb.clone()),
@@ -198,13 +207,13 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
                 Arg::Int(i64::from(y.width)),
             ],
         )];
-        cx.fabric((cg, rg), steps, finish);
+        cx.collectives((cg, rg), steps, finish);
         Ok(())
     })
 }
 
-/// The argmax with the blocks' pairs merged on the host
-/// (`PIE_CEREBRAS_FABRIC_SUM=0`).
+/// The argmax with the blocks' pairs merged on the host (the engine merges
+/// no [`Merge::Pick`] on the fabric).
 fn argmax_host_merge(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -218,9 +227,7 @@ fn argmax_host_merge(
     let parts_name = format!("am_{}_{}_{column}", x.buf, y.buf);
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
-        let parts = cx
-            .program()
-            .declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
+        let parts = cx.declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
         if pes > 1 {
             cx.over(pes);
             let tile = Shard::Tile {
@@ -231,9 +238,8 @@ fn argmax_host_merge(
             cx.shard(&xb, tile);
             cx.shard(&parts, tile);
         }
-        cx.library("sampling/argmax_part");
         cx.call(
-            "k_argmax_part",
+            Kernel::ArgmaxPart,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(parts),
@@ -244,9 +250,7 @@ fn argmax_host_merge(
         Ok(())
     })?;
     ctx.emit(&mut |cx| {
-        let parts = cx
-            .program()
-            .declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
+        let parts = cx.declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
         cx.read(y)?;
         let yb = cx.write(y)?;
         cx.host(HostOp::ArgmaxMerge {

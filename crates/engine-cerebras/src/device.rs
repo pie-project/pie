@@ -12,12 +12,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::fabric::lanes::{LanePlan, picks};
 use dtype::Dtype;
-use kernels_cerebras::program::{
-    BankSplit, ColPlane, HostOp, HostPhase, Manifest, Reduce, Rendered, Segment, picks,
-};
+use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, Reduce, Segment};
 
 use crate::error::{Fault, Result};
+use crate::fabric::{HostPhase, Manifest, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Target};
 use crate::trace::Signature;
 
@@ -815,7 +815,7 @@ pub fn run_phases(
         // A whole fire over rows of PEs: row `y` runs its own table, and
         // every row's PEs mirror the fire's PEs across, so a buffer is laid
         // out for the `w` PEs of a row.
-        let row_tables: Vec<&kernels_cerebras::program::Table> = if manifest.tables.is_empty() {
+        let row_tables: Vec<&crate::fabric::Table> = if manifest.tables.is_empty() {
             manifest.table.iter().collect()
         } else {
             manifest.tables.iter().collect()
@@ -889,13 +889,12 @@ pub fn run_phases(
             sent_of.insert(export.name.clone(), laid);
         }
         let pes = w as usize * h as usize;
-        let packed_back = |e: &kernels_cerebras::program::Export| {
-            e.packed && e.role != kernels_cerebras::program::Symbol::Input
-        };
-        let comes_back = |e: &kernels_cerebras::program::Export| {
+        let packed_back =
+            |e: &crate::fabric::Export| e.packed && e.role != crate::fabric::Symbol::Input;
+        let comes_back = |e: &crate::fabric::Export| {
             !skip.contains(&e.name.as_str())
                 && (!e.packed || packed_back(e))
-                && e.role != kernels_cerebras::program::Symbol::Input
+                && e.role != crate::fabric::Symbol::Input
         };
         let write_in = |file: &str, words: &[u32]| -> Result<()> {
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -972,7 +971,7 @@ pub fn run_phases(
                     t.arena
                         .iter()
                         .filter(|(_, off, _)| {
-                            *off < keep_chunks as u64 * kernels_cerebras::program::ARENA_CHUNK
+                            *off < keep_chunks as u64 * crate::fabric::ARENA_CHUNK
                         })
                         .map(|(n, o, w)| (n.clone(), *o as usize, *w as usize))
                         .collect()
@@ -1015,7 +1014,7 @@ pub fn run_phases(
                 }
             }
             for c in keep_chunks..chunks.unwrap_or(1) {
-                let lo = c * kernels_cerebras::program::ARENA_CHUNK as usize;
+                let lo = c * crate::fabric::ARENA_CHUNK as usize;
                 let len = chunk_len(c);
                 let mut words = Vec::with_capacity(pes * len);
                 for pe in 0..pes {
@@ -1110,7 +1109,7 @@ pub fn run_phases(
                 .map(|(_, words)| vec![0u32; lay_pes * words])
                 .collect();
             for c in keep_chunks..chunks.unwrap_or(1) {
-                let lo = c * kernels_cerebras::program::ARENA_CHUNK as usize;
+                let lo = c * crate::fabric::ARENA_CHUNK as usize;
                 let len = chunk_len(c);
                 let words = read_out(&format!("arena{c}.out"))?;
                 for pe in 0..pes {
@@ -1214,8 +1213,8 @@ pub fn run_phases(
                     // Partial sums are added in f32 and rounded here.
                     if matches!(
                         export.shard,
-                        kernels_cerebras::program::Shard::SumCols { .. }
-                            | kernels_cerebras::program::Shard::SumGrid { .. }
+                        kernels_cerebras::phase::Shard::SumCols { .. }
+                            | kernels_cerebras::phase::Shard::SumGrid { .. }
                     ) && export.dtype == Dtype::Bf16
                     {
                         for v in words.iter_mut() {
@@ -1247,18 +1246,19 @@ pub fn run_phases(
 /// their offsets, scratch zeros) back to back, and every PE's op rows
 /// (opcode, then the arguments resolved to arena offsets and words).
 fn pack_table(
-    table: &kernels_cerebras::program::Table,
-    exports: &[kernels_cerebras::program::Export],
+    table: &crate::fabric::Table,
+    exports: &[crate::fabric::Export],
     sent_of: &HashMap<String, Vec<u32>>,
     pes: usize,
     at: usize,
     moves: &[PoolMove],
 ) -> Result<(Vec<u32>, Vec<u32>)> {
-    use kernels_cerebras::csl::Arg;
-    use kernels_cerebras::program::{
-        FabricOp, MOVE_ROW_WORDS, OP_BROADCAST, OP_BROADCAST_FROM, OP_GATHER, OP_HANDOFF, OP_NOP,
-        OP_ON, OP_REDUCE, OP_ROOT, TableOp, op_words,
+    use crate::fabric::{
+        MOVE_ROW_WORDS, OP_BROADCAST, OP_BROADCAST_FROM, OP_GATHER, OP_HANDOFF, OP_NOP, OP_ON,
+        OP_REDUCE, OP_ROOT, TableOp, op_words,
     };
+    use kernels_cerebras::csl::Arg;
+    use kernels_cerebras::phase::FabricOp;
     let arena_words = table.arena_words as usize;
     let mut arena = vec![0u32; pes * arena_words];
     let offset = |name: &str| -> Option<usize> {
@@ -1275,7 +1275,7 @@ fn pack_table(
         // An output's slot may be a dead input's: nothing goes up for it.
         if exports
             .iter()
-            .any(|e| e.name == *name && e.role == kernels_cerebras::program::Symbol::Output)
+            .any(|e| e.name == *name && e.role == crate::fabric::Symbol::Output)
         {
             continue;
         }
@@ -1382,7 +1382,7 @@ fn pack_table(
         let copy = table
             .kernels
             .iter()
-            .position(|k| k == "k_copy")
+            .position(|k| *k == kernels_cerebras::library::Kernel::Copy)
             .ok_or_else(|| unbound("a page move without k_copy".to_string()))?
             as i32;
         let scratch = offset("move_scratch")
@@ -1407,7 +1407,7 @@ fn pack_table(
             let mut done = 0u64;
             while done < u64::from(m.rows) {
                 let left = u64::from(m.rows) - done;
-                let fit = (kernels_cerebras::program::MOVE_SCRATCH / row_words.max(1)).max(1);
+                let fit = (crate::fabric::MOVE_SCRATCH / row_words.max(1)).max(1);
                 let n = left
                     .min(fit)
                     .min(ps - (m.src_row + done) % ps)
@@ -2568,12 +2568,8 @@ struct Paged {
 }
 
 impl LaneLayout {
-    fn plan(
-        lane: &kernels_cerebras::program::LanePlan,
-        state: &HashMap<String, Vec<u32>>,
-        at: usize,
-    ) -> Result<LaneLayout> {
-        use kernels_cerebras::program::{LaneKind, PageSource};
+    fn plan(lane: &LanePlan, state: &HashMap<String, Vec<u32>>, at: usize) -> Result<LaneLayout> {
+        use kernels_cerebras::phase::{LaneKind, PageSource};
         let pes = lane.pes.max(1) as usize;
         // A plan without banks names no slot table.
         let no_slots = Vec::new();
@@ -3521,10 +3517,10 @@ fn lay_out(
     words: &[u32],
     rows: usize,
     width: usize,
-    shard: kernels_cerebras::program::Shard,
+    shard: kernels_cerebras::phase::Shard,
     pes: usize,
 ) -> Vec<u32> {
-    use kernels_cerebras::program::Shard;
+    use kernels_cerebras::phase::Shard;
     match shard {
         Shard::Whole | Shard::Local(_) => words
             .iter()
@@ -3661,10 +3657,10 @@ fn gather_up(
     laid: &[u32],
     rows: usize,
     width: usize,
-    shard: kernels_cerebras::program::Shard,
+    shard: kernels_cerebras::phase::Shard,
     pes: usize,
 ) -> Vec<u32> {
-    use kernels_cerebras::program::Shard;
+    use kernels_cerebras::phase::Shard;
     let n = rows * width;
     match shard {
         Shard::Whole | Shard::Local(_) => laid[..n.min(laid.len())].to_vec(),

@@ -370,7 +370,7 @@ pub const MAX_BLEND_BLOCKS: usize = 32;
 /// rms-normed, gained by `weight` and dotted with `proj` into a logit; the
 /// softmax over candidates weights their sum. `blocks` are separate
 /// `[rows, hidden]` operands (the wgpu engine hands one stacked plane
-/// instead). Reference: kernels-wgpu `norm/res_blend.wgsl`.
+/// instead). Reference: kernels-slang `elemwise/norm.slang`.
 pub fn res_blend(
     f: &mut Func,
     prefix: Operand,

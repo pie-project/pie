@@ -4,7 +4,7 @@
 //! ReLU-gated multi-head score against every cached key (or every
 //! `ratio`-th), and the `top_k` keys by a bisected threshold.
 //!
-//! In kernels-wgpu this module lives inline in `attn.rs` (`pub mod index`).
+//! kernels-slang's counterpart is `attn::index`.
 
 use dtype::Dtype;
 

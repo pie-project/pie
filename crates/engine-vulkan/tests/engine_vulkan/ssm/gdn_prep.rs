@@ -1,17 +1,11 @@
-//! The gated delta rule's gates on the first Vulkan device, beside the
-//! hand-written kernel, against an f64 host reference: `g = -exp(a_log)
-//! softplus(a + dt_bias)` and `beta = sigmoid(b)`, the softplus past its
-//! linear cut included.
+//! The gated delta rule's gates on the first Vulkan device, against an f64
+//! host reference: `g = -exp(a_log) softplus(a + dt_bias)` and `beta =
+//! sigmoid(b)`, the softplus past its linear cut included.
 
-use kernels_vulkan::Tensor;
-use kernels_vulkan::attn::ssm;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
+use crate::gpu::{Gpu, landed, noise};
 
 #[test]
 fn the_gdn_gates_answer_the_reference() {
@@ -43,20 +37,19 @@ fn the_gdn_gates_answer_the_reference() {
     let dtt = t(dtb, 1, heads, Dtype::Bf16);
     let alt = t(alb, 1, heads, Dtype::F32);
     let n = rows * 2 * heads;
-    both(
+    landed(
         &mut gpu,
         "gdn gates",
         &|g| vec![(g.up_f32(&vec![0.0; n]), n, true)],
         &[want],
-        &|g, o| g.run(|c| ssm::gdn_prep(c, bat, dtt, alt, t(o[0].0, rows, 2 * heads, Dtype::F32))),
         &|g, o| {
-            g.run_slang(|c| {
+            g.run(|c| {
                 kernels_slang::ssm::gdn_prep::gdn_prep(
                     c,
-                    st(bat),
-                    st(dtt),
-                    st(alt),
-                    st(t(o[0].0, rows, 2 * heads, Dtype::F32)),
+                    bat,
+                    dtt,
+                    alt,
+                    t(o[0].0, rows, 2 * heads, Dtype::F32),
                 )
             })
         },

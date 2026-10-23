@@ -1,8 +1,12 @@
-use kernels_wgpu::attn;
+use kernels_slang::attn::sdpa;
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::{Attn, IndexScore, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
+
+/// Storage buffers a split decode binds (its LSE form one more); a device
+/// offering fewer (SwiftShader: 10) walks each row whole.
+const SPLIT_STORAGE_BUFFERS: u32 = 12;
 
 impl DispatchAttn for Run<'_> {
     fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
@@ -11,6 +15,173 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// How this device runs paged attention: the adapter's tier (its
+    /// subgroup prefill tile where every subgroup is 32 lanes), a decode
+    /// workgroup of 256 invocations (128 measured 26-61% slower through
+    /// wgpu on an RTX 4090) and prefill tiles of 16 rows of 16 lanes, the
+    /// 256 invocations WebGPU's default workgroup holds.
+    fn sdpa_tactic(&self) -> sdpa::Tactic {
+        let tuning = self.tuning();
+        sdpa::Tactic {
+            tier: self.tier(),
+            narrow: false,
+            decode_threads: 256,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: tuning.sdpa_split_groups(),
+            split_min_keys: tuning.sdpa_split_min_keys(),
+        }
+    }
+
+    fn prefill_tables(
+        &self,
+        plan: poem_ir::ValueId,
+        mask: Option<kernels_slang::Tensor>,
+    ) -> sdpa::Tables {
+        let plan = *self.prefill_plan(plan);
+        sdpa::Tables {
+            mask: mask.unwrap_or(plan.mask),
+            ..plan
+        }
+    }
+
+    /// Refuses a pool whose row does not hold the stated kv heads.
+    fn kv_heads_agree(
+        op: &'static str,
+        pool: &kernels_slang::KvPool,
+        kv_heads: u32,
+    ) -> Result<(), kernels_slang::Error> {
+        if pool.head_stride == 0 || pool.seq_stride / pool.head_stride != u64::from(kv_heads) {
+            return Err(kernels_slang::Error::Backend {
+                op,
+                detail: format!(
+                    "the stated kv head count {kv_heads} is not the one the pool row's strides \
+                     spell ({} / {})",
+                    pool.seq_stride, pool.head_stride
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Prefill attention: query rows tiled a workgroup of one head where a
+    /// request brings enough of them (`kernel.sdpa.tile_rows_per_request`),
+    /// else each row walked as a decode row.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_attention(
+        &self,
+        q: poem_ir::ValueId,
+        plan: poem_ir::ValueId,
+        mask: Option<kernels_slang::Tensor>,
+        cache: poem_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: kernels_slang::Tensor,
+        lse: Option<kernels_slang::Tensor>,
+    ) -> Result<(), kernels_slang::Error> {
+        const OP: &str = "attn.prefill";
+        let q = self.ragged(q).data;
+        let pool = self.pool(cache);
+        Self::kv_heads_agree(OP, pool, kv_heads)?;
+        if let Some(mask) = mask
+            && mask.dtype != poem_ir::Dtype::U8
+        {
+            return Err(kernels_slang::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
+                    mask.dtype
+                ),
+            });
+        }
+        let tactic = self.sdpa_tactic();
+        let tables = self.prefill_tables(plan, mask);
+        let (q, pool, o) = (q, *pool, o);
+        let tiles = q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request();
+        if tiles {
+            sdpa::prefill(
+                self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse,
+            )
+        } else {
+            sdpa::decode(
+                self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse, None,
+            )
+        }
+    }
+
+    /// Decode attention, split into key ranges where the rows are too few
+    /// and the device binds the split's planes.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_attention(
+        &self,
+        q: poem_ir::ValueId,
+        plan: poem_ir::ValueId,
+        cache: poem_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        sm_scale: f32,
+        o: poem_ir::ValueId,
+        lse: Option<poem_ir::ValueId>,
+    ) -> Result<(), kernels_slang::Error> {
+        let buffers = self.tuning().storage_buffers();
+        let binds = SPLIT_STORAGE_BUFFERS + u32::from(lse.is_some());
+        let split = self
+            .sdpa_split()
+            .filter(|_| buffers == 0 || buffers >= binds);
+        sdpa::decode(
+            self.ctx,
+            self.sdpa_tactic(),
+            self.tensor(q),
+            self.decode_plan(plan),
+            self.pool(cache),
+            window,
+            head_dim,
+            sm_scale,
+            self.tensor(o),
+            lse.map(|l| self.tensor(l)),
+            split,
+        )
+    }
+
+    /// Attention over the key blocks a selection names.
+    #[allow(clippy::too_many_arguments)]
+    fn selected_attention(
+        &self,
+        op: &'static str,
+        q: kernels_slang::Tensor,
+        tables: &sdpa::Tables,
+        selection: poem_ir::ValueId,
+        cache: poem_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        sm_scale: f32,
+        ratio: u32,
+        o: poem_ir::ValueId,
+    ) -> Result<(), kernels_slang::Error> {
+        if window.is_some() {
+            return Err(kernels_slang::Error::Backend {
+                op,
+                detail: "a selection and a sliding window are two answers to which keys a row \
+                         reads"
+                    .to_string(),
+            });
+        }
+        sdpa::selected(
+            self.ctx,
+            self.sdpa_tactic(),
+            q,
+            tables,
+            self.pool(cache),
+            head_dim,
+            sm_scale,
+            ratio,
+            self.tensor(selection),
+            self.tensor(o),
+        )
+    }
+
     fn requests(&self) -> u32 {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
@@ -26,7 +197,7 @@ impl Run<'_> {
         kv_heads: u32,
         sm_scale: f32,
         lse: poem_ir::ValueId,
-    ) -> Result<(), kernels_wgpu::Error> {
+    ) -> Result<(), kernels_slang::Error> {
         let Some(seat) = self.score_seat() else {
             return Ok(());
         };
@@ -37,10 +208,10 @@ impl Run<'_> {
         let lane_offset = self.window().span.lane_offset;
         let requests = self.requests();
         kernels_slang::attn::score::capture(
-            &self.slang(),
-            crate::encode::slang_ragged(self.ragged(q)),
-            crate::encode::slang_tensor(self.prefill_plan(plan).positions),
-            &crate::encode::slang_pool(self.pool(cache)),
+            self.ctx,
+            self.ragged(q),
+            self.prefill_plan(plan).positions,
+            self.pool(cache),
             window,
             head_dim,
             kv_heads,
@@ -51,18 +222,17 @@ impl Run<'_> {
             plane,
             crate::scores::KV_MAX,
             requests,
-            crate::encode::slang_tensor(seat.slab),
+            seat.slab,
         )
-        .map_err(crate::encode::from_slang)
     }
 
-    fn attention(&mut self, op: &Attn) -> Result<(), kernels_wgpu::Error> {
+    fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
             Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
-                kv_len,
+                kv_len: _,
                 q_heads: _,
                 kv_heads: _,
                 head_dim: _,
@@ -76,18 +246,17 @@ impl Run<'_> {
                          decode plan kind"
                     ),
                 }
-                let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
-
-                let built = attn::plan_decode(
-                    self.ctx(),
-                    kv_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
-                    t.mask_stride,
+                let built = sdpa::Tables::plan(
+                    "attn.plan_decode",
+                    sdpa::Tables {
+                        positions: self.cut_rows(positions),
+                        request_of_token: self.cut_rows(t.request_of_token),
+                        mask: self.cut_rows(t.mask),
+                        mask_enabled: self.cut_rows(t.mask_enabled),
+                        mask_stride: t.mask_stride,
+                    },
                 )?;
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
@@ -97,7 +266,7 @@ impl Run<'_> {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
-                kv_len,
+                kv_len: _,
                 q_heads: _,
                 kv_heads: _,
                 head_dim: _,
@@ -111,18 +280,17 @@ impl Run<'_> {
                          prefill plan kind"
                     ),
                 }
-                let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
-
-                let built = attn::plan_prefill(
-                    self.ctx(),
-                    kv_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
-                    t.mask_stride,
+                let built = sdpa::Tables::plan(
+                    "attn.plan_prefill",
+                    sdpa::Tables {
+                        positions: self.cut_rows(positions),
+                        request_of_token: self.cut_rows(t.request_of_token),
+                        mask: self.cut_rows(t.mask),
+                        mask_enabled: self.cut_rows(t.mask_enabled),
+                        mask_stride: t.mask_stride,
+                    },
                 )?;
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
@@ -135,18 +303,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn::decode(
-                self.ctx(),
-                self.tuning(),
-                self.tensor(*q),
-                self.decode_plan(*plan),
-                self.pool(*cache),
-                *window,
-                *head_dim,
-                *sm_scale,
-                self.tensor(*o),
-                self.sdpa_split(),
-            ),
+            } => self.decode_attention(*q, *plan, *cache, *window, *head_dim, *sm_scale, *o, None),
 
             Attn::Prefill {
                 q,
@@ -157,18 +314,17 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-            } => attn::arbiter::prefill(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                None,
+                *cache,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.requests(),
-                self.tuning(),
+                None,
             ),
 
             Attn::DecodeSelected { per_head: true, .. }
@@ -180,10 +336,10 @@ impl Run<'_> {
             | Attn::IndexTopk {
                 score: IndexScore::PooledTokens,
                 ..
-            } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
             Attn::KvEnds { .. } | Attn::WindowSink { .. } | Attn::ReplayFloor { .. } => {
-                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Attn::DecodeSelected {
                 q,
@@ -196,17 +352,17 @@ impl Run<'_> {
                 ratio,
                 per_head: false,
                 o,
-            } => attn::decode_selected(
-                self.ctx(),
+            } => self.selected_attention(
+                "attn.decode_selected",
                 self.tensor(*q),
                 self.decode_plan(*plan),
-                self.tensor(*selection),
-                self.pool(*cache),
+                *selection,
+                *cache,
                 *window,
                 *head_dim,
                 *sm_scale,
                 *ratio,
-                self.tensor(*o),
+                *o,
             ),
             Attn::PrefillSelected {
                 q,
@@ -220,19 +376,22 @@ impl Run<'_> {
                 ratio,
                 per_head: false,
                 o,
-            } => attn::prefill_selected(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.tensor(*selection),
-                self.pool(*cache),
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *ratio,
-                self.tensor(*o),
-            ),
+            } => {
+                const OP: &str = "attn.prefill_selected";
+                Self::kv_heads_agree(OP, self.pool(*cache), *kv_heads)?;
+                self.selected_attention(
+                    OP,
+                    self.ragged(*q).data,
+                    &self.prefill_tables(*plan, None),
+                    *selection,
+                    *cache,
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    *ratio,
+                    *o,
+                )
+            }
             Attn::Dense {
                 q,
                 k,
@@ -242,22 +401,21 @@ impl Run<'_> {
                 sm_scale,
                 o,
             } => kernels_slang::attn::dense::bidirectional(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*q)),
-                crate::encode::slang_tensor(self.tensor(*k)),
-                crate::encode::slang_tensor(self.tensor(*v)),
-                crate::encode::slang_tensor(self.tensor(*segments)),
+                self.ctx,
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+                self.tensor(*segments),
                 *head_dim,
                 *sm_scale,
-                crate::encode::slang_tensor(self.tensor(*o)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*o),
+            ),
             Attn::Masked { causal: false, .. }
             | Attn::MaskedLse { causal: false, .. }
             | Attn::Ragged { .. }
-            | Attn::Voxel { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            | Attn::Voxel { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Attn::DecodeRel { .. } | Attn::PrefillRel { .. } => {
-                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Attn::Masked {
                 q,
@@ -266,22 +424,21 @@ impl Run<'_> {
                 cache,
                 window,
                 head_dim,
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 sm_scale,
                 o,
-            } => attn::arbiter::masked(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                Some(self.cut_rows(self.tensor(*mask))),
+                *cache,
                 *window,
                 *head_dim,
+                *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.requests(),
-                self.tuning(),
+                None,
             ),
             Attn::MaskedLse {
                 q,
@@ -290,24 +447,22 @@ impl Run<'_> {
                 cache,
                 window,
                 head_dim,
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 sm_scale,
                 o,
                 lse,
-            } => attn::arbiter::masked_lse(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                Some(self.cut_rows(self.tensor(*mask))),
+                *cache,
                 *window,
                 *head_dim,
+                *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.tensor(*lse),
-                self.requests(),
-                self.tuning(),
+                Some(self.tensor(*lse)),
             ),
             Attn::DecodeLse {
                 q,
@@ -318,18 +473,15 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse,
-            } => attn::decode_lse(
-                self.ctx(),
-                self.tuning(),
-                self.tensor(*q),
-                self.decode_plan(*plan),
-                self.pool(*cache),
+            } => self.decode_attention(
+                *q,
+                *plan,
+                *cache,
                 *window,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
-                self.sdpa_split(),
+                *o,
+                Some(*lse),
             ),
             Attn::PrefillLse {
                 q,
@@ -344,19 +496,17 @@ impl Run<'_> {
                 // This backend splits no prompt's rows, so a replay floor stays 0.
                 floor: _,
             } => {
-                attn::arbiter::prefill_lse(
-                    self.ctx(),
-                    self.ragged(*q),
-                    self.prefill_plan(*plan),
-                    self.pool(*cache),
+                self.prefill_attention(
+                    *q,
+                    *plan,
+                    None,
+                    *cache,
                     *window,
                     *head_dim,
                     *kv_heads,
                     *sm_scale,
                     self.tensor(*o),
-                    self.tensor(*lse),
-                    self.requests(),
-                    self.tuning(),
+                    Some(self.tensor(*lse)),
                 )?;
 
                 self.capture_scores(
@@ -370,13 +520,12 @@ impl Run<'_> {
                 head_dim,
                 o_out: _,
             } => kernels_slang::attn::merge::sink(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*o)),
-                crate::encode::slang_tensor(self.tensor(*lse)),
-                crate::encode::slang_tensor(self.tensor(*sink)),
+                self.ctx,
+                self.tensor(*o),
+                self.tensor(*lse),
+                self.tensor(*sink),
                 *head_dim,
-            )
-            .map_err(crate::encode::from_slang),
+            ),
             Attn::MergeLse {
                 o1,
                 lse1,
@@ -387,23 +536,19 @@ impl Run<'_> {
                 o,
                 lse,
             } => kernels_slang::attn::merge::merge_lse(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*o1)),
-                crate::encode::slang_tensor(self.tensor(*lse1)),
-                crate::encode::slang_tensor(self.tensor(*o2)),
-                crate::encode::slang_tensor(self.tensor(*lse2)),
+                self.ctx,
+                self.tensor(*o1),
+                self.tensor(*lse1),
+                self.tensor(*o2),
+                self.tensor(*lse2),
                 *heads,
                 *head_dim,
-                crate::encode::slang_tensor(self.tensor(*o)),
-                crate::encode::slang_tensor(self.tensor(*lse)),
-            )
-            .map_err(crate::encode::from_slang),
-            Attn::LogitSoftcap { x, cap, x_out: _ } => kernels_slang::attn::merge::logit_softcap(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*x)),
-                *cap,
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*o),
+                self.tensor(*lse),
+            ),
+            Attn::LogitSoftcap { x, cap, x_out: _ } => {
+                kernels_slang::attn::merge::logit_softcap(self.ctx, self.tensor(*x), *cap)
+            }
             Attn::KvAppend {
                 k,
                 v,
@@ -411,27 +556,25 @@ impl Run<'_> {
                 write_page,
                 write_offset,
             } => kernels_slang::attn::kv_append::kv_append(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*k)),
-                crate::encode::slang_tensor(self.tensor(*v)),
-                &crate::encode::slang_pool(self.pool(*cache)),
-                crate::encode::slang_tensor(self.tensor(*write_page)),
-                crate::encode::slang_tensor(self.tensor(*write_offset)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*k),
+                self.tensor(*v),
+                self.pool(*cache),
+                self.tensor(*write_page),
+                self.tensor(*write_offset),
+            ),
             Attn::KvAppendShared {
                 plane,
                 cache,
                 write_page,
                 write_offset,
             } => kernels_slang::attn::kv_append::kv_append_shared(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*plane)),
-                &crate::encode::slang_pool(self.pool(*cache)),
-                crate::encode::slang_tensor(self.tensor(*write_page)),
-                crate::encode::slang_tensor(self.tensor(*write_offset)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*plane),
+                self.pool(*cache),
+                self.tensor(*write_page),
+                self.tensor(*write_offset),
+            ),
 
             Attn::MlaPlan {
                 kv_indptr,
@@ -443,13 +586,12 @@ impl Run<'_> {
                 plan,
             } => {
                 let built = kernels_slang::attn::mla::plan(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*kv_indptr)),
-                    crate::encode::slang_tensor(self.tensor(*kv_indices)),
-                    crate::encode::slang_tensor(self.tensor(*last_page_len)),
-                    crate::encode::slang_tensor(self.tensor(*kv_len)),
-                )
-                .map_err(crate::encode::from_slang)?;
+                    self.ctx,
+                    self.tensor(*kv_indptr),
+                    self.tensor(*kv_indices),
+                    self.tensor(*last_page_len),
+                    self.tensor(*kv_len),
+                )?;
                 self.put(*plan, StructSlot::Mla(built));
                 Ok(())
             }
@@ -461,15 +603,14 @@ impl Run<'_> {
                 kv_c,
                 k_pe,
             } => kernels_slang::attn::mla::latents(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*kv_a)),
-                crate::encode::slang_tensor(self.tensor(*weight)),
+                self.ctx,
+                self.tensor(*kv_a),
+                self.tensor(*weight),
                 *eps,
                 *kv_lora_rank,
-                crate::encode::slang_tensor(self.tensor(*kv_c)),
-                crate::encode::slang_tensor(self.tensor(*k_pe)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*kv_c),
+                self.tensor(*k_pe),
+            ),
             Attn::MlaLatentsRope {
                 kv_a,
                 positions,
@@ -481,18 +622,17 @@ impl Run<'_> {
                 kv_c,
                 k_pe,
             } => kernels_slang::attn::mla::latents_rope(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*kv_a)),
-                crate::encode::slang_tensor(self.tensor(*positions)),
-                crate::encode::slang_tensor(self.tensor(*weight)),
+                self.ctx,
+                self.tensor(*kv_a),
+                self.tensor(*positions),
+                self.tensor(*weight),
                 *eps,
                 *kv_lora_rank,
                 *rope_dim,
                 *theta,
-                crate::encode::slang_tensor(self.tensor(*kv_c)),
-                crate::encode::slang_tensor(self.tensor(*k_pe)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*kv_c),
+                self.tensor(*k_pe),
+            ),
             Attn::MlaSplitQB {
                 q_b,
                 heads,
@@ -501,15 +641,14 @@ impl Run<'_> {
                 q_nope,
                 q_pe,
             } => kernels_slang::attn::mla::split_q_b(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*q_b)),
+                self.ctx,
+                self.tensor(*q_b),
                 *heads,
                 *nope_dim,
                 *rope_dim,
-                crate::encode::slang_tensor(self.tensor(*q_nope)),
-                crate::encode::slang_tensor(self.tensor(*q_pe)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*q_nope),
+                self.tensor(*q_pe),
+            ),
             Attn::MlaAbsorbQ {
                 q_nope,
                 kv_b,
@@ -519,16 +658,15 @@ impl Run<'_> {
                 v_head_dim,
                 q_latent,
             } => kernels_slang::attn::mla::absorb_q(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*q_nope)),
-                crate::encode::slang_tensor(self.tensor(*kv_b)),
+                self.ctx,
+                self.tensor(*q_nope),
+                self.tensor(*kv_b),
                 *heads,
                 *kv_lora_rank,
                 *nope_dim,
                 *v_head_dim,
-                crate::encode::slang_tensor(self.tensor(*q_latent)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*q_latent),
+            ),
             Attn::MlaAbsorbOut {
                 latent,
                 kv_b,
@@ -538,16 +676,15 @@ impl Run<'_> {
                 nope_dim,
                 o,
             } => kernels_slang::attn::mla::absorb_out(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*latent)),
-                crate::encode::slang_tensor(self.tensor(*kv_b)),
+                self.ctx,
+                self.tensor(*latent),
+                self.tensor(*kv_b),
                 *heads,
                 *kv_lora_rank,
                 *v_head_dim,
                 *nope_dim,
-                crate::encode::slang_tensor(self.tensor(*o)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*o),
+            ),
             Attn::MlaKvAppend {
                 kv_c,
                 k_pe,
@@ -555,28 +692,27 @@ impl Run<'_> {
                 write_page,
                 write_offset,
             } => kernels_slang::attn::mla::kv_append(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*kv_c)),
-                crate::encode::slang_tensor(self.tensor(*k_pe)),
-                &crate::encode::slang_pool(self.pool(*cache)),
-                crate::encode::slang_tensor(self.tensor(*write_page)),
-                crate::encode::slang_tensor(self.tensor(*write_offset)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*kv_c),
+                self.tensor(*k_pe),
+                self.pool(*cache),
+                self.tensor(*write_page),
+                self.tensor(*write_offset),
+            ),
 
             // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
             Attn::MlaDecode { lse: Some(_), .. }
             | Attn::MlaPrefill { lse: Some(_), .. }
             | Attn::MlaDecodeSelected { lse: Some(_), .. }
             | Attn::MlaPrefillSelected { lse: Some(_), .. } => {
-                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Attn::MlaDecode {
                 window: Some(_), ..
             }
             | Attn::MlaPrefill {
                 window: Some(_), ..
-            } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Attn::MlaDecode {
                 q,
                 plan: _,
@@ -594,18 +730,17 @@ impl Run<'_> {
                     (fire.positions, fire.tables.request_of_token)
                 };
                 kernels_slang::attn::mla::attention_decode(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*q)),
-                    crate::encode::slang_tensor(self.tensor(*q_pe)),
-                    &crate::encode::slang_pool(self.pool(*cache)),
-                    crate::encode::slang_tensor(self.cut_rows(positions)),
-                    crate::encode::slang_tensor(self.cut_rows(request_of_token)),
+                    self.ctx,
+                    self.tensor(*q),
+                    self.tensor(*q_pe),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    crate::encode::slang_tensor(self.tensor(*o)),
+                    self.tensor(*o),
                 )
-                .map_err(crate::encode::from_slang)
             }
             Attn::MlaPrefill {
                 q,
@@ -624,18 +759,17 @@ impl Run<'_> {
                     (fire.positions, fire.tables.request_of_token)
                 };
                 kernels_slang::attn::mla::attention_prefill(
-                    &self.slang(),
-                    crate::encode::slang_ragged(self.ragged(*q)),
-                    crate::encode::slang_tensor(self.tensor(*q_pe)),
-                    &crate::encode::slang_pool(self.pool(*cache)),
-                    crate::encode::slang_tensor(self.cut_rows(positions)),
-                    crate::encode::slang_tensor(self.cut_rows(request_of_token)),
+                    self.ctx,
+                    self.ragged(*q),
+                    self.tensor(*q_pe),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    crate::encode::slang_tensor(self.tensor(*o)),
+                    self.tensor(*o),
                 )
-                .map_err(crate::encode::from_slang)
             }
             Attn::MlaDecodeSelected {
                 q,
@@ -654,19 +788,18 @@ impl Run<'_> {
                     (fire.positions, fire.tables.request_of_token)
                 };
                 kernels_slang::attn::mla::attention_decode_selected(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*q)),
-                    crate::encode::slang_tensor(self.tensor(*q_pe)),
-                    crate::encode::slang_tensor(self.tensor(*selection)),
-                    &crate::encode::slang_pool(self.pool(*cache)),
-                    crate::encode::slang_tensor(self.cut_rows(positions)),
-                    crate::encode::slang_tensor(self.cut_rows(request_of_token)),
+                    self.ctx,
+                    self.tensor(*q),
+                    self.tensor(*q_pe),
+                    self.tensor(*selection),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    crate::encode::slang_tensor(self.tensor(*o)),
+                    self.tensor(*o),
                 )
-                .map_err(crate::encode::from_slang)
             }
             Attn::MlaPrefillSelected {
                 q,
@@ -685,19 +818,18 @@ impl Run<'_> {
                     (fire.positions, fire.tables.request_of_token)
                 };
                 kernels_slang::attn::mla::attention_prefill_selected(
-                    &self.slang(),
-                    crate::encode::slang_ragged(self.ragged(*q)),
-                    crate::encode::slang_tensor(self.tensor(*q_pe)),
-                    crate::encode::slang_tensor(self.tensor(*selection)),
-                    &crate::encode::slang_pool(self.pool(*cache)),
-                    crate::encode::slang_tensor(self.cut_rows(positions)),
-                    crate::encode::slang_tensor(self.cut_rows(request_of_token)),
+                    self.ctx,
+                    self.ragged(*q),
+                    self.tensor(*q_pe),
+                    self.tensor(*selection),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    crate::encode::slang_tensor(self.tensor(*o)),
+                    self.tensor(*o),
                 )
-                .map_err(crate::encode::from_slang)
             }
 
             Attn::IndexLayernormRope {
@@ -710,16 +842,15 @@ impl Run<'_> {
                 theta,
                 k_out: _,
             } => kernels_slang::attn::index::layernorm_rope(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*k)),
-                crate::encode::slang_tensor(self.tensor(*positions)),
-                crate::encode::slang_tensor(self.tensor(*weight)),
-                crate::encode::slang_tensor(self.tensor(*bias)),
+                self.ctx,
+                self.tensor(*k),
+                self.tensor(*positions),
+                self.tensor(*weight),
+                self.tensor(*bias),
                 *eps,
                 *rope_dim,
                 *theta,
-            )
-            .map_err(crate::encode::from_slang),
+            ),
             Attn::IndexRope {
                 q,
                 positions,
@@ -729,15 +860,14 @@ impl Run<'_> {
                 theta,
                 q_out: _,
             } => kernels_slang::attn::index::rope(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*q)),
-                crate::encode::slang_tensor(self.tensor(*positions)),
+                self.ctx,
+                self.tensor(*q),
+                self.tensor(*positions),
                 *heads,
                 *head_dim,
                 *rope_dim,
                 *theta,
-            )
-            .map_err(crate::encode::from_slang),
+            ),
 
             Attn::IndexTopk {
                 q,
@@ -751,27 +881,26 @@ impl Run<'_> {
                 selection,
             } => {
                 let Some(scores) = self.index_scores() else {
-                    return Err(kernels_wgpu::Error::Unsupported {
+                    return Err(kernels_slang::Error::Unsupported {
                         op: "attn.index_topk",
                     });
                 };
                 let fire = self.bindings();
                 let (positions, request_of_token) = (fire.positions, fire.tables.request_of_token);
                 kernels_slang::attn::index::topk(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*q)),
-                    weights.map(|w| crate::encode::slang_tensor(self.tensor(w))),
-                    &crate::encode::slang_pool(self.pool(*keys)),
-                    crate::encode::slang_tensor(self.cut_rows(positions)),
-                    crate::encode::slang_tensor(self.cut_rows(request_of_token)),
-                    crate::encode::slang_tensor(scores),
+                    self.ctx,
+                    self.tensor(*q),
+                    weights.map(|w| self.tensor(w)),
+                    self.pool(*keys),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    scores,
                     *heads,
                     *head_dim,
                     *top_k,
                     *ratio,
-                    crate::encode::slang_tensor(self.tensor(*selection)),
+                    self.tensor(*selection),
                 )
-                .map_err(crate::encode::from_slang)
             }
             Attn::IndexKvAppend {
                 k,
@@ -779,13 +908,12 @@ impl Run<'_> {
                 write_page,
                 write_offset,
             } => kernels_slang::attn::index::kv_append(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*k)),
-                &crate::encode::slang_pool(self.pool(*keys)),
-                crate::encode::slang_tensor(self.tensor(*write_page)),
-                crate::encode::slang_tensor(self.tensor(*write_offset)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*k),
+                self.pool(*keys),
+                self.tensor(*write_page),
+                self.tensor(*write_offset),
+            ),
 
             Attn::IndexBlockMean {
                 boundary_pos,
@@ -795,15 +923,14 @@ impl Run<'_> {
                 ratio,
                 entries,
             } => kernels_slang::attn::index::block_mean(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*boundary_pos)),
-                crate::encode::slang_tensor(self.tensor(*boundary_req)),
-                &crate::encode::slang_pool(self.pool(*keys)),
+                self.ctx,
+                self.tensor(*boundary_pos),
+                self.tensor(*boundary_req),
+                self.pool(*keys),
                 *head_dim,
                 *ratio,
-                crate::encode::slang_tensor(self.tensor(*entries)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*entries),
+            ),
             Attn::PoolBoundaryDecode {
                 positions,
                 row_valid,
@@ -812,16 +939,15 @@ impl Run<'_> {
                 boundary_req,
                 boundary_rope,
             } => kernels_slang::attn::pool::boundary_decode(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*positions)),
-                crate::encode::slang_tensor(self.cut_rows(self.bindings().tables.request_of_token)),
-                crate::encode::slang_tensor(self.tensor(*row_valid)),
+                self.ctx,
+                self.tensor(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
+                self.tensor(*row_valid),
                 *ratio,
-                crate::encode::slang_tensor(self.tensor(*boundary_pos)),
-                crate::encode::slang_tensor(self.tensor(*boundary_req)),
-                crate::encode::slang_tensor(self.tensor(*boundary_rope)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*boundary_pos),
+                self.tensor(*boundary_req),
+                self.tensor(*boundary_rope),
+            ),
             Attn::PoolBoundaryPrefill {
                 positions,
                 row_valid,
@@ -830,16 +956,15 @@ impl Run<'_> {
                 boundary_req,
                 boundary_rope,
             } => kernels_slang::attn::pool::boundary_prefill(
-                &self.slang(),
-                crate::encode::slang_ragged(self.ragged(*positions)),
-                crate::encode::slang_tensor(self.cut_rows(self.bindings().tables.request_of_token)),
-                crate::encode::slang_tensor(self.tensor(*row_valid)),
+                self.ctx,
+                self.ragged(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
+                self.tensor(*row_valid),
                 *ratio,
-                crate::encode::slang_tensor(self.tensor(*boundary_pos)),
-                crate::encode::slang_tensor(self.tensor(*boundary_req)),
-                crate::encode::slang_tensor(self.tensor(*boundary_rope)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*boundary_pos),
+                self.tensor(*boundary_req),
+                self.tensor(*boundary_rope),
+            ),
 
             Attn::PoolGather {
                 boundary_pos,
@@ -851,23 +976,22 @@ impl Run<'_> {
                 entries,
             } => {
                 let Some(state) = self.pool_state(*pages) else {
-                    return Err(kernels_wgpu::Error::Unsupported {
+                    return Err(kernels_slang::Error::Unsupported {
                         op: "attn.pool_gather",
                     });
                 };
                 kernels_slang::attn::pool::gather(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*boundary_pos)),
-                    crate::encode::slang_tensor(self.tensor(*boundary_req)),
-                    &crate::encode::slang_pool(self.pool(*pages)),
+                    self.ctx,
+                    self.tensor(*boundary_pos),
+                    self.tensor(*boundary_req),
+                    self.pool(*pages),
                     *head_dim,
                     *ratio,
-                    crate::encode::slang_tensor(state.state_kv),
-                    crate::encode::slang_tensor(state.state_score),
-                    ape.map(|id| crate::encode::slang_tensor(self.tensor(id))),
-                    crate::encode::slang_tensor(self.tensor(*entries)),
+                    state.state_kv,
+                    state.state_score,
+                    ape.map(|id| self.tensor(id)),
+                    self.tensor(*entries),
                 )
-                .map_err(crate::encode::from_slang)
             }
 
             Attn::PoolStateWrite {
@@ -880,23 +1004,22 @@ impl Run<'_> {
                 ratio,
             } => {
                 let Some(state) = self.pool_state(*pages) else {
-                    return Err(kernels_wgpu::Error::Unsupported {
+                    return Err(kernels_slang::Error::Unsupported {
                         op: "attn.pool_state_write",
                     });
                 };
                 kernels_slang::attn::pool::state_write(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*kv)),
-                    crate::encode::slang_tensor(self.tensor(*score)),
-                    &crate::encode::slang_pool(self.pool(*pages)),
-                    crate::encode::slang_tensor(self.tensor(*write_page)),
-                    crate::encode::slang_tensor(self.tensor(*write_offset)),
+                    self.ctx,
+                    self.tensor(*kv),
+                    self.tensor(*score),
+                    self.pool(*pages),
+                    self.tensor(*write_page),
+                    self.tensor(*write_offset),
                     *head_dim,
                     *ratio,
-                    crate::encode::slang_tensor(state.state_kv),
-                    crate::encode::slang_tensor(state.state_score),
+                    state.state_kv,
+                    state.state_score,
                 )
-                .map_err(crate::encode::from_slang)
             }
             Attn::PoolKvAppend {
                 entries,
@@ -906,15 +1029,14 @@ impl Run<'_> {
                 write_page,
                 write_offset,
             } => kernels_slang::attn::pool::kv_append(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*entries)),
-                crate::encode::slang_tensor(self.tensor(*boundary_pos)),
-                crate::encode::slang_tensor(self.tensor(*boundary_req)),
-                &crate::encode::slang_pool(self.pool(*into)),
-                crate::encode::slang_tensor(self.tensor(*write_page)),
-                crate::encode::slang_tensor(self.tensor(*write_offset)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*entries),
+                self.tensor(*boundary_pos),
+                self.tensor(*boundary_req),
+                self.pool(*into),
+                self.tensor(*write_page),
+                self.tensor(*write_offset),
+            ),
             Attn::PoolLse {
                 q,
                 positions,
@@ -927,19 +1049,18 @@ impl Run<'_> {
                 o,
                 lse,
             } => kernels_slang::attn::pool::attention_lse(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*q)),
-                crate::encode::slang_tensor(self.tensor(*positions)),
-                crate::encode::slang_tensor(self.tensor(*request_of_token)),
-                &crate::encode::slang_pool(self.pool(*entries)),
+                self.ctx,
+                self.tensor(*q),
+                self.tensor(*positions),
+                self.tensor(*request_of_token),
+                self.pool(*entries),
                 *ratio,
                 *heads,
                 *head_dim,
                 *sm_scale,
-                crate::encode::slang_tensor(self.tensor(*o)),
-                crate::encode::slang_tensor(self.tensor(*lse)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*o),
+                self.tensor(*lse),
+            ),
             Attn::PoolLseSelected {
                 q,
                 positions,
@@ -954,21 +1075,20 @@ impl Run<'_> {
                 o,
                 lse,
             } => kernels_slang::attn::pool::attention_lse_selected(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*q)),
-                crate::encode::slang_tensor(self.tensor(*positions)),
-                crate::encode::slang_tensor(self.tensor(*request_of_token)),
-                crate::encode::slang_tensor(self.tensor(*selection)),
-                &crate::encode::slang_pool(self.pool(*entries)),
+                self.ctx,
+                self.tensor(*q),
+                self.tensor(*positions),
+                self.tensor(*request_of_token),
+                self.tensor(*selection),
+                self.pool(*entries),
                 *ratio,
                 *top_k,
                 *heads,
                 *head_dim,
                 *sm_scale,
-                crate::encode::slang_tensor(self.tensor(*o)),
-                crate::encode::slang_tensor(self.tensor(*lse)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*o),
+                self.tensor(*lse),
+            ),
         }
     }
 }

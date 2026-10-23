@@ -20,8 +20,19 @@ const BM_RUNGS: [u32; 4] = [8, 16, 32, 64];
 
 const BN_RUNGS: [u32; 2] = [16, 32];
 
+/// The contraction the tiled rungs walk a step (`PIE_BK`): a shape whose
+/// contraction is not a whole number of them falls to the vector kernel.
+pub const TILE_K: u32 = 32;
+
 /// The cooperative-matrix tile, square.
 const COOPMAT_TILE: u32 = 64;
+
+/// Whether the tiled rungs are instantiated for banks of `group`-code
+/// groups at `bits` bits.
+#[must_use]
+pub const fn stamped(group: u32, bits: u32) -> bool {
+    matches!(group, 32 | 64 | 128) && matches!(bits, 2 | 4 | 8)
+}
 
 /// The register-tiled rung's column tile.
 const REGISTER_COLS: u32 = 64;
@@ -82,7 +93,7 @@ fn bounds(op: &'static str, act: Tensor, w: Bank, y: Tensor) -> Result<Bounds, E
         act.rows, y.rows,
         "the activation's rows are the rows the result lands"
     );
-    if !matches!(w.group, 32 | 64 | 128) || !matches!(w.bits, 2 | 4 | 8) {
+    if !stamped(w.group, w.bits) {
         return Err(refuse(
             op,
             format!(

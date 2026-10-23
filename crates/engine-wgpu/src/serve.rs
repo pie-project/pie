@@ -249,7 +249,7 @@ struct LandedSeat {
 }
 
 pub struct Shell {
-    tuning: kernels_wgpu::Tuning,
+    tuning: crate::tuning::Tuning,
     device: Context,
 
     pipelines: Pipelines,
@@ -359,7 +359,7 @@ impl Shell {
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
-        let tuning = kernels_wgpu::Tuning::new(chip, device.cores(), device.storage_buffers());
+        let tuning = crate::tuning::Tuning::new(chip, device.cores(), device.storage_buffers());
         let chip = tuning.profile();
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
@@ -2424,21 +2424,25 @@ enum Encoded<'a> {
     Live(Sink<'a>),
 }
 
-impl kernels_wgpu::Encode for Encoded<'_> {
+impl kernels_slang::Encode for Encoded<'_> {
     fn fire(
         &self,
-        fire: kernels_wgpu::Fire,
-        args: &[kernels_wgpu::ArgValue],
-    ) -> std::result::Result<(), kernels_wgpu::Error> {
+        fire: kernels_slang::Fire,
+        args: &[kernels_slang::ArgValue],
+    ) -> std::result::Result<(), kernels_slang::Error> {
         match self {
             Encoded::Live(sink) => sink.fire(fire, args),
         }
     }
 
-    fn absent(&self) -> std::result::Result<kernels_wgpu::ArgValue, kernels_wgpu::Error> {
+    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
         match self {
             Encoded::Live(sink) => sink.absent(),
         }
+    }
+
+    fn target(&self) -> kernels_slang::Target {
+        kernels_slang::Target::Wgsl
     }
 }
 

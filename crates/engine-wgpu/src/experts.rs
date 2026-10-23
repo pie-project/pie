@@ -8,7 +8,7 @@ use poem_ir::{Def, Linear, Operation, Trace, ValueId};
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 
 const RING: usize = 2;
 
@@ -1094,9 +1094,9 @@ impl Gathered {
         &self,
         handles: &Handles,
         host: &HostTier,
-        bank: kernels_wgpu::Bank,
+        bank: kernels_slang::Bank,
         ids: Tensor,
-    ) -> Result<Option<(kernels_wgpu::Bank, Tensor)>> {
+    ) -> Result<Option<(kernels_slang::Bank, Tensor)>> {
         if host.plane(bank.codes.buf).is_none() {
             return Ok(None);
         }

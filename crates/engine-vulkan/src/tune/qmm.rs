@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use kernels_vulkan::tuning::Qmm;
+use crate::tuning::Qmm;
 use profile::Decision as _;
 use profile::Profile;
 use profile::search::{Entries, Line};
@@ -202,7 +202,7 @@ fn forcing(q: &Qmm) -> String {
     }
 }
 
-/// The kernel `kernels_vulkan::linear::quant::ran` names for `q`.
+/// The kernel `kernels_slang::linear::qmm::ran` names for `q`.
 #[cfg(feature = "vulkan")]
 fn kernel(q: &Qmm) -> &'static str {
     match q {
@@ -322,7 +322,7 @@ impl Measured {
 
 /// A point's coordinates in `kernel.qmm`'s variable order.
 fn coords(p: &Point, cores: u32) -> Vec<i64> {
-    let at = kernels_vulkan::tuning::qmm_at(p.rows, p.n, p.k, p.bank.bits, p.bank.group, cores);
+    let at = crate::tuning::qmm_at(p.rows, p.n, p.k, p.bank.bits, p.bank.group, cores);
     vec![at.rows, at.fill, at.n, at.k, at.bits, at.group]
 }
 
@@ -371,7 +371,8 @@ pub use device::measure;
 mod device {
     use std::cell::RefCell;
 
-    use kernels_vulkan::{ArgValue, Encode, Error, Fire, Tensor, Tuning};
+    use crate::tuning::Tuning;
+    use kernels_slang::{ArgValue, Encode, Error, Fire, Target, Tensor};
     use poem_ir::Dtype;
     use profile::{Decision as _, Profile, Source};
 
@@ -387,12 +388,18 @@ mod device {
 
     impl Encode for Watch<'_> {
         fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
-            self.entries.borrow_mut().push(fire.entrypoint);
+            if let Some(key) = kernels_slang::key(fire.entrypoint, fire.tier) {
+                self.entries.borrow_mut().push(key);
+            }
             self.inner.fire(fire, args)
         }
 
         fn absent(&self) -> Result<ArgValue, Error> {
             self.inner.absent()
+        }
+
+        fn target(&self) -> Target {
+            self.inner.target()
         }
     }
 
@@ -589,7 +596,7 @@ mod device {
                     done += 1;
                     let launch = |sink: &dyn Encode, tuning: &Tuning, copy: usize| {
                         let copy = copy % w.codes.len();
-                        let b = kernels_vulkan::Bank {
+                        let b = kernels_slang::Bank {
                             codes: Tensor::new(w.codes[copy], n, k, dtype(bank.bits, bank.group)),
                             scales: Tensor::new(w.scales[copy], n, k / bank.group, Dtype::Bf16),
                             biases: Some(Tensor::new(
@@ -603,14 +610,13 @@ mod device {
                         };
                         let ladder = crate::encode::qmm_ladder(tuning, m, n, k, b);
                         kernels_slang::linear::qmm::matmul(
-                            &crate::encode::Slang(sink),
+                            sink,
                             &ladder,
-                            crate::encode::slang_tensor(Tensor::new(ha, m, k, Dtype::Bf16)),
-                            crate::encode::slang_bank(b),
-                            crate::encode::slang_tensor(Tensor::new(ho, m, n, Dtype::Bf16)),
+                            Tensor::new(ha, m, k, Dtype::Bf16),
+                            b,
+                            Tensor::new(ho, m, n, Dtype::Bf16),
                             cap,
                         )
-                        .map_err(crate::encode::from_slang)
                     };
                     let mut live: Vec<usize> = Vec::new();
                     for (c, q) in kept.iter().enumerate() {

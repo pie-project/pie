@@ -1,12 +1,10 @@
-//! The n-gram hashers on the first wgpu adapter, beside the hand-written kernels,
-//! against a host reference in wrapping u64: the decode form (a token a
-//! lane) and the chunked form (a request's run a lane), with an
-//! end-of-sequence id cutting a window and an empty request; the ids and the
-//! rolled recurrent state are compared exactly.
+//! The n-gram hashers on the first wgpu adapter, against a host reference in
+//! wrapping u64: the decode form (a token a lane) and the chunked form (a
+//! request's run a lane), with an end-of-sequence id cutting a window and an
+//! empty request; the ids and the rolled recurrent state are compared
+//! exactly.
 
-use kernels_wgpu::attn::ple;
-use kernels_wgpu::tensor::RecurrentPool;
-use kernels_wgpu::{RaggedTensor, Tensor};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::Gpu;
@@ -61,9 +59,8 @@ fn the_ngram_hashers_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let t = |buf: u32, r: usize, w: usize, d: Dtype| Tensor::new(buf, r as u32, w as u32, d);
-    let plane: Vec<u32> = ple::hash_constants(&MULTS, &PRIMES, &OFFSETS)
+    let plane: Vec<u32> = kernels_slang::gather::ngram::hash_constants(&MULTS, &PRIMES, &OFFSETS)
         .iter()
         .flat_map(|v| [*v as u32, (*v >> 32) as u32])
         .collect();
@@ -71,13 +68,6 @@ fn the_ngram_hashers_answer_the_reference() {
     let ht = t(hb, 1, MULTS.len() + 2 * HEADS, Dtype::U64);
     // Three slots of window state, `id + 1` with 0 for none yet.
     let state0 = [0i32, 0, 41, 120_001, 3, 3];
-    let pool = |state: u32, slots: u32, rows: usize| RecurrentPool {
-        state: t(state, 3, SPAN, Dtype::I32),
-        slots: t(slots, rows, 1, Dtype::U32),
-        conv_state: t(state, 3, SPAN, Dtype::I32),
-        new_conv_state: t(state, 3, SPAN, Dtype::I32),
-    };
-
     // Decode: lane r is slot slots[r].
     // Vocabulary-sized ids, so the 64-bit products carry between halves.
     let ids = [151_000i32, 5, 99_999];
@@ -92,50 +82,31 @@ fn the_ngram_hashers_answer_the_reference() {
         slab[SPAN - 1] = id + 1;
     }
     let (ib, sb) = (gpu.up_i32(&ids), gpu.up_u32(&slots));
-    for slang in [false, true] {
-        let who = if slang { "slang " } else { "" };
-        let (state, out) = (gpu.up_i32(&state0), gpu.up_i32(&[0; 3 * HEADS]));
-        let (it, ot) = (t(ib, 3, 1, Dtype::I32), t(out, 3, HEADS, Dtype::I32));
-        if slang {
-            gpu.run_slang(|c| {
-                kernels_slang::gather::ngram::ngram_ids(
-                    c,
-                    st(it),
-                    st(t(state, 3, SPAN, Dtype::I32)),
-                    st(t(sb, 3, 1, Dtype::U32)),
-                    st(ht),
-                    EOS as u32,
-                    &MULTS,
-                    &PRIMES,
-                    &OFFSETS,
-                    HEADS_PER as u32,
-                    st(ot),
-                )
-            });
-        } else {
-            gpu.run(|c| {
-                ple::ngram_ids(
-                    c,
-                    it,
-                    &pool(state, sb, 3),
-                    ht,
-                    EOS as u32,
-                    &MULTS,
-                    &PRIMES,
-                    &OFFSETS,
-                    HEADS_PER as u32,
-                    ot,
-                )
-            });
-        }
-        assert_eq!(ints(&gpu, out, 3 * HEADS), want, "{who}ngram ids, decode");
-        assert_eq!(
-            ints(&gpu, state, 3 * SPAN),
-            want_state,
-            "{who}ngram state, decode"
-        );
-        eprintln!("{who}ngram decode: exact");
-    }
+    let (state, out) = (gpu.up_i32(&state0), gpu.up_i32(&[0; 3 * HEADS]));
+    let (it, ot) = (t(ib, 3, 1, Dtype::I32), t(out, 3, HEADS, Dtype::I32));
+    gpu.run(|c| {
+        kernels_slang::gather::ngram::ngram_ids(
+            c,
+            it,
+            t(state, 3, SPAN, Dtype::I32),
+            t(sb, 3, 1, Dtype::U32),
+            ht,
+            EOS as u32,
+            &MULTS,
+            &PRIMES,
+            &OFFSETS,
+            HEADS_PER as u32,
+            ot,
+        )
+    });
+
+    assert_eq!(ints(&gpu, out, 3 * HEADS), want, "ngram ids, decode");
+    assert_eq!(
+        ints(&gpu, state, 3 * SPAN),
+        want_state,
+        "ngram state, decode"
+    );
+    eprintln!("ngram decode: exact");
 
     // Chunked: requests of 4, 0 and 3 tokens; a request's slot is its first
     // token's.
@@ -174,57 +145,34 @@ fn the_ngram_hashers_answer_the_reference() {
         slab.copy_from_slice(&next);
     }
     let (ib, pb, sb) = (gpu.up_i32(&ids), gpu.up_i32(&indptr), gpu.up_u32(&slots));
-    for slang in [false, true] {
-        let who = if slang { "slang " } else { "" };
-        let (state, out) = (gpu.up_i32(&state0), gpu.up_i32(&[0; 7 * HEADS]));
-        let (it, pt, ot) = (
-            t(ib, 7, 1, Dtype::I32),
-            t(pb, 4, 1, Dtype::I32),
-            t(out, 7, HEADS, Dtype::I32),
-        );
-        if slang {
-            gpu.run_slang(|c| {
-                kernels_slang::gather::ngram::ngram_ids_chunked(
-                    c,
-                    st(it),
-                    st(pt),
-                    st(t(state, 3, SPAN, Dtype::I32)),
-                    st(t(sb, 7, 1, Dtype::U32)),
-                    st(ht),
-                    EOS as u32,
-                    &MULTS,
-                    &PRIMES,
-                    &OFFSETS,
-                    HEADS_PER as u32,
-                    st(ot),
-                )
-            });
-        } else {
-            let ragged = RaggedTensor {
-                data: it,
-                indptr: pt,
-            };
-            gpu.run(|c| {
-                ple::ngram_ids_chunked(
-                    c,
-                    ragged,
-                    &pool(state, sb, 7),
-                    ht,
-                    EOS as u32,
-                    &MULTS,
-                    &PRIMES,
-                    &OFFSETS,
-                    HEADS_PER as u32,
-                    ot,
-                )
-            });
-        }
-        assert_eq!(ints(&gpu, out, 7 * HEADS), want, "{who}ngram ids, chunked");
-        assert_eq!(
-            ints(&gpu, state, 3 * SPAN),
-            want_state,
-            "{who}ngram state, chunked"
-        );
-        eprintln!("{who}ngram chunked: exact");
-    }
+    let (state, out) = (gpu.up_i32(&state0), gpu.up_i32(&[0; 7 * HEADS]));
+    let (it, pt, ot) = (
+        t(ib, 7, 1, Dtype::I32),
+        t(pb, 4, 1, Dtype::I32),
+        t(out, 7, HEADS, Dtype::I32),
+    );
+    gpu.run(|c| {
+        kernels_slang::gather::ngram::ngram_ids_chunked(
+            c,
+            it,
+            pt,
+            t(state, 3, SPAN, Dtype::I32),
+            t(sb, 7, 1, Dtype::U32),
+            ht,
+            EOS as u32,
+            &MULTS,
+            &PRIMES,
+            &OFFSETS,
+            HEADS_PER as u32,
+            ot,
+        )
+    });
+
+    assert_eq!(ints(&gpu, out, 7 * HEADS), want, "ngram ids, chunked");
+    assert_eq!(
+        ints(&gpu, state, 3 * SPAN),
+        want_state,
+        "ngram state, chunked"
+    );
+    eprintln!("ngram chunked: exact");
 }
