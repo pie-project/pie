@@ -25,10 +25,10 @@
 use dtype::Dtype;
 
 use super::{DecodePlan, PrefillPlan};
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Val};
-use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored, Tensor};
+use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored};
 use crate::tuning::Chunks;
 use crate::tuning::Tuning;
 
@@ -1356,7 +1356,7 @@ pub fn plan_prefill<T: Stored>(
 
 /// The fire tables an attention reads, whichever plan carried them.
 #[derive(Clone, Copy, Debug)]
-pub struct Tables<T = Tensor> {
+pub struct Tables<T> {
     pub positions: T,
     pub request_of_token: T,
     pub mask: T,
@@ -1530,7 +1530,7 @@ pub(crate) enum Walk {
 /// handles (`T`) and landings (`L`), read by [`Paged::try_map`] into the
 /// operands [`attend`] takes.
 #[derive(Clone, Copy, Debug)]
-pub struct Paged<T = Tensor, L = T> {
+pub struct Paged<T, L = T> {
     pub op: &'static str,
     pub q: T,
     pub tables: Tables<T>,

@@ -3,10 +3,12 @@
 //! it returns in the result handles, converted to their dtype and reshaped
 //! to their rows. Where data lives is the engine's; the kernel only emits.
 
+use crate::emit::{Ctx, Cx};
+use crate::handle::{RaggedTensor, Tensor};
+use kernels_xla::Error;
 use kernels_xla::hlo::{Func, Val};
-use kernels_xla::tensor::{Operand, RaggedTensor, Tensor};
+use kernels_xla::tensor::Operand;
 use kernels_xla::tuning::Tuning;
-use kernels_xla::{Ctx, Cx, Error};
 
 /// A kernel call under construction.
 pub struct Lower<'a, 'b> {
@@ -46,7 +48,7 @@ impl Lower<'_, '_> {
     /// kernel reads for such a bank.
     pub fn bank(
         &mut self,
-        w: kernels_xla::tensor::Bank,
+        w: crate::handle::Bank,
     ) -> Result<kernels_xla::tensor::Bank<Operand>, Error> {
         if w.codes.dtype != dtype::Dtype::E5m2 {
             return w.try_map(|t| self.read(t));
@@ -68,7 +70,10 @@ impl Lower<'_, '_> {
     }
 
     /// A ragged tensor's data, then its indptr.
-    pub fn ragged(&mut self, r: RaggedTensor) -> Result<RaggedTensor<Operand>, Error> {
+    pub fn ragged(
+        &mut self,
+        r: RaggedTensor,
+    ) -> Result<kernels_xla::tensor::RaggedTensor<Operand>, Error> {
         r.try_map(|t| self.read(t))
     }
 
@@ -123,9 +128,10 @@ pub fn lower(
 /// kernel's view says (`bank_view`, `kquant::view`, `nvfp4::views`), in the
 /// order the kernel consumes them.
 pub mod linear {
+    use crate::emit::Ctx;
+    use crate::handle::{Bank, Tensor};
+    use kernels_xla::Error;
     use kernels_xla::linear::{decode, kquant, nvfp4, quant};
-    use kernels_xla::tensor::{Bank, Tensor};
-    use kernels_xla::{Ctx, Error};
 
     use super::lower;
 

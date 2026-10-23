@@ -44,7 +44,7 @@
 
 use dtype::Dtype;
 
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, GatherDims, Ty, Val};
 use crate::linear::quant::{
@@ -802,7 +802,7 @@ fn stored_codes(op: &'static str, codes: impl Stored, bits: u32) -> Result<u64, 
         }
         return Ok(u64::from(codes.rows()) * per);
     }
-    match crate::cx::elem_of(op, codes.dtype()) {
+    match crate::check::elem_of(op, codes.dtype()) {
         Ok(e) if e.is_int() => Ok(codes.elements() * u64::from(e.bits()) / u64::from(bits)),
         _ => Err(refuse(
             op,

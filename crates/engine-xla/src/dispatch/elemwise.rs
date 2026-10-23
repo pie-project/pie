@@ -1,4 +1,5 @@
-use kernels_xla::{Tensor, elemwise};
+use crate::handle::Tensor;
+use kernels_xla::elemwise;
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, ModulateForm, MropeForm, RopeForm, ValueId};
 use poem_ir::{NormAxis, NormWeight};

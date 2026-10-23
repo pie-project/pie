@@ -23,7 +23,7 @@ const GROUP_CODES: u32 = 16;
 /// `U8 [n, k / 2]` bytes, the scales as their bytes. The engine reads these
 /// views.
 pub fn views<T: Stored>(codes: T, scales: T, k: u32) -> (T, T) {
-    let codes = if crate::cx::elem_of("linear.nvfp4", codes.dtype()).is_err() {
+    let codes = if crate::check::elem_of("linear.nvfp4", codes.dtype()).is_err() {
         codes.with_width(k / 2).with_dtype(Dtype::U8)
     } else {
         codes

@@ -4,7 +4,7 @@
 //! and Kimi's KDA, each in its decode (one row per lane), chunked (a query
 //! CSR of lanes) and committed (a rollback seat's extended window) form.
 //!
-//! State lives in a [`RecurrentPool`]: one slab row per slot. A fire gathers
+//! State lives in a [`RecurrentPool`](crate::tensor::RecurrentPool): one slab row per slot. A fire gathers
 //! its lanes' rows, computes, and scatters the new rows back; a lane whose
 //! write must not land is routed to an out-of-range slot, which XLA's scatter
 //! drops.
@@ -20,7 +20,7 @@ pub mod dyn_conv;
 
 use dtype::Dtype;
 
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, Val};
 use crate::lanes::{

@@ -14,16 +14,16 @@
 
 pub mod kv;
 
+use crate::handle::{KvPool, RecurrentPool, Tensor};
 use engine::transfer::KvRun;
 use kernels_xla::hlo::Elem;
-use kernels_xla::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{CacheRow, Dtype, Trace};
 
 use crate::device::Device;
+use crate::emit::Emit;
 use crate::error::{Fault, Result};
 use crate::pjrt::Buffer;
 use crate::store::kv::{Facts, Paging};
-use kernels_xla::Emit;
 
 use crate::trace::{Handles, Root, Source, Tracer};
 
@@ -803,7 +803,7 @@ fn indices(handles: &Handles, values: &[i64]) -> (crate::inputs::Inputs, Tensor)
 
 /// Entry `i` of an `indices` input, times `scale`, as an i32 scalar.
 fn index_at(
-    cx: &mut kernels_xla::Cx<'_>,
+    cx: &mut crate::emit::Cx<'_>,
     at: Tensor,
     i: i64,
     scale: i64,

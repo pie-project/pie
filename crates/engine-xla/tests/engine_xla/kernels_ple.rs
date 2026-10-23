@@ -2,9 +2,9 @@
 
 use dtype::Dtype;
 use engine_xla::bench::Bench;
+use engine_xla::handle::Committed;
+use engine_xla::handle::{RaggedTensor, RecurrentPool, Tensor};
 use kernels_xla::gather::ngram;
-use kernels_xla::lanes::Committed;
-use kernels_xla::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
 const MULTS: [u64; 3] = [
@@ -193,7 +193,7 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
                 let slots = l.read(p.slots)?;
                 let (rows, next) = ngram::ngram_ids_chunked(
                     l.f(),
-                    RaggedTensor { data, indptr },
+                    kernels_xla::tensor::RaggedTensor { data, indptr },
                     slab,
                     slots,
                     EOS as u32,
@@ -254,7 +254,7 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
                 let state_v = l.read(p.state)?;
                 let map_v = l.read_opt(with_map.then_some(mt))?;
                 let indptr_v = l.read(ip)?;
-                let seat_v = Committed {
+                let seat_v = kernels_xla::lanes::Committed {
                     replay: l.read(seat.replay)?,
                     commit: l.read(seat.commit)?,
                     slots: l.read(seat.slots)?,

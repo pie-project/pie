@@ -2,8 +2,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::lanes::Committed;
-use kernels_xla::{RaggedTensor, RecurrentPool, Tensor};
+use engine_xla::handle::Committed;
+use engine_xla::handle::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
 
@@ -36,15 +36,20 @@ fn silu(z: f32) -> f32 {
 /// pool. The tests drive them through these, with handles and a pool.
 #[allow(clippy::too_many_arguments)]
 mod ssm {
+    use engine_xla::emit::Ctx;
+    use engine_xla::handle::Committed;
+    use engine_xla::handle::{RaggedTensor, RecurrentPool, Tensor};
     use engine_xla::lower::{Lower, lower};
-    use kernels_xla::lanes::Committed;
+    use kernels_xla::Error;
     use kernels_xla::tensor::Operand;
-    use kernels_xla::{Ctx, Error, RaggedTensor, RecurrentPool, Tensor};
 
     pub use kernels_xla::ssm::dyn_conv;
 
-    fn seat(l: &mut Lower<'_, '_>, s: &Committed) -> Result<Committed<Operand>, Error> {
-        Ok(Committed {
+    fn seat(
+        l: &mut Lower<'_, '_>,
+        s: &Committed,
+    ) -> Result<kernels_xla::lanes::Committed<Operand>, Error> {
+        Ok(kernels_xla::lanes::Committed {
             replay: l.read(s.replay)?,
             commit: l.read(s.commit)?,
             slots: l.read(s.slots)?,
@@ -90,7 +95,7 @@ mod ssm {
             let slots = l.read(p.slots)?;
             let (yv, next) = kernels_xla::ssm::short_conv_chunked(
                 l.f(),
-                RaggedTensor { data, indptr },
+                kernels_xla::tensor::RaggedTensor { data, indptr },
                 w,
                 bank,
                 slots,
@@ -142,7 +147,7 @@ mod ssm {
             let slots = l.read(p.slots)?;
             let (yv, next) = kernels_xla::ssm::causal_conv1d_chunked(
                 l.f(),
-                RaggedTensor { data, indptr },
+                kernels_xla::tensor::RaggedTensor { data, indptr },
                 w,
                 bank,
                 slots,
@@ -261,7 +266,7 @@ mod ssm {
             let tuning = l.tuning();
             let (yv, next) = kernels_xla::ssm::gated_delta_chunked(
                 l.f(),
-                RaggedTensor { data, indptr },
+                kernels_xla::tensor::RaggedTensor { data, indptr },
                 gates,
                 slab,
                 slots,
@@ -386,7 +391,7 @@ mod ssm {
             let tuning = l.tuning();
             let (yv, next) = kernels_xla::ssm::kda_chunked(
                 l.f(),
-                RaggedTensor { data, indptr },
+                kernels_xla::tensor::RaggedTensor { data, indptr },
                 fv,
                 bv,
                 dt,

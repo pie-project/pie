@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use dtype::Dtype;
 
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::Func;
 use crate::hlo::{Elem, Val};

@@ -2,9 +2,9 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
+use engine_xla::handle::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor};
 use engine_xla::lower::attn as low;
 use kernels_xla::attn::{self, arbiter};
-use kernels_xla::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor};
 
 // ------------------------------------------------------------------ fixtures
 
@@ -12,7 +12,7 @@ use kernels_xla::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor};
 /// indptr, the positions, its data, the keys plane, the slab.
 #[allow(clippy::too_many_arguments)]
 fn capture(
-    ctx: &kernels_xla::Ctx<'_>,
+    ctx: &engine_xla::emit::Ctx<'_>,
     q: RaggedTensor,
     plan: &PrefillPlan,
     kv: &KvPool,
@@ -39,7 +39,7 @@ fn capture(
         let tuning = l.tuning();
         let v = attn::score::capture(
             l.f(),
-            RaggedTensor { data, indptr },
+            kernels_xla::tensor::RaggedTensor { data, indptr },
             positions,
             keys,
             page_indptr,

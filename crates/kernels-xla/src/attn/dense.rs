@@ -5,7 +5,7 @@
 use dtype::Dtype;
 
 use super::paged::{Heads, Planes, Rows, Rule, blocked, flat_i32, nonzero, row_heads, with_i};
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, Val};
 use crate::tensor::{Landing, Operand, Stored};

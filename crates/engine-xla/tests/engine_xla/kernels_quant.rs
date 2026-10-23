@@ -7,9 +7,9 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
+use engine_xla::handle::{Bank, Tensor};
 use kernels_xla::hlo::f16_bits;
 use kernels_xla::linear::kquant;
-use kernels_xla::{Bank, Tensor};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
