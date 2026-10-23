@@ -11,6 +11,7 @@ pub mod encode;
 pub mod error;
 pub mod gather;
 pub mod linear;
+pub mod runtime;
 pub mod sampling;
 pub mod sources;
 pub mod tensor;

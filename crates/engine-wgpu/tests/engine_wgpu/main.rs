@@ -6,4 +6,5 @@ mod elemwise;
 mod gather;
 mod gpu;
 mod linear;
+mod runtime;
 mod sampling;
