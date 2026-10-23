@@ -319,6 +319,23 @@ impl kernels_slang::Encode for Slang<'_> {
             ArgValue::F32(v) => Ok(kernels_slang::ArgValue::F32(v)),
         }
     }
+
+    fn comm(
+        &self,
+        op: &'static str,
+    ) -> std::result::Result<kernels_slang::Comm, kernels_slang::Error> {
+        let comm = self.0.comm(op).map_err(slang_error)?;
+        Ok(kernels_slang::Comm {
+            rank: comm.rank,
+            world: comm.world,
+            band: comm.band.buf,
+            slot_bytes: comm.slot_bytes,
+        })
+    }
+
+    fn rendezvous(&self, op: &'static str) -> std::result::Result<(), kernels_slang::Error> {
+        self.0.rendezvous(op).map_err(slang_error)
+    }
 }
 
 fn vulkan_arg(arg: kernels_slang::ArgValue) -> ArgValue {

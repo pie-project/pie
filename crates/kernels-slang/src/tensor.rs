@@ -76,3 +76,16 @@ pub struct KvPool {
 
     pub head_stride: u64,
 }
+
+/// A communicator as a device's collectives see it: this rank, the ranks,
+/// and the band every rank reads, `slot_bytes` of it a rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Comm {
+    pub rank: u32,
+
+    pub world: u32,
+
+    pub band: u32,
+
+    pub slot_bytes: u32,
+}

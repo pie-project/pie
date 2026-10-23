@@ -1,27 +1,25 @@
-use kernels_vulkan::collective;
+use kernels_slang::collective::band;
 use poem_exec::{DispatchCollective, KernelError};
 use poem_ir::Collective;
 
+use crate::encode::{from_slang, slang_tensor};
 use crate::run::Run;
 
 impl DispatchCollective for Run<'_> {
     fn dispatch(&mut self, op: &Collective) -> Result<(), KernelError> {
-        self.collective(op).map_err(crate::error::kernel)
+        self.collective(op)
+            .map_err(from_slang)
+            .map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn collective(&mut self, op: &Collective) -> Result<(), kernels_vulkan::Error> {
+    fn collective(&mut self, op: &Collective) -> Result<(), kernels_slang::Error> {
+        let t = |id| slang_tensor(self.tensor(id));
         match op {
-            Collective::AllReduce { buf, buf_out: _ } => {
-                collective::all_reduce(self.ctx(), self.tensor(*buf))
-            }
-            Collective::AllGather { x, y } => {
-                collective::all_gather(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
-            Collective::ReduceScatter { x, y } => {
-                collective::reduce_scatter(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
+            Collective::AllReduce { buf, buf_out: _ } => band::all_reduce(&self.slang(), t(*buf)),
+            Collective::AllGather { x, y } => band::all_gather(&self.slang(), t(*x), t(*y)),
+            Collective::ReduceScatter { x, y } => band::reduce_scatter(&self.slang(), t(*x), t(*y)),
         }
     }
 }
