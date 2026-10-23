@@ -34,16 +34,24 @@ impl Run<'_> {
                 segment: how,
                 sm_scale,
                 o,
-            } => kernels_xla::attn::voxel::attention(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                segment(*how),
-                *sm_scale,
-                self.tensor(*o),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let grid_v = l.read(self.tensor(*grid))?;
+                let q_v = l.read(self.tensor(*q))?;
+                let k_v = l.read(self.tensor(*k))?;
+                let v_v = l.read(self.tensor(*v))?;
+                let o_y = self.tensor(*o);
+                let v = kernels_xla::attn::voxel::attention(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    v_v,
+                    grid_v,
+                    segment(*how),
+                    *sm_scale,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
@@ -1078,7 +1086,7 @@ impl Run<'_> {
         match self.banked(w) {
             Some(bank) => {
                 let out = self.temp(n, k, poem_ir::Dtype::Bf16);
-                kernels_xla::linear::decode::decoded_plane(self.ctx(), op, bank, out)?;
+                crate::lower::linear::decoded_plane(self.ctx(), op, bank, out)?;
                 Ok(out)
             }
             None => Ok(self.tensor(w)),

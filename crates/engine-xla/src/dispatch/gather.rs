@@ -26,18 +26,31 @@ impl Run<'_> {
                 heads_per_ngram,
                 map,
                 ngram_ids,
-            } => gather::ngram::ngram_ids(
-                self.ctx(),
-                self.tensor(*ids),
-                &self.recurrent(*state),
-                *eos,
-                mults,
-                primes,
-                offsets,
-                *heads_per_ngram,
-                map.map(|m| self.tensor(m)),
-                self.tensor(*ngram_ids),
-            ),
+            } => {
+                let pool = self.recurrent(*state);
+                let out = self.tensor(*ngram_ids);
+                crate::lower::lower(self.ctx(), |l| {
+                    let ids = l.read(self.tensor(*ids))?;
+                    let slab = l.read(pool.state)?;
+                    let map = l.read_opt(map.map(|m| self.tensor(m)))?;
+                    let slots = l.read(pool.slots)?;
+                    let (rows, next) = gather::ngram::ngram_ids(
+                        l.f(),
+                        ids,
+                        slab,
+                        slots,
+                        *eos,
+                        mults,
+                        primes,
+                        offsets,
+                        *heads_per_ngram,
+                        map,
+                        out.landing(),
+                    )?;
+                    l.land(out, rows)?;
+                    l.land(pool.state, next)
+                })
+            }
             Gather::NgramIdsChunked {
                 ids,
                 state,
@@ -48,45 +61,67 @@ impl Run<'_> {
                 heads_per_ngram,
                 map,
                 ngram_ids,
-            } => gather::ngram::ngram_ids_chunked(
-                self.ctx(),
-                self.ragged(*ids),
-                &self.recurrent(*state),
-                *eos,
-                mults,
-                primes,
-                offsets,
-                *heads_per_ngram,
-                map.map(|m| self.tensor(m)),
-                self.tensor(*ngram_ids),
-            ),
+            } => {
+                let pool = self.recurrent(*state);
+                let ids = self.ragged(*ids);
+                let out = self.tensor(*ngram_ids);
+                crate::lower::lower(self.ctx(), |l| {
+                    let data = l.read(ids.data)?;
+                    let slab = l.read(pool.state)?;
+                    let map = l.read_opt(map.map(|m| self.tensor(m)))?;
+                    let indptr = l.read(ids.indptr)?;
+                    let slots = l.read(pool.slots)?;
+                    let (rows, next) = gather::ngram::ngram_ids_chunked(
+                        l.f(),
+                        kernels_xla::RaggedTensor { data, indptr },
+                        slab,
+                        slots,
+                        *eos,
+                        mults,
+                        primes,
+                        offsets,
+                        *heads_per_ngram,
+                        map,
+                        out.landing(),
+                    )?;
+                    l.land(out, rows)?;
+                    l.land(pool.state, next)
+                })
+            }
             Gather::Embed {
                 ids,
                 table,
                 vocab,
                 y,
             } => match self.banked(*table) {
-                Some(bank) => gather::embed_gather_mb_4bit(
-                    self.ctx(),
-                    self.tensor(*ids),
-                    bank,
-                    *vocab,
-                    self.tensor(*y),
-                ),
-                None if self.tensor(*table).rows < *vocab => gather::embed_vocab_shard(
-                    self.ctx(),
-                    self.tensor(*ids),
-                    self.tensor(*table),
-                    self.rank(),
-                    self.tensor(*y),
-                ),
-                None => gather::embed(
-                    self.ctx(),
-                    self.tensor(*ids),
-                    self.tensor(*table),
-                    *vocab,
-                    self.tensor(*y),
-                ),
+                Some(bank) => crate::lower::lower(self.ctx(), |l| {
+                    let ids_v = l.read(self.tensor(*ids))?;
+                    let table_v = l.bank(bank)?;
+                    let o_y = self.tensor(*y);
+                    let v =
+                        gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, *vocab, o_y.landing())?;
+                    l.land(o_y, v)
+                }),
+                None if self.tensor(*table).rows < *vocab => crate::lower::lower(self.ctx(), |l| {
+                    let ids_v = l.read(self.tensor(*ids))?;
+                    let table_v = l.read(self.tensor(*table))?;
+                    let o_y = self.tensor(*y);
+                    let v = gather::embed_vocab_shard(
+                        l.f(),
+                        ids_v,
+                        table_v,
+                        self.rank(),
+                        o_y.landing(),
+                    )?;
+                    l.land(o_y, v)
+                }),
+                None => crate::lower::lower(self.ctx(), |l| {
+                    let ids_v = l.read(self.tensor(*ids))?;
+                    let table_v = l.read(self.tensor(*table))?;
+                    let o_y = self.tensor(*y);
+                    let v = gather::embed(l.f(), ids_v, table_v, *vocab, o_y.landing())?;
+                    l.land(o_y, v)
+                }),
             },
 
             Gather::EmbedConcat {
@@ -105,18 +140,30 @@ impl Run<'_> {
                     let ids = self.tensor(*ids);
                     let width = self.tensor(*y).width / ids.width.max(1);
                     let guard = gather::table_rows(&bank, width).min(*vocab);
-                    gather::embed_concat_mb_4bit(self.ctx(), ids, bank, guard, self.tensor(*y))
+                    crate::lower::lower(self.ctx(), |l| {
+                        let ids_v = l.read(ids)?;
+                        let table_v = l.bank(bank)?;
+                        let o_y = self.tensor(*y);
+                        let v = gather::embed_concat_mb_4bit(
+                            l.f(),
+                            ids_v,
+                            table_v,
+                            guard,
+                            o_y.landing(),
+                        )?;
+                        l.land(o_y, v)
+                    })
                 }
                 None => {
                     let plane = self.tensor(*table);
                     let guard = plane.rows.min(*vocab);
-                    gather::embed_concat(
-                        self.ctx(),
-                        self.tensor(*ids),
-                        plane,
-                        guard,
-                        self.tensor(*y),
-                    )
+                    crate::lower::lower(self.ctx(), |l| {
+                        let ids_v = l.read(self.tensor(*ids))?;
+                        let table_v = l.read(plane)?;
+                        let o_y = self.tensor(*y);
+                        let v = gather::embed_concat(l.f(), ids_v, table_v, guard, o_y.landing())?;
+                        l.land(o_y, v)
+                    })
                 }
             },
             Gather::SplitQkv {
@@ -126,47 +173,74 @@ impl Run<'_> {
                 q,
                 k,
                 v,
-            } => gather::split_qkv(
-                self.ctx(),
-                self.tensor(*packed),
-                *q_width,
-                *kv_width,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let packed_v = l.read(self.tensor(*packed))?;
+                let o_q = self.tensor(*q);
+                let o_k = self.tensor(*k);
+                let o_v = self.tensor(*v);
+                let (v0, v1, v2) = gather::split_qkv(
+                    l.f(),
+                    packed_v,
+                    *q_width,
+                    *kv_width,
+                    o_q.landing(),
+                    o_k.landing(),
+                    o_v.landing(),
+                )?;
+                l.land(o_q, v0)?;
+                l.land(o_k, v1)?;
+                l.land(o_v, v2)?;
+                Ok(())
+            }),
             Gather::SplitQGate {
                 packed,
                 head_dim,
                 q,
                 gate,
-            } => gather::split_q_gate(
-                self.ctx(),
-                self.tensor(*packed),
-                *head_dim,
-                self.tensor(*q),
-                self.tensor(*gate),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let packed_v = l.read(self.tensor(*packed))?;
+                let o_q = self.tensor(*q);
+                let o_gate = self.tensor(*gate);
+                let (v0, v1) = gather::split_q_gate(
+                    l.f(),
+                    packed_v,
+                    *head_dim,
+                    o_q.landing(),
+                    o_gate.landing(),
+                )?;
+                l.land(o_q, v0)?;
+                l.land(o_gate, v1)?;
+                Ok(())
+            }),
             Gather::SplitRows {
                 x,
                 width,
                 left,
                 right,
-            } => gather::split_rows(
-                self.ctx(),
-                self.tensor(*x),
-                *width,
-                self.tensor(*left),
-                self.tensor(*right),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_left = self.tensor(*left);
+                let o_right = self.tensor(*right);
+                let (v0, v1) =
+                    gather::split_rows(l.f(), x_v, *width, o_left.landing(), o_right.landing())?;
+                l.land(o_left, v0)?;
+                l.land(o_right, v1)?;
+                Ok(())
+            }),
 
-            Gather::PoolRows { x, side, y } => {
-                gather::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
-            }
+            Gather::PoolRows { x, side, y } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = gather::pool_rows(l.f(), x_v, *side, o_y.landing())?;
+                l.land_head(o_y, v)
+            }),
 
-            Gather::MergeRows { x, side, y } => {
-                gather::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
-            }
+            Gather::MergeRows { x, side, y } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = gather::merge_rows(l.f(), x_v, *side, o_y.landing())?;
+                l.land_head(o_y, v)
+            }),
 
             Gather::Pixels {
                 x,
@@ -176,16 +250,23 @@ impl Run<'_> {
                 order,
                 temporal,
                 y,
-            } => gather::pixels(
-                self.ctx(),
-                self.tensor(*x),
-                *patch,
-                *mean,
-                *std,
-                *order == poem_ir::PixelOrder::Chw,
-                *temporal,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                if let Some(v) = gather::pixels(
+                    l.f(),
+                    x_v,
+                    *patch,
+                    *mean,
+                    *std,
+                    *order == poem_ir::PixelOrder::Chw,
+                    *temporal,
+                    o_y.landing(),
+                )? {
+                    l.land_head(o_y, v)?;
+                }
+                Ok(())
+            }),
 
             Gather::ConcatCols { .. } | Gather::SplitQkvPadded { .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
@@ -198,28 +279,49 @@ impl Run<'_> {
                 side,
                 ids,
                 weights,
-            } => gather::grid_taps(
-                self.ctx(),
-                self.tensor(*positions),
-                self.tensor(*grids),
-                self.tensor(*segments),
-                *kind == poem_ir::TapKind::Bilinear,
-                *side,
-                self.tensor(*ids),
-                self.tensor(*weights),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let positions_v = l.read(self.tensor(*positions))?;
+                let (grids, segments) = (self.tensor(*grids), self.tensor(*segments));
+                let bilinear = if *kind == poem_ir::TapKind::Bilinear {
+                    let segments = l.read(segments)?;
+                    Some(gather::Bilinear {
+                        segments,
+                        grids: l.read(grids)?,
+                    })
+                } else {
+                    None
+                };
+                let o_ids = self.tensor(*ids);
+                let o_weights = self.tensor(*weights);
+                if let Some((v0, v1)) = gather::grid_taps(
+                    l.f(),
+                    positions_v,
+                    grids,
+                    segments,
+                    bilinear,
+                    *side,
+                    o_ids.landing(),
+                    o_weights.landing(),
+                )? {
+                    l.land_head(o_ids, v0)?;
+                    l.land_head(o_weights, v1)?;
+                }
+                Ok(())
+            }),
 
             Gather::ScatterLiveRows {
                 src,
                 routes,
                 y,
                 y_out: _,
-            } => gather::scatter_live_rows(
-                self.ctx(),
-                self.tensor(*src),
-                self.tensor(*routes),
-                self.uncut(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let routes_v = l.read(self.tensor(*routes))?;
+                let src_v = l.read(self.tensor(*src))?;
+                let y_v = l.read(self.uncut(*y))?;
+                let o_y = self.uncut(*y);
+                let v = gather::scatter_live_rows(l.f(), src_v, routes_v, y_v)?;
+                l.land(o_y, v)
+            }),
 
             Gather::EmbedWeighted {
                 ids,
@@ -227,57 +329,69 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
-            } => gather::embed_weighted(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*weights),
-                self.tensor(*table),
-                *vocab,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let table_v = l.read(self.tensor(*table))?;
+                let ids_v = l.read(self.tensor(*ids))?;
+                let weights_v = l.read(self.tensor(*weights))?;
+                let o_y = self.tensor(*y);
+                let v = gather::embed_weighted(
+                    l.f(),
+                    ids_v,
+                    weights_v,
+                    table_v,
+                    *vocab,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
 
             Gather::ScatterRows {
                 src,
                 routes,
                 y,
                 y_out: _,
-            } => gather::scatter_rows(
-                self.ctx(),
-                self.tensor(*src),
-                self.tensor(*routes),
-                self.uncut(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let index_v = l.read(self.tensor(*routes))?;
+                let tight_v = l.read(self.tensor(*src))?;
+                let wide_v = l.read(self.uncut(*y))?;
+                let o_wide = self.uncut(*y);
+                let v = gather::scatter_rows(l.f(), tight_v, index_v, wide_v)?;
+                l.land(o_wide, v)
+            }),
 
-            Gather::PackRows { x, perm, y } => gather::pack_rows(
-                self.ctx(),
-                self.uncut(*x),
-                self.tensor(*perm),
-                self.tensor(*y),
-            ),
-            Gather::UnpackRows { x, perm, y } => gather::unpack_rows(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*perm),
-                self.uncut(*y),
-            ),
-            Gather::Rows { x, rows, y } => gather::gather_rows(
-                self.ctx(),
-                self.uncut(*x),
-                self.tensor(*rows),
-                self.tensor(*y),
-            ),
+            Gather::PackRows { x, perm, y } => crate::lower::lower(self.ctx(), |l| {
+                let perm_v = l.read(self.tensor(*perm))?;
+                let x_v = l.read(self.uncut(*x))?;
+                let o_y = self.tensor(*y);
+                let v = gather::pack_rows(l.f(), x_v, perm_v, o_y.landing())?;
+                l.land(o_y, v)
+            }),
+            Gather::UnpackRows { x, perm, y } => crate::lower::lower(self.ctx(), |l| {
+                let perm_v = l.read(self.tensor(*perm))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let y_v = l.read(self.uncut(*y))?;
+                let o_y = self.uncut(*y);
+                let v = gather::unpack_rows(l.f(), x_v, perm_v, y_v)?;
+                l.land(o_y, v)
+            }),
+            Gather::Rows { x, rows, y } => crate::lower::lower(self.ctx(), |l| {
+                let index_v = l.read(self.tensor(*rows))?;
+                let wide_v = l.read(self.uncut(*x))?;
+                let o_tight = self.tensor(*y);
+                let v = gather::gather_rows(l.f(), wide_v, index_v, o_tight.landing())?;
+                l.land(o_tight, v)
+            }),
             Gather::Select {
                 table,
                 layer,
                 width,
                 y,
-            } => gather::select(
-                self.ctx(),
-                self.tensor(*table),
-                *layer,
-                *width,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let table_v = l.read(self.tensor(*table))?;
+                let o_y = self.tensor(*y);
+                let v = gather::select(l.f(), table_v, *layer, *width, o_y.landing())?;
+                l.land(o_y, v)
+            }),
         }
     }
 }

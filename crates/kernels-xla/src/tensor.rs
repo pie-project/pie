@@ -69,12 +69,35 @@ pub trait Stored: Copy {
     fn width(self) -> u32;
     fn dtype(self) -> Dtype;
 
+    /// The same storage read as another dtype of the same width.
+    #[must_use]
+    fn with_dtype(self, dtype: Dtype) -> Self;
+
+    /// The same rows read `width` wide.
+    #[must_use]
+    fn with_width(self, width: u32) -> Self;
+
     fn elements(self) -> u64 {
         u64::from(self.rows()) * u64::from(self.width())
+    }
+
+    /// The shape and dtype alone.
+    fn shape(self) -> Landing {
+        Landing {
+            rows: self.rows(),
+            width: self.width(),
+            dtype: self.dtype(),
+        }
     }
 }
 
 impl Stored for Tensor {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }
@@ -87,6 +110,12 @@ impl Stored for Tensor {
 }
 
 impl Stored for Operand {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }
@@ -99,6 +128,12 @@ impl Stored for Operand {
 }
 
 impl Stored for Landing {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }
@@ -172,14 +207,14 @@ impl<T> RaggedTensor<T> {
 /// head_dim]` planes (values may be narrower), paged by the CSR
 /// `page_indptr`/`page_indices` of the fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvPool {
-    pub keys: Tensor,
+pub struct KvPool<T = Tensor> {
+    pub keys: T,
 
-    pub values: Tensor,
+    pub values: T,
 
-    pub page_indices: Tensor,
+    pub page_indices: T,
 
-    pub page_indptr: Tensor,
+    pub page_indptr: T,
 
     pub page_size: i32,
 
@@ -196,34 +231,45 @@ pub struct KvPool {
 /// A recurrent state space: `state` holds one row per slot, `slots` the slot
 /// of each lane of the fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecurrentPool {
-    pub state: Tensor,
+pub struct RecurrentPool<T = Tensor> {
+    pub state: T,
 
-    pub slots: Tensor,
+    pub slots: T,
 
-    pub conv_state: Tensor,
+    pub conv_state: T,
 
-    pub new_conv_state: Tensor,
+    pub new_conv_state: T,
 }
 
 /// A quantized weight: codes with per-group scales (and zero points when
 /// affine).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Bank {
-    pub codes: Tensor,
+pub struct Bank<T = Tensor> {
+    pub codes: T,
 
-    pub scales: Tensor,
+    pub scales: T,
 
-    pub biases: Option<Tensor>,
+    pub biases: Option<T>,
 
     pub group: u32,
 
     pub bits: u32,
 }
 
-impl Bank {
+impl<T> Bank<T> {
     #[must_use]
     pub const fn affine(&self) -> bool {
         self.biases.is_some()
+    }
+
+    /// The bank with its codes, scales and biases read (in that order).
+    pub fn try_map<U, E>(self, mut f: impl FnMut(T) -> Result<U, E>) -> Result<Bank<U>, E> {
+        Ok(Bank {
+            codes: f(self.codes)?,
+            scales: f(self.scales)?,
+            biases: self.biases.map(&mut f).transpose()?,
+            group: self.group,
+            bits: self.bits,
+        })
     }
 }
