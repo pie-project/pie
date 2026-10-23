@@ -144,7 +144,7 @@ impl Gpu {
             .find(|b| b.device_ptr() == t.ptr)
             .expect("a harness buffer");
         let mut all = held.read::<T>().unwrap();
-        all.truncate((t.elements() * u64::from(t.dtype.bytes_ceil())) as usize / size_of::<T>());
+        all.truncate((t.elements() * t.dtype.bytes_ceil()) as usize / size_of::<T>());
         all
     }
 
