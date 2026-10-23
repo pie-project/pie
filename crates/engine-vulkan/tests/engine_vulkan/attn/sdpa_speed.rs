@@ -30,6 +30,7 @@ fn st(t: Tensor) -> kernels_slang::Tensor {
 }
 
 type Run<'a> = &'a dyn Fn(&Gpu);
+type Boxed<'a> = Box<dyn Fn(&Gpu) + 'a>;
 
 /// The best trial's microseconds a repetition of each runner on the
 /// device's clock (the span of the frame's timestamps), the runners taking
@@ -335,30 +336,41 @@ fn sdpa_speed() {
                 Ok(())
             });
         };
-        let slang = |g: &Gpu| {
-            g.run_slang(|c| {
-                for _ in 0..REPS {
-                    sdpa::prefill(
-                        c,
-                        subgroup,
-                        st(qt),
-                        tables,
-                        spool,
-                        None,
-                        HD as u32,
-                        scale,
-                        st(ot),
-                        None,
-                    )?;
-                }
-                Ok(())
-            });
+        let slang = |tactic: sdpa::Tactic| {
+            move |g: &Gpu| {
+                g.run_slang(|c| {
+                    for _ in 0..REPS {
+                        sdpa::prefill(
+                            c,
+                            tactic,
+                            st(qt),
+                            tables,
+                            spool,
+                            None,
+                            HD as u32,
+                            scale,
+                            st(ot),
+                            None,
+                        )?;
+                    }
+                    Ok(())
+                });
+            }
         };
-        let times = race(&gpu, &[&hand, &slang]);
-        report(
-            &format!("prefill kv {kv} rows {rows}"),
-            &times,
-            &["slang tiled"],
-        );
+        // engine-vulkan's tile, and the 16-lane tile that folds by shuffles
+        // (engine-wgpu's) where a subgroup holds a row.
+        let mut runs: Vec<Boxed<'_>> = vec![Box::new(hand), Box::new(slang(subgroup))];
+        let mut names = vec!["slang tiled"];
+        if chip.subgroup >= 16 {
+            runs.push(Box::new(slang(sdpa::Tactic {
+                tile_rows: 16,
+                tile_lanes: 16,
+                ..subgroup
+            })));
+            names.push("slang tiled 16x16 subgroup");
+        }
+        let runs: Vec<Run<'_>> = runs.iter().map(|r| &**r as Run<'_>).collect();
+        let times = race(&gpu, &runs);
+        report(&format!("prefill kv {kv} rows {rows}"), &times, &names);
     }
 }
