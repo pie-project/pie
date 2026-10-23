@@ -11,8 +11,8 @@ use crate::csl::{Block, Call};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePhase, Lanes, LanesAt,
-    Phase, Reduce, Shard, Sink, Statement,
+    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, LanePhase, Lanes, LanesAt, Phase,
+    Shard, Sink, Statement,
 };
 use crate::plan::{LaneSplit, Plan};
 use crate::tensor::Tensor;
@@ -155,15 +155,6 @@ impl<'a> Cx<'a> {
             finish,
             round: Vec::new(),
         });
-    }
-
-    /// How many elements of `buf` each PE holds in this phase.
-    fn local_len(&self, buf: &Buf) -> u64 {
-        match self.shards.iter().find(|(n, _)| *n == buf.name) {
-            Some((_, Shard::Local(n))) => *n,
-            Some((_, s)) => buf.len() / u64::from(s.pes()),
-            None => buf.len(),
-        }
     }
 
     /// The device array holding `t`, in f32.
@@ -318,75 +309,17 @@ impl<'a> Cx<'a> {
     }
 
     /// Closes the phase and appends it to the program.
-    pub fn finish(mut self) {
-        if let Some(op) = self.host.take() {
-            let rounds = std::mem::take(&mut self.rounds)
-                .into_iter()
-                .map(|b| b.name)
-                .collect();
-            self.p.phase(Phase {
-                name: std::mem::take(&mut self.name),
-                body: Vec::new(),
-                pes: 1,
-                shards: Vec::new(),
-                lane: None,
-                host: Some(HostPhase { op, rounds }),
-                reduce: None,
-            });
-            return;
-        }
-        for b in std::mem::take(&mut self.rounds) {
-            // A partial sum stays f32 on the PE; the host rounds the sum.
-            let summed = self.shards.iter().any(|(n, s)| {
-                *n == b.name && matches!(s, Shard::SumCols { .. } | Shard::SumGrid { .. })
-            }) || self.lane.as_ref().is_some_and(|l| {
-                l.lanes
-                    .reduce
-                    .iter()
-                    .any(|(n, r)| *n == b.name && matches!(r, Reduce::Sum))
-            });
-            if summed {
-                continue;
-            }
-            // A buffer the fabric merges is rounded once the merge lands.
-            let roots = self.late_rounds.contains(&b.name)
-                || self
-                    .shards
-                    .iter()
-                    .any(|(n, s)| *n == b.name && matches!(s, Shard::Roots { .. }))
-                || self.lane.as_ref().is_some_and(|l| {
-                    l.lanes.reduce.iter().any(|(n, r)| {
-                        *n == b.name
-                            && matches!(r, Reduce::FabricSum { .. } | Reduce::FabricRoot { .. })
-                    })
-                });
-            if roots {
-                let n = self.local_len(&b);
-                if let Some(r) = self.reduce.as_mut() {
-                    r.round.push((b.name.clone(), n));
-                }
-                continue;
-            }
-            let n = self.local_len(&b);
-            self.body.push(Statement::Call(Call {
-                kernel: Kernel::RoundBf16,
-                args: vec![
-                    crate::csl::Arg::Ptr(b.clone()),
-                    crate::csl::Arg::Int(n as i64),
-                ],
-            }));
-        }
-        let shards = std::mem::take(&mut self.shards);
-        let lane = self.lane.take();
-        let reduce = self.reduce.take();
+    pub fn finish(self) {
         self.p.phase(Phase {
-            name: std::mem::take(&mut self.name),
-            body: std::mem::take(&mut self.body),
+            name: self.name,
+            body: self.body,
             pes: self.pes,
-            shards,
-            lane,
-            host: None,
-            reduce,
+            shards: self.shards,
+            lane: self.lane,
+            host: self.host,
+            reduce: self.reduce,
+            rounds: self.rounds,
+            late_rounds: self.late_rounds,
         });
     }
 }

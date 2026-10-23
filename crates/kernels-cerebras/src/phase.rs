@@ -370,8 +370,8 @@ pub struct LanesAt {
 
 /// One phase: its name and the kernel calls it makes, the PEs it runs on,
 /// and how each buffer it names is spread over them (unlisted buffers are
-/// whole on every PE); or a host phase, run by the host over its copies of
-/// the buffers.
+/// whole on every PE); or a host op, run by the host over its copies of the
+/// buffers (the calls are then dropped).
 #[derive(Debug, Clone)]
 pub struct Phase {
     pub name: String,
@@ -379,9 +379,16 @@ pub struct Phase {
     pub pes: u32,
     pub shards: Vec<(String, Shard)>,
     pub lane: Option<LanePhase>,
-    pub host: Option<HostPhase>,
+    pub host: Option<HostOp>,
     /// A sum the fabric takes after the function runs.
     pub reduce: Option<FabricReduce>,
+    /// The bf16 buffers the phase writes, computed in f32: each rounds to
+    /// bf16 once, where the engine puts it (after the calls, after the
+    /// fabric's merge, or on the host after a sum).
+    pub rounds: Vec<Buf>,
+    /// Of `rounds`, those the fabric steps fill (a collective, not the
+    /// calls): they round after the steps.
+    pub late_rounds: Vec<String>,
 }
 
 /// One statement of a phase: a kernel call, or raw CSL lines (only the
@@ -404,7 +411,8 @@ pub struct FabricReduce {
     pub rect: (u32, u32),
     pub steps: Vec<FabricStep>,
     pub finish: Vec<Guarded>,
-    /// Buffers rounded to bf16 when the steps are done: `(name, words)`.
+    /// Buffers rounded to bf16 when the steps are done: `(name, words)`
+    /// (the engine's, from the phase's `rounds`).
     pub round: Vec<(String, u64)>,
 }
 
@@ -473,16 +481,8 @@ pub enum FabricOp {
     Handoff { root: u32, buf: String, count: u64 },
 }
 
-/// A phase the host runs instead of the fabric: pure data movement, or a
-/// vocabulary-sized op no rectangle holds. Every buffer of a fire lives on
-/// the host between phases, so it costs no transfer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostPhase {
-    pub op: HostOp,
-    /// Buffers rounded to bf16 after the op (bf16 writes).
-    pub rounds: Vec<String>,
-}
-
+/// An op the host runs instead of the fabric: pure data movement, or a
+/// vocabulary-sized op no rectangle holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostOp {
     /// `y[r] = table[ids[r]]` for `rows` rows of `width`; an id outside

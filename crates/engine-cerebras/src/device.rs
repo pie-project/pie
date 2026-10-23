@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::fabric::lanes::{LanePlan, picks};
 use dtype::Dtype;
-use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, HostPhase, Reduce, Segment};
+use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, Reduce, Segment};
 
 use crate::error::{Fault, Result};
-use crate::fabric::{Manifest, Rendered};
+use crate::fabric::{HostPhase, Manifest, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Target};
 use crate::trace::Signature;
 

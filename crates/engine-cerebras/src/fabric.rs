@@ -20,7 +20,8 @@ use kernels_cerebras::csl::{Arg, Call, Func};
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
-    self, Buf, FabricOp, FabricReduce, Guarded, HostPhase, Lanes, LanesAt, PageSource, Shard, Sink,
+    self, Buf, FabricOp, FabricReduce, Guarded, HostOp, Lanes, LanesAt, PageSource, Reduce, Shard,
+    Sink,
 };
 use kernels_cerebras::plan::{LaneSplit, Plan};
 
@@ -60,16 +61,95 @@ fn func_of(name: String, body: Vec<phase::Statement>) -> Func {
     func
 }
 
+/// A phase the host runs instead of the fabric: pure data movement, or a
+/// vocabulary-sized op no rectangle holds. Every buffer of a fire lives on
+/// the host between phases, so it costs no transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPhase {
+    pub op: HostOp,
+    /// Buffers rounded to bf16 after the op (bf16 writes).
+    pub rounds: Vec<String>,
+}
+
 impl From<phase::Phase> for Phase {
+    /// An entry's phase as the engine runs it: a host op over the buffers'
+    /// copies (its calls dropped, its bf16 writes rounded after it), or
+    /// its function.
     fn from(p: phase::Phase) -> Self {
+        if let Some(op) = p.host {
+            return Phase {
+                func: Func::new(p.name),
+                pes: 1,
+                shards: Vec::new(),
+                lane: None,
+                host: Some(HostPhase {
+                    op,
+                    rounds: p.rounds.into_iter().map(|b| b.name).collect(),
+                }),
+                reduce: None,
+            };
+        }
         Phase {
             func: func_of(p.name, p.body),
             pes: p.pes,
             shards: p.shards,
             lane: p.lane.as_ref().map(lanes::plan_of),
-            host: p.host,
+            host: None,
             reduce: p.reduce,
         }
+    }
+}
+
+/// Where each bf16 write of a device phase rounds: a partial sum stays f32
+/// on the PE (the host rounds the sum); a buffer the fabric merges or fills
+/// rounds once the steps land; every other one after the phase's calls.
+fn round_writes(p: &mut phase::Phase) {
+    // How many elements of `buf` each PE holds in the phase.
+    let local_len =
+        |shards: &[(String, Shard)], buf: &Buf| match shards.iter().find(|(n, _)| *n == buf.name) {
+            Some((_, Shard::Local(n))) => *n,
+            Some((_, s)) => buf.len() / u64::from(s.pes()),
+            None => buf.len(),
+        };
+    let reduced = |name: &str, fabric: bool| {
+        p.lane.as_ref().is_some_and(|l| {
+            l.lanes.reduce.iter().any(|(n, r)| {
+                n == name
+                    && if fabric {
+                        matches!(r, Reduce::FabricSum { .. } | Reduce::FabricRoot { .. })
+                    } else {
+                        matches!(r, Reduce::Sum)
+                    }
+            })
+        })
+    };
+    let mut body = Vec::new();
+    let mut late = Vec::new();
+    for b in &p.rounds {
+        let summed = p.shards.iter().any(|(n, s)| {
+            *n == b.name && matches!(s, Shard::SumCols { .. } | Shard::SumGrid { .. })
+        }) || reduced(&b.name, false);
+        if summed {
+            continue;
+        }
+        let n = local_len(&p.shards, b);
+        let merged = p.late_rounds.contains(&b.name)
+            || p.shards
+                .iter()
+                .any(|(n, s)| *n == b.name && matches!(s, Shard::Roots { .. }))
+            || reduced(&b.name, true);
+        if merged {
+            late.push((b.name.clone(), n));
+        } else {
+            body.push(phase::Statement::Call(Call {
+                kernel: Kernel::RoundBf16,
+                args: vec![Arg::Ptr(b.clone()), Arg::Int(n as i64)],
+            }));
+        }
+    }
+    p.body.extend(body);
+    if let Some(r) = p.reduce.as_mut() {
+        r.round.extend(late);
     }
 }
 
@@ -343,7 +423,12 @@ impl Sink for Emitting<'_> {
         lanes::place(self.program, self.plan.row(), lanes, split)
     }
 
-    fn phase(&mut self, phase: phase::Phase) {
+    fn phase(&mut self, mut phase: phase::Phase) {
+        if phase.host.is_some() {
+            self.program.push(Phase::from(phase));
+            return;
+        }
+        round_writes(&mut phase);
         // The library units the phase's calls name join the program (the
         // prelude is in every program already).
         let calls = phase.body.iter().filter_map(|s| match s {
@@ -369,7 +454,6 @@ impl Sink for Emitting<'_> {
         // (whole buffers replicated); a phase spread over PEs of its own
         // keeps them.
         if let Some(n) = self.plan.row()
-            && phase.host.is_none()
             && phase.lane.is_none()
             && phase.pes == 1
         {

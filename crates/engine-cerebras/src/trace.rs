@@ -19,10 +19,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use dtype::Dtype;
-use kernels_cerebras::phase::{BankSplit, Buf, ColPlane, HostOp, HostPhase, Reduce, Segment};
+use kernels_cerebras::phase::{BankSplit, Buf, ColPlane, HostOp, Reduce, Segment};
 use kernels_cerebras::{Cx, Emit, Tensor};
 
-use crate::fabric::{Emitting, Operands, Placed, Program, Rendered, elem_of};
+use crate::fabric::{Emitting, HostPhase, Operands, Placed, Program, Rendered, elem_of};
 
 /// Where a root's value comes from when the program first reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
