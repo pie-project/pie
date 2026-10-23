@@ -534,6 +534,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sglang-attention-backend", default=None)
     p.add_argument("--sglang-sampling-backend", default=None)
     p.add_argument(
+        "--sglang-dsa-backend",
+        default=None,
+        help="SGLang's DSA prefill and decode kernels. Its auto pick on an "
+             "SM120 card at a bf16 KV cache is trtllm-gen, which runs on SM100 only.",
+    )
+    p.add_argument(
         "--sglang-max-total-tokens",
         type=int,
         default=None,

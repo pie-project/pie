@@ -78,6 +78,9 @@ def build_engine(args: argparse.Namespace, max_running_requests: int):
         engine_kwargs["attention_backend"] = args.sglang_attention_backend
     if args.sglang_sampling_backend:
         engine_kwargs["sampling_backend"] = args.sglang_sampling_backend
+    if args.sglang_dsa_backend:
+        engine_kwargs["dsa_prefill_backend"] = args.sglang_dsa_backend
+        engine_kwargs["dsa_decode_backend"] = args.sglang_dsa_backend
     # Without this the KV pool is sized from mem_fraction_static and SGLang is
     # not being handed the same KV budget as pie (--device-kv-budget) and vLLM
     # (--num-gpu-blocks-override), which makes the comparison meaningless
