@@ -511,6 +511,21 @@ fn build_lt_plan(
     {
         return None;
     }
+    // A split's partials are summed in f32 or not split at all: the in-place
+    // and output-type schemes add them in bf16, and over a cancelling K that
+    // is off by several percent (sm89 offers them at a hundred rows).
+    let reductions = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+    if unsafe {
+        lt::cublasLtMatmulPreferenceSetAttribute(
+            pref.0,
+            lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+            std::ptr::from_ref(&reductions).cast(),
+            std::mem::size_of::<u32>(),
+        )
+    } != ok
+    {
+        return None;
+    }
     let mut heuristics: Vec<lt::cublasLtMatmulHeuristicResult_t> =
         vec![unsafe { core::mem::zeroed() }; heuristics_wanted.max(1)];
     let mut returned: i32 = 0;
@@ -1005,10 +1020,9 @@ fn tune(
             "dense gemm bench"
         );
         // A captured step pays a split's reduce its own launch, which a
-        // lone timing hides (`kernel.gemm.split_launch_ns`); under the
-        // in-place scheme too, a `splitKreduce_kernel` follows the split
-        // (B200, cuBLAS 13). `cublasGemmEx` picks its own algorithm, a split
-        // one as likely, so it is charged too.
+        // lone timing hides (`kernel.gemm.split_launch_ns`).
+        // `cublasGemmEx` picks its own algorithm, a split one as likely, so
+        // it is charged too.
         let two = match candidate {
             Tactic::Lt(i) => plan.is_some_and(|p| splits_of(&p.heuristics[i].algo) > 1),
             Tactic::GemmEx => true,
@@ -1561,7 +1575,7 @@ fn signature() -> String {
         .to_string_lossy()
         .into_owned();
     format!(
-        "# pie-dense-gemm v8 sm{}{} cublas={version} dev={name}",
+        "# pie-dense-gemm v9 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
 }

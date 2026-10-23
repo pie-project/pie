@@ -316,9 +316,24 @@ impl Ctx {
         self.stream
     }
 
+    /// The context's cuBLAS handle, set to sum a split K's partials in the
+    /// compute type: cuBLAS's default adds them in a bf16 or f16 output's own
+    /// type, and over a cancelling K that is off by percents (sm89 splits a
+    /// hundred-row bf16 product so).
     pub fn cublas(&self, op: &'static str) -> Result<*mut c_void, Error> {
         if self.cublas.is_null() {
             return Err(refuse(op, "this context carries no cuBLAS handle"));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
+            // SAFETY: a live handle this context carries.
+            let _ = unsafe {
+                cublasSetMathMode(
+                    self.cublas.cast(),
+                    cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+                )
+            };
         }
         Ok(self.cublas)
     }
