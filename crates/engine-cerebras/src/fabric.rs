@@ -16,21 +16,49 @@ use std::fmt::Write;
 
 use dtype::Dtype;
 use kernels_cerebras::Tensor;
-use kernels_cerebras::csl::{Arg, Call};
+use kernels_cerebras::csl::{Arg, Call, Func};
 use kernels_cerebras::cx::View as Placed;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
-    Buf, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, LanesAt, PageSource, Phase, Shard,
-    Sink,
+    self, Buf, FabricOp, FabricReduce, Guarded, HostPhase, Lanes, LanesAt, PageSource, Shard, Sink,
 };
-use kernels_cerebras::plan::Plan;
+use kernels_cerebras::plan::{LaneSplit, Plan};
 
-mod lanes;
+use lanes::LanePlan;
+
+pub mod lanes;
 mod plan;
 mod table;
 
 pub use plan::Planner;
+
+/// A phase as the engine runs it: an entry's phase (its function, the PEs
+/// it runs on, how each buffer it names spreads over them; or a host
+/// phase), its lanes planned.
+#[derive(Debug, Clone)]
+pub struct Phase {
+    pub func: Func,
+    pub pes: u32,
+    pub shards: Vec<(String, Shard)>,
+    pub lane: Option<LanePlan>,
+    pub host: Option<HostPhase>,
+    /// A sum the fabric takes after the function runs.
+    pub reduce: Option<FabricReduce>,
+}
+
+impl From<phase::Phase> for Phase {
+    fn from(p: phase::Phase) -> Self {
+        Phase {
+            func: p.func,
+            pes: p.pes,
+            shards: p.shards,
+            lane: p.lane.as_ref().map(lanes::plan_of),
+            host: p.host,
+            reduce: p.reduce,
+        }
+    }
+}
 
 /// The terms the engine plans by: what a PE holds, how far a phase
 /// spreads, the placement in force, whether partials merge on the fabric
@@ -228,11 +256,12 @@ impl Sink for Emitting<'_> {
         self.program.helper(name, text);
     }
 
-    fn lanes(&mut self, plan: &LanePlan) -> Result<LanesAt, Error> {
-        lanes::place(self.program, self.plan.row(), plan)
+    fn lanes(&mut self, lanes: &Lanes, split: LaneSplit) -> Result<LanesAt, Error> {
+        lanes::place(self.program, self.plan.row(), lanes, split)
     }
 
-    fn phase(&mut self, mut phase: Phase) {
+    fn phase(&mut self, phase: phase::Phase) {
+        let mut phase = Phase::from(phase);
         // The resident placement runs every device phase on its row of PEs
         // (whole buffers replicated); a phase spread over PEs of its own
         // keeps them.

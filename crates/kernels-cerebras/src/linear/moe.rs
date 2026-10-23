@@ -10,9 +10,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{
-    BankSplit, BlockPlan, ColPlane, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
-};
+use crate::phase::{BankSplit, Block, ColPlane, HostOp, LaneKind, Lanes, Reduce, Segment, Shard};
 use crate::plan::{Footprint, Held, Routed};
 use crate::tensor::Tensor;
 
@@ -399,26 +397,16 @@ fn select_impl(
         cx.read(y)?;
         let yb = cx.write(y)?;
         let yb = cx.view_as(&yb, yd.rows, yd.width)?;
-        let header = cx.unique("lanes");
         let reduce = split
             .sum
             .iter()
             .map(|r| (yb.name.clone(), r.clone()))
             .collect();
-        let plan = LanePlan {
-            pes: split.pes,
+        let plan = Lanes {
             kind: LaneKind::PerRow { lanes },
-            header,
             slots: rb.name.clone(),
             banks: vec![(bb.name.clone(), stride, BankSplit::Block)],
-            block: Some(BlockPlan {
-                a: n,
-                b: k,
-                w: 1,
-                a_groups: split.a_groups,
-                b_groups: split.b_groups,
-            }),
-            lanes_per_pe: split.lanes_per_pe,
+            block: Some(Block { a: n, b: k, w: 1 }),
             a_first: false,
             row_outputs: Vec::new(),
             cols: vec![
@@ -449,7 +437,7 @@ fn select_impl(
             window: None,
             pages: None,
         };
-        let at = cx.lanes(plan)?;
+        let at = cx.lanes(plan, split.lanes())?;
         let (hdr, y_words) = (at.header, at.planes[1]);
         cx.call(
             Kernel::MoeSelect,

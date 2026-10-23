@@ -23,7 +23,7 @@ use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, PagePlan, PageSource, Reduce, Segment,
+    BankSplit, Block, ColPlane, LaneKind, Lanes, PageSource, Paged, Reduce, Segment,
 };
 use crate::plan::{LSE_GROUPS, Merge, PageSplit, PagedLanes, Pages};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
@@ -466,15 +466,14 @@ fn attend(
             let mut lse_buf = lb.clone();
             let (rows_range, heads_range) = match split {
                 None => (format!("0, {n}, 0"), format!("0, {kv_heads}, 0, {ps}")),
-                Some(PagedLanes {
-                    pes,
-                    lanes_per_pe,
-                    page_groups,
-                    head_groups,
-                    row_groups,
-                    strided_pages,
-                }) => {
-                    let header = cx.unique("lanes");
+                Some(paged) => {
+                    let PagedLanes {
+                        pes,
+                        page_groups,
+                        row_groups,
+                        strided_pages,
+                        ..
+                    } = paged;
                     // Pages split over PEs: every PE's output is partial, merged
                     // through a per-head lse, on the fabric (the page and row
                     // groups of a lane block are consecutive PEs, one
@@ -531,32 +530,27 @@ fn attend(
                     if let Some(l) = &lse_buf {
                         cols.push(plane(l, 1));
                     }
-                    let plan = LanePlan {
-                        pes,
+                    let plan = Lanes {
                         kind: LaneKind::ByTable {
                             lane_of_row: req.name.clone(),
                             lanes: lanes as u32,
                         },
-                        header,
                         slots: req.name.clone(),
                         banks: vec![
                             (kb.name.clone(), ps * kb.width / per, BankSplit::Block),
                             (vb.name.clone(), ps * vb.width / per, BankSplit::Block),
                         ],
-                        block: Some(BlockPlan {
+                        block: Some(Block {
                             a: ps,
                             b: kv_heads,
                             w: d / per,
-                            a_groups: row_groups,
-                            b_groups: head_groups,
                         }),
-                        lanes_per_pe,
                         a_first: fabric && !strided,
                         row_outputs: Vec::new(),
                         cols,
                         reduce,
                         window: None,
-                        pages: Some(PagePlan {
+                        pages: Some(Paged {
                             source: PageSource::Csr {
                                 indptr: ptr.name.clone(),
                                 indices: idx.name.clone(),
@@ -564,12 +558,9 @@ fn attend(
                             page_size: ps,
                             max_pages: pool.max_pages,
                             rewritten: Vec::new(),
-                            page_groups,
-                            strided,
-                            strided_pages: strided_pages.unwrap_or(0),
                         }),
                     };
-                    let at = cx.lanes(plan)?;
+                    let at = cx.lanes(plan, paged.lanes())?;
                     let o_words = at.planes[1];
                     let l_words = at.planes.get(2).copied().unwrap_or(0);
                     let hdr = at.header;
@@ -989,14 +980,8 @@ fn append(
             .lanes;
         let (rows_range, width) = match split {
             None => (format!("0, {}", k.rows), w.to_string()),
-            Some(PagedLanes {
-                pes,
-                lanes_per_pe: rows_per_pe,
-                head_groups,
-                strided_pages,
-                ..
-            }) => {
-                let header = cx.unique("lanes");
+            Some(paged) => {
+                let head_groups = paged.head_groups;
                 let mut banks = vec![(keys.name.clone(), ps * w / per, BankSplit::Block)];
                 if !shared {
                     banks.push((values.name.clone(), ps * w / per, BankSplit::Block));
@@ -1023,12 +1008,10 @@ fn append(
                         cols.push(plane(&vb));
                     }
                     (
-                        Some(BlockPlan {
+                        Some(Block {
                             a: ps,
                             b: w / per,
                             w: 1,
-                            a_groups: 1,
-                            b_groups: head_groups,
                         }),
                         cols,
                     )
@@ -1036,31 +1019,28 @@ fn append(
                     (None, Vec::new())
                 };
                 let hdr = cx
-                    .lanes(LanePlan {
-                        pes,
-                        kind: LaneKind::PerRow { lanes: k.rows },
-                        header,
-                        slots: pb.name.clone(),
-                        banks,
-                        block,
-                        lanes_per_pe: rows_per_pe,
-                        a_first: false,
-                        row_outputs: Vec::new(),
-                        cols,
-                        reduce: Vec::new(),
-                        window: None,
-                        pages: Some(PagePlan {
-                            source: PageSource::Rows {
-                                table: pb.name.clone(),
-                            },
-                            page_size: ps,
-                            max_pages: 1,
-                            rewritten: vec![pb.name.clone()],
-                            page_groups: 1,
-                            strided: strided_pages.is_some(),
-                            strided_pages: strided_pages.unwrap_or(0),
-                        }),
-                    })?
+                    .lanes(
+                        Lanes {
+                            kind: LaneKind::PerRow { lanes: k.rows },
+                            slots: pb.name.clone(),
+                            banks,
+                            block,
+                            a_first: false,
+                            row_outputs: Vec::new(),
+                            cols,
+                            reduce: Vec::new(),
+                            window: None,
+                            pages: Some(Paged {
+                                source: PageSource::Rows {
+                                    table: pb.name.clone(),
+                                },
+                                page_size: ps,
+                                max_pages: 1,
+                                rewritten: vec![pb.name.clone()],
+                            }),
+                        },
+                        paged.lanes(),
+                    )?
                     .header;
                 (
                     format!("{0}[7], {0}[8]", hdr.name),

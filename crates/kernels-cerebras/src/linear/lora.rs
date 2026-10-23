@@ -13,7 +13,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
+use crate::phase::{BankSplit, Block, ColPlane, LaneKind, Lanes, Reduce, Segment};
 use crate::plan::{Held, Routed};
 use crate::tensor::Tensor;
 
@@ -185,27 +185,21 @@ pub fn correct(
         let ab = cx.read(bank_a)?;
         let rb = cx.read(routes)?;
         let wb = cx.declare(&waist_name, Dtype::F32, rows, rank, true)?;
-        let header = cx.unique("lanes");
         let reduce = down
             .sum
             .iter()
             .map(|r| (wb.name.clone(), r.clone()))
             .collect();
         let pes = down.pes;
-        let plan = LanePlan {
-            pes,
+        let lanes = Lanes {
             kind: LaneKind::PerRow { lanes: rows },
-            header,
             slots: rb.name.clone(),
             banks: vec![(ab.name.clone(), bank_a.width, BankSplit::Block)],
-            block: Some(BlockPlan {
+            block: Some(Block {
                 a: rank,
                 b: in_width,
                 w: 1,
-                a_groups: down.a_groups,
-                b_groups: down.b_groups,
             }),
-            lanes_per_pe: down.lanes_per_pe,
             a_first: false,
             row_outputs: Vec::new(),
             cols: vec![plane(&xb, vec![Segment::along_b()]), plane(&wb, vec![by_a])],
@@ -213,7 +207,7 @@ pub fn correct(
             window: None,
             pages: None,
         };
-        let at = cx.lanes(plan)?;
+        let at = cx.lanes(lanes, down.lanes())?;
         let (hdr, w_words) = (at.header, at.planes[1]);
         cx.call(
             Kernel::LoraDown,
@@ -253,27 +247,21 @@ pub fn correct(
         let wb = cx.declare(&waist_name, Dtype::F32, rows, rank, true)?;
         cx.read(y)?;
         let yb = cx.write(y)?;
-        let header = cx.unique("lanes");
         let reduce = up
             .sum
             .iter()
             .map(|r| (yb.name.clone(), r.clone()))
             .collect();
         let pes = up.pes;
-        let plan = LanePlan {
-            pes,
+        let lanes = Lanes {
             kind: LaneKind::PerRow { lanes: rows },
-            header,
             slots: rb.name.clone(),
             banks: vec![(bb.name.clone(), bank_b.width, BankSplit::Block)],
-            block: Some(BlockPlan {
+            block: Some(Block {
                 a: out_width,
                 b: rank,
                 w: 1,
-                a_groups: up.a_groups,
-                b_groups: up.b_groups,
             }),
-            lanes_per_pe: up.lanes_per_pe,
             a_first: false,
             row_outputs: Vec::new(),
             cols: vec![plane(&wb, vec![Segment::along_b()]), plane(&yb, vec![by_a])],
@@ -281,7 +269,7 @@ pub fn correct(
             window: None,
             pages: None,
         };
-        let at = cx.lanes(plan)?;
+        let at = cx.lanes(lanes, up.lanes())?;
         let (hdr, y_words) = (at.header, at.planes[1]);
         cx.call(
             Kernel::LoraUp,

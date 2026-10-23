@@ -18,7 +18,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
+use crate::phase::{Block, ColPlane, LaneKind, Lanes, Reduce, Segment};
 use crate::plan::{BlockSplit, Blocks, Merge};
 use crate::tensor::Tensor;
 
@@ -88,11 +88,7 @@ pub fn bidirectional(
     };
     // The keys split `ag` ways and the kv heads `hg` ways, over windows of
     // the rows; the attention kernel's code takes a good part of a PE.
-    let BlockSplit {
-        window: chunk,
-        a_groups: ag,
-        b_groups: hg,
-    } = ctx
+    let blocks = ctx
         .plan()
         .blocks(&Blocks {
             rows,
@@ -111,6 +107,11 @@ pub fn bidirectional(
                 ),
             )
         })?;
+    let BlockSplit {
+        window: chunk,
+        a_groups: ag,
+        b_groups: hg,
+    } = blocks;
     let whole = chunk >= rows && ag == 1 && hg == 1;
     let merge = ag > 1
         && ctx.plan().merge(Merge::Lse {
@@ -160,7 +161,6 @@ pub fn bidirectional(
             // Partial rows over key groups need a per-head lse to merge by.
             let lse_name = cx.unique("lse");
             let lse = cx.declare(&lse_name, Dtype::F32, n, qh, true)?;
-            let header = cx.unique("lanes");
             let heads = |b: &crate::phase::Buf, per_head: u32, row_block: bool| ColPlane {
                 name: b.name.clone(),
                 rows: b.rows,
@@ -193,23 +193,18 @@ pub fn bidirectional(
             } else {
                 Vec::new()
             };
-            let plan = LanePlan {
-                pes: ag * hg,
+            let lanes = Lanes {
                 kind: LaneKind::Ragged {
                     indptr: sb.name.clone(),
                     lanes: images,
                 },
-                header,
                 slots: String::new(),
                 banks: Vec::new(),
-                block: Some(BlockPlan {
+                block: Some(Block {
                     a: keys,
                     b: kvh,
                     w: d,
-                    a_groups: ag,
-                    b_groups: hg,
                 }),
-                lanes_per_pe: images,
                 a_first: merge,
                 row_outputs: Vec::new(),
                 cols: vec![
@@ -223,7 +218,7 @@ pub fn bidirectional(
                 window: Some((c0, n)),
                 pages: None,
             };
-            let at = cx.lanes(plan)?;
+            let at = cx.lanes(lanes, blocks.lanes(images))?;
             let (o_words, l_words) = (at.planes[3], at.planes[4]);
             let hdr = at.header;
             if merge {

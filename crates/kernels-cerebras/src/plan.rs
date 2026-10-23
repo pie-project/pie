@@ -7,7 +7,7 @@
 //! entry then writes its calls against the split it is handed.
 
 use crate::error::Error;
-use crate::phase::{BlockPlan, Reduce};
+use crate::phase::Reduce;
 use crate::tensor::Tensor;
 
 /// The engine's planner: the placement a fire takes, and the split it
@@ -157,6 +157,19 @@ pub struct BlockSplit {
     pub b_groups: u32,
 }
 
+impl BlockSplit {
+    /// The lane split this places, `lanes` lanes on every PE.
+    pub fn lanes(&self, lanes: u32) -> LaneSplit {
+        LaneSplit {
+            pes: self.a_groups * self.b_groups,
+            lanes_per_pe: lanes,
+            block: Some((self.a_groups, self.b_groups)),
+            page_groups: 1,
+            strided_pages: None,
+        }
+    }
+}
+
 /// Lanes over a recurrent bank: `elements` words of bank over `lanes`
 /// lanes, a lane's slot state `[a][b][w]`, splitting along `b` and (when
 /// `a_splits`) `a`; `beside(a_groups, b_groups)` is what a PE holds besides
@@ -171,13 +184,25 @@ pub struct Slots<'a> {
     pub beside: &'a dyn Fn(u32, u32) -> u64,
 }
 
-/// A lane split: the PE count, the lanes one PE runs, and how a slot's
-/// state splits within a lane (none: whole slots).
+/// The engine's split of a lane phase: `pes` PEs, at most `lanes_per_pe`
+/// lanes one PE runs (the local bank rows it holds), a slot's state split
+/// into `block = (a_groups, b_groups)` ranges when it splits, a lane's
+/// pages over `page_groups` PEs (1: one PE holds them all; PE `p` then
+/// holds pages `[pg0, pg0 + max_pages / page_groups)` of each of its lanes,
+/// and its row outputs are partial, merged as the lanes' `reduce` says).
+/// Under the resident placement the pool is strided over the row:
+/// `strided_pages` local pages a PE, page `g` of the pool on PE `g % pes`
+/// as its local page `g / pes`, every PE running every lane over the pages
+/// it holds (a lane's other pages are -1 in its local list), so key
+/// positions stay whole, the row merges the lanes' partials, and the pool
+/// stays where it is between fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaneSplit {
     pub pes: u32,
     pub lanes_per_pe: u32,
-    pub block: Option<BlockPlan>,
+    pub block: Option<(u32, u32)>,
+    pub page_groups: u32,
+    pub strided_pages: Option<u32>,
 }
 
 /// Lanes over a routed bank (an adapter's or an expert's `[a][b]` block a
@@ -203,6 +228,19 @@ pub struct RoutedSplit {
     pub a_groups: u32,
     pub b_groups: u32,
     pub sum: Option<Reduce>,
+}
+
+impl RoutedSplit {
+    /// The lane split this places.
+    pub fn lanes(&self) -> LaneSplit {
+        LaneSplit {
+            pes: self.pes,
+            lanes_per_pe: self.lanes_per_pe,
+            block: Some((self.a_groups, self.b_groups)),
+            page_groups: 1,
+            strided_pages: None,
+        }
+    }
 }
 
 /// A paged pool an op spreads over PEs by lanes: `elements` words of pool
@@ -247,4 +285,18 @@ pub struct PagedLanes {
     pub head_groups: u32,
     pub row_groups: u32,
     pub strided_pages: Option<u32>,
+}
+
+impl PagedLanes {
+    /// The lane split this places: a page's rows and heads as the slot
+    /// state's `a` and `b` ranges.
+    pub fn lanes(&self) -> LaneSplit {
+        LaneSplit {
+            pes: self.pes,
+            lanes_per_pe: self.lanes_per_pe,
+            block: Some((self.row_groups, self.head_groups)),
+            page_groups: self.page_groups,
+            strided_pages: self.strided_pages,
+        }
+    }
 }

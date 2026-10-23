@@ -12,7 +12,7 @@ use crate::csl::{Arg, Call, Func};
 use crate::cx::View;
 use crate::error::Error;
 use crate::library::Kernel;
-use crate::plan::Plan;
+use crate::plan::{LaneSplit, Plan};
 use crate::tensor::Tensor;
 
 /// What an entry emits into: the engine's program under construction. It
@@ -74,7 +74,7 @@ pub trait Sink {
     /// Places a lane phase: the PEs it runs on, its header, and the share of
     /// a PE each buffer it holds by lane or block takes; or why the
     /// placement refuses it.
-    fn lanes(&mut self, plan: &LanePlan) -> Result<LanesAt, Error>;
+    fn lanes(&mut self, lanes: &Lanes, split: LaneSplit) -> Result<LanesAt, Error>;
 
     /// Appends a closed phase; phases run in the order they are appended.
     fn phase(&mut self, phase: Phase);
@@ -120,7 +120,7 @@ pub enum Shard {
     /// PE `x` of `n` holds every row's columns `[x * width / n, (x + 1) * width / n)`.
     Cols(u32),
     /// Every PE holds `elements` of the buffer, laid out by the phase's
-    /// [`LanePlan`] on the host.
+    /// lanes ([`Lanes`]) on the host.
     Local(u64),
     /// PE `x` holds row part `(x / period) % parts` of `parts`: rows split
     /// over one axis of a rectangle whose other axis is `period` wide.
@@ -206,22 +206,13 @@ pub enum BankSplit {
     ByB,
 }
 
-/// How one slot's state `[a][b][w]` splits within a lane: `a` into
-/// `a_groups` and `b` into `b_groups` ranges, `w` words contiguous.
+/// One slot's state `[a][b][w]`: `w` words contiguous, split (when the
+/// engine splits it) by ranges of `a` and of `b`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockPlan {
+pub struct Block {
     pub a: u32,
     pub b: u32,
     pub w: u32,
-    pub a_groups: u32,
-    pub b_groups: u32,
-}
-
-impl BlockPlan {
-    /// Words one PE holds of one slot.
-    pub fn words(&self) -> u64 {
-        u64::from(self.a / self.a_groups) * u64::from(self.b / self.b_groups) * u64::from(self.w)
-    }
 }
 
 /// A plane every PE holds a block of: its `segments` pick, from the PE's
@@ -266,67 +257,20 @@ impl Segment {
             span: 1,
         }
     }
-
-    /// The indices this segment picks for block `[a0, a1) × [b0, b1)`, below
-    /// `bound`, ascending and deduplicated.
-    pub fn picks(&self, (a0, a1): (u32, u32), (b0, b1): (u32, u32), bound: u32) -> Vec<u32> {
-        let mut seen = std::collections::BTreeSet::new();
-        for i in a0..a1 {
-            let ia = i.checked_div(self.a_group).unwrap_or(0);
-            let js = if self.b_stride > 0 { b0..b1 } else { 0..1 };
-            for j in js {
-                for t in 0..self.span {
-                    let at = self.base + ia * self.a_stride + j * self.b_stride + t;
-                    if at < bound {
-                        seen.insert(at);
-                    }
-                }
-            }
-        }
-        seen.into_iter().collect()
-    }
-}
-
-/// The indices `segments` pick together, ascending and deduplicated.
-pub fn picks(segments: &[Segment], a: (u32, u32), b: (u32, u32), bound: u32) -> Vec<u32> {
-    let mut all: Vec<u32> = segments.iter().flat_map(|s| s.picks(a, b, bound)).collect();
-    all.sort_unstable();
-    all.dedup();
-    all
 }
 
 /// The paged form of a lane's state: lane `l` holds pages
 /// `indices[indptr[l]..indptr[l + 1]]` of the banks (each page `page_size`
-/// rows of a bank plane, `stride` words a page). A PE holds `lanes_per_pe ×
-/// max_pages` local pages; it reads `indptr`, `indices` and the `rewritten`
-/// per-row page tables (kv_append's `write_page`) with local page numbers.
+/// rows of a bank plane), at most `max_pages` a lane; a PE reads `indptr`,
+/// `indices` and the `rewritten` per-row page tables (kv_append's
+/// `write_page`) with local page numbers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PagePlan {
+pub struct Paged {
     pub source: PageSource,
     pub page_size: u32,
     pub max_pages: u32,
     /// Per-row page tables rewritten to local pages for the PE's rows.
     pub rewritten: Vec<String>,
-    /// A lane's pages split over this many PEs (1: one PE holds them all):
-    /// PE `p` holds pages `[pg0, pg0 + max_pages / page_groups)` of each of
-    /// its lanes, with `pg0` (and the pages per PE) in its header words 9
-    /// and 10; its row outputs are then partial and merged by `reduce`.
-    pub page_groups: u32,
-    /// The resident placement of a pool: every PE runs every lane, page
-    /// `g` of the pool lives on PE `g % pes` as its local page `g / pes`
-    /// (`strided_pages` local pages a PE, the pool's pages over the row),
-    /// a lane's local page list keeping every page with the ones elsewhere
-    /// as -1, so key positions stay whole and the row merges the lanes'
-    /// partials; the pool then stays where it is between fires.
-    pub strided: bool,
-    pub strided_pages: u32,
-}
-
-impl PagePlan {
-    /// Pages one PE holds of one lane.
-    pub fn pages_per_pe(&self) -> u32 {
-        self.max_pages.max(1).div_ceil(self.page_groups.max(1))
-    }
 }
 
 /// How a row output held by several PEs (page groups) is merged.
@@ -354,29 +298,28 @@ pub enum Reduce {
     FabricRoot { group: u32 },
 }
 
-/// A phase spread over PEs by lanes (and blocks of each lane's state): PE
-/// `p` runs lanes `[l0, l1)` (rows `[r0, r1)`) over block `[a0, a1) × [b0,
-/// b1)`, read from its row of `header` (a `[pes, 16]` i32 buffer: `l0, l1,
-/// held slots, a0, a1, b0, b1, r0, r1, 0…`), holding only its lanes' slot
-/// blocks of `banks`, with `slots` rewritten to those local rows. The host
-/// cuts and pastes all of it around the run.
+/// A phase spread over PEs by lanes, as its entry states it: how the
+/// lanes are found, the banks and planes a PE holds its share of, and how
+/// row outputs held by several PEs merge. The engine splits it
+/// ([`LaneSplit`]) and places it ([`Sink::lanes`]): PE `p` runs lanes
+/// `[l0, l1)` (rows `[r0, r1)`) over block `[a0, a1) × [b0, b1)`, read from
+/// its row of the header (`l0, l1, held slots, a0, a1, b0, b1, r0, r1, pg0,
+/// pages, 0…`), holding only its lanes' slot blocks of `banks`, with
+/// `slots` rewritten to those local rows. The host cuts and pastes all of
+/// it around the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanePlan {
-    pub pes: u32,
+pub struct Lanes {
     pub kind: LaneKind,
-    pub header: String,
     /// The slot table (i32, one entry per row): lane `l`'s slot is entry
     /// `l` (per row) or entry `indptr[l]` (ragged).
     pub slots: String,
     /// Banks `(name, stride, split)`: `[slots_total, stride]` f32 planes; a
-    /// PE holds `lanes_per_pe` local slot rows, each the whole `stride`, its
-    /// block of `[a][b][w]`, or rows `[b0, b1)` of `[b][stride / b]`.
+    /// PE holds its local slot rows, each the whole `stride`, its block of
+    /// `[a][b][w]`, or rows `[b0, b1)` of `[b][stride / b]`.
     pub banks: Vec<(String, u32, BankSplit)>,
-    /// How each slot's state splits within a lane, when it does; `stride`
+    /// A slot's state, when the engine may split it by blocks; `stride`
     /// then equals `a × b × w`.
-    pub block: Option<BlockPlan>,
-    /// The most lanes one PE runs; the local bank rows it holds.
-    pub lanes_per_pe: u32,
+    pub block: Option<Block>,
     /// The PE order: page groups vary fastest, then the b axis's groups,
     /// then the a axis's, then the lane groups; `a_first` swaps the two
     /// block axes, so a merge over page groups and the a axis (attention's
@@ -385,7 +328,7 @@ pub struct LanePlan {
     /// Outputs written row by row per lane `(name, width, a_stride,
     /// b_stride)`: after the run PE `p`'s copy supplies, for the rows of
     /// lanes `[l0, l1)`, the columns `i * a_stride + j * b_stride` of its
-    /// block (all columns when the plan has no block).
+    /// block (all columns when the state is not split by blocks).
     pub row_outputs: Vec<(String, u32, u32, u32)>,
     /// Planes held by block (columns, or rows): activations and weights
     /// too wide for a PE.
@@ -396,7 +339,16 @@ pub struct LanePlan {
     /// `start`: the row-shaped buffers of this phase are that window.
     pub window: Option<(u32, u32)>,
     /// Paged banks instead of one slot per lane.
-    pub pages: Option<PagePlan>,
+    pub pages: Option<Paged>,
+}
+
+/// A lane phase: what its entry stated, the split the engine chose, and
+/// where the engine placed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanePhase {
+    pub lanes: Lanes,
+    pub split: LaneSplit,
+    pub at: LanesAt,
 }
 
 /// Where the engine placed a lane phase ([`Sink::lanes`]): its header
@@ -418,7 +370,7 @@ pub struct Phase {
     pub func: Func,
     pub pes: u32,
     pub shards: Vec<(String, Shard)>,
-    pub lane: Option<LanePlan>,
+    pub lane: Option<LanePhase>,
     pub host: Option<HostPhase>,
     /// A sum the fabric takes after the function runs.
     pub reduce: Option<FabricReduce>,

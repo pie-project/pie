@@ -533,8 +533,9 @@ pub fn render(r: &Rendered) -> String {
 /// The rendered program back from its text.
 #[must_use]
 pub fn unrender(text: &str) -> Option<Rendered> {
+    use crate::fabric::lanes::{BlockPlan, LanePlan, PagePlan};
     use crate::fabric::{Export, Manifest, Symbol, View};
-    use kernels_cerebras::phase::{BlockPlan, LaneKind, LanePlan, PagePlan, PageSource, Shard};
+    use kernels_cerebras::phase::{LaneKind, PageSource, Shard};
     let rest = text.strip_prefix("===manifest.json\n")?;
     let (manifest, rest) = rest.split_once("===layout.csl\n")?;
     let (layout, pe) = rest.split_once("===pe.csl\n")?;

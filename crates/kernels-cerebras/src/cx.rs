@@ -11,10 +11,10 @@ use crate::csl::{Block, Dsd1, Func};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan, LanesAt, Phase,
-    Reduce, Shard, Sink,
+    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePhase, Lanes, LanesAt,
+    Phase, Reduce, Shard, Sink,
 };
-use crate::plan::Plan;
+use crate::plan::{LaneSplit, Plan};
 use crate::tensor::Tensor;
 
 /// What a kernel entry emits into: the engine's sink for one node (or one
@@ -56,7 +56,7 @@ pub struct Cx<'a> {
     /// How many PEs the phase runs on, and how its buffers spread over them.
     pes: u32,
     shards: Vec<(String, Shard)>,
-    lane: Option<LanePlan>,
+    lane: Option<LanePhase>,
     host: Option<HostOp>,
     reduce: Option<FabricReduce>,
     /// Buffers whose bf16 rounding waits for the fabric steps (they are
@@ -93,19 +93,23 @@ impl<'a> Cx<'a> {
         self.host = Some(op);
     }
 
-    /// Spreads this phase over lanes as `plan` says, where the engine places
-    /// them ([`Sink::lanes`]): the phase runs on the PEs it chooses, and the
-    /// plan's header and every buffer it holds by lane or block take their
-    /// shares of a PE.
-    pub fn lanes(&mut self, mut plan: LanePlan) -> Result<LanesAt, Error> {
-        let at = self.p.lanes(&plan)?;
-        plan.pes = at.pes;
+    /// Spreads this phase over lanes as `lanes` states and `split` (the
+    /// engine's answer) divides them, where the engine places them
+    /// ([`Sink::lanes`]): the phase runs on the PEs it chooses, and the
+    /// header and every buffer held by lane or block take their shares of a
+    /// PE.
+    pub fn lanes(&mut self, lanes: Lanes, split: LaneSplit) -> Result<LanesAt, Error> {
+        let at = self.p.lanes(&lanes, split)?;
         self.pes = at.pes.max(1);
         for (name, shard) in &at.shards {
             self.shards.retain(|(n, _)| n != name);
             self.shards.push((name.clone(), *shard));
         }
-        self.lane = Some(plan);
+        self.lane = Some(LanePhase {
+            lanes,
+            split,
+            at: at.clone(),
+        });
         Ok(at)
     }
 
@@ -394,7 +398,8 @@ impl<'a> Cx<'a> {
             let summed = self.shards.iter().any(|(n, s)| {
                 *n == b.name && matches!(s, Shard::SumCols { .. } | Shard::SumGrid { .. })
             }) || self.lane.as_ref().is_some_and(|l| {
-                l.reduce
+                l.lanes
+                    .reduce
                     .iter()
                     .any(|(n, r)| *n == b.name && matches!(r, Reduce::Sum))
             });
@@ -408,7 +413,7 @@ impl<'a> Cx<'a> {
                     .iter()
                     .any(|(n, s)| *n == b.name && matches!(s, Shard::Roots { .. }))
                 || self.lane.as_ref().is_some_and(|l| {
-                    l.reduce.iter().any(|(n, r)| {
+                    l.lanes.reduce.iter().any(|(n, r)| {
                         *n == b.name
                             && matches!(r, Reduce::FabricSum { .. } | Reduce::FabricRoot { .. })
                     })

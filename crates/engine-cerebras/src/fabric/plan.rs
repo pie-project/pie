@@ -5,7 +5,7 @@ use dtype::Dtype;
 use kernels_cerebras::Tensor;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::linear::gemm::FABRIC_SUM_WORDS;
-use kernels_cerebras::phase::{BlockPlan, Reduce};
+use kernels_cerebras::phase::Reduce;
 use kernels_cerebras::plan::{
     BlockSplit, Blocks, Footprint, Held, LSE_GROUPS, LaneSplit, Merge, PageSplit, PagedLanes,
     Pages, Plan, Product, Routed, RoutedSplit, Slots, Spread,
@@ -311,6 +311,8 @@ pub fn slots(fab: &Fabric, op: &'static str, slots: &Slots<'_>) -> Result<LaneSp
             pes: 1,
             lanes_per_pe: lanes.max(1),
             block: None,
+            page_groups: 1,
+            strided_pages: None,
         });
     }
     let divisors = |n: u32| (1..=n).filter(move |d| n.is_multiple_of(*d));
@@ -334,14 +336,7 @@ pub fn slots(fab: &Fabric, op: &'static str, slots: &Slots<'_>) -> Result<LaneSp
             ),
         ));
     };
-    let block = BlockPlan {
-        a,
-        b,
-        w,
-        a_groups,
-        b_groups,
-    };
-    let words = block.words().max(1);
+    let words = block_words(a_groups, b_groups).max(1);
     // The bank is one array: its slot rows within ARRAY_WORDS too.
     let room = fab
         .pe_words
@@ -352,7 +347,9 @@ pub fn slots(fab: &Fabric, op: &'static str, slots: &Slots<'_>) -> Result<LaneSp
     Ok(LaneSplit {
         pes: lane_groups * a_groups * b_groups,
         lanes_per_pe,
-        block: Some(block),
+        block: Some((a_groups, b_groups)),
+        page_groups: 1,
+        strided_pages: None,
     })
 }
 

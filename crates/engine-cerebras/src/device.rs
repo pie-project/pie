@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::fabric::lanes::{LanePlan, picks};
 use dtype::Dtype;
-use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, HostPhase, Reduce, Segment, picks};
+use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, HostPhase, Reduce, Segment};
 
 use crate::error::{Fault, Result};
 use crate::fabric::{Manifest, Rendered};
@@ -2567,11 +2568,7 @@ struct Paged {
 }
 
 impl LaneLayout {
-    fn plan(
-        lane: &kernels_cerebras::phase::LanePlan,
-        state: &HashMap<String, Vec<u32>>,
-        at: usize,
-    ) -> Result<LaneLayout> {
+    fn plan(lane: &LanePlan, state: &HashMap<String, Vec<u32>>, at: usize) -> Result<LaneLayout> {
         use kernels_cerebras::phase::{LaneKind, PageSource};
         let pes = lane.pes.max(1) as usize;
         // A plan without banks names no slot table.

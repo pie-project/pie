@@ -17,14 +17,14 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{BankSplit, ColPlane, LaneKind, LanePlan, Segment};
+use crate::phase::{BankSplit, Block, ColPlane, LaneKind, Lanes, Segment};
 use crate::plan::{LaneSplit, Slots};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const MAX_OFFSET: u64 = i16::MAX as u64;
 
 /// Where a row's slot comes from.
-enum Lanes {
+enum LaneRows {
     /// One row per lane: slot `slots[row]`.
     PerRow,
     /// A CSR over rows: lane `l` spans `indptr[l]..indptr[l+1]`, slot `slots[indptr[l]]`.
@@ -90,7 +90,7 @@ fn conv(
     ctx: &Ctx<'_>,
     op: &'static str,
     x: Tensor,
-    lanes: Lanes,
+    lanes: LaneRows,
     weight: Tensor,
     state: &RecurrentPool,
     conv_width: u32,
@@ -101,8 +101,8 @@ fn conv(
     let slots_rows = state.conv_state.rows;
     let stride = hist * c;
     let lanes_n = match &lanes {
-        Lanes::PerRow => x.rows,
-        Lanes::Ragged(t) => t.elements().saturating_sub(1) as u32,
+        LaneRows::PerRow => x.rows,
+        LaneRows::Ragged(t) => t.elements().saturating_sub(1) as u32,
     };
     // A slot's state is `[hist][c]`: split along the channels, far enough
     // that a block, the window scratch, the rows of `x` and `y` (sharded by
@@ -128,8 +128,10 @@ fn conv(
         },
     )?;
     // Activations and weights travel by channel block when the channels split.
-    let shard_cols = split.block.is_some_and(|b| b.b_groups > 1);
-    let win_words = split.block.map_or(u64::from(stride), |b| b.words());
+    let shard_cols = split.block.is_some_and(|(_, bg)| bg > 1);
+    let win_words = split.block.map_or(u64::from(stride), |(ag, bg)| {
+        u64::from(hist / ag) * u64::from(c / bg)
+    });
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
         let wb = cx.read(weight)?;
@@ -139,8 +141,8 @@ fn conv(
         let yb = cx.write(y)?;
         let win = cx.scratch("win", win_words);
         let (indptr, per_row) = match &lanes {
-            Lanes::PerRow => (sb.ptr(), true),
-            Lanes::Ragged(t) => (cx.read(*t)?.ptr(), false),
+            LaneRows::PerRow => (sb.ptr(), true),
+            LaneRows::Ragged(t) => (cx.read(*t)?.ptr(), false),
         };
         let plane = |b: &crate::phase::Buf, by_rows: bool| ColPlane {
             name: b.name.clone(),
@@ -166,7 +168,11 @@ fn conv(
             &sb,
             &bank,
             stride,
-            (hist, c),
+            Block {
+                a: hist,
+                b: c,
+                w: 1,
+            },
             rows_out,
             cols,
             slots_rows,
@@ -205,34 +211,33 @@ fn conv(
 fn lane_range(
     cx: &mut crate::cx::Cx<'_>,
     split: &LaneSplit,
-    lanes: &Lanes,
+    rows: &LaneRows,
     lanes_n: u32,
     slots: &crate::phase::Buf,
     bank: &crate::phase::Buf,
     stride: u32,
-    (a, b): (u32, u32),
+    block: Block,
     rows_out: Option<(&crate::phase::Buf, u32, u32)>,
     cols: Vec<ColPlane>,
     slots_rows: u32,
 ) -> Result<(String, u32), Error> {
     if split.pes <= 1 && split.block.is_none() {
-        return Ok((format!("0, {lanes_n}, 0, {a}, 0, {b}"), slots_rows));
+        return Ok((
+            format!("0, {lanes_n}, 0, {}, 0, {}", block.a, block.b),
+            slots_rows,
+        ));
     }
-    let header = cx.unique("lanes");
-    let plan = LanePlan {
-        pes: split.pes,
-        kind: match lanes {
-            Lanes::PerRow => LaneKind::PerRow { lanes: lanes_n },
-            Lanes::Ragged(t) => LaneKind::Ragged {
+    let lanes = Lanes {
+        kind: match rows {
+            LaneRows::PerRow => LaneKind::PerRow { lanes: lanes_n },
+            LaneRows::Ragged(t) => LaneKind::Ragged {
                 indptr: cx.read(*t)?.name,
                 lanes: lanes_n,
             },
         },
-        header: header.clone(),
         slots: slots.name.clone(),
         banks: vec![(bank.name.clone(), stride, BankSplit::Block)],
-        block: split.block,
-        lanes_per_pe: split.lanes_per_pe,
+        block: Some(block),
         a_first: false,
         row_outputs: rows_out
             .into_iter()
@@ -243,7 +248,7 @@ fn lane_range(
         window: None,
         pages: None,
     };
-    let hdr = cx.lanes(plan)?.header;
+    let hdr = cx.lanes(lanes, *split)?.header;
     Ok((
         format!("{0}[0], {0}[1], {0}[3], {0}[4], {0}[5], {0}[6]", hdr.name),
         split.lanes_per_pe,
@@ -264,7 +269,7 @@ pub fn causal_conv1d(
         ctx,
         "ssm.causal_conv1d",
         x,
-        Lanes::PerRow,
+        LaneRows::PerRow,
         weight,
         state,
         conv_width,
@@ -289,7 +294,7 @@ pub fn causal_conv1d_chunked(
         ctx,
         "ssm.causal_conv1d_chunked",
         x.data,
-        Lanes::Ragged(x.indptr),
+        LaneRows::Ragged(x.indptr),
         weight,
         state,
         conv_width,
@@ -434,7 +439,7 @@ fn delta(
     ctx: &Ctx<'_>,
     op: &'static str,
     qkv: Tensor,
-    lanes: Lanes,
+    lanes: LaneRows,
     gates: Tensor,
     state: &RecurrentPool,
     hk: u32,
@@ -448,8 +453,8 @@ fn delta(
     let stride = hv * dv * dk;
     let slots_rows = state.state.rows;
     let lanes_n = match &lanes {
-        Lanes::PerRow => qkv.rows,
-        Lanes::Ragged(t) => t.elements().saturating_sub(1) as u32,
+        LaneRows::PerRow => qkv.rows,
+        LaneRows::Ragged(t) => t.elements().saturating_sub(1) as u32,
     };
     // A slot's state is `[hv][dv][dk]`: split along the state rows, then
     // heads. Split, a PE holds of qkv only its heads' q and k (the k heads
@@ -489,8 +494,8 @@ fn delta(
         let qn = cx.scratch("qn", u64::from(dk));
         let kn = cx.scratch("kn", u64::from(dk));
         let (indptr, per_row) = match &lanes {
-            Lanes::PerRow => (sb.ptr(), true),
-            Lanes::Ragged(t) => (cx.read(*t)?.ptr(), false),
+            LaneRows::PerRow => (sb.ptr(), true),
+            LaneRows::Ragged(t) => (cx.read(*t)?.ptr(), false),
         };
         let (rows_out, cols) = if sharded {
             let heads = |base: u32| Segment {
@@ -546,7 +551,11 @@ fn delta(
             &sb,
             &bank,
             stride,
-            (hv, dv),
+            Block {
+                a: hv,
+                b: dv,
+                w: dk,
+            },
             rows_out,
             cols,
             slots_rows,
@@ -597,7 +606,7 @@ pub fn gated_delta(
         ctx,
         "ssm.gated_delta",
         qkv,
-        Lanes::PerRow,
+        LaneRows::PerRow,
         gates,
         state,
         k_heads,
@@ -627,7 +636,7 @@ pub fn gated_delta_chunked(
         ctx,
         "ssm.gated_delta_chunked",
         qkv.data,
-        Lanes::Ragged(qkv.indptr),
+        LaneRows::Ragged(qkv.indptr),
         gates,
         state,
         k_heads,
