@@ -19,6 +19,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
+use crate::plan::{BlockSplit, Blocks};
 use crate::tensor::Tensor;
 
 /// Words of a PE the attention kernel's code and stack take.
@@ -71,9 +72,6 @@ pub fn bidirectional(
     let group = qh / kvh;
     let d = head_dim;
     let (rows, keys) = (q.rows, k.rows);
-    // The attention kernel's code takes a good part of a PE: plan below the
-    // data budget by that much.
-    let budget = ctx.plan().fabric().pe_words.saturating_sub(CODE_WORDS);
     // Words a PE holds for a window of `n` query rows with the keys split
     // `ag` ways and the kv heads `hg` ways.
     let fabric = ctx.plan().fabric().fabric_sum;
@@ -90,35 +88,31 @@ pub fn bidirectional(
         };
         kv + qo + lse + merge + u64::from(images) + 1 + u64::from(d) + 16
     };
-    let divisors = |x: u32| (1..=x).filter(move |dv| x.is_multiple_of(*dv));
-    // The window: all the rows when one PE fits them, else halved until a
-    // plan fits; the plan: the fewest PEs (key groups × head groups).
-    let mut chunk = rows;
-    let (chunk, ag, hg) = loop {
-        let mut best: Option<(u32, u32, u32)> = None;
-        for hg in divisors(kvh) {
-            for ag in divisors(keys) {
-                if words(chunk, ag, hg) <= budget {
-                    let pes = ag * hg;
-                    if best.is_none_or(|(p, ..)| pes < p) {
-                        best = Some((pes, ag, hg));
-                    }
-                    break;
-                }
-            }
-        }
-        match best {
-            Some((_, ag, hg)) => break (chunk, ag, hg),
-            None if chunk > 1 => chunk = chunk.div_ceil(2),
-            None => {
-                return Err(refuse(
-                    OP,
-                    format!("one query row and one key row of one head exceed a PE's {budget}"),
-                ));
-            }
-        }
-    };
-    let whole = chunk >= rows && ag == 1 && hg == 1 && words(rows, 1, 1) <= budget;
+    // The keys split `ag` ways and the kv heads `hg` ways, over windows of
+    // the rows; the attention kernel's code takes a good part of a PE.
+    let BlockSplit {
+        window: chunk,
+        a_groups: ag,
+        b_groups: hg,
+    } = ctx
+        .plan()
+        .blocks(&Blocks {
+            rows,
+            a: keys,
+            b: kvh,
+            code: CODE_WORDS,
+            held: &words,
+        })
+        .ok_or_else(|| {
+            refuse(
+                OP,
+                format!(
+                    "one query row and one key row of one head exceed a PE's {}",
+                    ctx.plan().fabric().pe_words.saturating_sub(CODE_WORDS)
+                ),
+            )
+        })?;
+    let whole = chunk >= rows && ag == 1 && hg == 1;
     let mut c0 = 0;
     while c0 < rows {
         let n = (rows - c0).min(chunk);

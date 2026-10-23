@@ -2,12 +2,16 @@
 //! within the terms of the fabric.
 
 use kernels_cerebras::error::{Error, refuse};
-use kernels_cerebras::linear::gemm::{ARRAY_WORDS, FABRIC_SUM_WORDS};
+use kernels_cerebras::linear::gemm::FABRIC_SUM_WORDS;
 use kernels_cerebras::phase::{BlockPlan, Reduce};
 use kernels_cerebras::plan::{
-    Fabric, Footprint, Held, LaneSplit, PageSplit, PagedLanes, Pages, Plan, Product, Routed,
-    RoutedSplit, Slots, Spread,
+    BlockSplit, Blocks, Fabric, Footprint, Held, LaneSplit, PageSplit, PagedLanes, Pages, Plan,
+    Product, Routed, RoutedSplit, Slots, Spread,
 };
+
+/// The most words one array holds: a word address of 16 bits (the probe's
+/// 8448-word array fails a 14-bit-plus-shift relocation).
+pub const ARRAY_WORDS: u64 = 8192;
 
 /// The planner over a set of terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +38,10 @@ impl Plan for Planner {
 
     fn spread(&self, spread: &Spread<'_>) -> Option<u32> {
         self::spread(&self.fabric, spread)
+    }
+
+    fn blocks(&self, blocks: &Blocks<'_>) -> Option<BlockSplit> {
+        self::blocks(&self.fabric, blocks)
     }
 
     fn slots(&self, op: &'static str, slots: &Slots<'_>) -> Result<LaneSplit, Error> {
@@ -163,27 +171,31 @@ pub fn grid(fab: &Fabric, product: Product) -> Option<(u32, u32, u32)> {
     best.map(|(g, _)| g)
 }
 
-/// The most PEs one fabric sum spans: one rectangle row of partials.
-const SUM_PES: u32 = 256;
+/// The most PEs one collective over a row of PEs spans.
+const ROW_PES: u32 = 256;
 
 /// The groups a [`Spread`] splits into: the fewest that divide its units
-/// and whose share fits a PE; a sum over the fabric spans at most one
-/// rectangle row and takes the collectives' words, and under the resident
-/// placement is over the whole row or none; any other split is capped at
-/// [`Fabric::max_pes`].
+/// and whose share fits a PE; groups combining over the fabric span at
+/// most one rectangle row and take the collectives' words, and under the
+/// resident placement are the whole row or one; any other split is capped
+/// at [`Fabric::max_pes`].
 pub fn spread(fab: &Fabric, spread: &Spread<'_>) -> Option<u32> {
     let Spread {
         units,
-        summed,
+        collective,
         held,
     } = *spread;
     let fits = |n: u32| {
         let h = held(n);
-        let collectives = if summed && n > 1 { FABRIC_SUM_WORDS } else { 0 };
+        let collectives = if collective && n > 1 {
+            FABRIC_SUM_WORDS
+        } else {
+            0
+        };
         h.array <= ARRAY_WORDS && h.words + collectives <= fab.pe_words
     };
     let divides = |n: u32| units.is_multiple_of(n);
-    if !summed {
+    if !collective {
         return (1..=units)
             .filter(|n| divides(*n) && *n <= fab.max_pes)
             .find(|n| fits(*n));
@@ -191,9 +203,50 @@ pub fn spread(fab: &Fabric, spread: &Spread<'_>) -> Option<u32> {
     if let Some(n) = fab.resident_pes {
         return [n, 1].into_iter().find(|n| divides(*n) && fits(*n));
     }
-    (1..=SUM_PES.min(units))
+    (1..=ROW_PES.min(units))
         .filter(|n| divides(*n))
         .find(|n| fits(*n))
+}
+
+/// How blocks of a state split over PEs: all the rows when a split holds
+/// them, else a window of them halved until one does; the split, the
+/// fewest PEs, each `b` group taking the first `a` grouping that fits.
+pub fn blocks(fab: &Fabric, blocks: &Blocks<'_>) -> Option<BlockSplit> {
+    let Blocks {
+        rows,
+        a,
+        b,
+        code,
+        held,
+    } = *blocks;
+    let budget = fab.pe_words.saturating_sub(code);
+    let divisors = |x: u32| (1..=x).filter(move |d| x.is_multiple_of(*d));
+    let mut window = rows;
+    loop {
+        let mut best: Option<(u32, u32, u32)> = None;
+        for bg in divisors(b) {
+            for ag in divisors(a) {
+                if held(window, ag, bg) <= budget {
+                    let pes = ag * bg;
+                    if best.is_none_or(|(p, ..)| pes < p) {
+                        best = Some((pes, ag, bg));
+                    }
+                    break;
+                }
+            }
+        }
+        match best {
+            Some((_, a_groups, b_groups)) => {
+                return Some(BlockSplit {
+                    window,
+                    a_groups,
+                    b_groups,
+                });
+            }
+            None if window > 1 => window = window.div_ceil(2),
+            None => return None,
+        }
+    }
 }
 
 /// How lanes over a recurrent bank spread over PEs: whole slots on one PE

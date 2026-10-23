@@ -7,7 +7,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{HostOp, Shard};
-use crate::plan::Product;
+use crate::plan::{Held, Product, Spread};
 use crate::tensor::Tensor;
 
 /// `y[m, n] = Σ_k act[m, k] · w[n, k]` over the first `y.rows` rows of `act`,
@@ -206,23 +206,37 @@ fn resident_matmul(
     pes: u32,
 ) -> Result<(), Error> {
     use crate::phase::{FabricOp, FabricStep, Guarded};
-    let budget = ctx.plan().fabric().pe_words;
     let (m64, k64, n64) = (u64::from(m), u64::from(k), u64::from(n));
     let a_words = u64::from(act.rows) * k64;
     let y_words = m64 * n64;
-    let split = n.is_multiple_of(pes) && {
-        let share = (n64 / u64::from(pes)) * k64;
-        share <= ARRAY_WORDS
-            && a_words + share + 2 * y_words + y_words / u64::from(pes) + FABRIC_SUM_WORDS <= budget
+    // The weight's rows over the row of PEs, its column blocks of `y`
+    // gathered (a block, the gathered whole and `y`), or whole on each.
+    let held = |g: u32| {
+        let share = (n64 / u64::from(g)) * k64;
+        Held {
+            words: if g > 1 {
+                a_words + share + 2 * y_words + y_words / u64::from(g)
+            } else {
+                a_words + share + y_words
+            },
+            array: share,
+        }
     };
-    if !split && (a_words + n64 * k64 + y_words > budget || n64 * k64 > ARRAY_WORDS) {
-        return Err(refuse(
-            op,
-            format!(
-                "the resident row of {pes} PEs holds neither a {n}x{k} weight whole nor by rows ({n} rows over {pes})"
-            ),
-        ));
-    }
+    let split = match ctx.plan().spread(&Spread {
+        units: n,
+        collective: true,
+        held: &held,
+    }) {
+        Some(g) => g > 1,
+        None => {
+            return Err(refuse(
+                op,
+                format!(
+                    "the resident row of {pes} PEs holds neither a {n}x{k} weight whole nor by rows ({n} rows over {pes})"
+                ),
+            ));
+        }
+    };
     ctx.emit(&mut |cx| {
         let ab = cx.read(act)?;
         let half = cx.read_half(w)?;
@@ -300,7 +314,3 @@ fn resident_matmul(
         Ok(())
     })
 }
-
-/// The most words one array holds: a word address of 16 bits (the probe's
-/// 8448-word array fails a 14-bit-plus-shift relocation).
-pub const ARRAY_WORDS: u64 = 8192;

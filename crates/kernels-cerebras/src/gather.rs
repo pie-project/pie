@@ -19,7 +19,7 @@ fn embed_pes(ctx: &Ctx<'_>, table: Tensor, beside: u64) -> Option<u32> {
     let width = u64::from(table.width);
     ctx.plan().spread(&Spread {
         units: table.rows,
-        summed: true,
+        collective: true,
         held: &|n| {
             let share = u64::from(table.rows / n) * width;
             Held {
@@ -37,9 +37,11 @@ fn copy_split(
     ctx: &Ctx<'_>,
     op: &'static str,
     rows: u32,
-    per_row: u64,
+    width: u32,
     same_rows: bool,
 ) -> Option<u32> {
+    // The source row and its parts.
+    let per_row = 2 * u64::from(width);
     if same_rows {
         return ctx
             .plan()
@@ -57,7 +59,12 @@ fn copy_split(
             .ok()
             .map(|(rg, _)| rg);
     }
-    (per_row * u64::from(rows) <= ctx.plan().fabric().pe_words).then_some(1)
+    ctx.plan()
+        .holds(Held {
+            words: per_row * u64::from(rows),
+            array: u64::from(width) * u64::from(rows),
+        })
+        .then_some(1)
 }
 
 /// A gather of `table` rows into `y` (`y_words` a PE) over `n` PEs holding
@@ -202,7 +209,7 @@ pub fn split_q_gate(
         ctx,
         OP,
         rows,
-        2 * u64::from(packed.width),
+        packed.width,
         q.rows == rows && gate.rows == rows,
     );
     ctx.emit(&mut |cx| {
@@ -271,7 +278,7 @@ pub fn split_rows(
         ctx,
         OP,
         rows,
-        2 * u64::from(x.width),
+        x.width,
         left.rows == rows && right.rows == rows,
     );
     ctx.emit(&mut |cx| {
@@ -538,7 +545,7 @@ pub fn split_qkv(
         ctx,
         OP,
         rows,
-        2 * u64::from(packed.width),
+        packed.width,
         q.rows == rows && k.rows == rows && v.rows == rows,
     );
     ctx.emit(&mut |cx| {

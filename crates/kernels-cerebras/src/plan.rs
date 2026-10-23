@@ -29,6 +29,10 @@ pub trait Plan {
     /// How many groups `spread` splits into; `None` when no split fits.
     fn spread(&self, spread: &Spread<'_>) -> Option<u32>;
 
+    /// How blocks of a state split over PEs, and the rows of one phase;
+    /// `None` when not even one row fits.
+    fn blocks(&self, blocks: &Blocks<'_>) -> Option<BlockSplit>;
+
     /// How lanes over a recurrent bank spread over PEs.
     fn slots(&self, op: &'static str, slots: &Slots<'_>) -> Result<LaneSplit, Error>;
 
@@ -119,22 +123,53 @@ impl Default for Fabric {
     }
 }
 
-/// What one PE holds: `words` in all, the largest array `array` of them.
+/// What one PE holds: `words` in all, the largest array `array` of them
+/// (an array has a bound of its own beside the PE's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Held {
     pub words: u64,
     pub array: u64,
 }
 
+impl Held {
+    /// Arrays of these words side by side, and `beside` words more.
+    pub fn arrays(words: &[u64], beside: u64) -> Self {
+        Held {
+            words: words.iter().sum::<u64>() + beside,
+            array: words.iter().copied().max().unwrap_or(0),
+        }
+    }
+}
+
 /// An op over `units` that split into equal groups, one group a PE:
-/// `held(groups)` is what a PE holds at that split. `summed` when the
-/// groups' partials add over one row of PEs on the fabric (an embedding
-/// table by rows), which the engine then caps at a rectangle row and gives
-/// the collectives' words.
+/// `held(groups)` is what a PE holds at that split. `collective` when the
+/// groups combine their results over one row of PEs on the fabric (a sum,
+/// a gather), which the engine then caps at a rectangle row and gives the
+/// collectives' words.
 pub struct Spread<'a> {
     pub units: u32,
-    pub summed: bool,
+    pub collective: bool,
     pub held: &'a dyn Fn(u32) -> Held,
+}
+
+/// A state `[a][b]` an op splits over PEs in blocks (attention's keys by
+/// kv heads), over `rows` rows run a window at a time: `held(window,
+/// a_groups, b_groups)` is what a PE holds, beside `code` words of the
+/// kernel's code.
+pub struct Blocks<'a> {
+    pub rows: u32,
+    pub a: u32,
+    pub b: u32,
+    pub code: u64,
+    pub held: &'a dyn Fn(u32, u32, u32) -> u64,
+}
+
+/// A block split: the rows of one phase and the groups of each axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSplit {
+    pub window: u32,
+    pub a_groups: u32,
+    pub b_groups: u32,
 }
 
 /// Lanes over a recurrent bank: `elements` words of bank over `lanes`

@@ -84,7 +84,7 @@ pub fn block_dyn_conv(
         .plan()
         .spread(&Spread {
             units: groups,
-            summed: false,
+            collective: false,
             held: &held,
         })
         .ok_or_else(|| {

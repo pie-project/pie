@@ -15,6 +15,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::HostOp;
+use crate::plan::Held;
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const MAX_NGRAM: usize = 4;
@@ -103,13 +104,16 @@ fn ngram(
     let (mults, primes, offsets) = (mults.to_vec(), primes.to_vec(), offsets.to_vec());
     // One PE hashes every lane (a few integer hashes a row); a fire whose
     // tables outgrow a PE hashes on the host.
-    let words = ids.elements()
-        + indptr.map_or(0, |ip| ip.elements())
-        + state.slots.elements()
-        + state.state.elements()
-        + out.elements()
-        + 3 * (mults.len() + primes.len()) as u64;
-    let on_pe = words <= ctx.plan().fabric().pe_words;
+    let on_pe = ctx.plan().holds(Held::arrays(
+        &[
+            ids.elements(),
+            indptr.map_or(0, |ip| ip.elements()),
+            state.slots.elements(),
+            state.state.elements(),
+            out.elements(),
+        ],
+        3 * (mults.len() + primes.len()) as u64,
+    ));
     ctx.emit(&mut |cx| {
         let ib = cx.read(ids)?;
         let ipb = match indptr {

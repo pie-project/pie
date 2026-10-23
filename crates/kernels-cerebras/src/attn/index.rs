@@ -18,7 +18,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::HostOp;
-use crate::plan::Fabric;
+use crate::plan::Held;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn paged(op: &'static str, pool: &KvPool) -> Result<u32, Error> {
@@ -31,11 +31,10 @@ fn paged(op: &'static str, pool: &KvPool) -> Result<u32, Error> {
     Ok(pool.page_size as u32)
 }
 
-/// Whether one PE holds these buffers' words (each within an array, all
-/// within the data budget); otherwise the op runs on the host.
-fn one_pe(fab: &Fabric, words: &[u64]) -> bool {
-    use crate::linear::gemm::ARRAY_WORDS;
-    words.iter().all(|w| *w <= ARRAY_WORDS) && words.iter().sum::<u64>() + 64 <= fab.pe_words
+/// Whether one PE holds these buffers' words (and a few scalars);
+/// otherwise the op runs on the host.
+fn one_pe(ctx: &Ctx<'_>, words: &[u64]) -> bool {
+    ctx.plan().holds(Held::arrays(words, 64))
 }
 
 fn long_enough(op: &'static str, what: &str, t: Tensor, n: u32) -> Result<(), Error> {
@@ -78,7 +77,7 @@ pub fn kv_append(
     long_enough(OP, "write offset table", write_offset, k.rows)?;
     let (rows, width, table_rows) = (k.rows, k.width, keys.keys.rows);
     let on_pe = one_pe(
-        &ctx.plan().fabric(),
+        ctx,
         &[
             k.elements(),
             keys.keys.elements(),
@@ -158,11 +157,18 @@ fn boundary(
     long_enough(op, "row-valid table", row_valid, rows)?;
     // One PE marks every row (the tables are small: a few words a row); a
     // fire whose tables outgrow a PE marks on the host.
-    let words = positions.elements()
-        + request_of_token.elements()
-        + row_valid.elements()
-        + 3 * u64::from(rows);
-    let on_pe = words <= ctx.plan().fabric().pe_words;
+    let rows64 = u64::from(rows);
+    let on_pe = ctx.plan().holds(Held::arrays(
+        &[
+            positions.elements(),
+            request_of_token.elements(),
+            row_valid.elements(),
+            rows64,
+            rows64,
+            rows64,
+        ],
+        0,
+    ));
     ctx.emit(&mut |cx| {
         let p = cx.read(positions)?;
         let r = cx.read(request_of_token)?;
@@ -284,7 +290,7 @@ pub fn block_mean(
     }
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let on_pe = one_pe(
-        &ctx.plan().fabric(),
+        ctx,
         &[
             boundary_pos.elements(),
             boundary_req.elements(),
@@ -366,7 +372,7 @@ pub fn pool_kv_append(
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let width = entries.width;
     let on_pe = one_pe(
-        &ctx.plan().fabric(),
+        ctx,
         &[
             entries.elements(),
             boundary_pos.elements(),
@@ -476,7 +482,7 @@ pub fn topk(
     }
     let nk = u64::from(keys.max_pages) * u64::from(ps) / u64::from(ratio.max(1));
     let on_pe = one_pe(
-        &ctx.plan().fabric(),
+        ctx,
         &[
             q.elements(),
             weights.map_or(0, |w| w.elements()),

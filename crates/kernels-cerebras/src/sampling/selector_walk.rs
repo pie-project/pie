@@ -10,6 +10,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::HostOp;
+use crate::plan::Held;
 use crate::tensor::{RaggedTensor, Tensor};
 
 /// The drafter's greedy walk over each lane's candidate rows: row `t` scores
@@ -82,8 +83,7 @@ pub fn selector_walk(
         succ.elements(),
         picks.elements(),
     ];
-    let on_pe = words.iter().all(|w| *w <= crate::linear::gemm::ARRAY_WORDS)
-        && words.iter().sum::<u64>() + 64 <= ctx.plan().fabric().pe_words;
+    let on_pe = ctx.plan().holds(Held::arrays(&words, 64));
     ctx.emit(&mut |cx| {
         let cb = cx.read(cand.data)?;
         let ib = cx.read(cand.indptr)?;
