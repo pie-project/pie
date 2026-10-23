@@ -43,12 +43,6 @@
     "@pie-project/server-web": "0.5.4",
     "ws": "^8.22.0"
   },
-  "optionalDependencies": {
-    "@pie-project/server-linux-x64": "0.5.4",
-    "@pie-project/server-linux-arm64": "0.5.4",
-    "@pie-project/server-darwin-arm64": "0.5.4",
-    "@pie-project/server-win32-x64": "0.5.4"
-  },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
