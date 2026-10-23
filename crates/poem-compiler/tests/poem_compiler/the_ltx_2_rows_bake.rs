@@ -599,7 +599,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
         let mut gates = 0usize;
         for node in &plan.nodes {
             match &node.op {
-                Operation::Elemwise(Elemwise::GatedResidualAdd { .. }) => {
+                Operation::Elemwise(Elemwise::ResidualAdd { gate: Some(_), .. }) => {
                     let mut pairs = Vec::new();
                     node.op.aliases(&mut pairs);
                     assert_eq!(

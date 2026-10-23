@@ -18,7 +18,7 @@ pub use collective::Collective;
 pub use conv::{Conv, GridRule, TimePad, VoxelSegment};
 pub use elemwise::{
     ActFn, BinaryOp, Bounds, Elemwise, GateActivation, ModulateForm, MropeForm, NormAxis, NormNext,
-    NormWeight, RopeForm, RopeFreqs, Turn, Yarn,
+    NormWeight, ResidualGate, RopeForm, RopeFreqs, Turn, Yarn,
 };
 pub use fused::{Fused, NormKind};
 pub use gather::{Gather, PixelOrder, TapKind};

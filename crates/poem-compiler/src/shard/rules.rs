@@ -202,6 +202,16 @@ fn rule(op: &Operation) -> Rule {
             BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
         };
     }
+    // A residual add is linear in its two rows; one under a gate reads its
+    // operands whole.
+    if let Operation::Elemwise(Elemwise::ResidualAdd { gate, .. }) = op {
+        return match gate {
+            None => Rule::Linear {
+                follow: &["x", "y"],
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
     // An expert product contracts with its bank's split, as a product does.
     if let Operation::Linear(Linear::MoeSelect { .. }) = op {
         return Rule::Contract {
@@ -223,9 +233,6 @@ fn rule(op: &Operation) -> Rule {
     }
     let name = op.name();
     match name {
-        "elemwise.residual_add" => Rule::Linear {
-            follow: &["x", "y"],
-        },
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
             follow: &["routed", "shared"],
         },

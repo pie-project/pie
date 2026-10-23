@@ -2,7 +2,7 @@ use crate::handle::Tensor;
 use kernels_xla::elemwise;
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, ModulateForm, MropeForm, RopeForm, ValueId};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{NormAxis, NormWeight, ResidualGate};
 
 use poem_ir::Operands;
 
@@ -196,12 +196,11 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Elemwise::GatedResidualAdd {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
+            Elemwise::ResidualAdd {
+                x: y,
+                gate: Some(ResidualGate { g, lane_of_row }),
+                y: r,
+                y_out: _,
             } => {
                 let r = self.tensor(*r);
                 crate::lower::lower(self.ctx(), |l| {
@@ -521,7 +520,12 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => {
                 // A readout-rowed `x` into a token-rowed `y` (an MTP head
                 // over the trunk's hidden rows): the GPU kernel adds row
                 // for row from the first, and only the readout rows mean

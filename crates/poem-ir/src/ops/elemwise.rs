@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Op;
+use crate::check::Expect;
 use crate::operands::{Part, Slot};
 use crate::value::ValueId;
 
@@ -62,6 +63,27 @@ pub enum NormAxis {
     Head(u32),
     /// Each `group`-wide run, the weight as wide as the row.
     Group(u32),
+}
+
+/// The gate an [`Elemwise::ResidualAdd`] scales its addend by: one row a
+/// row, or with `lane_of_row` one a request lane, each row reading its lane's.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResidualGate {
+    pub g: ValueId,
+    pub lane_of_row: Option<ValueId>,
+}
+
+impl Part for ResidualGate {
+    fn inputs(&self, sink: &mut Vec<ValueId>) {
+        sink.push(self.g);
+        sink.extend(self.lane_of_row);
+    }
+    fn outputs(&self, _sink: &mut Vec<ValueId>) {}
+    fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
+        if let Some(lanes) = self.lane_of_row {
+            sink.push(("lane_of_row", lanes, Expect::I32));
+        }
+    }
 }
 
 impl Part for NormNext {
@@ -159,9 +181,12 @@ pub enum Elemwise {
         #[output]
         y: ValueId,
     },
+    /// `y += x`, in place; under a `gate`, `y += gate ⊙ x`.
     ResidualAdd {
         #[input]
         x: ValueId,
+        #[part]
+        gate: Option<ResidualGate>,
         #[input]
         y: ValueId,
         #[output(alias = y)]
@@ -360,18 +385,6 @@ pub enum Elemwise {
         form: ModulateForm,
         #[output]
         y: ValueId,
-    },
-    GatedResidualAdd {
-        #[input]
-        r: ValueId,
-        #[input]
-        g: ValueId,
-        #[input]
-        y: ValueId,
-        #[input(I32)]
-        lane_of_row: Option<ValueId>,
-        #[output(alias = r)]
-        r_out: ValueId,
     },
     Sinusoid {
         #[input(F32)]

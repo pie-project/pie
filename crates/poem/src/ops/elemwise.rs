@@ -1,5 +1,5 @@
 use super::*;
-use poem_ir::{NormAxis, NormWeight, Turn};
+use poem_ir::{NormAxis, NormWeight, ResidualGate, Turn};
 
 pub use poem_ir::ops::elemwise::Yarn;
 
@@ -215,6 +215,7 @@ pub fn residual_add(x: &Value, y: &Value) -> Value {
     r.push(
         Elemwise::ResidualAdd {
             x: x.id(),
+            gate: None,
             y: y.id(),
             y_out: y_out.id(),
         },
@@ -936,12 +937,14 @@ pub fn gated_residual_add(
     let mut ins = vec![r_in, g, y];
     ins.extend(lane_of_row);
     r.push(
-        Elemwise::GatedResidualAdd {
-            r: r_in.id(),
-            g: g.id(),
-            y: y.id(),
-            lane_of_row: lane_of_row.map(Value::id),
-            r_out: r_out.id(),
+        Elemwise::ResidualAdd {
+            x: y.id(),
+            gate: Some(ResidualGate {
+                g: g.id(),
+                lane_of_row: lane_of_row.map(Value::id),
+            }),
+            y: r_in.id(),
+            y_out: r_out.id(),
         },
         &ins,
     );

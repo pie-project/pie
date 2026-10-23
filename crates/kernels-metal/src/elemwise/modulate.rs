@@ -148,7 +148,7 @@ pub fn gated_residual_add(
     lane_of_row: Option<Tensor>,
     r_out: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.gated_residual_add";
+    const OP: &str = "elemwise.residual_add";
     debug_assert!(
         r.rows == r_out.rows && r.width == r_out.width && y.rows == r.rows && y.width == r.width,
         "`{OP}` folds one rectangle"

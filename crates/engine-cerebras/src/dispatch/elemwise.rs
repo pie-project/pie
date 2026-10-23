@@ -73,7 +73,12 @@ impl Run<'_> {
                 matches!(act, GateActivation::Sigmoid),
                 self.tensor(*y),
             ),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => {
                 // A readout-rowed `x` into a token-rowed `y`: the kernel adds
                 // row for row from the first.
                 let (x, y) = (self.tensor(*x), self.tensor(*y));

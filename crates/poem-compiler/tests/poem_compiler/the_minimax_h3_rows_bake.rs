@@ -521,7 +521,12 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
                         "`{deployment}`: a lane-vector chain lands `[Lanes, ·]` f32, not {ty:?}"
                     );
                 }
-                Operation::Elemwise(Elemwise::GatedResidualAdd { r, r_out, .. }) => {
+                Operation::Elemwise(Elemwise::ResidualAdd {
+                    gate: Some(_),
+                    y: r,
+                    y_out: r_out,
+                    ..
+                }) => {
                     folds += 1;
                     assert_eq!(
                         plan.values[r.0 as usize].ty, plan.values[r_out.0 as usize].ty,

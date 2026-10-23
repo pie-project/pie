@@ -80,7 +80,6 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elemwise.clamp", Reads::Rows),
     entry("elemwise.gate_sigmoid_mul", Reads::Rows),
     entry("elemwise.gate_sigmoid_mul_heads", Reads::Rows),
-    entry("elemwise.gated_residual_add", Reads::Rows),
     entry("fused.gated_residual_norm_modulate", Reads::Rows),
     entry("elemwise.hc_expand", Reads::Rows),
     entry("elemwise.hc_fold", Reads::Rows),

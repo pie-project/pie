@@ -1,7 +1,7 @@
 use kernels_metal::{Tensor, elemwise};
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, Operands, RopeForm};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
 
@@ -246,12 +246,11 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 self.tensor(*y),
             ),
-            Elemwise::GatedResidualAdd {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
+            Elemwise::ResidualAdd {
+                x: y,
+                gate: Some(ResidualGate { g, lane_of_row }),
+                y: r,
+                y_out: _,
             } => elemwise::modulate::gated_residual_add(
                 self.ctx(),
                 self.tensor(*r),
@@ -540,9 +539,12 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
-                elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y)),
             Elemwise::AddBias {
                 bias,
                 out,
