@@ -77,6 +77,7 @@ fn sdpa_speed() {
         narrow: tuning.limits().lanes < 32,
         decode_threads: tuning.sdpa_decode_threads(HD as u32),
         tile_rows: tuning.sdpa_tile_rows(),
+        tile_lanes: 32,
         split_groups: tuning.sdpa_split_groups(),
         split_min_keys: tuning.sdpa_split_min_keys(),
     };

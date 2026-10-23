@@ -91,7 +91,8 @@ fn sdpa_speed() {
         tier: kernels_slang::Tier::Baseline,
         narrow: false,
         decode_threads: 256,
-        tile_rows: 8,
+        tile_rows: 16,
+        tile_lanes: 16,
         split_groups: tuning.sdpa_split_groups(),
         split_min_keys: tuning.sdpa_split_min_keys(),
     };
@@ -346,26 +347,41 @@ fn sdpa_speed() {
                 Ok(())
             });
         };
-        let slang = |g: &Gpu| {
-            g.run_slang(|c| {
-                for _ in 0..PREFILL_REPS {
-                    sdpa::prefill(
-                        c,
-                        tactic,
-                        st(qt),
-                        tables,
-                        spool,
-                        None,
-                        HD as u32,
-                        scale,
-                        st(ot),
-                        None,
-                    )?;
-                }
-                Ok(())
-            });
+        let slang = |tile_rows: u32, tile_lanes: u32| {
+            move |g: &Gpu| {
+                g.run_slang(|c| {
+                    for _ in 0..PREFILL_REPS {
+                        sdpa::prefill(
+                            c,
+                            sdpa::Tactic {
+                                tile_rows,
+                                tile_lanes,
+                                ..tactic
+                            },
+                            st(qt),
+                            tables,
+                            spool,
+                            None,
+                            HD as u32,
+                            scale,
+                            st(ot),
+                            None,
+                        )?;
+                    }
+                    Ok(())
+                });
+            }
         };
-        let times = race(&gpu, PREFILL_REPS, &[&hand, &slang]);
-        report(&format!("prefill kv {kv} rows {rows} (tiled)"), &times);
+        // Every tile the adapter's workgroup holds.
+        let invocations = gpu.device.workgroup_limits().0;
+        for (tile, lanes) in [(8u32, 32u32), (16, 32), (32, 32), (16, 16)] {
+            if lanes * tile <= invocations {
+                let times = race(&gpu, PREFILL_REPS, &[&hand, &slang(tile, lanes)]);
+                report(
+                    &format!("prefill kv {kv} rows {rows} (tiled {tile}x{lanes})"),
+                    &times,
+                );
+            }
+        }
     }
 }

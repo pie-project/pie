@@ -30,8 +30,11 @@ pub struct Tactic {
     pub narrow: bool,
     /// Invocations a decode workgroup walks with: 256, or 128.
     pub decode_threads: u32,
-    /// Query rows a prefill workgroup holds: 32, 16 or 8.
+    /// Query rows a prefill workgroup holds: 32, 16 or 8 at 32 lanes a row.
     pub tile_rows: u32,
+    /// Lanes a prefill row walks with: 32, or 16 (16 rows a workgroup,
+    /// whatever `tile_rows` says).
+    pub tile_lanes: u32,
     /// Decode workgroups the device wants in flight: a decode with fewer
     /// (heads x rows) splits its rows' keys to reach them.
     pub split_groups: u32,
@@ -436,14 +439,16 @@ pub fn prefill(
 ) -> Result<(), Error> {
     const OP: &str = "attn.prefill";
     let shape = shape(OP, q, pool, window, head_dim)?;
-    let tile = match tactic.tile_rows {
-        32.. => 32,
-        16..=31 => 16,
-        _ => 8,
+    let (lanes, tile) = match (tactic.tile_lanes, tactic.tile_rows) {
+        (..=16, _) => (16, 16),
+        (_, 32..) => (32, 32),
+        (_, 16..=31) => (32, 16),
+        _ => (32, 8),
     };
     let name = format!(
-        "attn_sdpa_{}{}_bf16_d_{head_dim}",
+        "attn_sdpa_{}{}{}_bf16_d_{head_dim}",
         if lse.is_some() { "tiled_lse" } else { "tiled" },
+        if lanes == 32 { "" } else { "_l16" },
         if tile == 32 {
             String::new()
         } else {
@@ -460,7 +465,7 @@ pub fn prefill(
     ctx.fire(
         Fire::at(SDPA, entry)
             .groups([shape.q_heads, shape.rows.div_ceil(tile), 1])
-            .group([32, tile, 1]),
+            .group([lanes, tile, 1]),
         &args,
     )
 }

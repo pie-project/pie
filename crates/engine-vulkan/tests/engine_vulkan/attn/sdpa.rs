@@ -335,17 +335,22 @@ fn paged_attention_answers_the_reference() {
                     });
                     close(&gpu.down(o, n), &want_o, &shape);
 
-                    let tactics: &[(bool, u32, u32)] = if matches!(form, Form::Tiled) {
-                        &[(false, 256, 32), (false, 256, 16), (false, 256, 8)]
+                    let tactics: &[(bool, u32, u32, u32)] = if matches!(form, Form::Tiled) {
+                        &[
+                            (false, 256, 32, 32),
+                            (false, 256, 16, 32),
+                            (false, 256, 8, 32),
+                            (false, 256, 16, 16),
+                        ]
                     } else {
                         &[
-                            (true, 256, 32),
-                            (true, 128, 32),
-                            (false, 256, 32),
-                            (false, 128, 32),
+                            (true, 256, 32, 32),
+                            (true, 128, 32, 32),
+                            (false, 256, 32, 32),
+                            (false, 128, 32, 32),
                         ]
                     };
-                    for &(subgroup, threads, tile) in tactics {
+                    for &(subgroup, threads, tile, lanes) in tactics {
                         let tactic = sdpa::Tactic {
                             tier: if subgroup {
                                 kernels_slang::Tier::Subgroup
@@ -355,6 +360,7 @@ fn paged_attention_answers_the_reference() {
                             narrow,
                             decode_threads: threads,
                             tile_rows: tile,
+                            tile_lanes: lanes,
                             split_groups: 1024,
                             split_min_keys: MIN_KEYS,
                         };
@@ -407,7 +413,7 @@ fn paged_attention_answers_the_reference() {
                                 ),
                             });
                             let label = format!(
-                                "slang {shape} subgroup {subgroup} threads {threads} rows {tile} lse {with_lse}"
+                                "slang {shape} subgroup {subgroup} threads {threads} rows {tile} lanes {lanes} lse {with_lse}"
                             );
                             close(&gpu.down(o, n), &want_o, &label);
                             if with_lse {

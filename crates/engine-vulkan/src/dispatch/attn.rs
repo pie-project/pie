@@ -21,6 +21,7 @@ impl Run<'_> {
             narrow: tuning.limits().lanes < 32,
             decode_threads: tuning.sdpa_decode_threads(head_dim),
             tile_rows: tuning.sdpa_tile_rows(),
+            tile_lanes: 32,
             split_groups: tuning.sdpa_split_groups(),
             split_min_keys: tuning.sdpa_split_min_keys(),
         }

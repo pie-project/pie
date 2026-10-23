@@ -13,7 +13,9 @@
 // names (`PIE_SELECTED`); one of `splits` key ranges a workgroup, landing f32
 // partials and their LSE for the fold (`PIE_SPLIT`, `PIE_SPLIT_LSE`).
 // Prefill (`PIE_TILED`) holds `PIE_TILE_ROWS` query rows of one head a
-// workgroup, 32 lanes a row, every row walking the tile's keys in step.
+// workgroup, `PIE_TILE_LANES` lanes a row (32, reduced as a tree; or 16,
+// each lane summing its row's partials after one barrier, as
+// kernels-wgpu's tile did), every row walking the tile's keys in step.
 // `PIE_FOLD` folds the split partials by their LSEs.
 
 static const float NEG_INF = -3.0e38;
@@ -229,15 +231,19 @@ uint row_base(uint row, uint q_head) {
 #if !defined(PIE_TILE_ROWS)
 #define PIE_TILE_ROWS 32
 #endif
-#define LANES_PER_ROW 32u
-// Pairs of dims a lane holds: pair `lane + 32 i`, dims `2p` and `2p + 1`.
+#if !defined(PIE_TILE_LANES)
+#define PIE_TILE_LANES 32
+#endif
+#define LANES_PER_ROW uint(PIE_TILE_LANES)
+// Pairs of dims a lane holds: pair `lane + LANES_PER_ROW i`, dims `2p` and
+// `2p + 1`.
 #define PAIRS_PER_LANE (uint(PIE_HEAD_DIM) / (2u * LANES_PER_ROW))
 
-groupshared float sdpa_part[PIE_TILE_ROWS][32];
+groupshared float sdpa_part[PIE_TILE_ROWS][PIE_TILE_LANES];
 groupshared int sdpa_last;
 
 [shader("compute")]
-[numthreads(32, PIE_TILE_ROWS, 1)]
+[numthreads(PIE_TILE_LANES, PIE_TILE_ROWS, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint q_head = group.x;
     uint lane = local.x;
@@ -288,6 +294,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
         sdpa_part[slot_y][lane] = partial;
         GroupMemoryBarrierWithGroupSync();
+#if PIE_TILE_LANES == 32
         for (uint half_ = LANES_PER_ROW >> 1; half_ > 0u; half_ >>= 1) {
             if (lane < half_) {
                 sdpa_part[slot_y][lane] += sdpa_part[slot_y][lane + half_];
@@ -295,6 +302,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             GroupMemoryBarrierWithGroupSync();
         }
         float score = sdpa_part[slot_y][0];
+#else
+        float score = 0.0;
+        for (uint l = 0u; l < LANES_PER_ROW; l++) {
+            score += sdpa_part[slot_y][l];
+        }
+#endif
         if (take) {
             float hist, w;
             online_update(score, max_score, sum_exp, hist, w);
@@ -758,6 +771,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_decode_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
@@ -794,6 +809,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_decode_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
@@ -830,6 +847,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_decode_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
@@ -866,5 +885,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_fold_bf16 PIE_FOLD=1 PIE_GROUP_X=256
 // pie:instantiate attn_sdpa_fold_lse_bf16 PIE_FOLD=1 PIE_LSE=1 PIE_GROUP_X=256
