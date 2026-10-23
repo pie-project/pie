@@ -1,8 +1,9 @@
+use crate::handle::Committed;
+use crate::handle::{RecurrentPool, Tensor};
 use crate::lower::{Lower, lower};
 use crate::run::Run;
-use kernels_xla::lanes::Committed;
 use kernels_xla::ssm;
-use kernels_xla::tensor::{Operand, RaggedTensor, RecurrentPool, Tensor};
+use kernels_xla::tensor::Operand;
 use poem_exec::{DispatchSsm, KernelError};
 use poem_ir::{Operands, Ssm};
 
@@ -30,8 +31,8 @@ fn conv_bank(op: &'static str, pool: &RecurrentPool) -> Result<(), kernels_xla::
 fn read_seat(
     l: &mut Lower<'_, '_>,
     seat: &Committed,
-) -> Result<Committed<Operand>, kernels_xla::Error> {
-    Ok(Committed {
+) -> Result<kernels_xla::lanes::Committed<Operand>, kernels_xla::Error> {
+    Ok(kernels_xla::lanes::Committed {
         replay: l.read(seat.replay)?,
         commit: l.read(seat.commit)?,
         slots: l.read(seat.slots)?,
@@ -278,7 +279,7 @@ impl Run<'_> {
                     let slots = l.read(pool.slots)?;
                     let (yv, next) = ssm::causal_conv1d_chunked(
                         l.f(),
-                        RaggedTensor { data, indptr },
+                        kernels_xla::tensor::RaggedTensor { data, indptr },
                         w,
                         bank,
                         slots,
@@ -354,7 +355,7 @@ impl Run<'_> {
                     let tuning = l.tuning();
                     let (yv, next) = ssm::gated_delta_chunked(
                         l.f(),
-                        RaggedTensor { data, indptr },
+                        kernels_xla::tensor::RaggedTensor { data, indptr },
                         gates,
                         slab,
                         slots,
@@ -440,7 +441,7 @@ impl Run<'_> {
                     let tuning = l.tuning();
                     let (yv, next) = ssm::kda_chunked(
                         l.f(),
-                        RaggedTensor { data, indptr },
+                        kernels_xla::tensor::RaggedTensor { data, indptr },
                         forget,
                         beta,
                         dt_bias,
@@ -497,7 +498,7 @@ impl Run<'_> {
                     let slots = l.read(pool.slots)?;
                     let (yv, next) = ssm::short_conv_chunked(
                         l.f(),
-                        RaggedTensor { data, indptr },
+                        kernels_xla::tensor::RaggedTensor { data, indptr },
                         w,
                         bank,
                         slots,

@@ -8,11 +8,11 @@
 
 use dtype::Dtype;
 
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
 use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
-use crate::tensor::{KvPool, Landing, Operand, Stored, Tensor};
+use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the pooled readers' flash loop.
 const KEY_BLOCK: i64 = 256;
@@ -632,7 +632,7 @@ fn pooled_flash(
 /// attends over its request's closed blocks of the `entries` pool (all, or
 /// the `selection`'s `top_k`), giving `(o, lse)`.
 #[derive(Clone, Copy, Debug)]
-pub struct PoolLse<T = Tensor, L = T> {
+pub struct PoolLse<T, L = T> {
     op: &'static str,
     pub q: T,
     pub positions: T,

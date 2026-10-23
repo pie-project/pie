@@ -13,12 +13,10 @@ pub mod voxel;
 #[allow(unused_imports)]
 pub use paged::*;
 
-use crate::tensor::Tensor;
-
 /// What a paged decode reads besides q and the pool: the fire's per-token
 /// positions and owning request, and the custom-mask plane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DecodePlan<T = Tensor> {
+pub struct DecodePlan<T> {
     pub positions: T,
 
     pub request_of_token: T,
@@ -31,7 +29,7 @@ pub struct DecodePlan<T = Tensor> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PrefillPlan<T = Tensor> {
+pub struct PrefillPlan<T> {
     pub positions: T,
 
     pub request_of_token: T,

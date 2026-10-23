@@ -5,9 +5,12 @@
 //! in the handle it updates.
 #![allow(clippy::too_many_arguments)]
 
-use kernels_xla::attn::paged::{self, Paged};
-use kernels_xla::tensor::{KvPool, Tensor};
-use kernels_xla::{Ctx, Error};
+use kernels_xla::attn::paged;
+
+use crate::emit::Ctx;
+use crate::handle::Paged;
+use crate::handle::{KvPool, Tensor};
+use kernels_xla::Error;
 
 use super::lower;
 
@@ -127,8 +130,9 @@ pub fn kv_append_shared(
 }
 
 pub mod dense {
-    use kernels_xla::tensor::Tensor;
-    use kernels_xla::{Ctx, Error};
+    use crate::emit::Ctx;
+    use crate::handle::Tensor;
+    use kernels_xla::Error;
 
     use super::super::lower;
 
@@ -166,9 +170,10 @@ pub mod dense {
 }
 
 pub mod ragged {
-    use kernels_xla::attn::ragged::RaggedMask;
-    use kernels_xla::tensor::Tensor;
-    use kernels_xla::{Ctx, Error};
+    use crate::emit::Ctx;
+    use crate::handle::RaggedMask;
+    use crate::handle::Tensor;
+    use kernels_xla::Error;
 
     use super::super::lower;
 
@@ -214,9 +219,12 @@ pub mod ragged {
 }
 
 pub mod mla {
-    use kernels_xla::attn::mla::{self, MlaCall};
-    use kernels_xla::tensor::{KvPool, Tensor};
-    use kernels_xla::{Ctx, Error};
+    use kernels_xla::attn::mla;
+
+    use crate::emit::Ctx;
+    use crate::handle::MlaCall;
+    use crate::handle::{KvPool, Tensor};
+    use kernels_xla::Error;
 
     use super::super::{Lower, lower};
 
@@ -420,10 +428,11 @@ pub mod mla {
 }
 
 pub mod index {
+    use crate::emit::Ctx;
+    use crate::handle::{KvPool, Tensor};
+    use kernels_xla::Error;
     use kernels_xla::attn::index;
     use kernels_xla::attn::pool::Entries;
-    use kernels_xla::tensor::{KvPool, Tensor};
-    use kernels_xla::{Ctx, Error};
 
     use super::super::{Lower, lower};
 
@@ -574,9 +583,12 @@ pub mod index {
 }
 
 pub mod pool {
-    use kernels_xla::attn::pool::{self, PoolLse};
-    use kernels_xla::tensor::{KvPool, RaggedTensor, Tensor};
-    use kernels_xla::{Ctx, Error};
+    use kernels_xla::attn::pool;
+
+    use crate::emit::Ctx;
+    use crate::handle::PoolLse;
+    use crate::handle::{KvPool, RaggedTensor, Tensor};
+    use kernels_xla::Error;
 
     use super::super::lower;
 

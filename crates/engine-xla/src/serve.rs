@@ -16,10 +16,10 @@ mod warm;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::handle::Tensor;
 use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
 use engine::frame::{Demand, Supply};
-use kernels_xla::Tensor;
 use poem_compiler::{Budget, Budgets, CompiledModel, FireRows, compile_axes};
 use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
 use poem_ir::{Dtype, Trace, ValueId};

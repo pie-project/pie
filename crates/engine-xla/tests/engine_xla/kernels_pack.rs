@@ -1,6 +1,7 @@
 //! The weight storage contract (`kernels_xla::pack`): banks landed the way
-//! the engine lands them — codes one per element in a native narrow type,
-//! mxfp4 pre-scaled to e5m2 — read by the dense, routed and gather kernels.
+//! the engine lands them (`engine_xla::pack`) — codes one per element in a
+//! native narrow type, mxfp4 pre-scaled to e5m2 — read by the dense, routed
+//! and gather kernels.
 //! The device types come from `engine_xla::trace::storage`, as the engine's
 //! tracer makes them.
 
@@ -10,12 +11,15 @@ use std::collections::{BTreeSet, HashMap};
 use dtype::Dtype;
 use engine_xla::bench::{assert_close, client, round_bf16};
 use engine_xla::device::element_type;
+use engine_xla::emit::{Cx, Emit, Env};
+use engine_xla::handle::{Bank, Tensor};
+use engine_xla::pack;
 use engine_xla::pjrt::Arg;
 use engine_xla::trace::storage;
+use kernels_xla::gather;
 use kernels_xla::hlo::{Func, Val, bf16_bits};
 use kernels_xla::linear::moe;
 use kernels_xla::tuning::{MoePath, Tuning};
-use kernels_xla::{Bank, Cx, Emit, Env, Tensor, gather, pack};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
@@ -66,7 +70,7 @@ impl Native {
 
     fn run(
         &mut self,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&engine_xla::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> bool {
         let Some(client) = client() else {
             return false;

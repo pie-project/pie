@@ -38,7 +38,7 @@
 
 use dtype::Dtype;
 
-use crate::cx::elem_of;
+use crate::check::elem_of;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, Val};
 use crate::linear::gemm::{dot_split, extent, head_rows, project};

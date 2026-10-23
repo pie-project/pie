@@ -84,10 +84,10 @@ impl Run<'_> {
     /// declares every such weight `ConvTapsMajor { c_in, taps }`).
     fn taps_major(
         &self,
-        w: kernels_xla::Tensor,
+        w: crate::handle::Tensor,
         c_in: u32,
         taps: u32,
-    ) -> Result<kernels_xla::Tensor, kernels_xla::Error> {
+    ) -> Result<crate::handle::Tensor, kernels_xla::Error> {
         if taps <= 1 || c_in <= 1 {
             return Ok(w);
         }
@@ -111,7 +111,10 @@ impl Run<'_> {
     }
 
     /// The fire's clip slot table, or a refusal naming `op`.
-    fn clip_slot_table(&self, op: &'static str) -> Result<kernels_xla::Tensor, kernels_xla::Error> {
+    fn clip_slot_table(
+        &self,
+        op: &'static str,
+    ) -> Result<crate::handle::Tensor, kernels_xla::Error> {
         self.clip_slots()
             .ok_or_else(|| kernels_xla::Error::Backend {
                 op,

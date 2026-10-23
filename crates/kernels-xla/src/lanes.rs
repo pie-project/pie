@@ -8,7 +8,7 @@ use dtype::Dtype;
 
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, GatherDims, ScatterDims, Val};
-use crate::tensor::{Operand, Stored, Tensor};
+use crate::tensor::{Operand, Stored};
 
 /// The slot a write that must not land is routed to.
 pub(crate) const DROP: i64 = i32::MAX as i64;
@@ -17,7 +17,7 @@ pub(crate) const DROP: i64 = i32::MAX as i64;
 /// lane's own rows, the `commit` prefix whose state lands, the lane's `slots`
 /// (negative: no state), all indexed from `lane0`.
 #[derive(Clone, Copy, Debug)]
-pub struct Committed<T = Tensor> {
+pub struct Committed<T> {
     pub replay: T,
 
     pub commit: T,

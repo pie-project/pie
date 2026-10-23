@@ -73,7 +73,7 @@ impl Run<'_> {
                     let slots = l.read(pool.slots)?;
                     let (rows, next) = gather::ngram::ngram_ids_chunked(
                         l.f(),
-                        kernels_xla::RaggedTensor { data, indptr },
+                        kernels_xla::tensor::RaggedTensor { data, indptr },
                         slab,
                         slots,
                         *eos,

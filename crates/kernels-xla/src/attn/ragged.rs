@@ -8,14 +8,14 @@ use dtype::Dtype;
 
 use super::dense::segment_of;
 use super::paged::{Heads, Planes, Rows, Rule, blocked, flat_i32, head, nonzero, row_heads};
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Elem, Func, Val};
-use crate::tensor::{Landing, Operand, Stored, Tensor};
+use crate::tensor::{Landing, Operand, Stored};
 
 /// What masks or biases a ragged attention besides its segments.
 #[derive(Clone, Copy, Debug)]
-pub enum RaggedMask<T = Tensor> {
+pub enum RaggedMask<T> {
     /// Segments only (poem_ir `None` and `GroupBlockDiagonal`).
     Segments,
     /// A row with tag `t >= 0` reads only keys tagged `t`; a negative tag
