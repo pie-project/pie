@@ -1,0 +1,9 @@
+mod conv1d;
+mod conv1d_chunked;
+mod dyn_conv;
+mod gdn_chunk;
+mod gdn_chunk_snapshot;
+mod gdn_recurrent;
+mod kda;
+mod mamba2;
+mod short_conv;

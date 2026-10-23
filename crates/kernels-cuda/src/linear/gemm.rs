@@ -1,12 +1,19 @@
+//! Host-only: the dense products on the vendor's libraries. `cublas` times
+//! cuBLAS and cuBLASLt tactics for a bf16 product; `cublas_lt_fp8` is
+//! cuBLASLt's fp8 product over `act_quant`'s scales.
+
 use crate::error::Error;
 
 use crate::jit::{Ctx, count, dtype_dispatch, stated};
 use crate::tensor::Tensor;
 
 #[cfg(feature = "cuda")]
-use super::dense;
-#[cfg(feature = "cuda")]
 use dtype::Dtype;
+
+#[cfg(feature = "cuda")]
+pub(crate) mod cublas;
+#[cfg(feature = "cuda")]
+pub mod cublas_lt_fp8;
 
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, None, y)
@@ -35,7 +42,7 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
     let m = ctx.opaque_rows(stated(OP, y.rows)?);
     #[cfg(feature = "cuda")]
     {
-        dense::act_x_wt_f32(ctx, OP, act.ptr, w.ptr, y.ptr, m, n, k)
+        cublas::act_x_wt_f32(ctx, OP, act.ptr, w.ptr, y.ptr, m, n, k)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -85,7 +92,7 @@ pub fn act_x_wt(
         let folded = bias
             .filter(|bias| bias.dtype == Dtype::Bf16)
             .map_or(0, |bias| bias.ptr);
-        if dense::act_x_wt(ctx, op, act.ptr, w.ptr, folded, y.ptr, m, n, k)? {
+        if cublas::act_x_wt(ctx, op, act.ptr, w.ptr, folded, y.ptr, m, n, k)? {
             return Ok(());
         }
         match bias {

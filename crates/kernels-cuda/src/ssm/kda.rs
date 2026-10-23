@@ -1,19 +1,18 @@
 use super::*;
+use crate::ssm::kda_chunk::kda_chunked_mma;
 
 const KDA: &str = "ssm/kda.cu";
-
-const KDA_CHUNK_SM80: &str = "ssm/kda_chunk_sm80.cu";
 
 const fn kda_shmem(d: u32) -> u32 {
     3u32.saturating_mul(d).saturating_mul(FLOAT)
 }
 
 #[derive(Clone, Copy)]
-struct Kda {
-    n: u32,
-    heads: u32,
-    head_dim: u32,
-    width: u32,
+pub(crate) struct Kda {
+    pub(super) n: u32,
+    pub(super) heads: u32,
+    pub(super) head_dim: u32,
+    pub(super) width: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -298,112 +297,12 @@ fn kda_step_splits(ctx: &Ctx, n: u32, heads: u32) -> u32 {
 }
 
 /// The raw decay and beta rows the tensor-core prep forms its gates from.
-struct KdaGates {
-    f: Tensor,
-    b: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
-    floor: f32,
-}
-
-/// [`kda_chunked`] on the tensor cores in sixteen-token chunks: two warps a
-/// (chunk, head) land the chunk's decayed queries and fold keys, its decay,
-/// its update directions `w` and `u` and its decayed causal scores; then a
-/// block a (request, head, 64 value columns) walks the chunks with the state
-/// in f32. 128-wide heads.
-#[allow(clippy::too_many_arguments)]
-fn kda_chunked_mma(
-    ctx: &Ctx,
-    op: &'static str,
-    shape: Kda,
-    gates: KdaGates,
-    mixed: RaggedTensor,
-    norm_eps: f32,
-    state: &RecurrentPool,
-    lanes: u32,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    const CH: u32 = 16;
-    const D: u32 = 128;
-    const TASKS: u32 = 2;
-    // `KDA16_TASK_SMEM`, and the scan's three `Kda16Scan<2>::STAGE`s and
-    // their barriers.
-    const LD: u32 = 136;
-    const LDT: u32 = 24;
-    const LDV: u32 = 136;
-    const TASK_SMEM: u32 = 3 * CH * LD * 2 + CH * (CH + 1) * FLOAT + 3 * D * FLOAT;
-    const STAGE: u32 = 3 * CH * LD * 2 + CH * LDV * 2 + 2 * CH * LDT * 2 + D * FLOAT;
-    let heads = shape.heads;
-    let slots = shape.n.div_ceil(CH) + lanes;
-    let rows = u64::from(shape.n + CH) * u64::from(heads) * u64::from(D);
-    let qg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_qg", rows)?;
-    let kg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_kg", rows)?;
-    let ke = plane_bf16(ctx, op, "attn.ssm_kda_chunk_ke", rows)?;
-    let squares = u64::from(slots) * u64::from(heads) * u64::from(CH * CH);
-    let tb = plane_bf16(ctx, op, "attn.ssm_kda_chunk_t", squares)?;
-    let pm = plane_bf16(ctx, op, "attn.ssm_kda_chunk_p", squares)?;
-    let gl = plane(
-        ctx,
-        op,
-        "attn.ssm_kda_chunk_gl",
-        u64::from(slots) * u64::from(heads) * u64::from(D),
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_prep").apply(
-            Launch::grid([heads.div_ceil(TASKS), slots, 1], [TASKS * 2 * WARP, 1, 1])
-                .smem(TASKS * TASK_SMEM),
-        ),
-        &[
-            mixed.data.arg(),
-            norm_eps.arg(),
-            gates.f.arg(),
-            gates.b.arg(),
-            gates.a_log.arg(),
-            gates.dt_bias.arg(),
-            gates.floor.arg(),
-            state.slot_ids.arg(),
-            mixed.indptr.arg(),
-            state.commit_len.arg(),
-            state.begin_at.arg(),
-            ArgValue::Ptr(qg),
-            ArgValue::Ptr(kg),
-            ArgValue::Ptr(ke),
-            ArgValue::Ptr(tb),
-            ArgValue::Ptr(pm),
-            ArgValue::Ptr(gl),
-            stated(op, lanes)?.arg(),
-            stated(op, heads)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_scan")
-            .apply(Launch::grid([lanes * heads * 2, 1, 1], [128, 1, 1]).smem(3 * STAGE + 64)),
-        &[
-            ArgValue::Ptr(gl),
-            mixed.data.arg(),
-            ArgValue::Ptr(qg),
-            ArgValue::Ptr(kg),
-            ArgValue::Ptr(ke),
-            ArgValue::Ptr(tb),
-            ArgValue::Ptr(pm),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            mixed.indptr.arg(),
-            state.slot_stride_elems.arg(),
-            state.commit_len.arg(),
-            state.begin_at.arg(),
-            state.write_state.arg(),
-            state.write_state_mask.arg(),
-            y.arg(),
-            stated(op, lanes)?.arg(),
-            stated(op, heads)?.arg(),
-            stated(op, ctx.multiprocessors().unwrap_or(1).max(1))?.arg(),
-            ctx.stage(),
-        ],
-    )
+pub(crate) struct KdaGates {
+    pub(super) f: Tensor,
+    pub(super) b: Tensor,
+    pub(super) dt_bias: Tensor,
+    pub(super) a_log: Tensor,
+    pub(super) floor: f32,
 }
 
 #[allow(clippy::too_many_arguments)]

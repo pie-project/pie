@@ -1,3 +1,6 @@
+//! Host-only: the fused expert MLP, a gate-up select then a down select over
+//! the banks `select` and its forms read.
+
 #[cfg(feature = "cuda")]
 use super::*;
 #[cfg(feature = "cuda")]

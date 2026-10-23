@@ -235,7 +235,7 @@ impl Run<'_> {
                 weight,
                 stream_count,
                 mixes,
-            } => elemwise::hc::norm_project(
+            } => elemwise::hc_project::norm_project(
                 self.ctx(),
                 self.tensor(*streams),
                 self.tensor(*weight),
@@ -1073,7 +1073,7 @@ impl Run<'_> {
                 weight,
                 stream_count,
                 mixes,
-            } => elemwise::hc::project(
+            } => elemwise::hc_project::project(
                 self.ctx(),
                 self.tensor(*normed),
                 self.tensor(*weight),

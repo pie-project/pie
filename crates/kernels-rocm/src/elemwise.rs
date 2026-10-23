@@ -1,5 +1,6 @@
 pub mod gate;
 pub mod hc;
+pub mod hc_project;
 pub mod modulate;
 pub mod norm;
 pub mod norm_residual;
@@ -23,7 +24,7 @@ const WARP: u32 = 64;
 
 const VEC_WIDTH: u32 = 8;
 
-fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
+pub(crate) fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     let n = t.elements();
     let lanes = u32::try_from(n).map_err(|_| {
         refuse(

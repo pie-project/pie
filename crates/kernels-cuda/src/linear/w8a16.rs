@@ -261,3 +261,56 @@ pub fn widen(
         ],
     )
 }
+
+/// `y = act . W^T` for an affine 4-bit MLX plane (group 64, its bias after
+/// the scale) at a decode's rows, on mma.sync (`linear/w8a16.cuh`): 32
+/// columns a block, eight warps over K, the codes three steps ahead
+/// (Llama-3.1-8B's decode 117 tok/s against the per-row kernel's 52; 16
+/// columns 108, a deeper prefetch spills to 93).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn affine_w4a16_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Tensor,
+    y: &mut Tensor,
+    n: u32,
+    k: u32,
+) -> Result<(), Error> {
+    const STAGES: u32 = 2;
+    const DEPTH: u32 = 3;
+    const N_SUB: u32 = 4;
+    const WARPS_K: u32 = 8;
+    const COLUMNS: u32 = 8 * N_SUB;
+    // Each K group's activation ring, or the fold of the groups' partials.
+    let smem = (WARPS_K * STAGES * 16 * 128).max(WARPS_K * 16 * COLUMNS * 4);
+    ctx.fire(
+        op,
+        Fire::at(
+            W8A16_SM80,
+            symbol(&format!(
+                "::pie::linear::affine_w4a16_mma<1, {N_SUB}, 1, {WARPS_K}, {STAGES}, {DEPTH}>"
+            )),
+        )
+        .apply(
+            Launch::grid(
+                [n.div_ceil(COLUMNS), y.rows.div_ceil(16), 1],
+                [32 * WARPS_K, 1, 1],
+            )
+            .smem(smem),
+        ),
+        &[
+            act.arg(),
+            codes.arg(),
+            scales.arg(),
+            biases.arg(),
+            y.arg(),
+            stated(op, y.rows)?.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}

@@ -25,6 +25,7 @@ pub mod moe;
 
 pub mod moe_route;
 
-pub mod quant;
+pub mod cast;
+pub mod dequant;
 
 pub mod affine;
