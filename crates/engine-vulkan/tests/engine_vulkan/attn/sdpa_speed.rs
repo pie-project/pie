@@ -1,38 +1,62 @@
 //! Paged attention's speed on the first Vulkan device: the hand-written
-//! decode and prefill beside kernels-slang's tiers, the same shapes and the
+//! decode (plain, split into key ranges, selected), its few-rows prefill arm
+//! and the tiled prefill beside kernels-slang's, the same shapes and the
 //! same keys. Ignored: it asks for a real GPU and minutes (`cargo test
 //! sdpa_speed -- --ignored --nocapture`). Each kernel fires `REPS` times a
-//! frame; a trial is a frame's wall time over its dispatches, and the best
-//! of `TRIALS` is reported.
+//! frame; a trial is a frame's wall time over its dispatches, the kernels
+//! of a shape take their trials in turn, and the best of `TRIALS` is
+//! reported.
 
 use std::time::Instant;
 
-use kernels_vulkan::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor};
+use kernels_slang::attn::sdpa;
+use kernels_vulkan::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Split, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, noise};
 
 const REPS: usize = 50;
-const TRIALS: usize = 7;
+const TRIALS: usize = 9;
 const PAGE: usize = 16;
 const QH: usize = 32;
 const KVH: usize = 8;
 const HD: usize = 128;
+/// The selected form's block width and blocks a row: 2048 keys.
+const RATIO: usize = 64;
+const TOP_K: usize = 32;
+/// The partial planes hold this many splits.
+const SPLITS: usize = 32;
 
 fn st(t: Tensor) -> kernels_slang::Tensor {
     kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
 }
 
-/// The best trial's microseconds a dispatch.
-fn time(gpu: &Gpu, run: &dyn Fn(&Gpu)) -> f64 {
-    run(gpu);
-    (0..TRIALS)
-        .map(|_| {
+type Run<'a> = &'a dyn Fn(&Gpu);
+
+/// The best trial's microseconds a dispatch of each runner, the runners
+/// taking their trials in turn.
+fn race(gpu: &Gpu, runs: &[Run<'_>]) -> Vec<f64> {
+    for run in runs {
+        run(gpu);
+    }
+    let mut best = vec![f64::INFINITY; runs.len()];
+    for _ in 0..TRIALS {
+        for (run, best) in runs.iter().zip(&mut best) {
             let t0 = Instant::now();
             run(gpu);
-            t0.elapsed().as_secs_f64() * 1e6 / REPS as f64
-        })
-        .fold(f64::INFINITY, f64::min)
+            *best = best.min(t0.elapsed().as_secs_f64() * 1e6 / REPS as f64);
+        }
+    }
+    best
+}
+
+fn report(shape: &str, times: &[f64], names: &[&str]) {
+    let hand = times[0];
+    let mut line = format!("SDPA {shape:<34} hand {hand:>8.1} us");
+    for (t, name) in times[1..].iter().zip(names) {
+        line += &format!("  {name} {t:>8.1} us ({:+.1}%)", (t / hand - 1.0) * 100.0);
+    }
+    eprintln!("{line}");
 }
 
 #[test]
@@ -45,11 +69,20 @@ fn sdpa_speed() {
     let chip = gpu.device.chip();
     eprintln!("device: {} (subgroup {})", chip.name, chip.subgroup);
     let (profile, _) = engine_vulkan::chip::resolve(&chip, None);
-    let tuning = kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::ASSUMED);
-    let narrow = chip.subgroup < 32;
-    let threads = tuning.sdpa_decode_threads(HD as u32);
-    let tile = tuning.sdpa_tile_rows();
-    eprintln!("tuning: decode threads {threads}, tile rows {tile}");
+    let tuning = &kernels_vulkan::Tuning::new(profile, gpu.device.limits());
+    let tactic = |tier| sdpa::Tactic {
+        tier,
+        narrow: tuning.limits().lanes < 32,
+        decode_threads: tuning.sdpa_decode_threads(HD as u32),
+        tile_rows: tuning.sdpa_tile_rows(),
+        split_groups: tuning.sdpa_split_groups(),
+        split_min_keys: tuning.sdpa_split_min_keys(),
+    };
+    let (subgroup, baseline) = (
+        tactic(kernels_slang::Tier::Subgroup),
+        tactic(kernels_slang::Tier::Baseline),
+    );
+    eprintln!("tactic: {subgroup:?}");
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
     let scale = 1.0 / (HD as f32).sqrt();
 
@@ -60,7 +93,7 @@ fn sdpa_speed() {
         let (pi, pp) = (gpu.up_u32(&page_ids), gpu.up_u32(&[0, pages as u32]));
         let keys = gpu.up(&noise(1, slots * KVH * HD)).0;
         let values = gpu.up(&noise(2, slots * KVH * HD)).0;
-        let pool = KvPool {
+        let pool = &KvPool {
             keys: t(keys, slots, KVH * HD, Dtype::Bf16),
             values: t(values, slots, KVH * HD, Dtype::Bf16),
             page_indices: t(pi, pages, 1, Dtype::U32),
@@ -69,7 +102,7 @@ fn sdpa_speed() {
             seq_stride: (KVH * HD) as u64,
             head_stride: HD as u64,
         };
-        let spool = kernels_slang::KvPool {
+        let spool = &kernels_slang::KvPool {
             keys: st(pool.keys),
             values: st(pool.values),
             page_indices: st(pool.page_indices),
@@ -79,83 +112,178 @@ fn sdpa_speed() {
             head_stride: pool.head_stride,
         };
 
-        // Decode: `rows` rows of one request, every row at the last position.
-        for rows in [1usize, 16] {
+        // Decode: `rows` rows of one request at its last positions.
+        for rows in [1usize, 4, 16] {
             let q = gpu.up(&noise(3, rows * QH * HD)).0;
-            let pos = gpu.up_i32(&vec![kv as i32 - 1; rows]);
+            let positions: Vec<i32> = (0..rows).map(|r| (kv - rows + r) as i32).collect();
+            let pos = gpu.up_i32(&positions);
             let own = gpu.up_i32(&vec![0; rows]);
             let none = gpu.up_u32(&vec![0; rows.div_ceil(4)]);
+            let qi = gpu.up_i32(&[0, rows as i32]);
+            let blocks: Vec<i32> = (0..rows * TOP_K)
+                .map(|i| ((i * 7) % (kv / RATIO - 1)) as i32)
+                .collect();
+            let sel = gpu.up_i32(&blocks);
             let o = gpu.zeros(rows * QH * HD);
-            let (qt, ot) = (
+            let part_out = gpu.up_f32(&vec![0.0; SPLITS * rows * QH * HD]);
+            let part_lse = gpu.up_f32(&vec![0.0; SPLITS * rows * QH]);
+            let (qt, ot, selt) = (
                 t(q, rows, QH * HD, Dtype::Bf16),
                 t(o, rows, QH * HD, Dtype::Bf16),
+                t(sel, rows, TOP_K, Dtype::I32),
             );
             let (pt, ow, mt) = (
                 t(pos, rows, 1, Dtype::I32),
                 t(own, rows, 1, Dtype::I32),
                 t(none, rows, 1, Dtype::U8),
             );
-            let plan = DecodePlan {
+            let split = Split {
+                part_out: t(part_out, SPLITS * rows * QH, HD, Dtype::F32),
+                part_lse: t(part_lse, SPLITS * rows, QH, Dtype::F32),
+            };
+            let ssplit = sdpa::Split {
+                part_out: st(split.part_out),
+                part_lse: st(split.part_lse),
+            };
+            let plan = &DecodePlan {
                 positions: pt,
                 request_of_token: ow,
                 mask: mt,
                 mask_enabled: mt,
                 mask_stride: 0,
             };
-            let tables = kernels_slang::attn::sdpa::Tables {
+            let pplan = PrefillPlan {
+                positions: pt,
+                request_of_token: ow,
+                mask: mt,
+                mask_enabled: mt,
+                mask_stride: 0,
+            };
+            let rag = RaggedTensor {
+                data: qt,
+                indptr: t(qi, 2, 1, Dtype::I32),
+            };
+            let tables = &sdpa::Tables {
                 positions: st(pt),
                 request_of_token: st(ow),
                 mask: st(mt),
                 mask_enabled: st(mt),
                 mask_stride: 0,
             };
-            let hand = time(&gpu, &|g| {
-                g.run(|c| {
-                    for _ in 0..REPS {
-                        kernels_vulkan::attn::decode(
-                            c, &tuning, qt, &plan, &pool, None, HD as u32, scale, ot, None,
-                        )?;
-                    }
-                    Ok(())
-                })
-            });
-            let tier = |subgroup| kernels_slang::attn::sdpa::Tactic {
-                tier: if subgroup {
-                    kernels_slang::Tier::Subgroup
-                } else {
-                    kernels_slang::Tier::Baseline
-                },
-                narrow,
-                decode_threads: threads,
-                tile_rows: tile,
+            let hand = |split: Option<Split>| {
+                move |g: &Gpu| {
+                    g.run(|c| {
+                        for _ in 0..REPS {
+                            kernels_vulkan::attn::decode(
+                                c, tuning, qt, plan, pool, None, HD as u32, scale, ot, split,
+                            )?;
+                        }
+                        Ok(())
+                    });
+                }
             };
-            let slang = |subgroup: bool| {
-                time(&gpu, &|g| {
+            let slang = |tactic: sdpa::Tactic, split: Option<sdpa::Split>| {
+                move |g: &Gpu| {
                     g.run_slang(|c| {
                         for _ in 0..REPS {
-                            kernels_slang::attn::sdpa::decode(
+                            sdpa::decode(
                                 c,
-                                tier(subgroup),
+                                tactic,
                                 st(qt),
-                                &tables,
-                                &spool,
+                                tables,
+                                spool,
                                 None,
                                 HD as u32,
                                 scale,
                                 st(ot),
                                 None,
+                                split,
                             )?;
                         }
                         Ok(())
-                    })
-                })
+                    });
+                }
             };
-            let (sg, base) = (slang(true), slang(false));
-            eprintln!(
-                "SDPA decode  kv {kv:>5} rows {rows:>3}: hand {hand:>8.1} us  slang subgroup {sg:>8.1} us ({:+.1}%)  slang baseline {base:>8.1} us ({:+.1}%)",
-                (sg / hand - 1.0) * 100.0,
-                (base / hand - 1.0) * 100.0
+            let names = ["slang subgroup", "slang baseline"];
+            let times = race(
+                &gpu,
+                &[&hand(None), &slang(subgroup, None), &slang(baseline, None)],
             );
+            report(&format!("decode kv {kv} rows {rows}"), &times, &names);
+            let times = race(
+                &gpu,
+                &[
+                    &hand(Some(split)),
+                    &slang(subgroup, Some(ssplit)),
+                    &slang(baseline, Some(ssplit)),
+                ],
+            );
+            report(&format!("split decode kv {kv} rows {rows}"), &times, &names);
+
+            let few = |g: &Gpu| {
+                g.run(|c| {
+                    for _ in 0..REPS {
+                        kernels_vulkan::attn::arbiter::prefill(
+                            c, rag, &pplan, pool, None, HD as u32, KVH as u32, scale, ot, 1, tuning,
+                        )?;
+                    }
+                    Ok(())
+                });
+            };
+            if (rows as u32) < tuning.sdpa_tile_rows_per_request() {
+                let times = race(&gpu, &[&few, &slang(subgroup, None)]);
+                report(
+                    &format!("few-rows prefill kv {kv} rows {rows}"),
+                    &times,
+                    &names[..1],
+                );
+            }
+
+            if kv >= RATIO * (TOP_K + 1) {
+                let hand = |g: &Gpu| {
+                    g.run(|c| {
+                        for _ in 0..REPS {
+                            kernels_vulkan::attn::decode_selected(
+                                c,
+                                tuning,
+                                qt,
+                                plan,
+                                selt,
+                                pool,
+                                None,
+                                HD as u32,
+                                scale,
+                                RATIO as u32,
+                                ot,
+                            )?;
+                        }
+                        Ok(())
+                    });
+                };
+                let slang = |tactic: sdpa::Tactic| {
+                    move |g: &Gpu| {
+                        g.run_slang(|c| {
+                            for _ in 0..REPS {
+                                sdpa::selected(
+                                    c,
+                                    tactic,
+                                    st(qt),
+                                    tables,
+                                    spool,
+                                    HD as u32,
+                                    scale,
+                                    RATIO as u32,
+                                    st(selt),
+                                    st(ot),
+                                )?;
+                            }
+                            Ok(())
+                        });
+                    }
+                };
+                let times = race(&gpu, &[&hand, &slang(subgroup), &slang(baseline)]);
+                report(&format!("selected kv {kv} rows {rows}"), &times, &names);
+            }
         }
 
         // Prefill: one request's `kv` rows at positions 0..kv.
@@ -176,7 +304,7 @@ fn sdpa_speed() {
             t(own, rows, 1, Dtype::I32),
             t(none, rows, 1, Dtype::U8),
         );
-        let plan = PrefillPlan {
+        let plan = &PrefillPlan {
             positions: pt,
             request_of_token: ow,
             mask: mt,
@@ -187,38 +315,32 @@ fn sdpa_speed() {
             data: qt,
             indptr: t(qi, 2, 1, Dtype::I32),
         };
-        let tables = kernels_slang::attn::sdpa::Tables {
+        let tables = &sdpa::Tables {
             positions: st(pt),
             request_of_token: st(ow),
             mask: st(mt),
             mask_enabled: st(mt),
             mask_stride: 0,
         };
-        let hand = time(&gpu, &|g| {
+        let hand = |g: &Gpu| {
             g.run(|c| {
                 for _ in 0..REPS {
                     kernels_vulkan::attn::arbiter::prefill(
-                        c, rag, &plan, &pool, None, HD as u32, KVH as u32, scale, ot, 1, &tuning,
+                        c, rag, plan, pool, None, HD as u32, KVH as u32, scale, ot, 1, tuning,
                     )?;
                 }
                 Ok(())
-            })
-        });
-        let tier = kernels_slang::attn::sdpa::Tactic {
-            tier: kernels_slang::Tier::Subgroup,
-            narrow,
-            decode_threads: threads,
-            tile_rows: tile,
+            });
         };
-        let slang = time(&gpu, &|g| {
+        let slang = |g: &Gpu| {
             g.run_slang(|c| {
                 for _ in 0..REPS {
-                    kernels_slang::attn::sdpa::prefill(
+                    sdpa::prefill(
                         c,
-                        tier,
+                        subgroup,
                         st(qt),
-                        &tables,
-                        &spool,
+                        tables,
+                        spool,
                         None,
                         HD as u32,
                         scale,
@@ -227,11 +349,13 @@ fn sdpa_speed() {
                     )?;
                 }
                 Ok(())
-            })
-        });
-        eprintln!(
-            "SDPA prefill kv {kv:>5} rows {rows:>4}: hand {hand:>8.1} us  slang tiled {slang:>8.1} us ({:+.1}%)",
-            (slang / hand - 1.0) * 100.0
+            });
+        };
+        let times = race(&gpu, &[&hand, &slang]);
+        report(
+            &format!("prefill kv {kv} rows {rows}"),
+            &times,
+            &["slang tiled"],
         );
     }
 }

@@ -1,13 +1,14 @@
-//! Paged attention over a KV cache (`attn.decode`, `attn.prefill` and their
-//! LSE forms) from `kernels/attn/sdpa.slang`. Decode walks a row's keys with
-//! the workgroup's subgroups on the subgroup tier or 32-lane strips on the
-//! baseline; prefill tiles query rows of one head and walks their keys in
-//! step.
+//! Paged attention over a KV cache (`attn.decode`, `attn.prefill`, their
+//! LSE forms, and the selected forms) from `kernels/attn/sdpa.slang`.
+//! Decode walks a row's keys with the workgroup's subgroups on the subgroup
+//! tier or 32-lane strips on the baseline, a long row split into key ranges
+//! folded by their LSEs where the device would otherwise idle; prefill tiles
+//! query rows of one head and walks their keys in step.
 #![allow(clippy::too_many_arguments)]
 
 use dtype::Dtype;
 
-use crate::encode::{Arg, ArgValue, Ctx, Fire, Tier, instantiated, nonzero, refuse, stated};
+use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, Tier, instantiated, nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{KvPool, Tensor};
 
@@ -15,6 +16,9 @@ const SDPA: &str = "attn/sdpa.slang";
 
 /// The head widths the kernels are instantiated at.
 const WIDTHS: [u32; 4] = [64, 128, 256, 512];
+
+/// The workgroup width the split fold is built at.
+const FOLD_GROUP: u32 = 256;
 
 /// How an engine runs paged attention on its device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +32,19 @@ pub struct Tactic {
     pub decode_threads: u32,
     /// Query rows a prefill workgroup holds: 32, 16 or 8.
     pub tile_rows: u32,
+    /// Decode workgroups the device wants in flight: a decode with fewer
+    /// (heads x rows) splits its rows' keys to reach them.
+    pub split_groups: u32,
+    /// The fewest keys a split walks.
+    pub split_min_keys: u32,
+}
+
+/// The f32 planes a split decode lands its partials in: `part_out` a head
+/// row a (split, row, head), `part_lse` one value each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Split {
+    pub part_out: Tensor,
+    pub part_lse: Tensor,
 }
 
 /// The per-token tables a fire's attention reads.
@@ -103,6 +120,8 @@ fn shape(
     })
 }
 
+/// The buffers, then `extra` (bound after the tables), then the scalars
+/// every form reads.
 fn args(
     op: &'static str,
     q: Tensor,
@@ -111,7 +130,7 @@ fn args(
     shape: &Shape,
     sm_scale: f32,
     o: Tensor,
-    lse: Option<Tensor>,
+    extra: &[ArgValue],
 ) -> Result<Vec<ArgValue>, Error> {
     let mut args = vec![
         q.arg(),
@@ -125,14 +144,7 @@ fn args(
         tables.mask.arg(),
         tables.mask_enabled.arg(),
     ];
-    if let Some(lse) = lse {
-        debug_assert_eq!(
-            lse.dtype,
-            Dtype::F32,
-            "`{op}` lands an f32 log-sum-exp plane"
-        );
-        args.push(lse.arg_mut());
-    }
+    args.extend_from_slice(extra);
     args.extend([
         stated(op, shape.q_heads / shape.kv_heads)?.arg(),
         pool.page_size.arg(),
@@ -145,8 +157,56 @@ fn args(
     Ok(args)
 }
 
+fn lse_plane(op: &'static str, lse: Tensor, shape: &Shape) -> Result<ArgValue, Error> {
+    let held = u64::from(lse.rows) * u64::from(lse.width);
+    if lse.dtype != Dtype::F32 || held < u64::from(shape.rows) * u64::from(shape.q_heads) {
+        return Err(refuse(
+            op,
+            format!(
+                "the log-sum-exp plane is {} x {} {:?}, and it holds an f32 a head a row ({} x {})",
+                lse.rows, lse.width, lse.dtype, shape.rows, shape.q_heads
+            ),
+        ));
+    }
+    Ok(lse.arg_mut())
+}
+
+/// A decode workgroup's entry: `kind`, then its thread and lane variants.
+fn decode_entry(
+    op: &'static str,
+    tactic: Tactic,
+    kind: &str,
+    head_dim: u32,
+) -> Result<Fire, Error> {
+    let threads = if tactic.decode_threads >= 256 {
+        256
+    } else {
+        128
+    };
+    let subgroup = tactic.tier == Tier::Subgroup;
+    let name = format!(
+        "attn_sdpa_{kind}{}{}_bf16_d_{head_dim}",
+        if threads < 256 { "_t128" } else { "" },
+        if subgroup && tactic.narrow {
+            "_lanes_8"
+        } else {
+            ""
+        },
+    );
+    let tier = if subgroup {
+        Tier::Subgroup
+    } else {
+        Tier::Baseline
+    };
+    Ok(Fire::at(SDPA, instantiated(op, name)?)
+        .tier(tier)
+        .group([threads, 1, 1]))
+}
+
 /// Each query row (one a token) attends its request's cached keys, causal,
 /// one workgroup a (head, row); with `lse`, the row's base-2 LSE lands too.
+/// With `split`, rows too few to fill the device split their keys into
+/// ranges, each landing a partial the fold then weighs by its LSE.
 pub fn decode(
     ctx: &Ctx<'_>,
     tactic: Tactic,
@@ -158,42 +218,171 @@ pub fn decode(
     sm_scale: f32,
     o: Tensor,
     lse: Option<Tensor>,
+    split: Option<Split>,
 ) -> Result<(), Error> {
     const OP: &str = "attn.decode";
     let shape = shape(OP, q, pool, window, head_dim)?;
-    let threads = if tactic.decode_threads >= 256 {
-        256
-    } else {
-        128
-    };
-    let subgroup = tactic.tier == Tier::Subgroup;
-    let name = format!(
-        "attn_sdpa_{}{}{}_bf16_d_{head_dim}",
+    if let Some(planes) = split {
+        let ceiling = split_ceiling(&planes, &shape, head_dim);
+        // Every page the fire's tables name: the walker splits no row past
+        // the keys it holds.
+        let keys = pool
+            .page_indices
+            .rows
+            .saturating_mul(pool.page_indices.width)
+            .saturating_mul(u32::try_from(pool.page_size).unwrap_or(0));
+        let slices = splits_for(&tactic, &shape, ceiling, window, keys);
+        if slices > 1 {
+            return decode_split(
+                ctx, tactic, q, tables, pool, &shape, head_dim, sm_scale, o, lse, planes, slices,
+            );
+        }
+    }
+    let mut extra = Vec::new();
+    if let Some(lse) = lse {
+        extra.push(lse_plane(OP, lse, &shape)?);
+    }
+    let fire = decode_entry(
+        OP,
+        tactic,
         if lse.is_some() {
             "decode_lse"
         } else {
             "decode"
         },
-        if threads < 256 { "_t128" } else { "" },
-        if subgroup && tactic.narrow {
-            "_lanes_8"
-        } else {
-            ""
-        },
-    );
-    let entry = instantiated(OP, name)?;
-    let args = args(OP, q, pool, tables, &shape, sm_scale, o, lse)?;
+        head_dim,
+    )?;
+    let args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
+    ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
+}
+
+/// The splits a decode of this shape takes: enough (heads x rows x splits)
+/// workgroups to reach the device's want, no split under its fewest keys,
+/// and no more than the partial planes hold.
+fn splits_for(tactic: &Tactic, shape: &Shape, ceiling: u32, window: Option<u32>, keys: u32) -> u32 {
+    let groups = shape.q_heads.saturating_mul(shape.rows).max(1);
+    if ceiling <= 1 || groups >= tactic.split_groups {
+        return 1;
+    }
+    let min_keys = tactic.split_min_keys.max(1);
+    let bound = window.map_or(keys, |w| w.min(keys));
+    tactic
+        .split_groups
+        .div_ceil(groups)
+        .min(bound.div_ceil(min_keys))
+        .clamp(1, ceiling.max(1))
+}
+
+/// The splits the partial planes hold for this shape.
+fn split_ceiling(split: &Split, shape: &Shape, head_dim: u32) -> u32 {
+    let out_room = u64::from(split.part_out.rows) * u64::from(split.part_out.width);
+    let lse_room = u64::from(split.part_lse.rows) * u64::from(split.part_lse.width);
+    let lse_slice = u64::from(shape.rows) * u64::from(shape.q_heads);
+    let out_slice = lse_slice * u64::from(head_dim);
+    if out_slice == 0 {
+        return 0;
+    }
+    u32::try_from((out_room / out_slice).min(lse_room / lse_slice)).unwrap_or(u32::MAX)
+}
+
+fn decode_split(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    q: Tensor,
+    tables: &Tables,
+    pool: &KvPool,
+    shape: &Shape,
+    head_dim: u32,
+    sm_scale: f32,
+    o: Tensor,
+    lse: Option<Tensor>,
+    split: Split,
+    slices: u32,
+) -> Result<(), Error> {
+    const OP: &str = "attn.decode_split";
+    if split.part_out.dtype != Dtype::F32 || split.part_lse.dtype != Dtype::F32 {
+        return Err(refuse(OP, "the split arm's partial planes are f32"));
+    }
+    let mut extra = vec![split.part_out.arg_mut(), split.part_lse.arg_mut()];
+    if let Some(lse) = lse {
+        extra.push(lse_plane(OP, lse, shape)?);
+    }
+    let fire = decode_entry(
+        OP,
+        tactic,
+        if lse.is_some() { "split_lse" } else { "split" },
+        head_dim,
+    )?;
+    let mut args = args(OP, q, pool, tables, shape, sm_scale, o, &extra)?;
+    args.extend([
+        stated(OP, slices)?.arg(),
+        stated(OP, shape.rows)?.arg(),
+        stated(OP, tactic.split_min_keys.max(1))?.arg(),
+    ]);
+    ctx.fire(fire.groups([shape.q_heads, shape.rows, slices]), &args)?;
+
+    let mut fold = vec![split.part_out.arg(), split.part_lse.arg(), o.arg_mut()];
+    if let Some(lse) = lse {
+        fold.push(lse.arg_mut());
+    }
+    fold.extend([
+        stated(OP, slices)?.arg(),
+        stated(OP, shape.rows)?.arg(),
+        stated(OP, shape.q_heads)?.arg(),
+        stated(OP, head_dim)?.arg(),
+    ]);
+    let entry = if lse.is_some() {
+        "attn_sdpa_fold_lse_bf16"
+    } else {
+        "attn_sdpa_fold_bf16"
+    };
     ctx.fire(
-        Fire::at(SDPA, entry)
-            .tier(if subgroup {
-                Tier::Subgroup
-            } else {
-                Tier::Baseline
-            })
-            .groups([shape.q_heads, shape.rows, 1])
-            .group([threads, 1, 1]),
-        &args,
+        Fire::at(SDPA, entry).apply(Grid::of([o.width / 2, shape.rows, 1], [FOLD_GROUP, 1, 1])),
+        &fold,
     )
+}
+
+/// Each query row attends the key blocks `selection` names (block ids
+/// `ratio` keys wide, `selection.width` a row, a negative id or one past the
+/// row's whole blocks skipped) and then its open block, causal.
+pub fn selected(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    q: Tensor,
+    tables: &Tables,
+    pool: &KvPool,
+    head_dim: u32,
+    sm_scale: f32,
+    ratio: u32,
+    selection: Tensor,
+    o: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attn.selected";
+    let shape = shape(OP, q, pool, None, head_dim)?;
+    if selection.dtype != Dtype::I32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the selection is {:?}, and the reader walks i32 block ids",
+                selection.dtype
+            ),
+        ));
+    }
+    let ratio = nonzero(OP, "the block width this reader expands", ratio)?;
+    let top_k = nonzero(OP, "the selection budget", selection.width)?;
+    if selection.rows < shape.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "the selection seats {} rows and this reader launches {}",
+                selection.rows, shape.rows
+            ),
+        ));
+    }
+    let fire = decode_entry(OP, tactic, "selected", head_dim)?;
+    let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &[selection.arg()])?;
+    args.extend([stated(OP, top_k)?.arg(), stated(OP, ratio)?.arg()]);
+    ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
 }
 
 /// Query rows tiled `tactic.tile_rows` a workgroup of one head, each attending
@@ -227,7 +416,11 @@ pub fn prefill(
         },
     );
     let entry = instantiated(OP, name)?;
-    let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, lse)?;
+    let extra = match lse {
+        Some(lse) => vec![lse_plane(OP, lse, &shape)?],
+        None => Vec::new(),
+    };
+    let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
     args.push(stated(OP, shape.rows)?.arg());
     ctx.fire(
         Fire::at(SDPA, entry)

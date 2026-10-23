@@ -3,9 +3,12 @@
 
 // Paged attention over a KV cache, bf16 two a word, causal (an optional
 // sliding window, an optional per-row byte mask). Decode reads one query row
-// a workgroup (per head): the workgroup's subgroups (`PIE_SUBGROUP`, SPIR-V
-// only) or 32-lane strips (the baseline, reduced through workgroup memory)
-// each walk a share of the keys with an online softmax and fold at the end.
+// a workgroup (per head): the workgroup's subgroups (the subgroup tier,
+// SPIR-V only) or 32-lane strips (the baseline, reduced through workgroup
+// memory) each walk a share of the keys with an online softmax and fold at
+// the end. The subgroup tier reads a bf16 value a lane and the mask a byte
+// at a time as 16- and 8-bit storage (the same bytes as the packed words),
+// one load a dim: engine-vulkan's decode, kept as it was measured.
 // Variants: the row's base-2 LSE (`PIE_LSE`); the keys a block selection
 // names (`PIE_SELECTED`); one of `splits` key ranges a workgroup, landing f32
 // partials and their LSE for the fold (`PIE_SPLIT`, `PIE_SPLIT_LSE`).
@@ -113,16 +116,44 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #error "attn/sdpa.slang is compiled at a head width: -DPIE_HEAD_DIM"
 #endif
 
+#if defined(PIE_SUBGROUP)
+[[vk::binding(0)]] StructuredBuffer<uint16_t> queries;
+[[vk::binding(1)]] StructuredBuffer<uint16_t> k_pages;
+[[vk::binding(2)]] StructuredBuffer<uint16_t> v_pages;
+[[vk::binding(3)]] RWStructuredBuffer<uint16_t> o;
+#else
 [[vk::binding(0)]] StructuredBuffer<uint> queries;
 [[vk::binding(1)]] StructuredBuffer<uint> k_pages;
 [[vk::binding(2)]] StructuredBuffer<uint> v_pages;
 [[vk::binding(3)]] RWStructuredBuffer<uint> o;
+#endif
 [[vk::binding(4)]] StructuredBuffer<int> position_ids;
 [[vk::binding(5)]] StructuredBuffer<int> req_of_token;
 [[vk::binding(6)]] StructuredBuffer<uint> kv_page_indices;
 [[vk::binding(7)]] StructuredBuffer<uint> kv_page_indptr;
+#if defined(PIE_SUBGROUP)
+[[vk::binding(8)]] StructuredBuffer<uint8_t> attention_mask;
+[[vk::binding(9)]] StructuredBuffer<uint8_t> attention_mask_enabled;
+
+uint mask_byte(uint i) {
+    return uint(attention_mask[i]);
+}
+
+uint mask_enabled_byte(uint row) {
+    return uint(attention_mask_enabled[row]);
+}
+#else
 [[vk::binding(8)]] StructuredBuffer<uint> attention_mask;
 [[vk::binding(9)]] StructuredBuffer<uint> attention_mask_enabled;
+
+uint mask_byte(uint i) {
+    return byte_at(attention_mask, i);
+}
+
+uint mask_enabled_byte(uint row) {
+    return byte_at(attention_mask_enabled, row);
+}
+#endif
 #if defined(PIE_SPLIT)
 [[vk::binding(10)]] RWStructuredBuffer<float> part_out;
 [[vk::binding(11)]] RWStructuredBuffer<float> part_lse;
@@ -174,11 +205,11 @@ bool keeps(uint row, int kp, int q_pos, int start) {
     if (kp > q_pos || kp < start) {
         return false;
     }
-    if (byte_at(attention_mask_enabled, row) != 0u) {
+    if (mask_enabled_byte(row) != 0u) {
         if (uint(kp) >= params.attention_mask_stride) {
             return false;
         }
-        if (byte_at(attention_mask, row * params.attention_mask_stride + uint(kp)) == 0u) {
+        if (mask_byte(row * params.attention_mask_stride + uint(kp)) == 0u) {
             return false;
         }
     }
@@ -287,51 +318,230 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
 }
 
+#elif defined(PIE_SUBGROUP)
+
+// Invocations a decode workgroup walks a row's keys with; `_t128` halves
+// them, and their workgroup memory, where the device's limits or the
+// profile ask.
+#if !defined(PIE_DECODE_THREADS)
+#define PIE_DECODE_THREADS 256
+#endif
+#define MAX_SUBGROUPS (PIE_DECODE_THREADS / 32)
+// The narrowest subgroup this variant serves: its per-lane registers hold
+// HEAD_DIM / MIN_LANES dims. A device narrower than 32 lanes that cannot be
+// pinned to 32 takes `_lanes_8`.
+#if !defined(PIE_MIN_LANES)
+#define PIE_MIN_LANES 32
+#endif
+#define DPL ((PIE_HEAD_DIM + PIE_MIN_LANES - 1) / PIE_MIN_LANES)
+
+groupshared float sdpa_acc[MAX_SUBGROUPS][PIE_HEAD_DIM];
+groupshared float sdpa_max[MAX_SUBGROUPS];
+groupshared float sdpa_sum[MAX_SUBGROUPS];
+
+float bf16_of(uint16_t h) {
+    return bf16_to_f32(uint(h));
+}
+
+// The workgroup's subgroups' share of the row's keys: each takes every
+// `subgroups`-th step from its own and reduces within itself.
+void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
+                 out float merged_max, out float merged_sum, out uint subgroups) {
+    int req = req_of_token[row];
+    uint base_row = row_base(row, q_head);
+    int kv_head = int(q_head) / params.gqa_factor;
+
+    uint width = WaveGetLaneCount();
+    // From the invocation's index: Adreno reads the SubgroupId builtin as 0
+    // in every subgroup.
+    uint sg = tid / width;
+    uint lane = WaveGetLaneIndex();
+    subgroups = min((uint(PIE_DECODE_THREADS) + width - 1u) / width, uint(MAX_SUBGROUPS));
+    bool walks = sg < subgroups;
+
+    // Dims a lane covers, rounded up: a subgroup wider than the head leaves
+    // its upper lanes idle rather than covering nothing.
+    uint per_lane = (uint(PIE_HEAD_DIM) + width - 1u) / width;
+
+    float qreg[DPL];
+    float acc[DPL];
+    [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
+        uint dd = lane + j * width;
+        qreg[j] = (j < per_lane && dd < uint(PIE_HEAD_DIM))
+            ? params.scale * bf16_of(queries[base_row + dd]) : 0.0;
+        acc[j] = 0.0;
+    }
+
+    float max_score = NEG_INF;
+    float sum_exp = 0.0;
+    if (walks) {
+        // `keeps` carries the causal and mask tests, so the selected walk
+        // only has to name cells: a block below `nblocks`, then the open one.
+#if defined(PIE_SELECTED)
+        int nblocks = (q_pos + 1) / params.ratio;
+        int sel_end = min(params.top_k, nblocks) * params.ratio;
+        int steps = sel_end + (params.ratio - 1);
+#else
+        int steps = k_hi - k_lo + 1;
+#endif
+        for (int n = int(sg); n < steps; n += int(subgroups)) {
+#if defined(PIE_SELECTED)
+            int kp;
+            if (n < sel_end) {
+                int c = selection[row * uint(params.top_k) + uint(n / params.ratio)];
+                if (c < 0 || c >= nblocks) {
+                    continue;
+                }
+                kp = c * params.ratio + (n % params.ratio);
+            } else {
+                kp = nblocks * params.ratio + (n - sel_end);
+            }
+#else
+            int kp = k_lo + n;
+#endif
+            if (!keeps(row, kp, q_pos, start)) {
+                continue;
+            }
+            uint base = (page_slot(req, kp) * uint(params.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
+            float partial = 0.0;
+            [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
+                uint dd = lane + j * width;
+                if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
+                    partial += qreg[j] * bf16_of(k_pages[base + dd]);
+                }
+            }
+            float score = WaveActiveSum(partial);
+            float hist, w;
+            online_update(score, max_score, sum_exp, hist, w);
+            [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
+                uint dd = lane + j * width;
+                if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
+                    acc[j] = acc[j] * hist + w * bf16_of(v_pages[base + dd]);
+                }
+            }
+        }
+        [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
+            uint dd = lane + j * width;
+            if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
+                sdpa_acc[sg][dd] = acc[j];
+            }
+        }
+        if (WaveIsFirstLane()) {
+            sdpa_max[sg] = max_score;
+            sdpa_sum[sg] = sum_exp;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    merged_max = NEG_INF;
+    for (uint s = 0u; s < subgroups; s++) {
+        merged_max = max(merged_max, sdpa_max[s]);
+    }
+    merged_sum = 0.0;
+    for (uint s = 0u; s < subgroups; s++) {
+        merged_sum += sdpa_sum[s] * exp(sdpa_max[s] - merged_max);
+    }
+}
+
+float decode_fold(uint d, float merged_max, uint subgroups) {
+    float out_acc = 0.0;
+    for (uint s = 0u; s < subgroups; s++) {
+        out_acc += sdpa_acc[s][d] * exp(sdpa_max[s] - merged_max);
+    }
+    return out_acc;
+}
+
+[shader("compute")]
+[numthreads(PIE_DECODE_THREADS, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    uint q_head = group.x;
+    uint row = group.y;
+    uint tid = local.x;
+    int q_pos = position_ids[row];
+    int start = window_start(q_pos);
+    uint base_row = row_base(row, q_head);
+    float merged_max, merged_sum;
+    uint subgroups;
+#if defined(PIE_SPLIT)
+    uint split = group.z;
+    int keys = q_pos - start + 1;
+    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, params.splits);
+    uint slice = (split * uint(params.n_rows) + row) * uint(params.n_q_heads) + q_head;
+    if (int(split) >= usable) {
+        if (tid == 0u) {
+            part_lse[slice] = asfloat(0xff800000u);
+        }
+        return;
+    }
+    int chunk = (keys + usable - 1) / usable;
+    int k_lo = start + int(split) * chunk;
+    int k_hi = min(q_pos, k_lo + chunk - 1);
+    decode_walk(row, q_head, tid, k_lo, k_hi, q_pos, start, merged_max, merged_sum, subgroups);
+    if (usable == 1) {
+        // One split covered the row: land it whole, and mark it done.
+        if (tid == 0u) {
+            part_lse[slice] = asfloat(0x7f800000u);
+#if defined(PIE_SPLIT_LSE)
+            lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+#endif
+        }
+        for (uint d = tid; d < uint(PIE_HEAD_DIM); d += uint(PIE_DECODE_THREADS)) {
+            float v = decode_fold(d, merged_max, subgroups);
+            o[base_row + d] = uint16_t(f32_to_bf16(merged_sum == 0.0 ? v : v / merged_sum));
+        }
+        return;
+    }
+    if (tid == 0u) {
+        part_lse[slice] = lse_base2(merged_max, merged_sum);
+    }
+    for (uint d = tid; d < uint(PIE_HEAD_DIM); d += uint(PIE_DECODE_THREADS)) {
+        float v = decode_fold(d, merged_max, subgroups);
+        part_out[slice * uint(PIE_HEAD_DIM) + d] = merged_sum == 0.0 ? 0.0 : v / merged_sum;
+    }
+#else
+    decode_walk(row, q_head, tid, start, q_pos, q_pos, start, merged_max, merged_sum, subgroups);
+#if defined(PIE_LSE)
+    if (tid == 0u) {
+        lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+    }
+#endif
+    for (uint d = tid; d < uint(PIE_HEAD_DIM); d += uint(PIE_DECODE_THREADS)) {
+        float v = decode_fold(d, merged_max, subgroups);
+        o[base_row + d] = uint16_t(f32_to_bf16(merged_sum == 0.0 ? v : v / merged_sum));
+    }
+#endif
+}
+
 #else
 
 #if !defined(PIE_DECODE_THREADS)
 #define PIE_DECODE_THREADS 256
 #endif
 #define MAX_WALKERS (PIE_DECODE_THREADS / 32)
-// The narrowest subgroup a variant serves: its per-lane registers hold
-// HEAD_DIM / MIN_LANES dims (`_narrow`, 8, for devices narrower than 32).
-#if !defined(PIE_MIN_LANES)
-#define PIE_MIN_LANES 32
-#endif
-// Dim pairs a lane holds: pair `lane + j * width`, dims `2p` and `2p + 1`,
-// so one word load serves two dims.
-#define PPL ((PIE_HEAD_DIM / 2 + PIE_MIN_LANES - 1) / PIE_MIN_LANES)
+// Dim pairs a lane holds: pair `lane + 32 j`, dims `2p` and `2p + 1`, so
+// one word load serves two dims.
+#define PPL ((PIE_HEAD_DIM / 2 + 31) / 32)
 
 groupshared float sdpa_acc[MAX_WALKERS][PIE_HEAD_DIM];
 groupshared float sdpa_max[MAX_WALKERS];
 groupshared float sdpa_sum[MAX_WALKERS];
-#if !defined(PIE_SUBGROUP)
 groupshared float sdpa_fold[MAX_WALKERS][32];
-#endif
 groupshared int sdpa_pos;
 
-// The walkers' share of the row's keys: each walker (a subgroup, or a
-// 32-lane strip) takes every `walkers`-th step from its own.
+// The walkers' share of the row's keys: each 32-lane strip takes every
+// `walkers`-th step from its own.
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint walkers) {
     int req = req_of_token[row];
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
-#if defined(PIE_SUBGROUP)
-    uint width = WaveGetLaneCount();
-    uint walker = tid / width;
-    uint lane = WaveGetLaneIndex();
-    walkers = min((uint(PIE_DECODE_THREADS) + width - 1u) / width, uint(MAX_WALKERS));
-#else
     uint width = 32u;
     uint walker = tid / 32u;
     uint lane = tid % 32u;
     walkers = uint(MAX_WALKERS);
-#endif
-    bool walks = walker < walkers;
-    // Pairs a lane covers, rounded up: a subgroup wider than the head's
-    // pairs leaves its upper lanes idle.
+    // Pairs a lane covers, rounded up: a strip wider than the head's pairs
+    // leaves its upper lanes idle.
     uint pairs = uint(PIE_HEAD_DIM) / 2u;
     uint per_lane = (pairs + width - 1u) / width;
 
@@ -352,16 +562,11 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #else
     int steps = k_hi - k_lo + 1;
 #endif
-#if defined(PIE_SUBGROUP)
-    // A subgroup reduces within itself: each walks its own steps.
-    for (int n = int(walker); walks && n < steps; n += int(walkers)) {
-#else
     // A strip reduces through workgroup memory, so every lane takes every
     // round, a strip past the keys with nothing to add.
     int rounds = (max(steps, 0) + int(walkers) - 1) / int(walkers);
     for (int round = 0; round < rounds; round++) {
         int n = round * int(walkers) + int(walker);
-#endif
 #if defined(PIE_SELECTED)
         int kp = -1;
         if (n < sel_end) {
@@ -388,9 +593,6 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
                 }
             }
         }
-#if defined(PIE_SUBGROUP)
-        float score = WaveActiveSum(partial);
-#else
         sdpa_fold[walker][lane] = partial;
         GroupMemoryBarrierWithGroupSync();
         for (uint half_ = 16u; half_ > 0u; half_ >>= 1) {
@@ -401,7 +603,6 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         }
         float score = sdpa_fold[walker][0];
         GroupMemoryBarrierWithGroupSync();
-#endif
         if (take) {
             float hist, w;
             online_update(score, max_score, sum_exp, hist, w);
@@ -413,18 +614,16 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
             }
         }
     }
-    if (walks) {
-        [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
-            uint pp = lane + j * width;
-            if (j < per_lane && pp < pairs) {
-                sdpa_acc[walker][2u * pp] = acc[j].x;
-                sdpa_acc[walker][2u * pp + 1u] = acc[j].y;
-            }
+    [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
+        uint pp = lane + j * width;
+        if (j < per_lane && pp < pairs) {
+            sdpa_acc[walker][2u * pp] = acc[j].x;
+            sdpa_acc[walker][2u * pp + 1u] = acc[j].y;
         }
-        if (lane == 0u) {
-            sdpa_max[walker] = max_score;
-            sdpa_sum[walker] = sum_exp;
-        }
+    }
+    if (lane == 0u) {
+        sdpa_max[walker] = max_score;
+        sdpa_sum[walker] = sum_exp;
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -524,17 +723,35 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
 
 // pie:instantiate attn_sdpa_decode_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_bf16_d_64 PIE_HEAD_DIM=64
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1
 // pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_bf16_d_64 PIE_HEAD_DIM=64 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_selected_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_bf16_d_64 PIE_HEAD_DIM=64 PIE_SELECTED=1
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1
+// pie:instantiate attn_sdpa_split_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lse_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_tiled_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_r8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=8
@@ -542,17 +759,35 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_decode_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_bf16_d_128 PIE_HEAD_DIM=128
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1
 // pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_bf16_d_128 PIE_HEAD_DIM=128 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_selected_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_bf16_d_128 PIE_HEAD_DIM=128 PIE_SELECTED=1
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1
+// pie:instantiate attn_sdpa_split_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lse_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_tiled_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_r8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=8
@@ -560,17 +795,35 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_decode_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_bf16_d_256 PIE_HEAD_DIM=256
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1
 // pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_bf16_d_256 PIE_HEAD_DIM=256 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_selected_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_bf16_d_256 PIE_HEAD_DIM=256 PIE_SELECTED=1
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1
+// pie:instantiate attn_sdpa_split_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lse_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_tiled_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_r8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=8
@@ -578,20 +831,40 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_decode_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_bf16_d_512 PIE_HEAD_DIM=512
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
-// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_decode_lse_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_lse_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1
 // pie:instantiate attn_sdpa_decode_lse_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_bf16_d_512 PIE_HEAD_DIM=512 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_selected_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_selected_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SELECTED=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_selected_bf16_d_512 PIE_HEAD_DIM=512 PIE_SELECTED=1
+// pie:instantiate attn_sdpa_selected_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1
+// pie:instantiate attn_sdpa_split_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate attn_sdpa_split_lse_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
+// pie:instantiate attn_sdpa_split_lse_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate attn_sdpa_split_lse_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1
+// pie:instantiate attn_sdpa_split_lse_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
 // pie:instantiate attn_sdpa_tiled_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_r8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_tiled_lse_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
+// pie:instantiate attn_sdpa_fold_bf16 PIE_FOLD=1 PIE_GROUP_X=256
+// pie:instantiate attn_sdpa_fold_lse_bf16 PIE_FOLD=1 PIE_LSE=1 PIE_GROUP_X=256
