@@ -3,11 +3,9 @@
 //! and the tiled prefill beside kernels-slang's, the same shapes and the
 //! same keys. Ignored: it asks for a real GPU and minutes (`cargo test
 //! sdpa_speed -- --ignored --nocapture`). Each kernel fires `REPS` times a
-//! frame; a trial is a frame's wall time over its dispatches, the kernels
-//! of a shape take their trials in turn, and the best of `TRIALS` is
-//! reported.
-
-use std::time::Instant;
+//! frame; a trial is the frame's span on the device's timestamps over its
+//! repetitions, the kernels of a shape take their trials in turn, and the
+//! best of `TRIALS` is reported.
 
 use kernels_slang::attn::sdpa;
 use kernels_vulkan::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Split, Tensor};
@@ -15,8 +13,8 @@ use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, noise};
 
-const REPS: usize = 50;
-const TRIALS: usize = 9;
+const REPS: usize = 100;
+const TRIALS: usize = 15;
 const PAGE: usize = 16;
 const QH: usize = 32;
 const KVH: usize = 8;
@@ -33,8 +31,9 @@ fn st(t: Tensor) -> kernels_slang::Tensor {
 
 type Run<'a> = &'a dyn Fn(&Gpu);
 
-/// The best trial's microseconds a dispatch of each runner, the runners
-/// taking their trials in turn.
+/// The best trial's microseconds a repetition of each runner on the
+/// device's clock (the span of the frame's timestamps), the runners taking
+/// their trials in turn.
 fn race(gpu: &Gpu, runs: &[Run<'_>]) -> Vec<f64> {
     for run in runs {
         run(gpu);
@@ -42,9 +41,10 @@ fn race(gpu: &Gpu, runs: &[Run<'_>]) -> Vec<f64> {
     let mut best = vec![f64::INFINITY; runs.len()];
     for _ in 0..TRIALS {
         for (run, best) in runs.iter().zip(&mut best) {
-            let t0 = Instant::now();
+            engine_vulkan::encode::reset_kernel_profile();
             run(gpu);
-            *best = best.min(t0.elapsed().as_secs_f64() * 1e6 / REPS as f64);
+            let span = engine_vulkan::encode::frame_span_ns() as f64 / 1e3;
+            *best = best.min(span / REPS as f64);
         }
     }
     best
@@ -66,6 +66,8 @@ fn sdpa_speed() {
         eprintln!("not asked: no device");
         return;
     };
+    // Every frame is timed on the device's clock.
+    engine_vulkan::encode::profile_kernels(true);
     let chip = gpu.device.chip();
     eprintln!("device: {} (subgroup {})", chip.name, chip.subgroup);
     let (profile, _) = engine_vulkan::chip::resolve(&chip, None);
