@@ -23,6 +23,40 @@ pub struct PatchSeat {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct VoxelSeat {
+    pub rows: u64,
+    pub clips: u64,
+    pub channels: u64,
+    pub dtype: Dtype,
+    pub token_grid: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VoxelAt {
+    payload: u64,
+    grid: u64,
+    token_grid: u64,
+    slots: u64,
+    seat: VoxelSeat,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VoxelHandles {
+    pub payload: Tensor,
+    pub grid: Tensor,
+    pub token_grid: Option<Tensor>,
+    pub slots: Tensor,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VoxelFire<'a> {
+    pub grid: &'a [i32],
+    pub token_grid: &'a [i32],
+    pub slots: &'a [i32],
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy)]
 struct PatchAt {
     payload: u64,
     segments: u64,
@@ -76,6 +110,8 @@ pub struct Handles {
 
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+
+    pub voxels: Option<VoxelHandles>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +170,8 @@ pub struct Fire<'a> {
 
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+
+    pub voxels: Option<VoxelFire<'a>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +213,8 @@ pub struct Inputs {
 
     rs_replay: u64,
     rs_commit: u64,
+
+    voxels: Option<VoxelAt>,
 }
 
 impl Inputs {
@@ -188,6 +228,7 @@ impl Inputs {
         gathered: usize,
         patch: Option<PatchSeat>,
         mrope: bool,
+        voxel: Option<VoxelSeat>,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
@@ -243,6 +284,20 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        let voxels = voxel.map(|seat| {
+            let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
+            VoxelAt {
+                payload: take(seat.rows * seat.channels * element),
+                grid: take(seat.clips * 4 * 4),
+                token_grid: if seat.token_grid {
+                    take(seat.clips * 4 * 4)
+                } else {
+                    0
+                },
+                slots: take(seat.clips * 4),
+                seat,
+            }
+        });
         let total = at;
 
         let store = Buffer::host(device, total)?;
@@ -267,7 +322,12 @@ impl Inputs {
             mrope,
             rs_replay,
             rs_commit,
+            voxels,
         })
+    }
+
+    pub fn voxel_payload(&self) -> Option<(&Buffer, u64)> {
+        self.voxels.map(|at| (&self.store, at.payload))
     }
 
     #[must_use]
@@ -466,6 +526,88 @@ impl Inputs {
             }
         };
 
+        let voxels = match (fire.voxels, self.voxels) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(Fault::Ceiling {
+                    what: "voxel rows against a load that reserved none",
+                    need: 1,
+                    have: 0,
+                });
+            }
+            (Some(staged), Some(at)) => {
+                let seat = at.seat;
+                let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
+                let clips = (staged.grid.len() / 4) as u64;
+                for (what, have, ceiling) in [
+                    ("voxel clips", clips, seat.clips),
+                    (
+                        "voxel payload bytes",
+                        staged.payload.len() as u64,
+                        seat.rows * seat.channels * element,
+                    ),
+                    (
+                        "voxel token grid",
+                        (staged.token_grid.len() / 4) as u64,
+                        if seat.token_grid { seat.clips } else { 0 },
+                    ),
+                    ("voxel clip slots", staged.slots.len() as u64, seat.clips),
+                ] {
+                    if have > ceiling {
+                        return Err(Fault::Ceiling {
+                            what,
+                            need: have,
+                            have: ceiling,
+                        });
+                    }
+                }
+                self.store.write(at.grid, bytes_of(staged.grid))?;
+                self.store.write(at.slots, bytes_of(staged.slots))?;
+                if !staged.token_grid.is_empty() {
+                    self.store
+                        .write(at.token_grid, bytes_of(staged.token_grid))?;
+                }
+                if !staged.payload.is_empty() {
+                    self.store.write(at.payload, staged.payload)?;
+                }
+                let clips32 = u32::try_from(clips).unwrap_or(u32::MAX);
+                Some(VoxelHandles {
+                    payload: Tensor::new(
+                        handles.bind(
+                            &self.store,
+                            at.payload,
+                            seat.rows * seat.channels * element,
+                        )?,
+                        u32::try_from(seat.rows).unwrap_or(u32::MAX),
+                        u32::try_from(seat.channels).unwrap_or(u32::MAX),
+                        seat.dtype,
+                    ),
+                    grid: Tensor::new(
+                        handles.bind(&self.store, at.grid, clips * 16)?,
+                        clips32,
+                        4,
+                        Dtype::I32,
+                    ),
+                    token_grid: if seat.token_grid {
+                        Some(Tensor::new(
+                            handles.bind(&self.store, at.token_grid, clips * 16)?,
+                            clips32,
+                            4,
+                            Dtype::I32,
+                        ))
+                    } else {
+                        None
+                    },
+                    slots: Tensor::new(
+                        handles.bind(&self.store, at.slots, clips * 4)?,
+                        clips32,
+                        1,
+                        Dtype::I32,
+                    ),
+                })
+            }
+        };
+
         let mut spaces = Vec::with_capacity(self.spaces.len());
         for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
@@ -547,6 +689,7 @@ impl Inputs {
             } else {
                 None
             },
+            voxels,
         })
     }
 

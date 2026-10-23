@@ -17,6 +17,8 @@ pub(crate) struct Seat {
     pub seat: Buffer,
     pub mirror: Buffer,
     pub draft: Option<(u32, Buffer)>,
+    /// The fire's pixel plane and its element count, where it wrote one.
+    pub pixels: Option<(Buffer, u32)>,
     pub guests: Option<Guests>,
 }
 
@@ -70,6 +72,7 @@ struct Landing {
     width: u32,
     seat: Buffer,
     mtp_width: u32,
+    pixels: Option<(Buffer, u32)>,
     read: Result<Rows, String>,
     guests: Option<Guests>,
     mailbox: Mailbox,
@@ -92,6 +95,7 @@ impl Landing {
                 &self.layout,
                 self.width,
                 self.mtp_width,
+                self.pixels.as_ref(),
             );
             tracing::debug!(seq = self.seq, guests = jobs.len(), "landing: guests run");
             worker
@@ -101,7 +105,15 @@ impl Landing {
         }
         #[cfg(not(feature = "wgpu"))]
         {
-            let _ = (rows, drafts, self.width, &self.seat, self.mtp_width, worker);
+            let _ = (
+                rows,
+                drafts,
+                self.width,
+                &self.seat,
+                self.mtp_width,
+                &self.pixels,
+                worker,
+            );
             match guests {}
         }
     }
@@ -293,6 +305,7 @@ pub(crate) fn on_done(
         seat,
         mirror,
         draft,
+        pixels,
         guests,
     } = seat;
     let mtp_width = draft.as_ref().map_or(0, |&(width, _)| width);
@@ -306,6 +319,7 @@ pub(crate) fn on_done(
             width,
             seat,
             mtp_width,
+            pixels,
             read,
             guests,
             mailbox,

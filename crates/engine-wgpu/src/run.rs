@@ -106,6 +106,8 @@ pub struct FireBindings {
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
     pub scores: Option<crate::scores::ScoreSeat>,
+
+    pub voxels: Option<crate::inputs::VoxelHandles>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -384,12 +386,10 @@ impl<'c> Run<'c> {
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
-            Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
-                panic!(
-                    "value {} lives on the voxel axis, which this shell does not seat",
-                    id.0
-                )
-            }
+            Some(Dim::Voxels) => (seated.voxel.row_offset, seated.voxel.rows),
+            Some(Dim::VoxelsTimes(k)) => (seated.voxel.row_offset * k, seated.voxel.rows * k),
+            Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
+            Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
         };
         self.slice(handle, skip, keep)
     }
@@ -515,11 +515,15 @@ impl<'c> Run<'c> {
                 | RuntimeInput::Latents { .. }
                 | RuntimeInput::LaneVector { .. }
                 | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }
-                | RuntimeInput::Grid
-                | RuntimeInput::Voxels { .. }
-                | RuntimeInput::TokenGrid { .. }),
+                | RuntimeInput::AxisPositions { .. }),
             ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
+            Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
+            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::TokenGrid { .. }) => {
+                self.voxel_seat(at).token_grid.unwrap_or_else(|| {
+                    panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
+                })
+            }
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;
                 let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
@@ -767,6 +771,22 @@ impl<'c> Run<'c> {
         Some(self.scratch.routed(self.handles)?.unwrap_or_else(|fault| {
             panic!("the routed scratch this load reserved does not mint: {fault}")
         }))
+    }
+
+    pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Option<(Tensor, Tensor)> {
+        Some(
+            self.scratch
+                .spatial_moments(self.handles, clips, groups)?
+                .unwrap_or_else(|fault| {
+                    panic!("the moment planes this load reserved do not mint: {fault}")
+                }),
+        )
+    }
+
+    fn voxel_seat(&self, at: usize) -> crate::inputs::VoxelHandles {
+        self.fire.voxels.unwrap_or_else(|| {
+            panic!("value {at} reads the voxel axis, and no lane of this fire submitted a clip")
+        })
     }
 
     pub(crate) fn sdpa_split(&self) -> Option<kernels_slang::attn::sdpa::Split> {

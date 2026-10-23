@@ -47,6 +47,10 @@ wgpu = { version = "30", default-features = false, features = [
     "fragile-send-sync-non-atomic-wasm",
 ], optional = true }
 
+[dev-dependencies]
+poem = { package = "pie-poem", path = "../poem" }
+ztensor = { workspace = true }
+
 [features]
 default = []
 wgpu = [
