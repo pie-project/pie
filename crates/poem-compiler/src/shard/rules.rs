@@ -2,7 +2,7 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId};
+use poem_ir::{BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -96,13 +96,8 @@ const KV_HEADS: &str = "kv_heads";
 /// How op `name` splits by head or channel, if it does.
 fn heads(name: &str) -> Option<Heads> {
     Some(match name {
-        "elemwise.act"
-        | "elemwise.rope_axes"
-        | "gather.rows"
-        | "gather.pack_rows"
-        | "gather.unpack_rows"
-        | "linear.gelu_tanh" => Heads::of(&["x"], &[]),
-        "elemwise.mul" => Heads::of(&["x", "y"], &[]),
+        "elemwise.act" | "elemwise.rope_axes" | "gather.rows" | "gather.pack_rows"
+        | "gather.unpack_rows" | "linear.gelu_tanh" => Heads::of(&["x"], &[]),
         "elemwise.gate_sigmoid_mul"
         | "elemwise.gate_sigmoid_mul_heads"
         | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
@@ -200,6 +195,16 @@ fn rule(op: &Operation) -> Rule {
             Rule::Whole
         };
     }
+    // A sum is linear in both operands, so partial sums stay one; a product
+    // splits with them by head or channel.
+    if let Operation::Elemwise(Elemwise::Binary { op: binary, .. }) = op {
+        return match binary {
+            BinaryOp::Add => Rule::Linear {
+                follow: &["x", "y"],
+            },
+            BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
+        };
+    }
     let name = op.name();
     match name {
         "linear.moe_matmul_select"
@@ -213,7 +218,7 @@ fn rule(op: &Operation) -> Rule {
         "linear.moe_weighted_sum" => Rule::Linear {
             follow: &["routed"],
         },
-        "elemwise.residual_add" | "elemwise.add" => Rule::Linear {
+        "elemwise.residual_add" => Rule::Linear {
             follow: &["x", "y"],
         },
         "linear.moe_sigmoid_gate_add" => Rule::Linear {

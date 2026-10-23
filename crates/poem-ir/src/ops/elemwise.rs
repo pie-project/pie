@@ -402,19 +402,13 @@ pub enum Elemwise {
         #[output(alias = x)]
         x_out: ValueId,
     },
-    Mul {
+    /// `x op y`, element by element.
+    Binary {
         #[input]
         x: ValueId,
         #[input]
         y: ValueId,
-        #[output]
-        z: ValueId,
-    },
-    Add {
-        #[input]
-        x: ValueId,
-        #[input]
-        y: ValueId,
+        op: BinaryOp,
         #[output]
         z: ValueId,
     },
@@ -448,6 +442,13 @@ impl ModulateForm {
             ModulateForm::Scale | ModulateForm::TanhGate => 1,
         }
     }
+}
+
+/// What an [`Elemwise::Binary`] computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BinaryOp {
+    Add,
+    Mul,
 }
 
 /// The function an [`Elemwise::Act`] applies.

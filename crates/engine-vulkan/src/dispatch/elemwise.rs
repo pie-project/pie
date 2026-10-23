@@ -241,7 +241,13 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*x)),
             )
             .map_err(crate::encode::from_slang),
-            Elemwise::Add { x, y, z } => kernels_slang::elemwise::pointwise::add(
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: poem_ir::BinaryOp::Add,
+                ..
+            } => kernels_slang::elemwise::pointwise::add(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*x)),
                 crate::encode::slang_tensor(self.tensor(*y)),
@@ -285,7 +291,10 @@ impl Run<'_> {
                 ..
             }
             | Elemwise::Hadamard { .. }
-            | Elemwise::Mul { .. }
+            | Elemwise::Binary {
+                op: poem_ir::BinaryOp::Mul,
+                ..
+            }
             | Elemwise::GateSigmoidMulHeads { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }

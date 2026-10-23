@@ -1178,10 +1178,11 @@ pub fn mul(x: &Value, y: &Value) -> Value {
     assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
     let z = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::Mul {
+        Elemwise::Binary {
             x: x.id(),
             y: y.id(),
             z: z.id(),
+            op: poem_ir::BinaryOp::Mul,
         },
         &[x, y],
     );
@@ -1193,10 +1194,11 @@ pub fn add(x: &Value, y: &Value) -> Value {
     assert_eq!(x.ty(), y.ty(), "a sum's operands share a type");
     let z = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::Add {
+        Elemwise::Binary {
             x: x.id(),
             y: y.id(),
             z: z.id(),
+            op: poem_ir::BinaryOp::Add,
         },
         &[x, y],
     );

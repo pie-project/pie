@@ -320,14 +320,26 @@ impl Run<'_> {
                     l.land(o_o, v)
                 })
             }
-            Elemwise::Mul { x, y, z } => crate::lower::lower(self.ctx(), |l| {
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: poem_ir::BinaryOp::Mul,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
                 let y_v = l.read(self.tensor(*y))?;
                 let o_z = self.tensor(*z);
                 let v = elemwise::act::mul(l.f(), x_v, y_v, o_z.landing())?;
                 l.land(o_z, v)
             }),
-            Elemwise::Add { x, y, z } => crate::lower::lower(self.ctx(), |l| {
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: poem_ir::BinaryOp::Add,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
                 let y_v = l.read(self.tensor(*y))?;
                 let o_z = self.tensor(*z);

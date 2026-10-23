@@ -121,7 +121,15 @@ fn the_same_stack_folding_onto_a_copy_traces() {
     let adds = plan
         .nodes
         .iter()
-        .filter(|n| matches!(&n.op, Operation::Elemwise(Elemwise::Add { .. })))
+        .filter(|n| {
+            matches!(
+                &n.op,
+                Operation::Elemwise(Elemwise::Binary {
+                    op: poem_ir::BinaryOp::Add,
+                    ..
+                })
+            )
+        })
         .count();
     assert_eq!(adds, BLOCKS, "one copy a block");
 }

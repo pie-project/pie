@@ -1088,13 +1088,25 @@ impl Run<'_> {
             // The forms no builder makes.
             Elemwise::Act { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Elemwise::Hadamard { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Elemwise::Mul { x, y, z } => elemwise::pointwise::mul(
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: poem_ir::BinaryOp::Mul,
+                ..
+            } => elemwise::pointwise::mul(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
                 &mut self.tensor(*z),
             ),
-            Elemwise::Add { x, y, z } => elemwise::pointwise::add(
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: poem_ir::BinaryOp::Add,
+                ..
+            } => elemwise::pointwise::add(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),

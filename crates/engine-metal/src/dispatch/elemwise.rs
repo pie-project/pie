@@ -324,13 +324,25 @@ impl Run<'_> {
                 *block,
                 signs.as_ref().map(|s| self.tensor(*s)),
             ),
-            Elemwise::Mul { x, y, z } => elemwise::pointwise::mul(
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: poem_ir::BinaryOp::Mul,
+                ..
+            } => elemwise::pointwise::mul(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
                 self.tensor(*z),
             ),
-            Elemwise::Add { x, y, z } => elemwise::pointwise::add(
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: poem_ir::BinaryOp::Add,
+                ..
+            } => elemwise::pointwise::add(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
