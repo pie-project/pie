@@ -74,9 +74,7 @@ impl<P> Ledger<P> {
     }
 
     fn queued(&self) -> std::sync::MutexGuard<'_, VecDeque<(Allotment, P)>> {
-        self.queued
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.queued.lock().expect("queued lock poisoned")
     }
 
     /// The next value to hand off on.

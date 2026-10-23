@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 #[cfg(feature = "cuda")]
 use super::*;
 #[cfg(feature = "cuda")]

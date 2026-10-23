@@ -34,3 +34,6 @@ blake3 = "1"
 poem = { package = "pie-poem", path = "../poem" }
 ztensor-compat = { workspace = true }
 ztensor = { workspace = true }
+
+[lints]
+workspace = true

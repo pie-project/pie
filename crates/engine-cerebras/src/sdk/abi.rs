@@ -4,6 +4,7 @@
 //! libstdc++ 13, `_GLIBCXX_USE_CXX11_ABI=1`) by dumping the objects the SDK's
 //! own pybind module builds, and is checked by the simulator round trip in
 //! `examples/gemv.rs`. Nothing in this file is a public API.
+#![allow(unsafe_code)]
 
 use std::ffi::c_void;
 

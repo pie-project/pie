@@ -3,6 +3,7 @@
 //! of this process's executions, collected as a serialized `XSpace` (what
 //! `jax.profiler` writes as `*.xplane.pb`). The structs are declared here by
 //! hand with the upstream layouts; the vendored header does not carry them.
+#![allow(unsafe_code)]
 
 use std::os::raw::c_char;
 use std::sync::Arc;

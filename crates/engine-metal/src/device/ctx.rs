@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 #[cfg(target_vendor = "apple")]
 use std::cell::RefCell;
 

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,22 +21,15 @@ fn slot() -> &'static Mutex<Option<PathBuf>> {
 pub fn dump_to(dir: impl Into<PathBuf>) {
     let dir = dir.into();
     let _ = std::fs::create_dir_all(&dir);
-    *slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir);
+    *slot().lock().expect("lock poisoned") = Some(dir);
 }
 
 pub fn stop() {
-    *slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *slot().lock().expect("lock poisoned") = None;
 }
 
 pub(crate) fn dir() -> Option<PathBuf> {
-    slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    slot().lock().expect("lock poisoned").clone()
 }
 
 pub(crate) fn next_seq() -> u64 {

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -34,8 +35,7 @@ fn instance(backends: wgpu::Backends) -> &'static wgpu::Instance {
 
 fn gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: Mutex<()> = Mutex::new(());
-    GATE.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    GATE.lock().expect("gate lock poisoned")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -181,7 +181,7 @@ impl Core {
         let taken = self
             .last_error
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("last error lock poisoned")
             .take();
         match taken {
             Some(why) => Err(Fault::Wgpu { what, why }),
@@ -203,22 +203,14 @@ impl Core {
     }
 
     pub(crate) fn destroy_spent(&self) {
-        let spent = std::mem::take(
-            &mut *self
-                .spent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let spent = std::mem::take(&mut *self.spent.lock().expect("spent lock poisoned"));
         for buffer in spent {
             buffer.destroy();
         }
     }
 
     pub(crate) fn spend(&self, buffer: wgpu::Buffer) {
-        self.spent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(buffer);
+        self.spent.lock().expect("spent lock poisoned").push(buffer);
     }
 
     pub(crate) fn submit_once(&self, encoder: wgpu::CommandEncoder) -> Result<()> {
@@ -227,12 +219,7 @@ impl Core {
     }
 
     pub(crate) fn uniform_chunk(&self) -> wgpu::Buffer {
-        if let Some(chunk) = self
-            .uniforms
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop()
-        {
+        if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
             return chunk;
         }
         self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -246,17 +233,13 @@ impl Core {
     pub(crate) fn return_uniforms(&self, chunks: Vec<wgpu::Buffer>) {
         self.uniforms
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("uniforms lock poisoned")
             .extend(chunks);
     }
 
     pub(crate) fn scratch_chunk(&self, bytes: u64) -> wgpu::Buffer {
         if bytes <= SCRATCH_CHUNK
-            && let Some(chunk) = self
-                .scratch
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop()
+            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
         {
             return chunk;
         }
@@ -273,7 +256,7 @@ impl Core {
     pub(crate) fn return_scratch(&self, chunks: Vec<wgpu::Buffer>) {
         self.scratch
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("scratch lock poisoned")
             .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
     }
 }
@@ -478,9 +461,7 @@ impl Context {
             device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
                 let text = error.to_string();
                 eprintln!("wgpu: {text}");
-                *sink
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
+                *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }
         let (heap, sm) = vulkan_facts(&adapter);
@@ -657,12 +638,7 @@ pub(crate) struct Inner {
 
 impl Inner {
     fn harvest(&self) {
-        let planes = std::mem::take(
-            &mut *self
-                .timing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let planes = std::mem::take(&mut *self.timing.lock().expect("timing lock poisoned"));
         for (at, plane) in planes.iter().enumerate() {
             plane.harvest(&self.core, at == 0);
         }
@@ -671,17 +647,9 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let ring = std::mem::take(
-            self.uniforms
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let ring = std::mem::take(self.uniforms.get_mut().expect("uniforms lock poisoned"));
         self.core.return_uniforms(ring.chunks);
-        let scratch = std::mem::take(
-            self.scratch
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let scratch = std::mem::take(self.scratch.get_mut().expect("scratch lock poisoned"));
         self.core.return_scratch(scratch.chunks);
     }
 }
@@ -694,11 +662,7 @@ pub struct Frame {
 
 impl Frame {
     pub(crate) fn close_pass(&self) {
-        self.inner
-            .pass
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        self.inner.pass.lock().expect("pass lock poisoned").take();
     }
 
     pub(crate) fn dispatch(
@@ -708,17 +672,9 @@ impl Frame {
         group: &wgpu::BindGroup,
         groups: [u32; 3],
     ) -> Result<()> {
-        let mut pass = self
-            .inner
-            .pass
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pass = self.inner.pass.lock().expect("pass lock poisoned");
         if pass.is_none() {
-            let mut guard = self
-                .inner
-                .encoder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = self.inner.encoder.lock().expect("encoder lock poisoned");
             let encoder = guard.as_mut().ok_or(Fault::Device {
                 call: "frame",
                 why: "this frame was already submitted".to_string(),
@@ -742,11 +698,7 @@ impl Frame {
 
     pub(crate) fn encode<T>(&self, f: impl FnOnce(&mut wgpu::CommandEncoder) -> T) -> Result<T> {
         self.close_pass();
-        let mut guard = self
-            .inner
-            .encoder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.inner.encoder.lock().expect("encoder lock poisoned");
         let encoder = guard.as_mut().ok_or(Fault::Device {
             call: "frame",
             why: "this frame was already submitted".to_string(),
@@ -757,11 +709,7 @@ impl Frame {
     pub(crate) fn uniform_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
-        let mut ring = self
-            .inner
-            .uniforms
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
         let at = ring.used.next_multiple_of(align);
         if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
             ring.chunks.push(core.uniform_chunk());
@@ -777,11 +725,7 @@ impl Frame {
         if !core.enabled.timestamps {
             return None;
         }
-        let mut planes = self
-            .inner
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut planes = self.inner.timing.lock().expect("timing lock poisoned");
         let first = planes.is_empty();
         if planes
             .last()
@@ -803,11 +747,7 @@ impl Frame {
     pub(crate) fn scratch_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
-        let mut ring = self
-            .inner
-            .scratch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         let at = ring.used.next_multiple_of(align);
         if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
             ring.chunks.push(core.scratch_chunk(bytes));
@@ -875,7 +815,7 @@ impl Frame {
             .inner
             .encoder
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("encoder lock poisoned")
             .take();
         let Some(encoder) = taken else {
             return Err(Fault::Device {
@@ -884,11 +824,7 @@ impl Frame {
             });
         };
         core.submit_once(encoder)?;
-        *self
-            .inner
-            .encoder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+        *self.inner.encoder.lock().expect("encoder lock poisoned") = Some(
             core.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("pie frame"),
@@ -908,7 +844,7 @@ impl Frame {
             .inner
             .encoder
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("encoder lock poisoned")
             .take();
         let Some(mut encoder) = taken else {
             return Ok(());
@@ -917,7 +853,7 @@ impl Frame {
             .inner
             .timing
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("timing lock poisoned")
             .iter()
             .enumerate()
             .filter(|(_, plane)| !plane.names.is_empty())
@@ -958,11 +894,7 @@ impl Frame {
             inner.done.store(true, Ordering::Release);
         });
         core.kick();
-        *self
-            .inner
-            .index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *self.inner.index.lock().expect("index lock poisoned") = Some(index);
         core.take_error("submit")
     }
 

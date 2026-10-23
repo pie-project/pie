@@ -4,7 +4,7 @@
 //!
 //! Generated from the prototypes in `hip/hip_runtime_api.h`; the constants
 //! and struct layouts below were read off the installed headers.
-
+#![allow(unsafe_code)]
 #![allow(
     non_snake_case,
     non_upper_case_globals,

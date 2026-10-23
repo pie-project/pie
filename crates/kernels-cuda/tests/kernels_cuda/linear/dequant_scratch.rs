@@ -1,4 +1,5 @@
 #![cfg(feature = "cuda")]
+#![allow(unsafe_code)]
 
 use core::ffi::c_void;
 

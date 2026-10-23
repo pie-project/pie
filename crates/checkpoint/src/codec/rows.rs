@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use half::{bf16, f16};
 
 use crate::types::DType;

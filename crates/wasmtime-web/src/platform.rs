@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::alloc::Layout;
 use std::cell::RefCell;
 use std::collections::HashMap;

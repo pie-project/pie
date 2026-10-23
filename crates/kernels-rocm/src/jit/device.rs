@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -28,9 +29,7 @@ fn arenas() -> &'static Mutex<HashMap<u32, Arena>> {
 }
 
 fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
-    arenas()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    arenas().lock().expect("lock poisoned")
 }
 
 pub(crate) fn attach(arena: u32, stream: *mut c_void) {
@@ -236,7 +235,7 @@ fn per_device(
     let mut map = cache
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     *map.entry(ordinal).or_insert_with(|| read(ordinal))
 }
 

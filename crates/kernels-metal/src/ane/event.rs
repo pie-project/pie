@@ -2,6 +2,7 @@
 //! `ready`, which only the GPU raises, and `done`, which only the Neural
 //! Engine raises (and this side, for a request that came back without). The
 //! order that keeps either from falling is the [`ledger`](crate::ledger)'s.
+#![allow(unsafe_code)]
 
 use std::sync::Arc;
 

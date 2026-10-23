@@ -32,7 +32,7 @@ pub fn symbol(name: &str) -> &'static str {
     let mut map = INTERNED
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     if let Some(found) = map.get(name) {
         return found;
     }

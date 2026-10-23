@@ -2,6 +2,7 @@
 //! what speaks it, `AZURE_BLOB`, ...): a buffer is written to a name whole,
 //! and read back from it given its length. The agent moves each batch
 //! between host memory and the store itself; no peer takes part.
+#![allow(unsafe_code)]
 
 use std::ffi::{CString, c_void};
 use std::ptr;

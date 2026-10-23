@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -462,19 +463,14 @@ fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) 
             scope.spawn(move || {
                 for &(dst, from, len) in chunk {
                     if let Err(why) = unsafe { pread_all(file, dst as *mut u8, from, len) } {
-                        *failed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+                        *failed.lock().expect("failed lock poisoned") = Some(why);
                         return;
                     }
                 }
             });
         }
     });
-    match failed
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    match failed.into_inner().expect("failed lock poisoned") {
         Some(why) => Err(why),
         None => Ok(()),
     }

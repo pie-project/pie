@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 
 use crate::error::Error;
@@ -561,9 +562,7 @@ impl Ctx {
             let gap = {
                 static LAST: std::sync::Mutex<Option<std::time::Instant>> =
                     std::sync::Mutex::new(None);
-                let mut last = LAST
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut last = LAST.lock().expect("last lock poisoned");
                 let gap = last.map_or(0, |at| now.duration_since(at).as_micros());
                 *last = Some(now);
                 gap

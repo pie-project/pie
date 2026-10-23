@@ -215,8 +215,12 @@ inventory = "0.3"
 ztensor = { path = "crates/ztensor" }
 ztensor-compat = { path = "crates/ztensor-compat" }
 
+[lints]
+workspace = true
+
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 missing_docs = "allow"
 
 [workspace.lints.clippy]

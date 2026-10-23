@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use poem_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
 
 use crate::arena::Arena;

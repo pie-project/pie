@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::Cell;
 use std::sync::Arc;
 

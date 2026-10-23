@@ -9,6 +9,7 @@ extern crate kernels_rocm as kernels_cuda;
 // back unseen.
 #[cfg(all(any(feature = "cuda", feature = "rocm"), target_os = "linux"))]
 #[used]
+#[allow(unsafe_code)]
 #[unsafe(link_section = ".init_array")]
 static STRICT_KERNELS: extern "C" fn() = {
     extern "C" fn on() {

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 fn container_has_attention_stages(container: &eta_ir::container::TraceContainer) -> bool {
     use eta_ir::registry::Stage;
     container

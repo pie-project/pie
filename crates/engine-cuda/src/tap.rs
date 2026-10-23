@@ -8,6 +8,7 @@
 //! A layer's group is told only once the walk has moved past it, and a walk
 //! that comes back to a layer it has left fails the tap: the group already
 //! gone may have missed that layer's rows.
+#![allow(unsafe_code)]
 
 use std::cell::Cell;
 

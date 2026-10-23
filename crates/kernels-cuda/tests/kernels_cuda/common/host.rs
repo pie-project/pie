@@ -1,5 +1,6 @@
 //! Host references and fixtures several kernel tests share.
 #![allow(dead_code)]
+#![allow(unsafe_code)]
 
 use super::from_bf16;
 use super::tc5::{e2m1, e4m3, ue8m0};

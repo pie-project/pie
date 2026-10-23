@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

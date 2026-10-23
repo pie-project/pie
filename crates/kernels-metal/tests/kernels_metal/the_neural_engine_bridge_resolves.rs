@@ -1,4 +1,5 @@
 #![cfg(target_vendor = "apple")]
+#![allow(unsafe_code)]
 
 use kernels_metal::ane::{Element, Surface, available};
 

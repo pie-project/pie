@@ -1,6 +1,7 @@
 //! The thin layer over HIP this crate launches through: hiprtc compiles a
 //! unit to a code object, a [`Module`] loads it, and [`Module::launch`] fires
 //! one of its kernels on a [`Stream`].
+#![allow(unsafe_code)]
 
 pub mod blas;
 pub mod lt;

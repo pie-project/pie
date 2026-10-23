@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 
 use cudarc::driver::sys as dr;
@@ -100,9 +101,7 @@ fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Fa
         });
     }
     let key = (device, function.addr());
-    let mut granted = GRANTED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut granted = GRANTED.lock().expect("granted lock poisoned");
     if let Some((_, high_water)) = granted.iter().find(|(k, _)| *k == key)
         && bytes <= *high_water
     {

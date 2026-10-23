@@ -1,0 +1,5 @@
+# A poisoned lock means a panic left the data behind it half-written:
+# reaching through the poison reads that state as if it held.
+disallowed-methods = [
+    { path = "std::sync::PoisonError::into_inner", reason = "a poisoned lock's state is not to be trusted; `.expect(\"… poisoned\")` instead" },
+]

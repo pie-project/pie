@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};

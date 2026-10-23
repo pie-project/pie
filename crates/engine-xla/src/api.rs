@@ -17,6 +17,7 @@
 //! scatter into its input pack); any other port that reads an in-flight
 //! cell waits for it to land. `PIE_XLA_SYNC=1` settles every frame inside
 //! `submit`, for an A/B.
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

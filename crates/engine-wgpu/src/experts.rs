@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 

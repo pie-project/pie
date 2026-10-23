@@ -1,5 +1,6 @@
 //! An IOSurface the Neural Engine reads or writes. The GPU reaches the same
 //! memory through a no-copy Metal buffer over [`Surface::base`].
+#![allow(unsafe_code)]
 
 use std::ffi::{c_int, c_void};
 

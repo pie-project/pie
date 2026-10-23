@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 use dtype::Dtype;
 

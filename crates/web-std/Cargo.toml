@@ -16,3 +16,6 @@ slab = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasmtime-fiber = { version = "=48.0.1", package = "wasmtime-internal-fiber", features = ["custom", "std"] }
+
+[lints]
+workspace = true

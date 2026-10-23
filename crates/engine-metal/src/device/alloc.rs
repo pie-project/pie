@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::{Fault, Result};
 
 #[cfg(target_vendor = "apple")]
@@ -389,19 +390,14 @@ impl FileWriter {
                                 + usize::try_from(into).expect("an offset inside a live mapping"))
                                 as *mut u8;
                             if let Err(why) = unsafe { pread_all(fd, dst, from, len) } {
-                                *failed
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+                                *failed.lock().expect("failed lock poisoned") = Some(why);
                                 return;
                             }
                         }
                     });
                 }
             });
-            match failed
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
+            match failed.into_inner().expect("failed lock poisoned") {
                 Some(why) => Err(why),
                 None => Ok(()),
             }

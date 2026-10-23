@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 use crate::jit::{
     Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,

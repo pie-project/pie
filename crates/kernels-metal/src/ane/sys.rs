@@ -1,5 +1,6 @@
 //! The C face of `native/ane.m`: every call into the private framework goes
 //! through one of these. Nothing outside this module touches them.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 

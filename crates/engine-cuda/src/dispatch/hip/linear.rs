@@ -1324,9 +1324,7 @@ fn staging(name: &'static str, bytes: usize) -> Option<u64> {
     if bytes == 0 {
         return None;
     }
-    let mut held = HELD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut held = HELD.lock().expect("held lock poisoned");
     let held = held.get_or_insert_with(|| Held {
         live: HashMap::new(),
         retired: Vec::new(),

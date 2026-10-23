@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_metal::Tensor;
 use poem_compiler::Budget;
 use poem_ir::Dtype;

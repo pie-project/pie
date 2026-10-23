@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::sync::Arc;
 
 use ash::vk;
@@ -377,11 +378,7 @@ impl Session {
     /// one is recorded.
     pub fn lend_landing(&mut self, device: &Context, stage: usize) -> Result<Buffer> {
         let bytes = self.stages[stage].landing.bytes();
-        let spare = self
-            .landings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
+        let spare = self.landings.lock().expect("landings lock poisoned").pop();
         match spare {
             Some(buffer) if buffer.bytes() >= bytes => Ok(buffer),
             _ => Buffer::with(device, bytes, Memory::Host),

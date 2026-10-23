@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::{Fault, Result};
 
 pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;

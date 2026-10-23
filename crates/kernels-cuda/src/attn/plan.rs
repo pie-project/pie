@@ -1,5 +1,6 @@
 //! Host-only: the work plans the FlashAttention-2 decode, prefill and MLA
 //! arms launch from (`sched` the shared allocator and splitter).
+#![allow(unsafe_code)]
 
 use crate::error::Error;
 

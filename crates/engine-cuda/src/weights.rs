@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 #[cfg(feature = "device")]
 pub mod arena;
 #[cfg(feature = "rocm")]

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
@@ -80,7 +81,7 @@ pub fn profiling() -> bool {
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .iter()
         .map(|(name, &(ns, n))| (name.clone(), ns, n))
         .collect();
@@ -90,16 +91,14 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
 
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
 }
 
 pub fn reset_kernel_profile() {
     KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .clear();
     HOST_ENCODE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     BARRIERS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -112,9 +111,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "vulkan")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
 }
 
@@ -137,11 +134,7 @@ pub fn capture_shapes(on: bool) {
 
 #[must_use]
 pub fn take_shapes() -> Vec<DispatchShape> {
-    std::mem::take(
-        &mut *SHAPES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    std::mem::take(&mut *SHAPES.lock().expect("shapes lock poisoned"))
 }
 
 #[cfg(feature = "vulkan")]
@@ -487,7 +480,7 @@ impl Sink<'_> {
                     .inner
                     .timing
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .expect("timing lock poisoned");
                 match slot.as_mut() {
                     Some(t) if (t.names.len() as u32) < t.capacity => {
                         let at = t.names.len() as u32;
@@ -521,7 +514,7 @@ impl Sink<'_> {
             use ash::vk::Handle;
             SHAPES
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("shapes lock poisoned")
                 .push(DispatchShape {
                     entrypoint: key,
                     bindings: infos

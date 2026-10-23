@@ -1,5 +1,6 @@
 //! The rocBLAS calls the linear and attention entries make: bf16/f16
 //! operands, f32 accumulation, column-major as BLAS reads it.
+#![allow(unsafe_code)]
 
 use core::ffi::{CStr, c_void};
 

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ffi::{CStr, c_char};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,8 +31,7 @@ fn entry() -> std::result::Result<ash::Entry, String> {
 
 fn instance_gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GATE.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    GATE.lock().expect("gate lock poisoned")
 }
 
 #[must_use]
@@ -172,10 +172,7 @@ impl Core {
             let bufs = [transfer.cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             {
-                let queue = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let queue = self.queue.lock().expect("queue lock poisoned");
                 d.queue_submit(*queue, &submits, transfer.fence)
                     .map_err(|e| self.fault("vkQueueSubmit", e))?;
             }
@@ -200,7 +197,7 @@ impl Core {
         if let Some(fence) = self
             .spare_fences
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("spare fences lock poisoned")
             .pop()
         {
             return Ok(fence);
@@ -216,7 +213,7 @@ impl Core {
         let mut spare = self
             .spare_fences
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("spare fences lock poisoned");
         if spare.len() >= SPARE_FENCES || unsafe { self.device.reset_fences(&[fence]) }.is_err() {
             drop(spare);
             unsafe { self.device.destroy_fence(fence, None) };
@@ -226,15 +223,9 @@ impl Core {
     }
 
     pub(crate) fn thread_pool(&self) -> Result<vk::CommandPool> {
-        let mut pools = self
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self.pools.lock().expect("pools lock poisoned");
         if let Some(&pool) = pools.get(&std::thread::current().id()) {
-            let mut orphans = self
-                .orphans
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut orphans = self.orphans.lock().expect("orphans lock poisoned");
             let mut freed = Vec::new();
             orphans.retain(|&(owner, cmd)| {
                 let mine = owner == pool;
@@ -267,25 +258,18 @@ impl Drop for Core {
         unsafe {
             let _ = self.device.device_wait_idle();
             {
-                let transfer = self
-                    .transfer
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let transfer = self.transfer.get_mut().expect("transfer lock poisoned");
                 transfer.staging = None;
                 self.device.destroy_fence(transfer.fence, None);
             }
             for fence in std::mem::take(
                 self.spare_fences
                     .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    .expect("spare fences lock poisoned"),
             ) {
                 self.device.destroy_fence(fence, None);
             }
-            let pools = std::mem::take(
-                self.pools
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
+            let pools = std::mem::take(self.pools.get_mut().expect("pools lock poisoned"));
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
             }
@@ -386,7 +370,7 @@ impl PipelineCache {
             && self
                 .written
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("written lock poisoned")
                 .elapsed()
                 >= PIPELINE_CACHE_SETTLE;
         if due && let Err(fault) = self.persist() {
@@ -398,10 +382,7 @@ impl PipelineCache {
         if !self.changed.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        *self
-            .written
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+        *self.written.lock().expect("written lock poisoned") = std::time::Instant::now();
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -437,7 +418,7 @@ impl Drop for Context {
         self.core
             .transfer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("transfer lock poisoned")
             .staging = None;
     }
 }
@@ -1070,27 +1051,17 @@ impl Drop for Inner {
             if self.submitted.load(Ordering::Acquire) {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
             }
-            for pool in self
-                .pools
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .drain(..)
-            {
+            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
                 d.destroy_descriptor_pool(pool, None);
             }
-            if let Some(timing) = self
-                .timing
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
+            if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
             let owned = self
                 .core
                 .pools
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("pools lock poisoned")
                 .get(&std::thread::current().id())
                 == Some(&self.cmd_pool);
             if owned {
@@ -1099,7 +1070,7 @@ impl Drop for Inner {
                 self.core
                     .orphans
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect("orphans lock poisoned")
                     .push((self.cmd_pool, self.cmd));
             }
         }
@@ -1217,7 +1188,7 @@ impl Frame {
         self.inner
             .keep
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("keep lock poisoned")
             .push(Arc::clone(slab));
     }
 
@@ -1230,21 +1201,13 @@ impl Frame {
         let d = &core.device;
         let key = layout.as_raw();
         {
-            let mut spare = self
-                .inner
-                .spare
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut spare = self.inner.spare.lock().expect("spare lock poisoned");
             if let Some(set) = spare.get_mut(&key).and_then(Vec::pop) {
                 return Ok(set);
             }
         }
         let layouts = [layout; SETS_PER_BATCH];
-        let mut pools = self
-            .inner
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self.inner.pools.lock().expect("pools lock poisoned");
         let mut got: Option<Vec<vk::DescriptorSet>> = None;
         if let Some(&pool) = pools.last() {
             let info = vk::DescriptorSetAllocateInfo::default()
@@ -1281,7 +1244,7 @@ impl Frame {
             self.inner
                 .spare
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("spare lock poisoned")
                 .entry(key)
                 .or_default()
                 .extend(sets);
@@ -1420,10 +1383,7 @@ impl Frame {
         {
             let bufs = [cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-            let queue = core
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = core.queue.lock().expect("queue lock poisoned");
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
         }
@@ -1460,10 +1420,7 @@ impl Frame {
         let core = &self.inner.core;
         let bufs = [self.inner.cmd];
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-        let queue = core
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue = core.queue.lock().expect("queue lock poisoned");
         unsafe { core.device.queue_submit(*queue, &submits, self.inner.fence) }
             .map_err(|e| core.fault("vkQueueSubmit", e))?;
         self.inner.submitted.store(true, Ordering::Release);
@@ -1557,10 +1514,7 @@ impl Kept {
         {
             let bufs = [self.inner.cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-            let queue = core
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = core.queue.lock().expect("queue lock poisoned");
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
         }
@@ -1617,10 +1571,7 @@ impl Pending {
 
 impl Inner {
     fn harvest_timing(&self) {
-        let mut slot = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = self.timing.lock().expect("timing lock poisoned");
         let Some(timing) = slot.as_mut() else {
             return;
         };

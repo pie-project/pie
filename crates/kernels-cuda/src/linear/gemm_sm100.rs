@@ -7,6 +7,7 @@
 //! [`atom_offset`]), atoms of one 128-row block consecutive along K, rows
 //! padded to whole blocks with finite (zero) bytes. A scale column covers
 //! `gran` K: 16 for NVFP4's ue4m3, 32 or 128 for ue8m0.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -1427,11 +1428,7 @@ pub(crate) struct Map {
 pub(crate) fn encode(m: Map) -> Result<[u64; 16], Error> {
     static MAPS: OnceLock<Mutex<HashMap<Map, [u64; 16]>>> = OnceLock::new();
     let maps = MAPS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(found) = maps
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&m)
-    {
+    if let Some(found) = maps.lock().expect("maps lock poisoned").get(&m) {
         return Ok(*found);
     }
     let dims = m.dims.map(u64::from);
@@ -1466,9 +1463,7 @@ pub(crate) fn encode(m: Map) -> Result<[u64; 16], Error> {
     }
     // SAFETY: CUtensorMap is 128 opaque bytes, 64-aligned.
     let raw: [u64; 16] = unsafe { core::mem::transmute(map) };
-    maps.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(m, raw);
+    maps.lock().expect("maps lock poisoned").insert(m, raw);
     Ok(raw)
 }
 

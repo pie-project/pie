@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unsafe_code)]
 
 use core::ffi::c_void;
 
@@ -338,16 +339,12 @@ static CAPTURE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// Held around a call on the legacy stream; see [`CAPTURE`].
 pub fn legacy() -> std::sync::RwLockReadGuard<'static, ()> {
-    CAPTURE
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    CAPTURE.read().expect("capture lock poisoned")
 }
 
 /// Held around a stream capture; see [`CAPTURE`].
 pub fn capturing() -> std::sync::RwLockWriteGuard<'static, ()> {
-    CAPTURE
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    CAPTURE.write().expect("capture lock poisoned")
 }
 
 /// The graph `body` fires on `ctx`'s stream, captured and instantiated.

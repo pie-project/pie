@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_arguments)]
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
@@ -780,7 +781,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
         let mut map = DEVICES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("lock poisoned");
         Arc::clone(map.entry(current_device()).or_insert_with(|| {
             Arc::new(Mutex::new(Device {
                 lt: LtCtx {
@@ -798,9 +799,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
             }))
         }))
     };
-    let mut device = device
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut device = device.lock().expect("device lock poisoned");
     f(&mut device)
 }
 

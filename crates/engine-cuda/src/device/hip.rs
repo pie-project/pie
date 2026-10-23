@@ -4,7 +4,7 @@
 //! same on either backend. Constants carry HIP's values, which are CUDA's
 //! wherever both define them. Enumerators HIP writes stand whether or not
 //! the engine names them.
-
+#![allow(unsafe_code)]
 #![allow(
     dead_code,
     non_camel_case_types,

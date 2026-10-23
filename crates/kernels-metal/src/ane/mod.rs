@@ -15,6 +15,7 @@
 //! * [`Handoff`]: the shared event the two engines order their work on.
 //! * [`mil`]: the text the programs are written in.
 //! * [`ffn`] and [`linear`]: the programs themselves, over those.
+#![allow(unsafe_code)]
 
 use std::ffi::c_int;
 use std::path::PathBuf;

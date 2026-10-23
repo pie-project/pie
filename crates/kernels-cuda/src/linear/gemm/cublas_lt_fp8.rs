@@ -2,6 +2,7 @@
 //! laid in atoms) against the rows quantized to e4m3 in 1x128 blocks (W8A8)
 //! on cuBLASLt's block-scaled FP8 GEMM (`BLK128x128_32F` A scales,
 //! `VEC128_32F` B scales): the wgmma GEMM where there is no tcgen05 one.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -200,9 +201,7 @@ fn plan_for(
     k: u32,
     workspace: usize,
 ) -> Option<(lt::cublasLtHandle_t, Arc<Mutex<Plan>>)> {
-    let mut st = state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut st = state().lock().expect("lock poisoned");
     let dev = device();
     let handle = match st.handles.get(&dev) {
         Some(&h) => h as lt::cublasLtHandle_t,
@@ -239,7 +238,7 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
     let mut held = SCALES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     if let Some(&at) = held.get(&key) {
         return Ok(at);
     }
@@ -356,9 +355,7 @@ pub fn matmul(
             stated(op, k)?.arg(),
         ],
     )?;
-    let plan = plan
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let plan = plan.lock().expect("plan lock poisoned");
     let slab = ctx.scratch_shared(op, LT_WORKSPACE, workspace)?;
     use lt::cublasLtMatmulDescAttributes_t as A;
     let pointer = std::mem::size_of::<*const c_void>();

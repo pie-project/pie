@@ -194,9 +194,7 @@ impl Root {
             self.text.as_ptr(),
         );
         let cache = PREFIXES.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut cache = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = cache.lock().expect("cache lock poisoned");
         if let Some(found) = cache.get(&identity) {
             return found;
         }

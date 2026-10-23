@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};

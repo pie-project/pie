@@ -1,5 +1,6 @@
 //! Partial attention states folded into one (`attn/merge.cu`): the split-KV
 //! fold, the LSE merge, the sink rescale and the logit softcap.
+#![allow(unsafe_code)]
 
 use crate::error::Error;
 use crate::jit::{

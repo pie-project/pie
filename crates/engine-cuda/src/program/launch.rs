@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{

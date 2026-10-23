@@ -1,5 +1,6 @@
 //! A MIL program compiled for and loaded on the Neural Engine, and the
 //! bindings that tie its procedures to surfaces.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::path::Path;

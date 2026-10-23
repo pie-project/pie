@@ -11,6 +11,7 @@
 //! the routes laid out by expert on the device, each quantized into its
 //! expert's rows (under its expert's global), one grouped [`tc5`] GEMM, and
 //! the rows gathered back to route order.
+#![allow(unsafe_code)]
 
 use cudarc::runtime::sys as rt;
 use dtype::Dtype;

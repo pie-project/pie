@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use super::e8m0::{encode_e8m0, exp2_e8m0};
 
 pub fn decode_mxfp4_elements(bytes: &[u8]) -> Vec<f64> {

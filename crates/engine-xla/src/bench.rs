@@ -8,6 +8,7 @@
 //! The device is opened once per process, under an exclusive `flock` on
 //! `$TMPDIR/pie-xla-device.lock`: libtpu admits one process at a time, and
 //! test binaries run concurrently.
+#![allow(unsafe_code)]
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -54,9 +55,7 @@ pub fn client() -> Option<&'static Mutex<Client>> {
 /// and then opens a `Device` with `PIE_XLA_LOCK=1` takes it again instead of
 /// waiting on itself (`flock` on a second open file would).
 pub fn lock_device() -> DeviceLock {
-    let mut held = HELD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut held = HELD.lock().expect("held lock poisoned");
     if held.0 == 0 {
         let path = std::env::temp_dir().join("pie-xla-device.lock");
         let file = std::fs::OpenOptions::new()
@@ -83,9 +82,7 @@ pub struct DeviceLock(());
 
 impl Drop for DeviceLock {
     fn drop(&mut self) {
-        let mut held = HELD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = HELD.lock().expect("held lock poisoned");
         held.0 -= 1;
         if held.0 == 0 {
             held.1 = None;

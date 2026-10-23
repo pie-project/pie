@@ -143,10 +143,7 @@ impl Device {
     #[must_use]
     pub fn dry_texts(&self) -> Vec<String> {
         self.dry.as_ref().map_or_else(Vec::new, |texts| {
-            texts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+            texts.lock().expect("texts lock poisoned").clone()
         })
     }
 
@@ -222,12 +219,7 @@ impl Device {
     /// The compiled form of `text`, from the cache or freshly built.
     pub fn program(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
         }
         if let Some(dir) = &self.dump {
@@ -238,7 +230,7 @@ impl Device {
         if let Some(texts) = &self.dry {
             texts
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("texts lock poisoned")
                 .push(text.to_string());
             let exe = match &self.client {
                 None => None,
@@ -254,7 +246,7 @@ impl Device {
             });
             self.cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("cache lock poisoned")
                 .insert(key, Arc::clone(&program));
             return Ok(program);
         }
@@ -313,17 +305,14 @@ impl Device {
         });
         self.cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("cache lock poisoned")
             .insert(key, Arc::clone(&program));
         Ok(program)
     }
 
     #[must_use]
     pub fn compiled(&self) -> usize {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.cache.lock().expect("cache lock poisoned").len()
     }
 
     /// Runs `program` over `args` (in its parameter order); returns its

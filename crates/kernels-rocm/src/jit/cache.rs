@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -22,7 +23,7 @@ fn slot(key: &str) -> &'static Slot {
     let mut map = SLOTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     if let Some(found) = map.get(key) {
         return found;
     }
@@ -252,7 +253,7 @@ pub fn arch(ordinal: i32) -> Option<&'static str> {
     let mut map = ARCHES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     *map.entry(ordinal).or_insert_with(|| {
         let name = crate::jit::device::arch_name(ordinal)?;
         Some(Box::leak(name.into_boxed_str()))

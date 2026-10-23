@@ -1,4 +1,5 @@
 //! The selected attention a block a row on tcgen05 (`attn/mla_sparse.cuh`).
+#![allow(unsafe_code)]
 pub(super) const SPARSE_SM100: &str = "attn/mla/sparse_sm100.cu";
 
 use super::{Ctx, Error, KvPool, Tensor};

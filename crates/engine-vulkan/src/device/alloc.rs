@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -156,10 +157,7 @@ impl Raw {
             return Ok(());
         }
         let core = &self.core;
-        let mut transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transfer = core.transfer.lock().expect("transfer lock poisoned");
         let staging = Arc::clone(core.staging(&mut transfer)?);
         let base = staging.mapped.expect("staging is mapped");
         let mut at = 0usize;
@@ -196,10 +194,7 @@ impl Raw {
             return Ok(());
         }
         let core = &self.core;
-        let mut transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transfer = core.transfer.lock().expect("transfer lock poisoned");
         let staging = Arc::clone(core.staging(&mut transfer)?);
         let base = staging.mapped.expect("staging is mapped");
         let mut at = 0usize;
@@ -233,10 +228,7 @@ impl Raw {
         }
 
         let core = &self.core;
-        let transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transfer = core.transfer.lock().expect("transfer lock poisoned");
         let start = offset & !3;
         let end = (offset + len).next_multiple_of(4).min(self.size);
         core.submit_once(&transfer, |d, cmd| unsafe {
@@ -399,10 +391,7 @@ impl FileWriter {
             return pread_jobs(file, &jobs, threads);
         }
         let core = &self.slab.core;
-        let mut transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transfer = core.transfer.lock().expect("transfer lock poisoned");
         let staging = Arc::clone(core.staging(&mut transfer)?);
         let base = staging.mapped.expect("staging is mapped").as_ptr() as usize;
 
@@ -455,19 +444,14 @@ fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) 
             scope.spawn(move || {
                 for &(dst, from, len) in chunk {
                     if let Err(why) = unsafe { pread_all(file, dst as *mut u8, from, len) } {
-                        *failed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+                        *failed.lock().expect("failed lock poisoned") = Some(why);
                         return;
                     }
                 }
             });
         }
     });
-    match failed
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    match failed.into_inner().expect("failed lock poisoned") {
         Some(why) => Err(why),
         None => Ok(()),
     }

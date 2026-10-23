@@ -1,4 +1,5 @@
 #![cfg(target_vendor = "apple")]
+#![allow(unsafe_code)]
 
 use kernels_metal::ane::ffn::{Ffn, INTERMEDIATE_BLOCK, Memory, SEGMENT, Shape, signs};
 use kernels_metal::ane::{Surface, available};

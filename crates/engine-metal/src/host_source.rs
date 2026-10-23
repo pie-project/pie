@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ops::{Deref, DerefMut};
 
 use crate::error::{Fault, Result};

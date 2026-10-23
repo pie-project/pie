@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 mod ffi;
 pub mod objects;
 

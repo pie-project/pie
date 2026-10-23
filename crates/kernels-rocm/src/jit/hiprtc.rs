@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ffi::{CStr, CString, c_char};
 
 use crate::hip::sys;
