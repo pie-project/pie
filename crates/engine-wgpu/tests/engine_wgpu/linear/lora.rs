@@ -1,17 +1,12 @@
-//! The LoRA correction on the first wgpu adapter, beside the hand-written
-//! kernel, against an f64 host reference: three rows over two adapters and
-//! a row with none, added onto a live output, at the baseline (the subgroup tier is
-//! SPIR-V's).
+//! The LoRA correction on the first wgpu adapter, against an f64 host
+//! reference: three rows over two adapters and a row with none, added onto a
+//! live output, at the baseline (the subgroup tier is SPIR-V's).
 
+use kernels_slang::Tensor;
 use kernels_slang::Tier;
-use kernels_wgpu::{Arg, Encode, Fire, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
+use crate::gpu::{Gpu, landed, noise};
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -58,36 +53,14 @@ fn the_lora_correction_answers_the_reference() {
     let bt = t(b, adapters, out * rank, Dtype::Bf16);
     let rt = t(routes, rows, 1, Dtype::I32);
     let tier = Tier::Baseline;
-    both(
+    landed(
         &mut gpu,
         &format!("lora at {}", tier.name()),
         &|g| vec![(g.up(&y0).0, rows * out, false)],
         std::slice::from_ref(&want),
         &|g, o| {
             let y = t(o[0].0, rows, out, Dtype::Bf16);
-            g.run(|c| {
-                c.fire(
-                    Fire::at("gemm/lora.wgsl", "lora_correct_bf16")
-                        .groups([1, rows as u32, 1])
-                        .group([256, 1, 1]),
-                    &[
-                        xt.arg(),
-                        at.arg(),
-                        bt.arg(),
-                        rt.arg(),
-                        y.arg_mut(),
-                        (input as i32).arg(),
-                        (out as i32).arg(),
-                        (rank as i32).arg(),
-                    ],
-                )
-            });
-        },
-        &|g, o| {
-            let y = st(t(o[0].0, rows, out, Dtype::Bf16));
-            g.run_slang(|c| {
-                kernels_slang::linear::lora::correct(c, tier, st(xt), st(at), st(bt), st(rt), y)
-            });
+            g.run(|c| kernels_slang::linear::lora::correct(c, tier, xt, at, bt, rt, y));
         },
     );
 }

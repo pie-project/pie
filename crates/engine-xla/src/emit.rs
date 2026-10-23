@@ -13,7 +13,7 @@ use kernels_xla::{Error, elem_of};
 
 /// What a lowering emits into: the engine's sink for one node (or one
 /// fire). A lowering hands its body to [`Emit::emit`], which lends it a [`Cx`]
-/// for the duration; `&Ctx` is shared, like kernels-wgpu's `&Ctx`, so an
+/// for the duration; `&Ctx` is shared, like kernels-slang's `&Ctx`, so an
 /// engine dispatch resolves its operands from `&self` while it holds one.
 pub trait Emit {
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error>;

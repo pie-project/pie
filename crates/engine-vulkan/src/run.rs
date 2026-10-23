@@ -1,7 +1,9 @@
 use kernels_slang::attn::mla::MlaPlan;
 use kernels_slang::attn::sdpa::Tables;
-use kernels_vulkan::linear::moe::RoutedScratch;
-use kernels_vulkan::{Bank, Ctx, KvPool, RaggedTensor, RecurrentPool, Tensor};
+use kernels_slang::linear::moe::select::RoutedScratch;
+use kernels_slang::{Bank, Ctx, KvPool, RaggedTensor, Tensor};
+
+use crate::store::RecurrentPool;
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
@@ -121,7 +123,7 @@ pub enum StructSlot {
 }
 
 pub struct Run<'c> {
-    ctx: &'c Ctx<'c>,
+    pub(crate) ctx: &'c Ctx<'c>,
 
     handles: &'c Handles,
 
@@ -159,7 +161,7 @@ pub struct Run<'c> {
 
     scratch: &'c Scratch,
 
-    tuning: &'c kernels_vulkan::Tuning,
+    tuning: &'c crate::tuning::Tuning,
 
     /// The layer whose work the frame holds unsubmitted, when the step is
     /// submitted a layer at a time.
@@ -173,7 +175,7 @@ pub(crate) struct StageCache {
 }
 
 impl<'c> Run<'c> {
-    pub(crate) fn tuning(&self) -> &'c kernels_vulkan::Tuning {
+    pub(crate) fn tuning(&self) -> &'c crate::tuning::Tuning {
         self.tuning
     }
 
@@ -191,7 +193,7 @@ impl<'c> Run<'c> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch,
-        tuning: &'c kernels_vulkan::Tuning,
+        tuning: &'c crate::tuning::Tuning,
         seats: Option<&'c crate::experts::Seats>,
         rows: Option<&'c crate::experts::Gathered>,
         host: Option<&'c crate::experts::HostTier>,
@@ -347,11 +349,6 @@ impl<'c> Run<'c> {
                     panic!("the copy rectangle this load reserved does not mint: {fault}")
                 }),
         )
-    }
-
-    /// The context for kernels-slang's entries.
-    pub(crate) fn slang(&self) -> crate::encode::Slang<'c> {
-        crate::encode::Slang(self.ctx)
     }
 
     pub(crate) fn bindings(&self) -> &FireBindings {
@@ -763,7 +760,7 @@ impl<'c> Run<'c> {
         bank: Option<Bank>,
         bias: Option<Tensor>,
         routes: Tensor,
-    ) -> Result<Option<Seated>, kernels_vulkan::Error> {
+    ) -> Result<Option<Seated>, kernels_slang::Error> {
         use crate::experts::Kind;
         const OP: &str = "linear.expert_stage";
         let (Some(seats), Some(host)) = (self.seats, self.host) else {
@@ -774,7 +771,7 @@ impl<'c> Run<'c> {
         if codes.is_none() && bias_plane.is_none() {
             return Ok(None);
         }
-        let fail = |detail: String| kernels_vulkan::Error::Backend { op: OP, detail };
+        let fail = |detail: String| kernels_slang::Error::Backend { op: OP, detail };
         let key = (routes.buf, routes.rows, routes.width);
         if self.stage.borrow().key != Some(key) {
             let n = u64::from(routes.rows) * u64::from(routes.width);
@@ -854,12 +851,12 @@ impl<'c> Run<'c> {
         &self,
         bank: Bank,
         ids: Tensor,
-    ) -> Result<Option<(Bank, Tensor)>, kernels_vulkan::Error> {
+    ) -> Result<Option<(Bank, Tensor)>, kernels_slang::Error> {
         let (Some(rows), Some(host)) = (self.rows, self.host) else {
             return Ok(None);
         };
         rows.stage(self.handles, host, bank, ids)
-            .map_err(|why| kernels_vulkan::Error::Backend {
+            .map_err(|why| kernels_slang::Error::Backend {
                 op: "gather.embed_concat",
                 detail: why.to_string(),
             })

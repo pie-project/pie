@@ -7,7 +7,7 @@
 //! broadcast touches only leading axes while `n` stays on the TPU's lanes
 //! (with the bytes on the minor axis, each field relayouts: ~15× a dense
 //! matmul, measured). The fields decode with shift/and over whole planes,
-//! exactly as kernels-wgpu `quant/kquant.wgsl` reads them, to a `[256,
+//! exactly as kernels-slang `linear/kquant.slang` reads them, to a `[256,
 //! blocks, n]` weight rounded to bf16 and contracted in one `dot_general`
 //! against the activation viewed `[m, blocks, 256]`.
 //!

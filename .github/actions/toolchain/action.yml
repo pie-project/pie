@@ -42,8 +42,8 @@ runs:
       shell: bash
       run: brew install cmake ninja libomp
 
-    # The Vulkan kernels compile to SPIR-V at build time, and kernels-slang
-    # to SPIR-V and WGSL (wgpu).
+    # kernels-slang compiles its modules at build time: SPIR-V (vulkan) and
+    # WGSL (wgpu).
     - if: contains(inputs.features, 'vulkan') || contains(inputs.features, 'wgpu')
       shell: bash
       env:

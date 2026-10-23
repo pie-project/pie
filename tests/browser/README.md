@@ -31,7 +31,7 @@ node tests/browser/tools/serve.mjs . 8765                                 # then
 `headless.mjs` opens a page in Playwright's Chromium with WebGPU and JSPI
 on, streams its console, and exits with the status the page reports.
 `run.sh` runs, in order: every kernel through Chrome's Tint
-(`crates/kernels-wgpu/tools/wgsl-check.html`), the build, and the pages:
+(`crates/kernels-slang/tools/wgsl-check.html`), the build, and the pages:
 
 | page | what it checks |
 |---|---|

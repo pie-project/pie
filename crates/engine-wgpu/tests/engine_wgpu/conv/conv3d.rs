@@ -4,10 +4,10 @@
 //! and without a bias, through the strip kernel (`c_in` 6) and the tiled one
 //! (`c_in` 16), and output rows past every clip landing zero.
 
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::conv::slang_alone;
+use crate::gpu::landed;
 use crate::gpu::{Gpu, noise};
 
 const C_OUT: usize = 6;
@@ -15,10 +15,6 @@ const C_OUT: usize = 6;
 const CLIPS: [[usize; 3]; 2] = [[3, 4, 5], [1, 3, 3]];
 const K: [usize; 3] = [3, 3, 3];
 const STRIDE: [usize; 3] = [1, 2, 2];
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 /// A clip table: each clip's extent and first row.
 fn table(clips: &[[usize; 3]]) -> Vec<i32> {
@@ -181,7 +177,7 @@ fn the_conv3d_answers_the_reference() {
             },
         };
         let n = rows_out * C_OUT;
-        slang_alone(
+        landed(
             &mut gpu,
             &format!(
                 "conv3d c_in {}, causal {}, bias {}",
@@ -190,16 +186,16 @@ fn the_conv3d_answers_the_reference() {
             &|g| vec![(g.up(&vec![7.0; n]).0, n, false)],
             &[want],
             &|g, o| {
-                g.run_slang(|c| {
+                g.run(|c| {
                     kernels_slang::conv::conv3d::conv3d(
                         c,
-                        st(x),
-                        st(grid),
-                        st(w),
-                        b.map(st),
+                        x,
+                        grid,
+                        w,
+                        b,
                         slang,
-                        st(o_grid),
-                        st(t(o[0].0, rows_out, C_OUT, Dtype::Bf16)),
+                        o_grid,
+                        t(o[0].0, rows_out, C_OUT, Dtype::Bf16),
                     )
                 })
             },

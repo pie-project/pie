@@ -3,19 +3,15 @@
 //! whole clip or its run of frames, heads 64 and 300 wide (two of the
 //! instantiations), and rows past every clip landing zero.
 
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::conv::slang_alone;
+use crate::gpu::landed;
 use crate::gpu::{Gpu, noise};
 
 /// Two clips: (t, h, w).
 const CLIPS: [[usize; 3]; 2] = [[3, 2, 3], [1, 2, 2]];
 const EXTRA: usize = 1;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[test]
 fn the_voxel_attention_answers_the_reference() {
@@ -81,7 +77,7 @@ fn the_voxel_attention_answers_the_reference() {
                 t(vb, rows, c, Dtype::Bf16),
             );
             let n = rows * c;
-            slang_alone(
+            landed(
                 &mut gpu,
                 &format!("voxel attention c {c}, frames {frames}"),
                 &|g| vec![(g.up(&vec![7.0; n]).0, n, false)],
@@ -93,16 +89,16 @@ fn the_voxel_attention_answers_the_reference() {
                     } else {
                         voxel::Segment::Frames(frames as u32)
                     };
-                    g.run_slang(|x| {
+                    g.run(|x| {
                         voxel::attention(
                             x,
-                            st(q),
-                            st(k),
-                            st(v),
-                            st(grid),
+                            q,
+                            k,
+                            v,
+                            grid,
                             segment,
                             scale,
-                            st(t(o[0].0, rows, c, Dtype::Bf16)),
+                            t(o[0].0, rows, c, Dtype::Bf16),
                         )
                     })
                 },

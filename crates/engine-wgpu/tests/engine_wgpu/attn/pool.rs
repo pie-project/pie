@@ -1,29 +1,13 @@
-//! The compressed KV pool on the first wgpu adapter, beside the hand-written kernels,
-//! against an f64 host reference: block boundaries, the compressor's state
-//! write, the gated pooling of each closed block (with and without a learned
-//! position bias), the block mean, the entry store, and the attention over
-//! pooled entries with its LSE, causal and selected.
+//! The compressed KV pool on the first wgpu adapter, against an f64 host
+//! reference: block boundaries, the compressor's state write, the gated
+//! pooling of each closed block (with and without a learned position bias),
+//! the block mean, the entry store, and the attention over pooled entries
+//! with its LSE, causal and selected.
 
-use kernels_wgpu::{KvPool, RaggedTensor, Tensor, attn::index, attn::pool};
+use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
-
-fn sp(p: &KvPool) -> kernels_slang::KvPool {
-    kernels_slang::KvPool {
-        keys: st(p.keys),
-        values: st(p.values),
-        page_indices: st(p.page_indices),
-        page_indptr: st(p.page_indptr),
-        page_size: p.page_size,
-        seq_stride: p.seq_stride,
-        head_stride: p.head_stride,
-    }
-}
+use crate::gpu::{Gpu, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -80,7 +64,7 @@ fn the_compressed_pool_answers_the_reference() {
     let want_pos = [3, -1, -1, 11];
     let want_rope = [0, 0, 0, 8];
     let qp = gpu.up_i32(&[0, 4]);
-    for (prefill, slang) in [(false, false), (false, true), (true, false), (true, true)] {
+    for prefill in [false, true] {
         let (bp, br, bro) = (
             gpu.up_i32(&[9; 4]),
             gpu.up_i32(&[9; 4]),
@@ -90,38 +74,10 @@ fn the_compressed_pool_answers_the_reference() {
             data: i32t(pos, n),
             indptr: i32t(qp, 2),
         };
-        let srag = kernels_slang::RaggedTensor {
-            data: st(i32t(pos, n)),
-            indptr: st(i32t(qp, 2)),
-        };
         let vt = t(vb, n, 1, Dtype::U8);
-        match (prefill, slang) {
-            (false, false) => gpu.run(|c| {
-                pool::boundary_decode(
-                    c,
-                    i32t(pos, n),
-                    i32t(own, n),
-                    vt,
-                    RATIO as u32,
-                    i32t(bp, n),
-                    i32t(br, n),
-                    i32t(bro, n),
-                )
-            }),
-            (false, true) => gpu.run_slang(|c| {
-                kernels_slang::attn::pool::boundary_decode(
-                    c,
-                    st(i32t(pos, n)),
-                    st(i32t(own, n)),
-                    st(vt),
-                    RATIO as u32,
-                    st(i32t(bp, n)),
-                    st(i32t(br, n)),
-                    st(i32t(bro, n)),
-                )
-            }),
-            (true, false) => gpu.run(|c| {
-                pool::boundary_prefill(
+        if prefill {
+            gpu.run(|c| {
+                kernels_slang::attn::pool::boundary_prefill(
                     c,
                     rag,
                     i32t(own, n),
@@ -131,23 +87,23 @@ fn the_compressed_pool_answers_the_reference() {
                     i32t(br, n),
                     i32t(bro, n),
                 )
-            }),
-            (true, true) => gpu.run_slang(|c| {
-                kernels_slang::attn::pool::boundary_prefill(
+            });
+        } else {
+            gpu.run(|c| {
+                kernels_slang::attn::pool::boundary_decode(
                     c,
-                    srag,
-                    st(i32t(own, n)),
-                    st(vt),
+                    i32t(pos, n),
+                    i32t(own, n),
+                    vt,
                     RATIO as u32,
-                    st(i32t(bp, n)),
-                    st(i32t(br, n)),
-                    st(i32t(bro, n)),
+                    i32t(bp, n),
+                    i32t(br, n),
+                    i32t(bro, n),
                 )
-            }),
+            });
         }
         let who = format!(
-            "{}pool boundary {}",
-            if slang { "slang " } else { "" },
+            "pool boundary {}",
             if prefill { "prefill" } else { "decode" }
         );
         assert_eq!(ints(&gpu, bp, n), want_pos, "{who}: positions");
@@ -173,7 +129,7 @@ fn the_compressed_pool_answers_the_reference() {
     let pool_pages = pool_of(pi, HD);
     let u = |b: u32| t(b, 3, 1, Dtype::U32);
     let bt = |b: u32, r: usize, w: usize| t(b, r, w, Dtype::Bf16);
-    both(
+    landed(
         &mut gpu,
         "pool state write",
         &|g| {
@@ -185,7 +141,7 @@ fn the_compressed_pool_answers_the_reference() {
         &[want_kv, want_sc],
         &|g, o| {
             g.run(|c| {
-                pool::state_write(
+                kernels_slang::attn::pool::state_write(
                     c,
                     bt(kv, 3, width),
                     bt(sc, 3, width),
@@ -196,22 +152,6 @@ fn the_compressed_pool_answers_the_reference() {
                     RATIO as u32,
                     bt(o[0].0, slots, width),
                     bt(o[1].0, slots, width),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::pool::state_write(
-                    c,
-                    st(bt(kv, 3, width)),
-                    st(bt(sc, 3, width)),
-                    &sp(&pool_pages),
-                    st(u(wp)),
-                    st(u(wo)),
-                    HD as u32,
-                    RATIO as u32,
-                    st(bt(o[0].0, slots, width)),
-                    st(bt(o[1].0, slots, width)),
                 )
             })
         },
@@ -261,14 +201,14 @@ fn the_compressed_pool_answers_the_reference() {
             })
             .collect();
         let apet = with_ape.then(|| t(ape, RATIO, ape_w, Dtype::F32));
-        both(
+        landed(
             &mut gpu,
             &format!("pool gather coff {coff} ape {with_ape}"),
             &|g| vec![(g.zeros(3 * HD), 3 * HD, false)],
             &[want],
             &|g, o| {
                 g.run(|c| {
-                    pool::gather(
+                    kernels_slang::attn::pool::gather(
                         c,
                         i32t(bpb, 3),
                         i32t(brb, 3),
@@ -279,22 +219,6 @@ fn the_compressed_pool_answers_the_reference() {
                         bt(ssc, slots, width),
                         apet,
                         bt(o[0].0, 3, HD),
-                    )
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
-                    kernels_slang::attn::pool::gather(
-                        c,
-                        st(i32t(bpb, 3)),
-                        st(i32t(brb, 3)),
-                        &sp(&pool_pages),
-                        HD as u32,
-                        RATIO as u32,
-                        st(bt(skv, slots, width)),
-                        st(bt(ssc, slots, width)),
-                        apet.map(st),
-                        st(bt(o[0].0, 3, HD)),
                     )
                 })
             },
@@ -320,14 +244,14 @@ fn the_compressed_pool_answers_the_reference() {
                 / RATIO as f64
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "pool block mean",
         &|g| vec![(g.zeros(3 * HD), 3 * HD, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                index::block_mean(
+                kernels_slang::attn::index::block_mean(
                     c,
                     i32t(bpb, 3),
                     i32t(brb, 3),
@@ -335,19 +259,6 @@ fn the_compressed_pool_answers_the_reference() {
                     HD as u32,
                     RATIO as u32,
                     bt(o[0].0, 3, HD),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::index::block_mean(
-                    c,
-                    st(i32t(bpb, 3)),
-                    st(i32t(brb, 3)),
-                    &sp(&key_pool),
-                    HD as u32,
-                    RATIO as u32,
-                    st(bt(o[0].0, 3, HD)),
                 )
             })
         },
@@ -361,14 +272,14 @@ fn the_compressed_pool_answers_the_reference() {
             want[s * HD..][..HD].copy_from_slice(&entr[c * HD..][..HD]);
         }
     }
-    both(
+    landed(
         &mut gpu,
         "pool store",
         &|g| vec![(g.zeros(slots * HD), slots * HD, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                pool::kv_append(
+                kernels_slang::attn::pool::kv_append(
                     c,
                     bt(ent, 3, HD),
                     i32t(bpb, 3),
@@ -376,19 +287,6 @@ fn the_compressed_pool_answers_the_reference() {
                     &pool_of(o[0].0, HD),
                     u(wp),
                     u(wo),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::pool::kv_append(
-                    c,
-                    st(bt(ent, 3, HD)),
-                    st(i32t(bpb, 3)),
-                    st(i32t(brb, 3)),
-                    &sp(&pool_of(o[0].0, HD)),
-                    st(u(wp)),
-                    st(u(wo)),
                 )
             })
         },
@@ -469,14 +367,14 @@ fn the_compressed_pool_answers_the_reference() {
         ]
     };
     let (hs, hd, rt) = (heads as u32, HD as u32, RATIO as u32);
-    both(
+    landed(
         &mut gpu,
         "pool attention lse",
         &outs,
         &[causal_o, causal_l],
         &|g, o| {
             g.run(|c| {
-                pool::attention_lse(
+                kernels_slang::attn::pool::attention_lse(
                     c,
                     qt,
                     i32t(ap, 3),
@@ -491,33 +389,16 @@ fn the_compressed_pool_answers_the_reference() {
                 )
             })
         },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::pool::attention_lse(
-                    c,
-                    st(qt),
-                    st(i32t(ap, 3)),
-                    st(i32t(ao, 3)),
-                    &sp(&entries),
-                    rt,
-                    hs,
-                    hd,
-                    scale as f32,
-                    st(ot(o[0].0)),
-                    st(lt(o[1].0)),
-                )
-            })
-        },
     );
     let selt = t(sel, 3, 4, Dtype::I32);
-    both(
+    landed(
         &mut gpu,
         "pool attention lse selected",
         &outs,
         &[sel_o, sel_l],
         &|g, o| {
             g.run(|c| {
-                pool::attention_lse_selected(
+                kernels_slang::attn::pool::attention_lse_selected(
                     c,
                     qt,
                     i32t(ap, 3),
@@ -531,25 +412,6 @@ fn the_compressed_pool_answers_the_reference() {
                     scale as f32,
                     ot(o[0].0),
                     lt(o[1].0),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::pool::attention_lse_selected(
-                    c,
-                    st(qt),
-                    st(i32t(ap, 3)),
-                    st(i32t(ao, 3)),
-                    st(selt),
-                    &sp(&entries),
-                    rt,
-                    4,
-                    hs,
-                    hd,
-                    scale as f32,
-                    st(ot(o[0].0)),
-                    st(lt(o[1].0)),
                 )
             })
         },

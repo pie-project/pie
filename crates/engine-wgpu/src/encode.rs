@@ -1,4 +1,4 @@
-use kernels_wgpu::{ArgValue, Encode, Error, Fire};
+use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
 use crate::device::handles::NIL;
@@ -143,13 +143,13 @@ fn shapes() -> bool {
 }
 
 #[cfg(feature = "wgpu")]
-fn label(fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<'static, str> {
+fn label(name: &'static str, fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<'static, str> {
     use std::fmt::Write;
     if !shapes() {
-        return std::borrow::Cow::Borrowed(fire.entrypoint);
+        return std::borrow::Cow::Borrowed(name);
     }
-    let mut key = String::with_capacity(fire.entrypoint.len() + 48);
-    key.push_str(fire.entrypoint);
+    let mut key = String::with_capacity(name.len() + 48);
+    key.push_str(name);
     let _ = write!(
         key,
         " g={}x{}x{}",
@@ -228,117 +228,6 @@ pub struct Sink<'a> {
     handles: &'a Handles,
 }
 
-/// Any kernels-wgpu context as a kernels-slang one: its `Fire` and arguments
-/// are kernels-wgpu's, field for field.
-pub struct Slang<'a>(pub &'a kernels_wgpu::Ctx<'a>);
-
-impl kernels_slang::Encode for Slang<'_> {
-    fn fire(
-        &self,
-        fire: kernels_slang::Fire,
-        args: &[kernels_slang::ArgValue],
-    ) -> std::result::Result<(), kernels_slang::Error> {
-        let entrypoint = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
-            kernels_slang::Error::Backend {
-                op: "slang.fire",
-                detail: format!(
-                    "`{}` is not instantiated at the {} tier",
-                    fire.entrypoint,
-                    fire.tier.name()
-                ),
-            }
-        })?;
-        let fire = Fire {
-            file: fire.file,
-            entrypoint,
-            groups: fire.groups,
-            group: fire.group,
-        };
-        let args: Vec<ArgValue> = args.iter().map(|a| wgpu_arg(*a)).collect();
-        self.0.fire(fire, &args).map_err(slang_error)
-    }
-
-    fn target(&self) -> kernels_slang::Target {
-        kernels_slang::Target::Wgsl
-    }
-
-    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
-        match self.0.absent().map_err(slang_error)? {
-            ArgValue::Buffer(h) => Ok(kernels_slang::ArgValue::Buffer(h)),
-            ArgValue::BufferMut(h) => Ok(kernels_slang::ArgValue::BufferMut(h)),
-            ArgValue::I32(v) => Ok(kernels_slang::ArgValue::I32(v)),
-            ArgValue::U32(v) => Ok(kernels_slang::ArgValue::U32(v)),
-            ArgValue::F32(v) => Ok(kernels_slang::ArgValue::F32(v)),
-        }
-    }
-}
-
-fn wgpu_arg(arg: kernels_slang::ArgValue) -> ArgValue {
-    match arg {
-        kernels_slang::ArgValue::Buffer(h) => ArgValue::Buffer(h),
-        kernels_slang::ArgValue::BufferMut(h) => ArgValue::BufferMut(h),
-        kernels_slang::ArgValue::I32(v) => ArgValue::I32(v),
-        kernels_slang::ArgValue::U32(v) => ArgValue::U32(v),
-        kernels_slang::ArgValue::F32(v) => ArgValue::F32(v),
-    }
-}
-
-/// kernels-slang's refusal as kernels-wgpu's.
-pub fn from_slang(e: kernels_slang::Error) -> Error {
-    match e {
-        kernels_slang::Error::Backend { op, detail } => Error::Backend { op, detail },
-        kernels_slang::Error::Unsupported { op } => Error::Unsupported { op },
-        kernels_slang::Error::DtypeUnsupported { op, dtype } => {
-            Error::DtypeUnsupported { op, dtype }
-        }
-    }
-}
-
-/// A kernels-wgpu tensor as kernels-slang's: the same handle and shape.
-#[must_use]
-pub fn slang_tensor(t: kernels_wgpu::Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
-
-pub fn slang_pool(p: &kernels_wgpu::KvPool) -> kernels_slang::KvPool {
-    kernels_slang::KvPool {
-        keys: slang_tensor(p.keys),
-        values: slang_tensor(p.values),
-        page_indices: slang_tensor(p.page_indices),
-        page_indptr: slang_tensor(p.page_indptr),
-        page_size: p.page_size,
-        seq_stride: p.seq_stride,
-        head_stride: p.head_stride,
-    }
-}
-
-pub fn slang_ragged(r: kernels_wgpu::RaggedTensor) -> kernels_slang::RaggedTensor {
-    kernels_slang::RaggedTensor {
-        data: slang_tensor(r.data),
-        indptr: slang_tensor(r.indptr),
-    }
-}
-
-pub fn slang_bank(b: kernels_wgpu::Bank) -> kernels_slang::Bank {
-    kernels_slang::Bank {
-        codes: slang_tensor(b.codes),
-        scales: slang_tensor(b.scales),
-        biases: b.biases.map(slang_tensor),
-        group: b.group,
-        bits: b.bits,
-    }
-}
-
-fn slang_error(e: Error) -> kernels_slang::Error {
-    match e {
-        Error::Backend { op, detail } => kernels_slang::Error::Backend { op, detail },
-        Error::Unsupported { op } => kernels_slang::Error::Unsupported { op },
-        Error::DtypeUnsupported { op, dtype } => {
-            kernels_slang::Error::DtypeUnsupported { op, dtype }
-        }
-    }
-}
-
 #[cfg(feature = "wgpu")]
 impl<'a> Sink<'a> {
     #[must_use]
@@ -391,14 +280,24 @@ impl Encode for Sink<'_> {
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
     }
+
+    fn target(&self) -> Target {
+        Target::Wgsl
+    }
 }
 
 #[cfg(feature = "wgpu")]
 impl Sink<'_> {
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
+        let name = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
+            Sink::backend(
+                fire,
+                format!("not instantiated at the {} tier", fire.tier.name()),
+            )
+        })?;
         let pipeline = self
             .pipelines
-            .get(self.device, fire)
+            .get(self.device, fire.file, name)
             .map_err(|fault| Sink::refuse(fire, fault))?;
         let core = self.device.core();
         let limits = &core.limits;
@@ -563,10 +462,7 @@ impl Sink<'_> {
         }
 
         let stated = fire.group.iter().product::<u32>();
-        if stated > 1
-            && pipeline.tier == kernels_wgpu::Capability::Baseline
-            && fire.group != pipeline.local
-        {
+        if stated > 1 && fire.group != pipeline.local {
             return Err(Sink::backend(
                 fire,
                 format!(
@@ -616,7 +512,7 @@ impl Sink<'_> {
                 });
             }
             core.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(fire.entrypoint),
+                label: Some(name),
                 layout: &pipeline.layout,
                 entries: &entries,
             })
@@ -624,12 +520,12 @@ impl Sink<'_> {
         core.take_error("create_bind_group")
             .map_err(|fault| Sink::refuse(fire, fault))?;
 
-        let key = label(fire, args);
+        let key = label(name, fire, args);
         if let Some((set, at)) = timing().then(|| self.frame.timestamp_slot(&key)).flatten() {
             self.frame
                 .encode(|encoder| {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some(fire.entrypoint),
+                        label: Some(name),
                         timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                             query_set: &set,
                             beginning_of_pass_write_index: Some(at),
@@ -647,7 +543,7 @@ impl Sink<'_> {
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         } else {
             self.frame
-                .dispatch(fire.entrypoint, &pipeline.pipeline, &group, fire.groups)
+                .dispatch(name, &pipeline.pipeline, &group, fire.groups)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         }
         if !staged.is_empty() {
@@ -707,5 +603,9 @@ impl Encode for Sink<'_> {
 
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
+    }
+
+    fn target(&self) -> Target {
+        Target::Wgsl
     }
 }

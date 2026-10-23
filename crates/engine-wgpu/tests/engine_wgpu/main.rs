@@ -10,4 +10,3 @@ mod linear;
 mod runtime;
 mod sampling;
 mod ssm;
-mod wgpu_speed;

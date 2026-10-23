@@ -17,19 +17,19 @@ struct Refusal {
 const REFUSED: &[Refusal] = &[
     Refusal {
         op: "collective.all_reduce",
-        why: "one device; kernels-vulkan refuses it too, kernels-cuda answers it through NCCL",
+        why: "one device; engine-vulkan refuses it too, kernels-cuda answers it through NCCL",
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.all_reduce\"",
     },
     Refusal {
         op: "collective.all_gather",
-        why: "one device; kernels-vulkan refuses it too, kernels-cuda answers it through NCCL",
+        why: "one device; engine-vulkan refuses it too, kernels-cuda answers it through NCCL",
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.all_gather\"",
     },
     Refusal {
         op: "collective.reduce_scatter",
-        why: "one device; kernels-vulkan refuses it too, kernels-cuda answers it through NCCL",
+        why: "one device; engine-vulkan refuses it too, kernels-cuda answers it through NCCL",
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.reduce_scatter\"",
     },

@@ -286,7 +286,7 @@ struct LandedSeat {
 }
 
 pub struct Shell {
-    tuning: kernels_vulkan::Tuning,
+    tuning: crate::tuning::Tuning,
     device: Context,
 
     pipelines: Pipelines,
@@ -390,7 +390,7 @@ impl Shell {
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
-        let tuning = kernels_vulkan::Tuning::new(chip, device.limits());
+        let tuning = crate::tuning::Tuning::new(chip, device.limits());
         let chip = tuning.profile();
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
@@ -1257,7 +1257,7 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn tuning(&self) -> &kernels_vulkan::Tuning {
+    pub fn tuning(&self) -> &crate::tuning::Tuning {
         &self.tuning
     }
 
@@ -1635,12 +1635,11 @@ impl Shell {
                 let source = self.handles.bind(copy.cell, 0, u64::from(values) * 4)?;
                 let at = u32::try_from(copy.at / 2).unwrap_or(u32::MAX);
                 kernels_slang::runtime::port::cast(
-                    &crate::encode::Slang(&sink),
+                    &sink,
                     kernels_slang::Tensor::new(source, 1, values, Dtype::F32),
                     into,
                     at,
                 )
-                .map_err(crate::encode::from_slang)
                 .map_err(crate::error::kernel)?;
             }
         }
@@ -3406,21 +3405,25 @@ enum Encoded<'a> {
     Live(Sink<'a>),
 }
 
-impl kernels_vulkan::Encode for Encoded<'_> {
+impl kernels_slang::Encode for Encoded<'_> {
     fn fire(
         &self,
-        fire: kernels_vulkan::Fire,
-        args: &[kernels_vulkan::ArgValue],
-    ) -> std::result::Result<(), kernels_vulkan::Error> {
+        fire: kernels_slang::Fire,
+        args: &[kernels_slang::ArgValue],
+    ) -> std::result::Result<(), kernels_slang::Error> {
         match self {
             Encoded::Live(sink) => sink.fire(fire, args),
         }
     }
 
-    fn absent(&self) -> std::result::Result<kernels_vulkan::ArgValue, kernels_vulkan::Error> {
+    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
         match self {
             Encoded::Live(sink) => sink.absent(),
         }
+    }
+
+    fn target(&self) -> kernels_slang::Target {
+        kernels_slang::Target::Spirv
     }
 }
 

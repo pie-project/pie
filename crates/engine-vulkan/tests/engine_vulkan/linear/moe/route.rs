@@ -1,15 +1,10 @@
-//! Mixture-of-experts routing on the first Vulkan device, beside the hand-written
-//! kernels, against a host reference: the experts picked exactly and their
-//! weights to f64.
+//! Mixture-of-experts routing on the first Vulkan device, against a host
+//! reference: the experts picked exactly and their weights to f64.
 
-use kernels_vulkan::{Tensor, linear::moe};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, close, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -115,47 +110,31 @@ fn moe_routing_answers_the_reference() {
             want_ids.extend(picks.iter().map(|&e| e as i32));
             want_w.extend(w);
         }
-        for slang in [false, true] {
-            let (ids, wb) = (
-                gpu.up_i32(&vec![-9; rows * k]),
-                gpu.up_f32(&vec![0.0; rows * k]),
-            );
-            let (it, wt) = (t(ids, rows, k, Dtype::I32), t(wb, rows, k, Dtype::F32));
-            let sct = t(sc, 1, experts, Dtype::Bf16);
-            if slang {
-                let (lt, bt, it, wt, sct) = (st(lt), st(bt), st(it), st(wt), st(sct));
-                gpu.run_slang(|c| match form {
-                    0 => kernels_slang::linear::moe::route::topk_softmax(c, lt, eu, ku, it, wt),
-                    1 => kernels_slang::linear::moe::route::topk_softmax_scaled(
-                        c, lt, sct, eu, ku, it, wt,
-                    ),
-                    2 => kernels_slang::linear::moe::route::topk_sigmoid(
-                        c, lt, eu, ku, true, scaling, it, wt,
-                    ),
-                    3 => kernels_slang::linear::moe::route::topk_sigmoid_biased(
-                        c, lt, bt, eu, ku, true, scaling, it, wt,
-                    ),
-                    4 => kernels_slang::linear::moe::route::topk_sqrt_softplus(
-                        c, lt, bt, eu, ku, true, scaling, it, wt,
-                    ),
-                    _ => {
-                        kernels_slang::linear::moe::route::predict_route(c, lt, bt, eu, ku, it, wt)
-                    }
-                });
-            } else {
-                gpu.run(|c| match form {
-                    0 => moe::topk_softmax(c, lt, eu, ku, it, wt),
-                    1 => moe::topk_softmax_scaled(c, lt, sct, eu, ku, it, wt),
-                    2 => moe::topk_sigmoid(c, lt, eu, ku, true, scaling, it, wt),
-                    3 => moe::topk_sigmoid_biased(c, lt, bt, eu, ku, true, scaling, it, wt),
-                    4 => moe::topk_sqrt_softplus(c, lt, bt, eu, ku, true, scaling, it, wt),
-                    _ => moe::predict_route(c, lt, bt, eu, ku, it, wt),
-                });
-            }
-            let who = format!("{}moe router {form}", if slang { "slang " } else { "" });
-            assert_eq!(ints(&gpu, ids, rows * k), want_ids, "{who}: experts");
-            close(&gpu.down_f32(wb, rows * k), &want_w, &who);
-        }
+        let (ids, wb) = (
+            gpu.up_i32(&vec![-9; rows * k]),
+            gpu.up_f32(&vec![0.0; rows * k]),
+        );
+        let (it, wt) = (t(ids, rows, k, Dtype::I32), t(wb, rows, k, Dtype::F32));
+        let sct = t(sc, 1, experts, Dtype::Bf16);
+        let (lt, bt, it, wt, sct) = (lt, bt, it, wt, sct);
+        gpu.run(|c| match form {
+            0 => kernels_slang::linear::moe::route::topk_softmax(c, lt, eu, ku, it, wt),
+            1 => kernels_slang::linear::moe::route::topk_softmax_scaled(c, lt, sct, eu, ku, it, wt),
+            2 => kernels_slang::linear::moe::route::topk_sigmoid(
+                c, lt, eu, ku, true, scaling, it, wt,
+            ),
+            3 => kernels_slang::linear::moe::route::topk_sigmoid_biased(
+                c, lt, bt, eu, ku, true, scaling, it, wt,
+            ),
+            4 => kernels_slang::linear::moe::route::topk_sqrt_softplus(
+                c, lt, bt, eu, ku, true, scaling, it, wt,
+            ),
+            _ => kernels_slang::linear::moe::route::predict_route(c, lt, bt, eu, ku, it, wt),
+        });
+
+        let who = format!("moe router {form}");
+        assert_eq!(ints(&gpu, ids, rows * k), want_ids, "{who}: experts");
+        close(&gpu.down_f32(wb, rows * k), &want_w, &who);
     }
 
     // Hash routing: three token ids, one out of the vocabulary (row 0's
@@ -192,45 +171,35 @@ fn moe_routing_answers_the_reference() {
         want_ids.extend((0..k).map(|j| table[tid * k + j] as u32 as i32));
         want_w.extend(w.iter().map(|v| v * f64::from(scaling) / sum));
     }
-    for slang in [false, true] {
-        let (ids, wb) = (
-            gpu.up_i32(&vec![-9; rows * k]),
-            gpu.up_f32(&vec![0.0; rows * k]),
-        );
-        let (it, wt) = (t(ids, rows, k, Dtype::I32), t(wb, rows, k, Dtype::F32));
-        let (tkt, tbt) = (t(tk, rows, 1, Dtype::U32), t(tb, vocab, k, Dtype::I64));
-        if slang {
-            gpu.run_slang(|c| {
-                kernels_slang::linear::moe::route::hash_route(
-                    c,
-                    st(tkt),
-                    st(tbt),
-                    st(lt),
-                    vocab as u32,
-                    ku,
-                    true,
-                    scaling,
-                    st(it),
-                    st(wt),
-                )
-            });
-        } else {
-            gpu.run(|c| moe::hash_route(c, tkt, tbt, lt, vocab as u32, ku, true, scaling, it, wt));
-        }
-        let who = format!("{}moe hash route", if slang { "slang " } else { "" });
-        assert_eq!(ints(&gpu, ids, rows * k), want_ids, "{who}: experts");
-        close(&gpu.down_f32(wb, rows * k), &want_w, &who);
-    }
-    for slang in [false, true] {
-        let ids = gpu.up_i32(&vec![-9; rows * 4]);
-        let it = t(ids, rows, 4, Dtype::I32);
-        if slang {
-            gpu.run_slang(|c| kernels_slang::linear::moe::route::group_routes(c, 4, st(it)));
-        } else {
-            gpu.run(|c| moe::group_routes(c, 4, it));
-        }
-        let want: Vec<i32> = (0..rows * 4).map(|i| (i % 4) as i32).collect();
-        assert_eq!(ints(&gpu, ids, rows * 4), want, "group routes");
-    }
+    let (ids, wb) = (
+        gpu.up_i32(&vec![-9; rows * k]),
+        gpu.up_f32(&vec![0.0; rows * k]),
+    );
+    let (it, wt) = (t(ids, rows, k, Dtype::I32), t(wb, rows, k, Dtype::F32));
+    let (tkt, tbt) = (t(tk, rows, 1, Dtype::U32), t(tb, vocab, k, Dtype::I64));
+    gpu.run(|c| {
+        kernels_slang::linear::moe::route::hash_route(
+            c,
+            tkt,
+            tbt,
+            lt,
+            vocab as u32,
+            ku,
+            true,
+            scaling,
+            it,
+            wt,
+        )
+    });
+
+    let who = "moe hash route";
+    assert_eq!(ints(&gpu, ids, rows * k), want_ids, "{who}: experts");
+    close(&gpu.down_f32(wb, rows * k), &want_w, who);
+    let ids = gpu.up_i32(&vec![-9; rows * 4]);
+    let it = t(ids, rows, 4, Dtype::I32);
+    gpu.run(|c| kernels_slang::linear::moe::route::group_routes(c, 4, it));
+
+    let want: Vec<i32> = (0..rows * 4).map(|i| (i % 4) as i32).collect();
+    assert_eq!(ints(&gpu, ids, rows * 4), want, "group routes");
     eprintln!("moe routing: exact experts");
 }

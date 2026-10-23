@@ -1,6 +1,6 @@
+use kernels_slang::Tensor;
 use kernels_slang::gather::ngram;
-use kernels_wgpu::Tensor;
-use kernels_wgpu::linear::moe::{self, RoutedScratch};
+use kernels_slang::linear::moe::select::RoutedScratch;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
@@ -9,7 +9,6 @@ use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, Value
 use crate::store::kv::Paging;
 
 use crate::device::{Buffer, Context, Handles};
-use crate::encode::slang_tensor;
 use crate::error::Result;
 use crate::run::PoolSlabs;
 
@@ -123,7 +122,7 @@ impl Scratch {
         compiled: &CompiledModel,
         budgets: &Budgets,
         paging: Paging,
-        tuning: &kernels_wgpu::Tuning,
+        tuning: &crate::tuning::Tuning,
     ) -> Result<Scratch> {
         let budget = &budgets.tokens;
         let map = &compiled.arena;
@@ -156,10 +155,10 @@ impl Scratch {
                         continue;
                     }
 
-                    if moe::tile_rows(y.rows, experts, tuning) <= 1 {
+                    if tuning.moe_tile_rows(y.rows, experts) <= 1 {
                         continue;
                     }
-                    let rows = moe::sorted_rows(y.rows, experts, tuning);
+                    let rows = tuning.moe_sorted_rows(y.rows, experts);
                     sorted = sorted.max(u64::from(rows));
                     pairs = pairs.max(u64::from(y.rows));
                     routed_k = routed_k.max(u64::from(x.width));
@@ -341,8 +340,8 @@ impl Scratch {
         let rooms = self.split?;
         let mint = || {
             Ok(kernels_slang::attn::sdpa::Split {
-                part_out: slang_tensor(rooms.part_out.bind(handles, &self.plane)?),
-                part_lse: slang_tensor(rooms.part_lse.bind(handles, &self.plane)?),
+                part_out: rooms.part_out.bind(handles, &self.plane)?,
+                part_lse: rooms.part_lse.bind(handles, &self.plane)?,
             })
         };
         Some(mint())

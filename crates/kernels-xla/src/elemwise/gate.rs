@@ -7,7 +7,7 @@ use crate::tensor::Operand;
 
 const FLOATS: &[Dtype] = &[Dtype::Bf16, Dtype::F16, Dtype::F32];
 
-/// `x *= σ(gate)`, element for element. Reference: kernels-wgpu
+/// `x *= σ(gate)`, element for element. Reference: kernels-slang
 /// `norm/gate.wgsl`.
 pub fn sigmoid_mul(f: &mut Func, gate: Operand, x: Operand) -> Result<Val, Error> {
     const OP: &str = "elemwise.gate_sigmoid_mul";

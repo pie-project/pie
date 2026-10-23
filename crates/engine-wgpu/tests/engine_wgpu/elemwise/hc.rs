@@ -1,11 +1,10 @@
-//! The hyper-connection kernels on the first wgpu adapter against an f64 host
-//! reference, beside the hand-written kernels: expand, the f32 stream norm,
-//! the gates (Sinkhorn-balanced), fold, collapse, and the
-//! trunk's mix, inject and PLE gate.
+//! The hyper-connection kernels on the first wgpu adapter against an f64
+//! host reference: expand, the f32 stream norm, the gates
+//! (Sinkhorn-balanced), fold, collapse, and the trunk's mix, inject and PLE
+//! gate.
 
-use crate::gpu::{Gpu, both, noise};
-use kernels_wgpu::Tensor;
-use kernels_wgpu::elemwise::hc;
+use crate::gpu::{Gpu, landed, noise};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 const N: usize = 3;
@@ -26,7 +25,6 @@ fn the_hyper_connections_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let b = |buf: u32, w: usize| Tensor::new(buf, N as u32, w as u32, Dtype::Bf16);
     let f = |buf: u32, rows: usize, w: usize| Tensor::new(buf, rows as u32, w as u32, Dtype::F32);
     let wide = M * H;
@@ -39,16 +37,13 @@ fn the_hyper_connections_answer_the_reference() {
 
     // expand
     let want: Vec<f64> = (0..N * wide).map(|i| xr[(i / wide) * H + i % H]).collect();
-    both(
+    landed(
         &mut gpu,
         "hc expand",
         &|g| vec![(g.zeros(N * wide), N * wide, false)],
         &[want],
-        &|g, o| g.run(|c| hc::expand(c, b(x, H), M as u32, b(o[0].0, wide))),
         &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::elemwise::hc::expand(c, st(b(x, H)), M as u32, st(b(o[0].0, wide)))
-            })
+            g.run(|c| kernels_slang::elemwise::hc::expand(c, b(x, H), M as u32, b(o[0].0, wide)))
         },
     );
 
@@ -60,19 +55,18 @@ fn the_hyper_connections_answer_the_reference() {
             sr[i] / (ms + f64::from(eps)).sqrt()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc rmsnorm f32",
         &|g| vec![(g.zeros(2 * N * wide), N * wide, true)],
         &[want],
-        &|g, o| g.run(|c| hc::rmsnorm_f32(c, b(streams, wide), eps, f(o[0].0, N, wide))),
         &|g, o| {
-            g.run_slang(|c| {
+            g.run(|c| {
                 kernels_slang::elemwise::hc::rmsnorm_f32(
                     c,
-                    st(b(streams, wide)),
+                    b(streams, wide),
                     eps,
-                    st(f(o[0].0, N, wide)),
+                    f(o[0].0, N, wide),
                 )
             })
         },
@@ -140,7 +134,7 @@ fn the_hyper_connections_answer_the_reference() {
                 .sum::<f64>()
         }));
     }
-    both(
+    landed(
         &mut gpu,
         "hc gates",
         &|g| {
@@ -153,7 +147,7 @@ fn the_hyper_connections_answer_the_reference() {
         &[layer_w, post_w.clone(), comb_w.clone()],
         &|g, o| {
             g.run(|c| {
-                hc::gates(
+                kernels_slang::elemwise::hc::gates(
                     c,
                     f(mixes, N, mix_hc),
                     b(streams, wide),
@@ -166,24 +160,6 @@ fn the_hyper_connections_answer_the_reference() {
                     b(o[0].0, H),
                     f(o[1].0, N, M),
                     f(o[2].0, N, M * M),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::elemwise::hc::gates(
-                    c,
-                    st(f(mixes, N, mix_hc)),
-                    st(b(streams, wide)),
-                    st(f(scale, 1, 3)),
-                    st(f(base, 1, mix_hc)),
-                    M as u32,
-                    eps,
-                    alpha,
-                    sinkhorn,
-                    st(b(o[0].0, H)),
-                    st(f(o[1].0, N, M)),
-                    st(f(o[2].0, N, M * M)),
                 )
             })
         },
@@ -202,32 +178,20 @@ fn the_hyper_connections_answer_the_reference() {
             acc
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc fold",
         &|g| vec![(g.zeros(N * wide), N * wide, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                hc::fold(
+                kernels_slang::elemwise::hc::fold(
                     c,
                     b(x, H),
                     b(streams, wide),
                     f(post, N, M),
                     f(comb, N, M * M),
                     b(o[0].0, wide),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::elemwise::hc::fold(
-                    c,
-                    st(b(x, H)),
-                    st(b(streams, wide)),
-                    st(f(post, N, M)),
-                    st(f(comb, N, M * M)),
-                    st(b(o[0].0, wide)),
                 )
             })
         },
@@ -249,14 +213,14 @@ fn the_hyper_connections_answer_the_reference() {
                 .sum()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc collapse",
         &|g| vec![(g.zeros(N * H), N * H, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                hc::collapse(
+                kernels_slang::elemwise::hc::collapse(
                     c,
                     f(cmix, N, M),
                     b(streams, wide),
@@ -265,20 +229,6 @@ fn the_hyper_connections_answer_the_reference() {
                     M as u32,
                     eps,
                     b(o[0].0, H),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::elemwise::hc::collapse(
-                    c,
-                    st(f(cmix, N, M)),
-                    st(b(streams, wide)),
-                    st(f(scale, 1, 3)),
-                    st(f(base, 1, mix_hc)),
-                    M as u32,
-                    eps,
-                    st(b(o[0].0, H)),
                 )
             })
         },
@@ -296,20 +246,19 @@ fn the_hyper_connections_answer_the_reference() {
                 / M as f64
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc mix",
         &|g| vec![(g.zeros(N * H), N * H, false)],
         &[want],
-        &|g, o| g.run(|c| hc::mix(c, b(gates, wide), b(streams, wide), M as u32, b(o[0].0, H))),
         &|g, o| {
-            g.run_slang(|c| {
+            g.run(|c| {
                 kernels_slang::elemwise::hc::mix(
                     c,
-                    st(b(gates, wide)),
-                    st(b(streams, wide)),
+                    b(gates, wide),
+                    b(streams, wide),
                     M as u32,
-                    st(b(o[0].0, H)),
+                    b(o[0].0, H),
                 )
             })
         },
@@ -326,30 +275,19 @@ fn the_hyper_connections_answer_the_reference() {
             hr[i] + 2.0 * sigmoid(sgr[n * M + s] / M as f64) * xr[n * H + k]
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc inject",
         &|g| vec![(g.up(&hv).0, N * wide, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                hc::inject(
+                kernels_slang::elemwise::hc::inject(
                     c,
                     b(x, H),
                     Tensor::new(sg, N as u32, M as u32, Dtype::Bf16),
                     M as u32,
                     b(o[0].0, wide),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::elemwise::hc::inject(
-                    c,
-                    st(b(x, H)),
-                    st(Tensor::new(sg, N as u32, M as u32, Dtype::Bf16)),
-                    M as u32,
-                    st(b(o[0].0, wide)),
                 )
             })
         },
@@ -375,32 +313,20 @@ fn the_hyper_connections_answer_the_reference() {
             sigmoid(damped) * xr[n * H + k]
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "ple gate",
         &|g| vec![(g.zeros(N * wide), N * wide, false)],
         &[want],
         &|g, o| {
             g.run(|c| {
-                hc::ple_gate(
+                kernels_slang::elemwise::hc::ple_gate(
                     c,
                     b(key, wide),
                     b(query, wide),
                     b(x, H),
                     M as u32,
                     b(o[0].0, wide),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::elemwise::hc::ple_gate(
-                    c,
-                    st(b(key, wide)),
-                    st(b(query, wide)),
-                    st(b(x, H)),
-                    M as u32,
-                    st(b(o[0].0, wide)),
                 )
             })
         },

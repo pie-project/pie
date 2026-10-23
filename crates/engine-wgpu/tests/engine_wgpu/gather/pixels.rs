@@ -1,14 +1,10 @@
-//! Image input on the first wgpu adapter, beside the hand-written kernels: patch bytes
-//! to normalized bf16 rows (channel- and pixel-major, repeated in time), and
-//! the position-table taps of each patch (bilinear and by axis).
+//! Image input on the first wgpu adapter: patch bytes to normalized bf16
+//! rows (channel- and pixel-major, repeated in time), and the position-table
+//! taps of each patch (bilinear and by axis).
 
-use crate::gpu::{Gpu, both};
-use kernels_wgpu::{Tensor, layout};
+use crate::gpu::{Gpu, landed};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[test]
 fn the_pixels_answer_the_reference() {
@@ -44,14 +40,14 @@ fn the_pixels_answer_the_reference() {
             })
             .collect();
         let yt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
-        both(
+        landed(
             &mut gpu,
             &format!("pixels channel-major {channel_major}"),
             &|g| vec![(g.zeros(rows * width), rows * width, false)],
             &[want],
             &|g, o| {
                 g.run(|c| {
-                    layout::pixels(
+                    kernels_slang::gather::pixels::pixels(
                         c,
                         xt,
                         patch as u32,
@@ -60,20 +56,6 @@ fn the_pixels_answer_the_reference() {
                         channel_major,
                         temporal as u32,
                         yt(o[0].0),
-                    )
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
-                    kernels_slang::gather::pixels::pixels(
-                        c,
-                        st(xt),
-                        patch as u32,
-                        mean,
-                        sd,
-                        channel_major,
-                        temporal as u32,
-                        st(yt(o[0].0)),
                     )
                 })
             },
@@ -127,22 +109,22 @@ fn the_pixels_answer_the_reference() {
             }
         }
         let fresh = |g: &mut Gpu| (g.up_i32(&vec![-7; n * taps]), g.zeros(2 * n * taps));
-        let check = |g: &Gpu, who: &str, ids: u32, ws: u32| {
+        let check = |g: &Gpu, ids: u32, ws: u32| {
             let got: Vec<i32> = g
                 .down_f32(ids, n * taps)
                 .iter()
                 .map(|v| v.to_bits() as i32)
                 .collect();
-            assert_eq!(got, want_ids, "{who}grid taps bilinear {bilinear}: ids");
+            assert_eq!(got, want_ids, "grid taps bilinear {bilinear}: ids");
             crate::gpu::close(
                 &g.down_f32(ws, n * taps),
                 &want_w,
-                &format!("{who}grid taps bilinear {bilinear}"),
+                &format!("grid taps bilinear {bilinear}"),
             );
         };
         let (ids, ws) = fresh(&mut gpu);
         gpu.run(|c| {
-            layout::grid_taps(
+            kernels_slang::gather::pixels::grid_taps(
                 c,
                 t(pb, n, 3, Dtype::I32),
                 t(gb, 2, 3, Dtype::I32),
@@ -153,20 +135,6 @@ fn the_pixels_answer_the_reference() {
                 t(ws, n, taps, Dtype::F32),
             )
         });
-        check(&gpu, "", ids, ws);
-        let (ids, ws) = fresh(&mut gpu);
-        gpu.run_slang(|c| {
-            kernels_slang::gather::pixels::grid_taps(
-                c,
-                st(t(pb, n, 3, Dtype::I32)),
-                st(t(gb, 2, 3, Dtype::I32)),
-                st(t(sb, 3, 1, Dtype::I32)),
-                bilinear,
-                side as u32,
-                st(t(ids, n, taps, Dtype::I32)),
-                st(t(ws, n, taps, Dtype::F32)),
-            )
-        });
-        check(&gpu, "slang ", ids, ws);
+        check(&gpu, ids, ws);
     }
 }

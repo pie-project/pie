@@ -1,4 +1,4 @@
-//! The elementwise ops kernels-wgpu refuses and kernels-metal / kernels-cuda
+//! The elementwise ops engine-wgpu refuses and kernels-metal / kernels-cuda
 //! serve: pointwise activations and binaries, DiT modulation, timestep and
 //! relative-position tables and multi-axis rotary.
 //! Each entry's `///` names the reference it follows.

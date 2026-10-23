@@ -1,4 +1,4 @@
-//! Paged attention (kernels-wgpu's `attn::` root), and the flash core every
+//! Paged attention (kernels-slang's `attn::sdpa`), and the flash core every
 //! attention family here shares.
 //!
 //! The core reads keys through a *flat key index*: for a paged pool, key

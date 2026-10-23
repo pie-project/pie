@@ -3,7 +3,7 @@
 //!
 //! The banks are `bank_a: [adapters, rank · in]` (adapter `a`'s `[rank, in]`
 //! down projection, row-major) and `bank_b: [adapters, out · rank]` (its
-//! `[out, rank]` up projection), as kernels-wgpu `gemm/lora.wgsl` reads them.
+//! `[out, rank]` up projection), as kernels-slang `linear/lora.slang` reads them.
 //! Rather than gather a per-row adapter, every row is contracted against the
 //! whole down bank in one dot (`[rows, adapters · rank]`), the waist is
 //! masked to the row's own adapter, and one dot over `(adapter, rank)` lands

@@ -1926,7 +1926,6 @@ dependencies = [
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
- "kernels-vulkan",
  "libc",
  "memmap2",
  "naga",
@@ -1951,8 +1950,6 @@ dependencies = [
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
- "kernels-vulkan",
- "kernels-wgpu",
  "libc",
  "memmap2",
  "naga",
@@ -3164,25 +3161,8 @@ dependencies = [
 name = "kernels-slang"
 version = "0.5.4"
 dependencies = [
- "pie-dtype",
-]
-
-[[package]]
-name = "kernels-vulkan"
-version = "0.5.4"
-dependencies = [
  "ash",
  "pie-dtype",
- "pie-profile",
-]
-
-[[package]]
-name = "kernels-wgpu"
-version = "0.5.4"
-dependencies = [
- "pie-dtype",
- "pie-profile",
- "serde_json",
 ]
 
 [[package]]

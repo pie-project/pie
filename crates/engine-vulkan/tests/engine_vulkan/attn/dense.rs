@@ -1,16 +1,12 @@
-//! Dense attention over segments on the first Vulkan device against an f64 host
-//! reference, beside the hand-written kernels: patch rows attending their own image
-//! (bidirectional), and ragged query segments attending the key span the
-//! CSR names, on the tiled kernel (bf16 at 64 and 128) and the scalar one.
+//! Dense attention over segments on the first Vulkan device against an f64
+//! host reference: patch rows attending their own image (bidirectional), and
+//! ragged query segments attending the key span the CSR names, on the tiled
+//! kernel (bf16 at 64 and 128) and the scalar one.
 
-use kernels_vulkan::{Tensor, attn};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, close, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn up(gpu: &mut Gpu, v: &[f32], dtype: Dtype) -> (u32, Vec<f64>) {
     if dtype == Dtype::F32 {
@@ -104,7 +100,7 @@ fn dense_attention_answers_the_reference() {
         let t = |b: u32, h: usize| Tensor::new(b, rows as u32, (h * hd) as u32, Dtype::Bf16);
         let y = gpu.zeros(n);
         gpu.run(|c| {
-            attn::dense::bidirectional(
+            kernels_slang::attn::dense::bidirectional(
                 c,
                 t(q, qh),
                 t(k, kvh),
@@ -119,24 +115,6 @@ fn dense_attention_answers_the_reference() {
             &gpu.down(y, n),
             &want,
             &format!("dense bidirectional d {hd}"),
-        );
-        let y = gpu.zeros(n);
-        gpu.run_slang(|c| {
-            kernels_slang::attn::dense::bidirectional(
-                c,
-                st(t(q, qh)),
-                st(t(k, kvh)),
-                st(t(v, kvh)),
-                st(st_),
-                hd as u32,
-                scale as f32,
-                st(t(y, qh)),
-            )
-        });
-        close(
-            &gpu.down(y, n),
-            &want,
-            &format!("slang dense bidirectional d {hd}"),
         );
     }
 
@@ -171,44 +149,22 @@ fn dense_attention_answers_the_reference() {
         let vt = Tensor::new(v, keys as u32, (kvh * hd) as u32, dtype);
         let ot = |b: u32| Tensor::new(b, rows as u32, (qh * hd) as u32, dtype);
         let shape = format!("{dtype:?} d {hd}");
-        {
-            let y = gpu.zeros(2 * n);
-            gpu.run(|c| {
-                attn::ragged::forward(
-                    c,
-                    qt,
-                    kt,
-                    vt,
-                    qp,
-                    kp,
-                    hd as u32,
-                    kvh as u32,
-                    scale as f32,
-                    ot(y),
-                )
-            });
-            close(&down(&gpu, y, n, dtype), &want, &format!("ragged {shape}"));
-        }
 
         let y = gpu.zeros(2 * n);
-        gpu.run_slang(|c| {
+        gpu.run(|c| {
             kernels_slang::attn::dense::ragged(
                 c,
-                st(qt),
-                st(kt),
-                st(vt),
-                st(qp),
-                st(kp),
+                qt,
+                kt,
+                vt,
+                qp,
+                kp,
                 hd as u32,
                 kvh as u32,
                 scale as f32,
-                st(ot(y)),
+                ot(y),
             )
         });
-        close(
-            &down(&gpu, y, n, dtype),
-            &want,
-            &format!("slang ragged {shape}"),
-        );
+        close(&down(&gpu, y, n, dtype), &want, &format!("ragged {shape}"));
     }
 }

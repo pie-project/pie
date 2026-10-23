@@ -3,7 +3,7 @@ name = "engine-vulkan"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The Vulkan engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-vulkan entries through dyn Encode."
+description = "The Vulkan engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-slang entries through dyn Encode."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -18,7 +18,6 @@ toml = "1.1"
 
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 
-kernels-vulkan = { path = "../kernels-vulkan" }
 kernels-slang = { path = "../kernels-slang" }
 
 engine = { path = "../engine" }
@@ -54,7 +53,6 @@ default = []
 vulkan = [
     "dep:ash",
     "dep:naga",
-    "kernels-vulkan/native",
-    "kernels-vulkan/probe",
     "kernels-slang/spirv",
+    "kernels-slang/probe",
 ]

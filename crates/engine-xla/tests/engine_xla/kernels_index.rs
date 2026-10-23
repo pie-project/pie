@@ -171,7 +171,7 @@ fn index_keys_are_filed_and_block_averaged() {
     assert_close(&b.read_f32(out), &want, 1e-2, 1e-2);
 }
 
-/// The GPU's bisected pick (kernels-wgpu `attn::index::bisect_select`).
+/// The GPU's bisected pick (kernels-slang's `attn/index.slang` top-k).
 fn bisect_select(scores: &[f32], topk: usize) -> Vec<i32> {
     let nkeys = scores.len();
     if nkeys <= topk {

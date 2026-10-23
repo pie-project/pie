@@ -1,16 +1,11 @@
-//! The gated linear units on the first wgpu adapter, beside the hand-written kernels,
-//! against an f64 host reference: the packed `[gate | up]` forms (SwiGLU,
-//! GeGLU, clamped, GPT-OSS, SiTU) and the split ones over an odd count, a
-//! sentinel past it.
+//! The gated linear units on the first wgpu adapter, against an f64 host
+//! reference: the packed `[gate | up]` forms (SwiGLU, GeGLU, clamped,
+//! GPT-OSS, SiTU) and the split ones over an odd count, a sentinel past it.
 
-use kernels_wgpu::{Tensor, linear::mlp};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
+use crate::gpu::{Gpu, landed, noise};
 
 /// A unit of the gate and the up, as the reference reads it.
 type Unit = Box<dyn Fn(f64, f64) -> f64>;
@@ -75,24 +70,14 @@ fn the_glus_answer_the_reference() {
                 })
                 .collect();
             let (pt, iu) = (b(p, rows, 2 * inter), inter as u32);
-            both(
+            landed(
                 &mut gpu,
                 &format!("{what} {inter}"),
                 &|g| vec![(g.zeros(n), n, false)],
                 &[want],
                 &|g, o| {
-                    let y = b(o[0].0, rows, inter);
+                    let (pt, y) = (pt, b(o[0].0, rows, inter));
                     g.run(|cx| match k {
-                        0 => mlp::swiglu(cx, pt, iu, y),
-                        1 => mlp::geglu_tanh_packed(cx, pt, iu, y),
-                        2 => mlp::swiglu_clamp(cx, pt, iu, limit, y),
-                        3 => mlp::swiglu_clamp_alpha(cx, pt, iu, limit, alpha, y),
-                        _ => mlp::situ(cx, pt, iu, beta, Some(cap), y),
-                    })
-                },
-                &|g, o| {
-                    let (pt, y) = (st(pt), st(b(o[0].0, rows, inter)));
-                    g.run_slang(|cx| match k {
                         0 => kernels_slang::linear::glu::swiglu(cx, pt, iu, y),
                         1 => kernels_slang::linear::glu::geglu_tanh_packed(cx, pt, iu, y),
                         2 => kernels_slang::linear::glu::swiglu_clamp(cx, pt, iu, limit, y),
@@ -128,22 +113,14 @@ fn the_glus_answer_the_reference() {
         let mut want: Vec<f64> = (0..n).map(|i| f(gr[i], ur[i])).collect();
         want.push(7.0);
         let (gt, ut) = (b(gate, r, w), b(up, r, w));
-        both(
+        landed(
             &mut gpu,
             what,
             &|g| vec![(g.up(&vec![7.0; n + 1]).0, n + 1, false)],
             &[want],
             &|g, o| {
-                let y = b(o[0].0, r, w);
+                let (gt, ut, y) = (gt, ut, b(o[0].0, r, w));
                 g.run(|cx| match k {
-                    0 => mlp::geglu_tanh(cx, gt, ut, y),
-                    1 => mlp::swiglu_clamp_split(cx, gt, ut, limit, y),
-                    _ => mlp::gelu_tanh(cx, gt, y),
-                })
-            },
-            &|g, o| {
-                let (gt, ut, y) = (st(gt), st(ut), st(b(o[0].0, r, w)));
-                g.run_slang(|cx| match k {
                     0 => kernels_slang::linear::glu::geglu_tanh(cx, gt, ut, y),
                     1 => kernels_slang::linear::glu::swiglu_clamp_split(cx, gt, ut, limit, y),
                     _ => kernels_slang::linear::glu::gelu_tanh(cx, gt, y),

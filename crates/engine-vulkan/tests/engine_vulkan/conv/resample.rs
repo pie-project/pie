@@ -1,22 +1,17 @@
-//! The resamplers on the first Vulkan device, beside the hand-written
-//! kernels, against a host reference: nearest upsampling (the first frame
-//! kept alone or not), pixel shuffle (a frame trimmed) and unshuffle, in bf16
-//! and in f32 (an odd row there), and the averaged downsample (time padded),
-//! over two clips, with rows past every clip landing zero.
+//! The resamplers on the first Vulkan device, against a host reference:
+//! nearest upsampling (the first frame kept alone or not), pixel shuffle (a
+//! frame trimmed) and unshuffle, in bf16 and in f32 (an odd row there), and
+//! the averaged downsample (time padded), over two clips, with rows past
+//! every clip landing zero.
 
-use kernels_vulkan::Tensor;
-use kernels_vulkan::spatial::resample;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 /// Two clips: (t, h, w).
 const CLIPS: [[usize; 3]; 2] = [[3, 4, 4], [1, 2, 2]];
 const EXTRA: usize = 2;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
@@ -180,7 +175,7 @@ fn the_resamplers_answer_the_reference() {
         let r = R.map(|n| n as u32);
         let n = rows_out * width;
         let f32 = dtype == Dtype::F32;
-        both(
+        landed(
             &mut gpu,
             &format!("{op:?} {dtype:?}"),
             &|g| {
@@ -197,23 +192,9 @@ fn the_resamplers_answer_the_reference() {
             },
             &[want],
             &|g, o| {
-                g.run(|c| match op {
-                    Op::Upsample { keep_first } => {
-                        resample::upsample_nearest(c, x, grid, r, keep_first, o_grid, y(o[0].0))
-                    }
-                    Op::Shuffle { trim } => {
-                        resample::pixel_shuffle(c, x, grid, r, trim as u32, o_grid, y(o[0].0))
-                    }
-                    Op::Unshuffle => resample::pixel_unshuffle(c, x, grid, r, o_grid, y(o[0].0)),
-                    Op::AvgDown { group } => {
-                        resample::avg_down(c, x, grid, r, group as u32, o_grid, y(o[0].0))
-                    }
-                })
-            },
-            &|g, o| {
                 use kernels_slang::conv::resample as sr;
-                let (x, grid, o_grid, y) = (st(x), st(grid), st(o_grid), st(y(o[0].0)));
-                g.run_slang(|c| match op {
+                let (x, grid, o_grid, y) = (x, grid, o_grid, y(o[0].0));
+                g.run(|c| match op {
                     Op::Upsample { keep_first } => {
                         sr::upsample_nearest(c, x, grid, r, keep_first, o_grid, y)
                     }

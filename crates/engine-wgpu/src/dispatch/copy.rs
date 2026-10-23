@@ -1,11 +1,10 @@
+use kernels_slang::Tensor;
 use kernels_slang::gather::rows;
-use kernels_wgpu::Tensor;
 use poem_compiler::Region;
 use poem_exec::KernelError;
 use poem_exec::fire::{Serve, fallback};
 use poem_ir::{Def, Dim, Ty, ValueId};
 
-use crate::encode::{from_slang, slang_tensor};
 use crate::run::Run;
 
 #[derive(Debug, Clone, Copy)]
@@ -137,17 +136,17 @@ impl Run<'_> {
     }
 
     fn move_rows(&self, region: &Region, out: bool) -> Result<(), kernels_slang::Error> {
-        let index = slang_tensor(self.gathered_rows(region));
+        let index = self.gathered_rows(region);
         for slot in &self.staged_copy().slots {
             let moving = if out { slot.written } else { slot.read };
             if !moving {
                 continue;
             }
-            let (tight, wide) = (slang_tensor(slot.tight), slang_tensor(slot.wide));
+            let (tight, wide) = (slot.tight, slot.wide);
             if out {
-                rows::scatter_rows(&self.slang(), tight, index, wide)?;
+                rows::scatter_rows(self.ctx, tight, index, wide)?;
             } else {
-                rows::gather_rows(&self.slang(), wide, index, tight)?;
+                rows::gather_rows(self.ctx, wide, index, tight)?;
             }
         }
         Ok(())
@@ -181,9 +180,7 @@ impl Serve for Run<'_> {
             self.mint_copy(&mut plan)?;
         }
         self.set_copy(plan);
-        self.move_rows(region, false)
-            .map_err(from_slang)
-            .map_err(crate::error::kernel)
+        self.move_rows(region, false).map_err(crate::error::kernel)
     }
 
     fn scatter(&mut self, region: &Region) -> Result<(), KernelError> {
@@ -195,8 +192,6 @@ impl Serve for Run<'_> {
              the pair and this is what says the bracket was lost",
             region.nodes.start
         );
-        self.move_rows(region, true)
-            .map_err(from_slang)
-            .map_err(crate::error::kernel)
+        self.move_rows(region, true).map_err(crate::error::kernel)
     }
 }
