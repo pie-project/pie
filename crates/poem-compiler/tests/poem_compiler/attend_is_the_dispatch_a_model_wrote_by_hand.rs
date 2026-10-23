@@ -53,12 +53,12 @@ def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
     seam.at(seam.ATTN_Q, [q])
 
     def scored(q):
-        o, lse = ops.attn.prefill_lse(q, plans.s, pages, None, d, m.kv_heads, m.sm_scale)
+        o, lse = ops.attn.prefill(q, plans.s, pages, None, d, m.kv_heads, m.sm_scale, lse = True)
         seam.at(seam.SCORES, [lse])
         return o
 
     o = switch(q, [
-        (fact.has(fact.Mask), lambda q: ops.attn.masked(q, plans.m, mask, pages, None, d, m.kv_heads, True, m.sm_scale)),
+        (fact.has(fact.Mask), lambda q: ops.attn.prefill(q, plans.m, pages, None, d, m.kv_heads, m.sm_scale, mask = mask)),
         (fact.scores(), scored),
         (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
     ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))

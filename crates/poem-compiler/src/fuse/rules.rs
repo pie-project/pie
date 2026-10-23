@@ -224,16 +224,7 @@ fn pool_attention() -> Rule {
             let sm_scale = p.f32("sm_scale");
             p.free("window");
             let floor = floored.then(|| p.indices("floor"));
-            let (o, lse) = attn::prefill_lse(
-                &q,
-                &plan,
-                cache,
-                None,
-                d,
-                p.u32("kv_heads"),
-                sm_scale,
-                floor.as_ref(),
-            );
+            let (o, lse) = both(attn::prefill(&q, &plan, cache, None, d, p.u32("kv_heads"), sm_scale, true, None, true, floor.as_ref(), None, None, false, None, None, None));
             p.name("o", &o);
             p.name("lse", &lse);
             let positions = p.indices("positions");
@@ -242,22 +233,9 @@ fn pool_attention() -> Rule {
             let (ratio, heads) = (p.u32("ratio"), p.u32("heads"));
             let (po, plse) = if selected {
                 let selection = p.rows("selection", W);
-                attn::pool_lse_selected(
-                    &q,
-                    &positions,
-                    &requests,
-                    &selection,
-                    entries,
-                    ratio,
-                    p.u32("top_k"),
-                    heads,
-                    d,
-                    sm_scale,
-                )
+                attn::pool_lse(&q, &positions, &requests, entries, ratio, heads, d, sm_scale, Some(&selection), Some(p.u32("top_k")))
             } else {
-                attn::pool_lse(
-                    &q, &positions, &requests, entries, ratio, heads, d, sm_scale,
-                )
+                attn::pool_lse(&q, &positions, &requests, entries, ratio, heads, d, sm_scale, None, None)
             };
             p.name("po", &po);
             p.name("plse", &plse);
@@ -351,16 +329,7 @@ fn mla_prefill_expanded() -> Rule {
             let plan = p.value("plan", Ty::Struct(StructKind::MlaPlan));
             let pages = p.cache("pages");
             p.free("window");
-            let scored = attn::mla_prefill(
-                &q,
-                &plan,
-                &q_pe,
-                pages,
-                heads,
-                rank,
-                p.f32("sm_scale"),
-                None,
-            );
+            let scored = attn::mla_prefill(&q, &plan, &q_pe, pages, heads, rank, p.f32("sm_scale"), None, false, None).0;
             p.name("scored", &scored);
             let o = attn::mla_absorb_out(&scored, &kv_b, heads, rank, nope, v);
             p.export("o", &o);
@@ -396,19 +365,10 @@ fn lse_sink() -> Rule {
             p.free("window");
             let (o, lse) = if decode {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
-                attn::decode_lse(&q, &plan, cache, None, d, p.f32("sm_scale"))
+                both(attn::decode(&q, &plan, cache, None, d, p.f32("sm_scale"), true, None, None, false, None, None, None))
             } else {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
-                attn::prefill_lse(
-                    &q,
-                    &plan,
-                    cache,
-                    None,
-                    d,
-                    p.u32("kv_heads"),
-                    p.f32("sm_scale"),
-                    None,
-                )
+                both(attn::prefill(&q, &plan, cache, None, d, p.u32("kv_heads"), p.f32("sm_scale"), true, None, true, None, None, None, false, None, None, None))
             };
             p.name("o", &o);
             p.name("lse", &lse);
@@ -2159,7 +2119,8 @@ fn q_gate_k_norm_rope_append() -> Rule {
     })
 }
 
-/// A rope's queries and the keys it was given.
+/// An op's two outputs, its second asked for: a rope's queries and the
+/// keys it was given, an attention's output and log-sum-exp.
 fn both((q, k): (poem::Value, Option<poem::Value>)) -> (poem::Value, poem::Value) {
-    (q, k.expect("a rope given keys turns them"))
+    (q, k.expect("an output asked for lands"))
 }

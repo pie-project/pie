@@ -56,7 +56,7 @@ impl ForwardHybrid for TokensAndLatents {
             &txt.write_offset(KV_ROW),
         );
         let plan = ops::attn::plan_prefill(&txt, HEADS, HEADS, HEAD_DIM, None);
-        let o = ops::attn::prefill(&q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE);
+        let o = ops::attn::prefill(&q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE, false, None, true, None, None, None, false, None, None, None).0;
         let h = ops::linear::matmul(&o, &w("txt.o", WIDTH, HEAD_DIM));
         seam::at(seam::HIDDEN, &[&h]);
 

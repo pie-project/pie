@@ -56,13 +56,28 @@ def forward(m, inputs):
         bias = ops.linear.rel_bias(r, w.rel_proj, m.heads, m.d_rel, w.extent)
         log_scaling = m.log_scaling if reading == GLOBAL else None
         a = merge([
-            ops.attn.decode_rel(
-                q.on(one), plan_d[reading], pages, bias.on(one), win, d, w.extent,
-                m.sm_scale, log_scaling,
+            ops.attn.decode(
+                q.on(one),
+                plan_d[reading],
+                pages,
+                win,
+                d,
+                m.sm_scale,
+                bias = bias.on(one),
+                extent = w.extent,
+                log_scaling = log_scaling,
             ),
-            ops.attn.prefill_rel(
-                q.on(~one), plan_p[reading], pages, bias.on(~one), win, d, w.kv_heads,
-                w.extent, m.sm_scale, log_scaling,
+            ops.attn.prefill(
+                q.on(~one),
+                plan_p[reading],
+                pages,
+                win,
+                d,
+                w.kv_heads,
+                m.sm_scale,
+                bias = bias.on(~one),
+                extent = w.extent,
+                log_scaling = log_scaling,
             ),
         ])
         seam.at(seam.ATTN_OUT, [a])

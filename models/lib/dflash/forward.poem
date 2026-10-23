@@ -86,7 +86,17 @@ def arm(d, inputs, fused, h_block, mask, block_draft):
         if b.window != None and not d.bidirectional:
             o = ops.attn.prefill(q, plan, inputs.kv(a.kv), b.window, hd, a.kv_heads, a.sm_scale)
         else:
-            o = ops.attn.masked(q, plan, mask, inputs.kv(a.kv), b.window, hd, a.kv_heads, False, a.sm_scale)
+            o = ops.attn.prefill(
+                q,
+                plan,
+                inputs.kv(a.kv),
+                b.window,
+                hd,
+                a.kv_heads,
+                a.sm_scale,
+                mask = mask,
+                causal = False,
+            )
         o = biased(ops.linear.matmul(o, a.o_proj), a.o_bias)
         o = conv_finish(o, b.attn_conv, attn_coeff)
         h = ops.elemwise.residual_add(o, h)

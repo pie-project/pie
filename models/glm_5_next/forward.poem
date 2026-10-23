@@ -165,10 +165,10 @@ def boundaries(positions, row_valid, ratio, split = True):
     rows into one: each boundary's position, request and rope position.
     With `split` the decode and prefill arms find theirs apart."""
     if not split:
-        return ops.attn.pool_boundary_prefill(positions, row_valid, ratio)
+        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
     one = fact.single_token()
-    dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
-    ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
+    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
+    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
     return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
 def caches(m, c):

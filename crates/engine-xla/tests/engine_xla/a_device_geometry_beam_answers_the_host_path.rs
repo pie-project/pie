@@ -71,7 +71,7 @@ impl ForwardHybrid for Tiny {
             &inputs.write_offset(KV_ROW),
         );
         let plan = ops::attn::plan_prefill(&inputs, HEADS, HEADS, HEAD_DIM, None);
-        let o = ops::attn::prefill(&q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE);
+        let o = ops::attn::prefill(&q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE, false, None, true, None, None, None, false, None, None, None).0;
         let h = ops::linear::matmul(&o, &w("o", WIDTH, HEAD_DIM));
         let logits = ops::linear::matmul(&h, &w("head", VOCAB, WIDTH));
         seam::at(seam::OUT, &[&logits]);

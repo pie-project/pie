@@ -56,10 +56,10 @@ def boundaries(positions, row_valid, ratio, split = True):
     rows into one: each boundary's position, request and rope position.
     With `split` the decode and prefill arms find theirs apart."""
     if not split:
-        return ops.attn.pool_boundary_prefill(positions, row_valid, ratio)
+        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
     one = fact.single_token()
-    dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
-    ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
+    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
+    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
     return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
 # An e4m3 kv deployment keeps the window's plane and the compressed rows as
@@ -429,10 +429,30 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
             fail("a CSA2 Reuse Mode layer follows a layer that ranked")
         # The window's attention runs beside the pool's, where a backend
         # may land the two, their merge and the sinks as one.
-        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale, floor)
+        o, lse = ops.attn.prefill(
+            q,
+            plan,
+            pages,
+            m.window,
+            m.head_dim,
+            rows.kv_heads,
+            at.sm_scale,
+            lse = True,
+            floor = floor,
+        )
         if at.selection != "none":
-            po, plse = ops.attn.pool_lse_selected(q, pos, request_of_token, selection.picked, entries,
-                                                  p.ratio, selection.top_k, m.heads, m.head_dim, at.sm_scale)
+            po, plse = ops.attn.pool_lse(
+                q,
+                pos,
+                request_of_token,
+                entries,
+                p.ratio,
+                m.heads,
+                m.head_dim,
+                at.sm_scale,
+                selection = selection.picked,
+                top_k = selection.top_k,
+            )
         else:
             po, plse = ops.attn.pool_lse(q, pos, request_of_token, entries, p.ratio, m.heads, m.head_dim, at.sm_scale)
         o, lse = ops.attn.merge_lse(o, lse, po, plse, m.heads, m.head_dim)
@@ -444,7 +464,16 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     else:
         if floor != None:
             fail("a replaying layer pools")
-        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
+        o, lse = ops.attn.prefill(
+            q,
+            plan,
+            pages,
+            m.window,
+            m.head_dim,
+            rows.kv_heads,
+            at.sm_scale,
+            lse = True,
+        )
 
     if at.window_sink == None:
         o = ops.attn.sink(o, lse, at.sink, m.head_dim)

@@ -66,7 +66,7 @@ def trunk(all, den, m):
 
         ([dq, aq], pq) = q.partition(classes)
         a = merge([
-            ops.attn.masked(dq, plan_den, mask, pages, None, hd, d.kv_heads, False, sm),
+            ops.attn.prefill(dq, plan_den, pages, None, hd, d.kv_heads, sm, mask = mask, causal = False),
             ops.attn.decode(aq, plan_dec, pages, None, hd, sm),
             ops.attn.prefill(pq, plan_pre, pages, None, hd, d.kv_heads, sm),
         ])

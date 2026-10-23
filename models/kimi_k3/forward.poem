@@ -85,12 +85,8 @@ def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
 def arm(decode, q_nope, plan, q_pe, selection, pages, a):
     """One arm's rows absorbed, scored and absorbed back out."""
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    if selection == None:
-        score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
-        scored = score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
-    else:
-        score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
-        scored = score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+    score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
+    scored = score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale, selection = selection)
     return ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
 
 def caches(m, c):

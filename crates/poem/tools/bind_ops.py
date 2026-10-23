@@ -65,7 +65,7 @@ PARAMS = {
     "IndexScore": ("Option<IndexScore>", "{}.unwrap_or_default()"),
 }
 # Parameters a package may leave out, by name, and what they then pass.
-DEFAULTED = {"per_head": ("bool", "false"), "mask": ("bool", "false"), "scores": ("bool", "false"), "whole": ("bool", "false")}
+DEFAULTED = {"per_head": ("bool", "false"), "mask": ("bool", "false"), "scores": ("bool", "false"), "whole": ("bool", "false"), "lse": ("bool", "false"), "causal": ("bool", "true")}
 RESULTS = {"Value", "(Value, Value)", "(Value, Option<Value>)", "(Value, Value, Value)", "()", "RaggedMask", "ValueId"}
 
 # Bound by hand in `src/star/ops_by_hand.rs`, not here: their parameters or

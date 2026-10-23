@@ -64,7 +64,21 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "attn",
         name: "decode",
-        params: &["q", "plan", "pages", "window", "head_dim", "sm_scale"],
+        params: &[
+            "q",
+            "plan",
+            "pages",
+            "window",
+            "head_dim",
+            "sm_scale",
+            "lse",
+            "selection",
+            "ratio",
+            "per_head",
+            "bias",
+            "extent",
+            "log_scaling",
+        ],
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
@@ -72,10 +86,31 @@ pub(crate) static OPS: &[Op] = &[
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let ratio: Option<u32> = a.next()?;
+            let per_head: Option<bool> = a.next()?;
+            let bias: Option<Value> = a.next()?;
+            let extent: Option<u32> = a.next()?;
+            let log_scaling: Option<(u32, f32)> = a.next()?;
             result(
                 heap,
                 dsl("attn.decode", || {
-                    ops::attn::decode(&q, &plan, pages, window, head_dim, sm_scale)
+                    ops::attn::decode(
+                        &q,
+                        &plan,
+                        pages,
+                        window,
+                        head_dim,
+                        sm_scale,
+                        lse.unwrap_or(false),
+                        selection.as_ref(),
+                        ratio,
+                        per_head.unwrap_or(false),
+                        bias.as_ref(),
+                        extent,
+                        log_scaling,
+                    )
                 })?,
             )
         },
@@ -84,7 +119,23 @@ pub(crate) static OPS: &[Op] = &[
         module: "attn",
         name: "prefill",
         params: &[
-            "q", "plan", "pages", "window", "head_dim", "kv_heads", "sm_scale",
+            "q",
+            "plan",
+            "pages",
+            "window",
+            "head_dim",
+            "kv_heads",
+            "sm_scale",
+            "lse",
+            "mask",
+            "causal",
+            "floor",
+            "selection",
+            "ratio",
+            "per_head",
+            "bias",
+            "extent",
+            "log_scaling",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -94,278 +145,20 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let mask: Option<Value> = a.next()?;
+            let causal: Option<bool> = a.next()?;
+            let floor: Option<Value> = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let ratio: Option<u32> = a.next()?;
+            let per_head: Option<bool> = a.next()?;
+            let bias: Option<Value> = a.next()?;
+            let extent: Option<u32> = a.next()?;
+            let log_scaling: Option<(u32, f32)> = a.next()?;
             result(
                 heap,
                 dsl("attn.prefill", || {
-                    ops::attn::prefill(&q, &plan, pages, window, head_dim, kv_heads, sm_scale)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "decode_selected",
-        params: &[
-            "q",
-            "plan",
-            "selection",
-            "pages",
-            "window",
-            "head_dim",
-            "sm_scale",
-            "ratio",
-            "per_head",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let ratio: u32 = a.next()?;
-            let per_head: Option<bool> = a.next()?;
-            result(
-                heap,
-                dsl("attn.decode_selected", || {
-                    ops::attn::decode_selected(
-                        &q,
-                        &plan,
-                        &selection,
-                        pages,
-                        window,
-                        head_dim,
-                        sm_scale,
-                        ratio,
-                        per_head.unwrap_or(false),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "prefill_selected",
-        params: &[
-            "q",
-            "plan",
-            "selection",
-            "pages",
-            "window",
-            "head_dim",
-            "kv_heads",
-            "sm_scale",
-            "ratio",
-            "per_head",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let ratio: u32 = a.next()?;
-            let per_head: Option<bool> = a.next()?;
-            result(
-                heap,
-                dsl("attn.prefill_selected", || {
-                    ops::attn::prefill_selected(
-                        &q,
-                        &plan,
-                        &selection,
-                        pages,
-                        window,
-                        head_dim,
-                        kv_heads,
-                        sm_scale,
-                        ratio,
-                        per_head.unwrap_or(false),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "decode_rel",
-        params: &[
-            "q",
-            "plan",
-            "pages",
-            "bias",
-            "window",
-            "head_dim",
-            "extent",
-            "sm_scale",
-            "log_scaling",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let bias: Value = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let extent: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let log_scaling: Option<(u32, f32)> = a.next()?;
-            result(
-                heap,
-                dsl("attn.decode_rel", || {
-                    ops::attn::decode_rel(
-                        &q,
-                        &plan,
-                        pages,
-                        &bias,
-                        window,
-                        head_dim,
-                        extent,
-                        sm_scale,
-                        log_scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "prefill_rel",
-        params: &[
-            "q",
-            "plan",
-            "pages",
-            "bias",
-            "window",
-            "head_dim",
-            "kv_heads",
-            "extent",
-            "sm_scale",
-            "log_scaling",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let bias: Value = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let extent: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let log_scaling: Option<(u32, f32)> = a.next()?;
-            result(
-                heap,
-                dsl("attn.prefill_rel", || {
-                    ops::attn::prefill_rel(
-                        &q,
-                        &plan,
-                        pages,
-                        &bias,
-                        window,
-                        head_dim,
-                        kv_heads,
-                        extent,
-                        sm_scale,
-                        log_scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "masked",
-        params: &[
-            "q", "plan", "mask", "pages", "window", "head_dim", "kv_heads", "causal", "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let mask: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let causal: bool = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.masked", || {
-                    ops::attn::masked(
-                        &q, &plan, &mask, pages, window, head_dim, kv_heads, causal, sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "masked_lse",
-        params: &[
-            "q", "plan", "mask", "pages", "window", "head_dim", "kv_heads", "causal", "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let mask: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let causal: bool = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.masked_lse", || {
-                    ops::attn::masked_lse(
-                        &q, &plan, &mask, pages, window, head_dim, kv_heads, causal, sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "decode_lse",
-        params: &["q", "plan", "pages", "window", "head_dim", "sm_scale"],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.decode_lse", || {
-                    ops::attn::decode_lse(&q, &plan, pages, window, head_dim, sm_scale)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "prefill_lse",
-        params: &[
-            "q", "plan", "pages", "window", "head_dim", "kv_heads", "sm_scale", "floor",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let floor: Option<Value> = a.next()?;
-            result(
-                heap,
-                dsl("attn.prefill_lse", || {
-                    ops::attn::prefill_lse(
+                    ops::attn::prefill(
                         &q,
                         &plan,
                         pages,
@@ -373,7 +166,16 @@ pub(crate) static OPS: &[Op] = &[
                         head_dim,
                         kv_heads,
                         sm_scale,
+                        lse.unwrap_or(false),
+                        mask.as_ref(),
+                        causal.unwrap_or(true),
                         floor.as_ref(),
+                        selection.as_ref(),
+                        ratio,
+                        per_head.unwrap_or(false),
+                        bias.as_ref(),
+                        extent,
+                        log_scaling,
                     )
                 })?,
             )
@@ -696,6 +498,8 @@ pub(crate) static OPS: &[Op] = &[
             "kv_lora_rank",
             "sm_scale",
             "window",
+            "lse",
+            "selection",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -706,6 +510,8 @@ pub(crate) static OPS: &[Op] = &[
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             let window: Option<u32> = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let selection: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_decode", || {
@@ -718,6 +524,8 @@ pub(crate) static OPS: &[Op] = &[
                         kv_lora_rank,
                         sm_scale,
                         window,
+                        lse.unwrap_or(false),
+                        selection.as_ref(),
                     )
                 })?,
             )
@@ -735,6 +543,8 @@ pub(crate) static OPS: &[Op] = &[
             "kv_lora_rank",
             "sm_scale",
             "window",
+            "lse",
+            "selection",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -745,6 +555,8 @@ pub(crate) static OPS: &[Op] = &[
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             let window: Option<u32> = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let selection: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_prefill", || {
@@ -757,240 +569,8 @@ pub(crate) static OPS: &[Op] = &[
                         kv_lora_rank,
                         sm_scale,
                         window,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_decode_selected",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_decode_selected", || {
-                    ops::attn::mla_decode_selected(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_prefill_selected",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_prefill_selected", || {
-                    ops::attn::mla_prefill_selected(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_decode_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-            "window",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let window: Option<u32> = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_decode_lse", || {
-                    ops::attn::mla_decode_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                        window,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_prefill_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-            "window",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let window: Option<u32> = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_prefill_lse", || {
-                    ops::attn::mla_prefill_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                        window,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_decode_selected_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_decode_selected_lse", || {
-                    ops::attn::mla_decode_selected_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_prefill_selected_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_prefill_selected_lse", || {
-                    ops::attn::mla_prefill_selected_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
+                        lse.unwrap_or(false),
+                        selection.as_ref(),
                     )
                 })?,
             )
@@ -1121,32 +701,17 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "attn",
-        name: "pool_boundary_decode",
-        params: &["positions", "row_valid", "ratio"],
+        name: "pool_boundary",
+        params: &["positions", "row_valid", "ratio", "decode"],
         call: |a, heap| {
             let positions: Value = a.next()?;
             let row_valid: Value = a.next()?;
             let ratio: u32 = a.next()?;
+            let decode: bool = a.next()?;
             result(
                 heap,
-                dsl("attn.pool_boundary_decode", || {
-                    ops::attn::pool_boundary_decode(&positions, &row_valid, ratio)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "pool_boundary_prefill",
-        params: &["positions", "row_valid", "ratio"],
-        call: |a, heap| {
-            let positions: Value = a.next()?;
-            let row_valid: Value = a.next()?;
-            let ratio: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.pool_boundary_prefill", || {
-                    ops::attn::pool_boundary_prefill(&positions, &row_valid, ratio)
+                dsl("attn.pool_boundary", || {
+                    ops::attn::pool_boundary(&positions, &row_valid, ratio, decode)
                 })?,
             )
         },
@@ -1268,6 +833,8 @@ pub(crate) static OPS: &[Op] = &[
             "heads",
             "head_dim",
             "sm_scale",
+            "selection",
+            "top_k",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1278,6 +845,8 @@ pub(crate) static OPS: &[Op] = &[
             let heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let top_k: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("attn.pool_lse", || {
@@ -1290,51 +859,8 @@ pub(crate) static OPS: &[Op] = &[
                         heads,
                         head_dim,
                         sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "pool_lse_selected",
-        params: &[
-            "q",
-            "positions",
-            "request_of_token",
-            "selection",
-            "entries",
-            "ratio",
-            "top_k",
-            "heads",
-            "head_dim",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let request_of_token: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let entries: ValueId = a.next()?;
-            let ratio: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let heads: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.pool_lse_selected", || {
-                    ops::attn::pool_lse_selected(
-                        &q,
-                        &positions,
-                        &request_of_token,
-                        &selection,
-                        entries,
-                        ratio,
+                        selection.as_ref(),
                         top_k,
-                        heads,
-                        head_dim,
-                        sm_scale,
                     )
                 })?,
             )

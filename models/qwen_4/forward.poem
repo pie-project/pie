@@ -239,8 +239,8 @@ def rotate(q, k, positions, m, a):
 
 def boundaries(positions, row_valid, ratio):
     one, many = positions.on(fact.single_token()), positions.on(~fact.single_token())
-    dpos, dreq, drope = ops.attn.pool_boundary_decode(one, row_valid, ratio)
-    ppos, preq, prope = ops.attn.pool_boundary_prefill(many, row_valid, ratio)
+    dpos, dreq, drope = ops.attn.pool_boundary(one, row_valid, ratio, decode = True)
+    ppos, preq, prope = ops.attn.pool_boundary(many, row_valid, ratio, decode = False)
     return (merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope]))
 
 def qsa_select(x, inputs, m, a, ix):

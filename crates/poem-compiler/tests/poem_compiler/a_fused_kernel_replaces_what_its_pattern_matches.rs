@@ -427,18 +427,16 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
                 "plan",
                 poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
             );
-            let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
+            let (o, lse) = both(attn::prefill(&q, &plan, cache, Some(128), 512, 1, 0.04, true, None, true, None, None, None, false, None, None, None));
             let (o, lse) = if pooled {
                 let positions = p.indices("positions");
                 let requests = p.indices("requests");
                 let entries = p.cache("entries");
                 let (po, plse) = if selected {
                     let selection = p.rows("selection", 512);
-                    attn::pool_lse_selected(
-                        &q, &positions, &requests, &selection, entries, 4, 512, 64, 512, 0.04,
-                    )
+                    attn::pool_lse(&q, &positions, &requests, entries, 4, 64, 512, 0.04, Some(&selection), Some(512))
                 } else {
-                    attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04)
+                    attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None)
                 };
                 attn::merge_lse(&o, &lse, &po, &plse, 64, 512)
             } else {
@@ -492,13 +490,13 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnDecodePlan),
                 );
-                attn::decode_lse(&q, &plan, cache, Some(128), 64, 0.125)
+                both(attn::decode(&q, &plan, cache, Some(128), 64, 0.125, true, None, None, false, None, None, None))
             } else {
                 let plan = p.value(
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
                 );
-                attn::prefill_lse(&q, &plan, cache, None, 64, 8, 0.125, None)
+                both(attn::prefill(&q, &plan, cache, None, 64, 8, 0.125, true, None, true, None, None, None, false, None, None, None))
             };
             let out = attn::sink(&o, &lse, &p.weight("sinks", [8]), 64);
             elemwise::silu(&out);
@@ -896,11 +894,11 @@ fn deepseeks_attention_lands_its_output_turned_back() {
             "plan",
             poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
         );
-        let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
+        let (o, lse) = both(attn::prefill(&q, &plan, cache, Some(128), 512, 1, 0.04, true, None, true, None, None, None, false, None, None, None));
         let positions = p.indices("positions");
         let requests = p.indices("requests");
         let entries = p.cache("entries");
-        let (po, plse) = attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04);
+        let (po, plse) = attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None);
         let (o, lse) = attn::merge_lse(&o, &lse, &po, &plse, 64, 512);
         let out = attn::sink(&o, &lse, &p.weight("sinks", [64]), 512);
         let turned = elemwise::rope(
@@ -1161,7 +1159,8 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
     );
 }
 
-/// A rope's queries and the keys it was given.
+/// An op's two outputs, its second asked for: a rope's queries and the
+/// keys it was given, an attention's output and log-sum-exp.
 fn both((q, k): (Value, Option<Value>)) -> (Value, Value) {
-    (q, k.expect("a rope given keys turns them"))
+    (q, k.expect("an output asked for lands"))
 }
