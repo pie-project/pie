@@ -376,16 +376,6 @@ __global__ void rope_yarn_split_append(
     }
 }
 
-// Qwen3.5's attention prologue in one launch, a warp a (row, head), PER
-// (head_dim / 32) consecutive values a lane in one 8- or 16-byte load: a q
-// head cut from its [q | gate] row (the gate copied out beside it) and a k
-// head, each normed per head with its plus-one weight and its rotary prefix
-// turned (`rope_partial`'s pairs, `span` apart, from the rounded normed
-// values, as the norm then the rotation land them); the k head and its v
-// head land in the paged (NHD) cache at the row's page and offset.
-template <int PER> struct QgRun { using type = uint4; };
-template <> struct QgRun<4> { using type = uint2; };
-
 template <class T>
 __global__ void rope_partial(
     T* __restrict__ q,

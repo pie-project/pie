@@ -53,7 +53,6 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attn.mla_split_q_b", Reads::Rows),
     entry("gather.ngram_ids", Reads::Rows),
     entry("attn.pool_lse", Reads::Rows),
-    entry("attn.pool_lse", Reads::Rows),
     entry("ssm.short_conv", Reads::RowsAndLanes),
     entry("attn.sink", Reads::Rows),
     entry("ssm.causal_conv1d", Reads::RowsAndLanes),
