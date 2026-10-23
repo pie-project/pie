@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -139,7 +140,7 @@ impl Instruct for DeepSeek {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(DeepSeekToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

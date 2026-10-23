@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tokenizer::Specials;
 
 use engine_metal::experts::{Attachments, Plan};
 use engine_metal::{Boot, Lane, Shell};
@@ -440,7 +441,10 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
         );
     }
     eprintln!("run-1 tokens {:?}", first.tokens);
-    eprintln!("run-1 text   {:?}", tokenizer.decode(&first.tokens, false));
+    eprintln!(
+        "run-1 text   {:?}",
+        tokenizer.decode(&first.tokens, Specials::Keep)
+    );
 
     assert!(
         first.warm,

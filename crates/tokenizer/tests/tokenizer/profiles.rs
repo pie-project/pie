@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use crate::common::{MergeFormat, byte_level_json, gemma_json, unigram_json};
 use serde_json::json;
@@ -21,22 +22,22 @@ fn assert_exact(json: &serde_json::Value, texts: &[&str]) {
         let hf_ids = hf.encode(text, false).unwrap().get_ids().to_vec();
         assert_eq!(ids, hf_ids, "encoding {text:?}");
         assert_eq!(
-            pie.decode(&hf_ids, false),
+            pie.decode(&hf_ids, Specials::Keep),
             hf.decode(&hf_ids, false).unwrap(),
             "HF→Pie decoding {text:?}"
         );
         assert_eq!(
-            pie.decode(&ids, false),
+            pie.decode(&ids, Specials::Keep),
             hf.decode(&ids, false).unwrap(),
             "Pie→HF decoding {text:?}"
         );
         assert_eq!(
-            pie.decode(&hf_ids, true),
+            pie.decode(&hf_ids, Specials::Skip),
             hf.decode(&hf_ids, true).unwrap(),
             "special-token filtering {text:?}"
         );
 
-        let mut decoder = pie.decoder(false);
+        let mut decoder = pie.decoder(Specials::Keep);
         let mut incremental = String::new();
         for token in &hf_ids {
             incremental.push_str(&decoder.feed(std::slice::from_ref(token)));
@@ -44,7 +45,7 @@ fn assert_exact(json: &serde_json::Value, texts: &[&str]) {
         incremental.push_str(&decoder.finish());
         assert_eq!(
             incremental,
-            pie.decode(&hf_ids, false),
+            pie.decode(&hf_ids, Specials::Keep),
             "incremental decoding {text:?}"
         );
     }
@@ -120,7 +121,7 @@ fn gemma_byte_fallback_profile_is_exact() {
     assert_exact(&tokenizer, &["a b", "叫", "<special>a b"]);
 
     let pie: Tokenizer = tokenizer.to_string().parse().unwrap();
-    assert_eq!(pie.decode(&[0xE5 + 6, 0x8F + 6], false), "��");
+    assert_eq!(pie.decode(&[0xE5 + 6, 0x8F + 6], Specials::Keep), "��");
 }
 
 fn grammar_bytes_are_decoder_aware_and_exclude_specials() {
@@ -157,7 +158,7 @@ fn a_unigram_walks_and_wraps_exactly_as_hugging_face_does() {
         let hf_ids = hf.encode(text, true).unwrap().get_ids().to_vec();
         assert_eq!(ids, hf_ids, "encoding {text:?}");
         assert_eq!(
-            pie.decode(&ids, true),
+            pie.decode(&ids, Specials::Skip),
             hf.decode(&ids, true).unwrap(),
             "decoding {text:?}"
         );
@@ -191,8 +192,8 @@ fn a_unigram_survives_being_baked_and_read_back() {
         assert_eq!(back.encode(text), pie.encode(text), "encoding {text:?}");
         let ids = pie.encode(text);
         assert_eq!(
-            back.decode(&ids, true),
-            pie.decode(&ids, true),
+            back.decode(&ids, Specials::Skip),
+            pie.decode(&ids, Specials::Skip),
             "decoding {text:?}"
         );
     }

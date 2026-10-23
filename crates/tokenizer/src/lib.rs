@@ -136,6 +136,13 @@ struct GrammarVocabulary {
     trie_subtree_end: Vec<usize>,
 }
 
+/// Whether decoding writes the special tokens' text or drops it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Specials {
+    Keep,
+    Skip,
+}
+
 pub struct TokenizerDecoder {
     tokenizer: Arc<Tokenizer>,
     skip_special: bool,
@@ -208,10 +215,10 @@ impl Tokenizer {
         loader::tiktoken::from_str(ranks, config_json, label)
     }
 
-    pub fn decoder(self: &Arc<Self>, skip_special: bool) -> TokenizerDecoder {
+    pub fn decoder(self: &Arc<Self>, specials: Specials) -> TokenizerDecoder {
         TokenizerDecoder {
             tokenizer: self.clone(),
-            skip_special,
+            skip_special: specials == Specials::Skip,
             strip_armed: self.strips_decoder_marker(),
             pending_utf8: Vec::new(),
             fallback_run: Vec::new(),
@@ -416,7 +423,8 @@ impl Tokenizer {
         )
     }
 
-    pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
+    pub fn decode(&self, ids: &[u32], specials: Specials) -> String {
+        let skip_special = specials == Specials::Skip;
         match &self.pipeline {
             Pipeline::ByteFallbackReplace {
                 normalizer_from,

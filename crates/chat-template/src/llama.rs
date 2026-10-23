@@ -4,6 +4,7 @@
 //! (`{"name": …, "parameters": …}`), and tool results in `ipython` turns.
 
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -182,7 +183,7 @@ impl Instruct for Llama {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(LlamaToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             python_tag: self.python_tag,
             text: String::new(),
             started: false,

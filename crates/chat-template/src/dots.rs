@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -181,7 +182,7 @@ impl Instruct for Dots {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(DotsToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

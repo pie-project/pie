@@ -7,6 +7,7 @@
 //! results come back in a `tool` turn as `<response>`s.
 
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use serde_json::Value;
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -216,7 +217,7 @@ impl Instruct for MiniMax2 {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(MiniMax2ToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

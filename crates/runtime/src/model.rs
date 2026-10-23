@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use tokenizer::Specials;
 
 use anyhow::{Result, anyhow};
 
@@ -421,7 +422,7 @@ impl Model {
     }
 
     pub fn detokenize(&self, tokens: &[u32]) -> String {
-        self.tokenizer.decode(tokens, false)
+        self.tokenizer.decode(tokens, Specials::Keep)
     }
 
     /// Every token the vocabulary spells, each with its bytes.

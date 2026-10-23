@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -430,7 +431,7 @@ impl Instruct for ChatMLInstruct {
             return Box::new(NoopToolDecoder);
         }
         Box::new(ChatMLToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
             xml: self.config.xml_tools,

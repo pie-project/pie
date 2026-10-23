@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -242,7 +243,7 @@ impl Instruct for Harmony {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(HarmonyToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             calling: None,
         })

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use serde_json::{Map, Value};
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -270,7 +271,7 @@ impl Instruct for MiniMax {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(MiniMaxToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

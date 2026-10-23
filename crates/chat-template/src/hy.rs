@@ -7,6 +7,7 @@
 //! thinking.
 
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use serde_json::Value;
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -339,7 +340,7 @@ impl Instruct for Hy {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(HyToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

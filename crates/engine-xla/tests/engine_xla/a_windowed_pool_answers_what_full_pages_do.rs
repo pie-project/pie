@@ -7,6 +7,7 @@
 //! naming a model with windowed kv rows (Gemma4).
 
 use crate::common;
+use tokenizer::Specials;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
 use poem::{Platform, Request};
@@ -220,7 +221,7 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         "windowed: ring {:?}\n          handed {:?}\n  => {:?}",
         windowed.ring,
         windowed.handed,
-        tokenizer.decode(&windowed.ring, true)
+        tokenizer.decode(&windowed.ring, Specials::Skip)
     );
     eprintln!(
         "full:     ring {:?}\n          handed {:?}",

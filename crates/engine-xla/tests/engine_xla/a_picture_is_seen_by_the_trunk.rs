@@ -21,6 +21,7 @@
 //! logit row as raw f32 for comparing against a reference offline.
 
 use crate::common;
+use tokenizer::Specials;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
 use media::front::{Image, Rgb8};
@@ -333,7 +334,7 @@ fn a_solid_square_is_named_by_its_colour() {
                 .iter()
                 .position(|&t| t == THINK_CLOSE)
                 .map_or(&produced[..], |at| &produced[at + 1..]);
-            let text = tokenizer.decode(after, true).to_lowercase();
+            let text = tokenizer.decode(after, Specials::Skip).to_lowercase();
             eprintln!("{name} ({how}): {text:?}");
             assert!(
                 text.contains(name),
