@@ -73,12 +73,15 @@ impl Run<'_> {
             Linear::GeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
-            Linear::MoeTopkSoftmax {
+            Linear::MoeRoute {
                 logits,
                 experts,
                 top_k,
                 routes,
                 weights,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => linear::moe::topk_softmax(
                 self.ctx(),
                 self.tensor(*logits),

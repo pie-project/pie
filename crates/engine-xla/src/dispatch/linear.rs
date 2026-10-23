@@ -196,16 +196,16 @@ impl Run<'_> {
                 *extent,
                 self.tensor(*y),
             ),
-            Linear::MoeTopkSigmoidSink {
+            Linear::MoeRoute {
                 logits,
                 bias,
                 scale,
                 experts,
                 top_k,
-                sink,
-                scaling,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::SigmoidSink { sink, scaling, .. },
+                ..
             } => linear::moe::topk_sigmoid_sink(
                 self.ctx(),
                 self.tensor(*logits),
@@ -253,12 +253,15 @@ impl Run<'_> {
 
             // The forms no builder makes.
             Linear::Glu { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            Linear::MoeTopkSoftmax {
+            Linear::MoeRoute {
                 logits,
                 experts,
                 top_k,
                 routes,
                 weights,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => linear::moe::topk_softmax(
                 self.ctx(),
                 self.tensor(*logits),
@@ -267,13 +270,15 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            Linear::MoeTopkSoftmaxScaled {
+            Linear::MoeRoute {
                 logits,
-                scale,
+                scale: Some(scale),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => linear::moe::topk_softmax_scaled(
                 self.ctx(),
                 self.tensor(*logits),
@@ -284,16 +289,21 @@ impl Run<'_> {
                 self.tensor(*weights),
             ),
 
-            Linear::MoeTopkSigmoid {
+            Linear::MoeRoute {
                 logits,
                 bias,
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
                 hint: _,
+                score:
+                    poem_ir::RouteScore::Sigmoid {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => match bias {
                 Some(bias) => linear::moe::topk_sigmoid_biased(
                     self.ctx(),
@@ -317,13 +327,15 @@ impl Run<'_> {
                     self.tensor(*weights),
                 ),
             },
-            Linear::MoePredictRoute {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Predict,
+                ..
             } => linear::moe::predict_route(
                 self.ctx(),
                 self.tensor(*logits),
@@ -334,16 +346,21 @@ impl Run<'_> {
                 self.tensor(*weights),
             ),
 
-            Linear::MoeTopkSqrtSoftplus {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 hint: _,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::SqrtSoftplus {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => linear::moe::topk_sqrt_softplus(
                 self.ctx(),
                 self.tensor(*logits),
@@ -356,17 +373,22 @@ impl Run<'_> {
                 self.tensor(*weights),
             ),
 
-            Linear::MoeHashRoute {
-                ids,
-                tid2eid,
+            Linear::MoeRoute {
+                ids: Some(ids),
+                table: Some(tid2eid),
                 logits,
-                vocab,
                 experts: _,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::Hash {
+                        vocab,
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => linear::moe::hash_route(
                 self.ctx(),
                 self.tensor(*ids),
@@ -379,6 +401,8 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
+            // The forms no builder makes.
+            Linear::MoeRoute { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::GroupRoutes { groups, routes } => {
                 linear::moe::group_routes(self.ctx(), *groups, self.tensor(*routes))
             }

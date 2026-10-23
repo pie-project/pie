@@ -317,12 +317,18 @@ pub fn moe_topk_softmax(logits: &Value, experts: u32, top_k: u32) -> (Value, Val
     let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
     let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
     r.push(
-        Linear::MoeTopkSoftmax {
+        Linear::MoeRoute {
             logits: logits.id(),
             experts,
             top_k,
             routes: routes.id(),
             weights: weights.id(),
+            ids: None,
+            table: None,
+            bias: None,
+            scale: None,
+            hint: None,
+            score: poem_ir::RouteScore::Softmax,
         },
         &[logits],
     );
@@ -339,13 +345,18 @@ pub fn moe_topk_softmax_scaled(
     let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
     let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
     r.push(
-        Linear::MoeTopkSoftmaxScaled {
+        Linear::MoeRoute {
             logits: logits.id(),
-            scale: r.weight(scale),
+            scale: Some(r.weight(scale)),
             experts,
             top_k,
             routes: routes.id(),
             weights: weights.id(),
+            ids: None,
+            table: None,
+            bias: None,
+            hint: None,
+            score: poem_ir::RouteScore::Softmax,
         },
         &[logits],
     );
@@ -363,16 +374,21 @@ pub fn moe_topk_sigmoid(
     let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
     let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
     r.push(
-        Linear::MoeTopkSigmoid {
+        Linear::MoeRoute {
             logits: logits.id(),
             bias: None,
             experts,
             top_k,
-            renormalize,
-            scaling,
             routes: routes.id(),
             weights: weights.id(),
             hint: None,
+            ids: None,
+            table: None,
+            scale: None,
+            score: poem_ir::RouteScore::Sigmoid {
+                renormalize,
+                scaling,
+            },
         },
         &[logits],
     );
@@ -415,16 +431,18 @@ pub fn moe_topk_sigmoid_sink(
     let routes = r.fresh(tensor(Dim::Tokens, fan, Dtype::I32));
     let weights = r.fresh(tensor(Dim::Tokens, fan, Dtype::F32));
     r.push(
-        Linear::MoeTopkSigmoidSink {
+        Linear::MoeRoute {
             logits: logits.id(),
             bias: Some(r.weight(bias)),
             scale: scale.map(|s| r.weight(s)),
             experts,
             top_k,
-            sink,
-            scaling,
             routes: routes.id(),
             weights: weights.id(),
+            ids: None,
+            table: None,
+            hint: None,
+            score: poem_ir::RouteScore::SigmoidSink { sink, scaling },
         },
         &[logits],
     );
@@ -458,16 +476,21 @@ pub fn moe_topk_sigmoid_biased_hinted(
     let mut ins: Vec<&Value> = vec![logits];
     ins.extend(hint);
     r.push(
-        Linear::MoeTopkSigmoid {
+        Linear::MoeRoute {
             logits: logits.id(),
             bias: Some(r.weight(bias)),
             experts,
             top_k,
-            renormalize,
-            scaling,
             routes: routes.id(),
             weights: weights.id(),
             hint: hint.map(Value::id),
+            ids: None,
+            table: None,
+            scale: None,
+            score: poem_ir::RouteScore::Sigmoid {
+                renormalize,
+                scaling,
+            },
         },
         &ins,
     );
@@ -501,16 +524,21 @@ pub fn moe_topk_sqrt_softplus_hinted(
     let mut inputs = vec![logits];
     inputs.extend(hint);
     r.push(
-        Linear::MoeTopkSqrtSoftplus {
+        Linear::MoeRoute {
             logits: logits.id(),
-            bias: r.weight(bias),
+            bias: Some(r.weight(bias)),
             experts,
             top_k,
-            renormalize,
-            scaling,
             hint: hint.map(Value::id),
             routes: routes.id(),
             weights: weights.id(),
+            ids: None,
+            table: None,
+            scale: None,
+            score: poem_ir::RouteScore::SqrtSoftplus {
+                renormalize,
+                scaling,
+            },
         },
         &inputs,
     );
@@ -522,13 +550,18 @@ pub fn moe_predict_route(logits: &Value, bias: &Weight, experts: u32, top_k: u32
     let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
     let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
     r.push(
-        Linear::MoePredictRoute {
+        Linear::MoeRoute {
             logits: logits.id(),
-            bias: r.weight(bias),
+            bias: Some(r.weight(bias)),
             experts,
             top_k,
             routes: routes.id(),
             weights: weights.id(),
+            ids: None,
+            table: None,
+            scale: None,
+            hint: None,
+            score: poem_ir::RouteScore::Predict,
         },
         &[logits],
     );
@@ -550,17 +583,22 @@ pub fn moe_hash_route(
     let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
     let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
     r.push(
-        Linear::MoeHashRoute {
-            ids: ids.id(),
-            tid2eid: r.weight(tid2eid),
+        Linear::MoeRoute {
+            ids: Some(ids.id()),
+            table: Some(r.weight(tid2eid)),
             logits: logits.id(),
-            vocab,
             experts,
             top_k,
-            renormalize,
-            scaling,
             routes: routes.id(),
             weights: weights.id(),
+            bias: None,
+            scale: None,
+            hint: None,
+            score: poem_ir::RouteScore::Hash {
+                vocab,
+                renormalize,
+                scaling,
+            },
         },
         &[ids, logits],
     );

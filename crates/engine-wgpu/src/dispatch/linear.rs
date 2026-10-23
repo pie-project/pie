@@ -183,7 +183,10 @@ impl Run<'_> {
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
             Linear::RelBias { .. }
-            | Linear::MoeTopkSigmoidSink { .. }
+            | Linear::MoeRoute {
+                score: poem_ir::RouteScore::SigmoidSink { .. },
+                ..
+            }
             | Linear::Matmul {
                 quant: Some(_),
                 logits: false,
@@ -246,12 +249,15 @@ impl Run<'_> {
 
             // The forms no builder makes.
             Linear::Glu { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
-            Linear::MoeTopkSoftmax {
+            Linear::MoeRoute {
                 logits,
                 experts,
                 top_k,
                 routes,
                 weights,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => kernels_slang::linear::moe::route::topk_softmax(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*logits)),
@@ -261,13 +267,15 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*weights)),
             )
             .map_err(crate::encode::from_slang),
-            Linear::MoeTopkSoftmaxScaled {
+            Linear::MoeRoute {
                 logits,
-                scale,
+                scale: Some(scale),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => kernels_slang::linear::moe::route::topk_softmax_scaled(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*logits)),
@@ -279,16 +287,21 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Linear::MoeTopkSigmoid {
+            Linear::MoeRoute {
                 logits,
                 bias,
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
                 hint: _,
+                score:
+                    poem_ir::RouteScore::Sigmoid {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => match bias {
                 Some(bias) => kernels_slang::linear::moe::route::topk_sigmoid_biased(
                     &self.slang(),
@@ -314,13 +327,15 @@ impl Run<'_> {
                 )
                 .map_err(crate::encode::from_slang),
             },
-            Linear::MoePredictRoute {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Predict,
+                ..
             } => kernels_slang::linear::moe::route::predict_route(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*logits)),
@@ -332,16 +347,21 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Linear::MoeTopkSqrtSoftplus {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 hint: _,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::SqrtSoftplus {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => kernels_slang::linear::moe::route::topk_sqrt_softplus(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*logits)),
@@ -355,17 +375,22 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Linear::MoeHashRoute {
-                ids,
-                tid2eid,
+            Linear::MoeRoute {
+                ids: Some(ids),
+                table: Some(tid2eid),
                 logits,
-                vocab,
                 experts: _,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::Hash {
+                        vocab,
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => kernels_slang::linear::moe::route::hash_route(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*ids)),
@@ -379,6 +404,8 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*weights)),
             )
             .map_err(crate::encode::from_slang),
+            // The forms no builder makes.
+            Linear::MoeRoute { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Linear::GroupRoutes { groups, routes } => {
                 kernels_slang::linear::moe::route::group_routes(
                     &self.slang(),

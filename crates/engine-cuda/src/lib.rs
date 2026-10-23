@@ -114,12 +114,19 @@ pub const UNCHAINED: [&str; 1] = ["fused.residual_add_rmsnorm"];
 
 /// What `op` reads of a seat's rows: the seat table's entry for its name,
 /// but a gated unit of routed rows (each times its route's weight) reads
-/// routed rows, none of the seat's.
+/// routed rows, none of the seat's, and a predicted route only the
+/// prediction's.
 fn reads(op: &poem_ir::Operation) -> Reads {
     match op {
-        poem_ir::Operation::Linear(poem_ir::Linear::Glu {
-            weights: Some(_), ..
-        }) => Reads::Nothing,
+        poem_ir::Operation::Linear(
+            poem_ir::Linear::Glu {
+                weights: Some(_), ..
+            }
+            | poem_ir::Linear::MoeRoute {
+                score: poem_ir::RouteScore::Predict,
+                ..
+            },
+        ) => Reads::Nothing,
         _ => kernels_cuda::seat::reads(poem_ir::Operands::name(op)),
     }
 }

@@ -36,6 +36,30 @@ impl ActQuant {
     }
 }
 
+/// How a [`Linear::MoeRoute`] scores and weighs its experts.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum RouteScore {
+    /// Softmax over the experts (times `scale`, a per-expert gain, where given).
+    Softmax,
+    /// Sigmoid scores, the top-k's weights renormalized where stated, then
+    /// times `scaling`.
+    Sigmoid { renormalize: bool, scaling: f32 },
+    /// Sigmoid scores, with `sink` slots past the `top_k` routed ones (its
+    /// routes and weights are `top_k + sink` wide).
+    SigmoidSink { sink: u32, scaling: f32 },
+    /// `sqrt(softplus(x))` scores (DeepSeek-V4).
+    SqrtSoftplus { renormalize: bool, scaling: f32 },
+    /// The routes a biased pick predicts; its weights are not read.
+    Predict,
+    /// Experts looked up by token id in `table` (`vocab` rows), weighted by
+    /// their scores of `logits`.
+    Hash {
+        vocab: u32,
+        renormalize: bool,
+        scaling: f32,
+    },
+}
+
 /// The gate's activation a [`Linear::Glu`] applies.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum GluAct {
@@ -116,100 +140,27 @@ pub enum Linear {
         #[output(F32)]
         y: ValueId,
     },
-    MoeTopkSoftmax {
+    /// A token's `top_k` of `experts`: each expert's score of `logits`
+    /// (`bias` added before the pick where given, `scale` the per-expert gain
+    /// or post-scale, `hint` an earlier pick to keep), the picked experts in
+    /// `routes` and their weights; a hashed route reads its experts from
+    /// `table` at the token's id instead.
+    MoeRoute {
+        #[input(I32)]
+        ids: Option<ValueId>,
         #[input]
-        logits: ValueId,
-        experts: u32,
-        top_k: u32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSoftmaxScaled {
-        #[input]
-        logits: ValueId,
-        #[input]
-        scale: ValueId,
-        experts: u32,
-        top_k: u32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSigmoid {
-        #[input]
-        logits: ValueId,
-        #[input]
-        bias: Option<ValueId>,
-        #[input]
-        hint: Option<ValueId>,
-        experts: u32,
-        top_k: u32,
-        renormalize: bool,
-        scaling: f32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSigmoidSink {
+        table: Option<ValueId>,
         #[input]
         logits: ValueId,
         #[input]
         bias: Option<ValueId>,
         #[input]
         scale: Option<ValueId>,
-        experts: u32,
-        top_k: u32,
-        sink: u32,
-        scaling: f32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSqrtSoftplus {
-        #[input]
-        logits: ValueId,
-        #[input]
-        bias: ValueId,
         #[input]
         hint: Option<ValueId>,
         experts: u32,
         top_k: u32,
-        renormalize: bool,
-        scaling: f32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoePredictRoute {
-        #[input]
-        logits: ValueId,
-        #[input]
-        bias: ValueId,
-        experts: u32,
-        top_k: u32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeHashRoute {
-        #[input(I32)]
-        ids: ValueId,
-        #[input]
-        tid2eid: ValueId,
-        #[input]
-        logits: ValueId,
-        vocab: u32,
-        experts: u32,
-        top_k: u32,
-        renormalize: bool,
-        scaling: f32,
+        score: RouteScore,
         #[output(I32)]
         routes: ValueId,
         #[output(F32)]

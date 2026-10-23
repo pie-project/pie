@@ -364,7 +364,13 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         let mut quant = 0usize;
         for node in &plan.nodes {
             match &node.op {
-                Operation::Linear(Linear::MoeTopkSoftmax { experts, top_k, .. }) => {
+                Operation::Linear(Linear::MoeRoute {
+                    experts,
+                    top_k,
+                    scale: None,
+                    score: poem_ir::RouteScore::Softmax,
+                    ..
+                }) => {
                     routers += 1;
                     assert_eq!((*experts, *top_k), (d.experts, d.top_k), "{deployment}");
                 }
