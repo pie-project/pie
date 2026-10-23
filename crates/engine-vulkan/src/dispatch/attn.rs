@@ -34,9 +34,7 @@ impl Run<'_> {
         let plan = self.prefill_plan(plan);
         let pool = self.pool(cache);
         let tuning = self.tuning();
-        if !(tuning.sdpa_prefill_slang()
-            && attn::arbiter::should_tile(q.data.rows, self.requests(), tuning))
-        {
+        if !attn::arbiter::should_tile(q.data.rows, self.requests(), tuning) {
             return match (mask, lse) {
                 (None, None) => attn::arbiter::prefill(
                     self.ctx(),
