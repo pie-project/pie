@@ -166,6 +166,16 @@ pub struct DecodeThreads(pub u32);
 #[decision(id = "kernel.sdpa.tile_rows", constant(set(8, 16, 32)), default = 32, tune = search)]
 pub struct SdpaTileRows(pub u32);
 
+/// Which source a tiled attention prefill runs from: the hand-written kernel
+/// here, or kernels-slang's. A family keeps the hand-written one until its
+/// devices have measured Slang's at least as fast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.prefill.source", default = "vulkan", tune = search)]
+pub enum SdpaPrefillSource {
+    Vulkan,
+    Slang,
+}
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<Qmm>()
@@ -176,7 +186,8 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeSplit>()
         .add::<DecodeSplitMinKeys>()
         .add::<DecodeThreads>()
-        .add::<SdpaTileRows>();
+        .add::<SdpaTileRows>()
+        .add::<SdpaPrefillSource>();
 }
 
 /// The point a dense matmul is chosen at on a device with `cores` cores.
@@ -275,6 +286,11 @@ impl Tuning {
     #[must_use]
     pub fn sdpa_tile_rows_per_request(&self) -> u32 {
         self.profile.get::<SdpaTileRowsPerRequest>().0
+    }
+
+    #[must_use]
+    pub fn sdpa_prefill_slang(&self) -> bool {
+        *self.profile.get::<SdpaPrefillSource>() == SdpaPrefillSource::Slang
     }
 
     /// The profile's, halved until 32 lanes a row fit the invocation limit.

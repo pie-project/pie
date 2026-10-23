@@ -14,3 +14,6 @@ sdpa.decode.split = [
   { when = "cores > 0", use = "per_core", per = 1 },
   { use = "fixed", groups = 16 },
 ]
+# Measured on an RTX 4090 (kernels-slang.md §10): Slang's tiled prefill
+# runs 11% faster there. Other families keep the hand-written kernel.
+sdpa.prefill.source = [{ when = "vendor == nvidia and coopmat", use = "slang" }, { use = "vulkan" }]
