@@ -4,10 +4,10 @@ use poem_ir::{Linear, Operands};
 
 use crate::run::Run;
 
-/// WGSL has no subgroup tier; two strips a workgroup.
+/// WGSL has no subgroup tier; four strips a workgroup (kernels-slang.md §15).
 const KQUANT: kernels_slang::linear::kquant::Tactic = kernels_slang::linear::kquant::Tactic {
     tier: kernels_slang::Tier::Baseline,
-    slices: 2,
+    slices: 4,
 };
 
 impl DispatchLinear for Run<'_> {

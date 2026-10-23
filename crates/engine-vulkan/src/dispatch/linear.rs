@@ -500,8 +500,9 @@ impl Run<'_> {
 }
 
 impl Run<'_> {
-    /// The subgroup tier where every subgroup holds a 32-lane strip; two
-    /// strips a workgroup.
+    /// The subgroup tier where every subgroup holds a 32-lane strip; four
+    /// strips a workgroup, the 4090's best at every scheme and row count
+    /// measured (kernels-slang.md §15).
     fn kquant_tactic(&self) -> kernels_slang::linear::kquant::Tactic {
         kernels_slang::linear::kquant::Tactic {
             tier: if self.tuning().limits().lanes >= 32 {
@@ -509,7 +510,7 @@ impl Run<'_> {
             } else {
                 kernels_slang::Tier::Baseline
             },
-            slices: 2,
+            slices: 4,
         }
     }
 }
