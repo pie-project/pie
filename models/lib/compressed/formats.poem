@@ -75,6 +75,13 @@ def channel_fp8_bank(reads, w, legs):
         tensor(scales_name(w.name), scales, encoding(dtype.f32), shape = counted),
     ])
 
+def recip(reads, name, expr, shape):
+    """`1 / expr` (read from `name`) as an f32 tensor of its own: a unary needs
+    a kernel, which a bank's join of byte runs cannot hold."""
+    inverse = name + ".recip"
+    reads.push(tensor(inverse, expr.unary("recip"), F32, shape = shape, internal = True))
+    return out(inverse)
+
 def nvfp4_packed_bank(reads, w, experts):
     """A routed bank of compressed-tensors NVFP4 experts ("nvfp4-pack-quantized",
     MiniMax-M3.1-Flash's), `experts` each expert's leg stems: `.weight_packed`
@@ -98,8 +105,8 @@ def nvfp4_packed_bank(reads, w, experts):
         for stem in stems:
             codes.append(src(stem + ".weight_packed").transmute([1, per_leg, cols], grouped(w)))
             scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 16], E4M3))
-            tensors.append(src(stem + ".weight_global_scale").transmute([1, 1], F32).unary("recip").gather(1, [0] * per_leg))
-        inputs.append(src(stems[0] + ".input_global_scale").transmute([1], F32).unary("recip"))
+            tensors.append(recip(reads, stem + ".weight_global_scale", src(stem + ".weight_global_scale").transmute([1, 1], F32).gather(1, [0] * per_leg), [1, per_leg]))
+        inputs.append(recip(reads, stems[0] + ".input_global_scale", src(stems[0] + ".input_global_scale").transmute([1], F32), [1]))
     counted = scales_shape(w)
     whole = lambda expr, shape, encoding: expr if legs == 1 else expr.transmute(shape, encoding)
     reads.extend([
