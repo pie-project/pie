@@ -17,13 +17,14 @@ impl Run<'_> {
             Linear::Matmul { act, w, y }
                 if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() =>
             {
-                linear::lane_gemm::act_x_wt(
-                    self.ctx(),
+                kernels_slang::linear::gemm::lane(
+                    &self.slang(),
                     "linear.matmul",
-                    self.tensor(*act),
-                    self.tensor(*w),
-                    self.tensor(*y),
+                    crate::encode::slang_tensor(self.tensor(*act)),
+                    crate::encode::slang_tensor(self.tensor(*w)),
+                    crate::encode::slang_tensor(self.tensor(*y)),
                 )
+                .map_err(crate::encode::from_slang)
             }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => {
@@ -56,13 +57,14 @@ impl Run<'_> {
                         crate::encode::slang_tensor(self.tensor(*y)),
                     )
                     .map_err(crate::encode::from_slang),
-                    None => linear::gemm::matmul(
-                        self.ctx(),
-                        self.tuning(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*y),
-                    ),
+                    None => kernels_slang::linear::gemm::matmul(
+                        &self.slang(),
+                        self.gemm_tactic(),
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(self.tensor(*w)),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                 },
             },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
@@ -96,13 +98,14 @@ impl Run<'_> {
                         crate::encode::slang_tensor(self.tensor(*y)),
                     )
                     .map_err(crate::encode::from_slang),
-                    None => linear::gemm::lm_head(
-                        self.ctx(),
-                        self.tuning(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*y),
-                    ),
+                    None => kernels_slang::linear::gemm::lm_head(
+                        &self.slang(),
+                        self.gemm_tactic(),
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(self.tensor(*w)),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                 },
             },
 
@@ -535,6 +538,19 @@ impl Run<'_> {
                 kernels_slang::Tier::Baseline
             },
             slices: 4,
+        }
+    }
+}
+
+impl Run<'_> {
+    /// Cooperative-matrix tiles where the profile takes them.
+    fn gemm_tactic(&self) -> kernels_slang::linear::gemm::Tactic {
+        kernels_slang::linear::gemm::Tactic {
+            tier: if self.tuning().gemm_coopmat() {
+                kernels_slang::Tier::Coopmat
+            } else {
+                kernels_slang::Tier::Baseline
+            },
         }
     }
 }

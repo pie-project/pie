@@ -1,3 +1,4 @@
+mod gemm;
 mod glu;
 mod kquant;
 mod moe;

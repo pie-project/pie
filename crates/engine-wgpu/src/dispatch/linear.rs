@@ -45,12 +45,14 @@ impl Run<'_> {
                         crate::encode::slang_tensor(self.tensor(*y)),
                     )
                     .map_err(crate::encode::from_slang),
-                    None => linear::gemm::matmul(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*y),
-                    ),
+                    None => kernels_slang::linear::gemm::matmul(
+                        &self.slang(),
+                        self.gemm_tactic(),
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(self.tensor(*w)),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                 },
             },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
@@ -78,12 +80,14 @@ impl Run<'_> {
                         crate::encode::slang_tensor(self.tensor(*y)),
                     )
                     .map_err(crate::encode::from_slang),
-                    None => linear::gemm::lm_head(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*y),
-                    ),
+                    None => kernels_slang::linear::gemm::lm_head(
+                        &self.slang(),
+                        self.gemm_tactic(),
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(self.tensor(*w)),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                 },
             },
 
@@ -525,4 +529,12 @@ fn qmm_ladder(
             Qmm::Qmv => Rung::Qmv { vecs: 4 },
         })
         .collect()
+}
+
+impl Run<'_> {
+    /// The vector kernel folds by shuffles where the adapter's subgroups
+    /// hold a 32-lane strip.
+    fn gemm_tactic(&self) -> kernels_slang::linear::gemm::Tactic {
+        kernels_slang::linear::gemm::Tactic { tier: self.tier() }
+    }
 }

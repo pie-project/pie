@@ -31,6 +31,16 @@ fn codes(seed: u64, words: usize) -> Vec<u32> {
         .collect()
 }
 
+/// `v` rounded to the nearest IEEE half: the cooperative-matrix tier
+/// multiplies halves, so its reference does too.
+fn half(v: f64) -> f64 {
+    if v == 0.0 {
+        return 0.0;
+    }
+    let quantum = 2f64.powi((v.abs().log2().floor() as i32).max(-14) - 10);
+    (v / quantum).round_ties_even() * quantum
+}
+
 /// A fire of the hand-written kernel: its unit, entry, groups and workgroup.
 type Hand = (&'static str, String, [u32; 3], [u32; 3]);
 
@@ -137,11 +147,12 @@ fn the_tiled_points_answer_the_reference() {
             xv.resize(cap * k, 0.0);
             let (x, xr) = gpu.up(&xv);
             let xt = t(x, m, k, Dtype::Bf16);
+            let operand = |v: f64| if rung == Qmm::Coopmat { half(v) } else { v };
             let want: Vec<f64> = (0..m * n)
                 .map(|i| {
                     let (r, c) = (i / n, i % n);
                     (0..k)
-                        .map(|j| f64::from(xr[r * k + j]) * weight(c * k + j))
+                        .map(|j| operand(f64::from(xr[r * k + j])) * operand(weight(c * k + j)))
                         .sum()
                 })
                 .collect();
