@@ -19,3 +19,5 @@ mod the_pixels_answer_the_reference;
 mod the_pointwise_kernels_answer_the_reference;
 mod the_ropes_answer_the_reference;
 mod the_row_movers_answer_the_reference;
+
+mod sdpa_speed;
