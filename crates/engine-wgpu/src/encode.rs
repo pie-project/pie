@@ -286,6 +286,25 @@ pub fn slang_tensor(t: kernels_wgpu::Tensor) -> kernels_slang::Tensor {
     kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
 }
 
+pub fn slang_pool(p: &kernels_wgpu::KvPool) -> kernels_slang::KvPool {
+    kernels_slang::KvPool {
+        keys: slang_tensor(p.keys),
+        values: slang_tensor(p.values),
+        page_indices: slang_tensor(p.page_indices),
+        page_indptr: slang_tensor(p.page_indptr),
+        page_size: p.page_size,
+        seq_stride: p.seq_stride,
+        head_stride: p.head_stride,
+    }
+}
+
+pub fn slang_ragged(r: kernels_wgpu::RaggedTensor) -> kernels_slang::RaggedTensor {
+    kernels_slang::RaggedTensor {
+        data: slang_tensor(r.data),
+        indptr: slang_tensor(r.indptr),
+    }
+}
+
 pub fn slang_bank(b: kernels_wgpu::Bank) -> kernels_slang::Bank {
     kernels_slang::Bank {
         codes: slang_tensor(b.codes),

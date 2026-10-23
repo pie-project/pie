@@ -367,13 +367,14 @@ impl Run<'_> {
                 sink,
                 head_dim,
                 o_out: _,
-            } => attn::sink(
-                self.ctx(),
-                self.tensor(*o),
-                self.tensor(*lse),
-                self.tensor(*sink),
+            } => kernels_slang::attn::merge::sink(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*o)),
+                crate::encode::slang_tensor(self.tensor(*lse)),
+                crate::encode::slang_tensor(self.tensor(*sink)),
                 *head_dim,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Attn::MergeLse {
                 o1,
                 lse1,
@@ -383,46 +384,52 @@ impl Run<'_> {
                 head_dim,
                 o,
                 lse,
-            } => attn::merge_lse(
-                self.ctx(),
-                self.tensor(*o1),
-                self.tensor(*lse1),
-                self.tensor(*o2),
-                self.tensor(*lse2),
+            } => kernels_slang::attn::merge::merge_lse(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*o1)),
+                crate::encode::slang_tensor(self.tensor(*lse1)),
+                crate::encode::slang_tensor(self.tensor(*o2)),
+                crate::encode::slang_tensor(self.tensor(*lse2)),
                 *heads,
                 *head_dim,
-                self.tensor(*o),
-                self.tensor(*lse),
-            ),
-            Attn::LogitSoftcap { x, cap, x_out: _ } => {
-                attn::logit_softcap(self.ctx(), self.tensor(*x), *cap)
-            }
+                crate::encode::slang_tensor(self.tensor(*o)),
+                crate::encode::slang_tensor(self.tensor(*lse)),
+            )
+            .map_err(crate::encode::from_slang),
+            Attn::LogitSoftcap { x, cap, x_out: _ } => kernels_slang::attn::merge::logit_softcap(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                *cap,
+            )
+            .map_err(crate::encode::from_slang),
             Attn::KvAppend {
                 k,
                 v,
                 cache,
                 write_page,
                 write_offset,
-            } => attn::kv_append(
-                self.ctx(),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => kernels_slang::attn::kv_append::kv_append(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*v)),
+                &crate::encode::slang_pool(self.pool(*cache)),
+                crate::encode::slang_tensor(self.tensor(*write_page)),
+                crate::encode::slang_tensor(self.tensor(*write_offset)),
+            )
+            .map_err(crate::encode::from_slang),
             Attn::KvAppendShared {
                 plane,
                 cache,
                 write_page,
                 write_offset,
-            } => attn::kv_append_shared(
-                self.ctx(),
-                self.tensor(*plane),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => kernels_slang::attn::kv_append::kv_append_shared(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*plane)),
+                &crate::encode::slang_pool(self.pool(*cache)),
+                crate::encode::slang_tensor(self.tensor(*write_page)),
+                crate::encode::slang_tensor(self.tensor(*write_offset)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Attn::MlaPlan {
                 kv_indptr,
