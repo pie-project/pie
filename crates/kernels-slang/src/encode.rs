@@ -193,6 +193,15 @@ pub(crate) fn nonzero(op: &'static str, axis: &'static str, v: u32) -> Result<u3
     Ok(v)
 }
 
+/// The instantiation named `name`, as the census spells it.
+pub(crate) fn instantiated(op: &'static str, name: String) -> Result<&'static str, Error> {
+    crate::CENSUS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(n, _)| *n)
+        .ok_or_else(|| refuse(op, format!("no kernel is instantiated as `{name}`")))
+}
+
 #[allow(dead_code)]
 pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the shader's int")))

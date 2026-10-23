@@ -7,7 +7,7 @@
 
 use dtype::Dtype;
 
-use crate::encode::{Arg, ArgValue, Ctx, Fire, nonzero, refuse, stated};
+use crate::encode::{Arg, ArgValue, Ctx, Fire, instantiated, nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{KvPool, Tensor};
 
@@ -39,15 +39,6 @@ pub struct Tables {
     /// One byte a row: whether the row reads its mask.
     pub mask_enabled: Tensor,
     pub mask_stride: u32,
-}
-
-/// The instantiation named `name`, as its census spells it.
-fn entry(op: &'static str, name: String) -> Result<&'static str, Error> {
-    crate::CENSUS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(n, _)| *n)
-        .ok_or_else(|| refuse(op, format!("no sdpa kernel is instantiated as `{name}`")))
 }
 
 struct Shape {
@@ -185,7 +176,7 @@ pub fn decode(
             ""
         },
     );
-    let entry = entry(OP, name)?;
+    let entry = instantiated(OP, name)?;
     let args = args(OP, q, pool, tables, &shape, sm_scale, o, lse)?;
     ctx.fire(
         Fire::at(SDPA, entry)
@@ -225,7 +216,7 @@ pub fn prefill(
             format!("_r{tile}")
         },
     );
-    let entry = entry(OP, name)?;
+    let entry = instantiated(OP, name)?;
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, lse)?;
     args.push(stated(OP, shape.rows)?.arg());
     ctx.fire(

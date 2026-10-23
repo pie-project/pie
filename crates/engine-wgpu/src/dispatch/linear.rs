@@ -4,6 +4,12 @@ use poem_ir::{Linear, Operands};
 
 use crate::run::Run;
 
+/// WGSL has no subgroup tier; two strips a workgroup.
+const KQUANT: kernels_slang::linear::kquant::Tier = kernels_slang::linear::kquant::Tier {
+    subgroup: false,
+    slices: 2,
+};
+
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.linear(op).map_err(crate::error::kernel)
@@ -25,12 +31,14 @@ impl Run<'_> {
                 ),
 
                 None => match self.maybe_stored(*w) {
-                    Some(block) => linear::kquant::matmul(
-                        self.ctx(),
-                        self.tensor(*act),
-                        block,
-                        self.tensor(*y),
-                    ),
+                    Some(block) => kernels_slang::linear::kquant::matmul(
+                        &self.slang(),
+                        KQUANT,
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(block),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                     None => linear::gemm::matmul(
                         self.ctx(),
                         self.tensor(*act),
@@ -50,12 +58,14 @@ impl Run<'_> {
                 ),
 
                 None => match self.maybe_stored(*w) {
-                    Some(block) => linear::kquant::lm_head(
-                        self.ctx(),
-                        self.tensor(*act),
-                        block,
-                        self.tensor(*y),
-                    ),
+                    Some(block) => kernels_slang::linear::kquant::lm_head(
+                        &self.slang(),
+                        KQUANT,
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(block),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                     None => linear::gemm::lm_head(
                         self.ctx(),
                         self.tensor(*act),

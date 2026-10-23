@@ -36,12 +36,14 @@ impl Run<'_> {
                 ),
 
                 None => match self.maybe_stored(*w) {
-                    Some(block) => linear::kquant::matmul(
-                        self.ctx(),
-                        self.tensor(*act),
-                        block,
-                        self.tensor(*y),
-                    ),
+                    Some(block) => kernels_slang::linear::kquant::matmul(
+                        &self.slang(),
+                        self.kquant_tier(),
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(block),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                     None => linear::gemm::matmul(
                         self.ctx(),
                         self.tuning(),
@@ -62,12 +64,14 @@ impl Run<'_> {
                 ),
 
                 None => match self.maybe_stored(*w) {
-                    Some(block) => linear::kquant::lm_head(
-                        self.ctx(),
-                        self.tensor(*act),
-                        block,
-                        self.tensor(*y),
-                    ),
+                    Some(block) => kernels_slang::linear::kquant::lm_head(
+                        &self.slang(),
+                        self.kquant_tier(),
+                        crate::encode::slang_tensor(self.tensor(*act)),
+                        crate::encode::slang_tensor(block),
+                        crate::encode::slang_tensor(self.tensor(*y)),
+                    )
+                    .map_err(crate::encode::from_slang),
                     None => linear::gemm::lm_head(
                         self.ctx(),
                         self.tuning(),
@@ -491,6 +495,17 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*y)),
             )
             .map_err(crate::encode::from_slang),
+        }
+    }
+}
+
+impl Run<'_> {
+    /// The subgroup tier where every subgroup holds a 32-lane strip; two
+    /// strips a workgroup.
+    fn kquant_tier(&self) -> kernels_slang::linear::kquant::Tier {
+        kernels_slang::linear::kquant::Tier {
+            subgroup: self.tuning().limits().lanes >= 32,
+            slices: 2,
         }
     }
 }
