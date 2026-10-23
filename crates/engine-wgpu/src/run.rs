@@ -1,4 +1,4 @@
-use kernels_wgpu::attn::mla::MlaPlan;
+use kernels_slang::attn::mla::MlaPlan;
 use kernels_wgpu::linear::moe::RoutedScratch;
 use kernels_wgpu::{
     Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
