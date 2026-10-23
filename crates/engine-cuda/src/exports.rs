@@ -253,8 +253,20 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            poem_ir::Operation::Attention(
-                poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
+            poem_ir::Operation::Attn(
+                poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: None,
+                    ..
+                } | poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                }
             )
         )
     })
@@ -275,8 +287,8 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir:
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            poem_ir::Operation::Layout(
-                poem_ir::Layout::ScatterRows { .. } | poem_ir::Layout::ScatterLiveRows { .. }
+            poem_ir::Operation::Gather(
+                poem_ir::Gather::ScatterRows { .. } | poem_ir::Gather::ScatterLiveRows { .. }
             )
         )
     })
@@ -368,7 +380,7 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
             region.nodes.clone().all(|node| {
                 trace.nodes.get(node as usize).is_some_and(|node| {
                     let name = poem_ir::Operands::name(&node.op);
-                    crate::shifted(name) || crate::PLANNED.contains(&name)
+                    crate::shifted(&node.op) || crate::PLANNED.contains(&name)
                 })
             })
         })
@@ -380,8 +392,15 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
 /// against a later fire's tables would read past what it staged.
 #[must_use]
 pub(crate) fn regions_staging(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
-    let quantized = |attn: &poem_ir::Attention| match attn {
-        poem_ir::Attention::PrefillLse { cache, .. } => matches!(
+    let quantized = |attn: &poem_ir::Attn| match attn {
+        poem_ir::Attn::Prefill {
+            cache,
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: Some(_),
+            ..
+        } => matches!(
             trace.values.get(cache.0 as usize).map(|decl| &decl.def),
             Some(poem_ir::Def::Cache(row)) if matches!(
                 trace.caches.get(*row as usize),
@@ -429,7 +448,7 @@ fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
         return false;
     };
     let name = Operands::name(&node.op);
-    if crate::lane_shifted(name) || crate::PLANNED.contains(&name) {
+    if crate::lane_shifted(&node.op) || crate::PLANNED.contains(&name) {
         return true;
     }
     let mut operands: Vec<ValueId> = Vec::new();

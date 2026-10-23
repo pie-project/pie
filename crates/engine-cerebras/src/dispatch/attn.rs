@@ -1,18 +1,18 @@
 use kernels_cerebras::attn;
-use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, Operands, StructKind};
+use poem_exec::{DispatchAttn, KernelError};
+use poem_ir::{Attn, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
-impl DispatchAttention for Run<'_> {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+impl DispatchAttn for Run<'_> {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
         self.attention(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn attention(&mut self, op: &Attention) -> Result<(), kernels_cerebras::Error> {
+    fn attention(&mut self, op: &Attn) -> Result<(), kernels_cerebras::Error> {
         if self.rs_seat().is_some() {
             return Err(kernels_cerebras::Error::Backend {
                 op: op.name(),
@@ -21,11 +21,11 @@ impl Run<'_> {
             });
         }
         match op {
-            Attention::PlanDecode { kv_len, plan, .. } => {
+            Attn::PlanDecode { kv_len, plan, .. } => {
                 match self.declared(*plan) {
                     StructKind::AttnDecodePlan => {}
                     other => panic!(
-                        "`attention.plan_decode` defines a {other:?}, which is no decode plan kind"
+                        "`attn.plan_decode` defines a {other:?}, which is no decode plan kind"
                     ),
                 }
                 let kv_len = self.tensor(*kv_len);
@@ -43,11 +43,11 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
             }
-            Attention::PlanPrefill { kv_len, plan, .. } => {
+            Attn::PlanPrefill { kv_len, plan, .. } => {
                 match self.declared(*plan) {
                     StructKind::AttnPrefillPlan => {}
                     other => panic!(
-                        "`attention.plan_prefill` defines a {other:?}, which is no prefill plan kind"
+                        "`attn.plan_prefill` defines a {other:?}, which is no prefill plan kind"
                     ),
                 }
                 let kv_len = self.tensor(*kv_len);
@@ -65,7 +65,7 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
             }
-            Attention::Decode {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -73,6 +73,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => attn::decode(
                 self.ctx(),
                 self.tensor(*q),
@@ -83,7 +88,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::DecodeLse {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -91,7 +96,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
             } => attn::decode_lse(
                 self.ctx(),
                 self.tensor(*q),
@@ -103,7 +112,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attention::Prefill {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -112,6 +121,14 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
+                mask: None,
+                selection: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected: None,
+                rel: None,
+                lse: None,
             } => attn::prefill(
                 self.ctx(),
                 self.ragged(*q),
@@ -123,7 +140,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::PrefillLse {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -132,8 +149,14 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
                 floor: None,
+                mask: None,
+                selection: None,
+                bias: None,
+                causal: true,
+                selected: None,
+                rel: None,
             } => attn::prefill_lse(
                 self.ctx(),
                 self.ragged(*q),
@@ -146,10 +169,10 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attention::Masked {
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -157,6 +180,12 @@ impl Run<'_> {
                 causal,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => {
                 let mask = self.cut_rows(self.tensor(*mask));
                 attn::masked(
@@ -172,10 +201,10 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attention::MaskedLse {
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -183,7 +212,12 @@ impl Run<'_> {
                 causal,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
             } => {
                 let mask = self.cut_rows(self.tensor(*mask));
                 attn::masked_lse(
@@ -200,9 +234,9 @@ impl Run<'_> {
                     self.tensor(*lse),
                 )
             }
-            Attention::KvAppend {
+            Attn::KvAppend {
                 k,
-                v,
+                v: Some(v),
                 cache,
                 write_page,
                 write_offset,
@@ -214,8 +248,9 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::KvAppendShared {
-                plane,
+            Attn::KvAppend {
+                k: plane,
+                v: None,
                 cache,
                 write_page,
                 write_offset,
@@ -226,97 +261,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::SsmCausalConv1d {
-                x,
-                weight,
-                state,
-                conv_width,
-                dilation,
-                y,
-                ..
-            } => attn::ssm::causal_conv1d(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                &self.recurrent(*state),
-                *conv_width,
-                *dilation,
-                self.tensor(*y),
-            ),
-            Attention::SsmCausalConv1dChunked {
-                x,
-                weight,
-                state,
-                conv_width,
-                dilation,
-                y,
-                ..
-            } => attn::ssm::causal_conv1d_chunked(
-                self.ctx(),
-                self.ragged(*x),
-                self.tensor(*weight),
-                &self.recurrent(*state),
-                *conv_width,
-                *dilation,
-                self.tensor(*y),
-            ),
-            Attention::SsmGdnPrep {
-                ba,
-                dt_bias,
-                a_log,
-                gates,
-            } => attn::ssm::gdn_prep(
-                self.ctx(),
-                self.tensor(*ba),
-                self.tensor(*dt_bias),
-                self.tensor(*a_log),
-                self.tensor(*gates),
-            ),
-            Attention::SsmGatedDelta {
-                qkv,
-                z,
-                gates,
-                state,
-                k_heads,
-                v_heads,
-                k_dim,
-                v_dim,
-                y,
-            } => attn::ssm::gated_delta(
-                self.ctx(),
-                self.tensor(*qkv),
-                self.tensor(*z),
-                self.tensor(*gates),
-                &self.recurrent(*state),
-                *k_heads,
-                *v_heads,
-                *k_dim,
-                *v_dim,
-                self.tensor(*y),
-            ),
-            Attention::SsmGatedDeltaChunked {
-                qkv,
-                z,
-                gates,
-                state,
-                k_heads,
-                v_heads,
-                k_dim,
-                v_dim,
-                y,
-            } => attn::ssm::gated_delta_chunked(
-                self.ctx(),
-                self.ragged(*qkv),
-                self.tensor(*z),
-                self.tensor(*gates),
-                &self.recurrent(*state),
-                *k_heads,
-                *v_heads,
-                *k_dim,
-                *v_dim,
-                self.tensor(*y),
-            ),
-            Attention::Dense {
+            Attn::Dense {
                 q,
                 k,
                 v,
@@ -334,17 +279,23 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attention::DecodeSelected {
+            Attn::Decode {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                bias: None,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => attn::decode_selected(
                 self.ctx(),
                 self.tensor(*q),
@@ -357,18 +308,27 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*o),
             ),
-            Attention::PrefillSelected {
+            Attn::Prefill {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 kv_heads,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                mask: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => attn::prefill_selected(
                 self.ctx(),
                 self.ragged(*q),
@@ -382,7 +342,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*o),
             ),
-            Attention::IndexKvAppend {
+            Attn::IndexKvAppend {
                 k,
                 keys,
                 write_page,
@@ -394,7 +354,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attention::IndexBlockMean {
+            Attn::IndexBlockMean {
                 boundary_pos,
                 boundary_req,
                 keys,
@@ -410,7 +370,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*entries),
             ),
-            Attention::IndexTopk {
+            Attn::IndexTopk {
                 q,
                 weights,
                 keys,
@@ -437,13 +397,14 @@ impl Run<'_> {
                     self.tensor(*selection),
                 )
             }
-            Attention::PoolBoundaryDecode {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: true,
             } => attn::index::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
@@ -454,13 +415,14 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attention::PoolBoundaryPrefill {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: false,
             } => attn::index::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
@@ -471,7 +433,7 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attention::PoolKvAppend {
+            Attn::PoolKvAppend {
                 entries,
                 boundary_pos,
                 boundary_req,
@@ -486,88 +448,6 @@ impl Run<'_> {
                 self.pool(*into),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
-            ),
-            Attention::PleNgramIds {
-                ids,
-                state,
-                eos,
-                mults,
-                primes,
-                offsets,
-                heads_per_ngram,
-                map,
-                ngram_ids,
-            } => attn::ple::ngram_ids(
-                self.ctx(),
-                self.tensor(*ids),
-                &self.recurrent(*state),
-                *eos,
-                mults,
-                primes,
-                offsets,
-                *heads_per_ngram,
-                map.map(|m| self.tensor(m)),
-                self.tensor(*ngram_ids),
-            ),
-            Attention::PleNgramIdsChunked {
-                ids,
-                state,
-                eos,
-                mults,
-                primes,
-                offsets,
-                heads_per_ngram,
-                map,
-                ngram_ids,
-            } => attn::ple::ngram_ids_chunked(
-                self.ctx(),
-                self.ragged(*ids),
-                &self.recurrent(*state),
-                *eos,
-                mults,
-                primes,
-                offsets,
-                *heads_per_ngram,
-                map.map(|m| self.tensor(m)),
-                self.tensor(*ngram_ids),
-            ),
-            Attention::SelectorWalk {
-                cand,
-                unary,
-                hp,
-                tokens,
-                pred,
-                succ,
-                first,
-                picks,
-            } => attn::dynconv::selector_walk(
-                self.ctx(),
-                self.ragged(*cand),
-                self.tensor(*unary),
-                hp.map(|h| self.tensor(h)),
-                self.tensor(*tokens),
-                self.tensor(*pred),
-                self.tensor(*succ),
-                *first,
-                self.tensor(*picks),
-            ),
-            Attention::BlockDynConv {
-                x,
-                coeff,
-                base,
-                side,
-                taps,
-                group,
-                y,
-            } => attn::dynconv::block_dyn_conv(
-                self.ctx(),
-                self.ragged(*x),
-                self.tensor(*coeff),
-                self.tensor(*base),
-                *side,
-                *taps,
-                *group,
-                self.tensor(*y),
             ),
             other => Err(kernels_cerebras::Error::Unsupported { op: other.name() }),
         }

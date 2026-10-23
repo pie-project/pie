@@ -2,7 +2,9 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{Operands, Operation, Shard, ValueId};
+use poem_ir::{
+    Attn, BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId,
+};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -96,113 +98,150 @@ const KV_HEADS: &str = "kv_heads";
 /// How op `name` splits by head or channel, if it does.
 fn heads(name: &str) -> Option<Heads> {
     Some(match name {
-        "elementwise.silu"
-        | "elementwise.gelu"
-        | "elementwise.tanh"
-        | "elementwise.mul_scalar"
-        | "elementwise.silu_scaled"
-        | "elementwise.scale"
-        | "elementwise.rmsnorm_per_head"
-        | "elementwise.rmsnorm_per_head_plus_one"
-        | "elementwise.rmsnorm_no_scale"
-        | "elementwise.rope_axes"
-        | "layout.gather_rows"
-        | "layout.pack_rows"
-        | "layout.unpack_rows"
-        | "linear.mlp_gelu_tanh" => Heads::of(&["x"], &[]),
-        "elementwise.mul" => Heads::of(&["x", "y"], &[]),
-        "elementwise.gate_sigmoid_mul"
-        | "elementwise.gate_sigmoid_mul_heads"
-        | "elementwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
-        "elementwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
-        "elementwise.rope_full"
-        | "elementwise.rope_partial"
-        | "elementwise.rope_yarn"
-        | "elementwise.rope_mrope" => Heads::of(&["q", "k"], &[]),
-        "elementwise.rope_partial_q" | "elementwise.rope_partial_last" => Heads::of(&["q"], &[]),
-        "elementwise.add_bias" => Heads::of(&["out"], &[]),
-        "layout.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
-        "layout.split_q_gate" => Heads::of(&["packed"], &[]),
-        "layout.split_rows" => Heads::of(&["x"], &["width"]),
-        "linear.mlp_swiglu"
-        | "linear.mlp_swiglu_clamp"
-        | "linear.mlp_swiglu_clamp_alpha"
-        | "linear.mlp_geglu_tanh_packed"
-        | "linear.mlp_situ" => Heads::of(&["packed"], &["intermediate"]),
-        "linear.mlp_swiglu_clamp_split" | "linear.mlp_geglu_tanh" => {
-            Heads::of(&["gate", "up"], &[])
-        }
+        "elemwise.act" | "elemwise.rope_axes" | "gather.rows" | "gather.pack_rows"
+        | "gather.unpack_rows" | "linear.gelu_tanh" => Heads::of(&["x"], &[]),
+        "elemwise.gate_sigmoid_mul" | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
+        "elemwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
+        // q, and k where the rotation turns one.
+        "elemwise.rope" => Heads::of(&["q", "k"], &[]),
+        "elemwise.add_bias" => Heads::of(&["out"], &[]),
+        "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
+        "gather.split_q_gate" => Heads::of(&["packed"], &[]),
+        "gather.split_rows" => Heads::of(&["x"], &["width"]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
-        "attention.decode" | "attention.decode_lse" | "attention.decode_selected" => {
-            Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)
-        }
-        "attention.prefill"
-        | "attention.prefill_lse"
-        | "attention.masked"
-        | "attention.masked_lse"
-        | "attention.prefill_selected" => Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole),
-        "attention.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
-        "attention.sink" => Heads::of(&["o", "lse"], &[]),
-        "attention.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
-        "attention.pool_lse" | "attention.pool_lse_selected" => Heads::of(&["q"], &["heads"]),
-        "attention.kv_append" => Heads::of(&["k", "v"], &[])
+        "attn.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
+        "attn.sink" => Heads::of(&["o", "lse"], &[]),
+        "attn.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
+        "attn.pool_lse" => Heads::of(&["q"], &["heads"]),
+        // k and v, or the one plane a shared pool reads as both.
+        "attn.kv_append" => Heads::of(&["k", "v"], &[])
             .cache(Cache::Split)
             .kv(&["k", "v"]),
-        "attention.kv_append_shared" => Heads::of(&["plane"], &[])
-            .cache(Cache::Split)
-            .kv(&["plane"]),
-        "attention.mla_split_q_b" => Heads::of(&["q_b"], &["heads"]),
-        "attention.mla_absorb_q" => Heads::of(&["q_nope"], &["heads"]),
-        "attention.mla_absorb_out" => Heads::of(&["latent"], &["heads"]),
-        "attention.mla_decode"
-        | "attention.mla_prefill"
-        | "attention.mla_decode_selected"
-        | "attention.mla_prefill_selected" => Heads::of(&["q", "q_pe"], &["heads"]),
-        "attention.ssm_causal_conv1d" | "attention.ssm_causal_conv1d_chunked" => {
+        "attn.mla_split_q_b" => Heads::of(&["q_b"], &["heads"]),
+        "attn.mla_absorb_q" => Heads::of(&["q_nope"], &["heads"]),
+        "attn.mla_absorb_out" => Heads::of(&["latent"], &["heads"]),
+        "attn.mla_decode" | "attn.mla_prefill" => Heads::of(&["q", "q_pe"], &["heads"]),
+        "ssm.causal_conv1d" | "ssm.causal_conv1d_chunked" => {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
-        "attention.ssm_gdn_prep" => Heads::of(&["ba"], &[]),
-        "attention.ssm_gated_delta" | "attention.ssm_gated_delta_chunked" => {
+        "ssm.gdn_gates" => Heads::of(&["ba"], &[]),
+        "ssm.gated_delta" | "ssm.gated_delta_chunked" => {
             Heads::of(&["qkv", "z", "gates"], &["k_heads", "v_heads"]).cache(Cache::Split)
         }
-        "attention.ssm_kda_step" | "attention.ssm_kda_chunked" => {
+        "ssm.kda" | "ssm.kda_chunked" => {
             Heads::of(&["mixed", "f", "b"], &["heads"]).cache(Cache::Split)
         }
         _ => return None,
     })
 }
 
-fn rule(name: &str) -> Rule {
-    match name {
-        "linear.matmul" | "linear.lm_head" => Rule::Contract {
+fn rule(op: &Operation) -> Rule {
+    // A norm splits by its axis: a whole row's weight against the row's
+    // blocks, a head's like any per-head op, a group's not at all.
+    if let Operation::Elemwise(Elemwise::Rmsnorm { axis, .. }) = op {
+        return match axis {
+            NormAxis::Row => Rule::Norm,
+            NormAxis::Head(_) => Rule::Heads(Heads::of(&["x"], &[])),
+            NormAxis::Group(_) => Rule::Whole,
+        };
+    }
+    // A gated unit splits with its columns, packed or as two planes; one of
+    // routed rows (each times its route's weight) reads them whole.
+    if let Operation::Linear(Linear::Glu {
+        packed, weights, ..
+    }) = op
+    {
+        return match (packed, weights) {
+            (_, Some(_)) => Rule::Whole,
+            (Some(_), None) => Rule::Heads(Heads::of(&["packed"], &["intermediate"])),
+            (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
+        };
+    }
+    // A product contracts with its weight's split, its activations quantized
+    // or not: one that quantizes them does so on each rank's share.
+    if let Operation::Linear(Linear::Matmul { .. }) = op {
+        return Rule::Contract {
             act: "act",
             w: "w",
             out: 0,
             input: 1,
-        },
-        "linear.moe_matmul_select"
-        | "linear.moe_matmul_select_bias"
-        | "linear.moe_matmul_select_quant" => Rule::Contract {
+        };
+    }
+    // A plain lookup reads the rows each rank holds of a row-split table; a
+    // weighted or concatenated one reads its table whole.
+    if let Operation::Gather(Gather::Embed {
+        weights, concat, ..
+    }) = op
+    {
+        return if weights.is_none() && !concat {
+            Rule::Lookup { table: "table" }
+        } else {
+            Rule::Whole
+        };
+    }
+    // A sum is linear in both operands, so partial sums stay one; a product
+    // splits with them by head or channel.
+    if let Operation::Elemwise(Elemwise::Binary { op: binary, .. }) = op {
+        return match binary {
+            BinaryOp::Add => Rule::Linear {
+                follow: &["x", "y"],
+            },
+            BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
+        };
+    }
+    // A residual add is linear in its two rows; one under a gate reads its
+    // operands whole.
+    if let Operation::Elemwise(Elemwise::ResidualAdd { gate, .. }) = op {
+        return match gate {
+            None => Rule::Linear {
+                follow: &["x", "y"],
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
+    // An expert product contracts with its bank's split, as a product does.
+    if let Operation::Linear(Linear::MoeSelect { .. }) = op {
+        return Rule::Contract {
             act: "x",
             w: "bank",
             out: 1,
             input: 2,
-        },
-        "linear.moe_weighted_sum" => Rule::Linear {
-            follow: &["routed"],
-        },
-        "elementwise.residual_add" | "elementwise.add" => Rule::Linear {
-            follow: &["x", "y"],
-        },
+        };
+    }
+    // A weighted sum of routed rows is linear in them; one that adds a shared
+    // row reads its operands whole.
+    if let Operation::Linear(Linear::MoeCombine { shared, .. }) = op {
+        return match shared {
+            None => Rule::Linear {
+                follow: &["routed"],
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
+    // A paged attention splits with its query heads, its cache split with
+    // them or kept whole; one under a relative bias reads its operands whole,
+    // as the biased ops did, which had no rule.
+    if let Operation::Attn(Attn::Decode { bias, .. }) = op {
+        return match bias {
+            Some(_) => Rule::Whole,
+            None => Rule::Heads(Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)),
+        };
+    }
+    if let Operation::Attn(Attn::Prefill { bias, .. }) = op {
+        return match bias {
+            Some(_) => Rule::Whole,
+            None => Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole)),
+        };
+    }
+    let name = op.name();
+    match name {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
             follow: &["routed", "shared"],
         },
-        "layout.embed" => Rule::Lookup { table: "table" },
-        "attention.plan_prefill" | "attention.plan_decode" => Rule::Plan {
+        "attn.plan_prefill" | "attn.plan_decode" => Rule::Plan {
             scale: &["q_heads", KV_HEADS],
         },
-        "attention.mla_plan" => Rule::Plan { scale: &["heads"] },
-        "elementwise.rmsnorm" | "elementwise.rmsnorm_plus_one" => Rule::Norm,
+        "attn.mla_plan" => Rule::Plan { scale: &["heads"] },
         "linear.group_routes" => Rule::Groups,
         _ => heads(name).map_or(Rule::Whole, Rule::Heads),
     }
@@ -219,7 +258,7 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
     };
     let mut outs = Vec::new();
     op.outputs(&mut outs);
-    let dists = match rule(at.name) {
+    let dists = match rule(op) {
         Rule::Whole => {
             at.whole_except(pass, &[])?;
             at.check_state(pass, false, Cache::Whole)?;
@@ -557,4 +596,45 @@ fn held_like(
          are held by groups of ranks alike",
         pass.maker(out),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every op name this file keys a rule on names an op: a rule under a
+    /// name no op carries never applies, and its op falls to `Whole`.
+    #[test]
+    fn every_op_a_rule_names_is_an_op() {
+        const GROUPS: [&str; 9] = [
+            "attn",
+            "linear",
+            "elemwise",
+            "gather",
+            "collective",
+            "sampling",
+            "ssm",
+            "fused",
+            "conv",
+        ];
+        let quote = char::from(34);
+        let named: Vec<&str> = include_str!("rules.rs")
+            .split(quote)
+            .skip(1)
+            .step_by(2)
+            .filter(|lit| {
+                lit.split_once('.').is_some_and(|(group, op)| {
+                    GROUPS.contains(&group)
+                        && !op.is_empty()
+                        && op
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                })
+            })
+            .collect();
+        assert!(named.len() > 20, "the rules name {} ops", named.len());
+        let stale: Vec<&&str> = named
+            .iter()
+            .filter(|name| !poem_ir::Operation::names_an_op(name))
+            .collect();
+        assert!(stale.is_empty(), "named by no op: {stale:?}");
+    }
 }

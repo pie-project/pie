@@ -22,7 +22,7 @@ use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 use poem::fact;
-use poem::ops::spatial::{self, Conv};
+use poem::ops::conv::{self, ConvShape};
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
     Trace, Value, Weight, ops, seam, trace_hybrid,
@@ -88,16 +88,16 @@ impl ForwardHybrid for TwoAxis {
         let perm = dit.row_permutation();
         let indptr = dit.group_indptr();
         let o = ops::attn::ragged(
-            &ops::layout::pack_rows(&q, &perm),
-            &ops::layout::pack_rows(&k, &perm),
-            &ops::layout::pack_rows(&v, &perm),
+            &ops::gather::pack_rows(&q, &perm),
+            &ops::gather::pack_rows(&k, &perm),
+            &ops::gather::pack_rows(&v, &perm),
             &indptr,
             &indptr,
             HEAD_DIM,
             SM_SCALE,
             RaggedMask::GroupBlockDiagonal,
         );
-        let o = ops::layout::unpack_rows(&o, &perm);
+        let o = ops::gather::unpack_rows(&o, &perm);
         let y = ops::linear::matmul(&o, &w("o", WIDTH, HEAD_DIM));
         let out = ops::elemwise::residual_add(&x, &y);
         seam::at(seam::VELOCITY, &[&out]);
@@ -110,7 +110,7 @@ impl ForwardHybrid for TwoAxis {
             Dtype::Bf16,
         )
         .conv_taps_major(C_IN, TAPS);
-        let (pixels, pixel_grid) = spatial::conv3d(&xv, &grid, &conv, None, Conv::same3(), None);
+        let (pixels, pixel_grid) = conv::conv3d(&xv, &grid, &conv, None, ConvShape::same3(), None);
         seam::at(seam::PIXELS, &[&pixels, &pixel_grid]);
 
         out

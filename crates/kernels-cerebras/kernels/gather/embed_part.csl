@@ -1,0 +1,17 @@
+// y[r] = table[ids[r]] for the ids in this PE's table rows [lo, lo + share)
+// (an id outside [0, limit) reads row 0), zeros for the others: the PEs'
+// parts add up to the gather.
+fn k_embed_part(ids: [*]i32, table: [*]f32, y: [*]f32, rows: i32, width: i32, limit: i32, lo: i32, share: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var id: i32 = ids[r];
+    if (id < 0 or id >= limit) { id = 0; }
+    if (id >= lo and id < lo + share) {
+      k_copy(y, r * width, table, (id - lo) * width, width);
+    } else {
+      var i: i32 = 0;
+      while (i < width) : (i += 1) { y[r * width + i] = 0.0; }
+    }
+  }
+}
+

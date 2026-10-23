@@ -39,18 +39,18 @@ fn halves(op: &'static str, packed: Tensor, intermediate: u32, y: Tensor) -> Res
 }
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", entry).apply(cut.grid),
+        Fire::at("linear/glu_packed.metal", entry).apply(cut.grid),
         &[cut.packed.arg(), cut.y.arg_mut(), cut.intermediate.arg()],
     )
 }
 
 /// [`swiglu`] over at most eight rows that also lays the register tile's
 /// input table of `y` in `table`, with `counters` arrival counters zeroed:
-/// the table `linear::quant`'s register matmul lays over `y`, bit for bit,
+/// the table `linear::qmm::sg`'s register matmul lays over `y`, bit for bit,
 /// so the down projection reads it and runs no table pass.
 pub fn swiglu_table(
     ctx: &Ctx<'_>,
@@ -60,7 +60,7 @@ pub fn swiglu_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     if y.rows > 8 || !intermediate.is_multiple_of(64) || intermediate > TABLE_WIDEST {
@@ -74,7 +74,7 @@ pub fn swiglu_table(
         ));
     }
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", "packed_swiglu_table").apply(Grid::of(
+        Fire::at("linear/glu_packed.metal", "packed_swiglu_table").apply(Grid::of(
             [intermediate.min(1024), 8, 1],
             [intermediate.min(1024), 1, 1],
         )),
@@ -98,11 +98,11 @@ pub fn swiglu_sorted(
     perm: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", "packed_swiglu_sorted").apply(cut.grid),
+        Fire::at("linear/glu_packed.metal", "packed_swiglu_sorted").apply(cut.grid),
         &[
             cut.packed.arg(),
             cut.y.arg_mut(),
@@ -122,11 +122,15 @@ pub fn swiglu_clamp_alpha_sorted(
     perm: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu_clamp_alpha";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", "packed_gptoss_swiglu_sorted").apply(cut.grid),
+        Fire::at(
+            "linear/glu_packed.metal",
+            "packed_swiglu_clamp_alpha_sorted",
+        )
+        .apply(cut.grid),
         &[
             cut.packed.arg(),
             cut.y.arg_mut(),
@@ -146,11 +150,11 @@ pub fn geglu_tanh_sorted(
     perm: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", "packed_geglu_tanh_sorted").apply(cut.grid),
+        Fire::at("linear/glu_packed.metal", "packed_geglu_tanh_sorted").apply(cut.grid),
         &[
             cut.packed.arg(),
             cut.y.arg_mut(),
@@ -172,12 +176,12 @@ pub fn geglu_tanh_sorted_sums(
     sums: Tensor,
     tile: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     debug_assert!(intermediate.is_multiple_of(64), "whole 64-wide groups");
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", "packed_geglu_tanh_sorted_sums")
+        Fire::at("linear/glu_packed.metal", "packed_geglu_tanh_sorted_sums")
             .apply(Grid::of([256, y.rows, 1], [256, 1, 1])),
         &[
             cut.packed.arg(),
@@ -197,11 +201,11 @@ pub fn swiglu_clamp(
     limit: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu_clamp";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_clamp_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", entry).apply(cut.grid),
+        Fire::at("linear/glu_packed.metal", entry).apply(cut.grid),
         &[
             cut.packed.arg(),
             cut.y.arg_mut(),
@@ -219,11 +223,11 @@ pub fn swiglu_clamp_alpha(
     alpha: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu_clamp_alpha";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_gptoss_swiglu_bfloat16" });
+    const OP: &str = "linear.glu";
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_clamp_alpha_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", entry).apply(cut.grid),
+        Fire::at("linear/glu_packed.metal", entry).apply(cut.grid),
         &[
             cut.packed.arg(),
             cut.y.arg_mut(),
@@ -241,7 +245,7 @@ pub fn swiglu_clamp_split(
     limit: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_swiglu_clamp_split";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "swiglu_clamp_bfloat16" });
     debug_assert_eq!(
         (up.rows, up.width),
@@ -254,7 +258,7 @@ pub fn swiglu_clamp_split(
         "the activation lands on the halves' own rectangle"
     );
     ctx.fire(
-        Fire::at("linear/mlp_gated.metal", entry).apply(Grid::of(
+        Fire::at("linear/glu_split.metal", entry).apply(Grid::of(
             elementwise(OP, gate.width, gate.rows)?,
             [GROUP, 1, 1],
         )),
@@ -263,10 +267,10 @@ pub fn swiglu_clamp_split(
 }
 
 pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_geglu_tanh";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "geglu_tanh_bfloat16" });
     ctx.fire(
-        Fire::at("linear/mlp_gated.metal", entry).apply(Grid::of(
+        Fire::at("linear/glu_split.metal", entry).apply(Grid::of(
             elementwise(OP, gate.width, gate.rows)?,
             [GROUP, 1, 1],
         )),
@@ -275,10 +279,10 @@ pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<
 }
 
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_gelu_tanh";
+    const OP: &str = "linear.gelu_tanh";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mlp_gelu_tanh_bfloat16" });
     ctx.fire(
-        Fire::at("linear/mlp_gated.metal", entry)
+        Fire::at("linear/glu_split.metal", entry)
             .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [GROUP, 1, 1])),
         &[x.arg(), y.arg_mut()],
     )
@@ -290,11 +294,11 @@ pub fn geglu_tanh_packed(
     intermediate: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_geglu_tanh_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", entry).apply(cut.grid),
+        Fire::at("linear/glu_packed.metal", entry).apply(cut.grid),
         &[cut.packed.arg(), cut.y.arg_mut(), cut.intermediate.arg()],
     )
 }
@@ -307,14 +311,14 @@ pub fn situ(
     up_cap: Option<f32>,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_situ";
+    const OP: &str = "linear.glu";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_situ_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
-        Fire::at("linear/mlp_packed.metal", entry).apply(cut.grid),
+        Fire::at("linear/glu_packed.metal", entry).apply(cut.grid),
         &[
             cut.packed.arg(),
             cut.y.arg_mut(),

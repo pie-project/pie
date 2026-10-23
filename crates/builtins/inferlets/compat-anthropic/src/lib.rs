@@ -8,14 +8,15 @@
 //!
 //! Supported: `system` (string or text blocks), `messages` with `text`,
 //! `tool_use` and `tool_result` blocks and a user's `image` blocks (a
-//! `base64` source), `tools` (custom tools with
-//! `input_schema`), `tool_choice` (`auto`/`any`/`tool`/`none`), `thinking`
+//! `base64` source), `tools` (custom tools with `input_schema`),
+//! `tool_choice` (`auto`/`any`/`tool`/`none`), `thinking`
 //! (`enabled`/`disabled`; off when absent, as the API says),
 //! `stop_sequences`, `temperature`, `top_p`, `top_k`, `max_tokens`
 //! (required), `stream`.
 //!
-//! Refused with 400: an image by `url` source, document blocks, built-in tool types, and
-//! more than one candidate. `anthropic-version` and `metadata` are ignored.
+//! Refused with 400: an image by `url` source, document blocks, built-in
+//! tool types, and more than one candidate. `anthropic-version` and
+//! `metadata` are ignored.
 
 use compat::{
     ApiError, Envelope, Event, Finish, Message, Request, Role, Thinking, ToolCall, ToolChoice, emit,
@@ -52,7 +53,6 @@ fn invalid(message: impl Into<String>) -> ApiError {
     )
 }
 
-/// Text blocks (or a bare string) joined.
 /// The bytes of an `image` block: a `base64` source, its payload beside its
 /// `media_type`. A `url` source would have this server fetch it, which it
 /// cannot.
@@ -71,6 +71,7 @@ fn image_of(block: &Value, what: &str) -> Result<Vec<u8>, ApiError> {
     }
 }
 
+/// Text blocks (or a bare string) joined.
 fn text_of(value: &Value, what: &str) -> Result<String, ApiError> {
     match value {
         Value::String(s) => Ok(s.clone()),

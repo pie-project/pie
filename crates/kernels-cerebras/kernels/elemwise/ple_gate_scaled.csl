@@ -1,0 +1,29 @@
+// The gate of k_ple_gate from the `parts` column blocks' partial dots in
+// pd[r, s, parts] (full = the whole stream's width), scaling this PE's h
+// columns of the value: y[r, s, i] = gate * value[r, i].
+fn k_ple_gate_scaled(value: [*]f32, pd: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32, parts: i32, full: i32) void {
+  var inv_sqrt_h: f32 = 1.0 / math.sqrt_f32(@as(f32, full));
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var d: f32 = 0.0;
+      var c: i32 = 0;
+      while (c < parts) : (c += 1) { d = d + pd[(r * m + s) * parts + c]; }
+      d = d * inv_sqrt_h;
+      var a: f32 = d;
+      if (a < 0.0) { a = -a; }
+      if (a < 0.000001) { a = 0.000001; }
+      var mag: f32 = math.sqrt_f32(a);
+      var damped: f32 = 0.0;
+      if (d > 0.0) { damped = mag; } else if (d < 0.0) { damped = -mag; }
+      var gate: f32 = 1.0 / (1.0 + math.exp_f32(-damped));
+      var base: i32 = (r * m + s) * h;
+      var i: i32 = 0;
+      while (i < h) : (i += 1) {
+        y[base + i] = gate * value[r * h + i];
+      }
+    }
+  }
+}
+

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kernels_metal::icb as layout;
+use kernels_metal::runtime::rebind as layout;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
@@ -124,6 +124,8 @@ fn fire_of(slot: &Slot) -> kernels_metal::Fire {
         stamp: slot.point.stamp,
         lanes: slot.lanes,
         group: slot.group,
+        // A tape launches its lanes, which a kernel with an indirect grid takes too.
+        indirect: None,
     }
 }
 

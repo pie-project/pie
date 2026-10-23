@@ -12,8 +12,8 @@
 // Scores live in the log2 domain (s = q·k · sm_scale · log2 e); a log-sum-
 // exp is m + log2 Σ 2^(s − m), the convention every lse plane here carries.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 #include "attn/kv.hip"
 
 namespace pie::attn {

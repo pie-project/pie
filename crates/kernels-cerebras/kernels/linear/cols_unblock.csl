@@ -1,0 +1,12 @@
+// y[i][c * nl + j] = all[c][i][j]: the n column blocks of a gathered
+// `[n][m][nl]` laid back as rows of y (`m` rows of `n * nl`).
+fn k_cols_unblock(all: [*]f32, y: [*]f32, n: i32, m: i32, nl: i32) void {
+  var c: i32 = 0;
+  while (c < n) : (c += 1) {
+    var i: i32 = 0;
+    while (i < m) : (i += 1) {
+      k_copy(y, i * n * nl + c * nl, all, (c * m + i) * nl, nl);
+    }
+  }
+}
+

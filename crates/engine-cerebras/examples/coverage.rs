@@ -6,13 +6,14 @@
 //! refusal), or `PANIC`.
 //!
 //! ```text
-//! cargo run --release -p engine-cerebras --example coverage -- [--compile] [--lean] [--dump DIR] [-v] [filter...]
+//! cargo run --release -p engine-cerebras --example coverage -- [--compile] [--lean] [--dump DIR] [--shard I/N] [-v] [filter...]
 //! ```
 //!
 //! `--lean` skips the classes that run a custom-mask, adapter or score
 //! capture arm. `--compile` also compiles every emitted program with cslc;
 //! `--dump DIR` writes each deployment's programs as
-//! `DIR/<deployment>.<n>.csl.txt`; `-v` prints every fire.
+//! `DIR/<deployment>.<n>.csl.txt`; `--shard I/N` takes every Nth deployment
+//! from the Ith (one process of N side by side); `-v` prints every fire.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ fn main() {
     let mut lean = false;
     let mut verbose = false;
     let mut dump: Option<PathBuf> = None;
+    let mut shard = (0usize, 1usize);
     let mut filters: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -37,6 +39,16 @@ fn main() {
             "-v" => verbose = true,
             "--lean" => lean = true,
             "--dump" => dump = args.next().map(PathBuf::from),
+            "--shard" => {
+                shard = args
+                    .next()
+                    .and_then(|s| {
+                        let (i, n) = s.split_once('/')?;
+                        Some((i.parse().ok()?, n.parse().ok()?))
+                    })
+                    .filter(|(i, n)| i < n)
+                    .expect("--shard I/N with I < N");
+            }
             other => filters.push(other.to_string()),
         }
     }
@@ -50,7 +62,10 @@ fn main() {
                 Box::new(|| d.trace(Platform::Cerebras)) as TraceFn,
             )
         });
-    for (name, trace) in catalog.chain(dev_models()) {
+    for (at, (name, trace)) in catalog.chain(dev_models()).enumerate() {
+        if at % shard.1 != shard.0 {
+            continue;
+        }
         if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
             continue;
         }

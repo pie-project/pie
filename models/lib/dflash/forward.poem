@@ -46,12 +46,12 @@ def conv_prepare(x, c):
     if c == None:
         return x, None
     coeff = ops.linear.matmul(x, c.proj)
-    return ops.attn.block_dyn_conv(x, coeff, c.base, 0, c.taps, c.group), coeff
+    return ops.ssm.dyn_conv(x, coeff, c.base, 0, c.taps, c.group), coeff
 
 def conv_finish(y, c, coeff):
     if c == None or coeff == None:
         return y
-    return ops.attn.block_dyn_conv(y, coeff, c.base, 1, c.taps, c.group)
+    return ops.ssm.dyn_conv(y, coeff, c.base, 1, c.taps, c.group)
 
 def arm(d, inputs, fused, h_block, mask, block_draft):
     """The drafted block's hidden rows, from the trunk's `fused` taps and
@@ -64,7 +64,7 @@ def arm(d, inputs, fused, h_block, mask, block_draft):
         k = biased(ops.linear.matmul(h_ctx, a.k_proj), a.k_bias)
         v = biased(ops.linear.matmul(h_ctx, a.v_proj), a.v_bias)
         k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, hd, a.k_norm_eps)
-        k = ops.elemwise.rope_partial_q(k, ctx_positions, a.rotary_dim, hd, a.theta)
+        k = ops.elemwise.rope(k, ctx_positions, hd, a.theta, rotary.partial(a.rotary_dim))
         ops.attn.kv_append(k, v, inputs.kv(a.kv), inputs.write_page(a.kv), inputs.write_offset(a.kv))
 
     input_block = inputs.on(block_draft)
@@ -81,19 +81,32 @@ def arm(d, inputs, fused, h_block, mask, block_draft):
         v = biased(ops.linear.matmul(x, a.v_proj), a.v_bias)
         q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, hd, a.q_norm_eps)
         k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, hd, a.k_norm_eps)
-        q, k = ops.elemwise.rope_partial(q, k, block_positions, a.rotary_dim, hd, a.theta)
+        q, k = ops.elemwise.rope(q, block_positions, hd, a.theta, rotary.partial(a.rotary_dim), k = k)
         ops.attn.kv_append(k, v, inputs.kv(a.kv), inputs.write_page(a.kv), inputs.write_offset(a.kv))
         if b.window != None and not d.bidirectional:
             o = ops.attn.prefill(q, plan, inputs.kv(a.kv), b.window, hd, a.kv_heads, a.sm_scale)
         else:
-            o = ops.attn.masked(q, plan, mask, inputs.kv(a.kv), b.window, hd, a.kv_heads, False, a.sm_scale)
+            o = ops.attn.prefill(
+                q,
+                plan,
+                inputs.kv(a.kv),
+                b.window,
+                hd,
+                a.kv_heads,
+                a.sm_scale,
+                mask = mask,
+                causal = False,
+            )
         o = biased(ops.linear.matmul(o, a.o_proj), a.o_bias)
         o = conv_finish(o, b.attn_conv, attn_coeff)
         h = ops.elemwise.residual_add(o, h)
 
         x = ops.elemwise.rmsnorm_plus_one(h, b.mlp_norm, b.mlp_norm_eps)
         x, mlp_coeff = conv_prepare(x, b.mlp_conv)
-        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, b.mlp.gate_up), b.mlp.inter), b.mlp.down)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, b.mlp.gate_up), gating.swiglu(), b.mlp.inter),
+            b.mlp.down,
+        )
         f = conv_finish(f, b.mlp_conv, mlp_coeff)
         h = ops.elemwise.residual_add(f, h)
     return ops.elemwise.rmsnorm_plus_one(h, d.norm, d.norm_eps)
@@ -115,11 +128,11 @@ def plant_readout(d, logits, inputs, read, block_draft):
     seam.at(seam.MTP, [dlogits])
     sel = d.selector
     if sel != None:
-        unary, cand = ops.layout.topk(dlogits, sel.top_k)
+        unary, cand = ops.sampling.top_k(dlogits, sel.top_k)
         hb = read.on(block_draft)
         hp = ops.linear.matmul(hb, sel.hidden_projection) if sel.hidden_projection != None else None
-        toks = ops.layout.gather_rows(inputs.tokens(), inputs.readout_rows()).on(block_draft)
-        picks = ops.attn.selector_walk(cand, unary, hp, toks, sel.pred, sel.succ, d.proposals_from)
+        toks = ops.gather.gather_rows(inputs.tokens(), inputs.readout_rows()).on(block_draft)
+        picks = ops.sampling.selector_walk(cand, unary, hp, toks, sel.pred, sel.succ, d.proposals_from)
     else:
-        picks = ops.layout.argmax([dlogits])
+        picks = ops.sampling.argmax([dlogits])
     seam.at(seam.MTP_DRAFTS, [picks])

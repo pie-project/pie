@@ -1,0 +1,23 @@
+// y = (x - mean) / sqrt(var + eps) * w + b per row.
+fn k_layernorm(x: [*]f32, w: [*]f32, b: [*]f32, y: [*]f32, rows: i32, width: i32, eps: f32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var base: i32 = r * width;
+    var sum: f32 = 0.0;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) { sum = sum + x[base + i]; }
+    var mean: f32 = sum / @as(f32, width);
+    var ss: f32 = 0.0;
+    i = 0;
+    while (i < width) : (i += 1) {
+      var d: f32 = x[base + i] - mean;
+      ss = ss + d * d;
+    }
+    var inv: f32 = 1.0 / math.sqrt_f32(ss / @as(f32, width) + eps);
+    i = 0;
+    while (i < width) : (i += 1) {
+      y[base + i] = (x[base + i] - mean) * inv * w[i] + b[i];
+    }
+  }
+}
+

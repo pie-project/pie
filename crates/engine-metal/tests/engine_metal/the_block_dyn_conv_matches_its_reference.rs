@@ -3,7 +3,7 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::attn::dynconv;
+use kernels_metal::ssm::dyn_conv;
 use kernels_metal::tensor::RaggedTensor;
 use poem_ir::Dtype;
 
@@ -117,7 +117,7 @@ fn the_convolution_matches_the_reference_on_both_sides() {
         {
             let frame = device.frame().expect("a frame");
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
-            dynconv::block_dyn_conv(&sink, xt, ct, bt, side, TAPS, GROUP, yt).expect("the launch");
+            dyn_conv::block_dyn_conv(&sink, xt, ct, bt, side, TAPS, GROUP, yt).expect("the launch");
             frame.commit().expect("the commit");
         }
         let got = bf16_floats(
@@ -179,7 +179,7 @@ fn the_convolution_matches_the_reference_on_both_sides() {
     {
         let frame = device.frame().expect("a frame");
         let sink = Sink::new(&device, &frame, &pipelines, &handles);
-        dynconv::block_dyn_conv(&sink, xt, ct, bt, 1, TAPS, GROUP, yt).expect("the launch");
+        dyn_conv::block_dyn_conv(&sink, xt, ct, bt, 1, TAPS, GROUP, yt).expect("the launch");
         frame.commit().expect("the commit");
     }
     let after = bf16_floats(

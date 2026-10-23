@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use engine_xla::serve::{Clips, Seated};
 use engine_xla::{Boot, DeviceBoot, Lane, Shell};
-use poem::ops::spatial::{self, Conv};
+use poem::ops::conv::{self, ConvShape};
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
 
@@ -62,11 +62,25 @@ impl ForwardHybrid for Decoder {
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
-        let (h, g1) = spatial::conv3d(&x, &g, &self.conv1, Some(&self.b1), Conv::same3(), None);
-        let h = spatial::group_norm(&h, &g1, GROUPS as u32, &self.gn_w, &self.gn_b, EPS, true);
-        let (h, g2) = spatial::upsample_nearest(&h, &g1, [1, 2, 2], false);
-        let (h, g3) = spatial::conv3d(&h, &g2, &self.conv2, Some(&self.b2), Conv::same3(), None);
-        let (y, g4) = spatial::pixel_shuffle(&h, &g3, [1, 2, 2]);
+        let (h, g1) = conv::conv3d(
+            &x,
+            &g,
+            &self.conv1,
+            Some(&self.b1),
+            ConvShape::same3(),
+            None,
+        );
+        let h = conv::group_norm(&h, &g1, GROUPS as u32, &self.gn_w, &self.gn_b, EPS, true);
+        let (h, g2) = conv::upsample_nearest(&h, &g1, [1, 2, 2], false);
+        let (h, g3) = conv::conv3d(
+            &h,
+            &g2,
+            &self.conv2,
+            Some(&self.b2),
+            ConvShape::same3(),
+            None,
+        );
+        let (y, g4) = conv::pixel_shuffle(&h, &g3, [1, 2, 2]);
         seam::at(seam::PIXELS, &[&y, &g4]);
         y
     }
@@ -544,12 +558,12 @@ impl ForwardHybrid for Causal {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
         let cache = inputs.state("conv.cache");
-        let (y, g1) = spatial::conv3d(
+        let (y, g1) = conv::conv3d(
             &x,
             &g,
             &self.conv,
             Some(&self.bias),
-            Conv::same3().causal(poem_ir::TimePad::Zero),
+            ConvShape::same3().causal(poem_ir::TimePad::Zero),
             Some(cache),
         );
         seam::at(seam::PIXELS, &[&y, &g1]);

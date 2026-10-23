@@ -12,7 +12,7 @@ use eta_ir::types::{MAX_RANK, name_or_unknown};
 
 use std::sync::Arc;
 
-use kernels_cuda::channel::MAX_RING;
+use kernels_cuda::runtime::channel::MAX_RING;
 
 use crate::device::Buffer;
 use crate::error::{Fault, Result};
@@ -230,7 +230,7 @@ pub struct Rings {
     shapes: Vec<ChannelShape>,
     endpoints: Vec<Option<Arc<Endpoint>>>,
     registry: Buffer,
-    device: kernels_cuda::channel::Rings,
+    device: kernels_cuda::runtime::channel::Rings,
 }
 
 impl Rings {
@@ -284,7 +284,7 @@ impl Rings {
             })
             .collect();
         registry.stage(stream, 2 * words as u64, &cap1)?;
-        let device = kernels_cuda::channel::Rings::new(
+        let device = kernels_cuda::runtime::channel::Rings::new(
             registry.at(full_at as u64)?,
             registry.ptr(),
             registry.at(words as u64)?,
@@ -302,7 +302,7 @@ impl Rings {
     }
 
     #[must_use]
-    pub const fn device(&self) -> kernels_cuda::channel::Rings {
+    pub const fn device(&self) -> kernels_cuda::runtime::channel::Rings {
         self.device
     }
 
@@ -330,7 +330,7 @@ impl Rings {
             head.extend_from_slice(&((cursor.head % ring) as u32).to_le_bytes());
             tail.extend_from_slice(&((cursor.tail % ring) as u32).to_le_bytes());
             for sequence in cursor.head..cursor.tail {
-                let at = kernels_cuda::channel::Rings::full_at(
+                let at = kernels_cuda::runtime::channel::Rings::full_at(
                     u32::try_from(channel).unwrap_or(u32::MAX),
                     (sequence % ring) as u32,
                 ) as usize;

@@ -84,8 +84,9 @@ fn heavy(trace: &Trace, nodes: &[u32]) -> bool {
     nodes.iter().any(|&i| {
         let name = trace.nodes[i as usize].op.name();
         name.contains("matmul")
-            || name.starts_with("attention.pool_lse")
+            || name.starts_with("attn.pool_lse")
             || name.starts_with("linear.moe")
+            || name.starts_with("fused.moe")
     })
 }
 

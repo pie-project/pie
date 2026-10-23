@@ -2,9 +2,10 @@
 //!
 //! The host machinery (serving, windows, weights, pools, programs) follows
 //! engine-xla's, which itself follows engine-wgpu's. The device half is
-//! [`device`]: roots live on the host, a fire is traced into one CSL program
-//! (`kernels-cerebras`), compiled with `cslc` and run through the SDK
-//! binding in [`sdk`] by a `fabric-run` process per fire.
+//! [`device`]: roots live on the host, a fire is traced into the phases its
+//! kernels (`kernels-cerebras`) emit, assembled into CSL programs by
+//! [`fabric`], compiled with `cslc` and run through the SDK binding in
+//! [`sdk`] by a `fabric-run` process per fire.
 
 pub mod adapter;
 pub mod api;
@@ -16,6 +17,7 @@ mod dispatch;
 pub mod dit;
 mod error;
 pub mod exec;
+pub mod fabric;
 pub mod guest;
 pub mod inputs;
 pub mod mask;
@@ -37,5 +39,6 @@ pub use boot::open;
 pub use error::{Fault, Result, kernel};
 pub use serve::{Boot, FireCost, Fired, Lane, Media, Seated, Shell};
 
-/// The fused kernels this backend ships; the compiler forms only these.
-pub const FUSED: [&str; 0] = [];
+/// The fusions this backend implements: none, so the compiler forms no
+/// fused op here.
+pub static FUSIONS: [poem_compiler::fuse::Rule; 0] = [];

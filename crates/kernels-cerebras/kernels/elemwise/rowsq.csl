@@ -1,0 +1,8 @@
+// ss[r] = sum of squares of row r of x (rows of width).
+fn k_rowsq(x: [*]f32, ss: [*]f32, rows: i32, width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    ss[r] = k_dot(x, r * width, x, r * width, width);
+  }
+}
+

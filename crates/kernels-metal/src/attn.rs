@@ -1,22 +1,12 @@
 pub mod arbiter;
-pub mod q8;
-pub mod split;
-
 pub mod dense;
-
+pub mod kv_codec;
 pub mod merge;
-
-pub mod ple;
-
-pub mod score;
-
-pub mod ssm;
-
-pub mod dynconv;
-
-pub mod selector;
-
+pub mod q8;
 pub mod ragged;
+pub mod score;
+pub mod split;
+pub mod voxel;
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -188,7 +178,7 @@ pub fn plan_decode(
 ) -> Result<DecodePlan, Error> {
     let _ = (ctx, kv_len);
     tables_agree(
-        "attention.plan_decode",
+        "attn.plan_decode",
         positions,
         request_of_token,
         mask,
@@ -214,7 +204,7 @@ pub fn plan_prefill(
 ) -> Result<PrefillPlan, Error> {
     let _ = (ctx, kv_len);
     tables_agree(
-        "attention.plan_prefill",
+        "attn.plan_prefill",
         positions,
         request_of_token,
         mask,
@@ -510,7 +500,7 @@ fn selected(
     debug_assert_eq!(
         selection.dtype,
         Dtype::I32,
-        "`{op}` walks the i32 block ids `attention.index_topk` published"
+        "`{op}` walks the i32 block ids `attn.index_topk` published"
     );
     if window.is_some() {
         return Err(refuse(
@@ -578,7 +568,7 @@ pub fn decode_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
-        "attention.decode_selected",
+        "attn.decode",
         q,
         pool,
         plan.positions,
@@ -609,7 +599,7 @@ pub fn prefill_selected(
     ratio: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_selected";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     selected(
         ctx,
@@ -743,7 +733,7 @@ pub fn decode(
 ) -> Result<(), Error> {
     vector(
         ctx,
-        "attention.decode",
+        "attn.decode",
         q,
         pool,
         plan,
@@ -772,7 +762,7 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     vector(
         ctx,
-        "attention.decode_lse",
+        "attn.decode",
         q,
         pool,
         plan,
@@ -799,7 +789,7 @@ pub fn prefill(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
         ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None, tuning,
@@ -820,7 +810,7 @@ pub fn prefill_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
         ctx,
@@ -853,7 +843,7 @@ pub fn masked(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
+    const OP: &str = "attn.prefill";
     if mask.dtype != Dtype::U8 {
         return Err(refuse(
             OP,
@@ -875,7 +865,7 @@ pub fn sink(
     sink: Tensor,
     head_dim: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.sink";
+    const OP: &str = "attn.sink";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
     if sink.dtype != o.dtype {
         return Err(Error::DtypeUnsupported {
@@ -895,7 +885,7 @@ pub fn sink(
     );
     let lanes = head_grid(OP, head_dim, heads, o.rows)?;
     ctx.fire(
-        Fire::at("attn/attn_sink.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
+        Fire::at("attn/sink.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
         &[o.arg(), o.arg_mut(), lse.arg(), sink.arg()],
     )
 }
@@ -916,7 +906,7 @@ pub fn merge_lse(
 }
 
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attention.logit_softcap";
+    const OP: &str = "elemwise.softcap";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "logit_softcap_bfloat16" });
     ctx.fire(
         Fire::at("attn/logit_softcap.metal", entry)
@@ -1002,7 +992,7 @@ fn append_paged(
                         format!(
                             "the packed KV codec has no write shader stamped at head width \
                              {other}; it packs whole {:?}-element heads",
-                            crate::linear::kv_codec::BLOCKS
+                            crate::attn::kv_codec::BLOCKS
                         ),
                     ));
                 }
@@ -1056,15 +1046,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    append_paged(
-        ctx,
-        "attention.kv_append",
-        k,
-        v,
-        pool,
-        write_page,
-        write_offset,
-    )
+    append_paged(ctx, "attn.kv_append", k, v, pool, write_page, write_offset)
 }
 
 pub fn kv_append_shared(
@@ -1076,7 +1058,7 @@ pub fn kv_append_shared(
 ) -> Result<(), Error> {
     append_paged(
         ctx,
-        "attention.kv_append_shared",
+        "attn.kv_append",
         plane,
         plane,
         pool,
@@ -1293,7 +1275,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         split_kv_a_norm(
             ctx,
-            "attention.mla_latents",
+            "attn.mla_latents",
             kv_a,
             weight,
             eps,
@@ -1318,7 +1300,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         split_kv_a_norm(
             ctx,
-            "attention.mla_latents_rope",
+            "attn.mla_latents_rope",
             kv_a,
             weight,
             eps,
@@ -1397,7 +1379,7 @@ pub mod mla {
         q_nope: Tensor,
         q_pe: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.mla_split_q_b";
+        const OP: &str = "attn.mla_split_q_b";
         let entry = dtype_dispatch!(OP, q_b.dtype, { Bf16 => "mla_split_q_b_bfloat16" });
         let heads = stated(OP, heads)?;
         let nope = stated(OP, nope_dim)?;
@@ -1443,7 +1425,7 @@ pub mod mla {
         v_head_dim: u32,
         q_latent: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.mla_absorb_q";
+        const OP: &str = "attn.mla_absorb_q";
         let entry = dtype_dispatch!(OP, q_nope.dtype, { Bf16 => "mla_absorb_q_bfloat16" });
         let heads_i = stated(OP, heads)?;
         let rank = stated(OP, kv_lora_rank)?;
@@ -1482,7 +1464,7 @@ pub mod mla {
         nope_dim: u32,
         o: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.mla_absorb_out";
+        const OP: &str = "attn.mla_absorb_out";
         let entry = dtype_dispatch!(OP, latent.dtype, { Bf16 => "mla_absorb_out_bfloat16" });
         let heads_i = stated(OP, heads)?;
         let rank = stated(OP, kv_lora_rank)?;
@@ -1525,7 +1507,7 @@ pub mod mla {
         write_page: Tensor,
         write_offset: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.mla_kv_append";
+        const OP: &str = "attn.mla_kv_append";
         let entry = dtype_dispatch!(OP, kv_c.dtype, { Bf16 => "mla_kv_append_bfloat16" });
         if pool.page_size <= 0 {
             return Err(refuse(OP, "the kv page size is zero"));
@@ -1675,7 +1657,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         flash(
             ctx,
-            "attention.mla_decode",
+            "attn.mla_decode",
             q,
             q_pe,
             None,
@@ -1704,7 +1686,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         flash(
             ctx,
-            "attention.mla_prefill",
+            "attn.mla_prefill",
             q.data,
             q_pe,
             None,
@@ -1734,7 +1716,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         flash(
             ctx,
-            "attention.mla_decode_selected",
+            "attn.mla_decode",
             q,
             q_pe,
             Some(selection),
@@ -1764,7 +1746,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         flash(
             ctx,
-            "attention.mla_prefill_selected",
+            "attn.mla_prefill",
             q.data,
             q_pe,
             Some(selection),
@@ -2016,7 +1998,7 @@ pub mod index {
         rope_dim: u32,
         theta: f32,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.index_layernorm_rope";
+        const OP: &str = "attn.index_layernorm_rope";
         let entry = dtype_dispatch!(OP, k.dtype, { Bf16 => "index_knorm_rope_bfloat16" });
         debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
         let head_dim = nonzero(OP, "the index key row's width", k.width)?;
@@ -2046,7 +2028,7 @@ pub mod index {
         rope_dim: u32,
         theta: f32,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.index_rope";
+        const OP: &str = "attn.index_rope";
         let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "index_q_rope_bfloat16" });
         debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
         let n_heads = nonzero(OP, "the head count this rotation states", heads)?;
@@ -2074,7 +2056,7 @@ pub mod index {
         write_page: Tensor,
         write_offset: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.index_kv_append";
+        const OP: &str = "attn.index_kv_append";
         dtype_dispatch!(OP, k.dtype, { Bf16 => () });
         pool_pitch(OP, keys, k.width)?;
         let no_rope = Tensor::new(k.buf, k.rows, 0, k.dtype);
@@ -2090,12 +2072,12 @@ pub mod index {
         ratio: u32,
         entries: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.index_block_mean";
+        const OP: &str = "attn.index_block_mean";
         let entry =
             dtype_dispatch!(OP, entries.dtype, { Bf16 => "index_block_mean_paged_bfloat16" });
         debug_assert!(
             boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
-            "`{OP}` reads the i32 block tables `attention.pool_boundary_*` published"
+            "`{OP}` reads the i32 block tables `attn.pool_boundary_*` published"
         );
         if keys.page_size <= 0 {
             return Err(refuse(OP, "the index cache page size is zero"));
@@ -2144,7 +2126,7 @@ pub mod index {
         ratio: u32,
         selection: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.index_topk";
+        const OP: &str = "attn.index_topk";
         let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "index_topk_paged_bfloat16" });
         debug_assert_eq!(
             selection.dtype,
@@ -2612,7 +2594,7 @@ pub mod pool {
         boundary_req: Tensor,
         boundary_rope: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.pool_boundary_decode";
+        const OP: &str = "attn.pool_boundary";
         boundary_tables(OP, &boundary_pos, &boundary_req);
         boundary_rope_table(OP, &boundary_pos, &boundary_rope);
         let n = stated(OP, nonzero(OP, "rows", boundary_pos.rows)?)?;
@@ -2644,7 +2626,7 @@ pub mod pool {
         boundary_req: Tensor,
         boundary_rope: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.pool_boundary_prefill";
+        const OP: &str = "attn.pool_boundary";
         boundary_tables(OP, &boundary_pos, &boundary_req);
         boundary_rope_table(OP, &boundary_pos, &boundary_rope);
         let n = stated(OP, nonzero(OP, "rows", boundary_pos.rows)?)?;
@@ -2678,7 +2660,7 @@ pub mod pool {
         state_kv: Tensor,
         state_score: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.pool_state_write";
+        const OP: &str = "attn.pool_state_write";
         let entry = dtype_dispatch!(OP, kv.dtype, { Bf16 => "pool_state_write_bfloat16" });
         debug_assert_eq!(
             score.dtype, kv.dtype,
@@ -2763,7 +2745,7 @@ pub mod pool {
         ape: Option<Tensor>,
         entries: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.pool_gather";
+        const OP: &str = "attn.pool_gather";
         let entry = dtype_dispatch!(OP, entries.dtype, { Bf16 => "pool_gather_paged_bfloat16" });
         boundary_tables(OP, &boundary_pos, &boundary_req);
         debug_assert_eq!(
@@ -2879,7 +2861,7 @@ pub mod pool {
         write_page: Tensor,
         write_offset: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.pool_kv_append";
+        const OP: &str = "attn.pool_kv_append";
         let _ = (write_page, write_offset);
         let entry = dtype_dispatch!(OP, entries.dtype, { Bf16 => "pool_store_entries_bfloat16" });
         boundary_tables(OP, &boundary_pos, &boundary_req);
@@ -2925,7 +2907,7 @@ pub mod pool {
         o: Tensor,
         lse: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.pool_lse";
+        const OP: &str = "attn.pool_lse";
         dtype_dispatch!(OP, q.dtype, { Bf16 => () });
         debug_assert_eq!(
             lse.dtype,
@@ -2991,7 +2973,7 @@ pub mod pool {
         o: Tensor,
         lse: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attention.pool_lse_selected";
+        const OP: &str = "attn.pool_lse";
         dtype_dispatch!(OP, q.dtype, { Bf16 => () });
         debug_assert_eq!(
             lse.dtype,
@@ -3001,7 +2983,7 @@ pub mod pool {
         debug_assert_eq!(
             selection.dtype,
             Dtype::I32,
-            "`{OP}` walks the i32 compressed-row ids `attention.index_topk` published"
+            "`{OP}` walks the i32 compressed-row ids `attn.index_topk` published"
         );
         debug_assert_eq!(
             request_of_token.dtype,

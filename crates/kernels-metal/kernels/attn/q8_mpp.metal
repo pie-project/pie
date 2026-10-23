@@ -2,7 +2,7 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp::tensor_ops;
-#include "../common/mpp.metal"
+#include "../prim/mpp.h"
 // KV is int8_t over a q8 pool, whose cells carry their own scale, and bfloat over a pool
 // stored as it was written.
 template <int D, bool DIRECT, typename KV, bool LSE = false>

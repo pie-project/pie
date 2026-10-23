@@ -258,34 +258,53 @@ fn found(
         let Operation::Linear(op) = &node.op else {
             continue;
         };
-        if let Linear::MoeTopkSqrtSoftplus {
+        if let Linear::MoeRoute {
             routes,
             hint: Some(hint),
+            score: poem_ir::RouteScore::SqrtSoftplus { .. },
             ..
         }
-        | Linear::MoeTopkSigmoid {
+        | Linear::MoeRoute {
             routes,
             hint: Some(hint),
+            score: poem_ir::RouteScore::Sigmoid { .. },
             ..
         } = op
         {
             hints.insert(routes.0, *hint);
         }
         let (routes, experts) = match op {
-            Linear::MoeTopkSoftmax {
-                routes, experts, ..
+            Linear::MoeRoute {
+                routes,
+                experts,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSoftmaxScaled {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                scale: Some(_),
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSigmoid {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Sigmoid { .. },
+                ..
             }
-            | Linear::MoeTopkSqrtSoftplus {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::SqrtSoftplus { .. },
+                ..
             }
-            | Linear::MoeHashRoute {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Hash { .. },
+                ..
             } => (*routes, *experts),
             _ => continue,
         };
@@ -301,10 +320,29 @@ fn found(
             continue;
         };
         let (routes, indexed) = match op {
-            Linear::MoeMatmulSelect { bank, routes, .. }
-            | Linear::MoeMatmulSelectQuant { bank, routes, .. } => (*routes, vec![*bank]),
-            Linear::MoeMatmulSelectBias {
-                bank, bias, routes, ..
+            Linear::MoeSelect {
+                bank,
+                routes,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            }
+            | Linear::MoeSelect {
+                bank,
+                routes,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => (*routes, vec![*bank]),
+            Linear::MoeSelect {
+                bank,
+                bias: Some(bias),
+                routes,
+                quantized: false,
+                quant: None,
+                ..
             } => (*routes, vec![*bank, *bias]),
             Linear::MoeBiasSum { bias, routes, .. } => (*routes, vec![*bias]),
             _ => continue,
@@ -421,20 +459,37 @@ fn found(
 #[must_use]
 pub fn fan_out(trace: &Trace, routes: ValueId) -> Option<u32> {
     trace.nodes.iter().find_map(|node| match &node.op {
-        Operation::Linear(Linear::MoeTopkSoftmax {
-            routes: r, top_k, ..
+        Operation::Linear(Linear::MoeRoute {
+            routes: r,
+            top_k,
+            scale: None,
+            score: poem_ir::RouteScore::Softmax,
+            ..
         })
-        | Operation::Linear(Linear::MoeTopkSoftmaxScaled {
-            routes: r, top_k, ..
+        | Operation::Linear(Linear::MoeRoute {
+            routes: r,
+            top_k,
+            scale: Some(_),
+            score: poem_ir::RouteScore::Softmax,
+            ..
         })
-        | Operation::Linear(Linear::MoeTopkSigmoid {
-            routes: r, top_k, ..
+        | Operation::Linear(Linear::MoeRoute {
+            routes: r,
+            top_k,
+            score: poem_ir::RouteScore::Sigmoid { .. },
+            ..
         })
-        | Operation::Linear(Linear::MoeTopkSqrtSoftplus {
-            routes: r, top_k, ..
+        | Operation::Linear(Linear::MoeRoute {
+            routes: r,
+            top_k,
+            score: poem_ir::RouteScore::SqrtSoftplus { .. },
+            ..
         })
-        | Operation::Linear(Linear::MoeHashRoute {
-            routes: r, top_k, ..
+        | Operation::Linear(Linear::MoeRoute {
+            routes: r,
+            top_k,
+            score: poem_ir::RouteScore::Hash { .. },
+            ..
         }) if *r == routes => Some(*top_k),
         _ => None,
     })
@@ -465,11 +520,33 @@ pub fn cuts(trace: &Trace, compiled: &CompiledModel, plan: &Plan) -> Result<Vec<
                 continue;
             };
             let routes = match op {
-                Linear::MoeTopkSoftmax { routes, .. }
-                | Linear::MoeTopkSoftmaxScaled { routes, .. }
-                | Linear::MoeTopkSigmoid { routes, .. }
-                | Linear::MoeTopkSqrtSoftplus { routes, .. }
-                | Linear::MoeHashRoute { routes, .. } => *routes,
+                Linear::MoeRoute {
+                    routes,
+                    scale: None,
+                    score: poem_ir::RouteScore::Softmax,
+                    ..
+                }
+                | Linear::MoeRoute {
+                    routes,
+                    scale: Some(_),
+                    score: poem_ir::RouteScore::Softmax,
+                    ..
+                }
+                | Linear::MoeRoute {
+                    routes,
+                    score: poem_ir::RouteScore::Sigmoid { .. },
+                    ..
+                }
+                | Linear::MoeRoute {
+                    routes,
+                    score: poem_ir::RouteScore::SqrtSoftplus { .. },
+                    ..
+                }
+                | Linear::MoeRoute {
+                    routes,
+                    score: poem_ir::RouteScore::Hash { .. },
+                    ..
+                } => *routes,
                 _ => continue,
             };
             if !streamed.contains(&routes.0) {

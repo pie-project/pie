@@ -61,7 +61,7 @@ fn walk(
     let deployment = poem_compiler::catalog::deployment(&stamp.deployment)
         .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
     let trace = deployment.trace(Platform::Cuda);
-    let facts = deployment.trace(Platform::Cuda).facts;
+    let facts = trace.facts.clone();
     let word = |query_len: usize| facts.word(&Request::new(query_len as u32, false));
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
     let contract =
@@ -188,28 +188,22 @@ fn an_mla_body_appends_only_its_window() {
     let mut strayed = Vec::new();
     for (slot, (a, b)) in eager.iter().zip(&bodied).enumerate() {
         assert_eq!(a.len(), b.len(), "lane {slot} fired as often in both walks");
-        let mut drift = 0.0f32;
         for (step, (a, b)) in a.iter().zip(b).enumerate() {
-            drift = a
+            let drift = a
                 .iter()
                 .zip(b)
                 .map(|(x, y)| (x - y).abs())
-                .fold(drift, f32::max);
+                .fold(0.0f32, f32::max);
             let pick = picks[slot][step] as usize;
             let best = b[argmax(b) as usize];
             if b[pick] < best - TIE {
                 strayed.push(format!(
                     "lane {slot} step {step}: eager picks {pick}, which the bodied row holds \
-                     {:.3} below its best",
+                     {:.3} below its best (rows {drift:.4} apart)",
                     best - b[pick]
                 ));
             }
         }
-        eprintln!(
-            "  lane {slot}: {} rows, drift {drift:.4}, picks {:?}",
-            a.len(),
-            picks[slot]
-        );
     }
     assert!(
         strayed.is_empty(),

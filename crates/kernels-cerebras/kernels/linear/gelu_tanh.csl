@@ -1,0 +1,15 @@
+fn k_gelu_tanh_one(x: f32) f32 {
+  var u: f32 = 0.7978845608 * (x + 0.044715 * x * x * x);
+  var e: f32 = math.exp_f32(2.0 * u);
+  var t: f32 = (e - 1.0) / (e + 1.0);
+  return 0.5 * x * (1.0 + t);
+}
+// y = gelu_tanh(x) over n elements.
+fn k_gelu_tanh(x: [*]f32, y: [*]f32, n: i32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  var dy = @set_dsd_base_addr(k_base_f32, y);
+  dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, n)));
+  @map(k_gelu_tanh_one, dx, dy);
+}
+

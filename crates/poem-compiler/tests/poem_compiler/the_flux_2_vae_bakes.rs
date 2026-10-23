@@ -7,7 +7,7 @@ use checkpoint::contract::{Expr, Partition, TensorType};
 use crate::flux_2_dims::{self as model, vae};
 use poem::generative::{PortKind, ReadoutKind};
 use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
-use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
+use poem_ir::{Attn, Conv, GridRule, ParamLayout, Seam};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -175,11 +175,8 @@ fn the_shapes_are_the_flux2_autoencoders() {
         (0, 0, 0, 0, 0, 0);
     let (mut shuffles, mut unshuffles, mut silu_off) = (0, 0, 0);
     for node in &plan.nodes {
-        let Operation::Spatial(op) = &node.op else {
-            continue;
-        };
-        match op {
-            Spatial::Attention { sm_scale, q, .. } => {
+        match &node.op {
+            Operation::Attn(Attn::Voxel { sm_scale, q, .. }) => {
                 attentions += 1;
                 let Ty::Tensor { shape, dtype } = &plan.values[q.0 as usize].ty else {
                     panic!("a query is a tensor")
@@ -189,11 +186,11 @@ fn the_shapes_are_the_flux2_autoencoders() {
                 assert!(matches!(shape[0], Dim::Voxels | Dim::VoxelsTimes(4)));
                 assert!((sm_scale - 512f32.sqrt().recip()).abs() < 1e-9);
             }
-            Spatial::UpsampleNearest {
+            Operation::Conv(Conv::Upsample {
                 factor,
                 keep_first_frame,
                 ..
-            } => {
+            }) => {
                 assert!(!keep_first_frame);
                 match *factor {
                     [1, 1, 1] => copies += 1,
@@ -201,15 +198,15 @@ fn the_shapes_are_the_flux2_autoencoders() {
                     other => panic!("no upsample of {other:?} belongs to this VAE"),
                 }
             }
-            Spatial::PixelShuffle { r, .. } => {
+            Operation::Conv(Conv::PixelShuffle { r, .. }) => {
                 shuffles += 1;
                 assert_eq!(*r, [1, model::PACK, model::PACK]);
             }
-            Spatial::PixelUnshuffle { r, .. } => {
+            Operation::Conv(Conv::PixelUnshuffle { r, .. }) => {
                 unshuffles += 1;
                 assert_eq!(*r, [1, model::PACK, model::PACK]);
             }
-            Spatial::Conv3d {
+            Operation::Conv(Conv::Conv3d {
                 x,
                 w,
                 k,
@@ -219,7 +216,7 @@ fn the_shapes_are_the_flux2_autoencoders() {
                 causal_t,
                 cache,
                 ..
-            } => {
+            }) => {
                 convs += 1;
                 assert!(!causal_t && cache.is_none() && k[0] == 1 && stride[0] == 1);
                 let c_in = match &plan.values[x.0 as usize].ty {
@@ -250,19 +247,19 @@ fn the_shapes_are_the_flux2_autoencoders() {
                     assert!(matches!((k[1], pad[1]), (3, 1) | (1, 0)));
                 }
             }
-            Spatial::GroupNorm {
+            Operation::Conv(Conv::GroupNorm {
                 groups, eps, silu, ..
-            } => {
+            }) => {
                 norms += 1;
                 assert_eq!((*groups, *eps), (vae::GN_GROUPS, vae::GN_EPS));
                 if !silu {
                     silu_off += 1;
                 }
             }
-            Spatial::Grid {
+            Operation::Conv(Conv::Grid {
                 rule: GridRule::Conv { pad, pad_back, .. },
                 ..
-            } => {
+            }) => {
                 assert!(pad == pad_back || *pad_back == [0, 1, 1]);
             }
             _ => {}

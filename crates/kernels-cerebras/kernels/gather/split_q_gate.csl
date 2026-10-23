@@ -1,0 +1,14 @@
+// Per row and head, packed = [q_h | gate_h] (hd each) cut into q and gate.
+fn k_split_q_gate(src: [*]f32, q: [*]f32, gate: [*]f32, rows: i32, heads: i32, hd: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var h: i32 = 0;
+    while (h < heads) : (h += 1) {
+      var from: i32 = (r * heads + h) * 2 * hd;
+      var to: i32 = (r * heads + h) * hd;
+      k_copy(q, to, src, from, hd);
+      k_copy(gate, to, src, from + hd, hd);
+    }
+  }
+}
+

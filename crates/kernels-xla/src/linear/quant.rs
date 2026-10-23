@@ -3,7 +3,7 @@
 //! row.
 //!
 //! - affine (MLX, `biases` present): `w = s · c + b`, `bits ∈ {2, 4, 8}`,
-//!   as kernels-wgpu `quant/qmv.wgsl` + `common/affine.inc.wgsl` decode it.
+//!   as kernels-slang `linear/qmv.slang` + `prim/affine.slang` decode it.
 //! - symmetric (`biases` absent): the mxfp4 bank the checkpoint pairs with
 //!   `RawE8M0` scales, `bits == 4`: `w = e2m1(c) · 2^(e − 127)`, as
 //!   `common/mxfp4.inc.wgsl` decodes it. (The GPU shells refuse a dense
@@ -29,7 +29,7 @@
 //!   (`s · c + b`, rounded as a GPU qmm stages its tile) and contracted in
 //!   one dense dot.
 //!
-//! Plane layout the engine binds (see [`planes`]):
+//! Plane layout the engine binds (see `planes`):
 //! - `codes`: `rows = n`; the bank's packed dtype (read as the `U8
 //!   [n, k · bits / 8]` bytes it lands as, any width) or already that `U8`
 //!   view.
@@ -38,58 +38,69 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx, elem_of};
+use crate::check::elem_of;
 use crate::error::{Error, refuse};
-use crate::hlo::{Cmp, Elem, Fold, Val};
+use crate::hlo::{Cmp, Elem, Fold, Func, Val};
 use crate::linear::gemm::{dot_split, extent, head_rows, project};
-use crate::tensor::{Bank, Tensor};
+use crate::tensor::{Bank, Landing, Operand, Stored};
+use crate::tuning::Tuning;
 
 /// Whether an `m`-row projection over `groups` groups of a packed bank runs
 /// group-batched; past it the weight is decoded once and contracted densely.
-pub(crate) fn grouped(cx: &Cx<'_>, m: i64, groups: i64) -> bool {
-    m * groups <= cx.tuning().grouped.max_cells
+pub(crate) fn grouped(tuning: Tuning, m: i64, groups: i64) -> bool {
+    m * groups <= tuning.grouped.max_cells
+}
+
+/// The bank as its planes are read: an mxfp4 bank's e8m0 scales as their
+/// bytes. The engine reads these views.
+pub fn bank_view<T: Stored>(w: Bank<T>) -> Bank<T> {
+    if w.biases.is_none() && w.bits == 4 && w.group == 32 {
+        Bank {
+            scales: w.scales.with_dtype(Dtype::U8),
+            ..w
+        }
+    } else {
+        w
+    }
 }
 
 /// A packed plane as a `U8 [rows, row_bytes]` handle over the same bytes: a
 /// packed dtype is read as the bytes it lands as; a `U8` view must already
 /// hold `row_bytes` per row.
-pub(crate) fn byte_view(
+pub(crate) fn byte_view<T: Stored>(
     op: &'static str,
     what: &str,
-    t: Tensor,
+    t: T,
     rows: u32,
     row_bytes: u64,
-) -> Result<Tensor, Error> {
+) -> Result<T, Error> {
     let width = u32::try_from(row_bytes)
         .map_err(|_| refuse(op, format!("a {row_bytes}-byte {what} row")))?;
-    let packed = elem_of(op, t.dtype).is_err();
-    if t.rows != rows || !(packed || (t.dtype == Dtype::U8 && t.width == width)) {
+    let packed = elem_of(op, t.dtype()).is_err();
+    if t.rows() != rows || !(packed || (t.dtype() == Dtype::U8 && t.width() == width)) {
         return Err(refuse(
             op,
             format!(
                 "the {what} plane is {}x{} {:?}, and this op wants {rows} rows of \
                  {row_bytes} bytes",
-                t.rows, t.width, t.dtype
+                t.rows(),
+                t.width(),
+                t.dtype()
             ),
         ));
     }
-    Ok(Tensor::new(t.buf, t.rows, width, Dtype::U8))
+    Ok(t.with_width(width).with_dtype(Dtype::U8))
 }
 
 /// The code planes of a byte plane `u8 [n, G · q]`, concatenated inside each
 /// group: bf16 `[n, G, per · q]`, position `i · q + j` holding code `i` of
 /// the group's byte `j` (the code at `per · j + i`), as its integer value.
-pub(crate) fn code_planes(
-    cx: &mut Cx<'_>,
-    bytes: Val,
-    bits: u32,
-    groups: i64,
-) -> Result<Val, Error> {
-    let dims = cx.dims(bytes).to_vec();
+pub(crate) fn code_planes(f: &mut Func, bytes: Val, bits: u32, groups: i64) -> Result<Val, Error> {
+    let dims = f.dims(bytes).to_vec();
     let (n, w) = (dims[0], dims[1]);
     let q = w / groups;
-    let v = cx.reshape(bytes, &[n, groups, q])?;
-    let v = cx.convert(v, Elem::Bf16);
+    let v = f.reshape(bytes, &[n, groups, q])?;
+    let v = f.convert(v, Elem::Bf16);
     let per = 8 / bits;
     if per == 1 {
         return Ok(v);
@@ -98,56 +109,56 @@ pub(crate) fn code_planes(
     let mut rest = v;
     let mut planes = Vec::with_capacity(per as usize);
     for _ in 1..per {
-        let h = cx.scale(rest, 1.0 / base)?;
-        let h = cx.floor(h);
-        let hb = cx.scale(h, base)?;
-        planes.push(cx.sub(rest, hb)?);
+        let h = f.scale(rest, 1.0 / base)?;
+        let h = f.floor(h);
+        let hb = f.scale(h, base)?;
+        planes.push(f.sub(rest, hb)?);
         rest = h;
     }
     planes.push(rest);
-    Ok(cx.concat(&planes, 2)?)
+    Ok(f.concat(&planes, 2)?)
 }
 
 /// The activation `[m, G · per · q]` in [`code_planes`] order:
 /// `[m, G, per · q]`, position `i · q + j` of group `g` holding column
 /// `g · group + per · j + i`.
-pub(crate) fn permute_act(cx: &mut Cx<'_>, x: Val, groups: i64, per: i64) -> Result<Val, Error> {
-    let dims = cx.dims(x).to_vec();
+pub(crate) fn permute_act(f: &mut Func, x: Val, groups: i64, per: i64) -> Result<Val, Error> {
+    let dims = f.dims(x).to_vec();
     let (m, k) = (dims[0], dims[1]);
     let group = k / groups;
     if per == 1 {
-        return Ok(cx.reshape(x, &[m, groups, group])?);
+        return Ok(f.reshape(x, &[m, groups, group])?);
     }
-    let v = cx.reshape(x, &[m, groups, group / per, per])?;
-    let v = cx.transpose(v, &[0, 1, 3, 2])?;
-    Ok(cx.reshape(v, &[m, groups, group])?)
+    let v = f.reshape(x, &[m, groups, group / per, per])?;
+    let v = f.transpose(v, &[0, 1, 3, 2])?;
+    Ok(f.reshape(v, &[m, groups, group])?)
 }
 
 /// `Σ_g factor[n, g] · (x_g · w_gᵀ)` for `xp: [m, G, group]`, `w: [n, G,
 /// group]` (exact bf16 values), `factor: f32 [n, G]`: f32 `[m, n]`.
-pub(crate) fn grouped_dot(cx: &mut Cx<'_>, xp: Val, w: Val, factor: Val) -> Result<Val, Error> {
+pub(crate) fn grouped_dot(f: &mut Func, xp: Val, w: Val, factor: Val) -> Result<Val, Error> {
     // Fewer than 8 rows run as 8: a 1-row `[G, 1, n]` partial wastes the
     // sublanes and is slower than 8 rows (v6e).
-    let rows = cx.dims(xp)[0];
+    let rows = f.dims(xp)[0];
     let xp = if rows < 8 {
-        let el = cx.elem(xp);
-        let z = cx.const_f(el, 0.0, &[]);
-        cx.pad(xp, z, &[0, 0, 0], &[8 - rows, 0, 0], &[0, 0, 0])?
+        let el = f.elem(xp);
+        let z = f.const_f(el, 0.0, &[]);
+        f.pad(xp, z, &[0, 0, 0], &[8 - rows, 0, 0], &[0, 0, 0])?
     } else {
         xp
     };
-    let m = cx.dims(xp)[0];
-    let (n, g) = (cx.dims(w)[0], cx.dims(w)[1]);
-    let p = if cx.elem(xp) == Elem::Bf16 {
-        cx.dot_general(xp, w, &[1], &[1], &[2], &[2], Elem::F32)?
+    let m = f.dims(xp)[0];
+    let (n, g) = (f.dims(w)[0], f.dims(w)[1]);
+    let p = if f.elem(xp) == Elem::Bf16 {
+        f.dot_general(xp, w, &[1], &[1], &[2], &[2], Elem::F32)?
     } else {
-        dot_split(cx, xp, w, 3, &[1], &[1], &[2], &[2])?
+        dot_split(f, xp, w, 3, &[1], &[1], &[2], &[2])?
     };
-    let f = cx.broadcast(factor, &[g, m, n], &[2, 0])?;
-    let p = cx.mul(p, f)?;
-    let out = cx.reduce(p, &[0], Fold::Sum)?;
+    let fq = f.broadcast(factor, &[g, m, n], &[2, 0])?;
+    let p = f.mul(p, fq)?;
+    let out = f.reduce(p, &[0], Fold::Sum)?;
     Ok(if rows < m {
-        cx.slice_axis(out, 0, 0, rows)?
+        f.slice_axis(out, 0, 0, rows)?
     } else {
         out
     })
@@ -155,32 +166,32 @@ pub(crate) fn grouped_dot(cx: &mut Cx<'_>, xp: Val, w: Val, factor: Val) -> Resu
 
 /// `Σ_g bias[n, g] · Σ_{k ∈ g} x[m, k]`, the affine offset's share: f32
 /// `[m, n]` for `x: [m, G · group]`, `bias: f32 [n, G]`.
-pub(crate) fn offset_dot(cx: &mut Cx<'_>, x: Val, bias: Val) -> Result<Val, Error> {
-    let (m, k) = (cx.dims(x)[0], cx.dims(x)[1]);
-    let g = cx.dims(bias)[1];
-    let xs = cx.convert(x, Elem::F32);
-    let xs = cx.reshape(xs, &[m, g, k / g])?;
-    let xs = cx.reduce(xs, &[2], Fold::Sum)?;
-    Ok(cx.dot_general(xs, bias, &[], &[], &[1], &[1], Elem::F32)?)
+pub(crate) fn offset_dot(f: &mut Func, x: Val, bias: Val) -> Result<Val, Error> {
+    let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
+    let g = f.dims(bias)[1];
+    let xs = f.convert(x, Elem::F32);
+    let xs = f.reshape(xs, &[m, g, k / g])?;
+    let xs = f.reduce(xs, &[2], Fold::Sum)?;
+    Ok(f.dot_general(xs, bias, &[], &[], &[1], &[1], Elem::F32)?)
 }
 
 /// Group planes `w: [n, G, group]` ([`code_planes`] order) decoded to f32
 /// `[n, G · group]`: `w · factor (+ bias)` per group.
 pub(crate) fn materialize(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     w: Val,
     factor: Val,
     bias: Option<Val>,
 ) -> Result<Val, Error> {
-    let d = cx.dims(w).to_vec();
-    let w = cx.convert(w, Elem::F32);
-    let f = cx.broadcast(factor, &d, &[0, 1])?;
-    let mut v = cx.mul(w, f)?;
+    let d = f.dims(w).to_vec();
+    let w = f.convert(w, Elem::F32);
+    let fq = f.broadcast(factor, &d, &[0, 1])?;
+    let mut v = f.mul(w, fq)?;
     if let Some(b) = bias {
-        let b = cx.broadcast(b, &d, &[0, 1])?;
-        v = cx.add(v, b)?;
+        let b = f.broadcast(b, &d, &[0, 1])?;
+        v = f.add(v, b)?;
     }
-    Ok(cx.reshape(v, &[d[0], d[1] * d[2]])?)
+    Ok(f.reshape(v, &[d[0], d[1] * d[2]])?)
 }
 
 /// `x · wᵀ` for packed codes `raw: u8 [n, k · bits / 8]` with one `factor`
@@ -189,105 +200,106 @@ pub(crate) fn materialize(
 /// every decoded weight times its factor is a bf16.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn contract_codes(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     x: Val,
     raw: Val,
     bits: u32,
     groups: i64,
     factor: Val,
     bias: Option<Val>,
-    decode: &dyn Fn(&mut Cx<'_>, Val) -> Result<Val, Error>,
+    decode: &dyn Fn(&mut Func, Val) -> Result<Val, Error>,
     exact: bool,
+    tuning: Tuning,
 ) -> Result<Val, Error> {
-    let m = cx.dims(x)[0];
+    let m = f.dims(x)[0];
     let per = i64::from(8 / bits);
-    let w = code_planes(cx, raw, bits, groups)?;
-    let w = decode(cx, w)?;
-    let xp = permute_act(cx, x, groups, per)?;
-    if grouped(cx, m, groups) {
-        let mut out = grouped_dot(cx, xp, w, factor)?;
+    let w = code_planes(f, raw, bits, groups)?;
+    let w = decode(f, w)?;
+    let xp = permute_act(f, x, groups, per)?;
+    if grouped(tuning, m, groups) {
+        let mut out = grouped_dot(f, xp, w, factor)?;
         if let Some(b) = bias {
-            let o = offset_dot(cx, x, b)?;
-            out = cx.add(out, o)?;
+            let o = offset_dot(f, x, b)?;
+            out = f.add(out, o)?;
         }
         return Ok(out);
     }
-    let wv = materialize(cx, w, factor, bias)?;
-    let k = cx.dims(wv)[1];
-    let xp = cx.reshape(xp, &[m, k])?;
-    project(cx, xp, wv, exact)
+    let wv = materialize(f, w, factor, bias)?;
+    let k = f.dims(wv)[1];
+    let xp = f.reshape(xp, &[m, k])?;
+    project(f, xp, wv, exact)
 }
 
 /// The e2m1 value of each code value `c ∈ [0, 16)` of a float array, in its
 /// own type: magnitude `m = c mod 8` maps to `{0, .5, 1, 1.5, 2, 3, 4, 6}`
 /// (`m/2` below 4, `m − 2` below 6, else `2m − 8`), `c ≥ 8` negative. Exact.
-pub(crate) fn e2m1(cx: &mut Cx<'_>, c: Val) -> Result<Val, Error> {
-    let eight = cx.like_f(c, 8.0);
-    let neg = cx.compare(Cmp::Ge, c, eight)?;
-    let lowered = cx.sub(c, eight)?;
-    let m = cx.select(neg, lowered, c)?;
-    let half = cx.scale(m, 0.5)?;
-    let less2 = cx.offset(m, -2.0)?;
-    let twice = cx.scale(m, 2.0)?;
-    let twice = cx.offset(twice, -8.0)?;
-    let four = cx.like_f(c, 4.0);
-    let six = cx.like_f(c, 6.0);
-    let below4 = cx.compare(Cmp::Lt, m, four)?;
-    let below6 = cx.compare(Cmp::Lt, m, six)?;
-    let hi = cx.select(below6, less2, twice)?;
-    let mag = cx.select(below4, half, hi)?;
-    let nmag = cx.neg(mag);
-    Ok(cx.select(neg, nmag, mag)?)
+pub(crate) fn e2m1(f: &mut Func, c: Val) -> Result<Val, Error> {
+    let eight = f.like_f(c, 8.0);
+    let neg = f.compare(Cmp::Ge, c, eight)?;
+    let lowered = f.sub(c, eight)?;
+    let m = f.select(neg, lowered, c)?;
+    let half = f.scale(m, 0.5)?;
+    let less2 = f.offset(m, -2.0)?;
+    let twice = f.scale(m, 2.0)?;
+    let twice = f.offset(twice, -8.0)?;
+    let four = f.like_f(c, 4.0);
+    let six = f.like_f(c, 6.0);
+    let below4 = f.compare(Cmp::Lt, m, four)?;
+    let below6 = f.compare(Cmp::Lt, m, six)?;
+    let hi = f.select(below6, less2, twice)?;
+    let mag = f.select(below4, half, hi)?;
+    let nmag = f.neg(mag);
+    Ok(f.select(neg, nmag, mag)?)
 }
 
 /// `2^(e − 127)` of each e8m0 byte of a u32 array; `0xff` is NaN.
-pub(crate) fn e8m0(cx: &mut Cx<'_>, e: Val) -> Result<Val, Error> {
-    let s23 = cx.like_i(e, 23);
-    let bits = cx.shl(e, s23)?;
-    let v = cx.bitcast(bits, Elem::F32)?;
-    let zero = cx.like_i(e, 0);
-    let is_zero = cx.compare(Cmp::Eq, e, zero)?;
-    let tiny = cx.like_f(v, 2f64.powi(-127));
-    let v = cx.select(is_zero, tiny, v)?;
-    let ff = cx.like_i(e, 0xff);
-    let is_nan = cx.compare(Cmp::Eq, e, ff)?;
-    let nan = cx.like_f(v, f64::NAN);
-    Ok(cx.select(is_nan, nan, v)?)
+pub(crate) fn e8m0(f: &mut Func, e: Val) -> Result<Val, Error> {
+    let s23 = f.like_i(e, 23);
+    let bits = f.shl(e, s23)?;
+    let v = f.bitcast(bits, Elem::F32)?;
+    let zero = f.like_i(e, 0);
+    let is_zero = f.compare(Cmp::Eq, e, zero)?;
+    let tiny = f.like_f(v, 2f64.powi(-127));
+    let v = f.select(is_zero, tiny, v)?;
+    let ff = f.like_i(e, 0xff);
+    let is_nan = f.compare(Cmp::Eq, e, ff)?;
+    let nan = f.like_f(v, f64::NAN);
+    Ok(f.select(is_nan, nan, v)?)
 }
 
 /// The e4m3 (fn) value of each byte of a u32 array, as the nvfp4 shader's
 /// `e4m3_to_f32`: subnormals `m · 2^-9`, `0x7f`/`0xff` NaN.
-pub(crate) fn e4m3(cx: &mut Cx<'_>, b: Val) -> Result<Val, Error> {
-    let three = cx.like_i(b, 3);
-    let fifteen = cx.like_i(b, 15);
-    let seven = cx.like_i(b, 7);
-    let exp = cx.shr(b, three)?;
-    let exp = cx.and(exp, fifteen)?;
-    let man = cx.and(b, seven)?;
+pub(crate) fn e4m3(f: &mut Func, b: Val) -> Result<Val, Error> {
+    let three = f.like_i(b, 3);
+    let fifteen = f.like_i(b, 15);
+    let seven = f.like_i(b, 7);
+    let exp = f.shr(b, three)?;
+    let exp = f.and(exp, fifteen)?;
+    let man = f.and(b, seven)?;
     // normal: (1 + m/8) · 2^(e − 7) on the f32 bits.
-    let bias = cx.like_i(b, 120);
-    let fe = cx.add(exp, bias)?;
-    let s23 = cx.like_i(b, 23);
-    let fe = cx.shl(fe, s23)?;
-    let s20 = cx.like_i(b, 20);
-    let fm = cx.shl(man, s20)?;
-    let normal = cx.or(fe, fm)?;
-    let normal = cx.bitcast(normal, Elem::F32)?;
-    let sub = cx.convert(man, Elem::F32);
-    let sub = cx.scale(sub, 2f64.powi(-9))?;
-    let zero = cx.like_i(b, 0);
-    let is_sub = cx.compare(Cmp::Eq, exp, zero)?;
-    let mag = cx.select(is_sub, sub, normal)?;
-    let is_top = cx.compare(Cmp::Eq, exp, fifteen)?;
-    let is_seven = cx.compare(Cmp::Eq, man, seven)?;
-    let is_nan = cx.and(is_top, is_seven)?;
-    let nan = cx.like_f(mag, f64::NAN);
-    let mag = cx.select(is_nan, nan, mag)?;
-    let x80 = cx.like_i(b, 0x80);
-    let sign = cx.and(b, x80)?;
-    let neg = cx.compare(Cmp::Ne, sign, zero)?;
-    let nmag = cx.neg(mag);
-    Ok(cx.select(neg, nmag, mag)?)
+    let bias = f.like_i(b, 120);
+    let fe = f.add(exp, bias)?;
+    let s23 = f.like_i(b, 23);
+    let fe = f.shl(fe, s23)?;
+    let s20 = f.like_i(b, 20);
+    let fm = f.shl(man, s20)?;
+    let normal = f.or(fe, fm)?;
+    let normal = f.bitcast(normal, Elem::F32)?;
+    let sub = f.convert(man, Elem::F32);
+    let sub = f.scale(sub, 2f64.powi(-9))?;
+    let zero = f.like_i(b, 0);
+    let is_sub = f.compare(Cmp::Eq, exp, zero)?;
+    let mag = f.select(is_sub, sub, normal)?;
+    let is_top = f.compare(Cmp::Eq, exp, fifteen)?;
+    let is_seven = f.compare(Cmp::Eq, man, seven)?;
+    let is_nan = f.and(is_top, is_seven)?;
+    let nan = f.like_f(mag, f64::NAN);
+    let mag = f.select(is_nan, nan, mag)?;
+    let x80 = f.like_i(b, 0x80);
+    let sign = f.and(b, x80)?;
+    let neg = f.compare(Cmp::Ne, sign, zero)?;
+    let nmag = f.neg(mag);
+    Ok(f.select(neg, nmag, mag)?)
 }
 
 /// A bank's codes as read, `[rows, K]`, one per code.
@@ -327,20 +339,20 @@ impl Codes {
 /// first), answering the codes per row it stores.
 pub(crate) fn codes_shape(
     op: &'static str,
-    t: Tensor,
+    t: impl Stored,
     rows: u32,
     k: u64,
     bits: u32,
 ) -> Result<(), Error> {
-    let ok = t.rows == rows
-        && match t.dtype {
-            Dtype::E5m2 => u64::from(t.width) == k,
+    let ok = t.rows() == rows
+        && match t.dtype() {
+            Dtype::E5m2 => u64::from(t.width()) == k,
             // The stored width is the read value's to tell (a packed dtype's
             // handle may view one code per element, or its raw bytes).
             d if crate::pack::code_elem(d).is_some() => crate::pack::code_bits(d) == Some(bits),
             d => match elem_of(op, d) {
                 Ok(e) if e.is_int() => {
-                    u64::from(t.width) * u64::from(e.bits()) == k * u64::from(bits)
+                    u64::from(t.width()) * u64::from(e.bits()) == k * u64::from(bits)
                 }
                 _ => false,
             },
@@ -352,7 +364,9 @@ pub(crate) fn codes_shape(
             op,
             format!(
                 "the code plane is {}x{} {:?}, and this op wants {rows} rows of {k} {bits}-bit codes",
-                t.rows, t.width, t.dtype
+                t.rows(),
+                t.width(),
+                t.dtype()
             ),
         ))
     }
@@ -362,23 +376,19 @@ pub(crate) fn codes_shape(
 /// per element is unpacked in-graph (a minor-axis interleave: correct, and
 /// slow on TPU — the engine lands codes natively, see `crate::pack`).
 pub(crate) fn read_codes(
-    cx: &mut Cx<'_>,
-    t: Tensor,
+    f: &mut Func,
+    t: Operand,
     bits: u32,
     mxfp4: bool,
     rows: i64,
     k: i64,
 ) -> Result<Codes, Error> {
-    let v = cx.read(t)?;
+    let v = t.val;
     // One code per element (`crate::pack`), or several packed per element.
-    let native = matches!(cx.elem(v), Elem::U4 | Elem::F4E2m1fn | Elem::F8E5m2)
-        || cx.ty(v).elements() == rows * k;
-    let v = if native {
-        cx.reshape(v, &[rows, k])?
-    } else {
-        v
-    };
-    Ok(match cx.elem(v) {
+    let native = matches!(f.elem(v), Elem::U4 | Elem::F4E2m1fn | Elem::F8E5m2)
+        || f.ty(v).elements() == rows * k;
+    let v = if native { f.reshape(v, &[rows, k])? } else { v };
+    Ok(match f.elem(v) {
         Elem::F8E5m2 if native => Codes::Weights(v),
         Elem::F4E2m1fn if native => Codes::E2m1(v),
         _ if native => {
@@ -399,24 +409,24 @@ pub(crate) fn read_codes(
             let v = if unsigned == elem {
                 v
             } else {
-                cx.bitcast(v, unsigned)?
+                f.bitcast(v, unsigned)?
             };
             let per = i64::from(unsigned.bits() / bits);
             let units = k / per;
-            let v = cx.reshape(v, &[rows, units])?;
+            let v = f.reshape(v, &[rows, units])?;
             let dims = [rows, units, per];
-            let b = cx.broadcast(v, &dims, &[0, 1])?;
-            let lane = cx.iota(unsigned, &dims, 2);
-            let step = cx.const_i(unsigned, i64::from(bits), &dims);
-            let shift = cx.mul(lane, step)?;
-            let b = cx.shr(b, shift)?;
+            let b = f.broadcast(v, &dims, &[0, 1])?;
+            let lane = f.iota(unsigned, &dims, 2);
+            let step = f.const_i(unsigned, i64::from(bits), &dims);
+            let shift = f.mul(lane, step)?;
+            let b = f.shr(b, shift)?;
             let b = if bits < unsigned.bits() {
-                let mask = cx.const_i(unsigned, (1i64 << bits) - 1, &dims);
-                cx.and(b, mask)?
+                let mask = f.const_i(unsigned, (1i64 << bits) - 1, &dims);
+                f.and(b, mask)?
             } else {
                 b
             };
-            let q = cx.reshape(b, &[rows, k])?;
+            let q = f.reshape(b, &[rows, k])?;
             if mxfp4 {
                 Codes::E2m1Int(q)
             } else {
@@ -428,13 +438,13 @@ pub(crate) fn read_codes(
 
 /// The codes' values before any factor, in `elem` (exact: small integers,
 /// e2m1 values, or e5m2 weights all hold in bf16).
-pub(crate) fn code_values(cx: &mut Cx<'_>, c: Codes, elem: Elem) -> Result<Val, Error> {
+pub(crate) fn code_values(f: &mut Func, c: Codes, elem: Elem) -> Result<Val, Error> {
     Ok(match c {
-        Codes::Int(v) | Codes::E2m1(v) | Codes::Weights(v) => cx.convert(v, elem),
+        Codes::Int(v) | Codes::E2m1(v) | Codes::Weights(v) => f.convert(v, elem),
         Codes::E2m1Int(v) => {
-            let f = cx.convert(v, Elem::F32);
-            let f = e2m1(cx, f)?;
-            cx.convert(f, elem)
+            let fq = f.convert(v, Elem::F32);
+            let fq = e2m1(f, fq)?;
+            f.convert(fq, elem)
         }
     })
 }
@@ -442,62 +452,68 @@ pub(crate) fn code_values(cx: &mut Cx<'_>, c: Codes, elem: Elem) -> Result<Val, 
 /// `x · wᵀ` for codes `[n, k]` with one `factor` (f32 `[n, G]`, and affine
 /// `bias`) per group: f32 `[m, n]`.
 pub(crate) fn contract_native(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     x: Val,
     codes: Codes,
     groups: i64,
     factor: Option<Val>,
     bias: Option<Val>,
+    tuning: Tuning,
 ) -> Result<Val, Error> {
-    let m = cx.dims(x)[0];
+    let m = f.dims(x)[0];
     let (n, k) = {
         let v = match codes {
             Codes::Int(v) | Codes::E2m1(v) | Codes::E2m1Int(v) | Codes::Weights(v) => v,
         };
-        (cx.dims(v)[0], cx.dims(v)[1])
+        (f.dims(v)[0], f.dims(v)[1])
     };
     let (Some(factor), false) = (factor, matches!(codes, Codes::Weights(_))) else {
-        let w = code_values(cx, codes, Elem::Bf16)?;
-        return project(cx, x, w, true);
+        let w = code_values(f, codes, Elem::Bf16)?;
+        return project(f, x, w, true);
     };
-    let q = code_values(cx, codes, Elem::Bf16)?;
-    let q = cx.reshape(q, &[n, groups, k / groups])?;
+    let q = code_values(f, codes, Elem::Bf16)?;
+    let q = f.reshape(q, &[n, groups, k / groups])?;
     // Group-batched: the dot contracts each group on its own and the factors
     // scale the `[G, m, n]` partials, so only a free convert feeds the MXU.
-    if m <= cx.tuning().grouped.max_rows {
-        let xp = cx.reshape(x, &[m, groups, k / groups])?;
-        let mut out = grouped_dot(cx, xp, q, factor)?;
+    if m <= tuning.grouped.max_rows {
+        let xp = f.reshape(x, &[m, groups, k / groups])?;
+        let mut out = grouped_dot(f, xp, q, factor)?;
         if let Some(b) = bias {
-            let o = offset_dot(cx, x, b)?;
-            out = cx.add(out, o)?;
+            let o = offset_dot(f, x, b)?;
+            out = f.add(out, o)?;
         }
         return Ok(out);
     }
-    let w = materialize(cx, q, factor, bias)?;
+    let w = materialize(f, q, factor, bias)?;
     // mxfp4 decodes exactly into bf16; an affine weight is `s · c + b` in f32.
-    project(cx, x, w, bias.is_none())
+    project(f, x, w, bias.is_none())
 }
 
 /// What a bank's planes decode as.
 #[derive(Clone, Copy)]
-pub(crate) enum Form {
-    Affine { biases: Tensor },
+pub(crate) enum Form<T = Operand> {
+    Affine { biases: T },
     Mxfp4,
 }
 
 /// A bank checked against an `[n, k]` projection, its planes as plain views.
 #[derive(Clone, Copy)]
-pub(crate) struct Planes {
-    pub codes: Tensor,
-    pub scales: Tensor,
-    pub form: Form,
+pub(crate) struct Planes<T = Operand> {
+    pub codes: T,
+    pub scales: T,
+    pub form: Form<T>,
     pub bits: u32,
     pub groups: u32,
 }
 
-pub(crate) fn planes(op: &'static str, w: &Bank, n: u32, k: u32) -> Result<Planes, Error> {
+pub(crate) fn planes<T: Stored>(
+    op: &'static str,
+    w: &Bank<T>,
+    n: u32,
+    k: u32,
+) -> Result<Planes<T>, Error> {
     let (group, bits) = (w.group, w.bits);
-    if w.codes.dtype == Dtype::U4g64tiled {
+    if w.codes.dtype() == Dtype::U4g64tiled {
         return Err(refuse(
             op,
             "the codes are U4g64tiled, in m16n8k16 fragment order (kernels-cuda \
@@ -540,17 +556,21 @@ pub(crate) fn planes(op: &'static str, w: &Bank, n: u32, k: u32) -> Result<Plane
             ));
         }
     };
-    let factor = |what: &str, t: Tensor, dtypes: &[Dtype]| -> Result<Tensor, Error> {
-        if !dtypes.contains(&t.dtype) {
-            return Err(Error::DtypeUnsupported { op, dtype: t.dtype });
+    let factor = |what: &str, t: T, dtypes: &[Dtype]| -> Result<T, Error> {
+        if !dtypes.contains(&t.dtype()) {
+            return Err(Error::DtypeUnsupported {
+                op,
+                dtype: t.dtype(),
+            });
         }
-        if t.rows != n || t.width != groups {
+        if t.rows() != n || t.width() != groups {
             return Err(refuse(
                 op,
                 format!(
                     "the {what} plane is {}x{}, and a {n}x{k} bank in groups of {group} \
                      has {n}x{groups}",
-                    t.rows, t.width
+                    t.rows(),
+                    t.width()
                 ),
             ));
         }
@@ -565,7 +585,7 @@ pub(crate) fn planes(op: &'static str, w: &Bank, n: u32, k: u32) -> Result<Plane
         }
         Form::Mxfp4 => {
             let s = factor("scale", w.scales, &[Dtype::E8m0, Dtype::U8])?;
-            (Tensor::new(s.buf, s.rows, s.width, Dtype::U8), Form::Mxfp4)
+            (s.with_dtype(Dtype::U8), Form::Mxfp4)
         }
     };
     Ok(Planes {
@@ -578,78 +598,113 @@ pub(crate) fn planes(op: &'static str, w: &Bank, n: u32, k: u32) -> Result<Plane
 }
 
 /// `x · wᵀ` for the bank, f32 `[m, n]`; `x` is `[m, k]` bf16 or f32.
-pub(crate) fn contract(cx: &mut Cx<'_>, x: Val, p: &Planes) -> Result<Val, Error> {
+pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Result<Val, Error> {
     let g = i64::from(p.groups);
     let n = i64::from(p.codes.rows);
-    let k = cx.dims(x)[1];
-    let raw = cx.read(p.codes)?;
-    if cx.elem(raw) == Elem::U8 && cx.ty(raw).elements() != n * k {
+    let k = f.dims(x)[1];
+    let raw = p.codes.val;
+    if f.elem(raw) == Elem::U8 && f.ty(raw).elements() != n * k {
         // A byte plane packing several codes: the code-plane path.
-        let units = cx.ty(raw).elements() / n;
-        let raw = cx.reshape(raw, &[n, units])?;
+        let units = f.ty(raw).elements() / n;
+        let raw = f.reshape(raw, &[n, units])?;
         return match p.form {
             Form::Affine { biases } => {
-                let s = cx.read_f32(p.scales)?;
-                let b = cx.read_f32(biases)?;
-                contract_codes(cx, x, raw, p.bits, g, s, Some(b), &|_, w| Ok(w), false)
+                let s = p.scales.f32(f);
+                let b = biases.f32(f);
+                contract_codes(
+                    f,
+                    x,
+                    raw,
+                    p.bits,
+                    g,
+                    s,
+                    Some(b),
+                    &|_, w| Ok(w),
+                    false,
+                    tuning,
+                )
             }
             Form::Mxfp4 => {
-                let e = cx.read(p.scales)?;
-                let e = cx.convert(e, Elem::U32);
-                let s = e8m0(cx, e)?;
-                contract_codes(cx, x, raw, p.bits, g, s, None, &|cx, w| e2m1(cx, w), true)
+                let e = p.scales.val;
+                let e = f.convert(e, Elem::U32);
+                let s = e8m0(f, e)?;
+                contract_codes(
+                    f,
+                    x,
+                    raw,
+                    p.bits,
+                    g,
+                    s,
+                    None,
+                    &|f, w| e2m1(f, w),
+                    true,
+                    tuning,
+                )
             }
         };
     }
     let mxfp4 = matches!(p.form, Form::Mxfp4);
-    let codes = read_codes(cx, p.codes, p.bits, mxfp4, n, k)?;
+    let codes = read_codes(f, p.codes, p.bits, mxfp4, n, k)?;
     if let Codes::Weights(_) = codes {
-        return contract_native(cx, x, codes, g, None, None);
+        return contract_native(f, x, codes, g, None, None, tuning);
     }
     match p.form {
         Form::Affine { biases } => {
-            let s = cx.read_f32(p.scales)?;
-            let b = cx.read_f32(biases)?;
-            contract_native(cx, x, codes, g, Some(s), Some(b))
+            let s = p.scales.f32(f);
+            let b = biases.f32(f);
+            contract_native(f, x, codes, g, Some(s), Some(b), tuning)
         }
         Form::Mxfp4 => {
-            let e = cx.read(p.scales)?;
-            let e = cx.convert(e, Elem::U32);
-            let s = e8m0(cx, e)?;
-            contract_native(cx, x, codes, g, Some(s), None)
+            let e = p.scales.val;
+            let e = f.convert(e, Elem::U32);
+            let s = e8m0(f, e)?;
+            contract_native(f, x, codes, g, Some(s), None, tuning)
         }
     }
 }
 
-pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Bank, y: Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, y)
+/// `y = act · wᵀ` for a quantized bank, its planes read as [`bank_view`]
+/// says. Nothing when `y` has no rows.
+pub fn matmul(
+    f: &mut Func,
+    act: Operand,
+    w: Bank<Operand>,
+    y: Landing,
+    tuning: Tuning,
+) -> Result<Option<Val>, Error> {
+    act_x_wt(f, "linear.matmul", act, w, y, tuning)
 }
 
-pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Bank, y: Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y)
+pub fn lm_head(
+    f: &mut Func,
+    act: Operand,
+    w: Bank<Operand>,
+    y: Landing,
+    tuning: Tuning,
+) -> Result<Option<Val>, Error> {
+    act_x_wt(f, "linear.matmul", act, w, y, tuning)
 }
 
 pub fn act_x_wt(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    act: Tensor,
-    w: Bank,
-    y: Tensor,
-) -> Result<(), Error> {
+    act: Operand,
+    w: Bank<Operand>,
+    y: Landing,
+    tuning: Tuning,
+) -> Result<Option<Val>, Error> {
     let (m, n, k) = extent(op, act, y)?;
     let p = planes(op, &w, n, k)?;
     if m == 0 {
-        return Ok(());
+        return Ok(None);
     }
-    ctx.emit(&mut |cx| {
-        let x = cx.read(act)?;
-        let x = head_rows(cx, x, m)?;
-        let x = if cx.elem(x) == Elem::F16 {
-            cx.convert(x, Elem::F32)
-        } else {
-            x
-        };
-        let out = contract(cx, x, &p)?;
-        cx.write(y, out)
-    })
+    let x = act.val;
+    let x = head_rows(f, x, m)?;
+    let x = if f.elem(x) == Elem::F16 {
+        f.convert(x, Elem::F32)
+    } else {
+        x
+    };
+    let out = contract(f, x, &p, tuning)?;
+    Ok(Some(out))
 }

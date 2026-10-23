@@ -9,8 +9,9 @@
 //! half of `serve/prepare.rs`, staged as this shell stages everything else:
 //! host tables handed to the traced program as inputs.
 
+use crate::emit::Emit;
+use crate::handle::Tensor;
 use engine::fire::{PortKind, ReadoutSeam};
-use kernels_xla::{Emit, Tensor};
 use poem_compiler::{CompiledModel, VoxelLadder};
 use poem_exec::fire::{Composition, LaneFacts, LaneRow};
 use poem_ir::{

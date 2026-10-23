@@ -338,7 +338,7 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
         .max();
     let exts =
         unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
-    let cores = kernels_vulkan::cores::shader_cores(&exts, &mut |p2| unsafe {
+    let cores = kernels_slang::cores::shader_cores(&exts, &mut |p2| unsafe {
         instance.get_physical_device_properties2(physical, p2);
     });
     (local, cores)
@@ -555,15 +555,6 @@ impl Context {
     #[must_use]
     pub fn cores(&self) -> u32 {
         self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
-    }
-
-    #[must_use]
-    pub fn tiers(&self) -> Vec<kernels_wgpu::Capability> {
-        let mut out = Vec::new();
-        if self.chip().subgroups_32() {
-            out.push(kernels_wgpu::Capability::Subgroup);
-        }
-        out
     }
 
     #[must_use]

@@ -48,13 +48,50 @@ fn activations_and_binaries_answer_the_host() {
     let of = b.zeros(Dtype::F32, rows, width);
     if !b
         .run(|ctx| {
-            act::silu(ctx, x, outs[0])?;
-            act::tanh(ctx, x, outs[1])?;
-            act::gelu_tanh(ctx, x, outs[2])?;
-            act::gelu_erf(ctx, x, outs[3])?;
-            act::add(ctx, x, y, outs[4])?;
-            act::mul(ctx, x, y, outs[5])?;
-            act::silu(ctx, xf, of)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_o = outs[0];
+                let v = act::silu(l.f(), x_v, o_o.landing())?;
+                l.land(o_o, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_o = outs[1];
+                let v = act::tanh(l.f(), x_v, o_o.landing())?;
+                l.land(o_o, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_o = outs[2];
+                let v = act::gelu_tanh(l.f(), x_v, o_o.landing())?;
+                l.land(o_o, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_o = outs[3];
+                let v = act::gelu_erf(l.f(), x_v, o_o.landing())?;
+                l.land(o_o, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let y_v = l.read(y)?;
+                let o_z = outs[4];
+                let v = act::add(l.f(), x_v, y_v, o_z.landing())?;
+                l.land(o_z, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let y_v = l.read(y)?;
+                let o_z = outs[5];
+                let v = act::mul(l.f(), x_v, y_v, o_z.landing())?;
+                l.land(o_z, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xf)?;
+                let o_o = of;
+                let v = act::silu(l.f(), x_v, o_o.landing())?;
+                l.land(o_o, v)
+            })
         })
         .unwrap()
     {
@@ -102,10 +139,67 @@ fn modulation_forms_and_lane_maps_answer_the_host() {
     let rr = b.bf16(r, w, &xs);
     if !b
         .run(|ctx| {
-            act::modulate(ctx, act::Form::ScaleShift, x, m, None, o_ss)?;
-            act::modulate(ctx, act::Form::Scale, x, g1, Some(lane), o_sc)?;
-            act::modulate(ctx, act::Form::TanhGate, x, g1, Some(lane), o_tg)?;
-            act::gated_residual_add(ctx, rr, g1, y, Some(lane), rr)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let m_v = l.read(m)?;
+                let lane_of_row_v = l.read_opt(None)?;
+                let o_y = o_ss;
+                let v = act::modulate(
+                    l.f(),
+                    act::Form::ScaleShift,
+                    x_v,
+                    m_v,
+                    lane_of_row_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let m_v = l.read(g1)?;
+                let lane_of_row_v = l.read_opt(Some(lane))?;
+                let o_y = o_sc;
+                let v = act::modulate(
+                    l.f(),
+                    act::Form::Scale,
+                    x_v,
+                    m_v,
+                    lane_of_row_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let m_v = l.read(g1)?;
+                let lane_of_row_v = l.read_opt(Some(lane))?;
+                let o_y = o_tg;
+                let v = act::modulate(
+                    l.f(),
+                    act::Form::TanhGate,
+                    x_v,
+                    m_v,
+                    lane_of_row_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let r_v = l.read(rr)?;
+                let g_v = l.read(g1)?;
+                let y_v = l.read(y)?;
+                let lane_of_row_v = l.read_opt(Some(lane))?;
+                let o_r_out = rr;
+                let v = act::gated_residual_add(
+                    l.f(),
+                    r_v,
+                    g_v,
+                    y_v,
+                    lane_of_row_v,
+                    o_r_out.landing(),
+                )?;
+                l.land(o_r_out, v)
+            })
         })
         .unwrap()
     {
@@ -168,10 +262,54 @@ fn sinusoid_and_bucket_tables_answer_the_host() {
     let tu = b.zeros(Dtype::F32, heads as u32, span);
     if !b
         .run(|ctx| {
-            act::sinusoid(ctx, t, dim as u32, 10000.0, false, 1000.0 / 1000.0, y)?;
-            act::sinusoid(ctx, t, 32, 10000.0, true, 2.0, yf)?;
-            act::relative_bucket_bias(ctx, e, max_len, nb, 128.0, true, tb)?;
-            act::relative_bucket_bias(ctx, e, max_len, nb, 128.0, false, tu)
+            engine_xla::lower::lower(ctx, |l| {
+                let t_v = l.read(t)?;
+                let o_y = y;
+                let v = act::sinusoid(
+                    l.f(),
+                    t_v,
+                    dim as u32,
+                    10000.0,
+                    false,
+                    1000.0 / 1000.0,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let t_v = l.read(t)?;
+                let o_y = yf;
+                let v = act::sinusoid(l.f(), t_v, 32, 10000.0, true, 2.0, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let embedding_v = l.read(e)?;
+                let o_y = tb;
+                let v = act::relative_bucket_bias(
+                    l.f(),
+                    embedding_v,
+                    max_len,
+                    nb,
+                    128.0,
+                    true,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let embedding_v = l.read(e)?;
+                let o_y = tu;
+                let v = act::relative_bucket_bias(
+                    l.f(),
+                    embedding_v,
+                    max_len,
+                    nb,
+                    128.0,
+                    false,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -235,10 +373,34 @@ fn gates_and_clamps_answer_the_host() {
     let hi = b.bf16(1, 1, &[1.25]);
     if !b
         .run(|ctx| {
-            gate::sigmoid_mul(ctx, g, x1)?;
-            gate::sigmoid_mul_heads(ctx, ghd, hd as u32, 0.5, x2)?;
-            clip::clamp(ctx, -1.3, 0.7001, x3)?;
-            clip::clamp_learned(ctx, lo, hi, x4)
+            engine_xla::lower::lower(ctx, |l| {
+                let gate_v = l.read(g)?;
+                let x_v = l.read(x1)?;
+                let o_x = x1;
+                let v = gate::sigmoid_mul(l.f(), gate_v, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let gate_v = l.read(ghd)?;
+                let x_v = l.read(x2)?;
+                let o_x = x2;
+                let v = gate::sigmoid_mul_heads(l.f(), gate_v, hd as u32, 0.5, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x3)?;
+                let o_x = x3;
+                let v = clip::clamp(l.f(), -1.3, 0.7001, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x4)?;
+                let lo_v = l.read(lo)?;
+                let hi_v = l.read(hi)?;
+                let o_x = x4;
+                let v = clip::clamp_learned(l.f(), lo_v, hi_v, x_v)?;
+                l.land(o_x, v)
+            })
         })
         .unwrap()
     {

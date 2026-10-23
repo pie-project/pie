@@ -90,17 +90,16 @@ pub fn yarn_of(config: &[u8]) -> Option<u32> {
 /// Whether some rotation of `trace` is scaled already: at stated
 /// frequencies, or by a package's own YaRN.
 fn scales_its_rotation(trace: &Trace) -> bool {
-    use poem_ir::{Elementwise, Operation};
+    use poem_ir::{Elemwise, Operation, Turn};
     trace.nodes.iter().any(|node| {
         matches!(
             &node.op,
-            Operation::Elementwise(
-                Elementwise::RopeFull { freqs: Some(_), .. }
-                    | Elementwise::RopePartial { freqs: Some(_), .. }
-                    | Elementwise::RopePartialQ { freqs: Some(_), .. }
-                    | Elementwise::RopeMrope { freqs: Some(_), .. }
-                    | Elementwise::RopeYarn { .. }
-                    | Elementwise::RopePartialLast { yarn: Some(_), .. }
+            Operation::Elemwise(
+                Elemwise::Rope { freqs: Some(_), .. }
+                    | Elemwise::Rope {
+                        turn: Turn::Yarn { .. } | Turn::Last { yarn: Some(_), .. },
+                        ..
+                    }
             )
         )
     })

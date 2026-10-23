@@ -10,9 +10,9 @@ mod common;
 use common::{Gpu, f16, from_f16, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
+use kernels_rocm::linear::affine::{self, OffsetKind, tiled};
 use kernels_rocm::linear::moe::GroupSeat;
-use kernels_rocm::linear::quant::{self, OffsetKind};
-use kernels_rocm::linear::tiled;
+use kernels_rocm::linear::{cast, dequant};
 
 /// The activation and factor element type.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -190,7 +190,7 @@ fn run(gpu: &Gpu, c: &Case, seed: u64) {
         .collect();
     let xt = gpu.tensor(&x, c.rows, c.k, c.e.dtype());
     let mut y = gpu.zeros(c.rows, c.n, c.e.dtype());
-    quant::matmul(
+    affine::matmul(
         &ctx,
         xt,
         codes,
@@ -350,7 +350,7 @@ fn linear_quant_window_and_seat() {
         let win = gpu.ints(&[live, 0, 0, 0].map(|v| v as i32));
         let mut y = gpu.zeros(rows, n, e.dtype());
         ctx.arm_stage(win.ptr);
-        quant::matmul(
+        affine::matmul(
             &ctx,
             xt,
             dc,
@@ -398,7 +398,7 @@ fn linear_quant_decoded() {
         let w = Weight::new(bits, group, offset, n, k, Elem::Bf16, 21);
         let (codes, scales, offs) = w.planes(&gpu, Elem::Bf16);
         let dst = gpu.zeros(n, k, Elem::Bf16.dtype());
-        quant::decode_into(
+        dequant::decode_into(
             &ctx,
             "linear.matmul",
             codes,
@@ -427,7 +427,7 @@ fn linear_quant_decoded() {
             .collect();
         let xt = gpu.tensor(&x, rows, k, Elem::Bf16.dtype());
         let mut y = gpu.zeros(rows, n, Elem::Bf16.dtype());
-        quant::matmul_via_dense(
+        dequant::matmul_via_dense(
             &ctx,
             xt,
             codes,
@@ -458,7 +458,7 @@ fn linear_quant_casts() {
     let src = values((rows * width) as usize, 31, 3.0);
     let s = gpu.tensor(&src, rows, width, Dtype::F32);
     let mut dst = gpu.zeros(rows, width, Dtype::Bf16);
-    quant::cast_fp32_to(&ctx, s, &mut dst).unwrap();
+    cast::cast_fp32_to(&ctx, s, &mut dst).unwrap();
     let want: Vec<f32> = src.iter().map(|&v| round_bf16(v)).collect();
     assert_eq!(
         gpu.read(&dst),
@@ -476,7 +476,7 @@ fn linear_quant_casts() {
         .collect();
     let mut b = gpu.tensor(&buf, rows, width, Dtype::Bf16);
     let lt = gpu.tensor(&l, 1, width, Dtype::Bf16);
-    quant::scale_rows(&ctx, lt, &mut b).unwrap();
+    cast::scale_rows(&ctx, lt, &mut b).unwrap();
     let want: Vec<f32> = buf
         .iter()
         .enumerate()

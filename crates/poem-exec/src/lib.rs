@@ -16,7 +16,7 @@ pub mod law;
 pub mod store;
 
 pub use dispatch::{
-    Dispatch, DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused,
-    DispatchLayout, DispatchLinear, DispatchProbe, DispatchSpatial,
+    Dispatch, DispatchAttn, DispatchCollective, DispatchConv, DispatchElemwise, DispatchFused,
+    DispatchGather, DispatchLinear, DispatchProbe, DispatchSampling, DispatchSsm,
 };
 pub use error::{Error, KernelError, Result};

@@ -7,8 +7,8 @@
 // gated-residual form (Qwen3.8 Flash Next) mixes and injects by sigmoid
 // gates. f32 throughout, one rounding a store.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 
 namespace pie::elemwise {
 

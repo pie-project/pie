@@ -5,7 +5,6 @@
 
 WINDOWED = 0
 FULL = 1
-CLASSES = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
 
 def caches(m, c):
     spaces = [c.kv_space(m.kv, m.window), c.kv_space(m.kv)]
@@ -14,24 +13,10 @@ def caches(m, c):
         plane = at.kv_heads * m.head_dim
         c.kv(spaces[at.reading], at.kv, [plane, plane], m.head_dim, heads = True, live = [m.qk_head_dim, m.v_head_dim])
 
-def plans(m, input, plan):
-    """`plan` over `input` for each reading, indexed by it."""
-    return [
-        plan(input, m.q_heads, m.window_kv_heads, m.head_dim, m.window),
-        plan(input, m.q_heads, m.full_kv_heads, m.head_dim, None),
-    ]
-
 def forward(m, inputs):
-    mask = inputs.mask()
     positions = inputs.positions()
-    ([input_m, input_s, input_d], input_p) = inputs.partition(CLASSES)
     d = m.head_dim
-
-    plan_m = plans(m, input_m, ops.attn.plan_prefill)
-    plan_s = plans(m, input_s, ops.attn.plan_prefill)
-    plan_d = plans(m, input_d, ops.attn.plan_decode)
-    plan_p = plans(m, input_p, ops.attn.plan_prefill)
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
@@ -44,41 +29,24 @@ def forward(m, inputs):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
         packed = ops.linear.matmul(x, at.qkv)
         if m.unpadded:
-            q, k, v = ops.layout.split_qkv_padded(packed, m.q_heads, kv_heads, m.qk_head_dim, m.v_head_dim, d)
+            q, k, v = ops.gather.split_qkv_padded(packed, m.q_heads, kv_heads, m.qk_head_dim, m.v_head_dim, d)
         else:
-            q, k, v = ops.layout.split_qkv(packed, m.q_heads * d, kv_heads * d)
+            q, k, v = ops.gather.split_qkv(packed, m.q_heads * d, kv_heads * d)
         v = v * f32(m.value_scale)
         seam.at(seam.ATTN_QV, [q, v])
-        q, k = ops.elemwise.rope_partial(q, k, positions, m.rotary_dim, d, at.theta)
+        q, k = ops.elemwise.rope(q, positions, d, at.theta, rotary.partial(m.rotary_dim), k = k)
         ops.attn.kv_append(k, v, pages, inputs.write_page(at.kv), inputs.write_offset(at.kv))
         seam.at(seam.ATTN_Q, [q])
 
-        ([mq, sq, dq], p) = q.partition(CLASSES)
-        if at.sinks != None:
-            o_m, lse_m = ops.attn.masked_lse(mq, plan_m[r], mask, pages, win, d, kv_heads, True, m.sm_scale)
-            o_s, lse_s = ops.attn.prefill_lse(sq, plan_s[r], pages, win, d, kv_heads, m.sm_scale)
-            o_d, lse_d = ops.attn.decode_lse(dq, plan_d[r], pages, win, d, m.sm_scale)
-            o_p, lse_p = ops.attn.prefill_lse(p, plan_p[r], pages, win, d, kv_heads, m.sm_scale)
-            a = merge([
-                ops.attn.sink(o_m, lse_m, at.sinks, d),
-                ops.attn.sink(o_s, lse_s, at.sinks, d),
-                ops.attn.sink(o_d, lse_d, at.sinks, d),
-                ops.attn.sink(o_p, lse_p, at.sinks, d),
-            ])
-        else:
-            o_s, lse_s = ops.attn.prefill_lse(sq, plan_s[r], pages, win, d, kv_heads, m.sm_scale)
-            seam.at(seam.SCORES, [lse_s])
-            a = merge([
-                ops.attn.masked(mq, plan_m[r], mask, pages, win, d, kv_heads, True, m.sm_scale),
-                o_s,
-                ops.attn.decode(dq, plan_d[r], pages, win, d, m.sm_scale),
-                ops.attn.prefill(p, plan_p[r], pages, win, d, kv_heads, m.sm_scale),
-            ])
+        # Each lane by its kind; a layer with sinks folds them in and keeps
+        # its scores in, one without reads them out at their seam.
+        a = ops.attn.attend(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, window = win,
+                            sinks = at.sinks, mask = True, scores = True, scores_seam = at.sinks == None)
         seam.at(seam.ATTN_OUT, [a])
 
         # Each head's values are its first half; the padding after them is
         # cut off before the output projection reads them.
-        a, _ = ops.layout.split_q_gate(a, m.v_head_dim)
+        a, _ = ops.gather.split_q_gate(a, m.v_head_dim)
         o = ops.linear.matmul(a, at.o_proj)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
@@ -90,21 +58,20 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
 
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter)
+        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
         return ops.linear.matmul(act, f.down)
-    routes, weights = ops.linear.moe_topk_sigmoid_biased(
+    routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
-        f.bias,
         f.experts,
         f.top_k,
-        True,
-        1.0,
+        routing.sigmoid(renormalize = True, scaling = 1.0),
+        bias = f.bias,
     )
     packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
-    act = ops.linear.mlp_swiglu(packed, f.inter)
+    act = ops.linear.glu(packed, gating.swiglu(), f.inter)
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k), weights)

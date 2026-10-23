@@ -1,16 +1,19 @@
-//! The fusion rules, in the order they run. A rule that forms a longer chain
-//! runs before one that forms a piece of it.
+//! The fusion rules' constructors, and [`all`]: every rule in every form, in
+//! the order rules run. A rule that forms a longer chain runs before one that
+//! forms a piece of it. A backend builds the rules it implements from these.
 
 use poem::declare::Precision;
-use poem::ops::{attn, elemwise, layout, linear};
+use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, Template, template};
-use poem_ir::ops::fused::PostNorm;
+use poem_ir::ops::fused::{Intermediates, PostNorm, Scaled};
 use poem_ir::{
-    ActQuant, Dim, Dtype, Elementwise, Fused, Layout, ModulateForm, NormKind, Operation,
-    StructKind, Ty,
+    ActQuant, Dim, Dtype, Elemwise, Fused, Gather, ModulateForm, NormKind, Operation, StructKind,
+    Ty,
 };
+use poem_ir::{NormAxis, NormWeight, Turn};
 
 use super::{Match, Rule};
+use poem_ir::GluAct;
 
 /// A placeholder width for pattern holes; the matcher compares op fields, not
 /// the types of the values they hold.
@@ -28,34 +31,52 @@ const W4A8: Precision = Precision {
     act: Some(ActQuant::E4m3 { gran: 128 }),
 };
 
-pub(super) fn all() -> Vec<Rule> {
+/// Every rule, in every form, that forms one of the fused ops `labels`
+/// names. Panics on a label no rule forms.
+#[must_use]
+pub fn forming(labels: &[&str]) -> Vec<Rule> {
+    let rules: Vec<Rule> = all()
+        .into_iter()
+        .filter(|rule| labels.contains(&rule.kernel()))
+        .collect();
+    for label in labels {
+        assert!(
+            rules.iter().any(|rule| rule.kernel() == *label),
+            "`{label}` is a fused op no rule forms"
+        );
+    }
+    rules
+}
+
+/// Every rule in every form it takes, in the order rules run.
+#[must_use]
+pub fn all() -> Vec<Rule> {
     vec![
         split_qkv_fused(),
-        qkv_qknorm_rope_vnorm_write(),
+        qkv_fused_qknorm_rope_vnorm_write(),
         rmsnorm_residual_add(),
         embed_scale_add_select(),
         embed_scale_add(),
         residual_add_rmsnorm(),
-        mlp_swiglu(),
-        matmul_geglu(),
+        matmul_swiglu_matmul(),
+        matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
         moe_experts(),
         moe_select_glu(),
-        matmul_swiglu(),
-        lm_head_softcap(),
+        matmul_softcap(),
         matmul_bias(),
         matmul_split_rows(),
         gated_residual_norm_modulate(),
         norm_modulate(),
-        rmsnorm_rope_partial_q(),
+        norm_rope(Rotated::First),
         hc_norm_project(),
-        ssm_gdn_step(),
-        q_gate_k_norm_rope_append(),
+        gdn_step(),
+        q_gate_norm_rope_append(Intermediates::Written),
         pool_compress(),
         norm_rope_pair(),
         index_topk_rope(),
         norm_rope_last_append(),
-        norm_rope_last(),
-        qg_qknorm_rope_append(),
+        norm_rope(Rotated::Last),
+        q_gate_norm_rope_append(Intermediates::Unwritten),
         split_rope_yarn_append(),
         rope_yarn_append(),
         pool_attention(),
@@ -71,7 +92,8 @@ pub(super) fn all() -> Vec<Rule> {
 /// A sublayer's whole hyper-connection pre-mix: the stream norm read only by
 /// the mix projection, the mixes read only by the combined gates, and their
 /// pre-mixed row read only by an RMS norm.
-fn hc_pre() -> Rule {
+#[must_use]
+pub fn hc_pre() -> Rule {
     let pattern = template(|p| {
         let streams = p.rows("streams", 4 * W);
         let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("mix_eps"));
@@ -95,9 +117,9 @@ fn hc_pre() -> Rule {
         let y = elemwise::rmsnorm(&x, &p.weight("weight", [W]), p.f32("eps"));
         p.export("y", &y);
     });
-    Rule::new("elementwise.hc_pre", [pattern], |m| {
+    Rule::new("fused.hc_pre", [pattern], |m| {
         let elementwise = |name: &str| {
-            let Operation::Elementwise(op) = m.op(name) else {
+            let Operation::Elemwise(op) = m.op(name) else {
                 panic!("`{name}` comes from an elementwise op");
             };
             Box::new(op.clone())
@@ -113,7 +135,8 @@ fn hc_pre() -> Rule {
 
 /// The combined hyper-connection gates whose pre-mixed row only an RMS norm
 /// reads.
-fn hc_gates_norm() -> Rule {
+#[must_use]
+pub fn hc_gates_norm() -> Rule {
     let pattern = template(|p| {
         let mixes = p.value(
             "mixes",
@@ -140,9 +163,9 @@ fn hc_gates_norm() -> Rule {
         let y = elemwise::rmsnorm(&x, &p.weight("weight", [W]), p.f32("eps"));
         p.export("y", &y);
     });
-    Rule::new("elementwise.hc_gates_norm", [pattern], |m| {
+    Rule::new("fused.hc_gates_norm", [pattern], |m| {
         let elementwise = |name: &str| {
-            let Operation::Elementwise(op) = m.op(name) else {
+            let Operation::Elemwise(op) = m.op(name) else {
                 panic!("`{name}` comes from an elementwise op");
             };
             Box::new(op.clone())
@@ -156,7 +179,8 @@ fn hc_gates_norm() -> Rule {
 
 /// AttnRes's blend whose row only an RMS norm reads (Kimi-K3's sublayer
 /// inputs), over however many closed blocks.
-fn res_blend_rmsnorm() -> Rule {
+#[must_use]
+pub fn res_blend_rmsnorm() -> Rule {
     let pattern = template(|p| {
         let prefix = p.rows("prefix", W);
         p.free("blocks");
@@ -171,9 +195,9 @@ fn res_blend_rmsnorm() -> Rule {
         let y = elemwise::rmsnorm(&h, &p.weight("weight", [W]), p.f32("norm_eps"));
         p.export("y", &y);
     });
-    Rule::new("elementwise.res_blend_rmsnorm", [pattern], |m| {
+    Rule::new("fused.res_blend_rmsnorm", [pattern], |m| {
         let elementwise = |name: &str| {
-            let Operation::Elementwise(op) = m.op(name) else {
+            let Operation::Elemwise(op) = m.op(name) else {
                 panic!("`{name}` comes from an elementwise op");
             };
             Box::new(op.clone())
@@ -186,7 +210,8 @@ fn res_blend_rmsnorm() -> Rule {
 }
 
 /// A hyper-connection stream norm read only by the mix projection over it.
-fn hc_prenorm_project() -> Rule {
+#[must_use]
+pub fn hc_prenorm_project() -> Rule {
     let pattern = template(|p| {
         let streams = p.rows("streams", W);
         let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("eps"));
@@ -195,9 +220,9 @@ fn hc_prenorm_project() -> Rule {
         let mixes = elemwise::hc_project(&normed, &p.weight("weight", [24, W]), 4);
         p.export("mixes", &mixes);
     });
-    Rule::new("elementwise.hc_prenorm_project", [pattern], |m| {
+    Rule::new("fused.hc_prenorm_project", [pattern], |m| {
         let elementwise = |name: &str| {
-            let Operation::Elementwise(op) = m.op(name) else {
+            let Operation::Elemwise(op) = m.op(name) else {
                 panic!("`{name}` comes from an elementwise op");
             };
             Box::new(op.clone())
@@ -212,7 +237,8 @@ fn hc_prenorm_project() -> Rule {
 /// DeepSeek-V4's attention: windowed and compressed-pool (all entries or the
 /// indexed ones) log-sum-exp attention over one q, their merge and the sinks;
 /// the window floored at each row's replay floor where it states one.
-fn pool_attention() -> Rule {
+#[must_use]
+pub fn pool_attention() -> Rule {
     let chain = |selected: bool, rotated: bool, floored: bool| {
         template(move |p| {
             let q = p.rows("q", W);
@@ -222,7 +248,7 @@ fn pool_attention() -> Rule {
             let sm_scale = p.f32("sm_scale");
             p.free("window");
             let floor = floored.then(|| p.indices("floor"));
-            let (o, lse) = attn::prefill_lse(
+            let (o, lse) = both(attn::prefill(
                 &q,
                 &plan,
                 cache,
@@ -230,8 +256,17 @@ fn pool_attention() -> Rule {
                 d,
                 p.u32("kv_heads"),
                 sm_scale,
+                true,
+                None,
+                true,
                 floor.as_ref(),
-            );
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            ));
             p.name("o", &o);
             p.name("lse", &lse);
             let positions = p.indices("positions");
@@ -240,21 +275,21 @@ fn pool_attention() -> Rule {
             let (ratio, heads) = (p.u32("ratio"), p.u32("heads"));
             let (po, plse) = if selected {
                 let selection = p.rows("selection", W);
-                attn::pool_lse_selected(
+                attn::pool_lse(
                     &q,
                     &positions,
                     &requests,
-                    &selection,
                     entries,
                     ratio,
-                    p.u32("top_k"),
                     heads,
                     d,
                     sm_scale,
+                    Some(&selection),
+                    Some(p.u32("top_k")),
                 )
             } else {
                 attn::pool_lse(
-                    &q, &positions, &requests, entries, ratio, heads, d, sm_scale,
+                    &q, &positions, &requests, entries, ratio, heads, d, sm_scale, None, None,
                 )
             };
             p.name("po", &po);
@@ -270,16 +305,21 @@ fn pool_attention() -> Rule {
                 p.free("inverse");
                 p.free("yarn");
                 p.name("o_out", &out);
-                let turned = elemwise::rope_partial_last_yarn(
+                let turned = elemwise::rope(
                     &out,
                     &positions,
-                    p.u32("rotary_dim"),
                     d,
                     p.f32("theta"),
-                    false,
-                    false,
+                    Turn::Last {
+                        rotary_dim: p.u32("rotary_dim"),
+                        interleaved: false,
+                        inverse: false,
+                        yarn: None,
+                    },
                     None,
-                );
+                    None,
+                )
+                .0;
                 p.export("o_rot", &turned);
             } else {
                 p.export("o_out", &out);
@@ -287,7 +327,7 @@ fn pool_attention() -> Rule {
         })
     };
     Rule::new(
-        "attention.pool_attention",
+        "fused.pool_attention",
         [
             chain(true, true, false),
             chain(false, true, false),
@@ -300,7 +340,7 @@ fn pool_attention() -> Rule {
         ],
         |m| {
             let attention = |name: &str| {
-                let Operation::Attention(attn) = m.op(name) else {
+                let Operation::Attn(attn) = m.op(name) else {
                     panic!("`{name}` comes from an attention");
                 };
                 Box::new(attn.clone())
@@ -309,11 +349,9 @@ fn pool_attention() -> Rule {
                 window: attention("o"),
                 pool: attention("po"),
                 merge: attention("mo"),
-                sink: m.value("sink"),
-                head_dim: m.u32("d"),
-                o_out: m.value("o_out"),
+                sink: attention("o_out"),
                 rotate: m.get("o_rot").map(|_| {
-                    let Operation::Elementwise(rotate) = m.op("o_rot") else {
+                    let Operation::Elemwise(rotate) = m.op("o_rot") else {
                         unreachable!("the turned rows come from a rotation")
                     };
                     Box::new(rotate.clone())
@@ -326,7 +364,8 @@ fn pool_attention() -> Rule {
 /// A latent attention's prefill: query absorb, scoring over every cached
 /// latent row and output absorb through one `kv_b`, opening on the cut of
 /// `q_b`'s rows where the query reaches it unturned, else on the two halves.
-fn mla_prefill_expanded() -> Rule {
+#[must_use]
+pub fn mla_prefill_expanded() -> Rule {
     let chain = |split: bool| {
         template(move |p| {
             let (heads, rank) = (p.u32("heads"), p.u32("rank"));
@@ -355,18 +394,21 @@ fn mla_prefill_expanded() -> Rule {
                 rank,
                 p.f32("sm_scale"),
                 None,
-            );
+                false,
+                None,
+            )
+            .0;
             p.name("scored", &scored);
             let o = attn::mla_absorb_out(&scored, &kv_b, heads, rank, nope, v);
             p.export("o", &o);
         })
     };
     Rule::new(
-        "attention.mla_prefill_expanded",
+        "fused.mla_prefill_expanded",
         [chain(true), chain(false)],
         |m| {
             let attention = |name: &str| {
-                let Operation::Attention(attn) = m.op(name) else {
+                let Operation::Attn(attn) = m.op(name) else {
                     panic!("`{name}` comes from an attention");
                 };
                 Box::new(attn.clone())
@@ -382,7 +424,8 @@ fn mla_prefill_expanded() -> Rule {
 }
 
 /// A log-sum-exp attention and the sinks over its output.
-fn lse_sink() -> Rule {
+#[must_use]
+pub fn lse_sink() -> Rule {
     let pair = |decode: bool| {
         template(move |p| {
             let q = p.rows("q", W);
@@ -391,10 +434,24 @@ fn lse_sink() -> Rule {
             p.free("window");
             let (o, lse) = if decode {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
-                attn::decode_lse(&q, &plan, cache, None, d, p.f32("sm_scale"))
+                both(attn::decode(
+                    &q,
+                    &plan,
+                    cache,
+                    None,
+                    d,
+                    p.f32("sm_scale"),
+                    true,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
             } else {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
-                attn::prefill_lse(
+                both(attn::prefill(
                     &q,
                     &plan,
                     cache,
@@ -402,8 +459,17 @@ fn lse_sink() -> Rule {
                     d,
                     p.u32("kv_heads"),
                     p.f32("sm_scale"),
+                    true,
                     None,
-                )
+                    true,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
             };
             p.name("o", &o);
             p.name("lse", &lse);
@@ -411,8 +477,8 @@ fn lse_sink() -> Rule {
             p.export("o_out", &out);
         })
     };
-    Rule::new("attention.lse_sink", [pair(true), pair(false)], |m| {
-        let Operation::Attention(attn) = m.op("o") else {
+    Rule::new("fused.lse_sink", [pair(true), pair(false)], |m| {
+        let Operation::Attn(attn) = m.op("o") else {
             panic!("the sinked output comes from an attention");
         };
         Fused::LseSink {
@@ -424,99 +490,41 @@ fn lse_sink() -> Rule {
     })
 }
 
-/// Qwen3.5's attention prologue: q cut from its gate, q and k normed per
-/// head (plus-one weights), turned, and k with its v written to the cache,
-/// through the `attn.qv` marker the model sets on the cut q and v.
-fn qg_qknorm_rope_append() -> Rule {
-    let pattern = template(|p| {
-        let qg = p.rows("qg", 2 * W);
-        let k = p.rows("k", W);
-        let v = p.rows("v", W);
-        let positions = p.indices("positions");
-        let d = p.u32("d");
-        let (q, gate) = layout::split_q_gate(&qg, d);
-        p.name("q_split", &q);
-        p.export("gate", &gate);
-        let qn =
-            elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [W]), d, p.f32("q_eps"));
-        p.name("q_normed", &qn);
-        let kn =
-            elemwise::rmsnorm_per_head_plus_one(&k, &p.weight("k_norm", [W]), d, p.f32("k_eps"));
-        p.name("k_normed", &kn);
-        let (q_out, k_out) = elemwise::rope_partial(
-            &qn,
-            &kn,
-            &positions,
-            p.u32("rotary"),
-            d,
-            p.f32("theta"),
-            Some(p.u32("span")),
-            None,
-        );
-        p.name("k_out", &k_out);
-        let cache = p.cache("cache");
-        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append(&k_out, &v, cache, &write_page, &write_offset);
-        p.export("q_out", &q_out);
-    });
-    Rule::new("elementwise.qg_qknorm_rope_append", [pattern], |m| {
-        Fused::QgQknormRopeAppend {
-            qg: m.value("qg"),
-            k: m.value("k"),
-            v: m.value("v"),
-            positions: m.value("positions"),
-            q_norm: m.value("q_norm"),
-            k_norm: m.value("k_norm"),
-            head_dim: m.u32("d"),
-            q_eps: m.f32("q_eps"),
-            k_eps: m.f32("k_eps"),
-            rotary_dim: m.u32("rotary"),
-            theta: m.f32("theta"),
-            span: m.u32("span"),
-            cache: m.value("cache"),
-            write_page: m.value("write_page"),
-            write_offset: m.value("write_offset"),
-            q_split: m.value("q_split"),
-            gate: m.value("gate"),
-            q_normed: m.value("q_normed"),
-            k_normed: m.value("k_normed"),
-            q_out: m.value("q_out"),
-            k_out: m.value("k_out"),
-        }
-    })
-    .through_markers()
-    .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
-}
-
 /// `rope_yarn_append` reading q, k and v straight from a packed q/k/v row
 /// rather than from a split's copies.
-fn split_rope_yarn_append() -> Rule {
+#[must_use]
+pub fn split_rope_yarn_append() -> Rule {
     let pattern = template(|p| {
         let packed = p.rows("packed", 3 * W);
-        let (q, k, v) = layout::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
+        let (q, k, v) = gather::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
         p.name("k_split", &k);
         p.name("v_split", &v);
         let positions = p.indices("positions");
         p.free("interleaved");
-        let (q, k) = elemwise::rope_yarn(
+        let (q, k) = both(elemwise::rope(
             &q,
-            &k,
             &positions,
             p.u32("d"),
             p.f32("theta"),
-            p.f32("factor"),
-            p.f32("beta_fast"),
-            p.f32("beta_slow"),
-            p.f32("attention_factor"),
-            p.u32("original_max_position"),
-            false,
-        );
+            Turn::Yarn {
+                yarn: elemwise::Yarn {
+                    factor: p.f32("factor"),
+                    beta_fast: p.f32("beta_fast"),
+                    beta_slow: p.f32("beta_slow"),
+                    original_max_position: p.u32("original_max_position"),
+                },
+                attention_factor: p.f32("attention_factor"),
+                interleaved: false,
+            },
+            Some(&k),
+            None,
+        ));
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
         p.export("q_out", &q);
     });
-    Rule::new("elementwise.split_rope_yarn_append", [pattern], |m| {
+    Rule::new("fused.split_rope_yarn_append", [pattern], |m| {
         Fused::SplitRopeYarnAppend {
             packed: m.value("packed"),
             q_width: m.u32("q_width"),
@@ -531,8 +539,11 @@ fn split_rope_yarn_append() -> Rule {
             original_max_position: m.u32("original_max_position"),
             interleaved: matches!(
                 m.op("q_out"),
-                Operation::Elementwise(Elementwise::RopeYarn {
-                    interleaved: true,
+                Operation::Elemwise(Elemwise::Rope {
+                    turn: Turn::Yarn {
+                        interleaved: true,
+                        ..
+                    },
                     ..
                 })
             ),
@@ -557,31 +568,37 @@ fn split_rope_yarn_append() -> Rule {
 }
 
 /// YaRN over q and k, and the rotated k written to the cache with its v.
-fn rope_yarn_append() -> Rule {
+#[must_use]
+pub fn rope_yarn_append() -> Rule {
     let pattern = template(|p| {
         let (q, k, v) = (p.rows("q", W), p.rows("k", W), p.rows("v", W));
         let positions = p.indices("positions");
         p.free("interleaved");
-        let (q, k) = elemwise::rope_yarn(
+        let (q, k) = both(elemwise::rope(
             &q,
-            &k,
             &positions,
             p.u32("d"),
             p.f32("theta"),
-            p.f32("factor"),
-            p.f32("beta_fast"),
-            p.f32("beta_slow"),
-            p.f32("attention_factor"),
-            p.u32("original_max_position"),
-            false,
-        );
+            Turn::Yarn {
+                yarn: elemwise::Yarn {
+                    factor: p.f32("factor"),
+                    beta_fast: p.f32("beta_fast"),
+                    beta_slow: p.f32("beta_slow"),
+                    original_max_position: p.u32("original_max_position"),
+                },
+                attention_factor: p.f32("attention_factor"),
+                interleaved: false,
+            },
+            Some(&k),
+            None,
+        ));
         p.name("k_out", &k);
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
         p.export("q_out", &q);
     });
-    Rule::new("elementwise.rope_yarn_append", [pattern], |m| {
+    Rule::new("fused.rope_yarn_append", [pattern], |m| {
         Fused::RopeYarnAppend {
             q: m.value("q"),
             k: m.value("k"),
@@ -596,8 +613,11 @@ fn rope_yarn_append() -> Rule {
             original_max_position: m.u32("original_max_position"),
             interleaved: matches!(
                 m.op("q_out"),
-                Operation::Elementwise(Elementwise::RopeYarn {
-                    interleaved: true,
+                Operation::Elemwise(Elemwise::Rope {
+                    turn: Turn::Yarn {
+                        interleaved: true,
+                        ..
+                    },
                     ..
                 })
             ),
@@ -638,8 +658,16 @@ impl Norm {
 
 fn plus_one(op: &Operation) -> bool {
     match op {
-        Operation::Elementwise(Elementwise::Rmsnorm { .. }) => false,
-        Operation::Elementwise(Elementwise::RmsnormPlusOne { .. }) => true,
+        Operation::Elemwise(Elemwise::Rmsnorm {
+            weight: NormWeight::Scale(_),
+            axis: NormAxis::Row,
+            ..
+        }) => false,
+        Operation::Elemwise(Elemwise::Rmsnorm {
+            weight: NormWeight::PlusOne(_),
+            axis: NormAxis::Row,
+            ..
+        }) => true,
         other => panic!("{other:?} is not a row norm"),
     }
 }
@@ -648,9 +676,10 @@ fn plus_one(op: &Operation) -> bool {
 /// head, rotate them, and write k and v to the cache. Gemma 4's norms carry
 /// weights and v's a scaleless norm, rotated in part on a global layer;
 /// Muse Spark's are scaleless with v as it is, its global layers unturned.
-fn qkv_qknorm_rope_vnorm_write() -> Rule {
+#[must_use]
+pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
     Rule::new(
-        "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+        "fused.qkv_fused_qknorm_rope_vnorm_write",
         qkv_patterns(false),
         |m| qkv_fused(m, m.value("packed")),
     )
@@ -661,8 +690,9 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
 /// The fused qkv write on the first columns of a row split, the rest of each
 /// row landing as the split's second half (Muse Spark's qkv|gate): the split
 /// read in place, not copied out first.
-fn split_qkv_fused() -> Rule {
-    Rule::new("custom_cuda.split_qkv_fused", qkv_patterns(true), |m| {
+#[must_use]
+pub fn split_qkv_fused() -> Rule {
+    Rule::new("fused.split_qkv_fused", qkv_patterns(true), |m| {
         Fused::SplitQkvFused {
             rest: m.value("rest"),
             qkv: Box::new(qkv_fused(m, m.value("full"))),
@@ -681,7 +711,7 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             let packed = if split {
                 // Any cut matches: the replacement reads the trace's own.
                 let full = p.rows("full", 4 * W);
-                let (packed, rest) = layout::split_rows(&full, W as u32 / 2);
+                let (packed, rest) = gather::split_rows(&full, W as u32 / 2);
                 p.free("width");
                 p.name("packed", &packed);
                 p.export("rest", &rest);
@@ -693,27 +723,29 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             let d = p.u32("d");
             let (q, k, v) = if rope == 4 {
                 let heads = [p.u32("q_heads"), p.u32("kv_heads")];
-                layout::split_qkv_padded(&packed, heads, [p.u32("qk"), p.u32("vw")], d)
+                gather::split_qkv_padded(&packed, heads, [p.u32("qk"), p.u32("vw")], d)
             } else {
-                layout::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"))
+                gather::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"))
             };
             if rope >= 3 {
                 let v = elemwise::mul_scalar(p.f32("v_scale"), &v);
                 let (rotary, theta) = (p.u32("rotary"), p.f32("theta"));
-                let (q, k) = elemwise::rope_partial(
+                let (q, k) = both(elemwise::rope(
                     &q,
-                    &k,
                     &positions,
-                    rotary,
                     d,
                     theta,
-                    Some(p.u32("span")),
+                    Turn::Partial {
+                        rotary_dim: rotary,
+                        span: p.u32("span"),
+                    },
+                    Some(&k),
                     None,
-                );
+                ));
                 let cache = p.cache("cache");
                 let (write_page, write_offset) =
                     (p.rows("write_page", 1), p.rows("write_offset", 1));
-                attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+                attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
                 p.export("q", &q);
                 return;
             }
@@ -733,16 +765,34 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             };
             let (q, k) = match rope {
                 0 => (q, k),
-                1 => elemwise::rope_full(&q, &k, &positions, d, p.f32("theta"), false, None),
+                1 => both(elemwise::rope(
+                    &q,
+                    &positions,
+                    d,
+                    p.f32("theta"),
+                    Turn::Full { interleaved: false },
+                    Some(&k),
+                    None,
+                )),
                 _ => {
-                    let span = Some(p.u32("span"));
-                    let (rotary, theta) = (p.u32("rotary"), p.f32("theta"));
-                    elemwise::rope_partial(&q, &k, &positions, rotary, d, theta, span, None)
+                    let (rotary, span, theta) = (p.u32("rotary"), p.u32("span"), p.f32("theta"));
+                    both(elemwise::rope(
+                        &q,
+                        &positions,
+                        d,
+                        theta,
+                        Turn::Partial {
+                            rotary_dim: rotary,
+                            span,
+                        },
+                        Some(&k),
+                        None,
+                    ))
                 }
             };
             let cache = p.cache("cache");
             let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-            attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+            attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
             p.export("q", &q);
         })
     };
@@ -803,7 +853,8 @@ fn qkv_admits(m: &Match) -> bool {
 
 /// A row norm whose output joins the residual stream, optionally scaled and
 /// normed again on the way out.
-fn rmsnorm_residual_add() -> Rule {
+#[must_use]
+pub fn rmsnorm_residual_add() -> Rule {
     let chain = |scaled: bool, post: Option<Norm>| {
         template(move |p| {
             let x = p.rows("x", W);
@@ -827,7 +878,7 @@ fn rmsnorm_residual_add() -> Rule {
         .into_iter()
         .flat_map(|scaled| Norm::BOTH.map(|post| chain(scaled, Some(post))))
         .chain([chain(true, None), chain(false, None)]);
-    Rule::new("elementwise.rmsnorm_residual_add", alternatives, |m| {
+    Rule::new("fused.rmsnorm_residual_add", alternatives, |m| {
         Fused::RmsnormResidualAdd {
             x: m.value("x"),
             weight: m.value("weight"),
@@ -835,7 +886,10 @@ fn rmsnorm_residual_add() -> Rule {
             t: m.value("t"),
             y: m.value("y"),
             y_out: m.value("y_out"),
-            scale: m.get("scaled").map(|scaled| (m.value("s"), scaled)),
+            scale: m.get("scaled").map(|out| Scaled {
+                by: m.value("s"),
+                out,
+            }),
             post: m.get("out").map(|out| PostNorm {
                 weight: m.value("post_weight"),
                 plus_one: plus_one(m.op("out")),
@@ -852,12 +906,12 @@ fn rmsnorm_residual_add() -> Rule {
 fn embed_chain(select: bool) -> Template {
     template(|p| {
         let ids = p.indices("ids");
-        let e = layout::embed(&ids, &p.weight("table", [W, W]), p.u32("vocab"));
+        let e = gather::embed(&ids, &p.weight("table", [W, W]), p.u32("vocab"));
         p.export("e", &e);
         let e_scaled = elemwise::mul_scalar(p.f32("embed_scale"), &e);
         p.export("e_scaled", &e_scaled);
         let y = if select {
-            let y = layout::select(&p.rows("stacked", 4 * W), p.u32("layer"), p.u32("width"));
+            let y = gather::select(&p.rows("stacked", 4 * W), p.u32("layer"), p.u32("width"));
             p.name("y", &y);
             y
         } else {
@@ -870,11 +924,10 @@ fn embed_chain(select: bool) -> Template {
     })
 }
 
-fn embed_scale_add_select() -> Rule {
-    Rule::new(
-        "elementwise.embed_scale_add_select",
-        [embed_chain(true)],
-        |m| Fused::EmbedScaleAddSelect {
+#[must_use]
+pub fn embed_scale_add_select() -> Rule {
+    Rule::new("fused.embed_scale_add_select", [embed_chain(true)], |m| {
+        Fused::EmbedScaleAddSelect {
             ids: m.value("ids"),
             table: m.value("table"),
             vocab: m.u32("vocab"),
@@ -887,8 +940,8 @@ fn embed_scale_add_select() -> Rule {
             y_out: m.value("y_out"),
             out_scale: m.f32("out_scale"),
             y_scaled: m.value("y_scaled"),
-        },
-    )
+        }
+    })
     .when(dense_table)
 }
 
@@ -898,8 +951,9 @@ fn dense_table(m: &Match<'_>) -> bool {
     m.weight_dtype("table").and_then(Dtype::elem).is_some()
 }
 
-fn embed_scale_add() -> Rule {
-    Rule::new("elementwise.embed_scale_add", [embed_chain(false)], |m| {
+#[must_use]
+pub fn embed_scale_add() -> Rule {
+    Rule::new("fused.embed_scale_add", [embed_chain(false)], |m| {
         Fused::EmbedScaleAdd {
             ids: m.value("ids"),
             table: m.value("table"),
@@ -917,7 +971,8 @@ fn embed_scale_add() -> Rule {
 }
 
 /// A residual add whose sum is normed.
-fn residual_add_rmsnorm() -> Rule {
+#[must_use]
+pub fn residual_add_rmsnorm() -> Rule {
     let pair = |norm: Norm| {
         template(move |p| {
             let y_out = elemwise::residual_add(&p.rows("x", W), &p.rows("y", W));
@@ -926,10 +981,8 @@ fn residual_add_rmsnorm() -> Rule {
             p.export("out", &out);
         })
     };
-    Rule::new(
-        "elementwise.residual_add_rmsnorm",
-        Norm::BOTH.map(pair),
-        |m| Fused::ResidualAddRmsnorm {
+    Rule::new("fused.residual_add_rmsnorm", Norm::BOTH.map(pair), |m| {
+        Fused::ResidualAddRmsnorm {
             x: m.value("x"),
             y: m.value("y"),
             y_out: m.value("y_out"),
@@ -937,31 +990,41 @@ fn residual_add_rmsnorm() -> Rule {
             plus_one: plus_one(m.op("out")),
             eps: m.f32("eps"),
             out: m.value("out"),
-        },
-    )
+        }
+    })
 }
 
 /// A dense MLP whole: the packed gate-up projection, swiglu, and the down
 /// projection. Both intermediates stay inside the match, so a chain that
 /// reads one of them elsewhere (Bonsai rotates `h` before `down`) stays as
 /// its three primitives.
-fn mlp_swiglu() -> Rule {
+#[must_use]
+pub fn matmul_swiglu_matmul() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("gate_up", [2 * W, W]));
         p.name("packed", &packed);
-        let h = linear::mlp_swiglu(&packed, p.u32("intermediate"));
+        let h = linear::glu(
+            &packed,
+            GluAct::Swiglu,
+            Some(p.u32("intermediate")),
+            None,
+            None,
+            None,
+        );
         p.name("h", &h);
         let y = linear::matmul(&h, &p.weight("down", [W, W]));
         p.export("y", &y);
     });
-    Rule::new("linear.mlp_swiglu", [pattern], |m| Fused::MlpSwiglu {
-        act: m.value("act"),
-        gate_up: m.value("gate_up"),
-        down: m.value("down"),
-        intermediate: m.u32("intermediate"),
-        packed: m.value("packed"),
-        h: m.value("h"),
-        y: m.value("y"),
+    Rule::new("fused.matmul_swiglu_matmul", [pattern], |m| {
+        Fused::MatmulSwigluMatmul {
+            act: m.value("act"),
+            gate_up: m.value("gate_up"),
+            down: m.value("down"),
+            intermediate: m.u32("intermediate"),
+            packed: m.value("packed"),
+            h: m.value("h"),
+            y: m.value("y"),
+        }
     })
 }
 
@@ -969,7 +1032,8 @@ fn mlp_swiglu() -> Rule {
 /// or SiTU; or an up select and its relu2), the down select of the GLU on the
 /// same routes (each row normed under a scale where `normed`, Muse Spark's),
 /// and the weighted sum.
-fn moe_experts() -> Rule {
+#[must_use]
+pub fn moe_experts() -> Rule {
     let mut alternatives = Vec::new();
     // Each leg's select: over a dense bank, a biased one, a quantized one,
     // or (both legs) a bank quantizing its activations: NVFP4 (W4A4) or
@@ -1026,24 +1090,57 @@ fn moe_experts() -> Rule {
                     let packed = select_of(&x, "bank", "bias", select);
                     p.name("packed", &packed);
                     let hidden = match glu {
-                        0 => linear::mlp_swiglu(&packed, p.u32("intermediate")),
-                        1 => {
-                            linear::mlp_swiglu_clamp(&packed, p.u32("intermediate"), p.f32("limit"))
-                        }
-                        3 => linear::mlp_geglu_tanh_packed(&packed, p.u32("intermediate")),
+                        0 => linear::glu(
+                            &packed,
+                            GluAct::Swiglu,
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            None,
+                        ),
+                        1 => linear::glu(
+                            &packed,
+                            GluAct::Swiglu,
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            Some(p.f32("limit")),
+                        ),
+                        3 => linear::glu(
+                            &packed,
+                            GluAct::GegluTanh,
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            None,
+                        ),
                         4 => {
                             // Kimi-K3's SiTU, its up cap whatever it holds.
                             p.free("up_cap");
-                            linear::mlp_situ(&packed, p.u32("intermediate"), p.f32("beta"), None)
+                            linear::glu(
+                                &packed,
+                                GluAct::Situ {
+                                    beta: p.f32("beta"),
+                                    up_cap: None,
+                                },
+                                Some(p.u32("intermediate")),
+                                None,
+                                None,
+                                None,
+                            )
                         }
                         // Nemotron-H's ungated experts: the select's rows
                         // are the up rows alone.
-                        5 => linear::mlp_relu2(&packed),
-                        _ => linear::mlp_swiglu_clamp_alpha(
+                        5 => linear::relu2(&packed),
+                        _ => linear::glu(
                             &packed,
-                            p.u32("intermediate"),
-                            p.f32("limit"),
-                            p.f32("alpha"),
+                            GluAct::SwigluAlpha {
+                                alpha: p.f32("alpha"),
+                            },
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            Some(p.f32("limit")),
                         ),
                     };
                     p.name("hidden", &hidden);
@@ -1107,11 +1204,13 @@ fn moe_experts() -> Rule {
                 dtype: Dtype::F32,
             },
         );
-        let hidden = linear::mlp_swiglu_clamp_routed(
+        let hidden = linear::glu(
             &packed,
-            p.u32("intermediate"),
-            &weights,
-            p.f32("limit"),
+            GluAct::Swiglu,
+            Some(p.u32("intermediate")),
+            None,
+            Some(&weights),
+            Some(p.f32("limit")),
         );
         p.name("hidden", &hidden);
         let routed = linear::moe_matmul_select_quant(
@@ -1124,7 +1223,7 @@ fn moe_experts() -> Rule {
         let y = linear::moe_sum_add(&routed, &p.rows("shared", W));
         p.export("y", &y);
     }));
-    Rule::new("linear.moe_experts", alternatives, |m| {
+    Rule::new("fused.moe_experts", alternatives, |m| {
         let linear_op = |name| match m.op(name) {
             Operation::Linear(op) => Box::new(op.clone()),
             other => panic!("`{name}` is computed by {other:?}, not a linear op"),
@@ -1139,7 +1238,7 @@ fn moe_experts() -> Rule {
             glu: linear_op("hidden"),
             down: linear_op("routed"),
             norm: m.get("normed").map(|_| match m.op("normed") {
-                Operation::Elementwise(op) => Box::new(op.clone()),
+                Operation::Elemwise(op) => Box::new(op.clone()),
                 other => panic!("the routes' norm is computed by {other:?}"),
             }),
             sum,
@@ -1151,7 +1250,8 @@ fn moe_experts() -> Rule {
 /// A routed gate-up select (over a dense, biased or quantized bank) and its
 /// GLU (SwiGLU, its clamp or clamp-alpha form, or GeGLU) over the packed
 /// gate|up rows, which stay inside the match.
-fn moe_select_glu() -> Rule {
+#[must_use]
+pub fn moe_select_glu() -> Rule {
     let mut alternatives = Vec::new();
     for select in 0..3 {
         for glu in 0..4 {
@@ -1180,21 +1280,46 @@ fn moe_select_glu() -> Rule {
                 p.name("packed", &packed);
                 let intermediate = p.u32("intermediate");
                 let y = match glu {
-                    0 => linear::mlp_swiglu(&packed, intermediate),
-                    1 => linear::mlp_swiglu_clamp(&packed, intermediate, p.f32("limit")),
-                    3 => linear::mlp_geglu_tanh_packed(&packed, intermediate),
-                    _ => linear::mlp_swiglu_clamp_alpha(
+                    0 => linear::glu(
                         &packed,
-                        intermediate,
-                        p.f32("limit"),
-                        p.f32("alpha"),
+                        GluAct::Swiglu,
+                        Some(intermediate),
+                        None,
+                        None,
+                        None,
+                    ),
+                    1 => linear::glu(
+                        &packed,
+                        GluAct::Swiglu,
+                        Some(intermediate),
+                        None,
+                        None,
+                        Some(p.f32("limit")),
+                    ),
+                    3 => linear::glu(
+                        &packed,
+                        GluAct::GegluTanh,
+                        Some(intermediate),
+                        None,
+                        None,
+                        None,
+                    ),
+                    _ => linear::glu(
+                        &packed,
+                        GluAct::SwigluAlpha {
+                            alpha: p.f32("alpha"),
+                        },
+                        Some(intermediate),
+                        None,
+                        None,
+                        Some(p.f32("limit")),
                     ),
                 };
                 p.export("y", &y);
             }));
         }
     }
-    Rule::new("linear.moe_select_glu", alternatives, |m| {
+    Rule::new("fused.moe_select_glu", alternatives, |m| {
         let linear_op = |name| match m.op(name) {
             Operation::Linear(op) => Box::new(op.clone()),
             other => panic!("`{name}` is computed by {other:?}, not a linear op"),
@@ -1206,50 +1331,45 @@ fn moe_select_glu() -> Rule {
     })
 }
 
-fn matmul_geglu() -> Rule {
-    let pattern = template(|p| {
-        let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
-        p.name("packed", &packed);
-        let y = linear::mlp_geglu_tanh_packed(&packed, p.u32("intermediate"));
-        p.export("y", &y);
-    });
-    Rule::new("linear.matmul_geglu", [pattern], |m| Fused::MatmulGeglu {
+/// The packed gate-up projection and its GLU under each of `acts`, where
+/// the MLP's down projection stays apart (a backend that holds
+/// `matmul_swiglu_matmul` forms that first).
+#[must_use]
+pub fn matmul_glu(acts: &[GluAct]) -> Rule {
+    let alternatives: Vec<Template> = acts
+        .iter()
+        .map(|&act| {
+            template(|p| {
+                let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
+                p.name("packed", &packed);
+                let y = linear::glu(&packed, act, Some(p.u32("intermediate")), None, None, None);
+                p.export("y", &y);
+            })
+        })
+        .collect();
+    Rule::new("fused.matmul_glu", alternatives, |m| Fused::MatmulGlu {
         act: m.value("act"),
         w: m.value("w"),
         intermediate: m.u32("intermediate"),
+        glu: match m.op("y") {
+            Operation::Linear(poem_ir::Linear::Glu { act, .. }) => *act,
+            other => panic!("`y` is computed by {other:?}, not a glu"),
+        },
         packed: m.value("packed"),
         y: m.value("y"),
     })
 }
 
-/// The packed gate-up projection and its SwiGLU, where the MLP's down
-/// projection stays apart (a backend that ships `linear.mlp_swiglu` forms
-/// that first).
-fn matmul_swiglu() -> Rule {
-    let pattern = template(|p| {
-        let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
-        p.name("packed", &packed);
-        let y = linear::mlp_swiglu(&packed, p.u32("intermediate"));
-        p.export("y", &y);
-    });
-    Rule::new("linear.matmul_swiglu", [pattern], |m| Fused::MatmulSwiglu {
-        act: m.value("act"),
-        w: m.value("w"),
-        intermediate: m.u32("intermediate"),
-        packed: m.value("packed"),
-        y: m.value("y"),
-    })
-}
-
-fn lm_head_softcap() -> Rule {
+#[must_use]
+pub fn matmul_softcap() -> Rule {
     let pattern = template(|p| {
         let y = linear::lm_head(&p.rows("act", W), &p.weight("w", [W, W]));
         p.name("y", &y);
         let y_out = attn::logit_softcap(&y, p.f32("cap"));
         p.export("y_out", &y_out);
     });
-    Rule::new("linear.lm_head_softcap", [pattern], |m| {
-        Fused::LmHeadSoftcap {
+    Rule::new("fused.matmul_softcap", [pattern], |m| {
+        Fused::MatmulSoftcap {
             act: m.value("act"),
             w: m.value("w"),
             cap: m.f32("cap"),
@@ -1259,14 +1379,15 @@ fn lm_head_softcap() -> Rule {
     })
 }
 
-fn matmul_bias() -> Rule {
+#[must_use]
+pub fn matmul_bias() -> Rule {
     let pattern = template(|p| {
         let y = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
         p.name("y", &y);
         let y_out = elemwise::add_bias(&p.weight("bias", [W]), &y);
         p.export("y_out", &y_out);
     });
-    Rule::new("linear.matmul_bias", [pattern], |m| Fused::MatmulBias {
+    Rule::new("fused.matmul_bias", [pattern], |m| Fused::MatmulBias {
         act: m.value("act"),
         w: m.value("w"),
         bias: m.value("bias"),
@@ -1277,7 +1398,8 @@ fn matmul_bias() -> Rule {
 
 /// A projection cut into two row halves (Qwen3.5's packed qkv|z), through
 /// the `recurrent` marker the cut's caller sets on the packed rows.
-fn matmul_split_rows() -> Rule {
+#[must_use]
+pub fn matmul_split_rows() -> Rule {
     let pattern = template(|p| {
         // The product's row as wide as `ssm_gdn_step`'s `qkvz`: the split
         // width is a pattern sentinel past any small width, and the rest of
@@ -1286,13 +1408,13 @@ fn matmul_split_rows() -> Rule {
         p.name("y", &y);
         // Any cut matches: the pattern cuts at a width its rows hold, and
         // the replacement reads the trace's own.
-        let (left, right) = layout::split_rows(&y, W as u32 / 2);
+        let (left, right) = gather::split_rows(&y, W as u32 / 2);
         p.free("width");
         p.export("left", &left);
         p.export("right", &right);
     });
-    Rule::new("linear.matmul_split_rows", [pattern], |m| {
-        let Operation::Layout(Layout::SplitRows { width, .. }) = m.op("left") else {
+    Rule::new("fused.matmul_split_rows", [pattern], |m| {
+        let Operation::Gather(Gather::SplitRows { width, .. }) = m.op("left") else {
             panic!("`left` comes from a row split");
         };
         Fused::MatmulSplitRows {
@@ -1326,22 +1448,28 @@ impl ScaleFree {
 
 fn norm_kind(op: &Operation) -> NormKind {
     match op {
-        Operation::Elementwise(Elementwise::LayernormNoScale { eps, .. }) => {
-            NormKind::Layernorm { eps: *eps }
-        }
-        Operation::Elementwise(Elementwise::RmsnormNoScale { head_dim, eps, .. }) => {
-            NormKind::Rmsnorm {
-                head_dim: *head_dim,
-                eps: *eps,
-            }
-        }
+        Operation::Elemwise(Elemwise::Layernorm {
+            eps,
+            weight: None,
+            bias: None,
+            ..
+        }) => NormKind::Layernorm { eps: *eps },
+        Operation::Elemwise(Elemwise::Rmsnorm {
+            axis: NormAxis::Head(head_dim),
+            eps,
+            weight: NormWeight::None,
+            ..
+        }) => NormKind::Rmsnorm {
+            head_dim: *head_dim,
+            eps: *eps,
+        },
         other => panic!("{other:?} is not a scale-free norm"),
     }
 }
 
 fn modulate_form(op: &Operation) -> ModulateForm {
     match op {
-        Operation::Elementwise(Elementwise::Modulate { form, .. }) => *form,
+        Operation::Elemwise(Elemwise::Modulate { form, .. }) => *form,
         other => panic!("{other:?} is not a modulation"),
     }
 }
@@ -1362,7 +1490,8 @@ fn modulation_inputs(p: &Pattern, per_lane: bool) -> (poem::Value, Option<poem::
 }
 
 /// A gated residual add, normed without a scale and modulated.
-fn gated_residual_norm_modulate() -> Rule {
+#[must_use]
+pub fn gated_residual_norm_modulate() -> Rule {
     let chain = |norm: ScaleFree, per_lane: bool| {
         template(move |p| {
             let (m, lanes, rows) = modulation_inputs(p, per_lane);
@@ -1386,10 +1515,8 @@ fn gated_residual_norm_modulate() -> Rule {
     let alternatives = ScaleFree::BOTH
         .into_iter()
         .flat_map(|norm| [chain(norm, true), chain(norm, false)]);
-    Rule::new(
-        "elementwise.gated_residual_norm_modulate",
-        alternatives,
-        |m| Fused::GatedResidualNormModulate {
+    Rule::new("fused.gated_residual_norm_modulate", alternatives, |m| {
+        Fused::GatedResidualNormModulate {
             r: m.value("r"),
             g: m.value("g"),
             y: m.value("y"),
@@ -1400,12 +1527,13 @@ fn gated_residual_norm_modulate() -> Rule {
             m: m.value("m"),
             form: modulate_form(m.op("out")),
             out: m.value("out"),
-        },
-    )
+        }
+    })
 }
 
 /// A norm without a scale, modulated.
-fn norm_modulate() -> Rule {
+#[must_use]
+pub fn norm_modulate() -> Rule {
     let pair = |norm: ScaleFree, per_lane: bool| {
         template(move |p| {
             let (m, lanes, _) = modulation_inputs(p, per_lane);
@@ -1419,7 +1547,7 @@ fn norm_modulate() -> Rule {
     let alternatives = ScaleFree::BOTH
         .into_iter()
         .flat_map(|norm| [pair(norm, true), pair(norm, false)]);
-    Rule::new("elementwise.norm_modulate", alternatives, |m| {
+    Rule::new("fused.norm_modulate", alternatives, |m| {
         Fused::NormModulate {
             x: m.value("x"),
             norm: norm_kind(m.op("normed")),
@@ -1432,74 +1560,117 @@ fn norm_modulate() -> Rule {
     })
 }
 
-/// A head's RMS norm, scaled (the whole row one head) or scale-free (per
-/// head), its last dims rotated: DeepSeek-V4's q, kv plane, compressed
-/// latent and index keys.
-fn norm_rope_last() -> Rule {
-    let rope = |p: &poem::pattern::Pattern, y: &poem::Value| {
-        p.free("interleaved");
-        p.free("inverse");
-        p.free("yarn");
-        let positions = p.indices("positions");
-        elemwise::rope_partial_last_yarn(
-            y,
-            &positions,
-            p.u32("rotary_dim"),
-            p.u32("head_dim"),
-            p.f32("theta"),
-            false,
-            false,
-            None,
-        )
-    };
-    let scale_free = template(move |p| {
-        let y = elemwise::rmsnorm_no_scale(&p.rows("x", W), p.u32("norm_dim"), p.f32("eps"));
-        p.name("y", &y);
-        let q_out = rope(p, &y);
-        p.export("q_out", &q_out);
-    });
-    let scaled = template(move |p| {
-        let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
-        p.name("y", &y);
-        let q_out = rope(p, &y);
-        p.export("q_out", &q_out);
-    });
-    Rule::new("elementwise.norm_rope_last", [scale_free, scaled], |m| {
-        let Operation::Elementwise(Elementwise::RopePartialLast {
-            interleaved,
-            inverse,
-            yarn,
-            ..
-        }) = *m.op("q_out")
-        else {
+/// The part of each head a [`norm_rope`] turns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rotated {
+    /// Its first dims (`Turn::Partial`), the norm scaled per head: Qwen's q.
+    First,
+    /// Its last dims (`Turn::Last`), the norm scaled over a row one head
+    /// wide or scale-free per head: DeepSeek-V4's q, kv plane, compressed
+    /// latent and index keys.
+    Last,
+}
+
+/// A head's RMS norm and the rotation of the part of each head `rotated`
+/// names, the rotated heads the norm's plane.
+#[must_use]
+pub fn norm_rope(rotated: Rotated) -> Rule {
+    fn replace(m: &Match) -> Fused {
+        let Operation::Elemwise(Elemwise::Rope { turn, .. }) = m.op("q_out") else {
             unreachable!("the pattern's last op is the rotation")
         };
-        Fused::NormRopeLast {
+        Fused::NormRope {
             x: m.value("x"),
             weight: m.get("weight"),
             head_dim: m.u32("head_dim"),
             eps: m.f32("eps"),
             positions: m.value("positions"),
-            rotary_dim: m.u32("rotary_dim"),
             theta: m.f32("theta"),
-            interleaved,
-            inverse,
-            yarn,
+            turn: *turn,
             y: m.value("y"),
             q_out: m.value("q_out"),
         }
-    })
-    // The norm's heads are the rotation's: a scale-free norm per head of
-    // the rotation's width, a scaled one over a row one head wide.
-    .when(|m| match m.get_u32("norm_dim") {
-        Some(norm_dim) => norm_dim == m.u32("head_dim"),
-        None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
-    })
+    }
+    match rotated {
+        Rotated::First => {
+            let pattern = template(|p| {
+                let positions = p.indices("positions");
+                let d = p.u32("head_dim");
+                let y = elemwise::rmsnorm_per_head(
+                    &p.rows("x", W),
+                    &p.weight("weight", [W]),
+                    d,
+                    p.f32("eps"),
+                );
+                p.name("y", &y);
+                let (rotary_dim, theta, span) =
+                    (p.u32("rotary_dim"), p.f32("theta"), p.u32("span"));
+                let q_out = elemwise::rope(
+                    &y,
+                    &positions,
+                    d,
+                    theta,
+                    Turn::Partial { rotary_dim, span },
+                    None,
+                    None,
+                )
+                .0;
+                p.export("q_out", &q_out);
+            });
+            Rule::new("fused.norm_rope", [pattern], replace).form("first")
+        }
+        Rotated::Last => {
+            let rope = |p: &poem::pattern::Pattern, y: &poem::Value| {
+                p.free("interleaved");
+                p.free("inverse");
+                p.free("yarn");
+                let positions = p.indices("positions");
+                elemwise::rope(
+                    y,
+                    &positions,
+                    p.u32("head_dim"),
+                    p.f32("theta"),
+                    Turn::Last {
+                        rotary_dim: p.u32("rotary_dim"),
+                        interleaved: false,
+                        inverse: false,
+                        yarn: None,
+                    },
+                    None,
+                    None,
+                )
+                .0
+            };
+            let scale_free = template(move |p| {
+                let y =
+                    elemwise::rmsnorm_no_scale(&p.rows("x", W), p.u32("norm_dim"), p.f32("eps"));
+                p.name("y", &y);
+                let q_out = rope(p, &y);
+                p.export("q_out", &q_out);
+            });
+            let scaled = template(move |p| {
+                let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
+                p.name("y", &y);
+                let q_out = rope(p, &y);
+                p.export("q_out", &q_out);
+            });
+            Rule::new("fused.norm_rope", [scale_free, scaled], replace)
+                .form("last")
+                // The norm's heads are the rotation's: a scale-free norm per
+                // head of the rotation's width, a scaled one over a row one
+                // head wide.
+                .when(|m| match m.get_u32("norm_dim") {
+                    Some(norm_dim) => norm_dim == m.u32("head_dim"),
+                    None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
+                })
+        }
+    }
 }
 
 /// An index's queries rotated and ranked, the rotated queries read by the
 /// ranking alone (DeepSeek-V4's indexer).
-fn index_topk_rope() -> Rule {
+#[must_use]
+pub fn index_topk_rope() -> Rule {
     let chain = |weighted: bool| {
         template(move |p| {
             p.free("interleaved");
@@ -1508,16 +1679,21 @@ fn index_topk_rope() -> Rule {
             p.free("score");
             let positions = p.indices("positions");
             let d = p.u32("head_dim");
-            let q = elemwise::rope_partial_last_yarn(
+            let q = elemwise::rope(
                 &p.rows("q", W),
                 &positions,
-                p.u32("rotary_dim"),
                 d,
                 p.f32("theta"),
-                false,
-                false,
+                Turn::Last {
+                    rotary_dim: p.u32("rotary_dim"),
+                    interleaved: false,
+                    inverse: false,
+                    yarn: None,
+                },
                 None,
-            );
+                None,
+            )
+            .0;
             p.name("q_rot", &q);
             let weights = weighted.then(|| p.rows("weights", W));
             let sel = attn::index_topk(
@@ -1533,28 +1709,25 @@ fn index_topk_rope() -> Rule {
             p.export("selection", &sel);
         })
     };
-    Rule::new(
-        "attention.index_topk_rope",
-        [chain(true), chain(false)],
-        |m| {
-            let Operation::Elementwise(rotate) = m.op("q_rot") else {
-                unreachable!("the rotated queries come from a rotation")
-            };
-            let Operation::Attention(rank) = m.op("selection") else {
-                unreachable!("the selection comes from the ranking")
-            };
-            Fused::IndexTopkRope {
-                rotate: Box::new(rotate.clone()),
-                rank: Box::new(rank.clone()),
-            }
-        },
-    )
+    Rule::new("fused.index_topk_rope", [chain(true), chain(false)], |m| {
+        let Operation::Elemwise(rotate) = m.op("q_rot") else {
+            unreachable!("the rotated queries come from a rotation")
+        };
+        let Operation::Attn(rank) = m.op("selection") else {
+            unreachable!("the selection comes from the ranking")
+        };
+        Fused::IndexTopkRope {
+            rotate: Box::new(rotate.clone()),
+            rank: Box::new(rank.clone()),
+        }
+    })
 }
 
 /// DeepSeek-V4's q (scale-free per-head norm, tail rotated) and kv plane
 /// (scaled norm of a one-head row, rotated and cached) of one layer: same
 /// positions and rotation, and nothing between them reads either.
-fn norm_rope_pair() -> Rule {
+#[must_use]
+pub fn norm_rope_pair() -> Rule {
     let pattern = template(|p| {
         p.free("interleaved");
         p.free("inverse");
@@ -1563,23 +1736,53 @@ fn norm_rope_pair() -> Rule {
         let (rotary, d, theta) = (p.u32("rotary_dim"), p.u32("head_dim"), p.f32("theta"));
         let qn = elemwise::rmsnorm_no_scale(&p.rows("q", W), d, p.f32("q_eps"));
         p.name("q_y", &qn);
-        let q =
-            elemwise::rope_partial_last_yarn(&qn, &positions, rotary, d, theta, false, false, None);
+        let q = elemwise::rope(
+            &qn,
+            &positions,
+            d,
+            theta,
+            Turn::Last {
+                rotary_dim: rotary,
+                interleaved: false,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         p.export("q_out", &q);
         let kn = elemwise::rmsnorm(&p.rows("kv", W), &p.weight("weight", [W]), p.f32("kv_eps"));
-        let k =
-            elemwise::rope_partial_last_yarn(&kn, &positions, rotary, d, theta, false, false, None);
+        let k = elemwise::rope(
+            &kn,
+            &positions,
+            d,
+            theta,
+            Turn::Last {
+                rotary_dim: rotary,
+                interleaved: false,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         p.name("kv_y", &k);
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append_shared(&k, cache, &write_page, &write_offset);
+        attn::kv_append(&k, None, cache, &write_page, &write_offset);
     });
-    Rule::new("elementwise.norm_rope_pair", [pattern], |m| {
+    Rule::new("fused.norm_rope_pair", [pattern], |m| {
         let rope = |name: &str| match *m.op(name) {
-            Operation::Elementwise(Elementwise::RopePartialLast {
-                interleaved,
-                inverse,
-                yarn,
+            Operation::Elemwise(Elemwise::Rope {
+                turn:
+                    Turn::Last {
+                        interleaved,
+                        inverse,
+                        yarn,
+                        ..
+                    },
                 ..
             }) => (interleaved, inverse, yarn),
             _ => unreachable!("`{name}` comes from a rotation"),
@@ -1587,17 +1790,19 @@ fn norm_rope_pair() -> Rule {
         let (q_interleaved, q_inverse, q_yarn) = rope("q_out");
         let (kv_interleaved, kv_inverse, kv_yarn) = rope("kv_y");
         Fused::NormRopePair {
-            q: Box::new(Fused::NormRopeLast {
+            q: Box::new(Fused::NormRope {
                 x: m.value("q"),
                 weight: None,
                 head_dim: m.u32("head_dim"),
                 eps: m.f32("q_eps"),
                 positions: m.value("positions"),
-                rotary_dim: m.u32("rotary_dim"),
                 theta: m.f32("theta"),
-                interleaved: q_interleaved,
-                inverse: q_inverse,
-                yarn: q_yarn,
+                turn: Turn::Last {
+                    rotary_dim: m.u32("rotary_dim"),
+                    interleaved: q_interleaved,
+                    inverse: q_inverse,
+                    yarn: q_yarn,
+                },
                 y: m.value("q_y"),
                 q_out: m.value("q_out"),
             }),
@@ -1626,7 +1831,8 @@ fn norm_rope_pair() -> Rule {
 /// DeepSeek-V4's compressor at its boundaries: the gathered entries normed,
 /// their tail rotated at the boundaries' rope positions, and written to the
 /// pool, the entries and the normed rows read by nothing else.
-fn pool_compress() -> Rule {
+#[must_use]
+pub fn pool_compress() -> Rule {
     let chain = |biased: bool, stated: bool| {
         template(move |p| {
             p.free("interleaved");
@@ -1660,16 +1866,21 @@ fn pool_compress() -> Rule {
             let latent = elemwise::rmsnorm(&gathered, &p.weight("weight", [W]), p.f32("eps"));
             p.name("latent", &latent);
             let brope = p.indices("brope");
-            let rotated = elemwise::rope_partial_last_yarn(
+            let rotated = elemwise::rope(
                 &latent,
                 &brope,
-                p.u32("rotary_dim"),
                 p.u32("head_dim"),
                 p.f32("theta"),
-                false,
-                false,
+                Turn::Last {
+                    rotary_dim: p.u32("rotary_dim"),
+                    interleaved: false,
+                    inverse: false,
+                    yarn: None,
+                },
                 None,
-            );
+                None,
+            )
+            .0;
             p.name("rotated", &rotated);
             let pool = p.cache("pool");
             let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
@@ -1677,7 +1888,7 @@ fn pool_compress() -> Rule {
         })
     };
     Rule::new(
-        "attention.pool_compress",
+        "fused.pool_compress",
         [
             chain(true, true),
             chain(false, true),
@@ -1685,37 +1896,40 @@ fn pool_compress() -> Rule {
             chain(false, false),
         ],
         |m| {
-            let Operation::Attention(gather) = m.op("gathered") else {
+            let Operation::Attn(gather) = m.op("gathered") else {
                 unreachable!("the entries come from the gather")
             };
-            let Operation::Elementwise(rotate) = m.op("rotated") else {
+            let Operation::Elemwise(rotate) = m.op("rotated") else {
                 unreachable!("the rotated rows come from the rotation")
             };
-            let append =
-                m.trace
-                    .nodes
-                    .iter()
-                    .find_map(|node| match &node.op {
-                        Operation::Attention(
-                            a @ poem_ir::Attention::PoolKvAppend { entries, .. },
-                        ) if *entries == m.value("rotated") => Some(a.clone()),
-                        _ => None,
-                    })
-                    .expect("the rotated rows are appended");
-            let state = m.get("s_kv").map(|kv| {
-                let op = m
-                    .trace
-                    .nodes
-                    .iter()
-                    .find_map(|node| match &node.op {
-                        Operation::Attention(
-                            a @ poem_ir::Attention::PoolStateWrite { kv: at, .. },
-                        ) if *at == kv => Some(a.clone()),
-                        _ => None,
-                    })
-                    .expect("the state is written");
-                Box::new(op)
-            });
+            let append = m
+                .trace
+                .nodes
+                .iter()
+                .find_map(|node| match &node.op {
+                    Operation::Attn(a @ poem_ir::Attn::PoolKvAppend { entries, .. })
+                        if *entries == m.value("rotated") =>
+                    {
+                        Some(a.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the rotated rows are appended");
+            let state =
+                m.get("s_kv").map(|kv| {
+                    let op =
+                        m.trace
+                            .nodes
+                            .iter()
+                            .find_map(|node| match &node.op {
+                                Operation::Attn(
+                                    a @ poem_ir::Attn::PoolStateWrite { kv: at, .. },
+                                ) if *at == kv => Some(a.clone()),
+                                _ => None,
+                            })
+                            .expect("the state is written");
+                    Box::new(op)
+                });
             Fused::PoolCompress {
                 gather: Box::new(gather.clone()),
                 weight: m.value("weight"),
@@ -1731,33 +1945,43 @@ fn pool_compress() -> Rule {
 
 /// DeepSeek-V4's kv plane: a scaled norm of a row one head wide, its last
 /// dims rotated, written to the cache and read by nothing else.
-fn norm_rope_last_append() -> Rule {
+#[must_use]
+pub fn norm_rope_last_append() -> Rule {
     let pattern = template(|p| {
         p.free("interleaved");
         p.free("inverse");
         p.free("yarn");
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
-        let k = elemwise::rope_partial_last_yarn(
+        let k = elemwise::rope(
             &y,
             &positions,
-            p.u32("rotary_dim"),
             p.u32("head_dim"),
             p.f32("theta"),
-            false,
-            false,
+            Turn::Last {
+                rotary_dim: p.u32("rotary_dim"),
+                interleaved: false,
+                inverse: false,
+                yarn: None,
+            },
             None,
-        );
+            None,
+        )
+        .0;
         p.name("y", &k);
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append_shared(&k, cache, &write_page, &write_offset);
+        attn::kv_append(&k, None, cache, &write_page, &write_offset);
     });
-    Rule::new("elementwise.norm_rope_last_append", [pattern], |m| {
-        let Operation::Elementwise(Elementwise::RopePartialLast {
-            interleaved,
-            inverse,
-            yarn,
+    Rule::new("fused.norm_rope_last_append", [pattern], |m| {
+        let Operation::Elemwise(Elemwise::Rope {
+            turn:
+                Turn::Last {
+                    interleaved,
+                    inverse,
+                    yarn,
+                    ..
+                },
             ..
         }) = *m.op("y")
         else {
@@ -1783,44 +2007,16 @@ fn norm_rope_last_append() -> Rule {
     .when(|m| m.width("x") == Some(u64::from(m.u32("head_dim"))))
 }
 
-/// A per-head norm of q, rotated.
-fn rmsnorm_rope_partial_q() -> Rule {
-    let pattern = template(|p| {
-        let positions = p.indices("positions");
-        let d = p.u32("head_dim");
-        let y =
-            elemwise::rmsnorm_per_head(&p.rows("x", W), &p.weight("weight", [W]), d, p.f32("eps"));
-        p.name("y", &y);
-        let (rotary_dim, theta, span) = (p.u32("rotary_dim"), p.f32("theta"), p.u32("span"));
-        let q_out =
-            elemwise::rope_partial_q(&y, &positions, rotary_dim, d, theta, Some(span), None);
-        p.export("q_out", &q_out);
-    });
-    Rule::new("elementwise.rmsnorm_rope_partial_q", [pattern], |m| {
-        Fused::RmsnormRopePartialQ {
-            x: m.value("x"),
-            weight: m.value("weight"),
-            head_dim: m.u32("head_dim"),
-            eps: m.f32("eps"),
-            positions: m.value("positions"),
-            rotary_dim: m.u32("rotary_dim"),
-            theta: m.f32("theta"),
-            span: m.u32("span"),
-            y: m.value("y"),
-            q_out: m.value("q_out"),
-        }
-    })
-}
-
 /// mHC's f32 stream norm read only by its mix projection.
-fn hc_norm_project() -> Rule {
+#[must_use]
+pub fn hc_norm_project() -> Rule {
     let pattern = template(|p| {
         let normed = elemwise::hc_rmsnorm_f32(&p.rows("streams", W), p.f32("eps"));
         let count = p.u32("stream_count");
         let weight = p.weight("weight", [u64::from(count), W]);
         p.export("mixes", &elemwise::hc_project(&normed, &weight, count));
     });
-    Rule::new("elementwise.hc_norm_project", [pattern], |m| {
+    Rule::new("fused.hc_norm_project", [pattern], |m| {
         Fused::HcNormProject {
             streams: m.value("streams"),
             eps: m.f32("eps"),
@@ -1833,14 +2029,15 @@ fn hc_norm_project() -> Rule {
 
 /// A gated-delta layer's decode step: the split of its in-projection, the
 /// conv update, the gate prep and the recurrence, all under one guard.
-fn ssm_gdn_step() -> Rule {
+#[must_use]
+pub fn gdn_step() -> Rule {
     let pattern = template(|p| {
         let qkvz = p.rows("qkvz", 1 << 40);
-        let (qkv, z) = layout::split_rows(&qkvz, p.u32("width"));
+        let (qkv, z) = gather::split_rows(&qkvz, p.u32("width"));
         p.export("qkv", &qkv);
         p.export("z", &z);
         let conv_state = p.cache("conv_state");
-        let conv = attn::ssm_causal_conv1d_dilated(
+        let conv = ssm::causal_conv1d_dilated(
             &qkv,
             &p.weight("conv_weight", [W, W]),
             None,
@@ -1849,13 +2046,13 @@ fn ssm_gdn_step() -> Rule {
             p.u32("dilation"),
         );
         p.name("conv", &conv);
-        let gates = attn::ssm_gdn_prep(
+        let gates = ssm::gdn_gates(
             &p.rows("ba", W),
             &p.weight("dt_bias", [W]),
             &p.weight("a_log", [W]),
         );
         p.name("gates", &gates);
-        let y = attn::ssm_gated_delta(
+        let y = ssm::gated_delta(
             &conv,
             &z,
             &gates,
@@ -1867,7 +2064,7 @@ fn ssm_gdn_step() -> Rule {
         );
         p.export("y", &y);
     });
-    Rule::new("attention.ssm_gdn_step", [pattern], |m| Fused::GdnStep {
+    Rule::new("fused.gdn_step", [pattern], |m| Fused::GdnStep {
         qkvz: m.value("qkvz"),
         width: m.u32("width"),
         qkv: m.value("qkv"),
@@ -1892,12 +2089,23 @@ fn ssm_gdn_step() -> Rule {
 
 /// Qwen's gated attention prologue: the q/gate split, the two per-head
 /// norms, the partial rotation and the kv append, all under one guard.
-fn q_gate_k_norm_rope_append() -> Rule {
+/// Qwen's gated attention prologue: q cut from its gate, q and k normed per
+/// head (plus-one weights), turned, and k with its v written to the cache.
+/// Under `Intermediates::Written` the cut q may be read past it (a seam's,
+/// `ATTN_QV`) and every intermediate lands. Under `Unwritten` nothing reads
+/// them, though a marker seam (`attn.qv`) may name them, and the gated row is
+/// bf16.
+#[must_use]
+pub fn q_gate_norm_rope_append(intermediates: Intermediates) -> Rule {
+    let written = intermediates == Intermediates::Written;
     let pattern = template(|p| {
         let d = p.u32("d");
-        let (q, gate) = layout::split_q_gate(&p.rows("qg", 2 * W), d);
-        // The split q is a seam's (`ATTN_QV`), so it still lands.
-        p.export("q", &q);
+        let (q, gate) = gather::split_q_gate(&p.rows("qg", 2 * W), d);
+        if written {
+            p.export("q", &q);
+        } else {
+            p.name("q", &q);
+        }
         p.export("gate", &gate);
         let qn =
             elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [W]), d, p.f32("q_eps"));
@@ -1909,30 +2117,33 @@ fn q_gate_k_norm_rope_append() -> Rule {
             p.f32("k_eps"),
         );
         p.name("kn", &kn);
-        let (q_out, k_out) = elemwise::rope_partial(
+        let (q_out, k_out) = both(elemwise::rope(
             &qn,
-            &kn,
             &p.indices("positions"),
-            p.u32("rotary"),
             d,
             p.f32("theta"),
-            Some(p.u32("span")),
+            Turn::Partial {
+                rotary_dim: p.u32("rotary"),
+                span: p.u32("span"),
+            },
+            Some(&kn),
             None,
-        );
+        ));
         p.export("q_out", &q_out);
         p.name("k_out", &k_out);
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
         attn::kv_append(
             &k_out,
-            &p.rows("v", W),
+            Some(&p.rows("v", W)),
             p.cache("cache"),
             &write_page,
             &write_offset,
         );
     });
-    Rule::new("attention.q_gate_k_norm_rope_append", [pattern], |m| {
+    fn replace(m: &Match, intermediates: Intermediates) -> Fused {
         Fused::QGateNormRopeAppend {
             qg: m.value("qg"),
+            intermediates,
             head_dim: m.u32("d"),
             q: m.value("q"),
             gate: m.value("gate"),
@@ -1954,5 +2165,24 @@ fn q_gate_k_norm_rope_append() -> Rule {
             write_page: m.value("write_page"),
             write_offset: m.value("write_offset"),
         }
-    })
+    }
+    if written {
+        Rule::new("fused.q_gate_norm_rope_append", [pattern], |m| {
+            replace(m, Intermediates::Written)
+        })
+        .form("written")
+    } else {
+        Rule::new("fused.q_gate_norm_rope_append", [pattern], |m| {
+            replace(m, Intermediates::Unwritten)
+        })
+        .form("unwritten")
+        .through_markers()
+        .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
+    }
+}
+
+/// An op's two outputs, its second asked for: a rope's queries and the
+/// keys it was given, an attention's output and log-sum-exp.
+fn both((q, k): (poem::Value, Option<poem::Value>)) -> (poem::Value, poem::Value) {
+    (q, k.expect("an output asked for lands"))
 }

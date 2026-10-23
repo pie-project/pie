@@ -14,22 +14,41 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cerebras::Error> {
         match op {
-            Linear::Matmul { act, w, y } => linear::gemm::matmul(
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } => linear::gemm::matmul(
                 self.ctx(),
                 self.tensor(*act),
                 self.tensor(*w),
                 self.tensor(*y),
             ),
-            Linear::LmHead { act, w, y } => linear::gemm::lm_head(
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            } => linear::gemm::lm_head(
                 self.ctx(),
                 self.tensor(*act),
                 self.tensor(*w),
                 self.tensor(*y),
             ),
-            Linear::MlpSwiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => linear::mlp::swiglu(
                 self.ctx(),
                 self.tensor(*packed),
@@ -51,15 +70,18 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MlpGeluTanh { x, y } => {
+            Linear::GeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
-            Linear::MoeTopkSoftmax {
+            Linear::MoeRoute {
                 logits,
                 experts,
                 top_k,
                 routes,
                 weights,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => linear::moe::topk_softmax(
                 self.ctx(),
                 self.tensor(*logits),
@@ -85,15 +107,39 @@ impl Run<'_> {
                 *groups,
                 self.tensor(*y),
             ),
-            Linear::MoeMatmulSelect { x, bank, routes, y }
-            | Linear::MoeMatmulSelectQuant { x, bank, routes, y } => linear::moe::matmul_select(
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            }
+            | Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => linear::moe::matmul_select(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*bank),
                 self.tensor(*routes),
                 self.tensor(*y),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
                 self.tensor(*weights),

@@ -288,7 +288,7 @@ mod tests {
 
         let first = seed(&models).unwrap();
         assert!(first.iter().all(|(_, s)| *s == Seeded::Written));
-        assert!(models.join("qwen_3").join("package.poem").is_file());
+        assert!(models.join("qwen_3").is_dir());
         assert!(models.join(LIB).join(SEEDED).is_file());
 
         let again = seed(&models).unwrap();

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokenizer::Tokenizer;
 
 use crate::decode::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
-use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
+use crate::{ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
 
 pub const STOP_TOKENS: &[&str] = &["<|content_model_end_sampling|>", "<|endoftext|>"];
 
@@ -72,9 +72,25 @@ impl Instruct for Inkling {
         self.message(&self.system_prefix, msg)
     }
 
+    /// The effort line goes ahead of the conversation's first message that
+    /// is not a system message: after an opening system turn, which opens
+    /// the conversation in its place ([`Instruct::open`]), or ahead of the
+    /// first user turn.
     fn first_user(&self, msg: &str) -> Vec<u32> {
         let mut tokens = self.effort.clone();
         tokens.extend(self.user(msg));
+        tokens
+    }
+
+    /// The system turn, then the effort line ([`Instruct::first_user`]).
+    /// A further leading system message follows the effort line here, where
+    /// the template writes it ahead.
+    fn open(&self, system: Option<&str>, _tools: &[String], _effort: Option<Effort>) -> Vec<u32> {
+        let Some(msg) = system else {
+            return Vec::new();
+        };
+        let mut tokens = self.system(msg);
+        tokens.extend(&self.effort);
         tokens
     }
 

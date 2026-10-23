@@ -723,7 +723,7 @@ fn feed_ops_split_norm_and_append() {
     let mut qp = gpu.zeros(rows as u32, (heads * rope) as u32, Dtype::Bf16);
     let win = gpu.ints(&[2, 1, 0, 0]);
     ctx.arm_stage(win.ptr);
-    mla::split_q_b(
+    mla::prep::split_q_b(
         &ctx,
         q_b,
         heads as u32,

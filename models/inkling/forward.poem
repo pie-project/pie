@@ -35,7 +35,7 @@ def forward(m, inputs):
         for kv_heads, win in geometry
     ]
 
-    y = ops.elemwise.rmsnorm(ops.layout.embed(inputs.tokens(), m.embed, m.vocab), m.embed_norm, m.norm_eps)
+    y = ops.elemwise.rmsnorm(ops.gather.embed(inputs.tokens(), m.embed, m.vocab), m.embed_norm, m.norm_eps)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
@@ -56,13 +56,28 @@ def forward(m, inputs):
         bias = ops.linear.rel_bias(r, w.rel_proj, m.heads, m.d_rel, w.extent)
         log_scaling = m.log_scaling if reading == GLOBAL else None
         a = merge([
-            ops.attn.decode_rel(
-                q.on(one), plan_d[reading], pages, bias.on(one), win, d, w.extent,
-                m.sm_scale, log_scaling,
+            ops.attn.decode(
+                q.on(one),
+                plan_d[reading],
+                pages,
+                win,
+                d,
+                m.sm_scale,
+                bias = bias.on(one),
+                extent = w.extent,
+                log_scaling = log_scaling,
             ),
-            ops.attn.prefill_rel(
-                q.on(~one), plan_p[reading], pages, bias.on(~one), win, d, w.kv_heads,
-                w.extent, m.sm_scale, log_scaling,
+            ops.attn.prefill(
+                q.on(~one),
+                plan_p[reading],
+                pages,
+                win,
+                d,
+                w.kv_heads,
+                m.sm_scale,
+                bias = bias.on(~one),
+                extent = w.extent,
+                log_scaling = log_scaling,
             ),
         ])
         seam.at(seam.ATTN_OUT, [a])
@@ -78,30 +93,29 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.norm_eps) * m.head_scale
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.unembed)
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter)
+        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
         return ops.elemwise.scale(f.scale, ops.linear.matmul(act, f.down))
     fan = f.top_k + f.sink
-    routes, weights = ops.linear.moe_topk_sigmoid_sink(
+    routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
-        f.bias,
-        f.scale,
         f.experts,
         f.top_k,
-        f.sink,
-        f.scaling,
+        routing.sigmoid_sink(f.sink, scaling = f.scaling),
+        bias = f.bias,
+        scale = f.scale,
     )
-    hidden = ops.linear.mlp_swiglu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), f.inter)
+    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), gating.swiglu(), f.inter)
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, routes, fan), weights)
 
 def conv(v, weight, state, inputs, m):
     slab = inputs.state(state)
     one = fact.single_token()
     return merge([
-        ops.attn.short_conv(v.on(one), weight, slab, m.conv_width),
-        ops.attn.short_conv_chunked(v.on(~one), weight, slab, m.conv_width),
+        ops.ssm.short_conv(v.on(one), weight, slab, m.conv_width),
+        ops.ssm.short_conv_chunked(v.on(~one), weight, slab, m.conv_width),
     ])

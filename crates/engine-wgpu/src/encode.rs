@@ -1,4 +1,4 @@
-use kernels_wgpu::{ArgValue, Encode, Error, Fire};
+use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
 use crate::device::handles::NIL;
@@ -143,13 +143,13 @@ fn shapes() -> bool {
 }
 
 #[cfg(feature = "wgpu")]
-fn label(fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<'static, str> {
+fn label(name: &'static str, fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<'static, str> {
     use std::fmt::Write;
     if !shapes() {
-        return std::borrow::Cow::Borrowed(fire.entrypoint);
+        return std::borrow::Cow::Borrowed(name);
     }
-    let mut key = String::with_capacity(fire.entrypoint.len() + 48);
-    key.push_str(fire.entrypoint);
+    let mut key = String::with_capacity(name.len() + 48);
+    key.push_str(name);
     let _ = write!(
         key,
         " g={}x{}x{}",
@@ -280,14 +280,24 @@ impl Encode for Sink<'_> {
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
     }
+
+    fn target(&self) -> Target {
+        Target::Wgsl
+    }
 }
 
 #[cfg(feature = "wgpu")]
 impl Sink<'_> {
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
+        let name = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
+            Sink::backend(
+                fire,
+                format!("not instantiated at the {} tier", fire.tier.name()),
+            )
+        })?;
         let pipeline = self
             .pipelines
-            .get(self.device, fire)
+            .get(self.device, fire.file, name)
             .map_err(|fault| Sink::refuse(fire, fault))?;
         let core = self.device.core();
         let limits = &core.limits;
@@ -452,10 +462,7 @@ impl Sink<'_> {
         }
 
         let stated = fire.group.iter().product::<u32>();
-        if stated > 1
-            && pipeline.tier == kernels_wgpu::Capability::Baseline
-            && fire.group != pipeline.local
-        {
+        if stated > 1 && fire.group != pipeline.local {
             return Err(Sink::backend(
                 fire,
                 format!(
@@ -505,7 +512,7 @@ impl Sink<'_> {
                 });
             }
             core.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(fire.entrypoint),
+                label: Some(name),
                 layout: &pipeline.layout,
                 entries: &entries,
             })
@@ -513,12 +520,12 @@ impl Sink<'_> {
         core.take_error("create_bind_group")
             .map_err(|fault| Sink::refuse(fire, fault))?;
 
-        let key = label(fire, args);
+        let key = label(name, fire, args);
         if let Some((set, at)) = timing().then(|| self.frame.timestamp_slot(&key)).flatten() {
             self.frame
                 .encode(|encoder| {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some(fire.entrypoint),
+                        label: Some(name),
                         timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                             query_set: &set,
                             beginning_of_pass_write_index: Some(at),
@@ -536,7 +543,7 @@ impl Sink<'_> {
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         } else {
             self.frame
-                .dispatch(fire.entrypoint, &pipeline.pipeline, &group, fire.groups)
+                .dispatch(name, &pipeline.pipeline, &group, fire.groups)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         }
         if !staged.is_empty() {
@@ -596,5 +603,9 @@ impl Encode for Sink<'_> {
 
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
+    }
+
+    fn target(&self) -> Target {
+        Target::Wgsl
     }
 }

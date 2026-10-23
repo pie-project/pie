@@ -46,14 +46,14 @@ impl Endpoint {
                 ),
             )
         })?;
-        if cap1 > kernels_cuda::channel::MAX_RING {
+        if cap1 > kernels_cuda::runtime::channel::MAX_RING {
             return Err(Fault::program(
                 "program::endpoint",
                 format!(
                     "a channel of capacity {capacity} wants a ring of {cap1} cells and the \
                      full/empty bytes are cut {} apart per slot, so its ring would \
                      address its neighbour's",
-                    kernels_cuda::channel::MAX_RING
+                    kernels_cuda::runtime::channel::MAX_RING
                 ),
             ));
         }

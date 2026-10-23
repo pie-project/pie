@@ -1,0 +1,22 @@
+// Marks the rows whose position closes a `ratio` block: bpos the position
+// (or -1), brope the block's first position (or 0), breq the row's request.
+fn k_boundary(positions: [*]i32, request_of_token: [*]i32, row_valid: [*]i32,
+              bpos: [*]i32, breq: [*]i32, brope: [*]i32, rows: i32, ratio: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var pos: i32 = positions[r];
+    var p1: i32 = pos + 1;
+    var closes: bool = false;
+    if (p1 >= 0) { closes = (p1 - (p1 / ratio) * ratio) == 0; }
+    var is_b: bool = closes and row_valid[r] != 0;
+    breq[r] = request_of_token[r];
+    if (is_b) {
+      bpos[r] = pos;
+      brope[r] = (pos / ratio) * ratio;
+    } else {
+      bpos[r] = -1;
+      brope[r] = 0;
+    }
+  }
+}
+

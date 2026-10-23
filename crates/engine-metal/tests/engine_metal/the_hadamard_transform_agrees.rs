@@ -1,6 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
-//! `elementwise.hadamard` on Metal is a blockwise butterfly FWHT: the row's
+//! `elemwise.hadamard` on Metal is a blockwise butterfly FWHT: the row's
 //! last dim is cut into contiguous `block`-vectors (a power of two) and each is
 //! turned by the normalized Sylvester Hadamard matrix H, whose entries are
 //! `(-1)^popcount(i & j) / sqrt(block)`. The fast Walsh-Hadamard transform's
@@ -23,7 +23,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::elemwise::pointwise;
-use poem_ir::{Dtype, Elementwise, Operation};
+use poem_ir::{Dtype, Elemwise, Operation};
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
@@ -343,7 +343,7 @@ fn hadamard_check_faults(d: u64, block: u32) -> bool {
             },
         ],
         nodes: vec![Node {
-            op: Operation::Elementwise(Elementwise::Hadamard {
+            op: Operation::Elemwise(Elemwise::Hadamard {
                 x: ValueId(0),
                 x_out: ValueId(1),
                 block,
@@ -397,7 +397,7 @@ fn hadamard_sign_dtype_faults(act: Dtype, sign: Dtype) -> bool {
             },
         ],
         nodes: vec![Node {
-            op: Operation::Elementwise(Elementwise::Hadamard {
+            op: Operation::Elemwise(Elemwise::Hadamard {
                 x: ValueId(0),
                 x_out: ValueId(2),
                 block: 128,

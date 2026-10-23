@@ -93,7 +93,7 @@ fn fire(
 }
 
 #[test]
-#[ignore = "needs a CUDA device, a Lightricks/LTX-2.5-Diffusers snapshot with a vae/ and the ltx2_golden.py --vae dump under PIE_IMAGEGEN_GOLDEN"]
+#[ignore = "needs a CUDA device, a Lightricks/LTX-2.5-Diffusers snapshot with a vae/ and the ltx2_golden.py dump under PIE_IMAGEGEN_GOLDEN"]
 fn the_decoder_answers_the_reference_in_one_fire() {
     assert!(engine_cuda::device::present(), "no CUDA device");
     let root = snapshot(

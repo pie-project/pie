@@ -14,22 +14,13 @@ METAL_FUNC void sdpa_online_update(
   sum_exp_score = sum_exp_score * history_scale + score_scale;
 }
 
-METAL_FUNC float sdpa_merge_sink(
-    float sink, float reference_max, thread float& sum_exp_score) {
-  const float merged_max = max(reference_max, sink);
-  const float output_scale = fast::exp(reference_max - merged_max);
-  sum_exp_score =
-      sum_exp_score * output_scale + fast::exp(sink - merged_max);
-  return output_scale;
-}
-
 METAL_FUNC float sdpa_lse_base2(float max_score, float sum_exp_score) {
   constexpr float kLog2E = 1.44269504088896340736f;
   return sum_exp_score > 0.0f ? (max_score * kLog2E + log2(sum_exp_score))
                               : -INFINITY;
 }
 
-template <typename T, int D, int KT, bool WITH_SINK, bool WITH_LSE>
+template <typename T, int D, int KT, bool WITH_LSE>
 inline void sdpa_paged_mma_body(
     const device T* queries,
     const device T* k_pages,
@@ -47,7 +38,6 @@ inline void sdpa_paged_mma_body(
     const uint attention_mask_stride,
     const device uchar* attention_mask_enabled,
     const int window,
-    const device T* sinks,
     const int n_rows,
     device float* lse,
     threadgroup half* qtile,
@@ -66,9 +56,6 @@ inline void sdpa_paged_mma_body(
 
   static_assert(D % 8 == 0 && KT % 8 == 0, "the matrix unit tiles in eights");
   static_assert(RPS == 8, "a simdgroup owns exactly one fragment row of queries");
-  static_assert(
-      !(WITH_SINK && WITH_LSE),
-      "a folded sink and a published lse are two readings of one denominator");
 
   const int q_head    = int(tid.x);
   const int n_q_heads = int(tpg.x);
@@ -241,20 +228,16 @@ inline void sdpa_paged_mma_body(
     }
   }
 
-  float orescale = 1.0f;
-  if (WITH_SINK) {
-    orescale = sdpa_merge_sink(float(sinks[q_head]), max_score, sum_exp);
-  }
   device T* op = out + (size_t(my_row) * n_q_heads + q_head) * D;
   for (int n = 0; n < DF; n++) {
     for (int j = 0; j < 2; j++) {
-      const float x = Ov[n * 2 + j] * orescale;
+      const float x = Ov[n * 2 + j];
       op[n * 8 + int(fn) + j] = static_cast<T>(sum_exp == 0.0f ? x : x / sum_exp);
     }
   }
 }
 
-template <typename T, int D, int KT, bool WITH_SINK>
+template <typename T, int D, int KT>
 [[kernel]] [[max_total_threads_per_threadgroup(128)]] void sdpa_paged_mma(
     const device T* queries     [[buffer(0)]],
     const device T* k_pages     [[buffer(1)]],
@@ -281,11 +264,12 @@ template <typename T, int D, int KT, bool WITH_SINK>
   threadgroup half qtile[32 * D];
   threadgroup half ktile[D * KT];
   threadgroup half vtile[KT * D];
-  sdpa_paged_mma_body<T, D, KT, WITH_SINK, false>(
+  (void)sinks;
+  sdpa_paged_mma_body<T, D, KT, false>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
-      sinks, n_rows, nullptr,
+      n_rows, nullptr,
       qtile, ktile, vtile, tid, tpg, simd_gid, simd_lid);
 }
 
@@ -317,17 +301,18 @@ template <typename T, int D, int KT>
   threadgroup half qtile[32 * D];
   threadgroup half ktile[D * KT];
   threadgroup half vtile[KT * D];
-  sdpa_paged_mma_body<T, D, KT, false, true>(
+  (void)sinks;
+  sdpa_paged_mma_body<T, D, KT, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
-      sinks, n_rows, lse,
+      n_rows, lse,
       qtile, ktile, vtile, tid, tpg, simd_gid, simd_lid);
 }
 
-#define instantiate_sdpa_paged_mma(sfx, name, itype, d, kt, sink)            \
-  template [[host_name("sdpa_paged_mma" sfx "_" #name "_d_" #d)]]            \
-  [[kernel]] void sdpa_paged_mma<itype, d, kt, sink>(                        \
+#define instantiate_sdpa_paged_mma(name, itype, d, kt)                       \
+  template [[host_name("sdpa_paged_mma_" #name "_d_" #d)]]                   \
+  [[kernel]] void sdpa_paged_mma<itype, d, kt>(                              \
       const device itype*, const device itype*, const device itype*,         \
       device itype*, const constant int&, const device int*,                 \
       const device int*, const device uint*, const device uint*,             \
@@ -336,8 +321,7 @@ template <typename T, int D, int KT>
       const constant int&, const device itype*, const constant int&,         \
       uint3, uint3, uint, uint);
 
-instantiate_sdpa_paged_mma("", bfloat16, bfloat, 64, 16, false)
-instantiate_sdpa_paged_mma("_sink", bfloat16, bfloat, 64, 16, true)
+instantiate_sdpa_paged_mma(bfloat16, bfloat, 64, 16)
 
 #define instantiate_sdpa_paged_mma_lse(name, itype, d, kt)                   \
   template [[host_name("sdpa_paged_mma_lse_" #name "_d_" #d)]]               \
@@ -412,7 +396,7 @@ METAL_FUNC void sdpa_wide_land(threadgroup bfloat* dst, const thread uint4* w, c
 // the queries against a 16-key block staged in threadgroup memory, the
 // slices' partial scores are summed through the same memory before the online
 // softmax, and each simdgroup accumulates its own slice of the output, in
-// f32. MLX's steel attention splits a 256-wide head the same way.
+// f32.
 template <typename T, int D, bool WITH_LSE>
 inline void sdpa_paged_mma_wide_body(
     const device T* queries,

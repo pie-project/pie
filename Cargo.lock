@@ -1932,7 +1932,7 @@ dependencies = [
  "engine",
  "eta-compiler",
  "eta-exec",
- "kernels-vulkan",
+ "kernels-slang",
  "libc",
  "memmap2",
  "naga",
@@ -1956,12 +1956,12 @@ dependencies = [
  "engine",
  "eta-compiler",
  "eta-exec",
- "kernels-vulkan",
- "kernels-wgpu",
+ "kernels-slang",
  "libc",
  "memmap2",
  "naga",
  "pie-eta-ir",
+ "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
@@ -1970,6 +1970,7 @@ dependencies = [
  "tracing",
  "web-std",
  "wgpu",
+ "ztensor",
 ]
 
 [[package]]
@@ -3163,21 +3164,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernels-vulkan"
+name = "kernels-slang"
 version = "0.5.4"
 dependencies = [
  "ash",
  "pie-dtype",
- "pie-profile",
-]
-
-[[package]]
-name = "kernels-wgpu"
-version = "0.5.4"
-dependencies = [
- "pie-dtype",
- "pie-profile",
- "serde_json",
 ]
 
 [[package]]
@@ -4395,7 +4386,17 @@ name = "pie-poem-ir"
 version = "0.5.4"
 dependencies = [
  "pie-dtype",
+ "pie-poem-ir-macros",
  "serde",
+]
+
+[[package]]
+name = "pie-poem-ir-macros"
+version = "0.5.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

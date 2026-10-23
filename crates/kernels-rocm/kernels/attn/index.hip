@@ -6,8 +6,8 @@
 // weight each) against the one shared key row, read from a paged key pool
 // that keeps one row per `ratio` tokens (cell (j + 1)·ratio − 1 for key j).
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 #include "attn/mla.hip"
 
 namespace pie::attn {

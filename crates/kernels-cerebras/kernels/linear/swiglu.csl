@@ -1,0 +1,20 @@
+fn k_silu_mul(g: f32, u: f32) f32 {
+  return g / (1.0 + math.exp_f32(-g)) * u;
+}
+// y = silu(g) * u where packed rows are [g | u], each inter wide.
+fn k_swiglu(pk: [*]f32, y: [*]f32, rows: i32, inter: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var dg = @set_dsd_base_addr(k_base_f32, pk);
+    dg = @set_dsd_length(dg, @bitcast(u16, @as(i16, inter)));
+    dg = @increment_dsd_offset(dg, @as(i16, r * 2 * inter), f32);
+    var du = @set_dsd_base_addr(k_base_f32, pk);
+    du = @set_dsd_length(du, @bitcast(u16, @as(i16, inter)));
+    du = @increment_dsd_offset(du, @as(i16, r * 2 * inter + inter), f32);
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, inter)));
+    dy = @increment_dsd_offset(dy, @as(i16, r * inter), f32);
+    @map(k_silu_mul, dg, du, dy);
+  }
+}
+

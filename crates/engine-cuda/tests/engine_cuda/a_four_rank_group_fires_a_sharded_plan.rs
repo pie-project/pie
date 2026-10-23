@@ -46,16 +46,16 @@ impl ForwardHybrid for Sharded {
         let perm = inputs.row_permutation();
         let indptr = inputs.lane_indptr();
         let o = ops::attn::ragged(
-            &ops::layout::pack_rows(&q, &perm),
-            &ops::layout::pack_rows(&k, &perm),
-            &ops::layout::pack_rows(&v, &perm),
+            &ops::gather::pack_rows(&q, &perm),
+            &ops::gather::pack_rows(&k, &perm),
+            &ops::gather::pack_rows(&v, &perm),
             &indptr,
             &indptr,
             HEAD_DIM,
             SM_SCALE,
             RaggedMask::None,
         );
-        let o = ops::layout::unpack_rows(&o, &perm);
+        let o = ops::gather::unpack_rows(&o, &perm);
         let y = ops::linear::matmul(
             &o,
             &Weight::sym("o", [u64::from(WIDTH), mine], Dtype::Bf16).rows(),

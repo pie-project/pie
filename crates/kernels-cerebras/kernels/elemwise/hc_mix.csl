@@ -1,0 +1,18 @@
+// y[r, i] = (1 / m) * sum_s v[r, s, i] * sigmoid(g[r, s, i]).
+fn k_hc_mix(g: [*]f32, v: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32) void {
+  var inv_m: f32 = 1.0 / @as(f32, m);
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var i: i32 = 0;
+    while (i < h) : (i += 1) {
+      var acc: f32 = 0.0;
+      var s: i32 = 0;
+      while (s < m) : (s += 1) {
+        var at: i32 = (r * m + s) * h + i;
+        acc = acc + v[at] / (1.0 + math.exp_f32(-g[at]));
+      }
+      y[r * h + i] = acc * inv_m;
+    }
+  }
+}
+

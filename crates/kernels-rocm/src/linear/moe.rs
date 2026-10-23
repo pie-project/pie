@@ -84,7 +84,7 @@ pub fn topk_softmax(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
@@ -118,7 +118,7 @@ pub fn topk_softmax_scaled(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax_scaled";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
         scale.dtype, logits.dtype,
@@ -198,7 +198,7 @@ pub fn topk_sigmoid(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     ranked_router(
         ctx,
@@ -229,7 +229,7 @@ pub fn topk_sigmoid_sink(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid_sink";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = top_k
         .checked_add(sink)
@@ -303,7 +303,7 @@ pub fn topk_sqrt_softplus(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sqrt_softplus";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
         bias.dtype,
@@ -405,7 +405,7 @@ pub fn matmul_select(
     y: &mut Tensor,
     experts: ExpertTable,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select";
+    const OP: &str = "linear.moe_select";
 
     let fan = selected(OP, x, routes, y)?;
     // Past 64 routes an expert at a decode batch, a bf16 bank on the matrix
@@ -2096,7 +2096,7 @@ pub fn matmul_select_mxfp4_lanes(
     routes: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     let op = OP;
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;
@@ -2193,7 +2193,7 @@ pub fn matmul_select_bias(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_bias";
+    const OP: &str = "linear.moe_select";
     matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
 }
 
@@ -2208,7 +2208,7 @@ pub fn matmul_select_quant(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     // A byte a code beside four a 128x128 block: an fp8 bank (`e4m3tile128`).
     if biases.is_none() && fp8_tiles(x, codes, scales, y) {
         return Err(refuse(
@@ -2249,7 +2249,7 @@ pub fn matmul_select_fp8_mfma(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false, 1)?;
     matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, seat)
@@ -2269,7 +2269,7 @@ pub fn matmul_select_fp8_quantized(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     let op = OP;
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     if q.rows != x.rows
@@ -2551,7 +2551,7 @@ fn matmul_select_mlxu4(
 /// Each token's routed rows (already weighted) summed in f32, plus its
 /// `shared` row, rounded once.
 pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.moe_sum_add";
+    const OP: &str = "linear.moe_combine";
     let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
     if !routed.rows.is_multiple_of(y.rows) || routed.width != y.width {
@@ -2929,9 +2929,9 @@ pub fn mlp_swiglu(ctx: &Ctx, p: &RoutedMlp, y: &mut Tensor) -> Result<(), Error>
         )?;
         match p.limit {
             Some(limit) => {
-                crate::linear::mlp::swiglu_clamp(ctx, packed, p.intermediate, p.fan, limit, &mut h)?
+                crate::linear::glu::swiglu_clamp(ctx, packed, p.intermediate, p.fan, limit, &mut h)?
             }
-            None => crate::linear::mlp::swiglu(ctx, packed, p.intermediate, p.fan, &mut h)?,
+            None => crate::linear::glu::swiglu(ctx, packed, p.intermediate, p.fan, &mut h)?,
         }
         matmul_select(ctx, h, p.down, p.routes, &mut routed, p.down_experts)?;
         Ok(())
@@ -2964,7 +2964,7 @@ fn weighted_fold(
     x: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
     nonzero(OP, "the token rows this fold lands on", y.rows)?;

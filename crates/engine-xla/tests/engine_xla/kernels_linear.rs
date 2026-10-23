@@ -75,17 +75,39 @@ fn dense_projections_answer_the_host() {
     let rel = b.zeros(Dtype::F32, m as u32, (heads * extent) as u32);
     if !b
         .run(|ctx| {
-            gemm::matmul(ctx, x, w, y)?;
-            gemm::lm_head(ctx, x, w, head)?;
-            gemm::rel_bias(
-                ctx,
-                rxt,
-                rwt,
-                heads as u32,
-                d_rel as u32,
-                extent as u32,
-                rel,
-            )
+            engine_xla::lower::lower(ctx, |l| {
+                let act_v = l.read(x)?;
+                let w_v = l.read(w)?;
+                let o_y = y;
+                if let Some(v) = gemm::matmul(l.f(), act_v, w_v, o_y.landing())? {
+                    l.land(o_y, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let act_v = l.read(x)?;
+                let w_v = l.read(w)?;
+                let o_y = head;
+                if let Some(v) = gemm::lm_head(l.f(), act_v, w_v, o_y.landing())? {
+                    l.land(o_y, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(rxt)?;
+                let w_v = l.read(rwt)?;
+                let o_y = rel;
+                let v = gemm::rel_bias(
+                    l.f(),
+                    x_v,
+                    w_v,
+                    heads as u32,
+                    d_rel as u32,
+                    extent as u32,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -125,8 +147,25 @@ fn an_f32_activation_is_contracted_at_f32() {
     let z = b.zeros(Dtype::F32, m as u32, n as u32);
     if !b
         .run(|ctx| {
-            gemm::act_x_wt(ctx, "linear.matmul", x, w, y)?;
-            gemm::matmul(ctx, x, w32, z)
+            engine_xla::lower::lower(ctx, |l| {
+                let act_v = l.read(x)?;
+                let w_v = l.read(w)?;
+                let o_y = y;
+                if let Some(v) = gemm::act_x_wt(l.f(), "linear.matmul", act_v, w_v, o_y.landing())?
+                {
+                    l.land(o_y, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let act_v = l.read(x)?;
+                let w_v = l.read(w32)?;
+                let o_y = z;
+                if let Some(v) = gemm::matmul(l.f(), act_v, w_v, o_y.landing())? {
+                    l.land(o_y, v)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -155,15 +194,62 @@ fn every_mlp_activation_answers_the_host() {
     let iu = i as u32;
     if !b
         .run(|ctx| {
-            mlp::swiglu(ctx, packed, iu, outs[0])?;
-            mlp::swiglu_clamp(ctx, packed, iu, limit, outs[1])?;
-            mlp::swiglu_clamp_alpha(ctx, packed, iu, limit, alpha, outs[2])?;
-            mlp::swiglu_clamp_split(ctx, gate, up, limit, outs[3])?;
-            mlp::geglu_tanh(ctx, gate, up, outs[4])?;
-            mlp::gelu_tanh(ctx, gate, outs[5])?;
-            mlp::geglu_tanh_packed(ctx, packed, iu, outs[6])?;
-            mlp::situ(ctx, packed, iu, beta, Some(up_cap), outs[7])?;
-            mlp::situ(ctx, packed, iu, beta, None, outs[8])
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(packed)?;
+                let o_y = outs[0];
+                let v = mlp::swiglu(l.f(), packed_v, iu, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(packed)?;
+                let o_y = outs[1];
+                let v = mlp::swiglu_clamp(l.f(), packed_v, iu, limit, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(packed)?;
+                let o_y = outs[2];
+                let v = mlp::swiglu_clamp_alpha(l.f(), packed_v, iu, limit, alpha, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let gate_v = l.read(gate)?;
+                let up_v = l.read(up)?;
+                let o_y = outs[3];
+                let v = mlp::swiglu_clamp_split(l.f(), gate_v, up_v, limit, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let gate_v = l.read(gate)?;
+                let up_v = l.read(up)?;
+                let o_y = outs[4];
+                let v = mlp::geglu_tanh(l.f(), gate_v, up_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(gate)?;
+                let o_y = outs[5];
+                let v = mlp::gelu_tanh(l.f(), x_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(packed)?;
+                let o_y = outs[6];
+                let v = mlp::geglu_tanh_packed(l.f(), packed_v, iu, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(packed)?;
+                let o_y = outs[7];
+                let v = mlp::situ(l.f(), packed_v, iu, beta, Some(up_cap), o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(packed)?;
+                let o_y = outs[8];
+                let v = mlp::situ(l.f(), packed_v, iu, beta, None, o_y.landing())?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -236,7 +322,23 @@ fn a_lora_correction_adds_each_rows_own_adapter() {
     let bt = b.bf16(adapters as u32, (n_out * rank) as u32, &bb);
     let rt = b.i32(rows as u32, 1, &routes);
     let y = b.bf16(rows as u32, n_out as u32, &ys);
-    if !b.run(|ctx| lora::correct(ctx, x, at, bt, rt, y)).unwrap() {
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let bank_a_v = l.read(at)?;
+                let routes_v = l.read(rt)?;
+                let bank_b_v = l.read(bt)?;
+                let y_v = l.read(y)?;
+                let o_y = y;
+                if let Some(v) = lora::correct(l.f(), x_v, bank_a_v, bank_b_v, routes_v, y_v)? {
+                    l.land(o_y, v)?;
+                }
+                Ok(())
+            })
+        })
+        .unwrap()
+    {
         return;
     }
     let mut want = ys.clone();

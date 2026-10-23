@@ -1,0 +1,20 @@
+// Every group-wide run of each width-wide row scaled by rsqrt(mean of
+// squares + eps), then by the gain of its column of the row: w or 1 + w.
+fn k_rmsnorm_banked(x: [*]f32, w: [*]f32, y: [*]f32, rows: i32, width: i32, group: i32, eps: f32, plus_one: bool) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var c: i32 = 0;
+    while (c < width) : (c += group) {
+      var base: i32 = r * width + c;
+      var ss: f32 = k_dot(x, base, x, base, group);
+      var inv: f32 = 1.0 / math.sqrt_f32(ss / @as(f32, group) + eps);
+      var i: i32 = 0;
+      while (i < group) : (i += 1) {
+        var g: f32 = w[c + i];
+        if (plus_one) { g = g + 1.0; }
+        y[base + i] = x[base + i] * inv * g;
+      }
+    }
+  }
+}
+

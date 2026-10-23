@@ -6,30 +6,11 @@ use starlark::environment::GlobalsBuilder;
 use starlark::values::Value;
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::UnpackList;
-use starlark::values::none::NoneOr;
 use starlark_derive::starlark_module;
 
 use crate::star::values::{
     DtypeValue, PrecisionValue, WeightValue, precision, precision_word, word,
 };
-
-thread_local! {
-    static ENV: std::cell::RefCell<Vec<(String, Option<String>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// `f`, with the variables of `vars` (`None` unset) as a layout's `env`
-/// reads them on this thread, whatever the process's environment holds.
-pub fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
-    let held: Vec<(String, Option<String>)> = vars
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
-        .collect();
-    let before = ENV.with(|env| std::mem::replace(&mut *env.borrow_mut(), held));
-    let out = f();
-    ENV.with(|env| *env.borrow_mut() = before);
-    out
-}
 
 #[starlark_module]
 pub(crate) fn layout(builder: &mut GlobalsBuilder) {
@@ -58,25 +39,6 @@ pub(crate) fn layout(builder: &mut GlobalsBuilder) {
                     precision_word(stated)
                 )
             })
-    }
-
-    /// The environment variable `name`, or `None`.
-    fn env(#[starlark(require = pos)] name: String) -> anyhow::Result<NoneOr<String>> {
-        if let Some(value) = ENV.with(|env| {
-            env.borrow()
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.clone())
-        }) {
-            return Ok(match value {
-                Some(value) => NoneOr::Other(value),
-                None => NoneOr::None,
-            });
-        }
-        Ok(match std::env::var(name) {
-            Ok(value) => NoneOr::Other(value),
-            Err(_) => NoneOr::None,
-        })
     }
 }
 

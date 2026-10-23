@@ -1124,6 +1124,7 @@ impl<'c> Run<'c> {
     }
 
     /// Whether nodes `a` and `b` sit in one region of the template.
+    #[cfg(feature = "rocm")]
     pub(crate) fn one_region(&self, a: u32, b: u32) -> bool {
         self.ceilings
             .regions

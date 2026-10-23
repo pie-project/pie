@@ -1,0 +1,29 @@
+// y[l][o - o0] = dot(bank[routes[l]][o][c0..c1], x[l / xdiv][c0..c1]) for
+// the PE's lanes (routed pairs) [l0, l1), outputs [o0, o1) and depth
+// [c0, c1); a negative route leaves the row. Whole: x rows k wide, bank
+// experts [n][k], y rows n wide. Sharded: x rows (c1 - c0) wide, bank
+// slots [o1 - o0][c1 - c0], y rows (o1 - o0) wide (a partial over depth).
+fn k_moe_select(x: [*]f32, bank: [*]f32, routes: [*]i32, y: [*]f32,
+                l0: i32, l1: i32, o0: i32, o1: i32, c0: i32, c1: i32, xdiv: i32, n: i32, k: i32, experts: i32, sharded: bool) void {
+  var kl: i32 = c1 - c0;
+  var ol: i32 = o1 - o0;
+  var xw: i32 = k;
+  var yw: i32 = n;
+  var bw: i32 = n * k;
+  var brow: i32 = k;
+  var os: i32 = 0;
+  var cs: i32 = 0;
+  if (sharded) { xw = kl; yw = ol; bw = ol * kl; brow = kl; os = o0; cs = c0; }
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var e: i32 = routes[l];
+    if (e >= 0 and e < experts) {
+      var xrow: i32 = (l / xdiv) * xw;
+      var o: i32 = o0;
+      while (o < o1) : (o += 1) {
+        y[l * yw + (o - os)] = k_dot(bank, e * bw + (o - os) * brow, x, xrow, kl);
+      }
+    }
+  }
+}
+

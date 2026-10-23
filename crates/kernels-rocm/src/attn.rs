@@ -1,36 +1,32 @@
-pub mod dsv4;
-
-pub mod dynconv;
+pub mod compressed;
+pub mod dense;
 
 pub mod index;
 
 pub mod kv;
+pub mod kv_window;
 
-pub mod markov;
-
+pub mod merge;
 pub mod mla;
 
 pub mod paged;
 
 pub mod plan;
-
-pub mod pool;
+pub mod qkv_append;
+pub mod ragged;
 
 pub mod rel;
 
 pub mod selected;
 
 pub mod sched;
+pub mod score;
 
 pub mod sched_decode;
 
 pub mod sched_mla;
 
 pub mod sched_prefill;
-
-pub mod selector;
-
-pub mod ssm;
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -42,7 +38,7 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 const BLOCK: u32 = 256;
 
 #[must_use]
-const fn elementwise(n: u32) -> Launch {
+pub(crate) const fn elementwise(n: u32) -> Launch {
     Launch::flat(n, BLOCK)
 }
 
@@ -77,7 +73,7 @@ fn attention_lands(op: &'static str, q: Tensor, o: &Tensor) {
     );
 }
 
-fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
+pub(crate) fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
     debug_assert_eq!(lse.dtype, Dtype::F32, "`{op}`'s log-sum-exp plane is f32");
     debug_assert!(
         lse.rows == rows && lse.width == heads,
@@ -263,7 +259,7 @@ pub fn decode(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.decode";
+    const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None,
@@ -282,7 +278,7 @@ pub fn decode_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.decode_lse";
+    const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx,
@@ -311,7 +307,7 @@ pub fn prefill(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    const OP: &str = "attn.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None,
@@ -340,7 +336,7 @@ pub fn prefill_selected_tiled(
     per_head: bool,
     o: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "attention.prefill_selected";
+    const OP: &str = "attn.prefill";
     if window.is_some()
         || q.data.dtype != Dtype::Bf16
         || pool.keys.dtype != Dtype::Bf16
@@ -400,7 +396,7 @@ pub fn prefill_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    const OP: &str = "attn.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx,
@@ -430,7 +426,7 @@ pub fn masked(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
+    const OP: &str = "attn.prefill";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
     let Some(mask_indptr) = plan.mask_indptr else {
@@ -468,7 +464,7 @@ pub fn masked_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked_lse";
+    const OP: &str = "attn.prefill";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
     let Some(mask_indptr) = plan.mask_indptr else {
@@ -504,7 +500,7 @@ pub struct RelBias {
 impl RelBias {
     /// The bias as the matrix-core walks take it.
     fn walked(self, rows: u32, heads: u32) -> Result<paged::Rel, Error> {
-        const OP: &str = "attention.rel_bias";
+        const OP: &str = "attn.rel_bias";
         if self.bias.dtype != Dtype::F32
             || self.bias.ptr == 0
             || self.bias.rows != rows
@@ -539,7 +535,7 @@ pub fn decode_rel(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.decode_rel";
+    const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx,
@@ -569,7 +565,7 @@ pub fn prefill_rel(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_rel";
+    const OP: &str = "attn.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx,
@@ -587,118 +583,6 @@ pub fn prefill_rel(
     )
 }
 
-pub fn sink(
-    ctx: &Ctx,
-    o: &mut Tensor,
-    lse: Tensor,
-    sink: Tensor,
-    head_dim: u32,
-) -> Result<(), Error> {
-    const OP: &str = "attention.sink";
-    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    // The sinks are the scores' own element, or f32 as a checkpoint keeps them.
-    let s = match sink.dtype {
-        Dtype::F32 => "float",
-        held if held == o.dtype => t,
-        held => {
-            return Err(refuse(
-                OP,
-                format!("the sinks are {held:?} and the scores {:?}", o.dtype),
-            ));
-        }
-    };
-    let heads = row_heads(OP, o.width, head_dim)?;
-    lse_plane(OP, &lse, o.rows, heads);
-    let rows = count(OP, "rows", o.rows)?;
-    let (vec, launch) = per_head_elementwise(o.rows, heads, head_dim);
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/attention.hip",
-            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}, {vec}>")),
-        )
-        .apply(launch),
-        &[
-            o.arg(),
-            lse.arg(),
-            sink.arg(),
-            rows.arg(),
-            stated(OP, heads)?.arg(),
-            stated(OP, head_dim)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn merge_lse(
-    ctx: &Ctx,
-    o1: Tensor,
-    lse1: Tensor,
-    o2: Tensor,
-    lse2: Tensor,
-    heads: u32,
-    head_dim: u32,
-    o: &mut Tensor,
-    lse: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.merge_lse";
-
-    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert!(
-        o1.rows == o.rows && o2.rows == o.rows,
-        "the merged outputs are one row per query row"
-    );
-    lse_plane(OP, lse, o.rows, heads);
-    let (vec, launch) = per_head_elementwise(o.rows, heads, head_dim);
-    let heads = count(OP, "the head count this merge states", heads)?;
-    let head_dim = count(OP, "the head width this merge states", head_dim)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/attention.hip",
-            symbol(&format!("::pie::attn::merge_lse_combine<{t}, {vec}>")),
-        )
-        .apply(launch),
-        &[
-            o1.arg(),
-            lse1.arg(),
-            o2.arg(),
-            lse2.arg(),
-            o.arg(),
-            lse.arg(),
-            heads.arg(),
-            head_dim.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attention.logit_softcap";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    if cap.is_nan() || cap <= 0.0 {
-        return Err(refuse(OP, format!("{cap} is not a logit soft cap")));
-    }
-    let n = x.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the element count", lanes)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/attention.hip",
-            symbol(&format!("::pie::attn::logit_softcap<{t}>")),
-        )
-        .apply(elementwise(lanes)),
-        &[x.arg(), cap.arg(), n.arg()],
-    )
-}
-
 pub fn kv_append(
     ctx: &Ctx,
     k: RaggedTensor,
@@ -707,7 +591,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.kv_append";
+    const OP: &str = "attn.kv_append";
     dtype_dispatch!(OP, k.data.dtype, { Bf16 => () });
     debug_assert!(
         v.rows == k.data.rows && v.width == k.data.width && v.dtype == k.data.dtype,
@@ -723,7 +607,7 @@ pub fn kv_append_shared(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.kv_append_shared";
+    const OP: &str = "attn.kv_append";
     dtype_dispatch!(OP, plane.data.dtype, { Bf16 => () });
     kv::write_kv_to_pages(
         ctx,
@@ -746,7 +630,7 @@ pub fn res_blend(
     proj: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.res_blend";
+    const OP: &str = "elemwise.res_blend";
 
     const MAX_BLOCKS: usize = 32;
 

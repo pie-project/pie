@@ -1,0 +1,19 @@
+fn k_softplus(z: f32) f32 {
+  if (z > 20.0) { return z; }
+  return math.log_f32(1.0 + math.exp_f32(z));
+}
+// [b | a] -> [g_log | beta]: g = -exp(a_log) * softplus(a + dt_bias), beta = sigmoid(b).
+fn k_gdn_prep(ba: [*]f32, dt: [*]f32, alog: [*]f32, gates: [*]f32, rows: i32, hv: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var row: i32 = t * 2 * hv;
+    var h: i32 = 0;
+    while (h < hv) : (h += 1) {
+      var bv: f32 = ba[row + h];
+      var av: f32 = ba[row + hv + h];
+      gates[row + h] = -math.exp_f32(alog[h]) * k_softplus(av + dt[h]);
+      gates[row + hv + h] = 1.0 / (1.0 + math.exp_f32(-bv));
+    }
+  }
+}
+

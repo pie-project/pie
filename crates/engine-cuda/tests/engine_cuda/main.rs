@@ -7,7 +7,7 @@ extern crate kernels_rocm as kernels_cuda;
 // Strict kernels for the whole binary, before any test runs: an
 // instantiation that will not compile fails its test instead of falling
 // back unseen.
-#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[cfg(all(any(feature = "cuda", feature = "rocm"), target_os = "linux"))]
 #[used]
 #[unsafe(link_section = ".init_array")]
 static STRICT_KERNELS: extern "C" fn() = {

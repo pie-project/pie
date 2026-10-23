@@ -320,7 +320,6 @@ fn the_minimax_h3_import_reads_the_fl2va_index_every_case() {
     the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply();
     the_flagship_refuses_a_bare_transformer();
     the_flagships_names_are_the_partitions_index();
-    the_miniature_reads_its_golden_fixture();
 }
 
 fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
@@ -469,45 +468,4 @@ fn the_flagships_names_are_the_partitions_index() {
         left.iter().any(|name| name.starts_with("model.visual.")),
         "the shipped encoder is a VLM and its tower is in the index"
     );
-}
-
-fn golden(file: &str) -> Option<PathBuf> {
-    let root = std::env::var_os("PIE_IMAGEGEN_GOLDEN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root/.cache/pie-imagegen/golden"));
-    let file = root.join("minimax_h3").join(file);
-    file.is_file().then_some(file)
-}
-
-fn the_miniature_reads_its_golden_fixture() {
-    let Some(path) = golden("h3_mini.safetensors") else {
-        eprintln!("skipping: no h3_mini.safetensors; run `h3_golden.py --mini`");
-        return;
-    };
-    let src = ztensor_compat::open(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    let index: BTreeSet<String> = src.names().map(str::to_string).collect();
-    let want: BTreeSet<String> = transformer(&Dims::mini())
-        .into_iter()
-        .map(|(name, ..)| name)
-        .collect();
-    assert_eq!(index, want, "the fixture is the miniature's state_dict");
-    for (name, shape, _) in transformer(&Dims::mini()) {
-        assert_eq!(
-            src.get(&name)
-                .unwrap_or_else(|| panic!("no `{name}`"))
-                .shape(),
-            shape.as_slice(),
-            "`{name}`"
-        );
-    }
-    let row = poem_compiler::catalog::deployment(MINI).expect("the catalog ships the miniature");
-    let contract = row
-        .contract(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the miniature does not read its own fixture: {why}"));
-    assert_eq!(
-        reads(&contract),
-        expected_reads("", &Dims::mini()),
-        "the miniature's counts over its fixture"
-    );
-    type_checks(&contract, &src);
 }

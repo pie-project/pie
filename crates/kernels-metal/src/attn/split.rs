@@ -157,7 +157,7 @@ pub fn try_tables(
     {
         return Ok(false);
     }
-    let shape = Paged::of("attention.split", q, pool, window, causal, head_dim)?;
+    let shape = Paged::of("attn.split", q, pool, window, causal, head_dim)?;
     let entries = if head_dim == 128 {
         point_d128(shape.gqa)
     } else {
