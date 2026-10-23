@@ -1,6 +1,9 @@
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::tensor::Tensor;
+use crate::voxels::lane_pair;
 use dtype::Dtype;
 
 const REL_BIAS_UNIT: &str = "linear/rel_bias.hip";
@@ -247,6 +250,93 @@ pub enum GridRule {
     },
 }
 
-crate::error::unsupported! {
-    derive_grid = "conv.derive_grid" (grid: Tensor, rule: GridRule, o_grid: &mut Tensor);
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct RuleGeom {
+    kind: i32,
+    a: [i32; 3],
+    b: [i32; 3],
+    c: [i32; 3],
+    d: [i32; 3],
+    flag: i32,
+    lanes: i32,
+}
+
+fn triple(op: &'static str, v: [u32; 3]) -> Result<[i32; 3], Error> {
+    Ok([stated(op, v[0])?, stated(op, v[1])?, stated(op, v[2])?])
+}
+
+/// The output lane table a voxel op lands on, derived on the device from
+/// its input's: each lane's extent under `rule`, the row offsets running
+/// lane after lane. A lane the rule cannot shape lands empty.
+pub fn derive_grid(
+    ctx: &Ctx,
+    grid: Tensor,
+    rule: GridRule,
+    o_grid: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "conv.grid";
+    let lanes = lane_pair(OP, grid, *o_grid)?;
+    let geom = match rule {
+        GridRule::Conv {
+            k,
+            stride,
+            pad,
+            pad_back,
+            causal_t,
+        } => RuleGeom {
+            kind: 0,
+            a: triple(OP, k)?,
+            b: triple(OP, stride)?,
+            c: triple(OP, pad)?,
+            d: triple(OP, pad_back)?,
+            flag: i32::from(causal_t),
+            lanes,
+        },
+        GridRule::Upsample {
+            factor,
+            keep_first_frame,
+        } => RuleGeom {
+            kind: 1,
+            a: triple(OP, factor)?,
+            b: [0; 3],
+            c: [0; 3],
+            d: [0; 3],
+            flag: i32::from(keep_first_frame),
+            lanes,
+        },
+        GridRule::Shuffle { r, trim_t } => RuleGeom {
+            kind: 2,
+            a: triple(OP, r)?,
+            b: [0; 3],
+            c: [0; 3],
+            d: [0; 3],
+            flag: stated(OP, trim_t)?,
+            lanes,
+        },
+        GridRule::Unshuffle { r } => RuleGeom {
+            kind: 3,
+            a: triple(OP, r)?,
+            b: [0; 3],
+            c: [0; 3],
+            d: [0; 3],
+            flag: 0,
+            lanes,
+        },
+        GridRule::AvgDown { factor } => RuleGeom {
+            kind: 4,
+            a: triple(OP, factor)?,
+            b: [0; 3],
+            c: [0; 3],
+            d: [0; 3],
+            flag: 0,
+            lanes,
+        },
+    };
+    ctx.fire(
+        OP,
+        Fire::at(POSENC_UNIT, "::pie::elemwise::grid_rule")
+            .apply(Launch::grid([1, 1, 1], [64, 1, 1])),
+        &[grid.arg(), o_grid.arg(), ArgValue::of(&geom)],
+    )
 }
