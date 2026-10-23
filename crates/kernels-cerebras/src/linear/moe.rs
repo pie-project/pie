@@ -63,6 +63,7 @@ pub fn topk_softmax(
             per_row: u64::from(logits.width) + 2 * u64::from(top_k),
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;
@@ -123,6 +124,7 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
             per_row: u64::from(groups),
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: groups,
         },
     )?;
@@ -528,6 +530,7 @@ pub fn weighted_sum(
             per_row: u64::from(width) * u64::from(top_k + 1) + u64::from(top_k),
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;
@@ -609,6 +612,7 @@ pub fn sigmoid_gate_add(
             per_row: 3 * u64::from(width) + 1,
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;

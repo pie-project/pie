@@ -5,8 +5,8 @@ use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::linear::gemm::FABRIC_SUM_WORDS;
 use kernels_cerebras::phase::{BlockPlan, Reduce};
 use kernels_cerebras::plan::{
-    BlockSplit, Blocks, Fabric, Footprint, Held, LaneSplit, PageSplit, PagedLanes, Pages, Plan,
-    Product, Routed, RoutedSplit, Slots, Spread,
+    BlockSplit, Blocks, Fabric, Footprint, Held, LSE_GROUPS, LaneSplit, Merge, PageSplit,
+    PagedLanes, Pages, Plan, Product, Routed, RoutedSplit, Slots, Spread,
 };
 
 /// The most words one array holds: a word address of 16 bits (the probe's
@@ -55,6 +55,21 @@ impl Plan for Planner {
     fn pages(&self, op: &'static str, pages: &Pages<'_>) -> Result<PageSplit, Error> {
         self::pages(&self.fabric, op, pages)
     }
+
+    fn merge(&self, merge: Merge) -> bool {
+        self::merge(&self.fabric, merge)
+    }
+}
+
+/// Whether the partials of `merge` combine on the fabric: when the terms
+/// merge there at all and there is more than one, an lse merge gathering
+/// at most [`LSE_GROUPS`] copies unless it spans the resident row.
+pub fn merge(fab: &Fabric, merge: Merge) -> bool {
+    let (group, capped) = match merge {
+        Merge::Sum { group } | Merge::Pick { group } => (group, false),
+        Merge::Lse { group, row } => (group, !row && group > LSE_GROUPS),
+    };
+    fab.fabric_sum && group > 1 && !capped
 }
 
 /// The `(row groups, column groups)` a row-wise op of `footprint` spreads
@@ -68,8 +83,11 @@ pub fn tile(fabric: &Fabric, op: &'static str, footprint: Footprint) -> Result<(
         per_row,
         per_col,
         whole,
+        merge,
         unit,
     } = footprint;
+    // A fabric merge's words are kept whatever the split.
+    let whole = whole + if fabric.fabric_sum { merge } else { 0 };
     let budget = fabric.pe_words;
     let (rows, width, unit) = (rows.max(1), width.max(1), unit.max(1));
     if fabric.resident_pes.is_some() {
@@ -218,7 +236,20 @@ pub fn blocks(fab: &Fabric, blocks: &Blocks<'_>) -> Option<BlockSplit> {
         b,
         code,
         held,
+        merge: merged,
     } = *blocks;
+    let held = |window: u32, ag: u32, bg: u32| {
+        let lse = Merge::Lse {
+            group: ag,
+            row: false,
+        };
+        let merged = if merge(fab, lse) {
+            merged(window, ag, bg)
+        } else {
+            0
+        };
+        held(window, ag, bg) + merged
+    };
     let budget = fab.pe_words.saturating_sub(code);
     let divisors = |x: u32| (1..=x).filter(move |d| x.is_multiple_of(*d));
     let mut window = rows;
@@ -375,6 +406,15 @@ pub fn routed(fab: &Fabric, routed: &Routed<'_>) -> Option<RoutedSplit> {
 /// groups, a page past that its heads and rows; the fewest PEs win.
 pub fn pages(fab: &Fabric, op: &'static str, pages: &Pages<'_>) -> Result<PageSplit, Error> {
     let p = pages;
+    // A fabric merge's words are kept whatever the split.
+    let beside = |window: u32, hg: u32| {
+        let merged = if fab.fabric_sum {
+            (p.merge)(window, hg)
+        } else {
+            0
+        };
+        (p.beside)(window, hg) + merged
+    };
     let mut window = if p.windows {
         p.rows.max(1).min(fab.attn_rows.unwrap_or(u32::MAX)).max(1)
     } else {
@@ -383,7 +423,7 @@ pub fn pages(fab: &Fabric, op: &'static str, pages: &Pages<'_>) -> Result<PageSp
     loop {
         let halve = p.windows && window > 1;
         if let Some(pes) = fab.resident_pes {
-            let beside = (p.beside)(window, 1);
+            let beside = beside(window, 1);
             match strided(fab, pes, p, beside) {
                 Some(lanes) => {
                     return Ok(PageSplit {
@@ -406,7 +446,7 @@ pub fn pages(fab: &Fabric, op: &'static str, pages: &Pages<'_>) -> Result<PageSp
                 }
             }
         }
-        match paged(fab, op, p, &|hg| (p.beside)(window, hg)) {
+        match paged(fab, op, p, &|hg| beside(window, hg)) {
             Ok(lanes) => return Ok(PageSplit { window, lanes }),
             Err(_) if halve => window = window.div_ceil(2),
             Err(e) => return Err(e),

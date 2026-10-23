@@ -53,6 +53,7 @@ fn copy_split(
                     per_row,
                     per_col: 0,
                     whole: 0,
+                    merge: 0,
                     unit: 1,
                 },
             )

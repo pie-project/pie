@@ -34,6 +34,7 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
                 per_row: u64::from(packed.width + y.width),
                 per_col: 0,
                 whole: 0,
+                merge: 0,
                 unit: 1,
             },
         )?
@@ -98,6 +99,7 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
                 per_row: 2 * u64::from(x.width),
                 per_col: 0,
                 whole: 0,
+                merge: 0,
                 unit: 1,
             },
         )?

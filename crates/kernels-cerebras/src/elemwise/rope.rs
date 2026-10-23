@@ -111,6 +111,7 @@ fn rotate(
                 per_row,
                 per_col: 0,
                 whole: u64::from(half),
+                merge: 0,
                 unit,
             },
         )?

@@ -88,6 +88,7 @@ pub fn rmsnorm_grouped_plus_one(
             per_row: 2 * u64::from(width),
             per_col: 1,
             whole: 0,
+            merge: 0,
             unit: group,
         },
     )?;
@@ -190,6 +191,7 @@ fn rms_row(
                     per_row: 2 * u64::from(width),
                     per_col: 0,
                     whole: weight.elements(),
+                    merge: 0,
                     unit: axis,
                 },
             )?
@@ -202,6 +204,7 @@ fn rms_row(
                     per_row: 2 * u64::from(width),
                     per_col: 1,
                     whole: 0,
+                    merge: 0,
                     unit: 1,
                 },
             )?
@@ -369,6 +372,7 @@ pub fn rmsnorm_gated(
                 per_row: 3 * u64::from(x.width),
                 per_col: 0,
                 whole: weight.elements(),
+                merge: 0,
                 unit: head_dim,
             },
         )?
@@ -431,6 +435,7 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
                 per_row: 2 * u64::from(x.width),
                 per_col: 0,
                 whole: 0,
+                merge: 0,
                 unit: 1,
             },
         )?
@@ -485,6 +490,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
             per_row: u64::from(width),
             per_col: 1,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;
@@ -577,6 +583,7 @@ pub fn layernorm(
                 per_row: 2 * u64::from(width),
                 per_col: 2,
                 whole: 0,
+                merge: 0,
                 unit: 1,
             },
         )?

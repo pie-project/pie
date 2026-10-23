@@ -265,6 +265,7 @@ fn rotate(
                 per_row,
                 per_col: 0,
                 whole: 4 * u64::from(n),
+                merge: 0,
                 unit,
             },
         )?

@@ -71,6 +71,7 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
             per_row: u64::from(h + y.width),
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;
@@ -126,6 +127,7 @@ pub fn mix(
             per_row: u64::from(2 * normed.width + h),
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;
@@ -187,6 +189,7 @@ pub fn inject(
                 per_row: u64::from(hyper.width + h),
                 per_col: 0,
                 whole: 0,
+                merge: 0,
                 unit: 1,
             },
         )?
@@ -265,6 +268,7 @@ pub fn ple_gate(
             per_row: u64::from(3 * y.width + h),
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;

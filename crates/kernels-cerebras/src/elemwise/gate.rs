@@ -22,6 +22,7 @@ pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
             per_row: u64::from(x.width),
             per_col: 0,
             whole: 0,
+            merge: 0,
             unit: 1,
         },
     )?;
@@ -71,6 +72,7 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
                 per_row: 2 * u64::from(x.width),
                 per_col: 0,
                 whole: 0,
+                merge: 0,
                 unit: 1,
             },
         )?

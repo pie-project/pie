@@ -42,6 +42,29 @@ pub trait Plan {
 
     /// How a paged pool's lanes spread over PEs, and the rows of one phase.
     fn pages(&self, op: &'static str, pages: &Pages<'_>) -> Result<PageSplit, Error>;
+
+    /// Whether the partials `merge` names combine on the fabric; `false`
+    /// leaves every partial for the host to combine.
+    fn merge(&self, merge: Merge) -> bool;
+}
+
+/// The most PEs whose attention partials [`Merge::Lse`] gathers on one
+/// (the lse merge's words are stated for that many copies), unless the
+/// group is the resident row.
+pub const LSE_GROUPS: u32 = 16;
+
+/// Partials a group of PEs leaves of one result, for the engine to say
+/// whether they combine on the fabric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Merge {
+    /// `group` partials add (a depth split's sum).
+    Sum { group: u32 },
+    /// `group` PEs' candidates gather on the first, which picks among them
+    /// (an argmax's column blocks).
+    Pick { group: u32 },
+    /// `group` attention partials merge by their lse; `row` when the group
+    /// is the resident row.
+    Lse { group: u32, row: bool },
 }
 
 /// The engine's terms an entry plans its splits within: what a PE holds,
@@ -68,8 +91,8 @@ pub struct Fabric {
     /// the row, a matmul's column blocks gathered back to every PE, lanes
     /// padded to the row; `None` is the per-phase placement.
     pub resident_pes: Option<u32>,
-    /// Whether a depth-split matmul (and a lane plan's partials) add on
-    /// the fabric rather than on the host.
+    /// Whether partials merge on the fabric rather than on the host
+    /// ([`Plan::merge`]).
     pub fabric_sum: bool,
     /// Whether bf16 weights live on the device packed two halves a word:
     /// half the memory, the kernels widening as they read.
@@ -86,7 +109,8 @@ pub struct Fabric {
 /// `rows × width`, with `per_row` words a row that split with the columns,
 /// `per_col` words a column (a gain) that split with the columns, `whole`
 /// words that do not split; columns split only in multiples of `unit` (a
-/// head).
+/// head); `merge` words more when the engine merges partials on the fabric
+/// (the collectives a column split's merge takes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footprint {
     pub rows: u32,
@@ -94,6 +118,7 @@ pub struct Footprint {
     pub per_row: u64,
     pub per_col: u64,
     pub whole: u64,
+    pub merge: u64,
     pub unit: u32,
 }
 
@@ -155,13 +180,15 @@ pub struct Spread<'a> {
 /// A state `[a][b]` an op splits over PEs in blocks (attention's keys by
 /// kv heads), over `rows` rows run a window at a time: `held(window,
 /// a_groups, b_groups)` is what a PE holds, beside `code` words of the
-/// kernel's code.
+/// kernel's code, and `merge(window, a_groups, b_groups)` words more when
+/// the `a` groups' partials merge on the fabric ([`Merge::Lse`]).
 pub struct Blocks<'a> {
     pub rows: u32,
     pub a: u32,
     pub b: u32,
     pub code: u64,
     pub held: &'a dyn Fn(u32, u32, u32) -> u64,
+    pub merge: &'a dyn Fn(u32, u32, u32) -> u64,
 }
 
 /// A block split: the rows of one phase and the groups of each axis.
@@ -225,7 +252,9 @@ pub struct RoutedSplit {
 /// (keys and values) of `page_rows` rows by `heads` column blocks;
 /// `pool_pages` pages in all; the op runs over `rows` rows, a window of
 /// them at a time (a phase each) when `windows`; `beside(window,
-/// head_groups)` is what a PE holds besides pages for a window of rows.
+/// head_groups)` is what a PE holds besides pages for a window of rows,
+/// and `merge(window, head_groups)` words more when the engine merges
+/// partials on the fabric (a lane's pages split over PEs).
 pub struct Pages<'a> {
     pub elements: u64,
     pub lanes: u32,
@@ -237,6 +266,7 @@ pub struct Pages<'a> {
     pub rows: u32,
     pub windows: bool,
     pub beside: &'a dyn Fn(u32, u32) -> u64,
+    pub merge: &'a dyn Fn(u32, u32) -> u64,
 }
 
 /// A paged pool's split: the rows of one phase, and how the lanes spread

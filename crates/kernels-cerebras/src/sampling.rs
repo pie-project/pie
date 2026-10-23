@@ -9,7 +9,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{FabricOp, FabricStep, Guarded, HostOp, Shard};
-use crate::plan::Footprint;
+use crate::plan::{Footprint, Merge};
 use crate::tensor::Tensor;
 
 /// The `k` largest of each row of `x`, largest first: ties go to the lower
@@ -51,6 +51,7 @@ pub fn topk(
                 per_row: u64::from(width) + 2 * u64::from(k),
                 per_col: 0,
                 whole: 0,
+                merge: 0,
                 unit: width,
             },
         )
@@ -120,12 +121,6 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     // Each column block's PE finds its greatest lane and index (a pair a
     // row); the blocks of a row group (one rectangle row) gather those on
     // the row's first PE, which picks among them into its rows of y.
-    let fabric = ctx.plan().fabric().fabric_sum;
-    let whole = if fabric {
-        crate::linear::gemm::FABRIC_SUM_WORDS
-    } else {
-        0
-    };
     let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
@@ -133,13 +128,14 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
             width: x.width,
             per_row: u64::from(x.width) + 4,
             per_col: 0,
-            whole,
+            whole: 0,
+            merge: crate::linear::gemm::FABRIC_SUM_WORDS,
             unit: 1,
         },
     )?;
     let (rows_local, width_local) = (x.rows / rg, x.width / cg);
     let pes = rg * cg;
-    if cg > 1 && !fabric {
+    if cg > 1 && !ctx.plan().merge(Merge::Pick { group: cg }) {
         return argmax_host_merge(ctx, x, column, y, rg, cg);
     }
     ctx.emit(&mut |cx| {
@@ -216,8 +212,8 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     })
 }
 
-/// The argmax with the blocks' pairs merged on the host (`Fabric::fabric_sum`
-/// off).
+/// The argmax with the blocks' pairs merged on the host (the engine merges
+/// no [`Merge::Pick`] on the fabric).
 fn argmax_host_merge(
     ctx: &Ctx<'_>,
     x: Tensor,

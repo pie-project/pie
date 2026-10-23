@@ -7,7 +7,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{HostOp, Shard};
-use crate::plan::{Held, Product, Spread};
+use crate::plan::{Held, Merge, Product, Spread};
 use crate::tensor::Tensor;
 
 /// `y[m, n] = Σ_k act[m, k] · w[n, k]` over the first `y.rows` rows of `act`,
@@ -89,7 +89,7 @@ fn act_x_wt(
         // fabric, the `kg` PEs of a block form one row of a `kg × (rg · cg)`
         // rectangle and add their partials into the row's first PE; else
         // every partial comes down and the host adds them.
-        let fabric = kg > 1 && cx.plan().fabric().fabric_sum;
+        let fabric = kg > 1 && cx.plan().merge(Merge::Sum { group: kg });
         if rg > 1 {
             // PE `x` of the `rg × cg × kg` grid: rows `x / (cg·kg)`, output
             // columns `(x / kg) % cg`, depth slice `x % kg`.

@@ -19,7 +19,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
-use crate::plan::{BlockSplit, Blocks};
+use crate::plan::{BlockSplit, Blocks, Merge};
 use crate::tensor::Tensor;
 
 /// Words of a PE the attention kernel's code and stack take.
@@ -74,19 +74,17 @@ pub fn bidirectional(
     let (rows, keys) = (q.rows, k.rows);
     // Words a PE holds for a window of `n` query rows with the keys split
     // `ag` ways and the kv heads `hg` ways.
-    let fabric = ctx.plan().fabric().fabric_sum;
     let words = |n: u32, ag: u32, hg: u32| -> u64 {
         let kv = 2 * u64::from(keys.div_ceil(ag)) * u64::from(kvh / hg) * u64::from(d);
         let qo = 2 * u64::from(n) * u64::from(qh / hg) * u64::from(d);
         let lse = u64::from(n) * u64::from(qh / hg);
-        // The fabric merge of a key split: the partial's copy, the lse
-        // copies and the collectives library.
-        let merge = if ag > 1 && ag <= super::paged::MERGE_GROUPS && fabric {
-            super::paged::merge_words(qo / 2, lse)
-        } else {
-            0
-        };
-        kv + qo + lse + merge + u64::from(images) + 1 + u64::from(d) + 16
+        kv + qo + lse + u64::from(images) + 1 + u64::from(d) + 16
+    };
+    // The fabric merge of a key split: the partial's copy, the lse copies
+    // and the collectives library.
+    let merged = |n: u32, _: u32, hg: u32| -> u64 {
+        let o = u64::from(n) * u64::from(qh / hg);
+        super::paged::merge_words(o * u64::from(d), o)
     };
     // The keys split `ag` ways and the kv heads `hg` ways, over windows of
     // the rows; the attention kernel's code takes a good part of a PE.
@@ -102,6 +100,7 @@ pub fn bidirectional(
             b: kvh,
             code: CODE_WORDS,
             held: &words,
+            merge: &merged,
         })
         .ok_or_else(|| {
             refuse(
@@ -113,6 +112,11 @@ pub fn bidirectional(
             )
         })?;
     let whole = chunk >= rows && ag == 1 && hg == 1;
+    let merge = ag > 1
+        && ctx.plan().merge(Merge::Lse {
+            group: ag,
+            row: false,
+        });
     let mut c0 = 0;
     while c0 < rows {
         let n = (rows - c0).min(chunk);
@@ -171,7 +175,6 @@ pub fn bidirectional(
                     span: per_head,
                 }],
             };
-            let merge = ag > 1 && ag <= super::paged::MERGE_GROUPS && fabric;
             let reduce = if merge {
                 vec![
                     (ob.name.clone(), Reduce::FabricRoot { group: ag }),

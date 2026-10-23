@@ -25,7 +25,7 @@ use crate::library::Kernel;
 use crate::phase::{
     BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, PagePlan, PageSource, Reduce, Segment,
 };
-use crate::plan::{PageSplit, PagedLanes, Pages};
+use crate::plan::{LSE_GROUPS, Merge, PageSplit, PagedLanes, Pages};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn tables(
@@ -175,15 +175,11 @@ fn pool_shape(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<(u32, u3
     Ok((kv_heads, width))
 }
 
-/// The most PEs one lane block's partials spread over for the fabric to
-/// merge them (the root gathers that many lse copies).
-pub const MERGE_GROUPS: u32 = 16;
-
 /// Words a PE spends on the fabric merge of its `o` (`o_words`) and lse
-/// (`l_words`) partials: the partial's copy, the gathered lse copies and
-/// the merged lse, and the collectives library.
+/// (`l_words`) partials: the partial's copy, the gathered lse copies (at
+/// most [`LSE_GROUPS`]) and the merged lse, and the collectives library.
 pub fn merge_words(o_words: u64, l_words: u64) -> u64 {
-    o_words + l_words * (u64::from(MERGE_GROUPS) + 1) + crate::linear::gemm::FABRIC_SUM_WORDS
+    o_words + l_words * (u64::from(LSE_GROUPS) + 1) + crate::linear::gemm::FABRIC_SUM_WORDS
 }
 
 /// The fabric merge of a lane block's attention partials over `group`
@@ -388,17 +384,14 @@ fn attend(
     let page_pair = u64::from(ps) * u64::from(pool.keys.width) * 2 / if packed { 2 } else { 1 };
     let (top_k, ratio) = selection.map_or((0, 0), |(s, r)| (s.width, r));
     let sblk_words = u64::from(span.checked_div(ratio).map_or(1, |b| b + 1));
-    let fabric = fab.fabric_sum;
+    let merged = |r: u32, hg: u32| -> u64 {
+        merge_words(
+            u64::from(r) * u64::from(q.width / hg),
+            u64::from(r) * u64::from(q_heads / hg),
+        )
+    };
     let beside = |r: u32, hg: u32| -> u64 {
         let q_cols = u64::from(q.width / hg);
-        let merge = if fabric {
-            merge_words(
-                u64::from(r) * q_cols,
-                u64::from(r) * u64::from(q_heads / hg),
-            )
-        } else {
-            0
-        };
         u64::from(r)
             * (2 * q_cols + u64::from(q_heads / hg) + 3 + u64::from(mask_w) + u64::from(top_k))
             + lanes
@@ -407,7 +400,6 @@ fn attend(
             + u64::from(mask_w)
             + sblk_words
             + 16
-            + merge
     };
     let pool_words = pool.keys.elements() + pool.values.elements();
     let PageSplit {
@@ -426,6 +418,7 @@ fn attend(
             rows,
             windows: true,
             beside: &beside,
+            merge: &merged,
         },
     )?;
     let mut c0 = 0;
@@ -496,9 +489,10 @@ fn attend(
                     } else {
                         page_groups * row_groups
                     };
-                    let fabric = merge_group > 1
-                        && (strided || merge_group <= MERGE_GROUPS)
-                        && fab.fabric_sum;
+                    let fabric = cx.plan().merge(Merge::Lse {
+                        group: merge_group,
+                        row: strided,
+                    });
                     if page_groups > 1 || row_groups > 1 || strided {
                         if lse_buf.is_none() {
                             let name = cx.unique("lse");
@@ -991,6 +985,7 @@ fn append(
                     rows: k.rows,
                     windows: false,
                     beside: &|_, hg| extra(hg),
+                    merge: &|_, _| 0,
                 },
             )?
             .lanes;
