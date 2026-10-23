@@ -467,14 +467,16 @@ impl Run<'_> {
                 routes,
                 y: _,
                 y_out,
-            } => linear::lora::correct(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*bank_a),
-                self.tensor(*bank_b),
-                self.tensor(*routes),
-                self.tensor(*y_out),
-            ),
+            } => kernels_slang::linear::lora::correct(
+                &self.slang(),
+                kernels_slang::Tier::Subgroup,
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*bank_a)),
+                crate::encode::slang_tensor(self.tensor(*bank_b)),
+                crate::encode::slang_tensor(self.tensor(*routes)),
+                crate::encode::slang_tensor(self.tensor(*y_out)),
+            )
+            .map_err(crate::encode::from_slang),
             Linear::MoeWeightedSum { routed, weights, y } => {
                 kernels_slang::linear::moe::combine::weighted_sum(
                     &self.slang(),
