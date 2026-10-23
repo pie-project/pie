@@ -137,17 +137,14 @@ fn the_register_tile_variants_price_their_matmuls() {
     let cores = device.cores();
     eprintln!("cores {cores:?}");
     // (U, NF, SIMDS, VS); None = the shipped kernel
-    let variants: [Option<(u32, u32, u32, u32)>; 10] = [
+    // (U, NF, SIMDS, VS), or (MODE, 0, 0, 99) for affine_qmm_sgp
+    let variants: [Option<(u32, u32, u32, u32)>; 6] = [
         None,
+        Some((0, 0, 0, 99)),
+        Some((1, 0, 0, 99)),
         Some((2, 2, 2, 0)),
-        Some((2, 2, 4, 4)),
-        Some((2, 2, 4, 5)),
-        Some((2, 2, 4, 6)),
-        Some((2, 2, 2, 4)),
-        Some((2, 2, 2, 5)),
-        Some((4, 2, 4, 4)),
         Some((2, 2, 4, 2)),
-        Some((2, 2, 4, 3)),
+        None,
     ];
     let mut totals = vec![0.0f64; variants.len()];
     // (what, K, N, layers a verify holds): the 27B verify's register projections
@@ -196,6 +193,10 @@ fn the_register_tile_variants_price_their_matmuls() {
                 None => {
                     let e = sym(format!("affine_qmm_sg_k{split}"));
                     (e, sym(format!("PIE_SG_POINT(\"{e}\",{split})")), 64, 128)
+                }
+                Some((mode, _, _, 99)) => {
+                    let e = sym(format!("affine_qmm_sgp_k{split}_m{mode}"));
+                    (e, sym(format!("PIE_SGP(\"{e}\",{split},{mode})")), 64, 128)
                 }
                 Some((u, nf, simds, vs)) => {
                     let e = sym(format!("affine_qmm_sgx_k{split}_u{u}_f{nf}_s{simds}_v{vs}"));
