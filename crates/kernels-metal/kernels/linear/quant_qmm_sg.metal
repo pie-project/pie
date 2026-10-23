@@ -521,7 +521,22 @@ affine_qmm_sgx(const device uint *weights [[buffer(0)]], const device bfloat *sc
           for (int f = 0; f < NF; ++f) {
             if constexpr (VS == 3) { if (p & 1) continue; }
             const uint sh = VS == 2 ? 0 : 4 * p;
-            mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> sh) & 0x000F000Fu) | 0x43004300u), b);
+            const uint w = cw[u][f][j];
+            if constexpr (VS == 4) {
+              const ushort lo = ushort(extract_bits(w, 4 * p, 4)) | ushort(0x4300);
+              const ushort hi = ushort(extract_bits(w, 16 + 4 * p, 4)) | ushort(0x4300);
+              mma(d[f], as_type<bfloat2>(ushort2(lo, hi)), b);
+            } else if constexpr (VS == 5) {
+              const ushort lo = ushort((w >> (4 * p)) & 0xFu) | ushort(0x4300);
+              const ushort hi = ushort((w >> (16 + 4 * p)) & 0xFu) | ushort(0x4300);
+              mma(d[f], as_type<bfloat2>(ushort2(lo, hi)), b);
+            } else if constexpr (VS == 6) {
+              const ushort2 h = as_type<ushort2>(w);
+              const ushort2 c2 = ((h >> ushort(4 * p)) & ushort(0xF)) | ushort(0x4300);
+              mma(d[f], as_type<bfloat2>(c2), b);
+            } else {
+              mma(d[f], as_type<bfloat2>(((w >> sh) & 0x000F000Fu) | 0x43004300u), b);
+            }
           }
         }
       const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +

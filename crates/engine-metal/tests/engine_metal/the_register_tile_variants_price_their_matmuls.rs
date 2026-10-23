@@ -137,20 +137,15 @@ fn the_register_tile_variants_price_their_matmuls() {
     let cores = device.cores();
     eprintln!("cores {cores:?}");
     // (U, NF, SIMDS, VS); None = the shipped kernel
-    let variants: [Option<(u32, u32, u32, u32)>; 15] = [
+    let variants: [Option<(u32, u32, u32, u32)>; 10] = [
         None,
-        Some((2, 2, 4, 0)),
-        Some((4, 2, 4, 0)),
-        Some((2, 2, 4, 1)),
-        Some((4, 2, 4, 1)),
-        Some((1, 2, 4, 0)),
-        Some((2, 4, 2, 0)),
-        Some((2, 4, 4, 0)),
-        Some((4, 4, 2, 1)),
         Some((2, 2, 2, 0)),
-        Some((2, 2, 8, 0)),
-        Some((2, 1, 4, 0)),
-        Some((4, 1, 8, 1)),
+        Some((2, 2, 4, 4)),
+        Some((2, 2, 4, 5)),
+        Some((2, 2, 4, 6)),
+        Some((2, 2, 2, 4)),
+        Some((2, 2, 2, 5)),
+        Some((4, 2, 4, 4)),
         Some((2, 2, 4, 2)),
         Some((2, 2, 4, 3)),
     ];
