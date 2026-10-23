@@ -1,7 +1,7 @@
 use kernels_metal::Tensor;
 use kernels_metal::gather::ngram;
 use kernels_metal::linear::moe::{self, RoutedScratch};
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
@@ -203,7 +203,7 @@ impl Scratch {
                     return false;
                 };
                 let limit = tuning.qmm_splitk();
-                quant::splitk(n, 8, 8, k, 32, 4, limit) > 1 || (tuning.qmm_mpp() && n <= 65536)
+                qmm::tiled::splitk(n, 8, 8, k, 32, 4, limit) > 1 || (tuning.qmm_mpp() && n <= 65536)
             })
             .map(|&(n, _)| u64::from(n))
             .max()

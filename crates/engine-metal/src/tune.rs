@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::tuning::{Qmm, QmmFp16};
 use kernels_metal::{ArgValue, Encode, Error, Fire, Tensor, Tuning};
 use poem_ir::Dtype;
@@ -1081,13 +1081,13 @@ fn measure(
                         (width == n && u64::from(rows) <= partial_rows)
                             .then(|| Tensor::new(hq, rows, width, Dtype::F32))
                     };
-                    quant::matmul(
+                    qmm::matmul(
                         sink,
                         tuning,
                         Tensor::new(ha, m, k, Dtype::Bf16),
                         b,
                         Tensor::new(ho, m, n, Dtype::Bf16),
-                        quant::Scratch {
+                        qmm::Scratch {
                             precast: &precast,
                             partials: &partials,
                             table: None,

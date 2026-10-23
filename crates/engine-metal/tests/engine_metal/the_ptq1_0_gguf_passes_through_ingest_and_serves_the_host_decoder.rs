@@ -46,7 +46,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmv;
 use poem_ir::Dtype as IrDtype;
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], .. }` +
@@ -437,7 +437,7 @@ fn serve_and_check(
     let sink = Sink::new(device, &frame, pipelines, handles);
     sink.fire(
         Fire::at(PTQ1_0_FILE, "ptq1_0_qmv_bfloat16_f32").apply(Grid::of(
-            quant::qmv_grid("m1c.readback", mi, ni).expect("grid"),
+            qmv::qmv_grid("m1c.readback", mi, ni).expect("grid"),
             QMV_GROUP,
         )),
         &[

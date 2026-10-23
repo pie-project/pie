@@ -449,7 +449,7 @@ impl<'c> Run<'c> {
             return None;
         }
         let (cols, k) = (i32::try_from(columns).ok()?, i32::try_from(x.width).ok()?);
-        let split = kernels_metal::linear::quant::register_split(cols, k, self.tuning.cores());
+        let split = kernels_metal::linear::qmm::sg::register_split(cols, k, self.tuning.cores());
         Some(if split > 1 { columns / 64 } else { 0 })
     }
 
