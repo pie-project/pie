@@ -36,30 +36,42 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             cache,
             window,
             head_dim,
+            selection: None,
+            bias: None,
+            lse: None,
             ..
         }
-        | Attn::DecodeLse {
+        | Attn::Decode {
             q,
             plan,
             cache,
             window,
             head_dim,
+            selection: None,
+            bias: None,
+            lse: Some(_),
             ..
         }
-        | Attn::DecodeRel {
+        | Attn::Decode {
             q,
             plan,
             cache,
             window,
             head_dim,
+            selection: None,
+            bias: Some(_),
+            lse: None,
             ..
         }
-        | Attn::DecodeSelected {
+        | Attn::Decode {
             q,
             plan,
             cache,
             window,
             head_dim,
+            selection: Some(_),
+            bias: None,
+            lse: None,
             ..
         } => Some(Reader {
             q: *q,
@@ -69,22 +81,30 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads: None,
             window: *window,
         }),
-        Attn::Masked {
+        Attn::Prefill {
             q,
             plan,
             cache,
             window,
             head_dim,
             kv_heads,
+            mask: Some(_),
+            selection: None,
+            bias: None,
+            lse: None,
             ..
         }
-        | Attn::MaskedLse {
+        | Attn::Prefill {
             q,
             plan,
             cache,
             window,
             head_dim,
             kv_heads,
+            mask: Some(_),
+            selection: None,
+            bias: None,
+            lse: Some(_),
             ..
         } => Some(Reader {
             q: *q,
@@ -101,33 +121,49 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: None,
             ..
         }
-        | Attn::PrefillLse {
+        | Attn::Prefill {
             q,
             plan,
             cache,
             window,
             head_dim,
             kv_heads,
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: Some(_),
             ..
         }
-        | Attn::PrefillRel {
+        | Attn::Prefill {
             q,
             plan,
             cache,
             window,
             head_dim,
             kv_heads,
+            mask: None,
+            selection: None,
+            bias: Some(_),
+            lse: None,
             ..
         }
-        | Attn::PrefillSelected {
+        | Attn::Prefill {
             q,
             plan,
             cache,
             window,
             head_dim,
             kv_heads,
+            mask: None,
+            selection: Some(_),
+            bias: None,
+            lse: None,
             ..
         } => Some(Reader {
             q: *q,

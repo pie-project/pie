@@ -64,12 +64,25 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
             _ => None,
         };
         match attention {
-            Some(Attn::PlanDecode { .. } | Attn::Decode { .. }) => continue,
-            Some(Attn::DecodeLse { plan, .. })
-                if lse
-                    && wide
-                        .get(plan)
-                        .is_some_and(|(_, slides)| !slides || lse_window) =>
+            Some(
+                Attn::PlanDecode { .. }
+                | Attn::Decode {
+                    selection: None,
+                    bias: None,
+                    lse: None,
+                    ..
+                },
+            ) => continue,
+            Some(Attn::Decode {
+                plan,
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }) if lse
+                && wide
+                    .get(plan)
+                    .is_some_and(|(_, slides)| !slides || lse_window) =>
             {
                 continue;
             }
@@ -117,6 +130,11 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 head_dim,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } if wide.contains_key(&plan) => Attn::Prefill {
                 q,
                 plan,
@@ -126,8 +144,16 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 kv_heads: wide[&plan].0,
                 sm_scale,
                 o,
+                mask: None,
+                selection: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected: None,
+                rel: None,
+                lse: None,
             },
-            Attn::DecodeLse {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -135,8 +161,12 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 head_dim,
                 sm_scale,
                 o,
-                lse,
-            } if wide.contains_key(&plan) => Attn::PrefillLse {
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+            } if wide.contains_key(&plan) => Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -145,8 +175,14 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
                 kv_heads: wide[&plan].0,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
                 floor: None,
+                mask: None,
+                selection: None,
+                bias: None,
+                causal: true,
+                selected: None,
+                rel: None,
             },
             other => other,
         };
@@ -170,11 +206,27 @@ mod tests {
                 _ => continue,
             };
             match op {
-                Attn::DecodeLse { window: None, .. } => counts.0 += 1,
-                Attn::DecodeLse {
-                    window: Some(_), ..
+                Attn::Decode {
+                    window: None,
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                } => counts.0 += 1,
+                Attn::Decode {
+                    window: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
                 } => counts.1 += 1,
-                Attn::PrefillLse { .. } => counts.2 += 1,
+                Attn::Prefill {
+                    mask: None,
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                } => counts.2 += 1,
                 _ => {}
             }
         }

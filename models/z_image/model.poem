@@ -1,7 +1,7 @@
 # The weights of Z-Image: a single-stream diffusion transformer whose image
 # rows first pass noise refiners and whose caption rows pass context refiners,
-# a Qwen3 4B text encoder and a Flux VAE. `PIE_Z_IMAGE_TAP` names an
-# intermediate the denoiser reads out instead of its velocity.
+# a Qwen3 4B text encoder and a Flux VAE. A deployment's tap (`-tap.{key}`)
+# names an intermediate the denoiser reads out instead of its velocity.
 
 def linear(name, out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
@@ -263,7 +263,7 @@ def layout(id, deploy):
         te = encoder(QWEN3_4B, TE_LAYERS, banks) if turbo else None,
         vae = flux_vae(CHANNELS, CHANNELS, vae_latent) if turbo else None,
         shift = 3.0,
-        tap = env("PIE_Z_IMAGE_TAP") or "",
+        tap = deploy.tap or "",
     )
 
 def turbo_sigmas(shift):

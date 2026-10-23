@@ -331,208 +331,62 @@ pub fn res_blend(
     y
 }
 
-/// `scaling`, if any, turns each pair at its own frequency (a checkpoint's
-/// `rope_scaling`), the rest of the op as stated.
-pub fn rope_full(
+/// `q`'s heads, and `k`'s where given, turned by their `positions` as
+/// `turn` says. `scaling`, if any, turns each pair at its own frequency (a
+/// checkpoint's `rope_scaling`), for a turn that reads `theta`'s own: a whole
+/// or partial turn, or an interleaved M-RoPE's.
+pub fn rope(
     q: &Value,
-    k: &Value,
     positions: &Value,
     head_dim: u32,
     theta: f32,
-    interleaved: bool,
+    turn: Turn,
+    k: Option<&Value>,
     scaling: Option<RopeScaling>,
-) -> (Value, Value) {
-    let freqs = scaled(scaling.as_ref(), theta, head_dim / 2, head_dim / 2);
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
-    r.push(
-        Elemwise::Rope {
-            q: q.id(),
-            k: Some(k.id()),
-            positions: positions.id(),
-            head_dim,
-            theta,
-            turn: Turn::Full { interleaved },
-            freqs,
-            q_out: q_out.id(),
-            k_out: Some(k_out.id()),
-        },
-        &[q, k, positions],
-    );
-    (q_out, k_out)
-}
-
-/// The frequencies `scaling` turns `pairs` pairs `span` apart at.
-fn scaled(
-    scaling: Option<&RopeScaling>,
-    theta: f32,
-    pairs: u32,
-    span: u32,
-) -> Option<poem_ir::RopeFreqs> {
-    scaling.map(|s| {
+) -> (Value, Option<Value>) {
+    let (pairs, span) = match turn {
+        Turn::Full { .. } => (head_dim / 2, head_dim / 2),
+        Turn::Partial { rotary_dim, span } => (rotary_dim / 2, span),
+        Turn::Mrope {
+            form, rotary_dim, ..
+        } => {
+            assert!(
+                scaling.is_none() || form == MropeForm::Interleaved,
+                "a {form:?} M-RoPE turns a still's grid, which no rope scaling stretches"
+            );
+            (rotary_dim / 2, rotary_dim / 2)
+        }
+        Turn::Last { .. } | Turn::Yarn { .. } => {
+            assert!(
+                scaling.is_none(),
+                "a {turn:?} turn states its own frequencies; no rope scaling stretches them"
+            );
+            (0, 0)
+        }
+    };
+    let freqs = scaling.map(|s| {
         s.freqs(theta, pairs, span)
             .unwrap_or_else(|why| panic!("{why}"))
-    })
-}
-
-/// A pair sits `span` apart, half the rotary width unless stated.
-pub fn rope_partial(
-    q: &Value,
-    k: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    span: Option<u32>,
-    scaling: Option<RopeScaling>,
-) -> (Value, Value) {
-    let span = span.unwrap_or(rotary_dim / 2);
-    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, span);
+    });
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
+    let k_out = k.map(|k| r.fresh(k.ty().clone()));
+    let mut ins = vec![q];
+    ins.extend(k);
+    ins.push(positions);
     r.push(
         Elemwise::Rope {
             q: q.id(),
-            k: Some(k.id()),
+            k: k.map(Value::id),
             positions: positions.id(),
             head_dim,
             theta,
-            turn: Turn::Partial { rotary_dim, span },
+            turn,
             freqs,
             q_out: q_out.id(),
-            k_out: Some(k_out.id()),
+            k_out: k_out.as_ref().map(Value::id),
         },
-        &[q, k, positions],
-    );
-    (q_out, k_out)
-}
-
-/// A pair sits `span` apart, half the rotary width unless stated.
-pub fn rope_partial_q(
-    q: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    span: Option<u32>,
-    scaling: Option<RopeScaling>,
-) -> Value {
-    let span = span.unwrap_or(rotary_dim / 2);
-    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, span);
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    r.push(
-        Elemwise::Rope {
-            q: q.id(),
-            k: None,
-            positions: positions.id(),
-            head_dim,
-            theta,
-            turn: Turn::Partial { rotary_dim, span },
-            freqs,
-            q_out: q_out.id(),
-            k_out: None,
-        },
-        &[q, positions],
-    );
-    q_out
-}
-
-pub fn rope_partial_last(
-    q: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    interleaved: bool,
-) -> Value {
-    rope_partial_last_yarn(
-        q,
-        positions,
-        rotary_dim,
-        head_dim,
-        theta,
-        interleaved,
-        false,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn rope_partial_last_yarn(
-    q: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    interleaved: bool,
-    inverse: bool,
-    yarn: Option<Yarn>,
-) -> Value {
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    r.push(
-        Elemwise::Rope {
-            q: q.id(),
-            k: None,
-            positions: positions.id(),
-            head_dim,
-            theta,
-            turn: Turn::Last {
-                rotary_dim,
-                interleaved,
-                inverse,
-                yarn,
-            },
-            freqs: None,
-            q_out: q_out.id(),
-            k_out: None,
-        },
-        &[q, positions],
-    );
-    q_out
-}
-
-pub fn rope_yarn(
-    q: &Value,
-    k: &Value,
-    positions: &Value,
-    head_dim: u32,
-    theta: f32,
-    factor: f32,
-    beta_fast: f32,
-    beta_slow: f32,
-    attention_factor: f32,
-    original_max_position: u32,
-    interleaved: bool,
-) -> (Value, Value) {
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
-    r.push(
-        Elemwise::Rope {
-            q: q.id(),
-            k: Some(k.id()),
-            positions: positions.id(),
-            head_dim,
-            theta,
-            turn: Turn::Yarn {
-                yarn: Yarn {
-                    factor,
-                    beta_fast,
-                    beta_slow,
-                    original_max_position,
-                },
-                attention_factor,
-                interleaved,
-            },
-            freqs: None,
-            q_out: q_out.id(),
-            k_out: Some(k_out.id()),
-        },
-        &[q, k, positions],
+        &ins,
     );
     (q_out, k_out)
 }
@@ -822,46 +676,6 @@ pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Valu
         &[key, query, value],
     );
     y
-}
-
-pub fn rope_mrope(
-    q: &Value,
-    k: &Value,
-    positions: &Value,
-    sections: [u32; 3],
-    form: MropeForm,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    scaling: Option<RopeScaling>,
-) -> (Value, Value) {
-    assert!(
-        scaling.is_none() || form == MropeForm::Interleaved,
-        "a {form:?} M-RoPE turns a still's grid, which no rope scaling stretches"
-    );
-    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, rotary_dim / 2);
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
-    r.push(
-        Elemwise::Rope {
-            q: q.id(),
-            k: Some(k.id()),
-            positions: positions.id(),
-            head_dim,
-            theta,
-            turn: Turn::Mrope {
-                sections,
-                form,
-                rotary_dim,
-            },
-            freqs,
-            q_out: q_out.id(),
-            k_out: Some(k_out.id()),
-        },
-        &[q, k, positions],
-    );
-    (q_out, k_out)
 }
 
 pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: ModulateForm) -> Value {

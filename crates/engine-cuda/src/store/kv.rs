@@ -304,24 +304,28 @@ fn latents(op: &Operation) -> Option<LatentReader> {
             plan,
             heads,
             kv_lora_rank,
+            selection: None,
             ..
         }
         | Attn::MlaPrefill {
             plan,
             heads,
             kv_lora_rank,
+            selection: None,
             ..
         }
-        | Attn::MlaDecodeSelected {
+        | Attn::MlaDecode {
             plan,
             heads,
             kv_lora_rank,
+            selection: Some(_),
             ..
         }
-        | Attn::MlaPrefillSelected {
+        | Attn::MlaPrefill {
             plan,
             heads,
             kv_lora_rank,
+            selection: Some(_),
             ..
         } => Some(LatentReader {
             plan: *plan,

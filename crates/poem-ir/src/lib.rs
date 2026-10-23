@@ -1,5 +1,6 @@
 extern crate self as poem_ir;
 
+pub mod canon;
 pub mod check;
 pub mod fact;
 pub mod guard;
@@ -17,10 +18,11 @@ pub use fact::{Builtin, Fact, Facts};
 pub use guard::Guard;
 pub use operands::{Operands, Part, Slot};
 pub use ops::{
-    ActFn, ActQuant, Attn, BinaryOp, Bounds, Collective, Conv, Elemwise, Fused, GateActivation,
-    GateHeads, Gather, GluAct, GridRule, IndexScore, Linear, ModulateForm, MropeForm, NormAxis,
-    NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask, ResidualGate, RopeForm,
-    RopeFreqs, RouteScore, Sampling, Ssm, TapKind, TimePad, Turn, VoxelSegment, Yarn,
+    ActFn, ActQuant, Attn, BinaryOp, Blocks, Bounds, Collective, Conv, Elemwise, Fused,
+    GateActivation, GateHeads, Gather, GluAct, GridRule, IndexScore, Linear, ModulateForm,
+    MropeForm, NormAxis, NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask,
+    Relative, ResidualGate, RopeForm, RopeFreqs, RouteScore, Sampling, Ssm, TapKind, TimePad, Turn,
+    VoxelSegment, Yarn,
 };
 pub use poem_ir_macros::Op;
 pub use request::{Request, Stream};

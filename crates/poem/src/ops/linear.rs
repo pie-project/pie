@@ -1,5 +1,5 @@
 use super::*;
-use poem_ir::GluAct;
+use poem_ir::{GluAct, RouteScore};
 
 /// `act . w^T`; a weight whose precision quantizes its activations has
 /// them quantized first.
@@ -106,144 +106,50 @@ pub fn lm_head(act: &Value, w: &Weight) -> Value {
     y
 }
 
-pub fn swiglu(packed: &Value, intermediate: u32) -> Value {
-    let r = packed.rec();
-    let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
-    r.push(
-        Linear::Glu {
-            packed: Some(packed.id()),
-            gate: None,
-            up: None,
-            weights: None,
-            intermediate,
-            act: GluAct::Swiglu,
-            limit: None,
-            y: y.id(),
-        },
-        &[packed],
-    );
-    y
-}
-
-pub fn swiglu_clamp(packed: &Value, intermediate: u32, limit: f32) -> Value {
-    let r = packed.rec();
-    let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
-    r.push(
-        Linear::Glu {
-            packed: Some(packed.id()),
-            gate: None,
-            up: None,
-            weights: None,
-            intermediate,
-            act: GluAct::Swiglu,
-            limit: Some(limit),
-            y: y.id(),
-        },
-        &[packed],
-    );
-    y
-}
-
-pub fn swiglu_clamp_alpha(packed: &Value, intermediate: u32, limit: f32, alpha: f32) -> Value {
-    let r = packed.rec();
-    let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
-    r.push(
-        Linear::Glu {
-            packed: Some(packed.id()),
-            gate: None,
-            up: None,
-            weights: None,
-            intermediate,
-            act: GluAct::SwigluAlpha { alpha },
-            limit: Some(limit),
-            y: y.id(),
-        },
-        &[packed],
-    );
-    y
-}
-
-pub fn swiglu_clamp_split(gate: &Value, up: &Value, limit: f32) -> Value {
-    let r = gate.rec();
-    let y = r.fresh(gate.ty().clone());
-    r.push(
-        Linear::Glu {
-            packed: None,
-            gate: Some(gate.id()),
-            up: Some(up.id()),
-            weights: None,
-            intermediate: u32::try_from(gate.width()).expect("a gate plane is narrower than 2^32"),
-            act: GluAct::Swiglu,
-            limit: Some(limit),
-            y: y.id(),
-        },
-        &[gate, up],
-    );
-    y
-}
-
-/// `swiglu_clamp_split` of routed rows, each times its route's weight
-/// before it rounds.
-pub fn swiglu_clamp_split_routed(gate: &Value, up: &Value, weights: &Value, limit: f32) -> Value {
-    let r = gate.rec();
-    let y = r.fresh(gate.ty().clone());
-    r.push(
-        Linear::Glu {
-            packed: None,
-            gate: Some(gate.id()),
-            up: Some(up.id()),
-            weights: Some(weights.id()),
-            intermediate: u32::try_from(gate.width()).expect("a gate plane is narrower than 2^32"),
-            act: GluAct::Swiglu,
-            limit: Some(limit),
-            y: y.id(),
-        },
-        &[gate, up, weights],
-    );
-    y
-}
-
-/// `swiglu_clamp` of routed rows (`packed` each row's gate columns,
-/// then its up columns), each times its route's weight before it rounds.
-pub fn swiglu_clamp_routed(
-    packed: &Value,
-    intermediate: u32,
-    weights: &Value,
-    limit: f32,
+/// A gated linear unit, `gating(gate) · up`: over `x`'s `[gate | up]` rows
+/// (`intermediate` columns of each), or `x` the gate and `up` its own plane;
+/// clamped at `limit` where stated, each row times its route's weight
+/// before it rounds where `weights` is given.
+pub fn glu(
+    x: &Value,
+    gating: GluAct,
+    intermediate: Option<u32>,
+    up: Option<&Value>,
+    weights: Option<&Value>,
+    limit: Option<f32>,
 ) -> Value {
-    let r = packed.rec();
-    let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
+    let r = x.rec();
+    let (packed, gate, intermediate, y) = match up {
+        None => {
+            let intermediate =
+                intermediate.expect("a packed gated unit states its intermediate width");
+            let y = r.fresh(tensor(x.rows(), intermediate, x.dtype()));
+            (Some(x.id()), None, intermediate, y)
+        }
+        Some(_) => {
+            let width = u32::try_from(x.width()).expect("a gate plane is narrower than 2^32");
+            assert!(
+                intermediate.is_none_or(|i| i == width),
+                "a gate plane {width} wide is its own intermediate width"
+            );
+            (None, Some(x.id()), width, r.fresh(x.ty().clone()))
+        }
+    };
+    let mut ins = vec![x];
+    ins.extend(up);
+    ins.extend(weights);
     r.push(
         Linear::Glu {
-            packed: Some(packed.id()),
-            gate: None,
-            up: None,
-            weights: Some(weights.id()),
+            packed,
+            gate,
+            up: up.map(Value::id),
+            weights: weights.map(Value::id),
             intermediate,
-            act: GluAct::Swiglu,
-            limit: Some(limit),
+            act: gating,
+            limit,
             y: y.id(),
         },
-        &[packed, weights],
-    );
-    y
-}
-
-pub fn geglu_tanh(gate: &Value, up: &Value) -> Value {
-    let r = gate.rec();
-    let y = r.fresh(gate.ty().clone());
-    r.push(
-        Linear::Glu {
-            packed: None,
-            gate: Some(gate.id()),
-            up: Some(up.id()),
-            weights: None,
-            intermediate: u32::try_from(gate.width()).expect("a gate plane is narrower than 2^32"),
-            act: GluAct::GegluTanh,
-            limit: None,
-            y: y.id(),
-        },
-        &[gate, up],
+        &ins,
     );
     y
 }
@@ -274,123 +180,53 @@ pub fn relu2(x: &Value) -> Value {
     y
 }
 
-pub fn geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
-    let r = packed.rec();
-    let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
-    r.push(
-        Linear::Glu {
-            packed: Some(packed.id()),
-            gate: None,
-            up: None,
-            weights: None,
-            intermediate,
-            act: GluAct::GegluTanh,
-            limit: None,
-            y: y.id(),
-        },
-        &[packed],
-    );
-    y
-}
-
-pub fn situ(packed: &Value, intermediate: u32, beta: f32, up_cap: Option<f32>) -> Value {
-    let r = packed.rec();
-    let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
-    r.push(
-        Linear::Glu {
-            packed: Some(packed.id()),
-            gate: None,
-            up: None,
-            weights: None,
-            intermediate,
-            act: GluAct::Situ { beta, up_cap },
-            limit: None,
-            y: y.id(),
-        },
-        &[packed],
-    );
-    y
-}
-
-pub fn moe_topk_softmax(logits: &Value, experts: u32, top_k: u32) -> (Value, Value) {
-    let r = logits.rec();
-    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
-    r.push(
-        Linear::MoeRoute {
-            logits: logits.id(),
-            experts,
-            top_k,
-            routes: routes.id(),
-            weights: weights.id(),
-            ids: None,
-            table: None,
-            bias: None,
-            scale: None,
-            hint: None,
-            score: poem_ir::RouteScore::Softmax,
-        },
-        &[logits],
-    );
-    (routes, weights)
-}
-
-pub fn moe_topk_softmax_scaled(
-    logits: &Value,
-    scale: &Weight,
-    experts: u32,
-    top_k: u32,
-) -> (Value, Value) {
-    let r = logits.rec();
-    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
-    r.push(
-        Linear::MoeRoute {
-            logits: logits.id(),
-            scale: Some(r.weight(scale)),
-            experts,
-            top_k,
-            routes: routes.id(),
-            weights: weights.id(),
-            ids: None,
-            table: None,
-            bias: None,
-            hint: None,
-            score: poem_ir::RouteScore::Softmax,
-        },
-        &[logits],
-    );
-    (routes, weights)
-}
-
-pub fn moe_topk_sigmoid(
+/// A token's `top_k` of `experts`, scored of `logits` as `routing` says:
+/// `bias` added before the pick where given, `scale` the per-expert gain or
+/// post-scale, `hint` an earlier pick to keep. A hashed route reads its
+/// experts from `table` at the token's `ids`. Its routes and their weights,
+/// `top_k` wide, or `top_k + sink` for a route with sink slots.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_route(
     logits: &Value,
     experts: u32,
     top_k: u32,
-    renormalize: bool,
-    scaling: f32,
+    routing: RouteScore,
+    bias: Option<&Weight>,
+    scale: Option<&Weight>,
+    hint: Option<&Value>,
+    ids: Option<&Value>,
+    table: Option<&Weight>,
 ) -> (Value, Value) {
+    let hashed = matches!(routing, RouteScore::Hash { .. });
+    assert!(
+        hashed == ids.is_some() && hashed == table.is_some(),
+        "a hashed route, and only it, reads a token's ids from a table"
+    );
+    let fan = match routing {
+        RouteScore::SigmoidSink { sink, .. } => top_k + sink,
+        _ => top_k,
+    };
     let r = logits.rec();
-    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
+    let routes = r.fresh(tensor(Dim::Tokens, fan, Dtype::I32));
+    let weights = r.fresh(tensor(Dim::Tokens, fan, Dtype::F32));
+    let mut ins: Vec<&Value> = ids.into_iter().collect();
+    ins.push(logits);
+    ins.extend(hint);
     r.push(
         Linear::MoeRoute {
+            ids: ids.map(Value::id),
+            table: table.map(|t| r.weight(t)),
             logits: logits.id(),
-            bias: None,
+            bias: bias.map(|b| r.weight(b)),
+            scale: scale.map(|s| r.weight(s)),
+            hint: hint.map(Value::id),
             experts,
             top_k,
+            score: routing,
             routes: routes.id(),
             weights: weights.id(),
-            hint: None,
-            ids: None,
-            table: None,
-            scale: None,
-            score: poem_ir::RouteScore::Sigmoid {
-                renormalize,
-                scaling,
-            },
         },
-        &[logits],
+        &ins,
     );
     (routes, weights)
 }
@@ -415,194 +251,6 @@ pub fn rel_bias(x: &Value, w: &Weight, heads: u32, d_rel: u32, extent: u32) -> V
         &[x],
     );
     y
-}
-
-pub fn moe_topk_sigmoid_sink(
-    logits: &Value,
-    bias: &Weight,
-    scale: Option<&Weight>,
-    experts: u32,
-    top_k: u32,
-    sink: u32,
-    scaling: f32,
-) -> (Value, Value) {
-    let r = logits.rec();
-    let fan = top_k + sink;
-    let routes = r.fresh(tensor(Dim::Tokens, fan, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, fan, Dtype::F32));
-    r.push(
-        Linear::MoeRoute {
-            logits: logits.id(),
-            bias: Some(r.weight(bias)),
-            scale: scale.map(|s| r.weight(s)),
-            experts,
-            top_k,
-            routes: routes.id(),
-            weights: weights.id(),
-            ids: None,
-            table: None,
-            hint: None,
-            score: poem_ir::RouteScore::SigmoidSink { sink, scaling },
-        },
-        &[logits],
-    );
-    (routes, weights)
-}
-
-pub fn moe_topk_sigmoid_biased(
-    logits: &Value,
-    bias: &Weight,
-    experts: u32,
-    top_k: u32,
-    renormalize: bool,
-    scaling: f32,
-) -> (Value, Value) {
-    moe_topk_sigmoid_biased_hinted(logits, bias, experts, top_k, renormalize, scaling, None)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn moe_topk_sigmoid_biased_hinted(
-    logits: &Value,
-    bias: &Weight,
-    experts: u32,
-    top_k: u32,
-    renormalize: bool,
-    scaling: f32,
-    hint: Option<&Value>,
-) -> (Value, Value) {
-    let r = logits.rec();
-    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
-    let mut ins: Vec<&Value> = vec![logits];
-    ins.extend(hint);
-    r.push(
-        Linear::MoeRoute {
-            logits: logits.id(),
-            bias: Some(r.weight(bias)),
-            experts,
-            top_k,
-            routes: routes.id(),
-            weights: weights.id(),
-            hint: hint.map(Value::id),
-            ids: None,
-            table: None,
-            scale: None,
-            score: poem_ir::RouteScore::Sigmoid {
-                renormalize,
-                scaling,
-            },
-        },
-        &ins,
-    );
-    (routes, weights)
-}
-
-pub fn moe_topk_sqrt_softplus(
-    logits: &Value,
-    bias: &Weight,
-    experts: u32,
-    top_k: u32,
-    renormalize: bool,
-    scaling: f32,
-) -> (Value, Value) {
-    moe_topk_sqrt_softplus_hinted(logits, bias, experts, top_k, renormalize, scaling, None)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn moe_topk_sqrt_softplus_hinted(
-    logits: &Value,
-    bias: &Weight,
-    experts: u32,
-    top_k: u32,
-    renormalize: bool,
-    scaling: f32,
-    hint: Option<&Value>,
-) -> (Value, Value) {
-    let r = logits.rec();
-    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
-    let mut inputs = vec![logits];
-    inputs.extend(hint);
-    r.push(
-        Linear::MoeRoute {
-            logits: logits.id(),
-            bias: Some(r.weight(bias)),
-            experts,
-            top_k,
-            hint: hint.map(Value::id),
-            routes: routes.id(),
-            weights: weights.id(),
-            ids: None,
-            table: None,
-            scale: None,
-            score: poem_ir::RouteScore::SqrtSoftplus {
-                renormalize,
-                scaling,
-            },
-        },
-        &inputs,
-    );
-    (routes, weights)
-}
-
-pub fn moe_predict_route(logits: &Value, bias: &Weight, experts: u32, top_k: u32) -> Value {
-    let r = logits.rec();
-    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
-    r.push(
-        Linear::MoeRoute {
-            logits: logits.id(),
-            bias: Some(r.weight(bias)),
-            experts,
-            top_k,
-            routes: routes.id(),
-            weights: weights.id(),
-            ids: None,
-            table: None,
-            scale: None,
-            hint: None,
-            score: poem_ir::RouteScore::Predict,
-        },
-        &[logits],
-    );
-    routes
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn moe_hash_route(
-    ids: &Value,
-    tid2eid: &Weight,
-    logits: &Value,
-    vocab: u32,
-    experts: u32,
-    top_k: u32,
-    renormalize: bool,
-    scaling: f32,
-) -> (Value, Value) {
-    let r = ids.rec();
-    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
-    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
-    r.push(
-        Linear::MoeRoute {
-            ids: Some(ids.id()),
-            table: Some(r.weight(tid2eid)),
-            logits: logits.id(),
-            experts,
-            top_k,
-            routes: routes.id(),
-            weights: weights.id(),
-            bias: None,
-            scale: None,
-            hint: None,
-            score: poem_ir::RouteScore::Hash {
-                vocab,
-                renormalize,
-                scaling,
-            },
-        },
-        &[ids, logits],
-    );
-    (routes, weights)
 }
 
 pub fn group_routes(x: &Value, groups: u32) -> Value {

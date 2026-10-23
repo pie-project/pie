@@ -22,7 +22,7 @@ pub fn append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.kv_append_shared";
+    const OP: &str = "attn.kv_append";
     let (fmt, div) = ds_pool(OP, pool)?;
     if div != 1 {
         return Err(refuse(OP, "the window's plane holds a row a position"));

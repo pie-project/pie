@@ -632,7 +632,7 @@ pub fn attention_decode_selected(
     let _ = plan;
     selected(
         ctx,
-        "attn.mla_decode_selected",
+        "attn.mla_decode",
         q,
         q_pe,
         selection,
@@ -663,7 +663,7 @@ pub fn attention_prefill_selected(
     let _ = plan;
     selected(
         ctx,
-        "attn.mla_prefill_selected",
+        "attn.mla_prefill",
         q,
         q_pe,
         selection,

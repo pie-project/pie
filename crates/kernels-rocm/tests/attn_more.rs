@@ -1175,7 +1175,7 @@ fn check_rel(
     let window_left = window.map_or(-1, |w| w as i32 - 1);
     attn::rel::walk(
         &ctx,
-        "attn.prefill_rel",
+        "attn.prefill",
         q,
         &pool,
         rel,

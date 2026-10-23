@@ -28,6 +28,7 @@ pub(crate) mod spelled {
         Dtype, GateActivation, IndexScore, Input, ModulateForm, MropeForm, PixelOrder, RaggedMask,
         RopeForm, TapKind, Value, ValueId, VoxelSegment, Weight,
     };
+    pub(crate) use poem_ir::{GluAct, RouteScore, Turn};
 }
 
 /// One op of the DSL, as a forward calls it.
@@ -336,7 +337,8 @@ impl<'v> Arg<'v> for ModulateForm {
 }
 
 /// A value of the DSL a package holds whole: a conv's geometry, a grid
-/// rule, a rope's yarn scaling, a ragged mask.
+/// rule, a rope's yarn scaling, a ragged mask, the turn a rope makes, the
+/// gating a gated unit applies, the scoring a router picks by.
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct Whole(#[allocative(skip)] pub(crate) Held);
 
@@ -347,6 +349,9 @@ pub(crate) enum Held {
     Scaling(RopeScaling),
     Mask(RaggedMask),
     Segment(VoxelSegment),
+    Turn(Turn),
+    Gating(GluAct),
+    Routing(RouteScore),
 }
 
 starlark_simple_value!(Whole);
@@ -379,6 +384,9 @@ whole!(Yarn, Yarn, "a yarn scaling");
 whole!(RopeScaling, Scaling, "a rope scaling");
 whole!(RaggedMask, Mask, "a ragged mask");
 whole!(VoxelSegment, Segment, "a voxel segment");
+whole!(Turn, Turn, "a rotary turn");
+whole!(GluAct, Gating, "a gating");
+whole!(RouteScore, Routing, "a routing");
 
 /// What an op's result is held as.
 pub(crate) trait Result {
@@ -394,6 +402,16 @@ impl Result for Value {
 impl Result for (Value, Value) {
     fn star(self, heap: Heap<'_>) -> Star<'_> {
         heap.alloc((hold(self.0), hold(self.1)))
+    }
+}
+
+/// A rope's queries alone, or its queries and keys.
+impl Result for (Value, Option<Value>) {
+    fn star(self, heap: Heap<'_>) -> Star<'_> {
+        match self.1 {
+            None => heap.alloc(hold(self.0)),
+            Some(k) => heap.alloc((hold(self.0), hold(k))),
+        }
     }
 }
 
@@ -488,10 +506,23 @@ impl<'v> StarlarkValue<'v> for Bound {
     }
 }
 
-/// The `Input` method `name`, bound to `this`.
-pub(crate) fn input_method<'v>(this: InputHandle, name: &str, heap: Heap<'v>) -> Option<Star<'v>> {
+/// Every op a package can spell: the generated bindings and those by hand.
+pub(crate) fn every_op() -> impl Iterator<Item = &'static Op> {
+    crate::star::ops::OPS
+        .iter()
+        .chain(crate::star::ops_by_hand::OPS)
+}
+
+/// Every `Input` method a package can spell, generated and by hand.
+pub(crate) fn every_input() -> impl Iterator<Item = &'static Op> {
     crate::star::ops::INPUTS
         .iter()
+        .chain(crate::star::ops_by_hand::INPUTS)
+}
+
+/// The `Input` method `name`, bound to `this`.
+pub(crate) fn input_method<'v>(this: InputHandle, name: &str, heap: Heap<'v>) -> Option<Star<'v>> {
+    every_input()
         .find(|op| op.name == name)
         .map(|op| heap.alloc(Bound(op, this)))
 }
@@ -746,6 +777,25 @@ impl crate::rope::Entries for Scalings<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    /// `src/star/ops.rs` is what `tools/bind_ops.py` writes, so a binding is
+    /// changed in the op's signature or by hand in `ops_by_hand.rs`, never in
+    /// the generated file.
+    #[test]
+    fn the_bindings_are_what_bind_ops_writes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let checked = std::process::Command::new("python3")
+            .arg("-I")
+            .arg(root.join("tools/bind_ops.py"))
+            .arg("--check")
+            .output()
+            .expect("python3 runs tools/bind_ops.py");
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+
     /// Every op of `src/ops` is bound, but for the ones `tools/bind_ops.py`
     /// names as not spellable: a new op is one run of it away.
     #[test]
@@ -765,9 +815,7 @@ mod tests {
                     continue;
                 };
                 let name = &rest[..rest.find(['(', '<']).unwrap()];
-                let bound = super::super::ops::OPS
-                    .iter()
-                    .any(|op| op.module == *module && op.name == name);
+                let bound = super::every_op().any(|op| op.module == *module && op.name == name);
                 if !bound && !unbound.contains(&format!("{module}::{name}").as_str()) {
                     missing.push(format!("{module}::{name}"));
                 }
@@ -781,7 +829,7 @@ mod tests {
                 continue;
             };
             let name = &rest[..rest.find(['(', '<']).unwrap()];
-            let bound = super::super::ops::INPUTS.iter().any(|op| op.name == name);
+            let bound = super::every_input().any(|op| op.name == name);
             if !bound
                 && !super::super::ops::NOT_GENERATED.contains(&name)
                 && !unbound.contains(&format!("inputs::{name}").as_str())
@@ -793,5 +841,167 @@ mod tests {
             missing.is_empty(),
             "run crates/poem/tools/bind_ops.py: {missing:?} are not bound"
         );
+    }
+}
+
+/// The `rotary` namespace: the turns a rope makes of a head's dims.
+#[starlark_module]
+pub(crate) fn rotary(builder: &mut starlark::environment::GlobalsBuilder) {
+    /// Every pair: `(i, i + head_dim/2)`, or `(2i, 2i + 1)` interleaved.
+    fn full(
+        #[starlark(require = named, default = false)] interleaved: bool,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Turn(Turn::Full { interleaved })))
+    }
+
+    /// The first `rotary_dim/2` pairs, pair `i` being `(i, i + span)`;
+    /// `span` is half the rotary width unless stated.
+    fn partial(
+        #[starlark(require = pos)] rotary_dim: u32,
+        #[starlark(require = named)] span: Option<u32>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Turn(Turn::Partial {
+            rotary_dim,
+            span: span.unwrap_or(rotary_dim / 2),
+        })))
+    }
+
+    /// The last `rotary_dim` dims (`inverse` turns them back), at
+    /// frequencies `yarn` ramps where it is given.
+    fn last<'v>(
+        #[starlark(require = pos)] rotary_dim: u32,
+        #[starlark(require = named, default = false)] interleaved: bool,
+        #[starlark(require = named, default = false)] inverse: bool,
+        #[starlark(require = named)] yarn: Option<Star<'v>>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Turn(Turn::Last {
+            rotary_dim,
+            interleaved,
+            inverse,
+            yarn: Option::<Yarn>::arg(yarn)?,
+        })))
+    }
+
+    /// Every pair at `yarn`'s stretched frequencies, cos and sin scaled by
+    /// `attention_factor`.
+    fn yarn<'v>(
+        #[starlark(require = pos)] yarn: Star<'v>,
+        #[starlark(require = named)] attention_factor: Star<'v>,
+        #[starlark(require = named, default = false)] interleaved: bool,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Turn(Turn::Yarn {
+            yarn: Yarn::arg(Some(yarn))?,
+            attention_factor: f32::arg(Some(attention_factor))?,
+            interleaved,
+        })))
+    }
+
+    /// Multimodal: a `(t, h, w)` position a row, `sections` naming which
+    /// pairs of the first `rotary_dim` turn by which axis, laid out as
+    /// `form` says.
+    fn mrope<'v>(
+        #[starlark(require = pos)] sections: Star<'v>,
+        #[starlark(require = pos)] form: Star<'v>,
+        #[starlark(require = pos)] rotary_dim: u32,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Turn(Turn::Mrope {
+            sections: <[u32; 3]>::arg(Some(sections))?,
+            form: MropeForm::arg(Some(form))?,
+            rotary_dim,
+        })))
+    }
+}
+
+/// The `gating` namespace: the activations a gated unit gates by.
+#[starlark_module]
+pub(crate) fn gating(builder: &mut starlark::environment::GlobalsBuilder) {
+    /// `silu(gate) · up`.
+    fn swiglu() -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Gating(GluAct::Swiglu)))
+    }
+
+    /// `gate · sigmoid(alpha · gate) · (up + 1)`.
+    fn swiglu_alpha<'v>(#[starlark(require = pos)] alpha: Star<'v>) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Gating(GluAct::SwigluAlpha {
+            alpha: f32::arg(Some(alpha))?,
+        })))
+    }
+
+    /// `gelu_tanh(gate) · up`.
+    fn geglu_tanh() -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Gating(GluAct::GegluTanh)))
+    }
+
+    /// `situ_beta(gate) · up`, `up` capped at `up_cap` where stated.
+    fn situ<'v>(
+        #[starlark(require = pos)] beta: Star<'v>,
+        #[starlark(require = named)] up_cap: Option<Star<'v>>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Gating(GluAct::Situ {
+            beta: f32::arg(Some(beta))?,
+            up_cap: Option::<f32>::arg(up_cap)?,
+        })))
+    }
+}
+
+/// The `routing` namespace: how a router scores and weighs its experts.
+#[starlark_module]
+pub(crate) fn routing(builder: &mut starlark::environment::GlobalsBuilder) {
+    /// Softmax over the experts.
+    fn softmax() -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Routing(RouteScore::Softmax)))
+    }
+
+    /// Sigmoid scores, the top-k's weights renormalized where stated, then
+    /// times `scaling`.
+    fn sigmoid<'v>(
+        #[starlark(require = named, default = false)] renormalize: bool,
+        #[starlark(require = named)] scaling: Option<Star<'v>>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Routing(RouteScore::Sigmoid {
+            renormalize,
+            scaling: Option::<f32>::arg(scaling)?.unwrap_or(1.0),
+        })))
+    }
+
+    /// Sigmoid scores with `sink` slots past the routed ones.
+    fn sigmoid_sink<'v>(
+        #[starlark(require = pos)] sink: u32,
+        #[starlark(require = named)] scaling: Option<Star<'v>>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Routing(RouteScore::SigmoidSink {
+            sink,
+            scaling: Option::<f32>::arg(scaling)?.unwrap_or(1.0),
+        })))
+    }
+
+    /// `sqrt(softplus(x))` scores.
+    fn sqrt_softplus<'v>(
+        #[starlark(require = named, default = false)] renormalize: bool,
+        #[starlark(require = named)] scaling: Option<Star<'v>>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Routing(RouteScore::SqrtSoftplus {
+            renormalize,
+            scaling: Option::<f32>::arg(scaling)?.unwrap_or(1.0),
+        })))
+    }
+
+    /// The routes a biased pick predicts; its weights are not read.
+    fn predict() -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Routing(RouteScore::Predict)))
+    }
+
+    /// Experts looked up by token id in a `vocab`-row table, weighted by
+    /// their scores.
+    fn hash<'v>(
+        #[starlark(require = pos)] vocab: u32,
+        #[starlark(require = named, default = false)] renormalize: bool,
+        #[starlark(require = named)] scaling: Option<Star<'v>>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Routing(RouteScore::Hash {
+            vocab,
+            renormalize,
+            scaling: Option::<f32>::arg(scaling)?.unwrap_or(1.0),
+        })))
     }
 }

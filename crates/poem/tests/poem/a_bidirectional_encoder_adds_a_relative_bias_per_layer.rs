@@ -1,6 +1,7 @@
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
 };
+use poem_ir::GluAct;
 use poem_ir::{Attn, Def, Dim, Elemwise, Guard, Operands, Operation, RaggedMask, Ty};
 
 const WIDTH: u32 = 64;
@@ -61,7 +62,7 @@ impl ForwardHybrid for Encoder {
             let h = ops::elemwise::rmsnorm(&x, &ln("mlp_norm"), 1e-6);
             let gate = ops::linear::matmul(&h, &w(&format!("l{l}.wi_0"), INNER, WIDTH));
             let up = ops::linear::matmul(&h, &w(&format!("l{l}.wi_1"), INNER, WIDTH));
-            let act = ops::linear::geglu_tanh(&gate, &up);
+            let act = ops::linear::glu(&gate, GluAct::GegluTanh, None, Some(&up), None, None);
             let y = ops::linear::matmul(&act, &w(&format!("l{l}.wo"), WIDTH, INNER));
             x = ops::elemwise::residual_add(&x, &y);
         }

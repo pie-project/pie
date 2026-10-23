@@ -38,9 +38,12 @@ impl Replay {
             .iter()
             .position(|fact| *fact == Fact::Flag(Request::ENCODE.to_string()))?;
         let floored = |attn: &Attn| match attn {
-            Attn::PrefillLse {
-                floor: Some(_),
+            Attn::Prefill {
                 window,
+                mask: None,
+                selection: None,
+                bias: None,
+                lse: Some(_),
                 ..
             } => *window,
             _ => None,

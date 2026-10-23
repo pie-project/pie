@@ -10,7 +10,7 @@ pub fn append(
     _write_offset: Tensor,
 ) -> Result<(), Error> {
     Err(Error::Unsupported {
-        op: "attn.kv_append_shared",
+        op: "attn.kv_append",
     })
 }
 

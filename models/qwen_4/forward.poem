@@ -23,17 +23,22 @@ def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
 
 def moe(x, f):
     """The routed MLP: `f.top_k` of `f.experts`, plus the gated shared expert."""
-    experts, weights = ops.linear.moe_topk_softmax(ops.linear.matmul(x, f.router), f.experts, f.top_k)
+    experts, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.softmax(),
+    )
 
     def select(act, bank):
         if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
             return ops.linear.moe_matmul_select(act, bank, experts, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, experts, f.top_k)
 
-    hidden = ops.linear.swiglu(select(x, f.gate_up), f.inter)
+    hidden = ops.linear.glu(select(x, f.gate_up), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(select(hidden, f.down), weights)
     shared = ops.linear.matmul(
-        ops.linear.swiglu(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter),
+        ops.linear.glu(ops.linear.matmul(x, f.shared_gate_up), gating.swiglu(), f.shared_inter),
         f.shared_down,
     )
     return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
@@ -46,8 +51,24 @@ def positions(inputs, vision):
 
 def rope(q, k, positions, vision, rotary_dim, head_dim, theta, scaling = None):
     if not vision:
-        return ops.elemwise.rope_partial(q, k, positions, rotary_dim, head_dim, theta, scaling = scaling)
-    return ops.elemwise.rope_mrope(q, k, positions, MROPE_SECTIONS, "interleaved", rotary_dim, head_dim, theta, scaling = scaling)
+        return ops.elemwise.rope(
+            q,
+            positions,
+            head_dim,
+            theta,
+            rotary.partial(rotary_dim),
+            k = k,
+            scaling = scaling,
+        )
+    return ops.elemwise.rope(
+        q,
+        positions,
+        head_dim,
+        theta,
+        rotary.mrope(MROPE_SECTIONS, "interleaved", rotary_dim),
+        k = k,
+        scaling = scaling,
+    )
 
 def tower(inputs, t):
     """The tower's merged rows for the request's patches."""
@@ -64,7 +85,7 @@ def tower(inputs, t):
     for b in t.blocks:
         n = ops.elemwise.layernorm(y, b.norm1, b.norm1_bias, t.norm_eps)
         q, k, v = ops.gather.split_qkv(ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)), t.hidden, t.hidden)
-        q, k = ops.elemwise.rope_mrope(q, k, grid, [0, d // 4, d // 4], "blocked", d, d, t.theta)
+        q, k = ops.elemwise.rope(q, grid, d, t.theta, rotary.mrope([0, d // 4, d // 4], "blocked", d), k = k)
         o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
         y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.proj_bias, ops.linear.matmul(o, b.proj)), y)
 
@@ -106,16 +127,7 @@ def caches(m, c):
     c.state(p.ids_state, [p.dilation - 1], dtype.i32)
     c.state(p.conv_state, [(p.conv_kernel - 1) * p.dilation + 1, m.streams * m.hidden], dtype.bf16)
 
-def classes():
-    return [fact.has(fact.Mask), fact.scores(), fact.single_token()]
-
 def forward(m, inputs):
-    ([input_m, input_s, input_d], input_p) = inputs.partition(classes())
-    plan_m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None)
-    plan_d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None)
-    plan_p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None)
-    plan_s = ops.attn.plan_prefill(input_s, m.q_heads, m.kv_heads, m.head_dim, None)
-    mask = inputs.mask()
 
     towered = tower(inputs, m.tower) if m.tower != None else None
 
@@ -132,7 +144,7 @@ def forward(m, inputs):
 
         x, normed = mix_in(y, w.attn_res, m)
         if w.attn != None:
-            o = attn_mixer(x, inputs, m, plan_m, plan_d, plan_p, plan_s, mask, w.attn, w.indexer)
+            o = attn_mixer(x, inputs, m, w.attn, w.indexer)
         else:
             o = gdn_mixer(x, inputs, w.gdn)
         y = inject(o, normed, w.attn_res, m, y)
@@ -227,8 +239,8 @@ def rotate(q, k, positions, m, a):
 
 def boundaries(positions, row_valid, ratio):
     one, many = positions.on(fact.single_token()), positions.on(~fact.single_token())
-    dpos, dreq, drope = ops.attn.pool_boundary_decode(one, row_valid, ratio)
-    ppos, preq, prope = ops.attn.pool_boundary_prefill(many, row_valid, ratio)
+    dpos, dreq, drope = ops.attn.pool_boundary(one, row_valid, ratio, decode = True)
+    ppos, preq, prope = ops.attn.pool_boundary(many, row_valid, ratio, decode = False)
     return (merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope]))
 
 def qsa_select(x, inputs, m, a, ix):
@@ -244,14 +256,14 @@ def qsa_select(x, inputs, m, a, ix):
     bpos, breq, brope = boundaries(positions, inputs.row_valid(), ix.ratio)
     blk = ops.attn.index_block_mean(bpos, breq, keys, ix.head_dim, ix.ratio, dtype.bf16)
     blk = ops.elemwise.rmsnorm_plus_one(blk, ix.k_norm, ix.norm_eps)
-    blk = ops.elemwise.rope_partial_q(blk, brope, a.rotary_dim, ix.head_dim, a.theta)
+    blk = ops.elemwise.rope(blk, brope, ix.head_dim, a.theta, rotary.partial(a.rotary_dim))
     ops.attn.pool_kv_append(blk, bpos, breq, keys, write_page, write_offset)
 
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, ix.q_norm, ix.head_dim, ix.norm_eps)
-    q = ops.elemwise.rope_partial_q(q, positions, a.rotary_dim, ix.head_dim, a.theta)
+    q = ops.elemwise.rope(q, positions, ix.head_dim, a.theta, rotary.partial(a.rotary_dim))
     return ops.attn.index_topk(q, None, keys, ix.heads, ix.head_dim, ix.top_k, ix.ratio)
 
-def attn_mixer(x, inputs, m, plan_m, plan_d, plan_p, plan_s, mask, a, ix):
+def attn_mixer(x, inputs, m, a, ix):
     pages = inputs.kv(a.kv)
     write_page = inputs.write_page(a.kv)
     write_offset = inputs.write_offset(a.kv)
@@ -266,19 +278,10 @@ def attn_mixer(x, inputs, m, plan_m, plan_d, plan_p, plan_s, mask, a, ix):
     ops.attn.kv_append(k, v, pages, write_page, write_offset)
     seam.at(seam.ATTN_Q, [q])
 
-    ([mq, sq, dq], p) = q.partition(classes())
-    so, lse = ops.attn.prefill_lse(sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale)
-    seam.at(seam.SCORES, [lse])
-    selection = qsa_select(x, inputs, m, a, ix)
-    ([_, _, d_sel], p_sel) = selection.partition(classes())
-    od = ops.attn.decode_selected(dq, plan_d, d_sel, pages, None, d, a.sm_scale, ix.ratio)
-    op = ops.attn.prefill_selected(p, plan_p, p_sel, pages, None, d, m.kv_heads, a.sm_scale, ix.ratio)
-    o = merge([
-        ops.attn.masked(mq, plan_m, mask, pages, None, d, m.kv_heads, True, a.sm_scale),
-        so,
-        od,
-        op,
-    ])
+    # Each lane by its kind; decode and prefill lanes read the key blocks
+    # the selector picked.
+    o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True, scores = True,
+                        selection = qsa_select(x, inputs, m, a, ix), ratio = ix.ratio)
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
 

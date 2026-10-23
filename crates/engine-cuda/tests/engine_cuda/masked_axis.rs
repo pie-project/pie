@@ -14,7 +14,21 @@ fn masked_arms(trace: &Trace) -> usize {
         .filter(|node| {
             matches!(
                 node.op,
-                Operation::Attn(Attn::Masked { .. } | Attn::MaskedLse { .. })
+                Operation::Attn(
+                    Attn::Prefill {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        lse: None,
+                        ..
+                    } | Attn::Prefill {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        lse: Some(_),
+                        ..
+                    }
+                )
             )
         })
         .count()

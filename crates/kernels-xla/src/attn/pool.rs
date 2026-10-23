@@ -173,7 +173,7 @@ pub fn boundary_decode(
 ) -> Result<(Val, Val, Val), Error> {
     boundary(
         f,
-        "attn.pool_boundary_decode",
+        "attn.pool_boundary",
         positions,
         request_of_token,
         row_valid,
@@ -198,7 +198,7 @@ pub fn boundary_prefill(
 ) -> Result<(Val, Val, Val), Error> {
     boundary(
         f,
-        "attn.pool_boundary_prefill",
+        "attn.pool_boundary",
         positions,
         request_of_token,
         row_valid,
@@ -899,7 +899,7 @@ pub fn attention_lse_selected<T: Stored>(
     lse: T,
 ) -> Result<PoolLse<T>, Error> {
     reader(
-        "attn.pool_lse_selected",
+        "attn.pool_lse",
         q,
         positions,
         request_of_token,

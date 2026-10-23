@@ -2,7 +2,9 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId};
+use poem_ir::{
+    Attn, BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId,
+};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -107,31 +109,18 @@ fn heads(name: &str) -> Option<Heads> {
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
-        "attn.decode" | "attn.decode_lse" | "attn.decode_selected" => {
-            Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)
-        }
-        "attn.prefill"
-        | "attn.prefill_lse"
-        | "attn.masked"
-        | "attn.masked_lse"
-        | "attn.prefill_selected" => Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole),
         "attn.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
         "attn.sink" => Heads::of(&["o", "lse"], &[]),
         "attn.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
-        "attn.pool_lse" | "attn.pool_lse_selected" => Heads::of(&["q"], &["heads"]),
+        "attn.pool_lse" => Heads::of(&["q"], &["heads"]),
+        // k and v, or the one plane a shared pool reads as both.
         "attn.kv_append" => Heads::of(&["k", "v"], &[])
             .cache(Cache::Split)
             .kv(&["k", "v"]),
-        "attn.kv_append_shared" => Heads::of(&["plane"], &[])
-            .cache(Cache::Split)
-            .kv(&["plane"]),
         "attn.mla_split_q_b" => Heads::of(&["q_b"], &["heads"]),
         "attn.mla_absorb_q" => Heads::of(&["q_nope"], &["heads"]),
         "attn.mla_absorb_out" => Heads::of(&["latent"], &["heads"]),
-        "attn.mla_decode"
-        | "attn.mla_prefill"
-        | "attn.mla_decode_selected"
-        | "attn.mla_prefill_selected" => Heads::of(&["q", "q_pe"], &["heads"]),
+        "attn.mla_decode" | "attn.mla_prefill" => Heads::of(&["q", "q_pe"], &["heads"]),
         "ssm.causal_conv1d" | "ssm.causal_conv1d_chunked" => {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
@@ -227,6 +216,21 @@ fn rule(op: &Operation) -> Rule {
                 follow: &["routed"],
             },
             Some(_) => Rule::Whole,
+        };
+    }
+    // A paged attention splits with its query heads, its cache split with
+    // them or kept whole; one under a relative bias reads its operands whole,
+    // as the biased ops did, which had no rule.
+    if let Operation::Attn(Attn::Decode { bias, .. }) = op {
+        return match bias {
+            Some(_) => Rule::Whole,
+            None => Rule::Heads(Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)),
+        };
+    }
+    if let Operation::Attn(Attn::Prefill { bias, .. }) = op {
+        return match bias {
+            Some(_) => Rule::Whole,
+            None => Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole)),
         };
     }
     let name = op.name();

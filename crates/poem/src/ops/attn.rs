@@ -1,7 +1,7 @@
 use super::conv::{expect_grid, expect_voxels};
 use super::*;
 use crate::forward::Input;
-use poem_ir::VoxelSegment;
+use poem_ir::{Blocks, Relative, VoxelSegment};
 
 pub fn plan_decode(
     inputs: &Input,
@@ -63,6 +63,54 @@ pub fn plan_prefill(
     plan
 }
 
+/// The blocks a selection reads, `ratio` keys each, where `selection` is
+/// given; `per_head`, one run per kv head.
+fn blocks(selection: Option<&Value>, ratio: Option<u32>, per_head: bool) -> Option<Blocks> {
+    match (selection, ratio) {
+        (Some(_), Some(ratio)) => Some(Blocks { ratio, per_head }),
+        (None, None) => None,
+        _ => panic!("a selection states its block ratio, and only a selection does"),
+    }
+}
+
+/// A relative bias over `extent` positions, its distances past
+/// `2^log_floor` in log buckets `log_alpha` wide where `log_scaling` says.
+fn relative(
+    bias: Option<&Value>,
+    extent: Option<u32>,
+    log_scaling: Option<(u32, f32)>,
+) -> Option<Relative> {
+    match (bias, extent) {
+        (Some(_), Some(extent)) => {
+            let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
+            Some(Relative {
+                extent,
+                log_floor,
+                log_alpha,
+            })
+        }
+        (None, None) => None,
+        _ => panic!("a relative bias states its extent, and only a bias does"),
+    }
+}
+
+/// Each row's per-head log-sum-exp beside its output, where asked for.
+fn lse_of(q: &Value, head_dim: u32, lse: bool) -> Option<Value> {
+    lse.then(|| {
+        q.rec().fresh(tensor(
+            q.rows(),
+            q.width() / u64::from(head_dim),
+            Dtype::F32,
+        ))
+    })
+}
+
+/// Each row's query against its lane's paged keys, as one token's: under a
+/// selection (`selection`, `ratio` keys a block, `per_head` one run per kv
+/// head) only its blocks; under a relative bias (`bias` over `extent`
+/// positions, `log_scaling` its log buckets) each key offset by its
+/// distance. With `lse`, each row's per-head log-sum-exp beside its output.
+#[allow(clippy::too_many_arguments)]
 pub fn decode(
     q: &Value,
     plan: &Value,
@@ -70,24 +118,47 @@ pub fn decode(
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
-) -> Value {
+    lse: bool,
+    selection: Option<&Value>,
+    ratio: Option<u32>,
+    per_head: bool,
+    bias: Option<&Value>,
+    extent: Option<u32>,
+    log_scaling: Option<(u32, f32)>,
+) -> (Value, Option<Value>) {
+    let selected = blocks(selection, ratio, per_head);
+    let rel = relative(bias, extent, log_scaling);
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
+    let lse = lse_of(q, head_dim, lse);
+    let mut ins = vec![q, plan];
+    ins.extend(selection);
+    ins.extend(bias);
     r.push(
         Attn::Decode {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
+            selection: selection.map(Value::id),
+            bias: bias.map(Value::id),
             window,
             head_dim,
             sm_scale,
+            selected,
+            rel,
             o: o.id(),
+            lse: lse.as_ref().map(Value::id),
         },
-        &[q, plan],
+        &ins,
     );
-    o
+    (o, lse)
 }
 
+/// Each row's query against its lane's paged keys, causally; or, given
+/// `mask`, as the mask lets it (and causally too where `causal`). `floor`,
+/// each row's least window position, below which the window reads no key.
+/// A selection, a relative bias and `lse` as [`decode`]'s.
+#[allow(clippy::too_many_arguments)]
 pub fn prefill(
     q: &Value,
     plan: &Value,
@@ -96,296 +167,51 @@ pub fn prefill(
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
-) -> Value {
+    lse: bool,
+    mask: Option<&Value>,
+    causal: bool,
+    floor: Option<&Value>,
+    selection: Option<&Value>,
+    ratio: Option<u32>,
+    per_head: bool,
+    bias: Option<&Value>,
+    extent: Option<u32>,
+    log_scaling: Option<(u32, f32)>,
+) -> (Value, Option<Value>) {
+    assert!(
+        causal || mask.is_some(),
+        "a prefill reads causally unless a mask states what each row sees"
+    );
+    let selected = blocks(selection, ratio, per_head);
+    let rel = relative(bias, extent, log_scaling);
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
+    let lse = lse_of(q, head_dim, lse);
+    let mut ins = vec![q, plan];
+    ins.extend(mask);
+    ins.extend(selection);
+    ins.extend(bias);
+    ins.extend(floor);
     r.push(
         Attn::Prefill {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            o: o.id(),
-        },
-        &[q, plan],
-    );
-    o
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_selected(
-    q: &Value,
-    plan: &Value,
-    selection: &Value,
-    pages: ValueId,
-    window: Option<u32>,
-    head_dim: u32,
-    sm_scale: f32,
-    ratio: u32,
-    per_head: bool,
-) -> Value {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    r.push(
-        Attn::DecodeSelected {
-            q: q.id(),
-            plan: plan.id(),
-            selection: selection.id(),
-            cache: pages,
-            window,
-            head_dim,
-            sm_scale,
-            ratio,
-            per_head,
-            o: o.id(),
-        },
-        &[q, plan, selection],
-    );
-    o
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn prefill_selected(
-    q: &Value,
-    plan: &Value,
-    selection: &Value,
-    pages: ValueId,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    ratio: u32,
-    per_head: bool,
-) -> Value {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    r.push(
-        Attn::PrefillSelected {
-            q: q.id(),
-            plan: plan.id(),
-            selection: selection.id(),
-            cache: pages,
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            ratio,
-            per_head,
-            o: o.id(),
-        },
-        &[q, plan, selection],
-    );
-    o
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_rel(
-    q: &Value,
-    plan: &Value,
-    pages: ValueId,
-    bias: &Value,
-    window: Option<u32>,
-    head_dim: u32,
-    extent: u32,
-    sm_scale: f32,
-    log_scaling: Option<(u32, f32)>,
-) -> Value {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
-    r.push(
-        Attn::DecodeRel {
-            q: q.id(),
-            plan: plan.id(),
-            cache: pages,
-            bias: bias.id(),
-            window,
-            head_dim,
-            extent,
-            sm_scale,
-            log_floor,
-            log_alpha,
-            o: o.id(),
-        },
-        &[q, plan, bias],
-    );
-    o
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn prefill_rel(
-    q: &Value,
-    plan: &Value,
-    pages: ValueId,
-    bias: &Value,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    extent: u32,
-    sm_scale: f32,
-    log_scaling: Option<(u32, f32)>,
-) -> Value {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
-    r.push(
-        Attn::PrefillRel {
-            q: q.id(),
-            plan: plan.id(),
-            cache: pages,
-            bias: bias.id(),
-            window,
-            head_dim,
-            kv_heads,
-            extent,
-            sm_scale,
-            log_floor,
-            log_alpha,
-            o: o.id(),
-        },
-        &[q, plan, bias],
-    );
-    o
-}
-
-pub fn masked(
-    q: &Value,
-    plan: &Value,
-    mask: &Value,
-    pages: ValueId,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    causal: bool,
-    sm_scale: f32,
-) -> Value {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    r.push(
-        Attn::Masked {
-            q: q.id(),
-            plan: plan.id(),
-            mask: mask.id(),
-            cache: pages,
-            window,
-            head_dim,
-            kv_heads,
-            causal,
-            sm_scale,
-            o: o.id(),
-        },
-        &[q, plan, mask],
-    );
-    o
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn masked_lse(
-    q: &Value,
-    plan: &Value,
-    mask: &Value,
-    pages: ValueId,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    causal: bool,
-    sm_scale: f32,
-) -> (Value, Value) {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    let lse = r.fresh(tensor(
-        q.rows(),
-        q.width() / u64::from(head_dim),
-        Dtype::F32,
-    ));
-    r.push(
-        Attn::MaskedLse {
-            q: q.id(),
-            plan: plan.id(),
-            mask: mask.id(),
-            cache: pages,
-            window,
-            head_dim,
-            kv_heads,
-            causal,
-            sm_scale,
-            o: o.id(),
-            lse: lse.id(),
-        },
-        &[q, plan, mask],
-    );
-    (o, lse)
-}
-
-pub fn decode_lse(
-    q: &Value,
-    plan: &Value,
-    pages: ValueId,
-    window: Option<u32>,
-    head_dim: u32,
-    sm_scale: f32,
-) -> (Value, Value) {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    let lse = r.fresh(tensor(
-        q.rows(),
-        q.width() / u64::from(head_dim),
-        Dtype::F32,
-    ));
-    r.push(
-        Attn::DecodeLse {
-            q: q.id(),
-            plan: plan.id(),
-            cache: pages,
-            window,
-            head_dim,
-            sm_scale,
-            o: o.id(),
-            lse: lse.id(),
-        },
-        &[q, plan],
-    );
-    (o, lse)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn prefill_lse(
-    q: &Value,
-    plan: &Value,
-    pages: ValueId,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    floor: Option<&Value>,
-) -> (Value, Value) {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    let lse = r.fresh(tensor(
-        q.rows(),
-        q.width() / u64::from(head_dim),
-        Dtype::F32,
-    ));
-    r.push(
-        Attn::PrefillLse {
-            q: q.id(),
-            plan: plan.id(),
-            cache: pages,
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            o: o.id(),
-            lse: lse.id(),
+            mask: mask.map(Value::id),
+            selection: selection.map(Value::id),
+            bias: bias.map(Value::id),
             floor: floor.map(Value::id),
+            window,
+            head_dim,
+            kv_heads,
+            causal,
+            sm_scale,
+            selected,
+            rel,
+            o: o.id(),
+            lse: lse.as_ref().map(Value::id),
         },
-        &match floor {
-            Some(floor) => vec![q, plan, floor],
-            None => vec![q, plan],
-        },
+        &ins,
     );
     (o, lse)
 }
@@ -465,30 +291,28 @@ pub fn logit_softcap(x: &Value, cap: f32) -> Value {
     x_out
 }
 
-pub fn kv_append(k: &Value, v: &Value, pages: ValueId, write_page: &Value, write_offset: &Value) {
+/// Each row's key and value written to `pages` at its page and offset;
+/// without `v`, `k` is one plane the pool reads as both.
+pub fn kv_append(
+    k: &Value,
+    v: Option<&Value>,
+    pages: ValueId,
+    write_page: &Value,
+    write_offset: &Value,
+) {
     let r = k.rec();
+    let mut ins = vec![k];
+    ins.extend(v);
+    ins.extend([write_page, write_offset]);
     r.push(
         Attn::KvAppend {
             k: k.id(),
-            v: v.id(),
+            v: v.map(Value::id),
             cache: pages,
             write_page: write_page.id(),
             write_offset: write_offset.id(),
         },
-        &[k, v, write_page, write_offset],
-    );
-}
-
-pub fn kv_append_shared(plane: &Value, pages: ValueId, write_page: &Value, write_offset: &Value) {
-    let r = plane.rec();
-    r.push(
-        Attn::KvAppendShared {
-            plane: plane.id(),
-            cache: pages,
-            write_page: write_page.id(),
-            write_offset: write_offset.id(),
-        },
-        &[plane, write_page, write_offset],
+        &ins,
     );
 }
 
@@ -761,6 +585,7 @@ fn mla_scored(
             sm_scale,
             o: o_id,
             lse: lse_id,
+            selection: None,
         },
         (None, false) => Attn::MlaPrefill {
             q: q_id,
@@ -773,30 +598,33 @@ fn mla_scored(
             sm_scale,
             o: o_id,
             lse: lse_id,
+            selection: None,
         },
-        (Some(selection), true) => Attn::MlaDecodeSelected {
+        (Some(selection), true) => Attn::MlaDecode {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
-            selection: selection.id(),
+            selection: Some(selection.id()),
             cache: pages,
             heads,
             kv_lora_rank,
             sm_scale,
             o: o_id,
             lse: lse_id,
+            window: None,
         },
-        (Some(selection), false) => Attn::MlaPrefillSelected {
+        (Some(selection), false) => Attn::MlaPrefill {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
-            selection: selection.id(),
+            selection: Some(selection.id()),
             cache: pages,
             heads,
             kv_lora_rank,
             sm_scale,
             o: o_id,
             lse: lse_id,
+            window: None,
         },
     };
     let mut deps = vec![q, plan, q_pe];
@@ -805,6 +633,10 @@ fn mla_scored(
     (o, lse)
 }
 
+/// One token's latent attention a row: its query (`q` absorbed, `q_pe` its
+/// rotated part) against its lane's latent rows, or those `selection` picks;
+/// with `lse`, each row's per-head log-sum-exp beside its output.
+#[allow(clippy::too_many_arguments)]
 pub fn mla_decode(
     q: &Value,
     plan: &Value,
@@ -814,23 +646,26 @@ pub fn mla_decode(
     kv_lora_rank: u32,
     sm_scale: f32,
     window: Option<u32>,
-) -> Value {
+    lse: bool,
+    selection: Option<&Value>,
+) -> (Value, Option<Value>) {
     mla_scored(
         q,
         plan,
         q_pe,
-        None,
+        selection,
         pages,
         heads,
         kv_lora_rank,
         sm_scale,
         true,
-        false,
+        lse,
         window,
     )
-    .0
 }
 
+/// A prompt's latent attention, as [`mla_decode`]'s causally over its rows.
+#[allow(clippy::too_many_arguments)]
 pub fn mla_prefill(
     q: &Value,
     plan: &Value,
@@ -840,190 +675,21 @@ pub fn mla_prefill(
     kv_lora_rank: u32,
     sm_scale: f32,
     window: Option<u32>,
-) -> Value {
+    lse: bool,
+    selection: Option<&Value>,
+) -> (Value, Option<Value>) {
     mla_scored(
         q,
         plan,
         q_pe,
-        None,
+        selection,
         pages,
         heads,
         kv_lora_rank,
         sm_scale,
         false,
-        false,
+        lse,
         window,
-    )
-    .0
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn mla_decode_selected(
-    q: &Value,
-    plan: &Value,
-    q_pe: &Value,
-    selection: &Value,
-    pages: ValueId,
-    heads: u32,
-    kv_lora_rank: u32,
-    sm_scale: f32,
-) -> Value {
-    mla_scored(
-        q,
-        plan,
-        q_pe,
-        Some(selection),
-        pages,
-        heads,
-        kv_lora_rank,
-        sm_scale,
-        true,
-        false,
-        None,
-    )
-    .0
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn mla_prefill_selected(
-    q: &Value,
-    plan: &Value,
-    q_pe: &Value,
-    selection: &Value,
-    pages: ValueId,
-    heads: u32,
-    kv_lora_rank: u32,
-    sm_scale: f32,
-) -> Value {
-    mla_scored(
-        q,
-        plan,
-        q_pe,
-        Some(selection),
-        pages,
-        heads,
-        kv_lora_rank,
-        sm_scale,
-        false,
-        false,
-        None,
-    )
-    .0
-}
-
-/// `mla_decode` with each row's per-head log-sum-exp beside its scores, for a
-/// sink to rescale them by.
-pub fn mla_decode_lse(
-    q: &Value,
-    plan: &Value,
-    q_pe: &Value,
-    pages: ValueId,
-    heads: u32,
-    kv_lora_rank: u32,
-    sm_scale: f32,
-    window: Option<u32>,
-) -> (Value, Value) {
-    lse_of(mla_scored(
-        q,
-        plan,
-        q_pe,
-        None,
-        pages,
-        heads,
-        kv_lora_rank,
-        sm_scale,
-        true,
-        true,
-        window,
-    ))
-}
-
-/// `mla_prefill` with each row's per-head log-sum-exp beside its scores.
-pub fn mla_prefill_lse(
-    q: &Value,
-    plan: &Value,
-    q_pe: &Value,
-    pages: ValueId,
-    heads: u32,
-    kv_lora_rank: u32,
-    sm_scale: f32,
-    window: Option<u32>,
-) -> (Value, Value) {
-    lse_of(mla_scored(
-        q,
-        plan,
-        q_pe,
-        None,
-        pages,
-        heads,
-        kv_lora_rank,
-        sm_scale,
-        false,
-        true,
-        window,
-    ))
-}
-
-/// `mla_decode_selected` with each row's per-head log-sum-exp beside its
-/// scores.
-#[allow(clippy::too_many_arguments)]
-pub fn mla_decode_selected_lse(
-    q: &Value,
-    plan: &Value,
-    q_pe: &Value,
-    selection: &Value,
-    pages: ValueId,
-    heads: u32,
-    kv_lora_rank: u32,
-    sm_scale: f32,
-) -> (Value, Value) {
-    lse_of(mla_scored(
-        q,
-        plan,
-        q_pe,
-        Some(selection),
-        pages,
-        heads,
-        kv_lora_rank,
-        sm_scale,
-        true,
-        true,
-        None,
-    ))
-}
-
-/// `mla_prefill_selected` with each row's per-head log-sum-exp beside its
-/// scores.
-#[allow(clippy::too_many_arguments)]
-pub fn mla_prefill_selected_lse(
-    q: &Value,
-    plan: &Value,
-    q_pe: &Value,
-    selection: &Value,
-    pages: ValueId,
-    heads: u32,
-    kv_lora_rank: u32,
-    sm_scale: f32,
-) -> (Value, Value) {
-    lse_of(mla_scored(
-        q,
-        plan,
-        q_pe,
-        Some(selection),
-        pages,
-        heads,
-        kv_lora_rank,
-        sm_scale,
-        false,
-        true,
-        None,
-    ))
-}
-
-fn lse_of((o, lse): (Value, Option<Value>)) -> (Value, Value) {
-    (
-        o,
-        lse.expect("a scoring asked for its log-sum-exp lands one"),
     )
 }
 
@@ -1154,43 +820,24 @@ pub fn index_kv_append(k: &Value, keys: ValueId, write_page: &Value, write_offse
     );
 }
 
-pub fn pool_boundary_decode(
+/// Where the rows close entries of a pool compressing `ratio` positions
+/// each: one token's rows (`decode`) or a prompt's.
+pub fn pool_boundary(
     positions: &Value,
     row_valid: &Value,
     ratio: u32,
+    decode: bool,
 ) -> (Value, Value, Value) {
     let r = positions.rec();
     let boundary_pos = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     r.push(
-        Attn::PoolBoundaryDecode {
+        Attn::PoolBoundary {
             positions: positions.id(),
             row_valid: row_valid.id(),
             ratio,
-            boundary_pos: boundary_pos.id(),
-            boundary_req: boundary_req.id(),
-            boundary_rope: boundary_rope.id(),
-        },
-        &[positions, row_valid],
-    );
-    (boundary_pos, boundary_req, boundary_rope)
-}
-
-pub fn pool_boundary_prefill(
-    positions: &Value,
-    row_valid: &Value,
-    ratio: u32,
-) -> (Value, Value, Value) {
-    let r = positions.rec();
-    let boundary_pos = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
-    let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
-    let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
-    r.push(
-        Attn::PoolBoundaryPrefill {
-            positions: positions.id(),
-            row_valid: row_valid.id(),
-            ratio,
+            decode,
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
             boundary_rope: boundary_rope.id(),
@@ -1278,6 +925,10 @@ pub fn pool_kv_append(
     );
 }
 
+/// Each row's query against the closed entries of its lane's compressed
+/// pool, or the `top_k` of them `selection` picks; its output and per-head
+/// log-sum-exp.
+#[allow(clippy::too_many_arguments)]
 pub fn pool_lse(
     q: &Value,
     positions: &Value,
@@ -1287,50 +938,25 @@ pub fn pool_lse(
     heads: u32,
     head_dim: u32,
     sm_scale: f32,
+    selection: Option<&Value>,
+    top_k: Option<u32>,
 ) -> (Value, Value) {
+    assert_eq!(
+        selection.is_some(),
+        top_k.is_some(),
+        "a selection states how many entries it picks, and only a selection does"
+    );
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     let lse = r.fresh(tensor(q.rows(), heads, Dtype::F32));
+    let mut ins = vec![q, positions, request_of_token];
+    ins.extend(selection);
     r.push(
         Attn::PoolLse {
             q: q.id(),
             positions: positions.id(),
             request_of_token: request_of_token.id(),
-            entries,
-            ratio,
-            heads,
-            head_dim,
-            sm_scale,
-            o: o.id(),
-            lse: lse.id(),
-        },
-        &[q, positions, request_of_token],
-    );
-    (o, lse)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn pool_lse_selected(
-    q: &Value,
-    positions: &Value,
-    request_of_token: &Value,
-    selection: &Value,
-    entries: ValueId,
-    ratio: u32,
-    top_k: u32,
-    heads: u32,
-    head_dim: u32,
-    sm_scale: f32,
-) -> (Value, Value) {
-    let r = q.rec();
-    let o = r.fresh(q.ty().clone());
-    let lse = r.fresh(tensor(q.rows(), heads, Dtype::F32));
-    r.push(
-        Attn::PoolLseSelected {
-            q: q.id(),
-            positions: positions.id(),
-            request_of_token: request_of_token.id(),
-            selection: selection.id(),
+            selection: selection.map(Value::id),
             entries,
             ratio,
             top_k,
@@ -1340,7 +966,7 @@ pub fn pool_lse_selected(
             o: o.id(),
             lse: lse.id(),
         },
-        &[q, positions, request_of_token, selection],
+        &ins,
     );
     (o, lse)
 }
@@ -1490,4 +1116,330 @@ pub fn voxel_over(
         &[q, k, v, grid],
     );
     o
+}
+
+/// Attention of `q` over the kv row `kv`, each lane by its kind: a lane with
+/// its own mask by that mask (when the model opens `mask`), a lane capturing
+/// scores by its own arm (when it opens `scores`), its log-sum-exp read out
+/// at the scores seam where `scores_seam` holds, a lane querying one token by
+/// decode, and the rest by prefill. The kinds are taken in that order, each
+/// lane by the first that holds. With `sinks`, every kind is attended with
+/// its log-sum-exp and the sink logits folded in. With a `selection` (the
+/// key blocks an indexer picked a row, `ratio` keys a block, one pick a head
+/// when `per_head`), decode and prefill lanes read only those blocks; a
+/// masked or score-capturing lane reads every key.
+///
+/// The host plans are the compiler's: each kind's is built once a trace,
+/// over the lanes of that kind and outside any layer, and every layer asking
+/// for the same one reads it.
+#[allow(clippy::too_many_arguments)]
+pub fn attend(
+    q: &Value,
+    inputs: &Input,
+    kv: &str,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    window: Option<u32>,
+    sinks: Option<&Weight>,
+    mask: bool,
+    scores: bool,
+    scores_seam: Option<bool>,
+    selection: Option<&Value>,
+    ratio: Option<u32>,
+    per_head: bool,
+) -> Value {
+    // Scores a model opens go out at their seam unless it says otherwise.
+    let scores_seam = scores_seam.unwrap_or(scores);
+    let selected = selection.map(|selection| {
+        assert!(
+            sinks.is_none(),
+            "`attn.attend` attends a selection without sinks; no kernel folds both"
+        );
+        let ratio = ratio.expect("`attn.attend` with a `selection` names its `ratio`");
+        (selection, ratio)
+    });
+    use crate::fact;
+    use crate::record::{FirstMatch, Refine};
+
+    let pages = inputs.kv(kv);
+    let rec = inputs.recorder();
+    let plan = |decode: bool, lanes: &Input| {
+        let kind = if decode { "decode" } else { "prefill" };
+        let key = format!(
+            "attn.plan_{kind} {:?} {q_heads} {kv_heads} {head_dim} {window:?}",
+            lanes.rows()
+        );
+        rec.once(key, || {
+            if decode {
+                plan_decode(lanes, q_heads, kv_heads, head_dim, window)
+            } else {
+                plan_prefill(lanes, q_heads, kv_heads, head_dim, window)
+            }
+        })
+    };
+    // The lanes of the kind `kind` names, or of none of them.
+    let lanes = |kind: Option<fact::Predicate>| {
+        let mut first = FirstMatch::default();
+        let mut cases = Vec::new();
+        if mask {
+            cases.push(fact::has(fact::Mask));
+        }
+        if scores {
+            cases.push(fact::scores());
+        }
+        cases.push(fact::single_token());
+        let mut picked = None;
+        for case in &cases {
+            let rows = first.case(rec.guard_of(case));
+            if kind.as_ref() == Some(case) {
+                picked = Some(rows);
+            }
+        }
+        inputs.refined(picked.unwrap_or_else(|| first.rest()))
+    };
+    // An arm's output, the sinks folded in when the model has them.
+    let sunk = |(o, lse): (Value, Value)| match sinks {
+        Some(sinks) => sink(&o, &lse, sinks, head_dim),
+        None => o,
+    };
+
+    // Each kind's rows of `q`: the first kind each lane is, within the rows
+    // `q` is over. A kind no lane of `q` can be is not attended (`q` may
+    // already be the lanes of some kinds alone). Every arm keeps `q`'s rows
+    // spelled in its guard, so the merge reads as over them.
+    let domain = q.cond();
+    let rows_of = |rows: poem_ir::Guard| {
+        let rows = poem_ir::Guard::and(domain.clone(), rows);
+        possible(q, rows.clone()).then(|| q.refined(rows))
+    };
+    // A selection's rows of a kind, as `q`'s are.
+    let picks = |rows: &poem_ir::Guard| {
+        selected.map(|(selection, ratio)| {
+            let over = poem_ir::Guard::and(selection.cond(), rows.clone());
+            (selection.refined(over), ratio)
+        })
+    };
+    let mut first = FirstMatch::default();
+    let mut arms = Vec::new();
+    if mask && let Some(q) = rows_of(first.case(rec.guard_of(&fact::has(fact::Mask)))) {
+        let masks = inputs.whole_mask();
+        let p = plan(false, &lanes(Some(fact::has(fact::Mask))));
+        let (o, lse) = prefill(
+            &q,
+            &p,
+            pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            sinks.is_some(),
+            Some(&masks),
+            true,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        arms.push(match lse {
+            Some(lse) => sunk((o, lse)),
+            None => o,
+        });
+    }
+    if scores && let Some(q) = rows_of(first.case(rec.guard_of(&fact::scores()))) {
+        let p = plan(false, &lanes(Some(fact::scores())));
+        // The log-sum-exp only where something reads it.
+        let (o, lse) = prefill(
+            &q,
+            &p,
+            pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            scores_seam || sinks.is_some(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        arms.push(match lse {
+            Some(lse) => {
+                if scores_seam {
+                    crate::seam::at(crate::seam::SCORES, &[&lse]);
+                }
+                sunk((o, lse))
+            }
+            None => o,
+        });
+    }
+    let single = first.case(rec.guard_of(&fact::single_token()));
+    if let Some(q) = rows_of(single.clone()) {
+        let p = plan(true, &lanes(Some(fact::single_token())));
+        // A selection's blocks hold no sink; a dense arm's sinks fold in.
+        let picked = picks(&single);
+        let (sel, ratio) = picked.map_or((None, None), |(sel, ratio)| (Some(sel), Some(ratio)));
+        let lse = sinks.is_some() && sel.is_none();
+        let (o, lse) = decode(
+            &q,
+            &p,
+            pages,
+            window,
+            head_dim,
+            sm_scale,
+            lse,
+            sel.as_ref(),
+            ratio,
+            per_head && sel.is_some(),
+            None,
+            None,
+            None,
+        );
+        arms.push(match lse {
+            Some(lse) => sunk((o, lse)),
+            None => o,
+        });
+    }
+    let rest = first.rest();
+    if let Some(q) = rows_of(rest.clone()) {
+        let p = plan(false, &lanes(None));
+        let picked = picks(&rest);
+        let (sel, ratio) = picked.map_or((None, None), |(sel, ratio)| (Some(sel), Some(ratio)));
+        let lse = sinks.is_some() && sel.is_none();
+        let (o, lse) = prefill(
+            &q,
+            &p,
+            pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            lse,
+            None,
+            true,
+            None,
+            sel.as_ref(),
+            ratio,
+            per_head && sel.is_some(),
+            None,
+            None,
+            None,
+        );
+        arms.push(match lse {
+            Some(lse) => sunk((o, lse)),
+            None => o,
+        });
+    }
+    if arms.len() == 1 {
+        return arms.remove(0);
+    }
+    Value::merge(arms)
+}
+
+/// Whether any row of `x` can be one `rows` holds for.
+fn possible(x: &Value, rows: poem_ir::Guard) -> bool {
+    use poem_ir::Guard;
+    !Guard::and(x.cond(), rows).implies(&Guard::not(Guard::Always))
+}
+
+/// Latent attention of the absorbed queries `q` (and their rotated part
+/// `q_pe`) over the latent kv row `kv`: a lane querying one token by decode,
+/// the rest by prefill; with `whole`, every lane by prefill (rows that read
+/// their keys whole, as a draft head's). With a `selection`, each lane reads
+/// only the keys its indexer picked; `window` bounds what a lane without one
+/// reads. With `sinks`, the arms' log-sum-exps are merged and the sink
+/// logits folded in once. What comes back is still in the latent space, for
+/// the model to absorb out.
+///
+/// The host plans are the compiler's, as [`attend`]'s are.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_mla(
+    q: &Value,
+    q_pe: &Value,
+    inputs: &Input,
+    kv: &str,
+    heads: u32,
+    kv_lora_rank: u32,
+    sm_scale: f32,
+    window: Option<u32>,
+    selection: Option<&Value>,
+    sinks: Option<&Weight>,
+    whole: bool,
+) -> Value {
+    use crate::fact;
+    use crate::record::Refine;
+    use poem_ir::Guard;
+
+    let pages = inputs.kv(kv);
+    let rec = inputs.recorder();
+    let plan = |lanes: &Input| {
+        let key = format!("attn.mla_plan {:?} {heads} {kv_lora_rank}", lanes.rows());
+        rec.once(key, || mla_plan(lanes, heads, kv_lora_rank))
+    };
+    // The arm over `rows` of the lanes (and the plan) `lanes` are.
+    let arm = |decode: bool, rows: Guard, lanes: &Input| {
+        let within = |x: &Value| x.refined(Guard::and(x.cond(), rows.clone()));
+        let (q, q_pe) = (within(q), within(q_pe));
+        let selection = selection.map(within);
+        let p = plan(lanes);
+        assert!(
+            selection.is_some() || sinks.is_none(),
+            "`attn.attend_mla` folds sinks into a selection's scores; no dense kernel returns \
+             the log-sum-exp they need"
+        );
+        // A selection's rows are its picks, whatever the window.
+        let window = if selection.is_some() { None } else { window };
+        let score = if decode { mla_decode } else { mla_prefill };
+        score(
+            &q,
+            &p,
+            &q_pe,
+            pages,
+            heads,
+            kv_lora_rank,
+            sm_scale,
+            window,
+            sinks.is_some(),
+            selection.as_ref(),
+        )
+    };
+    let arms = if whole {
+        vec![arm(false, Guard::Always, inputs)]
+    } else {
+        let one = rec.guard_of(&fact::single_token());
+        let (decode, prefill) = (one.clone(), Guard::not(one));
+        vec![
+            arm(true, decode.clone(), &inputs.refined(decode)),
+            arm(false, prefill.clone(), &inputs.refined(prefill)),
+        ]
+    };
+    let join = |mut parts: Vec<Value>| {
+        if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Value::merge(parts)
+        }
+    };
+    let (outs, lses): (Vec<Value>, Vec<Option<Value>>) = arms.into_iter().unzip();
+    let scored = join(outs);
+    match sinks {
+        Some(sinks) => {
+            let lse = join(
+                lses.into_iter()
+                    .map(|l| l.expect("an lse a sunk arm"))
+                    .collect(),
+            );
+            sink(&scored, &lse, sinks, kv_lora_rank)
+        }
+        None => scored,
+    }
 }

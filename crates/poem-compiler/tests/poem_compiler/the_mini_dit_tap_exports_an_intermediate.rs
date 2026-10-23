@@ -5,18 +5,25 @@ use crate::mini_dit_dims;
 use mini_dit_dims as model;
 use poem::{Def, Dim, Platform, RuntimeInput, Trace, Ty, seam};
 
-const TAP: &str = "PIE_MINI_DIT_TAP";
+const ROW: &str = "mini-dit-bf16-kv-bf16";
 
-fn row() -> &'static poem_compiler::catalog::Deployment {
-    poem_compiler::catalog::deployment("mini-dit-bf16-kv-bf16").expect("the mini-dit row")
+/// The deployment `ROW`, tapped at `tap` where given (`-tap.{key}`).
+fn row(tap: Option<&str>) -> poem_compiler::catalog::Deployment {
+    let name = match tap {
+        None => ROW.to_string(),
+        Some(key) => format!("{ROW}-tap.{key}"),
+    };
+    poem_compiler::catalog::repository()
+        .parse(&name)
+        .unwrap_or_else(|| panic!("{name} names a mini-dit deployment"))
 }
 
 fn traced(tap: Option<&str>) -> Trace {
-    poem::star::with_env(&[(TAP, tap)], || row().trace(Platform::Cuda))
+    row(tap).trace(Platform::Cuda)
 }
 
 fn generative(tap: Option<&str>) -> poem::generative::Generative {
-    poem::star::with_env(&[(TAP, tap)], || row().generative()).expect("mini-dit is generative")
+    row(tap).generative().expect("mini-dit is generative")
 }
 
 fn velocity_width(plan: &Trace) -> u64 {
@@ -58,7 +65,8 @@ fn the_mini_dit_tap_exports_an_intermediate_every_case() {
     a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width();
     a_tap_is_still_one_float_readout_and_no_logits();
     a_tap_that_cuts_the_trace_short_still_reads_every_port();
-    an_unknown_key_taps_nothing();
+    an_unknown_key_is_refused();
+    a_tap_is_named_in_the_deployment();
 }
 
 fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
@@ -122,9 +130,17 @@ fn a_tap_that_cuts_the_trace_short_still_reads_every_port() {
     }
 }
 
-fn an_unknown_key_taps_nothing() {
-    let model = traced(None);
-    let probe = traced(Some("not.a.dump.key"));
-    assert_eq!(probe.nodes.len(), model.nodes.len());
-    assert_eq!(velocity_width(&probe), velocity_width(&model));
+fn an_unknown_key_is_refused() {
+    let why = row(Some("not.a.dump.key"))
+        .try_trace(Platform::Cuda)
+        .expect_err("a tap that names no intermediate");
+    assert!(
+        format!("{why:?}").contains("names no intermediate"),
+        "the refusal names the tap: {why:?}"
+    );
+}
+
+fn a_tap_is_named_in_the_deployment() {
+    assert_eq!(row(Some("b0.in")).name, format!("{ROW}-tap.b0.in"));
+    assert_eq!(row(None).name, ROW);
 }

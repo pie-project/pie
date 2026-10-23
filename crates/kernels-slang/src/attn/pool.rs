@@ -63,7 +63,7 @@ pub fn boundary_decode(
     boundary_req: Tensor,
     boundary_rope: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.pool_boundary_decode";
+    const OP: &str = "attn.pool_boundary";
     boundary_tables(OP, &boundary_pos, &boundary_req);
     boundary_rope_table(OP, &boundary_pos, &boundary_rope);
     let n = stated(OP, nonzero(OP, "rows", boundary_pos.rows)?)?;
@@ -94,7 +94,7 @@ pub fn boundary_prefill(
     boundary_req: Tensor,
     boundary_rope: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.pool_boundary_prefill";
+    const OP: &str = "attn.pool_boundary";
     boundary_tables(OP, &boundary_pos, &boundary_req);
     boundary_rope_table(OP, &boundary_pos, &boundary_rope);
     let n = stated(OP, nonzero(OP, "rows", boundary_pos.rows)?)?;
@@ -431,7 +431,7 @@ pub fn attention_lse_selected(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.pool_lse_selected";
+    const OP: &str = "attn.pool_lse";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(
         lse.dtype,

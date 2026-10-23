@@ -6,6 +6,7 @@ use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
 use poem_compiler::Budget;
+use poem_ir::GluAct;
 use poem_ir::{Fused, Operation, Trace};
 
 const VOCAB: u32 = 1000;
@@ -42,7 +43,14 @@ impl ForwardHybrid for Micro {
 
     fn forward(&self, inputs: Input) -> Value {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
-        let act = ops::linear::swiglu(&ops::linear::matmul(&x, &self.gate_up), INTER);
+        let act = ops::linear::glu(
+            &ops::linear::matmul(&x, &self.gate_up),
+            GluAct::Swiglu,
+            Some(INTER),
+            None,
+            None,
+            None,
+        );
         let h = ops::linear::matmul(&act, &self.down);
         ops::linear::lm_head(&h, &self.head)
     }

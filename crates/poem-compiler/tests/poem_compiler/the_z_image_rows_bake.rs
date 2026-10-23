@@ -388,7 +388,18 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
         let prefills = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Attn(Attn::Prefill { .. })))
+            .filter(|node| {
+                matches!(
+                    &node.op,
+                    Operation::Attn(Attn::Prefill {
+                        mask: None,
+                        selection: None,
+                        bias: None,
+                        lse: None,
+                        ..
+                    })
+                )
+            })
             .count();
         let want = if deployment == TURBO {
             model::TE_LAYERS as usize

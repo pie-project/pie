@@ -100,7 +100,7 @@ def mlp_sublayer(m, at, stem, x, mlp, mods, gate, lanes):
     h = norm_modulate(x, mods, lanes, LN_EPS)
     if tap("norm3_out" if stem == "b2" else "norm2_out", h):
         return None
-    y = linear(mlp.down, ops.linear.swiglu(linear(mlp.gate_up, h), m.inter))
+    y = linear(mlp.down, ops.linear.glu(linear(mlp.gate_up, h), gating.swiglu(), m.inter))
     if tap("mlp_out", y):
         return None
     return ops.elemwise.gated_residual_add(x, gate, y, lanes)
@@ -225,6 +225,8 @@ def forward(m, inputs):
     hf = norm_modulate(x, linear(m.final_ada, temb), lanes, LN_EPS)
     if at("final.norm_out", hf):
         return hf
+    if m.tap not in ["", "final.tokens"]:
+        fail("the tap {} names no intermediate of mini-dit".format(m.tap))
     velocity = linear(m.final_proj, hf)
     seam.at(seam.VELOCITY, [velocity])
     return velocity

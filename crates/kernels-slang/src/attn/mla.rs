@@ -491,7 +491,7 @@ pub fn attention_decode_selected(
 ) -> Result<(), Error> {
     flash(
         ctx,
-        "attn.mla_decode_selected",
+        "attn.mla_decode",
         q,
         q_pe,
         Some(selection),
@@ -520,7 +520,7 @@ pub fn attention_prefill_selected(
 ) -> Result<(), Error> {
     flash(
         ctx,
-        "attn.mla_prefill_selected",
+        "attn.mla_prefill",
         q.data,
         q_pe,
         Some(selection),

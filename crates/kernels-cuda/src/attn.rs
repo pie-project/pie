@@ -465,7 +465,7 @@ pub fn decode_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.decode_lse";
+    const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx,
@@ -589,7 +589,7 @@ pub fn prefill_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.prefill_lse";
+    const OP: &str = "attn.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx,
@@ -619,7 +619,7 @@ pub fn masked(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.masked";
+    const OP: &str = "attn.prefill";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
     let Some(mask_indptr) = plan.mask_indptr else {
@@ -657,7 +657,7 @@ pub fn masked_lse(
     o: &mut Tensor,
     lse: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.masked_lse";
+    const OP: &str = "attn.prefill";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     plan.accepts(OP, head_dim, None, window)?;
     let Some(mask_indptr) = plan.mask_indptr else {
@@ -731,7 +731,7 @@ pub fn decode_rel(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.decode_rel";
+    const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(
         ctx,
@@ -761,7 +761,7 @@ pub fn prefill_rel(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.prefill_rel";
+    const OP: &str = "attn.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
         ctx,
@@ -803,7 +803,7 @@ pub fn kv_append_shared(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.kv_append_shared";
+    const OP: &str = "attn.kv_append";
     dtype_dispatch!(OP, plane.data.dtype, { Bf16 => () });
     kv_append::write_kv_to_pages(
         ctx,

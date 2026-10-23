@@ -104,7 +104,7 @@ def text_encode(arm, te):
         x = ops.elemwise.rmsnorm(y, w.ffn_norm, TE_EPS)
         gate = ops.linear.matmul(x, w.wi_0)
         up = ops.linear.matmul(x, w.wi_1)
-        act = ops.linear.geglu_tanh(gate, up)
+        act = ops.linear.glu(gate, gating.geglu_tanh(), up = up)
         return ops.elemwise.residual_add(ops.linear.matmul(act, w.wo), y)
 
     y = arm.fold_layers(te.layers, y, layer)

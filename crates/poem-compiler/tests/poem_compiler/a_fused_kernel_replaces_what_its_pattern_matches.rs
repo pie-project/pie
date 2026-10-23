@@ -1,6 +1,8 @@
+use poem::Value;
 use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, template};
 use poem_compiler::fuse::fuse;
+use poem_ir::{GluAct, Turn};
 use poem_ir::{Operands, Trace};
 
 fn trace(build: impl FnOnce(&Pattern)) -> Trace {
@@ -80,7 +82,7 @@ fn an_op_that_overwrites_what_the_match_reads_keeps_it_in_place() {
 
 fn dense_mlp(p: &Pattern) -> (poem::Value, poem::Value) {
     let packed = linear::matmul(&p.rows("x", 64), &p.weight("gate_up", [128, 64]));
-    let h = linear::swiglu(&packed, 64);
+    let h = linear::glu(&packed, GluAct::Swiglu, Some(64), None, None, None);
     let y = linear::matmul(&h, &p.weight("down", [64, 64]));
     (h, y)
 }
@@ -133,10 +135,18 @@ fn qkv_write_scaled(p: &Pattern, q_eps: f32, k_eps: f32, scaling: Option<poem::r
     let v = elemwise::rmsnorm_no_scale(&v, 64, q_eps);
     let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, q_eps);
     let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [64]), 64, k_eps);
-    let (q, k) = elemwise::rope_full(&q, &k, &positions, 64, 10_000.0, false, scaling);
+    let (q, k) = both(elemwise::rope(
+        &q,
+        &positions,
+        64,
+        10_000.0,
+        Turn::Full { interleaved: false },
+        Some(&k),
+        scaling,
+    ));
     attn::kv_append(
         &k,
-        &v,
+        Some(&v),
         p.cache("kv"),
         &p.rows("write_page", 1),
         &p.rows("write_offset", 1),
@@ -189,7 +199,7 @@ fn the_scaleless_unturned_qkv_write_folds() {
             let q = elemwise::rmsnorm_no_scale(&q, 64, 1e-5);
             let k = elemwise::rmsnorm_no_scale(&k, 64, 1e-5);
             let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-            attn::kv_append(&k, &v, p.cache("kv"), &page, &offset);
+            attn::kv_append(&k, Some(&v), p.cache("kv"), &page, &offset);
             elemwise::silu(&q);
         }),
         &["fused.qkv_fused_qknorm_rope_vnorm_write"],
@@ -222,9 +232,20 @@ fn the_unnormed_partly_turned_qkv_write_folds() {
                 };
                 let v = elemwise::mul_scalar(0.707, &v);
                 let positions = p.indices("positions");
-                let (q, k) = elemwise::rope_partial(&q, &k, &positions, 64, 256, 1e4, None, None);
+                let (q, k) = both(elemwise::rope(
+                    &q,
+                    &positions,
+                    256,
+                    1e4,
+                    Turn::Partial {
+                        rotary_dim: 64,
+                        span: 64 / 2,
+                    },
+                    Some(&k),
+                    None,
+                ));
                 let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-                attn::kv_append(&k, &v, p.cache("kv"), &page, &offset);
+                attn::kv_append(&k, Some(&v), p.cache("kv"), &page, &offset);
                 elemwise::silu(&q);
             }),
             &["fused.qkv_fused_qknorm_rope_vnorm_write"],
@@ -256,22 +277,27 @@ fn the_qkv_write_stays_apart_when_its_norms_do_not() {
 fn yarn_write(p: &Pattern, interleaved: bool) {
     let positions = p.indices("positions");
     let (q, k, v) = (p.rows("q", 512), p.rows("k", 128), p.rows("v", 128));
-    let (q, k) = elemwise::rope_yarn(
+    let (q, k) = both(elemwise::rope(
         &q,
-        &k,
         &positions,
         64,
         150_000.0,
-        32.0,
-        32.0,
-        1.0,
-        1.3,
-        4096,
-        interleaved,
-    );
+        Turn::Yarn {
+            yarn: elemwise::Yarn {
+                factor: 32.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: 4096,
+            },
+            attention_factor: 1.3,
+            interleaved,
+        },
+        Some(&k),
+        None,
+    ));
     attn::kv_append(
         &k,
-        &v,
+        Some(&v),
         p.cache("kv"),
         &p.rows("write_page", 1),
         &p.rows("write_offset", 1),
@@ -317,22 +343,27 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
             let positions = p.indices("positions");
             let packed = p.rows("packed", 768);
             let (q, k, v) = gather::split_qkv(&packed, 512, 128);
-            let (qr, kr) = elemwise::rope_yarn(
+            let (qr, kr) = both(elemwise::rope(
                 &q,
-                &k,
                 &positions,
                 64,
                 150_000.0,
-                32.0,
-                32.0,
-                1.0,
-                1.3,
-                4096,
-                interleaved,
-            );
+                Turn::Yarn {
+                    yarn: elemwise::Yarn {
+                        factor: 32.0,
+                        beta_fast: 32.0,
+                        beta_slow: 1.0,
+                        original_max_position: 4096,
+                    },
+                    attention_factor: 1.3,
+                    interleaved,
+                },
+                Some(&k),
+                None,
+            ));
             attn::kv_append(
                 &kr,
-                &v,
+                Some(&v),
                 p.cache("kv"),
                 &p.rows("write_page", 1),
                 &p.rows("write_offset", 1),
@@ -400,18 +431,47 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
                 "plan",
                 poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
             );
-            let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
+            let (o, lse) = both(attn::prefill(
+                &q,
+                &plan,
+                cache,
+                Some(128),
+                512,
+                1,
+                0.04,
+                true,
+                None,
+                true,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            ));
             let (o, lse) = if pooled {
                 let positions = p.indices("positions");
                 let requests = p.indices("requests");
                 let entries = p.cache("entries");
                 let (po, plse) = if selected {
                     let selection = p.rows("selection", 512);
-                    attn::pool_lse_selected(
-                        &q, &positions, &requests, &selection, entries, 4, 512, 64, 512, 0.04,
+                    attn::pool_lse(
+                        &q,
+                        &positions,
+                        &requests,
+                        entries,
+                        4,
+                        64,
+                        512,
+                        0.04,
+                        Some(&selection),
+                        Some(512),
                     )
                 } else {
-                    attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04)
+                    attn::pool_lse(
+                        &q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None,
+                    )
                 };
                 attn::merge_lse(&o, &lse, &po, &plse, 64, 512)
             } else {
@@ -438,15 +498,11 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
         assert!(matches!(**sink, poem_ir::Attn::Sink { head_dim: 512, .. }));
         assert_eq!(
             (window.name(), pool.name(), merge.name()),
-            (
-                "attn.prefill_lse",
-                if selected {
-                    "attn.pool_lse_selected"
-                } else {
-                    "attn.pool_lse"
-                },
-                "attn.merge_lse"
-            )
+            ("attn.prefill", "attn.pool_lse", "attn.merge_lse")
+        );
+        assert!(
+            matches!(**pool, poem_ir::Attn::PoolLse { selection, .. } if selection.is_some() == selected),
+            "the pool reads a selection exactly when the layer selects"
         );
     }
     assert_eq!(
@@ -469,13 +525,30 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnDecodePlan),
                 );
-                attn::decode_lse(&q, &plan, cache, Some(128), 64, 0.125)
+                both(attn::decode(
+                    &q,
+                    &plan,
+                    cache,
+                    Some(128),
+                    64,
+                    0.125,
+                    true,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
             } else {
                 let plan = p.value(
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
                 );
-                attn::prefill_lse(&q, &plan, cache, None, 64, 8, 0.125, None)
+                both(attn::prefill(
+                    &q, &plan, cache, None, 64, 8, 0.125, true, None, true, None, None, None,
+                    false, None, None, None,
+                ))
             };
             let out = attn::sink(&o, &lse, &p.weight("sinks", [8]), 64);
             elemwise::silu(&out);
@@ -496,9 +569,9 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
         assert_eq!(
             attn.name(),
             if decode {
-                "attn.decode_lse"
+                "attn.decode"
             } else {
-                "attn.prefill_lse"
+                "attn.prefill"
             }
         );
         let apart = sinked(decode, true);
@@ -536,11 +609,22 @@ fn qwens_attention_prologue_lands_as_one_fused_op() {
             1e-6,
         );
         let positions = p.indices("positions");
-        let (q, k) = elemwise::rope_partial(&q, &k, &positions, 16, d, 1e6, None, None);
+        let (q, k) = both(elemwise::rope(
+            &q,
+            &positions,
+            d,
+            1e6,
+            Turn::Partial {
+                rotary_dim: 16,
+                span: 16 / 2,
+            },
+            Some(&k),
+            None,
+        ));
         let cache = p.cache("cache");
         attn::kv_append(
             &k,
-            &p.rows("v", 64),
+            Some(&p.rows("v", 64)),
             cache,
             &p.rows("wp", 1),
             &p.rows("wo", 1),
@@ -571,7 +655,21 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     let q = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm_no_scale(&p.rows("q", 64 * 512), 512, 1e-6);
-        let q = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, false, yarn);
+        let q = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&q);
     });
     let fused = fuse(q, &kernels);
@@ -594,7 +692,21 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     let plane = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("kv", 512), &p.weight("norm", [512]), 1e-6);
-        let k = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, true, None);
+        let k = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: true,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&k);
     });
     assert_eq!(
@@ -605,7 +717,21 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     let wide = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("kv", 1024), &p.weight("norm", [1024]), 1e-6);
-        let k = elemwise::rope_partial_last(&y, &positions, 64, 512, 1e4, true);
+        let k = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&k);
     });
     assert_eq!(
@@ -619,10 +745,25 @@ fn deepseeks_kv_plane_norm_rotation_and_write_land_as_one_op() {
     let kv = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("kv", 512), &p.weight("norm", [512]), 1e-6);
-        let k = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, false, None);
+        let k = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let cache = p.cache("kv_cache");
-        attn::kv_append_shared(
+        attn::kv_append(
             &k,
+            None,
             cache,
             &p.rows("write_page", 1),
             &p.rows("write_offset", 1),
@@ -712,8 +853,21 @@ fn deepseeks_compressor_lands_as_one_op() {
             if read_latent {
                 elemwise::silu(&latent);
             }
-            let k =
-                elemwise::rope_partial_last_yarn(&latent, &brope, 64, 512, 1e4, true, false, None);
+            let k = elemwise::rope(
+                &latent,
+                &brope,
+                512,
+                1e4,
+                Turn::Last {
+                    rotary_dim: 64,
+                    interleaved: true,
+                    inverse: false,
+                    yarn: None,
+                },
+                None,
+                None,
+            )
+            .0;
             let pool = p.cache("entries");
             attn::pool_kv_append(&k, &bpos, &breq, pool, &p.rows("wp", 1), &p.rows("wo", 1));
         })
@@ -731,13 +885,40 @@ fn deepseeks_q_and_kv_plane_land_as_one_op() {
         let x = p.rows("x", 64);
         let q = linear::matmul(&x, &p.weight("q_up", [64 * 512, 64]));
         let q = elemwise::rmsnorm_no_scale(&q, 512, 1e-6);
-        let q = elemwise::rope_partial_last_yarn(&q, &positions, 64, 512, 1e4, true, false, None);
+        let q = elemwise::rope(
+            &q,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let plane = linear::matmul(&x, &p.weight("kv_down", [512, 64]));
         let plane = elemwise::rmsnorm(&plane, &p.weight("kv_norm", [512]), 1e-6);
-        let plane =
-            elemwise::rope_partial_last_yarn(&plane, &positions, 64, 512, 1e4, true, false, None);
+        let plane = elemwise::rope(
+            &plane,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let cache = p.cache("kv");
-        attn::kv_append_shared(&plane, cache, &p.rows("wp", 1), &p.rows("wo", 1));
+        attn::kv_append(&plane, None, cache, &p.rows("wp", 1), &p.rows("wo", 1));
         elemwise::silu(&q);
     });
     let kernels = [
@@ -765,15 +946,48 @@ fn deepseeks_attention_lands_its_output_turned_back() {
             "plan",
             poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
         );
-        let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
+        let (o, lse) = both(attn::prefill(
+            &q,
+            &plan,
+            cache,
+            Some(128),
+            512,
+            1,
+            0.04,
+            true,
+            None,
+            true,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        ));
         let positions = p.indices("positions");
         let requests = p.indices("requests");
         let entries = p.cache("entries");
-        let (po, plse) = attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04);
+        let (po, plse) = attn::pool_lse(
+            &q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None,
+        );
         let (o, lse) = attn::merge_lse(&o, &lse, &po, &plse, 64, 512);
         let out = attn::sink(&o, &lse, &p.weight("sinks", [64]), 512);
-        let turned =
-            elemwise::rope_partial_last_yarn(&out, &positions, 64, 512, 1e4, true, true, None);
+        let turned = elemwise::rope(
+            &out,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: true,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&turned);
     });
     let fused = fuse(layer, &["fused.pool_attention"]);
@@ -800,16 +1014,21 @@ fn deepseeks_attention_lands_its_output_turned_back() {
 fn an_index_ranking_lands_its_queries_turn() {
     let t = trace(|p| {
         let positions = p.indices("positions");
-        let q = elemwise::rope_partial_last_yarn(
+        let q = elemwise::rope(
             &p.rows("q", 64 * 128),
             &positions,
-            64,
             128,
             1e4,
-            true,
-            false,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
             None,
-        );
+            None,
+        )
+        .0;
         let w = p.rows("w", 64);
         let sel = attn::index_topk(
             &q,
@@ -854,7 +1073,21 @@ fn deepseeks_compressor_lands_its_state_write_too() {
             poem_ir::Dtype::Bf16,
         );
         let latent = elemwise::rmsnorm(&g, &p.weight("norm", [512]), 1e-6);
-        let k = elemwise::rope_partial_last_yarn(&latent, &brope, 64, 512, 1e4, true, false, None);
+        let k = elemwise::rope(
+            &latent,
+            &brope,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let pool = p.cache("entries");
         attn::pool_kv_append(&k, &bpos, &breq, pool, &p.rows("wp", 1), &p.rows("wo", 1));
     });
@@ -996,4 +1229,10 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
             "elemwise.act"
         ]
     );
+}
+
+/// An op's two outputs, its second asked for: a rope's queries and the
+/// keys it was given, an attention's output and log-sum-exp.
+fn both((q, k): (Value, Option<Value>)) -> (Value, Value) {
+    (q, k.expect("an output asked for lands"))
 }

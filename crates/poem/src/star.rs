@@ -11,11 +11,11 @@ mod generative;
 mod layout;
 mod manifest;
 mod ops;
+mod ops_by_hand;
 mod package;
 mod run;
 mod values;
 
-pub use layout::with_env;
 pub use manifest::{Manifest, Model, Published, Template, Tokenizer, dtype_of, precision_of};
 pub use package::Package;
 pub use run::{Deploy, ImageSpec};
