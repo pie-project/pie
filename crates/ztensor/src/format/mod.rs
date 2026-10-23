@@ -40,16 +40,6 @@ impl DigestAlgorithm {
         }
     }
 
-    pub fn parse(name: &str) -> Result<Self> {
-        match name {
-            "xxh3" => Ok(DigestAlgorithm::Xxh3),
-            "sha256" => Ok(DigestAlgorithm::Sha256),
-            _ => Err(Error::Unsupported(format!(
-                "digest algorithm {name:?}; this build computes xxh3 and sha256"
-            ))),
-        }
-    }
-
     pub fn digest(self, bytes: &[u8]) -> Digest {
         let mut hasher = Hasher::new(self);
         hasher.update(bytes);
@@ -63,6 +53,26 @@ pub struct Digest {
     pub value: Vec<u8>,
 }
 
+impl std::str::FromStr for DigestAlgorithm {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        match name {
+            "xxh3" => Ok(DigestAlgorithm::Xxh3),
+            "sha256" => Ok(DigestAlgorithm::Sha256),
+            _ => Err(Error::Unsupported(format!(
+                "digest algorithm {name:?}; this build computes xxh3 and sha256"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for DigestAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl Digest {
     pub fn new(algorithm: DigestAlgorithm, value: Vec<u8>) -> Self {
         Digest {
@@ -72,7 +82,7 @@ impl Digest {
     }
 
     pub fn algorithm(&self) -> Result<DigestAlgorithm> {
-        DigestAlgorithm::parse(&self.algorithm)
+        self.algorithm.parse()
     }
 
     pub fn hex(&self) -> String {
@@ -92,7 +102,7 @@ impl Digest {
                 format!("malformed digest {self}"),
             ));
         }
-        if let Ok(algo) = DigestAlgorithm::parse(&self.algorithm) {
+        if let Ok(algo) = self.algorithm.parse::<DigestAlgorithm>() {
             if self.value.len() != algo.width() {
                 return Err(Error::reject(
                     Rule::Schema,

@@ -275,7 +275,7 @@ impl Client {
     pub async fn authenticate(
         &self,
         username: &str,
-        private_key: &Option<ParsedPrivateKey>,
+        private_key: Option<&ParsedPrivateKey>,
     ) -> Result<()> {
         let msg = ClientMessage::AuthIdentify {
             corr_id: 0,
@@ -297,7 +297,6 @@ impl Client {
         }
 
         let private_key = private_key
-            .as_ref()
             .context("Client private key is required when engine uses public key authentication")?;
 
         let challenge = base64::engine::general_purpose::STANDARD

@@ -65,7 +65,7 @@ impl ForwardHybrid for DoubleBlock {
 fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let trace = trace_hybrid("double", &DoubleBlock, Platform::Cuda);
     let text = Guard::Fact(Stream::Text.code());
-    let image = Guard::not(text.clone());
+    let image = !text.clone();
 
     let ragged = trace
         .nodes

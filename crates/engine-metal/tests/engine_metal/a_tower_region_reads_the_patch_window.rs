@@ -87,9 +87,9 @@ fn tower_and_trunk() -> Trace {
     let merged = b.op(deeper, act(), Guard::Always);
     let seeded = b.op(tokens, act(), Guard::Always);
     let d = b.op(merged, act(), Guard::Fact(0));
-    let p = b.op(seeded, act(), Guard::not(Guard::Fact(0)));
+    let p = b.op(seeded, act(), !Guard::Fact(0));
     let o = b.value(
-        Def::Merge(vec![(d, Guard::Fact(0)), (p, Guard::not(Guard::Fact(0)))]),
+        Def::Merge(vec![(d, Guard::Fact(0)), (p, !Guard::Fact(0))]),
         act(),
     );
     let y = b.op(o, act(), Guard::Always);

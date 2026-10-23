@@ -400,8 +400,8 @@ mod tests {
         let x = b.input(8);
         let q = b.op(x, 8, Guard::Always);
         let d = b.op(q, 8, fact(0));
-        let p = b.op(q, 8, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let p = b.op(q, 8, !fact(0));
+        let o = b.merge(&[(d, fact(0)), (p, !fact(0))], 8);
         let y = b.op(o, 8, Guard::Always);
         b.append(y, Guard::Always);
         b.out(y);
@@ -420,11 +420,8 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(8);
         let d = b.op(x, 8, fact(0));
-        let m = b.op(x, 8, Guard::and(Guard::not(fact(0)), fact(1)));
-        let o = b.merge(
-            &[(d, fact(0)), (m, Guard::and(Guard::not(fact(0)), fact(1)))],
-            8,
-        );
+        let m = b.op(x, 8, Guard::and(!fact(0), fact(1)));
+        let o = b.merge(&[(d, fact(0)), (m, Guard::and(!fact(0), fact(1)))], 8);
         b.out(o);
 
         let refusal = compile(&b.trace, &Budget::new(4, 16), &DeviceProfile::default())

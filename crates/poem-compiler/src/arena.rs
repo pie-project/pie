@@ -1225,8 +1225,8 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(8);
         let d = b.op(x, 8, fact(0));
-        let p = b.op(x, 4, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let p = b.op(x, 4, !fact(0));
+        let o = b.merge(&[(d, fact(0)), (p, !fact(0))], 8);
         b.out(o);
 
         let classes = resolve_classes(&b.trace).expect("resolves");

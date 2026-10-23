@@ -1348,7 +1348,7 @@ pub fn attend(
 /// Whether any row of `x` can be one `rows` holds for.
 fn possible(x: &Value, rows: poem_ir::Guard) -> bool {
     use poem_ir::Guard;
-    !Guard::and(x.cond(), rows).implies(&Guard::not(Guard::Always))
+    !Guard::and(x.cond(), rows).implies(&!Guard::Always)
 }
 
 /// Latent attention of the absorbed queries `q` (and their rotated part
@@ -1416,7 +1416,7 @@ pub fn attend_mla(
         vec![arm(false, Guard::Always, inputs)]
     } else {
         let one = rec.guard_of(&fact::single_token());
-        let (decode, prefill) = (one.clone(), Guard::not(one));
+        let (decode, prefill) = (one.clone(), !one);
         vec![
             arm(true, decode.clone(), &inputs.refined(decode)),
             arm(false, prefill.clone(), &inputs.refined(prefill)),
