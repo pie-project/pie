@@ -1,5 +1,6 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
+#include "prim/shuffle.slang"
 
 // Paged attention over a KV cache, bf16 two a word, causal (an optional
 // sliding window, an optional per-row byte mask). Decode reads one query row
@@ -15,7 +16,9 @@
 // Prefill (`PIE_TILED`) holds `PIE_TILE_ROWS` query rows of one head a
 // workgroup, `PIE_TILE_LANES` lanes a row (32, reduced as a tree; or 16,
 // each lane summing its row's partials after one barrier, as
-// kernels-wgpu's tile did), every row walking the tile's keys in step.
+// kernels-wgpu's tile did; at the subgroup tier the 16 lanes fold by
+// shuffles, no barrier, on subgroups of at least 16 whose lanes are a row's
+// in order), every row walking the tile's keys in step.
 // `PIE_FOLD` folds the split partials by their LSEs.
 
 static const float NEG_INF = -3.0e38;
@@ -118,7 +121,13 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #error "attn/sdpa.slang is compiled at a head width: -DPIE_HEAD_DIM"
 #endif
 
-#if defined(PIE_SUBGROUP)
+// The subgroup decode reads bf16 and mask bytes through 16- and 8-bit
+// storage; the tile (and WGSL, which has neither) reads packed words.
+#if defined(PIE_SUBGROUP) && !defined(PIE_TILED)
+#define SDPA_NARROW_STORAGE 1
+#endif
+
+#if defined(SDPA_NARROW_STORAGE)
 [[vk::binding(0)]] StructuredBuffer<uint16_t> queries;
 [[vk::binding(1)]] StructuredBuffer<uint16_t> k_pages;
 [[vk::binding(2)]] StructuredBuffer<uint16_t> v_pages;
@@ -133,7 +142,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(5)]] StructuredBuffer<int> req_of_token;
 [[vk::binding(6)]] StructuredBuffer<uint> kv_page_indices;
 [[vk::binding(7)]] StructuredBuffer<uint> kv_page_indptr;
-#if defined(PIE_SUBGROUP)
+#if defined(SDPA_NARROW_STORAGE)
 [[vk::binding(8)]] StructuredBuffer<uint8_t> attention_mask;
 [[vk::binding(9)]] StructuredBuffer<uint8_t> attention_mask_enabled;
 
@@ -239,7 +248,12 @@ uint row_base(uint row, uint q_head) {
 // `2p + 1`.
 #define PAIRS_PER_LANE (uint(PIE_HEAD_DIM) / (2u * LANES_PER_ROW))
 
+#if defined(PIE_SUBGROUP) && PIE_TILE_LANES != 16
+#error "the subgroup tile folds 16 lanes a row"
+#endif
+#if !defined(PIE_SUBGROUP)
 groupshared float sdpa_part[PIE_TILE_ROWS][PIE_TILE_LANES];
+#endif
 groupshared int sdpa_last;
 
 [shader("compute")]
@@ -292,6 +306,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 partial += dot(qv[i], word_pair(k_pages[(base + 2u * (lane + i * LANES_PER_ROW)) >> 1]));
             }
         }
+#if defined(PIE_SUBGROUP)
+        float score = partial;
+        for (uint mask = LANES_PER_ROW >> 1; mask > 0u; mask >>= 1) {
+            score += pie_shuffle_xor(score, mask);
+        }
+#else
         sdpa_part[slot_y][lane] = partial;
         GroupMemoryBarrierWithGroupSync();
 #if PIE_TILE_LANES == 32
@@ -308,6 +328,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             score += sdpa_part[slot_y][l];
         }
 #endif
+#endif
         if (take) {
             float hist, w;
             online_update(score, max_score, sum_exp, hist, w);
@@ -315,7 +336,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 acc[i] = acc[i] * hist + w * word_pair(v_pages[(base + 2u * (lane + i * LANES_PER_ROW)) >> 1]);
             }
         }
+#if !defined(PIE_SUBGROUP)
         GroupMemoryBarrierWithGroupSync();
+#endif
     }
 
 #if defined(PIE_LSE)
@@ -772,7 +795,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_decode_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
@@ -810,7 +835,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_decode_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
@@ -848,7 +875,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_decode_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate attn_sdpa_decode_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8
 // pie:instantiate attn_sdpa_decode_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128
@@ -886,6 +915,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate attn_sdpa_tiled_lse_r8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_fold_bf16 PIE_FOLD=1 PIE_GROUP_X=256
 // pie:instantiate attn_sdpa_fold_lse_bf16 PIE_FOLD=1 PIE_LSE=1 PIE_GROUP_X=256

@@ -3,7 +3,8 @@
 //! decode a row a workgroup on the baseline tier, 256 and 128 invocations, plain, windowed, masked,
 //! with its LSE, and split into key ranges folded by their LSEs (rows a
 //! single split covers among them); the selected form over named key
-//! blocks; prefill tiled at 32, 16 and 8 rows, a request straddling a tile,
+//! blocks; prefill tiled at 32, 16 and 8 rows (16 lanes a row too, folded
+//! by shuffles where every subgroup is 32 lanes), a request straddling a tile,
 //! and walked a row a workgroup (the few-rows arm), with and without its
 //! LSE.
 
@@ -149,6 +150,7 @@ fn paged_attention_answers_the_reference() {
         return;
     };
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
+    let subgroups = gpu.device.chip().subgroups_32();
     let (profile, _) = engine_wgpu::chip::resolve(&gpu.device.chip(), None);
     let tn = kernels_wgpu::Tuning::new(profile, gpu.device.cores(), gpu.device.storage_buffers());
     let slots = 6 * PAGE;
@@ -326,17 +328,27 @@ fn paged_attention_answers_the_reference() {
                     });
                     close(&gpu.down(o, n), &want_o, &shape);
 
+                    // At the subgroup tier the 16-lane tile folds by
+                    // shuffles; decode stays the baseline's on WGSL.
                     let tactics: &[(bool, u32, u32, u32)] = if matches!(form, Form::Tiled) {
                         &[
                             (false, 256, 32, 32),
                             (false, 256, 16, 32),
                             (false, 256, 8, 32),
                             (false, 256, 16, 16),
+                            (true, 256, 16, 16),
                         ]
                     } else {
-                        &[(false, 256, 32, 32), (false, 128, 32, 32)]
+                        &[
+                            (false, 256, 32, 32),
+                            (false, 128, 32, 32),
+                            (true, 256, 32, 32),
+                        ]
                     };
                     for &(subgroup, threads, tile, lanes) in tactics {
+                        if subgroup && !subgroups {
+                            continue;
+                        }
                         let tactic = sdpa::Tactic {
                             tier: if subgroup {
                                 kernels_slang::Tier::Subgroup

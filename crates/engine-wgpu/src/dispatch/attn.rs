@@ -16,14 +16,15 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
-    /// How this device runs paged attention: WGSL's baseline tier, a decode
+    /// How this device runs paged attention: the adapter's tier (its
+    /// subgroup prefill tile where every subgroup is 32 lanes), a decode
     /// workgroup of 256 invocations (128 measured 26-61% slower through
     /// wgpu on an RTX 4090) and prefill tiles of 16 rows of 16 lanes, the
     /// 256 invocations WebGPU's default workgroup holds.
     fn sdpa_tactic(&self) -> sdpa::Tactic {
         let tuning = self.tuning();
         sdpa::Tactic {
-            tier: kernels_slang::Tier::Baseline,
+            tier: self.tier(),
             narrow: false,
             decode_threads: 256,
             tile_rows: 16,

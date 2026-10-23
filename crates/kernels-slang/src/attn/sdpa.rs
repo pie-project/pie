@@ -3,12 +3,15 @@
 //! Decode walks a row's keys with the workgroup's subgroups on the subgroup
 //! tier or 32-lane strips on the baseline, a long row split into key ranges
 //! folded by their LSEs where the device would otherwise idle; prefill tiles
-//! query rows of one head and walks their keys in step.
+//! query rows of one head and walks their keys in step, a 16-lane row
+//! folding by shuffles on the subgroup tier.
 #![allow(clippy::too_many_arguments)]
 
 use dtype::Dtype;
 
-use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, Tier, instantiated, nonzero, refuse, stated};
+use crate::encode::{
+    Arg, ArgValue, Ctx, Fire, Grid, Target, Tier, instantiated, nonzero, refuse, stated,
+};
 use crate::error::Error;
 use crate::tensor::{KvPool, Tensor};
 
@@ -23,8 +26,10 @@ const FOLD_GROUP: u32 = 256;
 /// How an engine runs paged attention on its device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tactic {
-    /// Decode reduces with subgroup operations at `Tier::Subgroup` (SPIR-V
-    /// only); prefill runs at the baseline whatever this says.
+    /// The device's tier. At `Tier::Subgroup` decode reduces with subgroup
+    /// operations on SPIR-V (WGSL's decode is the baseline's), and the
+    /// 16-lane prefill tile folds its rows by shuffles (subgroups of at
+    /// least 16 lanes); the 32-lane tiles run at the baseline.
     pub tier: Tier,
     /// The device's subgroups run narrower than 32 lanes.
     pub narrow: bool,
@@ -211,6 +216,7 @@ fn lse_plane(op: &'static str, lse: Tensor, shape: &Shape) -> Result<ArgValue, E
 
 /// A decode workgroup's entry: `kind`, then its thread and lane variants.
 fn decode_entry(
+    ctx: &Ctx<'_>,
     op: &'static str,
     tactic: Tactic,
     kind: &str,
@@ -221,7 +227,7 @@ fn decode_entry(
     } else {
         128
     };
-    let subgroup = tactic.tier == Tier::Subgroup;
+    let subgroup = tactic.tier == Tier::Subgroup && ctx.target() == Target::Spirv;
     let name = format!(
         "attn_sdpa_{kind}{}{}_bf16_d_{head_dim}",
         if threads < 256 { "_t128" } else { "" },
@@ -281,6 +287,7 @@ pub fn decode(
         extra.push(lse_plane(OP, lse, &shape)?);
     }
     let fire = decode_entry(
+        ctx,
         OP,
         tactic,
         if lse.is_some() {
@@ -346,6 +353,7 @@ fn decode_split(
         extra.push(lse_plane(OP, lse, shape)?);
     }
     let fire = decode_entry(
+        ctx,
         OP,
         tactic,
         if lse.is_some() { "split_lse" } else { "split" },
@@ -417,7 +425,7 @@ pub fn selected(
             ),
         ));
     }
-    let fire = decode_entry(OP, tactic, "selected", head_dim)?;
+    let fire = decode_entry(ctx, OP, tactic, "selected", head_dim)?;
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &[selection.arg()])?;
     args.extend([stated(OP, top_k)?.arg(), stated(OP, ratio)?.arg()]);
     ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
@@ -456,6 +464,11 @@ pub fn prefill(
         },
     );
     let entry = instantiated(OP, name)?;
+    let tier = if lanes == 16 && tactic.tier == Tier::Subgroup {
+        Tier::Subgroup
+    } else {
+        Tier::Baseline
+    };
     let extra = match lse {
         Some(lse) => vec![lse_plane(OP, lse, &shape)?],
         None => Vec::new(),
@@ -464,6 +477,7 @@ pub fn prefill(
     args.push(stated(OP, shape.rows)?.arg());
     ctx.fire(
         Fire::at(SDPA, entry)
+            .tier(tier)
             .groups([shape.q_heads, shape.rows.div_ceil(tile), 1])
             .group([lanes, tile, 1]),
         &args,

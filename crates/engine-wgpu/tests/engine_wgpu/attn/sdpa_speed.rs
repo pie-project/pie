@@ -88,7 +88,11 @@ fn sdpa_speed() {
         &kernels_wgpu::Tuning::new(profile, gpu.device.cores(), gpu.device.storage_buffers());
     // engine-wgpu's tactic (`dispatch/attn.rs`).
     let tactic = sdpa::Tactic {
-        tier: kernels_slang::Tier::Baseline,
+        tier: if chip.subgroups_32() {
+            kernels_slang::Tier::Subgroup
+        } else {
+            kernels_slang::Tier::Baseline
+        },
         narrow: false,
         decode_threads: 256,
         tile_rows: 16,
@@ -347,13 +351,14 @@ fn sdpa_speed() {
                 Ok(())
             });
         };
-        let slang = |tile_rows: u32, tile_lanes: u32| {
+        let slang = |tile_rows: u32, tile_lanes: u32, tier: kernels_slang::Tier| {
             move |g: &Gpu| {
                 g.run_slang(|c| {
                     for _ in 0..PREFILL_REPS {
                         sdpa::prefill(
                             c,
                             sdpa::Tactic {
+                                tier,
                                 tile_rows,
                                 tile_lanes,
                                 ..tactic
@@ -372,13 +377,24 @@ fn sdpa_speed() {
                 });
             }
         };
-        // Every tile the adapter's workgroup holds.
+        // Every tile the adapter's workgroup holds, at the baseline and
+        // (the 16-lane tile) at the tactic's tier.
         let invocations = gpu.device.workgroup_limits().0;
-        for (tile, lanes) in [(8u32, 32u32), (16, 32), (32, 32), (16, 16)] {
+        let mut tiles = vec![(8u32, 32u32, kernels_slang::Tier::Baseline)];
+        tiles.extend(
+            [(16, 32), (32, 32), (16, 16)].map(|(t, l)| (t, l, kernels_slang::Tier::Baseline)),
+        );
+        if tactic.tier != kernels_slang::Tier::Baseline {
+            tiles.push((16, 16, tactic.tier));
+        }
+        for (tile, lanes, tier) in tiles {
             if lanes * tile <= invocations {
-                let times = race(&gpu, PREFILL_REPS, &[&hand, &slang(tile, lanes)]);
+                let times = race(&gpu, PREFILL_REPS, &[&hand, &slang(tile, lanes, tier)]);
                 report(
-                    &format!("prefill kv {kv} rows {rows} (tiled {tile}x{lanes})"),
+                    &format!(
+                        "prefill kv {kv} rows {rows} (tiled {tile}x{lanes} {})",
+                        tier.name()
+                    ),
                     &times,
                 );
             }

@@ -3,7 +3,8 @@
 //! tier and the baseline, 256 and 128 invocations, plain, windowed, masked,
 //! with its LSE, and split into key ranges folded by their LSEs (rows a
 //! single split covers among them); the selected form over named key
-//! blocks; prefill tiled at 32, 16 and 8 rows, a request straddling a tile,
+//! blocks; prefill tiled at 32, 16 and 8 rows (16 lanes a row too, folded
+//! by shuffles where subgroups hold 16 lanes), a request straddling a tile,
 //! and walked a row a workgroup (the few-rows arm), with and without its
 //! LSE.
 
@@ -341,6 +342,7 @@ fn paged_attention_answers_the_reference() {
                             (false, 256, 16, 32),
                             (false, 256, 8, 32),
                             (false, 256, 16, 16),
+                            (true, 256, 16, 16),
                         ]
                     } else {
                         &[
@@ -351,6 +353,11 @@ fn paged_attention_answers_the_reference() {
                         ]
                     };
                     for &(subgroup, threads, tile, lanes) in tactics {
+                        // The subgroup tile folds a row's 16 lanes in one
+                        // subgroup.
+                        if subgroup && lanes == 16 && gpu.device.chip().subgroup < 16 {
+                            continue;
+                        }
                         let tactic = sdpa::Tactic {
                             tier: if subgroup {
                                 kernels_slang::Tier::Subgroup
