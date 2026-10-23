@@ -23,12 +23,66 @@ use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
     Buf, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, PageSource, Phase, Shard, Sink,
 };
-use kernels_cerebras::plan::{Fabric, Plan};
+use kernels_cerebras::plan::Plan;
 
 mod plan;
 mod table;
 
 pub use plan::Planner;
+
+/// The terms the engine plans by: what a PE holds, how far a phase
+/// spreads, the placement in force, whether partials merge on the fabric
+/// and how bf16 operands are stored. [`Planner`] chooses every split by
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fabric {
+    /// The most data words one phase places on a PE altogether (its share
+    /// of every buffer plus scratch). A probe (`pe_memory_probe`) links
+    /// 10240 words of data beside the memcpy module alone; the rest of a
+    /// PE's memory is code, stack and the task tables, and the kernels'
+    /// code takes its share below that.
+    pub pe_words: u64,
+    /// The most elements of one buffer a PE holds before it is split (a
+    /// small budget makes a small model take every split form).
+    pub shard_words: u64,
+    /// The most PEs one phase spreads over (a rectangle up to 16 rows
+    /// tall); a weight past `max_pes × shard_words` (the vocabulary
+    /// projection, by default) runs on the host. The default suits the
+    /// simulator; a wafer takes hundreds of thousands.
+    pub max_pes: u32,
+    /// The resident placement: every phase of a fire on one row of this
+    /// many PEs, activations whole on every PE, the weights by rows across
+    /// the row, a matmul's column blocks gathered back to every PE, lanes
+    /// padded to the row; `None` is the per-phase placement.
+    pub resident_pes: Option<u32>,
+    /// Whether partials merge on the fabric rather than on the host
+    /// (`Plan::merge`).
+    pub fabric_sum: bool,
+    /// Whether bf16 weights live on the device packed two halves a word:
+    /// half the memory, the kernels widening as they read.
+    pub half_weights: bool,
+    /// Whether bf16 kv pools live on the device packed two halves a word:
+    /// half the memory a page, attention widening a key or value row as it
+    /// reads it, `kv_append` packing as it lands.
+    pub half_pool: bool,
+    /// The most rows one attention phase takes, when capped.
+    pub attn_rows: Option<u32>,
+}
+
+impl Default for Fabric {
+    fn default() -> Self {
+        Fabric {
+            pe_words: 8704,
+            shard_words: 4096,
+            max_pes: 2048,
+            resident_pes: None,
+            fabric_sum: true,
+            half_weights: false,
+            half_pool: false,
+            attn_rows: None,
+        }
+    }
+}
 
 /// The fabric's terms as this process sets them: each from its
 /// environment variable, else the default.
@@ -172,7 +226,17 @@ impl Sink for Emitting<'_> {
         self.program.helper(name, text);
     }
 
-    fn phase(&mut self, phase: Phase) {
+    fn phase(&mut self, mut phase: Phase) {
+        // The resident placement runs every device phase on its row of PEs
+        // (whole buffers replicated); a phase spread over PEs of its own
+        // keeps them.
+        if let Some(n) = self.plan.row()
+            && phase.host.is_none()
+            && phase.lane.is_none()
+            && phase.pes == 1
+        {
+            phase.pes = n;
+        }
         self.program.push(phase);
     }
 

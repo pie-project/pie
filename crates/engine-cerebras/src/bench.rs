@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use dtype::Dtype;
-use kernels_cerebras::plan::{Fabric, Plan};
+use kernels_cerebras::plan::Plan;
 use kernels_cerebras::{Cx, Emit, Error, Tensor, View};
 
-use crate::fabric::{Emitting, Operands, Planner, Program, Rendered};
+use crate::fabric::{Emitting, Fabric, Operands, Planner, Program, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Sdk};
 
 /// One simulator at a time on this box: runs are serialised across threads

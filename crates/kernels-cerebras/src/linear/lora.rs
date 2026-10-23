@@ -136,7 +136,7 @@ pub fn correct(
             OP,
             format!(
                 "one row of the {what} and a row's planes exceed a PE's {}",
-                ctx.plan().fabric().pe_words
+                ctx.plan().pe_words()
             ),
         )
     };

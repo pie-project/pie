@@ -93,7 +93,7 @@ pub fn block_dyn_conv(
                 format!(
                     "{} rows of {channels} channels do not fit a PE's {} even one group of {group} at a time",
                     x.data.rows,
-                    ctx.plan().fabric().pe_words
+                    ctx.plan().pe_words()
                 ),
             )
         })?;

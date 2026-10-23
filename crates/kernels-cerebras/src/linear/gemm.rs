@@ -57,7 +57,7 @@ fn act_x_wt(
     // vocabulary projection), or one whose extents divide into no grid
     // within a PE (a 4304-wide projection: 4304 = 16 · 269), is multiplied
     // on the host.
-    if let Some(pes) = ctx.plan().fabric().resident_pes {
+    if let Some(pes) = ctx.plan().row() {
         return resident_matmul(ctx, op, act, w, y, m, k, n, pes);
     }
     ctx.emit(&mut |cx| {

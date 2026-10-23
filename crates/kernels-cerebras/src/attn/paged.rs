@@ -378,9 +378,7 @@ fn attend(
     // lse, the tables, the mask and the scratch, for the rows of one phase:
     // all the rows when that fits, else a window of them, halved until it
     // does, each window its own phase over views of the row-shaped buffers.
-    let fab = ctx.plan().fabric();
-    let packed =
-        fab.half_pool && pool.keys.dtype == Dtype::Bf16 && pool.keys.width.is_multiple_of(2);
+    let packed = ctx.plan().packs_pool(pool.keys);
     let page_pair = u64::from(ps) * u64::from(pool.keys.width) * 2 / if packed { 2 } else { 1 };
     let (top_k, ratio) = selection.map_or((0, 0), |(s, r)| (s.width, r));
     let sblk_words = u64::from(span.checked_div(ratio).map_or(1, |b| b + 1));
@@ -935,8 +933,7 @@ fn append(
         let vb = cx.read(v)?;
         let pb = cx.read(write_page)?;
         let obf = cx.read(write_offset)?;
-        let fab = cx.plan().fabric();
-        let packed_ok = fab.half_pool && pool.keys.dtype == Dtype::Bf16 && w.is_multiple_of(2);
+        let packed_ok = cx.plan().packs_pool(pool.keys);
         let keys = match cx.pool_half(pool.keys)? {
             Some(k) if packed_ok => k,
             _ => {

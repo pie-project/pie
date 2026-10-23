@@ -7,13 +7,27 @@
 //! entry then writes its calls against the split it is handed.
 
 use crate::error::Error;
-use crate::phase::{BlockPlan, Reduce};
+use crate::phase::{BlockPlan, LanePlan, Reduce};
+use crate::tensor::Tensor;
 
-/// The engine's planner: the terms of the fabric, and the split it chooses
-/// for each thing an op states.
+/// The engine's planner: the placement a fire takes, and the split it
+/// chooses for each thing an op states.
 pub trait Plan {
-    /// The terms the engine plans by.
-    fn fabric(&self) -> Fabric;
+    /// The most data words one phase places on a PE (what an op that does
+    /// not fit refuses with).
+    fn pe_words(&self) -> u64;
+
+    /// The resident placement's row of PEs, when the fire takes it: every
+    /// phase on the row, activations whole on every PE, the weights by rows
+    /// across it, a result gathered or summed back to every PE.
+    fn row(&self) -> Option<u32>;
+
+    /// Whether the engine keeps the kv pool plane `plane` packed two bf16
+    /// a word (see `Sink::pool_half`).
+    fn packs_pool(&self, plane: Tensor) -> bool;
+
+    /// The PEs `plan` runs on, or why the placement refuses it.
+    fn lanes(&self, plan: &LanePlan) -> Result<u32, Error>;
 
     /// Whether one PE holds `held`.
     fn holds(&self, held: Held) -> bool;
@@ -67,44 +81,6 @@ pub enum Merge {
     Lse { group: u32, row: bool },
 }
 
-/// The engine's terms an entry plans its splits within: what a PE holds,
-/// how far a phase spreads, the placement in force and how bf16 operands
-/// are stored. The engine sets them and chooses every split by them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Fabric {
-    /// The most data words one phase places on a PE altogether (its share
-    /// of every buffer plus scratch). A probe (`pe_memory_probe`) links
-    /// 10240 words of data beside the memcpy module alone; the rest of a
-    /// PE's memory is code, stack and the task tables, and the kernels'
-    /// code takes its share below that.
-    pub pe_words: u64,
-    /// The most elements of one buffer a PE holds before it is split (a
-    /// small budget makes a small model take every split form).
-    pub shard_words: u64,
-    /// The most PEs one phase spreads over (a rectangle up to 16 rows
-    /// tall); a weight past `max_pes × shard_words` (the vocabulary
-    /// projection, by default) runs on the host. The default suits the
-    /// simulator; a wafer takes hundreds of thousands.
-    pub max_pes: u32,
-    /// The resident placement: every phase of a fire on one row of this
-    /// many PEs, activations whole on every PE, the weights by rows across
-    /// the row, a matmul's column blocks gathered back to every PE, lanes
-    /// padded to the row; `None` is the per-phase placement.
-    pub resident_pes: Option<u32>,
-    /// Whether partials merge on the fabric rather than on the host
-    /// ([`Plan::merge`]).
-    pub fabric_sum: bool,
-    /// Whether bf16 weights live on the device packed two halves a word:
-    /// half the memory, the kernels widening as they read.
-    pub half_weights: bool,
-    /// Whether bf16 kv pools live on the device packed two halves a word:
-    /// half the memory a page, attention widening a key or value row as it
-    /// reads it, `kv_append` packing as it lands.
-    pub half_pool: bool,
-    /// The most rows one attention phase takes, when capped.
-    pub attn_rows: Option<u32>,
-}
-
 /// What a row-wise op holds on a PE, for the engine to choose its tile:
 /// `rows × width`, with `per_row` words a row that split with the columns,
 /// `per_col` words a column (a gain) that split with the columns, `whole`
@@ -131,21 +107,6 @@ pub struct Product {
     pub k: u32,
     pub n: u32,
     pub packed: bool,
-}
-
-impl Default for Fabric {
-    fn default() -> Self {
-        Fabric {
-            pe_words: 8704,
-            shard_words: 4096,
-            max_pes: 2048,
-            resident_pes: None,
-            fabric_sum: true,
-            half_weights: false,
-            half_pool: false,
-            attn_rows: None,
-        }
-    }
 }
 
 /// What one PE holds: `words` in all, the largest array `array` of them

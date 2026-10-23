@@ -1247,7 +1247,7 @@ fn root_buf(
 /// The tracer's `Operands`: the handle tables plus the state's maps.
 struct Lens<'a> {
     handles: &'a Handles,
-    fabric: kernels_cerebras::plan::Fabric,
+    fabric: crate::fabric::Fabric,
     pack_len: u32,
     current: &'a mut BTreeMap<u32, Buf>,
     params: &'a mut Vec<(u32, Source)>,

@@ -385,7 +385,7 @@ fn select_impl(
                 op_name,
                 format!(
                     "one row of an expert ({k} words) and a row of x and y exceed a PE's {}",
-                    ctx.plan().fabric().pe_words
+                    ctx.plan().pe_words()
                 ),
             )
         })?;

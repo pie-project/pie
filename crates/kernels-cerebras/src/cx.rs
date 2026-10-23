@@ -96,32 +96,10 @@ impl<'a> Cx<'a> {
     }
 
     /// Spreads this phase over lanes as `plan` says: the plan's header and
-    /// banks get their per-PE shapes, and the phase runs on `plan.pes` PEs.
+    /// banks get their per-PE shapes, and the phase runs on the PEs the
+    /// engine places the plan on ([`Plan::lanes`]).
     pub fn lanes(&mut self, mut plan: LanePlan) -> Result<Buf, Error> {
-        // The resident placement runs every phase on its row of PEs: a
-        // lane plan takes the row (idle PEs past its own), and a lane whose
-        // state would split over PEs (a merge) does not fit it.
-        if let Some(pes) = self.p.plan().fabric().resident_pes {
-            if plan.pes > pes {
-                return Err(refuse(
-                    "lanes",
-                    format!(
-                        "the lane plan wants {} PEs; the resident row has {pes}",
-                        plan.pes
-                    ),
-                ));
-            }
-            let whole_row = plan.reduce.iter().all(|(_, r)| {
-                matches!(r, Reduce::FabricRoot { group } | Reduce::FabricSum { group } if *group == pes)
-            });
-            if !whole_row {
-                return Err(refuse(
-                    "lanes",
-                    "the resident placement merges a lane's partials over the whole row or not at all",
-                ));
-            }
-            plan.pes = pes;
-        }
+        plan.pes = self.p.plan().lanes(&plan)?;
         self.pes = plan.pes.max(1);
         let header = self
             .p
@@ -184,7 +162,7 @@ impl<'a> Cx<'a> {
                 count,
             },
         }];
-        if self.p.plan().fabric().resident_pes.is_some() {
+        if self.p.plan().row().is_some() {
             steps.push(FabricStep {
                 calls: Vec::new(),
                 op: FabricOp::Broadcast {
@@ -476,16 +454,9 @@ impl<'a> Cx<'a> {
         let shards = std::mem::take(&mut self.shards);
         let lane = self.lane.take();
         let reduce = self.reduce.take();
-        // The resident placement: every phase on the row of PEs (whole
-        // buffers replicated; a phase on fewer PEs stays as it is only when
-        // it already spans the row).
-        let pes = match self.p.plan().fabric().resident_pes {
-            Some(n) if lane.is_none() && self.pes == 1 => n,
-            _ => self.pes,
-        };
         self.p.phase(Phase {
             func: phase,
-            pes,
+            pes: self.pes,
             shards,
             lane,
             host: None,

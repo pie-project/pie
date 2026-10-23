@@ -107,7 +107,7 @@ pub fn bidirectional(
                 OP,
                 format!(
                     "one query row and one key row of one head exceed a PE's {}",
-                    ctx.plan().fabric().pe_words.saturating_sub(CODE_WORDS)
+                    ctx.plan().pe_words().saturating_sub(CODE_WORDS)
                 ),
             )
         })?;
