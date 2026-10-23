@@ -1,8 +1,13 @@
-use kernels_wgpu::attn;
+use kernels_slang::attn::sdpa;
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::{Attn, IndexScore, Operands, StructKind};
 
+use crate::encode::{from_slang, slang_pool, slang_tensor};
 use crate::run::{Run, StructSlot};
+
+/// Storage buffers a split decode binds (its LSE form one more); a device
+/// offering fewer (SwiftShader: 10) walks each row whole.
+const SPLIT_STORAGE_BUFFERS: u32 = 12;
 
 impl DispatchAttn for Run<'_> {
     fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
@@ -11,6 +16,196 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// How this device runs paged attention: the adapter's tier (its
+    /// subgroup prefill tile where every subgroup is 32 lanes), a decode
+    /// workgroup of 256 invocations (128 measured 26-61% slower through
+    /// wgpu on an RTX 4090) and prefill tiles of 16 rows of 16 lanes, the
+    /// 256 invocations WebGPU's default workgroup holds.
+    fn sdpa_tactic(&self) -> sdpa::Tactic {
+        let tuning = self.tuning();
+        sdpa::Tactic {
+            tier: self.tier(),
+            narrow: false,
+            decode_threads: 256,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: tuning.sdpa_split_groups(),
+            split_min_keys: tuning.sdpa_split_min_keys(),
+        }
+    }
+
+    fn prefill_tables(
+        &self,
+        plan: poem_ir::ValueId,
+        mask: Option<kernels_wgpu::Tensor>,
+    ) -> sdpa::Tables {
+        let plan = *self.prefill_plan(plan);
+        sdpa::Tables {
+            mask: mask.map_or(plan.mask, slang_tensor),
+            ..plan
+        }
+    }
+
+    /// Refuses a pool whose row does not hold the stated kv heads.
+    fn kv_heads_agree(
+        op: &'static str,
+        pool: &kernels_wgpu::KvPool,
+        kv_heads: u32,
+    ) -> Result<(), kernels_wgpu::Error> {
+        if pool.head_stride == 0 || pool.seq_stride / pool.head_stride != u64::from(kv_heads) {
+            return Err(kernels_wgpu::Error::Backend {
+                op,
+                detail: format!(
+                    "the stated kv head count {kv_heads} is not the one the pool row's strides \
+                     spell ({} / {})",
+                    pool.seq_stride, pool.head_stride
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Prefill attention: query rows tiled a workgroup of one head where a
+    /// request brings enough of them (`kernel.sdpa.tile_rows_per_request`),
+    /// else each row walked as a decode row.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_attention(
+        &self,
+        q: poem_ir::ValueId,
+        plan: poem_ir::ValueId,
+        mask: Option<kernels_wgpu::Tensor>,
+        cache: poem_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: kernels_wgpu::Tensor,
+        lse: Option<kernels_wgpu::Tensor>,
+    ) -> Result<(), kernels_wgpu::Error> {
+        const OP: &str = "attn.prefill";
+        let q = self.ragged(q).data;
+        let pool = self.pool(cache);
+        Self::kv_heads_agree(OP, pool, kv_heads)?;
+        if let Some(mask) = mask
+            && mask.dtype != poem_ir::Dtype::U8
+        {
+            return Err(kernels_wgpu::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
+                    mask.dtype
+                ),
+            });
+        }
+        let tactic = self.sdpa_tactic();
+        let tables = self.prefill_tables(plan, mask);
+        let (q, pool, o) = (slang_tensor(q), slang_pool(pool), slang_tensor(o));
+        let lse = lse.map(slang_tensor);
+        let tiles = q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request();
+        if tiles {
+            sdpa::prefill(
+                &self.slang(),
+                tactic,
+                q,
+                &tables,
+                &pool,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+            )
+        } else {
+            sdpa::decode(
+                &self.slang(),
+                tactic,
+                q,
+                &tables,
+                &pool,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+                None,
+            )
+        }
+        .map_err(from_slang)
+    }
+
+    /// Decode attention, split into key ranges where the rows are too few
+    /// and the device binds the split's planes.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_attention(
+        &self,
+        q: poem_ir::ValueId,
+        plan: poem_ir::ValueId,
+        cache: poem_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        sm_scale: f32,
+        o: poem_ir::ValueId,
+        lse: Option<poem_ir::ValueId>,
+    ) -> Result<(), kernels_wgpu::Error> {
+        let buffers = self.tuning().storage_buffers();
+        let binds = SPLIT_STORAGE_BUFFERS + u32::from(lse.is_some());
+        let split = self
+            .sdpa_split()
+            .filter(|_| buffers == 0 || buffers >= binds);
+        sdpa::decode(
+            &self.slang(),
+            self.sdpa_tactic(),
+            slang_tensor(self.tensor(q)),
+            self.decode_plan(plan),
+            &slang_pool(self.pool(cache)),
+            window,
+            head_dim,
+            sm_scale,
+            slang_tensor(self.tensor(o)),
+            lse.map(|l| slang_tensor(self.tensor(l))),
+            split,
+        )
+        .map_err(from_slang)
+    }
+
+    /// Attention over the key blocks a selection names.
+    #[allow(clippy::too_many_arguments)]
+    fn selected_attention(
+        &self,
+        op: &'static str,
+        q: kernels_wgpu::Tensor,
+        tables: &sdpa::Tables,
+        selection: poem_ir::ValueId,
+        cache: poem_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        sm_scale: f32,
+        ratio: u32,
+        o: poem_ir::ValueId,
+    ) -> Result<(), kernels_wgpu::Error> {
+        if window.is_some() {
+            return Err(kernels_wgpu::Error::Backend {
+                op,
+                detail: "a selection and a sliding window are two answers to which keys a row \
+                         reads"
+                    .to_string(),
+            });
+        }
+        sdpa::selected(
+            &self.slang(),
+            self.sdpa_tactic(),
+            slang_tensor(q),
+            tables,
+            &slang_pool(self.pool(cache)),
+            head_dim,
+            sm_scale,
+            ratio,
+            slang_tensor(self.tensor(selection)),
+            slang_tensor(self.tensor(o)),
+        )
+        .map_err(from_slang)
+    }
+
     fn requests(&self) -> u32 {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
@@ -39,7 +234,7 @@ impl Run<'_> {
         kernels_slang::attn::score::capture(
             &self.slang(),
             crate::encode::slang_ragged(self.ragged(q)),
-            crate::encode::slang_tensor(self.prefill_plan(plan).positions),
+            self.prefill_plan(plan).positions,
             &crate::encode::slang_pool(self.pool(cache)),
             window,
             head_dim,
@@ -62,7 +257,7 @@ impl Run<'_> {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
-                kv_len,
+                kv_len: _,
                 q_heads: _,
                 kv_heads: _,
                 head_dim: _,
@@ -76,19 +271,19 @@ impl Run<'_> {
                          decode plan kind"
                     ),
                 }
-                let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
-
-                let built = attn::plan_decode(
-                    self.ctx(),
-                    kv_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
-                    t.mask_stride,
-                )?;
+                let built = sdpa::Tables::plan(
+                    "attn.plan_decode",
+                    sdpa::Tables {
+                        positions: slang_tensor(self.cut_rows(positions)),
+                        request_of_token: slang_tensor(self.cut_rows(t.request_of_token)),
+                        mask: slang_tensor(self.cut_rows(t.mask)),
+                        mask_enabled: slang_tensor(self.cut_rows(t.mask_enabled)),
+                        mask_stride: t.mask_stride,
+                    },
+                )
+                .map_err(from_slang)?;
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
             }
@@ -97,7 +292,7 @@ impl Run<'_> {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
-                kv_len,
+                kv_len: _,
                 q_heads: _,
                 kv_heads: _,
                 head_dim: _,
@@ -111,19 +306,19 @@ impl Run<'_> {
                          prefill plan kind"
                     ),
                 }
-                let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
-
-                let built = attn::plan_prefill(
-                    self.ctx(),
-                    kv_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
-                    t.mask_stride,
-                )?;
+                let built = sdpa::Tables::plan(
+                    "attn.plan_prefill",
+                    sdpa::Tables {
+                        positions: slang_tensor(self.cut_rows(positions)),
+                        request_of_token: slang_tensor(self.cut_rows(t.request_of_token)),
+                        mask: slang_tensor(self.cut_rows(t.mask)),
+                        mask_enabled: slang_tensor(self.cut_rows(t.mask_enabled)),
+                        mask_stride: t.mask_stride,
+                    },
+                )
+                .map_err(from_slang)?;
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
             }
@@ -135,18 +330,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn::decode(
-                self.ctx(),
-                self.tuning(),
-                self.tensor(*q),
-                self.decode_plan(*plan),
-                self.pool(*cache),
-                *window,
-                *head_dim,
-                *sm_scale,
-                self.tensor(*o),
-                self.sdpa_split(),
-            ),
+            } => self.decode_attention(*q, *plan, *cache, *window, *head_dim, *sm_scale, *o, None),
 
             Attn::Prefill {
                 q,
@@ -157,18 +341,17 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-            } => attn::arbiter::prefill(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                None,
+                *cache,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.requests(),
-                self.tuning(),
+                None,
             ),
 
             Attn::DecodeSelected { per_head: true, .. }
@@ -196,17 +379,17 @@ impl Run<'_> {
                 ratio,
                 per_head: false,
                 o,
-            } => attn::decode_selected(
-                self.ctx(),
+            } => self.selected_attention(
+                "attn.decode_selected",
                 self.tensor(*q),
                 self.decode_plan(*plan),
-                self.tensor(*selection),
-                self.pool(*cache),
+                *selection,
+                *cache,
                 *window,
                 *head_dim,
                 *sm_scale,
                 *ratio,
-                self.tensor(*o),
+                *o,
             ),
             Attn::PrefillSelected {
                 q,
@@ -220,19 +403,22 @@ impl Run<'_> {
                 ratio,
                 per_head: false,
                 o,
-            } => attn::prefill_selected(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.tensor(*selection),
-                self.pool(*cache),
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *ratio,
-                self.tensor(*o),
-            ),
+            } => {
+                const OP: &str = "attn.prefill_selected";
+                Self::kv_heads_agree(OP, self.pool(*cache), *kv_heads)?;
+                self.selected_attention(
+                    OP,
+                    self.ragged(*q).data,
+                    &self.prefill_tables(*plan, None),
+                    *selection,
+                    *cache,
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    *ratio,
+                    *o,
+                )
+            }
             Attn::Dense {
                 q,
                 k,
@@ -266,22 +452,21 @@ impl Run<'_> {
                 cache,
                 window,
                 head_dim,
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 sm_scale,
                 o,
-            } => attn::arbiter::masked(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                Some(self.cut_rows(self.tensor(*mask))),
+                *cache,
                 *window,
                 *head_dim,
+                *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.requests(),
-                self.tuning(),
+                None,
             ),
             Attn::MaskedLse {
                 q,
@@ -290,24 +475,22 @@ impl Run<'_> {
                 cache,
                 window,
                 head_dim,
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 sm_scale,
                 o,
                 lse,
-            } => attn::arbiter::masked_lse(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                Some(self.cut_rows(self.tensor(*mask))),
+                *cache,
                 *window,
                 *head_dim,
+                *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.tensor(*lse),
-                self.requests(),
-                self.tuning(),
+                Some(self.tensor(*lse)),
             ),
             Attn::DecodeLse {
                 q,
@@ -318,18 +501,15 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse,
-            } => attn::decode_lse(
-                self.ctx(),
-                self.tuning(),
-                self.tensor(*q),
-                self.decode_plan(*plan),
-                self.pool(*cache),
+            } => self.decode_attention(
+                *q,
+                *plan,
+                *cache,
                 *window,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
-                self.sdpa_split(),
+                *o,
+                Some(*lse),
             ),
             Attn::PrefillLse {
                 q,
@@ -344,19 +524,17 @@ impl Run<'_> {
                 // This backend splits no prompt's rows, so a replay floor stays 0.
                 floor: _,
             } => {
-                attn::arbiter::prefill_lse(
-                    self.ctx(),
-                    self.ragged(*q),
-                    self.prefill_plan(*plan),
-                    self.pool(*cache),
+                self.prefill_attention(
+                    *q,
+                    *plan,
+                    None,
+                    *cache,
                     *window,
                     *head_dim,
                     *kv_heads,
                     *sm_scale,
                     self.tensor(*o),
-                    self.tensor(*lse),
-                    self.requests(),
-                    self.tuning(),
+                    Some(self.tensor(*lse)),
                 )?;
 
                 self.capture_scores(

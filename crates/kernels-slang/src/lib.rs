@@ -5,12 +5,14 @@
 //! block (`prim/params.slang`), so one source reads the same on both.
 
 pub mod attn;
+pub mod collective;
 pub mod conv;
 pub mod elemwise;
 pub mod encode;
 pub mod error;
 pub mod gather;
 pub mod linear;
+pub mod runtime;
 pub mod sampling;
 pub mod sources;
 pub mod ssm;
@@ -19,4 +21,4 @@ pub mod tensor;
 pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid, Target, Tier};
 pub use error::Error;
 pub use sources::{CENSUS, SPIRV, WGSL, key, spirv, wgsl};
-pub use tensor::{Bank, KvPool, RaggedTensor, Tensor};
+pub use tensor::{Bank, Comm, KvPool, RaggedTensor, Tensor};

@@ -9,6 +9,7 @@ use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, Value
 use crate::store::kv::Paging;
 
 use crate::device::{Buffer, Context, Handles};
+use crate::encode::slang_tensor;
 use crate::error::Result;
 use crate::run::PoolSlabs;
 
@@ -56,7 +57,7 @@ struct SplitRooms {
 }
 
 /// Partial rows a decode of `heads` heads at up to `rows` rows writes when
-/// split across `groups` workgroups (`kernels_vulkan::attn::splits_for`).
+/// split across `groups` workgroups (`kernels_slang::attn::sdpa::decode`).
 fn split_rows(groups: u32, heads: u32, rows: u32) -> u64 {
     (1..=rows)
         .take_while(|r| u64::from(*r) * u64::from(heads) < u64::from(groups))
@@ -386,12 +387,12 @@ impl Scratch {
         Some(self.index?.bind(handles, &self.plane))
     }
 
-    pub fn split(&self, handles: &Handles) -> Option<Result<kernels_vulkan::Split>> {
+    pub fn split(&self, handles: &Handles) -> Option<Result<kernels_slang::attn::sdpa::Split>> {
         let rooms = self.split?;
         Some((|| {
-            Ok(kernels_vulkan::Split {
-                part_out: rooms.part_out.bind(handles, &self.plane)?,
-                part_lse: rooms.part_lse.bind(handles, &self.plane)?,
+            Ok(kernels_slang::attn::sdpa::Split {
+                part_out: slang_tensor(rooms.part_out.bind(handles, &self.plane)?),
+                part_lse: slang_tensor(rooms.part_lse.bind(handles, &self.plane)?),
             })
         })())
     }

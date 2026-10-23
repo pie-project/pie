@@ -1619,16 +1619,28 @@ impl Shell {
         }
         let casts: Vec<&PortCopy<'_>> = p.port_copies.iter().filter(|copy| copy.cast).collect();
         if !casts.is_empty() {
+            // A seat may sit at any bf16 element of the store, past what a
+            // descriptor's offset may name: the store binds whole and the
+            // kernel takes the seat's element.
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            let elements = u32::try_from(store.bytes() / 2).map_err(|_| Fault::Ceiling {
+                what: "bf16 elements of an input store",
+                need: store.bytes() / 2,
+                have: u64::from(u32::MAX),
+            })?;
+            let whole = self.handles.bind(store, 0, store.bytes())?;
+            let into = kernels_slang::Tensor::new(whole, 1, elements, Dtype::Bf16);
             for copy in casts {
                 let values = u32::try_from(copy.bytes / 2).unwrap_or(u32::MAX);
                 let source = self.handles.bind(copy.cell, 0, u64::from(values) * 4)?;
-                let into = self.handles.bind(store, copy.at, copy.bytes)?;
-                kernels_vulkan::elemwise::pointwise::cast_f32_to_bf16(
-                    &sink,
-                    kernels_vulkan::Tensor::new(source, values, 1, Dtype::F32),
-                    kernels_vulkan::Tensor::new(into, values, 1, Dtype::Bf16),
+                let at = u32::try_from(copy.at / 2).unwrap_or(u32::MAX);
+                kernels_slang::runtime::port::cast(
+                    &crate::encode::Slang(&sink),
+                    kernels_slang::Tensor::new(source, 1, values, Dtype::F32),
+                    into,
+                    at,
                 )
+                .map_err(crate::encode::from_slang)
                 .map_err(crate::error::kernel)?;
             }
         }

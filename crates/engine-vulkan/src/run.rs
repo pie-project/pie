@@ -1,8 +1,7 @@
 use kernels_slang::attn::mla::MlaPlan;
+use kernels_slang::attn::sdpa::Tables;
 use kernels_vulkan::linear::moe::RoutedScratch;
-use kernels_vulkan::{
-    Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
-};
+use kernels_vulkan::{Bank, Ctx, KvPool, RaggedTensor, RecurrentPool, Tensor};
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
@@ -114,9 +113,9 @@ pub struct FireBindings {
 
 #[derive(Clone, Copy, Debug)]
 pub enum StructSlot {
-    Decode(DecodePlan),
+    Decode(Tables),
 
-    Prefill(PrefillPlan),
+    Prefill(Tables),
 
     Mla(MlaPlan),
 }
@@ -350,11 +349,7 @@ impl<'c> Run<'c> {
         )
     }
 
-    pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
-        self.ctx
-    }
-
-    /// The same context for kernels-slang's entries.
+    /// The context for kernels-slang's entries.
     pub(crate) fn slang(&self) -> crate::encode::Slang<'c> {
         crate::encode::Slang(self.ctx)
     }
@@ -890,7 +885,7 @@ impl<'c> Run<'c> {
         )
     }
 
-    pub(crate) fn split_scratch(&self) -> Option<kernels_vulkan::Split> {
+    pub(crate) fn split_scratch(&self) -> Option<kernels_slang::attn::sdpa::Split> {
         Some(self.scratch.split(self.handles)?.unwrap_or_else(|fault| {
             panic!("the split partials this load reserved do not mint: {fault}")
         }))
@@ -983,7 +978,7 @@ impl<'c> Run<'c> {
         self.structs[at] = Some(built);
     }
 
-    pub(crate) fn decode_plan(&self, id: ValueId) -> &DecodePlan {
+    pub(crate) fn decode_plan(&self, id: ValueId) -> &Tables {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Decode(plan)) => plan,
             Some(_) => panic!(
@@ -998,7 +993,7 @@ impl<'c> Run<'c> {
         }
     }
 
-    pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {
+    pub(crate) fn prefill_plan(&self, id: ValueId) -> &Tables {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Prefill(plan)) => plan,
             Some(_) => panic!(

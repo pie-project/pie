@@ -301,7 +301,10 @@ fn decode(gpu: &mut Gpu, tuning: &kernels_wgpu::Tuning) {
                     tier: Tier::Baseline,
                     narrow: false,
                     decode_threads: threads,
-                    tile_rows: 32,
+                    tile_rows: 16,
+                    tile_lanes: 16,
+                    split_groups: 0,
+                    split_min_keys: 0,
                 };
                 let yt = t(gpu.zeros(n), rows, QH * HD, Dtype::Bf16);
                 let slang = time(gpu, &|g| {
@@ -317,6 +320,7 @@ fn decode(gpu: &mut Gpu, tuning: &kernels_wgpu::Tuning) {
                                 HD as u32,
                                 scale,
                                 st(yt),
+                                None,
                                 None,
                             )?;
                         }
