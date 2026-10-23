@@ -22,8 +22,8 @@ pub fn upsample_nearest(
 ) -> Result<(), Error> {
     const OP: &str = "conv.upsample";
     let entry = dtype_dispatch!(OP, y.dtype, {
-        Bf16 => "spatial_upsample_nearest_bfloat16",
-        F32 => "spatial_upsample_nearest_float32",
+        Bf16 => "upsample_nearest_bfloat16",
+        F32 => "upsample_nearest_float32",
     });
     let clips = super::clip_pair(OP, grid, o_grid)?;
     if x.width != y.width {
@@ -63,8 +63,8 @@ pub fn pixel_shuffle(
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_shuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
-        Bf16 => "spatial_pixel_shuffle_bfloat16",
-        F32 => "spatial_pixel_shuffle_float32",
+        Bf16 => "pixel_shuffle_bfloat16",
+        F32 => "pixel_shuffle_float32",
     });
     let clips = super::clip_pair(OP, grid, o_grid)?;
     let block = r[0] * r[1] * r[2];
@@ -110,8 +110,8 @@ pub fn pixel_unshuffle(
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_unshuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
-        Bf16 => "spatial_pixel_unshuffle_bfloat16",
-        F32 => "spatial_pixel_unshuffle_float32",
+        Bf16 => "pixel_unshuffle_bfloat16",
+        F32 => "pixel_unshuffle_float32",
     });
     let clips = super::clip_pair(OP, grid, o_grid)?;
     let block = r[0] * r[1] * r[2];
@@ -182,7 +182,7 @@ pub fn avg_down(
         return Ok(());
     }
     ctx.fire(
-        Fire::at(FILE, "spatial_avg_down_bfloat16").apply(grid_of(OP, y.width, y.rows)?),
+        Fire::at(FILE, "avg_down_bfloat16").apply(grid_of(OP, y.width, y.rows)?),
         &[
             x.arg(),
             grid.arg(),
@@ -244,7 +244,7 @@ pub fn cache_gather(
     }
     let stride = nonzero(OP, "the slot's rows", slab.rows)? * channels;
     ctx.fire(
-        Fire::at(FILE, "spatial_cache_gather_bfloat16").apply(grid_of(OP, channels, cache.rows)?),
+        Fire::at(FILE, "cache_gather_bfloat16").apply(grid_of(OP, channels, cache.rows)?),
         &[
             slab.arg(),
             slot_ids.arg(),
@@ -305,7 +305,7 @@ pub fn cache_store(
     }
     let stride = nonzero(OP, "the slot's rows", slab.rows)? * channels;
     ctx.fire(
-        Fire::at(FILE, "spatial_cache_store_bfloat16").apply(grid_of(OP, channels, cache.rows)?),
+        Fire::at(FILE, "cache_store_bfloat16").apply(grid_of(OP, channels, cache.rows)?),
         &[
             x.arg(),
             cache.arg(),

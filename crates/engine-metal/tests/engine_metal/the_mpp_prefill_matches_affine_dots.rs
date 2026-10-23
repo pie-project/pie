@@ -107,7 +107,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                 let bias_t = Tensor::new(bind(&biases_b), n, groups, Dtype::Bf16);
                 let dest = Tensor::new(bind(&buffer), n, k, Dtype::U4g64);
                 sink.fire(
-                    Fire::at("linear/quant_qmm_mpp.metal", "qmm_mpp_pack_bank")
+                    Fire::at("linear/qmm_mpp.metal", "qmm_mpp_pack_bank")
                         .apply(Grid::of([n * (k / 8), 1, 1], [256, 1, 1])),
                     &[
                         source.arg(),

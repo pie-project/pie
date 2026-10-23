@@ -708,46 +708,6 @@ constant constexpr uint kMaxExperts = 1024;
   out[at] = static_cast<bfloat>(acc);
 }
 
-[[kernel]] void combine_sorted(
-    const device bfloat* y              [[buffer(0)]],
-    const device bfloat* expert_weights [[buffer(1)]],
-    device bfloat* out                  [[buffer(2)]],
-
-    const device int* inv               [[buffer(3)]],
-
-    const constant uint& width             [[buffer(4)]],
-    const constant uint& experts_per_token [[buffer(5)]],
-    const constant uint& out_pitch         [[buffer(6)]],
-    uint2 gid                           [[thread_position_in_grid]]) {
-  const uint c = gid.x;
-  if (c >= width) return;
-  const uint row = gid.y;
-  const uint k = experts_per_token;
-  float acc = 0;
-  for (uint e = 0; e < k; ++e) {
-    const int at = inv[row * k + e];
-    if (at < 0) continue;
-    acc += float(expert_weights[row * k + e]) * float(y[uint(at) * width + c]);
-  }
-  out[row * (out_pitch != 0u ? out_pitch : width) + c] = static_cast<bfloat>(acc);
-}
-
-[[kernel]] void shared_expert_combine_strided(
-    const device bfloat* routed [[buffer(0)]],
-    const device bfloat* shared [[buffer(1)]],
-    const device bfloat* gate   [[buffer(2)]],
-    device bfloat* out          [[buffer(3)]],
-    constant uint& width        [[buffer(4)]],
-    const constant int& row_pitch [[buffer(5)]],
-    uint2 gid                   [[thread_position_in_grid]]) {
-  const uint c = gid.x;
-  if (c >= width) return;
-  const size_t row = size_t(gid.y) * size_t(row_pitch);
-  const float g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
-  const size_t at = row + size_t(c);
-  out[at] = static_cast<bfloat>(float(routed[at]) + g * float(shared[at]));
-}
-
 [[kernel]] void shared_expert_combine(
     const device bfloat* routed [[buffer(0)]],
     const device bfloat* shared [[buffer(1)]],

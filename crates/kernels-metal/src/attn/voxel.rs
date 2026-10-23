@@ -84,9 +84,9 @@ pub fn attention(
     }
     let width = stamp(channels)?;
     let entry = match width {
-        "256" => "spatial_attention_bfloat16_c_256",
-        "512" => "spatial_attention_bfloat16_c_512",
-        _ => "spatial_attention_bfloat16_c_1024",
+        "256" => "voxel_attention_bfloat16_c_256",
+        "512" => "voxel_attention_bfloat16_c_512",
+        _ => "voxel_attention_bfloat16_c_1024",
     };
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of([q.rows * THREADS, 1, 1], [THREADS, 1, 1])),

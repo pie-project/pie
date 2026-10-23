@@ -1,28 +1,16 @@
 #include <metal_stdlib>
 using namespace metal;
 
-template <typename T, bool SCALE_OUTPUT>
-METAL_FUNC void rope_rotate_pair(
-    device T* x, size_t i1, size_t i2, float theta, float output_scale) {
+template <typename T>
+METAL_FUNC void rope_rotate_pair(device T* x, size_t i1, size_t i2, float theta) {
   const float costheta = fast::cos(theta);
   const float sintheta = fast::sin(theta);
   const float x1 = float(x[i1]);
   const float x2 = float(x[i2]);
   const float y1 = x1 * costheta - x2 * sintheta;
   const float y2 = x1 * sintheta + x2 * costheta;
-  x[i1] = static_cast<T>(SCALE_OUTPUT ? output_scale * y1 : y1);
-  x[i2] = static_cast<T>(SCALE_OUTPUT ? output_scale * y2 : y2);
-}
-
-template <typename T>
-METAL_FUNC void rope_neox_freqs_body(
-    device T* x, int position, float scale, const device float* inv_freq,
-    int head_dim, int pair_half, float output_scale,
-    int i, int head, size_t row_base) {
-  const float theta = (scale * float(position)) * inv_freq[i];
-  const size_t i1 = row_base + size_t(head * head_dim + i);
-  rope_rotate_pair<T, true>(
-      x, i1, i1 + size_t(pair_half), theta, output_scale);
+  x[i1] = static_cast<T>(y1);
+  x[i2] = static_cast<T>(y2);
 }
 
 // The first grid.x pairs of each head turn, pair i being (i, i + span) at
@@ -43,7 +31,7 @@ template <typename T>
   const float d = float(i) / float(span);
   const float theta = float(position[m]) * exp2(-d * base);
   const size_t i1 = (size_t(m) * grid.y + h) * size_t(head_dim) + i;
-  rope_rotate_pair<T, false>(x, i1, i1 + size_t(span), theta, 1.0f);
+  rope_rotate_pair(x, i1, i1 + size_t(span), theta);
 }
 
 #define instantiate_rope_neox_mb(name, itype)                    \
@@ -53,35 +41,6 @@ template <typename T>
       const constant int&, const constant int&, uint3, uint3);
 
 instantiate_rope_neox_mb(bfloat16, bfloat)
-
-template <typename T>
-[[kernel]] void rope_neox_freqs_mb(
-    device T* x                       [[buffer(0)]],
-    const device int* position        [[buffer(1)]],
-    const constant float& scale       [[buffer(2)]],
-    const device float* inv_freq      [[buffer(3)]],
-    const constant int& head_dim      [[buffer(4)]],
-    const constant float& mscale      [[buffer(5)]],
-    uint3 pos  [[thread_position_in_grid]],
-    uint3 grid [[threads_per_grid]]) {
-  const int i = int(pos.x);
-  const int h = int(pos.y);
-  const int row = int(pos.z);
-  const int half_rd = int(grid.x);
-  const int n_head = int(grid.y);
-  rope_neox_freqs_body(
-      x, position[row], scale, inv_freq, head_dim, half_rd,
-      mscale, i, h, size_t(row) * size_t(n_head) * size_t(head_dim));
-}
-
-#define instantiate_rope_freqs(name, itype)                        \
-  template [[host_name("neox_freqs_mb_" #name)]]              \
-  [[kernel]] void rope_neox_freqs_mb<itype>(                       \
-      device itype*, const device int*, const constant float&,     \
-      const device float*, const constant int&, const constant float&, \
-      uint3, uint3);
-
-instantiate_rope_freqs(bfloat16, bfloat)
 
 template <typename T>
 [[kernel]] void rope_neox_last_mb(

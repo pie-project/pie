@@ -73,7 +73,7 @@ pub fn group_norm(
     }
 
     ctx.fire(
-        Fire::at(FILE, "spatial_group_norm_stats_bfloat16").apply(Grid::of(
+        Fire::at(FILE, "group_norm_stats_bfloat16").apply(Grid::of(
             [SPLITS * STATS_THREADS, clips, groups],
             [STATS_THREADS, 1, 1],
         )),
@@ -87,8 +87,7 @@ pub fn group_norm(
         ],
     )?;
     ctx.fire(
-        Fire::at(FILE, "spatial_group_norm_finalize")
-            .apply(Grid::of([groups * 32, clips, 1], [32, 1, 1])),
+        Fire::at(FILE, "group_norm_finalize").apply(Grid::of([groups * 32, clips, 1], [32, 1, 1])),
         &[
             partials.arg(),
             stats.arg_mut(),
@@ -98,7 +97,7 @@ pub fn group_norm(
         ],
     )?;
     ctx.fire(
-        Fire::at(FILE, "spatial_group_norm_apply_bfloat16")
+        Fire::at(FILE, "group_norm_apply_bfloat16")
             .apply(Grid::of([channels, x.rows, 1], [256.min(channels), 1, 1])),
         &[
             x.arg(),

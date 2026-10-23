@@ -111,7 +111,7 @@ pub fn derive_grid(
         },
     };
     ctx.fire(
-        Fire::at(FILE, "spatial_grid_rule").apply(Grid::of([1, 1, 1], [1, 1, 1])),
+        Fire::at(FILE, "grid_rule").apply(Grid::of([1, 1, 1], [1, 1, 1])),
         &[
             grid.arg(),
             o_grid.arg_mut(),

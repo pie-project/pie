@@ -45,11 +45,17 @@ CRATES = {
     ),
 }
 
-# crate -> (kernel tree, host trees), for the Metal checks.
+# crate -> (kernel tree, host trees), for the Metal checks. Tests are hosts:
+# an entry only a test fires (an f32-out probe of a decoder) is named.
 METAL = {
     "kernels-metal": (
         "crates/kernels-metal/kernels",
-        ["crates/kernels-metal/src", "crates/engine-metal/src"],
+        [
+            "crates/kernels-metal/src",
+            "crates/kernels-metal/tests",
+            "crates/engine-metal/src",
+            "crates/engine-metal/tests",
+        ],
     ),
 }
 
@@ -298,6 +304,11 @@ def metal_named(host):
     for lit in re.findall(r'"([^"\\]*\{[^"\\]*)"', host):
         if re.fullmatch(r"[\w{}:]+", lit) and re.search(r"\w\{|\}\w", lit):
             parts = re.split(r"\{[^}]*\}", lit)
+            # A literal whose fixed text is a letter or two (`"{p}m{k}"`, a
+            # tensor's name) names no kernel; as a pattern it would match
+            # every entry with that letter in it.
+            if max(map(len, parts)) < 3:
+                continue
             spliced.append(re.compile(r"\w*".join(map(re.escape, parts))))
     return words, spliced
 

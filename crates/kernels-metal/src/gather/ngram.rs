@@ -152,7 +152,7 @@ pub fn ngram_ids(
     );
     let rows = nonzero(OP, "rows", ids.rows)?;
     ctx.fire(
-        Fire::at(FILE, "ple_ngram_ids_update").apply([rows, 1, 1]),
+        Fire::at(FILE, "ngram_ids_update").apply([rows, 1, 1]),
         &[
             ids.arg(),
             state.state.arg_mut(),
@@ -220,7 +220,7 @@ pub fn ngram_ids_chunked(
         _ => return Err(refuse(OP, "the token CSR this fire names spans no request")),
     };
     ctx.fire(
-        Fire::at(FILE, "ple_ngram_ids_chunked").apply([lanes, 1, 1]),
+        Fire::at(FILE, "ngram_ids_chunked").apply([lanes, 1, 1]),
         &[
             ids.data.arg(),
             ids.indptr.arg(),
@@ -397,7 +397,7 @@ pub fn ngram_ids_committed(
         }
     };
     ctx.fire(
-        Fire::at(FILE, "ple_ngram_ids_committed").apply([lanes, 1, 1]),
+        Fire::at(FILE, "ngram_ids_committed").apply([lanes, 1, 1]),
         &[
             ids.arg(),
             indptr.arg(),

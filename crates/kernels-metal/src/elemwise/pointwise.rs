@@ -1,4 +1,8 @@
-use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, nonzero, refuse};
+use dtype::Dtype;
+
+use crate::encode::{
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, nonzero, refuse, stated,
+};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -317,5 +321,73 @@ pub fn relative_bucket_bias(
             u32::from(bidirectional).arg(),
             log_ratio.arg(),
         ],
+    )
+}
+
+pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.residual_add";
+    let entry = dtype_dispatch!(OP, y.dtype, {
+        Bf16 => "residual_add_bfloat16",
+        F32 => "residual_add_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, y.width, y.rows)?, [256, 1, 1])),
+        &[x.arg(), y.arg(), y.arg_mut()],
+    )
+}
+
+pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.add_bias";
+    let entry = match (out.dtype, bias.dtype) {
+        (Dtype::Bf16, Dtype::Bf16) => "add_bias_bfloat16",
+        (Dtype::F32, Dtype::F32) => "add_bias_float32",
+        (Dtype::F32, Dtype::Bf16) => "add_bias_float32_bf16",
+        (row, bank) => {
+            return Err(refuse(
+                OP,
+                format!("no point adds a {bank:?} bias to a {row:?} row"),
+            ));
+        }
+    };
+    let lanes = elementwise_rows(OP, out.width, out.rows)?;
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
+        &[out.arg_mut(), bias.arg(), stated(OP, out.width)?.arg()],
+    )
+}
+
+pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.mul_scalar";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "layer_scalar_mul_stated_bfloat16",
+        F32 => "layer_scalar_mul_stated_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
+        &[x.arg(), s.arg(), x.arg_mut()],
+    )
+}
+
+pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.silu_scaled";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "silu_scaled_bfloat16",
+        F32 => "silu_scaled_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
+        &[x.arg_mut(), s.arg()],
+    )
+}
+
+pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.scale";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "layer_scalar_mul_bfloat16",
+        F32 => "layer_scalar_mul_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
+        &[x.arg(), s.arg(), x.arg_mut()],
     )
 }

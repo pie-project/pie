@@ -1,5 +1,5 @@
 #include <metal_stdlib>
-#include "register_table.h"
+#include "../prim/register_table.h"
 
 using namespace metal;
 
@@ -105,7 +105,7 @@ template <typename T>
 instantiate_packed_swiglu_clamp(bfloat16, bfloat)
 
 template <typename T>
-[[kernel]] void packed_gptoss_swiglu(
+[[kernel]] void packed_swiglu_clamp_alpha(
     const device T* packed [[buffer(0)]],
     device T* out          [[buffer(1)]],
     const constant uint& intermediate [[buffer(2)]],
@@ -123,17 +123,17 @@ template <typename T>
   out[row + i] = static_cast<T>((g * sig) * (u + 1.0f));
 }
 
-#define instantiate_packed_gptoss_swiglu(name, itype)              \
-  template [[host_name("packed_gptoss_swiglu_" #name)]]            \
-  [[kernel]] void packed_gptoss_swiglu<itype>(                     \
+#define instantiate_packed_swiglu_clamp_alpha(name, itype)              \
+  template [[host_name("packed_swiglu_clamp_alpha_" #name)]]            \
+  [[kernel]] void packed_swiglu_clamp_alpha<itype>(                     \
       const device itype*, device itype*,                          \
       const constant uint&, const constant float&,                 \
       const constant float&, uint2);
 
-instantiate_packed_gptoss_swiglu(bfloat16, bfloat)
+instantiate_packed_swiglu_clamp_alpha(bfloat16, bfloat)
 
-// packed_gptoss_swiglu over a routed stack's sorted rows, skipping its padding rows.
-[[kernel]] void packed_gptoss_swiglu_sorted(
+// packed_swiglu_clamp_alpha over a routed stack's sorted rows, skipping its padding rows.
+[[kernel]] void packed_swiglu_clamp_alpha_sorted(
     const device bfloat* packed [[buffer(0)]],
     device bfloat* out          [[buffer(1)]],
     const constant uint& intermediate [[buffer(2)]],

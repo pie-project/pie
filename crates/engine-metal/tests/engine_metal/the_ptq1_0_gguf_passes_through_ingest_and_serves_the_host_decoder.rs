@@ -56,7 +56,7 @@ include!("../../../checkpoint/src/codec/ptq1_0_fixture.rs");
 const PTQ1_0_TYPE_ID: u32 = 143;
 const BLOCK: usize = 128;
 const BLOCK_BYTES: usize = 28;
-const PTQ1_0_FILE: &str = "linear/quant_ptq1_0.metal";
+const PTQ1_0_FILE: &str = "linear/qmv_ptq1_0.metal";
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
 /// One declared tensor: a name, its logical `[rows, k]` shape, and the raw ternary

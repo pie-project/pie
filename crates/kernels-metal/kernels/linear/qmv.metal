@@ -383,7 +383,7 @@ struct Mxfp4 {
 };
 
 template <typename T, typename Codec, bool BIASED, bool ROUTED, int PPT>
-METAL_FUNC void qmv_gptoss_impl(
+METAL_FUNC void qmv_codec_impl(
     const device uint32_t* w,
     const device typename Codec::scale_t* scales,
     const device T* biases,
@@ -473,7 +473,7 @@ METAL_FUNC void qmv_gptoss_impl(
   }
 }
 
-#define gptoss_qmv_kernel(name, BIASED, ROUTED, PPT)                                \
+#define qmv_codec_kernel(name, BIASED, ROUTED, PPT)                                \
   template <typename T, template <typename> class Codec>                       \
   [[kernel]] void name(                                                        \
       const device uint32_t* w   [[buffer(0)]],                                \
@@ -491,21 +491,21 @@ METAL_FUNC void qmv_gptoss_impl(
       uint3 tid       [[threadgroup_position_in_grid]],                        \
       uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
-    qmv_gptoss_impl<T, Codec<T>, BIASED, ROUTED, PPT>(                              \
+    qmv_codec_impl<T, Codec<T>, BIASED, ROUTED, PPT>(                              \
         w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
         x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
   }
 
-gptoss_qmv_kernel(qmv_tail, false, false, 2)
-gptoss_qmv_kernel(qmv_tail_bias, true, false, 2)
+qmv_codec_kernel(qmv_tail, false, false, 2)
+qmv_codec_kernel(qmv_tail_bias, true, false, 2)
 
-gptoss_qmv_kernel(qmv_routed_bias, true, true, 1)
-gptoss_qmv_kernel(qmv_routed, false, true, 1)
+qmv_codec_kernel(qmv_routed_bias, true, true, 1)
+qmv_codec_kernel(qmv_routed, false, true, 1)
 
-gptoss_qmv_kernel(qmv_routed_bias_p2, true, true, 2)
-gptoss_qmv_kernel(qmv_routed_p2, false, true, 2)
+qmv_codec_kernel(qmv_routed_bias_p2, true, true, 2)
+qmv_codec_kernel(qmv_routed_p2, false, true, 2)
 
-#define instantiate_gptoss_qmv(host, fn, codec, name, itype, gs, b)           \
+#define instantiate_qmv_codec(host, fn, codec, name, itype, gs, b)           \
   template [[host_name(#host "_" #name "_gs_" #gs "_b_" #b)]]                 \
   [[kernel]] void fn<itype, codec>(                                           \
       const device uint32_t*, const device codec<itype>::scale_t*,            \
@@ -515,21 +515,21 @@ gptoss_qmv_kernel(qmv_routed_p2, false, true, 2)
       const constant int&, const constant int&, const constant int&,          \
       uint3, uint, uint);
 
-instantiate_gptoss_qmv(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias_p2, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed_p2, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_qmv_codec(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_qmv_codec(affine_qmv_tail_bias, qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_qmv_codec(affine_qmv_routed_bias, qmv_routed_bias_p2, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_qmv_codec(affine_qmv_routed, qmv_routed_p2, AffineU4, bfloat16, bfloat, 64, 4)
 
-instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU2, bfloat16, bfloat, 64, 2)
-instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU2, bfloat16, bfloat, 64, 2)
-instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU2_gs32, bfloat16, bfloat, 32, 2)
-instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU2_gs32, bfloat16, bfloat, 32, 2)
-instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU2_gs128, bfloat16, bfloat, 128, 2)
-instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU2_gs128, bfloat16, bfloat, 128, 2)
+instantiate_qmv_codec(affine_qmv_routed_bias, qmv_routed_bias, AffineU2, bfloat16, bfloat, 64, 2)
+instantiate_qmv_codec(affine_qmv_routed, qmv_routed, AffineU2, bfloat16, bfloat, 64, 2)
+instantiate_qmv_codec(affine_qmv_routed_bias, qmv_routed_bias, AffineU2_gs32, bfloat16, bfloat, 32, 2)
+instantiate_qmv_codec(affine_qmv_routed, qmv_routed, AffineU2_gs32, bfloat16, bfloat, 32, 2)
+instantiate_qmv_codec(affine_qmv_routed_bias, qmv_routed_bias, AffineU2_gs128, bfloat16, bfloat, 128, 2)
+instantiate_qmv_codec(affine_qmv_routed, qmv_routed, AffineU2_gs128, bfloat16, bfloat, 128, 2)
 
-instantiate_gptoss_qmv(mxfp4_qmv_routed_bias, qmv_routed_bias, Mxfp4, bfloat16, bfloat, 32, 4)
-instantiate_gptoss_qmv(mxfp4_qmv_routed, qmv_routed, Mxfp4, bfloat16, bfloat, 32, 4)
+instantiate_qmv_codec(mxfp4_qmv_routed_bias, qmv_routed_bias, Mxfp4, bfloat16, bfloat, 32, 4)
+instantiate_qmv_codec(mxfp4_qmv_routed, qmv_routed, Mxfp4, bfloat16, bfloat, 32, 4)
 
-instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU8, bfloat16, bfloat, 64, 8)
+instantiate_qmv_codec(affine_qmv_tail_bias, qmv_tail_bias, AffineU8, bfloat16, bfloat, 64, 8)
 
-instantiate_gptoss_qmv(affine_qmv_tail, qmv_tail, AffineU8, bfloat16, bfloat, 64, 8)
+instantiate_qmv_codec(affine_qmv_tail, qmv_tail, AffineU8, bfloat16, bfloat, 64, 8)

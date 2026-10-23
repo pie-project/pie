@@ -10,12 +10,12 @@ use crate::tuning::Qmm;
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::tensor::{Bank, Tensor};
 
-const QMM_FILE: &str = "linear/quant_qmm_t.metal";
-const QMV_FILE: &str = "linear/quant_qmv.metal";
-const STAGED_FILE: &str = "linear/quant_qmm_staged.metal";
+const QMM_FILE: &str = "linear/qmm_t.metal";
+const QMV_FILE: &str = "linear/qmv.metal";
+const STAGED_FILE: &str = "linear/qmm_staged.metal";
 
 /// The PTQ1_0 ternary decode-in-dot kernel (`Dtype::Ptq1_0`, `g128_t3_f16_n`).
-const PTQ1_0_FILE: &str = "linear/quant_ptq1_0.metal";
+const PTQ1_0_FILE: &str = "linear/qmv_ptq1_0.metal";
 
 /// Production qmv entrypoint: bf16 activation in, bf16 out.
 const PTQ1_0_QMV: &str = "ptq1_0_qmv_bfloat16";
@@ -23,7 +23,7 @@ const PTQ1_0_QMV: &str = "ptq1_0_qmv_bfloat16";
 /// Weights per PTQ1_0 block; the scale is INLINE per block (single plane).
 const PTQ1_0_BLOCK: u32 = 128;
 
-const QMV_ROWS_FILE: &str = "linear/quant_qmv_rows.metal";
+const QMV_ROWS_FILE: &str = "linear/qmv_rows.metal";
 
 const QMV_ROWS_STAMP: &str = "PIE_STAMP_qmv_rows";
 
@@ -56,7 +56,7 @@ pub fn qmm_group(bm: i32) -> [u32; 3] {
     [32, 2, if bm < 2 * FRAG_ROWS { 1 } else { 2 }]
 }
 
-/// The threadgroup of the MXFP4 and fp16 routed matmuls: `quant_qmm_t.metal`'s
+/// The threadgroup of the MXFP4 and fp16 routed matmuls: `qmm_t.metal`'s
 /// `routed_wm`, two simdgroups for a tile of at most 16 rows.
 #[must_use]
 pub fn routed_group(bm: i32) -> [u32; 3] {
@@ -418,7 +418,7 @@ pub fn qmm_grid(
         return Err(refuse(
             op,
             format!(
-                "the column count is {n}, not a multiple of {bn}: `quant_qmm_t.metal` \
+                "the column count is {n}, not a multiple of {bn}: `qmm_t.metal` \
                  states `M % BM == 0, N % BN == 0 and K % BK == 0` as the \
                  condition under which the driver may select it at all, and \
                  `load_unsafe` is the only path its hot loop takes"
@@ -609,7 +609,7 @@ fn act_x_wt_over(
             op,
             format!(
                 "the weight is a symmetric {}-bit bank in groups of {}, and this plane \
-                 stamps no dense point for one: `quant_qmv.metal` instantiates the \
+                 stamps no dense point for one: `qmv.metal` instantiates the \
                  mxfp4 codec only at the routed shapes",
                 w.bits, w.group
             ),
@@ -675,7 +675,7 @@ fn act_x_wt_over(
                     if padded <= capacity_rows
                         && let Some(staged) = (scratch.precast)(padded, contraction)
                     {
-                        const FILE: &str = "linear/quant_qmm_mpp.metal";
+                        const FILE: &str = "linear/qmm_mpp.metal";
                         let aux =
                             Tensor::new(staged.buf, padded, contraction / 64, dtype::Dtype::F32);
                         ctx.fire(
@@ -1057,7 +1057,7 @@ fn act_x_wt_over(
 
 const STAGED_TILE: i32 = 8;
 
-const REGISTER_FILE: &str = "linear/quant_qmm_sg.metal";
+const REGISTER_FILE: &str = "linear/qmm_sg.metal";
 
 /// The columns of one threadgroup of the register tile: four simdgroups of 16.
 const REGISTER_COLUMNS: i32 = 64;

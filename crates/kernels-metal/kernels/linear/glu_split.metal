@@ -3,55 +3,6 @@
 using namespace metal;
 
 template <typename T>
-inline T sigmoid_stable(T x) {
-  float xf = float(x);
-  float y = 1.0f / (1.0f + metal::exp(-metal::fabs(xf)));
-  float s = (xf < 0.0f) ? (1.0f - y) : y;
-  return T(s);
-}
-
-template <typename T>
-[[kernel]] void silu_mul(
-    const device T* gate [[buffer(0)]],
-    const device T* up   [[buffer(1)]],
-    device T* out        [[buffer(2)]],
-    uint tid [[thread_position_in_grid]]) {
-  T g   = gate[tid];
-  T sg  = sigmoid_stable(g);
-  T sil = T(float(g) * float(sg));
-  out[tid] = T(float(sil) * float(up[tid]));
-}
-
-template <typename T>
-[[kernel]] void silu_mul_strided(
-    const device T* gate [[buffer(0)]],
-    const device T* up   [[buffer(1)]],
-    device T* out        [[buffer(2)]],
-    const constant int& row_pitch [[buffer(4)]],
-    uint2 tid [[thread_position_in_grid]]) {
-  const size_t i = size_t(tid.y) * size_t(row_pitch) + size_t(tid.x);
-  T g   = gate[i];
-  T sg  = sigmoid_stable(g);
-  T sil = T(float(g) * float(sg));
-  out[i] = T(float(sil) * float(up[i]));
-}
-
-#define instantiate_silu_mul_strided(name, itype)                 \
-  template [[host_name("silu_mul_strided_" #name)]]               \
-  [[kernel]] void silu_mul_strided<itype>(                        \
-      const device itype*, const device itype*, device itype*,    \
-      const constant int&, uint2);
-
-instantiate_silu_mul_strided(bfloat16, bfloat)
-
-#define instantiate_silu_mul(name, itype)                         \
-  template [[host_name("silu_mul_" #name)]]                       \
-  [[kernel]] void silu_mul<itype>(                                \
-      const device itype*, const device itype*, device itype*, uint);
-
-instantiate_silu_mul(bfloat16, bfloat)
-
-template <typename T>
 [[kernel]] void swiglu_clamp(
     const device T* gate        [[buffer(0)]],
     const device T* up          [[buffer(1)]],

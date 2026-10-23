@@ -400,7 +400,7 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
             Elemwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::norm::silu_scaled(self.ctx(), *s, self.tensor(*x))
+                elemwise::pointwise::silu_scaled(self.ctx(), *s, self.tensor(*x))
             }
             Elemwise::HcMix {
                 gates,
@@ -504,13 +504,13 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
             Elemwise::ResidualAdd { x, y, y_out: _ } => {
-                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
+                elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
             Elemwise::AddBias {
                 bias,
                 out,
                 out_out: _,
-            } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
+            } => elemwise::pointwise::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
             Elemwise::Standardize {
                 x,
                 bias,
@@ -523,10 +523,10 @@ impl Run<'_> {
                 self.tensor(*x),
             ),
             Elemwise::MulScalar { s, x, x_out: _ } => {
-                elemwise::norm::mul_scalar(self.ctx(), *s, self.tensor(*x))
+                elemwise::pointwise::mul_scalar(self.ctx(), *s, self.tensor(*x))
             }
             Elemwise::Scale { s, x, x_out: _ } => {
-                elemwise::norm::scale(self.ctx(), self.tensor(*s), self.tensor(*x))
+                elemwise::pointwise::scale(self.ctx(), self.tensor(*s), self.tensor(*x))
             }
             Elemwise::ResBlend {
                 prefix,

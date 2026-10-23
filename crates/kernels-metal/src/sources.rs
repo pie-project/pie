@@ -109,36 +109,8 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/elemwise/modulate.metal")),
     ),
     (
-        "elemwise/norm_add_bias.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_add_bias.metal")),
-    ),
-    (
-        "elemwise/norm_gated_rms.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_gated_rms.metal")),
-    ),
-    (
-        "elemwise/norm_layer_scalar.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_layer_scalar.metal")),
-    ),
-    (
-        "elemwise/norm_layernorm.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_layernorm.metal")),
-    ),
-    (
-        "elemwise/norm_residual_add.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_residual_add.metal")),
-    ),
-    (
-        "elemwise/norm_rms.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_rms.metal")),
-    ),
-    (
-        "elemwise/norm_standardize.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_standardize.metal")),
-    ),
-    (
-        "elemwise/norm_vector.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_vector.metal")),
+        "elemwise/norm.metal",
+        include_str!(concat!(source_root!(), "/elemwise/norm.metal")),
     ),
     (
         "elemwise/pointwise.metal",
@@ -197,10 +169,6 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/gather/pixels.metal")),
     ),
     (
-        "gather/ple_combine.metal",
-        include_str!(concat!(source_root!(), "/gather/ple_combine.metal")),
-    ),
-    (
         "gather/rows.metal",
         include_str!(concat!(source_root!(), "/gather/rows.metal")),
     ),
@@ -211,6 +179,10 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "linear/ane.metal",
         include_str!(concat!(source_root!(), "/linear/ane.metal")),
+    ),
+    (
+        "linear/dequant.h",
+        include_str!(concat!(source_root!(), "/linear/dequant.h")),
     ),
     (
         "linear/gemm.metal",
@@ -241,48 +213,32 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/moe/select.metal")),
     ),
     (
-        "linear/quant_block.h",
-        include_str!(concat!(source_root!(), "/linear/quant_block.h")),
+        "linear/qmm_mpp.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_mpp.metal")),
     ),
     (
-        "linear/quant_ptq1_0.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_ptq1_0.metal")),
+        "linear/qmm_sg.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_sg.metal")),
     ),
     (
-        "linear/quant_qmm_mpp.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_mpp.metal")),
+        "linear/qmm_staged.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_staged.metal")),
     ),
     (
-        "linear/quant_qmm_sg.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_sg.metal")),
+        "linear/qmm_t.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_t.metal")),
     ),
     (
-        "linear/quant_qmm_staged.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_staged.metal")),
+        "linear/qmv.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv.metal")),
     ),
     (
-        "linear/quant_qmm_t.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_t.metal")),
+        "linear/qmv_ptq1_0.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv_ptq1_0.metal")),
     ),
     (
-        "linear/quant_qmv.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmv.metal")),
-    ),
-    (
-        "linear/quant_qmv_rows.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmv_rows.metal")),
-    ),
-    (
-        "linear/quant_transcode.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_transcode.metal")),
-    ),
-    (
-        "linear/register_table.h",
-        include_str!(concat!(source_root!(), "/linear/register_table.h")),
-    ),
-    (
-        "prim/mpp.h",
-        include_str!(concat!(source_root!(), "/prim/mpp.h")),
+        "linear/qmv_rows.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv_rows.metal")),
     ),
     (
         "prim/gemm_loader.h",
@@ -301,6 +257,14 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/prim/gemm_transforms.h")),
     ),
     (
+        "prim/mpp.h",
+        include_str!(concat!(source_root!(), "/prim/mpp.h")),
+    ),
+    (
+        "prim/register_table.h",
+        include_str!(concat!(source_root!(), "/prim/register_table.h")),
+    ),
+    (
         "runtime/blit.metal",
         include_str!(concat!(source_root!(), "/runtime/blit.metal")),
     ),
@@ -315,10 +279,6 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "runtime/rebind.metal",
         include_str!(concat!(source_root!(), "/runtime/rebind.metal")),
-    ),
-    (
-        "sampling/argmax_logits.metal",
-        include_str!(concat!(source_root!(), "/sampling/argmax_logits.metal")),
     ),
     (
         "sampling/argmax_rows.metal",

@@ -112,7 +112,7 @@ pub fn conv3d(
             format!("the grid will not launch: {c_out} output channels"),
         )
     })?;
-    let entry = "spatial_conv3d_bfloat16";
+    let entry = "conv3d_bfloat16";
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of([lanes, rows_out, 1], [THREADS, 1, 1])),
         &[

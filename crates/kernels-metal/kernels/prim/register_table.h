@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// The register tile's input table (`qmm_sg_table` in linear/quant_qmm_sg.metal)
+// The register tile's input table (`qmm_sg_table` in linear/qmm_sg.metal)
 // as a producer of the tile's rows lays it while it writes them: eight rows of
 // `width` inputs, each at its lane slot; then each row's sum of each 32 inputs,
 // [group][row] f32, at `table` + 8 * width; then the split tile's arrival

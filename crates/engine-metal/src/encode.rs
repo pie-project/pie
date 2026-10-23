@@ -33,7 +33,7 @@ const ROUTER_POINTS: [&str; 2] = ["router_topk", "hash_route_gather"];
 const HASHER_FILE: &str = "gather/ngram.metal";
 
 #[cfg(target_vendor = "apple")]
-const HASHER_POINT: &str = "ple_ngram_ids";
+const HASHER_POINT: &str = "ngram_ids";
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Sink<'a> {

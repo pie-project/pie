@@ -487,7 +487,7 @@ impl Weights {
             let frame = device.frame()?;
             let sink = Sink::new(device, &frame, &pipelines, handles);
             sink.fire(
-                Fire::at("linear/quant_qmm_mpp.metal", "qmm_mpp_pack_bank")
+                Fire::at("linear/qmm_mpp.metal", "qmm_mpp_pack_bank")
                     .apply(Grid::of([work, 1, 1], [256, 1, 1])),
                 &[
                     bank.codes.arg(),
