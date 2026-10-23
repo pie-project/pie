@@ -170,17 +170,14 @@ fn rule(op: &Operation) -> Rule {
             (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
         };
     }
-    // A product at the activations' precision contracts with its weight's
-    // split; one that quantizes them first reads its weight whole.
-    if let Operation::Linear(Linear::Matmul { quant, .. }) = op {
-        return match quant {
-            None => Rule::Contract {
-                act: "act",
-                w: "w",
-                out: 0,
-                input: 1,
-            },
-            Some(_) => Rule::Whole,
+    // A product contracts with its weight's split, its activations quantized
+    // or not: one that quantizes them does so on each rank's share.
+    if let Operation::Linear(Linear::Matmul { .. }) = op {
+        return Rule::Contract {
+            act: "act",
+            w: "w",
+            out: 0,
+            input: 1,
         };
     }
     // A plain lookup reads the rows each rank holds of a row-split table; a
@@ -205,17 +202,13 @@ fn rule(op: &Operation) -> Rule {
             BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
         };
     }
-    // An expert product at the activations' precision contracts with its
-    // bank's split; one that quantizes them first reads its bank whole.
-    if let Operation::Linear(Linear::MoeSelect { quant, .. }) = op {
-        return match quant {
-            None => Rule::Contract {
-                act: "x",
-                w: "bank",
-                out: 1,
-                input: 2,
-            },
-            Some(_) => Rule::Whole,
+    // An expert product contracts with its bank's split, as a product does.
+    if let Operation::Linear(Linear::MoeSelect { .. }) = op {
+        return Rule::Contract {
+            act: "x",
+            w: "bank",
+            out: 1,
+            input: 2,
         };
     }
     // A weighted sum of routed rows is linear in them; one that adds a shared

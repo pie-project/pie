@@ -128,6 +128,18 @@ impl ExpertsThreads {
     }
 }
 
+/// Whether a load keeps the GPU's clocks up between fires with a spin on a queue of its own.
+/// Where the device runs at its power limit while it serves, the spin's draw comes out of the
+/// clocks the fires run at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.keepalive", default = "spin", tune = engine)]
+pub enum KeepAliveSpin {
+    /// The spin runs while fires come.
+    Spin,
+    /// The device idles between fires.
+    Idle,
+}
+
 /// The GPU cores the compiler prices a device at that does not say its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "compiler.unreported_cores", constant(range(1..=1024)), default = 32, tune = price)]
@@ -151,6 +163,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<AneMinColumns>()
         .add::<ExpertsPrefetch>()
         .add::<ExpertsThreads>()
+        .add::<KeepAliveSpin>()
         .add::<UnreportedCores>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     // Metal forks no side streams: one queue serves every region.

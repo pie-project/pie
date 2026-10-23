@@ -185,6 +185,8 @@ fn assert_old_tuning(
     assert_eq!(t.qmm_splitk(), Some((fill_tg, 8)), "{device}");
     assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
     assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
+    // A verify's routed MLP runs on the register expert tiles on Apple9, as Splash's does.
+    assert_eq!(t.moe_register(), family == 9, "{device}");
     assert_eq!(t.gdn_scan(), gdn_scan, "{device}");
     // An Apple10 GPU reads a prompt faster alone than beside the Neural
     // Engine, as Splash keeps a 512-token prompt there.
