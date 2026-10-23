@@ -107,10 +107,13 @@ impl EncodeOperand<'_> {
             EncodeOperand::Widened { bytes, dtype } => {
                 let width = dtype.bytes_ceil() as usize;
                 let row_bytes = &bytes[row * cols * width..(row + 1) * cols * width];
+                let buf = &mut buf[..cols];
                 match dtype {
                     DType::Bf16 => {
                         #[cfg(target_arch = "x86_64")]
                         if std::arch::is_x86_feature_detected!("avx2") {
+                            // SAFETY: avx2 was just detected, and `row_bytes` is
+                            // `cols` bf16s for the `cols` floats of `buf`.
                             unsafe { avx2::decode_bf16_row(row_bytes, buf) };
                             return;
                         }

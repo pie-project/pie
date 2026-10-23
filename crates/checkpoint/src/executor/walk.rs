@@ -1854,11 +1854,10 @@ impl Walk<'_, '_> {
                 let mut scale_out = vec![0u8; rows * groups];
                 let job = |row: usize, buf: &mut [f32], out: &mut [u8], scale: &mut [u8]| {
                     operand.row_bf16(row, cols, buf);
-                    for g in 0..groups {
-                        scale[g] = encode_mxfp4_group(
-                            &buf[g * 32..g * 32 + 32],
-                            &mut out[g * 16..g * 16 + 16],
-                        );
+                    let (groups_in, _) = buf.as_chunks::<32>();
+                    let (groups_out, _) = out.as_chunks_mut::<16>();
+                    for ((group, packed), scale) in groups_in.iter().zip(groups_out).zip(scale) {
+                        *scale = encode_mxfp4_group(group, packed);
                     }
                 };
                 encode_rows(

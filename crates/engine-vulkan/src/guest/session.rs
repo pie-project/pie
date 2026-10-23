@@ -43,14 +43,14 @@ fn desc_words(d: &ValueDesc) -> [u32; DESC_WORDS] {
     out
 }
 
-fn as_bytes<T: Copy>(items: &[T]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(size_of_val(items));
-    for item in items {
-        out.extend_from_slice(unsafe {
-            std::slice::from_raw_parts((item as *const T).cast::<u8>(), size_of::<T>())
-        });
+fn words_le(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+impl Cfg {
+    fn to_le_bytes(self) -> Vec<u8> {
+        words_le(&[self.value_count, self.temporary, self.op_count, self.lane])
     }
-    out
 }
 
 /// A stage's pipelines, which follow from its SPIR-V alone: built once per
@@ -612,7 +612,7 @@ fn build_stage(
 
     let desc_bytes: Vec<u8> = descriptors
         .iter()
-        .flat_map(|d| as_bytes(&desc_words(d)))
+        .flat_map(|d| words_le(&desc_words(d)))
         .collect();
     let offset_words: Vec<u32> = scratch
         .values
@@ -640,16 +640,17 @@ fn build_stage(
     let mut descs = Buffer::zeroed(device, desc_bytes.len().max(DESC_WORDS * 4) as u64)?;
     descs.write(0, &desc_bytes)?;
     let mut offs = Buffer::zeroed(device, (offset_words.len().max(1) * 4) as u64)?;
-    offs.write(0, &as_bytes(&offset_words))?;
+    offs.write(0, &words_le(&offset_words))?;
     let mut params = Buffer::zeroed(
         device,
         (records.len().max(1) * size_of::<OpParams>()) as u64,
     )?;
     if !records.is_empty() {
-        params.write(0, &as_bytes(&records))?;
+        let record_bytes: Vec<u8> = records.iter().flat_map(OpParams::to_le_bytes).collect();
+        params.write(0, &record_bytes)?;
     }
     let mut cfg = Buffer::with(device, size_of::<Cfg>() as u64, Memory::Host)?;
-    cfg.write(0, &as_bytes(&[config]))?;
+    cfg.write(0, &config.to_le_bytes())?;
 
     let bytes = scratch.total.max(256);
     let heap = Buffer::zeroed(device, bytes)?;

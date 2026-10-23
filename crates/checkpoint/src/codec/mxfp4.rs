@@ -12,16 +12,16 @@ pub fn decode_mxfp4_elements(bytes: &[u8]) -> Vec<f64> {
     values
 }
 
-pub fn encode_mxfp4_group(group: &[f32], out: &mut [u8]) -> u8 {
+pub fn encode_mxfp4_group(group: &[f32; 32], out: &mut [u8; 16]) -> u8 {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: avx2 just detected; slice lengths checked by callee's debug_asserts.
+        // SAFETY: avx2 was just detected, and the array types fix both lengths.
         return unsafe { avx2::encode_mxfp4_group(group, out) };
     }
     encode_mxfp4_group_scalar(group, out)
 }
 
-pub fn encode_mxfp4_group_scalar(group: &[f32], out: &mut [u8]) -> u8 {
+pub fn encode_mxfp4_group_scalar(group: &[f32; 32], out: &mut [u8; 16]) -> u8 {
     let mut absmax = 0.0f32;
     for &v in group {
         absmax = absmax.max(v.abs());
@@ -82,11 +82,9 @@ pub mod avx2 {
 
     /// # Safety
     ///
-    /// The caller must have verified AVX2 support; `group` must hold 32
-    /// floats and `out` 16 bytes.
+    /// The caller must have verified AVX2 support.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn encode_mxfp4_group(group: &[f32], out: &mut [u8]) -> u8 {
-        debug_assert!(group.len() == 32 && out.len() == 16);
+    pub unsafe fn encode_mxfp4_group(group: &[f32; 32], out: &mut [u8; 16]) -> u8 {
         unsafe {
             let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
 
