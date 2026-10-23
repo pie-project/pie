@@ -2,7 +2,7 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::attn::pool;
+use engine_xla::lower::attn::pool;
 use kernels_xla::{KvPool, RaggedTensor, Tensor};
 
 const PS: usize = 4;
@@ -222,10 +222,10 @@ fn pooled_readers_attend_over_closed_blocks() {
     let bp = b.i32(4, 1, &bpos);
     let br = b.i32(4, 1, &breq);
     let keys = b.bf16(CELLS as u32, hd as u32, &keys0);
-    let wp = b.u32(4, 1, &[0; 4]);
+    let _wp = b.u32(4, 1, &[0; 4]);
     let pages = kv_pool(&mut b, keys);
     if !b
-        .run(|ctx| pool::kv_append(ctx, et, bp, br, &pages, wp, wp))
+        .run(|ctx| pool::kv_append(ctx, et, bp, br, &pages))
         .unwrap()
     {
         return;
@@ -258,9 +258,9 @@ fn pooled_readers_attend_over_closed_blocks() {
         let lse = b.zeros(Dtype::F32, rows as u32, heads as u32);
         let pages = kv_pool(&mut b, keys);
         b.run(|ctx| {
-            if selected {
-                pool::attention_lse_selected(
-                    ctx,
+            use kernels_xla::attn::pool as call;
+            let c = if selected {
+                call::attention_lse_selected(
                     qt,
                     pt,
                     rt,
@@ -273,10 +273,9 @@ fn pooled_readers_attend_over_closed_blocks() {
                     scale,
                     o,
                     lse,
-                )
+                )?
             } else {
-                pool::attention_lse(
-                    ctx,
+                call::attention_lse(
                     qt,
                     pt,
                     rt,
@@ -287,8 +286,9 @@ fn pooled_readers_attend_over_closed_blocks() {
                     scale,
                     o,
                     lse,
-                )
-            }
+                )?
+            };
+            pool::lse(ctx, c, pages)
         })
         .unwrap();
         let (go, gl) = (b.read_f32(o), b.read_f32(lse));
