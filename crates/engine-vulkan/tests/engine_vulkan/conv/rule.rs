@@ -1,0 +1,177 @@
+//! The clip-table rules on the first Vulkan device, beside the hand-written
+//! kernel, against a host reference, exactly: conv (causal and not),
+//! upsample (the first frame kept alone or not), shuffle (a frame trimmed),
+//! unshuffle and avg-down, over three clips one of which a rule cannot shape
+//! (it lands empty) and the running row offsets after it.
+
+use kernels_slang::conv::rule as slang;
+use kernels_vulkan::Tensor;
+use kernels_vulkan::spatial::rule as hand;
+use poem_ir::Dtype;
+
+use crate::gpu::Gpu;
+
+const CLIPS: [[i32; 3]; 3] = [[3, 4, 6], [1, 3, 3], [2, 2, 4]];
+
+fn st(t: Tensor) -> kernels_slang::Tensor {
+    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
+}
+
+fn conv_axis(n: i32, k: i32, s: i32, front: i32, back: i32) -> Option<i32> {
+    let span = n + front + back - k;
+    (span >= 0).then(|| span / s.max(1) + 1)
+}
+
+/// The rule's clip `(t, h, w)`, `None` when it cannot shape it.
+fn shaped(rule: hand::GridRule, [t, h, w]: [i32; 3]) -> Option<[i32; 3]> {
+    let i = |v: [u32; 3]| v.map(|n| n as i32);
+    match rule {
+        hand::GridRule::Conv {
+            k,
+            stride,
+            pad,
+            pad_back,
+            causal_t,
+        } => {
+            let (k, s, f, b) = (i(k), i(stride), i(pad), i(pad_back));
+            let back_t = if causal_t { 0 } else { b[0] };
+            Some([
+                conv_axis(t, k[0], s[0], f[0], back_t)?,
+                conv_axis(h, k[1], s[1], f[1], b[1])?,
+                conv_axis(w, k[2], s[2], f[2], b[2])?,
+            ])
+        }
+        hand::GridRule::Upsample {
+            factor,
+            keep_first_frame,
+        } => {
+            let a = i(factor);
+            let ot = if keep_first_frame && t > 0 {
+                1 + (t - 1) * a[0]
+            } else {
+                t * a[0]
+            };
+            Some([ot, h * a[1], w * a[2]])
+        }
+        hand::GridRule::Shuffle { r, trim_t } => {
+            let a = i(r);
+            let ot = t * a[0] - trim_t as i32;
+            (ot > 0).then_some([ot, h * a[1], w * a[2]])
+        }
+        hand::GridRule::Unshuffle { r } => {
+            let a = i(r);
+            (t % a[0] == 0 && h % a[1] == 0 && w % a[2] == 0).then_some([
+                t / a[0],
+                h / a[1],
+                w / a[2],
+            ])
+        }
+        hand::GridRule::AvgDown { factor } => {
+            let a = i(factor);
+            (h % a[1] == 0 && w % a[2] == 0).then_some([(t + a[0] - 1) / a[0], h / a[1], w / a[2]])
+        }
+    }
+}
+
+fn slang_rule(rule: hand::GridRule) -> slang::GridRule {
+    match rule {
+        hand::GridRule::Conv {
+            k,
+            stride,
+            pad,
+            pad_back,
+            causal_t,
+        } => slang::GridRule::Conv {
+            k,
+            stride,
+            pad,
+            pad_back,
+            causal_t,
+        },
+        hand::GridRule::Upsample {
+            factor,
+            keep_first_frame,
+        } => slang::GridRule::Upsample {
+            factor,
+            keep_first_frame,
+        },
+        hand::GridRule::Shuffle { r, trim_t } => slang::GridRule::Shuffle { r, trim_t },
+        hand::GridRule::Unshuffle { r } => slang::GridRule::Unshuffle { r },
+        hand::GridRule::AvgDown { factor } => slang::GridRule::AvgDown { factor },
+    }
+}
+
+fn ints(gpu: &Gpu, buf: u32, n: usize) -> Vec<i32> {
+    gpu.down_f32(buf, n)
+        .iter()
+        .map(|v| v.to_bits() as i32)
+        .collect()
+}
+
+#[test]
+fn the_clip_rules_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let mut table = Vec::new();
+    let mut off = 0;
+    for c in CLIPS {
+        table.extend([c[0], c[1], c[2], off]);
+        off += c[0] * c[1] * c[2];
+    }
+    let gb = gpu.up_i32(&table);
+    let t = |buf: u32| Tensor::new(buf, CLIPS.len() as u32, 4, Dtype::I32);
+    let rules = [
+        hand::GridRule::Conv {
+            k: [3, 3, 3],
+            stride: [1, 2, 2],
+            pad: [1, 1, 1],
+            pad_back: [1, 1, 1],
+            causal_t: false,
+        },
+        hand::GridRule::Conv {
+            k: [3, 5, 5],
+            stride: [2, 1, 1],
+            pad: [2, 0, 0],
+            pad_back: [5, 0, 0],
+            causal_t: true,
+        },
+        hand::GridRule::Upsample {
+            factor: [2, 2, 2],
+            keep_first_frame: true,
+        },
+        hand::GridRule::Upsample {
+            factor: [1, 2, 3],
+            keep_first_frame: false,
+        },
+        hand::GridRule::Shuffle {
+            r: [2, 2, 2],
+            trim_t: 1,
+        },
+        hand::GridRule::Shuffle {
+            r: [1, 2, 2],
+            trim_t: 1,
+        },
+        hand::GridRule::Unshuffle { r: [1, 2, 2] },
+        hand::GridRule::AvgDown { factor: [2, 2, 2] },
+    ];
+    for rule in rules {
+        let mut want = Vec::new();
+        let mut off = 0;
+        for c in CLIPS {
+            let [ot, oh, ow] = shaped(rule, c).unwrap_or([0; 3]);
+            want.extend([ot, oh, ow, off]);
+            off += ot * oh * ow;
+        }
+        for who in ["hand", "slang"] {
+            let ob = gpu.up_i32(&[-7; 4 * CLIPS.len()]);
+            if who == "hand" {
+                gpu.run(|c| hand::derive_grid(c, t(gb), rule, t(ob)));
+            } else {
+                gpu.run_slang(|c| slang::derive_grid(c, st(t(gb)), slang_rule(rule), st(t(ob))));
+            }
+            assert_eq!(ints(&gpu, ob, 4 * CLIPS.len()), want, "{who} {rule:?}");
+        }
+    }
+}

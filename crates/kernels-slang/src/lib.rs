@@ -5,6 +5,7 @@
 //! block (`prim/params.slang`), so one source reads the same on both.
 
 pub mod attn;
+pub mod conv;
 pub mod elemwise;
 pub mod encode;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod gather;
 pub mod linear;
 pub mod sampling;
 pub mod sources;
+pub mod ssm;
 pub mod tensor;
 
 pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid, Target, Tier};

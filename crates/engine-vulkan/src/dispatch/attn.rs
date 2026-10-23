@@ -1,5 +1,4 @@
 use kernels_vulkan::attn;
-use kernels_vulkan::spatial;
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::{Attn, IndexScore, Operands, StructKind};
 
@@ -185,19 +184,22 @@ impl Run<'_> {
                 segment,
                 sm_scale,
                 o,
-            } => spatial::attn::attention(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
+            } => kernels_slang::attn::voxel::attention(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*v)),
+                crate::encode::slang_tensor(self.tensor(*grid)),
                 match segment {
-                    poem_ir::VoxelSegment::Clip => spatial::attn::Segment::Clip,
-                    poem_ir::VoxelSegment::Frames(n) => spatial::attn::Segment::Frames(*n),
+                    poem_ir::VoxelSegment::Clip => kernels_slang::attn::voxel::Segment::Clip,
+                    poem_ir::VoxelSegment::Frames(n) => {
+                        kernels_slang::attn::voxel::Segment::Frames(*n)
+                    }
                 },
                 *sm_scale,
-                self.tensor(*o),
-            ),
+                crate::encode::slang_tensor(self.tensor(*o)),
+            )
+            .map_err(crate::encode::from_slang),
             Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
