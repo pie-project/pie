@@ -4,6 +4,7 @@ mod a_narrow_device_reads_what_a_wide_one_does;
 mod argmax_answers_the_reference;
 mod dense_attention_answers_the_reference;
 mod gpu;
+mod mla_answers_the_reference;
 mod score_capture_answers_the_reference;
 mod the_attention_epilogues_answer_the_reference;
 mod the_embeddings_answer_the_reference;

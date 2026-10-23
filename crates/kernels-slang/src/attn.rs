@@ -6,6 +6,7 @@ use crate::error::Error;
 pub mod dense;
 pub mod kv_append;
 pub mod merge;
+pub mod mla;
 pub mod score;
 
 /// The heads a `width`-wide row of `head_dim`-wide heads holds.
@@ -31,4 +32,17 @@ pub(crate) fn pairs(op: &'static str, head_dim: u32) -> Result<u32, Error> {
         ));
     }
     Ok(head_dim / 2)
+}
+
+/// The bf16 words of a `width`-wide `what` plane, which must be even.
+pub(crate) fn even_lanes(op: &'static str, what: &str, width: u32) -> Result<u32, Error> {
+    if width == 0 || !width.is_multiple_of(2) {
+        return Err(refuse(
+            op,
+            format!(
+                "the {what} is {width} wide, and a bf16 plane moves as whole words (an even width)"
+            ),
+        ));
+    }
+    Ok(width / 2)
 }

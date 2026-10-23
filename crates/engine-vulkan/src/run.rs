@@ -1,4 +1,4 @@
-use kernels_vulkan::attn::mla::MlaPlan;
+use kernels_slang::attn::mla::MlaPlan;
 use kernels_vulkan::linear::moe::RoutedScratch;
 use kernels_vulkan::{
     Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
