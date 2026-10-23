@@ -93,6 +93,10 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
             } => match self.banked(*table) {
                 Some(bank) => crate::lower::lower(self.ctx(), |l| {
                     let ids_v = l.read(self.tensor(*ids))?;
@@ -124,17 +128,22 @@ impl Run<'_> {
                 }),
             },
 
-            Gather::EmbedConcat {
-                scales: Some(_), ..
+            Gather::Embed {
+                scales: Some(_),
+                weights: None,
+                concat: true,
+                ..
             } => Err(kernels_xla::Error::Unsupported {
                 op: "gather.embed_concat(mxfp8)",
             }),
-            Gather::EmbedConcat {
+            Gather::Embed {
                 ids,
                 table,
                 scales: None,
                 vocab,
                 y,
+                weights: None,
+                concat: true,
             } => match self.banked(*table) {
                 Some(bank) => {
                     let ids = self.tensor(*ids);
@@ -323,12 +332,15 @@ impl Run<'_> {
                 l.land(o_y, v)
             }),
 
-            Gather::EmbedWeighted {
+            Gather::Embed {
                 ids,
-                weights,
+                weights: Some(weights),
                 table,
                 vocab,
                 y,
+                scales: None,
+                concat: false,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let table_v = l.read(self.tensor(*table))?;
                 let ids_v = l.read(self.tensor(*ids))?;
@@ -345,6 +357,8 @@ impl Run<'_> {
                 l.land(o_y, v)
             }),
 
+            // The forms no builder makes.
+            Gather::Embed { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Gather::ScatterRows {
                 src,
                 routes,

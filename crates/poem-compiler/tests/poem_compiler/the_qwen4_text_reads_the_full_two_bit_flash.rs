@@ -15,7 +15,12 @@ fn the_full_row_emits_the_gather_the_planner_keys_on() {
             Operation::Gather(
                 Gather::NgramIds { primes, .. } | Gather::NgramIdsChunked { primes, .. },
             ) => heads.push(primes.len()),
-            Operation::Gather(Gather::EmbedConcat { table, .. }) => {
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) => {
                 let Some(Def::Weight(w)) = trace.values.get(table.0 as usize).map(|d| &d.def)
                 else {
                     panic!("the gather's table operand is not a weight");

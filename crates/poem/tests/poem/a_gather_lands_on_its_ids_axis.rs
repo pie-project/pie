@@ -63,9 +63,22 @@ fn gathered(axis: Axis, gather: Lookup) -> Ty {
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Gather(Gather::Embed { y, .. } | Gather::EmbedWeighted { y, .. }) => {
-                Some(*y)
-            }
+            Operation::Gather(
+                Gather::Embed {
+                    y,
+                    weights: None,
+                    scales: None,
+                    concat: false,
+                    ..
+                }
+                | Gather::Embed {
+                    y,
+                    weights: Some(_),
+                    scales: None,
+                    concat: false,
+                    ..
+                },
+            ) => Some(*y),
             _ => None,
         })
         .expect("the trace holds the gather it was written for");
@@ -140,7 +153,17 @@ fn the_axis_is_not_how_a_text_picks_the_op() {
         let gathers = trace
             .nodes
             .iter()
-            .filter(|node| matches!(node.op, Operation::Gather(Gather::Embed { .. })))
+            .filter(|node| {
+                matches!(
+                    node.op,
+                    Operation::Gather(Gather::Embed {
+                        weights: None,
+                        scales: None,
+                        concat: false,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             gathers, 1,

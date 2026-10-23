@@ -87,6 +87,10 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
             } => match self.banked(*table) {
                 Some(bank) => kernels_slang::gather::embed::embed_banked(
                     &self.slang(),
@@ -106,17 +110,22 @@ impl Run<'_> {
                 .map_err(crate::encode::from_slang),
             },
 
-            Gather::EmbedConcat {
-                scales: Some(_), ..
+            Gather::Embed {
+                scales: Some(_),
+                weights: None,
+                concat: true,
+                ..
             } => Err(kernels_wgpu::Error::Unsupported {
                 op: "gather.embed_concat(mxfp8)",
             }),
-            Gather::EmbedConcat {
+            Gather::Embed {
                 ids,
                 table,
                 scales: None,
                 vocab,
                 y,
+                weights: None,
+                concat: true,
             } => match self.banked(*table) {
                 Some(bank) => {
                     let (bank, ids) = match self.gathered_table(bank, self.tensor(*ids))? {
@@ -263,12 +272,15 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Gather::EmbedWeighted {
+            Gather::Embed {
                 ids,
-                weights,
+                weights: Some(weights),
                 table,
                 vocab,
                 y,
+                scales: None,
+                concat: false,
+                ..
             } => kernels_slang::gather::embed::embed_weighted(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*ids)),
@@ -279,6 +291,8 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
+            // The forms no builder makes.
+            Gather::Embed { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Gather::ScatterRows {
                 src,
                 routes,

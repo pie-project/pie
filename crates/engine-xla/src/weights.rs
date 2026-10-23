@@ -710,9 +710,21 @@ fn gather_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let table = match &node.op {
-            Operation::Gather(Gather::Embed { table, .. } | Gather::EmbedConcat { table, .. }) => {
-                Some(*table)
-            }
+            Operation::Gather(
+                Gather::Embed {
+                    table,
+                    weights: None,
+                    scales: None,
+                    concat: false,
+                    ..
+                }
+                | Gather::Embed {
+                    table,
+                    weights: None,
+                    concat: true,
+                    ..
+                },
+            ) => Some(*table),
             _ => None,
         };
         for &v in &inputs {

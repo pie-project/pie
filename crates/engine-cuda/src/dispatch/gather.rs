@@ -1,6 +1,6 @@
 use kernels_cuda::gather;
 use poem_exec::{DispatchGather, KernelError};
-use poem_ir::Gather;
+use poem_ir::{Gather, Operands};
 
 use crate::run::Run;
 
@@ -78,6 +78,10 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
             } => match self.maybe_planes(*table) {
                 Some((codes, ..))
                     if matches!(
@@ -116,12 +120,14 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 ),
             },
-            Gather::EmbedConcat {
+            Gather::Embed {
                 ids,
                 table,
                 scales: Some(scales),
                 vocab,
                 y,
+                weights: None,
+                concat: true,
             } => kernels_cuda::gather::embed_concat_mxfp8(
                 self.ctx(),
                 self.tensor(*ids),
@@ -130,12 +136,14 @@ impl Run<'_> {
                 *vocab,
                 &mut self.tensor(*y),
             ),
-            Gather::EmbedConcat {
+            Gather::Embed {
                 ids,
                 table,
                 scales: None,
                 vocab,
                 y,
+                weights: None,
+                concat: true,
             } => match self.maybe_planes(*table) {
                 #[cfg(not(feature = "rocm"))]
                 Some((codes, ..)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
@@ -233,12 +241,15 @@ impl Run<'_> {
                 &mut self.tensor(*left),
                 &mut self.tensor(*right),
             ),
-            Gather::EmbedWeighted {
+            Gather::Embed {
                 ids,
-                weights,
+                weights: Some(weights),
                 table,
                 vocab,
                 y,
+                scales: None,
+                concat: false,
+                ..
             } => kernels_cuda::gather::embed_weighted(
                 self.ctx(),
                 self.tensor(*ids),
@@ -247,6 +258,8 @@ impl Run<'_> {
                 *vocab,
                 &mut self.tensor(*y),
             ),
+            // The forms no builder makes.
+            Gather::Embed { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Gather::PoolRows { x, side, y } => kernels_cuda::gather::pool_rows(
                 self.ctx(),
                 self.tensor(*x),

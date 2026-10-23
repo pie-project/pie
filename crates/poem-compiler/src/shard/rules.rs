@@ -2,7 +2,7 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{Elemwise, Linear, NormAxis, Operands, Operation, Shard, ValueId};
+use poem_ir::{Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -193,6 +193,18 @@ fn rule(op: &Operation) -> Rule {
             Some(_) => Rule::Whole,
         };
     }
+    // A plain lookup reads the rows each rank holds of a row-split table; a
+    // weighted or concatenated one reads its table whole.
+    if let Operation::Gather(Gather::Embed {
+        weights, concat, ..
+    }) = op
+    {
+        return if weights.is_none() && !concat {
+            Rule::Lookup { table: "table" }
+        } else {
+            Rule::Whole
+        };
+    }
     let name = op.name();
     match name {
         "linear.moe_matmul_select"
@@ -212,7 +224,6 @@ fn rule(op: &Operation) -> Rule {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
             follow: &["routed", "shared"],
         },
-        "gather.embed" => Rule::Lookup { table: "table" },
         "attn.plan_prefill" | "attn.plan_decode" => Rule::Plan {
             scale: &["q_heads", KV_HEADS],
         },

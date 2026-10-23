@@ -770,7 +770,13 @@ impl Plan {
         let mut gathered = BTreeMap::new();
         let mut rows_per_token = 0u32;
         for node in &trace.nodes {
-            if let Operation::Gather(poem_ir::Gather::EmbedConcat { ids, table, .. }) = &node.op
+            if let Operation::Gather(poem_ir::Gather::Embed {
+                ids,
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) = &node.op
                 && let Ok(at) = weight_of(trace, *table)
             {
                 gathered.insert(at, ids.0);

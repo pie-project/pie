@@ -109,8 +109,6 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elemwise.sinusoid", Reads::Rows),
     entry("elemwise.tanh", Reads::Rows),
     entry("gather.embed", Reads::Rows),
-    entry("gather.embed_concat", Reads::Rows),
-    entry("gather.embed_weighted", Reads::Rows),
     entry("gather.pack_rows", Reads::Rows),
     entry("gather.scatter_live_rows", Reads::Rows),
     entry("gather.select", Reads::Rows),

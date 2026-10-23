@@ -8,36 +8,22 @@ use crate::value::ValueId;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
 #[op(group = "gather")]
 pub enum Gather {
+    /// Each id's row of `table` (`vocab` rows), times its f32 `weights`
+    /// where given; `concat` lands the rows of a token's several ids side by
+    /// side, and `scales` are an MXFP8 table's ue8m0 exponents, one a 32 of
+    /// each row.
     Embed {
         #[input(I32)]
         ids: ValueId,
-        #[input]
-        table: ValueId,
-        vocab: u32,
-        #[output]
-        y: ValueId,
-    },
-    EmbedWeighted {
-        #[input(I32)]
-        ids: ValueId,
         #[input(F32)]
-        weights: ValueId,
+        weights: Option<ValueId>,
         #[input]
         table: ValueId,
-        vocab: u32,
-        #[output]
-        y: ValueId,
-    },
-    EmbedConcat {
-        #[input(I32)]
-        ids: ValueId,
-        #[input]
-        table: ValueId,
-        /// An MXFP8 table's ue8m0 exponents, one a 32 of each row.
         #[serde(default)]
         #[input]
         scales: Option<ValueId>,
         vocab: u32,
+        concat: bool,
         #[output]
         y: ValueId,
     },

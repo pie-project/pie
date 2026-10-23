@@ -58,12 +58,14 @@ impl Run<'_> {
                 map.map(|m| self.tensor(m)),
                 self.tensor(*ngram_ids),
             ),
-            Gather::EmbedConcat {
+            Gather::Embed {
                 ids,
                 table,
                 scales: None,
                 vocab,
                 y,
+                weights: None,
+                concat: true,
             } => gather::embed_concat(
                 self.ctx(),
                 self.tensor(*ids),
@@ -76,6 +78,10 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
             } => gather::embed(
                 self.ctx(),
                 self.tensor(*ids),
@@ -143,12 +149,15 @@ impl Run<'_> {
                 self.tensor(*k),
                 self.tensor(*v),
             ),
-            Gather::EmbedWeighted {
+            Gather::Embed {
                 ids,
-                weights,
+                weights: Some(weights),
                 table,
                 vocab,
                 y,
+                scales: None,
+                concat: false,
+                ..
             } => gather::embed_weighted(
                 self.ctx(),
                 self.tensor(*ids),

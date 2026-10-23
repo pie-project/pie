@@ -77,7 +77,13 @@ impl Plan {
 
         let mut found: Option<Table> = None;
         for node in &trace.nodes {
-            let Operation::Gather(Gather::EmbedConcat { table, .. }) = &node.op else {
+            let Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) = &node.op
+            else {
                 continue;
             };
             let codes = weight_of(trace, *table)?;

@@ -8,12 +8,14 @@ pub fn embed_concat(ids: &Value, table: &Weight, vocab: u32) -> Value {
         table.compute_dtype(),
     ));
     r.push(
-        Gather::EmbedConcat {
+        Gather::Embed {
             ids: ids.id(),
             table: r.weight(table),
             scales: (table.dtype == Dtype::Mxfp8).then(|| r.weight_plane(table, poem_ir::SCALES)),
             vocab,
             y: y.id(),
+            weights: None,
+            concat: true,
         },
         &[ids],
     );
@@ -29,6 +31,9 @@ pub fn embed(ids: &Value, table: &Weight, vocab: u32) -> Value {
             table: r.weight(table),
             vocab,
             y: y.id(),
+            weights: None,
+            scales: None,
+            concat: false,
         },
         &[ids],
     );
@@ -39,12 +44,14 @@ pub fn embed_weighted(ids: &Value, weights: &Value, table: &Weight, vocab: u32) 
     let r = ids.rec();
     let y = r.fresh(tensor(ids.rows(), table.dim(1), table.compute_dtype()));
     r.push(
-        Gather::EmbedWeighted {
+        Gather::Embed {
             ids: ids.id(),
-            weights: weights.id(),
+            weights: Some(weights.id()),
             table: r.weight(table),
             vocab,
             y: y.id(),
+            scales: None,
+            concat: false,
         },
         &[ids, weights],
     );
