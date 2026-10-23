@@ -521,8 +521,9 @@ impl Run<'_> {
 }
 
 /// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs:
-/// the vector rung reads four activation rows a workgroup, kernels-vulkan's
-/// default.
+/// the vector rung reads two activation rows a workgroup, which on the 4090
+/// beat kernels-wgpu's one-row kernel at every row count from 1 to 11 where
+/// four rows lost at two (kernels-slang.md §17).
 fn qmm_ladder(
     tuning: &kernels_wgpu::Tuning,
     rows: u32,
@@ -538,7 +539,7 @@ fn qmm_ladder(
         .iter()
         .map(|q| match *q {
             Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
-            Qmm::Qmv => Rung::Qmv { vecs: 4 },
+            Qmm::Qmv => Rung::Qmv { vecs: 2 },
         })
         .collect()
 }
