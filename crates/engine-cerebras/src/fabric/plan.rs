@@ -5,7 +5,7 @@ use dtype::Dtype;
 use kernels_cerebras::Tensor;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::linear::gemm::FABRIC_SUM_WORDS;
-use kernels_cerebras::phase::{BlockPlan, LanePlan, Reduce};
+use kernels_cerebras::phase::{BlockPlan, Reduce};
 use kernels_cerebras::plan::{
     BlockSplit, Blocks, Footprint, Held, LSE_GROUPS, LaneSplit, Merge, PageSplit, PagedLanes,
     Pages, Plan, Product, Routed, RoutedSplit, Slots, Spread,
@@ -34,10 +34,6 @@ impl Plan for Planner {
 
     fn packs_pool(&self, plane: Tensor) -> bool {
         self.fabric.half_pool && plane.dtype == Dtype::Bf16 && plane.width.is_multiple_of(2)
-    }
-
-    fn lanes(&self, plan: &LanePlan) -> Result<u32, Error> {
-        lanes(&self.fabric, plan)
     }
 
     fn holds(&self, held: Held) -> bool {
@@ -75,34 +71,6 @@ impl Plan for Planner {
     fn merge(&self, merge: Merge) -> bool {
         self::merge(&self.fabric, merge)
     }
-}
-
-/// The PEs a lane plan runs on: its own, or under the resident placement
-/// the row (idle PEs past its own), where a lane whose state splits over
-/// PEs merges its partials over the whole row or not at all.
-pub fn lanes(fab: &Fabric, plan: &LanePlan) -> Result<u32, Error> {
-    let Some(pes) = fab.resident_pes else {
-        return Ok(plan.pes);
-    };
-    if plan.pes > pes {
-        return Err(refuse(
-            "lanes",
-            format!(
-                "the lane plan wants {} PEs; the resident row has {pes}",
-                plan.pes
-            ),
-        ));
-    }
-    let whole_row = plan.reduce.iter().all(|(_, r)| {
-        matches!(r, Reduce::FabricRoot { group } | Reduce::FabricSum { group } if *group == pes)
-    });
-    if !whole_row {
-        return Err(refuse(
-            "lanes",
-            "the resident placement merges a lane's partials over the whole row or not at all",
-        ));
-    }
-    Ok(pes)
 }
 
 /// Whether the partials of `merge` combine on the fabric: when the terms

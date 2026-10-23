@@ -449,8 +449,8 @@ fn select_impl(
             window: None,
             pages: None,
         };
-        let y_words = plan.plane_words(&plan.cols[1]);
-        let hdr = cx.lanes(plan)?;
+        let at = cx.lanes(plan)?;
+        let (hdr, y_words) = (at.header, at.planes[1]);
         cx.call(
             Kernel::MoeSelect,
             vec![

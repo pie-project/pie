@@ -223,9 +223,9 @@ pub fn bidirectional(
                 window: Some((c0, n)),
                 pages: None,
             };
-            let o_words = plan.plane_words(&plan.cols[3]);
-            let l_words = plan.plane_words(&plan.cols[4]);
-            let hdr = cx.lanes(plan)?;
+            let at = cx.lanes(plan)?;
+            let (o_words, l_words) = (at.planes[3], at.planes[4]);
+            let hdr = at.header;
             if merge {
                 super::paged::lse_merge(cx, &ob, &lse, o_words, l_words, ag, ag * hg);
             }

@@ -11,8 +11,8 @@ use crate::csl::{Block, Dsd1, Func};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan, PagePlan,
-    PageSource, Phase, Reduce, Shard, Sink,
+    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan, LanesAt, Phase,
+    Reduce, Shard, Sink,
 };
 use crate::plan::Plan;
 use crate::tensor::Tensor;
@@ -93,46 +93,20 @@ impl<'a> Cx<'a> {
         self.host = Some(op);
     }
 
-    /// Spreads this phase over lanes as `plan` says: the plan's header and
-    /// banks get their per-PE shapes, and the phase runs on the PEs the
-    /// engine places the plan on ([`Plan::lanes`]).
-    pub fn lanes(&mut self, mut plan: LanePlan) -> Result<Buf, Error> {
-        plan.pes = self.p.plan().lanes(&plan)?;
-        self.pes = plan.pes.max(1);
-        let header = self
-            .p
-            .declare(&plan.header, Dtype::I32, plan.pes, 16, true)?;
-        self.shards
-            .push((plan.header.clone(), Shard::Rows(plan.pes)));
-        for (bank, stride, split) in &plan.banks {
-            let buf = Buf {
-                name: bank.clone(),
-                rows: 0,
-                width: 0,
-                elem: "f32",
-            };
-            self.shards.retain(|(n, _)| *n != buf.name);
-            self.shards.push((
-                bank.clone(),
-                Shard::Local(plan.page_slots() * plan.slot_words(*stride, *split)),
-            ));
-        }
-        for plane in &plan.cols {
-            self.shards.retain(|(n, _)| *n != plane.name);
-            self.shards
-                .push((plane.name.clone(), Shard::Local(plan.plane_words(plane))));
-        }
-        if let Some(PagePlan {
-            source: PageSource::Csr { indices, .. },
-            ..
-        }) = &plan.pages
-        {
-            self.shards.retain(|(n, _)| *n != *indices);
-            self.shards
-                .push((indices.clone(), Shard::Local(plan.local_rows())));
+    /// Spreads this phase over lanes as `plan` says, where the engine places
+    /// them ([`Sink::lanes`]): the phase runs on the PEs it chooses, and the
+    /// plan's header and every buffer it holds by lane or block take their
+    /// shares of a PE.
+    pub fn lanes(&mut self, mut plan: LanePlan) -> Result<LanesAt, Error> {
+        let at = self.p.lanes(&plan)?;
+        plan.pes = at.pes;
+        self.pes = at.pes.max(1);
+        for (name, shard) in &at.shards {
+            self.shards.retain(|(n, _)| n != name);
+            self.shards.push((name.clone(), *shard));
         }
         self.lane = Some(plan);
-        Ok(header)
+        Ok(at)
     }
 
     /// Runs this phase over `pes` PEs; buffers spread as [`Cx::shard`] says.

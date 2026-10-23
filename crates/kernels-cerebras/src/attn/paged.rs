@@ -569,9 +569,10 @@ fn attend(
                             strided_pages: strided_pages.unwrap_or(0),
                         }),
                     };
-                    let o_words = plan.plane_words(&plan.cols[1]);
-                    let l_words = plan.cols.get(2).map_or(0, |c| plan.plane_words(c));
-                    let hdr = cx.lanes(plan)?;
+                    let at = cx.lanes(plan)?;
+                    let o_words = at.planes[1];
+                    let l_words = at.planes.get(2).copied().unwrap_or(0);
+                    let hdr = at.header;
                     if let (true, Some(l)) = (fabric, &lse_buf) {
                         lse_merge_with(cx, &ob, l, o_words, l_words, merge_group, pes, strided);
                     }
@@ -1034,31 +1035,33 @@ fn append(
                 } else {
                     (None, Vec::new())
                 };
-                let hdr = cx.lanes(LanePlan {
-                    pes,
-                    kind: LaneKind::PerRow { lanes: k.rows },
-                    header,
-                    slots: pb.name.clone(),
-                    banks,
-                    block,
-                    lanes_per_pe: rows_per_pe,
-                    a_first: false,
-                    row_outputs: Vec::new(),
-                    cols,
-                    reduce: Vec::new(),
-                    window: None,
-                    pages: Some(PagePlan {
-                        source: PageSource::Rows {
-                            table: pb.name.clone(),
-                        },
-                        page_size: ps,
-                        max_pages: 1,
-                        rewritten: vec![pb.name.clone()],
-                        page_groups: 1,
-                        strided: strided_pages.is_some(),
-                        strided_pages: strided_pages.unwrap_or(0),
-                    }),
-                })?;
+                let hdr = cx
+                    .lanes(LanePlan {
+                        pes,
+                        kind: LaneKind::PerRow { lanes: k.rows },
+                        header,
+                        slots: pb.name.clone(),
+                        banks,
+                        block,
+                        lanes_per_pe: rows_per_pe,
+                        a_first: false,
+                        row_outputs: Vec::new(),
+                        cols,
+                        reduce: Vec::new(),
+                        window: None,
+                        pages: Some(PagePlan {
+                            source: PageSource::Rows {
+                                table: pb.name.clone(),
+                            },
+                            page_size: ps,
+                            max_pages: 1,
+                            rewritten: vec![pb.name.clone()],
+                            page_groups: 1,
+                            strided: strided_pages.is_some(),
+                            strided_pages: strided_pages.unwrap_or(0),
+                        }),
+                    })?
+                    .header;
                 (
                     format!("{0}[7], {0}[8]", hdr.name),
                     if head_groups > 1 {

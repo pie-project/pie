@@ -243,7 +243,7 @@ fn lane_range(
         window: None,
         pages: None,
     };
-    let hdr = cx.lanes(plan)?;
+    let hdr = cx.lanes(plan)?.header;
     Ok((
         format!("{0}[0], {0}[1], {0}[3], {0}[4], {0}[5], {0}[6]", hdr.name),
         split.lanes_per_pe,

@@ -21,10 +21,12 @@ use kernels_cerebras::cx::View as Placed;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
-    Buf, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, PageSource, Phase, Shard, Sink,
+    Buf, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, LanesAt, PageSource, Phase, Shard,
+    Sink,
 };
 use kernels_cerebras::plan::Plan;
 
+mod lanes;
 mod plan;
 mod table;
 
@@ -224,6 +226,10 @@ impl Sink for Emitting<'_> {
 
     fn helper(&mut self, name: &'static str, text: &'static str) {
         self.program.helper(name, text);
+    }
+
+    fn lanes(&mut self, plan: &LanePlan) -> Result<LanesAt, Error> {
+        lanes::place(self.program, self.plan.row(), plan)
     }
 
     fn phase(&mut self, mut phase: Phase) {

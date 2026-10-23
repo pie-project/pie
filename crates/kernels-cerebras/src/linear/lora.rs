@@ -213,8 +213,8 @@ pub fn correct(
             window: None,
             pages: None,
         };
-        let w_words = plan.plane_words(&plan.cols[1]);
-        let hdr = cx.lanes(plan)?;
+        let at = cx.lanes(plan)?;
+        let (hdr, w_words) = (at.header, at.planes[1]);
         cx.call(
             Kernel::LoraDown,
             vec![
@@ -281,8 +281,8 @@ pub fn correct(
             window: None,
             pages: None,
         };
-        let y_words = plan.plane_words(&plan.cols[1]);
-        let hdr = cx.lanes(plan)?;
+        let at = cx.lanes(plan)?;
+        let (hdr, y_words) = (at.header, at.planes[1]);
         cx.call(
             Kernel::LoraUp,
             vec![

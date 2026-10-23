@@ -7,7 +7,7 @@
 //! entry then writes its calls against the split it is handed.
 
 use crate::error::Error;
-use crate::phase::{BlockPlan, LanePlan, Reduce};
+use crate::phase::{BlockPlan, Reduce};
 use crate::tensor::Tensor;
 
 /// The engine's planner: the placement a fire takes, and the split it
@@ -25,9 +25,6 @@ pub trait Plan {
     /// Whether the engine keeps the kv pool plane `plane` packed two bf16
     /// a word (see `Sink::pool_half`).
     fn packs_pool(&self, plane: Tensor) -> bool;
-
-    /// The PEs `plan` runs on, or why the placement refuses it.
-    fn lanes(&self, plan: &LanePlan) -> Result<u32, Error>;
 
     /// Whether one PE holds `held`.
     fn holds(&self, held: Held) -> bool;
