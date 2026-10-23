@@ -2,7 +2,7 @@
 # spellings, and DiffusionGemma's own.
 
 load("//lib/dflash/formats.poem", "bind_aux")
-load("//lib/modelopt/formats.poem", "nvfp4_bank")
+load("//pie/codec.poem", "nvfp4_bank")
 
 def product(xs):
     out = 1

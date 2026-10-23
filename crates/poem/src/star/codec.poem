@@ -1,0 +1,569 @@
+# The importer's codecs: how a release stores its quantized weights, and how
+# each lands as a weight of the encoding its deployment declares. A package
+# names a weight's legs (`weight`) or a bank's experts' legs (`bank`) and
+# this module reads them as the checkpoint stores them: a release's block
+# FP8 (e4m3 codes beside `*.weight_scale_inv` 128-square block factors, or
+# modelopt's one `.weight_scale`), compressed-tensors' per-channel FP8 (one
+# `.weight_scale` a row), MXFP8 (e4m3 codes beside an e8m0 exponent a 1x32
+# block) and modelopt's NVFP4 (e2m1 pairs, e4m3 scales a 16, a tensor scale
+# and an input scale). A weight the deployment reads plainly is read as
+# stored; a quantized leg of it is refused, or, where its package says it
+# may be (`widen`), dequantized to bf16 first.
+
+E4M3 = raw(dtype.e4m3)
+
+E8M0 = raw(dtype.e8m0)
+
+F32 = raw(dtype.f32)
+
+BF16 = raw(dtype.bf16)
+
+TILE = [dtype.e4m3tile128, dtype.e4m3tile128a8]
+
+CHANNEL = [dtype.e4m3g128, dtype.e4m3g128a8]
+
+MX = [dtype.mxfp8, dtype.mxfp8a8g32]
+
+# Block FP8.
+
+def fp8_proj(w):
+    """Whether the projection `w` keeps the release's own FP8."""
+    return w != None and w.dtype in [dtype.e4m3tile128, dtype.e4m3tile128a8]
+
+def block_factors(reads, name):
+    """The block factors `name`, read as f32: as stored, or, stored bf16 (as
+    Qwen's FP8 releases store them), widened exactly into an f32 tensor of
+    their own, which the join reads."""
+    if stored(name) == raw(dtype.f32):
+        return src(name)
+    reads.push(tensor(name + ".f32", src(name).cast(raw(dtype.f32)), raw(dtype.f32), internal = True))
+    return out(name + ".f32")
+
+def fp8_read(reads, w, names):
+    """The projection `w` as the release stores it: its legs' e4m3 codes
+    joined along the rows, and their `*.weight_scale_inv` f32 block factors
+    joined likewise, byte for byte."""
+    rows, cols = w.shape[0], w.shape[1]
+    codes = [src(name) for name in names]
+    factors = []
+    for name in names:
+        factor = name[:-len(".weight")] + ".weight_scale_inv"
+        if modelopt_fp8(name):
+            # modelopt's one scale a projection, every 128-square block's
+            # factor: the codes are read as they are.
+            leg_rows = shape(name)[0]
+            if leg_rows % 128 != 0 or cols % 128 != 0:
+                fail("`{}`: `{}` is {} and its one scale lands as 128-square block factors only on whole blocks".format(w.name, name, shape(name)))
+            one = src(name[:-len(".weight")] + ".weight_scale").transmute([1, 1], raw(dtype.f32))
+            factors.append(one.gather(1, [0] * (cols // 128)).gather(0, [0] * (leg_rows // 128)))
+            continue
+        if not has(factor):
+            fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
+        factors.append(block_factors(reads, factor))
+    counted = [(rows + 127) // 128, (cols + 127) // 128]
+    reads.extend([
+        tensor(w.name, codes[0] if len(codes) == 1 else concat(0, codes), encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), factors[0] if len(factors) == 1 else concat(0, factors), encoding(dtype.f32), shape = counted),
+    ])
+
+def fp8_rows(reads, w, names, rows):
+    """The projection `w` as the release stores the one leg `names`, its
+    rows gathered in the order `rows` lists them: the codes row for row, the
+    block factors a block row for every 128 rows, which `rows` keeps whole."""
+    if len(names) != 1:
+        fail("`{}`: a row gather reads one leg, not {}".format(w.name, names))
+    name = names[0]
+    blocks = []
+    for at in range(0, len(rows), 128):
+        run = rows[at:at + 128]
+        if len(run) != 128 or run[0] % 128 != 0 or run != list(range(run[0], run[0] + 128)):
+            fail("`{}`: its rows gather `{}` within its 128-square blocks, which the block factors cannot follow".format(w.name, name))
+        blocks.append(run[0] // 128)
+    scale = name[:-len(".weight")] + ".weight_scale_inv"
+    factors = src(scale).gather(0, blocks)
+    if stored(scale) != raw(dtype.f32):
+        reads.push(tensor(scale + ".f32", factors.cast(raw(dtype.f32)), raw(dtype.f32), internal = True))
+        factors = out(scale + ".f32")
+    n, k = w.shape[0], w.shape[1]
+    reads.extend([
+        tensor(w.name, src(name).gather(0, rows), encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), factors, encoding(dtype.f32), shape = [n // 128, (k + 127) // 128]),
+    ])
+
+def modelopt_fp8(name):
+    """Whether `name` is stored as modelopt's FP8: e4m3 codes under one
+    `.weight_scale`, not the release's 128-square block factors."""
+    stem = name[:-len(".weight")]
+    return stored(name) == raw(dtype.e4m3) and has(stem + ".weight_scale") and not has(name + "_scale_inv")
+
+def released_fp8(w):
+    """Whether the bank `w` keeps the release's own FP8: e4m3 codes under
+    one f32 factor a 128x128 block."""
+    return w.dtype in [dtype.e4m3tile128, dtype.e4m3tile128a8]
+
+def fp8_bank(reads, w, legs):
+    """A routed bank as the release stores it, byte for byte: each expert's
+    legs (`legs[e]`) e4m3 codes and `*.weight_scale_inv` block factors,
+    stacked on the leading axis as the bank's `[experts, ...]` rectangle."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    per = rows // len(legs[0])
+    codes = []
+    factors = []
+    for names in legs:
+        for name in names:
+            factor = name[:-len(".weight")] + ".weight_scale_inv"
+            if not has(factor):
+                fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
+            codes.append(src(name).transmute([1, per, cols], encoding(dtype.e4m3)))
+            factors.append(block_factors(reads, factor).transmute([1, per // 128, cols // 128], encoding(dtype.f32)))
+    counted = [experts, rows // 128, cols // 128]
+    codes = concat(0, codes)
+    factors = concat(0, factors)
+    # Two legs an expert (gate, up) stack to `[2E, inter, cols]`, which is
+    # the declared `[E, 2*inter, cols]` rectangle byte for byte.
+    if len(legs[0]) > 1:
+        codes = codes.transmute(list(w.shape), encoding(dtype.e4m3))
+        factors = factors.transmute(counted, encoding(dtype.f32))
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), factors, encoding(dtype.f32), shape = counted),
+    ])
+
+# A cast inside a join or a cut has no block factors to read, so an FP8
+# tensor that is joined or cut is first dequantized whole into a bf16 tensor
+# of its own, and the join or the cut reads that.
+
+
+# Per-channel FP8 (compressed-tensors).
+
+def channel_fp8(name):
+    """Whether `name` is stored as compressed-tensors' per-channel FP8: e4m3
+    codes beside a `.weight_scale` of one value a row."""
+    stem = name[:-len(".weight")]
+    scale = stem + ".weight_scale"
+    if stored(name) != E4M3 or not has(scale):
+        return False
+    held = shape(scale)
+    return len(held) == 2 and held[0] == shape(name)[0] and held[1] == 1
+
+def channel_kept(w):
+    """Whether `w` keeps per-channel FP8 codes (`e4m3g128`, a factor a row
+    every 128 along it)."""
+    return w != None and w.dtype in [dtype.e4m3g128, dtype.e4m3g128a8]
+
+def factors(reads, name, cols):
+    """`name`'s row scales as the f32 factors `[rows, cols / 128]` of its
+    128-wide spans: a bf16 scale widened exactly first."""
+    scale = name[:-len(".weight")] + ".weight_scale"
+    if not channel_fp8(name):
+        fail("`{}` is read as per-channel FP8, e4m3 codes under one `{}` a row, and is stored {} beside {}".format(
+            name, scale, stored(name), shape(scale) if has(scale) else "no scale"))
+    rows, spans = shape(name)[0], (cols + 127) // 128
+    wide = scale + ".f32"
+    spread = src(scale).gather(1, [0] * spans)
+    # An f32 scale's spread lowers to byte runs, which a bank's join takes;
+    # a bf16 one is widened into a tensor of its own first.
+    if stored(scale) == F32:
+        return spread
+    reads.push(tensor(wide, spread.cast(F32), F32, shape = [rows, spans], internal = True))
+    return out(wide)
+
+def channel_fp8_read(reads, w, names):
+    """The projection `w` from its legs `names` (joined along the rows):
+    their codes as stored, each row's scale its factors."""
+    cols = w.shape[1]
+    codes = [src(name) for name in names]
+    rows = [factors(reads, name, cols) for name in names]
+    one = len(names) == 1
+    reads.extend([
+        tensor(w.name, codes[0] if one else concat(0, codes), encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), rows[0] if one else concat(0, rows), encoding(dtype.f32), shape = [w.shape[0], (cols + 127) // 128]),
+    ])
+
+def channel_fp8_bank(reads, w, legs):
+    """A routed bank, each expert's legs (`legs[e]`) per-channel FP8, stacked
+    on the leading axis as the bank's `[experts, rows, cols]` rectangle."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    per = rows // len(legs[0])
+    spans = (cols + 127) // 128
+    codes = []
+    scales = []
+    for names in legs:
+        for name in names:
+            codes.append(src(name).transmute([1, per, cols], encoding(dtype.e4m3)))
+            scales.append(factors(reads, name, cols).transmute([1, per, spans], encoding(dtype.f32)))
+    counted = [experts, rows, spans]
+    codes = concat(0, codes)
+    scales = concat(0, scales)
+    if len(legs[0]) > 1:
+        codes = codes.transmute(list(w.shape), encoding(dtype.e4m3))
+        scales = scales.transmute(counted, encoding(dtype.f32))
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), scales, encoding(dtype.f32), shape = counted),
+    ])
+
+
+# MXFP8.
+
+def mx_proj(w):
+    """Whether `w` keeps the release's own MXFP8."""
+    return w != None and w.dtype in [dtype.mxfp8, dtype.mxfp8a8g32]
+
+def exponents_of(name):
+    """Where the exponents of the MXFP8 codes `name` are stored, or None."""
+    stem = name[:-len(".weight")] if name.endswith(".weight") else None
+    for beside in [name + "_scale_inv", stem + ".weight_scale" if stem != None else None, name + "_scale"]:
+        if beside != None and has(beside):
+            return beside
+    return None
+
+def codes(name):
+    """The e4m3 codes `name`, as stored."""
+    if stored(name) != E4M3:
+        fail("`{}` is read as MXFP8 codes, e4m3, and is stored {}".format(name, stored(name)))
+    return src(name)
+
+def exponents(name, rows = None):
+    """The e8m0 exponents of the codes `name`, one a 32 of each row, as
+    stored (bytes) read as e8m0; `rows`, if given, the rows kept, in order."""
+    beside = exponents_of(name)
+    if beside == None:
+        fail("`{}` holds MXFP8 codes whose exponents are stored beside it (`_scale_inv` or `.weight_scale`), and the checkpoint holds none".format(name))
+    dims = shape(name)
+    want = dims[:-1] + [dims[-1] // 32]
+    if dims[-1] % 32 != 0 or shape(beside) != want or stored(beside) not in [raw(dtype.u8), E8M0]:
+        fail("`{}` is stored {} {}; the exponents of `{}` {} are one byte a 1x32 block, {}".format(beside, stored(beside), shape(beside), name, dims, want))
+    e = src(beside)
+    if rows != None:
+        e = e.gather(0, rows)
+        want = [len(rows)] + want[1:]
+    if stored(beside) == E8M0:
+        return e
+    return e.transmute(want, E8M0)
+
+def mx_read(reads, w, names, rows = None):
+    """The projection `w` as the release stores it: its legs' e4m3 codes
+    joined along the rows, their exponents likewise; `rows`, if given, the
+    joined rows it keeps, in order."""
+    n, k = w.shape[0], w.shape[1]
+    if rows != None and len(names) != 1:
+        fail("`{}`: a row gather reads one leg, not {}".format(w.name, names))
+    c = [codes(name) for name in names]
+    e = [exponents(name, rows) for name in names]
+    c = c[0] if len(c) == 1 else concat(0, c)
+    e = e[0] if len(e) == 1 else concat(0, e)
+    if rows != None:
+        c = c.gather(0, rows)
+    reads.extend([
+        tensor(w.name, c, encoding(dtype.e4m3), shape = [n, k]),
+        tensor(scales_name(w.name), e, encoding(dtype.e8m0), shape = [n, k // 32]),
+    ])
+
+def mx_bank(reads, w, legs):
+    """A routed bank as the release stores it, byte for byte: each expert's
+    legs (`legs[e]`) e4m3 codes and exponents, stacked on the leading axis
+    as the bank's `[experts, rows, k]` rectangle (gate and up stack to `[2E,
+    inter, k]`, the same bytes)."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    per = rows // len(legs[0])
+    c = []
+    e = []
+    for names in legs:
+        for name in names:
+            c.append(codes(name).transmute([1, per, cols], E4M3))
+            e.append(exponents(name).transmute([1, per, cols // 32], E8M0))
+    c = concat(0, c)
+    e = concat(0, e)
+    if len(legs[0]) > 1:
+        c = c.transmute(list(w.shape), E4M3)
+        e = e.transmute([experts, rows, cols // 32], E8M0)
+    reads.extend([
+        tensor(w.name, c, encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), e, encoding(dtype.e8m0), shape = [experts, rows, cols // 32]),
+    ])
+
+def mx_stacked_bank(reads, w, name):
+    """A routed bank stored stacked as `w` lays it, `[experts, rows, k]`
+    codes beside `[experts, rows, k / 32]` exponents."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    if shape(name) != list(w.shape):
+        fail("`{}` is stored {} and `{}` is declared {}".format(name, shape(name), w.name, w.shape))
+    reads.extend([
+        tensor(w.name, codes(name), encoding(dtype.e4m3), shape = list(w.shape)),
+        tensor(scales_name(w.name), exponents(name), encoding(dtype.e8m0), shape = [experts, rows, cols // 32]),
+    ])
+
+def mx_widened(reads, name):
+    """The MXFP8 codes `name` as bf16, for a weight read at bf16: each code
+    times its block's exponent (exact in f32), rounded once."""
+    c, e = codes(name), exponents(name)
+    # The exponents land as e8m0 first, so the widen reads them as e8m0
+    # (2^(e - 127)) and not as the bytes they are stored as.
+    reads.extend([
+        tensor(name + ".e8m0", e, E8M0, internal = True),
+        tensor(name + ".exps", out(name + ".e8m0").cast(F32), F32, internal = True),
+        tensor(name + ".f32", c.cast(F32), F32, internal = True),
+        tensor(name + ".scaled", out(name + ".f32").scale_by(out(name + ".exps")), F32, internal = True),
+        tensor(name + ".bf16", out(name + ".scaled").cast(BF16), BF16, internal = True),
+    ])
+    return out(name + ".bf16")
+
+
+# modelopt: NVFP4 banks, a projection kept e4m3 under one tensor scale.
+
+def nvfp4_bank(reads, w, experts):
+    """A routed bank of modelopt NVFP4 experts, `experts` each expert's leg
+    stems: `.weight` (e2m1 pairs), `.weight_scale` (e4m3 per 16), and scalars
+    `.weight_scale_2` (tensor scale, landed once a row) and `.input_scale`.
+    Legs stack into `[experts, rows, cols]`; an expert's legs read one
+    activation, so its first leg's input scale is the expert's."""
+    if w.dtype != dtype.nvfp4:
+        fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
+    count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    legs = len(experts[0])
+    per_leg = rows // legs
+    for stems in experts:
+        for stem in stems:
+            if not nvfp4_stored(stem + ".weight"):
+                fail("`{}`: `{}` is stored {}, not NVFP4 beside a `weight_scale_2`; this deployment reads it as NVFP4".format(w.name, stem + ".weight", stored(stem + ".weight")))
+    if len(experts) != count or per_leg * legs != rows:
+        fail("`{}` is {} and the checkpoint holds {} experts of {} legs".format(w.name, w.shape, len(experts), legs))
+    codes = []
+    scales = []
+    tensors = []
+    inputs = []
+    for stems in experts:
+        for stem in stems:
+            codes.append(src(stem + ".weight").transmute([1, per_leg, cols], grouped(w)))
+            scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 16], E4M3))
+            tensors.append(src(stem + ".weight_scale_2").transmute([1, 1], F32).gather(1, [0] * per_leg))
+        inputs.append(src(stems[0] + ".input_scale").transmute([1], F32))
+    counted = scales_shape(w)
+
+    # One leg an expert stacks to the bank's own rectangle; two read it as
+    # their `[2 * experts, rows / 2, ...]` stack.
+    whole = lambda expr, shape, encoding: expr if legs == 1 else expr.transmute(shape, encoding)
+    reads.extend([
+        tensor(w.name, whole(concat(0, codes), w.shape, grouped(w)), grouped(w)),
+        tensor(scales_name(w.name), whole(concat(0, scales), counted, E4M3), E4M3, shape = counted, scaling = w),
+        tensor(global_scales_name(w.name), whole(concat(0, tensors), [count, rows], F32), F32, shape = [count, rows], tensor_scaling = w),
+        tensor(input_scales_name(w.name), concat(0, inputs), F32, shape = [count]),
+    ])
+
+def fp8_tensor_leg(reads, name):
+    """The modelopt FP8 projection `name` as bf16: its e4m3 codes widened to
+    f32, scaled by the f32 `{stem}.weight_scale` it is stored under, and
+    rounded once to bf16. Its `{stem}.input_scale` is not read: the
+    projection runs on bf16 activations."""
+    stem = name[:-len(".weight")]
+    scale = stem + ".weight_scale"
+    if stored(name) != E4M3 or not has(scale) or stored(scale) != F32:
+        fail("`{}` is read as modelopt FP8, e4m3 codes under one `{}`, and is stored {}".format(name, scale, stored(name)))
+    factor = name + ".factor"
+    wide = name + ".f32"
+    scaled = name + ".scaled"
+    reads.extend([
+        tensor(factor, src(scale).transmute([1, 1], F32), F32, shape = [1, 1], internal = True),
+        tensor(wide, src(name).cast(F32), F32, internal = True),
+        tensor(scaled, out(wide).scale_by(out(factor)), F32, internal = True),
+        tensor(name + ".bf16", out(scaled).cast(BF16), BF16, internal = True),
+    ])
+    return out(name + ".bf16")
+
+
+def nvfp4_stacked_bank(reads, w, stem, legs = None):
+    """A routed bank of modelopt NVFP4 experts stored stacked: `{stem}` e2m1
+    pairs `[experts, rows, cols / 2]`, `_weight_scale` (e4m3 per 16), and
+    `_weight_scale_2` / `_input_scale` (`[experts]`, or `[experts, legs]`
+    where gate and up stack). Tensor scales land once a row; an expert's
+    legs read one activation, so its first leg's input scale is the expert's."""
+    if w.dtype not in [dtype.nvfp4, dtype.nvfp4a4]:
+        fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
+    count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    legs = legs if legs != None else 1
+    per_leg = rows // legs
+    counted = scales_shape(w)
+    picks = []
+    for leg in range(legs):
+        picks.extend([leg] * per_leg)
+    # One leg a bank stores its scalars `[experts]`; two, `[experts, legs]`.
+    per_expert = lambda name: src(name) if legs == 1 else src(name).slice(1, 0, 1).transmute([count], F32)
+    per_row = lambda name: (src(name).transmute([count, 1], F32) if legs == 1 else src(name)).gather(1, picks)
+    reads.extend([
+        tensor(w.name, src(stem).transmute(w.shape, grouped(w)), grouped(w)),
+        tensor(scales_name(w.name), src(stem + "_weight_scale"), E4M3, shape = counted, scaling = w),
+        tensor(global_scales_name(w.name), per_row(stem + "_weight_scale_2"), F32, shape = [count, rows], tensor_scaling = w),
+        tensor(input_scales_name(w.name), per_expert(stem + "_input_scale"), F32, shape = [count]),
+    ])
+
+# A quantized leg dequantized to bf16, for a weight read plainly.
+
+def channel_widened(reads, name):
+    """The per-channel FP8 projection `name` as bf16: its e4m3 codes widened
+    to f32, each row times its scale, rounded once."""
+    rows = shape(name)[0]
+    scale = name[:-len(".weight")] + ".weight_scale"
+    reads.extend([
+        tensor(name + ".rows", src(scale) if stored(scale) == F32 else src(scale).cast(F32), F32, shape = [rows, 1], internal = True),
+        tensor(name + ".f32", src(name).cast(F32), F32, internal = True),
+        tensor(name + ".scaled", out(name + ".f32").scale_by(out(name + ".rows")), F32, internal = True),
+    ])
+    return out(name + ".scaled").cast(BF16)
+
+def nvfp4_widened(reads, name):
+    """The modelopt NVFP4 projection `name` as bf16: its e2m1 codes times
+    their e4m3 scale a 16 times the tensor's `weight_scale_2`."""
+    stem = name[:-len(".weight")]
+    rows, half = shape(name)[0], shape(name)[1]
+    cols = 2 * half
+    reads.extend([
+        tensor(name + ".scales", src(stem + ".weight_scale").cast(F32), F32, internal = True),
+        tensor(name + ".tensor", src(stem + ".weight_scale_2").transmute([1, 1], F32), F32, shape = [1, 1], internal = True),
+        tensor(name + ".blocked", src(name).transmute([rows, cols], encoding(dtype.nvfp4)).scale_by(out(name + ".scales")), BF16, internal = True),
+    ])
+    return out(name + ".blocked").scale_by(out(name + ".tensor"))
+
+def block_widened(reads, name):
+    """The block FP8 tensor `name` as bf16, dequantized by its block factors."""
+    reads.push(tensor(name + ".bf16", src(name).cast(BF16), BF16, internal = True))
+    return out(name + ".bf16")
+
+def nvfp4_stored(name):
+    """Whether `name` is stored as modelopt's NVFP4: e2m1 pairs beside a
+    `weight_scale_2`."""
+    return name.endswith(".weight") and has(name[:-len(".weight")] + ".weight_scale_2")
+
+def kind(name):
+    """How the leg `name` is stored: plain, or the scheme that quantizes it."""
+    if stored(name) == E4M3:
+        if channel_fp8(name):
+            return "per-channel FP8"
+        if modelopt_fp8(name):
+            return "modelopt FP8"
+        if exponents_of(name) != None and stored(exponents_of(name)) in [raw(dtype.u8), E8M0]:
+            return "MXFP8"
+        return "block FP8"
+    if nvfp4_stored(name):
+        return "NVFP4"
+    return None
+
+def dequantized(reads, name):
+    """The leg `name` as bf16: as stored where it is not quantized, else
+    dequantized by its scheme's scales."""
+    k = kind(name)
+    if k == None:
+        return src(name)
+    if k == "per-channel FP8":
+        return channel_widened(reads, name)
+    if k == "modelopt FP8":
+        return fp8_tensor_leg(reads, name)
+    if k == "MXFP8":
+        return mx_widened(reads, name)
+    if k == "NVFP4":
+        return nvfp4_widened(reads, name)
+    return block_widened(reads, name)
+
+def land(reads, w, value):
+    """`w` from the bf16 `value`, encoded to its own dtype."""
+    if w.dtype == dtype.bf16:
+        reads.push(tensor(w.name, value, BF16))
+    else:
+        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
+
+# What a package calls.
+
+def kept(w):
+    """Whether `w` keeps a release's quantized encoding (block or per-channel
+    FP8, MXFP8, NVFP4): the release's own planes are what it reads."""
+    return w != None and w.dtype in TILE + CHANNEL + MX + [dtype.nvfp4, dtype.nvfp4a4]
+
+def weight(reads, w, names, rows = None, quantized = "refuse"):
+    """The weight `w` from its legs `names` (one name, or several joined
+    along its rows), `rows` (if given) the joined rows it keeps, in order: as
+    the release stores it where `w` keeps the release's encoding, else read
+    as stored. A quantized leg of a weight read so is, by `quantized`:
+    refused where its codes are e4m3 (`"refuse"`); left to the importer's
+    own read (`"read"`); or dequantized to bf16 here (`"widen"`)."""
+    if quantized not in ["refuse", "read", "widen"]:
+        fail("`{}`: a quantized leg is refused, read or widened, not {}".format(w.name, quantized))
+    if type(names) == "string":
+        names = [names]
+    if w.dtype in TILE:
+        for name in names:
+            if channel_fp8(name):
+                fail("`{}` is stored per-channel FP8, and this deployment reads it as 128-square blocks; import the deployment that keeps it e4m3g128a8".format(name))
+        if rows != None:
+            fp8_rows(reads, w, names, rows)
+        else:
+            fp8_read(reads, w, names)
+        return
+    if w.dtype in CHANNEL:
+        channel_fp8_read(reads, w, names)
+        return
+    if w.dtype in MX:
+        mx_read(reads, w, names, rows)
+        return
+    # An NVFP4 weight reads NVFP4 legs as the importer reads their planes.
+    keeps = lambda name: kind(name) == "NVFP4" and w.dtype in [dtype.nvfp4, dtype.nvfp4a4]
+    held = [name for name in names if kind(name) != None and not keeps(name)]
+    if quantized == "refuse":
+        for name in held:
+            if stored(name) == E4M3:
+                fail("`{}`: `{}` is stored {} and this deployment reads it as {}; import the deployment that keeps it".format(w.name, name, kind(name), w.dtype))
+    if held and quantized == "widen":
+        # One block FP8 leg the importer dequantizes as it reads it.
+        if len(names) == 1 and rows == None and kind(names[0]) == "block FP8":
+            reads.read(w, names[0])
+            return
+        values = [dequantized(reads, name) for name in names]
+        value = values[0] if len(values) == 1 else concat(0, values)
+        if rows != None:
+            value = value.gather(0, rows)
+        land(reads, w, value)
+        return
+    if rows != None:
+        reads.read_expr(w, src(names[0]).gather(0, rows))
+    elif len(names) == 1:
+        reads.read(w, names[0])
+    else:
+        reads.read_concat(w, names)
+
+def stack(reads, w, legs):
+    """The routed bank `w` from each expert's bf16 legs `legs[e]`, joined
+    along the rows and stacked on the leading axis, encoded to its dtype."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    for names in legs:
+        for name in names:
+            if stored(name) == E4M3:
+                fail("`{}`: `{}` is stored FP8 and this deployment reads it as {}; import the deployment that keeps the release's FP8".format(w.name, name, w.dtype))
+    joined = lambda names: src(names[0]) if len(names) == 1 else concat(0, [src(name) for name in names])
+    value = concat(0, [joined(names).transmute([1, rows, cols], BF16) for names in legs])
+    if w.dtype == dtype.bf16:
+        reads.push(tensor(w.name, value, BF16))
+    else:
+        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
+
+def bank(reads, w, experts):
+    """The routed bank `w` from each expert's legs `experts[e]` (their
+    `.weight` tensors), stacked on its leading axis: as the release stores
+    it where `w` keeps the release's encoding, else bf16 legs encoded to
+    `w`'s dtype."""
+    if w.dtype in TILE:
+        fp8_bank(reads, w, experts)
+    elif w.dtype in CHANNEL:
+        channel_fp8_bank(reads, w, experts)
+    elif w.dtype in MX:
+        mx_bank(reads, w, experts)
+    elif w.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
+        nvfp4_bank(reads, w, [[name[:-len(".weight")] for name in legs] for legs in experts])
+    else:
+        stack(reads, w, experts)
+
+def stacked_bank(reads, w, stem, legs = None):
+    """The routed bank `w` stored stacked under `stem`: NVFP4 codes and their
+    scales, or MXFP8 codes and their exponents."""
+    if w.dtype in MX:
+        mx_stacked_bank(reads, w, stem)
+    else:
+        nvfp4_stacked_bank(reads, w, stem, legs)

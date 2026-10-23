@@ -18,6 +18,14 @@ entry once; a name a file only `load()`s is not its definition. `lib/`
 holds the helpers every package may load, as `//lib/…`; what a library
 defines is never a package's entry.
 
+How a release stores its quantized weights is the importer's, not a
+package's: `//pie/codec.poem`, which ships with pie, reads block FP8,
+per-channel FP8, MXFP8 and NVFP4 as the release stores them. A package's
+formats name a weight's legs (`weight(reads, w, legs)`) or a bank's experts'
+(`bank(reads, w, experts)`), and the weight's declared dtype says which
+encoding it keeps; a quantized leg of a weight read plainly is refused,
+or, with `widen = True`, dequantized to bf16.
+
 A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}]`; `yarn{f}` stretches the
 model's native context `f` times by YaRN, in a package that turns it
 (`deploy.yarn`, read into `rope_scaling(...)`); `tap.{key}`, for a parity

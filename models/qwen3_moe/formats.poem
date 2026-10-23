@@ -5,8 +5,7 @@
 # recognized by its per-head q norm and its first expert, and checked against
 # its config.
 
-load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read", "released_fp8")
-load("//lib/modelopt/formats.poem", "nvfp4_bank")
+load("//pie/codec.poem", "bank", "weight")
 
 def configured(m):
     return [
@@ -31,41 +30,6 @@ def formats(m):
         states = configured(m),
     )]
 
-def unscaled(w, name):
-    """Refuses to read `name`'s e4m3 codes as `w`'s dtype: without their
-    scales the codes are not the weight."""
-    if stored(name) == raw(dtype.e4m3):
-        fail("`{}`: `{}` is stored FP8 and this deployment reads it as {}; import the deployment that keeps the release's FP8".format(w.name, name, w.dtype))
-
-def proj(reads, w, names):
-    """`w` from its legs `names`: the release's FP8 kept, or read as stored
-    (bf16, or modelopt's NVFP4 joined leg by leg)."""
-    if fp8_proj(w):
-        fp8_read(reads, w, names)
-        return
-    for name in names:
-        unscaled(w, name)
-    if len(names) == 1:
-        reads.read(w, names[0])
-    else:
-        reads.read_concat(w, names)
-
-BF = raw(dtype.bf16)
-
-def stack(reads, w, legs):
-    """The routed bank `w` from each expert's bf16 legs `legs[e]`, joined
-    along the rows and stacked on the leading axis, encoded to its dtype."""
-    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
-    for names in legs:
-        for name in names:
-            unscaled(w, name)
-    joined = lambda names: src(names[0]) if len(names) == 1 else concat(0, [src(name) for name in names])
-    value = concat(0, [joined(names).transmute([1, rows, cols], BF) for names in legs])
-    if w.dtype == dtype.bf16:
-        reads.push(tensor(w.name, value, BF))
-    else:
-        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
-
 def read(m, reads):
     reads.read(m.embed, "model.embed_tokens.weight")
     reads.read(m.final_norm, "model.norm.weight")
@@ -73,22 +37,16 @@ def read(m, reads):
     for l, w in enumerate(m.layers):
         n = lambda s: "model.layers.{}.{}".format(l, s)
         reads.read(w.attn_norm, n("input_layernorm.weight"))
-        proj(reads, w.qkv, [n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")])
-        proj(reads, w.o, [n("self_attn.o_proj.weight")])
+        weight(
+            reads,
+            w.qkv,
+            [n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")],
+        )
+        weight(reads, w.o, [n("self_attn.o_proj.weight")])
         reads.read(w.q_norm, n("self_attn.q_norm.weight"))
         reads.read(w.k_norm, n("self_attn.k_norm.weight"))
         reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
         reads.read(w.router, n("mlp.gate.weight"))
-        stem = lambda e, leg: n("mlp.experts.{}.{}".format(e, leg))
-        gate_up = [[stem(e, "gate_proj"), stem(e, "up_proj")] for e in range(m.experts)]
-        down = [[stem(e, "down_proj")] for e in range(m.experts)]
-        weights = lambda legs: [[leg + ".weight" for leg in expert] for expert in legs]
-        if w.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
-            nvfp4_bank(reads, w.gate_up, gate_up)
-            nvfp4_bank(reads, w.down, down)
-        elif released_fp8(w.gate_up):
-            fp8_bank(reads, w.gate_up, weights(gate_up))
-            fp8_bank(reads, w.down, weights(down))
-        else:
-            stack(reads, w.gate_up, weights(gate_up))
-            stack(reads, w.down, weights(down))
+        leg = lambda e, name: n("mlp.experts.{}.{}.weight".format(e, name))
+        bank(reads, w.gate_up, [[leg(e, "gate_proj"), leg(e, "up_proj")] for e in range(m.experts)])
+        bank(reads, w.down, [[leg(e, "down_proj")] for e in range(m.experts)])

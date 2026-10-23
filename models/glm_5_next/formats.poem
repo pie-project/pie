@@ -3,7 +3,7 @@
 # `*_scale_inv`); or an imported artifact with its draft head and vision
 # tower overlaid under `aux.` (`pie model import --aux`).
 
-load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read")
+load("//pie/codec.poem", "bank", "dequantized", "kept", "weight", landed = "land")
 
 BF = raw(dtype.bf16)
 
@@ -107,16 +107,14 @@ def own_with_aux(m, reads):
 def read(reads, own, w, name):
     if own:
         reads.read_own(w)
-    elif fp8_proj(w):
-        fp8_read(reads, w, [name])
     else:
-        reads.read(w, name)
+        weight(reads, w, name, quantized = "read")
 
 def read_concat(reads, own, w, names, hf = False):
     if own:
         reads.read_own(w)
-    elif hf and fp8_proj(w):
-        fp8_read(reads, w, names)
+    elif hf and kept(w):
+        weight(reads, w, names)
     elif hf:
         joined(reads, w, names)
     else:
@@ -125,45 +123,26 @@ def read_concat(reads, own, w, names, hf = False):
 def read_stack(reads, own, w, rows, hf = False):
     if own:
         reads.read_own(w)
-    elif hf and fp8_proj(w):
-        fp8_bank(reads, w, rows)
+    elif hf and kept(w):
+        bank(reads, w, rows)
     elif hf:
         stacked(reads, w, rows)
     else:
         reads.read_stack(w, rows)
-
-# A cast inside a join or a cut has no block factors to read, so an FP8
-# tensor that is joined or stacked is first dequantized whole into a bf16
-# tensor of its own, and the join reads that.
-
-def leg(reads, name):
-    """The tensor `name` as bf16: as stored, or, stored FP8, dequantized by
-    its block factors."""
-    if stored(name) == BF:
-        return src(name)
-    reads.push(tensor(name + ".bf16", src(name).cast(BF), BF, internal = True))
-    return out(name + ".bf16")
-
-def landed(reads, w, value):
-    """`w` from the bf16 `value`, encoded to its own dtype."""
-    if w.dtype == dtype.bf16:
-        reads.push(tensor(w.name, value, BF))
-    else:
-        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
 
 def joined(reads, w, names):
     """`w` from the tensors `names`, joined along its first axis."""
     if all([stored(name) == BF for name in names]) and w.dtype == dtype.bf16:
         reads.read_concat(w, names)
     else:
-        landed(reads, w, concat(0, [leg(reads, name) for name in names]))
+        landed(reads, w, concat(0, [dequantized(reads, name) for name in names]))
 
 def stacked(reads, w, rows):
     """A bank `w`, an expert a row of `rows` (each the names its rows join
     from), stacked along its first axis."""
     each = product(w.shape) // w.shape[0]
     def one(names):
-        legs = [leg(reads, name) for name in names]
+        legs = [dequantized(reads, name) for name in names]
         return (concat(0, legs) if len(legs) > 1 else legs[0]).transmute([1, each], BF)
 
     landed(reads, w, concat(0, [one(names) for names in rows]).transmute(w.shape, BF))

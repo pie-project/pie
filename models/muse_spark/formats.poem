@@ -4,7 +4,7 @@
 # release, one plane an expert and leg (bf16, or MXFP4 codes beside their
 # e8m0 `weight_scale`).
 
-load("//lib/modelopt/formats.poem", "nvfp4_stacked_bank")
+load("//pie/codec.poem", "stacked_bank")
 
 TRUNK = "model.language_model."
 
@@ -49,7 +49,7 @@ def huggingface(m, reads):
             if bank.dtype == dtype.bf16:
                 reads.read(bank, stem)
             else:
-                nvfp4_stacked_bank(reads, bank, stem, legs = 2 if leg == "gate_up_proj" else 1)
+                stacked_bank(reads, bank, stem, legs = 2 if leg == "gate_up_proj" else 1)
 
 def quark_bank(reads, w, experts):
     """A bank `[experts, rows, cols]` from one plane an expert and leg: bf16

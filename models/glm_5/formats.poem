@@ -4,20 +4,9 @@
 # `*_scale_inv`; modelopt's export keeps attention and shared experts bf16,
 # the dense MLP per-tensor e4m3, and the routed experts NVFP4.
 
-load("//lib/modelopt/formats.poem", "fp8_tensor_leg", "nvfp4_bank")
-
-load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read", "modelopt_fp8", "released_fp8")
+load("//pie/codec.poem", "bank", "dequantized", "kept", "land", "weight")
 
 BF = raw(dtype.bf16)
-
-def proj_read(reads, w, name):
-    """`w` from `name`: as the release stores it where `w` keeps its FP8."""
-    if fp8_proj(w):
-        fp8_read(reads, w, [name])
-    elif modelopt_fp8(name):
-        land(reads, w, fp8_tensor_leg(reads, name))
-    else:
-        reads.read(w, name)
 
 def named(a, at):
     """`a`'s weights, each beside the name `at` gives its transformers leaf,
@@ -56,13 +45,18 @@ def huggingface(m, reads):
         reads.read(layer.attn_norm, at("input_layernorm.weight"))
         reads.read(layer.mlp_norm, at("post_attention_layernorm.weight"))
         for w, name in named(layer.attn, at):
-            proj_read(reads, w, name)
+            weight(reads, w, name, quantized = "widen")
         f = layer.mlp
         if f.routed:
             moe(reads, at, f)
         else:
-            joined(reads, f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
-            proj_read(reads, f.down, at("mlp.down_proj.weight"))
+            weight(
+                reads,
+                f.gate_up,
+                [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")],
+                quantized = "widen",
+            )
+            weight(reads, f.down, at("mlp.down_proj.weight"), quantized = "widen")
 
     mtp = m.mtp
     if mtp == None:
@@ -70,7 +64,7 @@ def huggingface(m, reads):
     at = lambda tail: "model.layers.{}.{}".format(len(m.layers), tail)
     reads.read(mtp.enorm, at("enorm.weight"))
     reads.read(mtp.hnorm, at("hnorm.weight"))
-    eh = leg(reads, at("eh_proj.weight"))
+    eh = dequantized(reads, at("eh_proj.weight"))
     land(reads, mtp.e_proj, eh.slice(1, 0, m.hidden))
     land(reads, mtp.h_proj, eh.slice(1, m.hidden, m.hidden))
     reads.read(mtp.attn_norm, at("input_layernorm.weight"))
@@ -85,19 +79,13 @@ def moe(reads, at, f):
     if f.bias != None:
         reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
     hidden = f.down.shape[1]
-    if f.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
-        stem = lambda e, leaf: at("mlp.experts.{}.{}".format(e, leaf))
-        nvfp4_bank(reads, f.gate_up, [[stem(e, "gate_proj"), stem(e, "up_proj")] for e in range(f.experts)])
-        nvfp4_bank(reads, f.down, [[stem(e, "down_proj")] for e in range(f.experts)])
-        shared(reads, at, f)
-        return
-    if released_fp8(f.gate_up):
+    if kept(f.gate_up):
         name = lambda e, leaf: at("mlp.experts.{}.{}.weight".format(e, leaf))
-        fp8_bank(reads, f.gate_up, [[name(e, "gate_proj"), name(e, "up_proj")] for e in range(f.experts)])
-        fp8_bank(reads, f.down, [[name(e, "down_proj")] for e in range(f.experts)])
+        bank(reads, f.gate_up, [[name(e, "gate_proj"), name(e, "up_proj")] for e in range(f.experts)])
+        bank(reads, f.down, [[name(e, "down_proj")] for e in range(f.experts)])
         shared(reads, at, f)
         return
-    expert = lambda e, leaf: leg(reads, at("mlp.experts.{}.{}.weight".format(e, leaf)))
+    expert = lambda e, leaf: dequantized(reads, at("mlp.experts.{}.{}.weight".format(e, leaf)))
     land(reads, f.gate_up, concat(0, [
         concat(0, [expert(e, "gate_proj"), expert(e, "up_proj")]).transmute([1, 2 * f.inter, hidden], BF)
         for e in range(f.experts)
@@ -109,35 +97,9 @@ def moe(reads, at, f):
     shared(reads, at, f)
 
 def shared(reads, at, f):
-    joined(reads, f.shared.gate_up, [
+    weight(reads, f.shared.gate_up, [
         at("mlp.shared_experts.gate_proj.weight"),
         at("mlp.shared_experts.up_proj.weight"),
-    ])
-    proj_read(reads, f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+    ], quantized = "widen")
+    weight(reads, f.shared.down, at("mlp.shared_experts.down_proj.weight"), quantized = "widen")
 
-def leg(reads, name):
-    """The tensor `name` as bf16: as stored, or, stored FP8, dequantized by
-    its block factors."""
-    if stored(name) == BF:
-        return src(name)
-    if modelopt_fp8(name):
-        return fp8_tensor_leg(reads, name)
-    reads.push(tensor(name + ".bf16", src(name).cast(BF), BF, internal = True))
-    return out(name + ".bf16")
-
-def land(reads, w, value):
-    """`w` from the bf16 `value`, encoded to its own dtype."""
-    if w.dtype == dtype.bf16:
-        reads.push(tensor(w.name, value, BF))
-    else:
-        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
-
-def joined(reads, w, names):
-    """`w` from the tensors `names`, joined along its first axis."""
-    if fp8_proj(w):
-        fp8_read(reads, w, names)
-        return
-    if all([stored(name) == BF for name in names]):
-        reads.read_concat(w, names)
-    else:
-        land(reads, w, concat(0, [leg(reads, name) for name in names]))
