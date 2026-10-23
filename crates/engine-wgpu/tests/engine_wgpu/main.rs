@@ -3,6 +3,7 @@
 mod argmax_answers_the_reference;
 mod dense_attention_answers_the_reference;
 mod gpu;
+mod score_capture_answers_the_reference;
 mod the_attention_epilogues_answer_the_reference;
 mod the_embeddings_answer_the_reference;
 mod the_hyper_connections_answer_the_reference;

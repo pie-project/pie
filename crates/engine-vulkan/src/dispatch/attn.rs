@@ -37,11 +37,11 @@ impl Run<'_> {
 
         let lane_offset = self.window().span.lane_offset;
         let requests = self.requests();
-        attn::score::capture(
-            self.ctx(),
-            self.ragged(q),
-            self.prefill_plan(plan),
-            self.pool(cache),
+        kernels_slang::attn::score::capture(
+            &self.slang(),
+            crate::encode::slang_ragged(self.ragged(q)),
+            crate::encode::slang_tensor(self.prefill_plan(plan).positions),
+            &crate::encode::slang_pool(self.pool(cache)),
             window,
             head_dim,
             kv_heads,
@@ -52,8 +52,9 @@ impl Run<'_> {
             plane,
             crate::scores::KV_MAX,
             requests,
-            seat.slab,
+            crate::encode::slang_tensor(seat.slab),
         )
+        .map_err(crate::encode::from_slang)
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_vulkan::Error> {

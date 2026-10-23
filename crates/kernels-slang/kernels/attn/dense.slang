@@ -43,7 +43,8 @@ groupshared float dense_fold[PIE_STRIPS][PIE_LANES];
 groupshared float dense_acc[PIE_STRIPS * PIE_HEAD_DIM_MAX];
 groupshared float dense_m[PIE_STRIPS];
 groupshared float dense_l[PIE_STRIPS];
-groupshared int dense_span[2];
+groupshared int dense_begin;
+groupshared int dense_end;
 
 [shader("compute")]
 [numthreads(PIE_THREADS, 1, 1)]
@@ -78,12 +79,14 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             end = segments[uint(lo + 1)];
 #endif
         }
-        dense_span[0] = begin;
-        dense_span[1] = end;
+        dense_begin = begin;
+        dense_end = end;
     }
     GroupMemoryBarrierWithGroupSync();
-    int begin = dense_span[0];
-    int end = dense_span[1];
+    // Read uniformly: WGSL lets a barrier follow only workgroup-uniform
+    // control flow, and the span bounds the key loop.
+    int begin = workgroupUniformLoad(dense_begin);
+    int end = workgroupUniformLoad(dense_end);
 
     uint out_row = (uint(row) * uint(params.num_q_heads) + uint(head)) * head_dim;
     if (end <= begin) {

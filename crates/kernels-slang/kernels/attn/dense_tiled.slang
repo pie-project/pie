@@ -36,6 +36,8 @@ groupshared float kt[PIE_BKEY * PIE_D];
 groupshared float vt[PIE_BKEY * PIE_D];
 groupshared float partial[PIE_BQ * PIE_BKEY * PIE_PARTS];
 groupshared int2 spans[PIE_BQ];
+groupshared int tile_lo;
+groupshared int tile_hi;
 
 int2 span_of(int row) {
     if (row < segments[0] || row >= segments[uint(params.num_segments)]) {
@@ -70,17 +72,25 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         spans[qi] = span_of(row);
     }
     GroupMemoryBarrierWithGroupSync();
-    int2 span = spans[qi];
-    // The keys any row of the tile reads.
-    int lo = 0x7fffffff;
-    int hi = 0;
-    for (uint i = 0u; i < uint(PIE_BQ); i++) {
-        int2 s = spans[i];
-        if (s.y > s.x) {
-            lo = min(lo, s.x);
-            hi = max(hi, s.y);
+    // The keys any row of the tile reads, folded once and read uniformly:
+    // they bound the loop of barriers below.
+    if (tid == 0u) {
+        int lo = 0x7fffffff;
+        int hi = 0;
+        for (uint i = 0u; i < uint(PIE_BQ); i++) {
+            int2 s = spans[i];
+            if (s.y > s.x) {
+                lo = min(lo, s.x);
+                hi = max(hi, s.y);
+            }
         }
+        tile_lo = lo;
+        tile_hi = hi;
     }
+    GroupMemoryBarrierWithGroupSync();
+    int2 span = spans[qi];
+    int lo = workgroupUniformLoad(tile_lo);
+    int hi = workgroupUniformLoad(tile_hi);
 
     bool live = row < total && span.y > span.x;
     uint q_row = (uint(max(row, 0)) * uint(params.num_q_heads) + head) * uint(PIE_D);
@@ -122,25 +132,25 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             s[jj] = in_ ? sum : -3.0e38;
             top = max(top, s[jj]);
         }
-        if (top <= -3.0e38) {
-            continue;
-        }
-        float rescale = exp(m - top);
-        l *= rescale;
-        [ForceUnroll] for (uint d = 0u; d < uint(PIE_DPT); d++) {
-            acc[d] *= rescale;
-        }
-        [ForceUnroll] for (uint jj = 0u; jj < uint(PIE_BKEY); jj++) {
-            if (s[jj] <= -3.0e38) {
-                continue;
-            }
-            float p = exp(s[jj] - top);
-            l += p;
+        // A row with no live key in this block skips it without leaving
+        // the loop body: every lane reaches the next block's barriers.
+        if (top > -3.0e38) {
+            float rescale = exp(m - top);
+            l *= rescale;
             [ForceUnroll] for (uint d = 0u; d < uint(PIE_DPT); d++) {
-                acc[d] += p * vt[jj * uint(PIE_D) + d0 + d];
+                acc[d] *= rescale;
             }
+            [ForceUnroll] for (uint jj = 0u; jj < uint(PIE_BKEY); jj++) {
+                if (s[jj] > -3.0e38) {
+                    float p = exp(s[jj] - top);
+                    l += p;
+                    [ForceUnroll] for (uint d = 0u; d < uint(PIE_DPT); d++) {
+                        acc[d] += p * vt[jj * uint(PIE_D) + d0 + d];
+                    }
+                }
+            }
+            m = top;
         }
-        m = top;
     }
 
     if (row >= total || row < 0) {
