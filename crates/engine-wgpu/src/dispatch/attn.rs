@@ -451,6 +451,29 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
+            Attn::Voxel {
+                q,
+                k,
+                v,
+                grid,
+                segment,
+                sm_scale,
+                o,
+            } => kernels_slang::attn::voxel::attention(
+                self.ctx,
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+                self.tensor(*grid),
+                match segment {
+                    poem_ir::VoxelSegment::Clip => kernels_slang::attn::voxel::Segment::Clip,
+                    poem_ir::VoxelSegment::Frames(n) => {
+                        kernels_slang::attn::voxel::Segment::Frames(*n)
+                    }
+                },
+                *sm_scale,
+                self.tensor(*o),
+            ),
             Attn::Prefill {
                 causal: false,
                 mask: Some(_),
@@ -467,8 +490,7 @@ impl Run<'_> {
                 lse: Some(_),
                 ..
             }
-            | Attn::Ragged { .. }
-            | Attn::Voxel { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
+            | Attn::Ragged { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Attn::Decode {
                 selection: None,
                 bias: Some(_),

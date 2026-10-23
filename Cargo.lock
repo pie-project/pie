@@ -1954,6 +1954,7 @@ dependencies = [
  "memmap2",
  "naga",
  "pie-eta-ir",
+ "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
@@ -1962,6 +1963,7 @@ dependencies = [
  "tracing",
  "web-std",
  "wgpu",
+ "ztensor",
 ]
 
 [[package]]

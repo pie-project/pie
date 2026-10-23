@@ -22,6 +22,9 @@ impl Gpu {
             return None;
         }
         hip::set_device(0).ok()?;
+        // An instantiation that will not compile fails its test instead of
+        // falling back unseen.
+        kernels_rocm::jit::strict_kernels();
         Some(Self {
             stream: hip::Stream::new().ok()?,
             blas: blas::Handle::new().ok()?,
@@ -141,7 +144,7 @@ impl Gpu {
             .find(|b| b.device_ptr() == t.ptr)
             .expect("a harness buffer");
         let mut all = held.read::<T>().unwrap();
-        all.truncate((t.elements() * u64::from(t.dtype.bytes_ceil())) as usize / size_of::<T>());
+        all.truncate((t.elements() * t.dtype.bytes_ceil()) as usize / size_of::<T>());
         all
     }
 
