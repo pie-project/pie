@@ -161,7 +161,7 @@ impl PartialEq for Comm {
 
 /// Bytes of each rank's peer stage; a longer message goes in stage-sized
 /// chunks.
-#[cfg(feature = "device")]
+#[cfg(feature = "cuda")]
 const STAGE_BYTES: u64 = 16 << 20;
 
 /// Maps every rank's stage into every other rank when each pair of devices
@@ -170,10 +170,11 @@ const STAGE_BYTES: u64 = 16 << 20;
 /// handshake below is the whole decision: a link that carries the kernels'
 /// stores and loads carries every message, since the peer all-reduce reads
 /// no more than NCCL's ring moves and never crosses host memory (#777).
-/// `None` otherwise, and the collectives stay on NCCL.
+/// `None` otherwise, and the collectives stay on NCCL; always `None` on ROCm,
+/// which has no peer kernels and carries every message on RCCL.
 #[must_use]
 pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peers>> {
-    #[cfg(feature = "device")]
+    #[cfg(feature = "cuda")]
     {
         match wire_peers(ordinals) {
             Ok(peers) => {
@@ -186,14 +187,14 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
             }
         }
     }
-    #[cfg(not(feature = "device"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = ordinals;
         None
     }
 }
 
-#[cfg(feature = "device")]
+#[cfg(feature = "cuda")]
 fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::Peers>>> {
     use crate::device::rt;
 
