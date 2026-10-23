@@ -1,10 +1,10 @@
 use crate::error::Error;
 
-use crate::attn::plan::{Built, Device, Live, MlaPlanInfo};
-use crate::attn::sched::{
+use crate::attn::plan::sched::{
     AlignedAllocator, CostHeap, Staging, at, cost_function, lengths, narrow, packed_causal_kv_end,
     spans,
 };
+use crate::attn::plan::{Built, Device, Live, MlaPlanInfo};
 use crate::jit::refuse;
 
 pub const MAX_TOTAL_NUM_WORKS: usize = 16384;

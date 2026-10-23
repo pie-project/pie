@@ -20,14 +20,7 @@ pub mod ragged;
 
 pub mod selected;
 
-pub mod sched;
 pub mod score;
-
-pub mod sched_decode;
-
-pub mod sched_mla;
-
-pub mod sched_prefill;
 
 pub mod decode_gqa;
 

@@ -14,6 +14,7 @@ mod gdn_chunk;
 mod gdn_prep;
 mod gdn_recurrent;
 mod kda;
+mod kda_chunk;
 mod mamba2;
 
 pub use conv1d::{causal_conv1d, causal_conv1d_chunked, short_conv, short_conv_chunked};

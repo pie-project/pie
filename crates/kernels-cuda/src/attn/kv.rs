@@ -1,3 +1,7 @@
+//! Host-only: a paged pool's layout as the attention units read it (its
+//! quantization scheme, the heads a row splits into, the lanes an indptr
+//! names).
+
 use crate::error::Error;
 use dtype::Dtype;
 

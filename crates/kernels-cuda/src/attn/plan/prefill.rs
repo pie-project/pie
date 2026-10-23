@@ -1,7 +1,7 @@
 use crate::error::Error;
 
-use crate::attn::plan::{Built, Device, Live, PrefillPlanInfo, Sizes};
-use crate::attn::sched::{AlignedAllocator, Staging, at, narrow, narrow_all, spans};
+use crate::attn::plan::sched::{AlignedAllocator, Staging, at, narrow, narrow_all, spans};
+use crate::attn::plan::{Built, Device, Live, PrefillPlanInfo};
 use crate::jit::refuse;
 
 #[derive(Clone, Copy, Debug)]
@@ -429,19 +429,6 @@ pub fn plan(
         int_upload,
         int_bytes: laid.int_bytes,
         float_bytes: laid.float_bytes,
-    })
-}
-
-pub fn workspace_size(
-    op: &'static str,
-    req: &Request<'_>,
-    device: &Device,
-) -> Result<Sizes, Error> {
-    let sched = schedule(op, req, device)?;
-    let laid = layout(op, req, &sched, usize::MAX, usize::MAX)?;
-    Ok(Sizes {
-        float_bytes: laid.float_bytes,
-        int_bytes: laid.int_bytes,
     })
 }
 
