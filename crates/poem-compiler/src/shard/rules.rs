@@ -128,8 +128,11 @@ fn heads(name: &str) -> Option<Heads> {
         | "linear.mlp_swiglu_clamp"
         | "linear.mlp_swiglu_clamp_alpha"
         | "linear.mlp_geglu_tanh_packed"
-        | "linear.mlp_situ" => Heads::of(&["packed"], &["intermediate"]),
-        "linear.mlp_swiglu_clamp_split" | "linear.mlp_geglu_tanh" => {
+        | "linear.mlp_situ"
+        | "linear.mlp_swiglu_clamp_routed" => Heads::of(&["packed"], &["intermediate"]),
+        "linear.mlp_swiglu_clamp_split"
+        | "linear.mlp_swiglu_clamp_split_routed"
+        | "linear.mlp_geglu_tanh" => {
             Heads::of(&["gate", "up"], &[])
         }
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
