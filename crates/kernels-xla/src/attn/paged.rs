@@ -2136,7 +2136,7 @@ pub fn sink(
 
 /// `cap · tanh(x / cap)`, the new `x`.
 pub fn logit_softcap(f: &mut Func, x: Operand, cap: f32) -> Result<Val, Error> {
-    const OP: &str = "attn.logit_softcap";
+    const OP: &str = "elemwise.softcap";
     expect(OP, x, &[Dtype::Bf16])?;
     if cap == 0.0 {
         return Err(refuse(OP, "the cap is zero"));

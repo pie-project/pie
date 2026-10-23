@@ -292,13 +292,6 @@ pub enum Attn {
         #[output(F32)]
         lse: ValueId,
     },
-    LogitSoftcap {
-        #[input]
-        x: ValueId,
-        cap: f32,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
     KvAppend {
         #[input]
         k: ValueId,

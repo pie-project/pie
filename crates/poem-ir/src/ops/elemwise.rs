@@ -222,6 +222,14 @@ pub enum Elemwise {
         #[output(alias = x)]
         x_out: ValueId,
     },
+    /// `cap · tanh(x / cap)`, in place.
+    Softcap {
+        #[input]
+        x: ValueId,
+        cap: f32,
+        #[output(alias = x)]
+        x_out: ValueId,
+    },
     ResBlend {
         #[input]
         prefix: ValueId,

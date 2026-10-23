@@ -220,6 +220,9 @@ impl Run<'_> {
                     l.land(o_r_out, v)
                 })
             }
+            Elemwise::Softcap { x, cap, x_out: _ } => {
+                crate::lower::attn::logit_softcap(self.ctx(), self.tensor(*x), *cap)
+            }
             Elemwise::Sinusoid {
                 t,
                 dim,

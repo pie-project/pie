@@ -262,6 +262,9 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 self.tensor(*r),
             ),
+            Elemwise::Softcap { x, cap, x_out: _ } => {
+                kernels_metal::attn::logit_softcap(self.ctx(), self.tensor(*x), *cap)
+            }
             Elemwise::Sinusoid {
                 t,
                 dim,
