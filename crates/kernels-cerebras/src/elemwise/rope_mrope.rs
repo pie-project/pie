@@ -12,7 +12,8 @@ use crate::csl::f32_lit;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Footprint, Shard};
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 pub const AXES: u32 = 3;
@@ -256,7 +257,7 @@ fn rotate(
         let heads_gcd = ts.iter().map(|t| t.width / head_dim).fold(0, gcd).max(1);
         let unit = head_dim * (first.width / head_dim).max(1) / heads_gcd;
         let per_row: u64 = ts.iter().map(|t| u64::from(t.width)).sum::<u64>() + u64::from(AXES);
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: first.rows,

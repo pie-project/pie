@@ -13,9 +13,10 @@ use crate::csl::{Block, Dsd1, Func};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    Buf, Fabric, FabricOp, FabricReduce, FabricStep, Footprint, Guarded, HostOp, HostPhase,
-    LanePlan, PagePlan, PageSource, Phase, Product, Reduce, Shard, Sink,
+    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan, PagePlan,
+    PageSource, Phase, Reduce, Shard, Sink,
 };
+use crate::plan::Plan;
 use crate::tensor::Tensor;
 
 /// What a kernel entry emits into: the engine's sink for one node (or one
@@ -24,16 +25,9 @@ use crate::tensor::Tensor;
 pub trait Emit {
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error>;
 
-    /// The engine's terms for the fabric (what the entry plans its splits by).
-    fn fabric(&self) -> Fabric;
-
-    /// The `(row groups, column groups)` the engine spreads a row-wise op of
-    /// this footprint over.
-    fn tile(&self, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error>;
-
-    /// The `(row groups, column groups, depth groups)` the engine spreads a
-    /// product over; `None` multiplies it on the host.
-    fn grid(&self, product: Product) -> Option<(u32, u32, u32)>;
+    /// The engine's planner: its terms, and the splits it chooses for what
+    /// the entry states.
+    fn plan(&self) -> &dyn Plan;
 
     /// Names what is emitted next (the op a dispatch is lowering).
     fn scope(&self, name: &str) {
@@ -90,9 +84,9 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// The engine's terms for the fabric.
-    pub fn fabric(&self) -> Fabric {
-        self.p.fabric()
+    /// The engine's planner.
+    pub fn plan(&self) -> &dyn Plan {
+        self.p.plan()
     }
 
     /// Makes this phase a host phase running `op` (statements emitted into
@@ -107,7 +101,7 @@ impl<'a> Cx<'a> {
         // The resident placement runs every phase on its row of PEs: a
         // lane plan takes the row (idle PEs past its own), and a lane whose
         // state would split over PEs (a merge) does not fit it.
-        if let Some(pes) = self.p.fabric().resident_pes {
+        if let Some(pes) = self.p.plan().fabric().resident_pes {
             if plan.pes > pes {
                 return Err(refuse(
                     "lanes",
@@ -497,7 +491,7 @@ impl<'a> Cx<'a> {
         // The resident placement: every phase on the row of PEs (whole
         // buffers replicated; a phase on fewer PEs stays as it is only when
         // it already spans the row).
-        let pes = match self.p.fabric().resident_pes {
+        let pes = match self.p.plan().fabric().resident_pes {
             Some(n) if lane.is_none() && self.pes == 1 => n,
             _ => self.pes,
         };

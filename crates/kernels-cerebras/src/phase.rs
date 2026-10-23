@@ -12,6 +12,7 @@ use crate::csl::{Arg, Call, Func};
 use crate::cx::View;
 use crate::error::Error;
 use crate::library::Kernel;
+use crate::plan::Plan;
 use crate::tensor::Tensor;
 
 /// What an entry emits into: the engine's program under construction. It
@@ -73,88 +74,8 @@ pub trait Sink {
     /// Appends a closed phase; phases run in the order they are appended.
     fn phase(&mut self, phase: Phase);
 
-    /// The engine's terms for the fabric the phases run on.
-    fn fabric(&self) -> Fabric;
-}
-
-/// The engine's terms an entry plans its splits within: what a PE holds,
-/// how far a phase spreads, the placement in force and how bf16 operands
-/// are stored. The engine sets them, and chooses tiles and grids by them;
-/// the planners still in the entries read them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Fabric {
-    /// The most data words one phase places on a PE altogether (its share
-    /// of every buffer plus scratch). A probe (`pe_memory_probe`) links
-    /// 10240 words of data beside the memcpy module alone; the rest of a
-    /// PE's memory is code, stack and the task tables, and the kernels'
-    /// code takes its share below that.
-    pub pe_words: u64,
-    /// The most elements of one buffer a PE holds before it is split (a
-    /// small budget makes a small model take every split form).
-    pub shard_words: u64,
-    /// The most PEs one phase spreads over (a rectangle up to 16 rows
-    /// tall); a weight past `max_pes × shard_words` (the vocabulary
-    /// projection, by default) runs on the host. The default suits the
-    /// simulator; a wafer takes hundreds of thousands.
-    pub max_pes: u32,
-    /// The resident placement: every phase of a fire on one row of this
-    /// many PEs, activations whole on every PE, the weights by rows across
-    /// the row, a matmul's column blocks gathered back to every PE, lanes
-    /// padded to the row; `None` is the per-phase placement.
-    pub resident_pes: Option<u32>,
-    /// Whether a depth-split matmul (and a lane plan's partials) add on
-    /// the fabric rather than on the host.
-    pub fabric_sum: bool,
-    /// Whether bf16 weights live on the device packed two halves a word:
-    /// half the memory, the kernels widening as they read.
-    pub half_weights: bool,
-    /// Whether bf16 kv pools live on the device packed two halves a word:
-    /// half the memory a page, attention widening a key or value row as it
-    /// reads it, `kv_append` packing as it lands.
-    pub half_pool: bool,
-    /// The most rows one attention phase takes, when capped.
-    pub attn_rows: Option<u32>,
-}
-
-/// What a row-wise op holds on a PE, for the engine to choose its tile:
-/// `rows × width`, with `per_row` words a row that split with the columns,
-/// `per_col` words a column (a gain) that split with the columns, `whole`
-/// words that do not split; columns split only in multiples of `unit` (a
-/// head).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Footprint {
-    pub rows: u32,
-    pub width: u32,
-    pub per_row: u64,
-    pub per_col: u64,
-    pub whole: u64,
-    pub unit: u32,
-}
-
-/// A product `y[m, n] = act[m, k] · w[n, k]ᵀ`, for the engine to choose the
-/// grid of PEs it spreads over; `packed` when the weight is held two bf16
-/// a word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Product {
-    pub m: u32,
-    pub k: u32,
-    pub n: u32,
-    pub packed: bool,
-}
-
-impl Default for Fabric {
-    fn default() -> Self {
-        Fabric {
-            pe_words: 8704,
-            shard_words: 4096,
-            max_pes: 2048,
-            resident_pes: None,
-            fabric_sum: true,
-            half_weights: false,
-            half_pool: false,
-            attn_rows: None,
-        }
-    }
+    /// The engine's planner: its terms, and the splits it chooses.
+    fn plan(&self) -> &dyn Plan;
 }
 
 /// A device buffer a kernel computes with: an array named `name` of `elem`

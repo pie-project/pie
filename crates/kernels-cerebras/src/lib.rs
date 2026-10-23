@@ -21,6 +21,7 @@ pub mod gather;
 pub mod library;
 pub mod linear;
 pub mod phase;
+pub mod plan;
 pub mod sampling;
 pub mod ssm;
 pub mod tensor;

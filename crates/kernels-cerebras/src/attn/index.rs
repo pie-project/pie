@@ -17,7 +17,8 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Fabric, HostOp};
+use crate::phase::HostOp;
+use crate::plan::Fabric;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn paged(op: &'static str, pool: &KvPool) -> Result<u32, Error> {
@@ -77,7 +78,7 @@ pub fn kv_append(
     long_enough(OP, "write offset table", write_offset, k.rows)?;
     let (rows, width, table_rows) = (k.rows, k.width, keys.keys.rows);
     let on_pe = one_pe(
-        &ctx.fabric(),
+        &ctx.plan().fabric(),
         &[
             k.elements(),
             keys.keys.elements(),
@@ -161,7 +162,7 @@ fn boundary(
         + request_of_token.elements()
         + row_valid.elements()
         + 3 * u64::from(rows);
-    let on_pe = words <= ctx.fabric().pe_words;
+    let on_pe = words <= ctx.plan().fabric().pe_words;
     ctx.emit(&mut |cx| {
         let p = cx.read(positions)?;
         let r = cx.read(request_of_token)?;
@@ -283,7 +284,7 @@ pub fn block_mean(
     }
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let on_pe = one_pe(
-        &ctx.fabric(),
+        &ctx.plan().fabric(),
         &[
             boundary_pos.elements(),
             boundary_req.elements(),
@@ -365,7 +366,7 @@ pub fn pool_kv_append(
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let width = entries.width;
     let on_pe = one_pe(
-        &ctx.fabric(),
+        &ctx.plan().fabric(),
         &[
             entries.elements(),
             boundary_pos.elements(),
@@ -475,7 +476,7 @@ pub fn topk(
     }
     let nk = u64::from(keys.max_pages) * u64::from(ps) / u64::from(ratio.max(1));
     let on_pe = one_pe(
-        &ctx.fabric(),
+        &ctx.plan().fabric(),
         &[
             q.elements(),
             weights.map_or(0, |w| w.elements()),

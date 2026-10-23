@@ -8,7 +8,8 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{FabricOp, FabricStep, Footprint, Guarded, HostOp, Shard};
+use crate::phase::{FabricOp, FabricStep, Guarded, HostOp, Shard};
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 /// The `k` largest of each row of `x`, largest first: ties go to the lower
@@ -41,6 +42,7 @@ pub fn topk(
     // Rows over PEs (a row whole on its PE); a row past a PE ranks on the
     // host.
     let split = ctx
+        .plan()
         .tile(
             OP,
             Footprint {
@@ -118,13 +120,13 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     // Each column block's PE finds its greatest lane and index (a pair a
     // row); the blocks of a row group (one rectangle row) gather those on
     // the row's first PE, which picks among them into its rows of y.
-    let fabric = ctx.fabric().fabric_sum;
+    let fabric = ctx.plan().fabric().fabric_sum;
     let whole = if fabric {
         crate::linear::gemm::FABRIC_SUM_WORDS
     } else {
         0
     };
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows: x.rows,

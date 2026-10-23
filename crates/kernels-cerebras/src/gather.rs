@@ -8,37 +8,26 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Fabric, Footprint, HostOp, Shard};
+use crate::phase::{HostOp, Shard};
+use crate::plan::{Footprint, Held, Spread};
 use crate::tensor::Tensor;
 
-/// The most PEs an embedding table spreads over for a fabric gather (one
-/// rectangle row of partials).
-const EMBED_PES: u32 = 256;
-
-/// How many PEs hold `table` for a gather, each a whole number of rows
-/// within an array, beside `beside` words (the ids and two copies of the
-/// output); `None` sends the gather to the host.
-fn embed_pes(fab: &Fabric, table: Tensor, beside: u64) -> Option<u32> {
-    use crate::linear::gemm::{ARRAY_WORDS, FABRIC_SUM_WORDS};
-    let budget = fab.pe_words;
-    // The resident row: the table over its PEs, or whole on each.
-    if let Some(n) = fab.resident_pes {
-        let fits = |n: u32| {
-            table.rows.is_multiple_of(n) && {
-                let share = u64::from(table.rows / n) * u64::from(table.width);
-                let extra = if n > 1 { FABRIC_SUM_WORDS } else { 0 };
-                share <= ARRAY_WORDS && share + beside + extra <= budget
+/// How many PEs hold `table` for a gather, each a whole number of rows,
+/// beside `beside` words (the ids and two copies of the output), the parts
+/// summed on the fabric; `None` sends the gather to the host.
+fn embed_pes(ctx: &Ctx<'_>, table: Tensor, beside: u64) -> Option<u32> {
+    let width = u64::from(table.width);
+    ctx.plan().spread(&Spread {
+        units: table.rows,
+        summed: true,
+        held: &|n| {
+            let share = u64::from(table.rows / n) * width;
+            Held {
+                words: share + beside,
+                array: share,
             }
-        };
-        return [n, 1].into_iter().find(|n| fits(*n));
-    }
-    (1..=EMBED_PES.min(table.rows))
-        .filter(|n| table.rows.is_multiple_of(*n))
-        .find(|n| {
-            let share = u64::from(table.rows / n) * u64::from(table.width);
-            let extra = if *n > 1 { FABRIC_SUM_WORDS } else { 0 };
-            share <= ARRAY_WORDS && share + beside + extra <= budget
-        })
+        },
+    })
 }
 
 /// The rows of a row-wise copy over PEs: `rg` row groups when every buffer
@@ -53,6 +42,7 @@ fn copy_split(
 ) -> Option<u32> {
     if same_rows {
         return ctx
+            .plan()
             .tile(
                 op,
                 Footprint {
@@ -67,7 +57,7 @@ fn copy_split(
             .ok()
             .map(|(rg, _)| rg);
     }
-    (per_row * u64::from(rows) <= ctx.fabric().pe_words).then_some(1)
+    (per_row * u64::from(rows) <= ctx.plan().fabric().pe_words).then_some(1)
 }
 
 /// A gather of `table` rows into `y` (`y_words` a PE) over `n` PEs holding
@@ -97,7 +87,7 @@ fn embed_over(
     let partial = cx.scratch("partial", y_words);
     // Under the resident placement every PE reads `y` in place after:
     // the sum comes back to the row.
-    let resident = cx.fabric().resident_pes.is_some();
+    let resident = cx.plan().fabric().resident_pes.is_some();
     cx.fabric_sum_with(&partial, y, y_words, (n, 1), resident);
     Arg::Scratch(partial, "f32")
 }
@@ -140,7 +130,7 @@ pub fn embed(
     // parts added on the fabric; a table no such row holds (the vocabulary
     // under the simulator's budget) is gathered by the host.
     let y_words = y.elements();
-    let pes = embed_pes(&ctx.fabric(), table, ids.elements() + 2 * y_words);
+    let pes = embed_pes(ctx, table, ids.elements() + 2 * y_words);
     ctx.emit(&mut |cx| {
         let ib = cx.read(ids)?;
         let tb = cx.read(table)?;
@@ -473,7 +463,7 @@ pub fn embed_concat(
     let (rows, width) = (y.rows, table.width);
     let limit = vocab.min(table.rows);
     let y_words = y.elements();
-    let pes = embed_pes(&ctx.fabric(), table, ids.elements() + 2 * y_words);
+    let pes = embed_pes(ctx, table, ids.elements() + 2 * y_words);
     ctx.emit(&mut |cx| {
         let ib = cx.read(ids)?;
         let tb = cx.read(table)?;
@@ -626,7 +616,7 @@ pub fn embed_weighted(
     let y_words = y.elements();
     let limit = vocab.min(table.rows);
     let pes = embed_pes(
-        &ctx.fabric(),
+        ctx,
         table,
         ids.elements() + weights.elements() + 2 * y_words,
     );

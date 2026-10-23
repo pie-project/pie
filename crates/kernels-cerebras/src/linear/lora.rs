@@ -13,8 +13,8 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::linear::gemm::ARRAY_WORDS;
 use crate::phase::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
+use crate::plan::{Held, Routed};
 use crate::tensor::Tensor;
 
 pub fn correct(
@@ -89,7 +89,10 @@ pub fn correct(
     let whole = u64::from(adapters) * (a_words + b_words)
         + u64::from(rows) * u64::from(in_width + out_width)
         + u64::from(rank);
-    if whole <= ctx.fabric().pe_words && u64::from(adapters) * a_words.max(b_words) <= ARRAY_WORDS {
+    if ctx.plan().holds(Held {
+        words: whole,
+        array: u64::from(adapters) * a_words.max(b_words),
+    }) {
         return ctx.emit(&mut |cx| {
             let xb = cx.read(x)?;
             let ab = cx.read(bank_a)?;
@@ -126,77 +129,41 @@ pub fn correct(
             Ok(())
         });
     }
-    let budget = ctx.fabric().pe_words;
-    let fabric = ctx.fabric().fabric_sum;
-    let divisors = |x: u32| (1..=x).filter(move |d| x.is_multiple_of(*d));
-    // The fewest PEs whose lane (rows) times a bank block, plus the planes,
-    // fit (a depth split summed on the fabric adds the output plane again
-    // and the collectives library); lanes per PE dividing the rows (lane
-    // groups are equal row parts).
-    let place = |block_of: &dyn Fn(u32, u32) -> u64,
-                 planes_of: &dyn Fn(u32, u32) -> u64,
-                 a_max: u32,
-                 b_max: u32,
-                 what: &str|
-     -> Result<(u32, u32, u32), Error> {
-        let mut best: Option<(u32, u32, u32, u32)> = None;
-        for bg in divisors(b_max) {
-            for ag in divisors(a_max) {
-                let (block, planes) = (block_of(ag, bg), planes_of(ag, bg));
-                if block + planes > budget || block > ARRAY_WORDS {
-                    continue;
-                }
-                let most = ((budget - planes) / block.max(1))
-                    .min(ARRAY_WORDS / block.max(1))
-                    .clamp(1, u64::from(rows)) as u32;
-                let per_pe = (1..=most)
-                    .rev()
-                    .find(|d| rows.is_multiple_of(*d))
-                    .unwrap_or(1);
-                let pes = (rows / per_pe) * ag * bg;
-                if best.is_none_or(|(p, ..)| pes < p) {
-                    best = Some((pes, per_pe, ag, bg));
-                }
-                break;
-            }
-        }
-        best.map(|(_, per_pe, ag, bg)| (per_pe, ag, bg))
-            .ok_or_else(|| {
-                refuse(
-                    OP,
-                    format!("one row of the {what} and a row's planes exceed a PE's {budget}"),
-                )
-            })
+    // Rows are the lanes, a bank block each (lanes per PE dividing the
+    // rows), beside the planes; a split of `b` leaves the output partial.
+    let refused = |what: &str| {
+        refuse(
+            OP,
+            format!(
+                "one row of the {what} and a row's planes exceed a PE's {}",
+                ctx.plan().fabric().pe_words
+            ),
+        )
     };
     // Down: a slot is `[rank][in]` as `[a = rank][b = in][1]`.
-    let extra = |bg: u32, out: u64| {
-        if bg > 1 && fabric {
-            u64::from(rows) * out + crate::linear::gemm::FABRIC_SUM_WORDS
-        } else {
-            0
-        }
-    };
-    let (rows_a, rg_a, ig) = place(
-        &|ag, bg| u64::from(rank / ag) * u64::from(in_width / bg),
-        &|ag, bg| {
-            u64::from(rows) * (u64::from(in_width / bg) + u64::from(rank / ag))
-                + extra(bg, u64::from(rank / ag))
-        },
-        rank,
-        in_width,
-        "down bank",
-    )?;
+    let down = ctx
+        .plan()
+        .routed(&Routed {
+            lanes: rows,
+            a: rank,
+            b: in_width,
+            block: &|ag, bg| u64::from(rank / ag) * u64::from(in_width / bg),
+            planes: &|ag, bg| u64::from(rows) * (u64::from(in_width / bg) + u64::from(rank / ag)),
+            partial: &|ag, _| u64::from(rows) * u64::from(rank / ag),
+        })
+        .ok_or_else(|| refused("down bank"))?;
     // Up: a slot is `[out][rank]` as `[a = out][b = rank][1]`.
-    let (rows_b, og, rg_b) = place(
-        &|ag, bg| u64::from(out_width / ag) * u64::from(rank / bg),
-        &|ag, bg| {
-            u64::from(rows) * (u64::from(rank / bg) + u64::from(out_width / ag))
-                + extra(bg, u64::from(out_width / ag))
-        },
-        out_width,
-        rank,
-        "up bank",
-    )?;
+    let up = ctx
+        .plan()
+        .routed(&Routed {
+            lanes: rows,
+            a: out_width,
+            b: rank,
+            block: &|ag, bg| u64::from(out_width / ag) * u64::from(rank / bg),
+            planes: &|ag, bg| u64::from(rows) * (u64::from(rank / bg) + u64::from(out_width / ag)),
+            partial: &|ag, _| u64::from(rows) * u64::from(out_width / ag),
+        })
+        .ok_or_else(|| refused("up bank"))?;
     let waist_name = format!("waist_{}_{}", x.buf, y.buf);
     let plane = |b: &crate::phase::Buf, segments: Vec<Segment>| ColPlane {
         name: b.name.clone(),
@@ -219,14 +186,12 @@ pub fn correct(
         let rb = cx.read(routes)?;
         let wb = cx.declare(&waist_name, Dtype::F32, rows, rank, true)?;
         let header = cx.unique("lanes");
-        let reduce = if ig > 1 && fabric {
-            vec![(wb.name.clone(), Reduce::FabricSum { group: ig })]
-        } else if ig > 1 {
-            vec![(wb.name.clone(), Reduce::Sum)]
-        } else {
-            Vec::new()
-        };
-        let pes = (rows / rows_a) * rg_a * ig;
+        let reduce = down
+            .sum
+            .iter()
+            .map(|r| (wb.name.clone(), r.clone()))
+            .collect();
+        let pes = down.pes;
         let plan = LanePlan {
             pes,
             kind: LaneKind::PerRow { lanes: rows },
@@ -237,10 +202,10 @@ pub fn correct(
                 a: rank,
                 b: in_width,
                 w: 1,
-                a_groups: rg_a,
-                b_groups: ig,
+                a_groups: down.a_groups,
+                b_groups: down.b_groups,
             }),
-            lanes_per_pe: rows_a,
+            lanes_per_pe: down.lanes_per_pe,
             a_first: false,
             row_outputs: Vec::new(),
             cols: vec![plane(&xb, vec![Segment::along_b()]), plane(&wb, vec![by_a])],
@@ -266,7 +231,7 @@ pub fn correct(
                 Arg::Int(i64::from(adapters)),
             ],
         );
-        if ig > 1 && fabric {
+        if let Some(Reduce::FabricSum { group }) = down.sum {
             let partial = cx.scratch("partial", w_words);
             cx.call(
                 Kernel::Copy,
@@ -282,8 +247,8 @@ pub fn correct(
                 &partial,
                 &wb,
                 w_words,
-                (ig, pes / ig),
-                ctx.fabric().resident_pes.is_some(),
+                (group, pes / group),
+                ctx.plan().fabric().resident_pes.is_some(),
             );
         }
         Ok(())
@@ -295,14 +260,12 @@ pub fn correct(
         cx.read(y)?;
         let yb = cx.write(y)?;
         let header = cx.unique("lanes");
-        let reduce = if rg_b > 1 && fabric {
-            vec![(yb.name.clone(), Reduce::FabricSum { group: rg_b })]
-        } else if rg_b > 1 {
-            vec![(yb.name.clone(), Reduce::Sum)]
-        } else {
-            Vec::new()
-        };
-        let pes = (rows / rows_b) * og * rg_b;
+        let reduce = up
+            .sum
+            .iter()
+            .map(|r| (yb.name.clone(), r.clone()))
+            .collect();
+        let pes = up.pes;
         let plan = LanePlan {
             pes,
             kind: LaneKind::PerRow { lanes: rows },
@@ -313,10 +276,10 @@ pub fn correct(
                 a: out_width,
                 b: rank,
                 w: 1,
-                a_groups: og,
-                b_groups: rg_b,
+                a_groups: up.a_groups,
+                b_groups: up.b_groups,
             }),
-            lanes_per_pe: rows_b,
+            lanes_per_pe: up.lanes_per_pe,
             a_first: false,
             row_outputs: Vec::new(),
             cols: vec![plane(&wb, vec![Segment::along_b()]), plane(&yb, vec![by_a])],
@@ -342,7 +305,7 @@ pub fn correct(
                 Arg::Int(i64::from(adapters)),
             ],
         );
-        if rg_b > 1 && fabric {
+        if let Some(Reduce::FabricSum { group }) = up.sum {
             let partial = cx.scratch("partial", y_words);
             cx.call(
                 Kernel::Copy,
@@ -358,8 +321,8 @@ pub fn correct(
                 &partial,
                 &yb,
                 y_words,
-                (rg_b, pes / rg_b),
-                ctx.fabric().resident_pes.is_some(),
+                (group, pes / group),
+                ctx.plan().fabric().resident_pes.is_some(),
             );
         }
         Ok(())

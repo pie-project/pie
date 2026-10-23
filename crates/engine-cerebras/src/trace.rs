@@ -186,7 +186,7 @@ pub const PHASE_SEPARATOR: &str = "\n=====phase\n";
 /// The tracer: one CSL program under construction for one fire.
 pub struct Tracer<'h> {
     handles: &'h Handles,
-    fabric: kernels_cerebras::phase::Fabric,
+    plan: crate::fabric::Planner,
     state: RefCell<State>,
 }
 
@@ -231,7 +231,9 @@ impl<'h> Tracer<'h> {
     pub fn new(handles: &'h Handles) -> Self {
         Self {
             handles,
-            fabric: crate::fabric::terms(),
+            plan: crate::fabric::Planner {
+                fabric: crate::fabric::terms(),
+            },
             state: RefCell::new(State {
                 pack_len: 0,
                 program: Program::new(),
@@ -1245,7 +1247,7 @@ fn root_buf(
 /// The tracer's `Operands`: the handle tables plus the state's maps.
 struct Lens<'a> {
     handles: &'a Handles,
-    fabric: kernels_cerebras::phase::Fabric,
+    fabric: kernels_cerebras::plan::Fabric,
     pack_len: u32,
     current: &'a mut BTreeMap<u32, Buf>,
     params: &'a mut Vec<(u32, Source)>,
@@ -1396,20 +1398,8 @@ impl Operands for Lens<'_> {
 }
 
 impl Emit for Tracer<'_> {
-    fn fabric(&self) -> kernels_cerebras::phase::Fabric {
-        self.fabric
-    }
-
-    fn tile(
-        &self,
-        op: &'static str,
-        footprint: kernels_cerebras::phase::Footprint,
-    ) -> Result<(u32, u32), kernels_cerebras::Error> {
-        crate::fabric::tile(&self.fabric, op, footprint)
-    }
-
-    fn grid(&self, product: kernels_cerebras::phase::Product) -> Option<(u32, u32, u32)> {
-        crate::fabric::grid(&self.fabric, product)
+    fn plan(&self) -> &dyn kernels_cerebras::plan::Plan {
+        &self.plan
     }
 
     fn scope(&self, name: &str) {
@@ -1433,7 +1423,7 @@ impl Emit for Tracer<'_> {
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
-            fabric: self.fabric,
+            fabric: self.plan.fabric,
             pack_len: *pack_len,
             current,
             params,
@@ -1445,7 +1435,7 @@ impl Emit for Tracer<'_> {
         let mut sink = Emitting {
             program,
             operands: &mut lens,
-            fabric: self.fabric,
+            plan: &self.plan,
         };
         let mut cx = Cx::new(&mut sink, &scope);
         body(&mut cx)?;

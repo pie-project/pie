@@ -21,11 +21,14 @@ use kernels_cerebras::cx::View as Placed;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
-    Buf, Fabric, FabricOp, FabricReduce, Footprint, Guarded, HostPhase, LanePlan, PageSource,
-    Phase, Product, Shard, Sink,
+    Buf, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, PageSource, Phase, Shard, Sink,
 };
+use kernels_cerebras::plan::{Fabric, Plan};
 
+mod plan;
 mod table;
+
+pub use plan::Planner;
 
 /// The fabric's terms as this process sets them: each from its
 /// environment variable, else the default.
@@ -76,122 +79,6 @@ pub fn terms() -> Fabric {
     }
 }
 
-/// The `(row groups, column groups)` a row-wise op of `footprint` spreads
-/// over so that one PE's share fits the terms' budget, each share's rows
-/// within an array: the fewest PEs win, rows first; the resident placement
-/// runs it whole on every PE of its row.
-pub fn tile(fabric: &Fabric, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error> {
-    use kernels_cerebras::linear::gemm::ARRAY_WORDS;
-    let Footprint {
-        rows,
-        width,
-        per_row,
-        per_col,
-        whole,
-        unit,
-    } = footprint;
-    let budget = fabric.pe_words;
-    let (rows, width, unit) = (rows.max(1), width.max(1), unit.max(1));
-    if fabric.resident_pes.is_some() {
-        let words = per_row * u64::from(rows) + per_col * u64::from(width) + whole;
-        return if words <= budget && per_row * u64::from(rows) <= ARRAY_WORDS {
-            Ok((1, 1))
-        } else {
-            Err(refuse(
-                op,
-                format!("the phase's {words} words exceed a resident PE's {budget}"),
-            ))
-        };
-    }
-    let units = width / unit;
-    let fits = |rg: u32, cg: u32| {
-        let words = per_row * u64::from(rows / rg) / u64::from(cg)
-            + per_col * u64::from(width / cg)
-            + whole;
-        words <= budget && per_row * u64::from(rows / rg) / u64::from(cg) <= ARRAY_WORDS
-    };
-    let mut best: Option<(u32, u32)> = None;
-    for cg in (1..=units).filter(|d| units.is_multiple_of(*d)) {
-        for rg in (1..=rows).filter(|d| rows.is_multiple_of(*d)) {
-            if fits(rg, cg) {
-                if best.is_none_or(|(br, bc)| rg * cg < br * bc) {
-                    best = Some((rg, cg));
-                }
-                break;
-            }
-        }
-    }
-    best.ok_or_else(|| {
-        refuse(
-            op,
-            format!(
-                "one row of {width} ({per_row} words with its planes) does not fit a PE's {budget} even one column of {unit} at a time"
-            ),
-        )
-    })
-}
-
-/// A grid `(rg, cg, kg)` with its `(words moved, PEs)` key.
-type GridPick = ((u32, u32, u32), (u64, u32));
-
-/// The `(row groups, column groups, depth groups)` grid of PEs a `m × k`
-/// by `n × k` product spreads over. PE `(r, c, d)` holds rows `r` and depth
-/// slice `d` of the activations, weight rows `c` at depth `d`, and a
-/// partial sum of output block `(r, c)`, which the host adds over `d`: the
-/// words moved are the activations once per column group, the weight once
-/// per row group, and the output once per depth group. The grid moving the
-/// fewest words whose shares fit [`Fabric::pe_words`] (arrays within
-/// `ARRAY_WORDS`) on at most [`Fabric::max_pes`] PEs wins, the fewer PEs the
-/// better among equals.
-pub fn grid(fab: &Fabric, product: Product) -> Option<(u32, u32, u32)> {
-    use kernels_cerebras::linear::gemm::{ARRAY_WORDS, FABRIC_SUM_WORDS};
-    let Product { m, k, n, packed } = product;
-    // A weight no row of PEs holds (the vocabulary projection, by default)
-    // is multiplied on the host.
-    let per = if packed { 2 } else { 1 };
-    if u64::from(n) * u64::from(k) / per > u64::from(fab.max_pes) * fab.shard_words {
-        return None;
-    }
-    let budget = fab.pe_words;
-    let most = fab.max_pes;
-    let fabric = fab.fabric_sum;
-    let divisors = |x: u32| (1..=x).filter(move |d| x.is_multiple_of(*d));
-    let (m64, k64, n64) = (u64::from(m), u64::from(k), u64::from(n));
-    let mut best: Option<GridPick> = None;
-    for rg in divisors(m) {
-        for cg in divisors(n) {
-            for kg in divisors(k) {
-                if packed && !(k / kg).is_multiple_of(2) {
-                    continue;
-                }
-                let a = (m64 / u64::from(rg)) * (k64 / u64::from(kg));
-                let w = (n64 / u64::from(cg)) * (k64 / u64::from(kg)) / per;
-                let y = (m64 / u64::from(rg)) * (n64 / u64::from(cg));
-                let extra = if kg > 1 && fabric {
-                    y + FABRIC_SUM_WORDS
-                } else {
-                    0
-                };
-                if a.max(w).max(y) > ARRAY_WORDS
-                    || a + w + y + extra > budget
-                    || rg * cg * kg > most
-                {
-                    continue;
-                }
-                let moved = m64 * k64 * u64::from(cg)
-                    + n64 * k64 * u64::from(rg)
-                    + m64 * n64 * u64::from(kg);
-                let key = (moved, rg * cg * kg);
-                if best.is_none_or(|(_, k)| key < k) {
-                    best = Some(((rg, cg, kg), key));
-                }
-                break;
-            }
-        }
-    }
-    best.map(|(g, _)| g)
-}
-
 /// What places a fire's operand handles on the program's buffers: the
 /// tracer's handle tables, or the bench's one buffer a handle.
 pub trait Operands {
@@ -219,11 +106,11 @@ pub trait Operands {
 }
 
 /// What an entry emits into: a program, the operands it places, and the
-/// terms the entry plans by.
+/// planner the entry asks for its splits.
 pub struct Emitting<'a> {
     pub program: &'a mut Program,
     pub operands: &'a mut dyn Operands,
-    pub fabric: Fabric,
+    pub plan: &'a dyn Plan,
 }
 
 impl Sink for Emitting<'_> {
@@ -289,8 +176,8 @@ impl Sink for Emitting<'_> {
         self.program.push(phase);
     }
 
-    fn fabric(&self) -> Fabric {
-        self.fabric
+    fn plan(&self) -> &dyn Plan {
+        self.plan
     }
 }
 

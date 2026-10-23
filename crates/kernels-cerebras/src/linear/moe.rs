@@ -10,10 +10,10 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::linear::gemm::ARRAY_WORDS;
 use crate::phase::{
-    BankSplit, BlockPlan, ColPlane, Footprint, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
+    BankSplit, BlockPlan, ColPlane, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
 };
+use crate::plan::{Footprint, Held, Routed};
 use crate::tensor::Tensor;
 
 /// `routes[t, s]`, `weights[t, s]` for `s < top_k`: the `top_k` largest of
@@ -55,7 +55,7 @@ pub fn topk_softmax(
         ));
     }
     // Rows over PEs; a row's logits and its picks on one.
-    let (rg, _) = ctx.tile(
+    let (rg, _) = ctx.plan().tile(
         OP,
         Footprint {
             rows: logits.rows,
@@ -115,7 +115,7 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
         ));
     }
     let rows = routes.rows;
-    let (rg, _) = ctx.tile(
+    let (rg, _) = ctx.plan().tile(
         OP,
         Footprint {
             rows,
@@ -326,7 +326,10 @@ fn select_impl(
     let xdiv = if per_pair { 1 } else { top_k };
     let lanes = pairs as u32;
     let whole = bd.elements() + xd.elements() + yd.elements();
-    if whole <= ctx.fabric().pe_words && bd.elements() <= ARRAY_WORDS {
+    if ctx.plan().holds(Held {
+        words: whole,
+        array: bd.elements(),
+    }) {
         return ctx.emit(&mut |cx| {
             let xb = cx.read(x)?;
             let xb = cx.view_as(&xb, xd.rows, xd.width)?;
@@ -363,42 +366,27 @@ fn select_impl(
     // A lane plan over the pairs: a PE holds a block `[o0, o1) × [c0, c1)`
     // of its lanes' experts, that slice of every x row (a column plane)
     // and its columns of y, a partial over the slices the host adds.
-    let budget = ctx.fabric().pe_words;
-    let divisors = |v: u32| (1..=v).filter(move |d| v.is_multiple_of(*d));
-    let mut best: Option<(u32, u32, u32, u32)> = None;
-    let fabric = ctx.fabric().fabric_sum;
-    for kg in divisors(k) {
-        for og in divisors(n) {
-            let block = u64::from(n / og) * u64::from(k / kg);
-            let y_plane = u64::from(yd.rows) * u64::from(n / og);
-            let mut planes = u64::from(xd.rows) * u64::from(k / kg) + y_plane;
-            if kg > 1 && fabric {
-                // The partial's copy and the collectives library.
-                planes += y_plane + crate::linear::gemm::FABRIC_SUM_WORDS;
-            }
-            if block + planes > budget || block > ARRAY_WORDS {
-                continue;
-            }
-            let most = ((budget - planes) / block.max(1))
-                .min(ARRAY_WORDS / block.max(1))
-                .clamp(1, u64::from(lanes)) as u32;
-            let per_pe = (1..=most)
-                .rev()
-                .find(|d| lanes.is_multiple_of(*d))
-                .unwrap_or(1);
-            let pes = (lanes / per_pe) * og * kg;
-            if best.is_none_or(|(p, ..)| pes < p) {
-                best = Some((pes, per_pe, og, kg));
-            }
-            break;
-        }
-    }
-    let (pes, lanes_per_pe, og, kg) = best.ok_or_else(|| {
-        refuse(
-            op_name,
-            format!("one row of an expert ({k} words) and a row of x and y exceed a PE's {budget}"),
-        )
-    })?;
+    let split = ctx
+        .plan()
+        .routed(&Routed {
+            lanes,
+            a: n,
+            b: k,
+            block: &|og, kg| u64::from(n / og) * u64::from(k / kg),
+            planes: &|og, kg| {
+                u64::from(xd.rows) * u64::from(k / kg) + u64::from(yd.rows) * u64::from(n / og)
+            },
+            partial: &|og, _| u64::from(yd.rows) * u64::from(n / og),
+        })
+        .ok_or_else(|| {
+            refuse(
+                op_name,
+                format!(
+                    "one row of an expert ({k} words) and a row of x and y exceed a PE's {}",
+                    ctx.plan().fabric().pe_words
+                ),
+            )
+        })?;
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
         let xb = cx.view_as(&xb, xd.rows, xd.width)?;
@@ -410,15 +398,13 @@ fn select_impl(
         let yb = cx.write(y)?;
         let yb = cx.view_as(&yb, yd.rows, yd.width)?;
         let header = cx.unique("lanes");
-        let reduce = if kg > 1 && fabric {
-            vec![(yb.name.clone(), Reduce::FabricSum { group: kg })]
-        } else if kg > 1 {
-            vec![(yb.name.clone(), Reduce::Sum)]
-        } else {
-            Vec::new()
-        };
+        let reduce = split
+            .sum
+            .iter()
+            .map(|r| (yb.name.clone(), r.clone()))
+            .collect();
         let plan = LanePlan {
-            pes,
+            pes: split.pes,
             kind: LaneKind::PerRow { lanes },
             header,
             slots: rb.name.clone(),
@@ -427,10 +413,10 @@ fn select_impl(
                 a: n,
                 b: k,
                 w: 1,
-                a_groups: og,
-                b_groups: kg,
+                a_groups: split.a_groups,
+                b_groups: split.b_groups,
             }),
-            lanes_per_pe,
+            lanes_per_pe: split.lanes_per_pe,
             a_first: false,
             row_outputs: Vec::new(),
             cols: vec![
@@ -479,11 +465,11 @@ fn select_impl(
                 Arg::Int(i64::from(xdiv)),
                 Arg::Int(i64::from(n)),
                 Arg::Int(i64::from(k)),
-                Arg::Int(i64::from(lanes_per_pe)),
+                Arg::Int(i64::from(split.lanes_per_pe)),
                 Arg::Bool(true),
             ],
         );
-        if kg > 1 && fabric {
+        if let Some(Reduce::FabricSum { group }) = split.sum {
             // The PE's y is its partial: copied aside, then the depth
             // group's copies are added into the group's first PE's y.
             let partial = cx.scratch("partial", y_words);
@@ -501,8 +487,8 @@ fn select_impl(
                 &partial,
                 &yb,
                 y_words,
-                (kg, pes / kg),
-                ctx.fabric().resident_pes.is_some(),
+                (group, split.pes / group),
+                ctx.plan().fabric().resident_pes.is_some(),
             );
         }
         Ok(())
@@ -540,7 +526,7 @@ pub fn weighted_sum(
         ));
     }
     let (rows, width) = (y.rows, y.width);
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows,
@@ -621,7 +607,7 @@ pub fn sigmoid_gate_add(
         ));
     }
     let (rows, width) = (y.rows, y.width);
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows,

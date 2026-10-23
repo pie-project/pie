@@ -23,9 +23,9 @@ use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    BankSplit, BlockPlan, ColPlane, Fabric, LaneKind, LanePlan, PagePlan, PageSource, Reduce,
-    Segment,
+    BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, PagePlan, PageSource, Reduce, Segment,
 };
+use crate::plan::{PageSplit, PagedLanes, Pages};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn tables(
@@ -175,84 +175,6 @@ fn pool_shape(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<(u32, u3
     Ok((kv_heads, width))
 }
 
-/// How a paged pool spreads over PEs.
-#[derive(Clone)]
-struct PageSplit {
-    pes: u32,
-    lanes_per_pe: u32,
-    /// A lane's pages over this many PEs.
-    page_groups: u32,
-    /// The kv heads over this many PEs (a block along the banks' heads).
-    head_groups: u32,
-    /// A page's rows over this many PEs (a block along the pages' rows):
-    /// each PE attends a strided subset of the keys, merged like page groups.
-    row_groups: u32,
-}
-
-/// How a paged pool of `elements` over `lanes` lanes spreads over PEs, or
-/// `None` when one PE holds it all (the pool plus `extra(1)`). A PE holds
-/// as many lanes' pages as fit beside `extra(head_groups)` (the phase's
-/// words besides pages, given the kv heads split that many ways); a
-/// lane's pages past that split over page groups; a page past that splits
-/// its kv heads. The fewest PEs win.
-fn page_split(
-    fab: &Fabric,
-    op: &'static str,
-    elements: u64,
-    lanes: u32,
-    page_pair: u64,
-    max_pages: u32,
-    kv_heads: u32,
-    page_rows: u32,
-    extra: impl Fn(u32) -> u64,
-) -> Result<Option<PageSplit>, Error> {
-    use crate::linear::gemm::ARRAY_WORDS;
-    if lanes == 0 || (elements + extra(1) <= fab.pe_words && elements <= ARRAY_WORDS) {
-        return Ok(None);
-    }
-    let max_pages = max_pages.max(1);
-    let mut best: Option<PageSplit> = None;
-    let page_rows = page_rows.max(1);
-    for hg in (1..=kv_heads.max(1)).filter(|g| kv_heads.max(1).is_multiple_of(*g)) {
-        for ag in (1..=page_rows).filter(|g| page_rows.is_multiple_of(*g)) {
-            // A bank plane is one array: its pages within ARRAY_WORDS too.
-            let room = fab.pe_words.saturating_sub(extra(hg)).min(2 * ARRAY_WORDS);
-            let pair = (page_pair / u64::from(hg) / u64::from(ag)).max(1);
-            let pages_per_pe = u32::try_from(room / pair).unwrap_or(u32::MAX);
-            if pages_per_pe == 0 {
-                continue;
-            }
-            let (lanes_per_pe, page_groups) = if pages_per_pe >= max_pages {
-                ((pages_per_pe / max_pages).clamp(1, lanes), 1)
-            } else {
-                (1, max_pages.div_ceil(pages_per_pe))
-            };
-            let pes = lanes.div_ceil(lanes_per_pe) * page_groups * hg * ag;
-            if best.as_ref().is_none_or(|b| pes < b.pes) {
-                best = Some(PageSplit {
-                    pes,
-                    lanes_per_pe,
-                    page_groups,
-                    head_groups: hg,
-                    row_groups: ag,
-                });
-            }
-            break;
-        }
-    }
-    let budget = fab.pe_words;
-    match best {
-        Some(b) => Ok(Some(b)),
-        None => Err(refuse(
-            op,
-            format!(
-                "one page's {page_pair} words and the phase's other {} words exceed a PE's {budget} even one kv head and one page row at a time",
-                extra(kv_heads.max(1))
-            ),
-        )),
-    }
-}
-
 /// The most PEs one lane block's partials spread over for the fabric to
 /// merge them (the root gathers that many lse copies).
 pub const MERGE_GROUPS: u32 = 16;
@@ -376,32 +298,6 @@ pub fn lse_merge_with(
     cx.collectives((group, pes / group), steps, finish);
 }
 
-/// The resident placement of a pool over a row of `pes` PEs: every PE runs
-/// every lane over the pages it holds (page `g` on PE `g % pes`), `None`
-/// when the share and the phase's other words do not fit a PE.
-fn resident_split(
-    fab: &Fabric,
-    pes: u32,
-    pool_pages: u32,
-    page_pair: u64,
-    lanes: u32,
-    extra: u64,
-) -> Option<(PageSplit, u32)> {
-    use crate::linear::gemm::ARRAY_WORDS;
-    let share = pool_pages.div_ceil(pes).max(1);
-    let words = u64::from(share) * page_pair;
-    (words / 2 <= ARRAY_WORDS && words + extra <= fab.pe_words).then_some((
-        PageSplit {
-            pes,
-            lanes_per_pe: lanes,
-            page_groups: 1,
-            head_groups: 1,
-            row_groups: 1,
-        },
-        share,
-    ))
-}
-
 /// Attends `rows` rows of `q` (`[rows, q_heads * head_dim]`) and writes `o`
 /// (same shape) and, when given, `lse` (`[rows, q_heads]`, f32, base 2).
 fn attend(
@@ -486,85 +382,52 @@ fn attend(
     // lse, the tables, the mask and the scratch, for the rows of one phase:
     // all the rows when that fits, else a window of them, halved until it
     // does, each window its own phase over views of the row-shaped buffers.
-    let fab = ctx.fabric();
+    let fab = ctx.plan().fabric();
     let packed =
         fab.half_pool && pool.keys.dtype == Dtype::Bf16 && pool.keys.width.is_multiple_of(2);
     let page_pair = u64::from(ps) * u64::from(pool.keys.width) * 2 / if packed { 2 } else { 1 };
     let (top_k, ratio) = selection.map_or((0, 0), |(s, r)| (s.width, r));
     let sblk_words = u64::from(span.checked_div(ratio).map_or(1, |b| b + 1));
     let fabric = fab.fabric_sum;
-    let resident = fab.resident_pes;
-    let pool_pages = pool.keys.rows / ps.max(1);
-    let extra_for = |r: u32| {
-        move |hg: u32| -> u64 {
-            let q_cols = u64::from(q.width / hg);
-            let merge = if fabric {
-                merge_words(
-                    u64::from(r) * q_cols,
-                    u64::from(r) * u64::from(q_heads / hg),
-                )
-            } else {
-                0
-            };
-            u64::from(r)
-                * (2 * q_cols + u64::from(q_heads / hg) + 3 + u64::from(mask_w) + u64::from(top_k))
-                + lanes
-                + 1
-                + u64::from(d)
-                + u64::from(mask_w)
-                + sblk_words
-                + 16
-                + merge
-        }
+    let beside = |r: u32, hg: u32| -> u64 {
+        let q_cols = u64::from(q.width / hg);
+        let merge = if fabric {
+            merge_words(
+                u64::from(r) * q_cols,
+                u64::from(r) * u64::from(q_heads / hg),
+            )
+        } else {
+            0
+        };
+        u64::from(r)
+            * (2 * q_cols + u64::from(q_heads / hg) + 3 + u64::from(mask_w) + u64::from(top_k))
+            + lanes
+            + 1
+            + u64::from(d)
+            + u64::from(mask_w)
+            + sblk_words
+            + 16
+            + merge
     };
     let pool_words = pool.keys.elements() + pool.values.elements();
-    let mut chunk = rows.max(1).min(fab.attn_rows.unwrap_or(u32::MAX)).max(1);
-    let mut strided_pages = 0;
-    let split = loop {
-        if let Some(pes) = resident {
-            // The resident row: the pool strided over it, all rows at once.
-            match resident_split(
-                &fab,
-                pes,
-                pool_pages,
-                page_pair,
-                lanes as u32,
-                extra_for(chunk)(1),
-            ) {
-                Some((split, share)) => {
-                    strided_pages = share;
-                    break Some(split);
-                }
-                None if chunk > 1 => {
-                    chunk = chunk.div_ceil(2);
-                    continue;
-                }
-                None => {
-                    return Err(refuse(
-                        op,
-                        format!(
-                            "the resident row of {pes} PEs does not hold the pool's {pool_pages} pages beside one row's buffers"
-                        ),
-                    ));
-                }
-            }
-        }
-        match page_split(
-            &fab,
-            op,
-            pool_words,
-            lanes as u32,
-            page_pair,
-            pool.max_pages,
-            kv_heads,
-            ps,
-            extra_for(chunk),
-        ) {
-            Ok(split) => break split,
-            Err(_) if chunk > 1 => chunk = chunk.div_ceil(2),
-            Err(e) => return Err(e),
-        }
-    };
+    let PageSplit {
+        window: chunk,
+        lanes: split,
+    } = ctx.plan().pages(
+        op,
+        &Pages {
+            elements: pool_words,
+            lanes: lanes as u32,
+            page_words: page_pair,
+            max_pages: pool.max_pages,
+            heads: kv_heads,
+            page_rows: ps,
+            pool_pages: pool.keys.rows / ps.max(1),
+            rows,
+            windows: true,
+            beside: &beside,
+        },
+    )?;
     let mut c0 = 0;
     while c0 < rows {
         let n = (rows - c0).min(chunk);
@@ -610,14 +473,15 @@ fn attend(
             let acc = cx.scratch("acc", u64::from(d));
             let mrow = cx.scratch_of("mrow", u64::from(mask_w.max(1)), "u32");
             let mut lse_buf = lb.clone();
-            let (rows_range, heads_range) = match split.clone() {
+            let (rows_range, heads_range) = match split {
                 None => (format!("0, {n}, 0"), format!("0, {kv_heads}, 0, {ps}")),
-                Some(PageSplit {
+                Some(PagedLanes {
                     pes,
                     lanes_per_pe,
                     page_groups,
                     head_groups,
                     row_groups,
+                    strided_pages,
                 }) => {
                     let header = cx.unique("lanes");
                     // Pages split over PEs: every PE's output is partial, merged
@@ -625,7 +489,7 @@ fn attend(
                     // groups of a lane block are consecutive PEs, one
                     // rectangle row) or by the host, which then writes the lse.
                     let mut reduce = Vec::new();
-                    let strided = resident.is_some();
+                    let strided = strided_pages.is_some();
                     // Strided: every PE holds a part of every lane's pages.
                     let merge_group = if strided {
                         pes
@@ -710,7 +574,7 @@ fn attend(
                             rewritten: Vec::new(),
                             page_groups,
                             strided,
-                            strided_pages,
+                            strided_pages: strided_pages.unwrap_or(0),
                         }),
                     };
                     let o_words = plan.plane_words(&plan.cols[1]);
@@ -1077,7 +941,7 @@ fn append(
         let vb = cx.read(v)?;
         let pb = cx.read(write_page)?;
         let obf = cx.read(write_offset)?;
-        let fab = cx.fabric();
+        let fab = cx.plan().fabric();
         let packed_ok = fab.half_pool && pool.keys.dtype == Dtype::Bf16 && w.is_multiple_of(2);
         let keys = match cx.pool_half(pool.keys)? {
             Some(k) if packed_ok => k,
@@ -1091,7 +955,8 @@ fn append(
         let values = if shared {
             keys.clone()
         } else if packed {
-            cx.pool_half(pool.values)?.ok_or_else(|| refuse(op, "the values pool is not packed like the keys"))?
+            cx.pool_half(pool.values)?
+                .ok_or_else(|| refuse(op, "the values pool is not packed like the keys"))?
         } else {
             cx.read(pool.values)?;
             cx.write(pool.values)?
@@ -1111,42 +976,31 @@ fn append(
                 + 2 * u64::from(k.rows)
                 + 16
         };
-        let resident = fab.resident_pes;
-        let mut strided_pages = 0;
-        let split = match resident {
-            Some(pes) => {
-                let pair = if shared { page_words } else { page_words * 2 };
-                match resident_split(&fab, pes, pages, pair, k.rows, extra(1)) {
-                    Some((split, share)) => {
-                        strided_pages = share;
-                        Some(split)
-                    }
-                    None => {
-                        return Err(refuse(
-                            op,
-                            format!("the resident row of {pes} PEs does not hold the pool's {pages} pages beside the rows"),
-                        ));
-                    }
-                }
-            }
-            None => page_split(
-                &fab,
+        let split = cx
+            .plan()
+            .pages(
                 op,
-                planes,
-                k.rows,
-                if shared { page_words } else { page_words * 2 },
-                1,
-                w,
-                1,
-                extra,
-            )?,
-        };
+                &Pages {
+                    elements: planes,
+                    lanes: k.rows,
+                    page_words: if shared { page_words } else { page_words * 2 },
+                    max_pages: 1,
+                    heads: w,
+                    page_rows: 1,
+                    pool_pages: pages,
+                    rows: k.rows,
+                    windows: false,
+                    beside: &|_, hg| extra(hg),
+                },
+            )?
+            .lanes;
         let (rows_range, width) = match split {
             None => (format!("0, {}", k.rows), w.to_string()),
-            Some(PageSplit {
+            Some(PagedLanes {
                 pes,
                 lanes_per_pe: rows_per_pe,
                 head_groups,
+                strided_pages,
                 ..
             }) => {
                 let header = cx.unique("lanes");
@@ -1209,8 +1063,8 @@ fn append(
                         max_pages: 1,
                         rewritten: vec![pb.name.clone()],
                         page_groups: 1,
-                        strided: resident.is_some(),
-                        strided_pages,
+                        strided: strided_pages.is_some(),
+                        strided_pages: strided_pages.unwrap_or(0),
                     }),
                 })?;
                 (

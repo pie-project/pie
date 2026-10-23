@@ -13,7 +13,8 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Footprint, Shard};
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 const MAX_HC_MULT: u32 = 8;
@@ -62,7 +63,7 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
         return Err(refuse(OP, "the expansion lands one wide row per row"));
     }
     let h = x.width;
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows: x.rows,
@@ -117,7 +118,7 @@ pub fn mix(
         ));
     }
     let h = y.width;
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows: y.rows,
@@ -178,7 +179,7 @@ pub fn inject(
     // The gates split by rows alone, every column group holding its row
     // group's; a gate plane taller than the rows rides whole on one PE.
     let (rg, cg) = if gates.rows == hyper.rows {
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: hyper.rows,
@@ -256,7 +257,7 @@ pub fn ple_gate(
     // Rows past a PE split over row groups; a row past a PE over column
     // groups of every stream, the dot then gathered from the blocks'
     // partials in a second phase (like the wide rmsnorm).
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows: y.rows,

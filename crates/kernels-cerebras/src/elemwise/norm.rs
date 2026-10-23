@@ -8,7 +8,8 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Footprint, Shard};
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 /// `y = rmsnorm(x) * weight`: each row of `x` scaled by
@@ -79,7 +80,7 @@ pub fn rmsnorm_grouped_plus_one(
     }
     // Rows past a PE spread over row groups, a row past a PE over whole
     // groups, the gain bank split with the columns.
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows: y.rows,
@@ -181,7 +182,7 @@ fn rms_row(
     let per_head = axis < width;
     let (rg, cg) = if x.rows == y.rows {
         if per_head {
-            ctx.tile(
+            ctx.plan().tile(
                 op,
                 Footprint {
                     rows: y.rows,
@@ -193,7 +194,7 @@ fn rms_row(
                 },
             )?
         } else {
-            ctx.tile(
+            ctx.plan().tile(
                 op,
                 Footprint {
                     rows: y.rows,
@@ -360,7 +361,7 @@ pub fn rmsnorm_gated(
     // Rows past a PE spread over row groups, a row past a PE over its
     // heads; the gain (one head) rides whole.
     let (rg, cg) = if x.rows == y.rows && gate.rows == y.rows {
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: y.rows,
@@ -422,7 +423,7 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
         ));
     }
     let (rg, cg) = if x.rows == y.rows {
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: x.rows,
@@ -476,7 +477,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
         ));
     }
     let (rows, width) = (out.rows, out.width);
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows,
@@ -568,7 +569,7 @@ pub fn layernorm(
     // Rows over row groups; a row past a PE over column groups too, the
     // row's sum and sum of squares gathered from every block first.
     let (rg, cg) = if x.rows == y.rows {
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: y.rows,

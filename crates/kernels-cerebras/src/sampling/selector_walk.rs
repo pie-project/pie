@@ -83,7 +83,7 @@ pub fn selector_walk(
         picks.elements(),
     ];
     let on_pe = words.iter().all(|w| *w <= crate::linear::gemm::ARRAY_WORDS)
-        && words.iter().sum::<u64>() + 64 <= ctx.fabric().pe_words;
+        && words.iter().sum::<u64>() + 64 <= ctx.plan().fabric().pe_words;
     ctx.emit(&mut |cx| {
         let cb = cx.read(cand.data)?;
         let ib = cx.read(cand.indptr)?;

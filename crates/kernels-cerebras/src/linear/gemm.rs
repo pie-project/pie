@@ -6,7 +6,8 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{HostOp, Product, Shard};
+use crate::phase::{HostOp, Shard};
+use crate::plan::Product;
 use crate::tensor::Tensor;
 
 /// `y[m, n] = Σ_k act[m, k] · w[n, k]` over the first `y.rows` rows of `act`,
@@ -56,7 +57,7 @@ fn act_x_wt(
     // vocabulary projection), or one whose extents divide into no grid
     // within a PE (a 4304-wide projection: 4304 = 16 · 269), is multiplied
     // on the host.
-    if let Some(pes) = ctx.fabric().resident_pes {
+    if let Some(pes) = ctx.plan().fabric().resident_pes {
         return resident_matmul(ctx, op, act, w, y, m, k, n, pes);
     }
     ctx.emit(&mut |cx| {
@@ -66,7 +67,7 @@ fn act_x_wt(
         let half = cx.read_half(w)?;
         let packed = half.is_some();
         let product = Product { m, k, n, packed };
-        let Some((rg, cg, kg)) = ctx.grid(product) else {
+        let Some((rg, cg, kg)) = ctx.plan().grid(product) else {
             let wb = cx.read(w)?;
             let yb = cx.write(y)?;
             cx.host(HostOp::Matmul {
@@ -88,7 +89,7 @@ fn act_x_wt(
         // fabric, the `kg` PEs of a block form one row of a `kg × (rg · cg)`
         // rectangle and add their partials into the row's first PE; else
         // every partial comes down and the host adds them.
-        let fabric = kg > 1 && cx.fabric().fabric_sum;
+        let fabric = kg > 1 && cx.plan().fabric().fabric_sum;
         if rg > 1 {
             // PE `x` of the `rg × cg × kg` grid: rows `x / (cg·kg)`, output
             // columns `(x / kg) % cg`, depth slice `x % kg`.
@@ -205,7 +206,7 @@ fn resident_matmul(
     pes: u32,
 ) -> Result<(), Error> {
     use crate::phase::{FabricOp, FabricStep, Guarded};
-    let budget = ctx.fabric().pe_words;
+    let budget = ctx.plan().fabric().pe_words;
     let (m64, k64, n64) = (u64::from(m), u64::from(k), u64::from(n));
     let a_words = u64::from(act.rows) * k64;
     let y_words = m64 * n64;

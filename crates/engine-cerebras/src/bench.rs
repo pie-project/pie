@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use dtype::Dtype;
-use kernels_cerebras::phase::{Fabric, Footprint, Product};
+use kernels_cerebras::plan::{Fabric, Plan};
 use kernels_cerebras::{Cx, Emit, Error, Tensor, View};
 
-use crate::fabric::{Emitting, Operands, Program, Rendered};
+use crate::fabric::{Emitting, Operands, Planner, Program, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Sdk};
 
 /// One simulator at a time on this box: runs are serialised across threads
@@ -270,7 +270,7 @@ impl Operands for Roots {
 pub struct Recorder {
     program: std::cell::RefCell<Program>,
     operands: std::cell::RefCell<Box<dyn Operands>>,
-    fabric: Fabric,
+    plan: Planner,
 }
 
 impl Recorder {
@@ -278,7 +278,7 @@ impl Recorder {
         Recorder {
             program: std::cell::RefCell::new(Program::new()),
             operands: std::cell::RefCell::new(Box::new(operands)),
-            fabric,
+            plan: Planner { fabric },
         }
     }
 
@@ -296,16 +296,8 @@ impl Default for Recorder {
 }
 
 impl Emit for Recorder {
-    fn fabric(&self) -> Fabric {
-        self.fabric
-    }
-
-    fn tile(&self, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error> {
-        crate::fabric::tile(&self.fabric, op, footprint)
-    }
-
-    fn grid(&self, product: Product) -> Option<(u32, u32, u32)> {
-        crate::fabric::grid(&self.fabric, product)
+    fn plan(&self) -> &dyn Plan {
+        &self.plan
     }
 
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {
@@ -314,7 +306,7 @@ impl Emit for Recorder {
         let mut sink = Emitting {
             program: &mut program,
             operands: operands.as_mut(),
-            fabric: self.fabric,
+            plan: &self.plan,
         };
         let mut cx = Cx::new(&mut sink, "op");
         body(&mut cx)?;

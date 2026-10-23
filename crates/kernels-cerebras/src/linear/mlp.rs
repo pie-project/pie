@@ -6,7 +6,8 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Footprint, Shard};
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
@@ -25,7 +26,7 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
     // Rows past a PE spread over row groups, a row past a PE over column
     // groups: the same block of `g` and of `u` lands on one PE.
     let (rg, cg) = if packed.rows == y.rows {
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: y.rows,
@@ -89,7 +90,7 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
         ));
     }
     let (rg, cg) = if x.rows == y.rows {
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: y.rows,

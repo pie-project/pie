@@ -6,14 +6,15 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Footprint, Shard};
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 /// `x = silu(s · x)`, in place.
 pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.silu_scaled";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
-    let (rg, cg) = ctx.tile(
+    let (rg, cg) = ctx.plan().tile(
         OP,
         Footprint {
             rows: x.rows,
@@ -62,7 +63,7 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
         ));
     }
     let (rg, cg) = if gate.rows == x.rows {
-        ctx.tile(
+        ctx.plan().tile(
             OP,
             Footprint {
                 rows: x.rows,

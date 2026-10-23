@@ -10,7 +10,8 @@ use crate::csl::f32_lit;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Footprint, Shard};
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 /// Rotates the first `rotary_dim` lanes of every `head_dim` head of `q` and
@@ -102,7 +103,7 @@ fn rotate(
         let heads_gcd = ts.iter().map(|t| t.width / head_dim).fold(0, gcd).max(1);
         let unit = head_dim * (first.width / head_dim).max(1) / heads_gcd;
         let per_row: u64 = ts.iter().map(|t| u64::from(t.width)).sum::<u64>() + 1;
-        ctx.tile(
+        ctx.plan().tile(
             op,
             Footprint {
                 rows: first.rows,
