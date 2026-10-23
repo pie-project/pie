@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 
 use crate::device::rt;
-use kernels_cuda::linear::quant;
+use kernels_cuda::linear::cast;
 use kernels_cuda::{Ctx, Tensor};
 use poem_ir::Dtype;
 
@@ -269,7 +269,7 @@ impl CudaArena {
         })?;
         let src = Tensor::new(self.device_ptr(op.src.offset), 1, width, Dtype::F32);
         let mut dst = Tensor::new(self.device_ptr(op.dst.offset), 1, width, Dtype::Bf16);
-        let fired = quant::cast_fp32_to(&self.ctx(), src, &mut dst);
+        let fired = cast::cast_fp32_to(&self.ctx(), src, &mut dst);
         declined(CUDA_CAST_FP32_TO_BF16, fired)
     }
 
@@ -282,7 +282,7 @@ impl CudaArena {
         self.bounds(factors.offset, factors.len)?;
         let l = Tensor::new(self.device_ptr(factors.offset), 1, cols, Dtype::Bf16);
         let mut buf = Tensor::new(self.device_ptr(op.dst.offset), rows, cols, Dtype::Bf16);
-        let fired = quant::scale_rows(&self.ctx(), l, &mut buf);
+        let fired = cast::scale_rows(&self.ctx(), l, &mut buf);
         declined(CUDA_SCALE_ROWS_BF16, fired)
     }
 
@@ -316,7 +316,7 @@ mod tests {
                 concat!(stringify!($ns), "::", stringify!($f))
             }};
         }
-        assert_eq!(CUDA_CAST_FP32_TO_BF16, spelled!(quant::cast_fp32_to));
-        assert_eq!(CUDA_SCALE_ROWS_BF16, spelled!(quant::scale_rows));
+        assert_eq!(CUDA_CAST_FP32_TO_BF16, spelled!(cast::cast_fp32_to));
+        assert_eq!(CUDA_SCALE_ROWS_BF16, spelled!(cast::scale_rows));
     }
 }

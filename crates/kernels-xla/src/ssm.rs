@@ -4,7 +4,7 @@
 //! and Kimi's KDA, each in its decode (one row per lane), chunked (a query
 //! CSR of lanes) and committed (a rollback seat's extended window) form.
 //!
-//! State lives in a [`RecurrentPool`]: one slab row per slot. A fire gathers
+//! State lives in a [`RecurrentPool`](crate::tensor::RecurrentPool): one slab row per slot. A fire gathers
 //! its lanes' rows, computes, and scatters the new rows back; a lane whose
 //! write must not land is routed to an out-of-range slot, which XLA's scatter
 //! drops.
@@ -20,15 +20,15 @@ pub mod dyn_conv;
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, Val};
 use crate::lanes::{
-    Committed, DROP, Lanes, ci, clamp_i, cmp_i, committed_lanes, count_le, csr_lanes, decode_lanes,
-    f_reshape_col, flat_f32, flat_i32, full_i, interleave, iota, land_slots, loop_upto, nonzero,
-    put_at, ragged_lanes, row_at, slot_rows, take, take_slots,
+    Committed, DROP, LaneTables, Lanes, ci, clamp_i, cmp_i, committed_lanes, count_le,
+    decode_lanes, f_reshape_col, flat_f32, flat_i32, full_i, interleave, iota, land_slots,
+    loop_upto, nonzero, put_at, ragged_lanes, row_at, slot_rows, take, take_slots,
 };
-use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
+use crate::tensor::{Landing, Operand, RaggedTensor, Stored};
 
 /// The GDN's q/k l2-norm epsilon, as the GPU kernels state it.
 const GDN_EPS: f64 = 1e-6;
@@ -145,25 +145,21 @@ fn conv_lanes(
     Ok((y, next))
 }
 
-#[derive(Clone, Copy)]
-enum ConvLanes {
-    Decode,
-    Ragged(Tensor),
-    Committed(Tensor, Committed),
-}
-
+/// `(y, conv_state)`: the conv's rows and the slab with each lane's window
+/// rolled. The state is rolled in place; the engine refuses a pool that
+/// names two banks for it.
 fn conv(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    x: Tensor,
-    lanes: ConvLanes,
-    weight: Tensor,
-    state: &RecurrentPool,
+    x: Operand,
+    lanes: LaneTables,
+    weight: Operand,
+    conv_state: Operand,
     conv_width: u32,
     dilation: u32,
-    y: Tensor,
+    y: Landing,
     out: ConvOut,
-) -> Result<(), Error> {
+) -> Result<(Val, Val), Error> {
     expect(op, x, &[Dtype::Bf16])?;
     let channels = nonzero(op, "the conv's channel count", x.width)?;
     nonzero(op, "rows", x.rows)?;
@@ -181,83 +177,48 @@ fn conv(
             ),
         ));
     }
-    if state.conv_state.buf != state.new_conv_state.buf {
-        return Err(refuse(
-            op,
-            "this plane rolls the conv state in place, and the pool names two banks",
-        ));
-    }
     let hist = u64::from(taps - 1) * u64::from(dil) + 1;
     let per = slot_rows(
         op,
         &format!(
             "conv (a width of {taps} at dilation {dil} keeps {hist} rows of {channels} channels)"
         ),
-        state.conv_state,
+        conv_state,
         hist * u64::from(channels),
     )?;
-    match lanes {
-        ConvLanes::Decode => {
-            if state.slots.elements() < u64::from(x.rows) {
-                return Err(refuse(
-                    op,
-                    "the pool names fewer slots than the fire has rows",
-                ));
-            }
-        }
-        ConvLanes::Ragged(indptr) | ConvLanes::Committed(indptr, _) => csr_lanes(op, indptr)?,
-    }
+    lanes.check(op, x.rows)?;
     let (t, c, k) = (i64::from(x.rows), i64::from(channels), i64::from(taps));
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let w = cx.read_f32(weight)?;
-        let w = cx.reshape(w, &[c, k])?;
-        let slab = cx.read(state.conv_state)?;
-        let lanes = match lanes {
-            ConvLanes::Decode => {
-                let slots = flat_i32(cx, state.slots)?;
-                decode_lanes(cx.func(), slots, t)?
-            }
-            ConvLanes::Ragged(indptr) => {
-                let ip = flat_i32(cx, indptr)?;
-                let slots = flat_i32(cx, state.slots)?;
-                ragged_lanes(cx.func(), ip, slots)?
-            }
-            ConvLanes::Committed(indptr, cm) => {
-                let ip = flat_i32(cx, indptr)?;
-                let rep = flat_i32(cx, cm.replay)?;
-                let com = flat_i32(cx, cm.commit)?;
-                let sl = flat_i32(cx, cm.slots)?;
-                committed_lanes(op, cx.func(), ip, rep, com, sl, cm.lane0)?
-            }
-        };
-        let f = cx.func();
-        let past = take_slots(f, slab, lanes.slot, per)?;
-        let past = f.convert(past, Elem::F32);
-        let (yv, next) = conv_lanes(f, xv, w, past, &lanes, i64::from(dil), out)?;
-        let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
-        cx.write(y, yv)?;
-        cx.write(state.new_conv_state, slab)
-    })
+    let xv = x.f32(f);
+    let w = weight.f32(f);
+    let w = f.reshape(w, &[c, k])?;
+    let slab = conv_state.val;
+    let lanes = lanes.lanes(f, op, t)?;
+    let past = take_slots(f, slab, lanes.slot, per)?;
+    let past = f.convert(past, Elem::F32);
+    let (yv, next) = conv_lanes(f, xv, w, past, &lanes, i64::from(dil), out)?;
+    let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
+    Ok((yv, slab))
 }
 
 /// One row per lane: `y = silu(conv(state ++ x))`, the window shifts by one.
+/// Returns `(y, conv_state)`.
 pub fn causal_conv1d(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    x: Operand,
+    weight: Operand,
+    conv_state: Operand,
+    slots: Operand,
     conv_width: u32,
     dilation: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<(Val, Val), Error> {
     conv(
-        ctx,
+        f,
         "ssm.causal_conv1d",
         x,
-        ConvLanes::Decode,
+        LaneTables::Decode { slots },
         weight,
-        state,
+        conv_state,
         conv_width,
         dilation,
         y,
@@ -265,24 +226,28 @@ pub fn causal_conv1d(
     )
 }
 
-/// The conv over a query CSR; `state.slots` is per row (a lane's slot is its
-/// first row's).
+/// The conv over a query CSR; `slots` is per row (a lane's slot is its first
+/// row's).
 pub fn causal_conv1d_chunked(
-    ctx: &Ctx<'_>,
-    x: RaggedTensor,
-    weight: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    x: RaggedTensor<Operand>,
+    weight: Operand,
+    conv_state: Operand,
+    slots: Operand,
     conv_width: u32,
     dilation: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<(Val, Val), Error> {
     conv(
-        ctx,
+        f,
         "ssm.causal_conv1d_chunked",
         x.data,
-        ConvLanes::Ragged(x.indptr),
+        LaneTables::Ragged {
+            indptr: x.indptr,
+            slots,
+        },
         weight,
-        state,
+        conv_state,
         conv_width,
         dilation,
         y,
@@ -293,23 +258,23 @@ pub fn causal_conv1d_chunked(
 /// The conv over a rollback seat's extended rows: every row is convolved,
 /// the window after each lane's committed prefix lands.
 pub fn causal_conv1d_committed(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    indptr: Tensor,
-    committed: &Committed,
-    weight: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    x: Operand,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    weight: Operand,
+    conv_state: Operand,
     conv_width: u32,
     dilation: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<(Val, Val), Error> {
     conv(
-        ctx,
+        f,
         "ssm.causal_conv1d_committed",
         x,
-        ConvLanes::Committed(indptr, *committed),
+        LaneTables::Committed { indptr, seat },
         weight,
-        state,
+        conv_state,
         conv_width,
         dilation,
         y,
@@ -320,20 +285,21 @@ pub fn causal_conv1d_committed(
 /// `y = conv(state ++ x) + x`, one row per lane.
 /// Reference: kernels-cuda `ssm::conv1d::short_conv` (`ConvOut::Residual`).
 pub fn short_conv(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    x: Operand,
+    weight: Operand,
+    conv_state: Operand,
+    slots: Operand,
     conv_width: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<(Val, Val), Error> {
     conv(
-        ctx,
+        f,
         "ssm.short_conv",
         x,
-        ConvLanes::Decode,
+        LaneTables::Decode { slots },
         weight,
-        state,
+        conv_state,
         conv_width,
         1,
         y,
@@ -344,20 +310,24 @@ pub fn short_conv(
 /// The short conv over a query CSR.
 /// Reference: kernels-cuda `ssm::conv1d::short_conv_chunked`.
 pub fn short_conv_chunked(
-    ctx: &Ctx<'_>,
-    x: RaggedTensor,
-    weight: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    x: RaggedTensor<Operand>,
+    weight: Operand,
+    conv_state: Operand,
+    slots: Operand,
     conv_width: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<(Val, Val), Error> {
     conv(
-        ctx,
+        f,
         "ssm.short_conv_chunked",
         x.data,
-        ConvLanes::Ragged(x.indptr),
+        LaneTables::Ragged {
+            indptr: x.indptr,
+            slots,
+        },
         weight,
-        state,
+        conv_state,
         conv_width,
         1,
         y,
@@ -370,12 +340,12 @@ pub fn short_conv_chunked(
 /// `[b | a]` → `[g_log | beta]`: `g = -exp(a_log) · softplus(a + dt_bias)`,
 /// `beta = σ(b)`, per value head.
 pub fn gdn_prep(
-    ctx: &Ctx<'_>,
-    ba: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
-    gates: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    ba: Operand,
+    dt_bias: Operand,
+    a_log: Operand,
+    gates: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "ssm.gdn_gates";
     expect(OP, ba, &[Dtype::Bf16])?;
     if ba.width == 0 || !ba.width.is_multiple_of(2) {
@@ -403,24 +373,22 @@ pub fn gdn_prep(
         }
     }
     let rows = i64::from(ba.rows);
-    ctx.emit(&mut |cx| {
-        let v = cx.read_f32(ba)?;
-        let db = flat_f32(cx, dt_bias)?;
-        let al = flat_f32(cx, a_log)?;
-        let f = cx.func();
-        let b = f.slice_axis(v, 1, 0, vh)?;
-        let a = f.slice_axis(v, 1, vh, 2 * vh)?;
-        let db = f.broadcast(db, &[rows, vh], &[1])?;
-        let z = f.add(a, db)?;
-        let sp = softplus20(f, z)?;
-        let al = f.exp(al);
-        let al = f.broadcast(al, &[rows, vh], &[1])?;
-        let g = f.mul(al, sp)?;
-        let g = f.neg(g);
-        let beta = f.sigmoid(b);
-        let out = f.concat(&[g, beta], 1)?;
-        cx.write(gates, out)
-    })
+    let v = ba.f32(f);
+    let db = flat_f32(f, dt_bias)?;
+    let al = flat_f32(f, a_log)?;
+    let fq = &mut *f;
+    let b = fq.slice_axis(v, 1, 0, vh)?;
+    let a = fq.slice_axis(v, 1, vh, 2 * vh)?;
+    let db = fq.broadcast(db, &[rows, vh], &[1])?;
+    let z = fq.add(a, db)?;
+    let sp = softplus20(fq, z)?;
+    let al = fq.exp(al);
+    let al = fq.broadcast(al, &[rows, vh], &[1])?;
+    let g = fq.mul(al, sp)?;
+    let g = fq.neg(g);
+    let beta = fq.sigmoid(b);
+    let out = fq.concat(&[g, beta], 1)?;
+    Ok(out)
 }
 
 /// `softplus` with the GPU kernels' linear cut above 20.
@@ -972,28 +940,22 @@ fn unit_lower_inverse(f: &mut Func, a: Val) -> Built<Val> {
 
 /// Which lanes a delta-rule entry walks.
 #[derive(Clone, Copy)]
-enum DeltaLanes {
-    Decode,
-    Ragged(Tensor),
-    Committed(Tensor, Committed),
-}
-
 /// The operands a delta rule reads: GDN's or KDA's.
 enum DeltaIn {
     Gdn {
-        qkv: Tensor,
-        gates: Tensor,
+        qkv: Operand,
+        gates: Operand,
         hk: i64,
         hv: i64,
         dk: i64,
         dv: i64,
     },
     Kda {
-        mixed: Tensor,
-        f: Tensor,
-        b: Tensor,
-        dt_bias: Tensor,
-        a_log: Tensor,
+        mixed: Operand,
+        f: Operand,
+        b: Operand,
+        dt_bias: Operand,
+        a_log: Operand,
         heads: i64,
         d: i64,
         eps: f32,
@@ -1033,10 +995,10 @@ impl DeltaIn {
     }
 
     /// The per-row operands as they are stored, and the per-head banks.
-    fn raw(&self, cx: &mut Cx<'_>) -> Result<Raw, Error> {
+    fn raw(&self, fq: &mut Func) -> Result<Raw, Error> {
         Ok(match *self {
             Self::Gdn { qkv, gates, .. } => Raw {
-                rows: vec![cx.read(qkv)?, cx.read_f32(gates)?],
+                rows: vec![qkv.val, gates.f32(fq)],
                 fixed: vec![],
             },
             Self::Kda {
@@ -1047,8 +1009,8 @@ impl DeltaIn {
                 a_log,
                 ..
             } => Raw {
-                rows: vec![cx.read(mixed)?, cx.read(f)?, cx.read(b)?],
-                fixed: vec![flat_f32(cx, dt_bias)?, flat_f32(cx, a_log)?],
+                rows: vec![mixed.val, f.val, b.val],
+                fixed: vec![flat_f32(fq, dt_bias)?, flat_f32(fq, a_log)?],
             },
         })
     }
@@ -1078,14 +1040,17 @@ struct Raw {
     fixed: Vec<Val>,
 }
 
+/// `(y, state)`: the recurrence's value rows and the slab with each lane's
+/// state landed.
 fn delta(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
     input: DeltaIn,
-    lanes: DeltaLanes,
-    state: &RecurrentPool,
-    y: Tensor,
-) -> Result<(), Error> {
+    lanes: LaneTables,
+    state: Operand,
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
     let (hh, dk, dv) = input.dims();
     let rows = input.rows();
     nonzero(op, "rows", rows)?;
@@ -1096,118 +1061,107 @@ fn delta(
     let per = slot_rows(
         op,
         &format!("state ({hh} heads of {dv}x{dk})"),
-        state.state,
+        state,
         stride as u64,
     )?;
-    match lanes {
-        DeltaLanes::Decode => {
-            if state.slots.elements() < u64::from(rows) {
-                return Err(refuse(
-                    op,
-                    "the pool names fewer slots than the fire has rows",
-                ));
-            }
-        }
-        DeltaLanes::Ragged(indptr) | DeltaLanes::Committed(indptr, _) => csr_lanes(op, indptr)?,
-    }
+    lanes.check(op, rows)?;
     let lanes_n = match lanes {
-        DeltaLanes::Decode => i64::from(rows),
-        DeltaLanes::Ragged(ip) | DeltaLanes::Committed(ip, _) => ip.elements() as i64 - 1,
+        LaneTables::Decode { .. } => i64::from(rows),
+        LaneTables::Ragged { indptr, .. } | LaneTables::Committed { indptr, .. } => {
+            indptr.elements() as i64 - 1
+        }
     };
     let t = i64::from(rows);
-    ctx.emit(&mut |cx| {
-        let tuning = cx.tuning();
-        let chunk = input.chunk(t, lanes_n, tuning.ssm);
-        let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
-        let raw = input.raw(cx)?;
-        let slab = cx.read(state.state)?;
-        let (yv, slab) = match lanes {
-            DeltaLanes::Decode => {
-                let slots = flat_i32(cx, state.slots)?;
-                let f = cx.func();
-                let lanes = decode_lanes(f, slots, t)?;
-                let heads = input.heads_from(f, &raw.rows, &raw.fixed)?;
-                // Over a slot-blocked bank, rounds of lanes, each gathered,
-                // stepped (in f32) and landed before the next, so a round's
-                // states stay on chip. A padded lane sharing the sink slot
-                // with an earlier round's reads what that round left there,
-                // which is garbage either way.
-                let round = if per == 1 {
-                    t
+    let chunk = input.chunk(t, lanes_n, tuning.ssm);
+    let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
+    let raw = input.raw(f)?;
+    let slab = state.val;
+    let (yv, slab) = match lanes {
+        LaneTables::Decode { slots } => {
+            let slots = flat_i32(f, slots)?;
+            let fq = &mut *f;
+            let lanes = decode_lanes(fq, slots, t)?;
+            let heads = input.heads_from(fq, &raw.rows, &raw.fixed)?;
+            // Over a slot-blocked bank, rounds of lanes, each gathered,
+            // stepped (in f32) and landed before the next, so a round's
+            // states stay on chip. A padded lane sharing the sink slot
+            // with an earlier round's reads what that round left there,
+            // which is garbage either way.
+            let round = if per == 1 {
+                t
+            } else {
+                (tuning.decode_round_bytes() / (stride * 4)).clamp(1, t)
+            };
+            let mut slab = slab;
+            let mut ys = Vec::new();
+            let mut lo = 0;
+            while lo < t {
+                let hi = (lo + round).min(t);
+                let cut = |fq: &mut Func, x: Val| fq.slice_axis(x, 0, lo, hi);
+                let part = if lo == 0 && hi == t {
+                    heads
                 } else {
-                    (tuning.decode_round_bytes() / (stride * 4)).clamp(1, t)
+                    Heads {
+                        q: cut(fq, heads.q)?,
+                        k: cut(fq, heads.k)?,
+                        v: cut(fq, heads.v)?,
+                        g: cut(fq, heads.g)?,
+                        beta: cut(fq, heads.beta)?,
+                    }
                 };
-                let mut slab = slab;
-                let mut ys = Vec::new();
-                let mut lo = 0;
-                while lo < t {
-                    let hi = (lo + round).min(t);
-                    let cut = |f: &mut Func, x: Val| f.slice_axis(x, 0, lo, hi);
-                    let part = if lo == 0 && hi == t {
-                        heads
-                    } else {
-                        Heads {
-                            q: cut(f, heads.q)?,
-                            k: cut(f, heads.k)?,
-                            v: cut(f, heads.v)?,
-                            g: cut(f, heads.g)?,
-                            beta: cut(f, heads.beta)?,
-                        }
-                    };
-                    let slot = cut(f, lanes.slot)?;
-                    let write = cut(f, lanes.write)?;
-                    let s = take_slots(f, slab, slot, per)?;
-                    let s = f.convert(s, Elem::F32);
-                    let s = f.reshape(s, &[hi - lo, hh, dv, dk])?;
-                    let (yv, s) = delta_step(f, &part, s)?;
-                    let s = f.reshape(s, &[hi - lo, stride])?;
-                    slab = land_slots(f, slab, slot, write, s, per)?;
-                    ys.push(yv);
-                    lo = hi;
-                }
-                let yv = if ys.len() == 1 {
-                    ys[0]
-                } else {
-                    f.concat(&ys, 0)?
-                };
-                (yv, slab)
+                let slot = cut(fq, lanes.slot)?;
+                let write = cut(fq, lanes.write)?;
+                let s = take_slots(fq, slab, slot, per)?;
+                let s = fq.convert(s, Elem::F32);
+                let s = fq.reshape(s, &[hi - lo, hh, dv, dk])?;
+                let (yv, s) = delta_step(fq, &part, s)?;
+                let s = fq.reshape(s, &[hi - lo, stride])?;
+                slab = land_slots(fq, slab, slot, write, s, per)?;
+                ys.push(yv);
+                lo = hi;
             }
-            DeltaLanes::Ragged(indptr) | DeltaLanes::Committed(indptr, _) => {
-                let ip = flat_i32(cx, indptr)?;
-                let (lanes, segs) = if let DeltaLanes::Committed(_, cm) = lanes {
-                    let rep = flat_i32(cx, cm.replay)?;
-                    let com = flat_i32(cx, cm.commit)?;
-                    let sl = flat_i32(cx, cm.slots)?;
-                    let f = cx.func();
-                    let lanes = committed_lanes(op, f, ip, rep, com, sl, cm.lane0)?;
+            let yv = if ys.len() == 1 {
+                ys[0]
+            } else {
+                fq.concat(&ys, 0)?
+            };
+            (yv, slab)
+        }
+        LaneTables::Ragged { indptr, .. } | LaneTables::Committed { indptr, .. } => {
+            let ip = flat_i32(f, indptr)?;
+            let (lanes, segs) = match lanes {
+                LaneTables::Committed { seat, .. } => {
+                    let rep = flat_i32(f, seat.replay)?;
+                    let com = flat_i32(f, seat.commit)?;
+                    let sl = flat_i32(f, seat.slots)?;
+                    let lanes = committed_lanes(op, f, ip, rep, com, sl, seat.lane0)?;
                     let segs = committed_segs(f, &lanes)?;
                     (lanes, segs)
-                } else {
-                    let slots = flat_i32(cx, state.slots)?;
-                    let f = cx.func();
+                }
+                LaneTables::Ragged { slots, .. } | LaneTables::Decode { slots } => {
+                    let slots = flat_i32(f, slots)?;
                     let lanes = ragged_lanes(f, ip, slots)?;
                     let segs = whole_segs(f, &lanes);
                     (lanes, segs)
-                };
-                let f = cx.func();
-                let l = lanes.count(f);
-                let init = take_slots(f, slab, lanes.slot, per)?;
-                let init = f.convert(init, Elem::F32);
-                let init = f.reshape(init, &[l, hh, dv, dk])?;
-                let (yv, fin) = delta_chunked(f, &input, &raw, &segs, init, chunk)?;
-                let fin = f.reshape(fin, &[l, stride])?;
-                (yv, land_slots(f, slab, lanes.slot, lanes.write, fin, per)?)
-            }
-        };
-        cx.write(y, yv)?;
-        cx.write(state.state, slab)
-    })
+                }
+            };
+            let fq = &mut *f;
+            let l = lanes.count(fq);
+            let init = take_slots(fq, slab, lanes.slot, per)?;
+            let init = fq.convert(init, Elem::F32);
+            let init = fq.reshape(init, &[l, hh, dv, dk])?;
+            let (yv, fin) = delta_chunked(fq, &input, &raw, &segs, init, chunk)?;
+            let fin = fq.reshape(fin, &[l, stride])?;
+            (yv, land_slots(fq, slab, lanes.slot, lanes.write, fin, per)?)
+        }
+    };
+    Ok((yv, slab))
 }
 
 fn gdn_in(
     op: &'static str,
-    qkv: Tensor,
-    gates: Tensor,
+    qkv: Operand,
+    gates: Operand,
     k_heads: u32,
     v_heads: u32,
     k_dim: u32,
@@ -1230,13 +1184,13 @@ fn gdn_in(
         i64::from(k_dim),
         i64::from(v_dim),
     );
-    if i64::from(qkv.width) != 2 * hk * dk + hv * dv {
+    if i64::from(qkv.width()) != 2 * hk * dk + hv * dv {
         return Err(refuse(
             op,
             "the post-convolution qkv's row is not the four stated head numbers",
         ));
     }
-    if gates.rows != qkv.rows || i64::from(gates.width) != 2 * hv {
+    if gates.rows() != qkv.rows() || i64::from(gates.width()) != 2 * hv {
         return Err(refuse(
             op,
             "the fused `[g_log | beta]` row is not two entries per value head",
@@ -1253,79 +1207,78 @@ fn gdn_in(
 }
 
 /// One token per lane of the gated delta rule; `y` is the f32 accumulator
-/// (`z` gates it later, in the gated rmsnorm).
+/// (`z` gates it later, in the gated rmsnorm). Returns `(y, state)`.
 pub fn gated_delta(
-    ctx: &Ctx<'_>,
-    qkv: Tensor,
-    z: Tensor,
-    gates: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    qkv: Operand,
+    gates: Operand,
+    state: Operand,
+    slots: Operand,
     k_heads: u32,
     v_heads: u32,
     k_dim: u32,
     v_dim: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "ssm.gated_delta";
-    let _ = z;
     let input = gdn_in(OP, qkv, gates, k_heads, v_heads, k_dim, v_dim)?;
-    delta(ctx, OP, input, DeltaLanes::Decode, state, y)
+    delta(f, OP, input, LaneTables::Decode { slots }, state, y, tuning)
 }
 
-/// The gated delta rule over a query CSR, chunked; `state.slots` is per row.
+/// The gated delta rule over a query CSR, chunked; `slots` is per row.
 pub fn gated_delta_chunked(
-    ctx: &Ctx<'_>,
-    qkv: RaggedTensor,
-    z: Tensor,
-    gates: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    qkv: RaggedTensor<Operand>,
+    gates: Operand,
+    state: Operand,
+    slots: Operand,
     k_heads: u32,
     v_heads: u32,
     k_dim: u32,
     v_dim: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "ssm.gated_delta_chunked";
-    let _ = z;
     let input = gdn_in(OP, qkv.data, gates, k_heads, v_heads, k_dim, v_dim)?;
-    delta(ctx, OP, input, DeltaLanes::Ragged(qkv.indptr), state, y)
+    let lanes = LaneTables::Ragged {
+        indptr: qkv.indptr,
+        slots,
+    };
+    delta(f, OP, input, lanes, state, y, tuning)
 }
 
 /// The gated delta rule over a rollback seat's extended rows: every row's
 /// `y`, and the state after each lane's committed prefix. The GPU's `work`
 /// scratch plane is not an operand here.
 pub fn gated_delta_committed(
-    ctx: &Ctx<'_>,
-    qkv: Tensor,
-    indptr: Tensor,
-    committed: &Committed,
-    gates: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    qkv: Operand,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    gates: Operand,
+    state: Operand,
     k_heads: u32,
     v_heads: u32,
     k_dim: u32,
     v_dim: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "ssm.gated_delta_committed";
     let input = gdn_in(OP, qkv, gates, k_heads, v_heads, k_dim, v_dim)?;
-    delta(
-        ctx,
-        OP,
-        input,
-        DeltaLanes::Committed(indptr, *committed),
-        state,
-        y,
-    )
+    let lanes = LaneTables::Committed { indptr, seat };
+    delta(f, OP, input, lanes, state, y, tuning)
 }
 
 fn kda_in(
     op: &'static str,
-    mixed: Tensor,
-    f: Tensor,
-    b: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
+    mixed: Operand,
+    f: Operand,
+    b: Operand,
+    dt_bias: Operand,
+    a_log: Operand,
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
@@ -1335,19 +1288,19 @@ fn kda_in(
     nonzero(op, "the KDA heads this statement states", heads)?;
     nonzero(op, "the KDA head width this statement states", head_dim)?;
     let (h, d) = (i64::from(heads), i64::from(head_dim));
-    if i64::from(mixed.width) != 3 * h * d {
+    if i64::from(mixed.width()) != 3 * h * d {
         return Err(refuse(
             op,
             "the post-convolution `[q | k | v]` row is not three head planes",
         ));
     }
-    if f.rows != mixed.rows || i64::from(f.width) != h * d {
+    if f.rows() != mixed.rows() || i64::from(f.width()) != h * d {
         return Err(refuse(
             op,
             "the forget projection's row is not one head plane",
         ));
     }
-    if b.rows != mixed.rows || i64::from(b.width) != h {
+    if b.rows() != mixed.rows() || i64::from(b.width()) != h {
         return Err(refuse(
             op,
             "the beta projection's row is not one entry per head",
@@ -1372,80 +1325,84 @@ fn kda_in(
     })
 }
 
-/// One token per lane of KDA (per-channel decay delta rule).
+/// One token per lane of KDA (per-channel decay delta rule). Returns
+/// `(y, state)`.
 pub fn kda_step(
-    ctx: &Ctx<'_>,
-    mixed: Tensor,
-    f: Tensor,
-    b: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    mixed: Operand,
+    forget: Operand,
+    b: Operand,
+    dt_bias: Operand,
+    a_log: Operand,
+    state: Operand,
+    slots: Operand,
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
     gate_floor: f32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "ssm.kda";
     let input = kda_in(
-        OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
+        OP, mixed, forget, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
     )?;
-    delta(ctx, OP, input, DeltaLanes::Decode, state, y)
+    delta(f, OP, input, LaneTables::Decode { slots }, state, y, tuning)
 }
 
-/// KDA over a query CSR, chunked; `state.slots` is per row.
+/// KDA over a query CSR, chunked; `slots` is per row.
 pub fn kda_chunked(
-    ctx: &Ctx<'_>,
-    mixed: RaggedTensor,
-    f: Tensor,
-    b: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    mixed: RaggedTensor<Operand>,
+    forget: Operand,
+    b: Operand,
+    dt_bias: Operand,
+    a_log: Operand,
+    state: Operand,
+    slots: Operand,
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
     gate_floor: f32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "ssm.kda_chunked";
     let input = kda_in(
-        OP, mixed.data, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
+        OP, mixed.data, forget, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
     )?;
-    delta(ctx, OP, input, DeltaLanes::Ragged(mixed.indptr), state, y)
+    let lanes = LaneTables::Ragged {
+        indptr: mixed.indptr,
+        slots,
+    };
+    delta(f, OP, input, lanes, state, y, tuning)
 }
 
 /// KDA over a rollback seat's extended rows. The GPU's `work` scratch plane
 /// is not an operand here.
 pub fn kda_committed(
-    ctx: &Ctx<'_>,
-    mixed: Tensor,
-    indptr: Tensor,
-    committed: &Committed,
-    f: Tensor,
-    b: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    mixed: Operand,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    forget: Operand,
+    b: Operand,
+    dt_bias: Operand,
+    a_log: Operand,
+    state: Operand,
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
     gate_floor: f32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "ssm.kda_committed";
     let input = kda_in(
-        OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
+        OP, mixed, forget, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
     )?;
-    delta(
-        ctx,
-        OP,
-        input,
-        DeltaLanes::Committed(indptr, *committed),
-        state,
-        y,
-    )
+    let lanes = LaneTables::Committed { indptr, seat };
+    delta(f, OP, input, lanes, state, y, tuning)
 }
 
 // ------------------------------------------------------------ dynamic conv

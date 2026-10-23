@@ -10,9 +10,9 @@ mod common;
 use common::{Gpu, f16, from_f16, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
-use kernels_rocm::linear::affine;
+use kernels_rocm::linear::affine::{self, OffsetKind, tiled};
 use kernels_rocm::linear::moe::GroupSeat;
-use kernels_rocm::linear::quant::{self, OffsetKind};
+use kernels_rocm::linear::{cast, dequant};
 
 /// The activation and factor element type.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -190,7 +190,7 @@ fn run(gpu: &Gpu, c: &Case, seed: u64) {
         .collect();
     let xt = gpu.tensor(&x, c.rows, c.k, c.e.dtype());
     let mut y = gpu.zeros(c.rows, c.n, c.e.dtype());
-    quant::matmul(
+    affine::matmul(
         &ctx,
         xt,
         codes,
@@ -350,7 +350,7 @@ fn linear_quant_window_and_seat() {
         let win = gpu.ints(&[live, 0, 0, 0].map(|v| v as i32));
         let mut y = gpu.zeros(rows, n, e.dtype());
         ctx.arm_stage(win.ptr);
-        quant::matmul(
+        affine::matmul(
             &ctx,
             xt,
             dc,
@@ -398,7 +398,7 @@ fn linear_quant_decoded() {
         let w = Weight::new(bits, group, offset, n, k, Elem::Bf16, 21);
         let (codes, scales, offs) = w.planes(&gpu, Elem::Bf16);
         let dst = gpu.zeros(n, k, Elem::Bf16.dtype());
-        quant::decode_into(
+        dequant::decode_into(
             &ctx,
             "linear.matmul",
             codes,
@@ -427,7 +427,7 @@ fn linear_quant_decoded() {
             .collect();
         let xt = gpu.tensor(&x, rows, k, Elem::Bf16.dtype());
         let mut y = gpu.zeros(rows, n, Elem::Bf16.dtype());
-        quant::matmul_via_dense(
+        dequant::matmul_via_dense(
             &ctx,
             xt,
             codes,
@@ -458,7 +458,7 @@ fn linear_quant_casts() {
     let src = values((rows * width) as usize, 31, 3.0);
     let s = gpu.tensor(&src, rows, width, Dtype::F32);
     let mut dst = gpu.zeros(rows, width, Dtype::Bf16);
-    quant::cast_fp32_to(&ctx, s, &mut dst).unwrap();
+    cast::cast_fp32_to(&ctx, s, &mut dst).unwrap();
     let want: Vec<f32> = src.iter().map(|&v| round_bf16(v)).collect();
     assert_eq!(
         gpu.read(&dst),
@@ -476,7 +476,7 @@ fn linear_quant_casts() {
         .collect();
     let mut b = gpu.tensor(&buf, rows, width, Dtype::Bf16);
     let lt = gpu.tensor(&l, 1, width, Dtype::Bf16);
-    quant::scale_rows(&ctx, lt, &mut b).unwrap();
+    cast::scale_rows(&ctx, lt, &mut b).unwrap();
     let want: Vec<f32> = buf
         .iter()
         .enumerate()
@@ -524,7 +524,7 @@ fn linear_quant_tiled() {
         let w = Weight::new(4, group, OffsetKind::Post, n, k, e, 41);
         let (codes, scales, offs) = w.planes(&gpu, e);
         let biases = offs.unwrap();
-        let n_pad = affine::repacked_rows(n);
+        let n_pad = tiled::repacked_rows(n);
         let mut tc = gpu.upload(
             &vec![0u8; (n_pad * k / 2) as usize],
             n_pad,
@@ -543,7 +543,7 @@ fn linear_quant_tiled() {
             scales.width,
             Dtype::U8,
         );
-        affine::repack(&ctx, codes, scales, biases, &mut tc, &mut ts, &mut tb).unwrap();
+        tiled::repack(&ctx, codes, scales, biases, &mut tc, &mut ts, &mut tb).unwrap();
         let have: Vec<u32> = gpu.read_as(&tc);
         assert_eq!(have, tile_codes(&w), "the repacked codes, g{group} {n}x{k}");
         let have: Vec<u16> = gpu.read_as(&ts);
@@ -577,9 +577,9 @@ fn linear_quant_tiled() {
                 ctx.arm_stage(s.ptr);
             }
             let entry = if rows > 16 {
-                affine::matmul
+                tiled::matmul
             } else {
-                affine::matmul_gemv
+                tiled::matmul_gemv
             };
             entry(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT).unwrap();
             ctx.disarm_stage();
@@ -599,7 +599,7 @@ fn linear_quant_tiled() {
             );
         }
         // Both GEMM tiles at a row count the gemv also takes.
-        for tuple in [affine::LONG, affine::SHORT] {
+        for tuple in [tiled::LONG, tiled::SHORT] {
             let rows = 16;
             let x: Vec<f32> = values((rows * k) as usize, 43, 1.0)
                 .into_iter()
@@ -607,7 +607,7 @@ fn linear_quant_tiled() {
                 .collect();
             let xt = gpu.tensor(&x, rows, k, e.dtype());
             let mut y = gpu.zeros(rows, n, e.dtype());
-            affine::matmul_with(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT, tuple).unwrap();
+            tiled::matmul_with(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT, tuple).unwrap();
             let (want, scale) = reference(&x, &w, rows as usize);
             check(
                 &format!("tiled {tuple:?} g{group}"),

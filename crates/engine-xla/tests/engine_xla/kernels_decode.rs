@@ -6,10 +6,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::attn::pool;
+use engine_xla::handle::{Bank, KvPool, Tensor};
 use kernels_xla::elemwise::norm;
-use kernels_xla::linear::decode;
-use kernels_xla::{Bank, KvPool, Tensor};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
@@ -133,7 +131,7 @@ fn a_bank_decodes_to_the_plane_its_codes_and_factors_state() {
     let ran = b
         .run(|ctx| {
             for (bank, out, _, _) in &cases {
-                decode::decoded_plane(ctx, "attn.mla_absorb_q", *bank, *out)?;
+                engine_xla::lower::linear::decoded_plane(ctx, "attn.mla_absorb_q", *bank, *out)?;
             }
             Ok(())
         })
@@ -236,8 +234,7 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
     let lse = b.f32(rows as u32, heads as u32, &vec![1.0; rows * heads]);
     let ran = b
         .run(|ctx| {
-            pool::attention_lse(
-                ctx,
+            let call = kernels_xla::attn::pool::attention_lse(
                 q,
                 pos,
                 req,
@@ -248,7 +245,8 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
                 0.5,
                 o,
                 lse,
-            )
+            )?;
+            engine_xla::lower::attn::pool::lse(ctx, call, pages)
         })
         .unwrap();
     if !ran {

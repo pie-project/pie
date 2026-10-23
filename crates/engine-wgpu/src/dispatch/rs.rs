@@ -1,4 +1,3 @@
-use kernels_wgpu::attn::ssm::Committed;
 use kernels_wgpu::{Error, Tensor};
 use poem_ir::ValueId;
 
@@ -27,11 +26,11 @@ impl Run<'_> {
         }
     }
 
-    pub(crate) fn rs_committed(&self, seat: &Seat) -> Committed {
-        Committed {
-            replay: seat.replay,
-            commit: seat.commit,
-            slots: seat.slots,
+    pub(crate) fn rs_committed(&self, seat: &Seat) -> kernels_slang::ssm::Committed {
+        kernels_slang::ssm::Committed {
+            replay: crate::encode::slang_tensor(seat.replay),
+            commit: crate::encode::slang_tensor(seat.commit),
+            slots: crate::encode::slang_tensor(seat.slots),
             lane0: self.window().span.lane_offset,
         }
     }

@@ -356,11 +356,11 @@ impl WindowMap {
 #[derive(Clone, Copy, Debug)]
 pub struct WindowInputs {
     pub rows_ext: u32,
-    pub from_buffer: kernels_xla::Tensor,
-    pub buffer_row: kernels_xla::Tensor,
-    pub own_row: kernels_xla::Tensor,
-    pub stash: kernels_xla::Tensor,
-    pub land: kernels_xla::Tensor,
+    pub from_buffer: crate::handle::Tensor,
+    pub buffer_row: crate::handle::Tensor,
+    pub own_row: crate::handle::Tensor,
+    pub stash: crate::handle::Tensor,
+    pub land: crate::handle::Tensor,
 }
 
 /// A fire's recurrent seat: each lane's plan and tables, the buffer planes,
@@ -368,14 +368,14 @@ pub struct WindowInputs {
 #[derive(Debug)]
 pub struct Seat {
     pub plans: Vec<LanePlan>,
-    pub replay: kernels_xla::Tensor,
-    pub commit: kernels_xla::Tensor,
-    pub slots: kernels_xla::Tensor,
+    pub replay: crate::handle::Tensor,
+    pub commit: crate::handle::Tensor,
+    pub slots: crate::handle::Tensor,
     pub layout: std::sync::Arc<Layout>,
     /// The buffer plane of each layout plane.
-    pub buffers: Vec<kernels_xla::Tensor>,
+    pub buffers: Vec<crate::handle::Tensor>,
     /// By window `(lane_offset, lanes, row_offset, rows)`.
     pub maps: HashMap<(u32, u32, u32, u32), WindowInputs>,
     /// Extended outputs landed by an earlier op of the current window.
-    pub ext: std::cell::RefCell<HashMap<u32, kernels_xla::Tensor>>,
+    pub ext: std::cell::RefCell<HashMap<u32, crate::handle::Tensor>>,
 }

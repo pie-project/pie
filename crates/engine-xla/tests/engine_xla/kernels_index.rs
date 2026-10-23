@@ -2,8 +2,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::attn::index;
-use kernels_xla::{KvPool, Tensor};
+use engine_xla::handle::{KvPool, Tensor};
+use engine_xla::lower::attn::index;
 
 const PS: usize = 4;
 /// Request 0 holds pages 3, 1, 4; request 1 pages 0, 2.

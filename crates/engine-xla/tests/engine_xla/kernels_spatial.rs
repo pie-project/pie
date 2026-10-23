@@ -199,18 +199,46 @@ fn conv3d_answers_by_gather_and_by_convolution() {
     if !b
         .run(|ctx| {
             for (conv, wt, yg, y, yb, cache, y_clips, _) in &runs {
-                conv::conv3d::conv3d(ctx, xt, gt, *wt, Some(bt), *conv, *cache, *y, *yg)?;
-                conv::conv3d::conv3d_boxed(
-                    ctx,
-                    xt,
-                    &host(&clips),
-                    *wt,
-                    Some(bt),
-                    *conv,
-                    *cache,
-                    *yb,
-                    &host(y_clips),
-                )?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let y_grid_v = l.read(*yg)?;
+                    let grid_v = l.read(gt)?;
+                    let x_v = l.read(xt)?;
+                    let cache_v = l.read_opt(*cache)?;
+                    let w_v = l.read(*wt)?;
+                    let bias_v = l.read_opt(Some(bt))?;
+                    let o_y = *y;
+                    let v = conv::conv3d::conv3d(
+                        l.f(),
+                        x_v,
+                        grid_v,
+                        w_v,
+                        bias_v,
+                        *conv,
+                        cache_v,
+                        o_y.landing(),
+                        y_grid_v,
+                    )?;
+                    l.land(o_y, v)
+                })?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let w_v = l.read(*wt)?;
+                    let x_v = l.read(xt)?;
+                    let cache_v = l.read_opt(*cache)?;
+                    let bias_v = l.read_opt(Some(bt))?;
+                    let o_y = *yb;
+                    let v = conv::conv3d::conv3d_boxed(
+                        l.f(),
+                        x_v,
+                        &host(&clips),
+                        w_v,
+                        bias_v,
+                        *conv,
+                        cache_v,
+                        o_y.landing(),
+                        &host(y_clips),
+                    )?;
+                    l.land(o_y, v)
+                })?;
             }
             Ok(())
         })
@@ -254,7 +282,12 @@ fn grid_rules_map_each_box() {
     if !b
         .run(|ctx| {
             for (rule, y) in rules.iter().zip(&outs) {
-                conv::rule::derive_grid(ctx, g, *rule, *y)?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let grid_v = l.read(g)?;
+                    let o_y = *y;
+                    let v = conv::rule::derive_grid(l.f(), grid_v, *rule, o_y.landing())?;
+                    l.land(o_y, v)
+                })?;
             }
             Ok(())
         })
@@ -355,9 +388,61 @@ fn group_norm_and_attention_stay_inside_their_clip() {
     let scale = 0.3f32;
     if !b
         .run(|ctx| {
-            conv::group_norm::group_norm(ctx, xt, g, groups as u32, w, bias, 1e-5, true, y)?;
-            kernels_xla::attn::voxel::attention(ctx, qt, kt, vt, g, Segment::Lane, scale, a)?;
-            kernels_xla::attn::voxel::attention(ctx, qt, kt, vt, g, Segment::Frames(1), scale, af)
+            engine_xla::lower::lower(ctx, |l| {
+                let grid_v = l.read(g)?;
+                let x_v = l.read(xt)?;
+                let weight_v = l.read(w)?;
+                let bias_v = l.read(bias)?;
+                let o_y = y;
+                let v = conv::group_norm::group_norm(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    groups as u32,
+                    weight_v,
+                    bias_v,
+                    1e-5,
+                    true,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let grid_v = l.read(g)?;
+                let q_v = l.read(qt)?;
+                let k_v = l.read(kt)?;
+                let v_v = l.read(vt)?;
+                let o_y = a;
+                let v = kernels_xla::attn::voxel::attention(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    v_v,
+                    grid_v,
+                    Segment::Lane,
+                    scale,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let grid_v = l.read(g)?;
+                let q_v = l.read(qt)?;
+                let k_v = l.read(kt)?;
+                let v_v = l.read(vt)?;
+                let o_y = af;
+                let v = kernels_xla::attn::voxel::attention(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    v_v,
+                    grid_v,
+                    Segment::Frames(1),
+                    scale,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -525,12 +610,85 @@ fn resamples_move_voxels_between_clip_layouts() {
     );
     if !b
         .run(|ctx| {
-            conv::resample::upsample_nearest(ctx, xt, g, [2, 2, 2], true, uy, ug)?;
-            conv::resample::pixel_unshuffle(ctx, xt, g, r, dy, dg)?;
-            conv::resample::patchify(ctx, xt, g, r, py, dg)?;
-            conv::resample::pixel_shuffle(ctx, pk, dg, rs, 1, sy, sg)?;
-            conv::resample::unpatchify(ctx, pk4, dg, r, ey, g)?;
-            conv::resample::avg_down(ctx, xt, g, ra, group, ay, ag)
+            engine_xla::lower::lower(ctx, |l| {
+                let y_grid_v = l.read(ug)?;
+                let grid_v = l.read(g)?;
+                let x_v = l.read(xt)?;
+                let o_y = uy;
+                let v = conv::resample::upsample_nearest(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    [2, 2, 2],
+                    true,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let y_grid_v = l.read(dg)?;
+                let grid_v = l.read(g)?;
+                let x_v = l.read(xt)?;
+                let o_y = dy;
+                let v = conv::resample::pixel_unshuffle(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    r,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let y_grid_v = l.read(dg)?;
+                let grid_v = l.read(g)?;
+                let x_v = l.read(xt)?;
+                let o_y = py;
+                let v = conv::resample::patchify(l.f(), x_v, grid_v, r, o_y.landing(), y_grid_v)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let y_grid_v = l.read(sg)?;
+                let grid_v = l.read(dg)?;
+                let x_v = l.read(pk)?;
+                let o_y = sy;
+                let v = conv::resample::pixel_shuffle(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    rs,
+                    1,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let y_grid_v = l.read(g)?;
+                let grid_v = l.read(dg)?;
+                let x_v = l.read(pk4)?;
+                let o_y = ey;
+                let v = conv::resample::unpatchify(l.f(), x_v, grid_v, r, o_y.landing(), y_grid_v)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let y_grid_v = l.read(ag)?;
+                let grid_v = l.read(g)?;
+                let x_v = l.read(xt)?;
+                let o_y = ay;
+                let v = conv::resample::avg_down(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    ra,
+                    group,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -669,8 +827,39 @@ fn a_frame_cache_gathers_and_stores_each_clip_slot() {
     let cache = b.zeros(Dtype::Bf16, cache_rows as u32, c as u32);
     if !b
         .run(|ctx| {
-            conv::cache::cache_gather(ctx, st, sl, g, frames, cache)?;
-            conv::cache::cache_store(ctx, xt, cache, sl, g, frames, st)
+            engine_xla::lower::lower(ctx, |l| {
+                let grid_v = l.read(g)?;
+                let slot_ids_v = l.read(sl)?;
+                let slab_v = l.read(st)?;
+                let o_cache = cache;
+                let v = conv::cache::cache_gather(
+                    l.f(),
+                    slab_v,
+                    slot_ids_v,
+                    grid_v,
+                    frames,
+                    o_cache.landing(),
+                )?;
+                l.land(o_cache, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let grid_v = l.read(g)?;
+                let slot_ids_v = l.read(sl)?;
+                let x_v = l.read(xt)?;
+                let cache_v = l.read(cache)?;
+                let slab_v = l.read(st)?;
+                let o_slab = st;
+                let v = conv::cache::cache_store(
+                    l.f(),
+                    x_v,
+                    cache_v,
+                    slot_ids_v,
+                    grid_v,
+                    frames,
+                    slab_v,
+                )?;
+                l.land(o_slab, v)
+            })
         })
         .unwrap()
     {

@@ -9,7 +9,7 @@ use dtype::Dtype;
 /// The sigmoid router stages twice as many (Kimi-K3 routes over 896).
 pub(super) const SIGMOID_MAX_EXPERTS: u32 = 1024;
 
-pub(super) const fn rms(rows: u32) -> Launch {
+pub(crate) const fn rms(rows: u32) -> Launch {
     Launch::per_row(rows, BLOCK).smem((BLOCK / WARP) * 4)
 }
 

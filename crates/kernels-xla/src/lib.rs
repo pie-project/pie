@@ -1,7 +1,7 @@
 pub mod attn;
+pub mod check;
 pub mod collective;
 pub mod conv;
-pub mod cx;
 pub mod elemwise;
 pub mod error;
 pub mod gather;
@@ -16,6 +16,6 @@ pub mod tensor;
 pub mod tuning;
 
 pub use attn::{DecodePlan, PrefillPlan};
-pub use cx::{Ctx, Cx, Emit, Env, elem_of};
+pub use check::elem_of;
 pub use error::Error;
-pub use tensor::{Bank, KvPool, RaggedTensor, RecurrentPool, Tensor};
+pub use tensor::{Bank, KvPool, Landing, Operand, RaggedTensor, RecurrentPool, Stored};

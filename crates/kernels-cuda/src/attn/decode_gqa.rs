@@ -7,7 +7,7 @@
 
 use dtype::Dtype;
 
-use crate::attn::fa2_abi::DecodeParams;
+use crate::attn::fa2::abi::DecodeParams;
 use crate::attn::plan::DecodePlan;
 use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, symbol};

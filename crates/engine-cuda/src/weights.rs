@@ -14,8 +14,8 @@ use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
+use kernels_cuda::linear::affine::OffsetKind;
 use kernels_cuda::linear::moe::GroupSeat;
-use kernels_cuda::linear::quant::OffsetKind;
 use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Buffer;
@@ -924,7 +924,7 @@ impl Weights {
                     let plane = Buffer::zeroed(bytes)?;
                     // SAFETY: `stream` is the load's stream, live for the load.
                     let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
-                    let tile = kernels_cuda::linear::quant::decode_into(
+                    let tile = kernels_cuda::linear::dequant::decode_into(
                         &ctx,
                         "linear.matmul",
                         codes,

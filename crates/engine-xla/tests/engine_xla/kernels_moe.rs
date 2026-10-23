@@ -2,7 +2,7 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::Bank;
+use engine_xla::handle::Bank;
 use kernels_xla::linear::moe;
 
 fn hash(i: usize, seed: u32) -> u32 {
@@ -98,27 +98,162 @@ fn the_routers_answer_the_host() {
     let o = outs.clone();
     if !b
         .run(|ctx| {
-            moe::topk_softmax(ctx, x, e as u32, k as u32, o[0].0, o[0].1)?;
-            moe::topk_softmax_scaled(ctx, x, g, e as u32, k as u32, o[1].0, o[1].1)?;
-            moe::topk_sigmoid(ctx, x, e as u32, k as u32, true, 2.5, o[2].0, o[2].1)?;
-            moe::topk_sigmoid_biased(ctx, x, c, e as u32, k as u32, false, 1.5, o[3].0, o[3].1)?;
-            moe::topk_sqrt_softplus(ctx, x, c, e as u32, k as u32, true, 1.0, o[4].0, o[4].1)?;
-            moe::predict_route(ctx, x, c, e as u32, k as u32, o[5].0, o[5].1)?;
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let o_routes = o[0].0;
+                let o_weights = o[0].1;
+                let (v0, v1) = moe::topk_softmax(
+                    l.f(),
+                    logits_v,
+                    e as u32,
+                    k as u32,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let scale_v = l.read(g)?;
+                let o_routes = o[1].0;
+                let o_weights = o[1].1;
+                let (v0, v1) = moe::topk_softmax_scaled(
+                    l.f(),
+                    logits_v,
+                    scale_v,
+                    e as u32,
+                    k as u32,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let o_routes = o[2].0;
+                let o_weights = o[2].1;
+                let (v0, v1) = moe::topk_sigmoid(
+                    l.f(),
+                    logits_v,
+                    e as u32,
+                    k as u32,
+                    true,
+                    2.5,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let bias_v = l.read(c)?;
+                let o_routes = o[3].0;
+                let o_weights = o[3].1;
+                let (v0, v1) = moe::topk_sigmoid_biased(
+                    l.f(),
+                    logits_v,
+                    bias_v,
+                    e as u32,
+                    k as u32,
+                    false,
+                    1.5,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let bias_v = l.read(c)?;
+                let o_routes = o[4].0;
+                let o_weights = o[4].1;
+                let (v0, v1) = moe::topk_sqrt_softplus(
+                    l.f(),
+                    logits_v,
+                    bias_v,
+                    e as u32,
+                    k as u32,
+                    true,
+                    1.0,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let bias_v = l.read(c)?;
+                let o_routes = o[5].0;
+                let o_weights = o[5].1;
+                let (v0, v1) = moe::predict_route(
+                    l.f(),
+                    logits_v,
+                    bias_v,
+                    e as u32,
+                    k as u32,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
             // A fan-out past the expert count: the tail lands expert 0 at weight 0.
-            moe::topk_sigmoid(ctx, x, e as u32, 14, true, 1.0, wide.0, wide.1)?;
-            moe::topk_sigmoid_sink(
-                ctx,
-                xs,
-                Some(cs),
-                Some(gs),
-                se as u32,
-                k as u32,
-                sink as u32,
-                2.0,
-                sunk.0,
-                sunk.1,
-            )?;
-            moe::group_routes(ctx, 4, groups)
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let o_routes = wide.0;
+                let o_weights = wide.1;
+                let (v0, v1) = moe::topk_sigmoid(
+                    l.f(),
+                    logits_v,
+                    e as u32,
+                    14,
+                    true,
+                    1.0,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(xs)?;
+                let correction_bias_v = l.read_opt(Some(cs))?;
+                let global_scale_v = l.read_opt(Some(gs))?;
+                let o_routes = sunk.0;
+                let o_weights = sunk.1;
+                let (v0, v1) = moe::topk_sigmoid_sink(
+                    l.f(),
+                    logits_v,
+                    correction_bias_v,
+                    global_scale_v,
+                    se as u32,
+                    k as u32,
+                    sink as u32,
+                    2.0,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let o_routes = groups;
+                let v = moe::group_routes(l.f(), 4, o_routes.landing())?;
+                l.land(o_routes, v)
+            })
         })
         .unwrap()
     {
@@ -217,7 +352,30 @@ fn a_hash_route_reads_its_table_and_weighs_the_named_experts() {
     let r = b.zeros(Dtype::I32, t as u32, k as u32);
     let w = b.zeros(Dtype::F32, t as u32, k as u32);
     if !b
-        .run(|ctx| moe::hash_route(ctx, id, tab, x, vocab as u32, k as u32, true, 1.5, r, w))
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(id)?;
+                let tid2eid_v = l.read(tab)?;
+                let logits_v = l.read(x)?;
+                let o_routes = r;
+                let o_weights = w;
+                let (v0, v1) = moe::hash_route(
+                    l.f(),
+                    ids_v,
+                    tid2eid_v,
+                    logits_v,
+                    vocab as u32,
+                    k as u32,
+                    true,
+                    1.5,
+                    o_routes.landing(),
+                    o_weights.landing(),
+                )?;
+                l.land(o_routes, v0)?;
+                l.land(o_weights, v1)?;
+                Ok(())
+            })
+        })
         .unwrap()
     {
         return;
@@ -273,9 +431,30 @@ fn the_combines_answer_the_host() {
     let y3 = b.zeros(Dtype::Bf16, t as u32, w as u32);
     if !b
         .run(|ctx| {
-            moe::weighted_sum(ctx, rt, wt, y1)?;
-            moe::bias_sum(ctx, x, bi, ro, wt, y2)?;
-            moe::sigmoid_gate_add(ctx, tk, sh, ga, y3)
+            engine_xla::lower::lower(ctx, |l| {
+                let routed_v = l.read(rt)?;
+                let weights_v = l.read(wt)?;
+                let o_y = y1;
+                let v = moe::weighted_sum(l.f(), routed_v, weights_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let bias_v = l.read(bi)?;
+                let routes_v = l.read(ro)?;
+                let weights_v = l.read(wt)?;
+                let o_y = y2;
+                let v = moe::bias_sum(l.f(), x_v, bias_v, routes_v, weights_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let routed_v = l.read(tk)?;
+                let shared_v = l.read(sh)?;
+                let gate_v = l.read(ga)?;
+                let o_y = y3;
+                let v = moe::sigmoid_gate_add(l.f(), routed_v, shared_v, gate_v, o_y.landing())?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -432,7 +611,7 @@ impl HostBank {
         }
     }
 
-    fn dense(&self, b: &mut Bench, e: usize) -> kernels_xla::Tensor {
+    fn dense(&self, b: &mut Bench, e: usize) -> engine_xla::handle::Tensor {
         b.bf16(e as u32, (self.w.len() / e) as u32, &self.w)
     }
 }
@@ -500,14 +679,63 @@ fn check_select(bank: &HostBank, e: usize, n: usize, k: usize, which: &str) {
         let run = match which {
             "dense" => {
                 let d = bank.dense(&mut b, e);
-                b.run(|ctx| moe::matmul_select(ctx, xt, d, rt, y))
+                b.run(|ctx| {
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(xt)?;
+                        let routes_v = l.read(rt)?;
+                        let y_v = l.read(y)?;
+                        let bank_v = l.read(d)?;
+                        let o_y = y;
+                        let tuning = l.tuning();
+                        let v = moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                        l.land(o_y, v)
+                    })
+                })
             }
             _ => {
                 let bk = bank.land(&mut b, e);
                 if biased {
-                    b.run(|ctx| moe::matmul_select_bias(ctx, xt, bk, bt, rt, y))
+                    b.run(|ctx| {
+                        engine_xla::lower::lower(ctx, |l| {
+                            let x_v = l.read(xt)?;
+                            let routes_v = l.read(rt)?;
+                            let bias_v = l.read(bt)?;
+                            let y_v = l.read(y)?;
+                            let bank_v = l.bank(bk)?;
+                            let o_y = y;
+                            let tuning = l.tuning();
+                            let v = moe::matmul_select_bias(
+                                l.f(),
+                                x_v,
+                                bank_v,
+                                bias_v,
+                                routes_v,
+                                y_v,
+                                tuning,
+                            )?;
+                            l.land(o_y, v)
+                        })
+                    })
                 } else {
-                    b.run(|ctx| moe::matmul_select_quant(ctx, xt, bk, rt, y))
+                    b.run(|ctx| {
+                        engine_xla::lower::lower(ctx, |l| {
+                            let x_v = l.read(xt)?;
+                            let routes_v = l.read(rt)?;
+                            let y_v = l.read(y)?;
+                            let bank_v = l.bank(bk)?;
+                            let o_y = y;
+                            let tuning = l.tuning();
+                            let v = moe::matmul_select_quant(
+                                l.f(),
+                                x_v,
+                                bank_v,
+                                routes_v,
+                                y_v,
+                                tuning,
+                            )?;
+                            l.land(o_y, v)
+                        })
+                    })
                 }
             }
         };
@@ -582,9 +810,33 @@ fn a_grouped_matmul_runs_each_slice_through_its_expert() {
     let y2 = b.zeros(Dtype::Bf16, rows as u32, (groups * n) as u32);
     if !b
         .run(|ctx| {
-            moe::group_routes(ctx, groups as u32, rt)?;
-            moe::matmul_grouped(ctx, xt, moe::GroupedPlane::Dense(d), rt, groups as u32, y1)?;
-            moe::matmul_grouped(ctx, xt, moe::GroupedPlane::Bank(q), rt, groups as u32, y2)
+            engine_xla::lower::lower(ctx, |l| {
+                let o_routes = rt;
+                let v = moe::group_routes(l.f(), groups as u32, o_routes.landing())?;
+                l.land(o_routes, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xt)?;
+                let routes_v = l.read(rt)?;
+                let y_v = l.read(y1)?;
+                let o_y = y1;
+                let plane = moe::GroupedPlane::Dense(l.read(d)?);
+                let tuning = l.tuning();
+                let v =
+                    moe::matmul_grouped(l.f(), x_v, plane, routes_v, groups as u32, y_v, tuning)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xt)?;
+                let routes_v = l.read(rt)?;
+                let y_v = l.read(y2)?;
+                let o_y = y2;
+                let plane = moe::GroupedPlane::Bank(l.bank(q)?);
+                let tuning = l.tuning();
+                let v =
+                    moe::matmul_grouped(l.f(), x_v, plane, routes_v, groups as u32, y_v, tuning)?;
+                l.land(o_y, v)
+            })
         })
         .unwrap_or_else(|err| panic!("{err}\n{}", b.last_module))
     {
@@ -677,13 +929,62 @@ fn the_grouped_matmul_kernel_answers_the_host() {
                     bits: 4,
                 };
                 if biased {
-                    b.run(|ctx| moe::matmul_select_bias(ctx, xt, bank, bt, rt, y))
+                    b.run(|ctx| {
+                        engine_xla::lower::lower(ctx, |l| {
+                            let x_v = l.read(xt)?;
+                            let routes_v = l.read(rt)?;
+                            let bias_v = l.read(bt)?;
+                            let y_v = l.read(y)?;
+                            let bank_v = l.bank(bank)?;
+                            let o_y = y;
+                            let tuning = l.tuning();
+                            let v = moe::matmul_select_bias(
+                                l.f(),
+                                x_v,
+                                bank_v,
+                                bias_v,
+                                routes_v,
+                                y_v,
+                                tuning,
+                            )?;
+                            l.land(o_y, v)
+                        })
+                    })
                 } else {
-                    b.run(|ctx| moe::matmul_select_quant(ctx, xt, bank, rt, y))
+                    b.run(|ctx| {
+                        engine_xla::lower::lower(ctx, |l| {
+                            let x_v = l.read(xt)?;
+                            let routes_v = l.read(rt)?;
+                            let y_v = l.read(y)?;
+                            let bank_v = l.bank(bank)?;
+                            let o_y = y;
+                            let tuning = l.tuning();
+                            let v = moe::matmul_select_quant(
+                                l.f(),
+                                x_v,
+                                bank_v,
+                                routes_v,
+                                y_v,
+                                tuning,
+                            )?;
+                            l.land(o_y, v)
+                        })
+                    })
                 }
             } else {
                 let d = b.bf16((e * n) as u32, k as u32, &w);
-                b.run(|ctx| moe::matmul_select(ctx, xt, d, rt, y))
+                b.run(|ctx| {
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(xt)?;
+                        let routes_v = l.read(rt)?;
+                        let y_v = l.read(y)?;
+                        let bank_v = l.read(d)?;
+                        let o_y = y;
+                        let tuning = l.tuning();
+                        let v = moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                        l.land(o_y, v)
+                    })
+                })
             };
             if !run.unwrap_or_else(|err| panic!("{err}\n{}", b.last_module)) {
                 return;

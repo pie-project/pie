@@ -1,11 +1,12 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
+#include "prim/shuffle.slang"
 
 // GGUF K-quant matmuls (Q2_K to Q6_K) on bf16 activations: `y[t, c]` is row
 // `t` of `x` against weight row `c`, a run of 256-wide super-blocks of
 // `PIE_BLOCK_BYTES` bytes, the bytes four to a word. A workgroup is
 // `PIE_SLICES` strips of 32 lanes; a strip lands two columns (one bf16 word)
-// of one row, its lanes walking the super-blocks, four codes at a time. The
+// of one row, its lanes walking the super-blocks (Q6_K's by halves), four codes at a time. The
 // strip's sums fold through workgroup memory, or (`PIE_SUBGROUP`, subgroups
 // at least 32 wide) with a butterfly inside the subgroup.
 
@@ -95,8 +96,17 @@ int q3_scale(uint at, uint sub) {
     return int(low | (top << 4u));
 }
 
-// Super-block `base`'s dot with the activations from `xb`.
-float block_dot(uint base, uint xb) {
+// A lane's share of a super-block: Q6_K's two 128-code halves are a share
+// each, so a 4096-wide row's 16 super-blocks keep all 32 lanes busy; the
+// other schemes take a super-block whole.
+#if PIE_SCHEME == 6
+#define PIE_PARTS 2u
+#else
+#define PIE_PARTS 1u
+#endif
+
+// Share `part` of super-block `base`'s dot with the activations from `xb`.
+float block_dot(uint base, uint xb, uint part) {
     float acc = 0.0;
 #if PIE_SCHEME == 2
     float d = half_at(base + 80u);
@@ -158,7 +168,8 @@ float block_dot(uint base, uint xb) {
     }
 #elif PIE_SCHEME == 6
     float d = half_at(base + 208u);
-    for (uint half_ = 0u; half_ < 2u; half_++) {
+    uint half_ = part;
+    {
         for (uint quarter = 0u; quarter < 4u; quarter++) {
             uint low_at = base + half_ * 64u + 32u * (quarter & 1u);
             uint low_shift = (quarter < 2u) ? 0u : 4u;
@@ -190,10 +201,9 @@ groupshared float folds[PIE_SLICES][2][LANES];
 // The strip's two sums, folded; every lane holds the totals after.
 float2 strip_sum(float2 v, uint lane, uint slice) {
 #if defined(PIE_SUBGROUP)
-    uint at = WaveGetLaneIndex();
     [ForceUnroll] for (uint off = LANES / 2u; off > 0u; off >>= 1u) {
-        v.x += WaveReadLaneAt(v.x, at ^ off);
-        v.y += WaveReadLaneAt(v.y, at ^ off);
+        v.x += pie_shuffle_xor(v.x, off);
+        v.y += pie_shuffle_xor(v.y, off);
     }
     return v;
 #else
@@ -224,11 +234,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
     float2 acc = float2(0.0, 0.0);
     if (col < n) {
-        for (uint g = lane; g < blocks; g += LANES) {
+        for (uint u = lane; u < blocks * PIE_PARTS; u += LANES) {
+            uint g = u / PIE_PARTS;
+            uint part = u - g * PIE_PARTS;
             uint xb = token * k + g * SUPER;
             uint base = col * row_bytes + g * uint(PIE_BLOCK_BYTES);
-            acc.x += block_dot(base, xb);
-            acc.y += block_dot(base + row_bytes, xb);
+            acc.x += block_dot(base, xb, part);
+            acc.y += block_dot(base + row_bytes, xb, part);
         }
     }
     float2 total = strip_sum(acc, lane, slice);

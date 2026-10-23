@@ -17,11 +17,10 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx};
 use crate::error::{Error, refuse};
-use crate::hlo::{Elem, Val};
+use crate::hlo::{Elem, Func, Val};
 use crate::linear::gemm::{extent, head_rows};
-use crate::tensor::Tensor;
+use crate::tensor::{Landing, Operand, Stored};
 
 const SUPER: u32 = 256;
 
@@ -98,21 +97,28 @@ pub fn scheme(op: &'static str, k: u32, row_bytes: u32) -> Result<Scheme, Error>
     ))
 }
 
-pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, y)
+/// A K-quant plane as it is read: its bytes. The engine reads this view.
+pub fn view<T: Stored>(w: T) -> T {
+    w.with_dtype(Dtype::U8)
 }
 
-pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y)
+/// `y = act · wᵀ` for a K-quant weight read as [`view`] says (the width names
+/// the scheme). Nothing when `y` has no rows.
+pub fn matmul(f: &mut Func, act: Operand, w: Operand, y: Landing) -> Result<Option<Val>, Error> {
+    act_x_wt(f, "linear.matmul", act, w, y)
+}
+
+pub fn lm_head(f: &mut Func, act: Operand, w: Operand, y: Landing) -> Result<Option<Val>, Error> {
+    act_x_wt(f, "linear.lm_head", act, w, y)
 }
 
 fn act_x_wt(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    act: Tensor,
-    w: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    act: Operand,
+    w: Operand,
+    y: Landing,
+) -> Result<Option<Val>, Error> {
     let (m, n, k) = extent(op, act, y)?;
     if !k.is_multiple_of(SUPER) {
         return Err(refuse(
@@ -136,24 +142,22 @@ fn act_x_wt(
         (_, Some(s)) if s == scheme => {}
         (other, _) => return Err(Error::DtypeUnsupported { op, dtype: other }),
     }
-    let w = Tensor::new(w.buf, w.rows, w.width, Dtype::U8);
+    let w = w.with_dtype(Dtype::U8);
     if m == 0 {
-        return Ok(());
+        return Ok(None);
     }
-    ctx.emit(&mut |cx| {
-        let wv = dequant(cx, w, scheme, k)?;
-        let x = cx.read(act)?;
-        let x = head_rows(cx, x, m)?;
-        let b = i64::from(k / SUPER);
-        let x = cx.reshape(x, &[i64::from(m), b, i64::from(SUPER)])?;
-        let (x, wv) = if cx.elem(x) == Elem::Bf16 {
-            (x, cx.convert(wv, Elem::Bf16))
-        } else {
-            (cx.convert(x, Elem::F32), wv)
-        };
-        let out = cx.dot_general(x, wv, &[], &[], &[1, 2], &[1, 0], Elem::F32)?;
-        cx.write(y, out)
-    })
+    let wv = dequant(f, w, scheme, k)?;
+    let x = act.val;
+    let x = head_rows(f, x, m)?;
+    let b = i64::from(k / SUPER);
+    let x = f.reshape(x, &[i64::from(m), b, i64::from(SUPER)])?;
+    let (x, wv) = if f.elem(x) == Elem::Bf16 {
+        (x, f.convert(wv, Elem::Bf16))
+    } else {
+        (f.convert(x, Elem::F32), wv)
+    };
+    let out = f.dot_general(x, wv, &[], &[], &[1, 2], &[1, 0], Elem::F32)?;
+    Ok(Some(out))
 }
 
 /// Block field helpers over a u32 `[block_bytes, blocks, n]` byte plane.
@@ -166,122 +170,122 @@ struct Blocks {
 impl Blocks {
     /// Bytes `[lo, hi)` of every block, `[hi − lo, blocks, n]`, split as
     /// `[dims.., blocks, n]`.
-    fn field(&self, cx: &mut Cx<'_>, lo: i64, hi: i64, dims: &[i64]) -> Result<Val, Error> {
-        let f = cx.slice_axis(self.v, 0, lo, hi)?;
+    fn field(&self, f: &mut Func, lo: i64, hi: i64, dims: &[i64]) -> Result<Val, Error> {
+        let v = f.slice_axis(self.v, 0, lo, hi)?;
         let mut shape = dims.to_vec();
         shape.extend_from_slice(&[self.b, self.n]);
-        Ok(cx.reshape(f, &shape)?)
+        Ok(f.reshape(v, &shape)?)
     }
 
     /// The little-endian f16 at byte `at` of every block, f32 `[blocks, n]`.
-    fn f16(&self, cx: &mut Cx<'_>, at: i64) -> Result<Val, Error> {
-        let lo = self.field(cx, at, at + 1, &[])?;
-        let hi = self.field(cx, at + 1, at + 2, &[])?;
-        let hi = shl(cx, hi, 8)?;
-        let h = cx.or(lo, hi)?;
-        let h = cx.convert(h, Elem::U16);
-        let h = cx.bitcast(h, Elem::F16)?;
-        Ok(cx.convert(h, Elem::F32))
+    fn f16(&self, f: &mut Func, at: i64) -> Result<Val, Error> {
+        let lo = self.field(f, at, at + 1, &[])?;
+        let hi = self.field(f, at + 1, at + 2, &[])?;
+        let hi = shl(f, hi, 8)?;
+        let h = f.or(lo, hi)?;
+        let h = f.convert(h, Elem::U16);
+        let h = f.bitcast(h, Elem::F16)?;
+        Ok(f.convert(h, Elem::F32))
     }
 }
 
-fn shl(cx: &mut Cx<'_>, v: Val, s: i64) -> Result<Val, Error> {
-    let c = cx.like_i(v, s);
-    Ok(cx.shl(v, c)?)
+fn shl(f: &mut Func, v: Val, s: i64) -> Result<Val, Error> {
+    let c = f.like_i(v, s);
+    Ok(f.shl(v, c)?)
 }
 
-fn shr(cx: &mut Cx<'_>, v: Val, s: i64) -> Result<Val, Error> {
-    let c = cx.like_i(v, s);
-    Ok(cx.shr(v, c)?)
+fn shr(f: &mut Func, v: Val, s: i64) -> Result<Val, Error> {
+    let c = f.like_i(v, s);
+    Ok(f.shr(v, c)?)
 }
 
-fn and(cx: &mut Cx<'_>, v: Val, m: i64) -> Result<Val, Error> {
-    let c = cx.like_i(v, m);
-    Ok(cx.and(v, c)?)
+fn and(f: &mut Func, v: Val, m: i64) -> Result<Val, Error> {
+    let c = f.like_i(v, m);
+    Ok(f.and(v, c)?)
 }
 
 /// `v >> Σ step · iota(axis)` for a u32 `v`, over the `(axis, step)` pairs.
-fn shr_by(cx: &mut Cx<'_>, v: Val, shifts: &[(i64, i64)]) -> Result<Val, Error> {
-    let dims = cx.dims(v).to_vec();
+fn shr_by(f: &mut Func, v: Val, shifts: &[(i64, i64)]) -> Result<Val, Error> {
+    let dims = f.dims(v).to_vec();
     let mut sh: Option<Val> = None;
     for &(axis, step) in shifts {
-        let at = cx.iota(Elem::U32, &dims, axis);
+        let at = f.iota(Elem::U32, &dims, axis);
         let at = if step == 1 {
             at
         } else {
-            let s = cx.like_i(at, step);
-            cx.mul(at, s)?
+            let s = f.like_i(at, step);
+            f.mul(at, s)?
         };
         sh = Some(match sh {
-            Some(prev) => cx.add(prev, at)?,
+            Some(prev) => f.add(prev, at)?,
             None => at,
         });
     }
     match sh {
-        Some(sh) => Ok(cx.shr(v, sh)?),
+        Some(sh) => Ok(f.shr(v, sh)?),
         None => Ok(v),
     }
 }
 
 /// `[s, blocks, n]` per-sub-block factors spread over `[s, t, blocks, n]`.
-fn spread(cx: &mut Cx<'_>, v: Val, t: i64) -> Result<Val, Error> {
-    let d = cx.dims(v).to_vec();
-    Ok(cx.broadcast(v, &[d[0], t, d[1], d[2]], &[0, 2, 3])?)
+fn spread(f: &mut Func, v: Val, t: i64) -> Result<Val, Error> {
+    let d = f.dims(v).to_vec();
+    Ok(f.broadcast(v, &[d[0], t, d[1], d[2]], &[0, 2, 3])?)
 }
 
 /// `[blocks, n]` per-block factors spread over `[s, blocks, n]`.
-fn per_block(cx: &mut Cx<'_>, v: Val, s: i64) -> Result<Val, Error> {
-    let d = cx.dims(v).to_vec();
-    Ok(cx.broadcast(v, &[s, d[0], d[1]], &[1, 2])?)
+fn per_block(f: &mut Func, v: Val, s: i64) -> Result<Val, Error> {
+    let d = f.dims(v).to_vec();
+    Ok(f.broadcast(v, &[s, d[0], d[1]], &[1, 2])?)
 }
 
-fn f32_of(cx: &mut Cx<'_>, v: Val) -> Val {
-    cx.convert(v, Elem::F32)
+fn f32_of(f: &mut Func, v: Val) -> Val {
+    f.convert(v, Elem::F32)
 }
 
 /// Q4_K / Q5_K's twelve packed 6-bit scale and min bytes at `at`, as f32
 /// `[8, blocks, n]` each (`q4k_scale_min`).
-fn scale_min(cx: &mut Cx<'_>, blk: &Blocks, at: i64) -> Result<(Val, Val), Error> {
-    let s0 = blk.field(cx, at, at + 4, &[4])?;
-    let s1 = blk.field(cx, at + 4, at + 8, &[4])?;
-    let s2 = blk.field(cx, at + 8, at + 12, &[4])?;
-    let sc_lo = and(cx, s0, 63)?;
-    let m_lo = and(cx, s1, 63)?;
-    let a = and(cx, s2, 15)?;
-    let t = shr(cx, s0, 6)?;
-    let t = shl(cx, t, 4)?;
-    let sc_hi = cx.or(a, t)?;
-    let a = shr(cx, s2, 4)?;
-    let t = shr(cx, s1, 6)?;
-    let t = shl(cx, t, 4)?;
-    let m_hi = cx.or(a, t)?;
-    let sc = cx.concat(&[sc_lo, sc_hi], 0)?;
-    let m = cx.concat(&[m_lo, m_hi], 0)?;
-    Ok((f32_of(cx, sc), f32_of(cx, m)))
+fn scale_min(f: &mut Func, blk: &Blocks, at: i64) -> Result<(Val, Val), Error> {
+    let s0 = blk.field(f, at, at + 4, &[4])?;
+    let s1 = blk.field(f, at + 4, at + 8, &[4])?;
+    let s2 = blk.field(f, at + 8, at + 12, &[4])?;
+    let sc_lo = and(f, s0, 63)?;
+    let m_lo = and(f, s1, 63)?;
+    let a = and(f, s2, 15)?;
+    let t = shr(f, s0, 6)?;
+    let t = shl(f, t, 4)?;
+    let sc_hi = f.or(a, t)?;
+    let a = shr(f, s2, 4)?;
+    let t = shr(f, s1, 6)?;
+    let t = shl(f, t, 4)?;
+    let m_hi = f.or(a, t)?;
+    let sc = f.concat(&[sc_lo, sc_hi], 0)?;
+    let m = f.concat(&[m_lo, m_hi], 0)?;
+    Ok((f32_of(f, sc), f32_of(f, m)))
 }
 
 /// The low/high nibbles of Q4_K / Q5_K's 128 code bytes at `at`, u32
 /// `[8, 32, blocks, n]`: sub-block `2p` is the low nibble of byte run `p`,
 /// `2p+1` its high nibble.
-fn nibbles(cx: &mut Cx<'_>, blk: &Blocks, at: i64) -> Result<Val, Error> {
+fn nibbles(f: &mut Func, blk: &Blocks, at: i64) -> Result<Val, Error> {
     let (b, n) = (blk.b, blk.n);
-    let qs = blk.field(cx, at, at + 128, &[4, 1, 32])?;
-    let lo = and(cx, qs, 15)?;
-    let hi = shr(cx, qs, 4)?;
-    let q = cx.concat(&[lo, hi], 1)?;
-    Ok(cx.reshape(q, &[8, 32, b, n])?)
+    let qs = blk.field(f, at, at + 128, &[4, 1, 32])?;
+    let lo = and(f, qs, 15)?;
+    let hi = shr(f, qs, 4)?;
+    let q = f.concat(&[lo, hi], 1)?;
+    Ok(f.reshape(q, &[8, 32, b, n])?)
 }
 
 /// Q2_K / Q3_K's 64 bytes of 2-bit codes at `at`, u32 `[16, 16, blocks,
 /// n]`: sub-block `8h + 2s + j`, element `l` is bits `2s` of byte
 /// `32h + 16j + l`.
-fn crumbs(cx: &mut Cx<'_>, blk: &Blocks, at: i64) -> Result<Val, Error> {
+fn crumbs(f: &mut Func, blk: &Blocks, at: i64) -> Result<Val, Error> {
     let (b, n) = (blk.b, blk.n);
-    let qs = blk.field(cx, at, at + 64, &[2, 2, 16])?;
-    let qs = cx.broadcast(qs, &[2, 4, 2, 16, b, n], &[0, 2, 3, 4, 5])?;
-    let q = shr_by(cx, qs, &[(1, 2)])?;
-    let q = and(cx, q, 3)?;
-    Ok(cx.reshape(q, &[16, 16, b, n])?)
+    let qs = blk.field(f, at, at + 64, &[2, 2, 16])?;
+    let qs = f.broadcast(qs, &[2, 4, 2, 16, b, n], &[0, 2, 3, 4, 5])?;
+    let q = shr_by(f, qs, &[(1, 2)])?;
+    let q = and(f, q, 3)?;
+    Ok(f.reshape(q, &[16, 16, b, n])?)
 }
 
 /// A K-quant plane `U8 [n, blocks · block_bytes]` as affine parts: codes
@@ -294,133 +298,133 @@ fn crumbs(cx: &mut Cx<'_>, blk: &Blocks, at: i64) -> Result<Val, Error> {
 /// - Q3_K `d·(sc − 32) · (q − borrow)`, Q6_K `d·sc · (q − 32)`: the code is
 ///   shifted non-negative (`q + 4·bit`, `q`) and the bias is `−offset ·
 ///   scale`.
-fn parts(cx: &mut Cx<'_>, w: Tensor, scheme: Scheme, k: u32) -> Result<(Val, Val, Val), Error> {
+fn parts(f: &mut Func, w: Operand, scheme: Scheme, k: u32) -> Result<(Val, Val, Val), Error> {
     let n = i64::from(w.rows);
     let b = i64::from(k / SUPER);
     let bb = i64::from(scheme.block_bytes());
-    let raw = cx.read(w)?;
-    let raw = cx.reshape(raw, &[n, b, bb])?;
-    let raw = cx.transpose(raw, &[2, 1, 0])?;
-    let v = cx.convert(raw, Elem::U32);
+    let raw = w.val;
+    let raw = f.reshape(raw, &[n, b, bb])?;
+    let raw = f.transpose(raw, &[2, 1, 0])?;
+    let v = f.convert(raw, Elem::U32);
     let blk = Blocks { v, b, n };
     Ok(match scheme {
         Scheme::Q2K => {
-            let sc = blk.field(cx, 0, 16, &[16])?;
-            let q = crumbs(cx, &blk, 16)?;
-            let d = blk.f16(cx, 80)?;
-            let dmin = blk.f16(cx, 82)?;
-            let lo = and(cx, sc, 15)?;
-            let lo = f32_of(cx, lo);
-            let hi = shr(cx, sc, 4)?;
-            let hi = f32_of(cx, hi);
-            let d = per_block(cx, d, 16)?;
-            let dmin = per_block(cx, dmin, 16)?;
-            let scale = cx.mul(d, lo)?;
-            let min = cx.mul(dmin, hi)?;
-            let bias = cx.neg(min);
-            (f32_of(cx, q), scale, bias)
+            let sc = blk.field(f, 0, 16, &[16])?;
+            let q = crumbs(f, &blk, 16)?;
+            let d = blk.f16(f, 80)?;
+            let dmin = blk.f16(f, 82)?;
+            let lo = and(f, sc, 15)?;
+            let lo = f32_of(f, lo);
+            let hi = shr(f, sc, 4)?;
+            let hi = f32_of(f, hi);
+            let d = per_block(f, d, 16)?;
+            let dmin = per_block(f, dmin, 16)?;
+            let scale = f.mul(d, lo)?;
+            let min = f.mul(dmin, hi)?;
+            let bias = f.neg(min);
+            (f32_of(f, q), scale, bias)
         }
         Scheme::Q3K => {
-            let q = crumbs(cx, &blk, 32)?;
-            let q = cx.reshape(q, &[2, 4, 2, 16, b, n])?;
+            let q = crumbs(f, &blk, 32)?;
+            let q = f.reshape(q, &[2, 4, 2, 16, b, n])?;
             // The high-bit mask: bit `4h + s` of byte `16j + l`; a clear bit
             // borrows 4, so `q − borrow + 4 = q + 4 · bit`.
-            let hm = blk.field(cx, 0, 32, &[2, 16])?;
-            let hm = cx.broadcast(hm, &[2, 4, 2, 16, b, n], &[2, 3, 4, 5])?;
-            let bit = shr_by(cx, hm, &[(0, 4), (1, 1)])?;
-            let bit = and(cx, bit, 1)?;
-            let bit = shl(cx, bit, 2)?;
-            let q = cx.add(q, bit)?;
-            let q = cx.reshape(q, &[16, 16, b, n])?;
+            let hm = blk.field(f, 0, 32, &[2, 16])?;
+            let hm = f.broadcast(hm, &[2, 4, 2, 16, b, n], &[2, 3, 4, 5])?;
+            let bit = shr_by(f, hm, &[(0, 4), (1, 1)])?;
+            let bit = and(f, bit, 1)?;
+            let bit = shl(f, bit, 2)?;
+            let q = f.add(q, bit)?;
+            let q = f.reshape(q, &[16, 16, b, n])?;
             // Scales: group `g` of four takes the low (g < 2) or high nibble
             // of bytes `4 · (g & 1) + j`, its top two bits from byte `8 + j`
             // at bit `2g`.
-            let s0 = blk.field(cx, 96, 100, &[1, 4])?;
-            let s1 = blk.field(cx, 100, 104, &[1, 4])?;
-            let s2 = blk.field(cx, 104, 108, &[4])?;
-            let g0 = and(cx, s0, 15)?;
-            let g1 = and(cx, s1, 15)?;
-            let g2 = shr(cx, s0, 4)?;
-            let g3 = shr(cx, s1, 4)?;
-            let low = cx.concat(&[g0, g1, g2, g3], 0)?;
-            let top = cx.broadcast(s2, &[4, 4, b, n], &[1, 2, 3])?;
-            let top = shr_by(cx, top, &[(0, 2)])?;
-            let top = and(cx, top, 3)?;
-            let top = shl(cx, top, 4)?;
-            let sc = cx.or(low, top)?;
-            let sc = f32_of(cx, sc);
-            let sc = cx.offset(sc, -32.0)?;
-            let sc = cx.reshape(sc, &[16, b, n])?;
-            let d = blk.f16(cx, 108)?;
-            let d = per_block(cx, d, 16)?;
-            let scale = cx.mul(d, sc)?;
-            let bias = cx.scale(scale, -4.0)?;
-            (f32_of(cx, q), scale, bias)
+            let s0 = blk.field(f, 96, 100, &[1, 4])?;
+            let s1 = blk.field(f, 100, 104, &[1, 4])?;
+            let s2 = blk.field(f, 104, 108, &[4])?;
+            let g0 = and(f, s0, 15)?;
+            let g1 = and(f, s1, 15)?;
+            let g2 = shr(f, s0, 4)?;
+            let g3 = shr(f, s1, 4)?;
+            let low = f.concat(&[g0, g1, g2, g3], 0)?;
+            let top = f.broadcast(s2, &[4, 4, b, n], &[1, 2, 3])?;
+            let top = shr_by(f, top, &[(0, 2)])?;
+            let top = and(f, top, 3)?;
+            let top = shl(f, top, 4)?;
+            let sc = f.or(low, top)?;
+            let sc = f32_of(f, sc);
+            let sc = f.offset(sc, -32.0)?;
+            let sc = f.reshape(sc, &[16, b, n])?;
+            let d = blk.f16(f, 108)?;
+            let d = per_block(f, d, 16)?;
+            let scale = f.mul(d, sc)?;
+            let bias = f.scale(scale, -4.0)?;
+            (f32_of(f, q), scale, bias)
         }
         Scheme::Q4K | Scheme::Q5K => {
-            let d = blk.f16(cx, 0)?;
-            let dmin = blk.f16(cx, 2)?;
-            let (sc, m) = scale_min(cx, &blk, 4)?;
+            let d = blk.f16(f, 0)?;
+            let dmin = blk.f16(f, 2)?;
+            let (sc, m) = scale_min(f, &blk, 4)?;
             let q = if scheme == Scheme::Q4K {
-                nibbles(cx, &blk, 16)?
+                nibbles(f, &blk, 16)?
             } else {
-                let low = nibbles(cx, &blk, 48)?;
-                let qh = blk.field(cx, 16, 48, &[32])?;
-                let qh = cx.broadcast(qh, &[8, 32, b, n], &[1, 2, 3])?;
-                let fifth = shr_by(cx, qh, &[(0, 1)])?;
-                let fifth = and(cx, fifth, 1)?;
-                let fifth = shl(cx, fifth, 4)?;
-                cx.or(low, fifth)?
+                let low = nibbles(f, &blk, 48)?;
+                let qh = blk.field(f, 16, 48, &[32])?;
+                let qh = f.broadcast(qh, &[8, 32, b, n], &[1, 2, 3])?;
+                let fifth = shr_by(f, qh, &[(0, 1)])?;
+                let fifth = and(f, fifth, 1)?;
+                let fifth = shl(f, fifth, 4)?;
+                f.or(low, fifth)?
             };
-            let d = per_block(cx, d, 8)?;
-            let dmin = per_block(cx, dmin, 8)?;
-            let scale = cx.mul(d, sc)?;
-            let min = cx.mul(dmin, m)?;
-            let bias = cx.neg(min);
-            (f32_of(cx, q), scale, bias)
+            let d = per_block(f, d, 8)?;
+            let dmin = per_block(f, dmin, 8)?;
+            let scale = f.mul(d, sc)?;
+            let min = f.mul(dmin, m)?;
+            let bias = f.neg(min);
+            (f32_of(f, q), scale, bias)
         }
         Scheme::Q6K => {
             // Element `128h + 32q + i`: the low nibble (q < 2) or high nibble
             // (q ≥ 2) of byte `64h + 32 (q & 1) + i`, its top two bits from
             // byte `128 + 32h + i` at bit `2q`; the weight is `q − 32`.
-            let ql = blk.field(cx, 0, 128, &[2, 1, 2, 32])?;
-            let lo = and(cx, ql, 15)?;
-            let hi = shr(cx, ql, 4)?;
-            let low = cx.concat(&[lo, hi], 1)?;
-            let low = cx.reshape(low, &[2, 4, 32, b, n])?;
-            let qh = blk.field(cx, 128, 192, &[2, 32])?;
-            let qh = cx.broadcast(qh, &[2, 4, 32, b, n], &[0, 2, 3, 4])?;
-            let top = shr_by(cx, qh, &[(1, 2)])?;
-            let top = and(cx, top, 3)?;
-            let top = shl(cx, top, 4)?;
-            let q = cx.or(low, top)?;
-            let q = cx.reshape(q, &[16, 16, b, n])?;
-            let sc = blk.field(cx, 192, 208, &[16])?;
-            let sc = f32_of(cx, sc);
-            let wrap = cx.offset(sc, -256.0)?;
-            let limit = cx.like_f(sc, 127.0);
-            let big = cx.compare(crate::hlo::Cmp::Gt, sc, limit)?;
-            let sc = cx.select(big, wrap, sc)?;
-            let d = blk.f16(cx, 208)?;
-            let d = per_block(cx, d, 16)?;
-            let scale = cx.mul(d, sc)?;
-            let bias = cx.scale(scale, -32.0)?;
-            (f32_of(cx, q), scale, bias)
+            let ql = blk.field(f, 0, 128, &[2, 1, 2, 32])?;
+            let lo = and(f, ql, 15)?;
+            let hi = shr(f, ql, 4)?;
+            let low = f.concat(&[lo, hi], 1)?;
+            let low = f.reshape(low, &[2, 4, 32, b, n])?;
+            let qh = blk.field(f, 128, 192, &[2, 32])?;
+            let qh = f.broadcast(qh, &[2, 4, 32, b, n], &[0, 2, 3, 4])?;
+            let top = shr_by(f, qh, &[(1, 2)])?;
+            let top = and(f, top, 3)?;
+            let top = shl(f, top, 4)?;
+            let q = f.or(low, top)?;
+            let q = f.reshape(q, &[16, 16, b, n])?;
+            let sc = blk.field(f, 192, 208, &[16])?;
+            let sc = f32_of(f, sc);
+            let wrap = f.offset(sc, -256.0)?;
+            let limit = f.like_f(sc, 127.0);
+            let big = f.compare(crate::hlo::Cmp::Gt, sc, limit)?;
+            let sc = f.select(big, wrap, sc)?;
+            let d = blk.f16(f, 208)?;
+            let d = per_block(f, d, 16)?;
+            let scale = f.mul(d, sc)?;
+            let bias = f.scale(scale, -32.0)?;
+            (f32_of(f, q), scale, bias)
         }
     })
 }
 
 /// A K-quant plane decoded to f32 `[256, blocks, n]` (element-in-block,
 /// block, column).
-fn dequant(cx: &mut Cx<'_>, w: Tensor, scheme: Scheme, k: u32) -> Result<Val, Error> {
-    let (q, scale, bias) = parts(cx, w, scheme, k)?;
-    let t = cx.dims(q)[1];
-    let scale = spread(cx, scale, t)?;
-    let bias = spread(cx, bias, t)?;
-    let v = cx.mul(q, scale)?;
-    let v = cx.add(v, bias)?;
-    let b = cx.dims(q)[2];
-    Ok(cx.reshape(v, &[i64::from(SUPER), b, i64::from(w.rows)])?)
+fn dequant(f: &mut Func, w: Operand, scheme: Scheme, k: u32) -> Result<Val, Error> {
+    let (q, scale, bias) = parts(f, w, scheme, k)?;
+    let t = f.dims(q)[1];
+    let scale = spread(f, scale, t)?;
+    let bias = spread(f, bias, t)?;
+    let v = f.mul(q, scale)?;
+    let v = f.add(v, bias)?;
+    let b = f.dims(q)[2];
+    Ok(f.reshape(v, &[i64::from(SUPER), b, i64::from(w.rows)])?)
 }
 
 /// The sub-block a K-quant scheme's scales cover: the `group` of its
@@ -440,15 +444,16 @@ pub const fn affine_group(scheme: Scheme) -> u32 {
 /// A load-time transform: the in-graph K-quant decode costs 4–17× a dense
 /// matmul per call on v6e, the repacked bank ~1.6–2.6× (measured).
 /// Serve it as `Bank { codes, scales, biases: Some(biases), group:
-/// affine_group(scheme), bits: 8 }`.
+/// affine_group(scheme), bits: 8 }`. `w` is read as its bytes; returns the
+/// scheme and the `(codes, scales, biases)` planes.
 pub fn to_affine(
-    ctx: &Ctx<'_>,
-    w: Tensor,
+    f: &mut Func,
+    w: Operand,
     k: u32,
-    codes: Tensor,
-    scales: Tensor,
-    biases: Tensor,
-) -> Result<Scheme, Error> {
+    codes: Landing,
+    scales: Landing,
+    biases: Landing,
+) -> Result<(Scheme, [Val; 3]), Error> {
     const OP: &str = "linear.kquant_to_affine";
     if k == 0 || !k.is_multiple_of(SUPER) {
         return Err(refuse(
@@ -469,23 +474,18 @@ pub fn to_affine(
     }
     let n = w.rows;
     let group = affine_group(scheme);
-    crate::cx::expect(OP, codes, &[Dtype::U8])?;
-    crate::cx::expect(OP, scales, &[Dtype::F32])?;
-    crate::cx::expect(OP, biases, &[Dtype::F32])?;
-    crate::cx::shaped(OP, "code", codes, n, k)?;
-    crate::cx::shaped(OP, "scale", scales, n, k / group)?;
-    crate::cx::shaped(OP, "bias", biases, n, k / group)?;
-    let w = Tensor::new(w.buf, w.rows, w.width, Dtype::U8);
-    ctx.emit(&mut |cx| {
-        let (q, scale, bias) = parts(cx, w, scheme, k)?;
-        // [S, T, B, n] → [n, B, S, T]; [S, B, n] → [n, B, S].
-        let q = cx.transpose(q, &[3, 2, 0, 1])?;
-        let q = cx.convert(q, Elem::U8);
-        cx.write(codes, q)?;
-        let scale = cx.transpose(scale, &[2, 1, 0])?;
-        cx.write(scales, scale)?;
-        let bias = cx.transpose(bias, &[2, 1, 0])?;
-        cx.write(biases, bias)
-    })?;
-    Ok(scheme)
+    crate::check::expect(OP, codes, &[Dtype::U8])?;
+    crate::check::expect(OP, scales, &[Dtype::F32])?;
+    crate::check::expect(OP, biases, &[Dtype::F32])?;
+    crate::check::shaped(OP, "code", codes, n, k)?;
+    crate::check::shaped(OP, "scale", scales, n, k / group)?;
+    crate::check::shaped(OP, "bias", biases, n, k / group)?;
+    let w = w.with_dtype(Dtype::U8);
+    let (q, scale, bias) = parts(f, w, scheme, k)?;
+    // [S, T, B, n] → [n, B, S, T]; [S, B, n] → [n, B, S].
+    let q = f.transpose(q, &[3, 2, 0, 1])?;
+    let q = f.convert(q, Elem::U8);
+    let scale = f.transpose(scale, &[2, 1, 0])?;
+    let bias = f.transpose(bias, &[2, 1, 0])?;
+    Ok((scheme, [q, scale, bias]))
 }

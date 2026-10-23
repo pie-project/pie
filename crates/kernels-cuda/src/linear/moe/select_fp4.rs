@@ -3,6 +3,7 @@ use crate::error::Error;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
+use crate::linear::dequant::{Planes, planes};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -685,6 +686,243 @@ pub(super) fn matmul_select_mlxu4(
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
             ctx.stage(),
+        ],
+    )
+}
+
+// NVFP4 selects read at bf16 (W4A16): see `crate::linear::dequant`'s
+// nvfp4 planes for the layout.
+
+const NVFP4_WARP: u32 = 32;
+
+const NVFP4_ROWS_PER_WARP: u32 = 4;
+
+const NVFP4_DECODE_BLOCK: u32 = 128;
+
+/// The grouped arm's K tile.
+const NVFP4_TILE_K: u32 = 128;
+
+/// The routed product: `y[route] = x[route or its token] · W[routes[route]]ᵀ`.
+#[allow(clippy::too_many_arguments)]
+pub fn select_nvfp4(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    tensor_scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_matmul_select_quant";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let fan = selected(OP, x, routes, y)?;
+    let Planes { n, k } = planes(OP, codes, scales, tensor_scales, y.width, x.width)?;
+    // A narrow fire on the register-dequant MMA kernel where the profile
+    // says; a launch that fails falls to the arms below.
+    #[cfg(feature = "cuda")]
+    if !seat.streams()
+        && matches!(
+            crate::linear::moe::select_nvfp4_mma(
+                ctx,
+                OP,
+                x,
+                codes,
+                scales,
+                tensor_scales,
+                routes,
+                y,
+                crate::linear::moe::ExpertTable::RESIDENT,
+            ),
+            Ok(true)
+        )
+    {
+        return Ok(());
+    }
+    // On the grouped tcgen05 GEMM (W4A16), the tensor scale a row in its
+    // epilogue.
+    #[cfg(feature = "cuda")]
+    if !seat.streams()
+        && k.is_multiple_of(64)
+        && crate::linear::moe::tc5_worth(
+            ctx,
+            x,
+            (Dtype::Bf16, codes.rows),
+            y,
+            crate::linear::moe::ExpertTable::RESIDENT,
+            routes.rows,
+            fan.route_count,
+        )
+    {
+        use crate::linear::gemm_sm100;
+        // A tcgen05 launch that fails falls back to the arm below.
+        if crate::linear::moe::select_tc5(
+            ctx,
+            OP,
+            x,
+            gemm_sm100::Operand::scaled(codes.ptr, gemm_sm100::Elem::E2m1, scales.ptr, 16),
+            codes.rows,
+            routes,
+            y,
+            gemm_sm100::Epilogue {
+                weight_scale: tensor_scales.ptr,
+                ..gemm_sm100::Epilogue::STORE
+            },
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    nonzero(OP, "N, the bank's output width", n)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    // Grouping pays once an expert serves more routes than the mxfp4 bank's
+    // knob says, the same trade at the same width of code.
+    if x.dtype == Dtype::Bf16
+        && k.is_multiple_of(NVFP4_TILE_K)
+        && ctx.tuning().mxfp4_grouped
+        && fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts
+    {
+        return select_nvfp4_grouped(
+            ctx,
+            OP,
+            x,
+            codes,
+            scales,
+            tensor_scales,
+            routes,
+            y,
+            seat,
+            &fan,
+            experts,
+        );
+    }
+    select_nvfp4_routed(
+        ctx,
+        OP,
+        t,
+        x,
+        Some(routes),
+        codes,
+        scales,
+        tensor_scales,
+        y,
+        seat,
+        fan.route_count,
+        fan.top_k,
+        act_div,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_nvfp4_grouped(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    tensor_scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    seat: GroupSeat,
+    fan: &Selected,
+    experts: u32,
+) -> Result<(), Error> {
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order(ctx, op, routes, fan, experts)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    ctx.fire(
+        op,
+        Fire::at(
+            SELECT_FP4_SM80,
+            symbol("::pie::linear::moe_matmul_select_nvfp4_mma"),
+        )
+        .apply(Launch::grid(
+            [work_cap, y.width.div_ceil(GROUPED_TILE_N), 1],
+            [GROUPED_BLOCK, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            codes.arg(),
+            scales.arg(),
+            tensor_scales.arg(),
+            y.arg(),
+            act_div.arg(),
+            stated(op, y.width)?.arg(),
+            stated(op, x.width)?.arg(),
+            stated(op, experts)?.arg(),
+            ArgValue::Ptr(seat.cell),
+            ArgValue::Ptr(seat.hits),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_nvfp4_routed(
+    ctx: &Ctx,
+    op: &'static str,
+    t: &str,
+    x: Tensor,
+    routes: Option<Tensor>,
+    codes: Tensor,
+    scales: Tensor,
+    tensor_scales: Tensor,
+    y: &mut Tensor,
+    seat: GroupSeat,
+    route_count: u32,
+    top_k: i32,
+    act_div: i32,
+) -> Result<(), Error> {
+    // A lean select (`kernel.moe.mxfp4_select_lean`) runs blocks of two warps.
+    let lean = ctx.tuning().mxfp4_select_lean;
+    let block = if lean {
+        2 * NVFP4_WARP
+    } else {
+        NVFP4_DECODE_BLOCK
+    };
+    let tile = (block / NVFP4_WARP) * NVFP4_ROWS_PER_WARP;
+    if route_count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(
+            SELECT,
+            symbol(&format!(
+                "::pie::linear::moe_matmul_select_nvfp4<{t}, ::pie::i32({NVFP4_ROWS_PER_WARP}){}>",
+                if lean { ", true" } else { "" }
+            )),
+        )
+        .apply(Launch::grid(
+            [route_count, y.width.div_ceil(tile), 1],
+            [block, 1, 1],
+        )),
+        &[
+            x.arg(),
+            routes.map_or(ArgValue::ABSENT, |routes| routes.arg()),
+            codes.arg(),
+            scales.arg(),
+            tensor_scales.arg(),
+            y.arg(),
+            top_k.arg(),
+            act_div.arg(),
+            stated(op, y.width)?.arg(),
+            stated(op, x.width)?.arg(),
+            ArgValue::Ptr(seat.cell),
+            ArgValue::Ptr(seat.hits),
+            if routes.is_some() {
+                ctx.stage()
+            } else {
+                ArgValue::ABSENT
+            },
         ],
     )
 }

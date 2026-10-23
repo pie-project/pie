@@ -2,7 +2,7 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::Bank;
+use engine_xla::handle::Bank;
 use kernels_xla::{gather, sampling};
 
 fn data(n: usize, seed: u32) -> Vec<f32> {
@@ -60,11 +60,42 @@ fn embeds_and_select_answer_the_host() {
     let vy = b.zeros(Dtype::Bf16, n, width);
     if !b
         .run(|ctx| {
-            gather::embed(ctx, i, t, vocab, y)?;
-            gather::embed_concat(ctx, ci, t, vocab, cy)?;
-            gather::embed_weighted(ctx, wi, ww, t, vocab, wy)?;
-            gather::select(ctx, rt, 1, 8, sy)?;
-            gather::embed_vocab_shard(ctx, i, shard, 1, vy)
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(i)?;
+                let table_v = l.read(t)?;
+                let o_y = y;
+                let v = gather::embed(l.f(), ids_v, table_v, vocab, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(ci)?;
+                let table_v = l.read(t)?;
+                let o_y = cy;
+                let v = gather::embed_concat(l.f(), ids_v, table_v, vocab, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let table_v = l.read(t)?;
+                let ids_v = l.read(wi)?;
+                let weights_v = l.read(ww)?;
+                let o_y = wy;
+                let v =
+                    gather::embed_weighted(l.f(), ids_v, weights_v, table_v, vocab, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let table_v = l.read(rt)?;
+                let o_y = sy;
+                let v = gather::select(l.f(), table_v, 1, 8, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(i)?;
+                let table_v = l.read(shard)?;
+                let o_y = vy;
+                let v = gather::embed_vocab_shard(l.f(), ids_v, table_v, 1, o_y.landing())?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -177,8 +208,20 @@ fn affine_embeds_decode_their_rows() {
     let cy = b.zeros(Dtype::Bf16, 2, 2 * width);
     if !b
         .run(|ctx| {
-            gather::embed_gather_mb_4bit(ctx, i, b4, vocab, y)?;
-            gather::embed_concat_mb_4bit(ctx, ci, b2, vocab, cy)
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(i)?;
+                let table_v = l.bank(b4)?;
+                let o_y = y;
+                let v = gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, vocab, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(ci)?;
+                let table_v = l.bank(b2)?;
+                let o_y = cy;
+                let v = gather::embed_concat_mb_4bit(l.f(), ids_v, table_v, vocab, o_y.landing())?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -229,7 +272,15 @@ fn a_folded_affine_table_reads_its_rows() {
     let i = b.i32(ids.len() as u32, 1, &ids);
     let y = b.zeros(Dtype::Bf16, ids.len() as u32, width);
     if !b
-        .run(|ctx| gather::embed_gather_mb_4bit(ctx, i, bank, vocab, y))
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(i)?;
+                let table_v = l.bank(bank)?;
+                let o_y = y;
+                let v = gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, vocab, o_y.landing())?;
+                l.land(o_y, v)
+            })
+        })
         .unwrap()
     {
         return;
@@ -275,9 +326,45 @@ fn splits_cut_where_they_state() {
     let r = b.zeros(Dtype::F32, rows, 6);
     if !b
         .run(|ctx| {
-            gather::split_qkv(ctx, p, qw, kw, q, k, v)?;
-            gather::split_q_gate(ctx, g_in, hd, gq, gg)?;
-            gather::split_rows(ctx, x, 4, l, r)
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(p)?;
+                let o_q = q;
+                let o_k = k;
+                let o_v = v;
+                let (v0, v1, v2) = gather::split_qkv(
+                    l.f(),
+                    packed_v,
+                    qw,
+                    kw,
+                    o_q.landing(),
+                    o_k.landing(),
+                    o_v.landing(),
+                )?;
+                l.land(o_q, v0)?;
+                l.land(o_k, v1)?;
+                l.land(o_v, v2)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let packed_v = l.read(g_in)?;
+                let o_q = gq;
+                let o_gate = gg;
+                let (v0, v1) =
+                    gather::split_q_gate(l.f(), packed_v, hd, o_q.landing(), o_gate.landing())?;
+                l.land(o_q, v0)?;
+                l.land(o_gate, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |lw| {
+                let x_v = lw.read(x)?;
+                let o_left = l;
+                let o_right = r;
+                let (v0, v1) =
+                    gather::split_rows(lw.f(), x_v, 4, o_left.landing(), o_right.landing())?;
+                lw.land(o_left, v0)?;
+                lw.land(o_right, v1)?;
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -319,11 +406,44 @@ fn row_moves_gather_scatter_and_permute() {
     let un = b.bf16(7, width as u32, &wide);
     if !b
         .run(|ctx| {
-            gather::gather_rows(ctx, w, gi, g)?;
-            gather::scatter_rows(ctx, t, si, s)?;
-            gather::scatter_live_rows(ctx, t, li, live)?;
-            gather::pack_rows(ctx, w, pi, pk)?;
-            gather::unpack_rows(ctx, t, pi, un)
+            engine_xla::lower::lower(ctx, |l| {
+                let index_v = l.read(gi)?;
+                let wide_v = l.read(w)?;
+                let o_tight = g;
+                let v = gather::gather_rows(l.f(), wide_v, index_v, o_tight.landing())?;
+                l.land(o_tight, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let index_v = l.read(si)?;
+                let tight_v = l.read(t)?;
+                let wide_v = l.read(s)?;
+                let o_wide = s;
+                let v = gather::scatter_rows(l.f(), tight_v, index_v, wide_v)?;
+                l.land(o_wide, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let routes_v = l.read(li)?;
+                let src_v = l.read(t)?;
+                let y_v = l.read(live)?;
+                let o_y = live;
+                let v = gather::scatter_live_rows(l.f(), src_v, routes_v, y_v)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let perm_v = l.read(pi)?;
+                let x_v = l.read(w)?;
+                let o_y = pk;
+                let v = gather::pack_rows(l.f(), x_v, perm_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let perm_v = l.read(pi)?;
+                let x_v = l.read(t)?;
+                let y_v = l.read(un)?;
+                let o_y = un;
+                let v = gather::unpack_rows(l.f(), x_v, perm_v, y_v)?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -363,8 +483,18 @@ fn folds_pool_and_merge_blocks_of_rows() {
     let merge = b.zeros(Dtype::Bf16, 2, 4 * width as u32);
     if !b
         .run(|ctx| {
-            gather::pool_rows(ctx, xs, side, pool)?;
-            gather::merge_rows(ctx, xs, side, merge)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xs)?;
+                let o_y = pool;
+                let v = gather::pool_rows(l.f(), x_v, side, o_y.landing())?;
+                l.land_head(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xs)?;
+                let o_y = merge;
+                let v = gather::merge_rows(l.f(), x_v, side, o_y.landing())?;
+                l.land_head(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -483,10 +613,70 @@ fn pixels_and_grid_taps_answer_the_host() {
     let aw = b.zeros(Dtype::F32, n, 2);
     if !b
         .run(|ctx| {
-            gather::pixels(ctx, x, patch, mean, std, true, 2, chw)?;
-            gather::pixels(ctx, x, patch, mean, std, false, 1, hwc)?;
-            gather::grid_taps(ctx, pos, grid, seg, true, side, bi, bw)?;
-            gather::grid_taps(ctx, pos, grid, seg, false, side, ai, aw)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_y = chw;
+                if let Some(v) =
+                    gather::pixels(l.f(), x_v, patch, mean, std, true, 2, o_y.landing())?
+                {
+                    l.land_head(o_y, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_y = hwc;
+                if let Some(v) =
+                    gather::pixels(l.f(), x_v, patch, mean, std, false, 1, o_y.landing())?
+                {
+                    l.land_head(o_y, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let positions_v = l.read(pos)?;
+                let segments_v = l.read(seg)?;
+                let bilinear = Some(gather::Bilinear {
+                    segments: segments_v,
+                    grids: l.read(grid)?,
+                });
+                let o_ids = bi;
+                let o_weights = bw;
+                if let Some((v0, v1)) = gather::grid_taps(
+                    l.f(),
+                    positions_v,
+                    grid,
+                    seg,
+                    bilinear,
+                    side,
+                    o_ids.landing(),
+                    o_weights.landing(),
+                )? {
+                    l.land_head(o_ids, v0)?;
+                    l.land_head(o_weights, v1)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let positions_v = l.read(pos)?;
+                let bilinear = None;
+                let o_ids = ai;
+                let o_weights = aw;
+                if let Some((v0, v1)) = gather::grid_taps(
+                    l.f(),
+                    positions_v,
+                    grid,
+                    seg,
+                    bilinear,
+                    side,
+                    o_ids.landing(),
+                    o_weights.landing(),
+                )? {
+                    l.land_head(o_ids, v0)?;
+                    l.land_head(o_weights, v1)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -542,10 +732,38 @@ fn argmax_and_topk_rank_rows_lowest_index_first() {
     let bi = b.zeros(Dtype::I32, 4, k);
     if !b
         .run(|ctx| {
-            sampling::argmax(ctx, xs, 0, y)?;
-            sampling::argmax(ctx, xb, 1, y)?;
-            sampling::topk(ctx, xs, k, tv, ti)?;
-            sampling::topk(ctx, xb, k, bv, bi)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xs)?;
+                let o_y = y;
+                let v = sampling::argmax(l.f(), x_v, 0, o_y.landing())?;
+                l.land_column(o_y, 0, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xb)?;
+                let o_y = y;
+                let v = sampling::argmax(l.f(), x_v, 1, o_y.landing())?;
+                l.land_column(o_y, 1, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xs)?;
+                let o_values = tv;
+                let o_indices = ti;
+                let (v0, v1) =
+                    sampling::topk(l.f(), x_v, k, o_values.landing(), o_indices.landing())?;
+                l.land(o_values, v0)?;
+                l.land(o_indices, v1)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xb)?;
+                let o_values = bv;
+                let o_indices = bi;
+                let (v0, v1) =
+                    sampling::topk(l.f(), x_v, k, o_values.landing(), o_indices.landing())?;
+                l.land(o_values, v0)?;
+                l.land(o_indices, v1)?;
+                Ok(())
+            })
         })
         .unwrap()
     {

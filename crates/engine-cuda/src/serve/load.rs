@@ -1022,7 +1022,7 @@ impl Shell {
             let Some(ctx) = ctx else {
                 continue;
             };
-            kernels_cuda::linear::quant::warm_decoded_weight(ctx, tile).map_err(|why| {
+            kernels_cuda::linear::dequant::warm_decoded_weight(ctx, tile).map_err(|why| {
                 Fault::Residency(format!(
                     "the card does not hold this deployment: the decoded-weight tile stream \
                      {stream} decodes its widest plane into, {tile} bytes, would not allocate \

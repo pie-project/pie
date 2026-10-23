@@ -44,13 +44,13 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, GatherDims, Ty, Val};
 use crate::linear::quant::{
     Codes, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes,
 };
-use crate::tensor::{Bank, Tensor};
+use crate::tensor::{Bank, Landing, Operand, Stored};
 use crate::tuning::{MoePath, Tuning};
 
 const MXFP4_BLOCK: u32 = 32;
@@ -66,21 +66,24 @@ fn planes(
     op: &'static str,
     rows: u32,
     top_k: u32,
-    routes: Tensor,
-    weights: Tensor,
+    routes: impl Stored,
+    weights: impl Stored,
 ) -> Result<(), Error> {
     expect(op, routes, &[Dtype::I32])?;
     expect(op, weights, &[Dtype::F32])?;
-    if routes.rows != rows
-        || weights.rows != rows
-        || routes.width != top_k
-        || weights.width != top_k
+    if routes.rows() != rows
+        || weights.rows() != rows
+        || routes.width() != top_k
+        || weights.width() != top_k
     {
         return Err(refuse(
             op,
             format!(
                 "routes {}x{} / weights {}x{} for {rows} rows at fan-out {top_k}",
-                routes.rows, routes.width, weights.rows, weights.width
+                routes.rows(),
+                routes.width(),
+                weights.rows(),
+                weights.width()
             ),
         ));
     }
@@ -89,29 +92,32 @@ fn planes(
 
 fn router(
     op: &'static str,
-    logits: Tensor,
+    logits: impl Stored,
     experts: u32,
     top_k: u32,
-    routes: Tensor,
-    weights: Tensor,
+    routes: impl Stored,
+    weights: impl Stored,
 ) -> Result<(), Error> {
     expect(op, logits, &[Dtype::Bf16])?;
     nonzero(op, "the expert count", experts)?;
     nonzero(op, "the fan-out", top_k)?;
-    if logits.width != experts {
+    if logits.width() != experts {
         return Err(refuse(
             op,
-            format!("the logits are {} wide for {experts} experts", logits.width),
+            format!(
+                "the logits are {} wide for {experts} experts",
+                logits.width()
+            ),
         ));
     }
-    planes(op, logits.rows, top_k, routes, weights)
+    planes(op, logits.rows(), top_k, routes, weights)
 }
 
 /// `v` as a flat f32 `[n]` vector.
-fn flat_f32(cx: &mut Cx<'_>, v: Val) -> Result<Val, Error> {
-    let n = cx.ty(v).elements();
-    let v = cx.convert(v, Elem::F32);
-    Ok(cx.reshape(v, &[n])?)
+fn flat_f32(f: &mut Func, v: Val) -> Result<Val, Error> {
+    let n = f.ty(v).elements();
+    let v = f.convert(v, Elem::F32);
+    Ok(f.reshape(v, &[n])?)
 }
 
 /// The `k` largest of `rank` (`[rows, n]` f32) per row, ties to the lowest
@@ -119,80 +125,80 @@ fn flat_f32(cx: &mut Cx<'_>, v: Val) -> Result<Val, Error> {
 /// `carry` (same shape as `rank`) rides the sort and is returned picked the
 /// same way.
 fn pick_top(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     rank: Val,
     carry: Option<Val>,
     k: i64,
 ) -> Result<(Val, Val, Option<Val>), Error> {
-    let dims = cx.dims(rank).to_vec();
+    let dims = f.dims(rank).to_vec();
     let (rows, n) = (dims[0], dims[1]);
     let clean = {
-        let nan = cx.compare(Cmp::Ne, rank, rank)?;
-        let lo = cx.const_f(Elem::F32, f64::NEG_INFINITY, &dims);
-        cx.select(nan, lo, rank)?
+        let nan = f.compare(Cmp::Ne, rank, rank)?;
+        let lo = f.const_f(Elem::F32, f64::NEG_INFINITY, &dims);
+        f.select(nan, lo, rank)?
     };
-    let iota = cx.iota(Elem::I32, &dims, 1);
+    let iota = f.iota(Elem::I32, &dims, 1);
     let mut xs = vec![clean, iota];
     if let Some(c) = carry {
         xs.push(c);
     }
-    let sorted = cx.sort(&xs, 1, true, |f, a, b| {
-        let gt = f.compare(Cmp::Gt, a[0], b[0])?;
-        let eq = f.compare(Cmp::Eq, a[0], b[0])?;
-        let lt = f.compare(Cmp::Lt, a[1], b[1])?;
-        let tie = f.and(eq, lt)?;
-        f.or(gt, tie)
+    let sorted = f.sort(&xs, 1, true, |fq, a, b| {
+        let gt = fq.compare(Cmp::Gt, a[0], b[0])?;
+        let eq = fq.compare(Cmp::Eq, a[0], b[0])?;
+        let lt = fq.compare(Cmp::Lt, a[1], b[1])?;
+        let tie = fq.and(eq, lt)?;
+        fq.or(gt, tie)
     })?;
     let k = k.min(n);
-    let v = cx.slice(sorted[0], &[0, 0], &[rows, k], &[1, 1])?;
-    let i = cx.slice(sorted[1], &[0, 0], &[rows, k], &[1, 1])?;
+    let v = f.slice(sorted[0], &[0, 0], &[rows, k], &[1, 1])?;
+    let i = f.slice(sorted[1], &[0, 0], &[rows, k], &[1, 1])?;
     let c = match carry {
-        Some(_) => Some(cx.slice(sorted[2], &[0, 0], &[rows, k], &[1, 1])?),
+        Some(_) => Some(f.slice(sorted[2], &[0, 0], &[rows, k], &[1, 1])?),
         None => None,
     };
     Ok((v, i, c))
 }
 
 /// Widens `[rows, picks]` to `[rows, width]` with `fill` in the tail.
-fn pad_cols(cx: &mut Cx<'_>, v: Val, width: i64, fill: Val) -> Result<Val, Error> {
-    let picks = cx.dims(v)[1];
+fn pad_cols(f: &mut Func, v: Val, width: i64, fill: Val) -> Result<Val, Error> {
+    let picks = f.dims(v)[1];
     if picks == width {
         return Ok(v);
     }
-    Ok(cx.pad(v, fill, &[0, 0], &[0, width - picks], &[0, 0])?)
+    Ok(f.pad(v, fill, &[0, 0], &[0, width - picks], &[0, 0])?)
 }
 
 /// Per-row `sum(w)`, broadcast back over `[rows, k]`.
-fn row_sum(cx: &mut Cx<'_>, w: Val) -> Result<Val, Error> {
-    let dims = cx.dims(w).to_vec();
-    let s = cx.reduce(w, &[1], Fold::Sum)?;
-    Ok(cx.broadcast(s, &dims, &[0])?)
+fn row_sum(f: &mut Func, w: Val) -> Result<Val, Error> {
+    let dims = f.dims(w).to_vec();
+    let s = f.reduce(w, &[1], Fold::Sum)?;
+    Ok(f.broadcast(s, &dims, &[0])?)
 }
 
 /// `w * scaling`, or `w * scaling / sum(w)` when renormalizing and the row's
 /// sum is positive (the WGSL routers' rule).
-fn renorm(cx: &mut Cx<'_>, w: Val, renormalize: bool, scaling: f32) -> Result<Val, Error> {
-    let scaled = cx.scale(w, f64::from(scaling))?;
+fn renorm(f: &mut Func, w: Val, renormalize: bool, scaling: f32) -> Result<Val, Error> {
+    let scaled = f.scale(w, f64::from(scaling))?;
     if !renormalize {
         return Ok(scaled);
     }
-    let sum = row_sum(cx, w)?;
-    let zero = cx.like_f(sum, 0.0);
-    let pos = cx.compare(Cmp::Gt, sum, zero)?;
-    let divided = cx.div(scaled, sum)?;
-    Ok(cx.select(pos, divided, scaled)?)
+    let sum = row_sum(f, w)?;
+    let zero = f.like_f(sum, 0.0);
+    let pos = f.compare(Cmp::Gt, sum, zero)?;
+    let divided = f.div(scaled, sum)?;
+    Ok(f.select(pos, divided, scaled)?)
 }
 
 fn softmax_router(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    logits: Tensor,
-    scale: Option<Tensor>,
+    logits: Operand,
+    scale: Option<Operand>,
     experts: u32,
     top_k: u32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     router(op, logits, experts, top_k, routes, weights)?;
     if let Some(s) = scale {
         expect(op, s, &[Dtype::Bf16])?;
@@ -206,49 +212,46 @@ fn softmax_router(
             ));
         }
     }
-    ctx.emit(&mut |cx| {
-        let k = i64::from(top_k);
-        let x = cx.read_f32(logits)?;
-        let (v, i, _) = top_k_fill(cx, x, k)?;
-        // Softmax over the chosen logits.
-        let w = cx.softmax(v, 1)?;
-        let w = match scale {
-            Some(s) => {
-                let s = cx.read(s)?;
-                let s = flat_f32(cx, s)?;
-                let picked = take_flat(cx, s, i)?;
-                cx.mul(w, picked)?
-            }
-            None => w,
-        };
-        cx.write(routes, i)?;
-        cx.write(weights, w)
-    })
+    let k = i64::from(top_k);
+    let x = logits.f32(f);
+    let (v, i, _) = top_k_fill(f, x, k)?;
+    // Softmax over the chosen logits.
+    let w = f.softmax(v, 1)?;
+    let w = match scale {
+        Some(s) => {
+            let s = s.val;
+            let s = flat_f32(f, s)?;
+            let picked = take_flat(f, s, i)?;
+            f.mul(w, picked)?
+        }
+        None => w,
+    };
+    Ok((i, w))
 }
 
 /// `top_k` for a fan-out that may exceed the row: picks past the row's end
 /// hold `-inf`/index `-1` (they get zero softmax weight).
-fn top_k_fill(cx: &mut Cx<'_>, x: Val, k: i64) -> Result<(Val, Val, Option<Val>), Error> {
-    let (v, i, c) = pick_top(cx, x, None, k)?;
-    let lo = cx.const_f(Elem::F32, f64::NEG_INFINITY, &[]);
-    let none = cx.const_i(Elem::I32, -1, &[]);
-    let v = pad_cols(cx, v, k, lo)?;
-    let i = pad_cols(cx, i, k, none)?;
+fn top_k_fill(f: &mut Func, x: Val, k: i64) -> Result<(Val, Val, Option<Val>), Error> {
+    let (v, i, c) = pick_top(f, x, None, k)?;
+    let lo = f.const_f(Elem::F32, f64::NEG_INFINITY, &[]);
+    let none = f.const_i(Elem::I32, -1, &[]);
+    let v = pad_cols(f, v, k, lo)?;
+    let i = pad_cols(f, i, k, none)?;
     Ok((v, i, c))
 }
 
 /// `table[ids]` elementwise for a flat `[n]` table and any-shaped i32 `ids`
 /// (clamped into range).
-fn take_flat(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
-    let n = cx.dims(table)[0];
-    let dims = cx.dims(ids).to_vec();
-    let lo = cx.const_i(Elem::I32, 0, &[]);
-    let hi = cx.const_i(Elem::I32, n - 1, &[]);
-    let ids = cx.clamp(lo, ids, hi)?;
+fn take_flat(f: &mut Func, table: Val, ids: Val) -> Result<Val, Error> {
+    let n = f.dims(table)[0];
+    let dims = f.dims(ids).to_vec();
+    let lo = f.const_i(Elem::I32, 0, &[]);
+    let hi = f.const_i(Elem::I32, n - 1, &[]);
+    let ids = f.clamp(lo, ids, hi)?;
     let mut with = dims.clone();
     with.push(1);
-    let ids = cx.reshape(ids, &with)?;
-    Ok(cx.gather(
+    let ids = f.reshape(ids, &with)?;
+    Ok(f.gather(
         table,
         ids,
         &GatherDims {
@@ -263,30 +266,30 @@ fn take_flat(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 }
 
 /// `x[r, ids[r, j]]` for `[rows, n]` `x` and `[rows, k]` i32 `ids` (clamped).
-fn take_cols(cx: &mut Cx<'_>, x: Val, ids: Val) -> Result<Val, Error> {
-    let (rows, n) = (cx.dims(x)[0], cx.dims(x)[1]);
-    let k = cx.dims(ids)[1];
-    let flat = cx.reshape(x, &[rows * n])?;
-    let base = cx.iota(Elem::I32, &[rows, k], 0);
-    let stride = cx.const_i(Elem::I32, n, &[rows, k]);
-    let base = cx.mul(base, stride)?;
-    let lo = cx.const_i(Elem::I32, 0, &[]);
-    let hi = cx.const_i(Elem::I32, n - 1, &[]);
-    let ids = cx.clamp(lo, ids, hi)?;
-    let at = cx.add(base, ids)?;
-    take_flat(cx, flat, at)
+fn take_cols(f: &mut Func, x: Val, ids: Val) -> Result<Val, Error> {
+    let (rows, n) = (f.dims(x)[0], f.dims(x)[1]);
+    let k = f.dims(ids)[1];
+    let flat = f.reshape(x, &[rows * n])?;
+    let base = f.iota(Elem::I32, &[rows, k], 0);
+    let stride = f.const_i(Elem::I32, n, &[rows, k]);
+    let base = f.mul(base, stride)?;
+    let lo = f.const_i(Elem::I32, 0, &[]);
+    let hi = f.const_i(Elem::I32, n - 1, &[]);
+    let ids = f.clamp(lo, ids, hi)?;
+    let at = f.add(base, ids)?;
+    take_flat(f, flat, at)
 }
 
 pub fn topk_softmax(
-    ctx: &Ctx<'_>,
-    logits: Tensor,
+    f: &mut Func,
+    logits: Operand,
     experts: u32,
     top_k: u32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     softmax_router(
-        ctx,
+        f,
         "linear.moe_topk_softmax",
         logits,
         None,
@@ -298,16 +301,16 @@ pub fn topk_softmax(
 }
 
 pub fn topk_softmax_scaled(
-    ctx: &Ctx<'_>,
-    logits: Tensor,
-    scale: Tensor,
+    f: &mut Func,
+    logits: Operand,
+    scale: Operand,
     experts: u32,
     top_k: u32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     softmax_router(
-        ctx,
+        f,
         "linear.moe_topk_softmax_scaled",
         logits,
         Some(scale),
@@ -325,26 +328,26 @@ enum Score {
     SqrtSoftplus,
 }
 
-fn score(cx: &mut Cx<'_>, x: Val, how: Score) -> Result<Val, Error> {
+fn score(f: &mut Func, x: Val, how: Score) -> Result<Val, Error> {
     Ok(match how {
         Score::Sigmoid => {
             // 1 / (1 + e^-x), as the routers compute it.
-            let nx = cx.neg(x);
-            let e = cx.exp(nx);
-            let d = cx.offset(e, 1.0)?;
-            let one = cx.like_f(d, 1.0);
-            cx.div(one, d)?
+            let nx = f.neg(x);
+            let e = f.exp(nx);
+            let d = f.offset(e, 1.0)?;
+            let one = f.like_f(d, 1.0);
+            f.div(one, d)?
         }
         Score::SqrtSoftplus => {
-            let e = cx.exp(x);
-            let sp = cx.offset(e, 1.0)?;
-            let sp = cx.log(sp);
-            let twenty = cx.like_f(x, 20.0);
-            let big = cx.compare(Cmp::Gt, x, twenty)?;
-            let sp = cx.select(big, x, sp)?;
-            let zero = cx.like_f(sp, 0.0);
-            let sp = cx.max(sp, zero)?;
-            cx.sqrt(sp)
+            let e = f.exp(x);
+            let sp = f.offset(e, 1.0)?;
+            let sp = f.log(sp);
+            let twenty = f.like_f(x, 20.0);
+            let big = f.compare(Cmp::Gt, x, twenty)?;
+            let sp = f.select(big, x, sp)?;
+            let zero = f.like_f(sp, 0.0);
+            let sp = f.max(sp, zero)?;
+            f.sqrt(sp)
         }
     })
 }
@@ -352,18 +355,18 @@ fn score(cx: &mut Cx<'_>, x: Val, how: Score) -> Result<Val, Error> {
 /// The sigmoid-family routers: rank by `score + bias`, weigh by `score`,
 /// slots past the expert count land expert 0 at weight 0.
 fn scored_router(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
     how: Score,
-    logits: Tensor,
-    bias: Option<Tensor>,
+    logits: Operand,
+    bias: Option<Operand>,
     experts: u32,
     top_k: u32,
     renormalize: bool,
     scaling: f32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     router(op, logits, experts, top_k, routes, weights)?;
     if let Some(b) = bias {
         expect(op, b, &[Dtype::F32])?;
@@ -377,43 +380,40 @@ fn scored_router(
             ));
         }
     }
-    ctx.emit(&mut |cx| {
-        let (rows, n, k) = (i64::from(logits.rows), i64::from(experts), i64::from(top_k));
-        let x = cx.read_f32(logits)?;
-        let s = score(cx, x, how)?;
-        let rank = match bias {
-            Some(b) => {
-                let b = cx.read(b)?;
-                let b = flat_f32(cx, b)?;
-                let b = cx.broadcast(b, &[rows, n], &[1])?;
-                cx.add(s, b)?
-            }
-            None => s,
-        };
-        let (_, i, w) = pick_top(cx, rank, Some(s), k)?;
-        let w = w.expect("the score rides the sort");
-        let zero_f = cx.const_f(Elem::F32, 0.0, &[]);
-        let zero_i = cx.const_i(Elem::I32, 0, &[]);
-        let w = pad_cols(cx, w, k, zero_f)?;
-        let i = pad_cols(cx, i, k, zero_i)?;
-        let w = renorm(cx, w, renormalize, scaling)?;
-        cx.write(routes, i)?;
-        cx.write(weights, w)
-    })
+    let (rows, n, k) = (i64::from(logits.rows), i64::from(experts), i64::from(top_k));
+    let x = logits.f32(f);
+    let s = score(f, x, how)?;
+    let rank = match bias {
+        Some(b) => {
+            let b = b.val;
+            let b = flat_f32(f, b)?;
+            let b = f.broadcast(b, &[rows, n], &[1])?;
+            f.add(s, b)?
+        }
+        None => s,
+    };
+    let (_, i, w) = pick_top(f, rank, Some(s), k)?;
+    let w = w.expect("the score rides the sort");
+    let zero_f = f.const_f(Elem::F32, 0.0, &[]);
+    let zero_i = f.const_i(Elem::I32, 0, &[]);
+    let w = pad_cols(f, w, k, zero_f)?;
+    let i = pad_cols(f, i, k, zero_i)?;
+    let w = renorm(f, w, renormalize, scaling)?;
+    Ok((i, w))
 }
 
 pub fn topk_sigmoid(
-    ctx: &Ctx<'_>,
-    logits: Tensor,
+    f: &mut Func,
+    logits: Operand,
     experts: u32,
     top_k: u32,
     renormalize: bool,
     scaling: f32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     scored_router(
-        ctx,
+        f,
         "linear.moe_topk_sigmoid",
         Score::Sigmoid,
         logits,
@@ -428,18 +428,18 @@ pub fn topk_sigmoid(
 }
 
 pub fn topk_sigmoid_biased(
-    ctx: &Ctx<'_>,
-    logits: Tensor,
-    bias: Tensor,
+    f: &mut Func,
+    logits: Operand,
+    bias: Operand,
     experts: u32,
     top_k: u32,
     renormalize: bool,
     scaling: f32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     scored_router(
-        ctx,
+        f,
         "linear.moe_topk_sigmoid",
         Score::Sigmoid,
         logits,
@@ -454,18 +454,18 @@ pub fn topk_sigmoid_biased(
 }
 
 pub fn topk_sqrt_softplus(
-    ctx: &Ctx<'_>,
-    logits: Tensor,
-    bias: Tensor,
+    f: &mut Func,
+    logits: Operand,
+    bias: Operand,
     experts: u32,
     top_k: u32,
     renormalize: bool,
     scaling: f32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     scored_router(
-        ctx,
+        f,
         "linear.moe_topk_sqrt_softplus",
         Score::SqrtSoftplus,
         logits,
@@ -480,16 +480,16 @@ pub fn topk_sqrt_softplus(
 }
 
 pub fn predict_route(
-    ctx: &Ctx<'_>,
-    logits: Tensor,
-    bias: Tensor,
+    f: &mut Func,
+    logits: Operand,
+    bias: Operand,
     experts: u32,
     top_k: u32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     scored_router(
-        ctx,
+        f,
         "linear.moe_predict_route",
         Score::SqrtSoftplus,
         logits,
@@ -509,17 +509,17 @@ pub fn predict_route(
 /// Reference: `kernels-cuda/kernels/linear/moe.cuh` `moe_topk_sigmoid_sink`
 /// (CUDA only; `global_scale` is an f32 scalar, the bias an f32 `[experts]`).
 pub fn topk_sigmoid_sink(
-    ctx: &Ctx<'_>,
-    logits: Tensor,
-    correction_bias: Option<Tensor>,
-    global_scale: Option<Tensor>,
+    f: &mut Func,
+    logits: Operand,
+    correction_bias: Option<Operand>,
+    global_scale: Option<Operand>,
     experts: u32,
     top_k: u32,
     sink: u32,
     scaling: f32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "linear.moe_topk_sigmoid_sink";
     expect(OP, logits, &[Dtype::Bf16])?;
     nonzero(OP, "the expert count", experts)?;
@@ -549,56 +549,53 @@ pub fn topk_sigmoid_sink(
     if let Some(g) = global_scale {
         expect(OP, g, &[Dtype::F32])?;
     }
-    ctx.emit(&mut |cx| {
-        let (rows, n, k, s) = (
-            i64::from(logits.rows),
-            i64::from(experts),
-            i64::from(top_k),
-            i64::from(sink),
-        );
-        let x = cx.read_f32(logits)?;
-        let sc = score(cx, x, Score::Sigmoid)?;
-        let routed = cx.slice(sc, &[0, 0], &[rows, n], &[1, 1])?;
-        let rank = match correction_bias {
-            Some(b) => {
-                let b = cx.read(b)?;
-                let b = flat_f32(cx, b)?;
-                let b = cx.slice(b, &[0], &[n], &[1])?;
-                let b = cx.broadcast(b, &[rows, n], &[1])?;
-                cx.add(routed, b)?
-            }
-            None => routed,
-        };
-        let (_, i, w) = pick_top(cx, rank, Some(routed), k)?;
-        let w = w.expect("the score rides the sort");
-        let zero_f = cx.const_f(Elem::F32, 0.0, &[]);
-        let none = cx.const_i(Elem::I32, -1, &[]);
-        let mut w = pad_cols(cx, w, k, zero_f)?;
-        let mut i = pad_cols(cx, i, k, none)?;
-        if s > 0 {
-            let sw = cx.slice(sc, &[0, n], &[rows, n + s], &[1, 1])?;
-            let si = cx.iota(Elem::I32, &[rows, s], 1);
-            let base = cx.const_i(Elem::I32, n, &[rows, s]);
-            let si = cx.add(si, base)?;
-            w = cx.concat(&[w, sw], 1)?;
-            i = cx.concat(&[i, si], 1)?;
+    let (rows, n, k, s) = (
+        i64::from(logits.rows),
+        i64::from(experts),
+        i64::from(top_k),
+        i64::from(sink),
+    );
+    let x = logits.f32(f);
+    let sc = score(f, x, Score::Sigmoid)?;
+    let routed = f.slice(sc, &[0, 0], &[rows, n], &[1, 1])?;
+    let rank = match correction_bias {
+        Some(b) => {
+            let b = b.val;
+            let b = flat_f32(f, b)?;
+            let b = f.slice(b, &[0], &[n], &[1])?;
+            let b = f.broadcast(b, &[rows, n], &[1])?;
+            f.add(routed, b)?
         }
-        let sum = row_sum(cx, w)?;
-        let sum = cx.offset(sum, 1e-20)?;
-        let mut scale = cx.like_f(sum, f64::from(scaling));
-        if let Some(g) = global_scale {
-            let g = cx.read(g)?;
-            let g = flat_f32(cx, g)?;
-            let g = cx.slice(g, &[0], &[1], &[1])?;
-            let g = cx.reshape(g, &[])?;
-            let g = cx.splat(g, &[rows, k + s])?;
-            scale = cx.mul(scale, g)?;
-        }
-        let scale = cx.div(scale, sum)?;
-        let w = cx.mul(w, scale)?;
-        cx.write(routes, i)?;
-        cx.write(weights, w)
-    })
+        None => routed,
+    };
+    let (_, i, w) = pick_top(f, rank, Some(routed), k)?;
+    let w = w.expect("the score rides the sort");
+    let zero_f = f.const_f(Elem::F32, 0.0, &[]);
+    let none = f.const_i(Elem::I32, -1, &[]);
+    let mut w = pad_cols(f, w, k, zero_f)?;
+    let mut i = pad_cols(f, i, k, none)?;
+    if s > 0 {
+        let sw = f.slice(sc, &[0, n], &[rows, n + s], &[1, 1])?;
+        let si = f.iota(Elem::I32, &[rows, s], 1);
+        let base = f.const_i(Elem::I32, n, &[rows, s]);
+        let si = f.add(si, base)?;
+        w = f.concat(&[w, sw], 1)?;
+        i = f.concat(&[i, si], 1)?;
+    }
+    let sum = row_sum(f, w)?;
+    let sum = f.offset(sum, 1e-20)?;
+    let mut scale = f.like_f(sum, f64::from(scaling));
+    if let Some(g) = global_scale {
+        let g = g.val;
+        let g = flat_f32(f, g)?;
+        let g = f.slice(g, &[0], &[1], &[1])?;
+        let g = f.reshape(g, &[])?;
+        let g = f.splat(g, &[rows, k + s])?;
+        scale = f.mul(scale, g)?;
+    }
+    let scale = f.div(scale, sum)?;
+    let w = f.mul(w, scale)?;
+    Ok((i, w))
 }
 
 /// Routes by a token-id hash table: `tid2eid[id]` (i64 `[vocab, top_k]`)
@@ -606,17 +603,17 @@ pub fn topk_sigmoid_sink(
 /// expert; an id past the vocabulary reads row 0, and a table entry outside
 /// `0..experts` lands its (truncated) id at weight 0.
 pub fn hash_route(
-    ctx: &Ctx<'_>,
-    ids: Tensor,
-    tid2eid: Tensor,
-    logits: Tensor,
+    f: &mut Func,
+    ids: Operand,
+    tid2eid: Operand,
+    logits: Operand,
     vocab: u32,
     top_k: u32,
     renormalize: bool,
     scaling: f32,
-    routes: Tensor,
-    weights: Tensor,
-) -> Result<(), Error> {
+    routes: Landing,
+    weights: Landing,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "linear.moe_hash_route";
     expect(OP, ids, &[Dtype::U32, Dtype::I32])?;
     expect(OP, tid2eid, &[Dtype::I64])?;
@@ -634,58 +631,55 @@ pub fn hash_route(
     if tid2eid.elements() < u64::from(vocab) * u64::from(top_k) {
         return Err(refuse(OP, "the hash table is smaller than vocab x top_k"));
     }
-    ctx.emit(&mut |cx| {
-        let (rows, n, k, v) = (
-            i64::from(routes.rows),
-            i64::from(experts),
-            i64::from(top_k),
-            i64::from(vocab),
-        );
-        let raw = cx.read(ids)?;
-        let raw = cx.reshape(raw, &[rows])?;
-        // Unsigned compare against the vocabulary, as the WGSL reads a u32.
-        let raw = cx.convert(raw, Elem::I64);
-        let raw = if ids.dtype == Dtype::I32 {
-            let m = cx.const_i(Elem::I64, 0xFFFF_FFFF, &[rows]);
-            cx.and(raw, m)?
-        } else {
-            raw
-        };
-        let vv = cx.const_i(Elem::I64, v, &[rows]);
-        let inside = cx.compare(Cmp::Lt, raw, vv)?;
-        let zero = cx.const_i(Elem::I64, 0, &[rows]);
-        let tid = cx.select(inside, raw, zero)?;
-        let tid = cx.convert(tid, Elem::I32);
-        let table = cx.read(tid2eid)?;
-        let total = cx.ty(table).elements();
-        let table = cx.reshape(table, &[total / k, k])?;
-        let eid = cx.take_rows(table, tid)?; // [rows, k] i64
-        let lo = cx.const_i(Elem::I64, 0, &[rows, k]);
-        let hi = cx.const_i(Elem::I64, n, &[rows, k]);
-        let ge = cx.compare(Cmp::Ge, eid, lo)?;
-        let lt = cx.compare(Cmp::Lt, eid, hi)?;
-        let ok = cx.and(ge, lt)?;
-        let route = cx.convert(eid, Elem::I32);
-        let x = cx.read_f32(logits)?;
-        let picked = take_cols(cx, x, route)?;
-        // The WGSL's hash score: sqrt(softplus) with no clamp at zero.
-        let e = cx.exp(picked);
-        let sp = cx.offset(e, 1.0)?;
-        let sp = cx.log(sp);
-        let twenty = cx.like_f(picked, 20.0);
-        let big = cx.compare(Cmp::Gt, picked, twenty)?;
-        let sp = cx.select(big, picked, sp)?;
-        let w = cx.sqrt(sp);
-        let zf = cx.const_f(Elem::F32, 0.0, &[rows, k]);
-        let w = cx.select(ok, w, zf)?;
-        let w = renorm(cx, w, renormalize, scaling)?;
-        cx.write(routes, route)?;
-        cx.write(weights, w)
-    })
+    let (rows, n, k, v) = (
+        i64::from(routes.rows),
+        i64::from(experts),
+        i64::from(top_k),
+        i64::from(vocab),
+    );
+    let raw = ids.val;
+    let raw = f.reshape(raw, &[rows])?;
+    // Unsigned compare against the vocabulary, as the WGSL reads a u32.
+    let raw = f.convert(raw, Elem::I64);
+    let raw = if ids.dtype == Dtype::I32 {
+        let m = f.const_i(Elem::I64, 0xFFFF_FFFF, &[rows]);
+        f.and(raw, m)?
+    } else {
+        raw
+    };
+    let vv = f.const_i(Elem::I64, v, &[rows]);
+    let inside = f.compare(Cmp::Lt, raw, vv)?;
+    let zero = f.const_i(Elem::I64, 0, &[rows]);
+    let tid = f.select(inside, raw, zero)?;
+    let tid = f.convert(tid, Elem::I32);
+    let table = tid2eid.val;
+    let total = f.ty(table).elements();
+    let table = f.reshape(table, &[total / k, k])?;
+    let eid = f.take_rows(table, tid)?; // [rows, k] i64
+    let lo = f.const_i(Elem::I64, 0, &[rows, k]);
+    let hi = f.const_i(Elem::I64, n, &[rows, k]);
+    let ge = f.compare(Cmp::Ge, eid, lo)?;
+    let lt = f.compare(Cmp::Lt, eid, hi)?;
+    let ok = f.and(ge, lt)?;
+    let route = f.convert(eid, Elem::I32);
+    let x = logits.f32(f);
+    let picked = take_cols(f, x, route)?;
+    // The WGSL's hash score: sqrt(softplus) with no clamp at zero.
+    let e = f.exp(picked);
+    let sp = f.offset(e, 1.0)?;
+    let sp = f.log(sp);
+    let twenty = f.like_f(picked, 20.0);
+    let big = f.compare(Cmp::Gt, picked, twenty)?;
+    let sp = f.select(big, picked, sp)?;
+    let w = f.sqrt(sp);
+    let zf = f.const_f(Elem::F32, 0.0, &[rows, k]);
+    let w = f.select(ok, w, zf)?;
+    let w = renorm(f, w, renormalize, scaling)?;
+    Ok((route, w))
 }
 
 /// `routes[row, slot] = slot`: the identity routing a grouped matmul reads.
-pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Error> {
+pub fn group_routes(f: &mut Func, groups: u32, routes: Landing) -> Result<Val, Error> {
     const OP: &str = "linear.group_routes";
     expect(OP, routes, &[Dtype::I32])?;
     nonzero(OP, "the group count", groups)?;
@@ -695,10 +689,8 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
             format!("the routes are {} wide for {groups} groups", routes.width),
         ));
     }
-    ctx.emit(&mut |cx| {
-        let v = cx.iota(Elem::I32, &[i64::from(routes.rows), i64::from(groups)], 1);
-        cx.write(routes, v)
-    })
+    let v = f.iota(Elem::I32, &[i64::from(routes.rows), i64::from(groups)], 1);
+    Ok(v)
 }
 
 // ------------------------------------------------------------ expert compute
@@ -710,22 +702,22 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
 /// pre-scaled mxfp4 weights (`E5m2`), or an integer plane packing several
 /// (low bits first).
 #[derive(Clone, Copy)]
-enum Form {
+enum Form<T = Operand> {
     /// bf16 weights.
-    Dense(Tensor),
+    Dense(T),
     /// `scale * q + bias`, `bits`-wide unsigned codes, bf16 factors.
     Affine {
-        codes: Tensor,
-        scales: Tensor,
-        biases: Tensor,
+        codes: T,
+        scales: T,
+        biases: T,
         group: u32,
         bits: u32,
     },
     /// e2m1 codes, one e8m0 exponent byte per 32 (or pre-scaled weights).
-    Mxfp4 { codes: Tensor, scales: Tensor },
+    Mxfp4 { codes: T, scales: T },
 }
 
-impl Form {
+impl<T> Form<T> {
     fn bits(self) -> u32 {
         match self {
             Self::Dense(_) => 16,
@@ -743,7 +735,7 @@ impl Form {
     }
 }
 
-fn form_of(op: &'static str, bank: Bank) -> Result<Form, Error> {
+fn form_of<T: Stored>(op: &'static str, bank: Bank<T>) -> Result<Form<T>, Error> {
     match (bank.biases, bank.group, bank.bits) {
         (Some(biases), group, bits @ (2 | 4 | 8)) if group > 0 => {
             expect(op, bank.scales, &[Dtype::Bf16])?;
@@ -797,27 +789,27 @@ impl Fan {
 }
 
 /// Codes a codes plane stores, counted in `bits`-wide codes.
-fn stored_codes(op: &'static str, codes: Tensor, bits: u32) -> Result<u64, Error> {
-    if codes.dtype == Dtype::E5m2 {
+fn stored_codes(op: &'static str, codes: impl Stored, bits: u32) -> Result<u64, Error> {
+    if codes.dtype() == Dtype::E5m2 {
         return Ok(codes.elements());
     }
-    if let Some(per) = crate::pack::codes_per_row(codes.dtype, u64::from(codes.width)) {
-        if crate::pack::code_bits(codes.dtype) != Some(bits) {
+    if let Some(per) = crate::pack::codes_per_row(codes.dtype(), u64::from(codes.width())) {
+        if crate::pack::code_bits(codes.dtype()) != Some(bits) {
             return Err(refuse(
                 op,
-                format!("a {:?} codes plane in a {bits}-bit bank", codes.dtype),
+                format!("a {:?} codes plane in a {bits}-bit bank", codes.dtype()),
             ));
         }
-        return Ok(u64::from(codes.rows) * per);
+        return Ok(u64::from(codes.rows()) * per);
     }
-    match crate::cx::elem_of(op, codes.dtype) {
+    match crate::check::elem_of(op, codes.dtype()) {
         Ok(e) if e.is_int() => Ok(codes.elements() * u64::from(e.bits()) / u64::from(bits)),
         _ => Err(refuse(
             op,
             format!(
                 "a {:?} codes plane; codes land one per element (`kernels_xla::pack`) or in an \
                  integer plane",
-                codes.dtype
+                codes.dtype()
             ),
         )),
     }
@@ -828,15 +820,15 @@ fn fan_of(
     x_rows: u32,
     k: u32,
     n: u32,
-    routes: Tensor,
-    form: Form,
+    routes: impl Stored,
+    form: Form<impl Stored>,
 ) -> Result<Fan, Error> {
     expect(op, routes, &[Dtype::I32])?;
-    nonzero(op, "the routed fan-out", routes.width)?;
+    nonzero(op, "the routed fan-out", routes.width())?;
     nonzero(op, "K, the activation's width", k)?;
     nonzero(op, "N, the output width", n)?;
-    let pairs = u64::from(routes.rows) * u64::from(routes.width);
-    let per_token = if x_rows == routes.rows {
+    let pairs = u64::from(routes.rows()) * u64::from(routes.width());
+    let per_token = if x_rows == routes.rows() {
         true
     } else if u64::from(x_rows) == pairs {
         false
@@ -902,8 +894,8 @@ fn fan_of(
         return Err(refuse(op, "the bank holds no expert"));
     }
     Ok(Fan {
-        tokens: i64::from(routes.rows),
-        top_k: i64::from(routes.width),
+        tokens: i64::from(routes.rows()),
+        top_k: i64::from(routes.width()),
         per_token,
         k: i64::from(k),
         n: i64::from(n),
@@ -920,14 +912,14 @@ struct Read {
     bias: Option<Val>,
 }
 
-fn read_bank(cx: &mut Cx<'_>, form: Form, fan: Fan) -> Result<Read, Error> {
+fn read_bank(f: &mut Func, form: Form, fan: Fan) -> Result<Read, Error> {
     let rows = fan.experts * fan.n;
     let groups = fan.k / i64::from(form.group());
     Ok(match form {
         Form::Dense(bank) => {
-            let w = cx.read(bank)?;
+            let w = bank.val;
             Read {
-                codes: Codes::Weights(cx.reshape(w, &[rows, fan.k])?),
+                codes: Codes::Weights(f.reshape(w, &[rows, fan.k])?),
                 factor: None,
                 bias: None,
             }
@@ -939,29 +931,29 @@ fn read_bank(cx: &mut Cx<'_>, form: Form, fan: Fan) -> Result<Read, Error> {
             bits,
             ..
         } => {
-            let c = read_codes(cx, codes, bits, false, rows, fan.k)?;
-            let s = cx.read_f32(scales)?;
-            let b = cx.read_f32(biases)?;
+            let c = read_codes(f, codes, bits, false, rows, fan.k)?;
+            let s = scales.f32(f);
+            let b = biases.f32(f);
             Read {
                 codes: c,
-                factor: Some(cx.reshape(s, &[rows, groups])?),
-                bias: Some(cx.reshape(b, &[rows, groups])?),
+                factor: Some(f.reshape(s, &[rows, groups])?),
+                bias: Some(f.reshape(b, &[rows, groups])?),
             }
         }
         Form::Mxfp4 { codes, scales } => {
-            let c = read_codes(cx, codes, 4, true, rows, fan.k)?;
+            let c = read_codes(f, codes, 4, true, rows, fan.k)?;
             let factor = if let Codes::Weights(_) = c {
                 None
             } else {
-                let s = cx.read(scales)?;
-                let s = if cx.elem(s) == Elem::U8 {
+                let s = scales.val;
+                let s = if f.elem(s) == Elem::U8 {
                     s
                 } else {
-                    cx.bitcast(s, Elem::U8)?
+                    f.bitcast(s, Elem::U8)?
                 };
-                let s = cx.reshape(s, &[rows, groups])?;
-                let s = cx.convert(s, Elem::U32);
-                Some(e8m0(cx, s)?)
+                let s = f.reshape(s, &[rows, groups])?;
+                let s = f.convert(s, Elem::U32);
+                Some(e8m0(f, s)?)
             };
             Read {
                 codes: c,
@@ -973,32 +965,32 @@ fn read_bank(cx: &mut Cx<'_>, form: Form, fan: Fan) -> Result<Read, Error> {
 }
 
 /// The bank decoded to bf16 `[E·N, K]`.
-fn decode(cx: &mut Cx<'_>, bank: &Read, groups: i64) -> Result<Val, Error> {
-    let q = code_values(cx, bank.codes, Elem::Bf16)?;
+fn decode(f: &mut Func, bank: &Read, groups: i64) -> Result<Val, Error> {
+    let q = code_values(f, bank.codes, Elem::Bf16)?;
     let Some(factor) = bank.factor else {
         return Ok(q);
     };
-    let (rows, k) = (cx.dims(q)[0], cx.dims(q)[1]);
-    let q = cx.reshape(q, &[rows, groups, k / groups])?;
-    let w = materialize(cx, q, factor, bank.bias)?;
-    Ok(cx.convert(w, Elem::Bf16))
+    let (rows, k) = (f.dims(q)[0], f.dims(q)[1]);
+    let q = f.reshape(q, &[rows, groups, k / groups])?;
+    let w = materialize(f, q, factor, bank.bias)?;
+    Ok(f.convert(w, Elem::Bf16))
 }
 
 /// `x [r, K] · W_allᵀ`: every row against every expert, f32 `[r, E·N]`.
-fn against_all(cx: &mut Cx<'_>, x: Val, bank: &Read, groups: i64) -> Result<Val, Error> {
+fn against_all(f: &mut Func, x: Val, bank: &Read, groups: i64) -> Result<Val, Error> {
     let Some(factor) = bank.factor else {
-        let w = code_values(cx, bank.codes, Elem::Bf16)?;
-        return Ok(cx.matmul_nt(x, w, Elem::F32)?);
+        let w = code_values(f, bank.codes, Elem::Bf16)?;
+        return Ok(f.matmul_nt(x, w, Elem::F32)?);
     };
-    let q = code_values(cx, bank.codes, Elem::Bf16)?;
-    let (rows, k) = (cx.dims(q)[0], cx.dims(q)[1]);
-    let q = cx.reshape(q, &[rows, groups, k / groups])?;
-    let r = cx.dims(x)[0];
-    let xg = cx.reshape(x, &[r, groups, k / groups])?;
-    let mut out = grouped_dot(cx, xg, q, factor)?;
+    let q = code_values(f, bank.codes, Elem::Bf16)?;
+    let (rows, k) = (f.dims(q)[0], f.dims(q)[1]);
+    let q = f.reshape(q, &[rows, groups, k / groups])?;
+    let r = f.dims(x)[0];
+    let xg = f.reshape(x, &[r, groups, k / groups])?;
+    let mut out = grouped_dot(f, xg, q, factor)?;
     if let Some(b) = bank.bias {
-        let o = offset_dot(cx, x, b)?;
-        out = cx.add(out, o)?;
+        let o = offset_dot(f, x, b)?;
+        out = f.add(out, o)?;
     }
     Ok(out)
 }
@@ -1007,30 +999,30 @@ fn against_all(cx: &mut Cx<'_>, x: Val, bank: &Read, groups: i64) -> Result<Val,
 /// (i32), group `e` contracted with `w[e]` (`[E, N, K]`), into f32 `[P, N]`.
 /// Rows past the last group come out zero. PJRT's MLIR ingestion legalizes
 /// it to XLA's `ragged-dot`, which the TPU compiler runs natively.
-fn ragged_dot(cx: &mut Cx<'_>, x: Val, w: Val, sizes: Val) -> Result<Val, Error> {
-    let (p, n) = (cx.dims(x)[0], cx.dims(w)[1]);
+fn ragged_dot(f: &mut Func, x: Val, w: Val, sizes: Val) -> Result<Val, Error> {
+    let (p, n) = (f.dims(x)[0], f.dims(w)[1]);
     let out = Ty::new(Elem::F32, &[p, n]);
     let attrs = "precision_config = [#chlo<precision DEFAULT>, #chlo<precision DEFAULT>], \
                  ragged_dot_dimension_numbers = #chlo.ragged_dot<lhs_batching_dimensions = [], \
                  rhs_batching_dimensions = [], lhs_contracting_dimensions = [1], \
                  rhs_contracting_dimensions = [2], lhs_ragged_dimensions = [0], \
                  rhs_group_dimensions = [0]>";
-    Ok(cx.op_named("chlo.ragged_dot", &[x, w, sizes], attrs, vec![out])[0])
+    Ok(f.op_named("chlo.ragged_dot", &[x, w, sizes], attrs, vec![out])[0])
 }
 
 /// `table[ids]` for a short i32 `table` (`[E]`) and `[n]` i32 `ids` in
 /// range, as a one-hot select and sum: XLA lowers a gather from a table this
 /// small to a serial chain of scalar selects (v6e: ~40 us over 768 ids).
-fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
-    let e = cx.dims(table)[0];
-    let n = cx.dims(ids)[0];
-    let is = cx.broadcast(ids, &[n, e], &[0])?;
-    let es = cx.iota(Elem::I32, &[n, e], 1);
-    let hit = cx.compare(Cmp::Eq, is, es)?;
-    let ts = cx.broadcast(table, &[n, e], &[1])?;
-    let zero = cx.const_i(Elem::I32, 0, &[n, e]);
-    let v = cx.select(hit, ts, zero)?;
-    Ok(cx.reduce(v, &[1], Fold::Sum)?)
+fn pick_small(f: &mut Func, table: Val, ids: Val) -> Result<Val, Error> {
+    let e = f.dims(table)[0];
+    let n = f.dims(ids)[0];
+    let is = f.broadcast(ids, &[n, e], &[0])?;
+    let es = f.iota(Elem::I32, &[n, e], 1);
+    let hit = f.compare(Cmp::Eq, is, es)?;
+    let ts = f.broadcast(table, &[n, e], &[1])?;
+    let zero = f.const_i(Elem::I32, 0, &[n, e]);
+    let v = f.select(hit, ts, zero)?;
+    Ok(f.reduce(v, &[1], Fold::Sum)?)
 }
 
 /// The grouped-matmul kernel (`crate::linear::moe_gmm`) for this bank, when its
@@ -1085,7 +1077,7 @@ fn gmm_spec(
 /// each pair's row picked back out. Only the routed experts' weights move.
 /// f32 `[P, N]`.
 fn gmm(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     spec: crate::linear::moe_gmm::Gmm,
     fan: Fan,
     bank: &Read,
@@ -1097,118 +1089,118 @@ fn gmm(
     use crate::linear::moe_gmm::Orient;
     let (p, e, n, tm) = (fan.pairs(), fan.experts, fan.n, spec.tm);
     let (tiles, rows) = (spec.tiles, spec.tiles * spec.tm);
-    let top = cx.const_i(Elem::I32, e, &[p]);
-    let key = cx.select(valid, r, top)?;
-    let iota = cx.iota(Elem::I32, &[p], 0);
-    let by = cx.sort(&[key, iota], 0, true, |f, a, b| {
-        f.compare(Cmp::Lt, a[0], b[0])
+    let top = f.const_i(Elem::I32, e, &[p]);
+    let key = f.select(valid, r, top)?;
+    let iota = f.iota(Elem::I32, &[p], 0);
+    let by = f.sort(&[key, iota], 0, true, |fq, a, b| {
+        fq.compare(Cmp::Lt, a[0], b[0])
     })?;
     let (skey, perm) = (by[0], by[1]);
     // Rows per expert, and each expert's first sorted position and tile.
     let counts = {
-        let ks = cx.broadcast(skey, &[p, e], &[0])?;
-        let es = cx.iota(Elem::I32, &[p, e], 1);
-        let hit = cx.compare(Cmp::Eq, ks, es)?;
-        let one = cx.const_i(Elem::I32, 1, &[p, e]);
-        let none = cx.const_i(Elem::I32, 0, &[p, e]);
-        let hit = cx.select(hit, one, none)?;
-        cx.reduce(hit, &[0], Fold::Sum)?
+        let ks = f.broadcast(skey, &[p, e], &[0])?;
+        let es = f.iota(Elem::I32, &[p, e], 1);
+        let hit = f.compare(Cmp::Eq, ks, es)?;
+        let one = f.const_i(Elem::I32, 1, &[p, e]);
+        let none = f.const_i(Elem::I32, 0, &[p, e]);
+        let hit = f.select(hit, one, none)?;
+        f.reduce(hit, &[0], Fold::Sum)?
     };
     let first = {
-        let upto = cx.scan(counts, 0, Fold::Sum)?;
-        cx.sub(upto, counts)?
+        let upto = f.scan(counts, 0, Fold::Sum)?;
+        f.sub(upto, counts)?
     };
     let per = {
-        let more = cx.const_i(Elem::I32, tm - 1, &[e]);
-        let c = cx.add(counts, more)?;
-        let tt = cx.const_i(Elem::I32, tm, &[e]);
-        cx.div(c, tt)?
+        let more = f.const_i(Elem::I32, tm - 1, &[e]);
+        let c = f.add(counts, more)?;
+        let tt = f.const_i(Elem::I32, tm, &[e]);
+        f.div(c, tt)?
     };
-    let tend = cx.scan(per, 0, Fold::Sum)?;
-    let tstart = cx.sub(tend, per)?;
-    let nt = cx.slice(tend, &[e - 1], &[e], &[1])?;
+    let tend = f.scan(per, 0, Fold::Sum)?;
+    let tstart = f.sub(tend, per)?;
+    let nt = f.slice(tend, &[e - 1], &[e], &[1])?;
     // Tile `t`'s expert: how many experts' tiles end at or before it.
     let se = {
-        let ends = cx.broadcast(tend, &[tiles, e], &[1])?;
-        let ts = cx.iota(Elem::I32, &[tiles, e], 0);
-        let done = cx.compare(Cmp::Le, ends, ts)?;
-        let one = cx.const_i(Elem::I32, 1, &[tiles, e]);
-        let none = cx.const_i(Elem::I32, 0, &[tiles, e]);
-        let done = cx.select(done, one, none)?;
-        let se = cx.reduce(done, &[1], Fold::Sum)?;
-        let hi = cx.const_i(Elem::I32, e - 1, &[tiles]);
-        cx.min(se, hi)?
+        let ends = f.broadcast(tend, &[tiles, e], &[1])?;
+        let ts = f.iota(Elem::I32, &[tiles, e], 0);
+        let done = f.compare(Cmp::Le, ends, ts)?;
+        let one = f.const_i(Elem::I32, 1, &[tiles, e]);
+        let none = f.const_i(Elem::I32, 0, &[tiles, e]);
+        let done = f.select(done, one, none)?;
+        let se = f.reduce(done, &[1], Fold::Sum)?;
+        let hi = f.const_i(Elem::I32, e - 1, &[tiles]);
+        f.min(se, hi)?
     };
     // Padded row `i` holds the `rank`-th row routed to its tile's expert.
     let xs = {
-        let ri = cx.iota(Elem::I32, &[rows], 0);
-        let tt = cx.const_i(Elem::I32, tm, &[rows]);
-        let t = cx.div(ri, tt)?;
-        let ex = pick_small(cx, se, t)?;
-        let base = pick_small(cx, tstart, ex)?;
-        let base = cx.mul(base, tt)?;
-        let rank = cx.sub(ri, base)?;
-        let count = pick_small(cx, counts, ex)?;
-        let ntb = cx.broadcast(nt, &[rows], &[0])?;
-        let live = cx.compare(Cmp::Lt, t, ntb)?;
-        let within = cx.compare(Cmp::Lt, rank, count)?;
-        let ok = cx.and(live, within)?;
-        let at = pick_small(cx, first, ex)?;
-        let at = cx.add(at, rank)?;
-        let pair = take_flat(cx, perm, at)?;
+        let ri = f.iota(Elem::I32, &[rows], 0);
+        let tt = f.const_i(Elem::I32, tm, &[rows]);
+        let t = f.div(ri, tt)?;
+        let ex = pick_small(f, se, t)?;
+        let base = pick_small(f, tstart, ex)?;
+        let base = f.mul(base, tt)?;
+        let rank = f.sub(ri, base)?;
+        let count = pick_small(f, counts, ex)?;
+        let ntb = f.broadcast(nt, &[rows], &[0])?;
+        let live = f.compare(Cmp::Lt, t, ntb)?;
+        let within = f.compare(Cmp::Lt, rank, count)?;
+        let ok = f.and(live, within)?;
+        let at = pick_small(f, first, ex)?;
+        let at = f.add(at, rank)?;
+        let pair = take_flat(f, perm, at)?;
         let src = if fan.per_token {
-            let kk = cx.const_i(Elem::I32, fan.top_k, &[rows]);
-            cx.div(pair, kk)?
+            let kk = f.const_i(Elem::I32, fan.top_k, &[rows]);
+            f.div(pair, kk)?
         } else {
             pair
         };
-        let zero = cx.const_i(Elem::I32, 0, &[rows]);
-        let src = cx.select(ok, src, zero)?;
-        cx.take_rows(x, src)?
+        let zero = f.const_i(Elem::I32, 0, &[rows]);
+        let src = f.select(ok, src, zero)?;
+        f.take_rows(x, src)?
     };
     let w = bank.codes.val();
     let w = match spec.orient {
         // The bank's layout on the device: a free transpose.
-        Orient::KMajor => cx.transpose(w, &[1, 0])?,
+        Orient::KMajor => f.transpose(w, &[1, 0])?,
         Orient::NMajor => w,
     };
     let kernel = spec.kernel()?;
-    let out = kernel.call(cx, &[se, nt, xs, w])?[0];
+    let out = kernel.call(f, &[se, nt, xs, w])?[0];
     // Pair `i`'s row: its sorted position's rank within its expert's run.
-    let back = cx.sort(&[perm, iota], 0, true, |f, a, b| {
-        f.compare(Cmp::Lt, a[0], b[0])
+    let back = f.sort(&[perm, iota], 0, true, |fq, a, b| {
+        fq.compare(Cmp::Lt, a[0], b[0])
     })?[1];
-    let base = pick_small(cx, tstart, ids)?;
-    let tt = cx.const_i(Elem::I32, tm, &[p]);
-    let base = cx.mul(base, tt)?;
-    let at = pick_small(cx, first, ids)?;
-    let rank = cx.sub(back, at)?;
-    let dest = cx.add(base, rank)?;
+    let base = pick_small(f, tstart, ids)?;
+    let tt = f.const_i(Elem::I32, tm, &[p]);
+    let base = f.mul(base, tt)?;
+    let at = pick_small(f, first, ids)?;
+    let rank = f.sub(back, at)?;
+    let dest = f.add(base, rank)?;
     let offsets = spec.offsets()?;
     if offsets.iter().all(|&o| o == 0) {
-        return Ok(cx.take_rows(out, dest)?);
+        return Ok(f.take_rows(out, dest)?);
     }
     // Whole rows, then each row's columns from among the few distinct
     // (static) offsets: a gather at a per-row column offset lowers to one
     // dynamic slice per pair (v6e: 256 of them, 0.3 ms a layer at 64 tokens).
-    let whole = cx.take_rows(out, dest)?;
-    let width = cx.dims(whole)[1];
-    let table = cx.const_ints(Elem::I32, &offsets, &[e])?;
-    let off = pick_small(cx, table, ids)?;
-    let off = cx.broadcast(off, &[p, n], &[0])?;
+    let whole = f.take_rows(out, dest)?;
+    let width = f.dims(whole)[1];
+    let table = f.const_ints(Elem::I32, &offsets, &[e])?;
+    let off = pick_small(f, table, ids)?;
+    let off = f.broadcast(off, &[p, n], &[0])?;
     let mut distinct = offsets.clone();
     distinct.sort_unstable();
     distinct.dedup();
     let mut y: Option<Val> = None;
     for &o in &distinct {
-        let cut = cx.slice(whole, &[0, o], &[p, o + n], &[1, 1])?;
+        let cut = f.slice(whole, &[0, o], &[p, o + n], &[1, 1])?;
         debug_assert!(o + n <= width);
         y = Some(match y {
             None => cut,
             Some(prev) => {
-                let at = cx.const_i(Elem::I32, o, &[p, n]);
-                let here = cx.compare(Cmp::Eq, off, at)?;
-                cx.select(here, cut, prev)?
+                let at = f.const_i(Elem::I32, o, &[p, n]);
+                let here = f.compare(Cmp::Eq, off, at)?;
+                f.select(here, cut, prev)?
             }
         });
     }
@@ -1218,33 +1210,34 @@ fn gmm(
 /// The routed matmul every select entry lowers to: `y[t*k + s] = W[routes[t,
 /// s]] · x_row (+ bias[e])`; a slot routed outside `0..experts` keeps `y`'s
 /// row as it was (the GPU kernels skip its store).
+#[allow(clippy::too_many_arguments)]
 fn routed(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     form: Form,
     fan: Fan,
     x: Val,
     routes: Val,
     bias: Option<Val>,
     prev: Val,
+    tuning: Tuning,
 ) -> Result<Val, Error> {
-    let tuning = cx.tuning();
     let (p, e, n, k) = (fan.pairs(), fan.experts, fan.n, fan.k);
     let groups = k / i64::from(form.group());
-    let r = cx.reshape(routes, &[p])?;
-    let zero = cx.const_i(Elem::I32, 0, &[p]);
-    let top = cx.const_i(Elem::I32, e, &[p]);
-    let ge = cx.compare(Cmp::Ge, r, zero)?;
-    let lt = cx.compare(Cmp::Lt, r, top)?;
-    let valid = cx.and(ge, lt)?;
-    let lo = cx.const_i(Elem::I32, 0, &[]);
-    let hi = cx.const_i(Elem::I32, e - 1, &[]);
-    let ids = cx.clamp(lo, r, hi)?;
-    let bank = read_bank(cx, form, fan)?;
-    let x = cx.convert(x, Elem::Bf16);
-    let rows = cx.dims(x)[0];
+    let r = f.reshape(routes, &[p])?;
+    let zero = f.const_i(Elem::I32, 0, &[p]);
+    let top = f.const_i(Elem::I32, e, &[p]);
+    let ge = f.compare(Cmp::Ge, r, zero)?;
+    let lt = f.compare(Cmp::Lt, r, top)?;
+    let valid = f.and(ge, lt)?;
+    let lo = f.const_i(Elem::I32, 0, &[]);
+    let hi = f.const_i(Elem::I32, e - 1, &[]);
+    let ids = f.clamp(lo, r, hi)?;
+    let bank = read_bank(f, form, fan)?;
+    let x = f.convert(x, Elem::Bf16);
+    let rows = f.dims(x)[0];
     let r8 = (rows + 7) / 8 * 8;
     let fold = if bank.factor.is_some() { groups } else { 1 };
-    let unit = match cx.elem(bank.codes.val()) {
+    let unit = match f.elem(bank.codes.val()) {
         Elem::U4 | Elem::F4E2m1fn => 1,
         Elem::Bf16 | Elem::F16 => 4,
         _ => 2,
@@ -1261,7 +1254,7 @@ fn routed(
         (expert_bytes / c.slice_bytes_per_ns.max(1)).max(c.loop_tile_ns + tile * c.loop_row_ns);
     let worth = whole_ns / tile_ns;
     // A forced `gmm` falls back to `all` for a bank the kernel does not read.
-    let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()), tuning);
+    let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), tuning);
     let path = match tuning.moe_path {
         MoePath::Gmm if grouped.is_none() => MoePath::All,
         MoePath::Auto { .. }
@@ -1284,23 +1277,23 @@ fn routed(
             // row alone: independent dots XLA overlaps, no join.
             let mut ys = Vec::with_capacity(p as usize);
             for i in 0..p {
-                let id = cx.slice(ids, &[i], &[i + 1], &[1])?;
-                let id = cx.reshape(id, &[])?;
-                let one = expert(cx, &bank, id, n)?;
+                let id = f.slice(ids, &[i], &[i + 1], &[1])?;
+                let id = f.reshape(id, &[])?;
+                let one = expert(f, &bank, id, n)?;
                 let row = if fan.per_token { i / fan.top_k } else { i };
-                let xr = cx.slice(x, &[row, 0], &[row + 1, k], &[1, 1])?;
-                ys.push(against_all(cx, xr, &one, groups)?);
+                let xr = f.slice(x, &[row, 0], &[row + 1, k], &[1, 1])?;
+                ys.push(against_all(f, xr, &one, groups)?);
             }
-            cx.concat(&ys, 0)?
+            f.concat(&ys, 0)?
         }
-        MoePath::All => every_expert(cx, &bank, fan, x, ids, groups)?,
+        MoePath::All => every_expert(f, &bank, fan, x, ids, groups)?,
         MoePath::Gmm => match grouped {
-            Some(spec) => gmm(cx, spec, fan, &bank, x, r, valid, ids)?,
-            None => every_expert(cx, &bank, fan, x, ids, groups)?,
+            Some(spec) => gmm(f, spec, fan, &bank, x, r, valid, ids)?,
+            None => every_expert(f, &bank, fan, x, ids, groups)?,
         },
         MoePath::Loop => {
-            let plan = plan_active(cx, fan, x, r, valid)?;
-            run_active(cx, &plan, &bank, fan, groups, None)?
+            let plan = plan_active(f, fan, x, r, valid, tuning)?;
+            run_active(f, &plan, &bank, fan, groups, None, tuning)?
         }
         MoePath::Active => {
             // The loop over the experts the fire routes to, unless more are
@@ -1308,78 +1301,77 @@ fn routed(
             // loops whose trip count the fire's routes decide (0 steps for
             // the one not taken); a `case` would copy the bank into its
             // branch (v6e: 3x the whole step).
-            let plan = plan_active(cx, fan, x, r, valid)?;
-            let most = cx.const_i(Elem::I32, worth, &[]);
-            let many = cx.compare(Cmp::Gt, plan.steps, most)?;
-            let looped = run_active(cx, &plan, &bank, fan, groups, Some(many))?;
-            let zeros = cx.const_f(Elem::F32, 0.0, &[p, n]);
-            let whole = cx.while_loop(
+            let plan = plan_active(f, fan, x, r, valid, tuning)?;
+            let most = f.const_i(Elem::I32, worth, &[]);
+            let many = f.compare(Cmp::Gt, plan.steps, most)?;
+            let looped = run_active(f, &plan, &bank, fan, groups, Some(many), tuning)?;
+            let zeros = f.const_f(Elem::F32, 0.0, &[p, n]);
+            let whole = f.while_loop(
                 &[many, zeros],
                 |_, a| Ok(a[0]),
-                |f, _| {
-                    let mut env = Sealed;
-                    let mut cx = Cx::new(f, &mut env).with_tuning(tuning);
-                    let all = every_expert(&mut cx, &bank, fan, x, ids, groups).map_err(sealed)?;
-                    let done = cx.const_i(Elem::Pred, 0, &[]);
+                |fq, _| {
+                    let f = fq;
+                    let all = every_expert(f, &bank, fan, x, ids, groups).map_err(sealed)?;
+                    let done = f.const_i(Elem::Pred, 0, &[]);
                     Ok(vec![done, all])
                 },
             )?[1];
-            let many = cx.broadcast(many, &[p, n], &[])?;
-            cx.select(many, whole, looped)?
+            let many = f.broadcast(many, &[p, n], &[])?;
+            f.select(many, whole, looped)?
         }
         MoePath::Ragged | MoePath::Auto { .. } => {
             // Sort the pairs by expert (unrouted last), run one ragged dot over
             // the whole bank, and put the rows back.
-            let top = cx.const_i(Elem::I32, e, &[p]);
-            let key = cx.select(valid, r, top)?;
-            let iota = cx.iota(Elem::I32, &[p], 0);
-            let by = cx.sort(&[key, iota], 0, true, |f, a, b| {
-                f.compare(Cmp::Lt, a[0], b[0])
+            let top = f.const_i(Elem::I32, e, &[p]);
+            let key = f.select(valid, r, top)?;
+            let iota = f.iota(Elem::I32, &[p], 0);
+            let by = f.sort(&[key, iota], 0, true, |fq, a, b| {
+                fq.compare(Cmp::Lt, a[0], b[0])
             })?;
             let (skey, perm) = (by[0], by[1]);
-            let ks = cx.broadcast(skey, &[p, e], &[0])?;
-            let es = cx.iota(Elem::I32, &[p, e], 1);
-            let hit = cx.compare(Cmp::Eq, ks, es)?;
-            let one = cx.const_i(Elem::I32, 1, &[p, e]);
-            let none = cx.const_i(Elem::I32, 0, &[p, e]);
-            let hit = cx.select(hit, one, none)?;
-            let sizes = cx.reduce(hit, &[0], Fold::Sum)?;
+            let ks = f.broadcast(skey, &[p, e], &[0])?;
+            let es = f.iota(Elem::I32, &[p, e], 1);
+            let hit = f.compare(Cmp::Eq, ks, es)?;
+            let one = f.const_i(Elem::I32, 1, &[p, e]);
+            let none = f.const_i(Elem::I32, 0, &[p, e]);
+            let hit = f.select(hit, one, none)?;
+            let sizes = f.reduce(hit, &[0], Fold::Sum)?;
             let src = if fan.per_token {
-                let kk = cx.const_i(Elem::I32, fan.top_k, &[p]);
-                cx.div(perm, kk)?
+                let kk = f.const_i(Elem::I32, fan.top_k, &[p]);
+                f.div(perm, kk)?
             } else {
                 perm
             };
-            let xs = cx.take_rows(x, src)?;
-            let w = decode(cx, &bank, groups)?;
-            let w = cx.reshape(w, &[e, n, k])?;
-            let ys = ragged_dot(cx, xs, w, sizes)?;
-            let back = cx.sort(&[perm, iota], 0, true, |f, a, b| {
-                f.compare(Cmp::Lt, a[0], b[0])
+            let xs = f.take_rows(x, src)?;
+            let w = decode(f, &bank, groups)?;
+            let w = f.reshape(w, &[e, n, k])?;
+            let ys = ragged_dot(f, xs, w, sizes)?;
+            let back = f.sort(&[perm, iota], 0, true, |fq, a, b| {
+                fq.compare(Cmp::Lt, a[0], b[0])
             })?;
-            cx.take_rows(ys, back[1])?
+            f.take_rows(ys, back[1])?
         }
     };
-    finish(cx, fan, y, ids, valid, bias, prev)
+    finish(f, fan, y, ids, valid, bias, prev)
 }
 
 /// Expert `e`'s (an i32 scalar) rows of a read bank: `[N, ..]` of each plane.
-fn expert(cx: &mut Cx<'_>, bank: &Read, e: Val, n: i64) -> Result<Read, Error> {
-    let nn = cx.const_i(Elem::I32, n, &[]);
-    let at = cx.mul(e, nn)?;
-    let zero = cx.const_i(Elem::I32, 0, &[]);
-    let rows = |cx: &mut Cx<'_>, v: Val| -> Result<Val, Error> {
-        let w = cx.dims(v)[1];
-        Ok(cx.dynamic_slice(v, &[at, zero], &[n, w])?)
+fn expert(f: &mut Func, bank: &Read, e: Val, n: i64) -> Result<Read, Error> {
+    let nn = f.const_i(Elem::I32, n, &[]);
+    let at = f.mul(e, nn)?;
+    let zero = f.const_i(Elem::I32, 0, &[]);
+    let rows = |f: &mut Func, v: Val| -> Result<Val, Error> {
+        let w = f.dims(v)[1];
+        Ok(f.dynamic_slice(v, &[at, zero], &[n, w])?)
     };
     Ok(Read {
-        codes: bank.codes.with(rows(cx, bank.codes.val())?),
+        codes: bank.codes.with(rows(f, bank.codes.val())?),
         factor: match bank.factor {
-            Some(f) => Some(rows(cx, f)?),
+            Some(fq) => Some(rows(f, fq)?),
             None => None,
         },
         bias: match bank.bias {
-            Some(b) => Some(rows(cx, b)?),
+            Some(b) => Some(rows(f, b)?),
             None => None,
         },
     })
@@ -1388,7 +1380,7 @@ fn expert(cx: &mut Cx<'_>, bank: &Read, e: Val, n: i64) -> Result<Read, Error> {
 /// Every activation row against every expert in one dot (the whole bank
 /// streams once), each pair's row picked: f32 `[P, N]`.
 fn every_expert(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     bank: &Read,
     fan: Fan,
     x: Val,
@@ -1396,27 +1388,27 @@ fn every_expert(
     groups: i64,
 ) -> Result<Val, Error> {
     let (p, e, n) = (fan.pairs(), fan.experts, fan.n);
-    let rows = cx.dims(x)[0];
+    let rows = f.dims(x)[0];
     let r8 = (rows + 7) / 8 * 8;
     let xp = if r8 > rows {
-        let z = cx.const_f(Elem::Bf16, 0.0, &[]);
-        cx.pad(x, z, &[0, 0], &[r8 - rows, 0], &[0, 0])?
+        let z = f.const_f(Elem::Bf16, 0.0, &[]);
+        f.pad(x, z, &[0, 0], &[r8 - rows, 0], &[0, 0])?
     } else {
         x
     };
-    let all = against_all(cx, xp, bank, groups)?;
-    let all = cx.reshape(all, &[r8 * e, n])?;
-    let pair = cx.iota(Elem::I32, &[p], 0);
+    let all = against_all(f, xp, bank, groups)?;
+    let all = f.reshape(all, &[r8 * e, n])?;
+    let pair = f.iota(Elem::I32, &[p], 0);
     let row = if fan.per_token {
-        let kk = cx.const_i(Elem::I32, fan.top_k, &[p]);
-        cx.div(pair, kk)?
+        let kk = f.const_i(Elem::I32, fan.top_k, &[p]);
+        f.div(pair, kk)?
     } else {
         pair
     };
-    let ee = cx.const_i(Elem::I32, e, &[p]);
-    let at = cx.mul(row, ee)?;
-    let at = cx.add(at, ids)?;
-    Ok(cx.take_rows(all, at)?)
+    let ee = f.const_i(Elem::I32, e, &[p]);
+    let at = f.mul(row, ee)?;
+    let at = f.add(at, ids)?;
+    Ok(f.take_rows(all, at)?)
 }
 
 /// The rows of one tile of the loop over active experts: the fire's tokens
@@ -1446,58 +1438,67 @@ struct Active {
 /// Sorts the pairs by expert (unrouted last) and cuts each expert's run
 /// into tiles of at most `tile` rows (a token routes to an expert once, so
 /// one tile per active expert unless a router repeats one).
-fn plan_active(cx: &mut Cx<'_>, fan: Fan, x: Val, r: Val, valid: Val) -> Result<Active, Error> {
+fn plan_active(
+    f: &mut Func,
+    fan: Fan,
+    x: Val,
+    r: Val,
+    valid: Val,
+    tuning: Tuning,
+) -> Result<Active, Error> {
     let (p, e) = (fan.pairs(), fan.experts);
-    let tile = loop_tile(fan, cx.tuning());
-    let top = cx.const_i(Elem::I32, e, &[p]);
-    let key = cx.select(valid, r, top)?;
-    let iota = cx.iota(Elem::I32, &[p], 0);
-    let by = cx.sort(&[key, iota], 0, true, |f, a, b| {
-        f.compare(Cmp::Lt, a[0], b[0])
+    let tile = loop_tile(fan, tuning);
+    let top = f.const_i(Elem::I32, e, &[p]);
+    let key = f.select(valid, r, top)?;
+    let iota = f.iota(Elem::I32, &[p], 0);
+    let by = f.sort(&[key, iota], 0, true, |fq, a, b| {
+        fq.compare(Cmp::Lt, a[0], b[0])
     })?;
     let (skey, perm) = (by[0], by[1]);
     let before = {
-        let head = cx.const_i(Elem::I32, e + 1, &[1]);
-        let body = cx.slice(skey, &[0], &[p - 1], &[1])?;
-        cx.concat(&[head, body], 0)?
+        let head = f.const_i(Elem::I32, e + 1, &[1]);
+        let body = f.slice(skey, &[0], &[p - 1], &[1])?;
+        f.concat(&[head, body], 0)?
     };
-    let first = cx.compare(Cmp::Ne, skey, before)?;
-    let zero = cx.const_i(Elem::I32, 0, &[p]);
-    let at_first = cx.select(first, iota, zero)?;
-    let begins = cx.scan(at_first, 0, Fold::Max)?;
-    let offset = cx.sub(iota, begins)?;
-    let tt = cx.const_i(Elem::I32, tile, &[p]);
-    let within = cx.rem(offset, tt)?;
-    let starts = cx.compare(Cmp::Eq, within, zero)?;
-    let routed = cx.compare(Cmp::Lt, skey, top)?;
-    let starts = cx.and(starts, routed)?;
-    let one = cx.const_i(Elem::I32, 1, &[p]);
-    let counted = cx.select(starts, one, zero)?;
-    let steps = cx.reduce(counted, &[0], Fold::Sum)?;
-    let pp = cx.const_i(Elem::I32, p, &[p]);
-    let late = cx.add(iota, pp)?;
-    let order = cx.select(starts, iota, late)?;
-    let order = cx.sort(&[order], 0, true, |f, a, b| f.compare(Cmp::Lt, a[0], b[0]))?[0];
+    let first = f.compare(Cmp::Ne, skey, before)?;
+    let zero = f.const_i(Elem::I32, 0, &[p]);
+    let at_first = f.select(first, iota, zero)?;
+    let begins = f.scan(at_first, 0, Fold::Max)?;
+    let offset = f.sub(iota, begins)?;
+    let tt = f.const_i(Elem::I32, tile, &[p]);
+    let within = f.rem(offset, tt)?;
+    let starts = f.compare(Cmp::Eq, within, zero)?;
+    let routed = f.compare(Cmp::Lt, skey, top)?;
+    let starts = f.and(starts, routed)?;
+    let one = f.const_i(Elem::I32, 1, &[p]);
+    let counted = f.select(starts, one, zero)?;
+    let steps = f.reduce(counted, &[0], Fold::Sum)?;
+    let pp = f.const_i(Elem::I32, p, &[p]);
+    let late = f.add(iota, pp)?;
+    let order = f.select(starts, iota, late)?;
+    let order = f.sort(&[order], 0, true, |fq, a, b| {
+        fq.compare(Cmp::Lt, a[0], b[0])
+    })?[0];
     // Past the tiles every entry is `P` or more: clamp to `P` (the padding
     // rows), and give that position a valid expert.
-    let cap = cx.const_i(Elem::I32, p, &[]);
-    let lo = cx.const_i(Elem::I32, 0, &[]);
-    let order = cx.clamp(lo, order, cap)?;
-    let pad = cx.const_i(Elem::I32, p, &[1]);
-    let order = cx.concat(&[order, pad], 0)?;
-    let first_expert = cx.slice(skey, &[0], &[1], &[1])?;
-    let hi = cx.const_i(Elem::I32, e - 1, &[]);
-    let first_expert = cx.clamp(lo, first_expert, hi)?;
-    let skey = cx.concat(&[skey, first_expert], 0)?;
+    let cap = f.const_i(Elem::I32, p, &[]);
+    let lo = f.const_i(Elem::I32, 0, &[]);
+    let order = f.clamp(lo, order, cap)?;
+    let pad = f.const_i(Elem::I32, p, &[1]);
+    let order = f.concat(&[order, pad], 0)?;
+    let first_expert = f.slice(skey, &[0], &[1], &[1])?;
+    let hi = f.const_i(Elem::I32, e - 1, &[]);
+    let first_expert = f.clamp(lo, first_expert, hi)?;
+    let skey = f.concat(&[skey, first_expert], 0)?;
     let src = if fan.per_token {
-        let kk = cx.const_i(Elem::I32, fan.top_k, &[p]);
-        cx.div(perm, kk)?
+        let kk = f.const_i(Elem::I32, fan.top_k, &[p]);
+        f.div(perm, kk)?
     } else {
         perm
     };
-    let xs = cx.take_rows(x, src)?;
-    let z = cx.const_f(Elem::Bf16, 0.0, &[]);
-    let xs = cx.pad(xs, z, &[0, 0], &[tile, 0], &[0, 0])?;
+    let xs = f.take_rows(x, src)?;
+    let z = f.const_f(Elem::Bf16, 0.0, &[]);
+    let xs = f.pad(xs, z, &[0, 0], &[tile, 0], &[0, 0])?;
     Ok(Active {
         steps,
         order,
@@ -1513,97 +1514,82 @@ fn plan_active(cx: &mut Cx<'_>, fan: Fan, x: Val, r: Val, valid: Val) -> Result<
 /// landed in sorted order, then put back in pair order. f32 `[P, N]`; no
 /// step runs when `skip` (an i1 scalar) holds.
 fn run_active(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     plan: &Active,
     bank: &Read,
     fan: Fan,
     groups: i64,
     skip: Option<Val>,
+    tuning: Tuning,
 ) -> Result<Val, Error> {
-    let tuning = cx.tuning();
     let (p, n, k) = (fan.pairs(), fan.n, fan.k);
     let tile = plan.tile;
-    let ys = cx.const_f(Elem::F32, 0.0, &[p + tile, n]);
-    let j0 = cx.const_i(Elem::I32, 0, &[]);
+    let ys = f.const_f(Elem::F32, 0.0, &[p + tile, n]);
+    let j0 = f.const_i(Elem::I32, 0, &[]);
     let per = tuning.moe_loop_unroll;
-    let per_v = cx.const_i(Elem::I32, per, &[]);
-    let more = cx.const_i(Elem::I32, per - 1, &[]);
-    let steps = cx.add(plan.steps, more)?;
-    let steps = cx.div(steps, per_v)?;
+    let per_v = f.const_i(Elem::I32, per, &[]);
+    let more = f.const_i(Elem::I32, per - 1, &[]);
+    let steps = f.add(plan.steps, more)?;
+    let steps = f.div(steps, per_v)?;
     let steps = match skip {
         Some(skip) => {
-            let none = cx.const_i(Elem::I32, 0, &[]);
-            cx.select(skip, none, steps)?
+            let none = f.const_i(Elem::I32, 0, &[]);
+            f.select(skip, none, steps)?
         }
         None => steps,
     };
     let (order, skey, xs) = (plan.order, plan.skey, plan.xs);
     let bank = *bank;
-    let out = cx.while_loop(
+    let out = f.while_loop(
         &[j0, ys],
-        |f, a| f.compare(Cmp::Lt, a[0], steps),
-        |f, a| {
-            let mut env = Sealed;
-            let mut cx = Cx::new(f, &mut env).with_tuning(tuning);
+        |fq, a| fq.compare(Cmp::Lt, a[0], steps),
+        |fq, a| {
+            let f = fq;
             let (j, mut ys) = (a[0], a[1]);
             let step = (|| -> Result<Val, Error> {
-                let per_v = cx.const_i(Elem::I32, per, &[]);
-                let first = cx.mul(j, per_v)?;
+                let per_v = f.const_i(Elem::I32, per, &[]);
+                let first = f.mul(j, per_v)?;
                 let mut outs = Vec::with_capacity(per as usize);
                 for u in 0..per {
                     // Tiles past the count read `order`'s padding entry
                     // (`P`): they run over the padding rows.
-                    let du = cx.const_i(Elem::I32, u, &[]);
-                    let t = cx.add(first, du)?;
-                    let s = scalar_at(&mut cx, order, t)?;
+                    let du = f.const_i(Elem::I32, u, &[]);
+                    let t = f.add(first, du)?;
+                    let s = scalar_at(f, order, t)?;
                     // The slice's start is `expert · N` computed here: read
                     // from a per-tile table instead, XLA stopped fusing the
                     // slice into the dot (v6e, gpt-oss: +4 ms at 64 rows).
-                    let ex = scalar_at(&mut cx, skey, s)?;
-                    let w = expert(&mut cx, &bank, ex, n)?;
-                    let zero = cx.const_i(Elem::I32, 0, &[]);
-                    let xe = cx.dynamic_slice(xs, &[s, zero], &[tile, k])?;
-                    let ye = against_all(&mut cx, xe, &w, groups)?;
+                    let ex = scalar_at(f, skey, s)?;
+                    let w = expert(f, &bank, ex, n)?;
+                    let zero = f.const_i(Elem::I32, 0, &[]);
+                    let xe = f.dynamic_slice(xs, &[s, zero], &[tile, k])?;
+                    let ye = against_all(f, xe, &w, groups)?;
                     outs.push((s, ye));
                 }
-                let zero = cx.const_i(Elem::I32, 0, &[]);
+                let zero = f.const_i(Elem::I32, 0, &[]);
                 for (s, ye) in outs {
-                    ys = cx.dynamic_update_slice(ys, ye, &[s, zero])?;
+                    ys = f.dynamic_update_slice(ys, ye, &[s, zero])?;
                 }
                 Ok(ys)
             })()
             .map_err(sealed)?;
-            let one = cx.const_i(Elem::I32, 1, &[]);
-            let j = cx.add(j, one)?;
+            let one = f.const_i(Elem::I32, 1, &[]);
+            let j = f.add(j, one)?;
             Ok(vec![j, step])
         },
     )?;
-    let sorted = cx.slice(out[1], &[0, 0], &[p, n], &[1, 1])?;
-    let iota = cx.iota(Elem::I32, &[p], 0);
-    let back = cx.sort(&[plan.perm, iota], 0, true, |f, a, b| {
-        f.compare(Cmp::Lt, a[0], b[0])
+    let sorted = f.slice(out[1], &[0, 0], &[p, n], &[1, 1])?;
+    let iota = f.iota(Elem::I32, &[p], 0);
+    let back = f.sort(&[plan.perm, iota], 0, true, |fq, a, b| {
+        fq.compare(Cmp::Lt, a[0], b[0])
     })?;
-    Ok(cx.take_rows(sorted, back[1])?)
+    Ok(f.take_rows(sorted, back[1])?)
 }
 
 /// The i32 scalar `v[at]` of a rank-1 `v` (`at` an i32 scalar).
-fn scalar_at(cx: &mut Cx<'_>, v: Val, at: Val) -> Result<Val, Error> {
-    let one = cx.dynamic_slice(v, &[at], &[1])?;
-    Ok(cx.reshape(one, &[])?)
-}
-
-/// The env of a region inside a kernel (a loop body, a case branch): its
-/// values are built from the enclosing kernel's, never read from handles.
-struct Sealed;
-
-impl crate::cx::Env for Sealed {
-    fn read(&mut self, _: &mut Func, _: Tensor) -> Result<Val, Error> {
-        Err(refuse("linear.moe", "a region reads no handle"))
-    }
-
-    fn write(&mut self, _: &mut Func, _: Tensor, _: Val) -> Result<(), Error> {
-        Err(refuse("linear.moe", "a region writes no handle"))
-    }
+fn scalar_at(f: &mut Func, v: Val, at: Val) -> Result<Val, Error> {
+    let one = f.dynamic_slice(v, &[at], &[1])?;
+    Ok(f.reshape(one, &[])?)
 }
 
 /// A kernel error raised inside a region, as the builder's.
@@ -1620,7 +1606,7 @@ fn sealed(e: Error) -> crate::hlo::Malformed {
 /// `y` (f32 `[P, N]`) plus each pair's expert bias, rounded, with the
 /// unrouted pairs keeping `prev`.
 fn finish(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     fan: Fan,
     y: Val,
     ids: Val,
@@ -1631,29 +1617,30 @@ fn finish(
     let (p, e, n) = (fan.pairs(), fan.experts, fan.n);
     let y = match bias {
         Some(b) => {
-            let b = cx.reshape(b, &[e, n])?;
-            let rows = cx.take_rows(b, ids)?;
-            let rows = cx.convert(rows, Elem::F32);
-            cx.add(y, rows)?
+            let b = f.reshape(b, &[e, n])?;
+            let rows = f.take_rows(b, ids)?;
+            let rows = f.convert(rows, Elem::F32);
+            f.add(y, rows)?
         }
         None => y,
     };
-    let y = cx.convert(y, Elem::Bf16);
-    let keep = cx.broadcast(valid, &[p, n], &[0])?;
-    let prev = cx.reshape(prev, &[p, n])?;
-    let prev = cx.convert(prev, Elem::Bf16);
-    Ok(cx.select(keep, y, prev)?)
+    let y = f.convert(y, Elem::Bf16);
+    let keep = f.broadcast(valid, &[p, n], &[0])?;
+    let prev = f.reshape(prev, &[p, n])?;
+    let prev = f.convert(prev, Elem::Bf16);
+    Ok(f.select(keep, y, prev)?)
 }
 
 fn select_entry(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    x: Tensor,
+    x: Operand,
     form: Form,
-    bias: Option<Tensor>,
-    routes: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    bias: Option<Operand>,
+    routes: Operand,
+    y: Operand,
+    tuning: Tuning,
+) -> Result<Val, Error> {
     expect(op, x, &[Dtype::Bf16])?;
     expect(op, y, &[Dtype::Bf16])?;
     let fan = fan_of(op, x.rows, x.width, y.width, routes, form)?;
@@ -1681,79 +1668,80 @@ fn select_entry(
             ));
         }
     }
-    ctx.emit(&mut |cx| {
-        let xv = cx.read(x)?;
-        let rv = cx.read(routes)?;
-        let bv = match bias {
-            Some(b) => Some(cx.read(b)?),
-            None => None,
-        };
-        let prev = cx.read(y)?;
-        let out = routed(cx, form, fan, xv, rv, bv, prev)?;
-        cx.write(y, out)
-    })
+    let xv = x.val;
+    let rv = routes.val;
+    let bv = bias.map(|b| b.val);
+    let prev = y.val;
+    let out = routed(f, form, fan, xv, rv, bv, prev, tuning)?;
+    Ok(out)
 }
 
 /// A dense (bf16) bank: `bank` holds `[experts, N * K]` (any row shape).
 pub fn matmul_select(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    bank: Tensor,
-    routes: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    x: Operand,
+    bank: Operand,
+    routes: Operand,
+    y: Operand,
+    tuning: Tuning,
+) -> Result<Val, Error> {
     select_entry(
-        ctx,
+        f,
         "linear.moe_matmul_select",
         x,
         Form::Dense(bank),
         None,
         routes,
         y,
+        tuning,
     )
 }
 
 pub fn matmul_select_bias(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    bank: Bank,
-    bias: Tensor,
-    routes: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    x: Operand,
+    bank: Bank<Operand>,
+    bias: Operand,
+    routes: Operand,
+    y: Operand,
+    tuning: Tuning,
+) -> Result<Val, Error> {
     const OP: &str = "linear.moe_matmul_select_bias";
     let form = form_of(OP, bank)?;
-    select_entry(ctx, OP, x, form, Some(bias), routes, y)
+    select_entry(f, OP, x, form, Some(bias), routes, y, tuning)
 }
 
 pub fn matmul_select_quant(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    bank: Bank,
-    routes: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    x: Operand,
+    bank: Bank<Operand>,
+    routes: Operand,
+    y: Operand,
+    tuning: Tuning,
+) -> Result<Val, Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     let form = form_of(OP, bank)?;
-    select_entry(ctx, OP, x, form, None, routes, y)
+    select_entry(f, OP, x, form, None, routes, y, tuning)
 }
 
+/// A grouped matmul's weight: a quantized bank, or a dense bf16 plane.
 #[derive(Clone, Copy)]
-pub enum GroupedPlane {
-    Bank(Bank),
-    Dense(Tensor),
+pub enum GroupedPlane<T = Operand> {
+    Bank(Bank<T>),
+    Dense(T),
 }
 
 /// `x [rows, groups*K]` split into `groups` slices, slice `g` of row `r`
 /// multiplied by expert `routes[r, g]`, into `y [rows, groups*N]`.
 pub fn matmul_grouped(
-    ctx: &Ctx<'_>,
-    x: Tensor,
+    f: &mut Func,
+    x: Operand,
     plane: GroupedPlane,
-    routes: Tensor,
+    routes: Operand,
     groups: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Operand,
+    tuning: Tuning,
+) -> Result<Val, Error> {
     const OP: &str = "linear.matmul_grouped";
     let groups = nonzero(OP, "the group count", groups)?;
     expect(OP, x, &[Dtype::Bf16])?;
@@ -1778,23 +1766,21 @@ pub fn matmul_grouped(
     };
     let (k, n) = (x.width / groups, y.width / groups);
     let fan = fan_of(OP, x.rows * groups, k, n, routes, form)?;
-    ctx.emit(&mut |cx| {
-        let xv = cx.read(x)?;
-        let xv = cx.reshape(xv, &[fan.pairs(), fan.k])?;
-        let rv = cx.read(routes)?;
-        let prev = cx.read(y)?;
-        let out = routed(cx, form, fan, xv, rv, None, prev)?;
-        cx.write(y, out)
-    })
+    let xv = x.val;
+    let xv = f.reshape(xv, &[fan.pairs(), fan.k])?;
+    let rv = routes.val;
+    let prev = y.val;
+    let out = routed(f, form, fan, xv, rv, None, prev, tuning)?;
+    Ok(out)
 }
 
 /// `y[t] = sum_s weights[t, s] * routed[t*k + s]`, in f32.
 pub fn weighted_sum(
-    ctx: &Ctx<'_>,
-    routed: Tensor,
-    weights: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    routed: Operand,
+    weights: Operand,
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.moe_weighted_sum";
     expect(OP, routed, &[Dtype::Bf16])?;
     expect(OP, weights, &[Dtype::F32])?;
@@ -1818,28 +1804,26 @@ pub fn weighted_sum(
             ),
         ));
     }
-    ctx.emit(&mut |cx| {
-        let (t, k, w) = (i64::from(y.rows), i64::from(top_k), i64::from(y.width));
-        let r = cx.read_f32(routed)?;
-        let r = cx.reshape(r, &[t, k, w])?;
-        let g = cx.read(weights)?;
-        let g = cx.broadcast(g, &[t, k, w], &[0, 1])?;
-        let v = cx.mul(r, g)?;
-        let v = cx.reduce(v, &[1], Fold::Sum)?;
-        cx.write(y, v)
-    })
+    let (t, k, w) = (i64::from(y.rows), i64::from(top_k), i64::from(y.width));
+    let r = routed.f32(f);
+    let r = f.reshape(r, &[t, k, w])?;
+    let g = weights.val;
+    let g = f.broadcast(g, &[t, k, w], &[0, 1])?;
+    let v = f.mul(r, g)?;
+    let v = f.reduce(v, &[1], Fold::Sum)?;
+    Ok(v)
 }
 
 /// `y = x + sum_s weights[t, s] * bias[routes[t, s]]` over routed slots
 /// (negative routes skipped; `bias` is `[experts, width]`).
 pub fn bias_sum(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    bias: Tensor,
-    routes: Tensor,
-    weights: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    x: Operand,
+    bias: Operand,
+    routes: Operand,
+    weights: Operand,
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.moe_bias_sum";
     expect(OP, x, &[Dtype::Bf16])?;
     expect(OP, bias, &[Dtype::Bf16])?;
@@ -1860,41 +1844,39 @@ pub fn bias_sum(
         ));
     }
     let experts = (bias.elements() / u64::from(y.width)) as i64;
-    ctx.emit(&mut |cx| {
-        let (t, k, w) = (i64::from(y.rows), i64::from(top_k), i64::from(y.width));
-        let xv = cx.read_f32(x)?;
-        let b = cx.read(bias)?;
-        let b = cx.reshape(b, &[experts, w])?;
-        let r = cx.read(routes)?;
-        let r = cx.reshape(r, &[t * k])?;
-        let zero = cx.const_i(Elem::I32, 0, &[t * k]);
-        let routed = cx.compare(Cmp::Ge, r, zero)?;
-        let lo = cx.const_i(Elem::I32, 0, &[]);
-        let hi = cx.const_i(Elem::I32, experts - 1, &[]);
-        let ids = cx.clamp(lo, r, hi)?;
-        let rows = cx.take_rows(b, ids)?;
-        let rows = cx.convert(rows, Elem::F32);
-        let g = cx.read(weights)?;
-        let g = cx.reshape(g, &[t * k])?;
-        let zf = cx.const_f(Elem::F32, 0.0, &[t * k]);
-        let g = cx.select(routed, g, zf)?;
-        let g = cx.broadcast(g, &[t * k, w], &[0])?;
-        let v = cx.mul(rows, g)?;
-        let v = cx.reshape(v, &[t, k, w])?;
-        let v = cx.reduce(v, &[1], Fold::Sum)?;
-        let v = cx.add(xv, v)?;
-        cx.write(y, v)
-    })
+    let (t, k, w) = (i64::from(y.rows), i64::from(top_k), i64::from(y.width));
+    let xv = x.f32(f);
+    let b = bias.val;
+    let b = f.reshape(b, &[experts, w])?;
+    let r = routes.val;
+    let r = f.reshape(r, &[t * k])?;
+    let zero = f.const_i(Elem::I32, 0, &[t * k]);
+    let routed = f.compare(Cmp::Ge, r, zero)?;
+    let lo = f.const_i(Elem::I32, 0, &[]);
+    let hi = f.const_i(Elem::I32, experts - 1, &[]);
+    let ids = f.clamp(lo, r, hi)?;
+    let rows = f.take_rows(b, ids)?;
+    let rows = f.convert(rows, Elem::F32);
+    let g = weights.val;
+    let g = f.reshape(g, &[t * k])?;
+    let zf = f.const_f(Elem::F32, 0.0, &[t * k]);
+    let g = f.select(routed, g, zf)?;
+    let g = f.broadcast(g, &[t * k, w], &[0])?;
+    let v = f.mul(rows, g)?;
+    let v = f.reshape(v, &[t, k, w])?;
+    let v = f.reduce(v, &[1], Fold::Sum)?;
+    let v = f.add(xv, v)?;
+    Ok(v)
 }
 
 /// `y = routed + sigmoid(gate[row]) * shared`.
 pub fn sigmoid_gate_add(
-    ctx: &Ctx<'_>,
-    routed: Tensor,
-    shared: Tensor,
-    gate: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    routed: Operand,
+    shared: Operand,
+    gate: Operand,
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.moe_sigmoid_gate_add";
     expect(OP, routed, &[Dtype::Bf16])?;
     expect(OP, shared, &[Dtype::Bf16])?;
@@ -1910,16 +1892,14 @@ pub fn sigmoid_gate_add(
             "the routed, shared, gate and result planes do not agree",
         ));
     }
-    ctx.emit(&mut |cx| {
-        let (t, w) = (i64::from(routed.rows), i64::from(routed.width));
-        let r = cx.read_f32(routed)?;
-        let s = cx.read_f32(shared)?;
-        let g = cx.read_f32(gate)?;
-        let g = cx.reshape(g, &[t])?;
-        let g = score(cx, g, Score::Sigmoid)?;
-        let g = cx.broadcast(g, &[t, w], &[0])?;
-        let v = cx.mul(g, s)?;
-        let v = cx.add(r, v)?;
-        cx.write(y, v)
-    })
+    let (t, w) = (i64::from(routed.rows), i64::from(routed.width));
+    let r = routed.f32(f);
+    let s = shared.f32(f);
+    let g = gate.f32(f);
+    let g = f.reshape(g, &[t])?;
+    let g = score(f, g, Score::Sigmoid)?;
+    let g = f.broadcast(g, &[t, w], &[0])?;
+    let v = f.mul(g, s)?;
+    let v = f.add(r, v)?;
+    Ok(v)
 }

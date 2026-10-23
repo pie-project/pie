@@ -19,21 +19,33 @@ impl Run<'_> {
                 k,
                 values,
                 indices,
-            } => sampling::topk(
-                self.ctx(),
-                self.tensor(*x),
-                *k,
-                self.tensor(*values),
-                self.tensor(*indices),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_values = self.tensor(*values);
+                let o_indices = self.tensor(*indices);
+                let (v0, v1) =
+                    sampling::topk(l.f(), x_v, *k, o_values.landing(), o_indices.landing())?;
+                l.land(o_values, v0)?;
+                l.land(o_indices, v1)?;
+                Ok(())
+            }),
             Sampling::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
-                    sampling::argmax(
-                        self.ctx(),
-                        self.tensor(*x),
-                        u32::try_from(column).expect("a draft depth inside u32"),
-                        self.tensor(*y),
-                    )?;
+                    crate::lower::lower(self.ctx(), |l| {
+                        let x_v = l.read(self.tensor(*x))?;
+                        let o_y = self.tensor(*y);
+                        let v = sampling::argmax(
+                            l.f(),
+                            x_v,
+                            u32::try_from(column).expect("a draft depth inside u32"),
+                            o_y.landing(),
+                        )?;
+                        l.land_column(
+                            o_y,
+                            u32::try_from(column).expect("a draft depth inside u32"),
+                            v,
+                        )
+                    })?;
                 }
                 Ok(())
             }
@@ -46,21 +58,36 @@ impl Run<'_> {
                 succ,
                 first,
                 picks,
-            } => sampling::selector_walk::selector_walk(
-                self.ctx(),
-                self.ragged(*cand),
-                self.tensor(*unary),
+            } => {
                 // The candidates are readout-rowed (a block drafter reads
                 // every row back), the tokens and the projected hidden
                 // token-rowed, padded past them: the GPU kernel reads the
                 // first rows.
-                hp.map(|hp| self.first_rows(self.tensor(hp), *cand)),
-                self.first_rows(self.tensor(*tokens), *cand),
-                self.tensor(*pred),
-                self.tensor(*succ),
-                *first,
-                self.tensor(*picks),
-            ),
+                let hp = hp.map(|hp| self.first_rows(self.tensor(hp), *cand));
+                let tokens = self.first_rows(self.tensor(*tokens), *cand);
+                let picks = self.tensor(*picks);
+                crate::lower::lower(self.ctx(), |l| {
+                    let cand = l.ragged(self.ragged(*cand))?;
+                    let unary = l.read(self.tensor(*unary))?;
+                    let hp = l.read_opt(hp)?;
+                    let tokens = l.read(tokens)?;
+                    let pred = l.read(self.tensor(*pred))?;
+                    let succ = l.read(self.tensor(*succ))?;
+                    let picked = l.read(picks)?;
+                    let v = sampling::selector_walk::selector_walk(
+                        l.f(),
+                        cand,
+                        unary,
+                        hp,
+                        tokens,
+                        pred,
+                        succ,
+                        *first,
+                        picked,
+                    )?;
+                    l.land(picks, v)
+                })
+            }
             Sampling::MarkovWalk { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
         }
     }

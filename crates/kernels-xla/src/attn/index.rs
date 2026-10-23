@@ -8,12 +8,12 @@
 
 use dtype::Dtype;
 
-use super::pool::{cell_of, first, paging, put_cols, write_cell};
-use crate::cx::{Ctx, expect};
+use super::pool::{Entries, cell_of, first, paging, put_cols, write_cell};
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
 use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero};
-use crate::tensor::{KvPool, Tensor};
+use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the scoring loop.
 const KEY_BLOCK: i64 = 512;
@@ -82,18 +82,18 @@ fn rope_heads(f: &mut Func, x: Val, pos: Val, rope_dim: i64, theta: f32) -> Buil
     f.concat(&[turned, rest], 2)
 }
 
-/// The index key, in place: layernorm (`w`, `b`), rounded to its bf16
-/// store, then its first `rope_dim` lanes roped at the row's position.
+/// The index key layernormed (`w`, `b`), rounded to its bf16 store, then
+/// its first `rope_dim` lanes roped at the row's position: the new `k`.
 pub fn layernorm_rope(
-    ctx: &Ctx<'_>,
-    k: Tensor,
-    positions: Tensor,
-    weight: Tensor,
-    bias: Tensor,
+    f: &mut Func,
+    k: Operand,
+    positions: Operand,
+    weight: Operand,
+    bias: Operand,
     eps: f32,
     rope_dim: u32,
     theta: f32,
-) -> Result<(), Error> {
+) -> Result<Val, Error> {
     const OP: &str = "attn.index_layernorm_rope";
     expect(OP, k, &[Dtype::Bf16])?;
     let hd = nonzero(OP, "the index key row's width", k.width)?;
@@ -109,12 +109,11 @@ pub fn layernorm_rope(
         return Err(refuse(OP, "the position table is shorter than the fire"));
     }
     let (n, hd) = (i64::from(rows), i64::from(hd));
-    ctx.emit(&mut |cx| {
-        let x = cx.read_f32(k)?;
-        let w = crate::lanes::flat_f32(cx, weight)?;
-        let b = crate::lanes::flat_f32(cx, bias)?;
-        let pos = flat_i32(cx, positions)?;
-        let f = cx.func();
+    {
+        let x = k.f32(f);
+        let w = crate::lanes::flat_f32(f, weight)?;
+        let b = crate::lanes::flat_f32(f, bias)?;
+        let pos = flat_i32(f, positions)?;
         let pos = first(f, pos, n)?;
         let sum = f.reduce(x, &[1], Fold::Sum)?;
         let mean = f.scale(sum, 1.0 / hd as f64)?;
@@ -135,21 +134,21 @@ pub fn layernorm_rope(
         let y = f.convert(y, Elem::Bf16);
         let y = f.convert(y, Elem::F32);
         let y = f.reshape(y, &[n, 1, hd])?;
-        let y = rope_heads(f, y, pos, i64::from(rope_dim), theta)?;
-        cx.write(k, y)
-    })
+        Ok(rope_heads(f, y, pos, i64::from(rope_dim), theta)?)
+    }
 }
 
-/// The index query, in place: the first `rope_dim` lanes of each head roped.
+/// The index query with the first `rope_dim` lanes of each head roped: the
+/// new `q`.
 pub fn rope(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    positions: Tensor,
+    f: &mut Func,
+    q: Operand,
+    positions: Operand,
     heads: u32,
     head_dim: u32,
     rope_dim: u32,
     theta: f32,
-) -> Result<(), Error> {
+) -> Result<Val, Error> {
     const OP: &str = "attn.index_rope";
     expect(OP, q, &[Dtype::Bf16])?;
     let h = nonzero(OP, "the head count this rotation states", heads)?;
@@ -163,32 +162,30 @@ pub fn rope(
         return Err(refuse(OP, "the position table is shorter than the fire"));
     }
     let n = i64::from(rows);
-    ctx.emit(&mut |cx| {
-        let x = cx.read_f32(q)?;
-        let pos = flat_i32(cx, positions)?;
-        let f = cx.func();
-        let pos = first(f, pos, n)?;
-        let x = f.reshape(x, &[n, i64::from(h), i64::from(hd)])?;
-        let y = rope_heads(f, x, pos, i64::from(rope_dim), theta)?;
-        cx.write(q, y)
-    })
+    let x = q.f32(f);
+    let pos = flat_i32(f, positions)?;
+    let pos = first(f, pos, n)?;
+    let x = f.reshape(x, &[n, i64::from(h), i64::from(hd)])?;
+    Ok(rope_heads(f, x, pos, i64::from(rope_dim), theta)?)
 }
 
 /// Files each row's index key at `write_page · page_size + write_offset`
-/// (a negative page or an out-of-page offset drops the row).
+/// (a negative page or an out-of-page offset drops the row) in the pool's
+/// keys plane `plane` (`keys` gives the paging): the new plane.
 pub fn kv_append(
-    ctx: &Ctx<'_>,
-    k: Tensor,
-    keys: &KvPool,
-    write_page: Tensor,
-    write_offset: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    k: Operand,
+    plane: Operand,
+    keys: &KvPool<impl Stored>,
+    write_page: Operand,
+    write_offset: Operand,
+) -> Result<Val, Error> {
     const OP: &str = "attn.index_kv_append";
     expect(OP, k, &[Dtype::Bf16])?;
     if keys.page_size <= 0 {
         return Err(refuse(OP, "the kv page size is zero"));
     }
-    if keys.seq_stride != u64::from(k.width) || keys.keys.width < k.width {
+    if keys.seq_stride != u64::from(k.width) || plane.width < k.width {
         return Err(refuse(
             OP,
             format!(
@@ -202,37 +199,33 @@ pub fn kv_append(
         return Err(refuse(OP, "the write tables are shorter than the fire"));
     }
     let (n, ps) = (i64::from(rows), i64::from(keys.page_size));
-    ctx.emit(&mut |cx| {
-        let wp = flat_i32(cx, write_page)?;
-        let wo = flat_i32(cx, write_offset)?;
-        let kv = cx.read(k)?;
-        let table = cx.read(keys.keys)?;
-        let f = cx.func();
-        let at = write_cell(f, wp, wo, n, ps)?;
-        let table = put_cols(f, table, at, kv)?;
-        cx.write(keys.keys, table)
-    })
+    let wp = flat_i32(f, write_page)?;
+    let wo = flat_i32(f, write_offset)?;
+    let at = write_cell(f, wp, wo, n, ps)?;
+    Ok(put_cols(f, plane.val, at, k.val)?)
 }
 
 /// Each boundary row's mean of the `ratio` cached keys ending at its
 /// position (positions before 0 add nothing; the divisor stays `ratio`);
-/// 0 for a row closing no block.
+/// 0 for a row closing no block. `planes` are the index pool's (`keys`
+/// gives its paging).
 pub fn block_mean(
-    ctx: &Ctx<'_>,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    keys: &KvPool,
+    f: &mut Func,
+    boundary_pos: Operand,
+    boundary_req: Operand,
+    planes: Entries,
+    keys: &KvPool<impl Stored>,
     head_dim: u32,
     ratio: u32,
-    entries: Tensor,
-) -> Result<(), Error> {
+    entries: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "attn.index_block_mean";
     expect(OP, entries, &[Dtype::Bf16])?;
     if keys.page_size <= 0 {
         return Err(refuse(OP, "the index cache page size is zero"));
     }
     let hd = nonzero(OP, "the key width this mean states", head_dim)?;
-    if entries.width != hd || keys.keys.width < hd {
+    if entries.width != hd || planes.keys.width < hd {
         return Err(refuse(
             OP,
             "the stated head width is not the entry's (or the pool's) width",
@@ -247,12 +240,17 @@ pub fn block_mean(
         ));
     }
     let (n, hd) = (i64::from(rows), i64::from(hd));
-    ctx.emit(&mut |cx| {
-        let (indices, indptr, ps) = paging(cx, OP, keys)?;
-        let bpos = flat_i32(cx, boundary_pos)?;
-        let breq = flat_i32(cx, boundary_req)?;
-        let table = cx.read(keys.keys)?;
-        let f = cx.func();
+    {
+        let (indices, indptr, ps) = paging(
+            f,
+            OP,
+            planes.page_indices,
+            planes.page_indptr,
+            keys.page_size,
+        )?;
+        let bpos = flat_i32(f, boundary_pos)?;
+        let breq = flat_i32(f, boundary_req)?;
+        let table = planes.keys.val;
         let bpos = first(f, bpos, n)?;
         let breq = first(f, breq, n)?;
         let i = f.iota(Elem::I32, &[n, ratio], 1);
@@ -276,9 +274,8 @@ pub fn block_mean(
         let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
         let has = f.broadcast(has, &[n, hd], &[0])?;
         let z2 = f.like_f(mean, 0.0);
-        let out = f.select(has, mean, z2)?;
-        cx.write(entries, out)
-    })
+        Ok(f.select(has, mean, z2)?)
+    }
 }
 
 /// Per query row: scores `Σ_h max(q_h · k_j, 0) · w_h` against the cached
@@ -288,20 +285,21 @@ pub fn block_mean(
 /// times between the row's min and max (as the GPU kernels pick them);
 /// unfilled slots are -1. The GPU's `scores` scratch plane is not an
 /// operand: the score row's bound is the pool's `max_pages · page_size /
-/// ratio`.
+/// ratio`. `planes` are the index pool's (`keys` gives its paging).
 pub fn topk(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    weights: Option<Tensor>,
-    keys: &KvPool,
-    positions: Tensor,
-    request_of_token: Tensor,
+    f: &mut Func,
+    q: Operand,
+    weights: Option<Operand>,
+    planes: Entries,
+    keys: &KvPool<impl Stored>,
+    positions: Operand,
+    request_of_token: Operand,
     heads: u32,
     head_dim: u32,
     top_k: u32,
     ratio: u32,
-    selection: Tensor,
-) -> Result<(), Error> {
+    selection: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "attn.index_topk";
     expect(OP, q, &[Dtype::Bf16])?;
     expect(OP, selection, &[Dtype::I32])?;
@@ -312,7 +310,7 @@ pub fn topk(
     if keys.page_size <= 0 {
         return Err(refuse(OP, "the index cache page size is zero"));
     }
-    if q.width != h * d || keys.keys.width < d {
+    if q.width != h * d || planes.keys.width < d {
         return Err(refuse(OP, "the index query is not heads x key width"));
     }
     if weights.is_some_and(|w| w.width != h) {
@@ -339,17 +337,19 @@ pub fn topk(
         return Err(refuse(OP, "the pool's page bound holds no key"));
     }
     let (n, hh, dd, kk) = (i64::from(rows), i64::from(h), i64::from(d), i64::from(k));
-    ctx.emit(&mut |cx| {
-        let (indices, indptr, ps) = paging(cx, OP, keys)?;
-        let qv = cx.read(q)?;
-        let w = match weights {
-            Some(w) => Some(cx.read_f32(w)?),
-            None => None,
-        };
-        let pos = flat_i32(cx, positions)?;
-        let req = flat_i32(cx, request_of_token)?;
-        let table = cx.read(keys.keys)?;
-        let f = cx.func();
+    {
+        let (indices, indptr, ps) = paging(
+            f,
+            OP,
+            planes.page_indices,
+            planes.page_indptr,
+            keys.page_size,
+        )?;
+        let qv = q.val;
+        let w = weights.map(|w| w.f32(f));
+        let pos = flat_i32(f, positions)?;
+        let req = flat_i32(f, request_of_token)?;
+        let table = planes.keys.val;
         let qv = f.slice_axis(qv, 0, 0, n)?;
         let qv = f.reshape(qv, &[n, hh, dd])?;
         let w = match w {
@@ -367,9 +367,8 @@ pub fn topk(
         let nkeys = f.select(pos_t, nkeys, zero)?;
         let nkeys = clamp_i(f, nkeys, 0, nk)?;
         let scores = index_scores(f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps)?;
-        let sel = bisect_select(f, scores, nkeys, kk)?;
-        cx.write(selection, sel)
-    })
+        Ok(bisect_select(f, scores, nkeys, kk)?)
+    }
 }
 
 /// The `[n, nk]` score rows (entries past a row's `nkeys` are garbage).

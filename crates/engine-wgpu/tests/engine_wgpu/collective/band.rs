@@ -29,6 +29,10 @@ impl Encode for Ranked<'_> {
         self.inner.absent()
     }
 
+    fn target(&self) -> kernels_slang::Target {
+        self.inner.target()
+    }
+
     fn comm(&self, _op: &'static str) -> Result<kernels_slang::Comm, Error> {
         Ok(kernels_slang::Comm {
             rank: RANK,

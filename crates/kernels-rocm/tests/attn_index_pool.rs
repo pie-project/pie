@@ -398,7 +398,16 @@ fn index_keys_append_and_block_mean() {
     let bpos = gpu.column(&[7, -1, 2]);
     let breq = gpu.column(&[0, 0, 1]);
     let mut out = gpu.zeros(3, d as u32, Dtype::Bf16);
-    index::block_mean(&ctx, bpos, breq, &p.pool, d as u32, ratio as u32, &mut out).unwrap();
+    kernels_rocm::attn::compressed::pool::block_mean(
+        &ctx,
+        bpos,
+        breq,
+        &p.pool,
+        d as u32,
+        ratio as u32,
+        &mut out,
+    )
+    .unwrap();
     let got = gpu.read(&out);
     let at = |r: usize, pos: usize| {
         let c = p.cell(r, pos);

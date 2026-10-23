@@ -349,11 +349,7 @@ impl<'c> Run<'c> {
         )
     }
 
-    pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
-        self.ctx
-    }
-
-    /// The same context for kernels-slang's entries.
+    /// The context for kernels-slang's entries.
     pub(crate) fn slang(&self) -> crate::encode::Slang<'c> {
         crate::encode::Slang(self.ctx)
     }

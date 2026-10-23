@@ -69,24 +69,35 @@ pub trait Stored: Copy {
     fn width(self) -> u32;
     fn dtype(self) -> Dtype;
 
+    /// The same storage read as another dtype of the same width.
+    #[must_use]
+    fn with_dtype(self, dtype: Dtype) -> Self;
+
+    /// The same rows read `width` wide.
+    #[must_use]
+    fn with_width(self, width: u32) -> Self;
+
     fn elements(self) -> u64 {
         u64::from(self.rows()) * u64::from(self.width())
     }
-}
 
-impl Stored for Tensor {
-    fn rows(self) -> u32 {
-        self.rows
-    }
-    fn width(self) -> u32 {
-        self.width
-    }
-    fn dtype(self) -> Dtype {
-        self.dtype
+    /// The shape and dtype alone.
+    fn shape(self) -> Landing {
+        Landing {
+            rows: self.rows(),
+            width: self.width(),
+            dtype: self.dtype(),
+        }
     }
 }
 
 impl Stored for Operand {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }
@@ -99,6 +110,12 @@ impl Stored for Operand {
 }
 
 impl Stored for Landing {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }
@@ -110,50 +127,8 @@ impl Stored for Landing {
     }
 }
 
-/// A handle the engine resolves: `buf` names a binding (a root plus a row
-/// window), `rows × width` is its shape in elements of `dtype`. The same
-/// four fields as kernels-wgpu's `Tensor`, so an engine dispatch reads the
-/// same on both.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Tensor {
-    pub buf: u32,
-
-    pub rows: u32,
-
-    pub width: u32,
-
-    pub dtype: Dtype,
-}
-
-impl Tensor {
-    #[must_use]
-    pub const fn new(buf: u32, rows: u32, width: u32, dtype: Dtype) -> Self {
-        Self {
-            buf,
-            rows,
-            width,
-            dtype,
-        }
-    }
-
-    #[must_use]
-    pub const fn elements(self) -> u64 {
-        self.rows as u64 * self.width as u64
-    }
-
-    /// Where a result lands in this handle.
-    #[must_use]
-    pub const fn landing(self) -> Landing {
-        Landing {
-            rows: self.rows,
-            width: self.width,
-            dtype: self.dtype,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RaggedTensor<T = Tensor> {
+pub struct RaggedTensor<T> {
     pub data: T,
 
     pub indptr: T,
@@ -172,14 +147,14 @@ impl<T> RaggedTensor<T> {
 /// head_dim]` planes (values may be narrower), paged by the CSR
 /// `page_indptr`/`page_indices` of the fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvPool {
-    pub keys: Tensor,
+pub struct KvPool<T> {
+    pub keys: T,
 
-    pub values: Tensor,
+    pub values: T,
 
-    pub page_indices: Tensor,
+    pub page_indices: T,
 
-    pub page_indptr: Tensor,
+    pub page_indptr: T,
 
     pub page_size: i32,
 
@@ -196,34 +171,45 @@ pub struct KvPool {
 /// A recurrent state space: `state` holds one row per slot, `slots` the slot
 /// of each lane of the fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecurrentPool {
-    pub state: Tensor,
+pub struct RecurrentPool<T> {
+    pub state: T,
 
-    pub slots: Tensor,
+    pub slots: T,
 
-    pub conv_state: Tensor,
+    pub conv_state: T,
 
-    pub new_conv_state: Tensor,
+    pub new_conv_state: T,
 }
 
 /// A quantized weight: codes with per-group scales (and zero points when
 /// affine).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Bank {
-    pub codes: Tensor,
+pub struct Bank<T> {
+    pub codes: T,
 
-    pub scales: Tensor,
+    pub scales: T,
 
-    pub biases: Option<Tensor>,
+    pub biases: Option<T>,
 
     pub group: u32,
 
     pub bits: u32,
 }
 
-impl Bank {
+impl<T> Bank<T> {
     #[must_use]
     pub const fn affine(&self) -> bool {
         self.biases.is_some()
+    }
+
+    /// The bank with its codes, scales and biases read (in that order).
+    pub fn try_map<U, E>(self, mut f: impl FnMut(T) -> Result<U, E>) -> Result<Bank<U>, E> {
+        Ok(Bank {
+            codes: f(self.codes)?,
+            scales: f(self.scales)?,
+            biases: self.biases.map(&mut f).transpose()?,
+            group: self.group,
+            bits: self.bits,
+        })
     }
 }

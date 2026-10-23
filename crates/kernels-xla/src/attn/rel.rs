@@ -5,11 +5,10 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use super::paged::{Paged, Tables, Walk, attend, kv_heads_agree};
+use super::paged::{Paged, Tables, Walk, kv_heads_agree};
 use super::{DecodePlan, PrefillPlan};
-use crate::cx::Ctx;
 use crate::error::Error;
-use crate::tensor::{KvPool, RaggedTensor, Tensor};
+use crate::tensor::{KvPool, RaggedTensor, Stored};
 
 /// `bias` is `[rows, q_heads · extent]` f32: row `r`, head `h`, distance
 /// `d = q_pos − k_pos` in `[0, extent)` adds `bias[r, h·extent + d]` to the
@@ -17,8 +16,8 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 /// logit is then scaled by `1 + log_alpha · ln((q_pos + 1) / log_floor)`
 /// wherever that ratio exceeds one.
 #[derive(Clone, Copy, Debug)]
-pub struct RelBias {
-    pub bias: Tensor,
+pub struct RelBias<T> {
+    pub bias: T,
     pub extent: u32,
     pub log_floor: u32,
     pub log_alpha: f32,
@@ -26,17 +25,15 @@ pub struct RelBias {
 
 /// Causal paged attention with the relative bias; the fire's custom mask is
 /// not read (as on CUDA).
-pub fn decode_rel(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    plan: &DecodePlan,
-    pool: &KvPool,
-    rel: RelBias,
+pub fn decode_rel<T: Stored>(
+    q: T,
+    plan: &DecodePlan<T>,
+    rel: RelBias<T>,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
+    o: T,
+) -> Result<Paged<T>, Error> {
     let call = rel_call(
         "attn.decode_rel",
         q,
@@ -48,21 +45,20 @@ pub fn decode_rel(
         o,
         Walk::PerRow,
     );
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
-pub fn prefill_rel(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
-    rel: RelBias,
+pub fn prefill_rel<T: Stored>(
+    q: RaggedTensor<T>,
+    plan: &PrefillPlan<T>,
+    pool: &KvPool<T>,
+    rel: RelBias<T>,
     window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
+    o: T,
+) -> Result<Paged<T>, Error> {
     const OP: &str = "attn.prefill_rel";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = rel_call(
@@ -76,20 +72,20 @@ pub fn prefill_rel(
         o,
         Walk::Auto,
     );
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
-fn rel_call(
+fn rel_call<T>(
     op: &'static str,
-    q: Tensor,
-    tables: Tables,
-    rel: RelBias,
+    q: T,
+    tables: Tables<T>,
+    rel: RelBias<T>,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
+    o: T,
     walk: Walk,
-) -> Paged {
+) -> Paged<T> {
     Paged {
         op,
         q,

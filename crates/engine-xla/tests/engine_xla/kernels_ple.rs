@@ -2,9 +2,9 @@
 
 use dtype::Dtype;
 use engine_xla::bench::Bench;
+use engine_xla::handle::Committed;
+use engine_xla::handle::{RaggedTensor, RecurrentPool, Tensor};
 use kernels_xla::gather::ngram;
-use kernels_xla::lanes::Committed;
-use kernels_xla::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
 const MULTS: [u64; 3] = [
@@ -126,18 +126,27 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
         let p = pool(st, sl);
         let ran = b
             .run(|ctx| {
-                ngram::ngram_ids(
-                    ctx,
-                    idt,
-                    &p,
-                    EOS as u32,
-                    &MULTS,
-                    &PRIMES,
-                    &OFFSETS,
-                    HPN as u32,
-                    with_map.then_some(mt),
-                    out,
-                )
+                engine_xla::lower::lower(ctx, |l| {
+                    let ids = l.read(idt)?;
+                    let slab = l.read(p.state)?;
+                    let map = l.read_opt(with_map.then_some(mt))?;
+                    let slots = l.read(p.slots)?;
+                    let (rows, next) = ngram::ngram_ids(
+                        l.f(),
+                        ids,
+                        slab,
+                        slots,
+                        EOS as u32,
+                        &MULTS,
+                        &PRIMES,
+                        &OFFSETS,
+                        HPN as u32,
+                        map,
+                        out.landing(),
+                    )?;
+                    l.land(out, rows)?;
+                    l.land(p.state, next)
+                })
             })
             .unwrap();
         if !ran {
@@ -176,21 +185,28 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
         let out = b.zeros(Dtype::I32, rows as u32, heads);
         let p = pool(st, sl);
         b.run(|ctx| {
-            ngram::ngram_ids_chunked(
-                ctx,
-                RaggedTensor {
-                    data: idt,
-                    indptr: ip,
-                },
-                &p,
-                EOS as u32,
-                &MULTS,
-                &PRIMES,
-                &OFFSETS,
-                HPN as u32,
-                with_map.then_some(mt),
-                out,
-            )
+            engine_xla::lower::lower(ctx, |l| {
+                let data = l.read(idt)?;
+                let slab = l.read(p.state)?;
+                let map = l.read_opt(with_map.then_some(mt))?;
+                let indptr = l.read(ip)?;
+                let slots = l.read(p.slots)?;
+                let (rows, next) = ngram::ngram_ids_chunked(
+                    l.f(),
+                    kernels_xla::tensor::RaggedTensor { data, indptr },
+                    slab,
+                    slots,
+                    EOS as u32,
+                    &MULTS,
+                    &PRIMES,
+                    &OFFSETS,
+                    HPN as u32,
+                    map,
+                    out.landing(),
+                )?;
+                l.land(out, rows)?;
+                l.land(p.state, next)
+            })
         })
         .unwrap();
         let got = b.read_i32(out);
@@ -233,20 +249,37 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
             lane0: 1,
         };
         b.run(|ctx| {
-            ngram::ngram_ids_committed(
-                ctx,
-                idt,
-                ip,
-                &seat,
-                &p,
-                EOS as u32,
-                &MULTS,
-                &PRIMES,
-                &OFFSETS,
-                HPN as u32,
-                with_map.then_some(mt),
-                out,
-            )
+            engine_xla::lower::lower(ctx, |l| {
+                let ids_v = l.read(idt)?;
+                let state_v = l.read(p.state)?;
+                let map_v = l.read_opt(with_map.then_some(mt))?;
+                let indptr_v = l.read(ip)?;
+                let seat_v = kernels_xla::lanes::Committed {
+                    replay: l.read(seat.replay)?,
+                    commit: l.read(seat.commit)?,
+                    slots: l.read(seat.slots)?,
+                    lane0: seat.lane0,
+                };
+                let o_ngram_ids = out;
+                let o_state = p.state;
+                let (v0, v1) = ngram::ngram_ids_committed(
+                    l.f(),
+                    ids_v,
+                    indptr_v,
+                    seat_v,
+                    state_v,
+                    EOS as u32,
+                    &MULTS,
+                    &PRIMES,
+                    &OFFSETS,
+                    HPN as u32,
+                    map_v,
+                    o_ngram_ids.landing(),
+                )?;
+                l.land(o_ngram_ids, v0)?;
+                l.land(o_state, v1)?;
+                Ok(())
+            })
         })
         .unwrap();
         let got = b.read_i32(out);
@@ -328,20 +361,32 @@ fn the_selector_walk_feeds_each_pick_to_the_next_row() {
         let out = b.i32(rows as u32, 1, &before);
         if !b
             .run(|ctx| {
-                kernels_xla::sampling::selector_walk::selector_walk(
-                    ctx,
-                    RaggedTensor {
+                engine_xla::lower::lower(ctx, |l| {
+                    let cand_v = (RaggedTensor {
                         data: ct,
                         indptr: ip,
-                    },
-                    ut,
-                    with_hp.then_some(ht),
-                    tt,
-                    pt,
-                    st,
-                    first,
-                    out,
-                )
+                    })
+                    .try_map(|t| l.read(t))?;
+                    let unary_v = l.read(ut)?;
+                    let hp_v = l.read_opt(with_hp.then_some(ht))?;
+                    let tokens_v = l.read(tt)?;
+                    let pred_v = l.read(pt)?;
+                    let succ_v = l.read(st)?;
+                    let picks_v = l.read(out)?;
+                    let o_picks = out;
+                    let v = kernels_xla::sampling::selector_walk::selector_walk(
+                        l.f(),
+                        cand_v,
+                        unary_v,
+                        hp_v,
+                        tokens_v,
+                        pred_v,
+                        succ_v,
+                        first,
+                        picks_v,
+                    )?;
+                    l.land(o_picks, v)
+                })
             })
             .unwrap()
         {

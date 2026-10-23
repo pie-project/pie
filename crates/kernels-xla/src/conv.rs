@@ -11,7 +11,7 @@
 //! share one fire, and a row no lane covers lands zero, as on CUDA. The only
 //! static extents are the planes' row counts (the fire's bucket).
 //!
-//! [`conv3d_boxed`] is the fast path for a table the host knows: each clip is
+//! [`conv3d::conv3d_boxed`] is the fast path for a table the host knows: each clip is
 //! cut out as a `[1, t, h, w, C]` volume and run through
 //! `stablehlo.convolution`, so the clip boxes become part of the executable's
 //! key. [`conv3d`] is the table-as-data form (an implicit GEMM: per tap, a
@@ -29,7 +29,7 @@ use dtype::Dtype;
 
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, GatherDims, Val};
-use crate::tensor::Tensor;
+use crate::tensor::Stored;
 
 // ------------------------------------------------------------------ types
 
@@ -113,20 +113,22 @@ pub(crate) fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error
     Ok(v)
 }
 
-pub(crate) fn lanes_of(op: &'static str, what: &str, grid: Tensor) -> Result<u32, Error> {
-    if grid.dtype != Dtype::I32 || grid.width != 4 {
+pub(crate) fn lanes_of(op: &'static str, what: &str, grid: impl Stored) -> Result<u32, Error> {
+    if grid.dtype() != Dtype::I32 || grid.width() != 4 {
         return Err(refuse(
             op,
             format!(
                 "the {what} grid is {}x{} {:?}; a lane table is `[lanes, 4]` i32 `{{t, h, w, row_offset}}`",
-                grid.rows, grid.width, grid.dtype
+                grid.rows(),
+                grid.width(),
+                grid.dtype()
             ),
         ));
     }
-    nonzero(op, "the lane count", grid.rows)
+    nonzero(op, "the lane count", grid.rows())
 }
 
-fn lane_pair(op: &'static str, grid: Tensor, y_grid: Tensor) -> Result<u32, Error> {
+fn lane_pair(op: &'static str, grid: impl Stored, y_grid: impl Stored) -> Result<u32, Error> {
     let lanes = lanes_of(op, "input", grid)?;
     let o = lanes_of(op, "output", y_grid)?;
     if lanes != o {
@@ -138,14 +140,21 @@ fn lane_pair(op: &'static str, grid: Tensor, y_grid: Tensor) -> Result<u32, Erro
     Ok(lanes)
 }
 
-fn movable(op: &'static str, x: Tensor, y: Tensor) -> Result<(), Error> {
-    if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) {
-        return Err(Error::DtypeUnsupported { op, dtype: x.dtype });
+fn movable(op: &'static str, x: impl Stored, y: impl Stored) -> Result<(), Error> {
+    if !matches!(x.dtype(), Dtype::Bf16 | Dtype::F16) {
+        return Err(Error::DtypeUnsupported {
+            op,
+            dtype: x.dtype(),
+        });
     }
-    if x.dtype != y.dtype {
+    if x.dtype() != y.dtype() {
         return Err(refuse(
             op,
-            format!("{:?} into {:?}; the op keeps the element", x.dtype, y.dtype),
+            format!(
+                "{:?} into {:?}; the op keeps the element",
+                x.dtype(),
+                y.dtype()
+            ),
         ));
     }
     Ok(())

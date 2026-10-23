@@ -13,20 +13,20 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Cmp, Elem};
+use crate::hlo::{Cmp, Elem, Func, Val};
 use crate::linear::gemm::dot_split;
-use crate::tensor::Tensor;
+use crate::tensor::Operand;
 
 pub fn correct(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    bank_a: Tensor,
-    bank_b: Tensor,
-    routes: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    x: Operand,
+    bank_a: Operand,
+    bank_b: Operand,
+    routes: Operand,
+    y: Operand,
+) -> Result<Option<Val>, Error> {
     const OP: &str = "linear.lora_correct";
     expect(OP, x, &[Dtype::Bf16])?;
     expect(OP, y, &[Dtype::Bf16])?;
@@ -81,32 +81,30 @@ pub fn correct(
         ));
     }
     if rows == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let (m, n_in, n_out) = (i64::from(rows), i64::from(in_width), i64::from(out_width));
     let (adapters, r) = (i64::from(bank_a.rows), i64::from(rank));
-    ctx.emit(&mut |cx| {
-        let xv = cx.read(x)?;
-        let a = cx.read(bank_a)?;
-        let a = cx.reshape(a, &[adapters * r, n_in])?;
-        let t = cx.matmul_nt(xv, a, Elem::F32)?;
-        let t = cx.reshape(t, &[m, adapters, r])?;
+    let xv = x.val;
+    let a = bank_a.val;
+    let a = f.reshape(a, &[adapters * r, n_in])?;
+    let t = f.matmul_nt(xv, a, Elem::F32)?;
+    let t = f.reshape(t, &[m, adapters, r])?;
 
-        let ids = cx.read(routes)?;
-        let ids = cx.reshape(ids, &[m])?;
-        let ids = cx.broadcast(ids, &[m, adapters], &[0])?;
-        let seat = cx.iota(Elem::I32, &[m, adapters], 1);
-        let mine = cx.compare(Cmp::Eq, ids, seat)?;
-        let mine = cx.broadcast(mine, &[m, adapters, r], &[0, 1])?;
-        let zero = cx.like_f(t, 0.0);
-        let t = cx.select(mine, t, zero)?;
+    let ids = routes.val;
+    let ids = f.reshape(ids, &[m])?;
+    let ids = f.broadcast(ids, &[m, adapters], &[0])?;
+    let seat = f.iota(Elem::I32, &[m, adapters], 1);
+    let mine = f.compare(Cmp::Eq, ids, seat)?;
+    let mine = f.broadcast(mine, &[m, adapters, r], &[0, 1])?;
+    let zero = f.like_f(t, 0.0);
+    let t = f.select(mine, t, zero)?;
 
-        let b = cx.read(bank_b)?;
-        let b = cx.reshape(b, &[adapters, n_out, r])?;
-        let corr = dot_split(cx, t, b, 2, &[], &[], &[1, 2], &[0, 2])?;
+    let b = bank_b.val;
+    let b = f.reshape(b, &[adapters, n_out, r])?;
+    let corr = dot_split(f, t, b, 2, &[], &[], &[1, 2], &[0, 2])?;
 
-        let yv = cx.read_f32(y)?;
-        let out = cx.add(yv, corr)?;
-        cx.write(y, out)
-    })
+    let yv = y.f32(f);
+    let out = f.add(yv, corr)?;
+    Ok(Some(out))
 }
