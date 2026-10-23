@@ -22,6 +22,9 @@ impl Gpu {
             return None;
         }
         hip::set_device(0).ok()?;
+        // An instantiation that will not compile fails its test instead of
+        // falling back unseen.
+        kernels_rocm::jit::strict_kernels();
         Some(Self {
             stream: hip::Stream::new().ok()?,
             blas: blas::Handle::new().ok()?,
