@@ -47,10 +47,24 @@ pub struct Phase {
     pub reduce: Option<FabricReduce>,
 }
 
+/// A phase's function: its statements in order.
+fn func_of(name: String, body: Vec<phase::Statement>) -> Func {
+    let mut func = Func::new(name);
+    for s in body {
+        match s {
+            phase::Statement::Call(c) => {
+                func.body.call(c);
+            }
+            phase::Statement::Raw(b) => func.body.append(b),
+        }
+    }
+    func
+}
+
 impl From<phase::Phase> for Phase {
     fn from(p: phase::Phase) -> Self {
         Phase {
-            func: p.func,
+            func: func_of(p.name, p.body),
             pes: p.pes,
             shards: p.shards,
             lane: p.lane.as_ref().map(lanes::plan_of),

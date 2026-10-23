@@ -8,7 +8,7 @@
 
 use dtype::Dtype;
 
-use crate::csl::{Arg, Call, Func};
+use crate::csl::{Arg, Call};
 use crate::cx::View;
 use crate::error::Error;
 use crate::library::Kernel;
@@ -209,7 +209,7 @@ pub enum BankSplit {
 /// One slot's state `[a][b][w]`: `w` words contiguous, split (when the
 /// engine splits it) by ranges of `a` and of `b`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Block {
+pub struct SlotState {
     pub a: u32,
     pub b: u32,
     pub w: u32,
@@ -319,7 +319,7 @@ pub struct Lanes {
     pub banks: Vec<(String, u32, BankSplit)>,
     /// A slot's state, when the engine may split it by blocks; `stride`
     /// then equals `a × b × w`.
-    pub block: Option<Block>,
+    pub block: Option<SlotState>,
     /// The PE order: page groups vary fastest, then the b axis's groups,
     /// then the a axis's, then the lane groups; `a_first` swaps the two
     /// block axes, so a merge over page groups and the a axis (attention's
@@ -362,18 +362,28 @@ pub struct LanesAt {
     pub planes: Vec<u64>,
 }
 
-/// One phase: its function, the PEs it runs on, and how each buffer it
-/// names is spread over them (unlisted buffers are whole on every PE); or
-/// a host phase, run by the host over its copies of the buffers.
+/// One phase: its name and the kernel calls it makes, the PEs it runs on,
+/// and how each buffer it names is spread over them (unlisted buffers are
+/// whole on every PE); or a host phase, run by the host over its copies of
+/// the buffers.
 #[derive(Debug, Clone)]
 pub struct Phase {
-    pub func: Func,
+    pub name: String,
+    pub body: Vec<Statement>,
     pub pes: u32,
     pub shards: Vec<(String, Shard)>,
     pub lane: Option<LanePhase>,
     pub host: Option<HostPhase>,
     /// A sum the fabric takes after the function runs.
     pub reduce: Option<FabricReduce>,
+}
+
+/// One statement of a phase: a kernel call, or raw CSL lines (only the
+/// device probes of CSL's own semantics write them).
+#[derive(Debug, Clone)]
+pub enum Statement {
+    Call(Call),
+    Raw(crate::csl::Block),
 }
 
 /// A phase whose PEs combine their results over the fabric after the

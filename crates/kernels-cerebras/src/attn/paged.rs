@@ -23,7 +23,7 @@ use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    BankSplit, Block, ColPlane, LaneKind, Lanes, PageSource, Paged, Reduce, Segment,
+    BankSplit, ColPlane, LaneKind, Lanes, PageSource, Paged, Reduce, Segment, SlotState,
 };
 use crate::plan::{LSE_GROUPS, Merge, PageSplit, PagedLanes, Pages};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
@@ -540,7 +540,7 @@ fn attend(
                             (kb.name.clone(), ps * kb.width / per, BankSplit::Block),
                             (vb.name.clone(), ps * vb.width / per, BankSplit::Block),
                         ],
-                        block: Some(Block {
+                        block: Some(SlotState {
                             a: ps,
                             b: kv_heads,
                             w: d / per,
@@ -1008,7 +1008,7 @@ fn append(
                         cols.push(plane(&vb));
                     }
                     (
-                        Some(Block {
+                        Some(SlotState {
                             a: ps,
                             b: w / per,
                             w: 1,

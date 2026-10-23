@@ -13,7 +13,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{BankSplit, Block, ColPlane, LaneKind, Lanes, Reduce, Segment};
+use crate::phase::{BankSplit, ColPlane, LaneKind, Lanes, Reduce, Segment, SlotState};
 use crate::plan::{Held, Routed};
 use crate::tensor::Tensor;
 
@@ -195,7 +195,7 @@ pub fn correct(
             kind: LaneKind::PerRow { lanes: rows },
             slots: rb.name.clone(),
             banks: vec![(ab.name.clone(), bank_a.width, BankSplit::Block)],
-            block: Some(Block {
+            block: Some(SlotState {
                 a: rank,
                 b: in_width,
                 w: 1,
@@ -257,7 +257,7 @@ pub fn correct(
             kind: LaneKind::PerRow { lanes: rows },
             slots: rb.name.clone(),
             banks: vec![(bb.name.clone(), bank_b.width, BankSplit::Block)],
-            block: Some(Block {
+            block: Some(SlotState {
                 a: out_width,
                 b: rank,
                 w: 1,

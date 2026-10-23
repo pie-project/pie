@@ -7,12 +7,12 @@
 
 use dtype::Dtype;
 
-use crate::csl::{Block, Dsd1, Func};
+use crate::csl::{Block, Call, Dsd1};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
     Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePhase, Lanes, LanesAt,
-    Phase, Reduce, Shard, Sink,
+    Phase, Reduce, Shard, Sink, Statement,
 };
 use crate::plan::{LaneSplit, Plan};
 use crate::tensor::Tensor;
@@ -48,7 +48,8 @@ pub struct View {
 /// An entry emits kernel calls ([`Cx::call`]); the phase is its call list.
 pub struct Cx<'a> {
     p: &'a mut dyn Sink,
-    phase: Func,
+    name: String,
+    body: Vec<Statement>,
     rounds: Vec<Buf>,
     /// Row windows this phase names, by handle: exported view buffers the
     /// host cuts from their roots and pastes back.
@@ -70,7 +71,8 @@ impl<'a> Cx<'a> {
         let name = p.unique(&format!("phase_{}", op.replace('.', "_")));
         Self {
             p,
-            phase: Func::new(name),
+            name,
+            body: Vec::new(),
             rounds: Vec::new(),
             windows: Vec::new(),
             pes: 1,
@@ -321,14 +323,20 @@ impl<'a> Cx<'a> {
     /// units it calls into) join the program.
     pub fn call(&mut self, kernel: Kernel, args: Vec<crate::csl::Arg>) {
         self.unit(kernel);
-        self.phase.body.call(crate::csl::Call { kernel, args });
+        self.body.push(Statement::Call(Call { kernel, args }));
     }
 
     /// Raw CSL statements in this phase, for the device probes of CSL's own
     /// semantics; no entry writes them, and a table-driven program refuses
     /// a phase that has them.
     pub fn statements(&mut self) -> &mut Block {
-        &mut self.phase.body
+        if !matches!(self.body.last(), Some(Statement::Raw(_))) {
+            self.body.push(Statement::Raw(Block::new(1)));
+        }
+        match self.body.last_mut() {
+            Some(Statement::Raw(b)) => b,
+            _ => unreachable!("a raw block was just pushed"),
+        }
     }
 
     /// Declares `kernel`'s unit and the units it calls into, once each; the
@@ -382,9 +390,9 @@ impl<'a> Cx<'a> {
                 .into_iter()
                 .map(|b| b.name)
                 .collect();
-            let phase = std::mem::replace(&mut self.phase, Func::new("closed"));
             self.p.phase(Phase {
-                func: phase,
+                name: std::mem::take(&mut self.name),
+                body: Vec::new(),
                 pes: 1,
                 shards: Vec::new(),
                 lane: None,
@@ -426,20 +434,20 @@ impl<'a> Cx<'a> {
                 continue;
             }
             let n = self.local_len(&b);
-            self.phase.body.call(crate::csl::Call {
+            self.body.push(Statement::Call(Call {
                 kernel: Kernel::RoundBf16,
                 args: vec![
                     crate::csl::Arg::Ptr(b.clone()),
                     crate::csl::Arg::Int(n as i64),
                 ],
-            });
+            }));
         }
-        let phase = std::mem::replace(&mut self.phase, Func::new("closed"));
         let shards = std::mem::take(&mut self.shards);
         let lane = self.lane.take();
         let reduce = self.reduce.take();
         self.p.phase(Phase {
-            func: phase,
+            name: std::mem::take(&mut self.name),
+            body: std::mem::take(&mut self.body),
             pes: self.pes,
             shards,
             lane,

@@ -18,7 +18,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Block, ColPlane, LaneKind, Lanes, Reduce, Segment};
+use crate::phase::{ColPlane, LaneKind, Lanes, Reduce, Segment, SlotState};
 use crate::plan::{BlockSplit, Blocks, Merge};
 use crate::tensor::Tensor;
 
@@ -200,7 +200,7 @@ pub fn bidirectional(
                 },
                 slots: String::new(),
                 banks: Vec::new(),
-                block: Some(Block {
+                block: Some(SlotState {
                     a: keys,
                     b: kvh,
                     w: d,

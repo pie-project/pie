@@ -10,7 +10,9 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{BankSplit, Block, ColPlane, HostOp, LaneKind, Lanes, Reduce, Segment, Shard};
+use crate::phase::{
+    BankSplit, ColPlane, HostOp, LaneKind, Lanes, Reduce, Segment, Shard, SlotState,
+};
 use crate::plan::{Footprint, Held, Routed};
 use crate::tensor::Tensor;
 
@@ -406,7 +408,7 @@ fn select_impl(
             kind: LaneKind::PerRow { lanes },
             slots: rb.name.clone(),
             banks: vec![(bb.name.clone(), stride, BankSplit::Block)],
-            block: Some(Block { a: n, b: k, w: 1 }),
+            block: Some(SlotState { a: n, b: k, w: 1 }),
             a_first: false,
             row_outputs: Vec::new(),
             cols: vec![

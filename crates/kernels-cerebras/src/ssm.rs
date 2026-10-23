@@ -17,7 +17,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{BankSplit, Block, ColPlane, LaneKind, Lanes, Segment};
+use crate::phase::{BankSplit, ColPlane, LaneKind, Lanes, Segment, SlotState};
 use crate::plan::{LaneSplit, Slots};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
@@ -168,7 +168,7 @@ fn conv(
             &sb,
             &bank,
             stride,
-            Block {
+            SlotState {
                 a: hist,
                 b: c,
                 w: 1,
@@ -216,7 +216,7 @@ fn lane_range(
     slots: &crate::phase::Buf,
     bank: &crate::phase::Buf,
     stride: u32,
-    block: Block,
+    block: SlotState,
     rows_out: Option<(&crate::phase::Buf, u32, u32)>,
     cols: Vec<ColPlane>,
     slots_rows: u32,
@@ -551,7 +551,7 @@ fn delta(
             &sb,
             &bank,
             stride,
-            Block {
+            SlotState {
                 a: hv,
                 b: dv,
                 w: dk,
