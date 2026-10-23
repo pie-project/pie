@@ -183,14 +183,15 @@ impl Run<'_> {
                 top_k,
                 routes,
                 weights,
-            } => linear::moe::topk_softmax(
-                self.ctx(),
-                self.tensor(*logits),
+            } => kernels_slang::linear::moe::route::topk_softmax(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*logits)),
                 *experts,
                 *top_k,
-                self.tensor(*routes),
-                self.tensor(*weights),
-            ),
+                crate::encode::slang_tensor(self.tensor(*routes)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+            )
+            .map_err(crate::encode::from_slang),
             Linear::MoeTopkSoftmaxScaled {
                 logits,
                 scale,
@@ -198,15 +199,16 @@ impl Run<'_> {
                 top_k,
                 routes,
                 weights,
-            } => linear::moe::topk_softmax_scaled(
-                self.ctx(),
-                self.tensor(*logits),
-                self.tensor(*scale),
+            } => kernels_slang::linear::moe::route::topk_softmax_scaled(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*logits)),
+                crate::encode::slang_tensor(self.tensor(*scale)),
                 *experts,
                 *top_k,
-                self.tensor(*routes),
-                self.tensor(*weights),
-            ),
+                crate::encode::slang_tensor(self.tensor(*routes)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Linear::MoeTopkSigmoid {
                 logits,
@@ -219,27 +221,29 @@ impl Run<'_> {
                 weights,
                 hint: _,
             } => match bias {
-                Some(bias) => linear::moe::topk_sigmoid_biased(
-                    self.ctx(),
-                    self.tensor(*logits),
-                    self.tensor(*bias),
+                Some(bias) => kernels_slang::linear::moe::route::topk_sigmoid_biased(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*logits)),
+                    crate::encode::slang_tensor(self.tensor(*bias)),
                     *experts,
                     *top_k,
                     *renormalize,
                     *scaling,
-                    self.tensor(*routes),
-                    self.tensor(*weights),
-                ),
-                None => linear::moe::topk_sigmoid(
-                    self.ctx(),
-                    self.tensor(*logits),
+                    crate::encode::slang_tensor(self.tensor(*routes)),
+                    crate::encode::slang_tensor(self.tensor(*weights)),
+                )
+                .map_err(crate::encode::from_slang),
+                None => kernels_slang::linear::moe::route::topk_sigmoid(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*logits)),
                     *experts,
                     *top_k,
                     *renormalize,
                     *scaling,
-                    self.tensor(*routes),
-                    self.tensor(*weights),
-                ),
+                    crate::encode::slang_tensor(self.tensor(*routes)),
+                    crate::encode::slang_tensor(self.tensor(*weights)),
+                )
+                .map_err(crate::encode::from_slang),
             },
             Linear::MoePredictRoute {
                 logits,
@@ -248,15 +252,16 @@ impl Run<'_> {
                 top_k,
                 routes,
                 weights,
-            } => linear::moe::predict_route(
-                self.ctx(),
-                self.tensor(*logits),
-                self.tensor(*bias),
+            } => kernels_slang::linear::moe::route::predict_route(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*logits)),
+                crate::encode::slang_tensor(self.tensor(*bias)),
                 *experts,
                 *top_k,
-                self.tensor(*routes),
-                self.tensor(*weights),
-            ),
+                crate::encode::slang_tensor(self.tensor(*routes)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Linear::MoeTopkSqrtSoftplus {
                 logits,
@@ -268,17 +273,18 @@ impl Run<'_> {
                 hint: _,
                 routes,
                 weights,
-            } => linear::moe::topk_sqrt_softplus(
-                self.ctx(),
-                self.tensor(*logits),
-                self.tensor(*bias),
+            } => kernels_slang::linear::moe::route::topk_sqrt_softplus(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*logits)),
+                crate::encode::slang_tensor(self.tensor(*bias)),
                 *experts,
                 *top_k,
                 *renormalize,
                 *scaling,
-                self.tensor(*routes),
-                self.tensor(*weights),
-            ),
+                crate::encode::slang_tensor(self.tensor(*routes)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Linear::MoeHashRoute {
                 ids,
@@ -291,20 +297,26 @@ impl Run<'_> {
                 scaling,
                 routes,
                 weights,
-            } => linear::moe::hash_route(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*tid2eid),
-                self.tensor(*logits),
+            } => kernels_slang::linear::moe::route::hash_route(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*ids)),
+                crate::encode::slang_tensor(self.tensor(*tid2eid)),
+                crate::encode::slang_tensor(self.tensor(*logits)),
                 *vocab,
                 *top_k,
                 *renormalize,
                 *scaling,
-                self.tensor(*routes),
-                self.tensor(*weights),
-            ),
+                crate::encode::slang_tensor(self.tensor(*routes)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+            )
+            .map_err(crate::encode::from_slang),
             Linear::GroupRoutes { groups, routes } => {
-                linear::moe::group_routes(self.ctx(), *groups, self.tensor(*routes))
+                kernels_slang::linear::moe::route::group_routes(
+                    &self.slang(),
+                    *groups,
+                    crate::encode::slang_tensor(self.tensor(*routes)),
+                )
+                .map_err(crate::encode::from_slang)
             }
 
             Linear::MatmulGrouped {
@@ -432,12 +444,15 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
-                self.ctx(),
-                self.tensor(*routed),
-                self.tensor(*weights),
-                self.tensor(*y),
-            ),
+            Linear::MoeWeightedSum { routed, weights, y } => {
+                kernels_slang::linear::moe::combine::weighted_sum(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*routed)),
+                    crate::encode::slang_tensor(self.tensor(*weights)),
+                    crate::encode::slang_tensor(self.tensor(*y)),
+                )
+                .map_err(crate::encode::from_slang)
+            }
 
             Linear::MoeBiasSum {
                 x,
@@ -453,27 +468,29 @@ impl Run<'_> {
                         }
                         None => (self.tensor(*bias), self.tensor(*routes)),
                     };
-                linear::moe::bias_sum(
-                    self.ctx(),
-                    self.tensor(*x),
-                    bias_plane,
-                    routed,
-                    self.tensor(*weights),
-                    self.tensor(*y),
+                kernels_slang::linear::moe::combine::bias_sum(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                    crate::encode::slang_tensor(bias_plane),
+                    crate::encode::slang_tensor(routed),
+                    crate::encode::slang_tensor(self.tensor(*weights)),
+                    crate::encode::slang_tensor(self.tensor(*y)),
                 )
+                .map_err(crate::encode::from_slang)
             }
             Linear::MoeSigmoidGateAdd {
                 routed,
                 shared,
                 gate,
                 y,
-            } => linear::moe::sigmoid_gate_add(
-                self.ctx(),
-                self.tensor(*routed),
-                self.tensor(*shared),
-                self.tensor(*gate),
-                self.tensor(*y),
-            ),
+            } => kernels_slang::linear::moe::combine::sigmoid_gate_add(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*routed)),
+                crate::encode::slang_tensor(self.tensor(*shared)),
+                crate::encode::slang_tensor(self.tensor(*gate)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
         }
     }
 }

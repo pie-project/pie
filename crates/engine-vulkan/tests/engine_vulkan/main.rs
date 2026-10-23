@@ -20,5 +20,6 @@ mod the_pointwise_kernels_answer_the_reference;
 mod the_ropes_answer_the_reference;
 mod the_row_movers_answer_the_reference;
 
+mod moe_routing_answers_the_reference;
 mod sdpa_speed;
 mod the_glus_answer_the_reference;
