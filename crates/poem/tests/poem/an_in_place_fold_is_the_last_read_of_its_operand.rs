@@ -2,7 +2,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Stream, Value, Weight, ops, seam,
     trace_hybrid,
 };
-use poem_ir::{Elementwise, Operands, Operation, Trace, ValueId};
+use poem_ir::{Elemwise, Operands, Operation, Trace, ValueId};
 
 const WIDTH: u32 = 64;
 const BLOCKS: usize = 3;
@@ -83,14 +83,14 @@ fn an_in_place_fold_is_the_last_read_of_its_operand_every_case() {
 fn a_table_folded_onto_the_vector_the_stack_shares_is_refused() {
     let message = refusal(&Stack { copy: false });
     assert!(
-        message.contains("elementwise.add_bias"),
+        message.contains("elemwise.add_bias"),
         "a stack that folded three tables into one shared vector traced: {message:?}"
     );
     assert!(
         message.contains("overwrites") && message.contains("reads it afterwards"),
         "{message}"
     );
-    let named = message.matches("elementwise.add_bias").count();
+    let named = message.matches("elemwise.add_bias").count();
     assert!(named >= 2, "{named} folds named in:\n{message}");
 }
 
@@ -99,7 +99,7 @@ fn the_same_stack_folding_onto_a_copy_traces() {
     let folds = plan
         .nodes
         .iter()
-        .filter(|n| matches!(&n.op, Operation::Elementwise(Elementwise::AddBias { .. })))
+        .filter(|n| matches!(&n.op, Operation::Elemwise(Elemwise::AddBias { .. })))
         .count();
     assert_eq!(folds, BLOCKS, "one fold a block");
     let mut pairs = Vec::new();
@@ -121,7 +121,15 @@ fn the_same_stack_folding_onto_a_copy_traces() {
     let adds = plan
         .nodes
         .iter()
-        .filter(|n| matches!(&n.op, Operation::Elementwise(Elementwise::Add { .. })))
+        .filter(|n| {
+            matches!(
+                &n.op,
+                Operation::Elemwise(Elemwise::Binary {
+                    op: poem_ir::BinaryOp::Add,
+                    ..
+                })
+            )
+        })
         .count();
     assert_eq!(adds, BLOCKS, "one copy a block");
 }
@@ -137,7 +145,7 @@ fn two_arms_of_one_split_fold_one_rectangle_on_disjoint_rows() {
         .nodes
         .iter()
         .filter_map(|n| match &n.op {
-            Operation::Elementwise(Elementwise::AddBias { out, .. }) => Some(*out),
+            Operation::Elemwise(Elemwise::AddBias { out, .. }) => Some(*out),
             _ => None,
         })
         .collect();

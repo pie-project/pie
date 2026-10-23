@@ -1,14 +1,15 @@
 //! Hyper-connections: `M` residual streams of width `H` ride one
-//! `[rows, M·H]` row. Reference: kernels-wgpu `elemwise/hc_*.wgsl`
+//! `[rows, M·H]` row. Reference: kernels-slang `elemwise/hc.slang`
 //! (Metal and CUDA compute the same).
 #![allow(clippy::too_many_arguments)]
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
+use crate::hlo::Func;
 use crate::hlo::{Elem, Fold, Val};
-use crate::tensor::Tensor;
+use crate::tensor::{Landing, Operand};
 
 const MAX_HC_MULT: u32 = 8;
 
@@ -42,61 +43,57 @@ fn stated_fan(op: &'static str, fan: u32, streams: u32) -> Result<(), Error> {
 }
 
 /// A `[rows, M·H]` handle read as f32 `[rows, M, H]`.
-fn streams3(cx: &mut Cx<'_>, t: Tensor, m: u32) -> Result<Val, Error> {
-    let v = cx.read_f32(t)?;
-    Ok(cx.reshape(
+fn streams3(f: &mut Func, t: Operand, m: u32) -> Result<Val, Error> {
+    let v = t.f32(f);
+    Ok(f.reshape(
         v,
         &[i64::from(t.rows), i64::from(m), i64::from(t.width / m)],
     )?)
 }
 
 /// A flat f32 plane's first `n` values as `[n]`.
-fn flat(cx: &mut Cx<'_>, t: Tensor, n: i64) -> Result<Val, Error> {
-    let v = cx.read_f32(t)?;
-    let all = cx.ty(v).elements();
-    let v = cx.reshape(v, &[all])?;
-    Ok(cx.slice(v, &[0], &[n], &[1])?)
+fn flat(f: &mut Func, t: Operand, n: i64) -> Result<Val, Error> {
+    let v = t.f32(f);
+    let all = f.ty(v).elements();
+    let v = f.reshape(v, &[all])?;
+    Ok(f.slice(v, &[0], &[n], &[1])?)
 }
 
 /// `y[n, s·H + h] = x[n, h]` for each of `streams` streams.
-pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_expand";
+pub fn expand(f: &mut Func, x: Operand, streams: u32, y: Landing) -> Result<Val, Error> {
+    const OP: &str = "elemwise.hc_expand";
     let fan = stream_fan(OP, y.width, x.width)?;
     stated_fan(OP, fan, streams)?;
     if y.rows != x.rows {
         return Err(refuse(OP, "the expansion lands one wide row per row"));
     }
-    ctx.emit(&mut |cx| {
-        let v = cx.read(x)?;
-        let (r, h) = (i64::from(x.rows), i64::from(x.width));
-        let v = cx.broadcast(v, &[r, i64::from(fan), h], &[0, 2])?;
-        cx.write(y, v)
-    })
+    let v = x.val;
+    let (r, h) = (i64::from(x.rows), i64::from(x.width));
+    let v = f.broadcast(v, &[r, i64::from(fan), h], &[0, 2])?;
+    Ok(v)
 }
 
 /// `y = x / rms(x)` over each whole row, widened to f32.
-pub fn rmsnorm_f32(ctx: &Ctx<'_>, streams: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_rmsnorm_f32";
+pub fn rmsnorm_f32(f: &mut Func, streams: Operand, eps: f32, y: Landing) -> Result<Val, Error> {
+    const OP: &str = "elemwise.hc_rmsnorm_f32";
     expect(OP, y, &[Dtype::F32])?;
     if y.rows != streams.rows || y.width != streams.width {
         return Err(refuse(OP, "the normed rectangle is the stream rectangle"));
     }
-    ctx.emit(&mut |cx| {
-        let v = cx.read_f32(streams)?;
-        let n = super::norm::inv_rms_rows(cx, OP, v, streams.width, eps)?;
-        cx.write(y, n)
-    })
+    let v = streams.f32(f);
+    let n = super::norm::inv_rms_rows(f, OP, v, streams.width, eps)?;
+    Ok(n)
 }
 
 /// `mixes[n, o] = Σ_d normed[n, d] · hc_fn[o, d]`, all f32.
 pub fn project(
-    ctx: &Ctx<'_>,
-    normed: Tensor,
-    hc_fn: Tensor,
+    f: &mut Func,
+    normed: Operand,
+    hc_fn: Operand,
     stream_count: u32,
-    mixes: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_project";
+    mixes: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.hc_project";
     expect(OP, mixes, &[Dtype::F32])?;
     if hc_fn.width != normed.width || normed.width == 0 {
         return Err(refuse(
@@ -125,31 +122,30 @@ pub fn project(
             ),
         ));
     }
-    ctx.emit(&mut |cx| {
-        let a = cx.read_f32(normed)?;
-        let w = cx.read_f32(hc_fn)?;
-        let m = cx.matmul_nt(a, w, Elem::F32)?;
-        cx.write(mixes, m)
-    })
+    let a = normed.f32(f);
+    let w = hc_fn.f32(f);
+    let m = f.matmul_nt(a, w, Elem::F32)?;
+    Ok(m)
 }
 
 /// Pre gates weight the streams into the layer input `x`; post gates and a
-/// Sinkhorn-normalized `M × M` comb matrix land for [`fold`].
+/// Sinkhorn-normalized `M × M` comb matrix land for [`fold`]. Returns
+/// `(post_mix, comb_mix, x)`, the order they land in.
 pub fn gates(
-    ctx: &Ctx<'_>,
-    normed: Tensor,
-    streams: Tensor,
-    scale: Tensor,
-    base: Tensor,
+    f: &mut Func,
+    normed: Operand,
+    streams: Operand,
+    scale: Operand,
+    base: Operand,
     stream_count: u32,
     gate_eps: f32,
     alpha: f32,
     sinkhorn: u32,
-    x: Tensor,
-    post_mix: Tensor,
-    comb_mix: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_gates";
+    x: Landing,
+    post_mix: Landing,
+    comb_mix: Landing,
+) -> Result<(Val, Val, Val), Error> {
+    const OP: &str = "elemwise.hc_gates";
     expect(OP, streams, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, streams.width, x.width)?;
     stated_fan(OP, fan, stream_count)?;
@@ -168,64 +164,60 @@ pub fn gates(
     }
     let rows = i64::from(x.rows);
     let h = i64::from(x.width);
-    ctx.emit(&mut |cx| {
-        let mix = cx.read_f32(normed)?;
-        let sc = flat(cx, scale, 3)?;
-        let bs = flat(cx, base, mix_hc)?;
-        let part = |cx: &mut Cx<'_>, lo: i64, n: i64, k: i64| -> Result<Val, Error> {
-            let v = cx.slice_axis(mix, 1, lo, lo + n)?;
-            let s = cx.slice(sc, &[k], &[k + 1], &[1])?;
-            let s = cx.reshape(s, &[])?;
-            let s = cx.splat(s, &[rows, n])?;
-            let b = cx.slice(bs, &[lo], &[lo + n], &[1])?;
-            let b = cx.broadcast(b, &[rows, n], &[1])?;
-            let v = cx.mul(v, s)?;
-            Ok(cx.add(v, b)?)
-        };
-        let pre = part(cx, 0, m, 0)?;
-        let pre = cx.sigmoid(pre);
-        let pre = cx.offset(pre, f64::from(gate_eps))?;
-        let post = part(cx, m, m, 1)?;
-        let post = cx.sigmoid(post);
-        let post = cx.scale(post, f64::from(alpha))?;
-        cx.write(post_mix, post)?;
+    let mix = normed.f32(f);
+    let sc = flat(f, scale, 3)?;
+    let bs = flat(f, base, mix_hc)?;
+    let part = |f: &mut Func, lo: i64, n: i64, k: i64| -> Result<Val, Error> {
+        let v = f.slice_axis(mix, 1, lo, lo + n)?;
+        let s = f.slice(sc, &[k], &[k + 1], &[1])?;
+        let s = f.reshape(s, &[])?;
+        let s = f.splat(s, &[rows, n])?;
+        let b = f.slice(bs, &[lo], &[lo + n], &[1])?;
+        let b = f.broadcast(b, &[rows, n], &[1])?;
+        let v = f.mul(v, s)?;
+        Ok(f.add(v, b)?)
+    };
+    let pre = part(f, 0, m, 0)?;
+    let pre = f.sigmoid(pre);
+    let pre = f.offset(pre, f64::from(gate_eps))?;
+    let post = part(f, m, m, 1)?;
+    let post = f.sigmoid(post);
+    let post = f.scale(post, f64::from(alpha))?;
 
-        let comb = part(cx, 2 * m, m * m, 2)?;
-        let comb = cx.reshape(comb, &[rows, m, m])?;
-        let comb = cx.softmax(comb, 2)?;
-        let mut comb = cx.offset(comb, f64::from(gate_eps))?;
-        let norm = |cx: &mut Cx<'_>, c: Val, axis: i64| -> Result<Val, Error> {
-            let s = cx.reduce(c, &[axis], Fold::Sum)?;
-            let s = cx.offset(s, f64::from(gate_eps))?;
-            let keep = if axis == 2 { [0, 1] } else { [0, 2] };
-            let s = cx.broadcast(s, &[rows, m, m], &keep)?;
-            Ok(cx.div(c, s)?)
-        };
-        comb = norm(cx, comb, 1)?;
-        for _ in 1..sinkhorn.max(1) {
-            comb = norm(cx, comb, 2)?;
-            comb = norm(cx, comb, 1)?;
-        }
-        cx.write(comb_mix, comb)?;
+    let comb = part(f, 2 * m, m * m, 2)?;
+    let comb = f.reshape(comb, &[rows, m, m])?;
+    let comb = f.softmax(comb, 2)?;
+    let mut comb = f.offset(comb, f64::from(gate_eps))?;
+    let norm = |f: &mut Func, c: Val, axis: i64| -> Result<Val, Error> {
+        let s = f.reduce(c, &[axis], Fold::Sum)?;
+        let s = f.offset(s, f64::from(gate_eps))?;
+        let keep = if axis == 2 { [0, 1] } else { [0, 2] };
+        let s = f.broadcast(s, &[rows, m, m], &keep)?;
+        Ok(f.div(c, s)?)
+    };
+    comb = norm(f, comb, 1)?;
+    for _ in 1..sinkhorn.max(1) {
+        comb = norm(f, comb, 2)?;
+        comb = norm(f, comb, 1)?;
+    }
 
-        let r = streams3(cx, streams, fan)?;
-        let p = cx.broadcast(pre, &[rows, m, h], &[0, 1])?;
-        let w = cx.mul(r, p)?;
-        let li = cx.reduce(w, &[1], Fold::Sum)?;
-        cx.write(x, li)
-    })
+    let r = streams3(f, streams, fan)?;
+    let p = f.broadcast(pre, &[rows, m, h], &[0, 1])?;
+    let w = f.mul(r, p)?;
+    let li = f.reduce(w, &[1], Fold::Sum)?;
+    Ok((post, comb, li))
 }
 
 /// `y[n, j, h] = post[n, j] · x[n, h] + Σ_i comb[n, i, j] · streams[n, i, h]`.
 pub fn fold(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    streams: Tensor,
-    post_mix: Tensor,
-    comb_mix: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_fold";
+    f: &mut Func,
+    x: Operand,
+    streams: Operand,
+    post_mix: Operand,
+    comb_mix: Operand,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.hc_fold";
     expect(OP, y, &[Dtype::Bf16])?;
     if y.rows != streams.rows || y.width != streams.width {
         return Err(refuse(OP, "the fold lands the stream rectangle it mixes"));
@@ -235,34 +227,32 @@ pub fn fold(
         return Err(refuse(OP, "the gate matrices are [N, M] and [N, M, M]"));
     }
     let (rows, m, h) = (i64::from(y.rows), i64::from(fan), i64::from(x.width));
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let r = streams3(cx, streams, fan)?;
-        let post = cx.read_f32(post_mix)?;
-        let comb = cx.read_f32(comb_mix)?;
-        let comb = cx.reshape(comb, &[rows, m, m])?;
-        // [rows, i, j] · [rows, i, h] over i → [rows, j, h].
-        let mixed = cx.dot_general(comb, r, &[0], &[0], &[1], &[1], Elem::F32)?;
-        let px = cx.broadcast(post, &[rows, m, h], &[0, 1])?;
-        let xb = cx.broadcast(xv, &[rows, m, h], &[0, 2])?;
-        let px = cx.mul(px, xb)?;
-        let out = cx.add(px, mixed)?;
-        cx.write(y, out)
-    })
+    let xv = x.f32(f);
+    let r = streams3(f, streams, fan)?;
+    let post = post_mix.f32(f);
+    let comb = comb_mix.f32(f);
+    let comb = f.reshape(comb, &[rows, m, m])?;
+    // [rows, i, j] · [rows, i, h] over i → [rows, j, h].
+    let mixed = f.dot_general(comb, r, &[0], &[0], &[1], &[1], Elem::F32)?;
+    let px = f.broadcast(post, &[rows, m, h], &[0, 1])?;
+    let xb = f.broadcast(xv, &[rows, m, h], &[0, 2])?;
+    let px = f.mul(px, xb)?;
+    let out = f.add(px, mixed)?;
+    Ok(out)
 }
 
 /// `y[n, h] = Σ_i (σ(mixes[n, i]·scale[0] + base[i]) + eps) · streams[n, i, h]`.
 pub fn collapse(
-    ctx: &Ctx<'_>,
-    mixes: Tensor,
-    streams: Tensor,
-    scale: Tensor,
-    base: Tensor,
+    f: &mut Func,
+    mixes: Operand,
+    streams: Operand,
+    scale: Operand,
+    base: Operand,
     stream_count: u32,
     hc_eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_collapse";
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.hc_collapse";
     expect(OP, streams, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, streams.width, y.width)?;
     stated_fan(OP, fan, stream_count)?;
@@ -276,34 +266,32 @@ pub fn collapse(
         ));
     }
     let (rows, m, h) = (i64::from(y.rows), i64::from(fan), i64::from(y.width));
-    ctx.emit(&mut |cx| {
-        let mix = cx.read_f32(mixes)?;
-        let s = flat(cx, scale, 1)?;
-        let s = cx.reshape(s, &[])?;
-        let s = cx.splat(s, &[rows, m])?;
-        let b = flat(cx, base, m)?;
-        let b = cx.broadcast(b, &[rows, m], &[1])?;
-        let l = cx.mul(mix, s)?;
-        let l = cx.add(l, b)?;
-        let g = cx.sigmoid(l);
-        let g = cx.offset(g, f64::from(hc_eps))?;
-        let r = streams3(cx, streams, fan)?;
-        let g = cx.broadcast(g, &[rows, m, h], &[0, 1])?;
-        let w = cx.mul(r, g)?;
-        let out = cx.reduce(w, &[1], Fold::Sum)?;
-        cx.write(y, out)
-    })
+    let mix = mixes.f32(f);
+    let s = flat(f, scale, 1)?;
+    let s = f.reshape(s, &[])?;
+    let s = f.splat(s, &[rows, m])?;
+    let b = flat(f, base, m)?;
+    let b = f.broadcast(b, &[rows, m], &[1])?;
+    let l = f.mul(mix, s)?;
+    let l = f.add(l, b)?;
+    let g = f.sigmoid(l);
+    let g = f.offset(g, f64::from(hc_eps))?;
+    let r = streams3(f, streams, fan)?;
+    let g = f.broadcast(g, &[rows, m, h], &[0, 1])?;
+    let w = f.mul(r, g)?;
+    let out = f.reduce(w, &[1], Fold::Sum)?;
+    Ok(out)
 }
 
 /// `y[n, h] = (1/M) Σ_s normed[n, s, h] · σ(gates[n, s, h])`.
 pub fn mix(
-    ctx: &Ctx<'_>,
-    gates: Tensor,
-    normed: Tensor,
+    f: &mut Func,
+    gates: Operand,
+    normed: Operand,
     streams: u32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_mix";
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.hc_mix";
     expect(OP, y, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, normed.width, y.width)?;
     stated_fan(OP, fan, streams)?;
@@ -313,26 +301,24 @@ pub fn mix(
             "the gates ride the normed rectangle element for element",
         ));
     }
-    ctx.emit(&mut |cx| {
-        let g = streams3(cx, gates, fan)?;
-        let v = streams3(cx, normed, fan)?;
-        let g = cx.sigmoid(g);
-        let w = cx.mul(v, g)?;
-        let s = cx.reduce(w, &[1], Fold::Sum)?;
-        let s = cx.scale(s, 1.0 / f64::from(fan))?;
-        cx.write(y, s)
-    })
+    let g = streams3(f, gates, fan)?;
+    let v = streams3(f, normed, fan)?;
+    let g = f.sigmoid(g);
+    let w = f.mul(v, g)?;
+    let s = f.reduce(w, &[1], Fold::Sum)?;
+    let s = f.scale(s, 1.0 / f64::from(fan))?;
+    Ok(s)
 }
 
 /// `hyper[n, s, h] += 2σ(gates[n, s] / M) · o[n, h]`.
 pub fn inject(
-    ctx: &Ctx<'_>,
-    o: Tensor,
-    gates: Tensor,
+    f: &mut Func,
+    o: Operand,
+    gates: Operand,
     streams: u32,
-    hyper: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_inject";
+    hyper: Operand,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.hc_inject";
     expect(OP, hyper, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, hyper.width, o.width)?;
     stated_fan(OP, fan, streams)?;
@@ -343,33 +329,31 @@ pub fn inject(
         ));
     }
     let (rows, m, h) = (i64::from(hyper.rows), i64::from(fan), i64::from(o.width));
-    ctx.emit(&mut |cx| {
-        let g = cx.read_f32(gates)?;
-        let g = cx.slice_axis(g, 0, 0, rows)?;
-        let g = cx.scale(g, 1.0 / f64::from(fan))?;
-        let g = cx.sigmoid(g);
-        let g = cx.scale(g, 2.0)?;
-        let g = cx.broadcast(g, &[rows, m, h], &[0, 1])?;
-        let ov = cx.read_f32(o)?;
-        let ov = cx.broadcast(ov, &[rows, m, h], &[0, 2])?;
-        let add = cx.mul(g, ov)?;
-        let hv = streams3(cx, hyper, fan)?;
-        let out = cx.add(hv, add)?;
-        cx.write(hyper, out)
-    })
+    let g = gates.f32(f);
+    let g = f.slice_axis(g, 0, 0, rows)?;
+    let g = f.scale(g, 1.0 / f64::from(fan))?;
+    let g = f.sigmoid(g);
+    let g = f.scale(g, 2.0)?;
+    let g = f.broadcast(g, &[rows, m, h], &[0, 1])?;
+    let ov = o.f32(f);
+    let ov = f.broadcast(ov, &[rows, m, h], &[0, 2])?;
+    let add = f.mul(g, ov)?;
+    let hv = streams3(f, hyper, fan)?;
+    let out = f.add(hv, add)?;
+    Ok(out)
 }
 
 /// Per stream, `gate = σ(sign(d)·√max(|d|, 1e-6))` for `d = key·query / √H`
 /// (`d = 0` gates by σ(0)); `y[n, s, h] = gate · value[n, h]`.
 pub fn ple_gate(
-    ctx: &Ctx<'_>,
-    key: Tensor,
-    query: Tensor,
-    value: Tensor,
+    f: &mut Func,
+    key: Operand,
+    query: Operand,
+    value: Operand,
     streams: u32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.ple_gate";
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.ple_gate";
     expect(OP, y, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, y.width, value.width)?;
     stated_fan(OP, fan, streams)?;
@@ -380,25 +364,23 @@ pub fn ple_gate(
         ));
     }
     let (rows, m, h) = (i64::from(y.rows), i64::from(fan), i64::from(value.width));
-    ctx.emit(&mut |cx| {
-        let k = streams3(cx, key, fan)?;
-        let q = streams3(cx, query, fan)?;
-        let kq = cx.mul(k, q)?;
-        let d = cx.reduce(kq, &[2], Fold::Sum)?;
-        let isq = cx.const_f(Elem::F32, 1.0 / (h as f64).sqrt(), &[]);
-        let isq = cx.splat(isq, &[rows, m])?;
-        let d = cx.mul(d, isq)?;
-        let a = cx.abs(d);
-        let floor = cx.like_f(a, 1e-6);
-        let a = cx.max(a, floor)?;
-        let mag = cx.sqrt(a);
-        let sg = cx.sign(d);
-        let damped = cx.mul(sg, mag)?;
-        let gate = cx.sigmoid(damped);
-        let gate = cx.broadcast(gate, &[rows, m, h], &[0, 1])?;
-        let v = cx.read_f32(value)?;
-        let v = cx.broadcast(v, &[rows, m, h], &[0, 2])?;
-        let out = cx.mul(gate, v)?;
-        cx.write(y, out)
-    })
+    let k = streams3(f, key, fan)?;
+    let q = streams3(f, query, fan)?;
+    let kq = f.mul(k, q)?;
+    let d = f.reduce(kq, &[2], Fold::Sum)?;
+    let isq = f.const_f(Elem::F32, 1.0 / (h as f64).sqrt(), &[]);
+    let isq = f.splat(isq, &[rows, m])?;
+    let d = f.mul(d, isq)?;
+    let a = f.abs(d);
+    let floor = f.like_f(a, 1e-6);
+    let a = f.max(a, floor)?;
+    let mag = f.sqrt(a);
+    let sg = f.sign(d);
+    let damped = f.mul(sg, mag)?;
+    let gate = f.sigmoid(damped);
+    let gate = f.broadcast(gate, &[rows, m, h], &[0, 1])?;
+    let v = value.f32(f);
+    let v = f.broadcast(v, &[rows, m, h], &[0, 2])?;
+    let out = f.mul(gate, v)?;
+    Ok(out)
 }

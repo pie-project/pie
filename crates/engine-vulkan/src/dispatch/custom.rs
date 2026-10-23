@@ -9,20 +9,22 @@ impl DispatchFused for Run<'_> {
     }
 }
 
-impl poem_exec::DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &poem_ir::Spatial) -> Result<(), KernelError> {
-        self.spatial(op).map_err(crate::error::kernel)
+impl poem_exec::DispatchConv for Run<'_> {
+    fn dispatch(&mut self, op: &poem_ir::Conv) -> Result<(), KernelError> {
+        self.conv(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn spatial(&mut self, op: &poem_ir::Spatial) -> Result<(), kernels_vulkan::Error> {
-        use kernels_vulkan::spatial;
-        use poem_ir::Spatial;
+    fn conv(&mut self, op: &poem_ir::Conv) -> Result<(), kernels_slang::Error> {
+        use kernels_slang::conv::{conv3d, group_norm, resample, rule};
+        use poem_ir::Conv;
+        let ctx = self.ctx;
+        let t = |id: poem_ir::ValueId| self.tensor(id);
         match op {
-            Spatial::Grid { grid, rule, y } => spatial::rule::derive_grid(
-                self.ctx(),
-                self.tensor(*grid),
+            Conv::Grid { grid, rule, y } => rule::derive_grid(
+                ctx,
+                t(*grid),
                 match *rule {
                     poem_ir::GridRule::Conv {
                         k,
@@ -30,7 +32,7 @@ impl Run<'_> {
                         pad,
                         pad_back,
                         causal_t,
-                    } => spatial::rule::GridRule::Conv {
+                    } => rule::GridRule::Conv {
                         k,
                         stride,
                         pad,
@@ -40,21 +42,19 @@ impl Run<'_> {
                     poem_ir::GridRule::Upsample {
                         factor,
                         keep_first_frame,
-                    } => spatial::rule::GridRule::Upsample {
+                    } => rule::GridRule::Upsample {
                         factor,
                         keep_first_frame,
                     },
                     poem_ir::GridRule::Shuffle { r, trim_t } => {
-                        spatial::rule::GridRule::Shuffle { r, trim_t }
+                        rule::GridRule::Shuffle { r, trim_t }
                     }
-                    poem_ir::GridRule::Unshuffle { r } => spatial::rule::GridRule::Unshuffle { r },
-                    poem_ir::GridRule::AvgDown { factor } => {
-                        spatial::rule::GridRule::AvgDown { factor }
-                    }
+                    poem_ir::GridRule::Unshuffle { r } => rule::GridRule::Unshuffle { r },
+                    poem_ir::GridRule::AvgDown { factor } => rule::GridRule::AvgDown { factor },
                 },
-                self.tensor(*y),
+                t(*y),
             ),
-            Spatial::Conv3d {
+            Conv::Conv3d {
                 x,
                 grid,
                 w,
@@ -70,33 +70,32 @@ impl Run<'_> {
                 y,
             } => {
                 if cache.is_some() {
-                    return Err(kernels_vulkan::Error::Unsupported {
-                        op: "spatial.conv3d (with a frame cache)",
+                    return Err(kernels_slang::Error::Unsupported {
+                        op: "conv.conv3d (with a frame cache)",
                     });
                 }
-                spatial::conv::conv3d(
-                    self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*grid),
-                    self.tensor(*w),
-                    bias.map(|bias| self.tensor(bias)),
-                    None,
-                    spatial::conv::Conv3d {
+                conv3d::conv3d(
+                    ctx,
+                    t(*x),
+                    t(*grid),
+                    t(*w),
+                    bias.map(t),
+                    conv3d::Conv3d {
                         k: *k,
                         stride: *stride,
                         pad: *pad,
                         pad_back: *pad_back,
                         causal_t: *causal_t,
                         time_pad: match time_pad {
-                            poem_ir::TimePad::Zero => spatial::conv::TimePad::Zero,
-                            poem_ir::TimePad::Replicate => spatial::conv::TimePad::Replicate,
+                            poem_ir::TimePad::Zero => conv3d::TimePad::Zero,
+                            poem_ir::TimePad::Replicate => conv3d::TimePad::Replicate,
                         },
                     },
-                    self.tensor(*y_grid),
-                    self.tensor(*y),
+                    t(*y_grid),
+                    t(*y),
                 )
             }
-            Spatial::GroupNorm {
+            Conv::GroupNorm {
                 x,
                 grid,
                 groups,
@@ -108,116 +107,69 @@ impl Run<'_> {
             } => {
                 let clips = self.tensor(*grid).rows;
                 let (partials, stats) = self.spatial_moments(clips, *groups).ok_or_else(|| {
-                    kernels_vulkan::Error::Backend {
-                        op: "spatial.group_norm",
+                    kernels_slang::Error::Backend {
+                        op: "conv.group_norm",
                         detail: format!(
                             "this load reserved no moment plane for {clips} clip(s) at \
                              {groups} group(s)"
                         ),
                     }
                 })?;
-                spatial::norm::group_norm(
-                    self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*grid),
+                group_norm::group_norm(
+                    ctx,
+                    t(*x),
+                    t(*grid),
                     *groups,
-                    self.tensor(*weight),
-                    self.tensor(*bias),
+                    t(*weight),
+                    t(*bias),
                     *eps,
                     *silu,
                     partials,
                     stats,
-                    self.tensor(*y),
+                    t(*y),
                 )
             }
-            Spatial::Attention {
-                q,
-                k,
-                v,
-                grid,
-                segment,
-                sm_scale,
-                y,
-            } => spatial::attn::attention(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                match segment {
-                    poem_ir::VoxelSegment::Clip => spatial::attn::Segment::Clip,
-                    poem_ir::VoxelSegment::Frames(n) => spatial::attn::Segment::Frames(*n),
-                },
-                *sm_scale,
-                self.tensor(*y),
-            ),
-            Spatial::UpsampleNearest {
+            Conv::Upsample {
                 x,
                 grid,
                 factor,
                 keep_first_frame,
                 y_grid,
                 y,
-            } => spatial::resample::upsample_nearest(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
+            } => resample::upsample_nearest(
+                ctx,
+                t(*x),
+                t(*grid),
                 *factor,
                 *keep_first_frame,
-                self.tensor(*y_grid),
-                self.tensor(*y),
+                t(*y_grid),
+                t(*y),
             ),
-            Spatial::PixelShuffle {
+            Conv::PixelShuffle {
                 x,
                 grid,
                 r,
                 trim_t,
                 y_grid,
                 y,
-            } => spatial::resample::pixel_shuffle(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *r,
-                *trim_t,
-                self.tensor(*y_grid),
-                self.tensor(*y),
-            ),
-            Spatial::PixelUnshuffle {
+            } => resample::pixel_shuffle(ctx, t(*x), t(*grid), *r, *trim_t, t(*y_grid), t(*y)),
+            Conv::PixelUnshuffle {
                 x,
                 grid,
                 r,
                 y_grid,
                 y,
-            } => spatial::resample::pixel_unshuffle(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *r,
-                self.tensor(*y_grid),
-                self.tensor(*y),
-            ),
-            Spatial::AvgDown {
+            } => resample::pixel_unshuffle(ctx, t(*x), t(*grid), *r, t(*y_grid), t(*y)),
+            Conv::AvgDown {
                 x,
                 grid,
                 factor,
                 group,
                 y_grid,
                 y,
-            } => spatial::resample::avg_down(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *factor,
-                *group,
-                self.tensor(*y_grid),
-                self.tensor(*y),
-            ),
-            Spatial::CacheStore { .. } => Err(kernels_vulkan::Error::Unsupported {
-                op: "spatial.cache_store",
-            }),
-            Spatial::Patchify { .. } | Spatial::Unpatchify { .. } => {
-                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
+            } => resample::avg_down(ctx, t(*x), t(*grid), *factor, *group, t(*y_grid), t(*y)),
+            Conv::CacheStore { .. } | Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
         }
     }
@@ -256,7 +208,7 @@ impl poem_exec::DispatchProbe for Run<'_> {
             };
             let t = self.tensor(id);
             let total = u64::from(t.rows) * u64::from(t.width) * elem;
-            if total == 0 || t.buf == kernels_vulkan::ABSENT {
+            if total == 0 || t.buf == kernels_slang::ABSENT {
                 continue;
             }
             let Ok(bytes) = self.handles().read(t.buf, total) else {

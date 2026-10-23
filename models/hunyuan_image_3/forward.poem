@@ -49,14 +49,14 @@ def trunk(all, den, m):
     mask = canvas_in.mask()
 
     positions = all.axis_positions(0, m.rope_axes)
-    y = ops.layout.embed(all.tokens(), m.embed, d.vocab)
+    y = ops.gather.embed(all.tokens(), m.embed, d.vocab)
     encoded = y.on(~on_canvas())
     y = merge([canvas_rows(den, m), encoded])
     rope_dims = [hd // 2, hd // 2, 0, 0]
 
     def block(l, w, y):
         n = ops.elemwise.rmsnorm(y, w.attn_norm, NORM_EPS)
-        q, k, v = ops.layout.split_qkv(ops.linear.matmul(n, w.qkv), m.q_width, m.kv_width)
+        q, k, v = ops.gather.split_qkv(ops.linear.matmul(n, w.qkv), m.q_width, m.kv_width)
         turn = lambda x: ops.elemwise.rope_axes(x, positions, rope_dims, [ROPE_THETA] * 4, "split", hd, hd)
         q = ops.elemwise.rmsnorm_per_head(turn(q), w.q_norm, hd, NORM_EPS)
         k = ops.elemwise.rmsnorm_per_head(turn(k), w.k_norm, hd, NORM_EPS)
@@ -66,7 +66,7 @@ def trunk(all, den, m):
 
         ([dq, aq], pq) = q.partition(classes)
         a = merge([
-            ops.attn.masked(dq, plan_den, mask, pages, None, hd, d.kv_heads, False, sm),
+            ops.attn.prefill(dq, plan_den, pages, None, hd, d.kv_heads, sm, mask = mask, causal = False),
             ops.attn.decode(aq, plan_dec, pages, None, hd, sm),
             ops.attn.prefill(pq, plan_pre, pages, None, hd, d.kv_heads, sm),
         ])
@@ -85,24 +85,29 @@ def trunk(all, den, m):
     seam.at(seam.HIDDEN, [canvas])
     text_in = all.on(~on_canvas())
     x = ops.elemwise.rmsnorm(text, m.final_norm, NORM_EPS)
-    x = ops.layout.gather_rows(x, text_in.readout_rows())
+    x = ops.gather.gather_rows(x, text_in.readout_rows())
     logits = ops.linear.lm_head(x, m.head)
     seam.at(seam.OUT, [logits])
     return canvas
 
 def moe(x, w, m):
     d = m.dims
-    routes, weights = ops.linear.moe_topk_softmax(ops.linear.matmul(x, w.router), d.experts, d.top_k)
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, w.router),
+        d.experts,
+        d.top_k,
+        routing.softmax(),
+    )
 
     def select(act, bank):
         if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
             return ops.linear.moe_matmul_select(act, bank, routes, d.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, d.top_k)
 
-    act = ops.linear.mlp_swiglu(select(x, w.experts_gate_up), d.moe_inter)
+    act = ops.linear.glu(select(x, w.experts_gate_up), gating.swiglu(), d.moe_inter)
     routed = ops.linear.moe_weighted_sum(select(act, w.experts_down), weights)
     shared = ops.linear.matmul(
-        ops.linear.mlp_swiglu(ops.linear.matmul(x, w.shared_gate_up), d.shared_inter),
+        ops.linear.glu(ops.linear.matmul(x, w.shared_gate_up), gating.swiglu(), d.shared_inter),
         w.shared_down,
     )
     return ops.elemwise.residual_add(shared, routed)
@@ -118,7 +123,7 @@ def canvas_rows(arm, m):
     doubled = embedder(m.timestep_emb, freqs)
 
     spread = ops.linear.matmul(flag, m.ones)
-    pos, neg = ops.layout.split_rows(spread, d.hidden)
+    pos, neg = ops.gather.split_rows(spread, d.hidden)
     zero = ops.elemwise.add(pos, neg)
     special = ops.elemwise.modulate(zero, doubled, lanes, "scale_shift")
 
@@ -127,10 +132,10 @@ def canvas_rows(arm, m):
 
 def convolve(x, g, c):
     shape = conv(c.k, [1, 1, 1], [0, c.k[1] // 2, c.k[2] // 2])
-    return ops.spatial.conv3d(x, g, c.w, c.bias, shape, None)
+    return ops.conv.conv3d(x, g, c.w, c.bias, shape, None)
 
 def group_norm(x, g, n, silu):
-    return ops.spatial.group_norm(x, g, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+    return ops.conv.group_norm(x, g, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
 
 def resblock(x, g, r, temb):
     h = group_norm(x, g, r.norm_in, True)
@@ -146,7 +151,7 @@ def resblock(x, g, r, temb):
 def image_in(arm, m):
     g = arm.grid()
     clip = arm.voxels(0, m.latent_channels + m.t_freq_dim, dtype.bf16)
-    z, freqs = ops.layout.split_rows(clip, m.latent_channels)
+    z, freqs = ops.gather.split_rows(clip, m.latent_channels)
     temb = embedder(m.time_embed, freqs)
     h, g1 = convolve(z, g, m.patch_embed.conv_in)
     x = resblock(h, g1, m.patch_embed.res, temb)
@@ -155,7 +160,7 @@ def image_in(arm, m):
 def image_out(arm, m):
     g = arm.grid()
     clip = arm.voxels(1, m.dims.hidden + m.t_freq_dim, dtype.bf16)
-    rows, freqs = ops.layout.split_rows(clip, m.dims.hidden)
+    rows, freqs = ops.gather.split_rows(clip, m.dims.hidden)
     temb = embedder(m.time_embed_2, freqs)
     x = resblock(rows, g, m.final_layer.res, temb)
     h = group_norm(x, g, m.final_layer.norm_out, True)

@@ -10,7 +10,7 @@ use common::{Gpu, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
 use kernels_rocm::hip::lt_grouped;
-use kernels_rocm::linear::{gemm, mlp, moe};
+use kernels_rocm::linear::{gemm, glu, moe};
 use kernels_rocm::tuning::Tuning;
 
 /// Distinct top-k routes over `experts`, every `dead`-th one -1.
@@ -228,7 +228,7 @@ fn the_decode_routed_mlp_answers_the_steps() {
         let mut h = gpu.zeros(rows, inter as u32, dt);
         let mut by_steps = gpu.zeros(rows, hidden as u32, dt);
         gemm::matmul(&ctx, m.p.x, banks.gate_up, &mut packed).unwrap();
-        mlp::swiglu(&ctx, packed, inter as u32, 1, &mut h).unwrap();
+        glu::swiglu(&ctx, packed, inter as u32, 1, &mut h).unwrap();
         gemm::matmul(&ctx, h, banks.down, &mut by_steps).unwrap();
         let gate_w = gpu.tensor(&values(hidden, 12, 0.05), 1, hidden as u32, dt);
         let mut gate_steps = gpu.zeros(rows, 1, dt);

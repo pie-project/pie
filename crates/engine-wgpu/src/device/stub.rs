@@ -68,11 +68,6 @@ impl Context {
     }
 
     #[must_use]
-    pub fn tiers(&self) -> Vec<kernels_wgpu::Capability> {
-        Vec::new()
-    }
-
-    #[must_use]
     pub fn subgroup_size(&self) -> u32 {
         match self.never {}
     }
@@ -398,14 +393,11 @@ impl Pipelines {
         self.compiles.get()
     }
 
-    pub fn warm(&self, _device: &Context, _fire: kernels_wgpu::Fire) -> Result<()> {
-        Err(Fault::Deviceless)
-    }
-
     pub fn get(
         &self,
         _device: &Context,
-        _fire: kernels_wgpu::Fire,
+        _file: &'static str,
+        _key: &'static str,
     ) -> Result<std::sync::Arc<Pipeline>> {
         Err(Fault::Deviceless)
     }

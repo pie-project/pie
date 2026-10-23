@@ -1,0 +1,26 @@
+// Per row r and stream s: d = key[r, s, :] . query[r, s, :] / sqrt(h),
+// gate = sigmoid(sign(d) * sqrt(max(|d|, 1e-6))) (d = 0 gates by 0.5),
+// y[r, s, i] = gate * value[r, i].
+fn k_ple_gate(key: [*]f32, query: [*]f32, value: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32) void {
+  var inv_sqrt_h: f32 = 1.0 / math.sqrt_f32(@as(f32, h));
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var base: i32 = (r * m + s) * h;
+      var d: f32 = k_dot(key, base, query, base, h) * inv_sqrt_h;
+      var a: f32 = d;
+      if (a < 0.0) { a = -a; }
+      if (a < 0.000001) { a = 0.000001; }
+      var mag: f32 = math.sqrt_f32(a);
+      var damped: f32 = 0.0;
+      if (d > 0.0) { damped = mag; } else if (d < 0.0) { damped = -mag; }
+      var gate: f32 = 1.0 / (1.0 + math.exp_f32(-damped));
+      var i: i32 = 0;
+      while (i < h) : (i += 1) {
+        y[base + i] = gate * value[r * h + i];
+      }
+    }
+  }
+}
+

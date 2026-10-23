@@ -13,9 +13,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
+use crate::emit::{Cx, Emit, Env};
+use crate::handle::Tensor;
 use dtype::Dtype;
+use kernels_xla::elem_of;
 use kernels_xla::hlo::{Func, Ty, Val, bf16_bits};
-use kernels_xla::{Cx, Emit, Env, Tensor, elem_of};
 
 use crate::pjrt::{Arg, Client, ElementType};
 
@@ -234,7 +236,7 @@ impl Bench {
     pub fn time(
         &mut self,
         iters: u32,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<Option<f64>, String> {
         self.time_with(iters, &[], false, body)
     }
@@ -248,7 +250,7 @@ impl Bench {
         &mut self,
         iters: u32,
         in_place: &[Tensor],
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<Option<f64>, String> {
         self.time_with(iters, in_place, true, body)
     }
@@ -258,7 +260,7 @@ impl Bench {
         iters: u32,
         in_place: &[Tensor],
         pipelined: bool,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<Option<f64>, String> {
         let Some(client) = client() else {
             return Ok(None);
@@ -356,7 +358,7 @@ impl Bench {
     /// `Ok(false)` when no device is present (the test should return).
     pub fn run(
         &mut self,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<bool, String> {
         let Some(client) = client() else {
             return Ok(false);

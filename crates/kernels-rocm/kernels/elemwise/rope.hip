@@ -7,7 +7,7 @@
 // where the angle is large. A neox rotation turns pair i with i + half; an
 // interleaved one turns 2i with 2i + 1.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::elemwise {
 

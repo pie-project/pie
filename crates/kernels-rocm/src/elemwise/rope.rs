@@ -1,12 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 
+use super::*;
 use crate::error::Error;
-use dtype::Dtype;
-
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::tensor::Tensor;
-
-const FILE: &str = "elemwise/rope.hip";
+use dtype::Dtype;
 
 pub const ROTATE_BLOCK: u32 = 256;
 
@@ -66,32 +66,9 @@ pub fn ramp_bounds(
     (low_dim, high_dim)
 }
 
-fn heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
-    nonzero(op, "the head width this rotation states", head_dim)?;
-    if !width.is_multiple_of(head_dim) {
-        return Err(refuse(
-            op,
-            format!("the {width}-wide row is not a whole number of {head_dim}-wide heads"),
-        ));
-    }
-    Ok(width / head_dim)
-}
-
 fn q_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the q region's width", width)?;
     heads(op, width, head_dim)
-}
-
-fn positions_stream(op: &'static str, positions: Tensor, x: &Tensor) {
-    debug_assert_eq!(
-        positions.dtype,
-        Dtype::I32,
-        "`{op}` reads an i32 position stream"
-    );
-    debug_assert_eq!(
-        positions.rows, x.rows,
-        "the position stream is one entry per rotated row"
-    );
 }
 
 pub fn full(
@@ -103,7 +80,7 @@ pub fn full(
     theta: f32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_full";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -115,7 +92,7 @@ pub fn full(
     ctx.fire(
         OP,
         Fire::at(
-            FILE,
+            ROPE_UNIT,
             "::pie::elemwise::rope_full<::pie::false_type::value, false>",
         )
         .apply(rotate_launch(
@@ -160,7 +137,7 @@ pub fn partial(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -178,68 +155,11 @@ pub fn partial_q(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial_q";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
     let k = Tensor::new(q.ptr, q.rows, 0, q.dtype);
     rope_partial(ctx, OP, *q, k, positions, rotary_dim, head_dim, theta, span)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn rmsnorm_rope_partial_q(
-    ctx: &Ctx,
-    x: Tensor,
-    weight: Tensor,
-    head_dim: u32,
-    eps: f32,
-    positions: Tensor,
-    rotary_dim: u32,
-    theta: f32,
-    span: u32,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_rope_partial_q";
-    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    positions_stream(OP, positions, &x);
-    if head_dim == 0
-        || !head_dim.is_multiple_of(2)
-        || !y.width.is_multiple_of(head_dim)
-        || !rotary_dim.is_multiple_of(2)
-        || span < rotary_dim / 2
-        || span + rotary_dim / 2 > head_dim
-    {
-        return Err(refuse(
-            OP,
-            format!(
-                "wants whole even heads and an even rotary width whose pairs sit within them, \
-                 and was handed width={}, head_dim={head_dim}, rotary_dim={rotary_dim}, \
-                 span={span}",
-                y.width
-            ),
-        ));
-    }
-    let heads = y.width / head_dim;
-    if y.rows == 0 || heads == 0 {
-        return Ok(());
-    }
-    ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::elemwise::q_rmsnorm_rope_partial<128>")
-            .apply(Launch::grid([y.rows, heads, 1], [128, 1, 1])),
-        &[
-            x.arg(),
-            weight.arg(),
-            positions.arg(),
-            y.arg(),
-            stated(OP, head_dim)?.arg(),
-            stated(OP, heads)?.arg(),
-            stated(OP, rotary_dim)?.arg(),
-            stated(OP, span)?.arg(),
-            theta.arg(),
-            eps.arg(),
-            ctx.stage(),
-        ],
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,7 +182,7 @@ pub fn partial_last(
     inverse: bool,
     yarn: Option<Yarn>,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial_last";
+    const OP: &str = "elemwise.rope";
     let (factor, low_dim, high_dim) = match yarn {
         Some(y) => {
             let max_position = nonzero(
@@ -301,7 +221,7 @@ pub fn partial_last(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::rope_partial_last")
+        Fire::at(ROPE_UNIT, "::pie::elemwise::rope_partial_last")
             .apply(Launch::per_row(q.rows, ROTATE_BLOCK).smem(8 * (rotary_dim / 2))),
         &[
             q.arg(),
@@ -354,7 +274,7 @@ pub fn yarn(
         attention_factor,
         interleaved,
     } = r;
-    const OP: &str = "elementwise.rope_yarn";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -380,7 +300,7 @@ pub fn yarn(
     let per_block = heads_per_block(half);
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::rope_yarn").apply(rotate_launch(
+        Fire::at(ROPE_UNIT, "::pie::elemwise::rope_yarn").apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -423,7 +343,7 @@ fn rope_partial(
     let pairs = cache_pairs(rotary_dim / 2);
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::elemwise::rope_partial<::pie::bf16>")
+        Fire::at(ROPE_UNIT, "::pie::elemwise::rope_partial<::pie::bf16>")
             .apply(Launch::per_row(q.rows, ROTATE_BLOCK).smem(pairs * 2 * 4)),
         &[
             q.arg(),
@@ -442,24 +362,392 @@ fn rope_partial(
     )
 }
 
-/// A head's norm and its tail's rotation in one pass, which is CUDA's
-/// (`elementwise.norm_rope_last`, outside ROCm's fused kernels).
+const ROPE_AXES_UNIT: &str = "elemwise/rope_axes.hip";
+
+pub const MAX_AXES: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeForm {
+    Interleaved,
+    Neox,
+    Split,
+    SplitLadder,
+}
+
+impl RopeForm {
+    const fn stamp(self) -> &'static str {
+        match self {
+            RopeForm::Interleaved => "0",
+            RopeForm::Neox => "1",
+            RopeForm::Split => "2",
+            RopeForm::SplitLadder => "3",
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn norm_rope_last(
-    _ctx: &Ctx,
-    _x: Tensor,
-    _weight: Option<Tensor>,
-    _head_dim: u32,
-    _eps: f32,
-    _positions: Tensor,
-    _rotary_dim: u32,
-    _theta: f32,
-    _interleaved: bool,
-    _inverse: bool,
-    _yarn: Option<Yarn>,
-    _y: &mut Tensor,
+pub fn rope_axes(
+    ctx: &Ctx,
+    x: Tensor,
+    positions: Tensor,
+    dims: [u32; MAX_AXES],
+    thetas: [f32; MAX_AXES],
+    form: RopeForm,
+    rotary_dim: u32,
+    head_dim: u32,
+    o: &mut Tensor,
 ) -> Result<(), Error> {
-    Err(Error::Unsupported {
-        op: "elementwise.norm_rope_last",
-    })
+    const OP: &str = "elemwise.rope_axes";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => (), F16 => () });
+    debug_assert!(
+        x.rows == o.rows && x.width == o.width && x.dtype == o.dtype,
+        "`{OP}` writes the rectangle it reads"
+    );
+    let rows = nonzero(OP, "rows", o.rows)?;
+    nonzero(OP, "the head width this rotation states", head_dim)?;
+    if !head_dim.is_multiple_of(2) {
+        return Err(refuse(
+            OP,
+            format!("a {head_dim}-wide head has no whole number of rotation pairs"),
+        ));
+    }
+    if rotary_dim == 0 || rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the rotated prefix is {rotary_dim} wide, and the head it sits at the front \
+                 of is {head_dim}"
+            ),
+        ));
+    }
+    if o.width == 0 || !o.width.is_multiple_of(head_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide row is not a whole number of {head_dim}-wide heads",
+                o.width
+            ),
+        ));
+    }
+    let heads = o.width / head_dim;
+
+    if positions.dtype != Dtype::F32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the position stream is {:?}, and this rotation reads f32 coordinates \
+                 (they may be fractional)",
+                positions.dtype
+            ),
+        ));
+    }
+    let axes = positions.width as usize;
+    if axes == 0 || axes > MAX_AXES || positions.rows < rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "the position stream is {} x {}, and this rotation reads one coordinate per \
+                 axis (at most {MAX_AXES}) for each of {rows} rows",
+                positions.rows, positions.width
+            ),
+        ));
+    }
+    if form == RopeForm::SplitLadder {
+        if rotary_dim != head_dim {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the ladder pairs (i, i + head_dim/2) and turns the whole head, and this \
+                     call rotates {rotary_dim} of {head_dim}"
+                ),
+            ));
+        }
+        let span: u32 = dims[..axes].iter().sum();
+        let row = heads * rotary_dim;
+        if span == 0 || span > row || !(row - span).is_multiple_of(2) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the ladder's axes own {span} channels of a {row}-wide rotated row, which \
+                     leaves no whole identity pad"
+                ),
+            ));
+        }
+        if dims[..axes].iter().any(|d| *d != dims[0]) {
+            return Err(refuse(
+                OP,
+                format!("one ladder hands its axes out round-robin, and {dims:?} is not flat"),
+            ));
+        }
+        return fire_axes(
+            ctx, x, positions, form, dims, thetas, rotary_dim, head_dim, heads, rows, o,
+        );
+    }
+    let mut spanned = 0u32;
+    for (a, &d) in dims.iter().enumerate() {
+        if a >= axes {
+            if d != 0 {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "axis {a} owns {d} channels and the position stream carries {axes} \
+                         axes; an axis with no coordinate is a text to fix"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if d == 0 || !d.is_multiple_of(2) {
+            return Err(refuse(
+                OP,
+                format!("axis {a} owns {d} channels, and an axis turns whole pairs"),
+            ));
+        }
+        spanned += d;
+    }
+    if spanned != rotary_dim {
+        return Err(refuse(
+            OP,
+            format!(
+                "the axes own {spanned} channels between them and the rotated prefix is \
+                 {rotary_dim} wide; the blocks tile it in axis order"
+            ),
+        ));
+    }
+
+    fire_axes(
+        ctx, x, positions, form, dims, thetas, rotary_dim, head_dim, heads, rows, o,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fire_axes(
+    ctx: &Ctx,
+    x: Tensor,
+    positions: Tensor,
+    form: RopeForm,
+    dims: [u32; MAX_AXES],
+    thetas: [f32; MAX_AXES],
+    rotary_dim: u32,
+    head_dim: u32,
+    heads: u32,
+    rows: u32,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elemwise.rope_axes";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    ctx.fire(
+        OP,
+        Fire::at(
+            ROPE_AXES_UNIT,
+            symbol(&format!(
+                "::pie::elemwise::rope_axes<{t}, {}>",
+                form.stamp()
+            )),
+        )
+        .apply(Launch::per_row(rows, ROTATE_BLOCK)),
+        &[
+            x.arg(),
+            positions.arg(),
+            o.arg(),
+            stated(OP, positions.width)?.arg(),
+            stated(OP, dims[0])?.arg(),
+            stated(OP, dims[1])?.arg(),
+            stated(OP, dims[2])?.arg(),
+            stated(OP, dims[3])?.arg(),
+            thetas[0].arg(),
+            thetas[1].arg(),
+            thetas[2].arg(),
+            thetas[3].arg(),
+            stated(OP, rotary_dim)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            stated(OP, heads)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+const ROPE_MROPE_UNIT: &str = "elemwise/rope_mrope.hip";
+
+pub const AXES: u32 = 3;
+
+#[allow(clippy::too_many_arguments)]
+pub fn interleaved(
+    ctx: &Ctx,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    sections: [u32; AXES as usize],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<(), Error> {
+    fire_mrope(
+        ctx,
+        "::pie::elemwise::rope_mrope",
+        q,
+        k,
+        positions,
+        sections,
+        rotary_dim,
+        head_dim,
+        theta,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn blocked(
+    ctx: &Ctx,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    sections: [u32; AXES as usize],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<(), Error> {
+    fire_mrope(
+        ctx,
+        "::pie::elemwise::rope_mrope_blocked",
+        q,
+        k,
+        positions,
+        sections,
+        rotary_dim,
+        head_dim,
+        theta,
+    )
+}
+
+/// Gemma's per-block form: axis `a` owns its own `2·sections[a]`-wide block,
+/// a rotate_half over that block.
+#[allow(clippy::too_many_arguments)]
+pub fn split(
+    ctx: &Ctx,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    sections: [u32; AXES as usize],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<(), Error> {
+    if sections.iter().all(|&s| s == 0) {
+        return Err(refuse(
+            "elemwise.rope",
+            format!(
+                "the sections {sections:?} name no frequency pair, and a split rotation \
+                 turns each axis by the pairs its section holds"
+            ),
+        ));
+    }
+    fire_mrope(
+        ctx,
+        "::pie::elemwise::rope_mrope_split",
+        q,
+        k,
+        positions,
+        sections,
+        rotary_dim,
+        head_dim,
+        theta,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fire_mrope(
+    ctx: &Ctx,
+    entry: &'static str,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    sections: [u32; AXES as usize],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<(), Error> {
+    const OP: &str = "elemwise.rope";
+    dtype_dispatch!(OP, q.dtype, { Bf16 => () });
+    debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
+
+    nonzero(OP, "the head width this rotation states", head_dim)?;
+    if !head_dim.is_multiple_of(2) {
+        return Err(refuse(
+            OP,
+            format!("a {head_dim}-wide head has no whole number of rotation pairs"),
+        ));
+    }
+    if rotary_dim == 0 || rotary_dim > head_dim {
+        return Err(refuse(
+            OP,
+            format!(
+                "the rotated prefix is {rotary_dim} wide, and the head it sits at the front \
+                 of is {head_dim}"
+            ),
+        ));
+    }
+    let num_q_heads = heads_of(OP, "query", q.width, head_dim)?;
+    let num_kv_heads = heads_of(OP, "key", k.width, head_dim)?;
+
+    if positions.dtype != Dtype::I32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the position stream is {:?}, and this rotation reads i32 (t, h, w) triples",
+                positions.dtype
+            ),
+        ));
+    }
+    if positions.width != AXES || positions.rows != q.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "the position stream is {} x {}, and this rotation reads one (t, h, w) triple \
+                 per one of {} rotated rows",
+                positions.rows, positions.width, q.rows
+            ),
+        ));
+    }
+
+    let half = head_dim / 2;
+    let stated_pairs: u32 = sections.iter().copied().sum();
+    if stated_pairs > half {
+        return Err(refuse(
+            OP,
+            format!(
+                "the sections {sections:?} name {stated_pairs} frequency pairs and a \
+                 {head_dim}-wide head has {half}"
+            ),
+        ));
+    }
+
+    let rows = nonzero(OP, "rows", q.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(ROPE_MROPE_UNIT, entry).apply(Launch::per_row(rows, ROTATE_BLOCK)),
+        &[
+            q.arg(),
+            k.arg(),
+            positions.arg(),
+            stated(OP, num_q_heads)?.arg(),
+            stated(OP, num_kv_heads)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            theta.arg(),
+            stated(OP, sections[0])?.arg(),
+            stated(OP, sections[1])?.arg(),
+            stated(OP, sections[2])?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+fn heads_of(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
+    if !width.is_multiple_of(head_dim) {
+        return Err(refuse(
+            op,
+            format!("the {width}-wide {what} row is not a whole number of {head_dim}-wide heads"),
+        ));
+    }
+    Ok(width / head_dim)
 }

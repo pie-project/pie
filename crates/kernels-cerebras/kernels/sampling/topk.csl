@@ -1,0 +1,28 @@
+// The k largest of each row of x, largest first: values[r][s], indices[r][s]
+// (ties to the lower column, NaN never picked); a slot no value fills holds
+// value 0 at column 0.
+fn k_topk(x: [*]f32, values: [*]f32, indices: [*]i32, rows: i32, width: i32, k: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < k) : (s += 1) { values[r * k + s] = 0.0; indices[r * k + s] = 0; }
+    s = 0;
+    while (s < k) : (s += 1) {
+      var best: f32 = 0.0; var bi: i32 = -1;
+      var i: i32 = 0;
+      while (i < width) : (i += 1) {
+        var v: f32 = x[r * width + i];
+        if (math.isNaN_f32(v)) { continue; }
+        var taken: bool = false;
+        var j: i32 = 0;
+        while (j < s) : (j += 1) { if (indices[r * k + j] == i) { taken = true; } }
+        if (taken) { continue; }
+        if (bi < 0 or v > best) { best = v; bi = i; }
+      }
+      if (bi < 0) { break; }
+      values[r * k + s] = best;
+      indices[r * k + s] = bi;
+    }
+  }
+}
+

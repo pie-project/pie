@@ -5,7 +5,7 @@
 // slice order (deterministic) and rounds. SWIGLU reads a packed [gate | up]
 // result and lands silu(gate)·up.
 
-#include "prelude/mfma.hip"
+#include "prim/mfma.hip"
 
 namespace pie::linear {
 

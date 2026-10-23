@@ -12,7 +12,7 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::linear::{mlp, moe, quant};
+use kernels_metal::linear::{mlp, moe, qmm};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -172,7 +172,7 @@ fn the_register_routed_mlp_prices_its_layer() {
             (rows <= 64 && width <= HIDDEN)
                 .then(|| Tensor::new(partial.buf, rows, width, Dtype::F32))
         };
-        let scratch = || quant::Scratch {
+        let scratch = || qmm::Scratch {
             precast: &precast,
             partials: &partials,
             table: None,
@@ -220,12 +220,12 @@ fn the_register_routed_mlp_prices_its_layer() {
             moe::weighted_sum(s, yt, wt, ft).expect("fold");
         };
         let own = |s: &Sink, l: &[Bank; 5]| {
-            quant::matmul(s, &register, xt, l[2], spt, scratch(), 8).expect("shared gate-up");
+            qmm::matmul(s, &register, xt, l[2], spt, scratch(), 8).expect("shared gate-up");
             mlp::swiglu(s, spt, INTER, sht).expect("shared swiglu");
-            quant::matmul(s, &register, sht, l[3], syt, scratch(), 8).expect("shared down");
+            qmm::matmul(s, &register, sht, l[3], syt, scratch(), 8).expect("shared down");
         };
         let gated = |s: &Sink, l: &[Bank; 5]| {
-            quant::matmul(s, &register, xt, l[4], gt, scratch(), 8).expect("gate");
+            qmm::matmul(s, &register, xt, l[4], gt, scratch(), 8).expect("gate");
             moe::sigmoid_gate_add(s, ft, syt, gt, ot).expect("gated add");
         };
         let cut = moe::REGISTER_CUT;

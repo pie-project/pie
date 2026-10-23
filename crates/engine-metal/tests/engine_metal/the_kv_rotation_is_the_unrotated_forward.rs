@@ -29,7 +29,7 @@ use engine_metal::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_compiler::catalog::{import_of, trace_of};
-use poem_ir::{Elementwise, Operation};
+use poem_ir::{Elemwise, Operation};
 
 // ---- the micro_text shape (must match the package's `qwen3-micro-text`) --------------
 const HIDDEN: usize = 128;
@@ -198,7 +198,7 @@ fn hadamards(trace: &poem_ir::Trace) -> usize {
     trace
         .nodes
         .iter()
-        .filter(|n| matches!(n.op, Operation::Elementwise(Elementwise::Hadamard { .. })))
+        .filter(|n| matches!(n.op, Operation::Elemwise(Elemwise::Hadamard { .. })))
         .count()
 }
 

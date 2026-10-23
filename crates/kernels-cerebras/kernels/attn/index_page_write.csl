@@ -1,0 +1,15 @@
+// Lands row r of src in pool row write_page[r] * ps + write_offset[r]; a
+// page or offset out of range drops the row.
+fn k_index_page_write(src: [*]f32, table: [*]f32, write_page: [*]i32, write_offset: [*]i32,
+                      rows: i32, width: i32, ps: i32, table_rows: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var page: i32 = write_page[r];
+    var off: i32 = write_offset[r];
+    if (page >= 0 and off >= 0 and off < ps) {
+      var cell: i32 = page * ps + off;
+      if (cell < table_rows) { k_copy(table, cell * width, src, r * width, width); }
+    }
+  }
+}
+

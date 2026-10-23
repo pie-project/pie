@@ -21,7 +21,7 @@ pub fn hash_route(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_hash_route";
+    const OP: &str = "linear.moe_route";
     debug_assert_eq!(logits.dtype, Dtype::Bf16, "`{OP}` reads bf16 router logits");
     debug_assert_eq!(
         logits.rows, routes.rows,

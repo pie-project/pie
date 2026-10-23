@@ -1,5 +1,5 @@
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, ops, seam, trace_hybrid};
-use poem_ir::{Def, Dim, Layout, Operands, Operation, RuntimeInput, Selection, Ty};
+use poem_ir::{Def, Dim, Gather, Operands, Operation, RuntimeInput, Selection, Ty};
 
 struct PackThenUnpack;
 
@@ -10,9 +10,9 @@ impl ForwardHybrid for PackThenUnpack {
     fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, 24, Dtype::Bf16);
         let perm = inputs.row_permutation();
-        let packed = ops::layout::pack_rows(&x, &perm);
+        let packed = ops::gather::pack_rows(&x, &perm);
         let normed = ops::elemwise::rmsnorm_no_scale(&packed, 24, 1e-6);
-        let back = ops::layout::unpack_rows(&normed, &perm);
+        let back = ops::gather::unpack_rows(&normed, &perm);
         seam::at(seam::VELOCITY, &[&back]);
         back
     }
@@ -32,10 +32,10 @@ fn pack_and_unpack_keep_the_row_space() {
             .nodes
             .iter()
             .fold((None, None), |(pack, unpack), node| match &node.op {
-                Operation::Layout(Layout::PackRows { x, perm, y }) => {
+                Operation::Gather(Gather::PackRows { x, perm, y }) => {
                     (Some((*x, *perm, *y)), unpack)
                 }
-                Operation::Layout(Layout::UnpackRows { x, perm, y }) => {
+                Operation::Gather(Gather::UnpackRows { x, perm, y }) => {
                     (pack, Some((*x, *perm, *y)))
                 }
                 _ => (pack, unpack),
@@ -71,7 +71,7 @@ fn pack_and_unpack_keep_the_row_space() {
     for node in &trace.nodes {
         if matches!(
             node.op,
-            Operation::Layout(Layout::PackRows { .. } | Layout::UnpackRows { .. })
+            Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
         ) {
             let mut pairs = Vec::new();
             node.op.aliases(&mut pairs);

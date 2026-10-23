@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::tuning::{Qmm, QmmFp16};
 use kernels_metal::{ArgValue, Encode, Error, Fire, Tensor, Tuning};
 use poem_ir::Dtype;
@@ -221,20 +221,20 @@ fn forcing(q: &Qmm) -> String {
 fn ran(files: &[&str], q: &Qmm) -> bool {
     let has = |name: &str| files.iter().any(|f| f.contains(name));
     match q {
-        Qmm::Mpp => has("quant_qmm_mpp"),
-        Qmm::Staged => has("quant_qmm_staged"),
-        Qmm::Register => has("quant_qmm_sg"),
+        Qmm::Mpp => has("linear/qmm_mpp.metal"),
+        Qmm::Staged => has("linear/qmm_staged.metal"),
+        Qmm::Register => has("linear/qmm_sg.metal"),
         Qmm::Tiled { .. } => {
-            !has("quant_qmm_mpp")
-                && !has("quant_qmm_staged")
-                && !has("quant_qmm_sg")
-                && has("quant_qmm_t")
+            !has("linear/qmm_mpp.metal")
+                && !has("linear/qmm_staged.metal")
+                && !has("linear/qmm_sg.metal")
+                && has("linear/qmm_t.metal")
         }
         Qmm::Qmv { .. } => {
-            !has("quant_qmm_mpp")
-                && !has("quant_qmm_staged")
-                && !has("quant_qmm_sg")
-                && !has("quant_qmm_t")
+            !has("linear/qmm_mpp.metal")
+                && !has("linear/qmm_staged.metal")
+                && !has("linear/qmm_sg.metal")
+                && !has("linear/qmm_t.metal")
         }
     }
 }
@@ -612,7 +612,7 @@ fn plan_of(deployment: &str, text: &str, cores: Option<u32>) -> Option<u64> {
     let row = poem_compiler::catalog::deployment(deployment)?;
     let trace = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Metal),
-        &poem_compiler::fuse::flags::kernels(&profile),
+        poem_compiler::fuse::flags::on(&profile, &crate::FUSIONS),
     );
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(slots, CONTEXT));
@@ -1081,13 +1081,13 @@ fn measure(
                         (width == n && u64::from(rows) <= partial_rows)
                             .then(|| Tensor::new(hq, rows, width, Dtype::F32))
                     };
-                    quant::matmul(
+                    qmm::matmul(
                         sink,
                         tuning,
                         Tensor::new(ha, m, k, Dtype::Bf16),
                         b,
                         Tensor::new(ho, m, n, Dtype::Bf16),
-                        quant::Scratch {
+                        qmm::Scratch {
                             precast: &precast,
                             partials: &partials,
                             table: None,
@@ -1457,7 +1457,7 @@ mod tests {
             "kernel.sdpa.prefill",
             "kernel.gdn.scan",
             "kernel.ane.mlp",
-            "fuse.mlp_swiglu",
+            "fuse.matmul_swiglu_matmul",
             "compiler.launch_us",
         ] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");

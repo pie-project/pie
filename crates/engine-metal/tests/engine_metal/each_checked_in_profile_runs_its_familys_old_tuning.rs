@@ -226,8 +226,11 @@ fn assert_old_tuning(
         "{device}"
     );
     assert_eq!(
-        poem_compiler::fuse::flags::kernels(&profile),
-        ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"],
+        poem_compiler::fuse::flags::on(&profile, &engine_metal::FUSIONS)
+            .iter()
+            .map(|rule| rule.kernel())
+            .collect::<Vec<_>>(),
+        ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"],
         "{device}"
     );
 }

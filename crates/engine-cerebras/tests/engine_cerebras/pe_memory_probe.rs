@@ -1,17 +1,17 @@
 //! How many data words one PE takes: compiles phases holding big arrays
 //! and reports where `cslc` fails. Run with `--nocapture` to read the
 //! boundary; the assertion pins the budget the kernels plan with
-//! (`kernels_cerebras::linear::gemm::pe_words()`).
+//! (`engine_cerebras::fabric::terms().pe_words`).
 
 use dtype::Dtype;
+use engine_cerebras::bench::Recorder;
+use engine_cerebras::fabric::terms;
 use engine_cerebras::sdk::{Arch, Compile, Cslc};
 use kernels_cerebras::Tensor;
-use kernels_cerebras::cx::Tracer;
-use kernels_cerebras::linear::gemm::pe_words;
 
 /// Compiles a phase holding `arrays` arrays of `words` f32 each.
 fn compiles(cslc: &Cslc, words: u32, arrays: u32) -> Result<(), String> {
-    let tracer = Tracer::default();
+    let tracer = Recorder::default();
     let xs: Vec<Tensor> = (0..arrays)
         .map(|i| Tensor::new(10 + i, 1, words, Dtype::F32))
         .collect();
@@ -20,7 +20,7 @@ fn compiles(cslc: &Cslc, words: u32, arrays: u32) -> Result<(), String> {
         let yb = cx.write(y)?;
         for x in &xs {
             let xb = cx.read(*x)?;
-            cx.line(format!(
+            cx.statements().line(format!(
                 "{}[0] = {}[0] + {}[{}];",
                 yb.name,
                 yb.name,
@@ -36,12 +36,12 @@ fn compiles(cslc: &Cslc, words: u32, arrays: u32) -> Result<(), String> {
         .prefix("pie-cerebras-probe-")
         .tempdir()
         .map_err(|e| e.to_string())?;
-    std::fs::write(dir.path().join("layout.csl"), &r.layout).map_err(|e| e.to_string())?;
+    std::fs::write(dir.path().join("gather.csl"), &r.layout).map_err(|e| e.to_string())?;
     std::fs::write(dir.path().join("pe.csl"), &r.pe).map_err(|e| e.to_string())?;
     let out = dir.path().join("out");
     cslc.compile(&Compile::memcpy(
         Arch::Wse3,
-        dir.path().join("layout.csl"),
+        dir.path().join("gather.csl"),
         1,
         1,
         &out,
@@ -84,8 +84,8 @@ fn a_pe_holds_the_budget_the_kernels_plan_with() {
         }
     }
     assert!(
-        u64::from(last_ok) >= pe_words(),
+        u64::from(last_ok) >= terms().pe_words,
         "a PE holds {last_ok} words, under the planned {}",
-        pe_words()
+        terms().pe_words
     );
 }

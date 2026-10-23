@@ -23,17 +23,17 @@ use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
     dead_code,
     reason = "the router's dispatch no longer cuts; kept as the name of the seam"
 )]
-const ROUTER_FILE: &str = "linear/moe_route.metal";
+const ROUTER_FILE: &str = "linear/moe/route.metal";
 
 #[cfg(target_vendor = "apple")]
 #[allow(dead_code, reason = "see ROUTER_FILE")]
 const ROUTER_POINTS: [&str; 2] = ["router_topk", "hash_route_gather"];
 
 #[cfg(target_vendor = "apple")]
-const HASHER_FILE: &str = "attn/ple.metal";
+const HASHER_FILE: &str = "gather/ngram.metal";
 
 #[cfg(target_vendor = "apple")]
-const HASHER_POINT: &str = "ple_ngram_ids";
+const HASHER_POINT: &str = "ngram_ids";
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Sink<'a> {

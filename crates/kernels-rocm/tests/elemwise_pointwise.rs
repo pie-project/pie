@@ -7,7 +7,7 @@ mod common;
 use common::{Gpu, close_abs, close_bf16, round_bf16, sigmoid, values};
 use dtype::Dtype;
 use kernels_rocm::elemwise::{gate, rope};
-use kernels_rocm::linear::mlp;
+use kernels_rocm::linear::glu;
 
 #[test]
 fn elemwise_pointwise() {
@@ -72,7 +72,7 @@ fn elemwise_pointwise() {
         .collect();
     let p = gpu.tensor(&packed, rows, 2 * inter, Dtype::Bf16);
     let mut y = gpu.zeros(rows, inter, Dtype::Bf16);
-    mlp::swiglu(&ctx, p, inter, 1, &mut y).unwrap();
+    glu::swiglu(&ctx, p, inter, 1, &mut y).unwrap();
     let want: Vec<f32> = (0..rows as usize)
         .flat_map(|r| {
             let row = &packed[r * 2 * inter as usize..(r + 1) * 2 * inter as usize];

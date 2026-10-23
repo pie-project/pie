@@ -1,34 +1,21 @@
-use kernels_cuda::custom;
+use kernels_cuda::attn::qkv_append;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::{Fused, Operands};
+use poem_ir::{NormAxis, NormWeight};
 
 use crate::run::{HeldGate, HeldShared, Run};
 use poem_ir::ValueId;
 
-impl DispatchFused for Run<'_> {
-    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
-        match op {
-            Fused::GdnStep { .. } => return self.gdn_step(op),
-            Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
-            Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
-            Fused::MatmulGeglu { .. }
-            | Fused::MlpSwiglu { .. }
-            | Fused::LmHeadSoftcap { .. }
-            | Fused::MatmulBias { .. } => self.fused_linear(op),
-            // Kernels this backend does not ship as one: never formed for it,
-            // and run as the primitives they stand for where a trace states
-            // them.
-            Fused::MatmulSwiglu { .. }
-            | Fused::MatmulSplitRows { .. }
-            | Fused::MoeSelectGlu { .. }
-            | Fused::MoeExperts { .. }
-            | Fused::LseSink { .. }
-            | Fused::RopeYarnAppend { .. }
-            | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
-            // CUDA's DeepSeek, hyper-connection and Qwen prologue kernels:
-            // never formed here.
-            Fused::NormRopeLast { .. }
-            | Fused::NormRopeLastAppend { .. }
+/// The fused ops this backend's dispatch turns away: CUDA's DeepSeek,
+/// hyper-connection and Qwen prologue kernels. Its rules form none of them
+/// (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
+pub(crate) fn refuses(op: &Fused) -> bool {
+    if let Fused::NormRope { weight, turn, .. } = op {
+        return !(matches!(turn, poem_ir::Turn::Partial { .. }) && weight.is_some());
+    }
+    matches!(
+        op,
+        Fused::NormRopeLastAppend { .. }
             | Fused::NormRopePair { .. }
             | Fused::IndexTopkRope { .. }
             | Fused::PoolCompress { .. }
@@ -38,24 +25,63 @@ impl DispatchFused for Run<'_> {
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
             | Fused::ResBlendRmsnorm { .. }
-            | Fused::QgQknormRopeAppend { .. }
-            | Fused::SplitQkvFused { .. } => {
-                Err(kernels_cuda::Error::Unsupported { op: op.name() })
+            | Fused::QGateNormRopeAppend {
+                intermediates: poem_ir::ops::fused::Intermediates::Unwritten,
+                ..
             }
+            | Fused::SplitQkvFused { .. }
+    )
+}
+
+impl DispatchFused for Run<'_> {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
+        match op {
+            _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Fused::GdnStep { .. } => return self.gdn_step(op),
+            Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
+            Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
+            Fused::MatmulGlu {
+                glu: poem_ir::GluAct::GegluTanh,
+                ..
+            }
+            | Fused::MatmulSwigluMatmul { .. }
+            | Fused::MatmulSoftcap { .. }
+            | Fused::MatmulBias { .. } => self.fused_linear(op),
+            // Kernels this backend does not ship as one: never formed for it,
+            // and run as the primitives they stand for where a trace states
+            // them.
+            Fused::MatmulGlu { .. }
+            | Fused::MatmulSplitRows { .. }
+            | Fused::MoeSelectGlu { .. }
+            | Fused::MoeExperts { .. }
+            | Fused::LseSink { .. }
+            | Fused::RopeYarnAppend { .. }
+            | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
+            Fused::NormRopeLastAppend { .. }
+            | Fused::NormRopePair { .. }
+            | Fused::IndexTopkRope { .. }
+            | Fused::PoolCompress { .. }
+            | Fused::PoolAttention { .. }
+            | Fused::MlaPrefillExpanded { .. }
+            | Fused::HcPre { .. }
+            | Fused::HcGatesNorm { .. }
+            | Fused::HcPrenormProject { .. }
+            | Fused::ResBlendRmsnorm { .. }
+            | Fused::SplitQkvFused { .. } => unreachable!("`refuses` names it"),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }
-            | Fused::RmsnormRopePartialQ { .. }
+            | Fused::NormRope { .. }
             | Fused::HcNormProject { .. }
             | Fused::NormModulate { .. }
             | Fused::GatedResidualNormModulate { .. } => {
                 let mut outputs = Vec::new();
                 op.outputs(&mut outputs);
                 if outputs.first().is_some_and(|out| self.lane_shaped(*out)) {
-                    self.unseated(|| self.fused_elementwise(op))
+                    self.unseated(|| self.fused_elemwise(op))
                 } else {
-                    self.fused_elementwise(op)
+                    self.fused_elemwise(op)
                 }
             }
         }
@@ -77,38 +103,57 @@ impl Run<'_> {
     ) -> Option<(kernels_cuda::linear::moe::RoutedMlp, ValueId)> {
         use poem_ir::Linear;
         let (
-            Linear::MoeMatmulSelect {
+            Linear::MoeSelect {
                 x,
                 bank: gate_up,
                 routes,
                 y: packed,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
             },
-            Linear::MoeMatmulSelect {
+            Linear::MoeSelect {
                 x: h,
                 bank: down_bank,
                 routes: down_routes,
                 y: routed,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
             },
-            Linear::MoeWeightedSum {
+            Linear::MoeCombine {
                 routed: summed,
-                weights,
+                weights: Some(weights),
                 y,
+                shared: None,
+                ..
             },
         ) = (select, down, sum)
         else {
             return None;
         };
         let (intermediate, limit, glu_in, glu_out) = match glu {
-            Linear::MlpSwiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => (*intermediate, None, *packed, *y),
-            Linear::MlpSwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => (*intermediate, Some(*limit), *packed, *y),
             _ => return None,
         };
@@ -213,7 +258,8 @@ impl Run<'_> {
         else {
             return None;
         };
-        if !matches!(**select, Linear::MoeMatmulSelect { x, .. } if x == act) {
+        if !matches!(**select, Linear::MoeSelect { x, bias: None, quantized: false, quant: None, .. } if x == act)
+        {
             return None;
         }
         let (p, y) = self.routed_mlp(select, glu, down, sum)?;
@@ -298,13 +344,14 @@ impl Run<'_> {
     /// A fused op as the primitives it replaced, each over the values the
     /// fused op keeps.
     fn primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchLayout, DispatchLinear};
-        use poem_ir::{Attention, Elementwise, Layout, Linear};
+        use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather, DispatchLinear};
+        use poem_ir::{Attn, Elemwise, Gather, Linear};
         match op {
-            Fused::MatmulSwiglu {
+            Fused::MatmulGlu {
                 act,
                 w,
                 intermediate,
+                glu,
                 packed,
                 y,
             } => {
@@ -314,14 +361,23 @@ impl Run<'_> {
                         act: *act,
                         w: *w,
                         y: *packed,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
                     },
                 )?;
                 DispatchLinear::dispatch(
                     self,
-                    &Linear::MlpSwiglu {
-                        packed: *packed,
+                    &Linear::Glu {
+                        packed: Some(*packed),
                         intermediate: *intermediate,
                         y: *y,
+                        gate: None,
+                        weights: None,
+                        limit: None,
+                        act: *glu,
+                        up: None,
                     },
                 )
             }
@@ -339,11 +395,15 @@ impl Run<'_> {
                         act: *act,
                         w: *w,
                         y: *y,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
                     },
                 )?;
-                DispatchLayout::dispatch(
+                DispatchGather::dispatch(
                     self,
-                    &Layout::SplitRows {
+                    &Gather::SplitRows {
                         x: *y,
                         width: *width,
                         left: *left,
@@ -374,7 +434,7 @@ impl Run<'_> {
                         DispatchLinear::dispatch(self, leg)?;
                     }
                     if let Some(norm) = norm {
-                        DispatchElementwise::dispatch(self, norm)?;
+                        DispatchElemwise::dispatch(self, norm)?;
                     }
                     DispatchLinear::dispatch(self, sum)?;
                 }
@@ -389,17 +449,30 @@ impl Run<'_> {
                 head_dim,
                 o_out,
             } => {
-                let (Attention::DecodeLse { o, lse, .. } | Attention::PrefillLse { o, lse, .. }) =
-                    **attn
+                let (Attn::Decode {
+                    o,
+                    lse: Some(lse),
+                    selection: None,
+                    bias: None,
+                    ..
+                }
+                | Attn::Prefill {
+                    o,
+                    lse: Some(lse),
+                    mask: None,
+                    selection: None,
+                    bias: None,
+                    ..
+                }) = **attn
                 else {
                     return Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
                         op: op.name(),
                     }));
                 };
-                DispatchAttention::dispatch(self, attn)?;
-                DispatchAttention::dispatch(
+                DispatchAttn::dispatch(self, attn)?;
+                DispatchAttn::dispatch(
                     self,
-                    &Attention::Sink {
+                    &Attn::Sink {
                         o,
                         lse,
                         sink: *sink,
@@ -427,29 +500,34 @@ impl Run<'_> {
                 q_out,
                 k_out,
             } => {
-                DispatchElementwise::dispatch(
+                DispatchElemwise::dispatch(
                     self,
-                    &Elementwise::RopeYarn {
+                    &Elemwise::Rope {
                         q: *q,
-                        k: *k,
+                        k: Some(*k),
                         positions: *positions,
                         head_dim: *head_dim,
                         theta: *theta,
-                        factor: *factor,
-                        beta_fast: *beta_fast,
-                        beta_slow: *beta_slow,
-                        attention_factor: *attention_factor,
-                        original_max_position: *original_max_position,
-                        interleaved: *interleaved,
+                        turn: poem_ir::Turn::Yarn {
+                            yarn: poem_ir::Yarn {
+                                factor: *factor,
+                                beta_fast: *beta_fast,
+                                beta_slow: *beta_slow,
+                                original_max_position: *original_max_position,
+                            },
+                            attention_factor: *attention_factor,
+                            interleaved: *interleaved,
+                        },
+                        freqs: None,
                         q_out: *q_out,
-                        k_out: *k_out,
+                        k_out: Some(*k_out),
                     },
                 )?;
-                DispatchAttention::dispatch(
+                DispatchAttn::dispatch(
                     self,
-                    &Attention::KvAppend {
+                    &Attn::KvAppend {
                         k: *k_out,
-                        v: *v,
+                        v: Some(*v),
                         cache: *cache,
                         write_page: *write_page,
                         write_offset: *write_offset,
@@ -477,9 +555,9 @@ impl Run<'_> {
                 v_out,
             } => {
                 // The split lands q where the rotation leaves it.
-                DispatchLayout::dispatch(
+                DispatchGather::dispatch(
                     self,
-                    &Layout::SplitQkv {
+                    &Gather::SplitQkv {
                         packed: *packed,
                         q_width: *q_width,
                         kv_width: *kv_width,
@@ -488,29 +566,34 @@ impl Run<'_> {
                         v: *v_out,
                     },
                 )?;
-                DispatchElementwise::dispatch(
+                DispatchElemwise::dispatch(
                     self,
-                    &Elementwise::RopeYarn {
+                    &Elemwise::Rope {
                         q: *q_out,
-                        k: *k_out,
+                        k: Some(*k_out),
                         positions: *positions,
                         head_dim: *head_dim,
                         theta: *theta,
-                        factor: *factor,
-                        beta_fast: *beta_fast,
-                        beta_slow: *beta_slow,
-                        attention_factor: *attention_factor,
-                        original_max_position: *original_max_position,
-                        interleaved: *interleaved,
+                        turn: poem_ir::Turn::Yarn {
+                            yarn: poem_ir::Yarn {
+                                factor: *factor,
+                                beta_fast: *beta_fast,
+                                beta_slow: *beta_slow,
+                                original_max_position: *original_max_position,
+                            },
+                            attention_factor: *attention_factor,
+                            interleaved: *interleaved,
+                        },
+                        freqs: None,
                         q_out: *q_out,
-                        k_out: *k_out,
+                        k_out: Some(*k_out),
                     },
                 )?;
-                DispatchAttention::dispatch(
+                DispatchAttn::dispatch(
                     self,
-                    &Attention::KvAppend {
+                    &Attn::KvAppend {
                         k: *k_out,
-                        v: *v_out,
+                        v: Some(*v_out),
                         cache: *cache,
                         write_page: *write_page,
                         write_offset: *write_offset,
@@ -526,7 +609,7 @@ impl Run<'_> {
     /// The gated-delta decode step whole where the kernel covers it, else
     /// its primitives over the values the fused op keeps.
     fn gdn_step(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttention, DispatchLayout};
+        use poem_exec::{DispatchGather, DispatchSsm};
         let Fused::GdnStep {
             qkvz,
             width,
@@ -552,7 +635,7 @@ impl Run<'_> {
             unreachable!("only the gated-delta step comes here");
         };
         if !self.rs_extended() {
-            let done = kernels_cuda::attn::ssm::gdn_step_fused(
+            let done = kernels_cuda::ssm::gdn_step_fused(
                 self.ctx(),
                 self.tensor(qkvz),
                 self.tensor(conv_weight),
@@ -573,25 +656,25 @@ impl Run<'_> {
             )
             .map_err(crate::error::kernel)?;
             if done {
-                self.rs_move("attention.ssm_causal_conv1d", qkv, self.tensor(qkv))
+                self.rs_move("ssm.causal_conv1d", qkv, self.tensor(qkv))
                     .map_err(crate::error::kernel)?;
                 return self
-                    .rs_move("attention.ssm_gdn_prep", ba, self.tensor(ba))
+                    .rs_move("ssm.gdn_gates", ba, self.tensor(ba))
                     .map_err(crate::error::kernel);
             }
         }
-        DispatchLayout::dispatch(
+        DispatchGather::dispatch(
             self,
-            &poem_ir::Layout::SplitRows {
+            &poem_ir::Gather::SplitRows {
                 x: qkvz,
                 width,
                 left: qkv,
                 right: z,
             },
         )?;
-        DispatchAttention::dispatch(
+        DispatchSsm::dispatch(
             self,
-            &poem_ir::Attention::SsmCausalConv1d {
+            &poem_ir::Ssm::CausalConv1d {
                 x: qkv,
                 weight: conv_weight,
                 bias: None,
@@ -601,18 +684,18 @@ impl Run<'_> {
                 y: conv,
             },
         )?;
-        DispatchAttention::dispatch(
+        DispatchSsm::dispatch(
             self,
-            &poem_ir::Attention::SsmGdnPrep {
+            &poem_ir::Ssm::GdnGates {
                 ba,
                 dt_bias,
                 a_log,
                 gates,
             },
         )?;
-        DispatchAttention::dispatch(
+        DispatchSsm::dispatch(
             self,
-            &poem_ir::Attention::SsmGatedDelta {
+            &poem_ir::Ssm::GatedDelta {
                 qkv: conv,
                 z,
                 gates,
@@ -629,9 +712,10 @@ impl Run<'_> {
     /// Qwen's gated attention prologue in one launch where the kernel takes
     /// it, else its primitives over the values the fused op keeps.
     fn q_gate_append(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchLayout};
+        use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather};
         let Fused::QGateNormRopeAppend {
             qg,
+            intermediates: _,
             head_dim,
             q,
             gate,
@@ -656,7 +740,7 @@ impl Run<'_> {
         else {
             unreachable!("only the gated attention prologue comes here");
         };
-        if custom::q_gate_k_norm_rope_append(
+        if qkv_append::q_gate_k_norm_rope_append(
             self.ctx(),
             self.tensor(qg),
             self.tensor(k),
@@ -681,55 +765,54 @@ impl Run<'_> {
         {
             return Ok(());
         }
-        DispatchLayout::dispatch(
+        DispatchGather::dispatch(
             self,
-            &poem_ir::Layout::SplitQGate {
+            &poem_ir::Gather::SplitQGate {
                 packed: qg,
                 head_dim,
                 q,
                 gate,
             },
         )?;
-        DispatchElementwise::dispatch(
+        DispatchElemwise::dispatch(
             self,
-            &poem_ir::Elementwise::RmsnormPerHeadPlusOne {
+            &poem_ir::Elemwise::Rmsnorm {
                 x: q,
-                weight: q_norm,
-                head_dim,
+                weight: NormWeight::PlusOne(q_norm),
+                axis: NormAxis::Head(head_dim),
                 eps: q_eps,
                 y: qn,
             },
         )?;
-        DispatchElementwise::dispatch(
+        DispatchElemwise::dispatch(
             self,
-            &poem_ir::Elementwise::RmsnormPerHeadPlusOne {
+            &poem_ir::Elemwise::Rmsnorm {
                 x: k,
-                weight: k_norm,
-                head_dim,
+                weight: NormWeight::PlusOne(k_norm),
+                axis: NormAxis::Head(head_dim),
                 eps: k_eps,
                 y: kn,
             },
         )?;
-        DispatchElementwise::dispatch(
+        DispatchElemwise::dispatch(
             self,
-            &poem_ir::Elementwise::RopePartial {
+            &poem_ir::Elemwise::Rope {
                 q: qn,
-                k: kn,
+                k: Some(kn),
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                span,
-                q_out,
-                k_out,
+                turn: poem_ir::Turn::Partial { rotary_dim, span },
                 freqs: None,
+                q_out,
+                k_out: Some(k_out),
             },
         )?;
-        DispatchAttention::dispatch(
+        DispatchAttn::dispatch(
             self,
-            &poem_ir::Attention::KvAppend {
+            &poem_ir::Attn::KvAppend {
                 k: k_out,
-                v,
+                v: Some(v),
                 cache,
                 write_page,
                 write_offset,
@@ -737,7 +820,7 @@ impl Run<'_> {
         )
     }
 
-    fn custom_cuda(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+    fn qkv_write(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite {
                 packed,
@@ -758,7 +841,7 @@ impl Run<'_> {
                 v_scale,
                 widths,
                 q,
-            } => custom::qkv_fused_qknorm_rope_vnorm_write(
+            } => qkv_append::qkv_fused_qknorm_rope_vnorm_write(
                 self.ctx(),
                 self.tensor(*packed),
                 positions.map(|p| self.tensor(p)),

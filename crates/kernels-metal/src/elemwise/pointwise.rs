@@ -1,4 +1,8 @@
-use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, nonzero, refuse};
+use dtype::Dtype;
+
+use crate::encode::{
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, nonzero, refuse, stated,
+};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -25,7 +29,7 @@ fn binary(
 }
 
 pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add";
+    const OP: &str = "elemwise.binary";
     let entry = dtype_dispatch!(OP, z.dtype, {
         Bf16 => "binary_add_bfloat16",
         F32 => "binary_add_float32",
@@ -34,7 +38,7 @@ pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
 }
 
 pub fn mul(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul";
+    const OP: &str = "elemwise.binary";
     let entry = dtype_dispatch!(OP, z.dtype, {
         Bf16 => "binary_mul_bfloat16",
         F32 => "binary_mul_float32",
@@ -60,7 +64,7 @@ fn activation(
 }
 
 pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_silu_bfloat16",
         F32 => "act_silu_float32",
@@ -69,7 +73,7 @@ pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.tanh";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_tanh_bfloat16",
         F32 => "act_tanh_float32",
@@ -78,7 +82,7 @@ pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gelu";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_gelu_tanh_bfloat16",
         F32 => "act_gelu_tanh_float32",
@@ -126,7 +130,7 @@ fn fwht_point(
 /// multiply the activation on load, before the butterfly (the Randomized
 /// Hadamard `H·S`); the sign vector repeats block-wise if wider than `block`.
 pub fn hadamard(ctx: &Ctx<'_>, x: Tensor, block: u32, signs: Option<Tensor>) -> Result<(), Error> {
-    const OP: &str = "elementwise.hadamard";
+    const OP: &str = "elemwise.hadamard";
     let (entry, threads) = fwht_point(OP, block, x.dtype)?;
     if !x.width.is_multiple_of(block) {
         return Err(refuse(
@@ -179,7 +183,7 @@ pub fn hadamard(ctx: &Ctx<'_>, x: Tensor, block: u32, signs: Option<Tensor>) -> 
 
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp";
+    const OP: &str = "elemwise.clamp";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "clamp_bounds_bfloat16",
         F32 => "clamp_bounds_float32",
@@ -197,7 +201,7 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.clamp_learned";
+    const OP: &str = "elemwise.clamp";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "clamp_learned_bfloat16",
         F32 => "clamp_learned_float32",
@@ -230,7 +234,7 @@ pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result
 }
 
 pub fn cast_f32_to_bf16(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.cast_f32_to_bf16";
+    const OP: &str = "elemwise.cast_f32_to_bf16";
     if x.dtype != dtype::Dtype::F32 || o.dtype != dtype::Dtype::Bf16 {
         return Err(refuse(
             OP,
@@ -252,7 +256,7 @@ pub fn relative_bucket_bias(
     bidirectional: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.relative_bucket_bias";
+    const OP: &str = "elemwise.relative_bucket_bias";
     let entry = dtype_dispatch!(OP, embedding.dtype, {
         Bf16 => "relative_bucket_bias_bfloat16",
         F32 => "relative_bucket_bias_float32",
@@ -317,5 +321,73 @@ pub fn relative_bucket_bias(
             u32::from(bidirectional).arg(),
             log_ratio.arg(),
         ],
+    )
+}
+
+pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.residual_add";
+    let entry = dtype_dispatch!(OP, y.dtype, {
+        Bf16 => "residual_add_bfloat16",
+        F32 => "residual_add_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, y.width, y.rows)?, [256, 1, 1])),
+        &[x.arg(), y.arg(), y.arg_mut()],
+    )
+}
+
+pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.add_bias";
+    let entry = match (out.dtype, bias.dtype) {
+        (Dtype::Bf16, Dtype::Bf16) => "add_bias_bfloat16",
+        (Dtype::F32, Dtype::F32) => "add_bias_float32",
+        (Dtype::F32, Dtype::Bf16) => "add_bias_float32_bf16",
+        (row, bank) => {
+            return Err(refuse(
+                OP,
+                format!("no point adds a {bank:?} bias to a {row:?} row"),
+            ));
+        }
+    };
+    let lanes = elementwise_rows(OP, out.width, out.rows)?;
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
+        &[out.arg_mut(), bias.arg(), stated(OP, out.width)?.arg()],
+    )
+}
+
+pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.act";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "layer_scalar_mul_stated_bfloat16",
+        F32 => "layer_scalar_mul_stated_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
+        &[x.arg(), s.arg(), x.arg_mut()],
+    )
+}
+
+pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.act";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "silu_scaled_bfloat16",
+        F32 => "silu_scaled_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
+        &[x.arg_mut(), s.arg()],
+    )
+}
+
+pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.act";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "layer_scalar_mul_bfloat16",
+        F32 => "layer_scalar_mul_float32",
+    });
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
+        &[x.arg(), s.arg(), x.arg_mut()],
     )
 }

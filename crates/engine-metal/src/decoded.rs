@@ -1,13 +1,13 @@
 use std::collections::BTreeSet;
 
-use poem_ir::{Attention, Def, Operation, Trace};
+use poem_ir::{Attn, Def, Operation, Trace};
 
 pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     let mut rows = BTreeSet::new();
     for node in &trace.nodes {
         let kv_b = match &node.op {
-            Operation::Attention(Attention::MlaAbsorbQ { kv_b, .. })
-            | Operation::Attention(Attention::MlaAbsorbOut { kv_b, .. }) => *kv_b,
+            Operation::Attn(Attn::MlaAbsorbQ { kv_b, .. })
+            | Operation::Attn(Attn::MlaAbsorbOut { kv_b, .. }) => *kv_b,
             _ => continue,
         };
         if let Some(Def::Weight(w)) = trace.values.get(kv_b.0 as usize).map(|v| &v.def) {

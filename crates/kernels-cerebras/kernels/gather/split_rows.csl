@@ -1,0 +1,9 @@
+// left[r] = x[r][..cut], right[r] = x[r][cut..].
+fn k_split_rows(x: [*]f32, left: [*]f32, right: [*]f32, rows: i32, width: i32, cut: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    k_copy(left, r * cut, x, r * width, cut);
+    k_copy(right, r * (width - cut), x, r * width + cut, width - cut);
+  }
+}
+

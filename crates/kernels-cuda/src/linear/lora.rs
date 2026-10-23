@@ -6,7 +6,7 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/lora.cuh";
+const LORA: &str = "linear/lora.cu";
 
 const BLOCK: u32 = 256;
 
@@ -112,7 +112,7 @@ pub fn correct(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::lora_combine<{t}>")))
+        Fire::at(LORA, symbol(&format!("::pie::linear::lora_combine<{t}>")))
             .apply(Launch::grid(grid, [BLOCK, 1, 1])),
         &[
             routes.arg(),

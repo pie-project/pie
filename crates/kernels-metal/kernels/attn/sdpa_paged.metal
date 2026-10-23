@@ -935,59 +935,6 @@ template <typename T, int D, int V = D>
       ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
 }
 
-template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LANE = false>
-[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled_strided(
-    const device T* queries     [[buffer(0)]],
-    const device T* k_pages     [[buffer(1)]],
-    const device T* v_pages     [[buffer(2)]],
-    device T* out               [[buffer(3)]],
-    const constant int& gqa_factor          [[buffer(4)]],
-    const device int* position_ids          [[buffer(5)]],
-    const device int* req_of_token          [[buffer(6)]],
-    const device uint* kv_page_indices      [[buffer(7)]],
-    const device uint* kv_page_indptr       [[buffer(8)]],
-    const constant int& page_size           [[buffer(9)]],
-    const constant int& n_kv_heads          [[buffer(10)]],
-    const constant float& scale             [[buffer(11)]],
-    const device uchar* attention_mask      [[buffer(12)]],
-    const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
-    const constant int& window                 [[buffer(15)]],
-    const device T* sinks                      [[buffer(16)]],
-    const constant int& n_rows                 [[buffer(17)]],
-    const constant int& q_row_pitch            [[buffer(18)]],
-    const constant int& o_row_pitch            [[buffer(19)]],
-    uint3 tid       [[threadgroup_position_in_grid]],
-    uint3 tpg       [[threadgroups_per_grid]],
-    uint simd_gid   [[simdgroup_index_in_threadgroup]],
-    uint simd_lid   [[thread_index_in_simdgroup]]) {
-  threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, KEY_PER_LANE>()];
-  threadgroup T vtile[sdpa_kt<D>() * D];
-  threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
-  threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
-  sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE, false>(
-      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
-      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
-      attention_mask, attention_mask_stride, attention_mask_enabled, window,
-      sinks, nullptr, n_rows,
-      q_row_pitch, o_row_pitch,
-      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
-}
-
-#define instantiate_sdpa_tiled_strided(fn, name, itype, d, v, sink, kpl)   \
-  template [[host_name(fn "_" #name "_d_" #d)]]                            \
-  [[kernel]] void sdpa_paged_tiled_strided<itype, d, v, sink, kpl>(        \
-      const device itype*, const device itype*, const device itype*,       \
-      device itype*, const constant int&, const device int*,               \
-      const device int*, const device uint*, const device uint*,           \
-      const constant int&, const constant int&, const constant float&,     \
-      const device uchar*, const device uint&, const device uchar*,        \
-      const constant int&, const device itype*, const constant int&,       \
-      const constant int&, const constant int&,                            \
-      uint3, uint3, uint, uint);
-
-instantiate_sdpa_tiled_strided("sdpa_paged_tiled_strided", bfloat16, bfloat, 256, 256, false, false)
-
 #define instantiate_sdpa_tiled_impl(fn, name, itype, d, v, sink, kpl)      \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
   [[kernel]] void sdpa_paged_tiled<itype, d, v, sink, kpl>(                \
@@ -1004,8 +951,6 @@ instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 64, 64, false,
 
 instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 256, 256, false, false)
 instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 512, 512, false, false)
-
-instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, bfloat, 64, 64, true, true)
 
 #define instantiate_sdpa_tiled_lse(fn, name, itype, d, v, kpl)             \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
@@ -1066,14 +1011,10 @@ instantiate_sdpa_tiled_lse_kv_u4(bfloat16, bfloat, 256, 256)
 #define instantiate_sdpa_paged(name, itype, d, v)                          \
   instantiate_sdpa_paged_impl("sdpa_paged_decode", name, itype, d, v, false)
 
-#define instantiate_sdpa_paged_sink(name, itype, d, v)                     \
-  instantiate_sdpa_paged_impl("sdpa_paged_decode_sink", name, itype, d, v, true)
-
 instantiate_sdpa_paged(bfloat16, bfloat, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)
 instantiate_sdpa_paged(bfloat16, bfloat, 128, 128)
 instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)
-instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)
 
 #define instantiate_sdpa_paged_selected(name, itype, d, v)                 \
   template [[host_name("sdpa_paged_selected_" #name "_d_" #d)]]            \
@@ -1122,29 +1063,3 @@ instantiate_sdpa_paged_lse(bfloat16, bfloat, 128, 128)
 instantiate_sdpa_paged_lse(bfloat16, bfloat, 256, 256)
 instantiate_sdpa_paged_lse(bfloat16, bfloat, 512, 512)
 
-#define instantiate_sdpa_paged_p32(name, itype, d, v)                       \
-  template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32")]]        \
-  [[kernel]] void sdpa_paged_decode<itype, d, v, false, 32, true, 32>(      \
-      const device itype*, const device itype*, const device itype*,        \
-      device itype*, const constant int&, const device int*,                \
-      const device int*, const device uint*, const device uint*,            \
-      const constant int&, const constant int&, const constant float&,      \
-      const device uchar*, const device uint&, const device uchar*,         \
-      const constant int&, const device itype*,                             \
-      uint3, uint3, uint, uint);
-
-instantiate_sdpa_paged_p32(bfloat16, bfloat, 128, 128)
-instantiate_sdpa_paged_p32(bfloat16, bfloat, 64, 64)
-
-#define instantiate_sdpa_paged_short(name, itype, d, v, sg)                  \
-  template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32_sg" #sg)]] \
-  [[kernel]] void sdpa_paged_decode<itype, d, v, false, 32, true, sg>(       \
-      const device itype*, const device itype*, const device itype*,         \
-      device itype*, const constant int&, const device int*,                 \
-      const device int*, const device uint*, const device uint*,             \
-      const constant int&, const constant int&, const constant float&,       \
-      const device uchar*, const device uint&, const device uchar*,          \
-      const constant int&, const device itype*,                              \
-      uint3, uint3, uint, uint);
-
-instantiate_sdpa_paged_short(bfloat16, bfloat, 64, 64, 8)

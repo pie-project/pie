@@ -30,19 +30,29 @@ macro_rules! primitive {
 }
 
 primitive!(
-    poem_ir::Attention,
+    poem_ir::Attn,
     poem_ir::Linear,
-    poem_ir::Elementwise,
-    poem_ir::Layout,
+    poem_ir::Sampling,
+    poem_ir::Ssm,
+    poem_ir::Elemwise,
+    poem_ir::Gather,
     poem_ir::Collective,
-    poem_ir::Spatial
+    poem_ir::Conv
 );
+
+/// A value recorded once a trace, by its parts.
+type Held = (ValueId, Option<Guard>, Ty);
 
 #[derive(Clone)]
 pub struct Recorder {
     inner: Rc<RefCell<Trace>>,
 
     at: Rc<Cell<Option<u32>>>,
+
+    /// The values recorded once a trace, by what they are: the host plans
+    /// every layer's attention reads. Held as their parts, so no value
+    /// outlives the trace through this.
+    once: Rc<RefCell<std::collections::HashMap<String, Held>>>,
 }
 
 impl Recorder {
@@ -60,7 +70,29 @@ impl Recorder {
                 facts: poem_ir::Facts::default(),
             })),
             at: Rc::new(Cell::new(None)),
+            once: Rc::default(),
         }
+    }
+
+    /// The value `make` records, recorded the first time `key` is asked for
+    /// and outside any layer: a host plan, built once and read by every
+    /// layer that asks for the same one.
+    pub(crate) fn once(&self, key: String, make: impl FnOnce() -> Value) -> Value {
+        if let Some((id, over, ty)) = self.once.borrow().get(&key).cloned() {
+            return Value {
+                rec: self.clone(),
+                id,
+                over,
+                ty,
+            };
+        }
+        let at = self.at.replace(None);
+        let made = make();
+        self.at.set(at);
+        self.once
+            .borrow_mut()
+            .insert(key, (made.id, made.over.clone(), made.ty.clone()));
+        made
     }
 
     /// The platform this trace is recorded for.
@@ -539,10 +571,12 @@ impl Mul<f32> for Value {
     fn mul(self, rhs: f32) -> Value {
         let y = self.rec.fresh(self.ty.clone());
         self.rec.push(
-            poem_ir::Elementwise::MulScalar {
-                s: rhs,
+            poem_ir::Elemwise::Act {
+                scale: Some(rhs),
                 x: self.id,
                 x_out: y.id(),
+                s: None,
+                act: poem_ir::ActFn::Identity,
             },
             &[&self],
         );
@@ -716,7 +750,7 @@ fn compatible(a: &Guard, b: &Guard) -> bool {
 }
 
 fn joins_arms(op: &Operation) -> bool {
-    matches!(op, Operation::Attention(poem_ir::Attention::Ragged { .. }))
+    matches!(op, Operation::Attn(poem_ir::Attn::Ragged { .. }))
 }
 
 fn join(ins: &[&Value]) -> Guard {

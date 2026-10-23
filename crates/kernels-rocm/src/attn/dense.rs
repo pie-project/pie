@@ -3,6 +3,8 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
+pub mod voxel;
+
 const FILE: &str = "attn/dense.hip";
 
 /// Wavefronts a block runs, 16 query rows each.
@@ -42,7 +44,7 @@ pub fn bidirectional(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.dense";
+    const OP: &str = "attn.dense";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` reads q, k and v in one element");
     debug_assert_eq!(v.dtype, q.dtype, "`{OP}` reads q, k and v in one element");

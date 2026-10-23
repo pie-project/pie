@@ -11,7 +11,8 @@ mod common;
 
 use common::{Gpu, KV, STATE, bf16s, close_abs, close_bf16, e4m3_value, indptr_of, values};
 use dtype::Dtype;
-use kernels_rocm::attn::{self, plan, selected, selector};
+use kernels_rocm::attn::{self, plan, selected};
+use kernels_rocm::sampling;
 use kernels_rocm::{KvPool, RaggedTensor, RecurrentPool};
 
 /// A bf16 NHD pool and the host keys and values it holds, [request][token]
@@ -130,7 +131,7 @@ fn logit_softcap_caps_every_logit() {
     let ctx = gpu.ctx();
     let xs = bf16s(3 * 1001, 1, 90.0);
     let mut x = gpu.tensor(&xs, 3, 1001, Dtype::Bf16);
-    attn::logit_softcap(&ctx, &mut x, 30.0).unwrap();
+    attn::merge::logit_softcap(&ctx, &mut x, 30.0).unwrap();
     let inv = 1.0f32 / 30.0;
     let want: Vec<f32> = xs.iter().map(|&v| 30.0 * (v * inv).tanh()).collect();
     close_bf16("logit_softcap", &gpu.read(&x), &want, 1.0);
@@ -170,20 +171,20 @@ fn sink_rescales_by_the_sinks_share() {
         };
 
         let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
-        attn::sink(&ctx, &mut o, lse, sink, d).unwrap();
+        attn::merge::sink(&ctx, &mut o, lse, sink, d).unwrap();
         close_bf16("sink", &gpu.read(&o), &want(&|_| true), 1.0);
 
         // The sinks in f32, as a checkpoint may keep them (Hy4).
         let sink32 = gpu.tensor(&sinks, 1, heads, Dtype::F32);
         let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
-        attn::sink(&ctx, &mut o, lse, sink32, d).unwrap();
+        attn::merge::sink(&ctx, &mut o, lse, sink32, d).unwrap();
         close_bf16("f32 sink", &gpu.read(&o), &want(&|_| true), 1.0);
 
         // Staged rows 1..4 of the 5.
         let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
         let win = gpu.ints(&[3, 1, 0, 0]);
         ctx.arm_stage(win.ptr);
-        attn::sink(&ctx, &mut o, lse, sink, d).unwrap();
+        attn::merge::sink(&ctx, &mut o, lse, sink, d).unwrap();
         ctx.disarm_stage();
         close_bf16(
             "windowed sink",
@@ -219,7 +220,7 @@ fn merge_lse_combines_two_partials() {
     );
     let mut o = gpu.zeros(n, heads * d, Dtype::Bf16);
     let mut lse = gpu.zeros(n, heads, Dtype::F32);
-    attn::merge_lse(&ctx, o1, lse1, o2, lse2, heads, d, &mut o, &mut lse).unwrap();
+    attn::merge::merge_lse(&ctx, o1, lse1, o2, lse2, heads, d, &mut o, &mut lse).unwrap();
     let (mut want, mut want_lse) = (vec![0f32; o1s.len()], vec![0f32; l1s.len()]);
     for cell in 0..(n * heads) as usize {
         let (a, b) = (l1s[cell], l2s[cell]);
@@ -277,7 +278,7 @@ fn dense_attends_inside_each_segment() {
         let seg = gpu.column(&segments);
         let scale = 1.0 / (d as f32).sqrt();
         let mut o = gpu.zeros(rows, hq * d, Dtype::Bf16);
-        kernels_rocm::attn_dense::bidirectional(&ctx, q, k, v, seg, d, scale, &mut o).unwrap();
+        kernels_rocm::attn::dense::bidirectional(&ctx, q, k, v, seg, d, scale, &mut o).unwrap();
         let got = gpu.read(&o);
         let (d_, g) = (d as usize, (hq / hk) as usize);
         for r in 0..rows as usize {
@@ -539,7 +540,7 @@ fn selector_walk_chains_each_rows_pick() {
             gpu.tensor(&succ, vocab, rank, Dtype::Bf16),
         );
         let mut picks = gpu.upload(&vec![-7i32; rows], rows as u32, 1, Dtype::I32);
-        selector::walk(&ctx, c, un, hpt, tok, pr, su, first, &mut picks).unwrap();
+        sampling::selector_walk(&ctx, c, un, hpt, tok, pr, su, first, &mut picks).unwrap();
         let got = gpu.read_as::<i32>(&picks);
 
         let mut want = vec![-7i32; rows];
@@ -654,7 +655,7 @@ fn score_capture_averages_the_observed_rows_mass() {
     let scale = 1.0 / (d as f32).sqrt();
     // Each lane seated at its own block.
     let seat_of = gpu.column(&(0..(lane_offset + n) as i32).collect::<Vec<_>>());
-    kernels_rocm::attn_score::capture(
+    kernels_rocm::attn::score::capture(
         &ctx,
         q,
         &built,
@@ -741,7 +742,7 @@ fn block_dyn_conv_convolves_inside_each_request() {
         let coeff = gpu.tensor(&cs, rows as u32, (2 * taps * groups) as u32, Dtype::Bf16);
         let base = gpu.tensor(&bs, (2 * taps) as u32, channels as u32, Dtype::Bf16);
         let mut y = gpu.zeros(rows as u32, channels as u32, Dtype::Bf16);
-        kernels_rocm::attn::dynconv::block_dyn_conv(
+        kernels_rocm::ssm::dyn_conv(
             &ctx,
             x,
             coeff,
@@ -842,7 +843,7 @@ fn ple_ngram_ids_hash_windows_across_the_state() {
             ..STATE
         };
         let mut out = gpu.upload(&[-1i32; 4 * 4], 4, 4, Dtype::I32);
-        kernels_rocm::attn_ple::ngram_ids(
+        kernels_rocm::gather::ngram_ids(
             &ctx,
             gpu.column(&ids),
             &pool,
@@ -897,7 +898,7 @@ fn ple_ngram_ids_hash_windows_across_the_state() {
             data: gpu.column(&tok),
             indptr: gpu.column(&qo),
         };
-        kernels_rocm::attn_ple::ngram_ids_chunked(
+        kernels_rocm::gather::ngram_ids_chunked(
             &ctx, x, &pool, EOS as u32, &MULTS, &PRIMES, &OFFSETS, 2, map_t, &mut out,
         )
         .unwrap();
@@ -1001,7 +1002,7 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
             if let Some(w) = win {
                 ctx.arm_stage(gpu.ints(&w).ptr);
             }
-            kernels_rocm::custom::qkv_fused_qknorm_rope_vnorm_write(
+            kernels_rocm::attn::qkv_append::qkv_fused_qknorm_rope_vnorm_write(
                 &ctx,
                 gpu.tensor(&packed_s, rows, width, Dtype::Bf16),
                 Some(gpu.column(&positions)),
@@ -1174,7 +1175,7 @@ fn check_rel(
     let window_left = window.map_or(-1, |w| w as i32 - 1);
     attn::rel::walk(
         &ctx,
-        "attention.prefill_rel",
+        "attn.prefill",
         q,
         &pool,
         rel,

@@ -14,13 +14,13 @@ impl Run<'_> {
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
         // The shared expert rides along on the routed register tiles: its rows
         // are tile 0 of their down, which the gated add reads.
-        if let Fused::MlpSwiglu { y, .. } = op
+        if let Fused::MatmulSwigluMatmul { y, .. } = op
             && self.tiles_shared(*y)
         {
             return Ok(());
         }
         match op {
-            Fused::MlpSwiglu {
+            Fused::MatmulSwigluMatmul {
                 act,
                 gate_up,
                 down,
@@ -52,12 +52,20 @@ impl Run<'_> {
                             act: *h,
                             w: *down,
                             y: *y,
+                            input_scales: None,
+                            scales: None,
+                            quant: None,
+                            logits: false,
                         });
                     }
                     self.linear(&Linear::Matmul {
                         act: *act,
                         w: *gate_up,
                         y: *packed,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
                     })?;
                     // The down on the register tile reads its input table as
                     // the swiglu lays it.
@@ -73,16 +81,25 @@ impl Run<'_> {
                             table,
                             counters,
                         )?,
-                        None => self.linear(&Linear::MlpSwiglu {
-                            packed: *packed,
+                        None => self.linear(&Linear::Glu {
+                            packed: Some(*packed),
                             intermediate: *intermediate,
                             y: *h,
+                            gate: None,
+                            weights: None,
+                            limit: None,
+                            act: poem_ir::GluAct::Swiglu,
+                            up: None,
                         })?,
                     }
                     self.linear(&Linear::Matmul {
                         act: *h,
                         w: *down,
                         y: *y,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
                     })
                 }
             },
@@ -112,7 +129,7 @@ impl Run<'_> {
         {
             return Ok(false);
         }
-        linear::quant::coop_swiglu(
+        linear::qmm::staged::coop_swiglu(
             self.ctx(),
             self.tuning(),
             x,
@@ -165,14 +182,14 @@ impl Run<'_> {
         let x = self.tensor(act);
         let out = self.tensor(y);
         ane.before_columns(self.ctx(), plan, x)?;
-        linear::quant::matmul_columns(
+        linear::qmm::matmul_columns(
             self.ctx(),
             self.tuning(),
             x,
             plan.view,
             out,
             plan.keep,
-            linear::quant::Scratch {
+            linear::qmm::Scratch {
                 precast: &|rows, contraction| self.precast(rows, contraction),
                 partials: &|rows, width| self.partials(rows, width),
                 table: None,
@@ -199,7 +216,7 @@ impl Run<'_> {
     ) -> Result<(), kernels_metal::Error> {
         let (Some(gate_up), Some(down)) = (self.banked(gate_up), self.banked(down)) else {
             return Err(kernels_metal::Error::Unsupported {
-                op: "fused.mlp_swiglu",
+                op: "fused.matmul_swiglu_matmul",
             });
         };
         let tail = self.tensor(act).rows - head;
@@ -207,13 +224,13 @@ impl Run<'_> {
         let room = |id: poem_ir::ValueId| self.capacity(id).saturating_sub(head);
         let precast = |rows, contraction| self.precast(rows, contraction);
         let partials = |rows, width| self.partials(rows, width);
-        let scratch = || linear::quant::Scratch {
+        let scratch = || linear::qmm::Scratch {
             precast: &precast,
             partials: &partials,
             table: None,
         };
         let (x, gate, hidden, out) = (at(act), at(packed), at(h), at(y));
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             x,
@@ -223,7 +240,7 @@ impl Run<'_> {
             room(act).min(room(packed)),
         )?;
         linear::mlp::swiglu(self.ctx(), gate, intermediate, hidden)?;
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             hidden,
@@ -272,13 +289,13 @@ impl Run<'_> {
         ane.before(self.ctx(), plan, x)?;
         let precast = |rows, contraction| self.precast(rows, contraction);
         let partials = |rows, width| self.partials(rows, width);
-        let scratch = || linear::quant::Scratch {
+        let scratch = || linear::qmm::Scratch {
             precast: &precast,
             partials: &partials,
             table: None,
         };
         let rows = self.capacity(act);
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             x,
@@ -287,7 +304,7 @@ impl Run<'_> {
             scratch(),
             rows.min(self.capacity(packed)),
         )?;
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             x,
@@ -297,7 +314,7 @@ impl Run<'_> {
             rows,
         )?;
         linear::mlp::swiglu_clamp_split(self.ctx(), gate, plan.up_rows, f32::MAX, h_gpu)?;
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             h_gpu,
@@ -330,14 +347,21 @@ impl Run<'_> {
         w: poem_ir::ValueId,
         y: poem_ir::ValueId,
     ) -> Result<bool, kernels_metal::Error> {
-        use linear::quant::{Segment, register_split};
+        use linear::qmm::sg::{Segment, register_split};
         use poem_ir::Operation;
         let Some((nodes, one_pass)) = self.region_nodes() else {
             return Ok(false);
         };
         let op = |at: u32| self.nodes().get(at as usize).map(|n| &n.op);
         let matmul = |at: u32| match op(at) {
-            Some(Operation::Linear(Linear::Matmul { act: a, w, y })) if *a == act => Some((*w, *y)),
+            Some(Operation::Linear(Linear::Matmul {
+                act: a,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            })) if *a == act => Some((*w, *y)),
             _ => None,
         };
         let Some(first) = self
@@ -359,7 +383,7 @@ impl Run<'_> {
                 last = at;
             } else {
                 match op(at) {
-                    Some(Operation::Layout(poem_ir::Layout::SplitQGate {
+                    Some(Operation::Gather(poem_ir::Gather::SplitQGate {
                         packed,
                         q,
                         gate,
@@ -385,7 +409,7 @@ impl Run<'_> {
                 self.banked(w)
                     .is_some_and(|b| b.bits == 4 && b.group == 64 && b.biases.is_some())
             })
-            && linear::quant::coop_segments_fit(self.tuning(), m, &widths, k);
+            && linear::qmm::staged::coop_segments_fit(self.tuning(), m, &widths, k);
         let mut segments = Vec::with_capacity(3);
         // The left half of the split whose halves a segment pair lands.
         let mut halves = None;
@@ -412,7 +436,7 @@ impl Run<'_> {
                 .iter()
                 .copied()
                 .find_map(|at| match op(at) {
-                    Some(Operation::Layout(poem_ir::Layout::SplitRows {
+                    Some(Operation::Gather(poem_ir::Gather::SplitRows {
                         x,
                         width,
                         left,
@@ -500,7 +524,7 @@ impl Run<'_> {
             }
         }
         if coop {
-            linear::quant::coop_segments(
+            linear::qmm::staged::coop_segments(
                 self.ctx(),
                 &segments,
                 x,
@@ -514,7 +538,7 @@ impl Run<'_> {
             ]);
             return Ok(true);
         }
-        let (counters, floats) = linear::quant::segments_scratch(&segments, m);
+        let (counters, floats) = linear::qmm::sg::segments_scratch(&segments, m);
         // Each split segment sums as its own launch would, or they run alone.
         let partials = if floats > 0 {
             match self.partials(1, floats) {
@@ -535,9 +559,9 @@ impl Run<'_> {
             return Ok(false);
         };
         if !laid {
-            linear::quant::register_table(self.ctx(), x, table, m, k, counters)?;
+            linear::qmm::sg::register_table(self.ctx(), x, table, m, k, counters)?;
         }
-        linear::quant::register_segments(self.ctx(), &segments, table, m, k, partials)?;
+        linear::qmm::sg::register_segments(self.ctx(), &segments, table, m, k, partials)?;
         self.land_ahead([
             members.get(1).map(|s| s.1),
             members.get(2).map(|s| s.1),
@@ -555,10 +579,15 @@ impl Run<'_> {
             return Ok(());
         }
         match op {
-            Linear::MlpRelu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            Linear::Matmul { act, w, y }
-                if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() =>
-            {
+            Linear::Relu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() => {
                 linear::lane_gemm::act_x_wt(
                     self.ctx(),
                     "linear.matmul",
@@ -567,7 +596,14 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
-            Linear::Matmul { act, w, y } => match self.banked(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } => match self.banked(*w) {
                 Some(bank) => {
                     // A segment launch of an earlier matmul of this activation landed it.
                     if self.landed_ahead(*y) {
@@ -586,13 +622,13 @@ impl Run<'_> {
                     }
                     // The matmuls of one activation (a layer's projections of
                     // its normed rows) share the register tile's input table.
-                    linear::quant::matmul(
+                    linear::qmm::matmul(
                         self.ctx(),
                         self.tuning(),
                         x,
                         bank,
                         self.tensor(*y),
-                        linear::quant::Scratch {
+                        linear::qmm::Scratch {
                             precast: &|rows, contraction| self.precast(rows, contraction),
                             partials: &|rows, width| self.partials(rows, width),
                             table: Some(&|rows, contraction, counters| {
@@ -609,14 +645,21 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Linear::LmHead { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::lm_head(
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            } => match self.banked(*w) {
+                Some(bank) => linear::qmm::lm_head(
                     self.ctx(),
                     self.tuning(),
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
-                    linear::quant::Scratch {
+                    linear::qmm::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
                         partials: &|rows, width| self.partials(rows, width),
                         table: Some(&|rows, contraction, counters| {
@@ -634,11 +677,24 @@ impl Run<'_> {
             },
 
             // The register chain's gate-up landed its SwiGLU already.
-            Linear::MlpSwiglu { packed, y, .. } if self.tiles_swiglu(*packed, *y) => Ok(()),
-            Linear::MlpSwiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
+                y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } if self.tiles_swiglu(*packed, *y) => Ok(()),
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => match self.chain_swiglu(*packed, *y) {
                 // The chain's gate-up rows sit sorted in the routed stack's
                 // output: the swiglu runs there and lands in its input.
@@ -670,11 +726,15 @@ impl Run<'_> {
                     }
                 }
             },
-            Linear::MlpSwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => linear::mlp::swiglu_clamp(
                 self.ctx(),
                 self.tensor(*packed),
@@ -682,12 +742,15 @@ impl Run<'_> {
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::MlpSwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => match self.chain_swiglu(*packed, *y) {
                 Some((sorted_packed, sorted_h, perm)) => linear::mlp::swiglu_clamp_alpha_sorted(
                     self.ctx(),
@@ -707,35 +770,90 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit: Some(limit),
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::MlpGegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => linear::mlp::geglu_tanh(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 self.tensor(*y),
             ),
-            Linear::MlpGeluTanh { x, y } => {
+            Linear::GeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
             Linear::RelBias { .. }
-            | Linear::MoeTopkSigmoidSink { .. }
-            | Linear::MatmulActQuant { .. }
-            | Linear::MoeMatmulSelectActQuant { .. }
-            | Linear::MlpSwigluClampSplitRouted { .. }
-            | Linear::MlpSwigluClampRouted { .. }
-            | Linear::MoeSumAdd { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            Linear::MlpGegluTanhPacked {
-                packed,
+            | Linear::MoeRoute {
+                score: poem_ir::RouteScore::SigmoidSink { .. },
+                ..
+            }
+            | Linear::Matmul {
+                quant: Some(_),
+                logits: false,
+                ..
+            }
+            | Linear::MoeSelect {
+                bias: None,
+                quantized: true,
+                quant: Some(_),
+                ..
+            }
+            | Linear::Glu {
+                packed: None,
+                gate: Some(_),
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
+            | Linear::Glu {
+                packed: Some(_),
+                gate: None,
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
+            | Linear::MoeCombine {
+                weights: None,
+                shared: Some(_),
+                ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            // The forms no builder makes.
+            Linear::Matmul { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => match self.chain_swiglu(*packed, *y) {
                 Some((sorted_packed, sorted_h, perm)) => match self.chain_sums() {
                     Some((sums, tile)) => linear::mlp::geglu_tanh_sorted_sums(
@@ -762,12 +880,15 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Linear::MlpSitu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                beta,
-                up_cap,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => linear::mlp::situ(
                 self.ctx(),
                 self.tensor(*packed),
@@ -777,12 +898,17 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
-            Linear::MoeTopkSoftmax {
+            // The forms no builder makes.
+            Linear::Glu { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            Linear::MoeRoute {
                 logits,
                 experts,
                 top_k,
                 routes,
                 weights,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => linear::moe::topk_softmax(
                 self.ctx(),
                 self.tensor(*logits),
@@ -791,13 +917,15 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            Linear::MoeTopkSoftmaxScaled {
+            Linear::MoeRoute {
                 logits,
-                scale,
+                scale: Some(scale),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => linear::moe::topk_softmax_scaled(
                 self.ctx(),
                 self.tensor(*logits),
@@ -807,16 +935,21 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            Linear::MoeTopkSigmoid {
+            Linear::MoeRoute {
                 logits,
                 bias,
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
                 hint: _,
+                score:
+                    poem_ir::RouteScore::Sigmoid {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => match bias {
                 Some(bias) => linear::moe::topk_sigmoid_biased(
                     self.ctx(),
@@ -840,13 +973,15 @@ impl Run<'_> {
                     self.tensor(*weights),
                 ),
             },
-            Linear::MoePredictRoute {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Predict,
+                ..
             } => linear::moe::predict_route(
                 self.ctx(),
                 self.tensor(*logits),
@@ -856,16 +991,21 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            Linear::MoeTopkSqrtSoftplus {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 hint: _,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::SqrtSoftplus {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => linear::moe::topk_sqrt_softplus(
                 self.ctx(),
                 self.tensor(*logits),
@@ -877,17 +1017,22 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            Linear::MoeHashRoute {
-                ids,
-                tid2eid,
+            Linear::MoeRoute {
+                ids: Some(ids),
+                table: Some(tid2eid),
                 logits,
-                vocab,
                 experts: _,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::Hash {
+                        vocab,
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => linear::moe::hash_route(
                 self.ctx(),
                 self.tensor(*ids),
@@ -900,6 +1045,8 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
+            // The forms no builder makes.
+            Linear::MoeRoute { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::GroupRoutes { groups, routes } => {
                 linear::moe::group_routes(self.ctx(), *groups, self.tensor(*routes))
             }
@@ -920,21 +1067,33 @@ impl Run<'_> {
                 *groups,
                 self.tensor(*y),
             ),
-            Linear::MoeMatmulSelect { x, bank, routes, y } => linear::moe::matmul_select(
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            } => linear::moe::matmul_select(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*bank),
                 self.tensor(*routes),
                 self.tensor(*y),
             ),
-            Linear::MoeMatmulSelectBias {
+            Linear::MoeSelect {
                 x,
                 bank,
-                bias,
+                bias: Some(bias),
                 routes,
                 y,
+                quantized: false,
+                quant: None,
+                ..
             } => {
-                const OP: &str = "linear.moe_matmul_select_bias";
+                const OP: &str = "linear.moe_select";
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
@@ -970,8 +1129,17 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
-            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
-                const OP: &str = "linear.moe_matmul_select_quant";
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => {
+                const OP: &str = "linear.moe_select";
                 // A routed MLP of a verify's few tokens on the register expert tiles.
                 if self.tiles_down(*x, *bank, *routes, *y)?
                     || self.tiles_start(*x, *bank, *routes, *y)?
@@ -1012,6 +1180,8 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
+            // The forms no builder makes.
+            Linear::MoeSelect { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::LoraCorrect {
                 x,
                 bank_a,
@@ -1027,7 +1197,13 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => match match self.tiles_fold(*routed) {
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => match match self.tiles_fold(*routed) {
                 // The gated add lands the register chain's sum.
                 Some(TiledFold::Deferred) => return Ok(()),
                 Some(TiledFold::Sorted(sorted, inv, top_k)) => Some((sorted, inv, top_k)),
@@ -1048,6 +1224,8 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
+            // The forms no builder makes.
+            Linear::MoeCombine { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::MoeBiasSum {
                 x,
                 bias,

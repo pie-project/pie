@@ -12,7 +12,7 @@ use std::fmt::Write;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Arg {
     /// A many-item pointer to an exported buffer.
-    Ptr(crate::program::Buf),
+    Ptr(crate::phase::Buf),
     /// A pointer to a scratch array (`name`, element type).
     Scratch(String, &'static str),
     Int(i64),
@@ -61,14 +61,14 @@ impl Arg {
 /// A kernel call, kept structured beside its rendered line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
-    pub kernel: String,
+    pub kernel: crate::library::Kernel,
     pub args: Vec<Arg>,
 }
 
 impl Call {
     pub fn render(&self) -> String {
         let args: Vec<String> = self.args.iter().map(Arg::render).collect();
-        format!("{}({});", self.kernel, args.join(", "))
+        format!("{}({});", self.kernel.name(), args.join(", "))
     }
 }
 
@@ -207,55 +207,6 @@ impl Func {
     }
 }
 
-/// A `mem1d_dsd` over an f32 array: `tensor_access = |i|{extent} -> arr[base + i * stride]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dsd1 {
-    pub array: String,
-    pub extent: String,
-    pub base: String,
-    pub stride: String,
-}
-
-impl Dsd1 {
-    /// `arr[i]` for `i < extent`.
-    pub fn contiguous(array: impl Into<String>, extent: impl std::fmt::Display) -> Self {
-        Dsd1 {
-            array: array.into(),
-            extent: extent.to_string(),
-            base: "0".into(),
-            stride: "1".into(),
-        }
-    }
-
-    pub fn strided(
-        array: impl Into<String>,
-        extent: impl std::fmt::Display,
-        base: impl std::fmt::Display,
-        stride: impl std::fmt::Display,
-    ) -> Self {
-        Dsd1 {
-            array: array.into(),
-            extent: extent.to_string(),
-            base: base.to_string(),
-            stride: stride.to_string(),
-        }
-    }
-
-    /// The `@get_dsd(..)` expression.
-    pub fn expr(&self) -> String {
-        let index = match (self.base.as_str(), self.stride.as_str()) {
-            ("0", "1") => "i".to_string(),
-            ("0", s) => format!("i * {s}"),
-            (b, "1") => format!("{b} + i"),
-            (b, s) => format!("{b} + i * {s}"),
-        };
-        format!(
-            "@get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{}}} -> {}[{index}] }})",
-            self.extent, self.array
-        )
-    }
-}
-
 /// Formats an `f32` as a CSL literal that parses back to the same value.
 pub fn f32_lit(v: f32) -> String {
     if v.is_nan() {
@@ -289,22 +240,6 @@ mod tests {
         assert_eq!(
             out,
             "fn phase_0(n: u32) void {\n  var acc: f32 = 0.0;\n  for (@range(i16, N)) |i| {\n    acc = acc + x[i];\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn a_dsd_names_its_access_pattern() {
-        assert_eq!(
-            Dsd1::contiguous("y", 4).expr(),
-            "@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> y[i] })"
-        );
-        assert_eq!(
-            Dsd1::strided("A", "M", "r * N", "1").expr(),
-            "@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{M} -> A[r * N + i] })"
-        );
-        assert_eq!(
-            Dsd1::strided("A", "M", 0, "N").expr(),
-            "@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{M} -> A[i * N] })"
         );
     }
 

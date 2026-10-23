@@ -55,7 +55,7 @@ impl ForwardHybrid for Micro {
     }
 
     fn forward(&self, inputs: Input) -> Value {
-        let x = ops::layout::embed(&inputs.tokens(), &self.embed, VOCAB);
+        let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let h = ops::linear::matmul(&x, &self.proj);
         ops::linear::lm_head(&h, &self.head)
     }

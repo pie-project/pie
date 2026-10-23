@@ -7,7 +7,7 @@ mod common;
 
 use common::{Gpu, STATE, bf16s, close_abs, indptr_of, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm::{self, Mamba2};
+use kernels_rocm::ssm::{self, Mamba2};
 use kernels_rocm::{RaggedTensor, RecurrentPool, Tensor};
 
 const H: usize = 4;
@@ -111,7 +111,7 @@ fn attn_mamba2_step() {
     let case = Case::new(rows);
     let (m, [xbc, dt, z], pool) = case.upload(&gpu, rows as u32, &slots);
     let mut y = gpu.zeros(rows as u32, INNER as u32, Dtype::Bf16);
-    ssm::mamba2_step(&ctx, xbc, dt, z, m, &pool, N as u32, &mut y).unwrap();
+    ssm::mamba2(&ctx, xbc, dt, z, m, &pool, N as u32, &mut y).unwrap();
     let got = gpu.read(&y);
     let mut state = case.state.clone();
     for (r, &slot) in slots.iter().enumerate() {

@@ -7,7 +7,7 @@ mod common;
 
 use common::{Gpu, bf16s, close_abs, close_bf16, round_bf16, sigmoid, values};
 use dtype::Dtype;
-use kernels_rocm::elemwise::{activation, binary, clip, gate};
+use kernels_rocm::elemwise::{gate, pointwise};
 
 /// `have` holds `want` on flat elements `live` and `before` elsewhere.
 fn windowed(what: &str, have: &[f32], want: &[f32], before: &[f32], live: std::ops::Range<usize>) {
@@ -41,7 +41,7 @@ fn binary_and_activation() {
             let y = gpu.tensor(&ys, rows, width, dtype);
 
             let mut o = gpu.zeros(rows, width, dtype);
-            binary::add(&ctx, x, y, &mut o).unwrap();
+            pointwise::add(&ctx, x, y, &mut o).unwrap();
             let want: Vec<f32> = xs.iter().zip(&ys).map(|(a, b)| a + b).collect();
             // A sum that cancels is exact in f32 and rounded once to bf16.
             close_abs(
@@ -52,7 +52,7 @@ fn binary_and_activation() {
             );
 
             let mut o = gpu.zeros(rows, width, dtype);
-            binary::mul(&ctx, x, y, &mut o).unwrap();
+            pointwise::mul(&ctx, x, y, &mut o).unwrap();
             let want: Vec<f32> = xs.iter().zip(&ys).map(|(a, b)| a * b).collect();
             close_bf16("mul", &gpu.read(&o), &want, ulps);
 
@@ -60,12 +60,12 @@ fn binary_and_activation() {
             // rounds them once.
             let tol = if dtype == Dtype::Bf16 { 1.0 } else { 1e-3 };
             let mut o = gpu.zeros(rows, width, dtype);
-            activation::silu(&ctx, x, &mut o).unwrap();
+            pointwise::silu(&ctx, x, &mut o).unwrap();
             let want: Vec<f32> = xs.iter().map(|v| v * sigmoid(*v)).collect();
             close_bf16("silu", &gpu.read(&o), &want, tol);
 
             let mut o = gpu.zeros(rows, width, dtype);
-            activation::tanh(&ctx, x, &mut o).unwrap();
+            pointwise::tanh(&ctx, x, &mut o).unwrap();
             let want: Vec<f32> = xs.iter().map(|v| v.tanh()).collect();
             close_bf16("tanh", &gpu.read(&o), &want, tol);
         }
@@ -82,9 +82,9 @@ fn binary_and_activation() {
     let win = gpu.ints(&[2, 1, 0, 0]);
     ctx.arm_stage(win.ptr);
     let mut o = gpu.zeros(rows, width, Dtype::Bf16);
-    binary::mul(&ctx, x, y, &mut o).unwrap();
+    pointwise::mul(&ctx, x, y, &mut o).unwrap();
     let mut a = gpu.zeros(rows, width, Dtype::Bf16);
-    activation::silu(&ctx, x, &mut a).unwrap();
+    pointwise::silu(&ctx, x, &mut a).unwrap();
     ctx.disarm_stage();
     let want: Vec<f32> = xs.iter().zip(&ys).map(|(a, b)| a * b).collect();
     windowed("windowed mul", &gpu.read(&o), &want, &zeros, wd..3 * wd);
@@ -103,7 +103,7 @@ fn clamps() {
         // Bounds between bf16 steps clamp to the rounded bound.
         let (lo, hi) = (-1.2345f32, 2.6789f32);
         let mut x = gpu.tensor(&xs, rows, width, Dtype::Bf16);
-        clip::clamp(&ctx, lo, hi, &mut x).unwrap();
+        pointwise::clamp(&ctx, lo, hi, &mut x).unwrap();
         let want: Vec<f32> = xs
             .iter()
             .map(|v| v.clamp(round_bf16(lo), round_bf16(hi)))
@@ -114,7 +114,7 @@ fn clamps() {
         let lt = gpu.tensor(&[lo], 1, 1, Dtype::Bf16);
         let ht = gpu.tensor(&[hi], 1, 1, Dtype::Bf16);
         let mut x = gpu.tensor(&xs, rows, width, Dtype::Bf16);
-        clip::clamp_learned(&ctx, lt, ht, &mut x).unwrap();
+        pointwise::clamp_learned(&ctx, lt, ht, &mut x).unwrap();
         let want: Vec<f32> = xs.iter().map(|v| v.clamp(lo, hi)).collect();
         close_bf16("clamp_learned", &gpu.read(&x), &want, 0.0);
     }
@@ -130,8 +130,8 @@ fn clamps() {
     let mut c = gpu.tensor(&xs, rows, width, Dtype::Bf16);
     let win = gpu.ints(&[1, 2, 0, 0]);
     ctx.arm_stage(win.ptr);
-    clip::clamp_learned(&ctx, lt, ht, &mut x).unwrap();
-    clip::clamp(&ctx, -1.0, 1.0, &mut c).unwrap();
+    pointwise::clamp_learned(&ctx, lt, ht, &mut x).unwrap();
+    pointwise::clamp(&ctx, -1.0, 1.0, &mut c).unwrap();
     ctx.disarm_stage();
     let want: Vec<f32> = xs.iter().map(|v| v.clamp(lo, hi)).collect();
     windowed(

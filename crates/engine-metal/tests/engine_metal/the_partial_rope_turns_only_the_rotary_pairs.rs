@@ -1,9 +1,9 @@
 #![cfg(target_vendor = "apple")]
 
-//! `elementwise.rope_partial` on Metal rotates the first `rotary_dim`
+//! `elemwise.rope` on Metal rotates the first `rotary_dim`
 //! entries of a head as pairs `(i, i + rotary_dim/2)` at
 //! `pos * theta^(-2i/rotary_dim)` and leaves the rest alone, the way HF
-//! transformers, mlx-lm and llama.cpp do. Positions sit far from zero: the
+//! transformers and llama.cpp do. Positions sit far from zero: the
 //! head-width convention this replaced agrees with the rotary-width one at
 //! position 0 and drifts with distance. Proportional (Gemma 4's global
 //! layers) pairs `(i, i + head_dim/2)` at `pos * theta^(-2i/head_dim)` for the

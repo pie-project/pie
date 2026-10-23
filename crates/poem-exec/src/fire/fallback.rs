@@ -3,8 +3,8 @@ use core::ops::Range;
 use crate::error::KernelError;
 use poem_compiler::{CompiledModel, Fallback, Phase, PqTree, Region};
 use poem_ir::{
-    CacheRow, ClassSet, Def, Dim, Dtype, GeomKind, Node, Operands, Operation, RowAxis,
-    RuntimeInput, Trace, Ty, ValueId,
+    CacheRow, ClassSet, Def, Dim, Dtype, GeomKind, Node, Operands, RowAxis, RuntimeInput, Trace,
+    Ty, ValueId,
 };
 
 #[must_use]
@@ -126,21 +126,8 @@ pub fn operands(nodes: &[Node], region: &Region) -> Option<(Vec<ValueId>, Vec<Va
     let mut outs: Vec<ValueId> = Vec::new();
     for node in region.nodes.clone() {
         let node = nodes.get(node as usize)?;
-        macro_rules! collect {
-            ($op:expr) => {{
-                $op.inputs(&mut ins);
-                $op.outputs(&mut outs);
-            }};
-        }
-        match &node.op {
-            Operation::Attention(op) => collect!(op),
-            Operation::Linear(op) => collect!(op),
-            Operation::Elementwise(op) => collect!(op),
-            Operation::Layout(op) => collect!(op),
-            Operation::Collective(op) => collect!(op),
-            Operation::Fused(op) => collect!(op),
-            Operation::Spatial(op) => collect!(op),
-        }
+        node.op.inputs(&mut ins);
+        node.op.outputs(&mut outs);
     }
     Some((ins, outs))
 }

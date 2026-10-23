@@ -4,15 +4,15 @@
 //! one entry, filed in a paged pool at the closing position; queries attend
 //! over their request's closed entries (all, or a selected few).
 //!
-//! In kernels-wgpu this module lives inline in `attn.rs` (`pub mod pool`).
+//! kernels-slang's counterpart is `attn::pool`.
 
 use dtype::Dtype;
 
-use super::ssm::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
-use crate::cx::{Ctx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
-use crate::tensor::{KvPool, RaggedTensor, Tensor};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
+use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the pooled readers' flash loop.
 const KEY_BLOCK: i64 = 256;
@@ -72,18 +72,21 @@ pub(crate) fn put_cols(f: &mut Func, table: Val, at: Val, rows: Val) -> Built<Va
     )
 }
 
-/// A KV pool's page tables as flat i32 vectors, and its page size.
+/// A KV pool's page tables as flat i32 vectors (indices, then indptr), and
+/// its page size.
 pub(crate) fn paging(
-    cx: &mut crate::cx::Cx<'_>,
+    f: &mut Func,
     op: &'static str,
-    pool: &KvPool,
+    page_indices: Operand,
+    page_indptr: Operand,
+    page_size: i32,
 ) -> Result<(Val, Val, i64), Error> {
-    if pool.page_size <= 0 {
+    if page_size <= 0 {
         return Err(refuse(op, "the pool's page size is zero"));
     }
-    let indices = flat_i32(cx, pool.page_indices)?;
-    let indptr = flat_i32(cx, pool.page_indptr)?;
-    Ok((indices, indptr, i64::from(pool.page_size)))
+    let indices = flat_i32(f, page_indices)?;
+    let indptr = flat_i32(f, page_indptr)?;
+    Ok((indices, indptr, i64::from(page_size)))
 }
 
 /// The first `n` elements of a flat vector.
@@ -91,7 +94,7 @@ pub(crate) fn first(f: &mut Func, v: Val, n: i64) -> Built<Val> {
     f.slice_axis(v, 0, 0, n)
 }
 
-fn long_enough(op: &'static str, what: &str, t: Tensor, n: u32) -> Result<(), Error> {
+fn long_enough(op: &'static str, what: &str, t: impl Stored, n: u32) -> Result<(), Error> {
     if t.elements() < u64::from(n) {
         return Err(refuse(
             op,
@@ -106,17 +109,18 @@ fn long_enough(op: &'static str, what: &str, t: Tensor, n: u32) -> Result<(), Er
 
 // --------------------------------------------------------------- boundaries
 
+/// `(boundary_pos, boundary_req, boundary_rope)`.
 fn boundary(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    positions: Tensor,
-    request_of_token: Tensor,
-    row_valid: Tensor,
+    positions: Operand,
+    request_of_token: Operand,
+    row_valid: Operand,
     ratio: u32,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    boundary_rope: Tensor,
-) -> Result<(), Error> {
+    boundary_pos: Landing,
+    boundary_req: Landing,
+    boundary_rope: Landing,
+) -> Result<(Val, Val, Val), Error> {
     let n = nonzero(op, "rows", boundary_pos.rows)?;
     let ratio = i64::from(nonzero(op, "the pooling ratio", ratio)?);
     for t in [boundary_pos, boundary_req, boundary_rope] {
@@ -132,49 +136,44 @@ fn boundary(
     long_enough(op, "owning-request table", request_of_token, n)?;
     long_enough(op, "row-valid table", row_valid, n)?;
     let n = i64::from(n);
-    ctx.emit(&mut |cx| {
-        let p = flat_i32(cx, positions)?;
-        let r = flat_i32(cx, request_of_token)?;
-        let v = flat_i32(cx, row_valid)?;
-        let f = cx.func();
-        let p = first(f, p, n)?;
-        let r = first(f, r, n)?;
-        let v = first(f, v, n)?;
-        let valid = cmp_i(f, Cmp::Ne, v, 0)?;
-        let one = f.like_i(p, 1);
-        let rv = f.like_i(p, ratio);
-        let next = f.add(p, one)?;
-        let m = f.rem(next, rv)?;
-        let closes = cmp_i(f, Cmp::Eq, m, 0)?;
-        let is_b = f.and(valid, closes)?;
-        let none = f.like_i(p, -1);
-        let bpos = f.select(is_b, p, none)?;
-        let blk = f.div(p, rv)?;
-        let blk = f.mul(blk, rv)?;
-        let zero = f.like_i(p, 0);
-        let rope = f.select(is_b, blk, zero)?;
-        cx.write(boundary_pos, bpos)?;
-        cx.write(boundary_req, r)?;
-        cx.write(boundary_rope, rope)
-    })
+    let p = flat_i32(f, positions)?;
+    let r = flat_i32(f, request_of_token)?;
+    let v = flat_i32(f, row_valid)?;
+    let p = first(f, p, n)?;
+    let r = first(f, r, n)?;
+    let v = first(f, v, n)?;
+    let valid = cmp_i(f, Cmp::Ne, v, 0)?;
+    let one = f.like_i(p, 1);
+    let rv = f.like_i(p, ratio);
+    let next = f.add(p, one)?;
+    let m = f.rem(next, rv)?;
+    let closes = cmp_i(f, Cmp::Eq, m, 0)?;
+    let is_b = f.and(valid, closes)?;
+    let none = f.like_i(p, -1);
+    let bpos = f.select(is_b, p, none)?;
+    let blk = f.div(p, rv)?;
+    let blk = f.mul(blk, rv)?;
+    let zero = f.like_i(p, 0);
+    let rope = f.select(is_b, blk, zero)?;
+    Ok((bpos, r, rope))
 }
 
-/// Marks the rows whose position closes a `ratio` block: `boundary_pos` the
-/// position (or -1), `boundary_rope` the block's first position, and
-/// `boundary_req` each row's request in the fire.
+/// Marks the rows whose position closes a `ratio` block: `(boundary_pos,
+/// boundary_req, boundary_rope)`, the position (or -1), each row's request
+/// in the fire, and the block's first position.
 pub fn boundary_decode(
-    ctx: &Ctx<'_>,
-    positions: Tensor,
-    request_of_token: Tensor,
-    row_valid: Tensor,
+    f: &mut Func,
+    positions: Operand,
+    request_of_token: Operand,
+    row_valid: Operand,
     ratio: u32,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    boundary_rope: Tensor,
-) -> Result<(), Error> {
+    boundary_pos: Landing,
+    boundary_req: Landing,
+    boundary_rope: Landing,
+) -> Result<(Val, Val, Val), Error> {
     boundary(
-        ctx,
-        "attention.pool_boundary_decode",
+        f,
+        "attn.pool_boundary",
         positions,
         request_of_token,
         row_valid,
@@ -185,20 +184,22 @@ pub fn boundary_decode(
     )
 }
 
+/// [`boundary_decode`] over a ragged fire; `positions` is the ragged
+/// positions' data (its indptr is not read).
 pub fn boundary_prefill(
-    ctx: &Ctx<'_>,
-    positions: RaggedTensor,
-    request_of_token: Tensor,
-    row_valid: Tensor,
+    f: &mut Func,
+    positions: Operand,
+    request_of_token: Operand,
+    row_valid: Operand,
     ratio: u32,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    boundary_rope: Tensor,
-) -> Result<(), Error> {
+    boundary_pos: Landing,
+    boundary_req: Landing,
+    boundary_rope: Landing,
+) -> Result<(Val, Val, Val), Error> {
     boundary(
-        ctx,
-        "attention.pool_boundary_prefill",
-        positions.data,
+        f,
+        "attn.pool_boundary",
+        positions,
         request_of_token,
         row_valid,
         ratio,
@@ -212,20 +213,21 @@ pub fn boundary_prefill(
 
 /// Files each row's compressor projections (`kv`, gate logits `score`) into
 /// the state planes at `write_page · page_size + write_offset`; a negative
-/// page or an offset outside the page drops the row.
+/// page or an offset outside the page drops the row. `pages` gives the
+/// paging. The new `(state_kv, state_score)`.
 pub fn state_write(
-    ctx: &Ctx<'_>,
-    kv: Tensor,
-    score: Tensor,
-    pages: &KvPool,
-    write_page: Tensor,
-    write_offset: Tensor,
+    f: &mut Func,
+    kv: Operand,
+    score: Operand,
+    pages: &KvPool<impl Stored>,
+    write_page: Operand,
+    write_offset: Operand,
     head_dim: u32,
     ratio: u32,
-    state_kv: Tensor,
-    state_score: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.pool_state_write";
+    state_kv: Operand,
+    state_score: Operand,
+) -> Result<(Val, Val), Error> {
+    const OP: &str = "attn.pool_state_write";
     expect(OP, kv, &[Dtype::Bf16])?;
     if pages.page_size <= 0 {
         return Err(refuse(OP, "the source pool's page size is zero"));
@@ -254,20 +256,12 @@ pub fn state_write(
     long_enough(OP, "write-page table", write_page, rows)?;
     long_enough(OP, "write-offset table", write_offset, rows)?;
     let (n, ps) = (i64::from(rows), i64::from(pages.page_size));
-    ctx.emit(&mut |cx| {
-        let wp = flat_i32(cx, write_page)?;
-        let wo = flat_i32(cx, write_offset)?;
-        let k = cx.read(kv)?;
-        let s = cx.read(score)?;
-        let sk = cx.read(state_kv)?;
-        let ss = cx.read(state_score)?;
-        let f = cx.func();
-        let at = write_cell(f, wp, wo, n, ps)?;
-        let sk = put_cols(f, sk, at, k)?;
-        let ss = put_cols(f, ss, at, s)?;
-        cx.write(state_kv, sk)?;
-        cx.write(state_score, ss)
-    })
+    let wp = flat_i32(f, write_page)?;
+    let wo = flat_i32(f, write_offset)?;
+    let at = write_cell(f, wp, wo, n, ps)?;
+    let sk = put_cols(f, state_kv.val, at, kv.val)?;
+    let ss = put_cols(f, state_score.val, at, score.val)?;
+    Ok((sk, ss))
 }
 
 /// `page · ps + off` of each row, or [`DROP`] when the page is negative or
@@ -291,19 +285,24 @@ pub(crate) fn write_cell(f: &mut Func, page: Val, off: Val, n: i64, ps: i64) -> 
 /// block's `coff · ratio` positions (per column, gated by the state's
 /// logits plus the absolute-position bias `ape`) of the state's kv. A
 /// `coff` of 2 reads the previous block through the second column half.
+///
+/// `page_indices`/`page_indptr` are the pooled space's page tables (`pages`
+/// gives its paging).
 pub fn gather(
-    ctx: &Ctx<'_>,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    pages: &KvPool,
+    f: &mut Func,
+    boundary_pos: Operand,
+    boundary_req: Operand,
+    page_indices: Operand,
+    page_indptr: Operand,
+    pages: &KvPool<impl Stored>,
     head_dim: u32,
     ratio: u32,
-    state_kv: Tensor,
-    state_score: Tensor,
-    ape: Option<Tensor>,
-    entries: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.pool_gather";
+    state_kv: Operand,
+    state_score: Operand,
+    ape: Option<Operand>,
+    entries: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "attn.pool_gather";
     expect(OP, entries, &[Dtype::Bf16])?;
     let hd = nonzero(OP, "the head width this gather states", head_dim)?;
     if hd != entries.width {
@@ -362,89 +361,83 @@ pub fn gather(
         i64::from(coff),
     );
     let window = coff * r;
-    ctx.emit(&mut |cx| {
-        let (indices, indptr, ps) = paging(cx, OP, pages)?;
-        let bpos = flat_i32(cx, boundary_pos)?;
-        let breq = flat_i32(cx, boundary_req)?;
-        let sk = cx.read(state_kv)?;
-        let ss = cx.read(state_score)?;
-        let ape = match ape {
-            Some(a) => Some(cx.read_f32(a)?),
-            None => None,
-        };
-        let f = cx.func();
-        let i = f.iota(Elem::I32, &[n, window], 1);
-        let bp = f.broadcast(bpos, &[n, window], &[0])?;
-        let back = f.const_i(Elem::I32, window - 1, &[n, window]);
-        let pos = f.add(bp, i)?;
-        let pos = f.sub(pos, back)?;
-        let live = cmp_i(f, Cmp::Ge, pos, 0)?;
-        let req = f.broadcast(breq, &[n, window], &[0])?;
-        let cell = cell_of(f, indices, indptr, req, pos, ps)?;
-        let cell = f.reshape(cell, &[n * window])?;
-        let pitch = f.dims(sk)[1];
-        let kvr = f.take_rows(sk, cell)?;
-        let scr = f.take_rows(ss, cell)?;
-        let kvr = f.reshape(kvr, &[n, window, pitch])?;
-        let scr = f.reshape(scr, &[n, window, pitch])?;
-        // Position i < ratio reads columns [0, hd), the rest [hd, 2hd).
-        // (A select, not a concat of the two cuts: libtpu merges
-        // `concat(slice(x), slice(x))` along the window axis as if the cuts
-        // were adjacent, dropping the second one's column offset.)
-        let second = f.iota(Elem::I32, &[n, window, hd], 1);
-        let second = cmp_i(f, Cmp::Ge, second, r)?;
-        let halves = |f: &mut Func, x: Val| -> Built<Val> {
-            let lo = f.slice_axis(x, 2, 0, hd)?;
-            if coff == 1 {
-                return Ok(lo);
-            }
-            let hi = f.slice_axis(x, 2, hd, 2 * hd)?;
-            f.select(second, hi, lo)
-        };
-        let kvr = halves(f, kvr)?;
-        let kvr = f.convert(kvr, Elem::F32);
-        let scr = halves(f, scr)?;
-        let mut scr = f.convert(scr, Elem::F32);
-        if let Some(a) = ape {
-            // ape[pos % ratio, column].
-            let rv = f.like_i(pos, r);
-            let zero = f.like_i(pos, 0);
-            let pz = f.max(pos, zero)?;
-            let m = f.rem(pz, rv)?;
-            let m = f.reshape(m, &[n * window])?;
-            let rowsa = f.take_rows(a, m)?;
-            let rowsa = f.reshape(rowsa, &[n, window, coff * hd])?;
-            let rowsa = halves(f, rowsa)?;
-            scr = f.add(scr, rowsa)?;
+    let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pages.page_size)?;
+    let bpos = flat_i32(f, boundary_pos)?;
+    let breq = flat_i32(f, boundary_req)?;
+    let sk = state_kv.val;
+    let ss = state_score.val;
+    let ape = ape.map(|a| a.f32(f));
+    let i = f.iota(Elem::I32, &[n, window], 1);
+    let bp = f.broadcast(bpos, &[n, window], &[0])?;
+    let back = f.const_i(Elem::I32, window - 1, &[n, window]);
+    let pos = f.add(bp, i)?;
+    let pos = f.sub(pos, back)?;
+    let live = cmp_i(f, Cmp::Ge, pos, 0)?;
+    let req = f.broadcast(breq, &[n, window], &[0])?;
+    let cell = cell_of(f, indices, indptr, req, pos, ps)?;
+    let cell = f.reshape(cell, &[n * window])?;
+    let pitch = f.dims(sk)[1];
+    let kvr = f.take_rows(sk, cell)?;
+    let scr = f.take_rows(ss, cell)?;
+    let kvr = f.reshape(kvr, &[n, window, pitch])?;
+    let scr = f.reshape(scr, &[n, window, pitch])?;
+    // Position i < ratio reads columns [0, hd), the rest [hd, 2hd).
+    // (A select, not a concat of the two cuts: libtpu merges
+    // `concat(slice(x), slice(x))` along the window axis as if the cuts
+    // were adjacent, dropping the second one's column offset.)
+    let second = f.iota(Elem::I32, &[n, window, hd], 1);
+    let second = cmp_i(f, Cmp::Ge, second, r)?;
+    let halves = |f: &mut Func, x: Val| -> Built<Val> {
+        let lo = f.slice_axis(x, 2, 0, hd)?;
+        if coff == 1 {
+            return Ok(lo);
         }
-        let dims = [n, window, hd];
-        let live3 = f.broadcast(live, &dims, &[0, 1])?;
-        let ninf = f.const_f(Elem::F32, f64::NEG_INFINITY, &dims);
-        let scr = f.select(live3, scr, ninf)?;
-        let mx = f.reduce(scr, &[1], Fold::Max)?;
-        let dead = f.like_f(mx, -3.0e38);
-        let dead = f.compare(Cmp::Gt, mx, dead)?;
-        let zero2 = f.like_f(mx, 0.0);
-        let mx = f.select(dead, mx, zero2)?;
-        let mb = f.broadcast(mx, &dims, &[0, 2])?;
-        let e = f.sub(scr, mb)?;
-        let e = f.exp(e);
-        let zero3 = f.const_f(Elem::F32, 0.0, &dims);
-        let e = f.select(live3, e, zero3)?;
-        let z = f.reduce(e, &[1], Fold::Sum)?;
-        let acc = f.mul(e, kvr)?;
-        let acc = f.reduce(acc, &[1], Fold::Sum)?;
-        let pos_z = cmp_f(f, Cmp::Gt, z, 0.0)?;
-        let one = f.like_f(z, 1.0);
-        let zs = f.select(pos_z, z, one)?;
-        let out = f.div(acc, zs)?;
-        let ok = f.and(pos_z, dead)?;
-        let out = f.select(ok, out, zero2)?;
-        let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
-        let has = f.broadcast(has, &[n, hd], &[0])?;
-        let out = f.select(has, out, zero2)?;
-        cx.write(entries, out)
-    })
+        let hi = f.slice_axis(x, 2, hd, 2 * hd)?;
+        f.select(second, hi, lo)
+    };
+    let kvr = halves(f, kvr)?;
+    let kvr = f.convert(kvr, Elem::F32);
+    let scr = halves(f, scr)?;
+    let mut scr = f.convert(scr, Elem::F32);
+    if let Some(a) = ape {
+        // ape[pos % ratio, column].
+        let rv = f.like_i(pos, r);
+        let zero = f.like_i(pos, 0);
+        let pz = f.max(pos, zero)?;
+        let m = f.rem(pz, rv)?;
+        let m = f.reshape(m, &[n * window])?;
+        let rowsa = f.take_rows(a, m)?;
+        let rowsa = f.reshape(rowsa, &[n, window, coff * hd])?;
+        let rowsa = halves(f, rowsa)?;
+        scr = f.add(scr, rowsa)?;
+    }
+    let dims = [n, window, hd];
+    let live3 = f.broadcast(live, &dims, &[0, 1])?;
+    let ninf = f.const_f(Elem::F32, f64::NEG_INFINITY, &dims);
+    let scr = f.select(live3, scr, ninf)?;
+    let mx = f.reduce(scr, &[1], Fold::Max)?;
+    let dead = f.like_f(mx, -3.0e38);
+    let dead = f.compare(Cmp::Gt, mx, dead)?;
+    let zero2 = f.like_f(mx, 0.0);
+    let mx = f.select(dead, mx, zero2)?;
+    let mb = f.broadcast(mx, &dims, &[0, 2])?;
+    let e = f.sub(scr, mb)?;
+    let e = f.exp(e);
+    let zero3 = f.const_f(Elem::F32, 0.0, &dims);
+    let e = f.select(live3, e, zero3)?;
+    let z = f.reduce(e, &[1], Fold::Sum)?;
+    let acc = f.mul(e, kvr)?;
+    let acc = f.reduce(acc, &[1], Fold::Sum)?;
+    let pos_z = cmp_f(f, Cmp::Gt, z, 0.0)?;
+    let one = f.like_f(z, 1.0);
+    let zs = f.select(pos_z, z, one)?;
+    let out = f.div(acc, zs)?;
+    let ok = f.and(pos_z, dead)?;
+    let out = f.select(ok, out, zero2)?;
+    let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
+    let has = f.broadcast(has, &[n, hd], &[0])?;
+    let out = f.select(has, out, zero2)?;
+    Ok(out)
 }
 
 fn cmp_f(f: &mut Func, dir: Cmp, v: Val, x: f64) -> Built<Val> {
@@ -453,22 +446,23 @@ fn cmp_f(f: &mut Func, dir: Cmp, v: Val, x: f64) -> Built<Val> {
 }
 
 /// Files each boundary row's entry in the compressed pool at the block's
-/// closing position. (`write_page`/`write_offset` are not read: the entry
-/// lands at its boundary position's cell, as the GPU kernels file it.)
+/// closing position: the new keys plane. (The fire's write tables are not
+/// read: the entry lands at its boundary position's cell, as the GPU kernels
+/// file it; `pool` gives the paging.)
 pub fn kv_append(
-    ctx: &Ctx<'_>,
-    entries: Tensor,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    pool: &KvPool,
-    write_page: Tensor,
-    write_offset: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
-    let _ = (write_page, write_offset);
+    f: &mut Func,
+    entries: Operand,
+    boundary_pos: Operand,
+    boundary_req: Operand,
+    page_indices: Operand,
+    page_indptr: Operand,
+    keys: Operand,
+    pool: &KvPool<impl Stored>,
+) -> Result<Val, Error> {
+    const OP: &str = "attn.pool_kv_append";
     expect(OP, entries, &[Dtype::Bf16])?;
     let rows = nonzero(OP, "rows", entries.rows)?;
-    if pool.keys.width < entries.width {
+    if keys.width < entries.width {
         return Err(refuse(
             OP,
             "the compressed pool's row is narrower than the entry",
@@ -477,17 +471,11 @@ pub fn kv_append(
     long_enough(OP, "boundary position table", boundary_pos, rows)?;
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let n = i64::from(rows);
-    ctx.emit(&mut |cx| {
-        let (indices, indptr, ps) = paging(cx, OP, pool)?;
-        let bpos = flat_i32(cx, boundary_pos)?;
-        let breq = flat_i32(cx, boundary_req)?;
-        let e = cx.read(entries)?;
-        let keys = cx.read(pool.keys)?;
-        let f = cx.func();
-        let at = boundary_cell(f, indices, indptr, bpos, breq, n, ps)?;
-        let keys = put_cols(f, keys, at, e)?;
-        cx.write(pool.keys, keys)
-    })
+    let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pool.page_size)?;
+    let bpos = flat_i32(f, boundary_pos)?;
+    let breq = flat_i32(f, boundary_req)?;
+    let at = boundary_cell(f, indices, indptr, bpos, breq, n, ps)?;
+    Ok(put_cols(f, keys.val, at, entries.val)?)
 }
 
 /// The pool cell of each boundary row, [`DROP`] for a row closing no block.
@@ -640,21 +628,121 @@ fn pooled_flash(
     Ok((o, lse))
 }
 
-fn reader(
-    ctx: &Ctx<'_>,
+/// A compressed-pool reader's call, its shapes checked: each query row
+/// attends over its request's closed blocks of the `entries` pool (all, or
+/// the `selection`'s `top_k`), giving `(o, lse)`.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolLse<T, L = T> {
     op: &'static str,
-    q: Tensor,
-    positions: Tensor,
-    request_of_token: Tensor,
-    selection: Option<(Tensor, u32)>,
-    entries: &KvPool,
+    pub q: T,
+    pub positions: T,
+    pub request_of_token: T,
+    /// `(selection [rows, top_k] i32 block ids, top_k)`.
+    pub selection: Option<(T, u32)>,
     ratio: u32,
     heads: u32,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
+    pub o: L,
+    pub lse: L,
+}
+
+impl<T: Stored, L> PoolLse<T, L> {
+    /// How many compressed rows the reader walks: the selection budget, or
+    /// every block a lane's pages close.
+    fn walked(&self, entries: &KvPool<impl Stored>) -> i64 {
+        match self.selection {
+            Some((_, k)) => i64::from(k),
+            None => {
+                i64::from(entries.max_pages) * i64::from(entries.page_size) / i64::from(self.ratio)
+            }
+        }
+    }
+}
+
+/// A [`PoolLse`] call read: the call and the entries pool's planes.
+pub type PoolRead<O> = (PoolLse<O, Landing>, Entries<O>);
+
+impl<T: Stored> PoolLse<T> {
+    /// The call with every plane [`lse`] consumes read by `read`, in the
+    /// order it consumes them: the page tables, `q`, the row tables, the
+    /// keys plane, the selection. `None`, reading nothing, when no lane
+    /// holds enough pages to close a block: every row then reads
+    /// [`nothing`].
+    pub fn try_map<O: Copy, E>(
+        self,
+        entries: &KvPool<T>,
+        mut read: impl FnMut(T) -> Result<O, E>,
+    ) -> Result<Option<PoolRead<O>>, E> {
+        if self.walked(entries) == 0 {
+            return Ok(None);
+        }
+        let page_indices = read(entries.page_indices)?;
+        let page_indptr = read(entries.page_indptr)?;
+        let q = read(self.q)?;
+        let positions = read(self.positions)?;
+        let request_of_token = read(self.request_of_token)?;
+        let keys = read(entries.keys)?;
+        let selection = match self.selection {
+            Some((s, k)) => Some((read(s)?, k)),
+            None => None,
+        };
+        Ok(Some((
+            PoolLse {
+                op: self.op,
+                q,
+                positions,
+                request_of_token,
+                selection,
+                ratio: self.ratio,
+                heads: self.heads,
+                head_dim: self.head_dim,
+                sm_scale: self.sm_scale,
+                o: self.o.shape(),
+                lse: self.lse.shape(),
+            },
+            Entries {
+                page_indices,
+                page_indptr,
+                keys,
+            },
+        )))
+    }
+}
+
+/// The compressed pool's paged planes a reader reads.
+#[derive(Clone, Copy, Debug)]
+pub struct Entries<T = Operand> {
+    pub page_indices: T,
+    pub page_indptr: T,
+    pub keys: T,
+}
+
+/// The reading of a row that sees nothing: `o = 0`, `lse = -inf`.
+pub fn nothing(f: &mut Func, o: Landing, lse: Landing) -> (Val, Val) {
+    let zero = f.const_f(Elem::F32, 0.0, &[i64::from(o.rows), i64::from(o.width)]);
+    let ninf = f.const_f(
+        Elem::F32,
+        f64::NEG_INFINITY,
+        &[i64::from(lse.rows), i64::from(lse.width)],
+    );
+    (zero, ninf)
+}
+
+fn reader<T: Stored>(
+    op: &'static str,
+    q: T,
+    positions: T,
+    request_of_token: T,
+    selection: Option<(T, u32)>,
+    entries: &KvPool<impl Stored>,
+    ratio: u32,
+    heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: T,
+    lse: T,
+) -> Result<PoolLse<T>, Error> {
     expect(op, q, &[Dtype::Bf16])?;
     expect(op, lse, &[Dtype::F32])?;
     if entries.page_size <= 0 {
@@ -662,15 +750,20 @@ fn reader(
     }
     let h = nonzero(op, "heads", heads)?;
     let d = nonzero(op, "the head width", head_dim)?;
-    let rows = nonzero(op, "rows", o.rows)?;
+    let rows = nonzero(op, "rows", o.rows())?;
     let ratio = nonzero(op, "the pooling ratio", ratio)?;
-    if q.rows < rows || q.width != h * d || o.width != h * d || lse.rows != rows || lse.width != h {
+    if q.rows() < rows
+        || q.width() != h * d
+        || o.width() != h * d
+        || lse.rows() != rows
+        || lse.width() != h
+    {
         return Err(refuse(
             op,
             "q, o and lse are not [rows, heads x head width] / [rows, heads]",
         ));
     }
-    if entries.keys.width < d {
+    if entries.keys.width() < d {
         return Err(refuse(
             op,
             "the compressed pool's row is narrower than a head",
@@ -680,84 +773,102 @@ fn reader(
     long_enough(op, "owning-request table", request_of_token, rows)?;
     if let Some((s, k)) = selection {
         nonzero(op, "the selection budget this reader states", k)?;
-        if s.width != k || s.rows < rows {
+        if s.width() != k || s.rows() < rows {
             return Err(refuse(op, "the selection is not [rows, top_k]"));
         }
     }
-    let (n, hh, dd, rt) = (
-        i64::from(rows),
-        i64::from(h),
-        i64::from(d),
-        i64::from(ratio),
-    );
-    let nk = match selection {
-        Some((_, k)) => i64::from(k),
-        None => i64::from(entries.max_pages) * i64::from(entries.page_size) / rt,
-    };
-    if nk == 0 {
-        // No lane holds enough pages to close a block: nothing is visible,
-        // so every row reads nothing (o = 0, lse = -inf), as the walk over
-        // an empty key set answers.
-        return ctx.emit(&mut |cx| {
-            let zero = cx.const_f(Elem::F32, 0.0, &[n, hh * dd]);
-            cx.write(o, zero)?;
-            let ninf = cx.const_f(Elem::F32, f64::NEG_INFINITY, &[n, hh]);
-            cx.write(lse, ninf)
-        });
-    }
-    ctx.emit(&mut |cx| {
-        let (indices, indptr, ps) = paging(cx, op, entries)?;
-        let qv = cx.read(q)?;
-        let pos = flat_i32(cx, positions)?;
-        let req = flat_i32(cx, request_of_token)?;
-        let table = cx.read(entries.keys)?;
-        let sel = match selection {
-            Some((s, _)) => {
-                let v = cx.read(s)?;
-                let v = cx.convert(v, Elem::I32);
-                Some(cx.slice_axis(v, 0, 0, n)?)
-            }
-            None => None,
-        };
-        let f = cx.func();
-        let qv = f.slice_axis(qv, 0, 0, n)?;
-        let qv = f.reshape(qv, &[n, hh, dd])?;
-        let pos = first(f, pos, n)?;
-        let req = first(f, req, n)?;
-        let one = f.like_i(pos, 1);
-        let rv = f.like_i(pos, rt);
-        let vis = f.add(pos, one)?;
-        let vis = f.div(vis, rv)?;
-        let keys = match sel {
-            Some(s) => Keys::Selected(s),
-            None => Keys::All,
-        };
-        let (ov, lv) = pooled_flash(
-            f, qv, table, indices, indptr, req, vis, keys, nk, rt, ps, sm_scale,
-        )?;
-        cx.write(o, ov)?;
-        cx.write(lse, lv)
+    Ok(PoolLse {
+        op,
+        q,
+        positions,
+        request_of_token,
+        selection,
+        ratio,
+        heads: h,
+        head_dim: d,
+        sm_scale,
+        o,
+        lse,
     })
 }
 
-/// Each query row attends over every closed block of its request; `o` is
-/// normalized, `lse` the base-2 log-sum-exp (for a later merge).
-pub fn attention_lse(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    positions: Tensor,
-    request_of_token: Tensor,
-    entries: &KvPool,
+/// The reading of a [`PoolLse`] call: `(o, lse)`, `o` normalized, `lse`
+/// the base-2 log-sum-exp (for a later merge).
+pub fn lse(
+    f: &mut Func,
+    call: PoolLse<Operand, Landing>,
+    planes: Entries,
+    entries: &KvPool<impl Stored>,
+) -> Result<(Val, Val), Error> {
+    let nk = call.walked(entries);
+    let (n, hh, dd, rt) = (
+        i64::from(call.o.rows),
+        i64::from(call.heads),
+        i64::from(call.head_dim),
+        i64::from(call.ratio),
+    );
+    let (indices, indptr, ps) = paging(
+        f,
+        call.op,
+        planes.page_indices,
+        planes.page_indptr,
+        entries.page_size,
+    )?;
+    let qv = call.q.val;
+    let pos = flat_i32(f, call.positions)?;
+    let req = flat_i32(f, call.request_of_token)?;
+    let table = planes.keys.val;
+    let sel = match call.selection {
+        Some((s, _)) => {
+            let v = f.convert(s.val, Elem::I32);
+            Some(f.slice_axis(v, 0, 0, n)?)
+        }
+        None => None,
+    };
+    let qv = f.slice_axis(qv, 0, 0, n)?;
+    let qv = f.reshape(qv, &[n, hh, dd])?;
+    let pos = first(f, pos, n)?;
+    let req = first(f, req, n)?;
+    let one = f.like_i(pos, 1);
+    let rv = f.like_i(pos, rt);
+    let vis = f.add(pos, one)?;
+    let vis = f.div(vis, rv)?;
+    let keys = match sel {
+        Some(s) => Keys::Selected(s),
+        None => Keys::All,
+    };
+    let (ov, lv) = pooled_flash(
+        f,
+        qv,
+        table,
+        indices,
+        indptr,
+        req,
+        vis,
+        keys,
+        nk,
+        rt,
+        ps,
+        call.sm_scale,
+    )?;
+    Ok((ov, lv))
+}
+
+/// Each query row attends over every closed block of its request.
+pub fn attention_lse<T: Stored>(
+    q: T,
+    positions: T,
+    request_of_token: T,
+    entries: &KvPool<T>,
     ratio: u32,
     heads: u32,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
+    o: T,
+    lse: T,
+) -> Result<PoolLse<T>, Error> {
     reader(
-        ctx,
-        "attention.pool_lse",
+        "attn.pool_lse",
         q,
         positions,
         request_of_token,
@@ -773,24 +884,22 @@ pub fn attention_lse(
 }
 
 /// As [`attention_lse`], over the row's selected block ids only.
-pub fn attention_lse_selected(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    positions: Tensor,
-    request_of_token: Tensor,
-    selection: Tensor,
-    entries: &KvPool,
+pub fn attention_lse_selected<T: Stored>(
+    q: T,
+    positions: T,
+    request_of_token: T,
+    selection: T,
+    entries: &KvPool<T>,
     ratio: u32,
     top_k: u32,
     heads: u32,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
+    o: T,
+    lse: T,
+) -> Result<PoolLse<T>, Error> {
     reader(
-        ctx,
-        "attention.pool_lse_selected",
+        "attn.pool_lse",
         q,
         positions,
         request_of_token,

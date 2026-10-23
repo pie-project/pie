@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kernels_metal::icb as layout;
+use kernels_metal::runtime::rebind as layout;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{

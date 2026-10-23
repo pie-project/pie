@@ -1,0 +1,17 @@
+// hy[r, s, i] += 2 * sigmoid(g[r, s] / m) * o[r, i].
+fn k_hc_inject(o: [*]f32, g: [*]f32, hy: [*]f32, rows: i32, h: i32, m: i32) void {
+  var inv_m: f32 = 1.0 / @as(f32, m);
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var gate: f32 = 2.0 / (1.0 + math.exp_f32(-g[r * m + s] * inv_m));
+      var base: i32 = (r * m + s) * h;
+      var i: i32 = 0;
+      while (i < h) : (i += 1) {
+        hy[base + i] = hy[base + i] + gate * o[r * h + i];
+      }
+    }
+  }
+}
+

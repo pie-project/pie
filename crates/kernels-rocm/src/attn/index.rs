@@ -9,7 +9,7 @@ const FILE: &str = "attn/index.hip";
 
 const K_BLOCK: u32 = 256;
 
-const POOL_BLOCK: u32 = 256;
+pub(crate) const POOL_BLOCK: u32 = 256;
 
 /// Keys a scoring block ranks.
 const SCORE_KEYS: u32 = 256;
@@ -39,7 +39,7 @@ fn q_rope_block(n_heads: i32) -> u32 {
     (n_heads.unsigned_abs().div_ceil(64) * 64).clamp(64, 1024)
 }
 
-fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
+pub(crate) fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
     if pool.layout != 0 {
         return Err(refuse(
             op,
@@ -73,7 +73,7 @@ pub fn layernorm_rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_layernorm_rope";
+    const OP: &str = "attn.index_layernorm_rope";
     dtype_dispatch!(OP, k.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
     let head_dim = count(OP, "the index key row's width", k.width)?;
@@ -104,7 +104,7 @@ pub fn rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_rope";
+    const OP: &str = "attn.index_rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
     let n_heads = count(OP, "the head count this rotation states", heads)?;
@@ -133,7 +133,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_kv_append";
+    const OP: &str = "attn.index_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, k.data.dtype, { Bf16 => () });
     pool_pitch(OP, keys, stated(OP, k.data.width)?)?;
@@ -150,52 +150,6 @@ pub fn kv_append(
     )
 }
 
-pub fn block_mean(
-    ctx: &Ctx,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    keys: &KvPool,
-    head_dim: u32,
-    ratio: u32,
-    entries: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.index_block_mean";
-    dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
-    debug_assert!(
-        boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
-        "`{OP}` reads the i32 block tables `attention.pool_boundary_*` published"
-    );
-    let head_dim = count(OP, "the key width this mean states", head_dim)?;
-    pool_pitch(OP, keys, head_dim)?;
-    if stated(OP, entries.width)? != head_dim {
-        return Err(refuse(
-            OP,
-            "the stated head width is not the entry this mean sized",
-        ));
-    }
-    let ratio = count(OP, "the block width this mean pools over", ratio)?;
-    let rows = count(OP, "rows", boundary_pos.rows)?;
-    ctx.fire(
-        OP,
-        Fire::at("attn/pool.hip", "::pie::attn::index_block_mean_paged")
-            .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
-        &[
-            keys.keys.arg(),
-            entries.arg(),
-            boundary_pos.arg(),
-            boundary_req.arg(),
-            keys.page_indices.arg(),
-            keys.page_indptr.arg(),
-            head_dim.arg(),
-            ratio.arg(),
-            keys.page_size.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    let _ = rows;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn topk(
     ctx: &Ctx,
@@ -208,7 +162,7 @@ pub fn topk(
     ratio: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");
     let heads = count(OP, "the head count this ranking states", heads)?;
@@ -216,7 +170,7 @@ pub fn topk(
     let top_k = count(OP, "the selection budget this ranking states", top_k)?;
 
     // The keys a row each (`page_size / ratio` a page) in a compact pool.
-    let compact = crate::attn::pool::compact(keys, ratio.max(1), i64::from(head_dim));
+    let compact = crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(head_dim));
     if !compact {
         pool_pitch(OP, keys, head_dim)?;
     }
@@ -291,19 +245,15 @@ pub fn topk(
     } else {
         TopkLists::default()
     };
-    let row_args = |extra: &[ArgValue]| -> Vec<ArgValue> {
-        let mut v = vec![
-            q.indptr.arg(),
-            keys.page_indices.arg(),
-            keys.page_indptr.arg(),
-            keys.last_page_lens.arg(),
-            num_requests.arg(),
-            keys.page_size.arg(),
-            max_kv.arg(),
-        ];
-        v.extend_from_slice(extra);
-        v
-    };
+    let row_args = [
+        q.indptr.arg(),
+        keys.page_indices.arg(),
+        keys.page_indptr.arg(),
+        keys.last_page_lens.arg(),
+        num_requests.arg(),
+        keys.page_size.arg(),
+        max_kv.arg(),
+    ];
     let launch = Launch::grid([score_blocks, rows, 1], [SCORE_KEYS, 1, 1]);
     if mfma && lists.count == 0 {
         // A prefill's rows, SCORE_ROWS a block over the same keys.
@@ -387,16 +337,18 @@ pub fn topk(
         )?;
     }
     if lists.count != 0 {
-        let mut args = vec![by_value(&lists)];
-        args.extend(row_args(&[top_k.arg(), ratio.arg(), ctx.stage()]));
+        let mut args = vec![ArgValue::of(&lists)];
+        args.extend(row_args);
+        args.extend([top_k.arg(), ratio.arg(), ctx.stage()]);
         ctx.fire(
             OP,
             Fire::at(FILE, "::pie::attn::index_topk_bound")
                 .apply(Launch::grid([rows, 1, 1], [SELECT_BLOCK, 1, 1])),
             &args,
         )?;
-        let mut args = vec![by_value(&lists), scores];
-        args.extend(row_args(&[top_k.arg(), ratio.arg(), ctx.stage()]));
+        let mut args = vec![ArgValue::of(&lists), scores];
+        args.extend(row_args);
+        args.extend([top_k.arg(), ratio.arg(), ctx.stage()]);
         ctx.fire(
             OP,
             Fire::at(FILE, "::pie::attn::index_topk_collect").apply(Launch::grid(
@@ -407,12 +359,8 @@ pub fn topk(
         )?;
     }
     let mut args = vec![scores, selection.arg()];
-    args.extend(row_args(&[
-        top_k.arg(),
-        ratio.arg(),
-        by_value(&lists),
-        ctx.stage(),
-    ]));
+    args.extend(row_args);
+    args.extend([top_k.arg(), ratio.arg(), ArgValue::of(&lists), ctx.stage()]);
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::index_topk_select")
@@ -436,20 +384,13 @@ struct TopkLists {
 
 const _: () = assert!(core::mem::size_of::<TopkLists>() == 48);
 
-fn by_value<P>(params: &P) -> ArgValue {
-    ArgValue::Bytes {
-        ptr: core::ptr::from_ref(params).cast::<u8>(),
-        len: core::mem::size_of::<P>(),
-    }
-}
-
 /// The most heads a block-max ranking holds, and the widest key row.
 const BLOCK_MAX_HEADS: i32 = 8;
 const BLOCK_MAX_DIM: i32 = 256;
 
 /// [`topk`]'s blocks read back as the tokens each stands for, then the
 /// row's own open block's (`top_k * ratio + ratio - 1` a row, -1 unused):
-/// `attention.index_topk` scored `pooled_tokens`.
+/// `attn.index_topk` scored `pooled_tokens`.
 #[allow(clippy::too_many_arguments)]
 pub fn topk_tokens(
     ctx: &Ctx,
@@ -462,7 +403,7 @@ pub fn topk_tokens(
     ratio: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     let ratio = ratio.max(1);
     let width = top_k
         .checked_mul(ratio)
@@ -514,7 +455,7 @@ pub fn topk_tokens(
     )
 }
 
-/// `attention.index_topk` scored block by block: each head ranks the blocks
+/// `attn.index_topk` scored block by block: each head ranks the blocks
 /// a row sees by their best key, keeps the row's own, and writes its run of
 /// `top_k` ascending into `selection`, `heads * top_k` wide.
 #[allow(clippy::too_many_arguments)]
@@ -528,7 +469,7 @@ pub fn topk_block_max(
     block: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 block ids");
     let heads = count(OP, "the head count this ranking states", heads)?;
@@ -639,6 +580,6 @@ pub fn store_fp4(
     _keys: &KvPool,
 ) -> Result<(), Error> {
     Err(Error::Unsupported {
-        op: "attention.pool_kv_append",
+        op: "attn.pool_kv_append",
     })
 }

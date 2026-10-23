@@ -1,0 +1,49 @@
+#pragma once
+
+// Affine-quantized banks: `PIE_BITS`-bit codes packed low first into 32-bit
+// words, a bf16 scale and bias per `PIE_GROUP` codes of a row; a value is
+// `scale * code + bias`.
+
+static const uint PIE_CODES_PER_WORD = 32u / uint(PIE_BITS);
+static const uint PIE_CODE_MASK = (1u << uint(PIE_BITS)) - 1u;
+
+float affine_code(uint word, uint i) {
+    return float((word >> (i * uint(PIE_BITS))) & PIE_CODE_MASK);
+}
+
+float affine_value(uint word, uint i, float scale, float bias) {
+    return scale * affine_code(word, i) + bias;
+}
+
+// The word holding code `k` of `row`, a row `row_len` codes long.
+uint affine_word_of(uint row, uint row_len, uint k) {
+    return row * (row_len / PIE_CODES_PER_WORD) + k / PIE_CODES_PER_WORD;
+}
+
+// Code `k`'s place within its word.
+uint affine_code_of(uint k) {
+    return k % PIE_CODES_PER_WORD;
+}
+
+// The scale (and bias) index of code `k` of `row`.
+uint affine_scale_of(uint row, uint row_len, uint k) {
+    return row * (row_len / uint(PIE_GROUP)) + k / uint(PIE_GROUP);
+}
+
+// Codes `i` to `i + 3` of `word`, dequantized.
+float4 affine_dequant4(uint word, uint i, float scale, float bias) {
+    return float4(affine_code(word, i), affine_code(word, i + 1u), affine_code(word, i + 2u),
+                  affine_code(word, i + 3u)) * scale + bias;
+}
+
+// One word of codes against its activations, with their sum folded in for
+// the bias: `scale * (codes . x) + bias * sum(x)`.
+float affine_word_dot(uint word, float x[32 / PIE_BITS], float scale, float bias) {
+    float accum = 0.0;
+    float sum = 0.0;
+    [ForceUnroll] for (uint i = 0u; i < 32u / uint(PIE_BITS); i++) {
+        accum += x[i] * affine_code(word, i);
+        sum += x[i];
+    }
+    return scale * accum + sum * bias;
+}

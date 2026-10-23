@@ -4,7 +4,7 @@
 // accumulation: one wavefront an output, its lanes striding K. The
 // projection of an f32 activation, which no matrix-core arm takes.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::linear {
 

@@ -9,7 +9,7 @@
 //
 // The factors are F (bf16 or f16), one row of K / GROUP a weight row.
 
-#include "prelude/mfma.hip"
+#include "prim/mfma.hip"
 
 namespace pie::linear {
 

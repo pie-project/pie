@@ -9,14 +9,6 @@ def caches(m, c):
         c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
 
 def forward(m, inputs):
-    ([input_m, input_s, input_d], input_p) = inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
-    plans = struct(
-        m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
-        d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
-        p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
-        s = ops.attn.plan_prefill(input_s, m.q_heads, m.kv_heads, m.head_dim, None),
-    )
-    mask = inputs.mask()
     positions = inputs.positions()
     scaling = rope_scaling({
         "rope_type": "llama3",
@@ -25,42 +17,37 @@ def forward(m, inputs):
         "high_freq_factor": m.rope.high_freq_factor,
         "original_max_position_embeddings": m.rope.original_max_position,
     })
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, plans, mask, positions, scaling, w)
+        o = attention(x, inputs, m, positions, scaling, w)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, w.gate_up), m.inter), w.down)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), m.inter),
+            w.down,
+        )
         return ops.elemwise.residual_add(f, y)
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
-def attention(x, inputs, m, plans, mask, positions, scaling, w):
+def attention(x, inputs, m, positions, scaling, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.layout.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
     seam.at(seam.ATTN_QV, [q, v])
-    q, k = ops.elemwise.rope_full(q, k, positions, d, m.theta, False, scaling = scaling)
+    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
     seam.at(seam.ATTN_Q, [q])
 
-    def scored(q):
-        o, lse = ops.attn.prefill_lse(q, plans.s, pages, None, d, m.kv_heads, m.sm_scale)
-        seam.at(seam.SCORES, [lse])
-        return o
-
-    o = switch(q, [
-        (fact.has(fact.Mask), lambda q: ops.attn.masked(q, plans.m, mask, pages, None, d, m.kv_heads, True, m.sm_scale)),
-        (fact.scores(), scored),
-        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
-    ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, w.o)

@@ -6,7 +6,7 @@ use poem::{
     trace_hybrid,
 };
 use poem_compiler::Placement;
-use poem_ir::{Attention, Def, Layout, Linear, Operation, RuntimeInput};
+use poem_ir::{Attn, Def, Gather, Linear, Operation, RuntimeInput};
 
 const AUDIO: u64 = 32;
 const VIDEO: u64 = 48;
@@ -29,9 +29,9 @@ impl ForwardHybrid for CrossAttention {
         let wo = Weight::sym("audio.o", [AUDIO, inner], Dtype::Bf16);
         let xa = audio.latents(0, AUDIO as u32, Dtype::Bf16);
         let xv = video.latents(1, VIDEO as u32, Dtype::Bf16);
-        let q = ops::layout::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
-        let k = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
-        let v = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
+        let q = ops::gather::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
+        let k = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
+        let v = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
         let o = ops::attn::ragged(
             &q,
             &k,
@@ -42,7 +42,7 @@ impl ForwardHybrid for CrossAttention {
             0.25,
             RaggedMask::None,
         );
-        let o = ops::layout::unpack_rows(&o, &audio.row_permutation());
+        let o = ops::gather::unpack_rows(&o, &audio.row_permutation());
         let out = ops::linear::matmul(&o, &wo);
         seam::at(seam::VELOCITY, &[&out]);
         out
@@ -93,7 +93,7 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .nodes
             .iter()
             .enumerate()
-            .find(|(_, node)| matches!(node.op, Operation::Attention(Attention::Ragged { .. })))
+            .find(|(_, node)| matches!(node.op, Operation::Attn(Attn::Ragged { .. })))
             .expect("one ragged attention");
         let ragged = region_of(ragged_at);
         assert!(
@@ -117,7 +117,16 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .nodes
             .iter()
             .enumerate()
-            .find(|(_, node)| matches!(node.op, Operation::Linear(Linear::Matmul { .. })))
+            .find(|(_, node)| {
+                matches!(
+                    node.op,
+                    Operation::Linear(Linear::Matmul {
+                        quant: None,
+                        logits: false,
+                        ..
+                    })
+                )
+            })
             .expect("the audio projection is the first matmul");
         let region = region_of(audio_proj);
         assert!(region.mask.contains(audio_class) && !region.mask.contains(video_class));
@@ -125,7 +134,16 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| matches!(node.op, Operation::Linear(Linear::Matmul { .. })))
+            .filter(|(_, node)| {
+                matches!(
+                    node.op,
+                    Operation::Linear(Linear::Matmul {
+                        quant: None,
+                        logits: false,
+                        ..
+                    })
+                )
+            })
             .nth(1)
             .expect("the key projection is the second matmul");
         let region = region_of(video_proj);
@@ -173,7 +191,7 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             trace
                 .nodes
                 .iter()
-                .any(|node| matches!(node.op, Operation::Layout(Layout::PackRows { .. })))
+                .any(|node| matches!(node.op, Operation::Gather(Gather::PackRows { .. })))
         );
     }
 }

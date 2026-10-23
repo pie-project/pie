@@ -1,23 +1,23 @@
 //! Multimodal rotary embeddings: each rotated pair reads one of three
 //! position axes `(t, h, w)` from an i32 `[rows, 3]` stream. Reference:
-//! kernels-wgpu `rope/mrope.wgsl` (interleaved and blocked agree with
+//! kernels-slang `elemwise/rope.slang` (interleaved and blocked agree with
 //! kernels-cuda `rope_mrope*`; CUDA refuses split).
 #![allow(clippy::too_many_arguments)]
 
-use crate::cx::Ctx;
 use crate::error::{Error, refuse};
-use crate::tensor::Tensor;
+use crate::hlo::{Func, Val};
+use crate::tensor::{Operand, Stored};
 
 use super::rope::{Turn, heads, int_positions, inv_freq, rotate_all};
 
 pub const AXES: u32 = 3;
 
-const OP: &str = "elementwise.rope_mrope";
+const OP: &str = "elemwise.rope";
 
 fn validate(
-    q: Tensor,
-    k: Tensor,
-    positions: Tensor,
+    q: impl Stored,
+    k: impl Stored,
+    positions: impl Stored,
     sections: [u32; AXES as usize],
     rotary_dim: u32,
     head_dim: u32,
@@ -37,8 +37,8 @@ fn validate(
             ),
         ));
     }
-    heads(OP, q.width, head_dim)?;
-    heads(OP, k.width, head_dim)?;
+    heads(OP, q.width(), head_dim)?;
+    heads(OP, k.width(), head_dim)?;
     let stated: u32 = sections.iter().sum();
     if stated > head_dim / 2 {
         return Err(refuse(
@@ -69,15 +69,15 @@ fn blocked_pairs(sections: [u32; AXES as usize], rotary_dim: u32) -> Result<u32,
 /// `apply_rotary_pos_emb` turns `x[..r]` (Qwen3.5's `r = d/4`), as the GPU
 /// kernels do.
 pub fn interleaved(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    k: Tensor,
-    positions: Tensor,
+    f: &mut Func,
+    q: Operand,
+    k: Operand,
+    positions: Operand,
     sections: [u32; AXES as usize],
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), Error> {
+) -> Result<[Option<Val>; 2], Error> {
     validate(q, k, positions, sections, rotary_dim, head_dim)?;
     let half = (rotary_dim / 2) as usize;
     let mut t = Turn::new(head_dim as usize, AXES as usize);
@@ -89,21 +89,22 @@ pub fn interleaved(
         };
         t.pair(i, i + half, axis, inv_freq(theta, i, rotary_dim));
     }
-    rotate_all(ctx, OP, &[q, k], positions, AXES, &t)
+    let v = rotate_all(f, OP, &[q, k], positions, AXES, &t)?;
+    Ok([v[0], v[1]])
 }
 
 /// Pairs `(i, i + d/2)` for `i < min(r/2, Σs)`, the sections taking pairs
 /// in order `t, h, w`, each at `theta^(-2·within/Σs)`.
 pub fn blocked(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    k: Tensor,
-    positions: Tensor,
+    f: &mut Func,
+    q: Operand,
+    k: Operand,
+    positions: Operand,
     sections: [u32; AXES as usize],
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), Error> {
+) -> Result<[Option<Val>; 2], Error> {
     validate(q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(sections, rotary_dim)? as usize;
     let total: u32 = sections.iter().sum();
@@ -120,21 +121,22 @@ pub fn blocked(
         };
         t.pair(i, i + half, axis, inv_freq(theta, within, total));
     }
-    rotate_all(ctx, OP, &[q, k], positions, AXES, &t)
+    let v = rotate_all(f, OP, &[q, k], positions, AXES, &t)?;
+    Ok([v[0], v[1]])
 }
 
 /// Each section owns `2·s` contiguous channels, rotated as its own neox half
 /// pair `(before·2 + j, before·2 + j + s)` at `theta^(-j/s)`.
 pub fn split(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    k: Tensor,
-    positions: Tensor,
+    f: &mut Func,
+    q: Operand,
+    k: Operand,
+    positions: Operand,
     sections: [u32; AXES as usize],
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), Error> {
+) -> Result<[Option<Val>; 2], Error> {
     validate(q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(sections, rotary_dim)? as usize;
     let (s0, s1) = (sections[0] as usize, sections[1] as usize);
@@ -157,5 +159,6 @@ pub fn split(
         let f = theta.powf(-(within as f32) / width as f32);
         t.pair(lo, lo + width, axis, f);
     }
-    rotate_all(ctx, OP, &[q, k], positions, AXES, &t)
+    let v = rotate_all(f, OP, &[q, k], positions, AXES, &t)?;
+    Ok([v[0], v[1]])
 }

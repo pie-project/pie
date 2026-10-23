@@ -4,13 +4,13 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use kernels_wgpu::tuning::{AXES, FACTS};
+use crate::tuning::{AXES, FACTS};
 use profile::{Facts, Profile, Registry, Report, Shelf};
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("wgpu", FACTS, AXES);
-    kernels_wgpu::tuning::register(&mut r);
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    crate::tuning::register(&mut r);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 0);
     r
 });
@@ -89,7 +89,7 @@ mod tests {
         };
         let (profile, report) = resolve(&d, None);
         assert_eq!(report.used, profile::Source::Defaults);
-        let t = kernels_wgpu::Tuning::new(profile, UNREPORTED_CORES, 0);
+        let t = crate::tuning::Tuning::new(profile, UNREPORTED_CORES, 0);
         assert_eq!(
             (
                 t.sdpa_tile_rows_per_request(),
@@ -98,7 +98,7 @@ mod tests {
             ),
             (32, 16, 256)
         );
-        use kernels_wgpu::tuning::Qmm;
+        use crate::tuning::Qmm;
         for (rows, k, want) in [
             (1, 4096, Qmm::Qmv),
             (11, 4096, Qmm::Qmv),

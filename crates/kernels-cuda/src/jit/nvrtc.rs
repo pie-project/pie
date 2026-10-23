@@ -58,15 +58,6 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     let arch = job.arch;
     let headers = job.headers;
     admits(unit, job.floor)?;
-    if job.wanted.is_empty() {
-        return Err(Fault::Compile {
-            unit,
-            log: format!(
-                "`{unit}` was asked for a cubin with no instantiations in it, which would \
-                 be cached under this architecture and satisfy no fire"
-            ),
-        });
-    }
     let options = options(arch, job.options)?;
 
     let root = CString::new(job.source.clone()).map_err(|_| Fault::Compile {
@@ -343,17 +334,22 @@ mod tests {
     /// takes every kernel in the unit with it, not only the fp8 ones.
     const FP8_UNITS: &[(&str, &[&str])] = &[
         (
-            "attn/kv.cuh",
+            "attn/kv_append.cu",
             &[
                 "::pie::attn::kv_append_explicit<::pie::true_type::value>",
                 "::pie::attn::kv_append_fp8_per_tensor",
                 "::pie::attn::kv_append_per_token_head<::pie::true_type::value>",
+            ],
+        ),
+        (
+            "attn/kv_dequant.cu",
+            &[
                 "::pie::attn::dequant_fp8_pages_active",
                 "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
             ],
         ),
         (
-            "linear/quant.cuh",
+            "linear/act_quant.cu",
             &["::pie::linear::quant_act_fp8_per_group"],
         ),
     ];
@@ -388,6 +384,46 @@ mod tests {
         present
     }
 
+    /// Every unit under `kernels/` lowers with no instantiation asked of it:
+    /// its text parses and its non-template code compiles. A template's body
+    /// is only checked where something instantiates it.
+    #[test]
+    fn every_unit_lowers() {
+        if !nvrtc_is_here() {
+            return;
+        }
+        // A unit another unit includes is a header: it compiles as part of
+        // its includers, under their options, not on its own.
+        let included: std::collections::BTreeSet<&str> = crate::source::LIBRARY
+            .iter()
+            .flat_map(|h| h.text.lines())
+            .filter_map(|line| line.strip_prefix("#include \"")?.split('"').next())
+            .collect();
+        let mut failed = Vec::new();
+        for header in crate::source::LIBRARY {
+            if included.contains(header.name) {
+                continue;
+            }
+            let Some(root) = Root::of(header.name) else {
+                continue;
+            };
+            let arch = if root.specific { "sm_100a" } else { "sm_90" };
+            let built = compile_text(&Job {
+                name: root.name,
+                source: root.text.to_owned(),
+                arch,
+                options: root.options,
+                headers: root.header_set(),
+                floor: Toolchain::ANY,
+                wanted: &[],
+            });
+            if let Err(why) = built {
+                failed.push(format!("{} at {arch}: {why}", header.name));
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n\n"));
+    }
+
     #[test]
     fn the_arch_specific_and_family_targets_are_real_and_a_virtual_one_is_not() {
         for real in [
@@ -403,7 +439,7 @@ mod tests {
     /// Every tcgen05 wrapper, issued once: what the arch-specific target
     /// must take and the plain one must refuse.
     const TCGEN05_PROBE: &str = r#"
-#include "prelude/tc5.cuh"
+#include "prim/mma_sm100.cuh"
 namespace pie {
 __global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* src, unsigned* out) {
     using namespace tc5;
@@ -504,7 +540,7 @@ __global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* s
 
     /// The affine-u4 arms are chosen by shape, never by capability, so
     /// sm_90 keeps every arm sm_89 has: no `__CUDA_ARCH__` gate in those
-    /// units, the prelude or the shims may admit 890 and refuse 900 (#680).
+    /// units, the prim headers or the shims may admit 890 and refuse 900 (#680).
     #[test]
     fn no_arch_gate_on_the_affine_u4_path_refuses_sm_90() {
         use crate::source::{LIBRARY, SHIM};
@@ -517,11 +553,16 @@ __global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* s
             ">" => arch > bound,
             _ => arch < bound,
         };
-        let units = ["linear/quant.cuh", "linear/tiled.cuh"]
-            .map(|file| Root::of(file).expect("a carried unit"));
+        let units = [
+            "linear/affine.cu",
+            "linear/dequant.cu",
+            "linear/quant.cuh",
+            "linear/codec.cuh",
+        ]
+        .map(|file| Root::of(file).expect("a carried unit"));
         let scanned = units.iter().map(|root| (root.name, root.text)).chain(
             SHIM.iter()
-                .chain(LIBRARY.iter().filter(|h| h.name.starts_with("prelude/")))
+                .chain(LIBRARY.iter().filter(|h| h.name.starts_with("prim/")))
                 .map(|h| (h.name, h.text)),
         );
         let mut gates = 0;

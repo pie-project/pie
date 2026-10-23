@@ -2,8 +2,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::attn::mla;
-use kernels_xla::{KvPool, RaggedTensor};
+use engine_xla::handle::{KvPool, RaggedTensor};
+use engine_xla::lower::attn::mla;
 
 struct Rng(u64);
 
@@ -279,10 +279,21 @@ fn mla_attention_reads_latents_through_pages() {
     let (h, r) = (heads as u32, rank as u32);
     if !b
         .run(|ctx| {
-            mla::attention_prefill(ctx, qr, qp, &kv, pt, rt, h, r, scale, outs[0])?;
-            mla::attention_decode(ctx, qt, qp, &kv, pt, rt, h, r, scale, outs[1])?;
-            mla::attention_prefill_selected(ctx, qr, qp, st, &kv, pt, rt, h, r, scale, outs[2])?;
-            mla::attention_decode_selected(ctx, qt, qp, st, &kv, pt, rt, h, r, scale, outs[3])
+            use kernels_xla::attn::mla as call;
+            mla::flash(
+                ctx,
+                call::attention_prefill(qr, qp, pt, rt, h, r, scale, outs[0]),
+                kv,
+            )?;
+            mla::flash(
+                ctx,
+                call::attention_decode(qt, qp, pt, rt, h, r, scale, outs[1]),
+                kv,
+            )?;
+            let c = call::attention_prefill_selected(qr, qp, st, pt, rt, h, r, scale, outs[2]);
+            mla::flash(ctx, c, kv)?;
+            let c = call::attention_decode_selected(qt, qp, st, pt, rt, h, r, scale, outs[3]);
+            mla::flash(ctx, c, kv)
         })
         .unwrap()
     {

@@ -1,0 +1,80 @@
+// Bidirectional attention within segments: for each lane (segment) l in
+// [l0, l1) with rows [indptr[l], indptr[l + 1]), each query row r of the
+// window (rows [r0, r1) of the window, which starts at global row w0) and
+// each query head of kv heads [kh0, kh1) attends the segment's keys within
+// [a0, a1). Whole: q/o rows are all heads, k/v rows all heads and all key
+// rows. Sharded: q/o/lse rows hold just the kv heads' query heads, k/v
+// rows hold key rows [a0, a1) and heads [kh0, kh1); the lse (base 2) of
+// each row and head is written for the host to merge key groups.
+fn k_attend_dense(q: [*]f32, k: [*]f32, v: [*]f32, o: [*]f32, lse: [*]f32, indptr: [*]i32, acc: [*]f32,
+                  l0: i32, l1: i32, a0: i32, a1: i32, kh0: i32, kh1: i32, r0: i32, r1: i32, w0: i32, group: i32, d: i32, scale: f32, sharded: bool) void {
+  var kwl: i32 = (kh1 - kh0) * d;
+  var h0: i32 = kh0 * group;
+  var h1: i32 = kh1 * group;
+  var lw: i32 = h1 - h0;
+  var qw: i32 = lw * d;
+  var dacc = @set_dsd_base_addr(k_base_f32, acc);
+  dacc = @set_dsd_length(dacc, @bitcast(u16, @as(i16, d)));
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var s0: i32 = indptr[l];
+    var s1: i32 = indptr[l + 1];
+    // Query rows of this segment inside the window, window-relative.
+    var qlo: i32 = s0 - w0;
+    if (qlo < r0) { qlo = r0; }
+    var qhi: i32 = s1 - w0;
+    if (qhi > r1) { qhi = r1; }
+    // Key rows of this segment this PE holds.
+    var klo: i32 = s0;
+    if (klo < a0) { klo = a0; }
+    var khi: i32 = s1;
+    if (khi > a1) { khi = a1; }
+    var r: i32 = qlo;
+    while (r < qhi) : (r += 1) {
+      var h: i32 = h0;
+      while (h < h1) : (h += 1) {
+        var kh: i32 = h / group;
+        var qoff: i32 = r * qw + (h - h0) * d;
+        var m: f32 = 0.0;
+        var lsum: f32 = 0.0;
+        var any: bool = false;
+        var kr: i32 = klo;
+        while (kr < khi) : (kr += 1) {
+          var koff: i32 = (kr - a0) * kwl + (kh - kh0) * d;
+          var s: f32 = k_dot(q, qoff, k, koff, d) * scale;
+          var dv = @set_dsd_base_addr(k_base_f32, v);
+          dv = @set_dsd_length(dv, @bitcast(u16, @as(i16, d)));
+          dv = @increment_dsd_offset(dv, @as(i16, koff), f32);
+          if (!any) {
+            any = true;
+            m = s;
+            lsum = 1.0;
+            @fmovs(dacc, dv);
+          } else if (s > m) {
+            var alpha: f32 = math.exp_f32(m - s);
+            lsum = lsum * alpha + 1.0;
+            @fmuls(dacc, dacc, alpha);
+            @fadds(dacc, dacc, dv);
+            m = s;
+          } else {
+            var p: f32 = math.exp_f32(s - m);
+            lsum = lsum + p;
+            @fmacs(dacc, dacc, dv, p);
+          }
+        }
+        var dout = @set_dsd_base_addr(k_base_f32, o);
+        dout = @set_dsd_length(dout, @bitcast(u16, @as(i16, d)));
+        dout = @increment_dsd_offset(dout, @as(i16, qoff), f32);
+        if (any) {
+          @fmuls(dout, dacc, 1.0 / lsum);
+          if (sharded) { lse[r * lw + (h - h0)] = (m + math.log_f32(lsum)) * 1.4426950408889634; }
+        } else {
+          var i: i32 = 0;
+          while (i < d) : (i += 1) { o[qoff + i] = 0.0; }
+          if (sharded) { lse[r * lw + (h - h0)] = @bitcast(f32, @as(u32, 0xFF800000)); }
+        }
+      }
+    }
+  }
+}
+

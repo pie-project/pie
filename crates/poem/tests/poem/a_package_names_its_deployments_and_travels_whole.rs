@@ -1,4 +1,4 @@
-//! `package.poem` states a package's models and the deployments it lists,
+//! `MODELS` and `DEPLOYMENTS` state a package's models and the deployments it lists,
 //! each named by the one grammar every deployment is named by; and its
 //! digest follows its files.
 
@@ -32,7 +32,7 @@ def caches(m, c):
     pass
 
 def forward(m, inputs):
-    return ops.linear.lm_head(ops.layout.embed(inputs.tokens(), m.embed, 16), m.head)
+    return ops.linear.lm_head(ops.gather.embed(inputs.tokens(), m.embed, 16), m.head)
 "#;
 
 fn toy() -> Package {

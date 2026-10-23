@@ -13,7 +13,7 @@ use std::cell::RefCell;
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -162,7 +162,7 @@ fn the_coop_tiles_price_their_matmuls() {
         for split in [1, 2, 4, 8] {
             let run = |ctx: &Sink<'_>| {
                 for (w, y) in banks.iter().zip(&ys) {
-                    quant::coop_matmul(
+                    qmm::staged::coop(
                         ctx,
                         act,
                         *w,
@@ -224,13 +224,13 @@ fn the_coop_tiles_price_their_matmuls() {
             for (w, h) in banks.iter().zip(&hs) {
                 if fused {
                     assert!(
-                        quant::coop_swiglu(ctx, &tuning, act, *w, intermediate, *h, 8)
+                        qmm::staged::coop_swiglu(ctx, &tuning, act, *w, intermediate, *h, 8)
                             .expect("fused"),
                         "the fused tile takes the shape"
                     );
                     continue;
                 }
-                quant::coop_matmul(
+                qmm::staged::coop(
                     ctx,
                     act,
                     *w,

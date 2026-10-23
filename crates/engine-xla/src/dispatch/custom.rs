@@ -1,6 +1,6 @@
-use kernels_xla::spatial;
-use poem_exec::{DispatchFused, DispatchProbe, DispatchSpatial, KernelError};
-use poem_ir::{Fused, GridRule, Spatial, TimePad, VoxelSegment};
+use kernels_xla::conv;
+use poem_exec::{DispatchConv, DispatchFused, DispatchProbe, KernelError};
+use poem_ir::{Conv, Fused, GridRule, TimePad};
 
 use poem_ir::Operands;
 
@@ -13,8 +13,8 @@ impl DispatchFused for Run<'_> {
     }
 }
 
-impl DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
+impl DispatchConv for Run<'_> {
+    fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
         self.spatial(op).map_err(crate::error::kernel)
     }
@@ -48,14 +48,7 @@ impl DispatchProbe for Run<'_> {
     }
 }
 
-fn segment(segment: VoxelSegment) -> spatial::Segment {
-    match segment {
-        VoxelSegment::Clip => spatial::Segment::Lane,
-        VoxelSegment::Frames(n) => spatial::Segment::Frames(n),
-    }
-}
-
-fn rule(rule: GridRule) -> spatial::GridRule {
+fn rule(rule: GridRule) -> conv::GridRule {
     match rule {
         GridRule::Conv {
             k,
@@ -63,7 +56,7 @@ fn rule(rule: GridRule) -> spatial::GridRule {
             pad,
             pad_back,
             causal_t,
-        } => spatial::GridRule::Conv {
+        } => conv::GridRule::Conv {
             k,
             stride,
             pad,
@@ -73,34 +66,34 @@ fn rule(rule: GridRule) -> spatial::GridRule {
         GridRule::Upsample {
             factor,
             keep_first_frame,
-        } => spatial::GridRule::Upsample {
+        } => conv::GridRule::Upsample {
             factor,
             keep_first_frame,
         },
-        GridRule::Shuffle { r, trim_t } => spatial::GridRule::Shuffle { r, trim_t },
-        GridRule::Unshuffle { r } => spatial::GridRule::Unshuffle { r },
-        GridRule::AvgDown { factor } => spatial::GridRule::AvgDown { factor },
+        GridRule::Shuffle { r, trim_t } => conv::GridRule::Shuffle { r, trim_t },
+        GridRule::Unshuffle { r } => conv::GridRule::Unshuffle { r },
+        GridRule::AvgDown { factor } => conv::GridRule::AvgDown { factor },
     }
 }
 
 impl Run<'_> {
-    /// A convolution weight in the tap-major order `spatial::conv3d` reads
+    /// A convolution weight in the tap-major order `conv::conv3d::conv3d` reads
     /// (`[C_out, taps · C_in]`, input channel inner), relabelled from the
     /// checkpoint's natural `[C_out, C_in · taps]` (engine-cuda
     /// `voxels::relabel_conv_weights`, done per program here: the plan
     /// declares every such weight `ConvTapsMajor { c_in, taps }`).
     fn taps_major(
         &self,
-        w: kernels_xla::Tensor,
+        w: crate::handle::Tensor,
         c_in: u32,
         taps: u32,
-    ) -> Result<kernels_xla::Tensor, kernels_xla::Error> {
+    ) -> Result<crate::handle::Tensor, kernels_xla::Error> {
         if taps <= 1 || c_in <= 1 {
             return Ok(w);
         }
         if u64::from(w.width) != u64::from(c_in) * u64::from(taps) {
             return Err(kernels_xla::Error::Backend {
-                op: "spatial.conv3d",
+                op: "conv.conv3d",
                 detail: format!(
                     "a weight {} wide does not hold {c_in} input channels by {taps} taps",
                     w.width
@@ -118,7 +111,10 @@ impl Run<'_> {
     }
 
     /// The fire's clip slot table, or a refusal naming `op`.
-    fn clip_slot_table(&self, op: &'static str) -> Result<kernels_xla::Tensor, kernels_xla::Error> {
+    fn clip_slot_table(
+        &self,
+        op: &'static str,
+    ) -> Result<crate::handle::Tensor, kernels_xla::Error> {
         self.clip_slots()
             .ok_or_else(|| kernels_xla::Error::Backend {
                 op,
@@ -130,14 +126,17 @@ impl Run<'_> {
 
     /// engine-cuda's `dispatch/spatial.rs`, entry for entry. The lane tables
     /// are device data, so a convolution runs the table-as-data
-    /// `spatial::conv3d`; `conv3d_boxed` (clip boxes as static attributes)
+    /// `conv::conv3d::conv3d`; `conv3d_boxed` (clip boxes as static attributes)
     /// needs the boxes on the host, which the walk does not hold.
-    fn spatial(&mut self, op: &Spatial) -> Result<(), kernels_xla::Error> {
+    fn spatial(&mut self, op: &Conv) -> Result<(), kernels_xla::Error> {
         match op {
-            Spatial::Grid { grid, rule: how, y } => {
-                spatial::derive_grid(self.ctx(), self.tensor(*grid), rule(*how), self.tensor(*y))
-            }
-            Spatial::Conv3d {
+            Conv::Grid { grid, rule: how, y } => crate::lower::lower(self.ctx(), |l| {
+                let grid_v = l.read(self.tensor(*grid))?;
+                let o_y = self.tensor(*y);
+                let v = conv::rule::derive_grid(l.f(), grid_v, rule(*how), o_y.landing())?;
+                l.land(o_y, v)
+            }),
+            Conv::Conv3d {
                 x,
                 grid,
                 w,
@@ -152,15 +151,15 @@ impl Run<'_> {
                 y_grid,
                 y,
             } => {
-                let conv = spatial::Conv3d {
+                let conv = conv::Conv3d {
                     k: *k,
                     stride: *stride,
                     pad: *pad,
                     pad_back: *pad_back,
                     causal_t: *causal_t,
                     time_pad: match time_pad {
-                        TimePad::Zero => spatial::TimePad::Zero,
-                        TimePad::Replicate => spatial::TimePad::Replicate,
+                        TimePad::Zero => conv::TimePad::Zero,
+                        TimePad::Replicate => conv::TimePad::Replicate,
                     },
                 };
                 let x = self.tensor(*x);
@@ -168,40 +167,91 @@ impl Run<'_> {
                 let bias = bias.map(|b| self.tensor(b));
                 let w = self.taps_major(self.tensor(*w), x.width, conv.taps())?;
                 let Some(state) = cache else {
-                    return spatial::conv3d(
-                        self.ctx(),
-                        x,
-                        grid,
-                        w,
-                        bias,
-                        conv,
-                        None,
-                        self.tensor(*y),
-                        self.tensor(*y_grid),
-                    );
+                    return crate::lower::lower(self.ctx(), |l| {
+                        let y_grid_v = l.read(self.tensor(*y_grid))?;
+                        let grid_v = l.read(grid)?;
+                        let x_v = l.read(x)?;
+                        let cache_v = l.read_opt(None)?;
+                        let w_v = l.read(w)?;
+                        let bias_v = l.read_opt(bias)?;
+                        let o_y = self.tensor(*y);
+                        let v = conv::conv3d::conv3d(
+                            l.f(),
+                            x_v,
+                            grid_v,
+                            w_v,
+                            bias_v,
+                            conv,
+                            cache_v,
+                            o_y.landing(),
+                            y_grid_v,
+                        )?;
+                        l.land(o_y, v)
+                    });
                 };
                 // The `pad[0]` frames before each clip: read from its slot,
                 // stood in front of frame 0, then this fire's tail written
                 // back over them.
                 let frames = conv.pad[0];
                 let slab = self.recurrent(*state).state;
-                let slot_ids = self.clip_slot_table("spatial.conv3d")?;
+                let slot_ids = self.clip_slot_table("conv.conv3d")?;
                 let frame_cache = self.temp(x.rows.saturating_mul(frames), x.width, x.dtype);
-                spatial::cache_gather(self.ctx(), slab, slot_ids, grid, frames, frame_cache)?;
-                spatial::conv3d(
-                    self.ctx(),
-                    x,
-                    grid,
-                    w,
-                    bias,
-                    conv,
-                    Some(frame_cache),
-                    self.tensor(*y),
-                    self.tensor(*y_grid),
-                )?;
-                spatial::cache_store(self.ctx(), x, frame_cache, slot_ids, grid, frames, slab)
+                crate::lower::lower(self.ctx(), |l| {
+                    let grid_v = l.read(grid)?;
+                    let slot_ids_v = l.read(slot_ids)?;
+                    let slab_v = l.read(slab)?;
+                    let o_cache = frame_cache;
+                    let v = conv::cache::cache_gather(
+                        l.f(),
+                        slab_v,
+                        slot_ids_v,
+                        grid_v,
+                        frames,
+                        o_cache.landing(),
+                    )?;
+                    l.land(o_cache, v)
+                })?;
+                crate::lower::lower(self.ctx(), |l| {
+                    let y_grid_v = l.read(self.tensor(*y_grid))?;
+                    let grid_v = l.read(grid)?;
+                    let x_v = l.read(x)?;
+                    let cache_v = l.read_opt(Some(frame_cache))?;
+                    let w_v = l.read(w)?;
+                    let bias_v = l.read_opt(bias)?;
+                    let o_y = self.tensor(*y);
+                    let v = conv::conv3d::conv3d(
+                        l.f(),
+                        x_v,
+                        grid_v,
+                        w_v,
+                        bias_v,
+                        conv,
+                        cache_v,
+                        o_y.landing(),
+                        y_grid_v,
+                    )?;
+                    l.land(o_y, v)
+                })?;
+                crate::lower::lower(self.ctx(), |l| {
+                    let grid_v = l.read(grid)?;
+                    let slot_ids_v = l.read(slot_ids)?;
+                    let x_v = l.read(x)?;
+                    let cache_v = l.read(frame_cache)?;
+                    let slab_v = l.read(slab)?;
+                    let o_slab = slab;
+                    let v = conv::cache::cache_store(
+                        l.f(),
+                        x_v,
+                        cache_v,
+                        slot_ids_v,
+                        grid_v,
+                        frames,
+                        slab_v,
+                    )?;
+                    l.land(o_slab, v)
+                })
             }
-            Spatial::GroupNorm {
+            Conv::GroupNorm {
                 x,
                 grid,
                 groups,
@@ -210,98 +260,116 @@ impl Run<'_> {
                 eps,
                 silu,
                 y,
-            } => spatial::group_norm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *groups,
-                self.tensor(*weight),
-                self.tensor(*bias),
-                *eps,
-                *silu,
-                self.tensor(*y),
-            ),
-            Spatial::Attention {
-                q,
-                k,
-                v,
-                grid,
-                segment: how,
-                sm_scale,
-                y,
-            } => spatial::attention(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                segment(*how),
-                *sm_scale,
-                self.tensor(*y),
-            ),
-            Spatial::UpsampleNearest {
+            } => crate::lower::lower(self.ctx(), |l| {
+                let grid_v = l.read(self.tensor(*grid))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let bias_v = l.read(self.tensor(*bias))?;
+                let o_y = self.tensor(*y);
+                let v = conv::group_norm::group_norm(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    *groups,
+                    weight_v,
+                    bias_v,
+                    *eps,
+                    *silu,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
+            Conv::Upsample {
                 x,
                 grid,
                 factor,
                 keep_first_frame,
                 y_grid,
                 y,
-            } => spatial::upsample_nearest(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *factor,
-                *keep_first_frame,
-                self.tensor(*y),
-                self.tensor(*y_grid),
-            ),
-            Spatial::PixelShuffle {
+            } => crate::lower::lower(self.ctx(), |l| {
+                let y_grid_v = l.read(self.tensor(*y_grid))?;
+                let grid_v = l.read(self.tensor(*grid))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = conv::resample::upsample_nearest(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    *factor,
+                    *keep_first_frame,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            }),
+            Conv::PixelShuffle {
                 x,
                 grid,
                 r,
                 trim_t,
                 y_grid,
                 y,
-            } => spatial::pixel_shuffle(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *r,
-                *trim_t,
-                self.tensor(*y),
-                self.tensor(*y_grid),
-            ),
-            Spatial::PixelUnshuffle {
+            } => crate::lower::lower(self.ctx(), |l| {
+                let y_grid_v = l.read(self.tensor(*y_grid))?;
+                let grid_v = l.read(self.tensor(*grid))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = conv::resample::pixel_shuffle(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    *r,
+                    *trim_t,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            }),
+            Conv::PixelUnshuffle {
                 x,
                 grid,
                 r,
                 y_grid,
                 y,
-            } => spatial::pixel_unshuffle(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *r,
-                self.tensor(*y),
-                self.tensor(*y_grid),
-            ),
-            Spatial::AvgDown {
+            } => crate::lower::lower(self.ctx(), |l| {
+                let y_grid_v = l.read(self.tensor(*y_grid))?;
+                let grid_v = l.read(self.tensor(*grid))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = conv::resample::pixel_unshuffle(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    *r,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            }),
+            Conv::AvgDown {
                 x,
                 grid,
                 factor,
                 group,
                 y_grid,
                 y,
-            } => spatial::avg_down(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *factor,
-                *group,
-                self.tensor(*y),
-                self.tensor(*y_grid),
-            ),
-            Spatial::CacheStore {
+            } => crate::lower::lower(self.ctx(), |l| {
+                let y_grid_v = l.read(self.tensor(*y_grid))?;
+                let grid_v = l.read(self.tensor(*grid))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = conv::resample::avg_down(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    *factor,
+                    *group,
+                    o_y.landing(),
+                    y_grid_v,
+                )?;
+                l.land(o_y, v)
+            }),
+            Conv::CacheStore {
                 x,
                 grid,
                 frames,
@@ -310,45 +378,55 @@ impl Run<'_> {
             } => {
                 let x = self.tensor(*x);
                 let slab = self.recurrent(*cache).state;
-                let slot_ids = self.clip_slot_table("spatial.cache_store")?;
-                spatial::cache_store(
-                    self.ctx(),
-                    x,
-                    x,
-                    slot_ids,
-                    self.tensor(*grid),
-                    *frames,
-                    slab,
-                )
+                let slot_ids = self.clip_slot_table("conv.cache_store")?;
+                crate::lower::lower(self.ctx(), |l| {
+                    let grid_v = l.read(self.tensor(*grid))?;
+                    let slot_ids_v = l.read(slot_ids)?;
+                    let x_v = l.read(x)?;
+                    let cache_v = l.read(x)?;
+                    let slab_v = l.read(slab)?;
+                    let o_slab = slab;
+                    let v = conv::cache::cache_store(
+                        l.f(),
+                        x_v,
+                        cache_v,
+                        slot_ids_v,
+                        grid_v,
+                        *frames,
+                        slab_v,
+                    )?;
+                    l.land(o_slab, v)
+                })
             }
-            Spatial::Patchify {
+            Conv::Patchify {
                 x,
                 grid,
                 p,
                 tgrid,
                 y,
-            } => spatial::patchify(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                *p,
-                self.tensor(*y),
-                self.tensor(*tgrid),
-            ),
-            Spatial::Unpatchify {
+            } => crate::lower::lower(self.ctx(), |l| {
+                let y_grid_v = l.read(self.tensor(*tgrid))?;
+                let grid_v = l.read(self.tensor(*grid))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = conv::resample::patchify(l.f(), x_v, grid_v, *p, o_y.landing(), y_grid_v)?;
+                l.land(o_y, v)
+            }),
+            Conv::Unpatchify {
                 x,
                 tgrid,
                 p,
                 grid,
                 y,
-            } => spatial::unpatchify(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*tgrid),
-                *p,
-                self.tensor(*y),
-                self.tensor(*grid),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let y_grid_v = l.read(self.tensor(*grid))?;
+                let grid_v = l.read(self.tensor(*tgrid))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v =
+                    conv::resample::unpatchify(l.f(), x_v, grid_v, *p, o_y.landing(), y_grid_v)?;
+                l.land(o_y, v)
+            }),
         }
     }
 }

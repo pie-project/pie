@@ -1,4 +1,5 @@
 use super::*;
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate, Turn};
 
 pub use poem_ir::ops::elemwise::Yarn;
 
@@ -10,11 +11,12 @@ pub fn rmsnorm(x: &Value, weight: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Rmsnorm {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
+            weight: NormWeight::Scale(r.weight(weight)),
             eps,
             y: y.id(),
+            axis: NormAxis::Row,
         },
         &[x],
     );
@@ -25,10 +27,10 @@ pub fn rmsnorm_per_head(x: &Value, weight: &Weight, head_dim: u32, eps: f32) -> 
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormPerHead {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
-            head_dim,
+            weight: NormWeight::Scale(r.weight(weight)),
+            axis: NormAxis::Head(head_dim),
             eps,
             y: y.id(),
         },
@@ -41,11 +43,12 @@ pub fn rmsnorm_plus_one(x: &Value, weight: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormPlusOne {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
+            weight: NormWeight::PlusOne(r.weight(weight)),
             eps,
             y: y.id(),
+            axis: NormAxis::Row,
         },
         &[x],
     );
@@ -56,10 +59,10 @@ pub fn rmsnorm_per_head_plus_one(x: &Value, weight: &Weight, head_dim: u32, eps:
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormPerHeadPlusOne {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
-            head_dim,
+            weight: NormWeight::PlusOne(r.weight(weight)),
+            axis: NormAxis::Head(head_dim),
             eps,
             y: y.id(),
         },
@@ -72,11 +75,12 @@ pub fn rmsnorm_no_scale(x: &Value, head_dim: u32, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormNoScale {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            head_dim,
+            axis: NormAxis::Head(head_dim),
             eps,
             y: y.id(),
+            weight: NormWeight::None,
         },
         &[x],
     );
@@ -87,10 +91,12 @@ pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::LayernormNoScale {
+        Elemwise::Layernorm {
             x: x.id(),
             eps,
             y: y.id(),
+            weight: None,
+            bias: None,
         },
         &[x],
     );
@@ -101,10 +107,10 @@ pub fn layernorm(x: &Value, weight: &Weight, bias: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Layernorm {
+        Elemwise::Layernorm {
             x: x.id(),
-            weight: r.weight(weight),
-            bias: r.weight(bias),
+            weight: Some(r.weight(weight)),
+            bias: Some(r.weight(bias)),
             eps,
             y: y.id(),
         },
@@ -117,11 +123,12 @@ pub fn clamp_learned(x: &Value, lo: &Weight, hi: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::ClampLearned {
+        Elemwise::Clamp {
             x: x.id(),
-            lo: r.weight(lo),
-            hi: r.weight(hi),
+            lo: Some(r.weight(lo)),
+            hi: Some(r.weight(hi)),
             x_out: x_out.id(),
+            bounds: poem_ir::Bounds::Learned,
         },
         &[x],
     );
@@ -132,11 +139,12 @@ pub fn clamp(x: &Value, lo: f32, hi: f32) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Clamp {
+        Elemwise::Clamp {
             x: x.id(),
-            lo,
-            hi,
             x_out: x_out.id(),
+            lo: None,
+            hi: None,
+            bounds: poem_ir::Bounds::Fixed { lo, hi },
         },
         &[x],
     );
@@ -154,7 +162,7 @@ pub fn rmsnorm_gated(
     let r = x.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Elementwise::RmsnormGated {
+        Elemwise::RmsnormGated {
             x: x.id(),
             gate: gate.id(),
             weight: weight.map(|w| r.weight(w)),
@@ -172,7 +180,7 @@ pub fn rmsnorm_gated_by(x: &Value, gate: &Value, weight: &Weight, heads: u32, ep
     let r = x.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Elementwise::RmsnormGatedBy {
+        Elemwise::RmsnormGatedBy {
             x: x.id(),
             gate: gate.id(),
             weight: r.weight(weight),
@@ -189,10 +197,10 @@ pub fn rmsnorm_grouped_plus_one(x: &Value, weight: &Weight, group: u32, eps: f32
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RmsnormGroupedPlusOne {
+        Elemwise::Rmsnorm {
             x: x.id(),
-            weight: r.weight(weight),
-            group,
+            weight: NormWeight::PlusOne(r.weight(weight)),
+            axis: NormAxis::Group(group),
             eps,
             y: y.id(),
         },
@@ -205,8 +213,9 @@ pub fn residual_add(x: &Value, y: &Value) -> Value {
     let r = x.rec();
     let y_out = r.fresh(y.ty().clone());
     r.push(
-        Elementwise::ResidualAdd {
+        Elemwise::ResidualAdd {
             x: x.id(),
+            gate: None,
             y: y.id(),
             y_out: y_out.id(),
         },
@@ -223,7 +232,7 @@ pub fn add_bias(bias: &Weight, out: &Value) -> Value {
     let r = out.rec();
     let out_out = r.fresh(out.ty().clone());
     r.push(
-        Elementwise::AddBias {
+        Elemwise::AddBias {
             bias: r.weight(bias),
             out: out.id(),
             out_out: out_out.id(),
@@ -237,7 +246,7 @@ pub fn standardize(x: &Value, bias: &Weight, scale: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Standardize {
+        Elemwise::Standardize {
             x: x.id(),
             bias: r.weight(bias),
             scale: r.weight(scale),
@@ -252,10 +261,12 @@ pub fn mul_scalar(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::MulScalar {
-            s,
+        Elemwise::Act {
+            scale: Some(s),
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            act: poem_ir::ActFn::Identity,
         },
         &[x],
     );
@@ -266,10 +277,12 @@ pub fn silu_scaled(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::SiluScaled {
-            s,
+        Elemwise::Act {
+            scale: Some(s),
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            act: poem_ir::ActFn::Silu,
         },
         &[x],
     );
@@ -280,10 +293,12 @@ pub fn scale(s: &Weight, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Scale {
-            s: r.weight(s),
+        Elemwise::Act {
+            s: Some(r.weight(s)),
             x: x.id(),
             x_out: x_out.id(),
+            scale: None,
+            act: poem_ir::ActFn::Identity,
         },
         &[x],
     );
@@ -303,7 +318,7 @@ pub fn res_blend(
     ins.push(prefix);
     ins.extend(blocks);
     r.push(
-        Elementwise::ResBlend {
+        Elemwise::ResBlend {
             prefix: prefix.id(),
             blocks: blocks.iter().map(Value::id).collect(),
             weight: r.weight(norm),
@@ -316,198 +331,62 @@ pub fn res_blend(
     y
 }
 
-/// `scaling`, if any, turns each pair at its own frequency (a checkpoint's
-/// `rope_scaling`), the rest of the op as stated.
-pub fn rope_full(
+/// `q`'s heads, and `k`'s where given, turned by their `positions` as
+/// `turn` says. `scaling`, if any, turns each pair at its own frequency (a
+/// checkpoint's `rope_scaling`), for a turn that reads `theta`'s own: a whole
+/// or partial turn, or an interleaved M-RoPE's.
+pub fn rope(
     q: &Value,
-    k: &Value,
     positions: &Value,
     head_dim: u32,
     theta: f32,
-    interleaved: bool,
+    turn: Turn,
+    k: Option<&Value>,
     scaling: Option<RopeScaling>,
-) -> (Value, Value) {
-    let freqs = scaled(scaling.as_ref(), theta, head_dim / 2, head_dim / 2);
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
-    r.push(
-        Elementwise::RopeFull {
-            q: q.id(),
-            k: k.id(),
-            positions: positions.id(),
-            head_dim,
-            theta,
-            interleaved,
-            q_out: q_out.id(),
-            k_out: k_out.id(),
-            freqs,
-        },
-        &[q, k, positions],
-    );
-    (q_out, k_out)
-}
-
-/// The frequencies `scaling` turns `pairs` pairs `span` apart at.
-fn scaled(
-    scaling: Option<&RopeScaling>,
-    theta: f32,
-    pairs: u32,
-    span: u32,
-) -> Option<poem_ir::RopeFreqs> {
-    scaling.map(|s| {
+) -> (Value, Option<Value>) {
+    let (pairs, span) = match turn {
+        Turn::Full { .. } => (head_dim / 2, head_dim / 2),
+        Turn::Partial { rotary_dim, span } => (rotary_dim / 2, span),
+        Turn::Mrope {
+            form, rotary_dim, ..
+        } => {
+            assert!(
+                scaling.is_none() || form == MropeForm::Interleaved,
+                "a {form:?} M-RoPE turns a still's grid, which no rope scaling stretches"
+            );
+            (rotary_dim / 2, rotary_dim / 2)
+        }
+        Turn::Last { .. } | Turn::Yarn { .. } => {
+            assert!(
+                scaling.is_none(),
+                "a {turn:?} turn states its own frequencies; no rope scaling stretches them"
+            );
+            (0, 0)
+        }
+    };
+    let freqs = scaling.map(|s| {
         s.freqs(theta, pairs, span)
             .unwrap_or_else(|why| panic!("{why}"))
-    })
-}
-
-/// A pair sits `span` apart, half the rotary width unless stated.
-pub fn rope_partial(
-    q: &Value,
-    k: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    span: Option<u32>,
-    scaling: Option<RopeScaling>,
-) -> (Value, Value) {
-    let span = span.unwrap_or(rotary_dim / 2);
-    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, span);
+    });
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
+    let k_out = k.map(|k| r.fresh(k.ty().clone()));
+    let mut ins = vec![q];
+    ins.extend(k);
+    ins.push(positions);
     r.push(
-        Elementwise::RopePartial {
+        Elemwise::Rope {
             q: q.id(),
-            k: k.id(),
+            k: k.map(Value::id),
             positions: positions.id(),
-            rotary_dim,
             head_dim,
             theta,
-            span,
-            q_out: q_out.id(),
-            k_out: k_out.id(),
+            turn,
             freqs,
-        },
-        &[q, k, positions],
-    );
-    (q_out, k_out)
-}
-
-/// A pair sits `span` apart, half the rotary width unless stated.
-pub fn rope_partial_q(
-    q: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    span: Option<u32>,
-    scaling: Option<RopeScaling>,
-) -> Value {
-    let span = span.unwrap_or(rotary_dim / 2);
-    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, span);
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    r.push(
-        Elementwise::RopePartialQ {
-            q: q.id(),
-            positions: positions.id(),
-            rotary_dim,
-            head_dim,
-            theta,
-            span,
             q_out: q_out.id(),
-            freqs,
+            k_out: k_out.as_ref().map(Value::id),
         },
-        &[q, positions],
-    );
-    q_out
-}
-
-pub fn rope_partial_last(
-    q: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    interleaved: bool,
-) -> Value {
-    rope_partial_last_yarn(
-        q,
-        positions,
-        rotary_dim,
-        head_dim,
-        theta,
-        interleaved,
-        false,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn rope_partial_last_yarn(
-    q: &Value,
-    positions: &Value,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    interleaved: bool,
-    inverse: bool,
-    yarn: Option<Yarn>,
-) -> Value {
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    r.push(
-        Elementwise::RopePartialLast {
-            q: q.id(),
-            positions: positions.id(),
-            rotary_dim,
-            head_dim,
-            theta,
-            interleaved,
-            inverse,
-            yarn,
-            q_out: q_out.id(),
-        },
-        &[q, positions],
-    );
-    q_out
-}
-
-pub fn rope_yarn(
-    q: &Value,
-    k: &Value,
-    positions: &Value,
-    head_dim: u32,
-    theta: f32,
-    factor: f32,
-    beta_fast: f32,
-    beta_slow: f32,
-    attention_factor: f32,
-    original_max_position: u32,
-    interleaved: bool,
-) -> (Value, Value) {
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
-    r.push(
-        Elementwise::RopeYarn {
-            q: q.id(),
-            k: k.id(),
-            positions: positions.id(),
-            head_dim,
-            theta,
-            factor,
-            beta_fast,
-            beta_slow,
-            attention_factor,
-            original_max_position,
-            interleaved,
-            q_out: q_out.id(),
-            k_out: k_out.id(),
-        },
-        &[q, k, positions],
+        &ins,
     );
     (q_out, k_out)
 }
@@ -516,9 +395,10 @@ pub fn gate_sigmoid_mul(x: &Value, gate: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::GateSigmoidMul {
+        Elemwise::GateSigmoidMul {
             x: x.id(),
             gate: gate.id(),
+            heads: None,
             x_out: x_out.id(),
         },
         &[x, gate],
@@ -547,11 +427,10 @@ pub fn gate_sigmoid_mul_heads(x: &Value, gate: &Value, head_dim: u32, scale: f32
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::GateSigmoidMulHeads {
+        Elemwise::GateSigmoidMul {
             x: x.id(),
             gate: gate.id(),
-            head_dim,
-            scale,
+            heads: Some(GateHeads { head_dim, scale }),
             x_out: x_out.id(),
         },
         &[x, gate],
@@ -563,7 +442,7 @@ pub fn hc_expand(x: &Value, streams: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(x.rows(), x.width() * u64::from(streams), x.dtype()));
     r.push(
-        Elementwise::HcExpand {
+        Elemwise::HcExpand {
             x: x.id(),
             streams,
             y: y.id(),
@@ -577,7 +456,7 @@ pub fn hc_rmsnorm_f32(streams: &Value, eps: f32) -> Value {
     let r = streams.rec();
     let y = r.fresh(tensor(streams.rows(), streams.width(), Dtype::F32));
     r.push(
-        Elementwise::HcRmsnormF32 {
+        Elemwise::HcRmsnormF32 {
             streams: streams.id(),
             eps,
             y: y.id(),
@@ -601,7 +480,7 @@ pub fn hc_project(normed: &Value, dynamic: &Weight, stream_count: u32) -> Value 
     );
     let mixes = r.fresh(tensor(normed.rows(), dynamic.dim(0), Dtype::F32));
     r.push(
-        Elementwise::HcProject {
+        Elemwise::HcProject {
             normed: normed.id(),
             weight: r.weight(dynamic),
             stream_count,
@@ -683,7 +562,7 @@ fn gates(
     let post_mix = r.fresh(tensor(streams.rows(), count, Dtype::F32));
     let comb_mix = r.fresh(tensor(streams.rows(), count * count, Dtype::F32));
     r.push(
-        Elementwise::HcGates {
+        Elemwise::HcGates {
             normed: normed.id(),
             streams: streams.id(),
             scale: r.weight(scale),
@@ -718,7 +597,7 @@ pub fn hc_collapse(
         streams.dtype(),
     ));
     r.push(
-        Elementwise::HcCollapse {
+        Elemwise::HcCollapse {
             mixes: mixes.id(),
             streams: streams.id(),
             scale: r.weight(scale),
@@ -736,7 +615,7 @@ pub fn hc_fold(x: &Value, streams: &Value, post_mix: &Value, comb_mix: &Value) -
     let r = x.rec();
     let y = r.fresh(streams.ty().clone());
     r.push(
-        Elementwise::HcFold {
+        Elemwise::HcFold {
             x: x.id(),
             streams: streams.id(),
             post_mix: post_mix.id(),
@@ -756,7 +635,7 @@ pub fn hc_mix(gates: &Value, normed: &Value, streams: u32) -> Value {
         normed.dtype(),
     ));
     r.push(
-        Elementwise::HcMix {
+        Elemwise::HcMix {
             gates: gates.id(),
             normed: normed.id(),
             streams,
@@ -771,7 +650,7 @@ pub fn hc_inject(o: &Value, gates: &Value, streams: u32, hyper: &Value) -> Value
     let r = o.rec();
     let hyper_out = r.fresh(hyper.ty().clone());
     r.push(
-        Elementwise::HcInject {
+        Elemwise::HcInject {
             o: o.id(),
             gates: gates.id(),
             streams,
@@ -787,7 +666,7 @@ pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Valu
     let r = key.rec();
     let y = r.fresh(key.ty().clone());
     r.push(
-        Elementwise::PleGate {
+        Elemwise::PleGate {
             key: key.id(),
             query: query.id(),
             value: value.id(),
@@ -797,44 +676,6 @@ pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Valu
         &[key, query, value],
     );
     y
-}
-
-pub fn rope_mrope(
-    q: &Value,
-    k: &Value,
-    positions: &Value,
-    sections: [u32; 3],
-    form: MropeForm,
-    rotary_dim: u32,
-    head_dim: u32,
-    theta: f32,
-    scaling: Option<RopeScaling>,
-) -> (Value, Value) {
-    assert!(
-        scaling.is_none() || form == MropeForm::Interleaved,
-        "a {form:?} M-RoPE turns a still's grid, which no rope scaling stretches"
-    );
-    let freqs = scaled(scaling.as_ref(), theta, rotary_dim / 2, rotary_dim / 2);
-    let r = q.rec();
-    let q_out = r.fresh(q.ty().clone());
-    let k_out = r.fresh(k.ty().clone());
-    r.push(
-        Elementwise::RopeMrope {
-            q: q.id(),
-            k: k.id(),
-            positions: positions.id(),
-            sections,
-            form,
-            rotary_dim,
-            head_dim,
-            theta,
-            q_out: q_out.id(),
-            k_out: k_out.id(),
-            freqs,
-        },
-        &[q, k, positions],
-    );
-    (q_out, k_out)
 }
 
 pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: ModulateForm) -> Value {
@@ -866,7 +707,7 @@ pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: Modulat
     let mut ins = vec![x, m];
     ins.extend(lane_of_row);
     r.push(
-        Elementwise::Modulate {
+        Elemwise::Modulate {
             x: x.id(),
             m: m.id(),
             lane_of_row: lane_of_row.map(Value::id),
@@ -910,12 +751,14 @@ pub fn gated_residual_add(
     let mut ins = vec![r_in, g, y];
     ins.extend(lane_of_row);
     r.push(
-        Elementwise::GatedResidualAdd {
-            r: r_in.id(),
-            g: g.id(),
-            y: y.id(),
-            lane_of_row: lane_of_row.map(Value::id),
-            r_out: r_out.id(),
+        Elemwise::ResidualAdd {
+            x: y.id(),
+            gate: Some(ResidualGate {
+                g: g.id(),
+                lane_of_row: lane_of_row.map(Value::id),
+            }),
+            y: r_in.id(),
+            y_out: r_out.id(),
         },
         &ins,
     );
@@ -932,7 +775,7 @@ pub fn sinusoid(t: &Value, dim: u32, max_period: f32, flip_sin_cos: bool, scale:
     );
     let y = r.fresh(tensor(t.rows(), dim, Dtype::F32));
     r.push(
-        Elementwise::Sinusoid {
+        Elemwise::Sinusoid {
             t: t.id(),
             dim,
             max_period,
@@ -983,7 +826,7 @@ pub fn relative_bucket_bias(
         dtype: Dtype::F32,
     });
     r.push(
-        Elementwise::RelativeBucketBias {
+        Elemwise::RelativeBucketBias {
             embedding: r.weight(embedding),
             max_len,
             num_buckets,
@@ -1000,9 +843,12 @@ pub fn silu(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Silu {
+        Elemwise::Act {
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            scale: None,
+            act: poem_ir::ActFn::Silu,
         },
         &[x],
     );
@@ -1013,10 +859,12 @@ pub fn gelu(x: &Value, tanh: bool) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Gelu {
+        Elemwise::Act {
             x: x.id(),
-            tanh,
             x_out: x_out.id(),
+            s: None,
+            scale: None,
+            act: poem_ir::ActFn::Gelu { tanh },
         },
         &[x],
     );
@@ -1027,9 +875,12 @@ pub fn tanh(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Tanh {
+        Elemwise::Act {
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            scale: None,
+            act: poem_ir::ActFn::Tanh,
         },
         &[x],
     );
@@ -1050,7 +901,7 @@ pub fn hadamard(x: &Value, block: u32, signs: Option<&Value>) -> Value {
         ins.push(s);
     }
     r.push(
-        Elementwise::Hadamard {
+        Elemwise::Hadamard {
             x: x.id(),
             x_out: x_out.id(),
             block,
@@ -1080,7 +931,7 @@ pub fn hadamard_signed(x: &Value, block: u32, signs: &Weight) -> Value {
     let signs_id = r.weight(signs);
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Hadamard {
+        Elemwise::Hadamard {
             x: x.id(),
             x_out: x_out.id(),
             block,
@@ -1091,7 +942,7 @@ pub fn hadamard_signed(x: &Value, block: u32, signs: &Weight) -> Value {
     x_out
 }
 
-/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`):
+/// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`):
 /// `x` times `scale` (rounded), RMS-normed unscaled, and with `res` and its
 /// `gate` the residual's gated sum; else the norm alone.
 /// With `next` (`weight, eps, plus_one`), also the norm the next sublayer
@@ -1117,7 +968,7 @@ pub fn norm_gate(
         ins.push(stream);
     }
     r.push(
-        Elementwise::NormGate {
+        Elemwise::NormGate {
             x: x.id(),
             scale: scale.map(|s| r.weight(s)),
             res: res.map(|(stream, _)| stream.id()),
@@ -1144,10 +995,11 @@ pub fn mul(x: &Value, y: &Value) -> Value {
     assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
     let z = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Mul {
+        Elemwise::Binary {
             x: x.id(),
             y: y.id(),
             z: z.id(),
+            op: poem_ir::BinaryOp::Mul,
         },
         &[x, y],
     );
@@ -1159,10 +1011,11 @@ pub fn add(x: &Value, y: &Value) -> Value {
     assert_eq!(x.ty(), y.ty(), "a sum's operands share a type");
     let z = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::Add {
+        Elemwise::Binary {
             x: x.id(),
             y: y.id(),
             z: z.id(),
+            op: poem_ir::BinaryOp::Add,
         },
         &[x, y],
     );
@@ -1232,7 +1085,7 @@ pub fn rope_axes(
     }
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elementwise::RopeAxes {
+        Elemwise::RopeAxes {
             x: x.id(),
             positions: positions.id(),
             dims,

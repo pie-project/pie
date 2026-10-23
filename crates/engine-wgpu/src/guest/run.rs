@@ -23,6 +23,7 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
+    pixels: Option<Readout<'a>>,
 
     ran: Vec<usize>,
 }
@@ -39,8 +40,17 @@ impl<'a> OnDevice<'a> {
             session,
             widen,
             logits,
+            pixels: None,
             ran: Vec::new(),
         }
+    }
+
+    /// The fire's pixel plane, offered to a pass that reads the `pixels`
+    /// intrinsic.
+    #[must_use]
+    pub fn with_pixels(mut self, pixels: Option<Readout<'a>>) -> OnDevice<'a> {
+        self.pixels = pixels;
+        self
     }
 
     #[must_use]
@@ -64,11 +74,23 @@ impl<'a> OnDevice<'a> {
                 continue;
             };
             let root = &package.values[global as usize];
-            if root.source == ValueOrigin::Intrinsic && root.intrinsic == Some(IntrinsicId::Logits)
+            if root.source == ValueOrigin::Intrinsic
+                && matches!(
+                    root.intrinsic,
+                    Some(IntrinsicId::Logits | IntrinsicId::Pixels)
+                )
             {
-                let seat = self.logits.ok_or_else(|| Fault::Program {
+                let offered = if root.intrinsic == Some(IntrinsicId::Pixels) {
+                    self.pixels
+                } else {
+                    self.logits
+                };
+                let seat = offered.ok_or_else(|| Fault::Program {
                     at: "guest::run",
-                    why: "this pass reads the logits and no readout row was offered".into(),
+                    why: format!(
+                        "this pass reads {:?} and the fire offered no such row",
+                        root.intrinsic
+                    ),
                 })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
                     at: "guest::run",
@@ -187,7 +209,8 @@ impl StageRunner for OnDevice<'_> {
     }
 
     fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        id == Some(IntrinsicId::Logits) && self.logits.is_some()
+        (id == Some(IntrinsicId::Logits) && self.logits.is_some())
+            || (id == Some(IntrinsicId::Pixels) && self.pixels.is_some())
     }
 }
 

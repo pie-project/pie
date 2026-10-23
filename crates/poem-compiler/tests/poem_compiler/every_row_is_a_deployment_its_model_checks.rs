@@ -38,6 +38,7 @@ fn deploy(weights: &[Dtype], tp: u32, parts: &[&str], drafter: Option<&str>) -> 
         parts: parts.iter().map(|p| (*p).to_string()).collect(),
         drafter: drafter.map(str::to_string),
         yarn: None,
+        tap: None,
     }
 }
 

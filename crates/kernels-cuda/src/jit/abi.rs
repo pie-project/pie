@@ -1,8 +1,11 @@
 #[cfg(feature = "cuda")]
 use core::ffi::c_void;
 
+/// A kernel argument. Scalars are held by value; an aggregate (a params
+/// struct, a tensor map) borrows the value it was made from, so it cannot
+/// outlive it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ArgValue {
+pub enum ArgValue<'a> {
     Ptr(u64),
     I32(i32),
     U32(u32),
@@ -10,19 +13,30 @@ pub enum ArgValue {
     I64(i64),
     Usize(u64),
     Bool(bool),
-    Bytes { ptr: *const u8, len: usize },
+    Bytes(Aggregate<'a>),
 }
 
-impl ArgValue {
+/// The bytes of a by-value aggregate, borrowed for `'a`. Held as a pointer
+/// rather than a `&[u8]`: the value's padding bytes are uninitialized and
+/// must not be read as `u8`s, only copied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Aggregate<'a> {
+    ptr: *const u8,
+    len: usize,
+    _borrow: core::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> ArgValue<'a> {
     pub const ABSENT: Self = Self::Ptr(0);
 
     /// `v`'s bytes, passed by value (a params struct, a tensor map).
     #[must_use]
-    pub fn of<T>(v: &T) -> Self {
-        Self::Bytes {
+    pub fn of<T>(v: &'a T) -> Self {
+        Self::Bytes(Aggregate {
             ptr: core::ptr::from_ref(v).cast(),
             len: core::mem::size_of::<T>(),
-        }
+            _borrow: core::marker::PhantomData,
+        })
     }
 
     #[must_use]
@@ -35,7 +49,7 @@ impl ArgValue {
             Self::I64(_) => "an i64",
             Self::Usize(_) => "a usize",
             Self::Bool(_) => "a bool",
-            Self::Bytes { .. } => "a by-value aggregate",
+            Self::Bytes(_) => "a by-value aggregate",
         }
     }
 
@@ -51,53 +65,53 @@ impl ArgValue {
             Self::I64(v) => v as u64,
             Self::Usize(v) => v,
             Self::Bool(v) => v as u64,
-            Self::Bytes { .. } => panic!("an aggregate has no cell; the launch copies it instead"),
+            Self::Bytes(_) => panic!("an aggregate has no cell; the launch copies it instead"),
         }
     }
 }
 
 pub trait Arg: Copy {
-    fn arg(self) -> ArgValue;
+    fn arg(self) -> ArgValue<'static>;
 }
 
 impl Arg for i32 {
-    fn arg(self) -> ArgValue {
+    fn arg(self) -> ArgValue<'static> {
         ArgValue::I32(self)
     }
 }
 
 impl Arg for u32 {
-    fn arg(self) -> ArgValue {
+    fn arg(self) -> ArgValue<'static> {
         ArgValue::U32(self)
     }
 }
 
 impl Arg for f32 {
-    fn arg(self) -> ArgValue {
+    fn arg(self) -> ArgValue<'static> {
         ArgValue::F32(self)
     }
 }
 
 impl Arg for i64 {
-    fn arg(self) -> ArgValue {
+    fn arg(self) -> ArgValue<'static> {
         ArgValue::I64(self)
     }
 }
 
 impl Arg for u64 {
-    fn arg(self) -> ArgValue {
+    fn arg(self) -> ArgValue<'static> {
         ArgValue::Usize(self)
     }
 }
 
 impl Arg for usize {
-    fn arg(self) -> ArgValue {
+    fn arg(self) -> ArgValue<'static> {
         ArgValue::Usize(self as u64)
     }
 }
 
 impl Arg for bool {
-    fn arg(self) -> ArgValue {
+    fn arg(self) -> ArgValue<'static> {
         ArgValue::Bool(self)
     }
 }
@@ -119,11 +133,11 @@ impl Bound {
         let mut slots = Vec::with_capacity(values.len());
         for value in values {
             match *value {
-                ArgValue::Bytes { ptr, len } => {
+                ArgValue::Bytes(Aggregate { ptr, len, .. }) => {
                     let mut blob = vec![0u64; len.div_ceil(8).max(1)].into_boxed_slice();
-                    // SAFETY: `Bytes` promises `len` live bytes at `ptr`
-                    // for the duration of the fire; they are copied here,
-                    // before the call returns.
+                    // SAFETY: an `Aggregate` borrows the `len` bytes at `ptr`
+                    // for `'a`, which outlives this call; `blob` holds at
+                    // least `len` bytes.
                     unsafe {
                         core::ptr::copy_nonoverlapping(ptr, blob.as_mut_ptr().cast::<u8>(), len);
                     }

@@ -1157,6 +1157,7 @@ mod tests {
     use crate::fixture::{Build, fact};
     use crate::region;
     use poem_ir::{Guard, resolve_classes};
+    use poem_ir::{NormAxis, NormWeight};
 
     fn budget() -> Budgets {
         Budgets::of(crate::Budget::new(4, 16))
@@ -1195,11 +1196,12 @@ mod tests {
             },
         );
         b.trace.nodes.push(poem_ir::Node {
-            op: poem_ir::ops::Elementwise::RmsnormNoScale {
+            op: poem_ir::ops::Elemwise::Rmsnorm {
                 x,
-                head_dim: 1,
+                axis: NormAxis::Head(1),
                 eps: 1e-6,
                 y,
+                weight: NormWeight::None,
             }
             .into(),
             guard: Guard::Always,

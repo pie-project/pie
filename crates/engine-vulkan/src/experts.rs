@@ -8,7 +8,7 @@ use poem_ir::{Def, Linear, Operation, Trace, ValueId};
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
-use kernels_vulkan::Tensor;
+use kernels_slang::Tensor;
 
 const RING: usize = 2;
 
@@ -770,17 +770,23 @@ impl Plan {
         let mut gathered = BTreeMap::new();
         let mut rows_per_token = 0u32;
         for node in &trace.nodes {
-            if let Operation::Layout(poem_ir::Layout::EmbedConcat { ids, table, .. }) = &node.op
+            if let Operation::Gather(poem_ir::Gather::Embed {
+                ids,
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) = &node.op
                 && let Ok(at) = weight_of(trace, *table)
             {
                 gathered.insert(at, ids.0);
             }
 
-            if let Operation::Attention(
-                poem_ir::Attention::PleNgramIds {
+            if let Operation::Gather(
+                poem_ir::Gather::NgramIds {
                     heads_per_ngram, ..
                 }
-                | poem_ir::Attention::PleNgramIdsChunked {
+                | poem_ir::Gather::NgramIdsChunked {
                     heads_per_ngram, ..
                 },
             ) = &node.op
@@ -791,10 +797,29 @@ impl Plan {
                 continue;
             };
             let (routes, indexed): (ValueId, Vec<ValueId>) = match op {
-                Linear::MoeMatmulSelect { bank, routes, .. }
-                | Linear::MoeMatmulSelectQuant { bank, routes, .. } => (*routes, vec![*bank]),
-                Linear::MoeMatmulSelectBias {
-                    bank, bias, routes, ..
+                Linear::MoeSelect {
+                    bank,
+                    routes,
+                    bias: None,
+                    quantized: false,
+                    quant: None,
+                    ..
+                }
+                | Linear::MoeSelect {
+                    bank,
+                    routes,
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                } => (*routes, vec![*bank]),
+                Linear::MoeSelect {
+                    bank,
+                    bias: Some(bias),
+                    routes,
+                    quantized: false,
+                    quant: None,
+                    ..
                 } => (*routes, vec![*bank, *bias]),
                 Linear::MoeBiasSum { bias, routes, .. } => (*routes, vec![*bias]),
                 _ => continue,
@@ -996,9 +1021,9 @@ impl Gathered {
         &self,
         handles: &Handles,
         host: &HostTier,
-        bank: kernels_vulkan::Bank,
+        bank: kernels_slang::Bank,
         ids: Tensor,
-    ) -> Result<Option<(kernels_vulkan::Bank, Tensor)>> {
+    ) -> Result<Option<(kernels_slang::Bank, Tensor)>> {
         if host.plane(bank.codes.buf).is_none() {
             return Ok(None);
         }

@@ -1,279 +1,294 @@
 use serde::{Deserialize, Serialize};
 
-use crate::operands::Operands;
+use crate::Op;
+use crate::check::Expect;
+use crate::operands::Part;
+use crate::ops::conv::VoxelSegment;
 use crate::value::ValueId;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Attention {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
+#[op(group = "attn")]
+pub enum Attn {
     PlanDecode {
+        #[input(I32)]
         kv_indptr: ValueId,
+        #[input(I32)]
         kv_indices: ValueId,
+        #[input(I32)]
         last_page_len: ValueId,
+        #[input(I32)]
         kv_len: ValueId,
         q_heads: u32,
         kv_heads: u32,
         head_dim: u32,
         window: Option<u32>,
+        #[output]
         plan: ValueId,
     },
     PlanPrefill {
+        #[input(I32)]
         kv_indptr: ValueId,
+        #[input(I32)]
         kv_indices: ValueId,
+        #[input(I32)]
         last_page_len: ValueId,
+        #[input(I32)]
         kv_len: ValueId,
         q_heads: u32,
         kv_heads: u32,
         head_dim: u32,
         window: Option<u32>,
+        #[output]
         plan: ValueId,
     },
+    /// Each row's query against its lane's paged keys, as one token's. A
+    /// selection (`selection`, its run of blocks as `selected` lays them out)
+    /// reads only those blocks; a relative bias (`bias`, as `rel` scales it)
+    /// adds each key's learned offset; `lse` writes the rows' log-sum-exp.
     Decode {
+        #[input]
         q: ValueId,
+        #[input(DECODE_PLAN)]
         plan: ValueId,
+        #[input(CACHE)]
         cache: ValueId,
+        #[input(I32)]
+        selection: Option<ValueId>,
+        #[input(F32)]
+        bias: Option<ValueId>,
         window: Option<u32>,
         head_dim: u32,
         sm_scale: f32,
+        selected: Option<Blocks>,
+        rel: Option<Relative>,
+        #[output]
         o: ValueId,
+        #[output(F32)]
+        lse: Option<ValueId>,
     },
+    /// Each row's query against its lane's paged keys, causally; or, given
+    /// `mask`, as the mask lets it (and causally too where `causal`). A
+    /// selection, a relative bias and `lse` as [`Attn::Decode`]'s; `floor`,
+    /// each row's least window position (i32 a row, from
+    /// `attn.replay_floor`), below which the window reads no key.
     Prefill {
+        #[input]
         q: ValueId,
+        #[input(PREFILL_PLAN)]
         plan: ValueId,
+        #[input(CACHE)]
         cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
-        o: ValueId,
-    },
-    DecodeRel {
-        q: ValueId,
-        plan: ValueId,
-        cache: ValueId,
-        bias: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        extent: u32,
-        sm_scale: f32,
-        log_floor: u32,
-        log_alpha: f32,
-        o: ValueId,
-    },
-    PrefillRel {
-        q: ValueId,
-        plan: ValueId,
-        cache: ValueId,
-        bias: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        extent: u32,
-        sm_scale: f32,
-        log_floor: u32,
-        log_alpha: f32,
-        o: ValueId,
-    },
-    Masked {
-        q: ValueId,
-        plan: ValueId,
-        mask: ValueId,
-        cache: ValueId,
+        #[input]
+        mask: Option<ValueId>,
+        #[input(I32)]
+        selection: Option<ValueId>,
+        #[input(F32)]
+        bias: Option<ValueId>,
+        #[input(I32)]
+        floor: Option<ValueId>,
         window: Option<u32>,
         head_dim: u32,
         kv_heads: u32,
         causal: bool,
         sm_scale: f32,
+        selected: Option<Blocks>,
+        rel: Option<Relative>,
+        #[output]
         o: ValueId,
-    },
-    MaskedLse {
-        q: ValueId,
-        plan: ValueId,
-        mask: ValueId,
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        causal: bool,
-        sm_scale: f32,
-        o: ValueId,
-        lse: ValueId,
+        #[output(F32)]
+        lse: Option<ValueId>,
     },
     Dense {
+        #[input]
         q: ValueId,
+        #[input]
         k: ValueId,
+        #[input]
         v: ValueId,
+        #[input(I32)]
         segments: ValueId,
         head_dim: u32,
         sm_scale: f32,
+        #[output]
         o: ValueId,
     },
     Ragged {
+        #[input]
         q: ValueId,
+        #[input]
         k: ValueId,
+        #[input]
         v: ValueId,
+        #[input(I32)]
         q_indptr: ValueId,
+        #[input(I32)]
         kv_indptr: ValueId,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
+        #[part]
         mask: RaggedMask,
-        o: ValueId,
-    },
-    DecodeLse {
-        q: ValueId,
-        plan: ValueId,
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        sm_scale: f32,
-        o: ValueId,
-        lse: ValueId,
-    },
-    PrefillLse {
-        q: ValueId,
-        plan: ValueId,
-        cache: ValueId,
-        window: Option<u32>,
         head_dim: u32,
         kv_heads: u32,
         sm_scale: f32,
-        o: ValueId,
-        lse: ValueId,
-        /// Each row's least window position (i32 a row, from
-        /// `attention.replay_floor`): the window reads no key below it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        floor: Option<ValueId>,
-    },
-    DecodeSelected {
-        q: ValueId,
-        plan: ValueId,
-        selection: ValueId,
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        sm_scale: f32,
-        ratio: u32,
-        /// The selection holds one run of blocks per kv head, each head's
-        /// queries reading its own; else one run every head shares.
-        #[serde(default)]
-        per_head: bool,
+        #[output]
         o: ValueId,
     },
-    PrefillSelected {
+    /// Bidirectional attention within each clip's voxel rows (or blocks of
+    /// its frames), as `grid` (i32) lays them out.
+    Voxel {
+        #[input]
         q: ValueId,
-        plan: ValueId,
-        selection: ValueId,
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
+        #[input]
+        k: ValueId,
+        #[input]
+        v: ValueId,
+        #[input(I32)]
+        grid: ValueId,
+        segment: VoxelSegment,
         sm_scale: f32,
-        ratio: u32,
-        #[serde(default)]
-        per_head: bool,
+        #[output]
         o: ValueId,
     },
     Sink {
+        #[input]
         o: ValueId,
+        #[input(F32)]
         lse: ValueId,
+        #[input]
         sink: ValueId,
         head_dim: u32,
+        #[output(alias = o)]
         o_out: ValueId,
     },
     MergeLse {
+        #[input]
         o1: ValueId,
+        #[input(F32)]
         lse1: ValueId,
+        #[input]
         o2: ValueId,
+        #[input(F32)]
         lse2: ValueId,
         heads: u32,
         head_dim: u32,
+        #[output]
         o: ValueId,
+        #[output(F32)]
         lse: ValueId,
     },
-    LogitSoftcap {
-        x: ValueId,
-        cap: f32,
-        x_out: ValueId,
-    },
+    /// Each row's key and value written at its page and offset; without
+    /// `v`, `k` is one plane a pool reads as both (a shared-kv latent).
     KvAppend {
+        #[input]
         k: ValueId,
-        v: ValueId,
+        #[input]
+        v: Option<ValueId>,
+        #[input(CACHE)]
         cache: ValueId,
+        #[input(I32)]
         write_page: ValueId,
+        #[input(I32)]
         write_offset: ValueId,
     },
-    KvAppendShared {
-        plane: ValueId,
-        cache: ValueId,
-        write_page: ValueId,
-        write_offset: ValueId,
-    },
-
     MlaPlan {
+        #[input(I32)]
         kv_indptr: ValueId,
+        #[input(I32)]
         kv_indices: ValueId,
+        #[input(I32)]
         last_page_len: ValueId,
+        #[input(I32)]
         kv_len: ValueId,
         heads: u32,
         kv_lora_rank: u32,
+        #[output]
         plan: ValueId,
     },
     MlaLatents {
+        #[input]
         kv_a: ValueId,
+        #[input]
         weight: ValueId,
         eps: f32,
         kv_lora_rank: u32,
+        #[output]
         kv_c: ValueId,
+        #[output]
         k_pe: ValueId,
     },
     MlaLatentsRope {
+        #[input]
         kv_a: ValueId,
+        #[input(I32)]
         positions: ValueId,
+        #[input]
         weight: ValueId,
         eps: f32,
         kv_lora_rank: u32,
         rope_dim: u32,
         theta: f32,
+        #[output]
         kv_c: ValueId,
+        #[output]
         k_pe: ValueId,
     },
     MlaSplitQB {
+        #[input]
         q_b: ValueId,
         heads: u32,
         nope_dim: u32,
         rope_dim: u32,
+        #[output]
         q_nope: ValueId,
+        #[output]
         q_pe: ValueId,
     },
     MlaAbsorbQ {
+        #[input]
         q_nope: ValueId,
+        #[input]
         kv_b: ValueId,
         heads: u32,
         kv_lora_rank: u32,
         nope_dim: u32,
         v_head_dim: u32,
+        #[output]
         q_latent: ValueId,
     },
     MlaAbsorbOut {
+        #[input]
         latent: ValueId,
+        #[input]
         kv_b: ValueId,
         heads: u32,
         kv_lora_rank: u32,
         v_head_dim: u32,
         nope_dim: u32,
+        #[output]
         o: ValueId,
     },
     MlaKvAppend {
+        #[input]
         kv_c: ValueId,
+        #[input]
         k_pe: ValueId,
+        #[input(CACHE)]
         cache: ValueId,
+        #[input(I32)]
         write_page: ValueId,
+        #[input(I32)]
         write_offset: ValueId,
     },
     MlaDecode {
+        #[input]
         q: ValueId,
+        #[input(MLA_PLAN)]
         plan: ValueId,
+        #[input]
         q_pe: ValueId,
+        /// The latent rows a query reads, where a selection picks them;
+        /// none reads its whole window.
+        #[input(I32)]
+        selection: Option<ValueId>,
+        #[input(CACHE)]
         cache: ValueId,
         /// The tokens a query reads back through, itself included; none
         /// reads every row.
@@ -282,13 +297,23 @@ pub enum Attention {
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,
+        #[output]
         o: ValueId,
+        #[output(F32)]
         lse: Option<ValueId>,
     },
     MlaPrefill {
+        #[input]
         q: ValueId,
+        #[input(MLA_PLAN)]
         plan: ValueId,
+        #[input]
         q_pe: ValueId,
+        /// The latent rows a query reads, where a selection picks them;
+        /// none reads its whole window.
+        #[input(I32)]
+        selection: Option<ValueId>,
+        #[input(CACHE)]
         cache: ValueId,
         /// The tokens a query reads back through, itself included; none
         /// reads every row.
@@ -297,317 +322,174 @@ pub enum Attention {
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,
+        #[output]
         o: ValueId,
+        #[output(F32)]
         lse: Option<ValueId>,
     },
-    MlaDecodeSelected {
-        q: ValueId,
-        plan: ValueId,
-        q_pe: ValueId,
-        selection: ValueId,
-        cache: ValueId,
-        heads: u32,
-        kv_lora_rank: u32,
-        sm_scale: f32,
-        o: ValueId,
-        lse: Option<ValueId>,
-    },
-    MlaPrefillSelected {
-        q: ValueId,
-        plan: ValueId,
-        q_pe: ValueId,
-        selection: ValueId,
-        cache: ValueId,
-        heads: u32,
-        kv_lora_rank: u32,
-        sm_scale: f32,
-        o: ValueId,
-        lse: Option<ValueId>,
-    },
-
-    SsmCausalConv1d {
-        x: ValueId,
-        weight: ValueId,
-        /// A bias a channel, added before the activation (Mamba-2's).
-        bias: Option<ValueId>,
-        state: ValueId,
-        conv_width: u32,
-        dilation: u32,
-        y: ValueId,
-    },
-    ShortConv {
-        x: ValueId,
-        weight: ValueId,
-        state: ValueId,
-        conv_width: u32,
-        y: ValueId,
-    },
-    ShortConvChunked {
-        x: ValueId,
-        weight: ValueId,
-        state: ValueId,
-        conv_width: u32,
-        y: ValueId,
-    },
-    SsmCausalConv1dChunked {
-        x: ValueId,
-        weight: ValueId,
-        bias: Option<ValueId>,
-        state: ValueId,
-        conv_width: u32,
-        dilation: u32,
-        y: ValueId,
-    },
-    BlockDynConv {
-        x: ValueId,
-        coeff: ValueId,
-        base: ValueId,
-        side: u32,
-        taps: u32,
-        group: u32,
-        y: ValueId,
-    },
-    SelectorWalk {
-        cand: ValueId,
-        unary: ValueId,
-        hp: Option<ValueId>,
-        tokens: ValueId,
-        pred: ValueId,
-        succ: ValueId,
-        first: u32,
-        picks: ValueId,
-    },
-    SsmGdnPrep {
-        ba: ValueId,
-        dt_bias: ValueId,
-        a_log: ValueId,
-        gates: ValueId,
-    },
-    SsmGatedDelta {
-        qkv: ValueId,
-        z: ValueId,
-        gates: ValueId,
-        state: ValueId,
-        k_heads: u32,
-        v_heads: u32,
-        k_dim: u32,
-        v_dim: u32,
-        y: ValueId,
-    },
-    SsmGatedDeltaChunked {
-        qkv: ValueId,
-        z: ValueId,
-        gates: ValueId,
-        state: ValueId,
-        k_heads: u32,
-        v_heads: u32,
-        k_dim: u32,
-        v_dim: u32,
-        y: ValueId,
-    },
-    SsmKdaStep {
-        mixed: ValueId,
-        f: ValueId,
-        b: ValueId,
-        dt_bias: ValueId,
-        a_log: ValueId,
-        state: ValueId,
-        heads: u32,
-        head_dim: u32,
-        norm_eps: f32,
-        gate_floor: f32,
-        y: ValueId,
-    },
-    SsmKdaChunked {
-        mixed: ValueId,
-        f: ValueId,
-        b: ValueId,
-        dt_bias: ValueId,
-        a_log: ValueId,
-        state: ValueId,
-        heads: u32,
-        head_dim: u32,
-        norm_eps: f32,
-        gate_floor: f32,
-        y: ValueId,
-    },
-    /// Mamba-2's selective scan over the convolved rows `xbc` (`x`, then
-    /// `groups` of `B`, then of `C`, each `state_dim` wide): per head, `dt =
-    /// softplus(dt + dt_bias)`, `S = exp(-exp(a_log) dt) S + dt x B^T`, and
-    /// `(C S + d x) * silu(z)`, RMS-normed a group of heads and scaled by
-    /// `norm`, landed bf16. `chunked` walks a prompt's rows; else each row is
-    /// a request's one step.
-    SsmMamba2 {
-        xbc: ValueId,
-        dt: ValueId,
-        z: ValueId,
-        a_log: ValueId,
-        dt_bias: ValueId,
-        d: ValueId,
-        norm: ValueId,
-        eps: f32,
-        state: ValueId,
-        heads: u32,
-        groups: u32,
-        state_dim: u32,
-        chunked: bool,
-        y: ValueId,
-    },
-
     IndexLayernormRope {
+        #[input]
         k: ValueId,
+        #[input(I32)]
         positions: ValueId,
+        #[input]
         weight: ValueId,
+        #[input]
         bias: ValueId,
         eps: f32,
         rope_dim: u32,
         theta: f32,
+        #[output(alias = k)]
         k_out: ValueId,
     },
     IndexRope {
+        #[input]
         q: ValueId,
+        #[input(I32)]
         positions: ValueId,
         heads: u32,
         head_dim: u32,
         rope_dim: u32,
         theta: f32,
+        #[output(alias = q)]
         q_out: ValueId,
     },
     IndexTopk {
+        #[input]
         q: ValueId,
-        weights: Option<ValueId>,
+        #[input(CACHE)]
         keys: ValueId,
+        #[input]
+        weights: Option<ValueId>,
         heads: u32,
         head_dim: u32,
         top_k: u32,
         ratio: u32,
         #[serde(default)]
         score: IndexScore,
+        #[output(I32)]
         selection: ValueId,
     },
     IndexKvAppend {
+        #[input]
         k: ValueId,
+        #[input(CACHE)]
         keys: ValueId,
+        #[input(I32)]
         write_page: ValueId,
+        #[input(I32)]
         write_offset: ValueId,
     },
     IndexBlockMean {
+        #[input(I32)]
         boundary_pos: ValueId,
+        #[input(I32)]
         boundary_req: ValueId,
+        #[input(CACHE)]
         keys: ValueId,
         head_dim: u32,
         ratio: u32,
+        #[output]
         entries: ValueId,
     },
-
-    PoolBoundaryDecode {
+    /// Where the rows close entries of a pool compressing `ratio` positions
+    /// each, for one token's rows (`decode`) or a prompt's.
+    PoolBoundary {
+        #[input(I32)]
         positions: ValueId,
+        #[input(U8)]
         row_valid: ValueId,
         ratio: u32,
+        decode: bool,
+        #[output(I32)]
         boundary_pos: ValueId,
+        #[output(I32)]
         boundary_req: ValueId,
-        boundary_rope: ValueId,
-    },
-    PoolBoundaryPrefill {
-        positions: ValueId,
-        row_valid: ValueId,
-        ratio: u32,
-        boundary_pos: ValueId,
-        boundary_req: ValueId,
+        #[output(I32)]
         boundary_rope: ValueId,
     },
     PoolStateWrite {
+        #[input]
         kv: ValueId,
+        #[input]
         score: ValueId,
+        #[input(CACHE)]
         pages: ValueId,
+        #[input(I32)]
         write_page: ValueId,
+        #[input(I32)]
         write_offset: ValueId,
         head_dim: u32,
         ratio: u32,
     },
     PoolGather {
+        #[input(I32)]
         boundary_pos: ValueId,
+        #[input(I32)]
         boundary_req: ValueId,
+        #[input(CACHE)]
         pages: ValueId,
+        #[input(F32)]
         ape: Option<ValueId>,
         head_dim: u32,
         ratio: u32,
+        #[output]
         entries: ValueId,
     },
     PoolKvAppend {
+        #[input]
         entries: ValueId,
+        #[input(I32)]
         boundary_pos: ValueId,
+        #[input(I32)]
         boundary_req: ValueId,
+        #[input(CACHE)]
         pool: ValueId,
+        #[input(I32)]
         write_page: ValueId,
+        #[input(I32)]
         write_offset: ValueId,
     },
     PoolLse {
+        #[input]
         q: ValueId,
+        #[input(I32)]
         positions: ValueId,
+        #[input(I32)]
         request_of_token: ValueId,
+        /// The `top_k` pool entries each row reads, where a selection picks
+        /// them; none reads every closed entry.
+        #[input(I32)]
+        selection: Option<ValueId>,
+        #[input(CACHE)]
         entries: ValueId,
         ratio: u32,
+        top_k: Option<u32>,
         heads: u32,
         head_dim: u32,
         sm_scale: f32,
+        #[output]
         o: ValueId,
+        #[output(F32)]
         lse: ValueId,
     },
-    PoolLseSelected {
-        q: ValueId,
-        positions: ValueId,
-        request_of_token: ValueId,
-        selection: ValueId,
-        entries: ValueId,
-        ratio: u32,
-        top_k: u32,
-        heads: u32,
-        head_dim: u32,
-        sm_scale: f32,
-        o: ValueId,
-        lse: ValueId,
-    },
-
-    PleNgramIds {
-        ids: ValueId,
-        state: ValueId,
-        eos: u32,
-        mults: Vec<u64>,
-        primes: Vec<u64>,
-        offsets: Vec<u64>,
-        heads_per_ngram: u32,
-        /// An i64 table the ids are mapped through before hashing (Engram's
-        /// tokenizer-compressed ids); the window keeps raw ids.
-        map: Option<ValueId>,
-        ngram_ids: ValueId,
-    },
-    PleNgramIdsChunked {
-        ids: ValueId,
-        state: ValueId,
-        eos: u32,
-        mults: Vec<u64>,
-        primes: Vec<u64>,
-        offsets: Vec<u64>,
-        heads_per_ngram: u32,
-        map: Option<ValueId>,
-        ngram_ids: ValueId,
-    },
-    /// Bounded replay's floor, a lane's least position whose window keys a
-    /// replaying layer holds: with `mark` the rows are ones it skips and the
-    /// lane's state moves past them; without, each row reads its lane's floor
-    /// (0 if it never skipped). `floor` is i32 a row.
     ReplayFloor {
+        #[input(I32)]
         positions: ValueId,
+        #[input(CACHE)]
         state: ValueId,
         mark: bool,
+        #[output(I32)]
         floor: ValueId,
     },
     /// Each row's lane's last key position in `cache` (i32 a row): its kv
     /// extent less one, whatever row of the lane it is.
     KvEnds {
+        #[input(I32)]
         request_of_token: ValueId,
+        #[input(CACHE)]
         cache: ValueId,
+        #[output(I32)]
         ends: ValueId,
     },
     /// DeepSeek's window attention with its sinks, each row reading the
@@ -615,37 +497,43 @@ pub enum Attention {
     /// a drafted block's rows each read the whole block), its output's tail
     /// not turned back.
     WindowSink {
+        #[input]
         q: ValueId,
+        #[input(I32)]
         positions: ValueId,
+        #[input(I32)]
         request_of_token: ValueId,
+        #[input(CACHE)]
         cache: ValueId,
+        #[input]
         sink: ValueId,
         window: u32,
         head_dim: u32,
         sm_scale: f32,
+        #[output]
         o: ValueId,
-    },
-    /// DSpark's Markov head over a drafted block's readouts: the one at depth
-    /// `i` (its position past `ends - block + 1`, `ends` its lane's last key)
-    /// adds the bias `head . embed[t]` of the token `t` picked at depth `i - 1`
-    /// (at depth 0, its own in `tokens`) and picks the argmax. `tokens`,
-    /// `positions` and `ends` are i32 a readout; `biased` the biased logits.
-    MarkovWalk {
-        logits: ValueId,
-        tokens: ValueId,
-        positions: ValueId,
-        ends: ValueId,
-        embed: ValueId,
-        head: ValueId,
-        /// The most readouts a lane's run holds (the drafted block's rows).
-        block: u32,
-        biased: ValueId,
-        /// Each readout's pick (i32), its biased row's argmax.
-        picks: ValueId,
     },
 }
 
-/// How `attention.index_topk` scores a block of keys.
+/// The blocks a selection reads, `ratio` keys each: one run every head
+/// shares, or (`per_head`) one run per kv head, each head's queries reading
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Blocks {
+    pub ratio: u32,
+    pub per_head: bool,
+}
+
+/// A learned relative bias over `extent` positions: a key's distance past
+/// `2^log_floor` falls into log buckets `log_alpha` wide.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Relative {
+    pub extent: u32,
+    pub log_floor: u32,
+    pub log_alpha: f32,
+}
+
+/// How `attn.index_topk` scores a block of keys.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IndexScore {
     /// `Σ_h relu(q_h·k)·w_h` against the one pooled key that stands for each
@@ -670,647 +558,23 @@ pub enum RaggedMask {
     RelativeBias { table: ValueId, max_len: u32 },
 }
 
-impl Operands for Attention {
+impl Part for RaggedMask {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
-            Self::PlanDecode {
-                kv_indptr,
-                kv_indices,
-                last_page_len,
-                kv_len,
-                ..
-            } => {
-                sink.extend([*kv_indptr, *kv_indices, *last_page_len, *kv_len]);
-            }
-            Self::PlanPrefill {
-                kv_indptr,
-                kv_indices,
-                last_page_len,
-                kv_len,
-                ..
-            } => {
-                sink.extend([*kv_indptr, *kv_indices, *last_page_len, *kv_len]);
-            }
-            Self::Decode { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            Self::Prefill { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            Self::Masked {
-                q,
-                plan,
-                mask,
-                cache,
-                ..
-            }
-            | Self::MaskedLse {
-                q,
-                plan,
-                mask,
-                cache,
-                ..
-            } => sink.extend([*q, *plan, *mask, *cache]),
-            Self::Dense {
-                q, k, v, segments, ..
-            } => sink.extend([*q, *k, *v, *segments]),
-            Self::Ragged {
-                q,
-                k,
-                v,
-                q_indptr,
-                kv_indptr,
-                mask,
-                ..
-            } => {
-                sink.extend([*q, *k, *v, *q_indptr, *kv_indptr]);
-                match mask {
-                    RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
-                        sink.extend([*q_tags, *kv_tags]);
-                    }
-                    RaggedMask::RelativeBias { table, .. } => sink.push(*table),
-                    RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
-                }
-            }
-            Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            Self::PrefillLse {
-                q,
-                plan,
-                cache,
-                floor,
-                ..
-            } => {
-                sink.extend([*q, *plan, *cache]);
-                sink.extend(*floor);
-            }
-            Self::DecodeSelected {
-                q,
-                plan,
-                selection,
-                cache,
-                ..
-            }
-            | Self::PrefillSelected {
-                q,
-                plan,
-                selection,
-                cache,
-                ..
-            } => sink.extend([*q, *plan, *selection, *cache]),
-            Self::DecodeRel {
-                q,
-                plan,
-                cache,
-                bias,
-                ..
-            } => {
-                sink.extend([*q, *plan, *cache, *bias]);
-            }
-            Self::PrefillRel {
-                q,
-                plan,
-                cache,
-                bias,
-                ..
-            } => {
-                sink.extend([*q, *plan, *cache, *bias]);
-            }
-            Self::Sink {
-                o,
-                lse,
-                sink: sink_id,
-                ..
-            } => sink.extend([*o, *lse, *sink_id]),
-            Self::MergeLse {
-                o1, lse1, o2, lse2, ..
-            } => sink.extend([*o1, *lse1, *o2, *lse2]),
-            Self::LogitSoftcap { x, .. } => sink.push(*x),
-            Self::KvAppend {
-                k,
-                v,
-                cache,
-                write_page,
-                write_offset,
-            } => {
-                sink.extend([*k, *v, *cache, *write_page, *write_offset]);
-            }
-            Self::KvAppendShared {
-                plane,
-                cache,
-                write_page,
-                write_offset,
-            } => {
-                sink.extend([*plane, *cache, *write_page, *write_offset]);
-            }
-            Self::MlaPlan {
-                kv_indptr,
-                kv_indices,
-                last_page_len,
-                kv_len,
-                ..
-            } => {
-                sink.extend([*kv_indptr, *kv_indices, *last_page_len, *kv_len]);
-            }
-            Self::MlaLatents { kv_a, weight, .. } => sink.extend([*kv_a, *weight]),
-            Self::MlaLatentsRope {
-                kv_a,
-                positions,
-                weight,
-                ..
-            } => {
-                sink.extend([*kv_a, *positions, *weight]);
-            }
-            Self::MlaSplitQB { q_b, .. } => sink.push(*q_b),
-            Self::MlaAbsorbQ { q_nope, kv_b, .. } => sink.extend([*q_nope, *kv_b]),
-            Self::MlaAbsorbOut { latent, kv_b, .. } => sink.extend([*latent, *kv_b]),
-            Self::MlaKvAppend {
-                kv_c,
-                k_pe,
-                cache,
-                write_page,
-                write_offset,
-            } => {
-                sink.extend([*kv_c, *k_pe, *cache, *write_page, *write_offset]);
-            }
-            Self::MlaDecode {
-                q,
-                plan,
-                q_pe,
-                cache,
-                ..
-            } => {
-                sink.extend([*q, *plan, *q_pe, *cache]);
-            }
-            Self::MlaPrefill {
-                q,
-                plan,
-                q_pe,
-                cache,
-                ..
-            } => {
-                sink.extend([*q, *plan, *q_pe, *cache]);
-            }
-            Self::MlaDecodeSelected {
-                q,
-                plan,
-                q_pe,
-                selection,
-                cache,
-                ..
-            } => {
-                sink.extend([*q, *plan, *q_pe, *selection, *cache]);
-            }
-            Self::MlaPrefillSelected {
-                q,
-                plan,
-                q_pe,
-                selection,
-                cache,
-                ..
-            } => {
-                sink.extend([*q, *plan, *q_pe, *selection, *cache]);
-            }
-            Self::SsmCausalConv1d {
-                x,
-                weight,
-                bias,
-                state,
-                ..
-            } => {
-                sink.extend([*x, *weight, *state]);
-                sink.extend(*bias);
-            }
-            Self::ShortConv {
-                x, weight, state, ..
-            } => sink.extend([*x, *weight, *state]),
-            Self::ShortConvChunked {
-                x, weight, state, ..
-            } => sink.extend([*x, *weight, *state]),
-            Self::SsmCausalConv1dChunked {
-                x,
-                weight,
-                bias,
-                state,
-                ..
-            } => {
-                sink.extend([*x, *weight, *state]);
-                sink.extend(*bias);
-            }
-            Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
-            Self::SelectorWalk {
-                cand,
-                unary,
-                hp,
-                tokens,
-                pred,
-                succ,
-                ..
-            } => {
-                sink.extend([*cand, *unary]);
-                sink.extend(hp.iter().copied());
-                sink.extend([*tokens, *pred, *succ]);
-            }
-            Self::SsmGdnPrep {
-                ba, dt_bias, a_log, ..
-            } => sink.extend([*ba, *dt_bias, *a_log]),
-            Self::SsmGatedDelta {
-                qkv,
-                z,
-                gates,
-                state,
-                ..
-            } => {
-                sink.extend([*qkv, *z, *gates, *state]);
-            }
-            Self::SsmGatedDeltaChunked {
-                qkv,
-                z,
-                gates,
-                state,
-                ..
-            } => {
-                sink.extend([*qkv, *z, *gates, *state]);
-            }
-            Self::SsmKdaStep {
-                mixed,
-                f,
-                b,
-                dt_bias,
-                a_log,
-                state,
-                ..
-            } => {
-                sink.extend([*mixed, *f, *b, *dt_bias, *a_log, *state]);
-            }
-            Self::SsmKdaChunked {
-                mixed,
-                f,
-                b,
-                dt_bias,
-                a_log,
-                state,
-                ..
-            } => {
-                sink.extend([*mixed, *f, *b, *dt_bias, *a_log, *state]);
-            }
-            Self::SsmMamba2 {
-                xbc,
-                dt,
-                z,
-                a_log,
-                dt_bias,
-                d,
-                norm,
-                state,
-                ..
-            } => {
-                sink.extend([*xbc, *dt, *z, *a_log, *dt_bias, *d, *norm, *state]);
-            }
-            Self::IndexLayernormRope {
-                k,
-                positions,
-                weight,
-                bias,
-                ..
-            } => {
-                sink.extend([*k, *positions, *weight, *bias]);
-            }
-            Self::IndexRope { q, positions, .. } => sink.extend([*q, *positions]),
-            Self::IndexTopk {
-                q, weights, keys, ..
-            } => {
-                sink.extend([*q, *keys]);
-                sink.extend(weights.iter().copied());
-            }
-            Self::IndexBlockMean {
-                boundary_pos,
-                boundary_req,
-                keys,
-                ..
-            } => sink.extend([*boundary_pos, *boundary_req, *keys]),
-            Self::IndexKvAppend {
-                k,
-                keys,
-                write_page,
-                write_offset,
-            } => {
-                sink.extend([*k, *keys, *write_page, *write_offset]);
-            }
-            Self::PoolBoundaryDecode {
-                positions,
-                row_valid,
-                ..
-            } => {
-                sink.extend([*positions, *row_valid]);
-            }
-            Self::PoolBoundaryPrefill {
-                positions,
-                row_valid,
-                ..
-            } => {
-                sink.extend([*positions, *row_valid]);
-            }
-            Self::PoolStateWrite {
-                kv,
-                score,
-                pages,
-                write_page,
-                write_offset,
-                ..
-            } => {
-                sink.extend([*kv, *score, *pages, *write_page, *write_offset]);
-            }
-            Self::PoolGather {
-                boundary_pos,
-                boundary_req,
-                pages,
-                ape,
-                ..
-            } => {
-                sink.extend([*boundary_pos, *boundary_req, *pages]);
-                sink.extend(ape.iter().copied());
-            }
-            Self::PoolKvAppend {
-                entries,
-                boundary_pos,
-                boundary_req,
-                pool,
-                write_page,
-                write_offset,
-            } => {
-                sink.extend([
-                    *entries,
-                    *boundary_pos,
-                    *boundary_req,
-                    *pool,
-                    *write_page,
-                    *write_offset,
-                ]);
-            }
-            Self::PoolLse {
-                q,
-                positions,
-                request_of_token,
-                entries,
-                ..
-            } => {
-                sink.extend([*q, *positions, *request_of_token, *entries]);
-            }
-            Self::PoolLseSelected {
-                q,
-                positions,
-                request_of_token,
-                selection,
-                entries,
-                ..
-            } => {
-                sink.extend([*q, *positions, *request_of_token, *selection, *entries]);
-            }
-            Self::PleNgramIds {
-                ids, state, map, ..
-            }
-            | Self::PleNgramIdsChunked {
-                ids, state, map, ..
-            } => {
-                sink.extend([*ids, *state]);
-                sink.extend(*map);
-            }
-            Self::ReplayFloor {
-                positions, state, ..
-            } => sink.extend([*positions, *state]),
-            Self::KvEnds {
-                request_of_token,
-                cache,
-                ..
-            } => sink.extend([*request_of_token, *cache]),
-            Self::WindowSink {
-                q,
-                positions,
-                request_of_token,
-                cache,
-                sink: sinks,
-                ..
-            } => sink.extend([*q, *positions, *request_of_token, *cache, *sinks]),
-            Self::MarkovWalk {
-                logits,
-                tokens,
-                positions,
-                ends,
-                embed,
-                head,
-                ..
-            } => sink.extend([*logits, *tokens, *positions, *ends, *embed, *head]),
+            RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => sink.extend([*q_tags, *kv_tags]),
+            RaggedMask::RelativeBias { table, .. } => sink.push(*table),
+            RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
         }
     }
-    fn outputs(&self, sink: &mut Vec<ValueId>) {
+    fn outputs(&self, _sink: &mut Vec<ValueId>) {}
+    fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
         match self {
-            Self::PlanDecode { plan, .. } => sink.push(*plan),
-            Self::PlanPrefill { plan, .. } => sink.push(*plan),
-            Self::Decode { o, .. } => sink.push(*o),
-            Self::Prefill { o, .. } => sink.push(*o),
-            Self::Masked { o, .. } => sink.push(*o),
-            Self::MaskedLse { o, lse, .. } => sink.extend([*o, *lse]),
-            Self::Dense { o, .. } => sink.push(*o),
-            Self::Ragged { o, .. } => sink.push(*o),
-            Self::DecodeLse { o, lse, .. } => sink.extend([*o, *lse]),
-            Self::PrefillLse { o, lse, .. } => sink.extend([*o, *lse]),
-            Self::DecodeSelected { o, .. } | Self::PrefillSelected { o, .. } => sink.push(*o),
-            Self::DecodeRel { o, .. } => sink.push(*o),
-            Self::PrefillRel { o, .. } => sink.push(*o),
-            Self::Sink { o_out, .. } => sink.push(*o_out),
-            Self::MergeLse { o, lse, .. } => sink.extend([*o, *lse]),
-            Self::LogitSoftcap { x_out, .. } => sink.push(*x_out),
-            Self::KvAppend { .. } => {}
-            Self::KvAppendShared { .. } => {}
-            Self::MlaPlan { plan, .. } => sink.push(*plan),
-            Self::MlaLatents { kv_c, k_pe, .. } => sink.extend([*kv_c, *k_pe]),
-            Self::MlaLatentsRope { kv_c, k_pe, .. } => sink.extend([*kv_c, *k_pe]),
-            Self::MlaSplitQB { q_nope, q_pe, .. } => sink.extend([*q_nope, *q_pe]),
-            Self::MlaAbsorbQ { q_latent, .. } => sink.push(*q_latent),
-            Self::MlaAbsorbOut { o, .. } => sink.push(*o),
-            Self::MlaKvAppend { .. } => {}
-            Self::MlaDecode { o, lse, .. } => {
-                sink.push(*o);
-                sink.extend(*lse);
+            RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
+                sink.push(("q_tags", *q_tags, Expect::I32));
+                sink.push(("kv_tags", *kv_tags, Expect::I32));
             }
-            Self::MlaPrefill { o, lse, .. } => {
-                sink.push(*o);
-                sink.extend(*lse);
-            }
-            Self::MlaDecodeSelected { o, lse, .. } => {
-                sink.push(*o);
-                sink.extend(*lse);
-            }
-            Self::MlaPrefillSelected { o, lse, .. } => {
-                sink.push(*o);
-                sink.extend(*lse);
-            }
-            Self::SsmCausalConv1d { y, .. } => sink.push(*y),
-            Self::ShortConv { y, .. } => sink.push(*y),
-            Self::ShortConvChunked { y, .. } => sink.push(*y),
-            Self::SsmCausalConv1dChunked { y, .. } => sink.push(*y),
-            Self::BlockDynConv { y, .. } => sink.push(*y),
-            Self::SelectorWalk { picks, .. } => sink.push(*picks),
-            Self::SsmGdnPrep { gates, .. } => sink.push(*gates),
-            Self::SsmGatedDelta { y, .. } => sink.push(*y),
-            Self::SsmGatedDeltaChunked { y, .. } => sink.push(*y),
-            Self::SsmKdaStep { y, .. } => sink.push(*y),
-            Self::SsmKdaChunked { y, .. } => sink.push(*y),
-            Self::SsmMamba2 { y, .. } => sink.push(*y),
-            Self::IndexLayernormRope { k_out, .. } => sink.push(*k_out),
-            Self::IndexRope { q_out, .. } => sink.push(*q_out),
-            Self::IndexTopk { selection, .. } => sink.push(*selection),
-            Self::IndexBlockMean { entries, .. } => sink.push(*entries),
-            Self::IndexKvAppend { .. } => {}
-            Self::PoolBoundaryDecode {
-                boundary_pos,
-                boundary_req,
-                boundary_rope,
-                ..
-            } => {
-                sink.extend([*boundary_pos, *boundary_req, *boundary_rope]);
-            }
-            Self::PoolBoundaryPrefill {
-                boundary_pos,
-                boundary_req,
-                boundary_rope,
-                ..
-            } => {
-                sink.extend([*boundary_pos, *boundary_req, *boundary_rope]);
-            }
-            Self::PoolStateWrite { .. } => {}
-            Self::PoolGather { entries, .. } => sink.push(*entries),
-            Self::PoolKvAppend { .. } => {}
-            Self::PoolLse { o, lse, .. } => sink.extend([*o, *lse]),
-            Self::PoolLseSelected { o, lse, .. } => sink.extend([*o, *lse]),
-            Self::PleNgramIds { ngram_ids, .. } => sink.push(*ngram_ids),
-            Self::PleNgramIdsChunked { ngram_ids, .. } => sink.push(*ngram_ids),
-            Self::ReplayFloor { floor, .. } => sink.push(*floor),
-            Self::KvEnds { ends, .. } => sink.push(*ends),
-            Self::WindowSink { o, .. } => sink.push(*o),
-            Self::MarkovWalk { biased, picks, .. } => sink.extend([*biased, *picks]),
-        }
-    }
-    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
-        match self {
-            Self::PlanDecode { .. } => {}
-            Self::PlanPrefill { .. } => {}
-            Self::Decode { .. } => {}
-            Self::Prefill { .. } => {}
-            Self::Masked { .. } => {}
-            Self::MaskedLse { .. } => {}
-            Self::Dense { .. } => {}
-            Self::Ragged { .. } => {}
-            Self::DecodeLse { .. } => {}
-            Self::PrefillLse { .. } => {}
-            Self::DecodeSelected { .. } | Self::PrefillSelected { .. } => {}
-            Self::DecodeRel { .. } => {}
-            Self::PrefillRel { .. } => {}
-            Self::Sink { o_out, o, .. } => sink.push((*o_out, *o)),
-            Self::MergeLse { .. } => {}
-            Self::LogitSoftcap { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::KvAppend { .. } => {}
-            Self::KvAppendShared { .. } => {}
-            Self::MlaPlan { .. } => {}
-            Self::MlaLatents { .. } => {}
-            Self::MlaLatentsRope { .. } => {}
-            Self::MlaSplitQB { .. } => {}
-            Self::MlaAbsorbQ { .. } => {}
-            Self::MlaAbsorbOut { .. } => {}
-            Self::MlaKvAppend { .. } => {}
-            Self::MlaDecode { .. } => {}
-            Self::MlaPrefill { .. } => {}
-            Self::MlaDecodeSelected { .. } => {}
-            Self::MlaPrefillSelected { .. } => {}
-            Self::SsmCausalConv1d { .. } => {}
-            Self::SsmCausalConv1dChunked { .. } => {}
-            Self::ShortConv { .. } => {}
-            Self::ShortConvChunked { .. } => {}
-            Self::BlockDynConv { .. } => {}
-            Self::SelectorWalk { .. } => {}
-            Self::SsmGdnPrep { .. } => {}
-            Self::SsmGatedDelta { .. } => {}
-            Self::SsmGatedDeltaChunked { .. } => {}
-            Self::SsmKdaStep { .. } => {}
-            Self::SsmKdaChunked { .. } => {}
-            Self::SsmMamba2 { .. } => {}
-            Self::IndexLayernormRope { k_out, k, .. } => sink.push((*k_out, *k)),
-            Self::IndexRope { q_out, q, .. } => sink.push((*q_out, *q)),
-            Self::IndexTopk { .. } => {}
-            Self::IndexBlockMean { .. } => {}
-            Self::IndexKvAppend { .. } => {}
-            Self::PoolBoundaryDecode { .. } => {}
-            Self::PoolBoundaryPrefill { .. } => {}
-            Self::PoolStateWrite { .. } => {}
-            Self::PoolGather { .. } => {}
-            Self::PoolKvAppend { .. } => {}
-            Self::PoolLse { .. } => {}
-            Self::PoolLseSelected { .. } => {}
-            Self::PleNgramIds { .. } => {}
-            Self::PleNgramIdsChunked { .. } => {}
-            Self::ReplayFloor { .. } => {}
-            Self::KvEnds { .. } | Self::WindowSink { .. } | Self::MarkovWalk { .. } => {}
-        }
-    }
-    fn name(&self) -> &'static str {
-        match self {
-            Self::PlanDecode { .. } => "attention.plan_decode",
-            Self::PlanPrefill { .. } => "attention.plan_prefill",
-            Self::Decode { .. } => "attention.decode",
-            Self::Prefill { .. } => "attention.prefill",
-            Self::Masked { .. } => "attention.masked",
-            Self::MaskedLse { .. } => "attention.masked_lse",
-            Self::Dense { .. } => "attention.dense",
-            Self::Ragged { .. } => "attention.ragged",
-            Self::DecodeLse { .. } => "attention.decode_lse",
-            Self::PrefillLse { .. } => "attention.prefill_lse",
-            Self::DecodeSelected { .. } => "attention.decode_selected",
-            Self::PrefillSelected { .. } => "attention.prefill_selected",
-            Self::DecodeRel { .. } => "attention.decode_rel",
-            Self::PrefillRel { .. } => "attention.prefill_rel",
-            Self::Sink { .. } => "attention.sink",
-            Self::MergeLse { .. } => "attention.merge_lse",
-            Self::LogitSoftcap { .. } => "attention.logit_softcap",
-            Self::KvAppend { .. } => "attention.kv_append",
-            Self::KvAppendShared { .. } => "attention.kv_append_shared",
-            Self::MlaPlan { .. } => "attention.mla_plan",
-            Self::MlaLatents { .. } => "attention.mla_latents",
-            Self::MlaLatentsRope { .. } => "attention.mla_latents_rope",
-            Self::MlaSplitQB { .. } => "attention.mla_split_q_b",
-            Self::MlaAbsorbQ { .. } => "attention.mla_absorb_q",
-            Self::MlaAbsorbOut { .. } => "attention.mla_absorb_out",
-            Self::MlaKvAppend { .. } => "attention.mla_kv_append",
-            Self::MlaDecode { .. } => "attention.mla_decode",
-            Self::MlaPrefill { .. } => "attention.mla_prefill",
-            Self::MlaDecodeSelected { .. } => "attention.mla_decode_selected",
-            Self::MlaPrefillSelected { .. } => "attention.mla_prefill_selected",
-            Self::SsmCausalConv1d { .. } => "attention.ssm_causal_conv1d",
-            Self::SsmCausalConv1dChunked { .. } => "attention.ssm_causal_conv1d_chunked",
-            Self::ShortConv { .. } => "attention.short_conv",
-            Self::ShortConvChunked { .. } => "attention.short_conv_chunked",
-            Self::BlockDynConv { .. } => "attention.block_dyn_conv",
-            Self::SelectorWalk { .. } => "attention.selector_walk",
-            Self::SsmGdnPrep { .. } => "attention.ssm_gdn_prep",
-            Self::SsmGatedDelta { .. } => "attention.ssm_gated_delta",
-            Self::SsmGatedDeltaChunked { .. } => "attention.ssm_gated_delta_chunked",
-            Self::SsmKdaStep { .. } => "attention.ssm_kda_step",
-            Self::SsmKdaChunked { .. } => "attention.ssm_kda_chunked",
-            Self::SsmMamba2 { chunked: false, .. } => "attention.ssm_mamba2_step",
-            Self::SsmMamba2 { chunked: true, .. } => "attention.ssm_mamba2_chunked",
-            Self::IndexLayernormRope { .. } => "attention.index_layernorm_rope",
-            Self::IndexRope { .. } => "attention.index_rope",
-            Self::IndexTopk { .. } => "attention.index_topk",
-            Self::IndexBlockMean { .. } => "attention.index_block_mean",
-            Self::IndexKvAppend { .. } => "attention.index_kv_append",
-            Self::PoolBoundaryDecode { .. } => "attention.pool_boundary_decode",
-            Self::PoolBoundaryPrefill { .. } => "attention.pool_boundary_prefill",
-            Self::PoolStateWrite { .. } => "attention.pool_state_write",
-            Self::PoolGather { .. } => "attention.pool_gather",
-            Self::PoolKvAppend { .. } => "attention.pool_kv_append",
-            Self::PoolLse { .. } => "attention.pool_lse",
-            Self::PoolLseSelected { .. } => "attention.pool_lse_selected",
-            Self::PleNgramIds { .. } => "attention.ple_ngram_ids",
-            Self::PleNgramIdsChunked { .. } => "attention.ple_ngram_ids_chunked",
-            Self::ReplayFloor { .. } => "attention.replay_floor",
-            Self::KvEnds { .. } => "attention.kv_ends",
-            Self::WindowSink { .. } => "attention.window_sink",
-            Self::MarkovWalk { .. } => "attention.markov_walk",
+            RaggedMask::RelativeBias { table, .. } => sink.push(("table", *table, Expect::F32)),
+            RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
         }
     }
 }

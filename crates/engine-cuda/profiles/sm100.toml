@@ -18,10 +18,10 @@ gemm.fp8_mma_k_until = 5120
 # DeepSeek-V4's attention: pool on mma.sync, prefill from 512 rows and
 # decode up to 64 in one launch, V4.1's bounded replay, its FP4 pass from 32.
 sdpa.pool_mma = true
-sdpa.dsv4_prefill_from = 512
-sdpa.dsv4_replay = true
-sdpa.dsv4_fp4_pass_from = 32
-sdpa.dsv4_decode_until = 64
+sdpa.compressed_prefill_from = 512
+sdpa.compressed_replay = true
+sdpa.compressed_fp4_pass_from = 32
+sdpa.compressed_decode_until = 64
 # GLM-5.3's DSA on tcgen05; a row under its selection size read dense.
 sdpa.mla_sparse = true
 sdpa.mla_dense_short = true
@@ -73,16 +73,16 @@ sdpa.prefill.wide_sliding = true
 # sinks too.
 sdpa.decode.grouped_prefill_from = 4
 sdpa.decode.grouped_prefill_lse = true
-# Tensor-core decode (attn/xqa.cuh): 64-wide heads from 16 requests, short
+# Tensor-core decode (attn/decode_gqa_sm80.cu): 64-wide heads from 16 requests, short
 # windows whole, unwindowed rows over a cluster of eight.
-sdpa.decode.xqa = true
-sdpa.decode.xqa_from_64 = 16
-sdpa.decode.xqa_whole_window = 128
-sdpa.decode.xqa_cluster = 8
+sdpa.decode.gqa = true
+sdpa.decode.gqa_from_64 = 16
+sdpa.decode.gqa_whole_window = 128
+sdpa.decode.gqa_cluster = 8
 # 64-wide heads three key tiles deep a warp, rows swizzled, four blocks an SM:
 # Muse Spark's bs64 decode attention 328 -> 288 us a step, gpt-oss-120b's
 # 7-8 us a step at bs1/8/64 (bs8 Muse even).
-sdpa.decode.xqa_deep_64 = true
+sdpa.decode.gqa_deep_64 = true
 # A dense bias from the cuBLASLt epilogue.
 gemm.bias_epilogue = true
 # Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4

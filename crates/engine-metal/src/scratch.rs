@@ -1,11 +1,11 @@
 use kernels_metal::Tensor;
-use kernels_metal::attn::ple;
+use kernels_metal::gather::ngram;
 use kernels_metal::linear::moe::{self, RegisterRooms, RoutedScratch};
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -188,8 +188,24 @@ impl Scratch {
                 continue;
             };
             match op {
-                Linear::MoeMatmulSelectBias { x, routes, y, .. }
-                | Linear::MoeMatmulSelectQuant { x, routes, y, .. } => {
+                Linear::MoeSelect {
+                    x,
+                    routes,
+                    y,
+                    bias: Some(_),
+                    quantized: false,
+                    quant: None,
+                    ..
+                }
+                | Linear::MoeSelect {
+                    x,
+                    routes,
+                    y,
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                } => {
                     let (Some(x), Some(y)) = (of(*x), of(*y)) else {
                         continue;
                     };
@@ -198,7 +214,13 @@ impl Scratch {
                         continue;
                     }
                     if tuning.moe_register()
-                        && matches!(op, Linear::MoeMatmulSelectQuant { .. })
+                        && matches!(
+                            op,
+                            Linear::MoeSelect {
+                                quantized: true,
+                                ..
+                            }
+                        )
                         && let Some(fan) = of(*routes).map(|r| r.width).filter(|w| *w > 0)
                     {
                         let tokens = moe::REGISTER_TOKENS;
@@ -232,7 +254,7 @@ impl Scratch {
                     return false;
                 };
                 let limit = tuning.qmm_splitk();
-                quant::splitk(n, 8, 8, k, 32, 4, limit) > 1 || (tuning.qmm_mpp() && n <= 65536)
+                qmm::tiled::splitk(n, 8, 8, k, 32, 4, limit) > 1 || (tuning.qmm_mpp() && n <= 65536)
             })
             .map(|&(n, _)| u64::from(n))
             .max()
@@ -284,7 +306,7 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Attention(Attention::IndexTopk { selection, .. }) => of(*selection),
+                Operation::Attn(Attn::IndexTopk { selection, .. }) => of(*selection),
                 _ => None,
             })
             .map(|rect| u64::from(rect.rows))
@@ -302,14 +324,14 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Spatial(poem_ir::Spatial::GroupNorm { groups, .. }) => Some(*groups),
+                Operation::Conv(poem_ir::Conv::GroupNorm { groups, .. }) => Some(*groups),
                 _ => None,
             })
             .max()
             .filter(|groups| *groups > 0)
             .map(|groups| {
                 let clips = budgets.max_clips().max(1);
-                let floats = kernels_metal::spatial::norm::scratch_floats(clips, groups);
+                let floats = kernels_metal::conv::group_norm::scratch_floats(clips, groups);
                 let mut at = 0u64;
                 Room::lay(&mut at, floats.div_ceil(4).max(1), 4, Dtype::F32)
             });
@@ -330,14 +352,14 @@ impl Scratch {
 
         let mut ple: Vec<PleHash> = Vec::new();
         for node in &trace.nodes {
-            let Operation::Attention(
-                Attention::PleNgramIds {
+            let Operation::Gather(
+                Gather::NgramIds {
                     mults,
                     primes,
                     offsets,
                     ..
                 }
-                | Attention::PleNgramIdsChunked {
+                | Gather::NgramIdsChunked {
                     mults,
                     primes,
                     offsets,
@@ -347,7 +369,7 @@ impl Scratch {
             else {
                 continue;
             };
-            let key: Box<[u64]> = ple::hash_constants(mults, primes, offsets).into();
+            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
             if key.is_empty() || ple.iter().any(|held| held.key == key) {
                 continue;
             }
@@ -418,7 +440,7 @@ impl Scratch {
         groups: u32,
     ) -> Option<Result<(Tensor, Tensor)>> {
         let room = self.spatial?;
-        let splits = kernels_metal::spatial::norm::SPLITS;
+        let splits = kernels_metal::conv::group_norm::SPLITS;
         let partial_floats = u64::from(clips) * u64::from(splits) * u64::from(groups) * 4;
         let stat_floats = u64::from(clips) * u64::from(groups) * 2;
         if partial_floats + stat_floats > u64::from(room.rows) * u64::from(room.width) {
@@ -524,7 +546,7 @@ impl Scratch {
         primes: &[u64],
         offsets: &[u64],
     ) -> Option<Result<Tensor>> {
-        let want = ple::hash_constants(mults, primes, offsets);
+        let want = ngram::hash_constants(mults, primes, offsets);
         let held = self.ple.iter().find(|h| *h.key == *want)?;
         Some(held.room.bind(handles, &self.plane))
     }
@@ -597,20 +619,37 @@ fn routers(trace: &Trace) -> Vec<u32> {
             continue;
         };
         let (routes, experts) = match op {
-            Linear::MoeTopkSoftmax {
-                routes, experts, ..
+            Linear::MoeRoute {
+                routes,
+                experts,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSoftmaxScaled {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                scale: Some(_),
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSigmoid {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Sigmoid { .. },
+                ..
             }
-            | Linear::MoeTopkSqrtSoftplus {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::SqrtSoftplus { .. },
+                ..
             }
-            | Linear::MoeHashRoute {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Hash { .. },
+                ..
             } => (*routes, *experts),
             _ => continue,
         };

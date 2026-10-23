@@ -316,9 +316,24 @@ impl Ctx {
         self.stream
     }
 
+    /// The context's cuBLAS handle, set to sum a split K's partials in the
+    /// compute type: cuBLAS's default adds them in a bf16 or f16 output's own
+    /// type, and over a cancelling K that is off by percents (sm89 splits a
+    /// hundred-row bf16 product so).
     pub fn cublas(&self, op: &'static str) -> Result<*mut c_void, Error> {
         if self.cublas.is_null() {
             return Err(refuse(op, "this context carries no cuBLAS handle"));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
+            // SAFETY: a live handle this context carries.
+            let _ = unsafe {
+                cublasSetMathMode(
+                    self.cublas.cast(),
+                    cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+                )
+            };
         }
         Ok(self.cublas)
     }
@@ -464,7 +479,7 @@ impl Ctx {
     }
 
     #[must_use]
-    pub fn stage(&self) -> ArgValue {
+    pub fn stage(&self) -> ArgValue<'static> {
         ArgValue::Ptr(self.stage.get())
     }
 
@@ -508,6 +523,13 @@ impl Ctx {
         {
             None
         }
+    }
+
+    /// Whether a block asking `bytes` of dynamic shared memory can launch
+    /// here; true where the device does not say.
+    #[must_use]
+    pub fn smem_fits(&self, bytes: u32) -> bool {
+        self.smem_per_block_optin().is_none_or(|max| bytes <= max)
     }
 
     /// The shared memory one SM holds across its resident blocks.

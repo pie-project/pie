@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::operands::Operands;
+use crate::Op;
 use crate::value::ValueId;
 
 /// The precision a product quantizes its bf16 activations to before reading
@@ -36,498 +36,220 @@ impl ActQuant {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// How a [`Linear::MoeRoute`] scores and weighs its experts.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum RouteScore {
+    /// Softmax over the experts (times `scale`, a per-expert gain, where given).
+    Softmax,
+    /// Sigmoid scores, the top-k's weights renormalized where stated, then
+    /// times `scaling`.
+    Sigmoid { renormalize: bool, scaling: f32 },
+    /// Sigmoid scores, with `sink` slots past the `top_k` routed ones (its
+    /// routes and weights are `top_k + sink` wide).
+    SigmoidSink { sink: u32, scaling: f32 },
+    /// `sqrt(softplus(x))` scores (DeepSeek-V4).
+    SqrtSoftplus { renormalize: bool, scaling: f32 },
+    /// The routes a biased pick predicts; its weights are not read.
+    Predict,
+    /// Experts looked up by token id in `table` (`vocab` rows), weighted by
+    /// their scores of `logits`.
+    Hash {
+        vocab: u32,
+        renormalize: bool,
+        scaling: f32,
+    },
+}
+
+/// The gate's activation a [`Linear::Glu`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum GluAct {
+    /// `silu(gate) · up`.
+    Swiglu,
+    /// GPT-OSS's: `gate · sigmoid(alpha · gate) · (up + 1)`.
+    SwigluAlpha { alpha: f32 },
+    /// `gelu_tanh(gate) · up`.
+    GegluTanh,
+    /// `situ_beta(gate) · up`, `up` capped at `up_cap` where stated.
+    Situ { beta: f32, up_cap: Option<f32> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
+#[op(group = "linear")]
 pub enum Linear {
+    /// `act · wᵀ`. `quant` states the precision `act` is quantized to
+    /// before it meets `w`'s codes (under `input_scales`, the weight's static
+    /// global, when the format has one; `scales` the weight's block scales
+    /// when they are a plane of their own beside raw codes, `fp8b128`), else
+    /// the product runs at the activations' own precision. `logits` marks the
+    /// vocabulary's head, which backends tile and gather as its own product.
     Matmul {
+        #[input]
         act: ValueId,
+        #[input]
         w: ValueId,
-        y: ValueId,
-    },
-    /// `act` quantized as `quant` states (under `input_scales`, the weight's
-    /// static global, when the format has one), then multiplied by `w`'s
-    /// codes at that precision; `scales` the weight's block scales when they
-    /// are a plane of their own beside raw codes (`fp8b128`).
-    MatmulActQuant {
-        act: ValueId,
-        w: ValueId,
-        quant: ActQuant,
+        #[input(F32)]
         input_scales: Option<ValueId>,
+        #[input]
         scales: Option<ValueId>,
+        quant: Option<ActQuant>,
+        logits: bool,
+        #[output]
         y: ValueId,
     },
-    LmHead {
-        act: ValueId,
-        w: ValueId,
-        y: ValueId,
-    },
-    MlpSwiglu {
-        packed: ValueId,
+    /// A gated linear unit: `act(gate) · up` over `[gate | up]` rows
+    /// (`packed`, `intermediate` columns of each) or two planes (`gate`,
+    /// `up`, `intermediate` wide), clamped at `limit` where stated, each row
+    /// times its route's f32 weight before it rounds where `weights` is given
+    /// (an expert scaling its activations before its down leg quantizes).
+    Glu {
+        #[input]
+        packed: Option<ValueId>,
+        #[input]
+        gate: Option<ValueId>,
+        #[input]
+        up: Option<ValueId>,
+        #[input(F32)]
+        weights: Option<ValueId>,
         intermediate: u32,
+        act: GluAct,
+        limit: Option<f32>,
+        #[output]
         y: ValueId,
     },
-    MlpSwigluClamp {
-        packed: ValueId,
-        intermediate: u32,
-        limit: f32,
-        y: ValueId,
-    },
-    MlpSwigluClampAlpha {
-        packed: ValueId,
-        intermediate: u32,
-        limit: f32,
-        alpha: f32,
-        y: ValueId,
-    },
-    MlpSwigluClampSplit {
-        gate: ValueId,
-        up: ValueId,
-        limit: f32,
-        y: ValueId,
-    },
-    /// [`Linear::MlpSwigluClampSplit`] of routed rows, each row times its
-    /// route's weight before it rounds: DeepSeek's expert scales its
-    /// activations before its down leg quantizes them.
-    MlpSwigluClampSplitRouted {
-        gate: ValueId,
-        up: ValueId,
-        weights: ValueId,
-        limit: f32,
-        y: ValueId,
-    },
-    /// [`Linear::MlpSwigluClamp`] of routed rows (each row's `intermediate`
-    /// gate columns, then as many up columns), each row times its route's
-    /// f32 weight before it rounds: the packed form of
-    /// [`Linear::MlpSwigluClampSplitRouted`].
-    MlpSwigluClampRouted {
-        packed: ValueId,
-        intermediate: u32,
-        weights: ValueId,
-        limit: f32,
-        y: ValueId,
-    },
-    MlpGegluTanh {
-        gate: ValueId,
-        up: ValueId,
-        y: ValueId,
-    },
-    MlpGeluTanh {
+    GeluTanh {
+        #[input]
         x: ValueId,
+        #[output]
         y: ValueId,
     },
     /// `relu(x)^2` (Nemotron-H's ungated experts).
-    MlpRelu2 {
+    Relu2 {
+        #[input]
         x: ValueId,
-        y: ValueId,
-    },
-    MlpGegluTanhPacked {
-        packed: ValueId,
-        intermediate: u32,
-        y: ValueId,
-    },
-    MlpSitu {
-        packed: ValueId,
-        intermediate: u32,
-        beta: f32,
-        up_cap: Option<f32>,
+        #[output]
         y: ValueId,
     },
     RelBias {
+        #[input]
         x: ValueId,
+        #[input]
         w: ValueId,
         heads: u32,
         d_rel: u32,
         extent: u32,
+        #[output(F32)]
         y: ValueId,
     },
-    MoeTopkSoftmax {
+    /// A token's `top_k` of `experts`: each expert's score of `logits`
+    /// (`bias` added before the pick where given, `scale` the per-expert gain
+    /// or post-scale, `hint` an earlier pick to keep), the picked experts in
+    /// `routes` and their weights; a hashed route reads its experts from
+    /// `table` at the token's id instead.
+    MoeRoute {
+        #[input(I32)]
+        ids: Option<ValueId>,
+        #[input]
+        table: Option<ValueId>,
+        #[input]
         logits: ValueId,
-        experts: u32,
-        top_k: u32,
-        routes: ValueId,
-        weights: ValueId,
-    },
-    MoeTopkSoftmaxScaled {
-        logits: ValueId,
-        scale: ValueId,
-        experts: u32,
-        top_k: u32,
-        routes: ValueId,
-        weights: ValueId,
-    },
-    MoeTopkSigmoid {
-        logits: ValueId,
+        #[input]
         bias: Option<ValueId>,
-        experts: u32,
-        top_k: u32,
-        renormalize: bool,
-        scaling: f32,
-        routes: ValueId,
-        weights: ValueId,
-        hint: Option<ValueId>,
-    },
-    MoeTopkSigmoidSink {
-        logits: ValueId,
-        bias: Option<ValueId>,
+        #[input]
         scale: Option<ValueId>,
-        experts: u32,
-        top_k: u32,
-        sink: u32,
-        scaling: f32,
-        routes: ValueId,
-        weights: ValueId,
-    },
-    MoeTopkSqrtSoftplus {
-        logits: ValueId,
-        bias: ValueId,
-        experts: u32,
-        top_k: u32,
-        renormalize: bool,
-        scaling: f32,
+        #[input]
         hint: Option<ValueId>,
-        routes: ValueId,
-        weights: ValueId,
-    },
-    MoePredictRoute {
-        logits: ValueId,
-        bias: ValueId,
         experts: u32,
         top_k: u32,
+        score: RouteScore,
+        #[output(I32)]
         routes: ValueId,
-        weights: ValueId,
-    },
-    MoeHashRoute {
-        ids: ValueId,
-        tid2eid: ValueId,
-        logits: ValueId,
-        vocab: u32,
-        experts: u32,
-        top_k: u32,
-        renormalize: bool,
-        scaling: f32,
-        routes: ValueId,
+        #[output(F32)]
         weights: ValueId,
     },
     GroupRoutes {
         groups: u32,
+        #[output(I32)]
         routes: ValueId,
     },
     MatmulGrouped {
+        #[input]
         x: ValueId,
+        #[input]
         w: ValueId,
+        #[input(I32)]
         routes: ValueId,
         groups: u32,
+        #[output]
         y: ValueId,
     },
-    MoeMatmulSelect {
+    /// Each routed row of `x` times its expert's plane of `bank` (`bias`
+    /// added where given): a plain bank, or a `quantized` one (codes and
+    /// their planes), whose routes are quantized as `quant` states first
+    /// where it does, each under its expert's `input_scales` when the format
+    /// has a static global.
+    MoeSelect {
+        #[input]
         x: ValueId,
+        #[input]
         bank: ValueId,
+        #[input]
+        bias: Option<ValueId>,
+        #[input(I32)]
         routes: ValueId,
-        y: ValueId,
-    },
-    MoeMatmulSelectBias {
-        x: ValueId,
-        bank: ValueId,
-        bias: ValueId,
-        routes: ValueId,
-        y: ValueId,
-    },
-    MoeMatmulSelectQuant {
-        x: ValueId,
-        bank: ValueId,
-        routes: ValueId,
-        y: ValueId,
-    },
-    /// [`Linear::MoeMatmulSelectQuant`] whose activations are quantized as
-    /// `quant` states first, each route's under its expert's `input_scales`
-    /// when the format has a static global.
-    MoeMatmulSelectActQuant {
-        x: ValueId,
-        bank: ValueId,
-        routes: ValueId,
-        quant: ActQuant,
+        #[input(F32)]
         input_scales: Option<ValueId>,
+        quantized: bool,
+        quant: Option<ActQuant>,
+        #[output]
         y: ValueId,
     },
-    MoeWeightedSum {
+    /// Each token's routed rows summed in f32, each times its f32 `weights`
+    /// where given (else already weighted), plus its `shared` row where
+    /// given, rounded once.
+    MoeCombine {
+        #[input]
         routed: ValueId,
-        weights: ValueId,
-        y: ValueId,
-    },
-    /// Each token's routed rows (already weighted) summed in f32, plus its
-    /// `shared` row, rounded once.
-    MoeSumAdd {
-        routed: ValueId,
-        shared: ValueId,
+        #[input(F32)]
+        weights: Option<ValueId>,
+        #[input]
+        shared: Option<ValueId>,
+        #[output]
         y: ValueId,
     },
     MoeBiasSum {
+        #[input]
         x: ValueId,
+        #[input]
         bias: ValueId,
+        #[input(I32)]
         routes: ValueId,
+        #[input(F32)]
         weights: ValueId,
+        #[output]
         y: ValueId,
     },
     MoeSigmoidGateAdd {
+        #[input]
         routed: ValueId,
+        #[input]
         shared: ValueId,
+        #[input]
         gate: ValueId,
+        #[output]
         y: ValueId,
     },
     LoraCorrect {
+        #[input]
         x: ValueId,
+        #[input]
         bank_a: ValueId,
+        #[input]
         bank_b: ValueId,
+        #[input(I32)]
         routes: ValueId,
+        #[input]
         y: ValueId,
+        #[output(alias = y)]
         y_out: ValueId,
     },
-}
-
-impl Operands for Linear {
-    fn inputs(&self, sink: &mut Vec<ValueId>) {
-        match self {
-            Self::Matmul { act, w, .. } => sink.extend([*act, *w]),
-            Self::MatmulActQuant {
-                act,
-                w,
-                input_scales,
-                scales,
-                ..
-            } => {
-                sink.extend([*act, *w]);
-                sink.extend(*input_scales);
-                sink.extend(*scales);
-            }
-            Self::LmHead { act, w, .. } => sink.extend([*act, *w]),
-            Self::MlpSwiglu { packed, .. } => sink.push(*packed),
-            Self::MlpSwigluClamp { packed, .. } => sink.push(*packed),
-            Self::MlpSwigluClampAlpha { packed, .. } => sink.push(*packed),
-            Self::MlpSwigluClampSplit { gate, up, .. } => sink.extend([*gate, *up]),
-            Self::MlpSwigluClampSplitRouted {
-                gate, up, weights, ..
-            } => sink.extend([*gate, *up, *weights]),
-            Self::MlpSwigluClampRouted {
-                packed, weights, ..
-            } => sink.extend([*packed, *weights]),
-            Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
-            Self::MlpGeluTanh { x, .. } | Self::MlpRelu2 { x, .. } => sink.push(*x),
-            Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
-            Self::MlpSitu { packed, .. } => sink.push(*packed),
-            Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
-            Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
-            Self::MoeTopkSigmoid {
-                logits, bias, hint, ..
-            } => {
-                sink.push(*logits);
-                sink.extend(*bias);
-                sink.extend(*hint);
-            }
-            Self::MoeTopkSqrtSoftplus {
-                logits, bias, hint, ..
-            } => {
-                sink.extend([*logits, *bias]);
-                sink.extend(*hint);
-            }
-            Self::MoeTopkSigmoidSink {
-                logits,
-                bias,
-                scale,
-                ..
-            } => {
-                sink.push(*logits);
-                sink.extend(*bias);
-                sink.extend(*scale);
-            }
-            Self::RelBias { x, w, .. } => sink.extend([*x, *w]),
-            Self::MoePredictRoute { logits, bias, .. } => sink.extend([*logits, *bias]),
-            Self::MoeHashRoute {
-                ids,
-                tid2eid,
-                logits,
-                ..
-            } => sink.extend([*ids, *tid2eid, *logits]),
-            Self::GroupRoutes { .. } => {}
-            Self::MatmulGrouped { x, w, routes, .. } => sink.extend([*x, *w, *routes]),
-            Self::MoeMatmulSelect {
-                x, bank, routes, ..
-            } => sink.extend([*x, *bank, *routes]),
-            Self::MoeMatmulSelectBias {
-                x,
-                bank,
-                bias,
-                routes,
-                ..
-            } => {
-                sink.extend([*x, *bank, *bias, *routes]);
-            }
-            Self::MoeMatmulSelectQuant {
-                x, bank, routes, ..
-            } => sink.extend([*x, *bank, *routes]),
-            Self::MoeMatmulSelectActQuant {
-                x,
-                bank,
-                routes,
-                input_scales,
-                ..
-            } => {
-                sink.extend([*x, *bank, *routes]);
-                sink.extend(*input_scales);
-            }
-            Self::MoeWeightedSum {
-                routed, weights, ..
-            } => sink.extend([*routed, *weights]),
-            Self::MoeSumAdd { routed, shared, .. } => sink.extend([*routed, *shared]),
-            Self::MoeBiasSum {
-                x,
-                bias,
-                routes,
-                weights,
-                ..
-            } => {
-                sink.extend([*x, *bias, *routes, *weights]);
-            }
-            Self::MoeSigmoidGateAdd {
-                routed,
-                shared,
-                gate,
-                ..
-            } => {
-                sink.extend([*routed, *shared, *gate]);
-            }
-            Self::LoraCorrect {
-                x,
-                bank_a,
-                bank_b,
-                routes,
-                y,
-                ..
-            } => {
-                sink.extend([*x, *bank_a, *bank_b, *routes, *y]);
-            }
-        }
-    }
-    fn outputs(&self, sink: &mut Vec<ValueId>) {
-        match self {
-            Self::Matmul { y, .. } => sink.push(*y),
-            Self::MatmulActQuant { y, .. } => sink.push(*y),
-            Self::LmHead { y, .. } => sink.push(*y),
-            Self::MlpSwiglu { y, .. } => sink.push(*y),
-            Self::MlpSwigluClamp { y, .. } => sink.push(*y),
-            Self::MlpSwigluClampAlpha { y, .. } => sink.push(*y),
-            Self::MlpSwigluClampSplit { y, .. } => sink.push(*y),
-            Self::MlpSwigluClampSplitRouted { y, .. } => sink.push(*y),
-            Self::MlpSwigluClampRouted { y, .. } => sink.push(*y),
-            Self::MlpGegluTanh { y, .. } => sink.push(*y),
-            Self::MlpGeluTanh { y, .. } | Self::MlpRelu2 { y, .. } => sink.push(*y),
-            Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
-            Self::MlpSitu { y, .. } => sink.push(*y),
-            Self::MoeTopkSoftmax {
-                routes, weights, ..
-            } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSoftmaxScaled {
-                routes, weights, ..
-            } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSigmoid {
-                routes, weights, ..
-            } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSqrtSoftplus {
-                routes, weights, ..
-            } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSigmoidSink {
-                routes, weights, ..
-            } => sink.extend([*routes, *weights]),
-            Self::RelBias { y, .. } => sink.push(*y),
-            Self::MoePredictRoute {
-                routes, weights, ..
-            } => sink.extend([*routes, *weights]),
-            Self::MoeHashRoute {
-                routes, weights, ..
-            } => sink.extend([*routes, *weights]),
-            Self::GroupRoutes { routes, .. } => sink.push(*routes),
-            Self::MatmulGrouped { y, .. } => sink.push(*y),
-            Self::MoeMatmulSelect { y, .. } => sink.push(*y),
-            Self::MoeMatmulSelectBias { y, .. } => sink.push(*y),
-            Self::MoeMatmulSelectQuant { y, .. } => sink.push(*y),
-            Self::MoeMatmulSelectActQuant { y, .. } => sink.push(*y),
-            Self::MoeWeightedSum { y, .. } => sink.push(*y),
-            Self::MoeSumAdd { y, .. } => sink.push(*y),
-            Self::MoeBiasSum { y, .. } => sink.push(*y),
-            Self::MoeSigmoidGateAdd { y, .. } => sink.push(*y),
-            Self::LoraCorrect { y_out, .. } => sink.push(*y_out),
-        }
-    }
-    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
-        match self {
-            Self::LoraCorrect { y, y_out, .. } => sink.push((*y_out, *y)),
-            Self::Matmul { .. }
-            | Self::MatmulActQuant { .. }
-            | Self::LmHead { .. }
-            | Self::MlpSwiglu { .. }
-            | Self::MlpSwigluClamp { .. }
-            | Self::MlpSwigluClampAlpha { .. }
-            | Self::MlpSwigluClampSplit { .. }
-            | Self::MlpSwigluClampSplitRouted { .. }
-            | Self::MlpSwigluClampRouted { .. }
-            | Self::MlpGegluTanh { .. }
-            | Self::MlpGeluTanh { .. }
-            | Self::MlpRelu2 { .. }
-            | Self::MlpGegluTanhPacked { .. }
-            | Self::MlpSitu { .. }
-            | Self::MoeTopkSoftmax { .. }
-            | Self::MoeTopkSoftmaxScaled { .. }
-            | Self::MoeTopkSigmoid { .. }
-            | Self::MoeTopkSigmoidSink { .. }
-            | Self::RelBias { .. }
-            | Self::MoeTopkSqrtSoftplus { .. }
-            | Self::MoePredictRoute { .. }
-            | Self::MoeHashRoute { .. }
-            | Self::GroupRoutes { .. }
-            | Self::MatmulGrouped { .. }
-            | Self::MoeMatmulSelect { .. }
-            | Self::MoeMatmulSelectBias { .. }
-            | Self::MoeMatmulSelectQuant { .. }
-            | Self::MoeMatmulSelectActQuant { .. }
-            | Self::MoeWeightedSum { .. }
-            | Self::MoeSumAdd { .. }
-            | Self::MoeBiasSum { .. }
-            | Self::MoeSigmoidGateAdd { .. } => {}
-        }
-    }
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Matmul { .. } => "linear.matmul",
-            Self::MatmulActQuant { .. } => "linear.matmul_act_quant",
-            Self::LmHead { .. } => "linear.lm_head",
-            Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
-            Self::MlpSwigluClamp { .. } => "linear.mlp_swiglu_clamp",
-            Self::MlpSwigluClampAlpha { .. } => "linear.mlp_swiglu_clamp_alpha",
-            Self::MlpSwigluClampSplit { .. } => "linear.mlp_swiglu_clamp_split",
-            Self::MlpSwigluClampSplitRouted { .. } => "linear.mlp_swiglu_clamp_split_routed",
-            Self::MlpSwigluClampRouted { .. } => "linear.mlp_swiglu_clamp_routed",
-            Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
-            Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
-            Self::MlpRelu2 { .. } => "linear.mlp_relu2",
-            Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
-            Self::MlpSitu { .. } => "linear.mlp_situ",
-            Self::MoeTopkSoftmax { .. } => "linear.moe_topk_softmax",
-            Self::MoeTopkSoftmaxScaled { .. } => "linear.moe_topk_softmax_scaled",
-            Self::MoeTopkSigmoid { .. } => "linear.moe_topk_sigmoid",
-            Self::MoeTopkSigmoidSink { .. } => "linear.moe_topk_sigmoid_sink",
-            Self::RelBias { .. } => "linear.rel_bias",
-            Self::MoeTopkSqrtSoftplus { .. } => "linear.moe_topk_sqrt_softplus",
-            Self::MoePredictRoute { .. } => "linear.moe_predict_route",
-            Self::MoeHashRoute { .. } => "linear.moe_hash_route",
-            Self::GroupRoutes { .. } => "linear.group_routes",
-            Self::MatmulGrouped { .. } => "linear.matmul_grouped",
-            Self::MoeMatmulSelect { .. } => "linear.moe_matmul_select",
-            Self::MoeMatmulSelectBias { .. } => "linear.moe_matmul_select_bias",
-            Self::MoeMatmulSelectQuant { .. } => "linear.moe_matmul_select_quant",
-            Self::MoeMatmulSelectActQuant { .. } => "linear.moe_matmul_select_act_quant",
-            Self::MoeWeightedSum { .. } => "linear.moe_weighted_sum",
-            Self::MoeSumAdd { .. } => "linear.moe_sum_add",
-            Self::MoeBiasSum { .. } => "linear.moe_bias_sum",
-            Self::MoeSigmoidGateAdd { .. } => "linear.moe_sigmoid_gate_add",
-            Self::LoraCorrect { .. } => "linear.lora_correct",
-        }
-    }
 }
