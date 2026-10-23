@@ -203,21 +203,16 @@ pub enum Linear {
         #[output]
         y: ValueId,
     },
-    MoeWeightedSum {
+    /// Each token's routed rows summed in f32, each times its f32 `weights`
+    /// where given (else already weighted), plus its `shared` row where
+    /// given, rounded once.
+    MoeCombine {
         #[input]
         routed: ValueId,
         #[input(F32)]
-        weights: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    /// Each token's routed rows (already weighted) summed in f32, plus its
-    /// `shared` row, rounded once.
-    MoeSumAdd {
+        weights: Option<ValueId>,
         #[input]
-        routed: ValueId,
-        #[input]
-        shared: ValueId,
+        shared: Option<ValueId>,
         #[output]
         y: ValueId,
     },

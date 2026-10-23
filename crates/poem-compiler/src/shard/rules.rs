@@ -218,11 +218,18 @@ fn rule(op: &Operation) -> Rule {
             Some(_) => Rule::Whole,
         };
     }
+    // A weighted sum of routed rows is linear in them; one that adds a shared
+    // row reads its operands whole.
+    if let Operation::Linear(Linear::MoeCombine { shared, .. }) = op {
+        return match shared {
+            None => Rule::Linear {
+                follow: &["routed"],
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
     let name = op.name();
     match name {
-        "linear.moe_weighted_sum" => Rule::Linear {
-            follow: &["routed"],
-        },
         "elemwise.residual_add" => Rule::Linear {
             follow: &["x", "y"],
         },

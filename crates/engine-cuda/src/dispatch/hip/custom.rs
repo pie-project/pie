@@ -98,10 +98,12 @@ impl Run<'_> {
                 quant: None,
                 ..
             },
-            Linear::MoeWeightedSum {
+            Linear::MoeCombine {
                 routed: summed,
-                weights,
+                weights: Some(weights),
                 y,
+                shared: None,
+                ..
             },
         ) = (select, down, sum)
         else {

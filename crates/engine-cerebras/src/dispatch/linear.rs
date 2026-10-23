@@ -133,7 +133,13 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
                 self.tensor(*weights),

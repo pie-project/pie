@@ -121,6 +121,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("sampling.top_k", Reads::Rows),
     entry("linear.glu", Reads::Rows),
     entry("linear.gelu_tanh", Reads::Rows),
+    entry("linear.moe_combine", Reads::Rows),
     entry("linear.moe_route", Reads::Rows),
     entry("linear.moe_select", Reads::Rows),
     entry("linear.relu2", Reads::Rows),
@@ -129,7 +130,6 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("fused.moe_experts", Reads::Rows),
     entry("linear.lora_correct", Reads::Rows),
     entry("linear.moe_sigmoid_gate_add", Reads::Rows),
-    entry("linear.moe_weighted_sum", Reads::Rows),
     entry("linear.rel_bias", Reads::Rows),
 ];
 

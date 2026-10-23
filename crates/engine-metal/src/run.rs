@@ -546,8 +546,12 @@ impl<'c> Run<'c> {
         else {
             return Sorted::default();
         };
-        let Some(Operation::Linear(Linear::MoeWeightedSum { routed: folded, .. })) =
-            self.sole_reader(*routed).map(|n| &n.op)
+        let Some(Operation::Linear(Linear::MoeCombine {
+            routed: folded,
+            weights: Some(_),
+            shared: None,
+            ..
+        })) = self.sole_reader(*routed).map(|n| &n.op)
         else {
             return Sorted::default();
         };

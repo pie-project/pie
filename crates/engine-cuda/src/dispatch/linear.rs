@@ -579,7 +579,13 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MoeSumAdd { routed, shared, y } => linear::moe::sum_add(
+            Linear::MoeCombine {
+                routed,
+                shared: Some(shared),
+                y,
+                weights: None,
+                ..
+            } => linear::moe::sum_add(
                 self.ctx(),
                 self.tensor(*routed),
                 self.tensor(*shared),
@@ -1081,12 +1087,20 @@ impl Run<'_> {
             } => self.select_act_quant(*x, *bank, *routes, *quant, *input_scales, *y),
             // The forms no builder makes.
             Linear::MoeSelect { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
                 self.tensor(*weights),
                 &mut self.tensor(*y),
             ),
+            // The forms no builder makes.
+            Linear::MoeCombine { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Linear::MoeBiasSum {
                 x,
                 bias,
@@ -1405,10 +1419,12 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             },
-            Linear::MoeSumAdd {
+            Linear::MoeCombine {
                 routed: summed,
-                shared,
+                shared: Some(shared),
                 y,
+                weights: None,
+                ..
             },
         ) = (glu, sum)
         {
@@ -1503,10 +1519,12 @@ impl Run<'_> {
             Linear::Relu2 { x, y } => (x, y, self.tensor(y).width, Glu::Relu2),
             _ => return Ok(false),
         };
-        let Linear::MoeWeightedSum {
+        let Linear::MoeCombine {
             routed: summed,
-            weights,
+            weights: Some(weights),
             y,
+            shared: None,
+            ..
         } = *sum
         else {
             return Ok(false);

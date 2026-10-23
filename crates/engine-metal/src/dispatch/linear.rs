@@ -742,7 +742,11 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             }
-            | Linear::MoeSumAdd { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            | Linear::MoeCombine {
+                weights: None,
+                shared: Some(_),
+                ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             // The forms no builder makes.
             Linear::Matmul { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::Glu {
@@ -1091,7 +1095,13 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => match self.chain_combine(*routed) {
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => match self.chain_combine(*routed) {
                 Some((sorted, inv, top_k)) => linear::moe::weighted_sum_sorted(
                     self.ctx(),
                     sorted,
@@ -1107,6 +1117,8 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
+            // The forms no builder makes.
+            Linear::MoeCombine { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::MoeBiasSum {
                 x,
                 bias,

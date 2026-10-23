@@ -434,7 +434,13 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MoeSumAdd { routed, shared, y } => linear::moe::sum_add(
+            Linear::MoeCombine {
+                routed,
+                shared: Some(shared),
+                y,
+                weights: None,
+                ..
+            } => linear::moe::sum_add(
                 self.ctx(),
                 self.tensor(*routed),
                 self.tensor(*shared),
@@ -876,12 +882,20 @@ impl Run<'_> {
             }
             // The forms no builder makes.
             Linear::MoeSelect { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
                 self.tensor(*weights),
                 &mut self.tensor(*y),
             ),
+            // The forms no builder makes.
+            Linear::MoeCombine { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Linear::MoeBiasSum {
                 x,
                 bias,

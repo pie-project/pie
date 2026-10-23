@@ -737,10 +737,11 @@ pub fn moe_weighted_sum(routed: &Value, weights: &Value) -> Value {
     let r = routed.rec();
     let y = r.fresh(tensor(Dim::Tokens, routed.width(), routed.dtype()));
     r.push(
-        Linear::MoeWeightedSum {
+        Linear::MoeCombine {
             routed: routed.id(),
-            weights: weights.id(),
+            weights: Some(weights.id()),
             y: y.id(),
+            shared: None,
         },
         &[routed, weights],
     );
@@ -753,10 +754,11 @@ pub fn moe_sum_add(routed: &Value, shared: &Value) -> Value {
     let r = routed.rec();
     let y = r.fresh(tensor(Dim::Tokens, routed.width(), routed.dtype()));
     r.push(
-        Linear::MoeSumAdd {
+        Linear::MoeCombine {
             routed: routed.id(),
-            shared: shared.id(),
+            shared: Some(shared.id()),
             y: y.id(),
+            weights: None,
         },
         &[routed, shared],
     );

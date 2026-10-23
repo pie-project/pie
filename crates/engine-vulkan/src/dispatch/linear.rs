@@ -253,7 +253,11 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             }
-            | Linear::MoeSumAdd { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+            | Linear::MoeCombine {
+                weights: None,
+                shared: Some(_),
+                ..
+            } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             // The forms no builder makes.
             Linear::Matmul { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Linear::Glu {
@@ -617,16 +621,22 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*y_out)),
             )
             .map_err(crate::encode::from_slang),
-            Linear::MoeWeightedSum { routed, weights, y } => {
-                kernels_slang::linear::moe::combine::weighted_sum(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*routed)),
-                    crate::encode::slang_tensor(self.tensor(*weights)),
-                    crate::encode::slang_tensor(self.tensor(*y)),
-                )
-                .map_err(crate::encode::from_slang)
-            }
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => kernels_slang::linear::moe::combine::weighted_sum(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*routed)),
+                crate::encode::slang_tensor(self.tensor(*weights)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
+            // The forms no builder makes.
+            Linear::MoeCombine { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Linear::MoeBiasSum {
                 x,
                 bias,

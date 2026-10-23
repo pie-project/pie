@@ -44,7 +44,11 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             }
-            | Linear::MoeSumAdd { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            | Linear::MoeCombine {
+                weights: None,
+                shared: Some(_),
+                ..
+            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::Matmul {
                 act,
                 w,
@@ -643,13 +647,21 @@ impl Run<'_> {
             }),
             // The forms no builder makes.
             Linear::MoeSelect { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            Linear::MoeWeightedSum { routed, weights, y } => crate::lower::lower(self.ctx(), |l| {
+            Linear::MoeCombine {
+                routed,
+                weights: Some(weights),
+                y,
+                shared: None,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
                 let routed_v = l.read(self.tensor(*routed))?;
                 let weights_v = l.read(self.tensor(*weights))?;
                 let o_y = self.tensor(*y);
                 let v = linear::moe::weighted_sum(l.f(), routed_v, weights_v, o_y.landing())?;
                 l.land(o_y, v)
             }),
+            // The forms no builder makes.
+            Linear::MoeCombine { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::MoeBiasSum {
                 x,
                 bias,
