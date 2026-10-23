@@ -499,6 +499,8 @@ def weight(reads, w, names, rows = None, quantized = "refuse"):
             fp8_read(reads, w, names)
         return
     if w.dtype in CHANNEL:
+        if rows != None:
+            fail("`{}`: a row gather of per-channel FP8 codes would leave their row scales behind; no reading here moves both".format(w.name))
         channel_fp8_read(reads, w, names)
         return
     if w.dtype in MX:
@@ -523,6 +525,8 @@ def weight(reads, w, names, rows = None, quantized = "refuse"):
         land(reads, w, value)
         return
     if rows != None:
+        if w.dtype in [dtype.nvfp4, dtype.nvfp4a4] or any([kind(name) == "NVFP4" for name in names]):
+            fail("`{}`: a row gather of NVFP4 codes would leave their scales behind; no reading here moves both".format(w.name))
         reads.read_expr(w, src(names[0]).gather(0, rows))
     elif len(names) == 1:
         reads.read(w, names[0])
@@ -572,23 +576,44 @@ def stacked_bank(reads, w, stem, legs = None):
 
 def at_path(m, path):
     """The weight at `path` in the layout `m` (`layers.3.q`): each part an
-    attribute, or an index where it is a number. None where any step is."""
+    attribute, or an index where it is a number. None where a step is None
+    or names no field: a layer without that weight."""
     x = m
     for part in path.split("."):
         if x == None:
             return None
-        x = x[int(part)] if part.isdigit() else getattr(x, part)
+        x = x[int(part)] if part.isdigit() else getattr(x, part, None)
     return x
 
+def named(m, path):
+    """Whether `path` names a field of the layout `m`, None or not."""
+    x = m
+    for part in path.split("."):
+        if x == None:
+            return True
+        if part.isdigit():
+            x = x[int(part)]
+        elif not hasattr(x, part):
+            return False
+        else:
+            x = getattr(x, part)
+    return True
+
 def mapped_row(reads, m, row, l, quantized):
+    """Reads `row` at layer `l`, where it names a weight of the shape it reads."""
     names, path = row[0], row[1]
     names = [names] if type(names) == "string" else names
     w = at_path(m, path.format(l = l))
     if w == None:
         return
-    if any(["{e}" in name for name in names]):
-        experts = [[name.format(l = l, e = e) for name in names] for e in range(w.shape[0])]
-        bank(reads, w, experts)
+    experts = any(["{e}" in name for name in names])
+    # A row naming experts reads a bank; one that does not, a weight that is
+    # not: where a layer's weight at the path is the other, the row is not
+    # its reading.
+    if experts != (len(w.shape) == 3):
+        return
+    if experts:
+        bank(reads, w, [[name.format(l = l, e = e) for name in names] for e in range(w.shape[0])])
     else:
         weight(reads, w, [name.format(l = l) for name in names], quantized = quantized)
 
@@ -597,13 +622,18 @@ def mapped(reads, m, rows, quantized = "refuse"):
     the checkpoint's tensor (or tensors, joined along the weight's rows) and
     the layout path of the weight it lands as. `{l}` in a row runs over
     `m.layers`, a run of such rows read a layer at a time; `{e}` over a
-    bank's experts, its names each expert's legs. A path that is None is not
-    read (a tied head, an absent norm)."""
+    bank's experts, its names each expert's legs, a row read only where the
+    weight is a bank and one without `{e}` only where it is not. A path that
+    is None, or names no field of a layer, is not read there (a tied head, a
+    norm or a bank only some layers have); a row whose path names a field of
+    no layer is refused, for it names nothing the layout has."""
     i = 0
     for _ in range(len(rows)):
         if i >= len(rows):
             break
         if "{l}" not in rows[i][1]:
+            if not named(m, rows[i][1]):
+                fail("the row for `{}` names no weight of this layout".format(rows[i][1]))
             mapped_row(reads, m, rows[i], None, quantized)
             i += 1
             continue
@@ -611,6 +641,9 @@ def mapped(reads, m, rows, quantized = "refuse"):
         for _ in range(len(rows)):
             if j < len(rows) and "{l}" in rows[j][1]:
                 j += 1
+        for row in rows[i:j]:
+            if not any([named(m, row[1].format(l = l)) for l in range(len(m.layers))]):
+                fail("the row for `{}` names no weight of any layer of this layout".format(row[1]))
         for l in range(len(m.layers)):
             for row in rows[i:j]:
                 mapped_row(reads, m, row, l, quantized)

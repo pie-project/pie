@@ -5,7 +5,7 @@
 # recognized by its routed `block_sparse_moe` and checked against its config.
 # The draft modules are not read.
 
-load("//pie/codec.poem", "bank", "kept", "weight")
+load("//pie/codec.poem", "kept", "mapped")
 
 def configured(m):
     return [
@@ -30,23 +30,31 @@ def formats(m):
         states = configured(m),
     )]
 
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.weight",
+        "model.layers.{l}.self_attn.k_proj.weight",
+        "model.layers.{l}.self_attn.v_proj.weight",
+    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    ("model.layers.{l}.block_sparse_moe.gate.weight", "layers.{l}.router"),
+    ("model.layers.{l}.block_sparse_moe.e_score_correction_bias", "layers.{l}.bias"),
+    ([
+        "model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight",
+        "model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight",
+    ], "layers.{l}.gate_up"),
+    ("model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight", "layers.{l}.down"),
+]
+
 def read(m, reads):
-    reads.read(m.embed, "model.embed_tokens.weight")
-    reads.read(m.final_norm, "model.norm.weight")
-    reads.read(m.head, "lm_head.weight")
-    for l, w in enumerate(m.layers):
-        n = lambda s: "model.layers.{}.{}".format(l, s)
-        a = lambda s: n("self_attn.{}".format(s))
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        weight(reads, w.qkv, [a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight")])
-        weight(reads, w.o, [a("o_proj.weight")])
-        reads.read(w.q_norm, a("q_norm.weight"))
-        reads.read(w.k_norm, a("k_norm.weight"))
-        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read(w.router, n("block_sparse_moe.gate.weight"))
-        reads.read(w.bias, n("block_sparse_moe.e_score_correction_bias"))
+    for w in m.layers:
         if not kept(w.gate_up):
             fail("`{}`: MiniMax-M2 is released FP8 and exported NVFP4; this deployment reads its experts as {}".format(w.gate_up.name, w.gate_up.dtype))
-        leg = lambda e, name: n("block_sparse_moe.experts.{}.{}.weight".format(e, name))
-        bank(reads, w.gate_up, [[leg(e, "w1"), leg(e, "w3")] for e in range(m.experts)])
-        bank(reads, w.down, [[leg(e, "w2")] for e in range(m.experts)])
+    mapped(reads, m, TRANSFORMERS)

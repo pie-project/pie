@@ -7,7 +7,7 @@
 # checked against its config. The draft layer stored after the last is not
 # read.
 
-load("//pie/codec.poem", "bank", "weight")
+load("//pie/codec.poem", "mapped")
 
 def configured(m):
     return [
@@ -28,51 +28,42 @@ def formats(m):
     return [format(
         "transformers",
         recognizes = lambda checkpoint: has("model.layers.0.self_attn.q_proj.bias") and has("model.layers.{}.mlp.gate.e_score_correction_bias".format(len(m.layers) - 1)),
-        read = lambda reads: read(m, reads),
+        read = lambda reads: mapped(reads, m, TRANSFORMERS, quantized = "widen"),
         states = configured(m),
     )]
 
-def read(m, reads):
-    reads.read(m.embed, "model.embed_tokens.weight")
-    reads.read(m.final_norm, "model.norm.weight")
-    reads.read(m.head, "lm_head.weight")
-    for l, w in enumerate(m.layers):
-        n = lambda s: "model.layers.{}.{}".format(l, s)
-        a = lambda s: n("self_attn.{}".format(s))
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        weight(
-            reads,
-            w.qkv,
-            [a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight")],
-            quantized = "widen",
-        )
-        reads.read_concat(w.qkv_bias, [a("q_proj.bias"), a("k_proj.bias"), a("v_proj.bias")])
-        weight(reads, w.o, [a("o_proj.weight")], quantized = "widen")
-        if w.q_norm != None:
-            reads.read(w.q_norm, a("q_norm.weight"))
-            reads.read(w.k_norm, a("k_norm.weight"))
-        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        f = w.mlp
-        if not f.routed:
-            weight(
-                reads,
-                f.gate_up,
-                [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
-                quantized = "widen",
-            )
-            weight(reads, f.down, [n("mlp.down_proj.weight")], quantized = "widen")
-            continue
-        reads.read(f.router, n("mlp.gate.weight"))
-        reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
-        weight(
-            reads,
-            f.shared.gate_up,
-            [n("mlp.shared_experts.gate_proj.weight"), n("mlp.shared_experts.up_proj.weight")],
-            quantized = "widen",
-        )
-        weight(reads, f.shared.down, [n("mlp.shared_experts.down_proj.weight")], quantized = "widen")
-        e = lambda i, leg: n("mlp.experts.{}.{}.weight".format(i, leg))
-        gate_up = [[e(i, "gate_proj"), e(i, "up_proj")] for i in range(f.experts)]
-        down = [[e(i, "down_proj")] for i in range(f.experts)]
-        bank(reads, f.gate_up, gate_up)
-        bank(reads, f.down, down)
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.weight",
+        "model.layers.{l}.self_attn.k_proj.weight",
+        "model.layers.{l}.self_attn.v_proj.weight",
+    ], "layers.{l}.qkv"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.bias",
+        "model.layers.{l}.self_attn.k_proj.bias",
+        "model.layers.{l}.self_attn.v_proj.bias",
+    ], "layers.{l}.qkv_bias"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    # A dense layer's MLP; a routed one's router, shared expert and banks.
+    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.mlp.gate_up"),
+    ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.mlp.down"),
+    ("model.layers.{l}.mlp.gate.weight", "layers.{l}.mlp.router"),
+    ("model.layers.{l}.mlp.gate.e_score_correction_bias", "layers.{l}.mlp.bias"),
+    ([
+        "model.layers.{l}.mlp.shared_experts.gate_proj.weight",
+        "model.layers.{l}.mlp.shared_experts.up_proj.weight",
+    ], "layers.{l}.mlp.shared.gate_up"),
+    ("model.layers.{l}.mlp.shared_experts.down_proj.weight", "layers.{l}.mlp.shared.down"),
+    ([
+        "model.layers.{l}.mlp.experts.{e}.gate_proj.weight",
+        "model.layers.{l}.mlp.experts.{e}.up_proj.weight",
+    ], "layers.{l}.mlp.gate_up"),
+    ("model.layers.{l}.mlp.experts.{e}.down_proj.weight", "layers.{l}.mlp.down"),
+]
