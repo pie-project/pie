@@ -1086,7 +1086,7 @@ impl Run<'_> {
         match self.banked(w) {
             Some(bank) => {
                 let out = self.temp(n, k, poem_ir::Dtype::Bf16);
-                kernels_xla::linear::decode::decoded_plane(self.ctx(), op, bank, out)?;
+                crate::lower::linear::decoded_plane(self.ctx(), op, bank, out)?;
                 Ok(out)
             }
             None => Ok(self.tensor(w)),

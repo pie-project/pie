@@ -210,14 +210,14 @@ fn affine_embeds_decode_their_rows() {
         .run(|ctx| {
             engine_xla::lower::lower(ctx, |l| {
                 let ids_v = l.read(i)?;
-                let table_v = (b4).try_map(|t| l.read(t))?;
+                let table_v = l.bank(b4)?;
                 let o_y = y;
                 let v = gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, vocab, o_y.landing())?;
                 l.land(o_y, v)
             })?;
             engine_xla::lower::lower(ctx, |l| {
                 let ids_v = l.read(ci)?;
-                let table_v = (b2).try_map(|t| l.read(t))?;
+                let table_v = l.bank(b2)?;
                 let o_y = cy;
                 let v = gather::embed_concat_mb_4bit(l.f(), ids_v, table_v, vocab, o_y.landing())?;
                 l.land(o_y, v)
@@ -275,7 +275,7 @@ fn a_folded_affine_table_reads_its_rows() {
         .run(|ctx| {
             engine_xla::lower::lower(ctx, |l| {
                 let ids_v = l.read(i)?;
-                let table_v = (bank).try_map(|t| l.read(t))?;
+                let table_v = l.bank(bank)?;
                 let o_y = y;
                 let v = gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, vocab, o_y.landing())?;
                 l.land(o_y, v)

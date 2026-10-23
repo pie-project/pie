@@ -8,7 +8,6 @@ use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use kernels_xla::attn::pool;
 use kernels_xla::elemwise::norm;
-use kernels_xla::linear::decode;
 use kernels_xla::{Bank, KvPool, Tensor};
 
 fn hash(i: usize, seed: u32) -> u32 {
@@ -133,7 +132,7 @@ fn a_bank_decodes_to_the_plane_its_codes_and_factors_state() {
     let ran = b
         .run(|ctx| {
             for (bank, out, _, _) in &cases {
-                decode::decoded_plane(ctx, "attn.mla_absorb_q", *bank, *out)?;
+                engine_xla::lower::linear::decoded_plane(ctx, "attn.mla_absorb_q", *bank, *out)?;
             }
             Ok(())
         })

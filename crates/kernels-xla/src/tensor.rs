@@ -69,6 +69,14 @@ pub trait Stored: Copy {
     fn width(self) -> u32;
     fn dtype(self) -> Dtype;
 
+    /// The same storage read as another dtype of the same width.
+    #[must_use]
+    fn with_dtype(self, dtype: Dtype) -> Self;
+
+    /// The same rows read `width` wide.
+    #[must_use]
+    fn with_width(self, width: u32) -> Self;
+
     fn elements(self) -> u64 {
         u64::from(self.rows()) * u64::from(self.width())
     }
@@ -84,6 +92,12 @@ pub trait Stored: Copy {
 }
 
 impl Stored for Tensor {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }
@@ -96,6 +110,12 @@ impl Stored for Tensor {
 }
 
 impl Stored for Operand {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }
@@ -108,6 +128,12 @@ impl Stored for Operand {
 }
 
 impl Stored for Landing {
+    fn with_dtype(self, dtype: Dtype) -> Self {
+        Self { dtype, ..self }
+    }
+    fn with_width(self, width: u32) -> Self {
+        Self { width, ..self }
+    }
     fn rows(self) -> u32 {
         self.rows
     }

@@ -6,44 +6,55 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx, expect};
+use crate::cx::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::Val;
-use crate::tensor::Tensor;
+use crate::hlo::{Func, Val};
+use crate::tensor::{Landing, Operand, Stored};
 
 /// The gate and up halves of a packed `[rows, 2 · intermediate]` row, in f32.
-fn halves(op: &'static str, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
+fn halves(
+    op: &'static str,
+    packed: impl Stored,
+    intermediate: u32,
+    y: impl Stored,
+) -> Result<(), Error> {
     expect(op, packed, &[Dtype::Bf16])?;
-    if packed.width != intermediate.saturating_mul(2) || y.width != intermediate {
+    if packed.width() != intermediate.saturating_mul(2) || y.width() != intermediate {
         return Err(refuse(
             op,
             format!(
                 "the packed row is {} wide and lands {} where the intermediate is {intermediate}",
-                packed.width, y.width
+                packed.width(),
+                y.width()
             ),
         ));
     }
-    if y.rows != packed.rows {
+    if y.rows() != packed.rows() {
         return Err(refuse(
             op,
-            format!("{} packed rows land {} rows", packed.rows, y.rows),
+            format!("{} packed rows land {} rows", packed.rows(), y.rows()),
         ));
     }
     Ok(())
 }
 
-fn read_halves(cx: &mut Cx<'_>, packed: Tensor, intermediate: u32) -> Result<(Val, Val), Error> {
-    let p = cx.read_f32(packed)?;
+fn read_halves(f: &mut Func, packed: Operand, intermediate: u32) -> Result<(Val, Val), Error> {
+    let p = packed.f32(f);
     let i = i64::from(intermediate);
-    let g = cx.slice_axis(p, 1, 0, i)?;
-    let u = cx.slice_axis(p, 1, i, 2 * i)?;
+    let g = f.slice_axis(p, 1, 0, i)?;
+    let u = f.slice_axis(p, 1, i, 2 * i)?;
     Ok((g, u))
 }
 
-fn split(op: &'static str, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
+fn split(
+    op: &'static str,
+    gate: impl Stored,
+    up: impl Stored,
+    y: impl Stored,
+) -> Result<(), Error> {
     expect(op, gate, &[Dtype::Bf16])?;
-    if (up.rows, up.width) != (gate.rows, gate.width)
-        || (y.rows, y.width) != (gate.rows, gate.width)
+    if (up.rows(), up.width()) != (gate.rows(), gate.width())
+        || (y.rows(), y.width()) != (gate.rows(), gate.width())
     {
         return Err(refuse(
             op,
@@ -54,118 +65,108 @@ fn split(op: &'static str, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Er
 }
 
 /// `g / (1 + e^-g)`, as the shaders spell silu.
-fn silu(cx: &mut Cx<'_>, g: Val) -> Result<Val, Error> {
-    let n = cx.neg(g);
-    let e = cx.exp(n);
-    let d = cx.offset(e, 1.0)?;
-    Ok(cx.div(g, d)?)
+fn silu(f: &mut Func, g: Val) -> Result<Val, Error> {
+    let n = f.neg(g);
+    let e = f.exp(n);
+    let d = f.offset(e, 1.0)?;
+    Ok(f.div(g, d)?)
 }
 
 /// `min(g, limit)` and `clamp(u, -limit, limit)`.
-fn clamped(cx: &mut Cx<'_>, g: Val, u: Val, limit: f32) -> Result<(Val, Val), Error> {
-    let hi = cx.like_f(g, f64::from(limit));
-    let g = cx.min(g, hi)?;
-    let lo = cx.like_f(u, -f64::from(limit));
-    let u = cx.max(u, lo)?;
-    let u = cx.min(u, hi)?;
+fn clamped(f: &mut Func, g: Val, u: Val, limit: f32) -> Result<(Val, Val), Error> {
+    let hi = f.like_f(g, f64::from(limit));
+    let g = f.min(g, hi)?;
+    let lo = f.like_f(u, -f64::from(limit));
+    let u = f.max(u, lo)?;
+    let u = f.min(u, hi)?;
     Ok((g, u))
 }
 
 /// `tanh(clamp(x, -16, 16))`, the shaders' `pie_tanh`.
-fn pie_tanh(cx: &mut Cx<'_>, x: Val) -> Result<Val, Error> {
-    let lo = cx.like_f(x, -16.0);
-    let hi = cx.like_f(x, 16.0);
-    let x = cx.max(x, lo)?;
-    let x = cx.min(x, hi)?;
-    Ok(cx.tanh(x))
+fn pie_tanh(f: &mut Func, x: Val) -> Result<Val, Error> {
+    let lo = f.like_f(x, -16.0);
+    let hi = f.like_f(x, 16.0);
+    let x = f.max(x, lo)?;
+    let x = f.min(x, hi)?;
+    Ok(f.tanh(x))
 }
 
-pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
+pub fn swiglu(f: &mut Func, packed: Operand, intermediate: u32, y: Landing) -> Result<Val, Error> {
     const OP: &str = "linear.swiglu";
     halves(OP, packed, intermediate, y)?;
-    ctx.emit(&mut |cx| {
-        let (g, u) = read_halves(cx, packed, intermediate)?;
-        let s = silu(cx, g)?;
-        let out = cx.mul(s, u)?;
-        cx.write(y, out)
-    })
+    let (g, u) = read_halves(f, packed, intermediate)?;
+    let s = silu(f, g)?;
+    let out = f.mul(s, u)?;
+    Ok(out)
 }
 
 pub fn swiglu_clamp(
-    ctx: &Ctx<'_>,
-    packed: Tensor,
+    f: &mut Func,
+    packed: Operand,
     intermediate: u32,
     limit: f32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.swiglu_clamp";
     halves(OP, packed, intermediate, y)?;
-    ctx.emit(&mut |cx| {
-        let (g, u) = read_halves(cx, packed, intermediate)?;
-        let (g, u) = clamped(cx, g, u, limit)?;
-        let s = silu(cx, g)?;
-        let out = cx.mul(s, u)?;
-        cx.write(y, out)
-    })
+    let (g, u) = read_halves(f, packed, intermediate)?;
+    let (g, u) = clamped(f, g, u, limit)?;
+    let s = silu(f, g)?;
+    let out = f.mul(s, u)?;
+    Ok(out)
 }
 
 /// gpt-oss: `min(g, limit) · σ(alpha · g) · (clamp(u) + 1)`.
 pub fn swiglu_clamp_alpha(
-    ctx: &Ctx<'_>,
-    packed: Tensor,
+    f: &mut Func,
+    packed: Operand,
     intermediate: u32,
     limit: f32,
     alpha: f32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.swiglu_clamp_alpha";
     halves(OP, packed, intermediate, y)?;
-    ctx.emit(&mut |cx| {
-        let (g, u) = read_halves(cx, packed, intermediate)?;
-        let (g, u) = clamped(cx, g, u, limit)?;
-        let ag = cx.scale(g, f64::from(alpha))?;
-        let n = cx.neg(ag);
-        let e = cx.exp(n);
-        let d = cx.offset(e, 1.0)?;
-        let s = cx.div(g, d)?;
-        let u1 = cx.offset(u, 1.0)?;
-        let out = cx.mul(s, u1)?;
-        cx.write(y, out)
-    })
+    let (g, u) = read_halves(f, packed, intermediate)?;
+    let (g, u) = clamped(f, g, u, limit)?;
+    let ag = f.scale(g, f64::from(alpha))?;
+    let n = f.neg(ag);
+    let e = f.exp(n);
+    let d = f.offset(e, 1.0)?;
+    let s = f.div(g, d)?;
+    let u1 = f.offset(u, 1.0)?;
+    let out = f.mul(s, u1)?;
+    Ok(out)
 }
 
 pub fn swiglu_clamp_split(
-    ctx: &Ctx<'_>,
-    gate: Tensor,
-    up: Tensor,
+    f: &mut Func,
+    gate: Operand,
+    up: Operand,
     limit: f32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.swiglu_clamp_split";
     split(OP, gate, up, y)?;
-    ctx.emit(&mut |cx| {
-        let g = cx.read_f32(gate)?;
-        let u = cx.read_f32(up)?;
-        let (g, u) = clamped(cx, g, u, limit)?;
-        let s = silu(cx, g)?;
-        let out = cx.mul(s, u)?;
-        cx.write(y, out)
-    })
+    let g = gate.f32(f);
+    let u = up.f32(f);
+    let (g, u) = clamped(f, g, u, limit)?;
+    let s = silu(f, g)?;
+    let out = f.mul(s, u)?;
+    Ok(out)
 }
 
-pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
+pub fn geglu_tanh(f: &mut Func, gate: Operand, up: Operand, y: Landing) -> Result<Val, Error> {
     const OP: &str = "linear.geglu_tanh";
     split(OP, gate, up, y)?;
-    ctx.emit(&mut |cx| {
-        let g = cx.read_f32(gate)?;
-        let u = cx.read_f32(up)?;
-        let g = cx.gelu_tanh(g)?;
-        let out = cx.mul(g, u)?;
-        cx.write(y, out)
-    })
+    let g = gate.f32(f);
+    let u = up.f32(f);
+    let g = f.gelu_tanh(g)?;
+    let out = f.mul(g, u)?;
+    Ok(out)
 }
 
-pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
+pub fn gelu_tanh(f: &mut Func, x: Operand, y: Landing) -> Result<Val, Error> {
     const OP: &str = "linear.gelu_tanh";
     expect(OP, x, &[Dtype::Bf16])?;
     if (y.rows, y.width) != (x.rows, x.width) {
@@ -174,62 +175,56 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
             "the input and output planes are not one rectangle",
         ));
     }
-    ctx.emit(&mut |cx| {
-        let v = cx.read_f32(x)?;
-        let out = cx.gelu_tanh(v)?;
-        cx.write(y, out)
-    })
+    let v = x.f32(f);
+    let out = f.gelu_tanh(v)?;
+    Ok(out)
 }
 
 pub fn geglu_tanh_packed(
-    ctx: &Ctx<'_>,
-    packed: Tensor,
+    f: &mut Func,
+    packed: Operand,
     intermediate: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.geglu_tanh_packed";
     halves(OP, packed, intermediate, y)?;
-    ctx.emit(&mut |cx| {
-        let (g, u) = read_halves(cx, packed, intermediate)?;
-        let g = cx.gelu_tanh(g)?;
-        let out = cx.mul(g, u)?;
-        cx.write(y, out)
-    })
+    let (g, u) = read_halves(f, packed, intermediate)?;
+    let g = f.gelu_tanh(g)?;
+    let out = f.mul(g, u)?;
+    Ok(out)
 }
 
 /// `beta · tanh(g / beta) · σ(g) · u`, with `u` soft-capped to
 /// `up_cap · tanh(u / up_cap)` when `up_cap` is positive.
 pub fn situ(
-    ctx: &Ctx<'_>,
-    packed: Tensor,
+    f: &mut Func,
+    packed: Operand,
     intermediate: u32,
     beta: f32,
     up_cap: Option<f32>,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "linear.situ";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }
     halves(OP, packed, intermediate, y)?;
     let cap = up_cap.unwrap_or(0.0);
-    ctx.emit(&mut |cx| {
-        let (g, u) = read_halves(cx, packed, intermediate)?;
-        let gb = cx.scale(g, 1.0 / f64::from(beta))?;
-        let t = pie_tanh(cx, gb)?;
-        let t = cx.scale(t, f64::from(beta))?;
-        let n = cx.neg(g);
-        let e = cx.exp(n);
-        let d = cx.offset(e, 1.0)?;
-        let sg = cx.div(t, d)?;
-        let u = if cap > 0.0 {
-            let uc = cx.scale(u, 1.0 / f64::from(cap))?;
-            let t = pie_tanh(cx, uc)?;
-            cx.scale(t, f64::from(cap))?
-        } else {
-            u
-        };
-        let out = cx.mul(sg, u)?;
-        cx.write(y, out)
-    })
+    let (g, u) = read_halves(f, packed, intermediate)?;
+    let gb = f.scale(g, 1.0 / f64::from(beta))?;
+    let t = pie_tanh(f, gb)?;
+    let t = f.scale(t, f64::from(beta))?;
+    let n = f.neg(g);
+    let e = f.exp(n);
+    let d = f.offset(e, 1.0)?;
+    let sg = f.div(t, d)?;
+    let u = if cap > 0.0 {
+        let uc = f.scale(u, 1.0 / f64::from(cap))?;
+        let t = pie_tanh(f, uc)?;
+        f.scale(t, f64::from(cap))?
+    } else {
+        u
+    };
+    let out = f.mul(sg, u)?;
+    Ok(out)
 }

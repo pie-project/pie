@@ -13,7 +13,7 @@ use engine_xla::device::element_type;
 use engine_xla::pjrt::Arg;
 use engine_xla::trace::storage;
 use kernels_xla::hlo::{Func, Val, bf16_bits};
-use kernels_xla::linear::{moe, quant};
+use kernels_xla::linear::moe;
 use kernels_xla::tuning::{MoePath, Tuning};
 use kernels_xla::{Bank, Cx, Emit, Env, Tensor, gather, pack};
 
@@ -330,7 +330,7 @@ fn dense_projections_read_native_codes_and_prescaled_weights() {
         let o = outs.clone();
         if !nat.run(|ctx| {
             for (bank, y) in &o {
-                quant::matmul(ctx, xt, *bank, *y)?;
+                engine_xla::lower::linear::quant(ctx, false, xt, *bank, *y)?;
             }
             Ok(())
         }) {
@@ -363,7 +363,7 @@ fn an_embedding_gathers_native_codes() {
     if !nat.run(|ctx| {
         engine_xla::lower::lower(ctx, |l| {
             let ids_v = l.read(it)?;
-            let table_v = (bank).try_map(|t| l.read(t))?;
+            let table_v = l.bank(bank)?;
             let o_y = y;
             let v =
                 gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, vocab as u32, o_y.landing())?;
@@ -467,9 +467,37 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
         let ran = nat.run(|ctx| {
             for (i, (bank, y)) in o.iter().enumerate() {
                 if i % 2 == 0 {
-                    moe::matmul_select_quant(ctx, xt, *bank, rt, *y)?;
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(xt)?;
+                        let routes_v = l.read(rt)?;
+                        let y_v = l.read(*y)?;
+                        let bank_v = l.bank(*bank)?;
+                        let o_y = *y;
+                        let tuning = l.tuning();
+                        let v =
+                            moe::matmul_select_quant(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                        l.land(o_y, v)
+                    })?;
                 } else {
-                    moe::matmul_select_bias(ctx, xt, *bank, bt, rt, *y)?;
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(xt)?;
+                        let routes_v = l.read(rt)?;
+                        let bias_v = l.read(bt)?;
+                        let y_v = l.read(*y)?;
+                        let bank_v = l.bank(*bank)?;
+                        let o_y = *y;
+                        let tuning = l.tuning();
+                        let v = moe::matmul_select_bias(
+                            l.f(),
+                            x_v,
+                            bank_v,
+                            bias_v,
+                            routes_v,
+                            y_v,
+                            tuning,
+                        )?;
+                        l.land(o_y, v)
+                    })?;
                 }
             }
             Ok(())

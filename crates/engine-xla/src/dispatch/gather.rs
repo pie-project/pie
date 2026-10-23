@@ -96,7 +96,7 @@ impl Run<'_> {
             } => match self.banked(*table) {
                 Some(bank) => crate::lower::lower(self.ctx(), |l| {
                     let ids_v = l.read(self.tensor(*ids))?;
-                    let table_v = (bank).try_map(|t| l.read(t))?;
+                    let table_v = l.bank(bank)?;
                     let o_y = self.tensor(*y);
                     let v =
                         gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, *vocab, o_y.landing())?;
@@ -142,7 +142,7 @@ impl Run<'_> {
                     let guard = gather::table_rows(&bank, width).min(*vocab);
                     crate::lower::lower(self.ctx(), |l| {
                         let ids_v = l.read(ids)?;
-                        let table_v = (bank).try_map(|t| l.read(t))?;
+                        let table_v = l.bank(bank)?;
                         let o_y = self.tensor(*y);
                         let v = gather::embed_concat_mb_4bit(
                             l.f(),
