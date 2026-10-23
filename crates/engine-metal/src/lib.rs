@@ -83,4 +83,4 @@ pub use weights::{AdapterPlane, BankSeat, Weights};
 pub use window::{Copies, Gathered, GatheredSpace, Window, Windows};
 
 /// The fused kernels this backend ships; the compiler forms only these.
-pub const FUSED: [&str; 2] = ["fused.residual_add_rmsnorm", "fused.mlp_swiglu"];
+pub const FUSED: [&str; 2] = ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"];

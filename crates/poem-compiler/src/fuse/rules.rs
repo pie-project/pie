@@ -37,7 +37,7 @@ pub(super) fn all() -> Vec<Rule> {
         embed_scale_add_select(),
         embed_scale_add(),
         residual_add_rmsnorm(),
-        mlp_swiglu(),
+        matmul_swiglu_matmul(),
         matmul_geglu(),
         moe_experts(),
         moe_select_glu(),
@@ -957,7 +957,7 @@ fn residual_add_rmsnorm() -> Rule {
 /// projection. Both intermediates stay inside the match, so a chain that
 /// reads one of them elsewhere (Bonsai rotates `h` before `down`) stays as
 /// its three primitives.
-fn mlp_swiglu() -> Rule {
+fn matmul_swiglu_matmul() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("gate_up", [2 * W, W]));
         p.name("packed", &packed);
@@ -966,14 +966,16 @@ fn mlp_swiglu() -> Rule {
         let y = linear::matmul(&h, &p.weight("down", [W, W]));
         p.export("y", &y);
     });
-    Rule::new("fused.mlp_swiglu", [pattern], |m| Fused::MlpSwiglu {
-        act: m.value("act"),
-        gate_up: m.value("gate_up"),
-        down: m.value("down"),
-        intermediate: m.u32("intermediate"),
-        packed: m.value("packed"),
-        h: m.value("h"),
-        y: m.value("y"),
+    Rule::new("fused.matmul_swiglu_matmul", [pattern], |m| {
+        Fused::MatmulSwigluMatmul {
+            act: m.value("act"),
+            gate_up: m.value("gate_up"),
+            down: m.value("down"),
+            intermediate: m.u32("intermediate"),
+            packed: m.value("packed"),
+            h: m.value("h"),
+            y: m.value("y"),
+        }
     })
 }
 
@@ -1229,7 +1231,7 @@ fn matmul_geglu() -> Rule {
 }
 
 /// The packed gate-up projection and its SwiGLU, where the MLP's down
-/// projection stays apart (a backend that ships `fused.mlp_swiglu` forms
+/// projection stays apart (a backend that ships `fused.matmul_swiglu_matmul` forms
 /// that first).
 fn matmul_swiglu() -> Rule {
     let pattern = template(|p| {

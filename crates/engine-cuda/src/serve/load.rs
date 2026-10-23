@@ -1359,7 +1359,7 @@ fn decoded_weight_planes(
                 | poem_ir::Operation::Fused(
                     poem_ir::Fused::MatmulSwiglu { .. }
                     | poem_ir::Fused::MatmulGeglu { .. }
-                    | poem_ir::Fused::MlpSwiglu { .. }
+                    | poem_ir::Fused::MatmulSwigluMatmul { .. }
                     | poem_ir::Fused::MatmulBias { .. }
                     | poem_ir::Fused::MatmulSplitRows { .. }
                     | poem_ir::Fused::MatmulSoftcap { .. },

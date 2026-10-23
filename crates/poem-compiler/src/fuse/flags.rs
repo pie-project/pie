@@ -42,7 +42,7 @@ flags! {
     EmbedScaleAddSelect = "fuse.embed_scale_add_select" => "fused.embed_scale_add_select",
     EmbedScaleAdd = "fuse.embed_scale_add" => "fused.embed_scale_add",
     ResidualAddRmsnorm = "fuse.residual_add_rmsnorm" => "fused.residual_add_rmsnorm",
-    MlpSwiglu = "fuse.mlp_swiglu" => "fused.mlp_swiglu",
+    MatmulSwigluMatmul = "fuse.matmul_swiglu_matmul" => "fused.matmul_swiglu_matmul",
     MatmulGeglu = "fuse.matmul_geglu" => "fused.matmul_geglu",
     MoeExperts = "fuse.moe_experts" => "fused.moe_experts",
     MoeSelectGlu = "fuse.moe_select_glu" => "fused.moe_select_glu",
@@ -105,10 +105,13 @@ mod tests {
     #[test]
     fn a_backend_registers_what_it_ships_and_a_profile_may_turn_it_off() {
         let mut r = Registry::new("toy", &[], &["rows"]);
-        register(&mut r, &["fused.residual_add_rmsnorm", "fused.mlp_swiglu"]);
+        register(
+            &mut r,
+            &["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"],
+        );
         assert_eq!(
             kernels(&r.defaults()),
-            ["fused.residual_add_rmsnorm", "fused.mlp_swiglu"]
+            ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"]
         );
         let p = r
             .load_user("api = 1\nfuse = [\"residual_add_rmsnorm\"]\n", "chip.toml")

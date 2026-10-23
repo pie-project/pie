@@ -47,7 +47,7 @@ pub const EXCLUSIVE: [&str; 0] = [];
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
 /// The fused kernels this backend ships; the compiler forms only these. A
-/// rule it does not list (`fused.mlp_swiglu`, which Metal splits across
+/// rule it does not list (`fused.matmul_swiglu_matmul`, which Metal splits across
 /// engines) leaves its primitives alone here.
 #[cfg(not(feature = "rocm"))]
 pub const FUSED: [&str; 31] = [
@@ -93,7 +93,7 @@ pub const FUSED: [&str; 16] = [
     "fused.matmul_geglu",
     "fused.matmul_softcap",
     "fused.matmul_bias",
-    "fused.mlp_swiglu",
+    "fused.matmul_swiglu_matmul",
     "fused.moe_experts",
     "fused.gated_residual_norm_modulate",
     "fused.norm_modulate",

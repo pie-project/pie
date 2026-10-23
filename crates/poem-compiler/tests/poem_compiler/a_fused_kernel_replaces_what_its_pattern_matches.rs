@@ -87,10 +87,14 @@ fn dense_mlp(p: &Pattern) -> (poem::Value, poem::Value) {
 
 #[test]
 fn a_dense_mlp_folds_into_one_op() {
-    let fused = fuse(trace(|p| drop(dense_mlp(p))), &["fused.mlp_swiglu"]);
-    assert_eq!(ops(&fused), ["fused.mlp_swiglu"]);
-    let Some(poem_ir::Operation::Fused(poem_ir::Fused::MlpSwiglu { intermediate, .. })) =
-        fused.nodes.first().map(|node| &node.op)
+    let fused = fuse(
+        trace(|p| drop(dense_mlp(p))),
+        &["fused.matmul_swiglu_matmul"],
+    );
+    assert_eq!(ops(&fused), ["fused.matmul_swiglu_matmul"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::MatmulSwigluMatmul {
+        intermediate, ..
+    })) = fused.nodes.first().map(|node| &node.op)
     else {
         panic!("the op is the fused mlp");
     };
@@ -106,7 +110,7 @@ fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
             let (h, _) = dense_mlp(p);
             elemwise::silu(&h);
         }),
-        &["fused.mlp_swiglu"],
+        &["fused.matmul_swiglu_matmul"],
     );
     assert_eq!(
         ops(&fused),

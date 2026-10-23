@@ -1457,7 +1457,7 @@ mod tests {
             "kernel.sdpa.prefill",
             "kernel.gdn.scan",
             "kernel.ane.mlp",
-            "fuse.mlp_swiglu",
+            "fuse.matmul_swiglu_matmul",
             "compiler.launch_us",
         ] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");

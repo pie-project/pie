@@ -189,7 +189,7 @@ impl Run<'_> {
             }
             // Not in `FUSED`, so never formed here; whole, it is its three
             // primitives.
-            Fused::MlpSwiglu {
+            Fused::MatmulSwigluMatmul {
                 act,
                 gate_up,
                 down,

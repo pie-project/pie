@@ -383,7 +383,7 @@ pub enum Fused {
     /// A whole dense MLP: `gate_up` over `act`, swiglu, `down`. `packed` and
     /// `h` are the two intermediates, still written, so a backend may run
     /// the three primitives, or split the chain between engines.
-    MlpSwiglu {
+    MatmulSwigluMatmul {
         #[input]
         act: ValueId,
         #[input]

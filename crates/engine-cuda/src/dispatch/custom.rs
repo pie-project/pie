@@ -32,7 +32,7 @@ impl DispatchFused for Run<'_> {
             Fused::HcPre { .. } => self.hc_pre(op),
             Fused::MatmulGeglu { .. }
             | Fused::MatmulSwiglu { .. }
-            | Fused::MlpSwiglu { .. }
+            | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. }
             | Fused::MatmulSplitRows { .. }
