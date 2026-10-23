@@ -29,3 +29,21 @@ uint affine_code_of(uint k) {
 uint affine_scale_of(uint row, uint row_len, uint k) {
     return row * (row_len / uint(PIE_GROUP)) + k / uint(PIE_GROUP);
 }
+
+// Codes `i` to `i + 3` of `word`, dequantized.
+float4 affine_dequant4(uint word, uint i, float scale, float bias) {
+    return float4(affine_code(word, i), affine_code(word, i + 1u), affine_code(word, i + 2u),
+                  affine_code(word, i + 3u)) * scale + bias;
+}
+
+// One word of codes against its activations, with their sum folded in for
+// the bias: `scale * (codes . x) + bias * sum(x)`.
+float affine_word_dot(uint word, float x[32 / PIE_BITS], float scale, float bias) {
+    float accum = 0.0;
+    float sum = 0.0;
+    [ForceUnroll] for (uint i = 0u; i < 32u / uint(PIE_BITS); i++) {
+        accum += x[i] * affine_code(word, i);
+        sum += x[i];
+    }
+    return scale * accum + sum * bias;
+}

@@ -156,6 +156,10 @@ pub struct Run<'c> {
     scratch: &'c Scratch,
 
     tuning: &'c kernels_wgpu::Tuning,
+
+    /// The highest kernels-slang tier the adapter runs: the subgroup tier
+    /// where every subgroup is at least 32 lanes.
+    tier: kernels_slang::Tier,
 }
 
 #[derive(Default)]
@@ -184,6 +188,7 @@ impl<'c> Run<'c> {
         place: &'c At,
         scratch: &'c Scratch,
         tuning: &'c kernels_wgpu::Tuning,
+        tier: kernels_slang::Tier,
         seats: Option<&'c crate::experts::Seats>,
         rows: Option<&'c crate::experts::Gathered>,
         host: Option<&'c crate::experts::HostTier>,
@@ -210,7 +215,12 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             scratch,
             tuning,
+            tier,
         }
+    }
+
+    pub(crate) fn tier(&self) -> kernels_slang::Tier {
+        self.tier
     }
 
     pub(crate) fn window(&self) -> &'c Window {

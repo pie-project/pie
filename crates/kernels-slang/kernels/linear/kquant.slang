@@ -1,5 +1,6 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
+#include "prim/shuffle.slang"
 
 // GGUF K-quant matmuls (Q2_K to Q6_K) on bf16 activations: `y[t, c]` is row
 // `t` of `x` against weight row `c`, a run of 256-wide super-blocks of
@@ -190,10 +191,9 @@ groupshared float folds[PIE_SLICES][2][LANES];
 // The strip's two sums, folded; every lane holds the totals after.
 float2 strip_sum(float2 v, uint lane, uint slice) {
 #if defined(PIE_SUBGROUP)
-    uint at = WaveGetLaneIndex();
     [ForceUnroll] for (uint off = LANES / 2u; off > 0u; off >>= 1u) {
-        v.x += WaveReadLaneAt(v.x, at ^ off);
-        v.y += WaveReadLaneAt(v.y, at ^ off);
+        v.x += pie_shuffle_xor(v.x, off);
+        v.y += pie_shuffle_xor(v.y, off);
     }
     return v;
 #else

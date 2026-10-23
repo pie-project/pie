@@ -2053,6 +2053,11 @@ impl Shell {
                 &place,
                 &self.scratch,
                 &self.tuning,
+                if self.device.chip().subgroups_32() {
+                    kernels_slang::Tier::Subgroup
+                } else {
+                    kernels_slang::Tier::Baseline
+                },
                 self.weights.seats(),
                 self.weights.gathered(),
                 self.weights.host(),
