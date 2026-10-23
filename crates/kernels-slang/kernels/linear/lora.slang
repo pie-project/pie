@@ -92,6 +92,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (lid == 0u) {
         route = routes[row];
     }
+    GroupMemoryBarrierWithGroupSync();
     int adapter = workgroupUniformLoad(route);
     if (adapter < 0) {
         return;

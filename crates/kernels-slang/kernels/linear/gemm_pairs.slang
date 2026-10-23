@@ -1,5 +1,6 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
+#include "prim/shuffle.slang"
 
 // y = x * w^T on bf16 for WGSL: every store lands a pair of columns, one
 // word. `PIE_GEMV`: a few rows, a 32-lane strip a column walking the
@@ -81,9 +82,8 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
     }
 #if defined(PIE_SUBGROUP)
     // A subgroup of at least 32 lanes holds a strip: fold it by shuffles.
-    uint lane = WaveGetLaneIndex();
     [ForceUnroll] for (uint off = 16u; off > 0u; off >>= 1u) {
-        acc += WaveReadLaneAt(acc, lane ^ off);
+        acc += pie_shuffle_xor(acc, off);
     }
     if (klane == 0u) {
         partial[clane] = acc;

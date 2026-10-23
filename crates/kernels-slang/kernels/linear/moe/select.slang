@@ -1,5 +1,6 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
+#include "prim/shuffle.slang"
 #if defined(PIE_MXFP4)
 #include "prim/mxfp4.slang"
 #elif !defined(PIE_DENSE)
@@ -282,9 +283,8 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
     }
 
 #if defined(PIE_SUBGROUP)
-    uint at = WaveGetLaneIndex();
     [ForceUnroll] for (uint off = 16u; off > 0u; off >>= 1u) {
-        acc += WaveReadLaneAt(acc, at ^ off);
+        acc += pie_shuffle_xor(acc, off);
     }
     float out = acc;
 #else
