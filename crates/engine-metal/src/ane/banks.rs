@@ -57,7 +57,7 @@ pub fn mlps(trace: &poem_ir::Trace, weights: &crate::weights::Weights) -> Vec<Ml
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            poem_ir::Operation::Fused(poem_ir::Fused::MlpSwiglu {
+            poem_ir::Operation::Fused(poem_ir::Fused::MatmulSwigluMatmul {
                 gate_up,
                 down,
                 intermediate,

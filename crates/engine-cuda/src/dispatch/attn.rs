@@ -598,9 +598,6 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attn::LogitSoftcap { x, cap, x_out: _ } => {
-                attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*x), *cap)
-            }
             Attn::KvAppend {
                 k,
                 v: Some(v),

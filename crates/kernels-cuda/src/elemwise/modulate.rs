@@ -300,7 +300,7 @@ pub fn gated_residual_add(
     lane_of_row: Option<Tensor>,
     r_out: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.gated_residual_add";
+    const OP: &str = "elemwise.residual_add";
     let t = dtype_dispatch!(OP, r.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
         r.rows == y.rows && r.width == y.width && r.rows == r_out.rows && r.width == r_out.width,

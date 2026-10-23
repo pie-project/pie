@@ -13,7 +13,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_sigmoid_mul_heads_bfloat16" });
     let head_dim = nonzero(OP, "the head width", head_dim)?;
     if !x.width.is_multiple_of(head_dim) {

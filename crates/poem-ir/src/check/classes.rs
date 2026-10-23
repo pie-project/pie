@@ -415,7 +415,6 @@ fn writes_cache(op: &Operation) -> bool {
             | Attn::Voxel { .. }
             | Attn::Sink { .. }
             | Attn::MergeLse { .. }
-            | Attn::LogitSoftcap { .. }
             | Attn::MlaPlan { .. }
             | Attn::MlaLatents { .. }
             | Attn::MlaLatentsRope { .. }

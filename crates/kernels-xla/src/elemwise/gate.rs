@@ -32,7 +32,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: Operand,
 ) -> Result<Val, Error> {
-    const OP: &str = "elemwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     expect(OP, x, FLOATS)?;
     if head_dim == 0 || x.width == 0 || !x.width.is_multiple_of(head_dim) {
         return Err(refuse(

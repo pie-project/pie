@@ -174,13 +174,6 @@ pub enum Attn {
         #[output(F32)]
         lse: ValueId,
     },
-    LogitSoftcap {
-        #[input]
-        x: ValueId,
-        cap: f32,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
     /// Each row's key and value written at its page and offset; without
     /// `v`, `k` is one plane a pool reads as both (a shared-kv latent).
     KvAppend {

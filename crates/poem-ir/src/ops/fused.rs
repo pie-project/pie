@@ -383,7 +383,7 @@ pub enum Fused {
     /// A whole dense MLP: `gate_up` over `act`, swiglu, `down`. `packed` and
     /// `h` are the two intermediates, still written, so a backend may run
     /// the three primitives, or split the chain between engines.
-    MlpSwiglu {
+    MatmulSwigluMatmul {
         #[input]
         act: ValueId,
         #[input]
@@ -398,7 +398,9 @@ pub enum Fused {
         #[output]
         y: ValueId,
     },
-    LmHeadSoftcap {
+    /// The logits' product (a `Matmul` with `logits`) and its softcap
+    /// (`Softcap`); `y` is still an output, read by nothing else.
+    MatmulSoftcap {
         #[input]
         act: ValueId,
         #[input]
@@ -437,10 +439,10 @@ pub enum Fused {
         #[output]
         right: ValueId,
     },
-    /// A routed gate-up select (`MoeMatmulSelect`, `..Bias` or `..Quant`, `y`
-    /// the packed gate|up rows) and its GLU (`MlpSwiglu`, `..Clamp`,
-    /// `..ClampAlpha` or `MlpGegluTanhPacked`), landable from the select's
-    /// epilogue. The packed rows are still an output, read by nothing else.
+    /// A routed gate-up select (`MoeSelect`, `y` the packed gate|up rows) and
+    /// its packed `Glu` (`Swiglu`, `SwigluAlpha` or `GegluTanh`), landable
+    /// from the select's epilogue. The packed rows are still an output, read
+    /// by nothing else.
     MoeSelectGlu {
         #[part]
         select: Box<Linear>,
@@ -640,7 +642,7 @@ pub enum Fused {
         v_out: ValueId,
     },
     /// A routed MLP: gate-up select and GLU (as in `MoeSelectGlu`), the down
-    /// select on the same routes, the per-token weighted sum (`MoeWeightedSum`)
+    /// select on the same routes, the per-token weighted sum (`MoeCombine`)
     /// and, where it follows, the sigmoid-gated shared expert
     /// (`MoeSigmoidGateAdd`). The rows between (and the sum, under a gate) are
     /// still outputs, read by nothing else. `norm`: each route's down row

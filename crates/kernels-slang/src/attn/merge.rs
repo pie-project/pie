@@ -1,5 +1,5 @@
 //! What follows an attention read (`attn.merge_lse`, `attn.sink`,
-//! `attn.logit_softcap`), from `kernels/attn/merge.slang`.
+//! `elemwise.softcap`), from `kernels/attn/merge.slang`.
 
 use dtype::Dtype;
 
@@ -100,7 +100,7 @@ pub fn sink(
 
 /// `x = cap * tanh(x / cap)` in place.
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attn.logit_softcap";
+    const OP: &str = "elemwise.softcap";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "attn_merge_softcap_bf16" });
     let [n, _, _] = elementwise(OP, x.width, x.rows)?;
     let groups = n.div_ceil(2).div_ceil(256);

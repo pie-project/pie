@@ -96,7 +96,7 @@ pub fn merge_lse(
 }
 
 pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attn.logit_softcap";
+    const OP: &str = "elemwise.softcap";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     if cap.is_nan() || cap <= 0.0 {
         return Err(refuse(OP, format!("{cap} is not a logit soft cap")));

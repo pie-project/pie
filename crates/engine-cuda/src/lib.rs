@@ -47,7 +47,7 @@ pub const EXCLUSIVE: [&str; 0] = [];
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
 /// The fused kernels this backend ships; the compiler forms only these. A
-/// rule it does not list (`fused.mlp_swiglu`, which Metal splits across
+/// rule it does not list (`fused.matmul_swiglu_matmul`, which Metal splits across
 /// engines) leaves its primitives alone here.
 #[cfg(not(feature = "rocm"))]
 pub const FUSED: [&str; 31] = [
@@ -61,7 +61,7 @@ pub const FUSED: [&str; 31] = [
     "fused.moe_experts",
     "fused.moe_select_glu",
     "fused.matmul_swiglu",
-    "fused.lm_head_softcap",
+    "fused.matmul_softcap",
     "fused.matmul_bias",
     "fused.matmul_split_rows",
     "fused.gated_residual_norm_modulate",
@@ -91,9 +91,9 @@ pub const FUSED: [&str; 16] = [
     "fused.embed_scale_add",
     "fused.residual_add_rmsnorm",
     "fused.matmul_geglu",
-    "fused.lm_head_softcap",
+    "fused.matmul_softcap",
     "fused.matmul_bias",
-    "fused.mlp_swiglu",
+    "fused.matmul_swiglu_matmul",
     "fused.moe_experts",
     "fused.gated_residual_norm_modulate",
     "fused.norm_modulate",
@@ -173,3 +173,26 @@ pub use blob::{
 pub use engine::fire::LayerScores;
 pub use weights::{AdapterPlane, BankSeat};
 pub use window::{Cursor, Window, WindowShape, Windows};
+
+#[cfg(test)]
+mod tests {
+    use poem_ir::Operation;
+
+    /// Every table this backend keys by op name names an op: an entry under
+    /// a name no op carries is never read, and the op it meant falls to the
+    /// table's default without a word.
+    #[test]
+    fn every_name_keyed_entry_names_an_op() {
+        let stale: Vec<&str> = kernels_cuda::seat::ENTRIES
+            .iter()
+            .map(|entry| entry.name)
+            .chain(super::FUSED)
+            .chain(super::UNCHAINED)
+            .chain(super::GROUPED)
+            .chain(super::PLANNED)
+            .chain(super::EXCLUSIVE)
+            .filter(|name| !Operation::names_an_op(name))
+            .collect();
+        assert!(stale.is_empty(), "named by no op: {stale:?}");
+    }
+}

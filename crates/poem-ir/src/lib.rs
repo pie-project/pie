@@ -19,9 +19,10 @@ pub use guard::Guard;
 pub use operands::{Operands, Part, Slot};
 pub use ops::{
     ActFn, ActQuant, Attn, BinaryOp, Blocks, Bounds, Collective, Conv, Elemwise, Fused,
-    GateActivation, Gather, GluAct, GridRule, IndexScore, Linear, ModulateForm, MropeForm,
-    NormAxis, NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask, Relative,
-    RopeForm, RopeFreqs, RouteScore, Sampling, Ssm, TapKind, TimePad, Turn, VoxelSegment, Yarn,
+    GateActivation, GateHeads, Gather, GluAct, GridRule, IndexScore, Linear, ModulateForm,
+    MropeForm, NormAxis, NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask,
+    Relative, ResidualGate, RopeForm, RopeFreqs, RouteScore, Sampling, Ssm, TapKind, TimePad, Turn,
+    VoxelSegment, Yarn,
 };
 pub use poem_ir_macros::Op;
 pub use request::{Request, Stream};

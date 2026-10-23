@@ -14,13 +14,13 @@ impl Run<'_> {
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
         // The shared expert rides along on the routed register tiles: its rows
         // are tile 0 of their down, which the gated add reads.
-        if let Fused::MlpSwiglu { y, .. } = op
+        if let Fused::MatmulSwigluMatmul { y, .. } = op
             && self.tiles_shared(*y)
         {
             return Ok(());
         }
         match op {
-            Fused::MlpSwiglu {
+            Fused::MatmulSwigluMatmul {
                 act,
                 gate_up,
                 down,
@@ -216,7 +216,7 @@ impl Run<'_> {
     ) -> Result<(), kernels_metal::Error> {
         let (Some(gate_up), Some(down)) = (self.banked(gate_up), self.banked(down)) else {
             return Err(kernels_metal::Error::Unsupported {
-                op: "fused.mlp_swiglu",
+                op: "fused.matmul_swiglu_matmul",
             });
         };
         let tail = self.tensor(act).rows - head;

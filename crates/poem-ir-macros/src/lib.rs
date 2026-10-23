@@ -14,6 +14,7 @@
 //! ```
 //!
 //! - The name is `<group>.<variant in snake case>`; it is never written.
+//!   `<Group>::NAMES` lists the group's, in declaration order.
 //! - `#[input]` and `#[output]` mark operands, in field order. A field is
 //!   anything that implements `poem_ir::operands::Slot` (`ValueId`,
 //!   `Option<ValueId>`, `Vec<ValueId>`, arrays, attribute types that carry
@@ -327,7 +328,16 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         .is_empty()
         .then(|| quote_spanned! {Span::mixed_site()=> _ => unreachable!() });
 
+    let every = variants
+        .iter()
+        .map(|variant| LitStr::new(&variant.name, Span::call_site()));
+
     Ok(quote_spanned! {Span::mixed_site()=>
+        impl #impl_generics #ident #ty_generics #where_clause {
+            /// Every op of the group, by name, in declaration order.
+            pub const NAMES: &'static [&'static str] = &[#(#every),*];
+        }
+
         impl #impl_generics ::poem_ir::Operands for #ident #ty_generics #where_clause {
             fn inputs(&self, sink: &mut Vec<::poem_ir::ValueId>) {
                 match self { #(#inputs)* #empty }

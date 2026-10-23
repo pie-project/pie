@@ -906,7 +906,7 @@ pub fn merge_lse(
 }
 
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attn.logit_softcap";
+    const OP: &str = "elemwise.softcap";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "logit_softcap_bfloat16" });
     ctx.fire(
         Fire::at("attn/logit_softcap.metal", entry)
