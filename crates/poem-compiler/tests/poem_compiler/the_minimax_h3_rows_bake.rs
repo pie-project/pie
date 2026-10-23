@@ -279,7 +279,18 @@ fn one_joint_read_per_block_and_one_lane_read_per_refiner() {
         let prefill = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Attn(Attn::Prefill { .. })))
+            .filter(|node| {
+                matches!(
+                    &node.op,
+                    Operation::Attn(Attn::Prefill {
+                        mask: None,
+                        selection: None,
+                        bias: None,
+                        lse: None,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             prefill,

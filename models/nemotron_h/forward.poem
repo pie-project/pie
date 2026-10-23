@@ -14,14 +14,6 @@ def caches(m, c):
             c.state(w.mamba.ssm_state, [m.mamba_heads, m.mamba_head_dim, m.state_dim], dtype.f32, split = 0)
 
 def forward(m, inputs):
-    ([input_m, input_s, input_d], input_p) = inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
-    plans = struct(
-        m = ops.attn.plan_prefill(input_m, m.heads, m.kv_heads, m.head_dim, None),
-        d = ops.attn.plan_decode(input_d, m.heads, m.kv_heads, m.head_dim, None),
-        p = ops.attn.plan_prefill(input_p, m.heads, m.kv_heads, m.head_dim, None),
-        s = ops.attn.plan_prefill(input_s, m.heads, m.kv_heads, m.head_dim, None),
-    )
-    mask = inputs.mask()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
 
     def block(l, w, y):
@@ -29,7 +21,7 @@ def forward(m, inputs):
         if w.mamba != None:
             o = mamba(x, inputs, m, w.mamba)
         elif w.attn != None:
-            o = attention(x, inputs, m, plans, mask, w.attn)
+            o = attention(x, inputs, m, w.attn)
         else:
             o = moe(x, m, w.moe)
         return ops.elemwise.residual_add(o, y)
@@ -68,7 +60,7 @@ def mamba(x, inputs, m, k):
     o = switch(xbc, [(fact.single_token(), lambda xbc: scan(xbc, False))], otherwise = lambda xbc: scan(xbc, True))
     return ops.linear.matmul(o, k.out_proj)
 
-def attention(x, inputs, m, plans, mask, a):
+def attention(x, inputs, m, a):
     pages = inputs.kv(a.kv)
     d = m.head_dim
     q = ops.linear.matmul(x, a.q)
@@ -78,27 +70,18 @@ def attention(x, inputs, m, plans, mask, a):
     ops.attn.kv_append(k, v, pages, inputs.write_page(a.kv), inputs.write_offset(a.kv))
     seam.at(seam.ATTN_Q, [q])
 
-    def scored(q):
-        o, lse = ops.attn.prefill_lse(q, plans.s, pages, None, d, m.kv_heads, m.sm_scale)
-        seam.at(seam.SCORES, [lse])
-        return o
-
-    o = switch(q, [
-        (fact.has(fact.Mask), lambda q: ops.attn.masked(q, plans.m, mask, pages, None, d, m.kv_heads, True, m.sm_scale)),
-        (fact.scores(), scored),
-        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
-    ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, a.kv, m.heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o)
 
 def moe(x, m, f):
-    routes, weights = ops.linear.moe_topk_sigmoid_biased(
+    routes, weights = ops.linear.moe_route(
         ops.linear.matmul_f32(x, f.router),
-        f.bias,
         m.experts,
         m.top_k,
-        True,
-        m.scaling,
+        routing.sigmoid(renormalize = True, scaling = m.scaling),
+        bias = f.bias,
     )
     # Super's and Ultra's experts read the residual squeezed to the latent
     # width; Nano's read it whole.

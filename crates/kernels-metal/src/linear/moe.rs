@@ -1085,6 +1085,462 @@ fn unsorted(op: &'static str, sorted: Sorted) -> Result<bool, Error> {
     Ok(false)
 }
 
+/// The most tokens a routed MLP runs on the register tile: an expert's routes
+/// of so many tokens fill one 8-row tile.
+pub const REGISTER_TOKENS: u32 = 8;
+
+/// The most experts the register tiles group: a thread each.
+pub const REGISTER_EXPERTS: u32 = ROUTER_MAX_EXPERTS;
+
+/// The widest fan-out the register tiles group: `moe_sg_group_gather` stages
+/// [`REGISTER_TOKENS`] tokens' routes of it.
+pub const REGISTER_FAN_OUT: u32 = 16;
+
+const REGISTER_FILE: &str = "linear/moe/select_sg.metal";
+
+/// How the register expert passes cut their work: the intermediate's
+/// 8-column fragments a simdgroup of the gate-up takes (each with its gate
+/// and up columns), the simdgroups a threadgroup of each pass holds, and the
+/// tile slots of their grids (0: one for every tile a fire may fill), each
+/// slot taking every slots-th live tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisterCut {
+    pub fragments: u32,
+    pub glu_simdgroups: u32,
+    pub down_simdgroups: u32,
+    pub slots: u32,
+}
+
+/// The cut the register expert passes run at: on an M4 Pro over a 35B-A3B
+/// layer's eight verify rows, 24 slots take a fifth off the gate-up of 21
+/// experts' tiles and add a twentieth to 59's.
+pub const REGISTER_CUT: RegisterCut = RegisterCut {
+    fragments: 1,
+    glu_simdgroups: 4,
+    down_simdgroups: 4,
+    slots: 24,
+};
+
+impl RegisterCut {
+    /// The column threadgroups of the gate-up over an intermediate of
+    /// `inter` and of the down over `columns`.
+    #[must_use]
+    pub fn groups(&self, inter: u32, columns: u32) -> [u32; 2] {
+        [
+            inter / (8 * self.fragments * self.glu_simdgroups),
+            columns / (16 * self.down_simdgroups),
+        ]
+    }
+
+    /// The tile slots of a pass over up to `tiles` tiles, where its encoder
+    /// cannot launch the grid the grouping wrote.
+    #[must_use]
+    pub fn slots(&self, tiles: u32) -> u32 {
+        if self.slots == 0 {
+            tiles
+        } else {
+            self.slots.min(tiles)
+        }
+    }
+}
+
+/// The scratch of a routed MLP on the register tile, as `linear/moe/select_sg.metal` reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct RegisterRooms {
+    /// The live tile count, then each tile's expert: i32, [`register_tiles`] + 1.
+    pub tiles: Tensor,
+    /// Each tile row's token, -1 past its routes: i32, 8 a tile.
+    pub rows: Tensor,
+    /// Each route's tile row: i32, a route each.
+    pub inv: Tensor,
+    /// Each tile's input table over the gate-up's input, [`register_table_width`] bf16 apiece.
+    pub table: Tensor,
+    /// Each tile's input table over the down's input, which the gate-up lands.
+    pub hidden: Tensor,
+    /// Each tile's eight rows of the down's output, of which those that hold
+    /// a route are written.
+    pub y: Tensor,
+    /// What [`register_combine`] reads beside the rows: the routes' weights,
+    /// then from [`REGISTER_MIX_GATES`] each token's shared expert gate: f32,
+    /// [`REGISTER_MIX`].
+    pub mix: Tensor,
+    /// The gate-up's and the down's threadgroup counts over the live tiles,
+    /// which the grouping writes: u32, [`REGISTER_GRIDS`].
+    pub grids: Tensor,
+}
+
+/// The u32 width of [`RegisterRooms::grids`]: the gate-up's three counts at
+/// 0, the down's at [`REGISTER_DOWN_GRID`] bytes.
+pub const REGISTER_GRIDS: u32 = 8;
+
+const REGISTER_DOWN_GRID: u32 = 16;
+
+/// Where the shared expert's gates sit in [`RegisterRooms::mix`], past the
+/// most routes a fire groups (`kMixGates`).
+pub const REGISTER_MIX_GATES: u32 = 128;
+
+/// The f32 width of [`RegisterRooms::mix`].
+pub const REGISTER_MIX: u32 = REGISTER_MIX_GATES + REGISTER_TOKENS;
+
+/// The routes' weights and the shared expert's scalar gate (a bank of one
+/// column), which the grouping lands for [`register_combine`].
+#[derive(Clone, Copy, Debug)]
+pub struct RegisterGate {
+    pub weights: Tensor,
+    pub gate: Bank,
+}
+
+/// Whether the register grouping takes `bank` as the shared expert's scalar
+/// gate over `width` inputs: one column, 4- or 8-bit, 64-group affine with
+/// bf16 factors.
+#[must_use]
+pub fn register_gate_bank(bank: Bank, width: u32) -> bool {
+    bank.affine()
+        && matches!(bank.bits, 4 | 8)
+        && bank.group == 64
+        && bank.scales.dtype == Dtype::Bf16
+        && bank.codes.rows == 1
+        && bank.ld == width
+        && width.is_multiple_of(256)
+}
+
+/// The tiles a fire of `tokens` tokens routing to `top_k` of `experts`
+/// experts may fill: an expert's routes take one, and the shared expert, where
+/// one rides along, one more.
+#[must_use]
+pub fn register_tiles(tokens: u32, top_k: u32, experts: u32, shared: bool) -> u32 {
+    tokens.saturating_mul(top_k).min(experts) + u32::from(shared)
+}
+
+/// The bf16 width of one tile's input table over `width` inputs: its eight
+/// rows' inputs and their sums of each 32.
+#[must_use]
+pub fn register_table_width(width: u32) -> u64 {
+    8 * u64::from(width) + u64::from(width / 2)
+}
+
+/// Whether a bank multiplies on the register tile: 4-bit, 64-group affine
+/// with bf16 factors, each expert `columns` whole 64-column tiles over a
+/// whole number of 256-input spans, its rows packed (laid as rows of `width`
+/// codes, or an expert a row).
+#[must_use]
+pub fn register_bank(bank: Bank, width: u32, columns: u32) -> bool {
+    bank.affine()
+        && bank.bits == 4
+        && bank.group == 64
+        && bank.scales.dtype == Dtype::Bf16
+        && (bank.ld == width || u64::from(bank.ld) == u64::from(columns) * u64::from(width))
+        && width.is_multiple_of(256)
+        && columns.is_multiple_of(64)
+}
+
+/// Whether the register passes cut as `cut` take an intermediate of `inter`
+/// columns and a down of `columns`.
+#[must_use]
+pub fn register_cuts(inter: u32, columns: u32, cut: RegisterCut) -> bool {
+    inter.is_multiple_of((8 * cut.fragments * cut.glu_simdgroups).max(64))
+        && columns.is_multiple_of(16 * cut.down_simdgroups)
+}
+
+/// The routes of `routes` (at most [`REGISTER_TOKENS`] tokens) grouped into
+/// the register tile's expert tiles, after the shared expert's where `shared`,
+/// and each tile's input table laid from `x`, in one launch; where `gate`,
+/// the routes' weights and each token's shared expert gate land in
+/// `rooms.mix` too, for [`register_combine`]; and the expert passes' grids
+/// over the live tiles in `rooms.grids`, of `groups` column threadgroups
+/// ([`RegisterCut::groups`]).
+#[allow(clippy::too_many_arguments)]
+pub fn register_group(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    routes: Tensor,
+    experts: u32,
+    shared: bool,
+    gate: Option<RegisterGate>,
+    groups: [u32; 2],
+    rooms: RegisterRooms,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` walks i32 routes");
+    let tokens = nonzero(OP, "the routed tokens", routes.rows)?;
+    let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
+    if tokens > REGISTER_TOKENS
+        || top_k > REGISTER_FAN_OUT
+        || x.rows != tokens
+        || !x.width.is_multiple_of(256)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the register tile takes at most {REGISTER_TOKENS} tokens' rows of whole \
+                 256-input spans and {REGISTER_FAN_OUT} routes a token, not {} x {} over \
+                 {tokens} tokens of {top_k}",
+                x.rows, x.width
+            ),
+        ));
+    }
+    let tiles = register_tiles(tokens, top_k, experts, shared);
+    debug_assert!(
+        rooms.tiles.width > tiles
+            && rooms.rows.width >= 8 * tiles
+            && u64::from(rooms.table.width) >= u64::from(tiles) * register_table_width(x.width),
+        "`{OP}`'s register rooms hold every tile a fire may fill"
+    );
+    if experts > REGISTER_EXPERTS {
+        return Err(refuse(
+            OP,
+            format!(
+                "{experts} experts are more than the {REGISTER_EXPERTS} the register tiles group"
+            ),
+        ));
+    }
+    if let Some(gate) = gate
+        && (!shared
+            || !register_gate_bank(gate.gate, x.width)
+            || gate.weights.rows != tokens
+            || gate.weights.width != top_k
+            || rooms.mix.width < REGISTER_MIX)
+    {
+        return Err(refuse(
+            OP,
+            "the register grouping lands the shared expert's gate of a one-column 4- or 8-bit \
+             affine bank, beside the shared tile, and the weights of the routes it groups"
+                .to_string(),
+        ));
+    }
+    // A fire without a gate binds the input in its planes' places; nothing reads them.
+    let (weights, codes, scales, biases, bits) = match gate {
+        Some(RegisterGate { weights, gate }) => (
+            weights.arg(),
+            gate.codes.arg(),
+            gate.scales.arg(),
+            zero_points(ctx, gate)?,
+            gate.bits,
+        ),
+        None => (x.arg(), x.arg(), x.arg(), x.arg(), 0),
+    };
+    ctx.fire(
+        Fire::at(REGISTER_FILE, "moe_sg_group_gather")
+            .apply(Grid::of([32, x.width / 64, tiles], [32, 4, 1])),
+        &[
+            x.arg(),
+            routes.arg(),
+            rooms.table.arg_mut(),
+            rooms.tiles.arg_mut(),
+            rooms.rows.arg_mut(),
+            rooms.inv.arg_mut(),
+            x.width.arg(),
+            tokens.arg(),
+            top_k.arg(),
+            experts.arg(),
+            u32::from(shared).arg(),
+            weights,
+            codes,
+            scales,
+            biases,
+            rooms.mix.arg_mut(),
+            bits.arg(),
+            rooms.grids.arg_mut(),
+            groups[0].arg(),
+            groups[1].arg(),
+        ],
+    )
+}
+
+/// Each of `y`'s token rows from the register tiles' down rows: its routes'
+/// rows weighed and the shared expert's (tile 0's) gated, by what
+/// [`register_group`] landed in `rooms.mix`. `y` is the gated add's output, so
+/// the fold, the shared expert's own pass and its gate run nothing.
+pub fn register_combine(
+    ctx: &Ctx<'_>,
+    rooms: RegisterRooms,
+    tiles: u32,
+    top_k: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_sigmoid_gate_add";
+    dtype_dispatch!(OP, y.dtype, { Bf16 => () });
+    let tokens = nonzero(OP, "the token rows the combine lands", y.rows)?;
+    if tokens > REGISTER_TOKENS
+        || top_k > REGISTER_FAN_OUT
+        || !y.width.is_multiple_of(4)
+        || rooms.mix.width < REGISTER_MIX
+        || rooms.y.rows < 8 * tiles
+        || rooms.y.width < y.width
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the register combine lands at most {REGISTER_TOKENS} rows of whole 4-column \
+                 spans from the rows its rooms hold, not {tokens} x {}",
+                y.width
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(REGISTER_FILE, "moe_sg_combine")
+            .apply(Grid::of([y.width / 4, tokens, 1], [128, 1, 1])),
+        &[
+            rooms.y.arg(),
+            rooms.inv.arg(),
+            rooms.mix.arg(),
+            y.arg_mut(),
+            y.width.arg(),
+            top_k.arg(),
+        ],
+    )
+}
+
+/// The banks of a register pass: the routed experts' and the shared expert's,
+/// which a fire without one binds as the routed bank again (no tile reads it).
+fn register_banks(
+    ctx: &Ctx<'_>,
+    bank: Bank,
+    shared: Option<Bank>,
+) -> Result<[crate::encode::ArgValue; 6], Error> {
+    let own = shared.unwrap_or(bank);
+    Ok([
+        bank.codes.arg(),
+        bank.scales.arg(),
+        zero_points(ctx, bank)?,
+        own.codes.arg(),
+        own.scales.arg(),
+        zero_points(ctx, own)?,
+    ])
+}
+
+/// A routed gate-up (`gate_up`: each expert's `2 * inter` packed gate and up
+/// rows over `width` inputs) and its SwiGLU on the register tile, over the
+/// tiles [`register_group`] laid: lands each tile's down input table in
+/// `rooms.hidden`. Launched on the live tiles' grid the grouping wrote for
+/// `cut`, where the encoder can; else on `cut`'s tile slots.
+#[allow(clippy::too_many_arguments)]
+pub fn register_glu(
+    ctx: &Ctx<'_>,
+    gate_up: Bank,
+    shared: Option<Bank>,
+    width: u32,
+    inter: u32,
+    tiles: u32,
+    experts: u32,
+    rooms: RegisterRooms,
+    cut: RegisterCut,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select";
+    let (fragments, simdgroups) = (cut.fragments, cut.glu_simdgroups);
+    let entry = match (fragments, simdgroups) {
+        (1, 4) => "affine_qmm_sg_glu_routed_h1_s4",
+        (1, 8) => "affine_qmm_sg_glu_routed_h1_s8",
+        (1, 16) => "affine_qmm_sg_glu_routed_h1_s16",
+        (2, 4) => "affine_qmm_sg_glu_routed_h2_s4",
+        (2, 8) => "affine_qmm_sg_glu_routed_h2_s8",
+        _ => {
+            return Err(refuse(
+                OP,
+                format!(
+                    "no register gate-up takes {fragments} fragments a simdgroup in \
+                     {simdgroups}-simdgroup threadgroups"
+                ),
+            ));
+        }
+    };
+    let columns = 8 * fragments * simdgroups;
+    if !inter.is_multiple_of(columns.max(64)) || !register_bank(gate_up, width, 2 * inter) {
+        return Err(refuse(
+            OP,
+            format!("the register gate-up does not take this bank over {width} x {inter}"),
+        ));
+    }
+    let [codes, scales, biases, own_codes, own_scales, own_biases] =
+        register_banks(ctx, gate_up, shared)?;
+    ctx.fire(
+        Fire::at(REGISTER_FILE, entry)
+            .apply(Grid::of(
+                [32 * simdgroups * (inter / columns), cut.slots(tiles), 1],
+                [32 * simdgroups, 1, 1],
+            ))
+            .indirect(rooms.grids.buf, 0),
+        &[
+            codes,
+            scales,
+            biases,
+            own_codes,
+            own_scales,
+            own_biases,
+            rooms.table.arg(),
+            rooms.hidden.arg_mut(),
+            rooms.tiles.arg(),
+            stated(OP, width)?.arg(),
+            stated(OP, inter)?.arg(),
+            stated(OP, experts)?.arg(),
+        ],
+    )
+}
+
+/// A routed down (each expert's `columns` rows over `inter` inputs) on the
+/// register tile, over the tables [`register_glu`] landed: each tile's rows
+/// that hold a route into `rooms.y`, route `at`'s at row `rooms.inv[at]`.
+/// Launched as [`register_glu`] is.
+#[allow(clippy::too_many_arguments)]
+pub fn register_down(
+    ctx: &Ctx<'_>,
+    down: Bank,
+    shared: Option<Bank>,
+    inter: u32,
+    columns: u32,
+    tiles: u32,
+    experts: u32,
+    rooms: RegisterRooms,
+    cut: RegisterCut,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select";
+    let simdgroups = cut.down_simdgroups;
+    let entry = match simdgroups {
+        4 => "affine_qmm_sg_routed_s4",
+        8 => "affine_qmm_sg_routed_s8",
+        16 => "affine_qmm_sg_routed_s16",
+        _ => {
+            return Err(refuse(
+                OP,
+                format!("no register down runs {simdgroups}-simdgroup threadgroups"),
+            ));
+        }
+    };
+    let span = 16 * simdgroups;
+    if !columns.is_multiple_of(span) || !register_bank(down, inter, columns) {
+        return Err(refuse(
+            OP,
+            format!("the register down does not take this bank over {inter} x {columns}"),
+        ));
+    }
+    let [codes, scales, biases, own_codes, own_scales, own_biases] =
+        register_banks(ctx, down, shared)?;
+    ctx.fire(
+        Fire::at(REGISTER_FILE, entry)
+            .apply(Grid::of(
+                [32 * simdgroups * (columns / span), cut.slots(tiles), 1],
+                [32 * simdgroups, 1, 1],
+            ))
+            .indirect(rooms.grids.buf, REGISTER_DOWN_GRID),
+        &[
+            codes,
+            scales,
+            biases,
+            own_codes,
+            own_scales,
+            own_biases,
+            rooms.hidden.arg(),
+            rooms.y.arg_mut(),
+            rooms.tiles.arg(),
+            stated(OP, inter)?.arg(),
+            stated(OP, columns)?.arg(),
+            stated(OP, experts)?.arg(),
+            rooms.rows.arg(),
+        ],
+    )
+}
+
 fn zero_points(ctx: &Ctx<'_>, bank: Bank) -> Result<crate::encode::ArgValue, Error> {
     match bank.biases {
         Some(biases) => Ok(biases.arg()),

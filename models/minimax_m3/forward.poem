@@ -14,26 +14,12 @@ def caches(m, c):
             index = c.kv_space(dtype.bf16)
             c.kv(index, w.indexer.keys, [w.indexer.head_dim], w.indexer.head_dim)
 
-def classes():
-    return [fact.has(fact.Mask), fact.scores(), fact.single_token()]
-
-def plans(inputs, m):
-    ([input_m, input_s, input_d], input_p) = inputs.partition(classes())
-    return struct(
-        m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
-        s = ops.attn.plan_prefill(input_s, m.q_heads, m.kv_heads, m.head_dim, None),
-        d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
-        p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
-    )
-
 def forward(m, inputs):
-    plan = plans(inputs, m)
-    mask = inputs.mask()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm_plus_one(y, w.attn_norm, m.norm_eps)
-        o = attn_mixer(x, inputs, m, plan, mask, w.attn, w.indexer)
+        o = attn_mixer(x, inputs, m, w.attn, w.indexer)
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm_plus_one(y, w.mlp_norm, m.norm_eps)
         f = moe(x, w.mlp) if w.mlp != None else swiglu_oai(x, w.dense)
@@ -45,18 +31,22 @@ def forward(m, inputs):
     return ops.linear.lm_head(x, m.head)
 
 def swiglu_oai(x, f):
-    act = ops.linear.swiglu_clamp_alpha(ops.linear.matmul(x, f.gate_up), f.inter, f.limit, f.alpha)
+    act = ops.linear.glu(
+        ops.linear.matmul(x, f.gate_up),
+        gating.swiglu_alpha(f.alpha),
+        f.inter,
+        limit = f.limit,
+    )
     return ops.linear.matmul(act, f.down)
 
 def moe(x, f):
     """The routed experts, scaled, beside the shared expert."""
-    experts, weights = ops.linear.moe_topk_sigmoid_biased(
+    experts, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
-        f.bias,
         f.experts,
         f.top_k,
-        True,
-        f.routed_scaling,
+        routing.sigmoid(renormalize = True, scaling = f.routed_scaling),
+        bias = f.bias,
     )
 
     def select(act, bank):
@@ -64,7 +54,7 @@ def moe(x, f):
             return ops.linear.moe_matmul_select(act, bank, experts, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, experts, f.top_k)
 
-    act = ops.linear.swiglu_clamp_alpha(select(x, f.gate_up), f.inter, f.limit, f.alpha)
+    act = ops.linear.glu(select(x, f.gate_up), gating.swiglu_alpha(f.alpha), f.inter, limit = f.limit)
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     return ops.elemwise.residual_add(swiglu_oai(x, f.shared), routed)
 
@@ -76,11 +66,11 @@ def select_blocks(x, inputs, a, ix):
     k = ops.linear.matmul(x, ix.k_proj)
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, ix.q_norm, ix.head_dim, ix.norm_eps)
     k = ops.elemwise.rmsnorm_per_head_plus_one(k, ix.k_norm, ix.head_dim, ix.norm_eps)
-    q, k = ops.elemwise.rope_partial(q, k, positions, a.rotary_dim, ix.head_dim, a.theta)
+    q, k = ops.elemwise.rope(q, positions, ix.head_dim, a.theta, rotary.partial(a.rotary_dim), k = k)
     ops.attn.index_kv_append(k, keys, inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
     return ops.attn.index_topk(q, None, keys, ix.heads, ix.head_dim, ix.top_k, ix.block, score = "block_max")
 
-def attn_mixer(x, inputs, m, plan, mask, a, ix):
+def attn_mixer(x, inputs, m, a, ix):
     pages = inputs.kv(a.kv)
     d = m.head_dim
     q = ops.linear.matmul(x, a.q_proj)
@@ -89,25 +79,14 @@ def attn_mixer(x, inputs, m, plan, mask, a, ix):
     seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.norm_eps)
     k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.norm_eps)
-    q, k = ops.elemwise.rope_partial(q, k, inputs.positions(), a.rotary_dim, d, a.theta)
+    q, k = ops.elemwise.rope(q, inputs.positions(), d, a.theta, rotary.partial(a.rotary_dim), k = k)
     ops.attn.kv_append(k, v, pages, inputs.write_page(a.kv), inputs.write_offset(a.kv))
     seam.at(seam.ATTN_Q, [q])
 
-    ([mq, sq, dq], pq) = q.partition(classes())
-    so, lse = ops.attn.prefill_lse(sq, plan.s, pages, None, d, m.kv_heads, a.sm_scale)
-    seam.at(seam.SCORES, [lse])
-    if ix == None:
-        od = ops.attn.decode(dq, plan.d, pages, None, d, a.sm_scale)
-        op = ops.attn.prefill(pq, plan.p, pages, None, d, m.kv_heads, a.sm_scale)
-    else:
-        ([_, _, d_sel], p_sel) = select_blocks(x, inputs, a, ix).partition(classes())
-        od = ops.attn.decode_selected(dq, plan.d, d_sel, pages, None, d, a.sm_scale, ix.block, per_head = True)
-        op = ops.attn.prefill_selected(pq, plan.p, p_sel, pages, None, d, m.kv_heads, a.sm_scale, ix.block, per_head = True)
-    o = merge([
-        ops.attn.masked(mq, plan.m, mask, pages, None, d, m.kv_heads, True, a.sm_scale),
-        so,
-        od,
-        op,
-    ])
+    # Each lane by its kind; on a sparse layer decode and prefill lanes read
+    # the key blocks the indexer picked, one pick a head.
+    selection = select_blocks(x, inputs, a, ix) if ix != None else None
+    o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True, scores = True,
+                        selection = selection, ratio = ix.block if ix != None else None, per_head = True)
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj)

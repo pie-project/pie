@@ -54,17 +54,9 @@ def select(x, bank, routes, top_k):
     return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)
 
 def forward(m, inputs):
-    classes = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
     dr = m.dflash
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
-    ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(classes)
     positions = trunk_inputs.positions()
-
-    plan_m = plans(m, input_m, ops.attn.plan_prefill)
-    plan_d = plans(m, input_d, ops.attn.plan_decode)
-    plan_p = plans(m, input_p, ops.attn.plan_prefill)
-    plan_s = plans(m, input_s, ops.attn.plan_prefill)
-    mask = inputs.mask()
 
     towered = tower(inputs, m.tower) if m.tower != None else None
 
@@ -87,7 +79,7 @@ def forward(m, inputs):
             m.vocab,
         ) * root
         normed = ops.elemwise.rmsnorm(soft, sc.pre_norm, sc.norm_eps)
-        act = ops.linear.geglu_tanh_packed(ops.linear.matmul(normed, sc.gate_up), sc.inter)
+        act = ops.linear.glu(ops.linear.matmul(normed, sc.gate_up), gating.geglu_tanh(), sc.inter)
         signal = ops.linear.matmul(act, sc.down)
         den = ops.elemwise.rmsnorm_no_scale(ops.elemwise.residual_add(den, signal), m.hidden, sc.norm_eps)
         y = merge([den, enc])
@@ -136,23 +128,11 @@ def forward(m, inputs):
                             at.banks.k_norm, at.banks.k_norm_eps, pages)
         seam.at(seam.ATTN_Q, [q])
 
-        r = at.reading
-        if whole:  # the tail's rows of lanes that mask or capture scores
-            ([mq], sq) = q.partition(classes[:1])
-        else:
-            ([mq, sq, dq], p) = q.partition(classes)
-        if r == SLIDING:
-            so = ops.attn.prefill(sq, plan_s[r], pages, win, d, kv_heads, at.sm_scale)
-        else:
-            so, lse = ops.attn.prefill_lse(sq, plan_s[r], pages, win, d, kv_heads, at.sm_scale)
-            seam.at(seam.SCORES, [lse])
-        arms = [ops.attn.masked(mq, plan_m[r], mask, pages, win, d, kv_heads, True, at.sm_scale), so]
-        if not whole:
-            arms += [
-                ops.attn.decode(dq, plan_d[r], pages, win, d, at.sm_scale),
-                ops.attn.prefill(p, plan_p[r], pages, win, d, kv_heads, at.sm_scale),
-            ]
-        a = merge(arms)
+        # Each lane by its kind (the tail's whole rows are lanes that mask or
+        # capture scores, so only those two); a global layer's scores go out
+        # at their seam.
+        a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
+                            mask = True, scores = True, scores_seam = at.reading != SLIDING)
         seam.at(seam.ATTN_OUT, [a])
         return normed, a, routes
 
@@ -177,19 +157,20 @@ def forward(m, inputs):
 
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
-        act = ops.linear.geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
+        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.geglu_tanh(), w.inter)
         f = ops.linear.matmul(act, w.down)
         if w.moe != None:
             x = w.moe
             h1 = ops.elemwise.rmsnorm(f, x.post_ffw_norm_1, x.post_ffw_norm_1_eps)
-            experts, weights = ops.linear.moe_topk_softmax_scaled(
+            experts, weights = ops.linear.moe_route(
                 ops.linear.matmul(ops.elemwise.rmsnorm(y, x.router_norm, x.router_norm_eps), x.router),
-                x.per_expert_scale,
                 x.experts,
                 x.top_k,
+                routing.softmax(),
+                scale = x.per_expert_scale,
             )
             moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
-            hidden = ops.linear.geglu_tanh_packed(select(moe_in, x.gate_up, experts, x.top_k), x.inter)
+            hidden = ops.linear.glu(select(moe_in, x.gate_up, experts, x.top_k), gating.geglu_tanh(), x.inter)
             routed = ops.linear.moe_weighted_sum(select(hidden, x.down, experts, x.top_k), weights)
             h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
             f = ops.elemwise.residual_add(h1, h2)
@@ -201,7 +182,7 @@ def forward(m, inputs):
             layer_ids, layer_relay = (ro.ids, ro.relay) if readouts else (ids, relay)
             table = ops.gather.embed(layer_ids, lp.table, m.vocab) * f32(sqrt(ple.dim))
             mixed = ops.elemwise.residual_add(table, ops.gather.select(layer_relay, l, ple.dim)) * FRAC_1_SQRT_2
-            gated = ops.linear.geglu_tanh(ops.linear.matmul(y, lp.gate), mixed)
+            gated = ops.linear.glu(ops.linear.matmul(y, lp.gate), gating.geglu_tanh(), up = mixed)
             out = ops.linear.matmul(gated, lp.proj)
             out = ops.elemwise.rmsnorm(out, lp.norm, lp.norm_eps)
             y = ops.elemwise.scale(lp.scalar, ops.elemwise.residual_add(out, y))
@@ -228,7 +209,7 @@ def forward(m, inputs):
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
-        hb = arm(dr, inputs, tapped, h_block, mask, block_rows(dr))
+        hb = arm(dr, inputs, tapped, h_block, inputs.mask(), block_rows(dr))
         x = merge([hb, x])
     if tail == None:
         x = ops.gather.gather_rows(x, inputs.readout_rows())
@@ -264,7 +245,7 @@ def eagle_draft(m, inputs, x, logits, root):
     o = ops.linear.matmul(o, a.o_proj)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, a.post_attn_norm, a.norm_eps), dy)
     mlp_in = ops.elemwise.rmsnorm(dy, a.pre_ffw_norm, a.norm_eps)
-    act = ops.linear.geglu_tanh_packed(ops.linear.matmul(mlp_in, a.gate_up), a.inter)
+    act = ops.linear.glu(ops.linear.matmul(mlp_in, a.gate_up), gating.geglu_tanh(), a.inter)
     f = ops.linear.matmul(act, a.down)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, a.post_ffw_norm, a.norm_eps), dy)
 
@@ -295,7 +276,7 @@ def assistant_draft(m, inputs, positions, x, logits, root):
         o = ops.linear.matmul(o, w.o_proj)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, a.norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, a.norm_eps)
-        act = ops.linear.geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
+        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.geglu_tanh(), w.inter)
         f = ops.linear.matmul(act, w.down)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
         y = ops.elemwise.scale(w.scalar, y)
@@ -326,12 +307,12 @@ def tower(inputs, t):
         q = ops.elemwise.rmsnorm_per_head(clipped(n, b.q), b.q_norm, d, t.norm_eps)
         k = ops.elemwise.rmsnorm_per_head(clipped(n, b.k), b.k_norm, d, t.norm_eps)
         v = ops.elemwise.rmsnorm_no_scale(clipped(n, b.v), d, t.norm_eps)
-        q, k = ops.elemwise.rope_mrope(q, k, grid, [0, d // 4, d // 4], "split", d, d, t.theta)
+        q, k = ops.elemwise.rope(q, grid, d, t.theta, rotary.mrope([0, d // 4, d // 4], "split", d), k = k)
         o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(clipped(o, b.o), b.post_attn_norm, t.norm_eps), y)
 
         n = ops.elemwise.rmsnorm(y, b.pre_ffw_norm, t.norm_eps)
-        act = ops.linear.geglu_tanh(clipped(n, b.gate), clipped(n, b.up))
+        act = ops.linear.glu(clipped(n, b.gate), gating.geglu_tanh(), up = clipped(n, b.up))
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(clipped(act, b.down), b.post_ffw_norm, t.norm_eps), y)
 
     pooled = ops.gather.pool_rows(y, t.pool) * f32(sqrt(t.hidden))
@@ -347,14 +328,21 @@ def qkv_unfused(x, pos, inputs, m, at, d, kv_heads, qkv, k_norm, k_norm_eps, pag
     q = ops.elemwise.rmsnorm_per_head(q, at.q_norm, d, at.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head(k, k_norm, d, k_norm_eps)
     if at.reading == GLOBAL:  # proportional: a pair sits half a head apart
-        q, k = ops.elemwise.rope_partial(q, k, pos, m.glob.rotary_dim, d, m.glob.theta, span = d // 2)
+        q, k = ops.elemwise.rope(
+            q,
+            pos,
+            d,
+            m.glob.theta,
+            rotary.partial(m.glob.rotary_dim, span = d // 2),
+            k = k,
+        )
     else:
-        q, k = ops.elemwise.rope_full(q, k, pos, d, m.sliding.theta, False)
+        q, k = ops.elemwise.rope(q, pos, d, m.sliding.theta, rotary.full(), k = k)
     ops.attn.kv_append(k, v, pages, write_page, write_offset)
     return q
 
 def q_only(x, pos, m, at, d, q_proj):
     q = ops.elemwise.rmsnorm_per_head(ops.linear.matmul(x, q_proj), at.q_norm, d, at.q_norm_eps)
     if at.reading == GLOBAL:  # proportional, as above
-        return ops.elemwise.rope_partial_q(q, pos, m.glob.rotary_dim, d, m.glob.theta, span = d // 2)
-    return ops.elemwise.rope_partial_q(q, pos, d, d, m.sliding.theta)
+        return ops.elemwise.rope(q, pos, d, m.glob.theta, rotary.partial(m.glob.rotary_dim, span = d // 2))
+    return ops.elemwise.rope(q, pos, d, m.sliding.theta, rotary.partial(d))

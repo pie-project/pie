@@ -254,7 +254,19 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
         matches!(
             op,
             poem_ir::Operation::Attn(
-                poem_ir::Attn::Masked { .. } | poem_ir::Attn::MaskedLse { .. }
+                poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: None,
+                    ..
+                } | poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                }
             )
         )
     })
@@ -381,7 +393,14 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
 #[must_use]
 pub(crate) fn regions_staging(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
     let quantized = |attn: &poem_ir::Attn| match attn {
-        poem_ir::Attn::PrefillLse { cache, .. } => matches!(
+        poem_ir::Attn::Prefill {
+            cache,
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: Some(_),
+            ..
+        } => matches!(
             trace.values.get(cache.0 as usize).map(|decl| &decl.def),
             Some(poem_ir::Def::Cache(row)) if matches!(
                 trace.caches.get(*row as usize),

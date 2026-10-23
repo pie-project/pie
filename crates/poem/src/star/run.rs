@@ -1,6 +1,6 @@
 //! A deployment of a package traced and read: its layout evaluated, then the
 //! caches and forward of `forward.poem` recorded into a trace, or the formats
-//! of `formats.poem` read into a contract.
+//! of `formats(m)` read into a contract.
 
 use std::cell::RefCell;
 
@@ -72,6 +72,9 @@ pub struct Deploy {
     /// The YaRN factor the deployment stretches the model's native context
     /// by, past what its package states (`-yarn{factor}` in its name).
     pub yarn: Option<u32>,
+    /// The intermediate the forward ends at and reads out in place of its
+    /// own result (`-tap.{key}` in its name), for a parity check.
+    pub tap: Option<String>,
 }
 
 impl Deploy {
@@ -100,6 +103,13 @@ impl Deploy {
                     None => Star::new_none(),
                 },
             ),
+            (
+                "tap",
+                match &self.tap {
+                    Some(key) => heap.alloc(key.as_str()),
+                    None => Star::new_none(),
+                },
+            ),
         ]))
     }
 }
@@ -119,14 +129,14 @@ impl Package {
     ) -> anyhow::Result<Star<'v>> {
         let layout = module
             .heap()
-            .access_owned_frozen_value(&self.module("model.poem")?.get("layout")?);
+            .access_owned_frozen_value(&self.required("layout")?);
         let heap = module.heap();
         eval.eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[])
             .map_err(error)
     }
 
     /// What `id`'s deployment `deploy` states of itself as a generative
-    /// model, if its `model.poem` states it (`generative(m)`).
+    /// model, if its package states it (`generative(m)`).
     pub fn generative(
         &self,
         id: &str,
@@ -141,7 +151,7 @@ impl Package {
     }
 
     /// The canvas `id`'s deployment `deploy` denoises as a text diffusion
-    /// model, if its `model.poem` states one (`diffusion(m)`).
+    /// model, if its package states one (`diffusion(m)`).
     pub fn diffusion(
         &self,
         id: &str,
@@ -162,7 +172,7 @@ impl Package {
         function: &str,
         of: fn(Star<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<Option<T>> {
-        let Ok(stating) = self.module("model.poem")?.get(function) else {
+        let Some(stating) = self.entry(function)? else {
             return Ok(None);
         };
         Module::with_temp_heap(|module| {
@@ -177,7 +187,7 @@ impl Package {
         })
     }
 
-    /// How `id`'s deployment `deploy` reads a still, if its `model.poem`
+    /// How `id`'s deployment `deploy` reads a still, if its package
     /// states a `media(id, deploy)` with an `image`.
     pub fn image(&self, id: &str, deploy: &Deploy) -> anyhow::Result<Option<ImageSpec>> {
         self.with_image(id, deploy, |_, heap, image| ImageSpec::of(image, heap))
@@ -218,7 +228,7 @@ impl Package {
         deploy: &Deploy,
         f: impl for<'v> FnOnce(&mut Evaluator<'v, '_, '_>, Heap<'v>, Star<'v>) -> anyhow::Result<T>,
     ) -> anyhow::Result<Option<T>> {
-        let Ok(media) = self.module("model.poem")?.get("media") else {
+        let Some(media) = self.entry("media")? else {
             return Ok(None);
         };
         Module::with_temp_heap(|module| {
@@ -252,13 +262,12 @@ impl Package {
         Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
             let m = self.layout(id, deploy, &module, &mut eval)?;
-            let forward = self.module("forward.poem")?;
             let caches = module
                 .heap()
-                .access_owned_frozen_value(&forward.get("caches")?);
+                .access_owned_frozen_value(&self.required("caches")?);
             let run = module
                 .heap()
-                .access_owned_frozen_value(&forward.get("forward")?);
+                .access_owned_frozen_value(&self.required("forward")?);
 
             TRAIL.with(|t| *t.borrow_mut() = Trail::default());
             let declared = eval
@@ -361,7 +370,7 @@ impl ForwardHybrid for Model<'_, '_, '_> {
 
 impl Package {
     /// The contract that reads `src` into `id`'s deployment `deploy`, by the
-    /// one format of `formats.poem` that recognizes it.
+    /// one format of `formats(m)` that recognizes it.
     pub fn import(
         &self,
         id: &str,
@@ -375,7 +384,7 @@ impl Package {
         })?
     }
 
-    /// `then` of the formats of `formats.poem`, each reading `src` into
+    /// `then` of the formats of `formats(m)`, each reading `src` into
     /// `id`'s deployment `deploy`.
     fn formats<R>(
         &self,
@@ -408,8 +417,7 @@ impl Package {
                 .layout(id, deploy, &module, &mut eval)
                 .map_err(|e| illegible(format!("{e:#}")))?;
             let formats = self
-                .module("formats.poem")
-                .and_then(|f| f.get("formats"))
+                .required("formats")
                 .map_err(|e| illegible(format!("{e:#}")))?;
             let formats = heap.access_owned_frozen_value(&formats);
             let listed = eval

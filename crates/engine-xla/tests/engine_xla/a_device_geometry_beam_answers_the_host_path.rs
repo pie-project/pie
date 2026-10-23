@@ -22,6 +22,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value, Weight, ops, seam,
     trace_hybrid,
 };
+use poem_ir::Turn;
 
 const VOCAB: u32 = 64;
 const WIDTH: u32 = 32;
@@ -52,18 +53,25 @@ impl ForwardHybrid for Tiny {
         let q = ops::linear::matmul(&x, &w("q", HEAD_DIM, WIDTH));
         let k = ops::linear::matmul(&x, &w("k", HEAD_DIM, WIDTH));
         let v = ops::linear::matmul(&x, &w("v", HEAD_DIM, WIDTH));
-        let (q, k) =
-            ops::elemwise::rope_full(&q, &k, &inputs.positions(), HEAD_DIM, 10_000.0, false, None);
+        let (q, k) = both(ops::elemwise::rope(
+            &q,
+            &inputs.positions(),
+            HEAD_DIM,
+            10_000.0,
+            Turn::Full { interleaved: false },
+            Some(&k),
+            None,
+        ));
         let pages = inputs.kv(KV_ROW);
         ops::attn::kv_append(
             &k,
-            &v,
+            Some(&v),
             pages,
             &inputs.write_page(KV_ROW),
             &inputs.write_offset(KV_ROW),
         );
         let plan = ops::attn::plan_prefill(&inputs, HEADS, HEADS, HEAD_DIM, None);
-        let o = ops::attn::prefill(&q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE);
+        let o = ops::attn::prefill(&q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE, false, None, true, None, None, None, false, None, None, None).0;
         let h = ops::linear::matmul(&o, &w("o", WIDTH, HEAD_DIM));
         let logits = ops::linear::matmul(&h, &w("head", VOCAB, WIDTH));
         seam::at(seam::OUT, &[&logits]);
@@ -270,4 +278,9 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             );
         }
     }
+}
+
+/// A rope's queries and the keys it was given.
+fn both((q, k): (Value, Option<Value>)) -> (Value, Value) {
+    (q, k.expect("a rope given keys turns them"))
 }

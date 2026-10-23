@@ -247,5 +247,6 @@ fn flagship() -> poem::star::Deploy {
         parts: vec![],
         drafter: None,
         yarn: None,
+        tap: None,
     }
 }

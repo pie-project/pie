@@ -41,6 +41,10 @@ pub enum Attn {
         #[output]
         plan: ValueId,
     },
+    /// Each row's query against its lane's paged keys, as one token's. A
+    /// selection (`selection`, its run of blocks as `selected` lays them out)
+    /// reads only those blocks; a relative bias (`bias`, as `rel` scales it)
+    /// adds each key's learned offset; `lse` writes the rows' log-sum-exp.
     Decode {
         #[input]
         q: ValueId,
@@ -48,12 +52,25 @@ pub enum Attn {
         plan: ValueId,
         #[input(CACHE)]
         cache: ValueId,
+        #[input(I32)]
+        selection: Option<ValueId>,
+        #[input(F32)]
+        bias: Option<ValueId>,
         window: Option<u32>,
         head_dim: u32,
         sm_scale: f32,
+        selected: Option<Blocks>,
+        rel: Option<Relative>,
         #[output]
         o: ValueId,
+        #[output(F32)]
+        lse: Option<ValueId>,
     },
+    /// Each row's query against its lane's paged keys, causally; or, given
+    /// `mask`, as the mask lets it (and causally too where `causal`). A
+    /// selection, a relative bias and `lse` as [`Attn::Decode`]'s; `floor`,
+    /// each row's least window position (i32 a row, from
+    /// `attn.replay_floor`), below which the window reads no key.
     Prefill {
         #[input]
         q: ValueId,
@@ -61,85 +78,25 @@ pub enum Attn {
         plan: ValueId,
         #[input(CACHE)]
         cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
-        #[output]
-        o: ValueId,
-    },
-    DecodeRel {
         #[input]
-        q: ValueId,
-        #[input(DECODE_PLAN)]
-        plan: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
+        mask: Option<ValueId>,
+        #[input(I32)]
+        selection: Option<ValueId>,
         #[input(F32)]
-        bias: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        extent: u32,
-        sm_scale: f32,
-        log_floor: u32,
-        log_alpha: f32,
-        #[output]
-        o: ValueId,
-    },
-    PrefillRel {
-        #[input]
-        q: ValueId,
-        #[input(PREFILL_PLAN)]
-        plan: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        #[input(F32)]
-        bias: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        extent: u32,
-        sm_scale: f32,
-        log_floor: u32,
-        log_alpha: f32,
-        #[output]
-        o: ValueId,
-    },
-    Masked {
-        #[input]
-        q: ValueId,
-        #[input(PREFILL_PLAN)]
-        plan: ValueId,
-        #[input]
-        mask: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
+        bias: Option<ValueId>,
+        #[input(I32)]
+        floor: Option<ValueId>,
         window: Option<u32>,
         head_dim: u32,
         kv_heads: u32,
         causal: bool,
         sm_scale: f32,
-        #[output]
-        o: ValueId,
-    },
-    MaskedLse {
-        #[input]
-        q: ValueId,
-        #[input(PREFILL_PLAN)]
-        plan: ValueId,
-        #[input]
-        mask: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        causal: bool,
-        sm_scale: f32,
+        selected: Option<Blocks>,
+        rel: Option<Relative>,
         #[output]
         o: ValueId,
         #[output(F32)]
-        lse: ValueId,
+        lse: Option<ValueId>,
     },
     Dense {
         #[input]
@@ -190,81 +147,6 @@ pub enum Attn {
         #[output]
         o: ValueId,
     },
-    DecodeLse {
-        #[input]
-        q: ValueId,
-        #[input(DECODE_PLAN)]
-        plan: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        sm_scale: f32,
-        #[output]
-        o: ValueId,
-        #[output(F32)]
-        lse: ValueId,
-    },
-    PrefillLse {
-        #[input]
-        q: ValueId,
-        #[input(PREFILL_PLAN)]
-        plan: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        /// Each row's least window position (i32 a row, from
-        /// `attn.replay_floor`): the window reads no key below it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[input(I32)]
-        floor: Option<ValueId>,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
-        #[output]
-        o: ValueId,
-        #[output(F32)]
-        lse: ValueId,
-    },
-    DecodeSelected {
-        #[input]
-        q: ValueId,
-        #[input(DECODE_PLAN)]
-        plan: ValueId,
-        #[input(I32)]
-        selection: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        sm_scale: f32,
-        ratio: u32,
-        /// The selection holds one run of blocks per kv head, each head's
-        /// queries reading its own; else one run every head shares.
-        #[serde(default)]
-        per_head: bool,
-        #[output]
-        o: ValueId,
-    },
-    PrefillSelected {
-        #[input]
-        q: ValueId,
-        #[input(PREFILL_PLAN)]
-        plan: ValueId,
-        #[input(I32)]
-        selection: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
-        ratio: u32,
-        #[serde(default)]
-        per_head: bool,
-        #[output]
-        o: ValueId,
-    },
     Sink {
         #[input]
         o: ValueId,
@@ -299,21 +181,13 @@ pub enum Attn {
         #[output(alias = x)]
         x_out: ValueId,
     },
+    /// Each row's key and value written at its page and offset; without
+    /// `v`, `k` is one plane a pool reads as both (a shared-kv latent).
     KvAppend {
         #[input]
         k: ValueId,
         #[input]
-        v: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        #[input(I32)]
-        write_page: ValueId,
-        #[input(I32)]
-        write_offset: ValueId,
-    },
-    KvAppendShared {
-        #[input]
-        plane: ValueId,
+        v: Option<ValueId>,
         #[input(CACHE)]
         cache: ValueId,
         #[input(I32)]
@@ -417,6 +291,10 @@ pub enum Attn {
         plan: ValueId,
         #[input]
         q_pe: ValueId,
+        /// The latent rows a query reads, where a selection picks them;
+        /// none reads its whole window.
+        #[input(I32)]
+        selection: Option<ValueId>,
         #[input(CACHE)]
         cache: ValueId,
         /// The tokens a query reads back through, itself included; none
@@ -438,50 +316,16 @@ pub enum Attn {
         plan: ValueId,
         #[input]
         q_pe: ValueId,
+        /// The latent rows a query reads, where a selection picks them;
+        /// none reads its whole window.
+        #[input(I32)]
+        selection: Option<ValueId>,
         #[input(CACHE)]
         cache: ValueId,
         /// The tokens a query reads back through, itself included; none
         /// reads every row.
         #[serde(default)]
         window: Option<u32>,
-        heads: u32,
-        kv_lora_rank: u32,
-        sm_scale: f32,
-        #[output]
-        o: ValueId,
-        #[output(F32)]
-        lse: Option<ValueId>,
-    },
-    MlaDecodeSelected {
-        #[input]
-        q: ValueId,
-        #[input(MLA_PLAN)]
-        plan: ValueId,
-        #[input]
-        q_pe: ValueId,
-        #[input(I32)]
-        selection: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
-        heads: u32,
-        kv_lora_rank: u32,
-        sm_scale: f32,
-        #[output]
-        o: ValueId,
-        #[output(F32)]
-        lse: Option<ValueId>,
-    },
-    MlaPrefillSelected {
-        #[input]
-        q: ValueId,
-        #[input(MLA_PLAN)]
-        plan: ValueId,
-        #[input]
-        q_pe: ValueId,
-        #[input(I32)]
-        selection: ValueId,
-        #[input(CACHE)]
-        cache: ValueId,
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,
@@ -555,25 +399,15 @@ pub enum Attn {
         #[output]
         entries: ValueId,
     },
-    PoolBoundaryDecode {
+    /// Where the rows close entries of a pool compressing `ratio` positions
+    /// each, for one token's rows (`decode`) or a prompt's.
+    PoolBoundary {
         #[input(I32)]
         positions: ValueId,
         #[input(U8)]
         row_valid: ValueId,
         ratio: u32,
-        #[output(I32)]
-        boundary_pos: ValueId,
-        #[output(I32)]
-        boundary_req: ValueId,
-        #[output(I32)]
-        boundary_rope: ValueId,
-    },
-    PoolBoundaryPrefill {
-        #[input(I32)]
-        positions: ValueId,
-        #[input(U8)]
-        row_valid: ValueId,
-        ratio: u32,
+        decode: bool,
         #[output(I32)]
         boundary_pos: ValueId,
         #[output(I32)]
@@ -630,9 +464,14 @@ pub enum Attn {
         positions: ValueId,
         #[input(I32)]
         request_of_token: ValueId,
+        /// The `top_k` pool entries each row reads, where a selection picks
+        /// them; none reads every closed entry.
+        #[input(I32)]
+        selection: Option<ValueId>,
         #[input(CACHE)]
         entries: ValueId,
         ratio: u32,
+        top_k: Option<u32>,
         heads: u32,
         head_dim: u32,
         sm_scale: f32,
@@ -641,31 +480,6 @@ pub enum Attn {
         #[output(F32)]
         lse: ValueId,
     },
-    PoolLseSelected {
-        #[input]
-        q: ValueId,
-        #[input(I32)]
-        positions: ValueId,
-        #[input(I32)]
-        request_of_token: ValueId,
-        #[input(I32)]
-        selection: ValueId,
-        #[input(CACHE)]
-        entries: ValueId,
-        ratio: u32,
-        top_k: u32,
-        heads: u32,
-        head_dim: u32,
-        sm_scale: f32,
-        #[output]
-        o: ValueId,
-        #[output(F32)]
-        lse: ValueId,
-    },
-    /// Bounded replay's floor, a lane's least position whose window keys a
-    /// replaying layer holds: with `mark` the rows are ones it skips and the
-    /// lane's state moves past them; without, each row reads its lane's floor
-    /// (0 if it never skipped). `floor` is i32 a row.
     ReplayFloor {
         #[input(I32)]
         positions: ValueId,
@@ -706,6 +520,24 @@ pub enum Attn {
         #[output]
         o: ValueId,
     },
+}
+
+/// The blocks a selection reads, `ratio` keys each: one run every head
+/// shares, or (`per_head`) one run per kv head, each head's queries reading
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Blocks {
+    pub ratio: u32,
+    pub per_head: bool,
+}
+
+/// A learned relative bias over `extent` positions: a key's distance past
+/// `2^log_floor` falls into log buckets `log_alpha` wide.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Relative {
+    pub extent: u32,
+    pub log_floor: u32,
+    pub log_alpha: f32,
 }
 
 /// How `attn.index_topk` scores a block of keys.

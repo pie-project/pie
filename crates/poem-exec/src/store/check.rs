@@ -22,16 +22,82 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
             _ => continue,
         };
         let consumed = match op {
-            Attn::Decode { plan, .. }
-            | Attn::DecodeLse { plan, .. }
-            | Attn::Prefill { plan, .. }
-            | Attn::PrefillLse { plan, .. }
-            | Attn::DecodeRel { plan, .. }
-            | Attn::PrefillRel { plan, .. }
-            | Attn::Masked { plan, .. }
-            | Attn::MaskedLse { plan, .. }
-            | Attn::DecodeSelected { plan, .. }
-            | Attn::PrefillSelected { plan, .. } => *plan,
+            Attn::Decode {
+                plan,
+                selection: None,
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Decode {
+                plan,
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: None,
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }
+            | Attn::Decode {
+                plan,
+                selection: None,
+                bias: Some(_),
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: None,
+                bias: Some(_),
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: Some(_),
+                selection: None,
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: Some(_),
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }
+            | Attn::Decode {
+                plan,
+                selection: Some(_),
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: Some(_),
+                bias: None,
+                lse: None,
+                ..
+            } => *plan,
             _ => continue,
         };
         let Some(Def::Op(built_by)) = trace.values.get(consumed.0 as usize).map(|v| &v.def) else {

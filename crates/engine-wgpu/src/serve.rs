@@ -405,7 +405,19 @@ impl Shell {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(poem_ir::Operation::Attn(
-                        poem_ir::Attn::Masked { .. } | poem_ir::Attn::MaskedLse { .. }
+                        poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: None,
+                            ..
+                        } | poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: Some(_),
+                            ..
+                        }
                     ))
                 )
             });

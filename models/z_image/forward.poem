@@ -124,13 +124,16 @@ def qwen3_encode(arm, te, tap = None):
         v = ops.linear.matmul(x, w.v)
         q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, te.head_dim, te.eps)
         k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, te.head_dim, te.eps)
-        q, k = ops.elemwise.rope_full(q, k, positions, te.head_dim, te.theta, False)
+        q, k = ops.elemwise.rope(q, positions, te.head_dim, te.theta, rotary.full(), k = k)
         ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
         o = ops.attn.prefill(q, plan, pages, None, te.head_dim, te.kv_heads, te.sm_scale)
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        f = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, w.gate_up), te.inter), w.down)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), te.inter),
+            w.down,
+        )
         y = ops.elemwise.residual_add(f, y)
         if tap != None:
             tap(l, y)
@@ -294,6 +297,8 @@ def denoise(arm, m):
     v = linear(dit.final_linear, h)
     if tap == "final_linear":
         return seam_tapped(v, context)
+    if tap:
+        fail("the tap {} names no intermediate of z-image".format(tap))
     velocity = ops.elemwise.mul_scalar(-1.0, v)
     seam.at(seam.VELOCITY, [velocity])
     return velocity
@@ -345,7 +350,10 @@ def run_block(x, b, mods, m, g, tap):
     h = ops.elemwise.rmsnorm(x, b.ffn_norm1, NORM_EPS)
     if mods != None:
         h = ops.elemwise.modulate(h, mods[0].scale_mlp, mods[1], "scale")
-    f = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(h, b.mlp.gate_up), d.inter), b.mlp.down)
+    f = ops.linear.matmul(
+        ops.linear.glu(ops.linear.matmul(h, b.mlp.gate_up), gating.swiglu(), d.inter),
+        b.mlp.down,
+    )
     at("b0.ffn", f)
     f = ops.elemwise.rmsnorm(f, b.ffn_norm2, NORM_EPS)
     at("b0.ffn_norm2", f)

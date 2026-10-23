@@ -49,17 +49,17 @@ def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
     x, _, _ = gate(streams, mix, hy)
     x = ops.elemwise.rmsnorm(x, norm, norm_eps)
     logits = ops.linear.matmul(x, router)
-    return ops.linear.moe_predict_route(logits, bias, experts, PREDICT_K)
+    return ops.linear.moe_route(logits, experts, PREDICT_K, routing.predict(), bias = bias)[0]
 
 def boundaries(positions, row_valid, ratio, split = True):
     """Where the rows close entries of a key pool that compresses `ratio`
     rows into one: each boundary's position, request and rope position.
     With `split` the decode and prefill arms find theirs apart."""
     if not split:
-        return ops.attn.pool_boundary_prefill(positions, row_valid, ratio)
+        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
     one = fact.single_token()
-    dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
-    ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
+    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
+    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
     return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
 # An e4m3 kv deployment keeps the window's plane and the compressed rows as
@@ -245,7 +245,13 @@ def dspark_keys(m, rows, taps):
         plane = ops.linear.matmul(main, at.kv_down)
         plane = ops.elemwise.rmsnorm(plane, at.kv_norm, at.kv_norm_eps)
         plane = rope(plane, rows.positions, at.rope_dim, m.head_dim, at.theta, at.yarn)
-        ops.attn.kv_append_shared(plane, inputs.kv(at.kv), inputs.write_page(at.kv), inputs.write_offset(at.kv))
+        ops.attn.kv_append(
+            plane,
+            None,
+            inputs.kv(at.kv),
+            inputs.write_page(at.kv),
+            inputs.write_offset(at.kv),
+        )
 
 def dspark_block(m, whole, rows, ends):
     """A drafted block's rows (its anchor, then noise tokens) through the
@@ -336,7 +342,13 @@ def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
             beta_slow = scaling.beta_slow,
             original_max_position = scaling.original_max_position,
         )
-    return ops.elemwise.rope_partial_last_yarn(x, pos, rope_dim, head_dim, theta, True, inverse, scaling)
+    return ops.elemwise.rope(
+        x,
+        pos,
+        head_dim,
+        theta,
+        rotary.last(rope_dim, interleaved = True, inverse = inverse, yarn = scaling),
+    )
 
 def layer(m, rows, w, streams, trail, following = None, narrow = False, replays = False):
     """The layer `w` over `rows`, given the `trail` earlier layers left it:
@@ -388,7 +400,7 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     plane = ops.linear.matmul(x, at.kv_down)
     plane = ops.elemwise.rmsnorm(plane, at.kv_norm, at.kv_norm_eps)
     plane = rope(plane, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
-    ops.attn.kv_append_shared(plane, pages, write_page, write_offset)
+    ops.attn.kv_append(plane, None, pages, write_page, write_offset)
 
     selection = trail.selection
     p = at.pool
@@ -417,10 +429,30 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
             fail("a CSA2 Reuse Mode layer follows a layer that ranked")
         # The window's attention runs beside the pool's, where a backend
         # may land the two, their merge and the sinks as one.
-        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale, floor)
+        o, lse = ops.attn.prefill(
+            q,
+            plan,
+            pages,
+            m.window,
+            m.head_dim,
+            rows.kv_heads,
+            at.sm_scale,
+            lse = True,
+            floor = floor,
+        )
         if at.selection != "none":
-            po, plse = ops.attn.pool_lse_selected(q, pos, request_of_token, selection.picked, entries,
-                                                  p.ratio, selection.top_k, m.heads, m.head_dim, at.sm_scale)
+            po, plse = ops.attn.pool_lse(
+                q,
+                pos,
+                request_of_token,
+                entries,
+                p.ratio,
+                m.heads,
+                m.head_dim,
+                at.sm_scale,
+                selection = selection.picked,
+                top_k = selection.top_k,
+            )
         else:
             po, plse = ops.attn.pool_lse(q, pos, request_of_token, entries, p.ratio, m.heads, m.head_dim, at.sm_scale)
         o, lse = ops.attn.merge_lse(o, lse, po, plse, m.heads, m.head_dim)
@@ -432,7 +464,16 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     else:
         if floor != None:
             fail("a replaying layer pools")
-        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
+        o, lse = ops.attn.prefill(
+            q,
+            plan,
+            pages,
+            m.window,
+            m.head_dim,
+            rows.kv_heads,
+            at.sm_scale,
+            lse = True,
+        )
 
     if at.window_sink == None:
         o = ops.attn.sink(o, lse, at.sink, m.head_dim)
@@ -549,23 +590,48 @@ def predict_next(streams, following, hy):
 
 def mlp(x, ids, f, streams, following, hy):
     if f.kind == "dense":
-        return ops.linear.matmul(ops.linear.swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit), f.down)
+        return ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter, limit = f.limit),
+            f.down,
+        )
     if f.kind == "routed":
-        routes, weights = ops.linear.moe_topk_sqrt_softplus(
-            ops.linear.matmul(x, f.router), f.bias, f.experts, f.top_k, f.renorm, f.scaling)
+        routes, weights = ops.linear.moe_route(
+            ops.linear.matmul(x, f.router),
+            f.experts,
+            f.top_k,
+            routing.sqrt_softplus(renormalize = f.renorm, scaling = f.scaling),
+            bias = f.bias,
+        )
         hidden = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
-        act = ops.linear.swiglu_clamp(hidden, f.inter, f.limit)
+        act = ops.linear.glu(hidden, gating.swiglu(), f.inter, limit = f.limit)
         return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     if f.gate.kind == "bias":
         hint = predict_next(streams, following, hy)
-        routes, weights = ops.linear.moe_topk_sqrt_softplus_hinted(
-            ops.linear.matmul(x, f.router), f.gate.bias, f.experts, f.top_k, f.renorm, f.scaling, hint)
+        routes, weights = ops.linear.moe_route(
+            ops.linear.matmul(x, f.router),
+            f.experts,
+            f.top_k,
+            routing.sqrt_softplus(renormalize = f.renorm, scaling = f.scaling),
+            bias = f.gate.bias,
+            hint = hint,
+        )
     else:
         vocab = f.gate.tid2eid.shape[0]
-        routes, weights = ops.linear.moe_hash_route(
-            ids, f.gate.tid2eid, ops.linear.matmul(x, f.router), vocab, f.experts, f.top_k, f.renorm, f.scaling)
+        routes, weights = ops.linear.moe_route(
+            ops.linear.matmul(x, f.router),
+            f.experts,
+            f.top_k,
+            routing.hash(vocab, renormalize = f.renorm, scaling = f.scaling),
+            ids = ids,
+            table = f.gate.tid2eid,
+        )
     shared = ops.linear.matmul(
-        ops.linear.swiglu_clamp(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter, f.limit),
+        ops.linear.glu(
+            ops.linear.matmul(x, f.shared_gate_up),
+            gating.swiglu(),
+            f.shared_inter,
+            limit = f.limit,
+        ),
         f.shared_down,
     )
 
@@ -577,19 +643,34 @@ def mlp(x, ids, f, streams, following, hy):
     if f.down.precision != f.down.dtype and f.gate_up.fused != None:
         # The same over one packed gate-up bank: each expert's gate rows,
         # then its up rows.
-        act = ops.linear.swiglu_clamp_routed(
-            select(x, f.gate_up.fused), f.inter, weights, f.limit)
+        act = ops.linear.glu(
+            select(x, f.gate_up.fused),
+            gating.swiglu(),
+            f.inter,
+            weights = weights,
+            limit = f.limit,
+        )
         return ops.linear.moe_sum_add(select(act, f.down), shared)
     if f.down.precision != f.down.dtype and f.gate_up.fused == None:
         # DeepSeek's expert weighs its activations before its down leg
         # quantizes them, and sums its routes and the shared expert in f32.
-        act = ops.linear.swiglu_clamp_split_routed(
-            select(x, f.gate_up.gate), select(x, f.gate_up.up), weights, f.limit)
+        act = ops.linear.glu(
+            select(x, f.gate_up.gate),
+            gating.swiglu(),
+            up = select(x, f.gate_up.up),
+            weights = weights,
+            limit = f.limit,
+        )
         return ops.linear.moe_sum_add(select(act, f.down), shared)
     if f.gate_up.fused != None:
-        act = ops.linear.swiglu_clamp(select(x, f.gate_up.fused), f.inter, f.limit)
+        act = ops.linear.glu(select(x, f.gate_up.fused), gating.swiglu(), f.inter, limit = f.limit)
     else:
-        act = ops.linear.swiglu_clamp_split(select(x, f.gate_up.gate), select(x, f.gate_up.up), f.limit)
+        act = ops.linear.glu(
+            select(x, f.gate_up.gate),
+            gating.swiglu(),
+            up = select(x, f.gate_up.up),
+            limit = f.limit,
+        )
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     return ops.elemwise.residual_add(shared, routed)
 

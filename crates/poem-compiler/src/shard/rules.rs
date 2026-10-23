@@ -2,7 +2,9 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId};
+use poem_ir::{
+    Attn, BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId,
+};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -109,31 +111,18 @@ fn heads(name: &str) -> Option<Heads> {
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
-        "attn.decode" | "attn.decode_lse" | "attn.decode_selected" => {
-            Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)
-        }
-        "attn.prefill"
-        | "attn.prefill_lse"
-        | "attn.masked"
-        | "attn.masked_lse"
-        | "attn.prefill_selected" => Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole),
         "attn.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
         "attn.sink" => Heads::of(&["o", "lse"], &[]),
         "attn.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
-        "attn.pool_lse" | "attn.pool_lse_selected" => Heads::of(&["q"], &["heads"]),
+        "attn.pool_lse" => Heads::of(&["q"], &["heads"]),
+        // k and v, or the one plane a shared pool reads as both.
         "attn.kv_append" => Heads::of(&["k", "v"], &[])
             .cache(Cache::Split)
             .kv(&["k", "v"]),
-        "attn.kv_append_shared" => Heads::of(&["plane"], &[])
-            .cache(Cache::Split)
-            .kv(&["plane"]),
         "attn.mla_split_q_b" => Heads::of(&["q_b"], &["heads"]),
         "attn.mla_absorb_q" => Heads::of(&["q_nope"], &["heads"]),
         "attn.mla_absorb_out" => Heads::of(&["latent"], &["heads"]),
-        "attn.mla_decode"
-        | "attn.mla_prefill"
-        | "attn.mla_decode_selected"
-        | "attn.mla_prefill_selected" => Heads::of(&["q", "q_pe"], &["heads"]),
+        "attn.mla_decode" | "attn.mla_prefill" => Heads::of(&["q", "q_pe"], &["heads"]),
         "ssm.causal_conv1d" | "ssm.causal_conv1d_chunked" => {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
@@ -170,17 +159,14 @@ fn rule(op: &Operation) -> Rule {
             (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
         };
     }
-    // A product at the activations' precision contracts with its weight's
-    // split; one that quantizes them first reads its weight whole.
-    if let Operation::Linear(Linear::Matmul { quant, .. }) = op {
-        return match quant {
-            None => Rule::Contract {
-                act: "act",
-                w: "w",
-                out: 0,
-                input: 1,
-            },
-            Some(_) => Rule::Whole,
+    // A product contracts with its weight's split, its activations quantized
+    // or not: one that quantizes them does so on each rank's share.
+    if let Operation::Linear(Linear::Matmul { .. }) = op {
+        return Rule::Contract {
+            act: "act",
+            w: "w",
+            out: 0,
+            input: 1,
         };
     }
     // A plain lookup reads the rows each rank holds of a row-split table; a
@@ -205,17 +191,13 @@ fn rule(op: &Operation) -> Rule {
             BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
         };
     }
-    // An expert product at the activations' precision contracts with its
-    // bank's split; one that quantizes them first reads its bank whole.
-    if let Operation::Linear(Linear::MoeSelect { quant, .. }) = op {
-        return match quant {
-            None => Rule::Contract {
-                act: "x",
-                w: "bank",
-                out: 1,
-                input: 2,
-            },
-            Some(_) => Rule::Whole,
+    // An expert product contracts with its bank's split, as a product does.
+    if let Operation::Linear(Linear::MoeSelect { .. }) = op {
+        return Rule::Contract {
+            act: "x",
+            w: "bank",
+            out: 1,
+            input: 2,
         };
     }
     // A weighted sum of routed rows is linear in them; one that adds a shared
@@ -226,6 +208,21 @@ fn rule(op: &Operation) -> Rule {
                 follow: &["routed"],
             },
             Some(_) => Rule::Whole,
+        };
+    }
+    // A paged attention splits with its query heads, its cache split with
+    // them or kept whole; one under a relative bias reads its operands whole,
+    // as the biased ops did, which had no rule.
+    if let Operation::Attn(Attn::Decode { bias, .. }) = op {
+        return match bias {
+            Some(_) => Rule::Whole,
+            None => Rule::Heads(Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)),
+        };
+    }
+    if let Operation::Attn(Attn::Prefill { bias, .. }) = op {
+        return match bias {
+            Some(_) => Rule::Whole,
+            None => Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole)),
         };
     }
     let name = op.name();

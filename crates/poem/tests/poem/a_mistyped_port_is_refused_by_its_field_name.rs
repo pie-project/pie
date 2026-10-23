@@ -2,6 +2,7 @@
 //! the validator names the field it refuses.
 
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
+use poem_ir::Turn;
 use poem_ir::check::Port;
 use poem_ir::{Fault, Operation, Sampling, Trace, Ty};
 
@@ -70,7 +71,19 @@ impl ForwardHybrid for Turned {
     fn forward(&self, inputs: Input) -> Value {
         let table = Weight::sym("embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
         let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
-        ops::elemwise::rope_partial_q(&x, &inputs.positions(), 16, 32, 1e4, None, None)
+        ops::elemwise::rope(
+            &x,
+            &inputs.positions(),
+            32,
+            1e4,
+            Turn::Partial {
+                rotary_dim: 16,
+                span: 16 / 2,
+            },
+            None,
+            None,
+        )
+        .0
     }
 }
 

@@ -13,5 +13,8 @@ qmm = [
 # verify rows attend as Splash's do on M3/M4: one threadgroup a KV head and history slice,
 # each page read once for the rows' grouped query heads
 sdpa.split_bf16 = true
+# a verify's routed MLP groups its routes into an 8-row register tile an expert, the shared
+# expert riding along, as Splash's Apple9 expert tiles do
+moe.register    = true
 ane.mlp         = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
 ane.projections = [{ when = "ane", use = "share", percent = 47 }, "gpu"]

@@ -12,6 +12,7 @@ use poem_ir::{
 use poem_ir::{NormAxis, NormWeight, Turn};
 
 use super::{Match, Rule};
+use poem_ir::GluAct;
 
 /// A placeholder width for pattern holes; the matcher compares op fields, not
 /// the types of the values they hold.
@@ -223,16 +224,7 @@ fn pool_attention() -> Rule {
             let sm_scale = p.f32("sm_scale");
             p.free("window");
             let floor = floored.then(|| p.indices("floor"));
-            let (o, lse) = attn::prefill_lse(
-                &q,
-                &plan,
-                cache,
-                None,
-                d,
-                p.u32("kv_heads"),
-                sm_scale,
-                floor.as_ref(),
-            );
+            let (o, lse) = both(attn::prefill(&q, &plan, cache, None, d, p.u32("kv_heads"), sm_scale, true, None, true, floor.as_ref(), None, None, false, None, None, None));
             p.name("o", &o);
             p.name("lse", &lse);
             let positions = p.indices("positions");
@@ -241,22 +233,9 @@ fn pool_attention() -> Rule {
             let (ratio, heads) = (p.u32("ratio"), p.u32("heads"));
             let (po, plse) = if selected {
                 let selection = p.rows("selection", W);
-                attn::pool_lse_selected(
-                    &q,
-                    &positions,
-                    &requests,
-                    &selection,
-                    entries,
-                    ratio,
-                    p.u32("top_k"),
-                    heads,
-                    d,
-                    sm_scale,
-                )
+                attn::pool_lse(&q, &positions, &requests, entries, ratio, heads, d, sm_scale, Some(&selection), Some(p.u32("top_k")))
             } else {
-                attn::pool_lse(
-                    &q, &positions, &requests, entries, ratio, heads, d, sm_scale,
-                )
+                attn::pool_lse(&q, &positions, &requests, entries, ratio, heads, d, sm_scale, None, None)
             };
             p.name("po", &po);
             p.name("plse", &plse);
@@ -271,16 +250,21 @@ fn pool_attention() -> Rule {
                 p.free("inverse");
                 p.free("yarn");
                 p.name("o_out", &out);
-                let turned = elemwise::rope_partial_last_yarn(
+                let turned = elemwise::rope(
                     &out,
                     &positions,
-                    p.u32("rotary_dim"),
                     d,
                     p.f32("theta"),
-                    false,
-                    false,
+                    Turn::Last {
+                        rotary_dim: p.u32("rotary_dim"),
+                        interleaved: false,
+                        inverse: false,
+                        yarn: None,
+                    },
                     None,
-                );
+                    None,
+                )
+                .0;
                 p.export("o_rot", &turned);
             } else {
                 p.export("o_out", &out);
@@ -345,16 +329,7 @@ fn mla_prefill_expanded() -> Rule {
             let plan = p.value("plan", Ty::Struct(StructKind::MlaPlan));
             let pages = p.cache("pages");
             p.free("window");
-            let scored = attn::mla_prefill(
-                &q,
-                &plan,
-                &q_pe,
-                pages,
-                heads,
-                rank,
-                p.f32("sm_scale"),
-                None,
-            );
+            let scored = attn::mla_prefill(&q, &plan, &q_pe, pages, heads, rank, p.f32("sm_scale"), None, false, None).0;
             p.name("scored", &scored);
             let o = attn::mla_absorb_out(&scored, &kv_b, heads, rank, nope, v);
             p.export("o", &o);
@@ -390,19 +365,10 @@ fn lse_sink() -> Rule {
             p.free("window");
             let (o, lse) = if decode {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
-                attn::decode_lse(&q, &plan, cache, None, d, p.f32("sm_scale"))
+                both(attn::decode(&q, &plan, cache, None, d, p.f32("sm_scale"), true, None, None, false, None, None, None))
             } else {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
-                attn::prefill_lse(
-                    &q,
-                    &plan,
-                    cache,
-                    None,
-                    d,
-                    p.u32("kv_heads"),
-                    p.f32("sm_scale"),
-                    None,
-                )
+                both(attn::prefill(&q, &plan, cache, None, d, p.u32("kv_heads"), p.f32("sm_scale"), true, None, true, None, None, None, false, None, None, None))
             };
             p.name("o", &o);
             p.name("lse", &lse);
@@ -442,20 +408,22 @@ fn qg_qknorm_rope_append() -> Rule {
         let kn =
             elemwise::rmsnorm_per_head_plus_one(&k, &p.weight("k_norm", [W]), d, p.f32("k_eps"));
         p.name("k_normed", &kn);
-        let (q_out, k_out) = elemwise::rope_partial(
+        let (q_out, k_out) = both(elemwise::rope(
             &qn,
-            &kn,
             &positions,
-            p.u32("rotary"),
             d,
             p.f32("theta"),
-            Some(p.u32("span")),
+            Turn::Partial {
+                rotary_dim: p.u32("rotary"),
+                span: p.u32("span"),
+            },
+            Some(&kn),
             None,
-        );
+        ));
         p.name("k_out", &k_out);
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append(&k_out, &v, cache, &write_page, &write_offset);
+        attn::kv_append(&k_out, Some(&v), cache, &write_page, &write_offset);
         p.export("q_out", &q_out);
     });
     Rule::new("fused.qg_qknorm_rope_append", [pattern], |m| {
@@ -497,22 +465,27 @@ fn split_rope_yarn_append() -> Rule {
         p.name("v_split", &v);
         let positions = p.indices("positions");
         p.free("interleaved");
-        let (q, k) = elemwise::rope_yarn(
+        let (q, k) = both(elemwise::rope(
             &q,
-            &k,
             &positions,
             p.u32("d"),
             p.f32("theta"),
-            p.f32("factor"),
-            p.f32("beta_fast"),
-            p.f32("beta_slow"),
-            p.f32("attention_factor"),
-            p.u32("original_max_position"),
-            false,
-        );
+            Turn::Yarn {
+                yarn: elemwise::Yarn {
+                    factor: p.f32("factor"),
+                    beta_fast: p.f32("beta_fast"),
+                    beta_slow: p.f32("beta_slow"),
+                    original_max_position: p.u32("original_max_position"),
+                },
+                attention_factor: p.f32("attention_factor"),
+                interleaved: false,
+            },
+            Some(&k),
+            None,
+        ));
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
         p.export("q_out", &q);
     });
     Rule::new("fused.split_rope_yarn_append", [pattern], |m| {
@@ -564,23 +537,28 @@ fn rope_yarn_append() -> Rule {
         let (q, k, v) = (p.rows("q", W), p.rows("k", W), p.rows("v", W));
         let positions = p.indices("positions");
         p.free("interleaved");
-        let (q, k) = elemwise::rope_yarn(
+        let (q, k) = both(elemwise::rope(
             &q,
-            &k,
             &positions,
             p.u32("d"),
             p.f32("theta"),
-            p.f32("factor"),
-            p.f32("beta_fast"),
-            p.f32("beta_slow"),
-            p.f32("attention_factor"),
-            p.u32("original_max_position"),
-            false,
-        );
+            Turn::Yarn {
+                yarn: elemwise::Yarn {
+                    factor: p.f32("factor"),
+                    beta_fast: p.f32("beta_fast"),
+                    beta_slow: p.f32("beta_slow"),
+                    original_max_position: p.u32("original_max_position"),
+                },
+                attention_factor: p.f32("attention_factor"),
+                interleaved: false,
+            },
+            Some(&k),
+            None,
+        ));
         p.name("k_out", &k);
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
         p.export("q_out", &q);
     });
     Rule::new("fused.rope_yarn_append", [pattern], |m| {
@@ -713,20 +691,22 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             if rope >= 3 {
                 let v = elemwise::mul_scalar(p.f32("v_scale"), &v);
                 let (rotary, theta) = (p.u32("rotary"), p.f32("theta"));
-                let (q, k) = elemwise::rope_partial(
+                let (q, k) = both(elemwise::rope(
                     &q,
-                    &k,
                     &positions,
-                    rotary,
                     d,
                     theta,
-                    Some(p.u32("span")),
+                    Turn::Partial {
+                        rotary_dim: rotary,
+                        span: p.u32("span"),
+                    },
+                    Some(&k),
                     None,
-                );
+                ));
                 let cache = p.cache("cache");
                 let (write_page, write_offset) =
                     (p.rows("write_page", 1), p.rows("write_offset", 1));
-                attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+                attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
                 p.export("q", &q);
                 return;
             }
@@ -746,16 +726,34 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
             };
             let (q, k) = match rope {
                 0 => (q, k),
-                1 => elemwise::rope_full(&q, &k, &positions, d, p.f32("theta"), false, None),
+                1 => both(elemwise::rope(
+                    &q,
+                    &positions,
+                    d,
+                    p.f32("theta"),
+                    Turn::Full { interleaved: false },
+                    Some(&k),
+                    None,
+                )),
                 _ => {
-                    let span = Some(p.u32("span"));
-                    let (rotary, theta) = (p.u32("rotary"), p.f32("theta"));
-                    elemwise::rope_partial(&q, &k, &positions, rotary, d, theta, span, None)
+                    let (rotary, span, theta) = (p.u32("rotary"), p.u32("span"), p.f32("theta"));
+                    both(elemwise::rope(
+                        &q,
+                        &positions,
+                        d,
+                        theta,
+                        Turn::Partial {
+                            rotary_dim: rotary,
+                            span,
+                        },
+                        Some(&k),
+                        None,
+                    ))
                 }
             };
             let cache = p.cache("cache");
             let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-            attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+            attn::kv_append(&k, Some(&v), cache, &write_page, &write_offset);
             p.export("q", &q);
         })
     };
@@ -961,7 +959,14 @@ fn mlp_swiglu() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("gate_up", [2 * W, W]));
         p.name("packed", &packed);
-        let h = linear::swiglu(&packed, p.u32("intermediate"));
+        let h = linear::glu(
+            &packed,
+            GluAct::Swiglu,
+            Some(p.u32("intermediate")),
+            None,
+            None,
+            None,
+        );
         p.name("h", &h);
         let y = linear::matmul(&h, &p.weight("down", [W, W]));
         p.export("y", &y);
@@ -1038,22 +1043,57 @@ fn moe_experts() -> Rule {
                     let packed = select_of(&x, "bank", "bias", select);
                     p.name("packed", &packed);
                     let hidden = match glu {
-                        0 => linear::swiglu(&packed, p.u32("intermediate")),
-                        1 => linear::swiglu_clamp(&packed, p.u32("intermediate"), p.f32("limit")),
-                        3 => linear::geglu_tanh_packed(&packed, p.u32("intermediate")),
+                        0 => linear::glu(
+                            &packed,
+                            GluAct::Swiglu,
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            None,
+                        ),
+                        1 => linear::glu(
+                            &packed,
+                            GluAct::Swiglu,
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            Some(p.f32("limit")),
+                        ),
+                        3 => linear::glu(
+                            &packed,
+                            GluAct::GegluTanh,
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            None,
+                        ),
                         4 => {
                             // Kimi-K3's SiTU, its up cap whatever it holds.
                             p.free("up_cap");
-                            linear::situ(&packed, p.u32("intermediate"), p.f32("beta"), None)
+                            linear::glu(
+                                &packed,
+                                GluAct::Situ {
+                                    beta: p.f32("beta"),
+                                    up_cap: None,
+                                },
+                                Some(p.u32("intermediate")),
+                                None,
+                                None,
+                                None,
+                            )
                         }
                         // Nemotron-H's ungated experts: the select's rows
                         // are the up rows alone.
                         5 => linear::relu2(&packed),
-                        _ => linear::swiglu_clamp_alpha(
+                        _ => linear::glu(
                             &packed,
-                            p.u32("intermediate"),
-                            p.f32("limit"),
-                            p.f32("alpha"),
+                            GluAct::SwigluAlpha {
+                                alpha: p.f32("alpha"),
+                            },
+                            Some(p.u32("intermediate")),
+                            None,
+                            None,
+                            Some(p.f32("limit")),
                         ),
                     };
                     p.name("hidden", &hidden);
@@ -1117,8 +1157,14 @@ fn moe_experts() -> Rule {
                 dtype: Dtype::F32,
             },
         );
-        let hidden =
-            linear::swiglu_clamp_routed(&packed, p.u32("intermediate"), &weights, p.f32("limit"));
+        let hidden = linear::glu(
+            &packed,
+            GluAct::Swiglu,
+            Some(p.u32("intermediate")),
+            None,
+            Some(&weights),
+            Some(p.f32("limit")),
+        );
         p.name("hidden", &hidden);
         let routed = linear::moe_matmul_select_quant(
             &hidden,
@@ -1186,14 +1232,39 @@ fn moe_select_glu() -> Rule {
                 p.name("packed", &packed);
                 let intermediate = p.u32("intermediate");
                 let y = match glu {
-                    0 => linear::swiglu(&packed, intermediate),
-                    1 => linear::swiglu_clamp(&packed, intermediate, p.f32("limit")),
-                    3 => linear::geglu_tanh_packed(&packed, intermediate),
-                    _ => linear::swiglu_clamp_alpha(
+                    0 => linear::glu(
                         &packed,
-                        intermediate,
-                        p.f32("limit"),
-                        p.f32("alpha"),
+                        GluAct::Swiglu,
+                        Some(intermediate),
+                        None,
+                        None,
+                        None,
+                    ),
+                    1 => linear::glu(
+                        &packed,
+                        GluAct::Swiglu,
+                        Some(intermediate),
+                        None,
+                        None,
+                        Some(p.f32("limit")),
+                    ),
+                    3 => linear::glu(
+                        &packed,
+                        GluAct::GegluTanh,
+                        Some(intermediate),
+                        None,
+                        None,
+                        None,
+                    ),
+                    _ => linear::glu(
+                        &packed,
+                        GluAct::SwigluAlpha {
+                            alpha: p.f32("alpha"),
+                        },
+                        Some(intermediate),
+                        None,
+                        None,
+                        Some(p.f32("limit")),
                     ),
                 };
                 p.export("y", &y);
@@ -1216,7 +1287,14 @@ fn matmul_geglu() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
         p.name("packed", &packed);
-        let y = linear::geglu_tanh_packed(&packed, p.u32("intermediate"));
+        let y = linear::glu(
+            &packed,
+            GluAct::GegluTanh,
+            Some(p.u32("intermediate")),
+            None,
+            None,
+            None,
+        );
         p.export("y", &y);
     });
     Rule::new("fused.matmul_geglu", [pattern], |m| Fused::MatmulGeglu {
@@ -1235,7 +1313,14 @@ fn matmul_swiglu() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
         p.name("packed", &packed);
-        let y = linear::swiglu(&packed, p.u32("intermediate"));
+        let y = linear::glu(
+            &packed,
+            GluAct::Swiglu,
+            Some(p.u32("intermediate")),
+            None,
+            None,
+            None,
+        );
         p.export("y", &y);
     });
     Rule::new("fused.matmul_swiglu", [pattern], |m| Fused::MatmulSwiglu {
@@ -1451,16 +1536,21 @@ fn norm_rope_last() -> Rule {
         p.free("inverse");
         p.free("yarn");
         let positions = p.indices("positions");
-        elemwise::rope_partial_last_yarn(
+        elemwise::rope(
             y,
             &positions,
-            p.u32("rotary_dim"),
             p.u32("head_dim"),
             p.f32("theta"),
-            false,
-            false,
+            Turn::Last {
+                rotary_dim: p.u32("rotary_dim"),
+                interleaved: false,
+                inverse: false,
+                yarn: None,
+            },
+            None,
             None,
         )
+        .0
     };
     let scale_free = template(move |p| {
         let y = elemwise::rmsnorm_no_scale(&p.rows("x", W), p.u32("norm_dim"), p.f32("eps"));
@@ -1522,16 +1612,21 @@ fn index_topk_rope() -> Rule {
             p.free("score");
             let positions = p.indices("positions");
             let d = p.u32("head_dim");
-            let q = elemwise::rope_partial_last_yarn(
+            let q = elemwise::rope(
                 &p.rows("q", W),
                 &positions,
-                p.u32("rotary_dim"),
                 d,
                 p.f32("theta"),
-                false,
-                false,
+                Turn::Last {
+                    rotary_dim: p.u32("rotary_dim"),
+                    interleaved: false,
+                    inverse: false,
+                    yarn: None,
+                },
                 None,
-            );
+                None,
+            )
+            .0;
             p.name("q_rot", &q);
             let weights = weighted.then(|| p.rows("weights", W));
             let sel = attn::index_topk(
@@ -1573,16 +1668,42 @@ fn norm_rope_pair() -> Rule {
         let (rotary, d, theta) = (p.u32("rotary_dim"), p.u32("head_dim"), p.f32("theta"));
         let qn = elemwise::rmsnorm_no_scale(&p.rows("q", W), d, p.f32("q_eps"));
         p.name("q_y", &qn);
-        let q =
-            elemwise::rope_partial_last_yarn(&qn, &positions, rotary, d, theta, false, false, None);
+        let q = elemwise::rope(
+            &qn,
+            &positions,
+            d,
+            theta,
+            Turn::Last {
+                rotary_dim: rotary,
+                interleaved: false,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         p.export("q_out", &q);
         let kn = elemwise::rmsnorm(&p.rows("kv", W), &p.weight("weight", [W]), p.f32("kv_eps"));
-        let k =
-            elemwise::rope_partial_last_yarn(&kn, &positions, rotary, d, theta, false, false, None);
+        let k = elemwise::rope(
+            &kn,
+            &positions,
+            d,
+            theta,
+            Turn::Last {
+                rotary_dim: rotary,
+                interleaved: false,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         p.name("kv_y", &k);
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append_shared(&k, cache, &write_page, &write_offset);
+        attn::kv_append(&k, None, cache, &write_page, &write_offset);
     });
     Rule::new("fused.norm_rope_pair", [pattern], |m| {
         let rope = |name: &str| match *m.op(name) {
@@ -1674,16 +1795,21 @@ fn pool_compress() -> Rule {
             let latent = elemwise::rmsnorm(&gathered, &p.weight("weight", [W]), p.f32("eps"));
             p.name("latent", &latent);
             let brope = p.indices("brope");
-            let rotated = elemwise::rope_partial_last_yarn(
+            let rotated = elemwise::rope(
                 &latent,
                 &brope,
-                p.u32("rotary_dim"),
                 p.u32("head_dim"),
                 p.f32("theta"),
-                false,
-                false,
+                Turn::Last {
+                    rotary_dim: p.u32("rotary_dim"),
+                    interleaved: false,
+                    inverse: false,
+                    yarn: None,
+                },
                 None,
-            );
+                None,
+            )
+            .0;
             p.name("rotated", &rotated);
             let pool = p.cache("pool");
             let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
@@ -1755,20 +1881,25 @@ fn norm_rope_last_append() -> Rule {
         p.free("yarn");
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
-        let k = elemwise::rope_partial_last_yarn(
+        let k = elemwise::rope(
             &y,
             &positions,
-            p.u32("rotary_dim"),
             p.u32("head_dim"),
             p.f32("theta"),
-            false,
-            false,
+            Turn::Last {
+                rotary_dim: p.u32("rotary_dim"),
+                interleaved: false,
+                inverse: false,
+                yarn: None,
+            },
             None,
-        );
+            None,
+        )
+        .0;
         p.name("y", &k);
         let cache = p.cache("cache");
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append_shared(&k, cache, &write_page, &write_offset);
+        attn::kv_append(&k, None, cache, &write_page, &write_offset);
     });
     Rule::new("fused.norm_rope_last_append", [pattern], |m| {
         let Operation::Elemwise(Elemwise::Rope {
@@ -1813,8 +1944,16 @@ fn rmsnorm_rope_partial_q() -> Rule {
             elemwise::rmsnorm_per_head(&p.rows("x", W), &p.weight("weight", [W]), d, p.f32("eps"));
         p.name("y", &y);
         let (rotary_dim, theta, span) = (p.u32("rotary_dim"), p.f32("theta"), p.u32("span"));
-        let q_out =
-            elemwise::rope_partial_q(&y, &positions, rotary_dim, d, theta, Some(span), None);
+        let q_out = elemwise::rope(
+            &y,
+            &positions,
+            d,
+            theta,
+            Turn::Partial { rotary_dim, span },
+            None,
+            None,
+        )
+        .0;
         p.export("q_out", &q_out);
     });
     Rule::new("fused.rmsnorm_rope_partial_q", [pattern], |m| {
@@ -1930,22 +2069,24 @@ fn q_gate_k_norm_rope_append() -> Rule {
             p.f32("k_eps"),
         );
         p.name("kn", &kn);
-        let (q_out, k_out) = elemwise::rope_partial(
+        let (q_out, k_out) = both(elemwise::rope(
             &qn,
-            &kn,
             &p.indices("positions"),
-            p.u32("rotary"),
             d,
             p.f32("theta"),
-            Some(p.u32("span")),
+            Turn::Partial {
+                rotary_dim: p.u32("rotary"),
+                span: p.u32("span"),
+            },
+            Some(&kn),
             None,
-        );
+        ));
         p.export("q_out", &q_out);
         p.name("k_out", &k_out);
         let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
         attn::kv_append(
             &k_out,
-            &p.rows("v", W),
+            Some(&p.rows("v", W)),
             p.cache("cache"),
             &write_page,
             &write_offset,
@@ -1976,4 +2117,10 @@ fn q_gate_k_norm_rope_append() -> Rule {
             write_offset: m.value("write_offset"),
         }
     })
+}
+
+/// An op's two outputs, its second asked for: a rope's queries and the
+/// keys it was given, an attention's output and log-sum-exp.
+fn both((q, k): (poem::Value, Option<poem::Value>)) -> (poem::Value, poem::Value) {
+    (q, k.expect("an output asked for lands"))
 }

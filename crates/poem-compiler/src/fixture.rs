@@ -139,6 +139,11 @@ impl Build {
                 head_dim: 4,
                 sm_scale: 1.0,
                 o,
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+                lse: None,
             }
             .into(),
             guard,
@@ -151,8 +156,9 @@ impl Build {
         let write_page = self.input(1);
         let write_offset = self.input(1);
         self.push(
-            Attn::KvAppendShared {
-                plane: x,
+            Attn::KvAppend {
+                k: x,
+                v: None,
                 cache,
                 write_page,
                 write_offset,

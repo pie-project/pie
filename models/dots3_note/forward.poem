@@ -3,22 +3,13 @@
 # rope pairs interleaved and each head gated; then a dense or routed SwiGLU
 # MLP.
 
-def plans(inputs, heads, kv_lora_rank):
-    """The decode and prefill arms' plans over `inputs`."""
-    one = fact.single_token()
-    decode, prefill = inputs.on(one), inputs.on(~one)
-    return struct(
-        decode = ops.attn.mla_plan(decode, heads, kv_lora_rank),
-        prefill = ops.attn.mla_plan(prefill, heads, kv_lora_rank),
-    )
-
 def rope(x, positions, a):
     """`x`'s rope part rotated in adjacent pairs, as the checkpoint was
     trained."""
     d = a.qk_rope_head_dim
-    return ops.elemwise.rope_partial_last(x, positions, d, d, a.theta, True)
+    return ops.elemwise.rope(x, positions, d, a.theta, rotary.last(d, interleaved = True))
 
-def attention(x, inputs, plan, a, select = None):
+def attention(x, inputs, a, select = None):
     """Latent attention of the rows `x`. `select(q_a)`, if given, picks the
     keys each query reads."""
     pages = inputs.kv(a.kv)
@@ -42,24 +33,14 @@ def attention(x, inputs, plan, a, select = None):
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     seam.at(seam.ATTN_Q, [q])
 
-    one = fact.single_token()
-    on = lambda rows, holds: rows.on(holds) if rows != None else None
-    scored = merge([
-        arm(True, q.on(one), plan.decode, q_pe.on(one), on(selection, one), pages, a),
-        arm(False, q.on(~one), plan.prefill, q_pe.on(~one), on(selection, ~one), pages, a),
-    ])
+    # A selection's lanes read the keys it picked; the rest their window.
+    scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
+                                 window = a.window, selection = selection)
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     o = ops.elemwise.gate_sigmoid_mul_heads(o, ops.linear.matmul(x, a.gate), a.v_head_dim, 1.0)
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj)
-
-def arm(decode, q, plan, q_pe, selection, pages, a):
-    if selection == None:
-        score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
-        return score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale, window = a.window)
-    score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
-    return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
 
 def caches(m, c):
     full = c.kv_space(m.kv)
@@ -72,8 +53,6 @@ def caches(m, c):
             c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
-    full = plans(inputs, m.full.heads, m.full.kv_lora_rank)
-    sliding = plans(inputs, m.sliding.heads, m.sliding.kv_lora_rank)
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
@@ -81,9 +60,9 @@ def forward(m, inputs):
         a = w.attn
         x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
         if a.indexer != None:
-            o = attention(x, inputs, full, a, select = lambda q_a: index_select(x, q_a, inputs, a.indexer))
+            o = attention(x, inputs, a, select = lambda q_a: index_select(x, q_a, inputs, a.indexer))
         else:
-            o = attention(x, inputs, sliding, a)
+            o = attention(x, inputs, a)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
@@ -98,14 +77,16 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
-    routes, weights = ops.linear.moe_topk_sigmoid_biased(
+        return ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
+            f.down,
+        )
+    routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
-        f.bias,
         f.experts,
         f.top_k,
-        True,
-        f.scaling,
+        routing.sigmoid(renormalize = True, scaling = f.scaling),
+        bias = f.bias,
     )
 
     def select(act, bank):
@@ -113,10 +94,13 @@ def mlp(x, f):
             return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
 
-    act = ops.linear.swiglu(select(x, f.gate_up), f.inter)
+    act = ops.linear.glu(select(x, f.gate_up), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     s = f.shared
-    shared = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, s.gate_up), s.inter), s.down)
+    shared = ops.linear.matmul(
+        ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter),
+        s.down,
+    )
     return ops.elemwise.residual_add(shared, routed)
 
 def index_select(x, q_a, inputs, ix):

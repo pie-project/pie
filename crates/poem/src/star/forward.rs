@@ -185,9 +185,7 @@ impl<'v> StarlarkValue<'v> for InputHandle {
     }
 
     fn has_attr(&self, attribute: &str, _heap: Heap<'v>) -> bool {
-        crate::star::ops::INPUTS
-            .iter()
-            .any(|op| op.name == attribute)
+        crate::star::bind::every_input().any(|op| op.name == attribute)
     }
 }
 
@@ -497,10 +495,7 @@ pub(crate) fn ops(builder: &mut GlobalsBuilder) {
     builder.namespace("ops", |ops| {
         for module in crate::star::ops::MODULES {
             ops.namespace(module, |ns| {
-                for op in crate::star::ops::OPS
-                    .iter()
-                    .filter(|op| op.module == *module)
-                {
+                for op in crate::star::bind::every_op().filter(|op| op.module == *module) {
                     ns.set(op.name, crate::star::bind::OpValue(op));
                 }
             });
@@ -509,6 +504,9 @@ pub(crate) fn ops(builder: &mut GlobalsBuilder) {
     builder.namespace("fact", facts);
     crate::star::bind::wholes(builder);
     builder.namespace("seam", seams);
+    builder.namespace("rotary", crate::star::bind::rotary);
+    builder.namespace("gating", crate::star::bind::gating);
+    builder.namespace("routing", crate::star::bind::routing);
 }
 
 #[starlark_module]

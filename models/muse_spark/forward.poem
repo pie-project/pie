@@ -4,7 +4,6 @@
 
 WINDOWED = 0
 FULL = 1
-CLASSES = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
@@ -17,7 +16,13 @@ def moe(m, w, x):
     pooled down and normed, each route's output normed under its scale, the
     routes weighed and summed, and the sum unpooled."""
     logits = ops.linear.matmul(x, w.router)
-    routes, weights = ops.linear.moe_topk_sigmoid_biased(logits, w.router_bias, m.experts, m.top_k, True, 1.0)
+    routes, weights = ops.linear.moe_route(
+        logits,
+        m.experts,
+        m.top_k,
+        routing.sigmoid(renormalize = True, scaling = 1.0),
+        bias = w.router_bias,
+    )
     h = ops.elemwise.rmsnorm_plus_one(ops.linear.matmul(x, w.pool), w.pool_norm, m.norm_eps)
 
     def select(act, bank):
@@ -25,23 +30,13 @@ def moe(m, w, x):
             return ops.linear.moe_matmul_select(act, bank, routes, m.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, m.top_k)
 
-    act = ops.linear.swiglu(select(h, w.gate_up), m.inter)
+    act = ops.linear.glu(select(h, w.gate_up), gating.swiglu(), m.inter)
     out = ops.elemwise.norm_gate(select(act, w.down), w.expert_scale, None, None, m.post_norm_eps, 1.0)
     return ops.linear.matmul(ops.linear.moe_weighted_sum(out, weights), w.unpool)
 
 def forward(m, inputs):
     d = m.head_dim
     windows = [m.window, None]
-    ([input_m, input_s, input_d], input_p) = inputs.partition(CLASSES)
-
-    def plans(input, plan):
-        return [plan(input, m.q_heads, m.kv_heads, d, win) for win in windows]
-
-    plan_m = plans(input_m, ops.attn.plan_prefill)
-    plan_s = plans(input_s, ops.attn.plan_prefill)
-    plan_d = plans(input_d, ops.attn.plan_decode)
-    plan_p = plans(input_p, ops.attn.plan_prefill)
-    mask = inputs.mask()
     positions = inputs.positions()
 
     y = ops.elemwise.rmsnorm_no_scale(
@@ -64,22 +59,13 @@ def forward(m, inputs):
         q = ops.elemwise.rmsnorm_no_scale(q, d, m.norm_eps)
         k = ops.elemwise.rmsnorm_no_scale(k, d, m.norm_eps)
         if not w.full:
-            q, k = ops.elemwise.rope_full(q, k, positions, d, m.theta, False)
+            q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k)
         ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
         seam.at(seam.ATTN_Q, [q])
 
-        ([mq, sq, dq], p) = q.partition(CLASSES)
-        if w.full:
-            so, lse = ops.attn.prefill_lse(sq, plan_s[reading], pages, win, d, m.kv_heads, m.sm_scale)
-            seam.at(seam.SCORES, [lse])
-        else:
-            so = ops.attn.prefill(sq, plan_s[reading], pages, win, d, m.kv_heads, m.sm_scale)
-        a = merge([
-            ops.attn.masked(mq, plan_m[reading], mask, pages, win, d, m.kv_heads, True, m.sm_scale),
-            so,
-            ops.attn.decode(dq, plan_d[reading], pages, win, d, m.sm_scale),
-            ops.attn.prefill(p, plan_p[reading], pages, win, d, m.kv_heads, m.sm_scale),
-        ])
+        # Each lane by its kind; a full layer's scores go out at their seam.
+        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
+                            mask = True, scores = True, scores_seam = w.full)
         seam.at(seam.ATTN_OUT, [a])
 
         # Each head normed, then gated, in one pass.

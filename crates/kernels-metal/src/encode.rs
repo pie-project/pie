@@ -97,6 +97,19 @@ pub struct Fire {
     pub lanes: [u32; 3],
 
     pub group: [u32; 3],
+
+    /// Where an encoder that launches a grid a buffer holds finds this fire's
+    /// threadgroup counts (three u32, of `group` threads each), written by an
+    /// earlier fire of the frame; one that cannot launches `lanes`, which the
+    /// kernel takes as well.
+    pub indirect: Option<Indirect>,
+}
+
+/// Three u32 threadgroup counts at `offset` bytes into the buffer `buf` binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Indirect {
+    pub buf: u32,
+    pub offset: u32,
 }
 
 impl Fire {
@@ -108,7 +121,16 @@ impl Fire {
             stamp: "",
             lanes: [0, 0, 0],
             group: [0, 0, 0],
+            indirect: None,
         }
+    }
+
+    /// Launches the threadgroup counts `buf` holds at `offset` where the
+    /// encoder can ([`Fire::indirect`]).
+    #[must_use]
+    pub const fn indirect(mut self, buf: u32, offset: u32) -> Self {
+        self.indirect = Some(Indirect { buf, offset });
+        self
     }
 
     #[must_use]

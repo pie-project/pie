@@ -128,13 +128,16 @@ def qwen3_encode(arm, te, tap = None):
         v = ops.linear.matmul(x, w.v)
         q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, te.head_dim, te.eps)
         k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, te.head_dim, te.eps)
-        q, k = ops.elemwise.rope_full(q, k, positions, te.head_dim, te.theta, False)
+        q, k = ops.elemwise.rope(q, positions, te.head_dim, te.theta, rotary.full(), k = k)
         ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
         o = ops.attn.prefill(q, plan, pages, None, te.head_dim, te.kv_heads, te.sm_scale)
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        f = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, w.gate_up), te.inter), w.down)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), te.inter),
+            w.down,
+        )
         y = ops.elemwise.residual_add(f, y)
         if tap != None:
             tap(l, y)
@@ -223,7 +226,7 @@ def denoise(arm, m):
 
     def ff_sublayer(x, ff, mods, lanes):
         h = norm_modulate(x, mods.scale_shift, lanes, NORM_EPS)
-        h = ops.linear.swiglu(ops.linear.matmul(h, ff.linear_in), d.inter)
+        h = ops.linear.glu(ops.linear.matmul(h, ff.linear_in), gating.swiglu(), d.inter)
         return ops.elemwise.gated_residual_add(x, mods.gate, ops.linear.matmul(h, ff.linear_out), lanes)
 
     t = arm.lane_vector(0, 1)
@@ -281,7 +284,7 @@ def denoise(arm, m):
         q, k, v = ops.gather.split_qkv(qkv, dim, dim)
         o = attention(turn(q, block.q_norm, positions, hd), turn(k, block.k_norm, positions, hd), v)
         a = ops.linear.matmul(o, block.out_attn)
-        f = ops.linear.matmul(ops.linear.swiglu(mlp, d.inter), block.out_mlp)
+        f = ops.linear.matmul(ops.linear.glu(mlp, gating.swiglu(), d.inter), block.out_mlp)
         return ops.elemwise.gated_residual_add(x, mod_single.gate, ops.elemwise.residual_add(a, f), lanes)
 
     x = arm.fold_layers(dit.single, merge([txt, img]), single)

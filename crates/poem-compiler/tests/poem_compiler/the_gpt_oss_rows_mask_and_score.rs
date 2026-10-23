@@ -29,7 +29,16 @@ fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
                 matches!(op, Operation::Attn(Attn::Sink { .. }))
             });
             let masked = count(&trace, |op| {
-                matches!(op, Operation::Attn(Attn::MaskedLse { causal: true, .. }))
+                matches!(
+                    op,
+                    Operation::Attn(Attn::Prefill {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        lse: Some(_),
+                        ..
+                    })
+                )
             });
             assert!(
                 masked > 0 && sinks == 4 * masked,

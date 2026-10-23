@@ -643,7 +643,7 @@ pub fn attention_decode_selected<T: Stored>(
     o: T,
 ) -> MlaCall<T> {
     MlaCall {
-        op: "attn.mla_decode_selected",
+        op: "attn.mla_decode",
         q,
         q_pe,
         selection: Some(selection),
@@ -669,7 +669,7 @@ pub fn attention_prefill_selected<T: Stored>(
     o: T,
 ) -> MlaCall<T> {
     MlaCall {
-        op: "attn.mla_prefill_selected",
+        op: "attn.mla_prefill",
         q: q.data,
         q_pe,
         selection: Some(selection),

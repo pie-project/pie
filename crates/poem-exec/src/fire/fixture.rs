@@ -126,6 +126,11 @@ impl Build {
                 head_dim: 4,
                 sm_scale: 1.0,
                 o,
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+                lse: None,
             }
             .into(),
             guard,

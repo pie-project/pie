@@ -108,7 +108,7 @@ pub fn kv_append_shared(
 ) -> Result<(), Error> {
     append(
         ctx,
-        "attn.kv_append_shared",
+        "attn.kv_append",
         plane,
         plane,
         pool,

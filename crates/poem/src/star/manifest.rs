@@ -1,4 +1,5 @@
-//! What a package states of itself in `package.poem`: its models, the
+//! What a package states of itself in its `MODELS`, `DEPLOYMENTS` and
+//! `PUBLISHED`: its models, the
 //! deployments it lists, and each model's template and tokenizer, as data.
 
 use std::collections::BTreeMap;
@@ -91,6 +92,9 @@ pub struct Model {
     pub parts: Vec<String>,
     /// The drafters it pairs with.
     pub drafters: Vec<String>,
+    /// Whether a deployment may tap it: end its forward at a named
+    /// intermediate and read that out instead (`-tap.{key}`).
+    pub taps: bool,
     pub template: Template,
     pub tokenizer: Tokenizer,
     /// The architecture its media front-ends are chosen by.
@@ -162,17 +166,17 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// The manifest `package.poem` states: its `MODELS` and `DEPLOYMENTS`.
+    /// The manifest a package states: its `MODELS` and `DEPLOYMENTS`.
     pub(crate) fn of(package: &str, frozen: &FrozenModule) -> anyhow::Result<Manifest> {
         Module::with_temp_heap(|module| {
             let heap = module.heap();
             let list = |name: &str| -> anyhow::Result<Vec<Value<'_>>> {
                 let value = frozen
                     .get(name)
-                    .map_err(|_| anyhow::anyhow!("`{package}/package.poem` states no `{name}`"))?;
+                    .map_err(|_| anyhow::anyhow!("the package `{package}` states no `{name}`"))?;
                 let value = heap.access_owned_frozen_value(&value);
                 let items = ListRef::from_value(value).ok_or_else(|| {
-                    anyhow::anyhow!("`{package}/package.poem`: `{name}` is no list")
+                    anyhow::anyhow!("the package `{package}`: `{name}` is no list")
                 })?;
                 Ok(items.iter().collect())
             };
@@ -180,25 +184,25 @@ impl Manifest {
             for value in list("MODELS")? {
                 let model = value.downcast_ref::<Model>().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`{package}/package.poem`: `MODELS` holds {}, not a model",
+                        "the package `{package}`: `MODELS` holds {}, not a model",
                         value.get_type()
                     )
                 })?;
                 if manifest.model(&model.id).is_some() {
-                    anyhow::bail!("`{package}/package.poem` states `{}` twice", model.id);
+                    anyhow::bail!("the package `{package}` states `{}` twice", model.id);
                 }
                 manifest.models.push(model.clone());
             }
             for value in list("DEPLOYMENTS")? {
                 let listed = value.downcast_ref::<Listed>().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`{package}/package.poem`: `DEPLOYMENTS` holds {}, not a deployment",
+                        "the package `{package}`: `DEPLOYMENTS` holds {}, not a deployment",
                         value.get_type()
                     )
                 })?;
                 let model = manifest.model(&listed.model).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`{package}/package.poem` lists a deployment of `{}`, which it states \
+                        "the package `{package}` lists a deployment of `{}`, which it states \
                          no model of",
                         listed.model
                     )
@@ -212,7 +216,7 @@ impl Manifest {
                 for value in list("PUBLISHED")? {
                     let published = value.downcast_ref::<Published>().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "`{package}/package.poem`: `PUBLISHED` holds {}, not a published \
+                            "the package `{package}`: `PUBLISHED` holds {}, not a published \
                              drafter",
                             value.get_type()
                         )
@@ -224,7 +228,7 @@ impl Manifest {
                     });
                     if !listed {
                         anyhow::bail!(
-                            "`{package}/package.poem` publishes a drafter for `{}`, which it \
+                            "the package `{package}` publishes a drafter for `{}`, which it \
                              lists no deployment of",
                             published.deployment
                         );
@@ -266,6 +270,14 @@ impl Model {
         {
             anyhow::bail!("`{}` pairs with no {drafter} drafter", self.id);
         }
+        if let Some(tap) = &deploy.tap
+            && !self.taps
+        {
+            anyhow::bail!(
+                "`{}` reads out no intermediate; it takes no tap {tap}",
+                self.id
+            );
+        }
         if deploy.tp == 0 {
             anyhow::bail!("a deployment runs on at least one rank");
         }
@@ -276,7 +288,7 @@ impl Model {
     }
 
     /// The name a deployment of this model is served under:
-    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tp{n}]`, its parts in
+    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}]`, its parts in
     /// the order the model states them.
     #[must_use]
     pub fn name(&self, deploy: &Deploy) -> String {
@@ -297,6 +309,9 @@ impl Model {
         name.push_str(&word(deploy.kv));
         if let Some(factor) = deploy.yarn {
             name.push_str(&format!("-yarn{factor}"));
+        }
+        if let Some(tap) = &deploy.tap {
+            name.push_str(&format!("-tap.{tap}"));
         }
         if deploy.tp > 1 {
             name.push_str(&format!("-tp{}", deploy.tp));
@@ -337,6 +352,14 @@ impl Model {
             }
             None => None,
         };
+        let tap = match words.peek().and_then(|w| w.strip_prefix("tap.")) {
+            Some(key) => {
+                let key = Some(key.to_string()).filter(|k| !k.is_empty())?;
+                words.next();
+                Some(key)
+            }
+            None => None,
+        };
         let tp = match words.next() {
             None => 1,
             Some(word) => word.strip_prefix("tp")?.parse().ok().filter(|tp| *tp > 1)?,
@@ -351,6 +374,7 @@ impl Model {
             parts,
             drafter,
             yarn,
+            tap,
         })
     }
 }
@@ -435,6 +459,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] mini: bool,
         #[starlark(require = named, default = UnpackList::default())] parts: UnpackList<String>,
         #[starlark(require = named, default = UnpackList::default())] drafters: UnpackList<String>,
+        #[starlark(require = named, default = false)] taps: bool,
         #[starlark(require = named, default = String::new())] arch: String,
         #[starlark(require = named, default = 0)] layers: u32,
         #[starlark(require = named, default = 0)] vocab: u32,
@@ -444,6 +469,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
             mini,
             parts: parts.items,
             drafters: drafters.items,
+            taps,
             template: template.clone(),
             tokenizer: tokenizer.clone(),
             arch,
@@ -500,6 +526,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
                 parts: parts.items,
                 drafter: drafter.into_option(),
                 yarn: None,
+                tap: None,
             },
         })
     }

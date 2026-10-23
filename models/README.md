@@ -1,22 +1,28 @@
 # Models
 
 Each directory here is a model package, written in Starlark against the
-builtins of `crates/poem`. A package is four kinds of file, each evaluated
-with only the builtins of its stage:
+builtins of `crates/poem`. A package is whatever `.poem` files its directory
+holds; what they are named says nothing. It is read by the entries it
+defines, each defined once across its files:
 
-| file           | states                                                          |
-| -------------- | --------------------------------------------------------------- |
-| `package.poem` | `MODELS` (ids, miniatures, parts, drafters, template, tokenizer), `DEPLOYMENTS`, in the order an import tries them, and `PUBLISHED`: the draft heads published for a checkpoint repository, the first listed being what `pie model import` drafts with unless told `--drafter none` |
-| `model.poem`   | `layout(id, deploy)`: a deployment's dims and the weights they lay out; `media(id, deploy)`, if it reads stills: `struct(image = struct(patch, block, mrope, prefix, placeholder, suffix, frame))` |
-| `forward.poem` | `caches(m, c)` and `forward(m, inputs)`: the caches it holds and the forward its rows run |
-| `formats.poem` | `formats(m)`: the checkpoint formats it is read in, and what lands where |
+| entry      | states                                                          |
+| ---------- | --------------------------------------------------------------- |
+| `MODELS`, `DEPLOYMENTS`, `PUBLISHED` | the models (ids, miniatures, parts, drafters, template, tokenizer); the deployments, in the order an import tries them; and the draft heads published for a checkpoint repository, the first listed being what `pie model import` drafts with unless told `--drafter none` |
+| `layout(id, deploy)` | a deployment's dims and the weights they lay out |
+| `media(id, deploy)` | if it reads stills: `struct(image = struct(patch, block, mrope, prefix, placeholder, suffix, frame))` |
+| `caches(m, c)`, `forward(m, inputs)` | the caches it holds and the forward its rows run |
+| `formats(m)` | the checkpoint formats it is read in, and what lands where |
 
-Any other `.poem` file is a helper the stages may `load()`; `lib/` holds
-the helpers every package may load, as `//lib/…`.
+One file may hold them all. A package split across files still names each
+entry once; a name a file only `load()`s is not its definition. `lib/`
+holds the helpers every package may load, as `//lib/…`; what a library
+defines is never a package's entry.
 
-A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tp{n}]`; `yarn{f}` stretches the
+A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}]`; `yarn{f}` stretches the
 model's native context `f` times by YaRN, in a package that turns it
-(`deploy.yarn`, read into `rope_scaling(...)`).
+(`deploy.yarn`, read into `rope_scaling(...)`); `tap.{key}`, for a parity
+check, ends the forward at the intermediate `key` and reads it out instead,
+in a model that states `taps = True` (`deploy.tap`).
 Each of its weights is a dtype or a precision: a stored dtype whose products
 quantize their activations, spelled with what they quantize to (`nvfp4a4`,
 NVFP4 codes against NVFP4 activations; `mxfp4a8`, MXFP4 codes against e4m3
@@ -29,7 +35,7 @@ MXFP4 or NVFP4 bank as W4A16, a block-FP8 one as W8A16
 ## What a model says of its tokens
 
 A model is spoken through a template and a tokenizer, both stated as data in
-`package.poem`, so no Rust names a model:
+`MODELS`, so no Rust names a model:
 
 - `template(format, …)` picks a format the runtime ships (`chatml`, `harmony`,
   `gemma`, `deepseek`, `dots`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `mimo`, `minimax`,

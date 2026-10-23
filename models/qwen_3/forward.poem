@@ -27,17 +27,22 @@ def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
 
 def moe(x, f):
     """The routed MLP: `f.top_k` of `f.experts`, plus the gated shared expert."""
-    experts, weights = ops.linear.moe_topk_softmax(ops.linear.matmul(x, f.router), f.experts, f.top_k)
+    experts, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.softmax(),
+    )
 
     def select(act, bank):
         if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
             return ops.linear.moe_matmul_select(act, bank, experts, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, experts, f.top_k)
 
-    hidden = ops.linear.swiglu(select(x, f.gate_up), f.inter)
+    hidden = ops.linear.glu(select(x, f.gate_up), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(select(hidden, f.down), weights)
     shared = ops.linear.matmul(
-        ops.linear.swiglu(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter),
+        ops.linear.glu(ops.linear.matmul(x, f.shared_gate_up), gating.swiglu(), f.shared_inter),
         f.shared_down,
     )
     return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
@@ -50,8 +55,24 @@ def positions(inputs, vision):
 
 def rope(q, k, positions, vision, rotary_dim, head_dim, theta, scaling = None):
     if not vision:
-        return ops.elemwise.rope_partial(q, k, positions, rotary_dim, head_dim, theta, scaling = scaling)
-    return ops.elemwise.rope_mrope(q, k, positions, MROPE_SECTIONS, "interleaved", rotary_dim, head_dim, theta, scaling = scaling)
+        return ops.elemwise.rope(
+            q,
+            positions,
+            head_dim,
+            theta,
+            rotary.partial(rotary_dim),
+            k = k,
+            scaling = scaling,
+        )
+    return ops.elemwise.rope(
+        q,
+        positions,
+        head_dim,
+        theta,
+        rotary.mrope(MROPE_SECTIONS, "interleaved", rotary_dim),
+        k = k,
+        scaling = scaling,
+    )
 
 def tower(inputs, t):
     """The tower's merged rows for the request's patches."""
@@ -68,7 +89,7 @@ def tower(inputs, t):
     for b in t.blocks:
         n = ops.elemwise.layernorm(y, b.norm1, b.norm1_bias, t.norm_eps)
         q, k, v = ops.gather.split_qkv(ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)), t.hidden, t.hidden)
-        q, k = ops.elemwise.rope_mrope(q, k, grid, [0, d // 4, d // 4], "blocked", d, d, t.theta)
+        q, k = ops.elemwise.rope(q, grid, d, t.theta, rotary.mrope([0, d // 4, d // 4], "blocked", d), k = k)
         o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
         y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.proj_bias, ops.linear.matmul(o, b.proj)), y)
 
@@ -189,7 +210,7 @@ def mlp(x, f, bonsai):
         # Bonsai: the gate and up projections share the rotated residual;
         # down rotates the swiglu intermediate.
         gate_in = rot_copy(x, bonsai.hidden) if bonsai != None else x
-        h = ops.linear.swiglu(ops.linear.matmul(gate_in, f.gate_up), f.inter)
+        h = ops.linear.glu(ops.linear.matmul(gate_in, f.gate_up), gating.swiglu(), f.inter)
         down_in = rot_take(h, bonsai.ffn_down) if bonsai != None else h
         return ops.linear.matmul(down_in, f.down)
     return moe(x, f)
@@ -212,7 +233,10 @@ def draft(m, inputs, x, logits, head):
     dy = ops.elemwise.residual_add(o, dy)
 
     nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
-    f = ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(nx, mtp.mlp.gate_up), mtp.mlp.inter), mtp.mlp.down)
+    f = ops.linear.matmul(
+        ops.linear.glu(ops.linear.matmul(nx, mtp.mlp.gate_up), gating.swiglu(), mtp.mlp.inter),
+        mtp.mlp.down,
+    )
     dy = ops.elemwise.residual_add(f, dy)
 
     read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
@@ -249,12 +273,21 @@ def attn_mixer(x, inputs, m, plans, mask, a):
     seam.at(seam.ATTN_Q, [q])
 
     def scored(q):
-        o, lse = ops.attn.prefill_lse(q, plans.s, pages, None, d, m.kv_heads, a.sm_scale)
+        o, lse = ops.attn.prefill(q, plans.s, pages, None, d, m.kv_heads, a.sm_scale, lse = True)
         seam.at(seam.SCORES, [lse])
         return o
 
     o = switch(q, [
-        (fact.has(fact.Mask), lambda q: ops.attn.masked(q, plans.m, mask, pages, None, d, m.kv_heads, True, a.sm_scale)),
+        (fact.has(fact.Mask), lambda q: ops.attn.prefill(
+            q,
+            plans.m,
+            pages,
+            None,
+            d,
+            m.kv_heads,
+            a.sm_scale,
+            mask = mask,
+        )),
         (fact.scores(), scored),
         (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, a.sm_scale)),
     ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, a.sm_scale))

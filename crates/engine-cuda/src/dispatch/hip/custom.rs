@@ -423,7 +423,21 @@ impl Run<'_> {
                 head_dim,
                 o_out,
             } => {
-                let (Attn::DecodeLse { o, lse, .. } | Attn::PrefillLse { o, lse, .. }) = **attn
+                let (Attn::Decode {
+                    o,
+                    lse: Some(lse),
+                    selection: None,
+                    bias: None,
+                    ..
+                }
+                | Attn::Prefill {
+                    o,
+                    lse: Some(lse),
+                    mask: None,
+                    selection: None,
+                    bias: None,
+                    ..
+                }) = **attn
                 else {
                     return Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
                         op: op.name(),
@@ -487,7 +501,7 @@ impl Run<'_> {
                     self,
                     &Attn::KvAppend {
                         k: *k_out,
-                        v: *v,
+                        v: Some(*v),
                         cache: *cache,
                         write_page: *write_page,
                         write_offset: *write_offset,
@@ -553,7 +567,7 @@ impl Run<'_> {
                     self,
                     &Attn::KvAppend {
                         k: *k_out,
-                        v: *v_out,
+                        v: Some(*v_out),
                         cache: *cache,
                         write_page: *write_page,
                         write_offset: *write_offset,
@@ -771,7 +785,7 @@ impl Run<'_> {
             self,
             &poem_ir::Attn::KvAppend {
                 k: k_out,
-                v,
+                v: Some(v),
                 cache,
                 write_page,
                 write_offset,

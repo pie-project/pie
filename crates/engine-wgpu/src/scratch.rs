@@ -222,7 +222,22 @@ impl Scratch {
             .iter()
             .filter_map(|node| match &node.op {
                 Operation::Attn(
-                    Attn::Decode { o, head_dim, .. } | Attn::DecodeLse { o, head_dim, .. },
+                    Attn::Decode {
+                        o,
+                        head_dim,
+                        selection: None,
+                        bias: None,
+                        lse: None,
+                        ..
+                    }
+                    | Attn::Decode {
+                        o,
+                        head_dim,
+                        selection: None,
+                        bias: None,
+                        lse: Some(_),
+                        ..
+                    },
                 ) => of(*o).map(|rect| (rect.width, rect.rows, *head_dim)),
                 _ => None,
             })

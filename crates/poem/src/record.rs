@@ -40,11 +40,19 @@ primitive!(
     poem_ir::Conv
 );
 
+/// A value recorded once a trace, by its parts.
+type Held = (ValueId, Option<Guard>, Ty);
+
 #[derive(Clone)]
 pub struct Recorder {
     inner: Rc<RefCell<Trace>>,
 
     at: Rc<Cell<Option<u32>>>,
+
+    /// The values recorded once a trace, by what they are: the host plans
+    /// every layer's attention reads. Held as their parts, so no value
+    /// outlives the trace through this.
+    once: Rc<RefCell<std::collections::HashMap<String, Held>>>,
 }
 
 impl Recorder {
@@ -62,7 +70,29 @@ impl Recorder {
                 facts: poem_ir::Facts::default(),
             })),
             at: Rc::new(Cell::new(None)),
+            once: Rc::default(),
         }
+    }
+
+    /// The value `make` records, recorded the first time `key` is asked for
+    /// and outside any layer: a host plan, built once and read by every
+    /// layer that asks for the same one.
+    pub(crate) fn once(&self, key: String, make: impl FnOnce() -> Value) -> Value {
+        if let Some((id, over, ty)) = self.once.borrow().get(&key).cloned() {
+            return Value {
+                rec: self.clone(),
+                id,
+                over,
+                ty,
+            };
+        }
+        let at = self.at.replace(None);
+        let made = make();
+        self.at.set(at);
+        self.once
+            .borrow_mut()
+            .insert(key, (made.id, made.over.clone(), made.ty.clone()));
+        made
     }
 
     /// The platform this trace is recorded for.

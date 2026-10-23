@@ -1944,7 +1944,7 @@ pub fn decode_lse<T: Stored>(
     lse: T,
 ) -> Result<Paged<T>, Error> {
     let call = plain(
-        "attn.decode_lse",
+        "attn.decode",
         q,
         Tables::decode(plan),
         window,
@@ -1994,7 +1994,7 @@ pub fn prefill_lse<T: Stored>(
     o: T,
     lse: T,
 ) -> Result<Paged<T>, Error> {
-    const OP: &str = "attn.prefill_lse";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = plain(
         OP,
@@ -2024,7 +2024,7 @@ pub fn masked<T: Stored>(
 ) -> Result<Paged<T>, Error> {
     let tables = Tables::prefill(plan).with_mask(mask);
     let call = plain(
-        "attn.masked",
+        "attn.prefill",
         q.data,
         tables,
         window,
@@ -2050,7 +2050,7 @@ pub fn decode_selected<T: Stored>(
     o: T,
 ) -> Result<Paged<T>, Error> {
     let mut call = plain(
-        "attn.decode_selected",
+        "attn.decode",
         q,
         Tables::decode(plan),
         window,
@@ -2076,7 +2076,7 @@ pub fn prefill_selected<T: Stored>(
     ratio: u32,
     o: T,
 ) -> Result<Paged<T>, Error> {
-    const OP: &str = "attn.prefill_selected";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let mut call = plain(
         OP,
@@ -2307,7 +2307,7 @@ pub fn kv_append_shared(
 ) -> Result<(Val, Val), Error> {
     append(
         f,
-        "attn.kv_append_shared",
+        "attn.kv_append",
         plane,
         plane,
         keys,

@@ -303,6 +303,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => self.decode_attention(*q, *plan, *cache, *window, *head_dim, *sm_scale, *o, None),
 
             Attn::Prefill {
@@ -314,6 +319,14 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
+                mask: None,
+                selection: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected: None,
+                rel: None,
+                lse: None,
             } => self.prefill_attention(
                 *q,
                 *plan,
@@ -327,8 +340,21 @@ impl Run<'_> {
                 None,
             ),
 
-            Attn::DecodeSelected { per_head: true, .. }
-            | Attn::PrefillSelected { per_head: true, .. }
+            Attn::Decode {
+                selection: Some(_),
+                bias: None,
+                selected: Some(poem_ir::Blocks { per_head: true, .. }),
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                mask: None,
+                selection: Some(_),
+                bias: None,
+                selected: Some(poem_ir::Blocks { per_head: true, .. }),
+                lse: None,
+                ..
+            }
             | Attn::IndexTopk {
                 score: IndexScore::BlockMax,
                 ..
@@ -341,19 +367,25 @@ impl Run<'_> {
             Attn::KvEnds { .. } | Attn::WindowSink { .. } | Attn::ReplayFloor { .. } => {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
-            Attn::DecodeSelected {
+            Attn::Decode {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                bias: None,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => self.selected_attention(
-                "attn.decode_selected",
+                "attn.decode",
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 *selection,
@@ -364,20 +396,29 @@ impl Run<'_> {
                 *ratio,
                 *o,
             ),
-            Attn::PrefillSelected {
+            Attn::Prefill {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 kv_heads,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                mask: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => {
-                const OP: &str = "attn.prefill_selected";
+                const OP: &str = "attn.prefill";
                 Self::kv_heads_agree(OP, self.pool(*cache), *kv_heads)?;
                 self.selected_attention(
                     OP,
@@ -433,16 +474,40 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attn::Masked { causal: false, .. }
-            | Attn::MaskedLse { causal: false, .. }
-            | Attn::Ragged { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
-            Attn::DecodeRel { .. } | Attn::PrefillRel { .. } => {
-                Err(kernels_slang::Error::Unsupported { op: op.name() })
+            Attn::Prefill {
+                causal: false,
+                mask: Some(_),
+                selection: None,
+                bias: None,
+                lse: None,
+                ..
             }
-            Attn::Masked {
+            | Attn::Prefill {
+                causal: false,
+                mask: Some(_),
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }
+            | Attn::Ragged { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
+            Attn::Decode {
+                selection: None,
+                bias: Some(_),
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                mask: None,
+                selection: None,
+                bias: Some(_),
+                lse: None,
+                ..
+            } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -450,6 +515,12 @@ impl Run<'_> {
                 causal: _,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => self.prefill_attention(
                 *q,
                 *plan,
@@ -462,10 +533,10 @@ impl Run<'_> {
                 self.tensor(*o),
                 None,
             ),
-            Attn::MaskedLse {
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -473,7 +544,12 @@ impl Run<'_> {
                 causal: _,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
             } => self.prefill_attention(
                 *q,
                 *plan,
@@ -486,7 +562,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 Some(self.tensor(*lse)),
             ),
-            Attn::DecodeLse {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -494,7 +570,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
             } => self.decode_attention(
                 *q,
                 *plan,
@@ -505,7 +585,7 @@ impl Run<'_> {
                 *o,
                 Some(*lse),
             ),
-            Attn::PrefillLse {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -514,9 +594,15 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
                 // This backend splits no prompt's rows, so a replay floor stays 0.
                 floor: _,
+                mask: None,
+                selection: None,
+                bias: None,
+                causal: true,
+                selected: None,
+                rel: None,
             } => {
                 self.prefill_attention(
                     *q,
@@ -573,7 +659,7 @@ impl Run<'_> {
             }
             Attn::KvAppend {
                 k,
-                v,
+                v: Some(v),
                 cache,
                 write_page,
                 write_offset,
@@ -585,8 +671,9 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attn::KvAppendShared {
-                plane,
+            Attn::KvAppend {
+                k: plane,
+                v: None,
                 cache,
                 write_page,
                 write_offset,
@@ -723,17 +810,35 @@ impl Run<'_> {
             ),
 
             // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
-            Attn::MlaDecode { lse: Some(_), .. }
-            | Attn::MlaPrefill { lse: Some(_), .. }
-            | Attn::MlaDecodeSelected { lse: Some(_), .. }
-            | Attn::MlaPrefillSelected { lse: Some(_), .. } => {
-                Err(kernels_slang::Error::Unsupported { op: op.name() })
-            }
             Attn::MlaDecode {
-                window: Some(_), ..
+                lse: Some(_),
+                selection: None,
+                ..
             }
             | Attn::MlaPrefill {
-                window: Some(_), ..
+                lse: Some(_),
+                selection: None,
+                ..
+            }
+            | Attn::MlaDecode {
+                lse: Some(_),
+                selection: Some(_),
+                ..
+            }
+            | Attn::MlaPrefill {
+                lse: Some(_),
+                selection: Some(_),
+                ..
+            } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
+            Attn::MlaDecode {
+                window: Some(_),
+                selection: None,
+                ..
+            }
+            | Attn::MlaPrefill {
+                window: Some(_),
+                selection: None,
+                ..
             } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Attn::MlaDecode {
                 q,
@@ -746,6 +851,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse: _,
+                selection: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -775,6 +881,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse: _,
+                selection: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -793,17 +900,18 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attn::MlaDecodeSelected {
+            Attn::MlaDecode {
                 q,
                 plan: _,
                 q_pe,
-                selection,
+                selection: Some(selection),
                 cache,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
                 lse: _,
+                window: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -823,17 +931,18 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attn::MlaPrefillSelected {
+            Attn::MlaPrefill {
                 q,
                 plan: _,
                 q_pe,
-                selection,
+                selection: Some(selection),
                 cache,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
                 lse: _,
+                window: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -953,13 +1062,14 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*entries),
             ),
-            Attn::PoolBoundaryDecode {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: true,
             } => kernels_slang::attn::pool::boundary_decode(
                 self.ctx,
                 self.tensor(*positions),
@@ -970,13 +1080,14 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attn::PoolBoundaryPrefill {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: false,
             } => kernels_slang::attn::pool::boundary_prefill(
                 self.ctx,
                 self.ragged(*positions),
@@ -1070,6 +1181,8 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse,
+                selection: None,
+                top_k: None,
             } => kernels_slang::attn::pool::attention_lse(
                 self.ctx,
                 self.tensor(*q),
@@ -1083,14 +1196,14 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attn::PoolLseSelected {
+            Attn::PoolLse {
                 q,
                 positions,
                 request_of_token,
-                selection,
+                selection: Some(selection),
                 entries,
                 ratio,
-                top_k,
+                top_k: Some(top_k),
                 heads,
                 head_dim,
                 sm_scale,
@@ -1111,6 +1224,13 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
+            // A selection, a window, a relative bias and a mask no kernel here
+            // combines.
+            Attn::Decode { .. }
+            | Attn::Prefill { .. }
+            | Attn::MlaDecode { .. }
+            | Attn::MlaPrefill { .. }
+            | Attn::PoolLse { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
         }
     }
 }

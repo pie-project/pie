@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "register_mma.h"
 using namespace metal;
 
 // Up to eight rows of a 4-bit, 64-group affine matmul on the 8x8 simdgroup
@@ -24,23 +25,6 @@ using namespace metal;
 // of each column tile to arrive.
 
 namespace qmm_sg {
-
-template <typename T>
-__attribute__((always_inline)) inline thread vec<T, 2> &te(thread simdgroup_matrix<T, 8, 8> &m) {
-  return reinterpret_cast<thread vec<T, 2> &>(m.thread_elements());
-}
-
-// c += a x b on operands held in plain registers: lane (fm, fn) holds
-// M[fm][fn] and M[fm][fn + 1] of each.
-__attribute__((always_inline)) inline void mma(thread float2 &c, bfloat2 a, bfloat2 b) {
-  simdgroup_matrix<bfloat, 8, 8> A, B;
-  simdgroup_matrix<float, 8, 8> C, D;
-  te(A) = a;
-  te(B) = b;
-  te(C) = c;
-  simdgroup_multiply_accumulate(D, A, B, C);
-  c = te(D);
-}
 
 constant constexpr int kSpan = 256;
 
@@ -105,6 +89,7 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
               uint lane [[thread_index_in_simdgroup]],
               uint simd [[simdgroup_index_in_threadgroup]]) {
   using namespace qmm_sg;
+  using namespace register_mma;
   constexpr int NF = 2; // 8-column fragments a simdgroup holds
   const uint qid = lane >> 2;
   const uint fm = (qid & 4) | ((lane >> 1) & 3);
@@ -277,6 +262,7 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
                        uint lane [[thread_index_in_simdgroup]],
                        uint simd [[simdgroup_index_in_threadgroup]]) {
   using namespace qmm_sg;
+  using namespace register_mma;
   constexpr int NF = 2; // 8-column fragments a simdgroup holds
   const int seg_columns[3] = {c0, c1, c2}, splits[3] = {p0, p1, p2}, strides[3] = {d0, d1, d2};
   const int offsets[3] = {o0, o1, o2};

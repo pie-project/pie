@@ -213,6 +213,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/moe/select.metal")),
     ),
     (
+        "linear/moe/select_sg.metal",
+        include_str!(concat!(source_root!(), "/linear/moe/select_sg.metal")),
+    ),
+    (
         "linear/qmm_mpp.metal",
         include_str!(concat!(source_root!(), "/linear/qmm_mpp.metal")),
     ),
@@ -239,6 +243,10 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "linear/qmv_rows.metal",
         include_str!(concat!(source_root!(), "/linear/qmv_rows.metal")),
+    ),
+    (
+        "linear/register_mma.h",
+        include_str!(concat!(source_root!(), "/linear/register_mma.h")),
     ),
     (
         "prim/gemm_loader.h",

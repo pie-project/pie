@@ -14,7 +14,17 @@ fn count(trace: &Trace, op: impl Fn(&Operation) -> bool) -> usize {
 }
 
 fn non_causal(op: &Operation) -> bool {
-    matches!(op, Operation::Attn(Attn::Masked { causal: false, .. }))
+    matches!(
+        op,
+        Operation::Attn(Attn::Prefill {
+            causal: false,
+            mask: Some(_),
+            selection: None,
+            bias: None,
+            lse: None,
+            ..
+        })
+    )
 }
 
 fn block_dyn_conv(op: &Operation) -> bool {

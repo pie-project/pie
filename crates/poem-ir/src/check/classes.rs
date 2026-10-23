@@ -401,7 +401,6 @@ fn writes_cache(op: &Operation) -> bool {
     match op {
         Operation::Attn(op) => match op {
             Attn::KvAppend { .. }
-            | Attn::KvAppendShared { .. }
             | Attn::MlaKvAppend { .. }
             | Attn::IndexKvAppend { .. }
             | Attn::PoolKvAppend { .. }
@@ -411,17 +410,9 @@ fn writes_cache(op: &Operation) -> bool {
             | Attn::PlanPrefill { .. }
             | Attn::Decode { .. }
             | Attn::Prefill { .. }
-            | Attn::DecodeRel { .. }
-            | Attn::PrefillRel { .. }
-            | Attn::Masked { .. }
-            | Attn::MaskedLse { .. }
             | Attn::Dense { .. }
             | Attn::Ragged { .. }
             | Attn::Voxel { .. }
-            | Attn::DecodeLse { .. }
-            | Attn::PrefillLse { .. }
-            | Attn::DecodeSelected { .. }
-            | Attn::PrefillSelected { .. }
             | Attn::Sink { .. }
             | Attn::MergeLse { .. }
             | Attn::LogitSoftcap { .. }
@@ -431,21 +422,33 @@ fn writes_cache(op: &Operation) -> bool {
             | Attn::MlaSplitQB { .. }
             | Attn::MlaAbsorbQ { .. }
             | Attn::MlaAbsorbOut { .. }
-            | Attn::MlaDecode { .. }
-            | Attn::MlaPrefill { .. }
-            | Attn::MlaDecodeSelected { .. }
-            | Attn::MlaPrefillSelected { .. }
+            | Attn::MlaDecode {
+                selection: None, ..
+            }
+            | Attn::MlaPrefill {
+                selection: None, ..
+            }
+            | Attn::MlaDecode {
+                selection: Some(_), ..
+            }
+            | Attn::MlaPrefill {
+                selection: Some(_), ..
+            }
             | Attn::KvEnds { .. }
             | Attn::WindowSink { .. }
             | Attn::IndexLayernormRope { .. }
             | Attn::IndexRope { .. }
             | Attn::IndexTopk { .. }
             | Attn::IndexBlockMean { .. }
-            | Attn::PoolBoundaryDecode { .. }
-            | Attn::PoolBoundaryPrefill { .. }
+            | Attn::PoolBoundary { decode: true, .. }
+            | Attn::PoolBoundary { decode: false, .. }
             | Attn::PoolGather { .. }
-            | Attn::PoolLse { .. }
-            | Attn::PoolLseSelected { .. } => false,
+            | Attn::PoolLse {
+                selection: None, ..
+            }
+            | Attn::PoolLse {
+                selection: Some(_), ..
+            } => false,
         },
         Operation::Fused(op) => matches!(
             op,
@@ -617,8 +620,9 @@ mod tests {
             let page = self.input();
             let offset = self.input();
             self.trace.nodes.push(Node {
-                op: Attn::KvAppendShared {
-                    plane: x,
+                op: Attn::KvAppend {
+                    k: x,
+                    v: None,
                     cache,
                     write_page: page,
                     write_offset: offset,
