@@ -31,9 +31,18 @@ fn product(trace: &Trace) -> &Linear {
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Linear(op @ (Linear::Matmul { .. } | Linear::MatmulActQuant { .. })) => {
-                Some(op)
-            }
+            Operation::Linear(
+                op @ (Linear::Matmul {
+                    quant: None,
+                    logits: false,
+                    ..
+                }
+                | Linear::Matmul {
+                    quant: Some(_),
+                    logits: false,
+                    ..
+                }),
+            ) => Some(op),
             _ => None,
         })
         .expect("the trace holds its product")
@@ -58,7 +67,14 @@ fn a_precision_traces_the_product_it_quantizes_for_every_case() {
 
 fn a_plain_dtype_reads_its_activations_as_they_are() {
     let trace = traced(Precision::of(Dtype::Bf16));
-    assert!(matches!(product(&trace), Linear::Matmul { .. }));
+    assert!(matches!(
+        product(&trace),
+        Linear::Matmul {
+            quant: None,
+            logits: false,
+            ..
+        }
+    ));
 }
 
 fn an_fp8_block_weight_lands_raw_codes_beside_its_block_exponents() {
@@ -67,11 +83,12 @@ fn an_fp8_block_weight_lands_raw_codes_beside_its_block_exponents() {
         .find(|p| p.dtype == Dtype::Fp8b128)
         .expect("fp8b128 is read at a W8A8 precision");
     let trace = traced(w8a8);
-    let Linear::MatmulActQuant {
+    let Linear::Matmul {
         w,
-        quant,
+        quant: Some(quant),
         input_scales,
         scales: Some(scales),
+        logits: false,
         ..
     } = product(&trace)
     else {
@@ -100,10 +117,11 @@ fn an_fp8_tile_weight_lands_raw_codes_beside_its_f32_factors() {
         .find(|p| p.dtype == Dtype::E4m3tile128)
         .expect("e4m3tile128 is read at a W8A8 precision");
     let trace = traced(w8a8);
-    let Linear::MatmulActQuant {
+    let Linear::Matmul {
         w,
-        quant,
+        quant: Some(quant),
         scales: Some(scales),
+        logits: false,
         ..
     } = product(&trace)
     else {
@@ -132,10 +150,11 @@ fn an_mxfp8_weight_lands_one_exponent_a_32_square_block() {
         .find(|p| p.dtype == Dtype::Fp8b32)
         .expect("fp8b32 is read at a W8A8 precision");
     let trace = traced(w8a8);
-    let Linear::MatmulActQuant {
+    let Linear::Matmul {
         w,
-        quant,
+        quant: Some(quant),
         scales: Some(scales),
+        logits: false,
         ..
     } = product(&trace)
     else {
@@ -160,11 +179,12 @@ fn an_ocp_mxfp8_weight_lands_one_exponent_a_32_of_each_row() {
         .find(|p| p.dtype == Dtype::Mxfp8)
         .expect("mxfp8 is read at a W8A8 precision");
     let trace = traced(w8a8);
-    let Linear::MatmulActQuant {
+    let Linear::Matmul {
         w,
-        quant,
+        quant: Some(quant),
         input_scales,
         scales: Some(scales),
+        logits: false,
         ..
     } = product(&trace)
     else {

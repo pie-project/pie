@@ -114,7 +114,16 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
         .nodes
         .iter()
         .rev()
-        .filter(|node| matches!(node.op, Operation::Linear(poem_ir::Linear::Matmul { .. })))
+        .filter(|node| {
+            matches!(
+                node.op,
+                Operation::Linear(poem_ir::Linear::Matmul {
+                    quant: None,
+                    logits: false,
+                    ..
+                })
+            )
+        })
         .take(2)
         .map(|node| &node.guard)
         .collect();

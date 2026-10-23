@@ -608,7 +608,20 @@ fn gemm_only(
         let w = match &node.op {
             // XLA ships no fused kernels (`crate::FUSED` is empty), so no
             // `Fused` op reaches a trace this reads.
-            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. }) => Some(*w),
+            Operation::Linear(
+                Linear::Matmul {
+                    w,
+                    quant: None,
+                    logits: false,
+                    ..
+                }
+                | Linear::Matmul {
+                    w,
+                    quant: None,
+                    logits: true,
+                    ..
+                },
+            ) => Some(*w),
             _ => None,
         };
         for &v in &inputs {

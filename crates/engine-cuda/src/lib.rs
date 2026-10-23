@@ -112,19 +112,35 @@ pub const UNCHAINED: [&str; 2] = [
 #[cfg(feature = "rocm")]
 pub const UNCHAINED: [&str; 1] = ["fused.residual_add_rmsnorm"];
 
+/// What `op` reads of a seat's rows: the seat table's entry for its name,
+/// but a gated unit of routed rows (each times its route's weight) reads
+/// routed rows, none of the seat's, and a predicted route only the
+/// prediction's.
+fn reads(op: &poem_ir::Operation) -> Reads {
+    match op {
+        poem_ir::Operation::Linear(
+            poem_ir::Linear::Glu {
+                weights: Some(_), ..
+            }
+            | poem_ir::Linear::MoeRoute {
+                score: poem_ir::RouteScore::Predict,
+                ..
+            },
+        ) => Reads::Nothing,
+        _ => kernels_cuda::seat::reads(poem_ir::Operands::name(op)),
+    }
+}
+
 #[must_use]
-pub fn shifted(op: &str) -> bool {
-    matches!(
-        kernels_cuda::seat::reads(op),
-        Reads::Rows | Reads::RowsAndLanes
-    )
+pub fn shifted(op: &poem_ir::Operation) -> bool {
+    matches!(reads(op), Reads::Rows | Reads::RowsAndLanes)
 }
 
 pub const PLANNED: [&str; 2] = ["attn.plan_decode", "attn.plan_prefill"];
 
 #[must_use]
-pub fn lane_shifted(op: &str) -> bool {
-    kernels_cuda::seat::reads(op) == Reads::RowsAndLanes
+pub fn lane_shifted(op: &poem_ir::Operation) -> bool {
+    reads(op) == Reads::RowsAndLanes
 }
 
 pub use api::{ContractFor, Cuda, DeviceBoot, World};

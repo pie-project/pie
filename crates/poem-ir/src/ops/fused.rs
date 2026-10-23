@@ -143,7 +143,7 @@ pub enum Fused {
         q_out: ValueId,
     },
     /// A head's RMS norm (scaled by `weight`, or scale-free) and the
-    /// rotation of its last `rotary_dim` dims (`RopePartialLast`), the
+    /// rotation of its last `rotary_dim` dims (a `Rope` turning `Last`), the
     /// normed heads the rotation's own plane.
     NormRopeLast {
         #[input]
@@ -191,7 +191,7 @@ pub enum Fused {
         write_offset: ValueId,
     },
     /// An index's ranking (`rank`, an `IndexTopk`) of queries whose tail is
-    /// rotated just before it (`rotate`, a `RopePartialLast` of the queries
+    /// rotated just before it (`rotate`, a `Rope` turning the queries' `Last`
     /// the ranking alone reads): a backend may turn them as it loads them.
     IndexTopkRope {
         #[part]

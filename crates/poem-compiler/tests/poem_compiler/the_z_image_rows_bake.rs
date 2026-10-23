@@ -438,10 +438,11 @@ fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Elemwise(Elemwise::RopeFull {
+                Operation::Elemwise(Elemwise::Rope {
                     head_dim,
                     theta,
-                    interleaved,
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full { interleaved, .. },
                     ..
                 }) => Some((*head_dim, *theta, *interleaved)),
                 _ => None,

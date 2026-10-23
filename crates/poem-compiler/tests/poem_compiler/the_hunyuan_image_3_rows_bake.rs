@@ -295,8 +295,15 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
         let neox = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elemwise(Elemwise::RopeFull { .. })
-                    | Operation::Elemwise(Elemwise::RopePartial { .. })
+                Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full { .. },
+                    ..
+                }) | Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                })
             )
         });
         assert!(
@@ -357,7 +364,13 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         let mut quant = 0usize;
         for node in &plan.nodes {
             match &node.op {
-                Operation::Linear(Linear::MoeTopkSoftmax { experts, top_k, .. }) => {
+                Operation::Linear(Linear::MoeRoute {
+                    experts,
+                    top_k,
+                    scale: None,
+                    score: poem_ir::RouteScore::Softmax,
+                    ..
+                }) => {
                     routers += 1;
                     assert_eq!((*experts, *top_k), (d.experts, d.top_k), "{deployment}");
                 }
@@ -387,7 +400,19 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         let swiglus = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Linear(Linear::Swiglu { .. })))
+            .filter(|node| {
+                matches!(
+                    &node.op,
+                    Operation::Linear(Linear::Glu {
+                        packed: Some(_),
+                        gate: None,
+                        weights: None,
+                        limit: None,
+                        act: poem_ir::GluAct::Swiglu,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             swiglus,

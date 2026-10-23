@@ -337,11 +337,24 @@ impl<'c> Run<'c> {
         self.readers_of(value)
             .iter()
             .filter_map(|&at| match &self.nodes.get(at as usize)?.op {
-                Operation::Linear(Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y })
-                    if *act == value =>
-                {
-                    self.register_counters(value, *w, self.tensor(*y).width)
-                }
+                Operation::Linear(
+                    Linear::Matmul {
+                        act,
+                        w,
+                        y,
+                        quant: None,
+                        logits: false,
+                        ..
+                    }
+                    | Linear::Matmul {
+                        act,
+                        w,
+                        y,
+                        quant: None,
+                        logits: true,
+                        ..
+                    },
+                ) if *act == value => self.register_counters(value, *w, self.tensor(*y).width),
                 Operation::Fused(Fused::MlpSwiglu {
                     act,
                     gate_up,
@@ -490,14 +503,32 @@ impl<'c> Run<'c> {
         self.chain.set(None);
         let (packed, hidden) = match self.sole_reader(y).map(|n| &n.op) {
             Some(Operation::Linear(
-                Linear::Swiglu {
-                    packed, y: hidden, ..
+                Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::Swiglu,
+                    ..
                 }
-                | Linear::SwigluClampAlpha {
-                    packed, y: hidden, ..
+                | Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: Some(_),
+                    act: poem_ir::GluAct::SwigluAlpha { .. },
+                    ..
                 }
-                | Linear::GegluTanhPacked {
-                    packed, y: hidden, ..
+                | Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::GegluTanh,
+                    ..
                 },
             )) => (packed, hidden),
             _ => return Sorted::default(),

@@ -8,10 +8,30 @@ fn tables(trace: &poem_ir::Trace) -> Vec<&RopeFreqs> {
         .iter()
         .filter_map(|node| match &node.op {
             Operation::Elemwise(
-                Elemwise::RopeFull { freqs, .. }
-                | Elemwise::RopePartial { freqs, .. }
-                | Elemwise::RopePartialQ { freqs, .. }
-                | Elemwise::RopeMrope { freqs, .. },
+                Elemwise::Rope {
+                    freqs,
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full { .. },
+                    ..
+                }
+                | Elemwise::Rope {
+                    freqs,
+                    k: Some(_),
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                }
+                | Elemwise::Rope {
+                    freqs,
+                    k: None,
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                }
+                | Elemwise::Rope {
+                    freqs,
+                    k: Some(_),
+                    turn: poem_ir::Turn::Mrope { .. },
+                    ..
+                },
             ) => freqs.as_ref(),
             _ => None,
         })
@@ -52,12 +72,32 @@ fn stated_forms(trace: &poem_ir::Trace) -> Vec<&'static str> {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Elemwise(Elemwise::RopeFull { freqs: Some(_), .. }) => Some("full"),
+            Operation::Elemwise(Elemwise::Rope {
+                freqs: Some(_),
+                k: Some(_),
+                turn: poem_ir::Turn::Full { .. },
+                ..
+            }) => Some("full"),
             Operation::Elemwise(
-                Elemwise::RopePartial { freqs: Some(_), .. }
-                | Elemwise::RopePartialQ { freqs: Some(_), .. },
+                Elemwise::Rope {
+                    freqs: Some(_),
+                    k: Some(_),
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                }
+                | Elemwise::Rope {
+                    freqs: Some(_),
+                    k: None,
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                },
             ) => Some("partial"),
-            Operation::Elemwise(Elemwise::RopeMrope { freqs: Some(_), .. }) => Some("mrope"),
+            Operation::Elemwise(Elemwise::Rope {
+                freqs: Some(_),
+                k: Some(_),
+                turn: poem_ir::Turn::Mrope { .. },
+                ..
+            }) => Some("mrope"),
             _ => None,
         })
         .collect()

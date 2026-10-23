@@ -98,7 +98,13 @@ pub fn projections(
 ) -> Vec<((u32, u32), Vec<Projection>)> {
     let mut groups: Vec<((u32, u32), Vec<Projection>)> = Vec::new();
     for node in &trace.nodes {
-        let poem_ir::Operation::Linear(poem_ir::Linear::Matmul { w, .. }) = &node.op else {
+        let poem_ir::Operation::Linear(poem_ir::Linear::Matmul {
+            w,
+            quant: None,
+            logits: false,
+            ..
+        }) = &node.op
+        else {
             continue;
         };
         let Some(bank) = q4_bank(trace, weights, *w) else {

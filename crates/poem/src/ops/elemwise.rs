@@ -1,5 +1,5 @@
 use super::*;
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{NormAxis, NormWeight, Turn};
 
 pub use poem_ir::ops::elemwise::Yarn;
 
@@ -338,16 +338,16 @@ pub fn rope_full(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elemwise::RopeFull {
+        Elemwise::Rope {
             q: q.id(),
-            k: k.id(),
+            k: Some(k.id()),
             positions: positions.id(),
             head_dim,
             theta,
-            interleaved,
-            q_out: q_out.id(),
-            k_out: k_out.id(),
+            turn: Turn::Full { interleaved },
             freqs,
+            q_out: q_out.id(),
+            k_out: Some(k_out.id()),
         },
         &[q, k, positions],
     );
@@ -384,17 +384,16 @@ pub fn rope_partial(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elemwise::RopePartial {
+        Elemwise::Rope {
             q: q.id(),
-            k: k.id(),
+            k: Some(k.id()),
             positions: positions.id(),
-            rotary_dim,
             head_dim,
             theta,
-            span,
-            q_out: q_out.id(),
-            k_out: k_out.id(),
+            turn: Turn::Partial { rotary_dim, span },
             freqs,
+            q_out: q_out.id(),
+            k_out: Some(k_out.id()),
         },
         &[q, k, positions],
     );
@@ -416,15 +415,16 @@ pub fn rope_partial_q(
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     r.push(
-        Elemwise::RopePartialQ {
+        Elemwise::Rope {
             q: q.id(),
+            k: None,
             positions: positions.id(),
-            rotary_dim,
             head_dim,
             theta,
-            span,
-            q_out: q_out.id(),
+            turn: Turn::Partial { rotary_dim, span },
             freqs,
+            q_out: q_out.id(),
+            k_out: None,
         },
         &[q, positions],
     );
@@ -465,16 +465,21 @@ pub fn rope_partial_last_yarn(
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     r.push(
-        Elemwise::RopePartialLast {
+        Elemwise::Rope {
             q: q.id(),
+            k: None,
             positions: positions.id(),
-            rotary_dim,
             head_dim,
             theta,
-            interleaved,
-            inverse,
-            yarn,
+            turn: Turn::Last {
+                rotary_dim,
+                interleaved,
+                inverse,
+                yarn,
+            },
+            freqs: None,
             q_out: q_out.id(),
+            k_out: None,
         },
         &[q, positions],
     );
@@ -498,20 +503,25 @@ pub fn rope_yarn(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elemwise::RopeYarn {
+        Elemwise::Rope {
             q: q.id(),
-            k: k.id(),
+            k: Some(k.id()),
             positions: positions.id(),
             head_dim,
             theta,
-            factor,
-            beta_fast,
-            beta_slow,
-            attention_factor,
-            original_max_position,
-            interleaved,
+            turn: Turn::Yarn {
+                yarn: Yarn {
+                    factor,
+                    beta_fast,
+                    beta_slow,
+                    original_max_position,
+                },
+                attention_factor,
+                interleaved,
+            },
+            freqs: None,
             q_out: q_out.id(),
-            k_out: k_out.id(),
+            k_out: Some(k_out.id()),
         },
         &[q, k, positions],
     );
@@ -825,18 +835,20 @@ pub fn rope_mrope(
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
     r.push(
-        Elemwise::RopeMrope {
+        Elemwise::Rope {
             q: q.id(),
-            k: k.id(),
+            k: Some(k.id()),
             positions: positions.id(),
-            sections,
-            form,
-            rotary_dim,
             head_dim,
             theta,
-            q_out: q_out.id(),
-            k_out: k_out.id(),
+            turn: Turn::Mrope {
+                sections,
+                form,
+                rotary_dim,
+            },
             freqs,
+            q_out: q_out.id(),
+            k_out: Some(k_out.id()),
         },
         &[q, k, positions],
     );

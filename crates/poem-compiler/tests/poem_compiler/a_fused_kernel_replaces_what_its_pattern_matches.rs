@@ -112,7 +112,7 @@ fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
         ops(&fused),
         [
             "linear.matmul",
-            "linear.swiglu",
+            "linear.glu",
             "linear.matmul",
             "elemwise.silu"
         ]
@@ -172,11 +172,7 @@ fn a_scaled_rotation_keeps_the_qkv_write_apart() {
         trace(|p| qkv_write_scaled(p, 1e-6, 1e-6, Some(scaling))),
         &["fused.qkv_fused_qknorm_rope_vnorm_write"],
     );
-    assert!(
-        ops(&fused).contains(&"elemwise.rope_full"),
-        "{:?}",
-        ops(&fused)
-    );
+    assert!(ops(&fused).contains(&"elemwise.rope"), "{:?}", ops(&fused));
 }
 
 /// Muse Spark's form folds too: scaleless q and k norms, v as it is, and a
@@ -610,11 +606,7 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     });
     assert_eq!(
         ops(&fuse(wide, &kernels)),
-        [
-            "elemwise.rmsnorm",
-            "elemwise.rope_partial_last",
-            "elemwise.silu"
-        ]
+        ["elemwise.rmsnorm", "elemwise.rope", "elemwise.silu"]
     );
 }
 
@@ -790,7 +782,11 @@ fn deepseeks_attention_lands_its_output_turned_back() {
     assert!(
         matches!(
             rotate.as_deref(),
-            Some(poem_ir::Elemwise::RopePartialLast { inverse: true, .. })
+            Some(poem_ir::Elemwise::Rope {
+                k: None,
+                turn: poem_ir::Turn::Last { inverse: true, .. },
+                ..
+            })
         ),
         "the attention holds the turn"
     );

@@ -8,9 +8,24 @@ use poem_ir::{Fused, Linear, Operation, ValueId};
 /// matmul is one leg, a fused dense MLP is its gate-up and down legs.
 pub(crate) fn matmuls(op: &Operation) -> impl Iterator<Item = (ValueId, ValueId, ValueId)> {
     let legs: [Option<(ValueId, ValueId, ValueId)>; 2] = match op {
-        Operation::Linear(Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y }) => {
-            [Some((*act, *w, *y)), None]
-        }
+        Operation::Linear(
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            }
+            | Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            },
+        ) => [Some((*act, *w, *y)), None],
         Operation::Fused(Fused::MlpSwiglu {
             act,
             gate_up,

@@ -17,10 +17,10 @@ pub use fact::{Builtin, Fact, Facts};
 pub use guard::Guard;
 pub use operands::{Operands, Part, Slot};
 pub use ops::{
-    ActQuant, Attn, Collective, Conv, Elemwise, Fused, GateActivation, Gather, GridRule,
+    ActQuant, Attn, Collective, Conv, Elemwise, Fused, GateActivation, Gather, GluAct, GridRule,
     IndexScore, Linear, ModulateForm, MropeForm, NormAxis, NormKind, NormNext, NormWeight,
-    Operation, PixelOrder, RaggedMask, RopeForm, RopeFreqs, Sampling, Ssm, TapKind, TimePad,
-    VoxelSegment,
+    Operation, PixelOrder, RaggedMask, RopeForm, RopeFreqs, RouteScore, Sampling, Ssm, TapKind,
+    TimePad, Turn, VoxelSegment, Yarn,
 };
 pub use poem_ir_macros::Op;
 pub use request::{Request, Stream};

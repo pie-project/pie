@@ -1152,9 +1152,11 @@ impl Weights {
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
         let mut done = 0;
         for node in &trace.nodes {
-            let Operation::Linear(Linear::MatmulActQuant {
+            let Operation::Linear(Linear::Matmul {
                 w,
                 scales: Some(scales),
+                quant: Some(_),
+                logits: false,
                 ..
             }) = &node.op
             else {
@@ -1574,9 +1576,13 @@ impl TensorSink for Landing<'_> {
 fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
     use poem_ir::{Def, Fused, Linear, Operation};
     let lowp = |op: &Linear| match op {
-        Linear::MatmulActQuant { w, .. } | Linear::MoeMatmulSelectActQuant { bank: w, .. } => {
-            Some(*w)
+        Linear::Matmul {
+            w,
+            quant: Some(_),
+            logits: false,
+            ..
         }
+        | Linear::MoeMatmulSelectActQuant { bank: w, .. } => Some(*w),
         _ => None,
     };
     let mut banks = BTreeMap::new();
@@ -1895,9 +1901,11 @@ fn lay_block_atoms(
         _ => None,
     };
     for node in &trace.nodes {
-        let Operation::Linear(Linear::MatmulActQuant {
+        let Operation::Linear(Linear::Matmul {
             w,
             scales: Some(scales),
+            quant: Some(_),
+            logits: false,
             ..
         }) = &node.op
         else {

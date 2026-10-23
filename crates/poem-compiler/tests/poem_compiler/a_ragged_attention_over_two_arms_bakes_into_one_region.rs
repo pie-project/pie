@@ -117,7 +117,16 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .nodes
             .iter()
             .enumerate()
-            .find(|(_, node)| matches!(node.op, Operation::Linear(Linear::Matmul { .. })))
+            .find(|(_, node)| {
+                matches!(
+                    node.op,
+                    Operation::Linear(Linear::Matmul {
+                        quant: None,
+                        logits: false,
+                        ..
+                    })
+                )
+            })
             .expect("the audio projection is the first matmul");
         let region = region_of(audio_proj);
         assert!(region.mask.contains(audio_class) && !region.mask.contains(video_class));
@@ -125,7 +134,16 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| matches!(node.op, Operation::Linear(Linear::Matmul { .. })))
+            .filter(|(_, node)| {
+                matches!(
+                    node.op,
+                    Operation::Linear(Linear::Matmul {
+                        quant: None,
+                        logits: false,
+                        ..
+                    })
+                )
+            })
             .nth(1)
             .expect("the key projection is the second matmul");
         let region = region_of(video_proj);

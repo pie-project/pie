@@ -535,20 +535,37 @@ fn routers(trace: &Trace) -> Vec<u32> {
             continue;
         };
         let (routes, experts) = match op {
-            Linear::MoeTopkSoftmax {
-                routes, experts, ..
+            Linear::MoeRoute {
+                routes,
+                experts,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSoftmaxScaled {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                scale: Some(_),
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSigmoid {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Sigmoid { .. },
+                ..
             }
-            | Linear::MoeTopkSqrtSoftplus {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::SqrtSoftplus { .. },
+                ..
             }
-            | Linear::MoeHashRoute {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Hash { .. },
+                ..
             } => (*routes, *experts),
             _ => continue,
         };

@@ -17,12 +17,37 @@ impl Run<'_> {
             Linear::Relu2 { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
-            Linear::MatmulActQuant { .. }
+            Linear::Matmul {
+                quant: Some(_),
+                logits: false,
+                ..
+            }
             | Linear::MoeMatmulSelectActQuant { .. }
-            | Linear::SwigluClampSplitRouted { .. }
-            | Linear::SwigluClampRouted { .. }
+            | Linear::Glu {
+                packed: None,
+                gate: Some(_),
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
+            | Linear::Glu {
+                packed: Some(_),
+                gate: None,
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
             | Linear::MoeSumAdd { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            Linear::Matmul { act, w, y } => match self.banked(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
+            } => match self.banked(*w) {
                 Some(bank) => crate::lower::linear::quant(
                     self.ctx(),
                     false,
@@ -50,7 +75,14 @@ impl Run<'_> {
                     }),
                 },
             },
-            Linear::LmHead { act, w, y } => match self.banked(*w) {
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            } => match self.banked(*w) {
                 Some(bank) => crate::lower::linear::quant(
                     self.ctx(),
                     true,
@@ -79,21 +111,32 @@ impl Run<'_> {
                 },
             },
 
-            Linear::Swiglu {
-                packed,
+            // The forms no builder makes.
+            Linear::Matmul { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let packed_v = l.read(self.tensor(*packed))?;
                 let o_y = self.tensor(*y);
                 let v = linear::mlp::swiglu(l.f(), packed_v, *intermediate, o_y.landing())?;
                 l.land(o_y, v)
             }),
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let packed_v = l.read(self.tensor(*packed))?;
                 let o_y = self.tensor(*y);
@@ -106,12 +149,15 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let packed_v = l.read(self.tensor(*packed))?;
                 let o_y = self.tensor(*y);
@@ -126,22 +172,33 @@ impl Run<'_> {
                 l.land(o_y, v)
             }),
 
-            Linear::SwigluClampSplit { gate, up, limit, y } => {
-                crate::lower::lower(self.ctx(), |l| {
-                    let gate_v = l.read(self.tensor(*gate))?;
-                    let up_v = l.read(self.tensor(*up))?;
-                    let o_y = self.tensor(*y);
-                    let v = linear::mlp::swiglu_clamp_split(
-                        l.f(),
-                        gate_v,
-                        up_v,
-                        *limit,
-                        o_y.landing(),
-                    )?;
-                    l.land(o_y, v)
-                })
-            }
-            Linear::GegluTanh { gate, up, y } => crate::lower::lower(self.ctx(), |l| {
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit: Some(limit),
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gate_v = l.read(self.tensor(*gate))?;
+                let up_v = l.read(self.tensor(*up))?;
+                let o_y = self.tensor(*y);
+                let v =
+                    linear::mlp::swiglu_clamp_split(l.f(), gate_v, up_v, *limit, o_y.landing())?;
+                l.land(o_y, v)
+            }),
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
                 let gate_v = l.read(self.tensor(*gate))?;
                 let up_v = l.read(self.tensor(*up))?;
                 let o_y = self.tensor(*y);
@@ -176,16 +233,16 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Linear::MoeTopkSigmoidSink {
+            Linear::MoeRoute {
                 logits,
                 bias,
                 scale,
                 experts,
                 top_k,
-                sink,
-                scaling,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::SigmoidSink { sink, scaling, .. },
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let logits_v = l.read(self.tensor(*logits))?;
                 let correction_bias_v = l.read_opt(bias.map(|b| self.tensor(b)))?;
@@ -208,10 +265,15 @@ impl Run<'_> {
                 l.land(o_weights, v1)?;
                 Ok(())
             }),
-            Linear::GegluTanhPacked {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let packed_v = l.read(self.tensor(*packed))?;
                 let o_y = self.tensor(*y);
@@ -219,12 +281,15 @@ impl Run<'_> {
                     linear::mlp::geglu_tanh_packed(l.f(), packed_v, *intermediate, o_y.landing())?;
                 l.land(o_y, v)
             }),
-            Linear::Situ {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                beta,
-                up_cap,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let packed_v = l.read(self.tensor(*packed))?;
                 let o_y = self.tensor(*y);
@@ -239,12 +304,17 @@ impl Run<'_> {
                 l.land(o_y, v)
             }),
 
-            Linear::MoeTopkSoftmax {
+            // The forms no builder makes.
+            Linear::Glu { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Linear::MoeRoute {
                 logits,
                 experts,
                 top_k,
                 routes,
                 weights,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let logits_v = l.read(self.tensor(*logits))?;
                 let o_routes = self.tensor(*routes);
@@ -261,13 +331,15 @@ impl Run<'_> {
                 l.land(o_weights, v1)?;
                 Ok(())
             }),
-            Linear::MoeTopkSoftmaxScaled {
+            Linear::MoeRoute {
                 logits,
-                scale,
+                scale: Some(scale),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let logits_v = l.read(self.tensor(*logits))?;
                 let scale_v = l.read(self.tensor(*scale))?;
@@ -287,16 +359,21 @@ impl Run<'_> {
                 Ok(())
             }),
 
-            Linear::MoeTopkSigmoid {
+            Linear::MoeRoute {
                 logits,
                 bias,
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
                 hint: _,
+                score:
+                    poem_ir::RouteScore::Sigmoid {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => match bias {
                 Some(bias) => crate::lower::lower(self.ctx(), |l| {
                     let logits_v = l.read(self.tensor(*logits))?;
@@ -337,13 +414,15 @@ impl Run<'_> {
                     Ok(())
                 }),
             },
-            Linear::MoePredictRoute {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
                 routes,
                 weights,
+                score: poem_ir::RouteScore::Predict,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let logits_v = l.read(self.tensor(*logits))?;
                 let bias_v = l.read(self.tensor(*bias))?;
@@ -363,16 +442,21 @@ impl Run<'_> {
                 Ok(())
             }),
 
-            Linear::MoeTopkSqrtSoftplus {
+            Linear::MoeRoute {
                 logits,
-                bias,
+                bias: Some(bias),
                 experts,
                 top_k,
-                renormalize,
-                scaling,
                 hint: _,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::SqrtSoftplus {
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let logits_v = l.read(self.tensor(*logits))?;
                 let bias_v = l.read(self.tensor(*bias))?;
@@ -394,17 +478,22 @@ impl Run<'_> {
                 Ok(())
             }),
 
-            Linear::MoeHashRoute {
-                ids,
-                tid2eid,
+            Linear::MoeRoute {
+                ids: Some(ids),
+                table: Some(tid2eid),
                 logits,
-                vocab,
                 experts: _,
                 top_k,
-                renormalize,
-                scaling,
                 routes,
                 weights,
+                score:
+                    poem_ir::RouteScore::Hash {
+                        vocab,
+                        renormalize,
+                        scaling,
+                        ..
+                    },
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let ids_v = l.read(self.tensor(*ids))?;
                 let tid2eid_v = l.read(self.tensor(*tid2eid))?;
@@ -427,6 +516,8 @@ impl Run<'_> {
                 l.land(o_weights, v1)?;
                 Ok(())
             }),
+            // The forms no builder makes.
+            Linear::MoeRoute { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::GroupRoutes { groups, routes } => crate::lower::lower(self.ctx(), |l| {
                 let o_routes = self.tensor(*routes);
                 let v = linear::moe::group_routes(l.f(), *groups, o_routes.landing())?;

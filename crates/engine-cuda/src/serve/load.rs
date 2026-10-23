@@ -1298,7 +1298,11 @@ fn decoded_weight_planes(
                 // A low-precision product decodes no bf16 tile.
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Linear(
-                    poem_ir::Linear::MatmulActQuant { .. }
+                    poem_ir::Linear::Matmul {
+                        quant: Some(_),
+                        logits: false,
+                        ..
+                    }
                     | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
                 ) => continue,
                 #[cfg(not(feature = "rocm"))]
@@ -1366,9 +1370,11 @@ fn decoded_weight_planes(
             let decoded = !kernels_cuda::linear::gemm_sm100::supported();
             #[cfg(any(feature = "rocm", feature = "cuda"))]
             if decoded
-                && let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
+                && let poem_ir::Operation::Linear(poem_ir::Linear::Matmul {
                     w,
                     scales: Some(_),
+                    quant: Some(_),
+                    logits: false,
                     ..
                 }) = &node.op
                 && let Some(poem_ir::Ty::Tensor { shape, .. }) =

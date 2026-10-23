@@ -36,22 +36,53 @@ impl ActQuant {
     }
 }
 
+/// How a [`Linear::MoeRoute`] scores and weighs its experts.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum RouteScore {
+    /// Softmax over the experts (times `scale`, a per-expert gain, where given).
+    Softmax,
+    /// Sigmoid scores, the top-k's weights renormalized where stated, then
+    /// times `scaling`.
+    Sigmoid { renormalize: bool, scaling: f32 },
+    /// Sigmoid scores, with `sink` slots past the `top_k` routed ones (its
+    /// routes and weights are `top_k + sink` wide).
+    SigmoidSink { sink: u32, scaling: f32 },
+    /// `sqrt(softplus(x))` scores (DeepSeek-V4).
+    SqrtSoftplus { renormalize: bool, scaling: f32 },
+    /// The routes a biased pick predicts; its weights are not read.
+    Predict,
+    /// Experts looked up by token id in `table` (`vocab` rows), weighted by
+    /// their scores of `logits`.
+    Hash {
+        vocab: u32,
+        renormalize: bool,
+        scaling: f32,
+    },
+}
+
+/// The gate's activation a [`Linear::Glu`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum GluAct {
+    /// `silu(gate) · up`.
+    Swiglu,
+    /// GPT-OSS's: `gate · sigmoid(alpha · gate) · (up + 1)`.
+    SwigluAlpha { alpha: f32 },
+    /// `gelu_tanh(gate) · up`.
+    GegluTanh,
+    /// `situ_beta(gate) · up`, `up` capped at `up_cap` where stated.
+    Situ { beta: f32, up_cap: Option<f32> },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
 #[op(group = "linear")]
 pub enum Linear {
+    /// `act · wᵀ`. `quant` states the precision `act` is quantized to
+    /// before it meets `w`'s codes (under `input_scales`, the weight's static
+    /// global, when the format has one; `scales` the weight's block scales
+    /// when they are a plane of their own beside raw codes, `fp8b128`), else
+    /// the product runs at the activations' own precision. `logits` marks the
+    /// vocabulary's head, which backends tile and gather as its own product.
     Matmul {
-        #[input]
-        act: ValueId,
-        #[input]
-        w: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    /// `act` quantized as `quant` states (under `input_scales`, the weight's
-    /// static global, when the format has one), then multiplied by `w`'s
-    /// codes at that precision; `scales` the weight's block scales when they
-    /// are a plane of their own beside raw codes (`fp8b128`).
-    MatmulActQuant {
         #[input]
         act: ValueId,
         #[input]
@@ -60,84 +91,28 @@ pub enum Linear {
         input_scales: Option<ValueId>,
         #[input]
         scales: Option<ValueId>,
-        quant: ActQuant,
+        quant: Option<ActQuant>,
+        logits: bool,
         #[output]
         y: ValueId,
     },
-    LmHead {
+    /// A gated linear unit: `act(gate) · up` over `[gate | up]` rows
+    /// (`packed`, `intermediate` columns of each) or two planes (`gate`,
+    /// `up`, `intermediate` wide), clamped at `limit` where stated, each row
+    /// times its route's f32 weight before it rounds where `weights` is given
+    /// (an expert scaling its activations before its down leg quantizes).
+    Glu {
         #[input]
-        act: ValueId,
+        packed: Option<ValueId>,
         #[input]
-        w: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    Swiglu {
+        gate: Option<ValueId>,
         #[input]
-        packed: ValueId,
-        intermediate: u32,
-        #[output]
-        y: ValueId,
-    },
-    SwigluClamp {
-        #[input]
-        packed: ValueId,
-        intermediate: u32,
-        limit: f32,
-        #[output]
-        y: ValueId,
-    },
-    SwigluClampAlpha {
-        #[input]
-        packed: ValueId,
-        intermediate: u32,
-        limit: f32,
-        alpha: f32,
-        #[output]
-        y: ValueId,
-    },
-    SwigluClampSplit {
-        #[input]
-        gate: ValueId,
-        #[input]
-        up: ValueId,
-        limit: f32,
-        #[output]
-        y: ValueId,
-    },
-    /// [`Linear::SwigluClampSplit`] of routed rows, each row times its
-    /// route's weight before it rounds: DeepSeek's expert scales its
-    /// activations before its down leg quantizes them.
-    SwigluClampSplitRouted {
-        #[input]
-        gate: ValueId,
-        #[input]
-        up: ValueId,
+        up: Option<ValueId>,
         #[input(F32)]
-        weights: ValueId,
-        limit: f32,
-        #[output]
-        y: ValueId,
-    },
-    /// [`Linear::SwigluClamp`] of routed rows (each row's `intermediate`
-    /// gate columns, then as many up columns), each row times its route's
-    /// f32 weight before it rounds: the packed form of
-    /// [`Linear::SwigluClampSplitRouted`].
-    SwigluClampRouted {
-        #[input]
-        packed: ValueId,
-        #[input(F32)]
-        weights: ValueId,
+        weights: Option<ValueId>,
         intermediate: u32,
-        limit: f32,
-        #[output]
-        y: ValueId,
-    },
-    GegluTanh {
-        #[input]
-        gate: ValueId,
-        #[input]
-        up: ValueId,
+        act: GluAct,
+        limit: Option<f32>,
         #[output]
         y: ValueId,
     },
@@ -154,22 +129,6 @@ pub enum Linear {
         #[output]
         y: ValueId,
     },
-    GegluTanhPacked {
-        #[input]
-        packed: ValueId,
-        intermediate: u32,
-        #[output]
-        y: ValueId,
-    },
-    Situ {
-        #[input]
-        packed: ValueId,
-        intermediate: u32,
-        beta: f32,
-        up_cap: Option<f32>,
-        #[output]
-        y: ValueId,
-    },
     RelBias {
         #[input]
         x: ValueId,
@@ -181,100 +140,27 @@ pub enum Linear {
         #[output(F32)]
         y: ValueId,
     },
-    MoeTopkSoftmax {
+    /// A token's `top_k` of `experts`: each expert's score of `logits`
+    /// (`bias` added before the pick where given, `scale` the per-expert gain
+    /// or post-scale, `hint` an earlier pick to keep), the picked experts in
+    /// `routes` and their weights; a hashed route reads its experts from
+    /// `table` at the token's id instead.
+    MoeRoute {
+        #[input(I32)]
+        ids: Option<ValueId>,
         #[input]
-        logits: ValueId,
-        experts: u32,
-        top_k: u32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSoftmaxScaled {
-        #[input]
-        logits: ValueId,
-        #[input]
-        scale: ValueId,
-        experts: u32,
-        top_k: u32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSigmoid {
-        #[input]
-        logits: ValueId,
-        #[input]
-        bias: Option<ValueId>,
-        #[input]
-        hint: Option<ValueId>,
-        experts: u32,
-        top_k: u32,
-        renormalize: bool,
-        scaling: f32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSigmoidSink {
+        table: Option<ValueId>,
         #[input]
         logits: ValueId,
         #[input]
         bias: Option<ValueId>,
         #[input]
         scale: Option<ValueId>,
-        experts: u32,
-        top_k: u32,
-        sink: u32,
-        scaling: f32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeTopkSqrtSoftplus {
-        #[input]
-        logits: ValueId,
-        #[input]
-        bias: ValueId,
         #[input]
         hint: Option<ValueId>,
         experts: u32,
         top_k: u32,
-        renormalize: bool,
-        scaling: f32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoePredictRoute {
-        #[input]
-        logits: ValueId,
-        #[input]
-        bias: ValueId,
-        experts: u32,
-        top_k: u32,
-        #[output(I32)]
-        routes: ValueId,
-        #[output(F32)]
-        weights: ValueId,
-    },
-    MoeHashRoute {
-        #[input(I32)]
-        ids: ValueId,
-        #[input]
-        tid2eid: ValueId,
-        #[input]
-        logits: ValueId,
-        vocab: u32,
-        experts: u32,
-        top_k: u32,
-        renormalize: bool,
-        scaling: f32,
+        score: RouteScore,
         #[output(I32)]
         routes: ValueId,
         #[output(F32)]

@@ -87,14 +87,7 @@ fn routed_breaks(trace: &Trace) -> std::collections::BTreeSet<u32> {
 pub(crate) fn is_router(node: &poem_ir::Node) -> bool {
     matches!(
         node.op,
-        Operation::Linear(
-            Linear::MoeTopkSoftmax { .. }
-                | Linear::MoeTopkSoftmaxScaled { .. }
-                | Linear::MoeTopkSigmoid { .. }
-                | Linear::MoeTopkSigmoidSink { .. }
-                | Linear::MoeTopkSqrtSoftplus { .. }
-                | Linear::MoeHashRoute { .. }
-        )
+        Operation::Linear(Linear::MoeRoute { score, .. }) if score != poem_ir::RouteScore::Predict
     )
 }
 

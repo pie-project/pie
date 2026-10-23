@@ -18,11 +18,11 @@ pub use collective::Collective;
 pub use conv::{Conv, GridRule, TimePad, VoxelSegment};
 pub use elemwise::{
     Elemwise, GateActivation, ModulateForm, MropeForm, NormAxis, NormNext, NormWeight, RopeForm,
-    RopeFreqs,
+    RopeFreqs, Turn, Yarn,
 };
 pub use fused::{Fused, NormKind};
 pub use gather::{Gather, PixelOrder, TapKind};
-pub use linear::{ActQuant, Linear};
+pub use linear::{ActQuant, GluAct, Linear, RouteScore};
 pub use sampling::Sampling;
 pub use ssm::Ssm;
 

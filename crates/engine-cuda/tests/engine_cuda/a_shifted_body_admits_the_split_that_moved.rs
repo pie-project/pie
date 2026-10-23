@@ -8,8 +8,8 @@ fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Operands, Platform, RuntimeInput, Seam, Trace, Ty,
-    ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
+    ValueId,
 };
 
 const WIDTH: u64 = 8;
@@ -119,7 +119,7 @@ fn shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
                 trace
                     .nodes
                     .get(node as usize)
-                    .is_some_and(|node| engine_cuda::shifted(Operands::name(&node.op)))
+                    .is_some_and(|node| engine_cuda::shifted(&node.op))
             })
         })
         .collect()

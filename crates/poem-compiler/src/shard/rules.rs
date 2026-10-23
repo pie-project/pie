@@ -2,7 +2,7 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{Elemwise, NormAxis, Operands, Operation, Shard, ValueId};
+use poem_ir::{Elemwise, Linear, NormAxis, Operands, Operation, Shard, ValueId};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -112,21 +112,12 @@ fn heads(name: &str) -> Option<Heads> {
         | "elemwise.gate_sigmoid_mul_heads"
         | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
         "elemwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
-        "elemwise.rope_full"
-        | "elemwise.rope_partial"
-        | "elemwise.rope_yarn"
-        | "elemwise.rope_mrope" => Heads::of(&["q", "k"], &[]),
-        "elemwise.rope_partial_q" | "elemwise.rope_partial_last" => Heads::of(&["q"], &[]),
+        // q, and k where the rotation turns one.
+        "elemwise.rope" => Heads::of(&["q", "k"], &[]),
         "elemwise.add_bias" => Heads::of(&["out"], &[]),
         "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
-        "linear.swiglu"
-        | "linear.swiglu_clamp"
-        | "linear.swiglu_clamp_alpha"
-        | "linear.geglu_tanh_packed"
-        | "linear.situ" => Heads::of(&["packed"], &["intermediate"]),
-        "linear.swiglu_clamp_split" | "linear.geglu_tanh" => Heads::of(&["gate", "up"], &[]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
         "attn.decode" | "attn.decode_lse" | "attn.decode_selected" => {
             Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)
@@ -177,14 +168,33 @@ fn rule(op: &Operation) -> Rule {
             NormAxis::Group(_) => Rule::Whole,
         };
     }
+    // A gated unit splits with its columns, packed or as two planes; one of
+    // routed rows (each times its route's weight) reads them whole.
+    if let Operation::Linear(Linear::Glu {
+        packed, weights, ..
+    }) = op
+    {
+        return match (packed, weights) {
+            (_, Some(_)) => Rule::Whole,
+            (Some(_), None) => Rule::Heads(Heads::of(&["packed"], &["intermediate"])),
+            (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
+        };
+    }
+    // A product at the activations' precision contracts with its weight's
+    // split; one that quantizes them first reads its weight whole.
+    if let Operation::Linear(Linear::Matmul { quant, .. }) = op {
+        return match quant {
+            None => Rule::Contract {
+                act: "act",
+                w: "w",
+                out: 0,
+                input: 1,
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
     let name = op.name();
     match name {
-        "linear.matmul" | "linear.lm_head" => Rule::Contract {
-            act: "act",
-            w: "w",
-            out: 0,
-            input: 1,
-        },
         "linear.moe_matmul_select"
         | "linear.moe_matmul_select_bias"
         | "linear.moe_matmul_select_quant" => Rule::Contract {

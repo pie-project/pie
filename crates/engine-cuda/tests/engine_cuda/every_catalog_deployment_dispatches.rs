@@ -21,8 +21,12 @@ fn refuses_split_mrope(op: &poem_ir::ops::Operation) -> bool {
     !cfg!(feature = "rocm")
         && matches!(
             op,
-            poem_ir::ops::Operation::Elemwise(poem_ir::ops::Elemwise::RopeMrope {
-                form: poem_ir::ops::MropeForm::Split,
+            poem_ir::ops::Operation::Elemwise(poem_ir::ops::Elemwise::Rope {
+                k: Some(_),
+                turn: poem_ir::Turn::Mrope {
+                    form: poem_ir::ops::MropeForm::Split,
+                    ..
+                },
                 ..
             })
         )

@@ -11,7 +11,13 @@ fn a_u4_trunk_projection_decodes_on_the_tiled_arm() {
     let trace = deployment.trace(Platform::Cuda);
     let mut row_major = Vec::new();
     for node in &trace.nodes {
-        let Operation::Linear(Linear::Matmul { w, .. }) = &node.op else {
+        let Operation::Linear(Linear::Matmul {
+            w,
+            quant: None,
+            logits: false,
+            ..
+        }) = &node.op
+        else {
             continue;
         };
         let Def::Weight(p) = trace.values[w.0 as usize].def else {

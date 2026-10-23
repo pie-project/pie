@@ -368,7 +368,7 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
             region.nodes.clone().all(|node| {
                 trace.nodes.get(node as usize).is_some_and(|node| {
                     let name = poem_ir::Operands::name(&node.op);
-                    crate::shifted(name) || crate::PLANNED.contains(&name)
+                    crate::shifted(&node.op) || crate::PLANNED.contains(&name)
                 })
             })
         })
@@ -429,7 +429,7 @@ fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
         return false;
     };
     let name = Operands::name(&node.op);
-    if crate::lane_shifted(name) || crate::PLANNED.contains(&name) {
+    if crate::lane_shifted(&node.op) || crate::PLANNED.contains(&name) {
         return true;
     }
     let mut operands: Vec<ValueId> = Vec::new();
