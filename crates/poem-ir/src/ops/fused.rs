@@ -398,7 +398,9 @@ pub enum Fused {
         #[output]
         y: ValueId,
     },
-    LmHeadSoftcap {
+    /// The logits' product (a `Matmul` with `logits`) and its softcap
+    /// (`LogitSoftcap`); `y` is still an output, read by nothing else.
+    MatmulSoftcap {
         #[input]
         act: ValueId,
         #[input]

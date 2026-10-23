@@ -237,7 +237,7 @@ impl FamilyCosts {
                 poem_ir::Fused::MatmulGeglu { .. }
                 | poem_ir::Fused::MatmulSwiglu { .. }
                 | poem_ir::Fused::MlpSwiglu { .. }
-                | poem_ir::Fused::LmHeadSoftcap { .. }
+                | poem_ir::Fused::MatmulSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. }
                 | poem_ir::Fused::MatmulSplitRows { .. }
                 | poem_ir::Fused::MoeSelectGlu { .. }

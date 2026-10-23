@@ -171,7 +171,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Fused::LmHeadSoftcap {
+            Fused::MatmulSoftcap {
                 act,
                 w,
                 cap,

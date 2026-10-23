@@ -1362,7 +1362,7 @@ fn decoded_weight_planes(
                     | poem_ir::Fused::MlpSwiglu { .. }
                     | poem_ir::Fused::MatmulBias { .. }
                     | poem_ir::Fused::MatmulSplitRows { .. }
-                    | poem_ir::Fused::LmHeadSoftcap { .. },
+                    | poem_ir::Fused::MatmulSoftcap { .. },
                 ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);

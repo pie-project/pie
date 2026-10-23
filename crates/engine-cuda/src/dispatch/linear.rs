@@ -312,7 +312,7 @@ impl Run<'_> {
                     &mut self.tensor(*right),
                 )
             }
-            Fused::LmHeadSoftcap {
+            Fused::MatmulSoftcap {
                 act,
                 w,
                 cap,

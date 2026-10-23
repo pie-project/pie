@@ -14,7 +14,7 @@ impl DispatchFused for Run<'_> {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
             Fused::MatmulGeglu { .. }
             | Fused::MlpSwiglu { .. }
-            | Fused::LmHeadSoftcap { .. }
+            | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. } => self.fused_linear(op),
             // Kernels this backend does not ship as one: never formed for it,
             // and run as the primitives they stand for where a trace states

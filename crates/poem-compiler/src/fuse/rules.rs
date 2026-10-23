@@ -42,7 +42,7 @@ pub(super) fn all() -> Vec<Rule> {
         moe_experts(),
         moe_select_glu(),
         matmul_swiglu(),
-        lm_head_softcap(),
+        matmul_softcap(),
         matmul_bias(),
         matmul_split_rows(),
         gated_residual_norm_modulate(),
@@ -1247,15 +1247,15 @@ fn matmul_swiglu() -> Rule {
     })
 }
 
-fn lm_head_softcap() -> Rule {
+fn matmul_softcap() -> Rule {
     let pattern = template(|p| {
         let y = linear::lm_head(&p.rows("act", W), &p.weight("w", [W, W]));
         p.name("y", &y);
         let y_out = attn::logit_softcap(&y, p.f32("cap"));
         p.export("y_out", &y_out);
     });
-    Rule::new("fused.lm_head_softcap", [pattern], |m| {
-        Fused::LmHeadSoftcap {
+    Rule::new("fused.matmul_softcap", [pattern], |m| {
+        Fused::MatmulSoftcap {
             act: m.value("act"),
             w: m.value("w"),
             cap: m.f32("cap"),

@@ -47,7 +47,7 @@ flags! {
     MoeExperts = "fuse.moe_experts" => "fused.moe_experts",
     MoeSelectGlu = "fuse.moe_select_glu" => "fused.moe_select_glu",
     MatmulSwiglu = "fuse.matmul_swiglu" => "fused.matmul_swiglu",
-    LmHeadSoftcap = "fuse.lm_head_softcap" => "fused.lm_head_softcap",
+    MatmulSoftcap = "fuse.matmul_softcap" => "fused.matmul_softcap",
     MatmulBias = "fuse.matmul_bias" => "fused.matmul_bias",
     MatmulSplitRows = "fuse.matmul_split_rows" => "fused.matmul_split_rows",
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "fused.gated_residual_norm_modulate",
