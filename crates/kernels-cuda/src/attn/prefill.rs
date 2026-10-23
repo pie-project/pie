@@ -4,8 +4,9 @@
 //! head, an NHD pool of 16-token pages, and rows long enough that a 128-row
 //! tile of packed query heads is mostly full. Everything else stays on FA2.
 
-use crate::attn::fa2_abi::sm_scale_or_default;
+use crate::attn::fa2::abi::sm_scale_or_default;
 use crate::attn::kv;
+use crate::attn::kv_dequant;
 use crate::attn::plan::PrefillPlan;
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
@@ -182,7 +183,7 @@ pub(crate) fn try_prefill(
     // cap FA2 reads them as they are.
     if kv::native_e4m3(pool) {
         const SHADOW_CAP: usize = 1 << 30;
-        return match kv::widen_e4m3(ctx, op, pool, SHADOW_CAP)? {
+        return match kv_dequant::widen_e4m3(ctx, op, pool, SHADOW_CAP)? {
             Some(shadow) => try_prefill(
                 ctx,
                 op,

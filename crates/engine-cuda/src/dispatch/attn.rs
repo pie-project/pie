@@ -1,10 +1,10 @@
 use kernels_cuda::attn::compressed::pool;
 use kernels_cuda::attn::dense;
+use kernels_cuda::attn::dense::voxel;
 #[cfg(not(feature = "rocm"))]
 use kernels_cuda::attn::fa2;
 #[cfg(feature = "rocm")]
 use kernels_cuda::attn::paged;
-use kernels_cuda::attn::voxel;
 use kernels_cuda::attn::{self, index, mla, plan, selected};
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::VoxelSegment;
@@ -515,7 +515,7 @@ impl Run<'_> {
                 sink,
                 head_dim,
                 o_out: _,
-            } => attn::sink(
+            } => attn::merge::sink(
                 self.ctx(),
                 &mut self.tensor(*o),
                 self.tensor(*lse),
@@ -531,7 +531,7 @@ impl Run<'_> {
                 head_dim,
                 o,
                 lse,
-            } => attn::merge_lse(
+            } => attn::merge::merge_lse(
                 self.ctx(),
                 self.tensor(*o1),
                 self.tensor(*lse1),
@@ -543,7 +543,7 @@ impl Run<'_> {
                 &mut self.tensor(*lse),
             ),
             Attn::LogitSoftcap { x, cap, x_out: _ } => {
-                attn::logit_softcap(self.ctx(), &mut self.tensor(*x), *cap)
+                attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*x), *cap)
             }
             Attn::KvAppend {
                 k,
@@ -568,7 +568,7 @@ impl Run<'_> {
                 let pool = self.pool(*cache);
                 if attn::compressed::decode::ds_rows(&pool) {
                     // DeepSeek's quantized rows, quantized on the way in.
-                    attn::compressed::decode::append(
+                    attn::compressed::kv_fp8::append(
                         self.ctx(),
                         self.ragged_lanes(*plane).data,
                         &pool,
@@ -674,7 +674,7 @@ impl Run<'_> {
                 rope_dim,
                 q_nope,
                 q_pe,
-            } => mla::split_q_b(
+            } => mla::prep::split_q_b(
                 self.ctx(),
                 self.tensor(*q_b),
                 *heads,
@@ -1033,7 +1033,7 @@ impl Run<'_> {
                 head_dim,
                 ratio,
                 entries,
-            } => index::block_mean(
+            } => pool::block_mean(
                 self.ctx(),
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
@@ -1130,7 +1130,7 @@ impl Run<'_> {
             } => {
                 let into = self.pool(*into);
                 if attn::compressed::decode::ds_rows(&into) {
-                    attn::compressed::decode::store_entries(
+                    attn::compressed::kv_fp8::store_entries(
                         self.ctx(),
                         self.tensor(*entries),
                         self.tensor(*boundary_pos),

@@ -1,8 +1,8 @@
-use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
-use crate::attn::fa2_abi::{
+use crate::attn::fa2::abi::{
     PrefillRaggedBiasParams, PrefillRaggedClassParams, PrefillRaggedParams, PrefillRaggedRefParams,
     PrefillRaggedTagParams, UintFastdiv, sm_scale_or_default,
 };
+use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::kv;
 use crate::attn::plan::Device;
 use crate::error::Error;

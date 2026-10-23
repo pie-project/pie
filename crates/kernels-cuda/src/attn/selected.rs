@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::attn::mla::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
+use crate::attn::mla::decode::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 

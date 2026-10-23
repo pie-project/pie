@@ -11,7 +11,7 @@ use crate::common::host::rows_read;
 use crate::common::{Gpu, Lcg, captured, forget, host::upload_to, replay};
 use dtype::Dtype::{Bf16, F32, I32, U8, U32};
 use kernels_cuda::attn::compressed::decode::{self, Pooled, Rows, Turn};
-use kernels_cuda::attn::compressed::{pool as pools, prefill as pre};
+use kernels_cuda::attn::compressed::{kv_fp8, pool as pools, prefill as pre};
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 
 const PAGE: usize = 64;
@@ -47,7 +47,7 @@ fn plane(gpu: &mut Gpu, src: u64, exact: &[f32], fmt: Option<Rows>) -> (KvPool, 
     let off: Vec<u32> = (0..CELLS as u32).map(|c| c % PAGE as u32).collect();
     let (page, off) = (col(gpu, &page, U32), col(gpu, &off, U32));
     let src = ten(src, CELLS, D, Bf16);
-    decode::append(&gpu.ctx(), src, &rows, page, off).expect("the append fires");
+    kv_fp8::append(&gpu.ctx(), src, &rows, page, off).expect("the append fires");
     gpu.sync();
     let read = rows_read(&gpu.down::<u8>(at, CELLS * row), CELLS, PAGE, fmt);
     match fmt {

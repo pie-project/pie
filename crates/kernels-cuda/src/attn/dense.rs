@@ -3,6 +3,8 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
+pub mod voxel;
+
 const DENSE: &str = "attn/dense.cu";
 
 const WARPS: u32 = 4;

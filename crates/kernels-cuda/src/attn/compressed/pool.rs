@@ -1,14 +1,18 @@
 use crate::error::Error;
 use dtype::Dtype;
 
+use crate::attn::compressed::pool_lse::pool_mma;
+use crate::attn::compressed::pool_lse::pool_mma_takes;
+use crate::attn::index::POOL_BLOCK;
+use crate::attn::index::pool_pitch;
 use crate::attn::kv;
+use crate::jit::stated;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, nonzero, refuse, symbol,
 };
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const POOL: &str = "attn/compressed/pool.cu";
-const POOL_LSE_SM80: &str = "attn/compressed/pool_lse_sm80.cu";
 
 const META_BLOCK: u32 = 128;
 
@@ -576,75 +580,6 @@ pub fn attention_lse_selected(
     )
 }
 
-/// The head widths the tensor-core pool walk is built for.
-const POOL_MMA_WIDTHS: [i32; 3] = [128, 256, 512];
-
-fn pool_mma_takes(ctx: &Ctx, head_dim: i32) -> bool {
-    ctx.tuning().pool_mma && POOL_MMA_WIDTHS.contains(&head_dim)
-}
-
-/// `pool_lse` (or its selected form, with `selection`) on tensor cores: a
-/// block a row's 16 heads (`attn/pool_mma.cuh`).
-#[allow(clippy::too_many_arguments)]
-fn pool_mma(
-    ctx: &Ctx,
-    op: &'static str,
-    q: Tensor,
-    positions: Tensor,
-    request_of_token: Tensor,
-    selection: Option<Tensor>,
-    entries: &KvPool,
-    ratio: i32,
-    top_k: i32,
-    num_q_heads: i32,
-    head_dim: i32,
-    sm_scale: f32,
-    o: &mut Tensor,
-    lse: &mut Tensor,
-) -> Result<(), Error> {
-    const HEADS: u32 = 16;
-    const KEYS: u32 = 16;
-    const WARPS: u32 = 4;
-    let d = head_dim.unsigned_abs();
-    let ld = d + 8;
-    let smem = HEADS * ld * 2 + 2 * KEYS * ld * 2 + WARPS * HEADS * KEYS * 4;
-    let selected = selection.is_some();
-    ctx.fire(
-        op,
-        Fire::at(
-            POOL_LSE_SM80,
-            symbol(&format!(
-                "::pie::attn::compressed::pool_lse_mma<{d}, {selected}>"
-            )),
-        )
-        .apply(
-            Launch::grid(
-                [o.rows, num_q_heads.unsigned_abs().div_ceil(HEADS), 1],
-                [WARPS * 32, 1, 1],
-            )
-            .smem(smem),
-        ),
-        &[
-            q.arg(),
-            entries.keys.arg(),
-            selection.map_or(ArgValue::ABSENT, |s| s.arg()),
-            o.arg(),
-            lse.arg(),
-            positions.arg(),
-            entries.page_indices.arg(),
-            entries.page_indptr.arg(),
-            request_of_token.arg(),
-            num_q_heads.arg(),
-            ratio.arg(),
-            top_k.arg(),
-            entries.page_size.arg(),
-            sm_scale.arg(),
-            i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
 /// DeepSeek-V4's compressor at its boundaries in one launch
 /// (`pool_compress`): the gather `gather` fires, the entry's RMS norm times
 /// `weight`, its tail rotated forward (interleaved) at `rope_pos`, and the
@@ -811,4 +746,53 @@ pub struct StateRows {
     pub score: Tensor,
     pub write_page: Tensor,
     pub write_offset: Tensor,
+}
+
+pub fn block_mean(
+    ctx: &Ctx,
+    boundary_pos: Tensor,
+    boundary_req: Tensor,
+    keys: &KvPool,
+    head_dim: u32,
+    ratio: u32,
+    entries: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attn.index_block_mean";
+    dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
+    debug_assert!(
+        boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
+        "`{OP}` reads the i32 block tables `attn.pool_boundary_*` published"
+    );
+    let head_dim = count(OP, "the key width this mean states", head_dim)?;
+    pool_pitch(OP, keys, head_dim)?;
+    if stated(OP, entries.width)? != head_dim {
+        return Err(refuse(
+            OP,
+            "the stated head width is not the entry this mean sized",
+        ));
+    }
+    let ratio = count(OP, "the block width this mean pools over", ratio)?;
+    let rows = count(OP, "rows", boundary_pos.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            POOL,
+            "::pie::attn::compressed::index_block_mean_paged<::pie::bf16>",
+        )
+        .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
+        &[
+            keys.keys.arg(),
+            entries.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            keys.page_indices.arg(),
+            keys.page_indptr.arg(),
+            head_dim.arg(),
+            ratio.arg(),
+            keys.page_size.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    let _ = rows;
+    Ok(())
 }

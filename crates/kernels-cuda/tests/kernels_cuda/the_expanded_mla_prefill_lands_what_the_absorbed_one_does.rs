@@ -9,7 +9,10 @@
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::attn::mla::{self, ExpandedQ, Heads};
+use kernels_cuda::attn::mla::{
+    self,
+    expand::{ExpandedQ, Heads},
+};
 use kernels_cuda::attn::plan::{self, Device, Live, Workspace};
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -40,7 +43,7 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
         rope: ROPE as u32,
         v: V as u32,
     };
-    if !mla::expanded_takes(&h) {
+    if !mla::expand::expanded_takes(&h) {
         eprintln!("no tcgen05 here: skipped");
         return;
     }
@@ -127,7 +130,8 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
         (HEADS * ROPE) as u32,
         Dtype::Bf16,
     );
-    mla::split_q_b(&ctx, q_b_t, h.heads, h.nope, h.rope, &mut q_nope, &mut q_pe).expect("splits");
+    mla::prep::split_q_b(&ctx, q_b_t, h.heads, h.nope, h.rope, &mut q_nope, &mut q_pe)
+        .expect("splits");
     let mut q_lat = Tensor::new(
         gpu.zeros(tokens * HEADS * RANK * 2),
         rows,
@@ -227,8 +231,8 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
         } else {
             ExpandedQ::Split { q_nope, q_pe }
         };
-        let took =
-            mla::prefill_expanded(&ctx, q, qo, &pool, kv_b_t, h, sm_scale, &mut o).expect("fires");
+        let took = mla::expand::prefill_expanded(&ctx, q, qo, &pool, kv_b_t, h, sm_scale, &mut o)
+            .expect("fires");
         assert!(took, "the expanded prefill takes the fire");
         gpu.sync();
         let got: Vec<u16> = gpu.down(o.ptr, tokens * HEADS * V);

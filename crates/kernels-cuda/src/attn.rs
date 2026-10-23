@@ -3,13 +3,15 @@ pub mod dense;
 
 pub mod fa2;
 
-pub mod fa2_abi;
-
 pub mod index;
 
 pub mod kv;
+pub mod kv_append;
+pub mod kv_dequant;
+pub mod kv_envelope;
 pub mod kv_window;
 
+pub mod merge;
 pub mod mla;
 
 pub mod plan;
@@ -20,7 +22,6 @@ pub mod selected;
 
 pub mod sched;
 pub mod score;
-pub mod voxel;
 
 pub mod sched_decode;
 
@@ -31,27 +32,25 @@ pub mod sched_prefill;
 pub mod decode_gqa;
 
 #[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
-pub mod tc5_fmha;
+pub mod prefill;
 
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::attn::fa2_abi::{
+use crate::attn::fa2::abi::{
     Buffers, DecodeRelParams, PrefillRelParams, make_decode_params, make_prefill_params,
 };
+use crate::attn::merge::sink;
 use crate::attn::plan::{DecodePlan, PrefillPlan};
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Ctx, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
-
-const MERGE: &str = "attn/merge.cu";
 
 const BLOCK: u32 = 256;
 
 const NO_SOFT_CAP: f32 = 0.0;
 
 #[must_use]
-const fn elementwise(n: u32) -> Launch {
+pub(crate) const fn elementwise(n: u32) -> Launch {
     Launch::flat(n, BLOCK)
 }
 
@@ -93,7 +92,7 @@ fn attention_lands(op: &'static str, q: Tensor, o: &Tensor) {
     );
 }
 
-fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
+pub(crate) fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
     debug_assert_eq!(lse.dtype, Dtype::F32, "`{op}`'s log-sum-exp plane is f32");
     debug_assert!(
         lse.rows == rows && lse.width == heads,
@@ -194,7 +193,7 @@ fn fa2_decode_with(
         ));
     }
 
-    kv::dequant_active(
+    kv_dequant::dequant_active(
         ctx,
         op,
         pool,
@@ -224,7 +223,7 @@ fn fa2_decode_with(
         // A whole-window plan's block reads its request's window entire and
         // lands the request's rows (sinks folded) itself: no partial, no fold.
         None if tensor_cores && plan.info.whole => {
-            let direct = fa2_abi::DecodeParams {
+            let direct = fa2::abi::DecodeParams {
                 o: split.o,
                 lse: split.lse,
                 partition_kv: false,
@@ -264,15 +263,15 @@ fn fa2_decode_with(
         }
     }
     if plan.info.split_kv {
-        fa2::fold(ctx, op, &sinked(split, sinks))
+        merge::fold(ctx, op, &sinked(split, sinks))
     } else {
         Ok(false)
     }
 }
 
-fn sinked(split: fa2_abi::Partials, sinks: Option<Tensor>) -> fa2_abi::Partials {
+fn sinked(split: fa2::abi::Partials, sinks: Option<Tensor>) -> fa2::abi::Partials {
     match sinks {
-        Some(sinks) => fa2_abi::Partials {
+        Some(sinks) => fa2::abi::Partials {
             sinks: sinks.ptr,
             sinks_f32: sinks.dtype == Dtype::F32,
             ..split
@@ -324,7 +323,7 @@ fn fa2_prefill_with(
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
 
-    kv::dequant_active(
+    kv_dequant::dequant_active(
         ctx,
         op,
         pool,
@@ -343,7 +342,7 @@ fn fa2_prefill_with(
         }
         if mask.is_none()
             && rel.is_none()
-            && tc5_fmha::try_prefill(
+            && prefill::try_prefill(
                 ctx,
                 op,
                 q,
@@ -433,11 +432,11 @@ fn fa2_prefill_with(
         }
     }
     if plan.info.split_kv {
-        let split = fa2_abi::Partials {
+        let split = fa2::abi::Partials {
             live: if widths == [head; 2] { 0 } else { widths[1] },
             ..split
         };
-        fa2::fold(ctx, op, &sinked(split, sinks))
+        merge::fold(ctx, op, &sinked(split, sinks))
     } else {
         Ok(false)
     }
@@ -787,136 +786,6 @@ pub fn prefill_rel(
     )
 }
 
-pub fn sink(
-    ctx: &Ctx,
-    o: &mut Tensor,
-    lse: Tensor,
-    sink: Tensor,
-    head_dim: u32,
-) -> Result<(), Error> {
-    const OP: &str = "attn.sink";
-    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    // The sinks are the scores' own element, or f32 as a checkpoint keeps them.
-    let s = match sink.dtype {
-        Dtype::F32 => "float",
-        held if held == o.dtype => t,
-        held => {
-            return Err(refuse(
-                OP,
-                format!("the sinks are {held:?} and the scores {:?}", o.dtype),
-            ));
-        }
-    };
-    let heads = row_heads(OP, o.width, head_dim)?;
-    lse_plane(OP, &lse, o.rows, heads);
-    let rows = count(OP, "rows", o.rows)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            MERGE,
-            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}>")),
-        )
-        .apply(per_head_elementwise(o.rows, heads, head_dim)),
-        &[
-            o.arg(),
-            lse.arg(),
-            sink.arg(),
-            rows.arg(),
-            stated(OP, heads)?.arg(),
-            stated(OP, head_dim)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn merge_lse(
-    ctx: &Ctx,
-    o1: Tensor,
-    lse1: Tensor,
-    o2: Tensor,
-    lse2: Tensor,
-    heads: u32,
-    head_dim: u32,
-    o: &mut Tensor,
-    lse: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attn.merge_lse";
-
-    const COMBINE_BLOCK_MIN: u32 = 32;
-
-    const COMBINE_BLOCK_MAX: u32 = 256;
-
-    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert!(
-        o1.rows == o.rows && o2.rows == o.rows,
-        "the merged outputs are one row per query row"
-    );
-    lse_plane(OP, lse, o.rows, heads);
-    let heads = count(OP, "the head count this merge states", heads)?;
-    let head_dim = count(OP, "the head width this merge states", head_dim)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            MERGE,
-            symbol(&format!("::pie::attn::merge_lse_combine<{t}>")),
-        )
-        .apply(Launch::grid(
-            [o.rows, heads.unsigned_abs(), 1],
-            [
-                head_dim
-                    .unsigned_abs()
-                    .clamp(COMBINE_BLOCK_MIN, COMBINE_BLOCK_MAX),
-                1,
-                1,
-            ],
-        )),
-        &[
-            o1.arg(),
-            lse1.arg(),
-            o2.arg(),
-            lse2.arg(),
-            o.arg(),
-            lse.arg(),
-            heads.arg(),
-            head_dim.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attn.logit_softcap";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    if cap.is_nan() || cap <= 0.0 {
-        return Err(refuse(OP, format!("{cap} is not a logit soft cap")));
-    }
-    let n = x.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the element count", lanes)?;
-    // Eight elements a thread where the plane takes whole 16-byte runs: the
-    // same values, element for element.
-    let (entry, extent) = if lanes.is_multiple_of(8) && x.ptr.is_multiple_of(16) {
-        ("logit_softcap_vec8", lanes / 8)
-    } else {
-        ("logit_softcap", lanes)
-    };
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/merge.cu",
-            symbol(&format!("::pie::attn::{entry}<{t}>")),
-        )
-        .apply(elementwise(extent)),
-        &[x.arg(), cap.arg(), (extent as usize).arg()],
-    )
-}
-
 pub fn kv_append(
     ctx: &Ctx,
     k: RaggedTensor,
@@ -931,7 +800,7 @@ pub fn kv_append(
         v.rows == k.data.rows && v.width == k.data.width && v.dtype == k.data.dtype,
         "the value plane is appended beside the key plane, one rectangle"
     );
-    kv::write_kv_to_pages(ctx, OP, k.data, v, k.indptr, pool, write_page, write_offset)
+    kv_append::write_kv_to_pages(ctx, OP, k.data, v, k.indptr, pool, write_page, write_offset)
 }
 
 pub fn kv_append_shared(
@@ -943,7 +812,7 @@ pub fn kv_append_shared(
 ) -> Result<(), Error> {
     const OP: &str = "attn.kv_append_shared";
     dtype_dispatch!(OP, plane.data.dtype, { Bf16 => () });
-    kv::write_kv_to_pages(
+    kv_append::write_kv_to_pages(
         ctx,
         OP,
         plane.data,

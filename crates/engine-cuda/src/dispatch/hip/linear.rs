@@ -178,7 +178,7 @@ impl Run<'_> {
                     w: *w,
                     y: *y,
                 })?;
-                kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
+                kernels_cuda::attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
             }
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }

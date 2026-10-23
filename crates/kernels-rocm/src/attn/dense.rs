@@ -3,6 +3,8 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
+pub mod voxel;
+
 const FILE: &str = "attn/dense.hip";
 
 /// Wavefronts a block runs, 16 query rows each.

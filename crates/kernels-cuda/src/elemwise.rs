@@ -18,7 +18,7 @@ const BLOCK: u32 = 256;
 
 const WARP: u32 = 32;
 
-fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
+pub(crate) fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     let n = t.elements();
     let lanes = u32::try_from(n).map_err(|_| {
         refuse(
