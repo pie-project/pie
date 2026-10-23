@@ -220,8 +220,8 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         return peers.all_gather(ctx, OP, &x, y);
     }
     let comm = ctx.comm(OP)?;
-    debug_assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
-    debug_assert!(
+    assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
+    assert!(
         x.elements() > 0 && y.elements().is_multiple_of(x.elements()),
         "the gathered rectangle is a whole number of shards"
     );
@@ -239,7 +239,7 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             // SAFETY: `comm` and the stream are `ctx`'s, live by its
             // contracts. NCCL reads `count` elements of `x` and writes
             // `count * world` into `y`; that `y` is that large is the
-            // caller's to keep (checked only by the debug assertion above).
+            // caller's to keep beyond the assertion above, which holds it to whole shards.
             let code = unsafe {
                 nccl::ncclAllGather(
                     send,
@@ -318,8 +318,8 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
             ),
         ));
     }
-    debug_assert_eq!(x.dtype, y.dtype, "a reduction does not change the dtype");
-    debug_assert!(
+    assert_eq!(x.dtype, y.dtype, "a reduction does not change the dtype");
+    assert!(
         y.elements() > 0 && x.elements().is_multiple_of(y.elements()),
         "the reduced rectangle is a whole number of shards"
     );
@@ -334,8 +334,8 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
         };
         // SAFETY: `comm` and the stream are `ctx`'s. NCCL writes `count`
         // elements of `y` and reads `count * world` of `x`; that `x` holds
-        // that many is the caller's to keep (checked only by the debug
-        // assertion above).
+        // that many is the caller's to keep beyond the assertion above,
+        // which holds it to whole shards.
         let code = unsafe {
             nccl::ncclReduceScatter(
                 x.ptr as usize as *const core::ffi::c_void,
