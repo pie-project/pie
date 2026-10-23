@@ -60,10 +60,15 @@ pub struct Comm {
     peers: Option<kernels_cuda::collective::Peers>,
 }
 
-// SAFETY: NCCL communicators are used from any thread as long as calls on one
-// communicator are not concurrent, which the group guarantees by driving each
-// rank from one thread at a time.
+// SAFETY: an NCCL communicator may be used from any thread as long as calls
+// on it are not concurrent; the group drives each rank's collectives from that
+// rank's one lane thread.
 unsafe impl Send for Comm {}
+// SAFETY: the group shares `Arc<Comm>` with its abort closures. Through `&self`
+// a `Comm` only hands out its immutable fields (`raw`, `peers`, `rank`,
+// `size`) or calls `ncclCommAbort`, which NCCL allows from another thread
+// while a collective runs on the communicator; `Poison::set` runs the aborts
+// once.
 unsafe impl Sync for Comm {}
 
 impl Comm {

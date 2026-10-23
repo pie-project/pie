@@ -36,9 +36,12 @@ pub(crate) fn next_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Points this thread's probes at `frame` and returns the frame it pointed at
+/// before. `encode::Sink` sets it for as long as it borrows the frame and puts
+/// the previous one back when dropped, so the pointer is live or null.
 #[cfg(feature = "wgpu")]
-pub(crate) fn set_frame(frame: *const Frame) {
-    FRAME.with(|f| f.set(frame));
+pub(crate) fn set_frame(frame: *const Frame) -> *const Frame {
+    FRAME.with(|f| f.replace(frame))
 }
 
 pub(crate) fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> Option<R> {
@@ -47,6 +50,8 @@ pub(crate) fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> Option<R> {
         return None;
     }
 
+    // SAFETY: a non-null `FRAME` is the frame a live `Sink` on this thread
+    // borrows (see `set_frame`), so it outlives this call.
     Some(f(unsafe { &*frame }))
 }
 
@@ -56,5 +61,6 @@ pub(crate) fn flush() -> Result<()> {
         return Ok(());
     }
 
+    // SAFETY: as `with_frame`.
     unsafe { (*frame).flush() }
 }

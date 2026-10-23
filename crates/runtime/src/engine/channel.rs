@@ -411,6 +411,9 @@ impl std::fmt::Display for ChannelWaitError {
 impl std::error::Error for ChannelWaitError {}
 
 fn load_channel_word(word_base: u64, index: u32) -> u64 {
+    // SAFETY: as `load_word` — the binding is the one its engine minted over
+    // `registered.ring`, which the endpoint keeps alive while it waits, and
+    // `index` is one of that ring's four words.
     unsafe { (&*((word_base as *const AtomicU64).add(index as usize))).load(Ordering::Acquire) }
 }
 

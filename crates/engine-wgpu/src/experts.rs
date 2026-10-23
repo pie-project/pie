@@ -147,6 +147,10 @@ impl HostPlane {
                 have: map.len() as u64,
             })?;
 
+            // SAFETY: `into` is this row's `per` bytes of a live staging view
+            // (`copy_row_at` seats row `seat` at `seat * per` of a stage sized
+            // `per * unique.len()`), and `at - start + take <= end - start = per`.
+            // `src` is `take` bytes of the mapping, which no view aliases.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     src.as_ptr(),
@@ -642,7 +646,17 @@ fn copy_plane(map: &Mapping, plane: &HostPlane, into: usize) -> Result<()> {
             need: file + len,
             have: map.len() as u64,
         })?;
+        if virt.saturating_add(len) > plane.bytes {
+            return Err(Fault::Ceiling {
+                what: "bytes of a host-tier plane a run writes",
+                need: virt.saturating_add(len),
+                have: plane.bytes,
+            });
+        }
 
+        // SAFETY: `into` is a live staging view of at least `plane.bytes`
+        // (`Pump::stage`), and the run `[virt, virt + len)` was just checked to
+        // lie inside it; `src` is `len` bytes of the mapping, which no view aliases.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.as_ptr(),

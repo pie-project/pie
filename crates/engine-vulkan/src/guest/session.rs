@@ -67,6 +67,9 @@ pub struct Built {
 impl Drop for Built {
     fn drop(&mut self) {
         let d = &self.core.device;
+        // SAFETY: the last `Arc<Built>` is gone with the last session that ran
+        // it; each session settles its frames before it drops, so no pending
+        // command uses these pipelines or layouts.
         unsafe {
             for &pipeline in &self.pipelines {
                 d.destroy_pipeline(pipeline, None);
@@ -190,6 +193,8 @@ impl Session {
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(stages.len() as u32),
         ];
+        // SAFETY: `core.device` is live and the create info and `sizes` outlive
+        // the call.
         let pool = unsafe {
             core.device
                 .create_descriptor_pool(
@@ -217,6 +222,9 @@ impl Session {
     fn bind_sets(&mut self) -> Result<()> {
         let d = &self.core.device;
         for at in 0..self.stages.len() {
+            // SAFETY: `&mut self` owns the pool, so its external sync holds;
+            // it was sized for one set per stage and this runs once, at
+            // construction. The layout is the stage's live set layout.
             let set = unsafe {
                 let layouts = [self.stages[at].built.set_layout];
                 d.allocate_descriptor_sets(
@@ -256,6 +264,10 @@ impl Session {
                         .buffer_info(info)
                 })
                 .collect();
+            // SAFETY: `set` was just allocated and no command uses it yet; each
+            // write names a live buffer of this session over its whole length,
+            // with the descriptor type its layout binding declares, and the
+            // `infos` it points into outlive the call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
             self.stages[at].set = set;
         }
@@ -479,6 +491,10 @@ impl Session {
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
         let d = &self.core.device;
+        // SAFETY: `cmd` is the open frame's buffer, recorded only on this
+        // thread (`Frame` is not `Sync`). The set, layout and pipelines are
+        // this session's own and stay alive until it settles the frame; the
+        // set was written once at construction and matches the layout.
         unsafe {
             let cmd = frame.cmd();
 
@@ -559,6 +575,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.settle();
+        // SAFETY: `settle` waited every frame this session sent out, so no
+        // pending command uses its descriptor sets; destroying the pool frees
+        // them with it.
         unsafe {
             let d = &self.core.device;
             d.destroy_descriptor_pool(self.pool, None);
@@ -691,6 +710,11 @@ fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<
         })
         .collect();
     let d = &core.device;
+    // SAFETY: `d` is live; every create info and the arrays and names it
+    // borrows are locals that outlive their call. `lowered.words` is SPIR-V
+    // the guest compiler emitted for these entry points and bindings. Each
+    // failure path destroys exactly what was made before it, and the module
+    // is destroyed only after the pipelines are built from it.
     unsafe {
         let set_layout = d
             .create_descriptor_set_layout(

@@ -170,9 +170,13 @@ fn find(api: &Api) -> Option<*const ProfilerApi> {
     // SAFETY: the extension list is the plugin's, immutable for its life.
     let mut at = unsafe { (*api.raw).extension_start };
     while !at.is_null() {
+        // SAFETY: `at` is a non-null node of the plugin's extension list,
+        // which lives as long as the plugin.
         let base = unsafe { &*at };
         if base.type_ == sys::PJRT_Extension_Type_Profiler {
             let ext = at.cast::<ProfilerExtension>();
+            // SAFETY: a node typed `Profiler` is a `PJRT_Profiler_Extension`,
+            // whose layout `ProfilerExtension` copies.
             let table = unsafe { (*ext).profiler_api };
             return (!table.is_null()).then_some(table);
         }
@@ -181,6 +185,9 @@ fn find(api: &Api) -> Option<*const ProfilerApi> {
     None
 }
 
+/// # Safety
+/// `table` is the plugin's live profiler table and `error`, if non-null, an
+/// error it returned and nobody has destroyed.
 unsafe fn check(table: *const ProfilerApi, error: *mut PluginError) -> Result<(), Error> {
     if error.is_null() {
         return Ok(());
@@ -192,6 +199,9 @@ unsafe fn check(table: *const ProfilerApi, error: *mut PluginError) -> Result<()
         message: std::ptr::null(),
         message_size: 0,
     };
+    // SAFETY: `table` and `error` are live (the caller's promise); the
+    // message is owned by `error`, which is destroyed only below, after
+    // `text` has copied it.
     let text = unsafe {
         ((*table).error_message)(&mut message);
         super::text(message.message, message.message_size)
@@ -201,6 +211,7 @@ unsafe fn check(table: *const ProfilerApi, error: *mut PluginError) -> Result<()
         priv_: std::ptr::null_mut(),
         error,
     };
+    // SAFETY: `error` is live and destroyed here, once.
     unsafe { ((*table).error_destroy)(&mut destroy) };
     Err(Error::local(format!("profiler: {text}")))
 }

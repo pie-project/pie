@@ -324,9 +324,10 @@ fn available_bytes(directory: &Path) -> Result<u64, Error> {
             directory.display()
         ))
     })?;
-    // SAFETY: `path` is a NUL-terminated C string that outlives the call, and
-    // `stat` is a plain out-parameter the call fully initializes on success.
+    // SAFETY: `statvfs` is plain integers, for which all-zero bytes are valid.
     let mut stat = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    // SAFETY: `path` is a NUL-terminated C string that outlives the call, and
+    // `stat` is an out-parameter the call fills on success.
     let rc = unsafe { libc::statvfs(path.as_ptr(), &raw mut stat) };
     if rc != 0 {
         return Err(Error::Checkpoint(format!(

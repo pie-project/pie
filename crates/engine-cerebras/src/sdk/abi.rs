@@ -34,6 +34,8 @@ impl CxxString {
             // SAFETY: plain C allocation of len + 1 bytes, filled and NUL-terminated below.
             let p = unsafe { libc::malloc(s.len() + 1) } as *mut u8;
             assert!(!p.is_null(), "malloc failed");
+            // SAFETY: `p` is a fresh, non-null allocation of `len + 1` bytes
+            // that cannot overlap `s`; the copy fills `len` and the NUL the last.
             unsafe {
                 std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
                 *p.add(s.len()) = 0;

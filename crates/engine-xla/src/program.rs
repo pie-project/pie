@@ -209,6 +209,8 @@ impl Flights {
         let event = match event {
             Ok(event) => event,
             Err(why) => {
+                // SAFETY: `dst` came from `Box::into_raw` above, and the
+                // copy failed to start, so the plugin never took it.
                 drop(unsafe { Box::from_raw(dst) });
                 let outcome = self.land(id, Err(why.to_string()), None);
                 if let Some(latch) = latch {

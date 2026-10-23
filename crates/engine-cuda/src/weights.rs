@@ -276,12 +276,13 @@ fn restore_from_checkpoint(
             .map_or(std::ptr::null_mut(), |tier| tier.host().host()),
     );
     let (read, moved, verified) = std::thread::scope(|scope| {
-        // SAFETY: `into` is the tier's own uninitialized allocation, which
-        // `host_layout` tiles exactly, and no other reader names it yet.
         let reading = scope.spawn(move || match &refill {
             None => serving.verify_planes(&pinned_params),
             Some(refill) => {
                 let into = into;
+                // SAFETY: `refill` exists only when a tier does, so `into` is
+                // the tier's own allocation, which `host_layout` tiles
+                // exactly, and no other reader names it yet.
                 unsafe { crate::checkpoint_serving::read_into(refill, into.0) }
             }
         });
@@ -532,6 +533,7 @@ struct Volume {
 fn volume(at: &Path) -> Option<Volume> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(at.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statfs` is a plain C struct of integers; zero is a valid value.
     let mut said: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: a NUL-terminated path and a struct this frame owns.
     if unsafe { libc::statfs(path.as_ptr(), &raw mut said) } != 0 {

@@ -918,6 +918,8 @@ fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) ->
 }
 
 fn bytes_of(values: &[i32]) -> &[u8] {
+    // SAFETY: an `i32` slice is `size_of_val` initialized bytes with no
+    // padding, `u8` has alignment 1, and the result borrows `values`.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }

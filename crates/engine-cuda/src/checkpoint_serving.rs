@@ -534,6 +534,7 @@ mod tests {
             .expect("the scales are in the file");
         raw[at + 3] ^= 0xFF;
         std::fs::write(&path, &raw).unwrap();
+        // SAFETY: the same landings over the same `image` as above.
         let why = unsafe { read_into(&refill, image.as_mut_ptr()) }
             .expect_err("a rotted block must not pass");
         assert!(why.contains("block 0 of \"w\""), "{why}");

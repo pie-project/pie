@@ -296,6 +296,8 @@ impl Event {
                 rt::cudaError::cudaSuccess => Ok(true),
                 rt::cudaError::cudaErrorNotReady => {
                     #[allow(unused_must_use)]
+                    // SAFETY: takes no arguments; it only clears the
+                    // not-ready status the query left on this thread.
                     unsafe {
                         rt::cudaGetLastError();
                     }

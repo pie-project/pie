@@ -334,6 +334,9 @@ impl Pipelines {
             .map(std::path::Path::to_path_buf);
         let initial = path.as_ref().and_then(|p| std::fs::read(p).ok());
 
+        // SAFETY: the file at `path` is written only by `persist`, from
+        // `PipelineCache::get_data`; wgpu ignores data keyed to another adapter
+        // or driver, and `fallback` gives an empty cache in place of an error.
         let cache = unsafe {
             core.device
                 .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {

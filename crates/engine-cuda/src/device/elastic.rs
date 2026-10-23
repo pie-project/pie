@@ -891,6 +891,8 @@ fn said(call: &'static str, code: crate::device::dr::CUresult) -> Result<()> {
 fn allocation_prop(device: i32) -> crate::device::dr::CUmemAllocationProp {
     use crate::device::dr;
 
+    // SAFETY: a plain C struct of ints, enums whose zero is a variant, and a
+    // null-able pointer; all zero bytes is the driver's documented default.
     let mut prop: dr::CUmemAllocationProp = unsafe { core::mem::zeroed() };
     prop.type_ = dr::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
@@ -902,6 +904,8 @@ fn allocation_prop(device: i32) -> crate::device::dr::CUmemAllocationProp {
 fn access_desc(device: i32) -> crate::device::dr::CUmemAccessDesc {
     use crate::device::dr;
 
+    // SAFETY: a plain C struct of ints and enums whose zero is a variant;
+    // every field is then set.
     let mut desc: dr::CUmemAccessDesc = unsafe { core::mem::zeroed() };
     desc.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
     desc.location.id = device;

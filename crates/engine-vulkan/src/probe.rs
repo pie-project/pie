@@ -36,9 +36,22 @@ pub(crate) fn next_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Names `frame` as this thread's recording frame. Only `Sink::new` calls
+/// this, for the frame it borrows, and its drop calls `clear_frame`, so a
+/// non-null `FRAME` names a frame some live `Sink` on this thread borrows.
 #[cfg(feature = "vulkan")]
 pub(crate) fn set_frame(frame: *const Frame) {
     FRAME.with(|f| f.set(frame));
+}
+
+/// Forgets `frame` if it is still this thread's recording frame.
+#[cfg(feature = "vulkan")]
+pub(crate) fn clear_frame(frame: *const Frame) {
+    FRAME.with(|f| {
+        if f.get() == frame {
+            f.set(std::ptr::null());
+        }
+    });
 }
 
 pub(crate) fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> Option<R> {
@@ -47,6 +60,9 @@ pub(crate) fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> Option<R> {
         return None;
     }
 
+    // SAFETY: a non-null `FRAME` names the frame a live `Sink` on this thread
+    // borrows (its drop clears it), so the frame is alive and unmoved; only
+    // a shared reference is handed out, as the `Sink` itself holds.
     Some(f(unsafe { &*frame }))
 }
 
@@ -56,5 +72,7 @@ pub(crate) fn flush() -> Result<()> {
         return Ok(());
     }
 
+    // SAFETY: as in `with_frame`, the frame is borrowed by a live `Sink` on
+    // this thread, and `flush` takes it by shared reference.
     unsafe { (*frame).flush() }
 }

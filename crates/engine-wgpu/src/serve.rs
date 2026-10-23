@@ -2370,7 +2370,7 @@ impl Shell {
             )?;
         }
 
-        let Encoded::Live(_) = sink;
+        drop(sink);
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
             .sum();

@@ -27,6 +27,9 @@ pub struct Pipeline {
 impl Drop for Pipeline {
     fn drop(&mut self) {
         let d = &self.core.device;
+        // SAFETY: the last `Arc<Pipeline>` is gone, so no frame records with
+        // it any more; the shell's context drains the queue before its
+        // pipelines drop, so no pending command uses it either.
         unsafe {
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
@@ -112,6 +115,11 @@ fn build(
         })
         .collect();
     let d = &core.device;
+    // SAFETY: `d` is live; every create info and the arrays it borrows are
+    // locals that outlive their call. `words` is SPIR-V that `spirv::words`
+    // and `spirv::declared` parsed, whose bindings and push range the layout
+    // copies; the subgroup size is chained only when the device can pin it.
+    // Each failure path destroys exactly what was made before it.
     unsafe {
         let set_layout = d
             .create_descriptor_set_layout(

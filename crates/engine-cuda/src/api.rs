@@ -1411,10 +1411,19 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
     out
 }
 
-// SAFETY: `Shell` holds raw device handles inline, none of which is `Send`
-// to the compiler. Sound because every verb takes `&mut self`, so exactly
-// one thread touches a shell at a time.
+// SAFETY: `Shell` holds raw device handles and `Cell`s inline, none of
+// which the compiler lets cross threads. The handles name driver objects that
+// any thread may use once it binds the context, and every verb that touches
+// the device, the stream or a `Cell` takes `&mut self` (and `bind_thread`
+// binds the context first), so one thread drives a shell at a time.
 unsafe impl Send for Cuda {}
+// SAFETY: `Engine: Send + Sync` demands this only so the runtime's registry
+// can sit in a `RwLock`; the runtime moves an engine in and out and never
+// shares one. Even shared, the `&self` surface is `kind`, `device_facts`,
+// `export_kv_handle`, `settles_asynchronously`, `tap_groups`,
+// `host_kv_layout` and the trait's `disconnect`/`unsupported`; each reads
+// host data fixed at load (`caps`, the shell's tap spans and pool shapes) and
+// none reaches a raw handle, the stream or a `Cell`.
 unsafe impl Sync for Cuda {}
 
 #[cfg(test)]

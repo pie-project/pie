@@ -413,7 +413,8 @@ impl FileWriter {
                     || (!piece.is_multiple_of(4) && at + piece == len && piece < 8)
                 {
                     let mut bytes = vec![0u8; piece as usize];
-                    pread_jobs(file, &[(bytes.as_mut_ptr() as usize, src, piece)], 1)?;
+                    // SAFETY: the one job fills `bytes`, `piece` bytes long.
+                    unsafe { pread_jobs(file, &[(bytes.as_mut_ptr() as usize, src, piece)], 1)? };
                     self.slab.write(dst, &bytes)?;
                     at += piece;
                     continue;
@@ -437,12 +438,17 @@ impl FileWriter {
                         split.push((base + off as usize, src + off, n));
                         off += n;
                     }
-                    pread_jobs(file, &split, threads)?;
+                    // SAFETY: the jobs tile `[base, base + whole)`, the staging
+                    // view `view` maps and keeps alive until this scope ends.
+                    unsafe { pread_jobs(file, &split, threads)? };
                 }
                 if whole < piece {
                     let tail = piece - whole;
                     let mut bytes = vec![0u8; tail as usize];
-                    pread_jobs(file, &[(bytes.as_mut_ptr() as usize, src + whole, tail)], 1)?;
+                    // SAFETY: the one job fills `bytes`, `tail` bytes long.
+                    unsafe {
+                        pread_jobs(file, &[(bytes.as_mut_ptr() as usize, src + whole, tail)], 1)?;
+                    }
                     self.slab.write(dst + whole, &bytes)?;
                 }
                 at += piece;
@@ -452,8 +458,16 @@ impl FileWriter {
     }
 }
 
+/// # Safety
+///
+/// Each job's `(dst, _, len)` must be `len` writable bytes, live for the call
+/// and disjoint from every other job's.
 #[cfg(not(target_arch = "wasm32"))]
-fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) -> Result<()> {
+unsafe fn pread_jobs(
+    file: &std::fs::File,
+    jobs: &[(usize, u64, u64)],
+    threads: usize,
+) -> Result<()> {
     let threads = threads.clamp(1, jobs.len().max(1));
     let per = jobs.len().div_ceil(threads).max(1);
     let failed: std::sync::Mutex<Option<Fault>> = std::sync::Mutex::new(None);
@@ -462,6 +476,8 @@ fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) 
             let failed = &failed;
             scope.spawn(move || {
                 for &(dst, from, len) in chunk {
+                    // SAFETY: per this fn's contract, `dst` is `len` writable
+                    // bytes no other job touches.
                     if let Err(why) = unsafe { pread_all(file, dst as *mut u8, from, len) } {
                         *failed.lock().expect("failed lock poisoned") = Some(why);
                         return;

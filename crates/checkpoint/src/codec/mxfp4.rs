@@ -66,6 +66,9 @@ pub mod avx2 {
         debug_assert!(row.len() == out.len() * 2);
         let n = out.len();
         let mut at = 0;
+        // SAFETY: AVX2 is present per this fn's contract. Each pass reads the
+        // 16 bytes at `2 * at` and writes the 8 floats at `at`, with
+        // `at + 8 <= n`; `row` holds `2 * n` bytes and `out` holds `n`.
         unsafe {
             while at + 8 <= n {
                 let half = _mm_loadu_si128(row.as_ptr().add(at * 2).cast());
@@ -86,6 +89,9 @@ pub mod avx2 {
     /// The caller must have verified AVX2 support.
     #[target_feature(enable = "avx2")]
     pub unsafe fn encode_mxfp4_group(group: &[f32; 32], out: &mut [u8; 16]) -> u8 {
+        // SAFETY: AVX2 is present per this fn's contract. The four loads read
+        // `group`'s 32 floats and the four stores write `codes`' 32 ints, eight
+        // at a time at `i * 8` for `i < 4`.
         unsafe {
             let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
 

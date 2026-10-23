@@ -304,11 +304,15 @@ fn rank(kind: wgpu::DeviceType, preference: wgpu::PowerPreference) -> u8 {
 #[cfg(not(any(target_vendor = "apple", target_arch = "wasm32")))]
 fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
     use ash::vk;
+    // SAFETY: the guard is only read through, and dropped before the adapter;
+    // nothing here destroys the instance or physical device it hands out.
     let Some(hal) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else {
         return (None, None);
     };
     let instance = hal.shared_instance().raw_instance();
     let physical = hal.raw_physical_device();
+    // SAFETY: `physical` is a live handle of `instance`, both kept alive by
+    // `hal`, and the call only fills the returned struct.
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     let heaps = memory.memory_heap_count as usize;
     let local = (0..heaps)
@@ -319,8 +323,11 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
         })
         .map(|i| memory.memory_heaps[i].size)
         .max();
+    // SAFETY: as above — a query on a live physical device of `instance`.
     let exts =
         unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    // SAFETY: as above; `shader_cores` chains onto `p2` only the struct of an
+    // extension `exts` says this physical device supports.
     let cores = kernels_slang::cores::shader_cores(&exts, &mut |p2| unsafe {
         instance.get_physical_device_properties2(physical, p2);
     });

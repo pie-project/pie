@@ -1415,9 +1415,12 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
         .collect()
 }
 
-// SAFETY: the runtime drives an engine from one thread at a time (it is
-// moved to the engine thread and stays there); the shell's interior cells
-// are never touched from two threads at once. engine-wgpu makes the same
-// promise for the same reason.
-unsafe impl Send for Xla {}
+// SAFETY: the only state that is not `Sync` is the shell's
+// `trace::Handles` (a `RefCell` and a `Cell`). Every method that reaches it
+// (`open`, `copy_*`, the fire path under `fire_padded`) takes `&mut Shell`,
+// so it runs under `&mut Xla`. What a shared `&Xla` reaches (the `Engine`
+// `&self` methods, `shell()`, `capabilities()` and the shell's `&self`
+// getters) never touches those cells. `Engine: Sync` is asked for only by
+// runtime's registry lock; the runtime moves an engine, never shares it.
+// `Xla` is `Send` on its own.
 unsafe impl Sync for Xla {}
