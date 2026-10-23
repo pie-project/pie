@@ -5,9 +5,11 @@
 use dtype::Dtype;
 
 use crate::csl::Arg;
-use crate::cx::{Ctx, expect, tile_split};
+use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
-use crate::program::Shard;
+use crate::library::Kernel;
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 /// `y = rmsnorm(x) * weight`: each row of `x` scaled by
@@ -78,7 +80,18 @@ pub fn rmsnorm_grouped_plus_one(
     }
     // Rows past a PE spread over row groups, a row past a PE over whole
     // groups, the gain bank split with the columns.
-    let (rg, cg) = tile_split(OP, y.rows, width, 2 * u64::from(width), 1, 0, group)?;
+    let (rg, cg) = ctx.plan().tile(
+        OP,
+        Footprint {
+            rows: y.rows,
+            width,
+            per_row: 2 * u64::from(width),
+            per_col: 1,
+            whole: 0,
+            merge: 0,
+            unit: group,
+        },
+    )?;
     let pes = rg * cg;
     let (rows, width_local) = (y.rows / rg, width / cg);
     ctx.emit(&mut |cx| {
@@ -112,9 +125,8 @@ pub fn rmsnorm_grouped_plus_one(
                 cx.shard(&wb, gain);
             }
         }
-        cx.library("elemwise/rmsnorm_banked");
         cx.call(
-            "k_rmsnorm_banked",
+            Kernel::RmsnormBanked,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(wb),
@@ -171,17 +183,31 @@ fn rms_row(
     let per_head = axis < width;
     let (rg, cg) = if x.rows == y.rows {
         if per_head {
-            tile_split(
+            ctx.plan().tile(
                 op,
-                y.rows,
-                width,
-                2 * u64::from(width),
-                0,
-                weight.elements(),
-                axis,
+                Footprint {
+                    rows: y.rows,
+                    width,
+                    per_row: 2 * u64::from(width),
+                    per_col: 0,
+                    whole: weight.elements(),
+                    merge: 0,
+                    unit: axis,
+                },
             )?
         } else {
-            tile_split(op, y.rows, width, 2 * u64::from(width), 1, 0, 1)?
+            ctx.plan().tile(
+                op,
+                Footprint {
+                    rows: y.rows,
+                    width,
+                    per_row: 2 * u64::from(width),
+                    per_col: 1,
+                    whole: 0,
+                    merge: 0,
+                    unit: 1,
+                },
+            )?
         }
     } else {
         (1, 1)
@@ -205,9 +231,8 @@ fn rms_row(
                 cx.shard(&xb, tile);
                 cx.shard(&yb, tile);
             }
-            cx.library("elemwise/rmsnorm");
             cx.call(
-                "k_rmsnorm",
+                Kernel::Rmsnorm,
                 vec![
                     Arg::Ptr(xb),
                     Arg::Ptr(wb),
@@ -226,9 +251,7 @@ fn rms_row(
     let ss_name = format!("ss_{}_{}", x.buf, y.buf);
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
-        let ss = cx
-            .program()
-            .declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
+        let ss = cx.declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
         cx.over(pes);
         let tile = Shard::Tile {
             rows: rg,
@@ -237,9 +260,8 @@ fn rms_row(
         };
         cx.shard(&xb, tile);
         cx.shard(&ss, tile);
-        cx.library("elemwise/rowsq");
         cx.call(
-            "k_rowsq",
+            Kernel::Rowsq,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(ss),
@@ -253,9 +275,7 @@ fn rms_row(
         let xb = cx.read(x)?;
         let wb = cx.read(weight)?;
         let yb = cx.write(y)?;
-        let ss = cx
-            .program()
-            .declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
+        let ss = cx.declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
         cx.over(pes);
         let tile = Shard::Tile {
             rows: rg,
@@ -285,9 +305,8 @@ fn rms_row(
                 period: cg,
             },
         );
-        cx.library("elemwise/rmsnorm_scaled");
         cx.call(
-            "k_rmsnorm_scaled",
+            Kernel::RmsnormScaled,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(wb),
@@ -345,14 +364,17 @@ pub fn rmsnorm_gated(
     // Rows past a PE spread over row groups, a row past a PE over its
     // heads; the gain (one head) rides whole.
     let (rg, cg) = if x.rows == y.rows && gate.rows == y.rows {
-        tile_split(
+        ctx.plan().tile(
             OP,
-            y.rows,
-            x.width,
-            3 * u64::from(x.width),
-            0,
-            weight.elements(),
-            head_dim,
+            Footprint {
+                rows: y.rows,
+                width: x.width,
+                per_row: 3 * u64::from(x.width),
+                per_col: 0,
+                whole: weight.elements(),
+                merge: 0,
+                unit: head_dim,
+            },
         )?
     } else {
         (1, 1)
@@ -377,9 +399,8 @@ pub fn rmsnorm_gated(
                 );
             }
         }
-        cx.library("elemwise/rmsnorm_gated");
         cx.call(
-            "k_rmsnorm_gated",
+            Kernel::RmsnormGated,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(gb),
@@ -406,7 +427,18 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
         ));
     }
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(OP, x.rows, x.width, 2 * u64::from(x.width), 0, 0, 1)?
+        ctx.plan().tile(
+            OP,
+            Footprint {
+                rows: x.rows,
+                width: x.width,
+                per_row: 2 * u64::from(x.width),
+                per_col: 0,
+                whole: 0,
+                merge: 0,
+                unit: 1,
+            },
+        )?
     } else {
         (1, 1)
     };
@@ -426,9 +458,8 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
             cx.shard(&xb, tile);
             cx.shard(&yb, tile);
         }
-        cx.library("elemwise/residual_add");
         cx.call(
-            "k_residual_add",
+            Kernel::ResidualAdd,
             vec![Arg::Ptr(xb), Arg::Ptr(yb), Arg::Int(n as i64)],
         );
         Ok(())
@@ -451,7 +482,18 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
         ));
     }
     let (rows, width) = (out.rows, out.width);
-    let (rg, cg) = tile_split(OP, rows, width, u64::from(width), 1, 0, 1)?;
+    let (rg, cg) = ctx.plan().tile(
+        OP,
+        Footprint {
+            rows,
+            width,
+            per_row: u64::from(width),
+            per_col: 1,
+            whole: 0,
+            merge: 0,
+            unit: 1,
+        },
+    )?;
     let pes = rg * cg;
     ctx.emit(&mut |cx| {
         let bb = cx.read(bias)?;
@@ -469,9 +511,8 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
             );
             cx.shard(&bb, column_split(&bb, cg));
         }
-        cx.library("elemwise/add_bias");
         cx.call(
-            "k_add_bias",
+            Kernel::AddBias,
             vec![
                 Arg::Ptr(ob),
                 Arg::Ptr(bb),
@@ -485,7 +526,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
 
 /// How a per-column vector (`[width][1]` or `[1][width]`) splits with `cg`
 /// column groups, every row group holding it.
-fn column_split(b: &crate::program::Buf, cg: u32) -> Shard {
+fn column_split(b: &crate::phase::Buf, cg: u32) -> Shard {
     if b.rows == 1 {
         Shard::ColsBy {
             parts: cg,
@@ -534,7 +575,18 @@ pub fn layernorm(
     // Rows over row groups; a row past a PE over column groups too, the
     // row's sum and sum of squares gathered from every block first.
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(OP, y.rows, width, 2 * u64::from(width), 2, 0, 1)?
+        ctx.plan().tile(
+            OP,
+            Footprint {
+                rows: y.rows,
+                width,
+                per_row: 2 * u64::from(width),
+                per_col: 2,
+                whole: 0,
+                merge: 0,
+                unit: 1,
+            },
+        )?
     } else {
         (1, 1)
     };
@@ -556,9 +608,8 @@ pub fn layernorm(
                 cx.shard(&xb, tile);
                 cx.shard(&yb, tile);
             }
-            cx.library("elemwise/layernorm");
             cx.call(
-                "k_layernorm",
+                Kernel::Layernorm,
                 vec![
                     Arg::Ptr(xb),
                     Arg::Ptr(wb),
@@ -575,9 +626,7 @@ pub fn layernorm(
     let st_name = format!("st_{}_{}", x.buf, y.buf);
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
-        let st = cx
-            .program()
-            .declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
+        let st = cx.declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
         cx.over(pes);
         cx.shard(
             &xb,
@@ -595,9 +644,8 @@ pub fn layernorm(
                 segments: 2,
             },
         );
-        cx.library("elemwise/rowstats");
         cx.call(
-            "k_rowstats",
+            Kernel::Rowstats,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(st),
@@ -612,9 +660,7 @@ pub fn layernorm(
         let wb = cx.read(weight)?;
         let bb = cx.read(bias)?;
         let yb = cx.write(y)?;
-        let st = cx
-            .program()
-            .declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
+        let st = cx.declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
         cx.over(pes);
         let tile = Shard::Tile {
             rows: rg,
@@ -632,9 +678,8 @@ pub fn layernorm(
                 period: cg,
             },
         );
-        cx.library("elemwise/layernorm_scaled");
         cx.call(
-            "k_layernorm_scaled",
+            Kernel::LayernormScaled,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(wb),

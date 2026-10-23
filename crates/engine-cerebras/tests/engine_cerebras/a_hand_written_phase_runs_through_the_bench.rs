@@ -17,7 +17,7 @@ fn a_scaled_sum_lands_rounded_to_bf16() {
                 let xb = cx.read(x)?;
                 let yb = cx.read(y)?;
                 let zb = cx.write(z)?;
-                cx.for_range("i", 12, |blk| {
+                cx.statements().for_range("i", 12, |blk| {
                     blk.line(format!(
                         "{}[i] = 1.5 * {}[i] + {}[i];",
                         zb.name, xb.name, yb.name

@@ -8,8 +8,9 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
-use crate::linear::gemm::{ARRAY_WORDS, max_pes, pe_words};
-use crate::program::Shard;
+use crate::library::Kernel;
+use crate::phase::Shard;
+use crate::plan::{Held, Spread};
 use crate::tensor::{RaggedTensor, Tensor};
 
 /// Row `t` of a lane is `Σ_{k ≤ t} (base[side·taps + k, c] + coeff[t,
@@ -70,29 +71,29 @@ pub fn block_dyn_conv(
     }
     let lanes = x.indptr.elements().saturating_sub(1);
     let rows = u64::from(x.data.rows);
-    let budget = pe_words();
-    let words = |cg: u32| {
+    let held = |cg: u32| {
         let cb = u64::from(channels / cg);
         let gl = u64::from(groups / cg);
         let coeff_local = rows * 2 * u64::from(taps) * gl;
-        let largest = (rows * cb).max(coeff_local);
-        (
-            rows * cb * 2 + 2 * u64::from(taps) * cb + coeff_local + lanes + 1,
-            largest,
-        )
+        Held {
+            words: rows * cb * 2 + 2 * u64::from(taps) * cb + coeff_local + lanes + 1,
+            array: (rows * cb).max(coeff_local),
+        }
     };
-    let cg = (1..=groups)
-        .filter(|cg| groups.is_multiple_of(*cg) && *cg <= max_pes())
-        .find(|cg| {
-            let (total, largest) = words(*cg);
-            total <= budget && largest <= ARRAY_WORDS
+    let cg = ctx
+        .plan()
+        .spread(&Spread {
+            units: groups,
+            collective: false,
+            held: &held,
         })
         .ok_or_else(|| {
             refuse(
                 OP,
                 format!(
-                    "{} rows of {channels} channels do not fit a PE's {budget} even one group of {group} at a time",
-                    x.data.rows
+                    "{} rows of {channels} channels do not fit a PE's {} even one group of {group} at a time",
+                    x.data.rows,
+                    ctx.plan().pe_words()
                 ),
             )
         })?;
@@ -117,9 +118,8 @@ pub fn block_dyn_conv(
                 },
             );
         }
-        cx.library("ssm/block_dyn_conv");
         cx.call(
-            "k_block_dyn_conv",
+            Kernel::BlockDynConv,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(cb_),

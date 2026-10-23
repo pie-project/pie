@@ -245,7 +245,7 @@ pub struct Shell {
     trace: Trace,
     /// The shape every whole-fire program of this model follows, so they
     /// are one program text (see `Shell::unified_of_texts`).
-    unified: Option<kernels_cerebras::program::Unified>,
+    unified: Option<crate::fabric::Unified>,
     compiled: CompiledModel,
     budgets: Budgets,
     weights: Weights,
@@ -383,36 +383,36 @@ impl Shell {
     /// Follows `unified` from here on: every whole-fire program traced
     /// takes its kernels, kept slots, arena and table capacity, so the
     /// classes share one program text and one resident server.
-    pub fn set_unified(&mut self, unified: Option<kernels_cerebras::program::Unified>) {
+    pub fn set_unified(&mut self, unified: Option<crate::fabric::Unified>) {
         self.unified = unified;
     }
 
     /// The shape uniting the whole-fire programs among `texts` (a dry
     /// shell's `Device::dry_texts` after `synthetic_fires`): `None` when
     /// none of them rendered table-driven.
-    pub fn unified_of_texts(texts: &[String]) -> Option<kernels_cerebras::program::Unified> {
+    pub fn unified_of_texts(texts: &[String]) -> Option<crate::fabric::Unified> {
         let programs = Self::table_programs(texts);
         if programs.is_empty() {
             return None;
         }
         if programs.iter().all(|p| p.len() == 1) {
-            return Some(kernels_cerebras::program::Unified::union(
+            return Some(crate::fabric::Unified::union(
                 programs.iter().map(|p| &p[0]),
             ));
         }
-        kernels_cerebras::program::Unified::union_rows(&programs)
+        crate::fabric::Unified::union_rows(&programs)
     }
 
     /// The partition of the fire into rows every class is to follow, from
     /// the programs a dry shell traced (`Unified::partition`): a shell
     /// traced again under it splits every class alike, and
     /// `unified_of_texts` then unites the rows.
-    pub fn unified_partition(texts: &[String]) -> Option<kernels_cerebras::program::Unified> {
-        kernels_cerebras::program::Unified::partition(&Self::table_programs(texts))
+    pub fn unified_partition(texts: &[String]) -> Option<crate::fabric::Unified> {
+        crate::fabric::Unified::partition(&Self::table_programs(texts))
     }
 
     /// Each whole-fire program's tables (its rows), from the texts.
-    fn table_programs(texts: &[String]) -> Vec<Vec<kernels_cerebras::program::Table>> {
+    fn table_programs(texts: &[String]) -> Vec<Vec<crate::fabric::Table>> {
         texts
             .iter()
             .flat_map(|t| t.split(crate::trace::PHASE_SEPARATOR))
@@ -1459,7 +1459,7 @@ impl Shell {
             })
             .collect();
         if !window_copies.is_empty() {
-            if kernels_cerebras::program::keep_pools() {
+            if crate::fabric::keep_pools() {
                 // The pools stay on the device: the next program's table
                 // carries the moves.
                 self.device

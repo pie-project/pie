@@ -15,9 +15,10 @@ The checks, the ones the rest of the convention leans on:
     a form beside one (`select_bf16` beside `select`), is a directory module
     the kernel tree also has, or says `//! Host-only:` on its first line (as
     do its submodules, then);
-  * kernels-cerebras: every `library("<group>/<name>")` the host writes is
-    a unit under `kernels/`, every unit outside `prim/` is named by one, and
-    every unit sits in one of the convention's groups;
+  * kernels-cerebras: every `Kernel::<Name>` id the host writes is a unit's
+    entry (`k_<name>`) or a `prim/` function, every unit outside `prim/` is
+    called by its id or by another unit, and every unit sits in one of the
+    convention's groups;
   * kernels-slang: every unit sits in one of the convention's groups and
     has its host module at the mirrored path; every `pie:instantiate` entry
     is named by host code (kernels-slang's `src/` or an engine's dispatch);
@@ -368,37 +369,60 @@ def metal_misdirected_launches(crate):
     return found
 
 
-# kernels-cerebras: CSL units, looked up by path (`cx.library("elemwise/rmsnorm")`).
+# kernels-cerebras: CSL units, called by the census's ids (`Kernel::Rmsnorm`
+# is `k_rmsnorm`, the entry of `elemwise/rmsnorm`; `prim/` functions are ids too).
 CSL_TREE = "crates/kernels-cerebras/kernels"
 CSL_HOST = ["crates/kernels-cerebras/src", "crates/engine-cerebras/src"]
 CSL_GROUPS = {
     "prim", "attn", "ssm", "linear", "elemwise", "conv", "gather", "sampling", "collective",
     "runtime",
 }
-LIBRARY = re.compile(r'library\("([^"]+)"\)')
+KERNEL_ID = re.compile(r"\bKernel::([A-Z][A-Za-z0-9]*)\b")
+CSL_FN = re.compile(r"(?m)^fn (k_\w+)\(")
+
+
+def csl_id(name):
+    """`k_round_bf16` → `RoundBf16`, as build.rs names the ids."""
+    return "".join(w[:1].upper() + w[1:] for w in name.removeprefix("k_").split("_"))
 
 
 def csl_units():
     tree = REPO / CSL_TREE
     units = {p.relative_to(tree).with_suffix("").as_posix() for p in tree.rglob("*.csl")}
     findings = []
+    ids = {}
     for unit in sorted(units):
         group = unit.split("/")[0]
         if "/" not in unit or group not in CSL_GROUPS:
             findings.append(f"{CSL_TREE}/{unit}.csl: `{group}` is not one of the convention's groups")
+        if group == "prim":
+            for f in CSL_FN.findall((tree / f"{unit}.csl").read_text()):
+                ids[csl_id(f)] = unit
+        else:
+            ids[csl_id("k_" + unit.rsplit("/", 1)[-1])] = unit
     named = set()
     for root in CSL_HOST:
         for path in sorted((REPO / root).rglob("*.rs")):
             text = path.read_text()
-            for m in LIBRARY.finditer(text):
+            for m in KERNEL_ID.finditer(text):
+                if m.group(1) in ("ALL", "of"):
+                    continue
                 named.add(m.group(1))
-                if m.group(1) not in units:
+                if m.group(1) not in ids:
                     line = text.count("\n", 0, m.start()) + 1
                     rel = path.relative_to(REPO)
-                    findings.append(f"{rel}:{line}: `{m.group(1)}` is no unit under {CSL_TREE}")
-    for unit in sorted(units - named):
-        if not unit.startswith("prim/"):
-            findings.append(f'{CSL_TREE}/{unit}.csl: no host `library("{unit}")` names it')
+                    findings.append(f"{rel}:{line}: `Kernel::{m.group(1)}` is no kernel under {CSL_TREE}")
+    # A unit no host calls may still be a helper another unit calls into.
+    code = {
+        u: re.sub(r"//[^\n]*", "", (tree / f"{u}.csl").read_text()) for u in units
+    }
+    for kid, unit in sorted(ids.items(), key=lambda kv: kv[1]):
+        entry = "k_" + unit.rsplit("/", 1)[-1]
+        called = any(
+            re.search(rf"\b{entry}\(", text) for u, text in code.items() if u != unit
+        )
+        if not unit.startswith("prim/") and kid not in named and not called:
+            findings.append(f"{CSL_TREE}/{unit}.csl: no host `Kernel::{kid}` calls it")
     return findings
 
 

@@ -7,50 +7,65 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
-use crate::program::{HostOp, Shard};
+use crate::library::Kernel;
+use crate::phase::{HostOp, Shard};
+use crate::plan::{Footprint, Held, Spread};
 use crate::tensor::Tensor;
 
-/// The most PEs an embedding table spreads over for a fabric gather (one
-/// rectangle row of partials).
-const EMBED_PES: u32 = 256;
-
-/// How many PEs hold `table` for a gather, each a whole number of rows
-/// within an array, beside `beside` words (the ids and two copies of the
-/// output); `None` sends the gather to the host.
-fn embed_pes(table: Tensor, beside: u64) -> Option<u32> {
-    use crate::linear::gemm::{ARRAY_WORDS, FABRIC_SUM_WORDS, pe_words, resident_pes};
-    let budget = pe_words();
-    // The resident row: the table over its PEs, or whole on each.
-    if let Some(n) = resident_pes() {
-        let fits = |n: u32| {
-            table.rows.is_multiple_of(n) && {
-                let share = u64::from(table.rows / n) * u64::from(table.width);
-                let extra = if n > 1 { FABRIC_SUM_WORDS } else { 0 };
-                share <= ARRAY_WORDS && share + beside + extra <= budget
+/// How many PEs hold `table` for a gather, each a whole number of rows,
+/// beside `beside` words (the ids and two copies of the output), the parts
+/// summed on the fabric; `None` sends the gather to the host.
+fn embed_pes(ctx: &Ctx<'_>, table: Tensor, beside: u64) -> Option<u32> {
+    let width = u64::from(table.width);
+    ctx.plan().spread(&Spread {
+        units: table.rows,
+        collective: true,
+        held: &|n| {
+            let share = u64::from(table.rows / n) * width;
+            Held {
+                words: share + beside,
+                array: share,
             }
-        };
-        return [n, 1].into_iter().find(|n| fits(*n));
-    }
-    (1..=EMBED_PES.min(table.rows))
-        .filter(|n| table.rows.is_multiple_of(*n))
-        .find(|n| {
-            let share = u64::from(table.rows / n) * u64::from(table.width);
-            let extra = if *n > 1 { FABRIC_SUM_WORDS } else { 0 };
-            share <= ARRAY_WORDS && share + beside + extra <= budget
-        })
+        },
+    })
 }
 
 /// The rows of a row-wise copy over PEs: `rg` row groups when every buffer
 /// has `rows` rows and a group's words fit a PE, else one PE when the
 /// whole fits, else `None` (the host copies).
-fn copy_split(op: &'static str, rows: u32, per_row: u64, same_rows: bool) -> Option<u32> {
-    use crate::linear::gemm::pe_words;
+fn copy_split(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    rows: u32,
+    width: u32,
+    same_rows: bool,
+) -> Option<u32> {
+    // The source row and its parts.
+    let per_row = 2 * u64::from(width);
     if same_rows {
-        return crate::cx::tile_split(op, rows, 1, per_row, 0, 0, 1)
+        return ctx
+            .plan()
+            .tile(
+                op,
+                Footprint {
+                    rows,
+                    width: 1,
+                    per_row,
+                    per_col: 0,
+                    whole: 0,
+                    merge: 0,
+                    unit: 1,
+                },
+            )
             .ok()
             .map(|(rg, _)| rg);
     }
-    (per_row * u64::from(rows) <= pe_words()).then_some(1)
+    ctx.plan()
+        .holds(Held {
+            words: per_row * u64::from(rows),
+            array: u64::from(width) * u64::from(rows),
+        })
+        .then_some(1)
 }
 
 /// A gather of `table` rows into `y` (`y_words` a PE) over `n` PEs holding
@@ -60,8 +75,8 @@ fn copy_split(op: &'static str, rows: u32, per_row: u64, same_rows: bool) -> Opt
 fn embed_over(
     cx: &mut Cx<'_>,
     n: u32,
-    table: &crate::program::Buf,
-    y: &crate::program::Buf,
+    table: &crate::phase::Buf,
+    y: &crate::phase::Buf,
     y_words: u64,
 ) -> Arg {
     if n == 1 {
@@ -78,10 +93,7 @@ fn embed_over(
         },
     );
     let partial = cx.scratch("partial", y_words);
-    // Under the resident placement every PE reads `y` in place after:
-    // the sum comes back to the row.
-    let resident = crate::linear::gemm::resident_pes().is_some();
-    cx.fabric_sum_with(&partial, y, y_words, (n, 1), resident);
+    cx.fabric_sum(&partial, y, y_words, (n, 1));
     Arg::Scratch(partial, "f32")
 }
 
@@ -123,7 +135,7 @@ pub fn embed(
     // parts added on the fabric; a table no such row holds (the vocabulary
     // under the simulator's budget) is gathered by the host.
     let y_words = y.elements();
-    let pes = embed_pes(table, ids.elements() + 2 * y_words);
+    let pes = embed_pes(ctx, table, ids.elements() + 2 * y_words);
     ctx.emit(&mut |cx| {
         let ib = cx.read(ids)?;
         let tb = cx.read(table)?;
@@ -141,9 +153,8 @@ pub fn embed(
         };
         let out = embed_over(cx, n, &tb, &yb, y_words);
         let share = table.rows / n;
-        cx.library("gather/embed_part");
         cx.call(
-            "k_embed_part",
+            Kernel::EmbedPart,
             vec![
                 Arg::Ptr(ib),
                 Arg::Ptr(tb),
@@ -193,9 +204,10 @@ pub fn split_q_gate(
     }
     let rows = packed.rows;
     let split = copy_split(
+        ctx,
         OP,
         rows,
-        2 * u64::from(packed.width),
+        packed.width,
         q.rows == rows && gate.rows == rows,
     );
     ctx.emit(&mut |cx| {
@@ -219,9 +231,8 @@ pub fn split_q_gate(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("gather/split_q_gate");
         cx.call(
-            "k_split_q_gate",
+            Kernel::SplitQGate,
             vec![
                 Arg::Ptr(pb),
                 Arg::Ptr(qb),
@@ -262,9 +273,10 @@ pub fn split_rows(
     }
     let rows = x.rows;
     let split = copy_split(
+        ctx,
         OP,
         rows,
-        2 * u64::from(x.width),
+        x.width,
         left.rows == rows && right.rows == rows,
     );
     ctx.emit(&mut |cx| {
@@ -288,9 +300,8 @@ pub fn split_rows(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("gather/split_rows");
         cx.call(
-            "k_split_rows",
+            Kernel::SplitRows,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(lb),
@@ -330,9 +341,8 @@ pub fn gather_rows(ctx: &Ctx<'_>, wide: Tensor, index: Tensor, tight: Tensor) ->
         let wb = cx.read(wide)?;
         let ib = cx.read(index)?;
         let tb = cx.write(tight)?;
-        cx.library("gather/gather_rows");
         cx.call(
-            "k_gather_rows",
+            Kernel::GatherRows,
             vec![
                 Arg::Ptr(wb),
                 Arg::Ptr(ib),
@@ -374,9 +384,8 @@ pub fn scatter_live_rows(
         let rb = cx.read(routes)?;
         cx.read(y)?;
         let yb = cx.write(y)?;
-        cx.library("gather/scatter_live_rows");
         cx.call(
-            "k_scatter_live_rows",
+            Kernel::ScatterLiveRows,
             vec![
                 Arg::Ptr(sb),
                 Arg::Ptr(rb),
@@ -412,7 +421,7 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
         let xb = cx.read(x)?;
         let yb = cx.write(y)?;
         cx.call(
-            "k_copy",
+            Kernel::Copy,
             vec![
                 Arg::Ptr(yb),
                 Arg::Int(0),
@@ -459,7 +468,7 @@ pub fn embed_concat(
     let (rows, width) = (y.rows, table.width);
     let limit = vocab.min(table.rows);
     let y_words = y.elements();
-    let pes = embed_pes(table, ids.elements() + 2 * y_words);
+    let pes = embed_pes(ctx, table, ids.elements() + 2 * y_words);
     ctx.emit(&mut |cx| {
         let ib = cx.read(ids)?;
         let tb = cx.read(table)?;
@@ -478,9 +487,8 @@ pub fn embed_concat(
         };
         let out = embed_over(cx, n, &tb, &yb, y_words);
         let share = table.rows / n;
-        cx.library("gather/embed_concat_part");
         cx.call(
-            "k_embed_concat_part",
+            Kernel::EmbedConcatPart,
             vec![
                 Arg::Ptr(ib),
                 Arg::Ptr(tb),
@@ -532,9 +540,10 @@ pub fn split_qkv(
     }
     let rows = packed.rows;
     let split = copy_split(
+        ctx,
         OP,
         rows,
-        2 * u64::from(packed.width),
+        packed.width,
         q.rows == rows && k.rows == rows && v.rows == rows,
     );
     ctx.emit(&mut |cx| {
@@ -560,9 +569,8 @@ pub fn split_qkv(
                 cx.shard(b, Shard::Rows(rg));
             }
         }
-        cx.library("gather/split_qkv");
         cx.call(
-            "k_split_qkv",
+            Kernel::SplitQkv,
             vec![
                 Arg::Ptr(pb),
                 Arg::Ptr(qb),
@@ -612,7 +620,11 @@ pub fn embed_weighted(
     }
     let y_words = y.elements();
     let limit = vocab.min(table.rows);
-    let pes = embed_pes(table, ids.elements() + weights.elements() + 2 * y_words);
+    let pes = embed_pes(
+        ctx,
+        table,
+        ids.elements() + weights.elements() + 2 * y_words,
+    );
     ctx.emit(&mut |cx| {
         let ib = cx.read(ids)?;
         let wb = cx.read(weights)?;
@@ -633,9 +645,8 @@ pub fn embed_weighted(
         };
         let out = embed_over(cx, n, &tb, &yb, y_words);
         let share = table.rows / n;
-        cx.library("gather/embed_weighted_part");
         cx.call(
-            "k_embed_weighted_part",
+            Kernel::EmbedWeightedPart,
             vec![
                 Arg::Ptr(ib),
                 Arg::Ptr(wb),
