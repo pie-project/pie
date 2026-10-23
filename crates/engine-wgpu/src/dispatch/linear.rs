@@ -392,8 +392,7 @@ impl Run<'_> {
                 let bias_plane = bias_plane.unwrap_or_else(|| self.tensor(*bias));
                 if !staged
                     && let Some(scratch) = self.routed_scratch()
-                    && linear::moe::matmul_select_batched(
-                        self.ctx(),
+                    && self.batched(
                         OP,
                         self.tensor(*x),
                         planes,
@@ -402,7 +401,6 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        self.tuning(),
                     )?
                 {
                     return Ok(());
@@ -430,8 +428,7 @@ impl Run<'_> {
                     };
                 if !staged
                     && let Some(scratch) = self.routed_scratch()
-                    && linear::moe::matmul_select_batched(
-                        self.ctx(),
+                    && self.batched(
                         OP,
                         self.tensor(*x),
                         planes,
@@ -440,7 +437,6 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        self.tuning(),
                     )?
                 {
                     return Ok(());
@@ -552,5 +548,52 @@ impl Run<'_> {
     /// hold a 32-lane strip.
     fn gemm_tactic(&self) -> kernels_slang::linear::gemm::Tactic {
         kernels_slang::linear::gemm::Tactic { tier: self.tier() }
+    }
+}
+
+impl Run<'_> {
+    /// The routed matmul over sorted expert tiles, at the device's tile
+    /// rows, sort width and tier; `Ok(false)` where it declines.
+    #[allow(clippy::too_many_arguments)]
+    fn batched(
+        &self,
+        op: &'static str,
+        x: kernels_wgpu::Tensor,
+        bank: kernels_wgpu::Bank,
+        bias: Option<kernels_wgpu::Tensor>,
+        routes: kernels_wgpu::Tensor,
+        experts: u32,
+        scratch: linear::moe::RoutedScratch,
+        y: kernels_wgpu::Tensor,
+    ) -> Result<bool, kernels_wgpu::Error> {
+        use crate::encode::slang_tensor as st;
+        let pairs = y.rows;
+        let batch = kernels_slang::linear::moe::select::Batch {
+            tile: linear::moe::tile_rows(pairs, experts, self.tuning()),
+            padded: linear::moe::sorted_rows(pairs, experts, self.tuning()),
+            tier: kernels_slang::Tier::Baseline,
+            sort_lanes: 256,
+        };
+        let scratch = kernels_slang::linear::moe::select::RoutedScratch {
+            perm: st(scratch.perm),
+            row_expert: st(scratch.row_expert),
+            tile_expert: st(scratch.tile_expert),
+            inv: st(scratch.inv),
+            x: st(scratch.x),
+            y: st(scratch.y),
+        };
+        kernels_slang::linear::moe::select::matmul_select_batched(
+            &self.slang(),
+            op,
+            st(x),
+            crate::encode::slang_bank(bank),
+            bias.map(st),
+            st(routes),
+            experts,
+            scratch,
+            st(y),
+            batch,
+        )
+        .map_err(crate::encode::from_slang)
     }
 }
