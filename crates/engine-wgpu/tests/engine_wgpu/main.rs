@@ -1,6 +1,7 @@
 #![cfg(feature = "wgpu")]
 
 mod attn;
+mod conv;
 mod elemwise;
 mod gather;
 mod gpu;

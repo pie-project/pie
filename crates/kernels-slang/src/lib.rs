@@ -5,6 +5,7 @@
 //! block (`prim/params.slang`), so one source reads the same on both.
 
 pub mod attn;
+pub mod conv;
 pub mod elemwise;
 pub mod encode;
 pub mod error;
