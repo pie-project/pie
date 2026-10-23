@@ -429,13 +429,13 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
             window,
             pool,
             merge,
-            head_dim,
+            sink,
             ..
         })) = fused.nodes.first().map(|node| &node.op)
         else {
             panic!("the first op is the pool attention");
         };
-        assert_eq!(*head_dim, 512);
+        assert!(matches!(**sink, poem_ir::Attn::Sink { head_dim: 512, .. }));
         assert_eq!(
             (window.name(), pool.name(), merge.name()),
             (

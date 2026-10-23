@@ -21,7 +21,8 @@
 //! - `#[input(I32)]` names the operand's expected type, a constant on
 //!   `poem_ir::check::Expect`; the validator checks it under the field's
 //!   name.
-//! - `#[output(alias = f)]` says the output is input `f` updated in place.
+//! - `#[output(alias = f)]` says the output is operand `f` (an input, or an
+//!   intermediate output of the same op) updated in place.
 //! - `#[part]` marks a field holding operands on both sides (a sub-op, or an
 //!   attribute that reads one value and lands another): it implements
 //!   `poem_ir::operands::Part`.
@@ -30,7 +31,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{ToTokens, quote};
+use quote::{ToTokens, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, Ident, LitStr, parse_macro_input};
 
@@ -118,7 +119,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                     attr.parse_nested_meta(|meta| {
                         if meta.path.is_ident("alias") {
                             if !output {
-                                return Err(meta.error("only an output aliases an input"));
+                                return Err(meta.error("only an output aliases an operand"));
                             }
                             operand.alias = Some(meta.value()?.parse()?);
                         } else if let Some(want) = meta.path.get_ident() {
@@ -140,11 +141,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             if let Some(alias) = &operand.alias
                 && !operands
                     .iter()
-                    .any(|o| o.kind == Kind::Input && o.field == *alias)
+                    .any(|o| o.kind != Kind::Part && o.field == *alias && o.alias.is_none())
             {
                 return Err(syn::Error::new(
                     alias.span(),
-                    format!("`{alias}` is not an #[input] of this op"),
+                    format!("`{alias}` is no operand of this op an output may land over"),
                 ));
             }
         }
@@ -160,7 +161,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     let arm = |variant: &Variant, body: TokenStream2, fields: Vec<&Ident>| {
         let v = &variant.ident;
-        quote! { Self::#v { #(#fields,)* .. } => { #body } }
+        quote_spanned! {Span::mixed_site()=> Self::#v { #(#fields,)* .. } => { #body } }
     };
 
     let side = |kind: Kind| {
@@ -175,15 +176,15 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 let field = &o.field;
                 match (o.kind, kind) {
                     (Kind::Part, Kind::Input) => {
-                        quote! { ::poem_ir::operands::Part::inputs(#field, sink); }
+                        quote_spanned! {Span::mixed_site()=> ::poem_ir::operands::Part::inputs(#field, sink); }
                     }
                     (Kind::Part, _) => {
-                        quote! { ::poem_ir::operands::Part::outputs(#field, sink); }
+                        quote_spanned! {Span::mixed_site()=> ::poem_ir::operands::Part::outputs(#field, sink); }
                     }
-                    _ => quote! { ::poem_ir::operands::Slot::push(#field, sink); },
+                    _ => quote_spanned! {Span::mixed_site()=> ::poem_ir::operands::Slot::push(#field, sink); },
                 }
             });
-            arm(variant, quote! { #(#body)* }, fields)
+            arm(variant, quote_spanned! {Span::mixed_site()=> #(#body)* }, fields)
         })
     };
     // A variant with parts reads, in field order, each value no earlier part
@@ -194,7 +195,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         let steps = variant.operands.iter().map(|o| {
             let field = &o.field;
             match o.kind {
-                Kind::Input => quote! {
+                Kind::Input => quote_spanned! {Span::mixed_site()=>
                     held.clear();
                     ::poem_ir::operands::Slot::push(#field, &mut held);
                     for id in held.drain(..) {
@@ -203,7 +204,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                         }
                     }
                 },
-                Kind::Part => quote! {
+                Kind::Part => quote_spanned! {Span::mixed_site()=>
                     held.clear();
                     ::poem_ir::operands::Part::inputs(#field, &mut held);
                     for id in held.drain(..) {
@@ -213,12 +214,12 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                     }
                     ::poem_ir::operands::Part::outputs(#field, &mut made);
                 },
-                Kind::Output => quote! {
+                Kind::Output => quote_spanned! {Span::mixed_site()=>
                     ::poem_ir::operands::Slot::push(#field, &mut made);
                 },
             }
         });
-        let body = quote! {
+        let body = quote_spanned! {Span::mixed_site()=>
             let start = sink.len();
             let mut made: Vec<::poem_ir::ValueId> = Vec::new();
             let mut held: Vec<::poem_ir::ValueId> = Vec::new();
@@ -261,7 +262,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
         let body = pairs.iter().map(|(out, input)| {
-            quote! {
+            quote_spanned! {Span::mixed_site()=>
                 if let (Some(out), Some(input)) = (
                     ::poem_ir::operands::Slot::one(#out),
                     ::poem_ir::operands::Slot::one(#input),
@@ -272,13 +273,17 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         });
         let parts = parts
             .iter()
-            .map(|p| quote! { ::poem_ir::operands::Part::aliases(#p, sink); });
-        arm(variant, quote! { #(#body)* #(#parts)* }, fields)
+            .map(|p| quote_spanned! {Span::mixed_site()=> ::poem_ir::operands::Part::aliases(#p, sink); });
+        arm(variant, quote_spanned! {Span::mixed_site()=> #(#body)* #(#parts)* }, fields)
     });
 
     let names = variants.iter().map(|variant| {
         let name = LitStr::new(&variant.name, Span::call_site());
-        arm(variant, quote! { #name }, Vec::new())
+        arm(
+            variant,
+            quote_spanned! {Span::mixed_site()=> #name },
+            Vec::new(),
+        )
     });
 
     let ports = variants.iter().map(|variant| {
@@ -298,25 +303,31 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             .map(|o| &o.field)
             .chain(parts.iter().copied())
             .collect();
-        let parts = parts
-            .iter()
-            .map(|p| quote! { ::poem_ir::operands::Part::ports(#p, sink); });
+        let parts = parts.iter().map(
+            |p| quote_spanned! {Span::mixed_site()=> ::poem_ir::operands::Part::ports(#p, sink); },
+        );
         let body = wanted.iter().map(|o| {
             let field = &o.field;
             let want = o.want.as_ref().expect("filtered");
             let port = LitStr::new(&field.to_string(), field.span());
-            quote! {
+            quote_spanned! {Span::mixed_site()=>
                 ::poem_ir::operands::Slot::each(#field, &mut |id| {
                     sink.push((#port, id, ::poem_ir::check::Expect::#want));
                 });
             }
         });
-        arm(variant, quote! { #(#body)* #(#parts)* }, fields)
+        arm(
+            variant,
+            quote_spanned! {Span::mixed_site()=> #(#body)* #(#parts)* },
+            fields,
+        )
     });
 
-    let empty = variants.is_empty().then(|| quote! { _ => unreachable!() });
+    let empty = variants
+        .is_empty()
+        .then(|| quote_spanned! {Span::mixed_site()=> _ => unreachable!() });
 
-    Ok(quote! {
+    Ok(quote_spanned! {Span::mixed_site()=>
         impl #impl_generics ::poem_ir::Operands for #ident #ty_generics #where_clause {
             fn inputs(&self, sink: &mut Vec<::poem_ir::ValueId>) {
                 match self { #(#inputs)* #empty }

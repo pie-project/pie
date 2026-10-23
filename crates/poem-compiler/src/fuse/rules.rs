@@ -4,7 +4,7 @@
 use poem::declare::Precision;
 use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, Template, template};
-use poem_ir::ops::fused::PostNorm;
+use poem_ir::ops::fused::{PostNorm, Scaled};
 use poem_ir::{
     ActQuant, Dim, Dtype, Elemwise, Fused, Gather, ModulateForm, NormKind, Operation, StructKind,
     Ty,
@@ -310,9 +310,7 @@ fn pool_attention() -> Rule {
                 window: attention("o"),
                 pool: attention("po"),
                 merge: attention("mo"),
-                sink: m.value("sink"),
-                head_dim: m.u32("d"),
-                o_out: m.value("o_out"),
+                sink: attention("o_out"),
                 rotate: m.get("o_rot").map(|_| {
                     let Operation::Elemwise(rotate) = m.op("o_rot") else {
                         unreachable!("the turned rows come from a rotation")
@@ -844,7 +842,10 @@ fn rmsnorm_residual_add() -> Rule {
             t: m.value("t"),
             y: m.value("y"),
             y_out: m.value("y_out"),
-            scale: m.get("scaled").map(|scaled| (m.value("s"), scaled)),
+            scale: m.get("scaled").map(|out| Scaled {
+                by: m.value("s"),
+                out,
+            }),
             post: m.get("out").map(|out| PostNorm {
                 weight: m.value("post_weight"),
                 plus_one: plus_one(m.op("out")),

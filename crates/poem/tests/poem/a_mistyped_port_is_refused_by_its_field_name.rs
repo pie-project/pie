@@ -51,7 +51,7 @@ fn a_mistyped_port_is_refused_by_its_field_name() {
         faults.iter().any(|fault| matches!(
             fault,
             Fault::PortDtype {
-                port: Port::Named("indices"),
+                port: Port("indices"),
                 want: Dtype::I32,
                 ..
             }
