@@ -4,8 +4,9 @@
 //! rows land back where the plan reads them. Every move is a gather or a
 //! scatter over the index maps staged for the window (`rs::WindowMap`).
 
-use kernels_xla::lanes::Committed;
-use kernels_xla::{Error, Tensor};
+use crate::handle::Committed;
+use crate::handle::Tensor;
+use kernels_xla::Error;
 use poem_ir::ValueId;
 
 use crate::rs::{Seat, WindowInputs};
@@ -68,7 +69,7 @@ impl Run<'_> {
             let buf = cx.read(buffer)?;
             let mine = cx.read(own)?;
             let n = i64::from(map.rows_ext.max(1));
-            let flat = |cx: &mut kernels_xla::Cx<'_>, t: Tensor, len: i64| {
+            let flat = |cx: &mut crate::emit::Cx<'_>, t: Tensor, len: i64| {
                 let v = cx.read(t)?;
                 let all = cx.ty(v).elements();
                 let v = cx.reshape(v, &[all])?;

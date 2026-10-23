@@ -12,7 +12,7 @@ pub mod ngram;
 
 use dtype::Dtype;
 
-use crate::cx::elem_of;
+use crate::check::elem_of;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Func, Val};
 use crate::tensor::{Bank, Landing, Operand, Stored};

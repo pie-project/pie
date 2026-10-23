@@ -20,7 +20,7 @@ pub mod dyn_conv;
 
 use dtype::Dtype;
 
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, Val};
 use crate::lanes::{

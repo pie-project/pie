@@ -2,7 +2,7 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::Bank;
+use engine_xla::handle::Bank;
 use kernels_xla::linear::moe;
 
 fn hash(i: usize, seed: u32) -> u32 {
@@ -611,7 +611,7 @@ impl HostBank {
         }
     }
 
-    fn dense(&self, b: &mut Bench, e: usize) -> kernels_xla::Tensor {
+    fn dense(&self, b: &mut Bench, e: usize) -> engine_xla::handle::Tensor {
         b.bf16(e as u32, (self.w.len() / e) as u32, &self.w)
     }
 }

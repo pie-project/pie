@@ -1083,9 +1083,9 @@ impl Run<'_> {
     /// `t`'s first rows, as many as `like` has, when it has more.
     pub(crate) fn first_rows(
         &self,
-        t: kernels_xla::Tensor,
+        t: crate::handle::Tensor,
         like: poem_ir::ValueId,
-    ) -> kernels_xla::Tensor {
+    ) -> crate::handle::Tensor {
         let rows = self.tensor(like).rows;
         if t.rows > rows {
             self.handles().cut(t, 0, rows)
@@ -1103,7 +1103,7 @@ impl Run<'_> {
         w: poem_ir::ValueId,
         n: u32,
         k: u32,
-    ) -> Result<kernels_xla::Tensor, kernels_xla::Error> {
+    ) -> Result<crate::handle::Tensor, kernels_xla::Error> {
         match self.banked(w) {
             Some(bank) => {
                 let out = self.temp(n, k, poem_ir::Dtype::Bf16);

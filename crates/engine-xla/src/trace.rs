@@ -2,7 +2,7 @@
 //!
 //! A *root* is one array the fire program may name: a weight plane, a pool
 //! plane, a per-fire input, or an activation the plan computes. A *handle*
-//! (the `buf` of a `kernels_xla::Tensor`) is a row window of a root. The
+//! (the `buf` of a `crate::handle::Tensor`) is a row window of a root. The
 //! engine resolves plan values to handles exactly as engine-wgpu does; the
 //! tracer then turns every kernel's reads and writes of handles into SSA
 //! values of one StableHLO function:
@@ -17,9 +17,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+use crate::emit::{Cx, Emit, Env};
+use crate::handle::Tensor;
 use dtype::Dtype;
 use kernels_xla::hlo::{Elem, Func, Ty, Val};
-use kernels_xla::{Cx, Emit, Env, Tensor};
 
 /// Where a root's value comes from when the program first reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -5,7 +5,7 @@
 
 use dtype::Dtype;
 
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Func, Val};
 use crate::lanes::{clamp_i, cmp_i, count_le, csr_lanes, flat_i32, iota, nonzero, take};

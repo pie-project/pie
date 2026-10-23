@@ -12,11 +12,11 @@ use super::paged::{
     Heads, KeyList, Planes, Rows, Rule, blocked, per_row, pool_paging, read_geometry,
     read_rows_i32, scatter_slots, with_i,
 };
-use crate::cx::expect;
+use crate::check::expect;
 use crate::elemwise::norm::inv_rms_rows;
 use crate::error::{Error, refuse};
 use crate::hlo::{Elem, Func, Val};
-use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored, Tensor};
+use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored};
 use crate::tuning::Tuning;
 
 fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
@@ -371,7 +371,7 @@ pub fn kv_append(
 /// One MLA attention call: a description over handles (`T`) and landings
 /// (`L`), read by [`MlaCall::try_map`] into the operands [`flash`] takes.
 #[derive(Clone, Copy, Debug)]
-pub struct MlaCall<T = Tensor, L = T> {
+pub struct MlaCall<T, L = T> {
     pub op: &'static str,
     pub q: T,
     pub q_pe: T,

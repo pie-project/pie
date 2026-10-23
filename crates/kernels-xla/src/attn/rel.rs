@@ -8,7 +8,7 @@
 use super::paged::{Paged, Tables, Walk, kv_heads_agree};
 use super::{DecodePlan, PrefillPlan};
 use crate::error::Error;
-use crate::tensor::{KvPool, RaggedTensor, Stored, Tensor};
+use crate::tensor::{KvPool, RaggedTensor, Stored};
 
 /// `bias` is `[rows, q_heads · extent]` f32: row `r`, head `h`, distance
 /// `d = q_pos − k_pos` in `[0, extent)` adds `bias[r, h·extent + d]` to the
@@ -16,7 +16,7 @@ use crate::tensor::{KvPool, RaggedTensor, Stored, Tensor};
 /// logit is then scaled by `1 + log_alpha · ln((q_pos + 1) / log_floor)`
 /// wherever that ratio exceeds one.
 #[derive(Clone, Copy, Debug)]
-pub struct RelBias<T = Tensor> {
+pub struct RelBias<T> {
     pub bias: T,
     pub extent: u32,
     pub log_floor: u32,

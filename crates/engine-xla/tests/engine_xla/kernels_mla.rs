@@ -2,8 +2,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
+use engine_xla::handle::{KvPool, RaggedTensor};
 use engine_xla::lower::attn::mla;
-use kernels_xla::{KvPool, RaggedTensor};
 
 struct Rng(u64);
 

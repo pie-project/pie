@@ -9,7 +9,7 @@
 use dtype::Dtype;
 
 use super::pool::{Entries, cell_of, first, paging, put_cols, write_cell};
-use crate::cx::expect;
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
 use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero};

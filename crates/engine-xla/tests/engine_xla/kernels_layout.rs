@@ -2,7 +2,7 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::Bank;
+use engine_xla::handle::Bank;
 use kernels_xla::{gather, sampling};
 
 fn data(n: usize, seed: u32) -> Vec<f32> {

@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::handle::{Bank, Tensor};
 use checkpoint::contract::ModelContract;
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
@@ -14,7 +15,6 @@ use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
-use kernels_xla::{Bank, Tensor};
 use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::chip::{Engine, Mxfp4Prescale};

@@ -474,12 +474,12 @@ pub fn to_affine(
     }
     let n = w.rows;
     let group = affine_group(scheme);
-    crate::cx::expect(OP, codes, &[Dtype::U8])?;
-    crate::cx::expect(OP, scales, &[Dtype::F32])?;
-    crate::cx::expect(OP, biases, &[Dtype::F32])?;
-    crate::cx::shaped(OP, "code", codes, n, k)?;
-    crate::cx::shaped(OP, "scale", scales, n, k / group)?;
-    crate::cx::shaped(OP, "bias", biases, n, k / group)?;
+    crate::check::expect(OP, codes, &[Dtype::U8])?;
+    crate::check::expect(OP, scales, &[Dtype::F32])?;
+    crate::check::expect(OP, biases, &[Dtype::F32])?;
+    crate::check::shaped(OP, "code", codes, n, k)?;
+    crate::check::shaped(OP, "scale", scales, n, k / group)?;
+    crate::check::shaped(OP, "bias", biases, n, k / group)?;
     let w = w.with_dtype(Dtype::U8);
     let (q, scale, bias) = parts(f, w, scheme, k)?;
     // [S, T, B, n] → [n, B, S, T]; [S, B, n] → [n, B, S].

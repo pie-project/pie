@@ -6,9 +6,8 @@
 //! plans its own temporaries), and no copy compaction (a traced slice is
 //! free).
 
-use kernels_xla::{
-    Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
-};
+use crate::emit::Ctx;
+use crate::handle::{Bank, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor};
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 

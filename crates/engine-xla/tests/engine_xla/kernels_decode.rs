@@ -6,8 +6,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
+use engine_xla::handle::{Bank, KvPool, Tensor};
 use kernels_xla::elemwise::norm;
-use kernels_xla::{Bank, KvPool, Tensor};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
