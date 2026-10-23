@@ -1,4 +1,4 @@
-//! The prefill entries engine dispatches call (kernels-wgpu `attn::arbiter`),
+//! The prefill entries engine dispatches call (kernels-slang `attn::sdpa`),
 //! with Metal's `causal` flag on the masked forms. The paged driver picks
 //! the walk (`Walk::Auto`); `requests` and the GPU tuning argument are
 //! dropped.

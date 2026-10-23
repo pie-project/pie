@@ -572,7 +572,7 @@ impl Run<'_> {
 
 /// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs:
 /// the vector rung reads two activation rows a workgroup, which on the 4090
-/// beat kernels-wgpu's one-row kernel at every row count from 1 to 11 where
+/// beat the old hand-written WGSL one-row kernel at every row count from 1 to 11 where
 /// four rows lost at two (kernels-slang.md §17).
 fn qmm_ladder(
     tuning: &crate::tuning::Tuning,

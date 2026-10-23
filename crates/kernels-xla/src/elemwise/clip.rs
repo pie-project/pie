@@ -18,7 +18,7 @@ fn clip(f: &mut Func, x: Val, lo: Val, hi: Val) -> Result<Val, Error> {
 }
 
 /// `x = min(max(x, lo), hi)`; for a bf16 `x` the stated bounds round to bf16
-/// first, as kernels-wgpu `norm/clip.wgsl` lands them (an f32 `x` clamps at
+/// first, as kernels-slang `elemwise/pointwise.slang` lands them (an f32 `x` clamps at
 /// the f32 bounds, as kernels-metal does).
 pub fn clamp(f: &mut Func, lo: f32, hi: f32, x: Operand) -> Result<Val, Error> {
     const OP: &str = "elemwise.clamp";
@@ -47,7 +47,7 @@ pub fn clamp(f: &mut Func, lo: f32, hi: f32, x: Operand) -> Result<Val, Error> {
 }
 
 /// `x = min(max(x, lo[0]), hi[0])` with one-scalar bound planes in `x`'s
-/// element. Reference: kernels-wgpu `clamp_learned_bf16`.
+/// element. Reference: kernels-slang `elemwise_pointwise_clamp_learned_bf16`.
 pub fn clamp_learned(f: &mut Func, lo: Operand, hi: Operand, x: Operand) -> Result<Val, Error> {
     const OP: &str = "elemwise.clamp_learned";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;

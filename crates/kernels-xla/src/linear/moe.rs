@@ -37,9 +37,8 @@
 //! e5m2 costs (measured: 0.8 ms for the gate/up bank as `i4` codes, 2 ms
 //! as `f4E2M1FN`, 0.45 ms pre-scaled).
 //!
-//! References: `kernels-wgpu/src/linear/moe.rs` + `kernels/moe/{route,
-//! qmv_routed}.wgsl`; the sink router from `kernels-cuda/kernels/linear/
-//! moe.cuh` (`moe_topk_sigmoid_sink`).
+//! References: kernels-slang `linear/moe/{route, select}.slang`; the sink
+//! router from kernels-cuda `linear/moe/route.cu`.
 #![allow(clippy::too_many_arguments)]
 
 use dtype::Dtype;

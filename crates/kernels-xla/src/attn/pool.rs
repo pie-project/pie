@@ -4,7 +4,7 @@
 //! one entry, filed in a paged pool at the closing position; queries attend
 //! over their request's closed entries (all, or a selected few).
 //!
-//! In kernels-wgpu this module lives inline in `attn.rs` (`pub mod pool`).
+//! kernels-slang's counterpart is `attn::pool`.
 
 use dtype::Dtype;
 

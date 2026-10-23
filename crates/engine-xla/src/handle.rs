@@ -8,7 +8,7 @@ use kernels_xla::tensor::{Landing, Stored};
 
 /// A handle the engine resolves: `buf` names a binding (a root plus a row
 /// window), `rows × width` is its shape in elements of `dtype`. The same
-/// four fields as kernels-wgpu's `Tensor`, so an engine dispatch reads the
+/// four fields as kernels-slang's `Tensor`, so an engine dispatch reads the
 /// same on both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Tensor {

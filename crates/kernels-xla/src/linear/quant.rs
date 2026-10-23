@@ -3,7 +3,7 @@
 //! row.
 //!
 //! - affine (MLX, `biases` present): `w = s · c + b`, `bits ∈ {2, 4, 8}`,
-//!   as kernels-wgpu `quant/qmv.wgsl` + `common/affine.inc.wgsl` decode it.
+//!   as kernels-slang `linear/qmv.slang` + `prim/affine.slang` decode it.
 //! - symmetric (`biases` absent): the mxfp4 bank the checkpoint pairs with
 //!   `RawE8M0` scales, `bits == 4`: `w = e2m1(c) · 2^(e − 127)`, as
 //!   `common/mxfp4.inc.wgsl` decodes it. (The GPU shells refuse a dense
