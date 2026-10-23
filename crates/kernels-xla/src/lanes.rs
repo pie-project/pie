@@ -323,6 +323,64 @@ impl Lanes {
 }
 
 /// One row per lane, the slot of each row in `slots`.
+/// How a fire's rows fall into lanes, with the tables that say so: one row
+/// a lane (`slots` its state row), a query CSR (`slots` per row), or a
+/// rollback seat's extended lanes.
+#[derive(Clone, Copy, Debug)]
+pub enum LaneTables {
+    Decode {
+        slots: Operand,
+    },
+    Ragged {
+        indptr: Operand,
+        slots: Operand,
+    },
+    Committed {
+        indptr: Operand,
+        seat: Committed<Operand>,
+    },
+}
+
+impl LaneTables {
+    /// Refuses tables that cannot cover `rows` rows.
+    pub(crate) fn check(&self, op: &'static str, rows: u32) -> Result<(), Error> {
+        match self {
+            Self::Decode { slots } => {
+                if slots.elements() < u64::from(rows) {
+                    return Err(refuse(
+                        op,
+                        "the pool names fewer slots than the fire has rows",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Ragged { indptr, .. } | Self::Committed { indptr, .. } => csr_lanes(op, *indptr),
+        }
+    }
+
+    /// The lanes of `rows` rows, the tables read in order (indptr first).
+    pub(crate) fn lanes(&self, f: &mut Func, op: &'static str, rows: i64) -> Result<Lanes, Error> {
+        match *self {
+            Self::Decode { slots } => {
+                let slots = flat_i32(f, slots)?;
+                Ok(decode_lanes(f, slots, rows)?)
+            }
+            Self::Ragged { indptr, slots } => {
+                let ip = flat_i32(f, indptr)?;
+                let slots = flat_i32(f, slots)?;
+                Ok(ragged_lanes(f, ip, slots)?)
+            }
+            Self::Committed { indptr, seat } => {
+                let ip = flat_i32(f, indptr)?;
+                let rep = flat_i32(f, seat.replay)?;
+                let com = flat_i32(f, seat.commit)?;
+                let sl = flat_i32(f, seat.slots)?;
+                committed_lanes(op, f, ip, rep, com, sl, seat.lane0)
+            }
+        }
+    }
+}
+
 pub(crate) fn decode_lanes(f: &mut Func, slots: Val, rows: i64) -> Built<Lanes> {
     let slot = f.slice_axis(slots, 0, 0, rows)?;
     let t = f.const_i(Elem::Pred, 1, &[rows]);

@@ -13,8 +13,8 @@ use dtype::Dtype;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Func, Val};
 use crate::lanes::{
-    Committed, Lanes, clamp_i, cmp_i, committed_lanes, count_le, csr_lanes, decode_lanes, flat_i32,
-    land_rows, nonzero, ragged_lanes, take,
+    Committed, LaneTables, Lanes, clamp_i, cmp_i, committed_lanes, count_le, csr_lanes,
+    decode_lanes, flat_i32, land_rows, nonzero, ragged_lanes, take,
 };
 use crate::tensor::{Landing, Operand, RaggedTensor, Stored};
 
@@ -272,27 +272,13 @@ fn hash_lanes(
     Ok((out, next))
 }
 
-/// How a fire's rows fall into lanes, with the tables that say so.
-#[derive(Clone, Copy)]
-enum PleLanes {
-    /// One row a lane; `slots` is the lane's state row.
-    Decode { slots: Operand },
-    /// A query CSR's lanes; `slots` is per row.
-    Ragged { indptr: Operand, slots: Operand },
-    /// A rollback seat's extended lanes.
-    Committed {
-        indptr: Operand,
-        seat: Committed<Operand>,
-    },
-}
-
 /// `(out, state)`: the hashed rows, and the slab with each lane's window
 /// pushed.
 fn ngram(
     f: &mut Func,
     op: &'static str,
     ids: Operand,
-    lanes: PleLanes,
+    lanes: LaneTables,
     state: Operand,
     h: &Hash<'_>,
     map: Option<Operand>,
@@ -300,18 +286,18 @@ fn ngram(
 ) -> Result<(Val, Val), Error> {
     planes(op, h, ids, state, map, out)?;
     match lanes {
-        PleLanes::Decode { slots } => {
+        LaneTables::Decode { slots } => {
             if slots.elements() < u64::from(ids.rows) || out.rows != ids.rows {
                 return Err(refuse(op, "the slots and the landing ride the fire's rows"));
             }
         }
-        PleLanes::Ragged { indptr, .. } => {
+        LaneTables::Ragged { indptr, .. } => {
             csr_lanes(op, indptr)?;
             if out.rows != ids.rows {
                 return Err(refuse(op, "the landing rides the fire's rows"));
             }
         }
-        PleLanes::Committed { indptr, .. } => csr_lanes(op, indptr)?,
+        LaneTables::Committed { indptr, .. } => csr_lanes(op, indptr)?,
     }
     let t = i64::from(ids.rows);
     let idv = flat_i32(f, ids)?;
@@ -325,16 +311,16 @@ fn ngram(
         None => None,
     };
     let (lanes, own) = match lanes {
-        PleLanes::Decode { slots } => {
+        LaneTables::Decode { slots } => {
             let slots = flat_i32(f, slots)?;
             (decode_lanes(f, slots, t)?, None)
         }
-        PleLanes::Ragged { indptr, slots } => {
+        LaneTables::Ragged { indptr, slots } => {
             let ip = flat_i32(f, indptr)?;
             let slots = flat_i32(f, slots)?;
             (ragged_lanes(f, ip, slots)?, None)
         }
-        PleLanes::Committed { indptr, seat } => {
+        LaneTables::Committed { indptr, seat } => {
             let ip = flat_i32(f, indptr)?;
             let rep = flat_i32(f, seat.replay)?;
             let com = flat_i32(f, seat.commit)?;
@@ -396,7 +382,7 @@ pub fn ngram_ids(
         f,
         OP,
         ids,
-        PleLanes::Decode { slots },
+        LaneTables::Decode { slots },
         state,
         &h,
         map,
@@ -420,7 +406,7 @@ pub fn ngram_ids_chunked(
 ) -> Result<(Val, Val), Error> {
     const OP: &str = "gather.ngram_ids_chunked";
     let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
-    let lanes = PleLanes::Ragged {
+    let lanes = LaneTables::Ragged {
         indptr: ids.indptr,
         slots,
     };
@@ -446,7 +432,7 @@ pub fn ngram_ids_committed(
 ) -> Result<(Val, Val), Error> {
     const OP: &str = "gather.ngram_ids_committed";
     let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
-    let lanes = PleLanes::Committed { indptr, seat };
+    let lanes = LaneTables::Committed { indptr, seat };
     ngram(f, OP, ids, lanes, state, &h, map, ngram_ids)
 }
 

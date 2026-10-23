@@ -5,26 +5,26 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, expect};
+use crate::cx::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Cmp, Elem};
+use crate::hlo::{Cmp, Elem, Func, Val};
 use crate::lanes::{clamp_i, cmp_i, count_le, csr_lanes, flat_i32, iota, nonzero, take};
-use crate::tensor::{RaggedTensor, Tensor};
+use crate::tensor::{Landing, Operand, RaggedTensor};
 
 /// A stateless causal depthwise conv whose taps move per row: row `t` of a
 /// lane is `Σ_{k ≤ t} (base[side·taps + k, c] + coeff[t, (side·taps + k)·groups
 /// + c / group]) · x[t − k, c]`, the lane's rows before its first reading
 /// nothing. Reference: kernels-metal `attn::dynconv::block_dyn_conv`.
 pub fn block_dyn_conv(
-    ctx: &Ctx<'_>,
-    x: RaggedTensor,
-    coeff: Tensor,
-    base: Tensor,
+    f: &mut Func,
+    x: RaggedTensor<Operand>,
+    coeff: Operand,
+    base: Operand,
     side: u32,
     taps: u32,
     group: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "ssm.dyn_conv";
     expect(OP, x.data, &[Dtype::Bf16])?;
     csr_lanes(OP, x.indptr)?;
@@ -67,44 +67,39 @@ pub fn block_dyn_conv(
         i64::from(groups),
     );
     let side = i64::from(side);
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x.data)?;
-        let ip = {
-            let o = cx.operand(x.indptr)?;
-            flat_i32(cx, o)
-        }?;
-        let co = cx.read_f32(coeff)?;
-        let ba = cx.read_f32(base)?;
-        let f = cx.func();
-        let l = f.dims(ip)[0] - 1;
-        let lo = f.slice_axis(ip, 0, 0, l)?;
-        let ti = iota(f, t);
-        let lane = count_le(f, lo, ti)?;
-        let one = f.like_i(lane, 1);
-        let lane = f.sub(lane, one)?;
-        let lane = clamp_i(f, lane, 0, l - 1)?;
-        let begin = take(f, lo, lane)?;
-        let j = f.sub(ti, begin)?;
-        let zero = f.const_f(Elem::F32, 0.0, &[]);
-        let mut acc = f.const_f(Elem::F32, 0.0, &[t, c]);
-        for tap in 0..k {
-            let at = side * k + tap;
-            let xs = f.pad(xv, zero, &[tap, 0], &[0, 0], &[0, 0])?;
-            let xs = f.slice_axis(xs, 0, 0, t)?;
-            let live = cmp_i(f, Cmp::Ge, j, tap)?;
-            let live = f.broadcast(live, &[t, c], &[0])?;
-            let zc = f.like_f(xs, 0.0);
-            let xs = f.select(live, xs, zc)?;
-            let b = f.slice_axis(ba, 0, at, at + 1)?;
-            let b = f.reshape(b, &[c])?;
-            let b = f.broadcast(b, &[t, c], &[1])?;
-            let d = f.slice_axis(co, 1, at * gs, (at + 1) * gs)?;
-            let d = f.broadcast(d, &[t, gs, g], &[0, 1])?;
-            let d = f.reshape(d, &[t, c])?;
-            let coef = f.add(b, d)?;
-            let term = f.mul(coef, xs)?;
-            acc = f.add(acc, term)?;
-        }
-        cx.write(y, acc)
-    })
+    let xv = x.data.f32(f);
+    let ip = flat_i32(f, x.indptr)?;
+    let co = coeff.f32(f);
+    let ba = base.f32(f);
+    let fq = &mut *f;
+    let l = fq.dims(ip)[0] - 1;
+    let lo = fq.slice_axis(ip, 0, 0, l)?;
+    let ti = iota(fq, t);
+    let lane = count_le(fq, lo, ti)?;
+    let one = fq.like_i(lane, 1);
+    let lane = fq.sub(lane, one)?;
+    let lane = clamp_i(fq, lane, 0, l - 1)?;
+    let begin = take(fq, lo, lane)?;
+    let j = fq.sub(ti, begin)?;
+    let zero = fq.const_f(Elem::F32, 0.0, &[]);
+    let mut acc = fq.const_f(Elem::F32, 0.0, &[t, c]);
+    for tap in 0..k {
+        let at = side * k + tap;
+        let xs = fq.pad(xv, zero, &[tap, 0], &[0, 0], &[0, 0])?;
+        let xs = fq.slice_axis(xs, 0, 0, t)?;
+        let live = cmp_i(fq, Cmp::Ge, j, tap)?;
+        let live = fq.broadcast(live, &[t, c], &[0])?;
+        let zc = fq.like_f(xs, 0.0);
+        let xs = fq.select(live, xs, zc)?;
+        let b = fq.slice_axis(ba, 0, at, at + 1)?;
+        let b = fq.reshape(b, &[c])?;
+        let b = fq.broadcast(b, &[t, c], &[1])?;
+        let d = fq.slice_axis(co, 1, at * gs, (at + 1) * gs)?;
+        let d = fq.broadcast(d, &[t, gs, g], &[0, 1])?;
+        let d = fq.reshape(d, &[t, c])?;
+        let coef = fq.add(b, d)?;
+        let term = fq.mul(coef, xs)?;
+        acc = fq.add(acc, term)?;
+    }
+    Ok(acc)
 }
