@@ -1,0 +1,61 @@
+// Per query row: scores sum_h max(q_h . k_j, 0) * w_h against the cached keys
+// j < (pos + 1) / ratio (key j at position (j + 1) * ratio - 1, at most nk),
+// then the top_k keys: every key when there are no more than top_k, else,
+// in key order, those at or above a threshold bisected 40 times between the
+// row's min and max; unfilled slots are -1.
+fn k_index_topk(q: [*]f32, weights: [*]f32, has_w: bool, table: [*]f32, indices: [*]i32, indptr: [*]i32, nidx: i32, nptr: i32,
+                positions: [*]i32, request_of_token: [*]i32, selection: [*]i32, scores: [*]f32,
+                rows: i32, h: i32, d: i32, k: i32, ratio: i32, ps: i32, nk: i32, cells: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < k) : (s += 1) { selection[r * k + s] = -1; }
+    var p1: i32 = positions[r] + 1;
+    var nkeys: i32 = 0;
+    if (p1 > 0) { nkeys = p1 / ratio; }
+    if (nkeys > nk) { nkeys = nk; }
+    var req: i32 = request_of_token[r];
+    var j: i32 = 0;
+    while (j < nkeys) : (j += 1) {
+      var kpos: i32 = (j + 1) * ratio - 1;
+      var cell: i32 = k_index_cell(indices, indptr, nidx, nptr, req, kpos, ps, cells);
+      var sc: f32 = 0.0;
+      var hh: i32 = 0;
+      while (hh < h) : (hh += 1) {
+        var dot: f32 = 0.0;
+        if (cell >= 0) { dot = k_dot(q, (r * h + hh) * d, table, cell * d, d); }
+        if (dot < 0.0) { dot = 0.0; }
+        var w: f32 = 1.0;
+        if (has_w) { w = weights[r * h + hh]; }
+        sc = sc + dot * w;
+      }
+      scores[j] = sc;
+    }
+    if (nkeys <= k) {
+      j = 0;
+      while (j < nkeys) : (j += 1) { selection[r * k + j] = j; }
+    } else {
+      var lo: f32 = scores[0];
+      var hi: f32 = scores[0];
+      j = 1;
+      while (j < nkeys) : (j += 1) {
+        if (scores[j] < lo) { lo = scores[j]; }
+        if (scores[j] > hi) { hi = scores[j]; }
+      }
+      var it: i32 = 0;
+      while (it < 40) : (it += 1) {
+        var mid: f32 = (lo + hi) * 0.5;
+        var cnt: i32 = 0;
+        j = 0;
+        while (j < nkeys) : (j += 1) { if (scores[j] >= mid) { cnt += 1; } }
+        if (cnt > k) { lo = mid; } else { hi = mid; }
+      }
+      var slot: i32 = 0;
+      j = 0;
+      while (j < nkeys and slot < k) : (j += 1) {
+        if (scores[j] >= hi) { selection[r * k + slot] = j; slot += 1; }
+      }
+    }
+  }
+}
+

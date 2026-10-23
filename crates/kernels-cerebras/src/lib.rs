@@ -15,10 +15,12 @@ pub mod csl;
 pub mod cx;
 pub mod elemwise;
 pub mod error;
-pub mod layout;
+pub mod gather;
 pub mod library;
 pub mod linear;
 pub mod program;
+pub mod sampling;
+pub mod ssm;
 pub mod tensor;
 
 pub use attn::{DecodePlan, PrefillPlan};

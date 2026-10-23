@@ -3,7 +3,7 @@
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use kernels_xla::Bank;
-use kernels_xla::layout;
+use kernels_xla::{gather, sampling};
 
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
@@ -60,11 +60,11 @@ fn embeds_and_select_answer_the_host() {
     let vy = b.zeros(Dtype::Bf16, n, width);
     if !b
         .run(|ctx| {
-            layout::embed(ctx, i, t, vocab, y)?;
-            layout::embed_concat(ctx, ci, t, vocab, cy)?;
-            layout::embed_weighted(ctx, wi, ww, t, vocab, wy)?;
-            layout::select(ctx, rt, 1, 8, sy)?;
-            layout::embed_vocab_shard(ctx, i, shard, 1, vy)
+            gather::embed(ctx, i, t, vocab, y)?;
+            gather::embed_concat(ctx, ci, t, vocab, cy)?;
+            gather::embed_weighted(ctx, wi, ww, t, vocab, wy)?;
+            gather::select(ctx, rt, 1, 8, sy)?;
+            gather::embed_vocab_shard(ctx, i, shard, 1, vy)
         })
         .unwrap()
     {
@@ -177,8 +177,8 @@ fn affine_embeds_decode_their_rows() {
     let cy = b.zeros(Dtype::Bf16, 2, 2 * width);
     if !b
         .run(|ctx| {
-            layout::embed_gather_mb_4bit(ctx, i, b4, vocab, y)?;
-            layout::embed_concat_mb_4bit(ctx, ci, b2, vocab, cy)
+            gather::embed_gather_mb_4bit(ctx, i, b4, vocab, y)?;
+            gather::embed_concat_mb_4bit(ctx, ci, b2, vocab, cy)
         })
         .unwrap()
     {
@@ -229,7 +229,7 @@ fn a_folded_affine_table_reads_its_rows() {
     let i = b.i32(ids.len() as u32, 1, &ids);
     let y = b.zeros(Dtype::Bf16, ids.len() as u32, width);
     if !b
-        .run(|ctx| layout::embed_gather_mb_4bit(ctx, i, bank, vocab, y))
+        .run(|ctx| gather::embed_gather_mb_4bit(ctx, i, bank, vocab, y))
         .unwrap()
     {
         return;
@@ -275,9 +275,9 @@ fn splits_cut_where_they_state() {
     let r = b.zeros(Dtype::F32, rows, 6);
     if !b
         .run(|ctx| {
-            layout::split_qkv(ctx, p, qw, kw, q, k, v)?;
-            layout::split_q_gate(ctx, g_in, hd, gq, gg)?;
-            layout::split_rows(ctx, x, 4, l, r)
+            gather::split_qkv(ctx, p, qw, kw, q, k, v)?;
+            gather::split_q_gate(ctx, g_in, hd, gq, gg)?;
+            gather::split_rows(ctx, x, 4, l, r)
         })
         .unwrap()
     {
@@ -319,11 +319,11 @@ fn row_moves_gather_scatter_and_permute() {
     let un = b.bf16(7, width as u32, &wide);
     if !b
         .run(|ctx| {
-            layout::gather_rows(ctx, w, gi, g)?;
-            layout::scatter_rows(ctx, t, si, s)?;
-            layout::scatter_live_rows(ctx, t, li, live)?;
-            layout::pack_rows(ctx, w, pi, pk)?;
-            layout::unpack_rows(ctx, t, pi, un)
+            gather::gather_rows(ctx, w, gi, g)?;
+            gather::scatter_rows(ctx, t, si, s)?;
+            gather::scatter_live_rows(ctx, t, li, live)?;
+            gather::pack_rows(ctx, w, pi, pk)?;
+            gather::unpack_rows(ctx, t, pi, un)
         })
         .unwrap()
     {
@@ -363,8 +363,8 @@ fn folds_pool_and_merge_blocks_of_rows() {
     let merge = b.zeros(Dtype::Bf16, 2, 4 * width as u32);
     if !b
         .run(|ctx| {
-            layout::pool_rows(ctx, xs, side, pool)?;
-            layout::merge_rows(ctx, xs, side, merge)
+            gather::pool_rows(ctx, xs, side, pool)?;
+            gather::merge_rows(ctx, xs, side, merge)
         })
         .unwrap()
     {
@@ -483,10 +483,10 @@ fn pixels_and_grid_taps_answer_the_host() {
     let aw = b.zeros(Dtype::F32, n, 2);
     if !b
         .run(|ctx| {
-            layout::pixels(ctx, x, patch, mean, std, true, 2, chw)?;
-            layout::pixels(ctx, x, patch, mean, std, false, 1, hwc)?;
-            layout::grid_taps(ctx, pos, grid, seg, true, side, bi, bw)?;
-            layout::grid_taps(ctx, pos, grid, seg, false, side, ai, aw)
+            gather::pixels(ctx, x, patch, mean, std, true, 2, chw)?;
+            gather::pixels(ctx, x, patch, mean, std, false, 1, hwc)?;
+            gather::grid_taps(ctx, pos, grid, seg, true, side, bi, bw)?;
+            gather::grid_taps(ctx, pos, grid, seg, false, side, ai, aw)
         })
         .unwrap()
     {
@@ -542,10 +542,10 @@ fn argmax_and_topk_rank_rows_lowest_index_first() {
     let bi = b.zeros(Dtype::I32, 4, k);
     if !b
         .run(|ctx| {
-            layout::argmax(ctx, xs, 0, y)?;
-            layout::argmax(ctx, xb, 1, y)?;
-            layout::topk(ctx, xs, k, tv, ti)?;
-            layout::topk(ctx, xb, k, bv, bi)
+            sampling::argmax(ctx, xs, 0, y)?;
+            sampling::argmax(ctx, xb, 1, y)?;
+            sampling::topk(ctx, xs, k, tv, ti)?;
+            sampling::topk(ctx, xb, k, bv, bi)
         })
         .unwrap()
     {

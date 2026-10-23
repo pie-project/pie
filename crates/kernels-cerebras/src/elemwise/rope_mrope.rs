@@ -285,7 +285,7 @@ fn rotate(
         let hi = cx.table("mrope_hi", "i32", &list(&|p| p.hi.to_string()));
         let axis = cx.table("mrope_axis", "i32", &list(&|p| p.axis.to_string()));
         let freq = cx.table("mrope_freq", "f32", &list(&|p| f32_lit(p.freq)));
-        cx.library("k_rope_table");
+        cx.library("elemwise/rope_table");
         for t in ts {
             cx.read(*t)?;
             let b = cx.write(*t)?;

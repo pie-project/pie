@@ -2,7 +2,7 @@ use crate::common;
 
 use common::data;
 use engine_cerebras::bench::{Bench, assert_close};
-use kernels_cerebras::layout;
+use kernels_cerebras::{gather, sampling};
 
 #[test]
 fn an_embed_gathers_rows_and_guards_the_vocabulary() {
@@ -13,7 +13,7 @@ fn an_embed_gathers_rows_and_guards_the_vocabulary() {
     let id_t = b.i32(ids.len() as u32, 1, &ids);
     let tab = b.bf16(vocab_rows, width, &table);
     let y = b.zeros(dtype::Dtype::Bf16, ids.len() as u32, width);
-    if !b.run(|ctx| layout::embed(ctx, id_t, tab, 8, y)).unwrap() {
+    if !b.run(|ctx| gather::embed(ctx, id_t, tab, 8, y)).unwrap() {
         return;
     }
     let want: Vec<f32> = ids
@@ -46,8 +46,8 @@ fn splits_cut_rows_where_they_are_told() {
     let r = b.zeros(dtype::Dtype::Bf16, rows, 6);
     let ran = b
         .run(|ctx| {
-            layout::split_q_gate(ctx, packed, hd, q, g)?;
-            layout::split_rows(ctx, x, 4, l, r)
+            gather::split_q_gate(ctx, packed, hd, q, g)?;
+            gather::split_rows(ctx, x, 4, l, r)
         })
         .unwrap();
     if !ran {
@@ -86,9 +86,9 @@ fn row_moves_gather_scatter_and_merge() {
     let merged = b.zeros(dtype::Dtype::Bf16, 3, 4 * width as u32);
     let ran = b
         .run(|ctx| {
-            layout::gather_rows(ctx, wt, ids, gathered)?;
-            layout::scatter_live_rows(ctx, tt, routes, scattered)?;
-            layout::merge_rows(ctx, xt, 2, merged)
+            gather::gather_rows(ctx, wt, ids, gathered)?;
+            gather::scatter_live_rows(ctx, tt, routes, scattered)?;
+            gather::merge_rows(ctx, xt, 2, merged)
         })
         .unwrap();
     if !ran {
@@ -138,7 +138,7 @@ fn an_argmax_ranks_rows_on_one_pe() {
     let mut b = Bench::new();
     let x = b.f32(rows, 4, &xs);
     let y = b.i32(rows, 2, &[7; 8]);
-    if !b.run(|ctx| layout::argmax(ctx, x, 1, y)).unwrap() {
+    if !b.run(|ctx| sampling::argmax(ctx, x, 1, y)).unwrap() {
         return;
     }
     assert_eq!(b.read_i32(y), vec![7, 1, 7, 2, 7, 0, 7, 1]);
@@ -158,7 +158,7 @@ fn an_argmax_over_wide_rows_merges_its_blocks_on_the_fabric() {
     let mut b = Bench::new();
     let x = b.f32(rows as u32, width as u32, &xs);
     let y = b.i32(rows as u32, 2, &[5; 4]);
-    if !b.run(|ctx| layout::argmax(ctx, x, 0, y)).unwrap() {
+    if !b.run(|ctx| sampling::argmax(ctx, x, 0, y)).unwrap() {
         return;
     }
     let phase = b.phases.first().expect("the argmax phase");
@@ -190,8 +190,8 @@ fn qkv_splits_and_weighted_embeddings_gather_on_the_host() {
     let y = b.zeros(dtype::Dtype::F32, rows, 3);
     if !b
         .run(|ctx| {
-            layout::split_qkv(ctx, packed, qw, kw, q, k, v)?;
-            layout::embed_weighted(ctx, it, wt, t, 5, y)
+            gather::split_qkv(ctx, packed, qw, kw, q, k, v)?;
+            gather::embed_weighted(ctx, it, wt, t, 5, y)
         })
         .unwrap()
     {
@@ -233,7 +233,7 @@ fn an_embed_concat_lands_each_ids_row_side_by_side() {
     let ids = b.i32(2, heads, &[6, 0, 3, 1, 7, -1]);
     let y = b.bf16(2, heads * width, &vec![9.0; (2 * heads * width) as usize]);
     if !b
-        .run(|ctx| layout::embed_concat(ctx, ids, table, vocab, y))
+        .run(|ctx| gather::embed_concat(ctx, ids, table, vocab, y))
         .unwrap()
     {
         return;
@@ -264,7 +264,7 @@ fn a_topk_ranks_each_rows_largest_values() {
     let values = b.zeros(dtype::Dtype::F32, 2, 3);
     let indices = b.zeros(dtype::Dtype::I32, 2, 3);
     if !b
-        .run(|ctx| layout::topk(ctx, x, 3, values, indices))
+        .run(|ctx| sampling::topk(ctx, x, 3, values, indices))
         .unwrap()
     {
         return;

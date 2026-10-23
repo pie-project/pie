@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """The kernel lint: rules every `kernels-*` crate's device tree keeps.
 
-Two checks so far, the ones the rest of the convention leans on:
+The checks, the ones the rest of the convention leans on:
 
   * every entry point in a crate's kernel tree is named by its host code;
   * every launch the host writes with a literal symbol names, by namespace
     (and every `::pie::` scope in it, template arguments too, exists)
-    and name, a kernel its unit (or a header the unit includes) defines.
+    and name, a kernel its unit (or a header the unit includes) defines;
+  * kernels-cerebras: every `library("<group>/<name>")` the host writes is
+    a unit under `kernels/`, every unit outside `prim/` is named by one, and
+    every unit sits in one of the convention's groups.
 
 A CUDA entry is a `__global__` function; the host names it in a symbol
 string (`"::pie::attn::kv_append<...>"`), sometimes with a placeholder
@@ -235,12 +238,47 @@ def stray_symbols(crate):
     return found
 
 
+# kernels-cerebras: CSL units, looked up by path (`cx.library("elemwise/rmsnorm")`).
+CSL_TREE = "crates/kernels-cerebras/kernels"
+CSL_HOST = ["crates/kernels-cerebras/src", "crates/engine-cerebras/src"]
+CSL_GROUPS = {
+    "prim", "attn", "ssm", "linear", "elemwise", "conv", "gather", "sampling", "collective",
+    "runtime",
+}
+LIBRARY = re.compile(r'library\("([^"]+)"\)')
+
+
+def csl_units():
+    tree = REPO / CSL_TREE
+    units = {p.relative_to(tree).with_suffix("").as_posix() for p in tree.rglob("*.csl")}
+    findings = []
+    for unit in sorted(units):
+        group = unit.split("/")[0]
+        if "/" not in unit or group not in CSL_GROUPS:
+            findings.append(f"{CSL_TREE}/{unit}.csl: `{group}` is not one of the convention's groups")
+    named = set()
+    for root in CSL_HOST:
+        for path in sorted((REPO / root).rglob("*.rs")):
+            text = path.read_text()
+            for m in LIBRARY.finditer(text):
+                named.add(m.group(1))
+                if m.group(1) not in units:
+                    line = text.count("\n", 0, m.start()) + 1
+                    rel = path.relative_to(REPO)
+                    findings.append(f"{rel}:{line}: `{m.group(1)}` is no unit under {CSL_TREE}")
+    for unit in sorted(units - named):
+        if not unit.startswith("prim/"):
+            findings.append(f'{CSL_TREE}/{unit}.csl: no host `library("{unit}")` names it')
+    return findings
+
+
 def main():
     findings = []
     for crate in CRATES:
         findings += unnamed_entries(crate)
         findings += misdirected_launches(crate)
         findings += stray_symbols(crate)
+    findings += csl_units()
     for f in findings:
         print(f)
     print(f"kernel-lint: {len(findings)} finding(s)", file=sys.stderr)

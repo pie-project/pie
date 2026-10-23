@@ -61,7 +61,7 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
                 },
             );
         }
-        cx.library("k_swiglu");
+        cx.library("linear/swiglu");
         cx.call(
             "k_swiglu",
             vec![
@@ -106,7 +106,7 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
             cx.shard(&xb, tile);
             cx.shard(&yb, tile);
         }
-        cx.library("k_gelu_tanh");
+        cx.library("linear/gelu_tanh");
         cx.call(
             "k_gelu_tanh",
             vec![Arg::Ptr(xb), Arg::Ptr(yb), Arg::Int(n as i64)],

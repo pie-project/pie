@@ -25,7 +25,7 @@
 //!   run one `chlo.ragged_dot`, then un-permute with the inverse sort.
 //!
 //! Where the bank is plain (bf16, or pre-scaled f8, no group factors) and a
-//! block of it fits VMEM, the grouped-matmul kernel (`crate::mosaic::gmm`)
+//! block of it fits VMEM, the grouped-matmul kernel (`crate::linear::moe_gmm`)
 //! is preferred over all of these past the slice case. `kernel.moe.path`
 //! may force any formulation.
 //!
@@ -1033,7 +1033,7 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
     Ok(cx.reduce(v, &[1], Fold::Sum)?)
 }
 
-/// The grouped-matmul kernel (`crate::mosaic::gmm`) for this bank, when its
+/// The grouped-matmul kernel (`crate::linear::moe_gmm`) for this bank, when its
 /// weights are plain (bf16 or pre-scaled f8, no group factors) and a block
 /// of them fits VMEM, unless the profile's `kernel.moe.path` rules it out.
 ///
@@ -1047,8 +1047,13 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 /// Keep the XLA around the call free of gathers from short tables
 /// (`pick_small`) and of per-row column offsets: XLA lowers both to serial
 /// scalar code, which cost more than the kernel saved.
-fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::mosaic::gmm::Gmm> {
-    use crate::mosaic::gmm::{Gmm, Orient};
+fn gmm_spec(
+    fan: Fan,
+    bank: &Read,
+    elem: Elem,
+    tuning: Tuning,
+) -> Option<crate::linear::moe_gmm::Gmm> {
+    use crate::linear::moe_gmm::{Gmm, Orient};
     let off = !tuning.moe_gmm();
     if off
         || bank.factor.is_some()
@@ -1081,7 +1086,7 @@ fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::
 /// f32 `[P, N]`.
 fn gmm(
     cx: &mut Cx<'_>,
-    spec: crate::mosaic::gmm::Gmm,
+    spec: crate::linear::moe_gmm::Gmm,
     fan: Fan,
     bank: &Read,
     x: Val,
@@ -1089,7 +1094,7 @@ fn gmm(
     valid: Val,
     ids: Val,
 ) -> Result<Val, Error> {
-    use crate::mosaic::gmm::Orient;
+    use crate::linear::moe_gmm::Orient;
     let (p, e, n, tm) = (fan.pairs(), fan.experts, fan.n, spec.tm);
     let (tiles, rows) = (spec.tiles, spec.tiles * spec.tm);
     let top = cx.const_i(Elem::I32, e, &[p]);

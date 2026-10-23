@@ -1,4 +1,4 @@
-use kernels_xla::spatial;
+use kernels_xla::conv;
 use poem_exec::{DispatchConv, DispatchFused, DispatchProbe, KernelError};
 use poem_ir::{Conv, Fused, GridRule, TimePad};
 
@@ -48,7 +48,7 @@ impl DispatchProbe for Run<'_> {
     }
 }
 
-fn rule(rule: GridRule) -> spatial::GridRule {
+fn rule(rule: GridRule) -> conv::GridRule {
     match rule {
         GridRule::Conv {
             k,
@@ -56,7 +56,7 @@ fn rule(rule: GridRule) -> spatial::GridRule {
             pad,
             pad_back,
             causal_t,
-        } => spatial::GridRule::Conv {
+        } => conv::GridRule::Conv {
             k,
             stride,
             pad,
@@ -66,18 +66,18 @@ fn rule(rule: GridRule) -> spatial::GridRule {
         GridRule::Upsample {
             factor,
             keep_first_frame,
-        } => spatial::GridRule::Upsample {
+        } => conv::GridRule::Upsample {
             factor,
             keep_first_frame,
         },
-        GridRule::Shuffle { r, trim_t } => spatial::GridRule::Shuffle { r, trim_t },
-        GridRule::Unshuffle { r } => spatial::GridRule::Unshuffle { r },
-        GridRule::AvgDown { factor } => spatial::GridRule::AvgDown { factor },
+        GridRule::Shuffle { r, trim_t } => conv::GridRule::Shuffle { r, trim_t },
+        GridRule::Unshuffle { r } => conv::GridRule::Unshuffle { r },
+        GridRule::AvgDown { factor } => conv::GridRule::AvgDown { factor },
     }
 }
 
 impl Run<'_> {
-    /// A convolution weight in the tap-major order `spatial::conv3d` reads
+    /// A convolution weight in the tap-major order `conv::conv3d::conv3d` reads
     /// (`[C_out, taps · C_in]`, input channel inner), relabelled from the
     /// checkpoint's natural `[C_out, C_in · taps]` (engine-cuda
     /// `voxels::relabel_conv_weights`, done per program here: the plan
@@ -123,12 +123,12 @@ impl Run<'_> {
 
     /// engine-cuda's `dispatch/spatial.rs`, entry for entry. The lane tables
     /// are device data, so a convolution runs the table-as-data
-    /// `spatial::conv3d`; `conv3d_boxed` (clip boxes as static attributes)
+    /// `conv::conv3d::conv3d`; `conv3d_boxed` (clip boxes as static attributes)
     /// needs the boxes on the host, which the walk does not hold.
     fn spatial(&mut self, op: &Conv) -> Result<(), kernels_xla::Error> {
         match op {
             Conv::Grid { grid, rule: how, y } => {
-                spatial::derive_grid(self.ctx(), self.tensor(*grid), rule(*how), self.tensor(*y))
+                conv::rule::derive_grid(self.ctx(), self.tensor(*grid), rule(*how), self.tensor(*y))
             }
             Conv::Conv3d {
                 x,
@@ -145,15 +145,15 @@ impl Run<'_> {
                 y_grid,
                 y,
             } => {
-                let conv = spatial::Conv3d {
+                let conv = conv::Conv3d {
                     k: *k,
                     stride: *stride,
                     pad: *pad,
                     pad_back: *pad_back,
                     causal_t: *causal_t,
                     time_pad: match time_pad {
-                        TimePad::Zero => spatial::TimePad::Zero,
-                        TimePad::Replicate => spatial::TimePad::Replicate,
+                        TimePad::Zero => conv::TimePad::Zero,
+                        TimePad::Replicate => conv::TimePad::Replicate,
                     },
                 };
                 let x = self.tensor(*x);
@@ -161,7 +161,7 @@ impl Run<'_> {
                 let bias = bias.map(|b| self.tensor(b));
                 let w = self.taps_major(self.tensor(*w), x.width, conv.taps())?;
                 let Some(state) = cache else {
-                    return spatial::conv3d(
+                    return conv::conv3d::conv3d(
                         self.ctx(),
                         x,
                         grid,
@@ -180,8 +180,8 @@ impl Run<'_> {
                 let slab = self.recurrent(*state).state;
                 let slot_ids = self.clip_slot_table("conv.conv3d")?;
                 let frame_cache = self.temp(x.rows.saturating_mul(frames), x.width, x.dtype);
-                spatial::cache_gather(self.ctx(), slab, slot_ids, grid, frames, frame_cache)?;
-                spatial::conv3d(
+                conv::cache::cache_gather(self.ctx(), slab, slot_ids, grid, frames, frame_cache)?;
+                conv::conv3d::conv3d(
                     self.ctx(),
                     x,
                     grid,
@@ -192,7 +192,7 @@ impl Run<'_> {
                     self.tensor(*y),
                     self.tensor(*y_grid),
                 )?;
-                spatial::cache_store(self.ctx(), x, frame_cache, slot_ids, grid, frames, slab)
+                conv::cache::cache_store(self.ctx(), x, frame_cache, slot_ids, grid, frames, slab)
             }
             Conv::GroupNorm {
                 x,
@@ -203,7 +203,7 @@ impl Run<'_> {
                 eps,
                 silu,
                 y,
-            } => spatial::group_norm(
+            } => conv::group_norm::group_norm(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -221,7 +221,7 @@ impl Run<'_> {
                 keep_first_frame,
                 y_grid,
                 y,
-            } => spatial::upsample_nearest(
+            } => conv::resample::upsample_nearest(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -237,7 +237,7 @@ impl Run<'_> {
                 trim_t,
                 y_grid,
                 y,
-            } => spatial::pixel_shuffle(
+            } => conv::resample::pixel_shuffle(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -252,7 +252,7 @@ impl Run<'_> {
                 r,
                 y_grid,
                 y,
-            } => spatial::pixel_unshuffle(
+            } => conv::resample::pixel_unshuffle(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -267,7 +267,7 @@ impl Run<'_> {
                 group,
                 y_grid,
                 y,
-            } => spatial::avg_down(
+            } => conv::resample::avg_down(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -286,7 +286,7 @@ impl Run<'_> {
                 let x = self.tensor(*x);
                 let slab = self.recurrent(*cache).state;
                 let slot_ids = self.clip_slot_table("conv.cache_store")?;
-                spatial::cache_store(
+                conv::cache::cache_store(
                     self.ctx(),
                     x,
                     x,
@@ -302,7 +302,7 @@ impl Run<'_> {
                 p,
                 tgrid,
                 y,
-            } => spatial::patchify(
+            } => conv::resample::patchify(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*grid),
@@ -316,7 +316,7 @@ impl Run<'_> {
                 p,
                 grid,
                 y,
-            } => spatial::unpatchify(
+            } => conv::resample::unpatchify(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*tgrid),

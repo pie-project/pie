@@ -443,10 +443,11 @@ impl<'a> Cx<'a> {
         self.p.helper(name, source)
     }
 
-    /// The kernel library section `name`, declared once; returns the name.
-    pub fn library(&mut self, name: &'static str) -> &'static str {
-        let source = crate::library::section(name)
-            .unwrap_or_else(|| panic!("no kernel library section {name}"));
+    /// The library unit at `path` (`elemwise/rmsnorm`), declared once;
+    /// returns the name it is called by (`k_rmsnorm`).
+    pub fn library(&mut self, path: &str) -> &'static str {
+        let (name, source) =
+            crate::library::unit(path).unwrap_or_else(|| panic!("no kernel library unit {path}"));
         self.p.helper(name, source);
         name
     }

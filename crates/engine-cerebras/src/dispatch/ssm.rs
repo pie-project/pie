@@ -1,5 +1,5 @@
 use crate::run::Run;
-use kernels_cerebras::attn;
+use kernels_cerebras::ssm;
 use poem_exec::{DispatchSsm, KernelError};
 use poem_ir::{Operands, Ssm};
 
@@ -21,7 +21,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } => attn::ssm::causal_conv1d(
+            } => ssm::causal_conv1d(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
@@ -38,7 +38,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } => attn::ssm::causal_conv1d_chunked(
+            } => ssm::causal_conv1d_chunked(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
@@ -52,7 +52,7 @@ impl Run<'_> {
                 dt_bias,
                 a_log,
                 gates,
-            } => attn::ssm::gdn_prep(
+            } => ssm::gdn_prep(
                 self.ctx(),
                 self.tensor(*ba),
                 self.tensor(*dt_bias),
@@ -69,7 +69,7 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta(
+            } => ssm::gated_delta(
                 self.ctx(),
                 self.tensor(*qkv),
                 self.tensor(*z),
@@ -91,7 +91,7 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta_chunked(
+            } => ssm::gated_delta_chunked(
                 self.ctx(),
                 self.ragged(*qkv),
                 self.tensor(*z),
@@ -111,7 +111,7 @@ impl Run<'_> {
                 taps,
                 group,
                 y,
-            } => attn::dynconv::block_dyn_conv(
+            } => ssm::dyn_conv::block_dyn_conv(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*coeff),

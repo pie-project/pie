@@ -1,0 +1,12 @@
+// pd[r, s] = key[r, s, :] . query[r, s, :] over this PE's h columns.
+fn k_ple_dot(key: [*]f32, query: [*]f32, pd: [*]f32, rows: i32, h: i32, m: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var base: i32 = (r * m + s) * h;
+      pd[r * m + s] = k_dot(key, base, query, base, h);
+    }
+  }
+}
+

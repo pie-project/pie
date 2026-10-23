@@ -311,8 +311,8 @@ pub fn lse_merge_with(
     let all = cx.scratch("lse_all", l_words * u64::from(group));
     let total = cx.scratch("lse_total", l_words);
     let partial = cx.scratch("partial", o_words);
-    cx.library("k_lse_merge");
-    cx.library("k_lse_scale");
+    cx.library("attn/lse_merge");
+    cx.library("attn/lse_scale");
     let d = o_words / l_words.max(1);
     let mut steps = vec![
         FabricStep {
@@ -744,13 +744,13 @@ fn attend(
                 .map_or(Arg::Dummy("f32"), |b| Arg::Ptr(b.clone()));
             let (kernel, vrow) = if packed {
                 let vrow = cx.scratch("vrow", u64::from(d));
-                cx.library("k_half");
+                cx.library("prim/half");
                 (
-                    cx.library("k_attend_packed"),
+                    cx.library("attn/attend_packed"),
                     Some(Arg::Scratch(vrow, "f32")),
                 )
             } else {
-                (cx.library("k_attend"), None)
+                (cx.library("attn/attend"), None)
             };
             let mut args = vec![Arg::Ptr(qb), Arg::Ptr(kb), Arg::Ptr(vb)];
             args.extend(vrow);
@@ -1240,10 +1240,10 @@ fn append(
             }
         };
         let kernel = if packed {
-            cx.library("k_half");
-            cx.library("k_kv_append_packed")
+            cx.library("prim/half");
+            cx.library("attn/kv_append_packed")
         } else {
-            cx.library("k_kv_append")
+            cx.library("attn/kv_append")
         };
         let mut args = vec![
             Arg::Ptr(kb),

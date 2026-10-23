@@ -1,0 +1,33 @@
+// A stateless causal depthwise conv whose taps move per row: for lane l in
+// [0, lanes) with rows [indptr[l], indptr[l + 1]), row t at position j of
+// its lane is y[t, ch] = sum_{k <= j} (base[side * taps + k, ch] +
+// coeff[t, (side * taps + k) * gl + ch / group]) * x[t - k, ch] over this
+// PE's cb channels (gl = cb / group groups); the rows before the lane's
+// first read nothing.
+fn k_block_dyn_conv(x: [*]f32, coeff: [*]f32, base: [*]f32, indptr: [*]i32, y: [*]f32,
+                    lanes: i32, cb: i32, taps: i32, group: i32, side: i32) void {
+  var gl: i32 = cb / group;
+  var cw: i32 = 2 * taps * gl;
+  var l: i32 = 0;
+  while (l < lanes) : (l += 1) {
+    var b: i32 = indptr[l];
+    var e: i32 = indptr[l + 1];
+    var t: i32 = b;
+    while (t < e) : (t += 1) {
+      var j: i32 = t - b;
+      var ch: i32 = 0;
+      while (ch < cb) : (ch += 1) {
+        var g: i32 = ch / group;
+        var acc: f32 = 0.0;
+        var k: i32 = 0;
+        while (k < taps and k <= j) : (k += 1) {
+          var at: i32 = side * taps + k;
+          var coef: f32 = base[at * cb + ch] + coeff[t * cw + at * gl + g];
+          acc = acc + coef * x[(t - k) * cb + ch];
+        }
+        y[t * cb + ch] = acc;
+      }
+    }
+  }
+}
+

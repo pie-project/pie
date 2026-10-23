@@ -1,10 +1,11 @@
 //! The spatial family against host references transcribed from the CUDA
-//! kernels (`kernels-cuda/kernels/spatial/*.cuh`). Every fire holds two clips
+//! kernels (`kernels-cuda/kernels/conv/*.cu`, `attn/voxel.cu`). Every fire holds two clips
 //! of different boxes and trailing rows no lane covers.
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::spatial::{self, Conv3d, GridRule, Segment, TimePad};
+use kernels_xla::attn::voxel::Segment;
+use kernels_xla::conv::{self, Conv3d, GridRule, TimePad};
 
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
@@ -198,8 +199,8 @@ fn conv3d_answers_by_gather_and_by_convolution() {
     if !b
         .run(|ctx| {
             for (conv, wt, yg, y, yb, cache, y_clips, _) in &runs {
-                spatial::conv3d(ctx, xt, gt, *wt, Some(bt), *conv, *cache, *y, *yg)?;
-                spatial::conv3d_boxed(
+                conv::conv3d::conv3d(ctx, xt, gt, *wt, Some(bt), *conv, *cache, *y, *yg)?;
+                conv::conv3d::conv3d_boxed(
                     ctx,
                     xt,
                     &host(&clips),
@@ -253,7 +254,7 @@ fn grid_rules_map_each_box() {
     if !b
         .run(|ctx| {
             for (rule, y) in rules.iter().zip(&outs) {
-                spatial::derive_grid(ctx, g, *rule, *y)?;
+                conv::rule::derive_grid(ctx, g, *rule, *y)?;
             }
             Ok(())
         })
@@ -354,9 +355,9 @@ fn group_norm_and_attention_stay_inside_their_clip() {
     let scale = 0.3f32;
     if !b
         .run(|ctx| {
-            spatial::group_norm(ctx, xt, g, groups as u32, w, bias, 1e-5, true, y)?;
-            spatial::attention(ctx, qt, kt, vt, g, Segment::Lane, scale, a)?;
-            spatial::attention(ctx, qt, kt, vt, g, Segment::Frames(1), scale, af)
+            conv::group_norm::group_norm(ctx, xt, g, groups as u32, w, bias, 1e-5, true, y)?;
+            kernels_xla::attn::voxel::attention(ctx, qt, kt, vt, g, Segment::Lane, scale, a)?;
+            kernels_xla::attn::voxel::attention(ctx, qt, kt, vt, g, Segment::Frames(1), scale, af)
         })
         .unwrap()
     {
@@ -524,12 +525,12 @@ fn resamples_move_voxels_between_clip_layouts() {
     );
     if !b
         .run(|ctx| {
-            spatial::upsample_nearest(ctx, xt, g, [2, 2, 2], true, uy, ug)?;
-            spatial::pixel_unshuffle(ctx, xt, g, r, dy, dg)?;
-            spatial::patchify(ctx, xt, g, r, py, dg)?;
-            spatial::pixel_shuffle(ctx, pk, dg, rs, 1, sy, sg)?;
-            spatial::unpatchify(ctx, pk4, dg, r, ey, g)?;
-            spatial::avg_down(ctx, xt, g, ra, group, ay, ag)
+            conv::resample::upsample_nearest(ctx, xt, g, [2, 2, 2], true, uy, ug)?;
+            conv::resample::pixel_unshuffle(ctx, xt, g, r, dy, dg)?;
+            conv::resample::patchify(ctx, xt, g, r, py, dg)?;
+            conv::resample::pixel_shuffle(ctx, pk, dg, rs, 1, sy, sg)?;
+            conv::resample::unpatchify(ctx, pk4, dg, r, ey, g)?;
+            conv::resample::avg_down(ctx, xt, g, ra, group, ay, ag)
         })
         .unwrap()
     {
@@ -668,8 +669,8 @@ fn a_frame_cache_gathers_and_stores_each_clip_slot() {
     let cache = b.zeros(Dtype::Bf16, cache_rows as u32, c as u32);
     if !b
         .run(|ctx| {
-            spatial::cache_gather(ctx, st, sl, g, frames, cache)?;
-            spatial::cache_store(ctx, xt, cache, sl, g, frames, st)
+            conv::cache::cache_gather(ctx, st, sl, g, frames, cache)?;
+            conv::cache::cache_store(ctx, xt, cache, sl, g, frames, st)
         })
         .unwrap()
     {

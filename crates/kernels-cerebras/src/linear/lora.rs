@@ -97,7 +97,7 @@ pub fn correct(
             cx.read(y)?;
             let yb = cx.write(y)?;
             let waist = cx.scratch("waist", u64::from(rank));
-            cx.library("k_lora");
+            cx.library("linear/lora");
             cx.call(
                 "k_lora",
                 vec![
@@ -252,7 +252,7 @@ pub fn correct(
         };
         let w_words = plan.plane_words(&plan.cols[1]);
         let hdr = cx.lanes(plan)?;
-        cx.library("k_lora_down");
+        cx.library("linear/lora_down");
         cx.call(
             "k_lora_down",
             vec![
@@ -331,7 +331,7 @@ pub fn correct(
         };
         let y_words = plan.plane_words(&plan.cols[1]);
         let hdr = cx.lanes(plan)?;
-        cx.library("k_lora_up");
+        cx.library("linear/lora_up");
         cx.call(
             "k_lora_up",
             vec![

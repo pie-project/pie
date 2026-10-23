@@ -1,0 +1,12 @@
+fn k_sig_mul(x: f32, g: f32) f32 {
+  return x / (1.0 + math.exp_f32(-g));
+}
+// x[i] *= sigmoid(g[i]) for i < n.
+fn k_sigmoid_mul(x: [*]f32, g: [*]f32, n: i32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  var dg = @set_dsd_base_addr(k_base_f32, g);
+  dg = @set_dsd_length(dg, @bitcast(u16, @as(i16, n)));
+  @map(k_sig_mul, dx, dg, dx);
+}
+

@@ -132,7 +132,7 @@ pub fn bidirectional(
             let qb = cx.window_of(&qb, c0, n)?;
             let ob = cx.window_of(&ob, c0, n)?;
             if whole {
-                cx.library("k_attend_dense");
+                cx.library("attn/attend_dense");
                 cx.call(
                     "k_attend_dense",
                     vec![
@@ -233,7 +233,7 @@ pub fn bidirectional(
             if merge {
                 super::paged::lse_merge(cx, &ob, &lse, o_words, l_words, ag, ag * hg);
             }
-            cx.library("k_attend_dense");
+            cx.library("attn/attend_dense");
             let h = |i| Arg::Word(hdr.name.clone(), i);
             cx.call(
                 "k_attend_dense",

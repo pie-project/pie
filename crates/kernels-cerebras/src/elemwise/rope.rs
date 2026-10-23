@@ -128,7 +128,7 @@ fn rotate(
         }
         debug_assert_eq!(inv_freq.len(), half as usize);
         let table = cx.table("inv_freq", "f32", &inv_freq);
-        cx.library("k_rope");
+        cx.library("elemwise/rope");
         for t in ts {
             cx.read(*t)?;
             let b = cx.write(*t)?;

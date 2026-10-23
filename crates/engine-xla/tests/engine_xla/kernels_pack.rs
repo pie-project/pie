@@ -15,7 +15,7 @@ use engine_xla::trace::storage;
 use kernels_xla::hlo::{Func, Val, bf16_bits};
 use kernels_xla::linear::{moe, quant};
 use kernels_xla::tuning::{MoePath, Tuning};
-use kernels_xla::{Bank, Cx, Emit, Env, Tensor, layout, pack};
+use kernels_xla::{Bank, Cx, Emit, Env, Tensor, gather, pack};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
@@ -360,7 +360,7 @@ fn an_embedding_gathers_native_codes() {
         width as u32,
         &vec![0.0; ids.len() * width],
     );
-    if !nat.run(|ctx| layout::embed_gather_mb_4bit(ctx, it, bank, vocab as u32, y)) {
+    if !nat.run(|ctx| gather::embed_gather_mb_4bit(ctx, it, bank, vocab as u32, y)) {
         return;
     }
     let want: Vec<f32> = ids

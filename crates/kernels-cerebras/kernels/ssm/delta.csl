@@ -1,0 +1,90 @@
+// The gated delta rule over lanes [l0, l1), value heads [h0, h1) and state
+// rows [c0, c1) (see kernels-cerebras attn::ssm). The bank holds, per local
+// slot, the block's rows: (h - h0) * (c1 - c0) + (c - c0) rows of dk.
+fn k_delta(qkv: [*]f32, gates: [*]f32, slots: [*]i32, indptr: [*]i32, bank: [*]f32, y: [*]f32, qn: [*]f32, kn: [*]f32,
+           l0: i32, l1: i32, h0: i32, h1: i32, c0: i32, c1: i32, per_row: bool, hk: i32, hv: i32, dk: i32, dv: i32, width: i32, slots_rows: i32, inv_sqrt_dk: f32, sharded: bool) void {
+  var group: i32 = hv / hk;
+  var cb: i32 = c1 - c0;
+  var stride: i32 = (h1 - h0) * cb * dk;
+  // Whole rows, or (sharded) rows of just this PE's heads: q and k of the k
+  // heads [kh0, kh1), then v cells [h0, h1) x [c0, c1); y likewise.
+  var kh0: i32 = 0;
+  var nq: i32 = hk * dk;
+  var rw: i32 = width;
+  var vb0: i32 = 2 * hk * dk;
+  var vh: i32 = dv;
+  var yw: i32 = hv * dv;
+  var hb: i32 = 0;
+  var cs: i32 = 0;
+  if (sharded) {
+    kh0 = h0 / group;
+    var kh1: i32 = (h1 + group - 1) / group;
+    nq = (kh1 - kh0) * dk;
+    rw = 2 * nq + (h1 - h0) * cb;
+    vb0 = 2 * nq;
+    vh = cb;
+    yw = (h1 - h0) * cb;
+    hb = h0;
+    cs = c0;
+  }
+  var dqn = @set_dsd_base_addr(k_base_f32, qn);
+  dqn = @set_dsd_length(dqn, @bitcast(u16, @as(i16, dk)));
+  var dkn = @set_dsd_base_addr(k_base_f32, kn);
+  dkn = @set_dsd_length(dkn, @bitcast(u16, @as(i16, dk)));
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var start: i32 = l;
+    var n: i32 = 1;
+    var slot: i32 = 0;
+    if (per_row) {
+      slot = slots[l];
+    } else {
+      start = indptr[l];
+      n = indptr[l + 1] - start;
+      if (n > 0) { slot = slots[start]; }
+    }
+    if (n > 0 and slot >= 0 and slot < slots_rows) {
+      var sbase: i32 = slot * stride;
+      var i: i32 = 0;
+      while (i < n) : (i += 1) {
+        var t: i32 = start + i;
+        var row: i32 = t * rw;
+        var grow: i32 = t * 2 * hv;
+        var h: i32 = h0;
+        while (h < h1) : (h += 1) {
+          var kh: i32 = h / group;
+          var qoff: i32 = row + (kh - kh0) * dk;
+          var koff: i32 = row + nq + (kh - kh0) * dk;
+          var dq = @set_dsd_base_addr(k_base_f32, qkv);
+          dq = @set_dsd_length(dq, @bitcast(u16, @as(i16, dk)));
+          dq = @increment_dsd_offset(dq, @as(i16, qoff), f32);
+          var dkr = @set_dsd_base_addr(k_base_f32, qkv);
+          dkr = @set_dsd_length(dkr, @bitcast(u16, @as(i16, dk)));
+          dkr = @increment_dsd_offset(dkr, @as(i16, koff), f32);
+          var qq: f32 = k_dot(qkv, qoff, qkv, qoff, dk);
+          @fmuls(dqn, dq, inv_sqrt_dk / math.sqrt_f32(qq + 1e-6));
+          var kk: f32 = k_dot(qkv, koff, qkv, koff, dk);
+          @fmuls(dkn, dkr, 1.0 / math.sqrt_f32(kk + 1e-6));
+          var a: f32 = math.exp_f32(gates[grow + h]);
+          var beta: f32 = gates[grow + hv + h];
+          var vbase: i32 = row + vb0 + (h - hb) * vh - cs;
+          var hbase: i32 = sbase + (h - h0) * cb * dk;
+          var ybase: i32 = t * yw + (h - hb) * vh - cs;
+          var c: i32 = c0;
+          while (c < c1) : (c += 1) {
+            var soff: i32 = hbase + (c - c0) * dk;
+            var ds = @set_dsd_base_addr(k_base_f32, bank);
+            ds = @set_dsd_length(ds, @bitcast(u16, @as(i16, dk)));
+            ds = @increment_dsd_offset(ds, @as(i16, soff), f32);
+            @fmuls(ds, ds, a);
+            var mem: f32 = k_dot(bank, soff, kn, 0, dk);
+            var delta: f32 = (qkv[vbase + c] - mem) * beta;
+            @fmacs(ds, ds, dkn, delta);
+            y[ybase + c] = k_dot(bank, soff, qn, 0, dk);
+          }
+        }
+      }
+    }
+  }
+}
+

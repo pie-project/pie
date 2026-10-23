@@ -2,8 +2,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::Bench;
-use kernels_xla::attn::ple;
-use kernels_xla::attn::ssm::Committed;
+use kernels_xla::gather::ngram;
+use kernels_xla::lanes::Committed;
 use kernels_xla::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
@@ -126,7 +126,7 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
         let p = pool(st, sl);
         let ran = b
             .run(|ctx| {
-                ple::ngram_ids(
+                ngram::ngram_ids(
                     ctx,
                     idt,
                     &p,
@@ -176,7 +176,7 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
         let out = b.zeros(Dtype::I32, rows as u32, heads);
         let p = pool(st, sl);
         b.run(|ctx| {
-            ple::ngram_ids_chunked(
+            ngram::ngram_ids_chunked(
                 ctx,
                 RaggedTensor {
                     data: idt,
@@ -233,7 +233,7 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
             lane0: 1,
         };
         b.run(|ctx| {
-            ple::ngram_ids_committed(
+            ngram::ngram_ids_committed(
                 ctx,
                 idt,
                 ip,
@@ -328,7 +328,7 @@ fn the_selector_walk_feeds_each_pick_to_the_next_row() {
         let out = b.i32(rows as u32, 1, &before);
         if !b
             .run(|ctx| {
-                ple::selector_walk(
+                kernels_xla::sampling::selector_walk::selector_walk(
                     ctx,
                     RaggedTensor {
                         data: ct,

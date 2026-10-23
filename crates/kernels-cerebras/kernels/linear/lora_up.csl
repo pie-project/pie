@@ -1,0 +1,20 @@
+// y[r][o - o0] += dot(B[routes[r]][o][k0..k1], waist[r][k0..k1]) for the
+// PE's rows [r0, r1), outputs [o0, o1) and ranks [k0, k1): its up bank
+// slots are [o1 - o0][k1 - k0], its waist rows (k1 - k0) wide, its y rows
+// (o1 - o0) wide (a partial over rank groups).
+fn k_lora_up(waist: [*]f32, b: [*]f32, routes: [*]i32, y: [*]f32,
+             r0: i32, r1: i32, o0: i32, o1: i32, k0: i32, k1: i32, adapters: i32) void {
+  var rl: i32 = k1 - k0;
+  var ol: i32 = o1 - o0;
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var ad: i32 = routes[r];
+    if (ad >= 0 and ad < adapters) {
+      var o: i32 = 0;
+      while (o < ol) : (o += 1) {
+        y[r * ol + o] = y[r * ol + o] + k_dot(b, ad * ol * rl + o * rl, waist, r * rl, rl);
+      }
+    }
+  }
+}
+
