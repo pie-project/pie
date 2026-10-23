@@ -1,9 +1,9 @@
-//! Catalog coverage: for every single-device deployment (or those whose name holds
-//! one of the arguments), trace the plan for `Platform::Xla`, load it on a
-//! dry shell (no weights, no buffers) and trace each class of the plan at a
-//! prefill and a decode shape (`engine_xla::serve::dry`). Prints one line
-//! per deployment: `OK` (every fire emitted its programs), `REFUSED` (the first
-//! refusal), or `PANIC`.
+//! Catalog coverage: for every single-device deployment and the two bring-up
+//! fixtures (or those whose name holds one of the arguments), trace the plan
+//! for `Platform::Xla`, load it on a dry shell (no weights, no buffers) and
+//! trace each class of the plan at a prefill and a decode shape
+//! (`engine_xla::serve::dry`). Prints one line per deployment: `OK` (every
+//! fire emitted its programs), `REFUSED` (the first refusal), or `PANIC`.
 //!
 //! ```text
 //! cargo run --release -p engine-xla --example coverage -- [--compile] [--lean] [--dump DIR] [-v] [filter...]
@@ -42,16 +42,16 @@ fn main() {
     }
     std::panic::set_hook(Box::new(|_| {}));
     let mut tally = [0usize; 3];
-    for deployment in poem_compiler::catalog::deployments() {
-        if deployment.deploy.tp != 1 {
-            continue;
-        }
-        if !filters.is_empty() && !filters.iter().any(|f| deployment.name.contains(f.as_str())) {
+    let catalog = poem_compiler::catalog::deployments()
+        .filter(|d| d.deploy.tp == 1)
+        .map(|d| (d.name.clone(), Box::new(|| d.trace(Platform::Xla)) as TraceFn));
+    for (name, trace) in catalog.chain(dev_models()) {
+        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
             continue;
         }
         let started = std::time::Instant::now();
         let got = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            one(deployment, compile, lean, verbose, dump.as_deref())
+            one(&name, trace(), compile, lean, verbose, dump.as_deref())
         }));
         let secs = started.elapsed().as_secs_f64();
         let (status, detail) = match got {
@@ -73,7 +73,7 @@ fn main() {
         }] += 1;
         println!(
             "{:<58} {:<8} {:>6.1}s  {}",
-            deployment.name,
+            name,
             status,
             secs,
             detail.replace('\n', " ")
@@ -82,14 +82,32 @@ fn main() {
     println!("ok {} refused {} panicked {}", tally[0], tally[1], tally[2]);
 }
 
+type TraceFn<'a> = Box<dyn Fn() -> poem::Trace + 'a>;
+
+/// The bring-up fixtures beside the catalog: the tiny and the pico Qwen at
+/// bf16 weights.
+fn dev_models() -> impl Iterator<Item = (String, TraceFn<'static>)> {
+    ["qwen35-tiny", "qwen35-pico"].into_iter().map(|id| {
+        let trace = move || {
+            poem_compiler::catalog::repository().trace_of(
+                id,
+                poem::Dtype::Bf16,
+                poem::Dtype::Bf16,
+                Platform::Xla,
+            )
+        };
+        (format!("{id}-bf16"), Box::new(trace) as TraceFn)
+    })
+}
+
 fn one(
-    deployment: &poem_compiler::catalog::Deployment,
+    name: &str,
+    trace: poem::Trace,
     compile: bool,
     lean: bool,
     verbose: bool,
     dump: Option<&Path>,
 ) -> Result<String, String> {
-    let trace = deployment.trace(Platform::Xla);
     let weights: u64 = trace
         .params
         .iter()
@@ -154,7 +172,7 @@ fn one(
     if let Some(dir) = dump {
         let _ = std::fs::create_dir_all(dir);
         for (n, text) in shell.device().dry_texts().iter().enumerate() {
-            let _ = std::fs::write(dir.join(format!("{}.{n}.mlir", deployment.name)), text);
+            let _ = std::fs::write(dir.join(format!("{name}.{n}.mlir")), text);
         }
     }
     let texts = shell.device().dry_texts();
