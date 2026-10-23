@@ -112,11 +112,8 @@ fn heads(name: &str) -> Option<Heads> {
         | "elemwise.gate_sigmoid_mul_heads"
         | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
         "elemwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
-        "elemwise.rope_full"
-        | "elemwise.rope_partial"
-        | "elemwise.rope_yarn"
-        | "elemwise.rope_mrope" => Heads::of(&["q", "k"], &[]),
-        "elemwise.rope_partial_q" | "elemwise.rope_partial_last" => Heads::of(&["q"], &[]),
+        // q, and k where the rotation turns one.
+        "elemwise.rope" => Heads::of(&["q", "k"], &[]),
         "elemwise.add_bias" => Heads::of(&["out"], &[]),
         "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),

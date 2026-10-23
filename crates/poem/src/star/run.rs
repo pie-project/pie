@@ -308,12 +308,7 @@ fn stretched(trace: &Trace) -> bool {
     trace.nodes.iter().any(|node| {
         matches!(
             &node.op,
-            Operation::Elemwise(
-                Elemwise::RopeFull { freqs: Some(_), .. }
-                    | Elemwise::RopePartial { freqs: Some(_), .. }
-                    | Elemwise::RopePartialQ { freqs: Some(_), .. }
-                    | Elemwise::RopeMrope { freqs: Some(_), .. }
-            )
+            Operation::Elemwise(Elemwise::Rope { freqs: Some(_), .. })
         )
     })
 }

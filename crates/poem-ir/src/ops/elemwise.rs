@@ -226,111 +226,26 @@ pub enum Elemwise {
         #[output]
         y: ValueId,
     },
-    RopeFull {
+    /// The rotary turn of each head's dims at its row's position, q and
+    /// (where given) k in place. `turn` says which dims turn and how their
+    /// frequencies run; `freqs` states the frequencies outright where the
+    /// model's `rope_scaling` does.
+    Rope {
         #[input]
         q: ValueId,
         #[input]
-        k: ValueId,
+        k: Option<ValueId>,
         #[input(I32)]
         positions: ValueId,
         head_dim: u32,
         theta: f32,
-        interleaved: bool,
+        turn: Turn,
         #[serde(default)]
         freqs: Option<RopeFreqs>,
         #[output(alias = q)]
         q_out: ValueId,
         #[output(alias = k)]
-        k_out: ValueId,
-    },
-    /// The first `rotary_dim/2` pairs of each head turn, pair `i` being
-    /// `(i, i + span)` at `theta^(-i/span)`: `span` is `rotary_dim/2` for a
-    /// plain partial rotary, `head_dim/2` for a proportional one (Gemma 4's
-    /// global layers).
-    RopePartial {
-        #[input]
-        q: ValueId,
-        #[input]
-        k: ValueId,
-        #[input(I32)]
-        positions: ValueId,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        span: u32,
-        #[serde(default)]
-        freqs: Option<RopeFreqs>,
-        #[output(alias = q)]
-        q_out: ValueId,
-        #[output(alias = k)]
-        k_out: ValueId,
-    },
-    RopeMrope {
-        #[input]
-        q: ValueId,
-        #[input]
-        k: ValueId,
-        #[input(I32)]
-        positions: ValueId,
-        sections: [u32; 3],
-        form: MropeForm,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        #[serde(default)]
-        freqs: Option<RopeFreqs>,
-        #[output(alias = q)]
-        q_out: ValueId,
-        #[output(alias = k)]
-        k_out: ValueId,
-    },
-    RopePartialQ {
-        #[input]
-        q: ValueId,
-        #[input(I32)]
-        positions: ValueId,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        span: u32,
-        #[serde(default)]
-        freqs: Option<RopeFreqs>,
-        #[output(alias = q)]
-        q_out: ValueId,
-    },
-    RopePartialLast {
-        #[input]
-        q: ValueId,
-        #[input(I32)]
-        positions: ValueId,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        interleaved: bool,
-        inverse: bool,
-        yarn: Option<Yarn>,
-        #[output(alias = q)]
-        q_out: ValueId,
-    },
-    RopeYarn {
-        #[input]
-        q: ValueId,
-        #[input]
-        k: ValueId,
-        #[input(I32)]
-        positions: ValueId,
-        head_dim: u32,
-        theta: f32,
-        factor: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        attention_factor: f32,
-        original_max_position: u32,
-        interleaved: bool,
-        #[output(alias = q)]
-        q_out: ValueId,
-        #[output(alias = k)]
-        k_out: ValueId,
+        k_out: Option<ValueId>,
     },
     GateSigmoidMul {
         #[input]
@@ -568,6 +483,39 @@ impl ModulateForm {
             ModulateForm::Scale | ModulateForm::TanhGate => 1,
         }
     }
+}
+
+/// Which of a head's dims a [`Elemwise::Rope`] turns, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Turn {
+    /// Every pair: `(i, i + head_dim/2)`, or `(2i, 2i + 1)` interleaved.
+    Full { interleaved: bool },
+    /// The first `rotary_dim/2` pairs, pair `i` being `(i, i + span)` at
+    /// `theta^(-i/span)`: `span` is `rotary_dim/2` for a plain partial
+    /// rotary, `head_dim/2` for a proportional one (Gemma 4's global layers).
+    Partial { rotary_dim: u32, span: u32 },
+    /// The last `rotary_dim` dims (`inverse` turns them back), at frequencies
+    /// YaRN ramps where it is given.
+    Last {
+        rotary_dim: u32,
+        interleaved: bool,
+        inverse: bool,
+        yarn: Option<Yarn>,
+    },
+    /// Every pair at YaRN's stretched frequencies, cos and sin scaled by
+    /// `attention_factor`.
+    Yarn {
+        yarn: Yarn,
+        attention_factor: f32,
+        interleaved: bool,
+    },
+    /// Multimodal: a `(t, h, w)` position a row, `sections` naming which
+    /// pairs of the first `rotary_dim` turn by which axis.
+    Mrope {
+        sections: [u32; 3],
+        form: MropeForm,
+        rotary_dim: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

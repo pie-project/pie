@@ -417,9 +417,19 @@ fn every_rope_is_one_ladder_across_the_row() {
         let no_other = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elemwise(Elemwise::RopeFull { .. })
-                    | Operation::Elemwise(Elemwise::RopePartial { .. })
-                    | Operation::Elemwise(Elemwise::RopeMrope { .. })
+                Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full { .. },
+                    ..
+                }) | Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                }) | Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Mrope { .. },
+                    ..
+                })
             )
         });
         assert!(!no_other, "{deployment}: this text turns one kind of rope");

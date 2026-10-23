@@ -295,8 +295,15 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
         let neox = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elemwise(Elemwise::RopeFull { .. })
-                    | Operation::Elemwise(Elemwise::RopePartial { .. })
+                Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full { .. },
+                    ..
+                }) | Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                })
             )
         });
         assert!(

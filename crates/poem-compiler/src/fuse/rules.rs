@@ -9,7 +9,7 @@ use poem_ir::{
     ActQuant, Dim, Dtype, Elemwise, Fused, Gather, ModulateForm, NormKind, Operation, StructKind,
     Ty,
 };
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{NormAxis, NormWeight, Turn};
 
 use super::{Match, Rule};
 
@@ -530,8 +530,11 @@ fn split_rope_yarn_append() -> Rule {
             original_max_position: m.u32("original_max_position"),
             interleaved: matches!(
                 m.op("q_out"),
-                Operation::Elemwise(Elemwise::RopeYarn {
-                    interleaved: true,
+                Operation::Elemwise(Elemwise::Rope {
+                    turn: Turn::Yarn {
+                        interleaved: true,
+                        ..
+                    },
                     ..
                 })
             ),
@@ -595,8 +598,11 @@ fn rope_yarn_append() -> Rule {
             original_max_position: m.u32("original_max_position"),
             interleaved: matches!(
                 m.op("q_out"),
-                Operation::Elemwise(Elemwise::RopeYarn {
-                    interleaved: true,
+                Operation::Elemwise(Elemwise::Rope {
+                    turn: Turn::Yarn {
+                        interleaved: true,
+                        ..
+                    },
                     ..
                 })
             ),
@@ -1469,10 +1475,14 @@ fn norm_rope_last() -> Rule {
         p.export("q_out", &q_out);
     });
     Rule::new("fused.norm_rope_last", [scale_free, scaled], |m| {
-        let Operation::Elemwise(Elemwise::RopePartialLast {
-            interleaved,
-            inverse,
-            yarn,
+        let Operation::Elemwise(Elemwise::Rope {
+            turn:
+                Turn::Last {
+                    interleaved,
+                    inverse,
+                    yarn,
+                    ..
+                },
             ..
         }) = *m.op("q_out")
         else {
@@ -1576,10 +1586,14 @@ fn norm_rope_pair() -> Rule {
     });
     Rule::new("fused.norm_rope_pair", [pattern], |m| {
         let rope = |name: &str| match *m.op(name) {
-            Operation::Elemwise(Elemwise::RopePartialLast {
-                interleaved,
-                inverse,
-                yarn,
+            Operation::Elemwise(Elemwise::Rope {
+                turn:
+                    Turn::Last {
+                        interleaved,
+                        inverse,
+                        yarn,
+                        ..
+                    },
                 ..
             }) => (interleaved, inverse, yarn),
             _ => unreachable!("`{name}` comes from a rotation"),
@@ -1757,10 +1771,14 @@ fn norm_rope_last_append() -> Rule {
         attn::kv_append_shared(&k, cache, &write_page, &write_offset);
     });
     Rule::new("fused.norm_rope_last_append", [pattern], |m| {
-        let Operation::Elemwise(Elemwise::RopePartialLast {
-            interleaved,
-            inverse,
-            yarn,
+        let Operation::Elemwise(Elemwise::Rope {
+            turn:
+                Turn::Last {
+                    interleaved,
+                    inverse,
+                    yarn,
+                    ..
+                },
             ..
         }) = *m.op("y")
         else {

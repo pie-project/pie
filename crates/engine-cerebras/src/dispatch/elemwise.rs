@@ -84,17 +84,20 @@ impl Run<'_> {
                 };
                 elemwise::norm::residual_add(self.ctx(), x, y)
             }
-            Elemwise::RopePartial {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                rotary_dim,
                 head_dim,
-                span,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } if *span == rotary_dim / 2 => elemwise::rope::partial(
                 self.ctx(),
                 self.tensor(*q),
@@ -104,15 +107,19 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elemwise::RopePartialQ {
+            Elemwise::Rope {
                 q,
                 positions,
-                rotary_dim,
                 head_dim,
-                span,
                 theta,
                 freqs: None,
                 q_out: _,
+                k: None,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } if *span == rotary_dim / 2 => elemwise::rope::partial_q(
                 self.ctx(),
                 self.tensor(*q),
@@ -121,18 +128,23 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elemwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => {
                 let rotate = match form {
                     MropeForm::Interleaved => elemwise::rope_mrope::interleaved,

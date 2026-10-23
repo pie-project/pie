@@ -59,3 +59,48 @@ fn a_mistyped_port_is_refused_by_its_field_name() {
         "{faults:?}"
     );
 }
+
+struct Turned;
+
+impl ForwardHybrid for Turned {
+    fn caches(&self) -> HybridSpec {
+        HybridSpec::new()
+    }
+
+    fn forward(&self, inputs: Input) -> Value {
+        let table = Weight::sym("embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
+        let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
+        ops::elemwise::rope_partial_q(&x, &inputs.positions(), 16, 32, 1e4, None, None)
+    }
+}
+
+/// The folded rotation names its positions port too, whichever turn it takes.
+#[test]
+fn a_rotation_at_f32_positions_is_refused_by_its_field_name() {
+    let mut trace = trace_hybrid("turned", &Turned, Platform::Cuda);
+    assert_eq!(poem_ir::check(&trace), Ok(()));
+    let positions = trace
+        .nodes
+        .iter()
+        .find_map(|node| match &node.op {
+            Operation::Elemwise(poem_ir::Elemwise::Rope { positions, .. }) => Some(*positions),
+            _ => None,
+        })
+        .expect("the trace holds its rotation");
+    let Ty::Tensor { dtype, .. } = &mut trace.values[positions.0 as usize].ty else {
+        panic!("positions are a tensor");
+    };
+    *dtype = Dtype::F32;
+    let faults = poem_ir::check(&trace).expect_err("f32 positions are refused");
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            Fault::PortDtype {
+                port: Port("positions"),
+                want: Dtype::I32,
+                ..
+            }
+        )),
+        "{faults:?}"
+    );
+}

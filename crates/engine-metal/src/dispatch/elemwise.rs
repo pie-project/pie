@@ -175,10 +175,7 @@ impl Run<'_> {
             }),
             // A rotation at its own frequencies (a checkpoint's rope scaling) is
             // served on CUDA.
-            Elemwise::RopeFull { freqs: Some(_), .. }
-            | Elemwise::RopePartial { freqs: Some(_), .. }
-            | Elemwise::RopePartialQ { freqs: Some(_), .. }
-            | Elemwise::RopeMrope { freqs: Some(_), .. } => {
+            Elemwise::Rope { freqs: Some(_), .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             Elemwise::Rmsnorm {
@@ -580,16 +577,17 @@ impl Run<'_> {
                 )
             }
 
-            Elemwise::RopeFull {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
                 head_dim,
                 theta,
-                interleaved,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn: poem_ir::Turn::Full { interleaved, .. },
+                ..
             } => elemwise::rope::full(
                 self.ctx(),
                 self.tensor(*q),
@@ -599,17 +597,20 @@ impl Run<'_> {
                 *theta,
                 *interleaved,
             ),
-            Elemwise::RopePartial {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                span,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } => elemwise::rope::partial(
                 self.ctx(),
                 self.tensor(*q),
@@ -620,18 +621,23 @@ impl Run<'_> {
                 *theta,
                 *span,
             ),
-            Elemwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form: MropeForm::Interleaved,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form: MropeForm::Interleaved,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => elemwise::rope_mrope::interleaved(
                 self.ctx(),
                 self.tensor(*q),
@@ -642,18 +648,23 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elemwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form: MropeForm::Split,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form: MropeForm::Split,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => elemwise::rope_mrope::split(
                 self.ctx(),
                 self.tensor(*q),
@@ -664,18 +675,23 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elemwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form: MropeForm::Blocked,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form: MropeForm::Blocked,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => elemwise::rope_mrope::blocked(
                 self.ctx(),
                 self.tensor(*q),
@@ -686,15 +702,19 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elemwise::RopePartialQ {
+            Elemwise::Rope {
                 q,
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                span,
                 freqs: None,
                 q_out: _,
+                k: None,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } => elemwise::rope::partial_q(
                 self.ctx(),
                 self.tensor(*q),
@@ -704,16 +724,22 @@ impl Run<'_> {
                 *theta,
                 *span,
             ),
-            Elemwise::RopePartialLast {
+            Elemwise::Rope {
                 q,
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                interleaved,
-                inverse,
-                yarn,
                 q_out: _,
+                k: None,
+                turn:
+                    poem_ir::Turn::Last {
+                        rotary_dim,
+                        interleaved,
+                        inverse,
+                        yarn,
+                        ..
+                    },
+                ..
             } => elemwise::rope::partial_last(
                 self.ctx(),
                 self.tensor(*q),
@@ -730,20 +756,29 @@ impl Run<'_> {
                     original_max_position: y.original_max_position,
                 }),
             ),
-            Elemwise::RopeYarn {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
                 head_dim,
                 theta,
-                factor,
-                beta_fast,
-                beta_slow,
-                attention_factor,
-                original_max_position,
-                interleaved,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Yarn {
+                        yarn:
+                            poem_ir::Yarn {
+                                factor,
+                                beta_fast,
+                                beta_slow,
+                                original_max_position,
+                                ..
+                            },
+                        attention_factor,
+                        interleaved,
+                        ..
+                    },
+                ..
             } => elemwise::rope::yarn(
                 self.ctx(),
                 self.tensor(*q),
@@ -759,6 +794,8 @@ impl Run<'_> {
                 *interleaved,
             ),
 
+            // The pairs no builder makes.
+            Elemwise::Rope { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Elemwise::GateSigmoidMul { x, gate, x_out } => {
                 // The gated rows' projection on the register tile reads its
                 // input table as the gate lays it.

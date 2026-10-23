@@ -377,9 +377,13 @@ fn every_rope_turns_four_axes_of_the_whole_head_interleaved() {
         .filter(|node| {
             matches!(
                 &node.op,
-                Operation::Elemwise(Elemwise::RopeFull {
-                    interleaved: false,
+                Operation::Elemwise(Elemwise::Rope {
                     head_dim: model::TE_HEAD_DIM,
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full {
+                        interleaved: false,
+                        ..
+                    },
                     ..
                 })
             )

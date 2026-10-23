@@ -429,20 +429,25 @@ impl Run<'_> {
             } => {
                 DispatchElemwise::dispatch(
                     self,
-                    &Elemwise::RopeYarn {
+                    &Elemwise::Rope {
                         q: *q,
-                        k: *k,
+                        k: Some(*k),
                         positions: *positions,
                         head_dim: *head_dim,
                         theta: *theta,
-                        factor: *factor,
-                        beta_fast: *beta_fast,
-                        beta_slow: *beta_slow,
-                        attention_factor: *attention_factor,
-                        original_max_position: *original_max_position,
-                        interleaved: *interleaved,
+                        turn: poem_ir::Turn::Yarn {
+                            yarn: poem_ir::Yarn {
+                                factor: *factor,
+                                beta_fast: *beta_fast,
+                                beta_slow: *beta_slow,
+                                original_max_position: *original_max_position,
+                            },
+                            attention_factor: *attention_factor,
+                            interleaved: *interleaved,
+                        },
+                        freqs: None,
                         q_out: *q_out,
-                        k_out: *k_out,
+                        k_out: Some(*k_out),
                     },
                 )?;
                 DispatchAttn::dispatch(
@@ -490,20 +495,25 @@ impl Run<'_> {
                 )?;
                 DispatchElemwise::dispatch(
                     self,
-                    &Elemwise::RopeYarn {
+                    &Elemwise::Rope {
                         q: *q_out,
-                        k: *k_out,
+                        k: Some(*k_out),
                         positions: *positions,
                         head_dim: *head_dim,
                         theta: *theta,
-                        factor: *factor,
-                        beta_fast: *beta_fast,
-                        beta_slow: *beta_slow,
-                        attention_factor: *attention_factor,
-                        original_max_position: *original_max_position,
-                        interleaved: *interleaved,
+                        turn: poem_ir::Turn::Yarn {
+                            yarn: poem_ir::Yarn {
+                                factor: *factor,
+                                beta_fast: *beta_fast,
+                                beta_slow: *beta_slow,
+                                original_max_position: *original_max_position,
+                            },
+                            attention_factor: *attention_factor,
+                            interleaved: *interleaved,
+                        },
+                        freqs: None,
                         q_out: *q_out,
-                        k_out: *k_out,
+                        k_out: Some(*k_out),
                     },
                 )?;
                 DispatchAttn::dispatch(
@@ -712,17 +722,16 @@ impl Run<'_> {
         )?;
         DispatchElemwise::dispatch(
             self,
-            &poem_ir::Elemwise::RopePartial {
+            &poem_ir::Elemwise::Rope {
                 q: qn,
-                k: kn,
+                k: Some(kn),
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                span,
-                q_out,
-                k_out,
+                turn: poem_ir::Turn::Partial { rotary_dim, span },
                 freqs: None,
+                q_out,
+                k_out: Some(k_out),
             },
         )?;
         DispatchAttn::dispatch(

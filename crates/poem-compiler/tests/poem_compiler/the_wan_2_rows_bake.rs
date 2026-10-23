@@ -406,8 +406,15 @@ fn every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved() {
         let neox = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elemwise(Elemwise::RopeFull { .. })
-                    | Operation::Elemwise(Elemwise::RopePartial { .. })
+                Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full { .. },
+                    ..
+                }) | Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                })
             )
         });
         assert!(!neox, "{deployment}: umT5 has no rotary embedding");

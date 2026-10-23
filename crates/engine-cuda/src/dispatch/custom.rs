@@ -477,15 +477,20 @@ impl Run<'_> {
         // DeepSeek-V4's (interleaved, inverse, at the pool's positions).
         let turn = match (rotate.as_deref(), &**pool) {
             (
-                Some(poem_ir::Elemwise::RopePartialLast {
+                Some(poem_ir::Elemwise::Rope {
                     q,
                     positions: at,
-                    rotary_dim,
                     head_dim: d,
                     theta,
-                    interleaved: true,
-                    inverse: true,
-                    yarn,
+                    k: None,
+                    turn:
+                        poem_ir::Turn::Last {
+                            rotary_dim,
+                            interleaved: true,
+                            inverse: true,
+                            yarn,
+                            ..
+                        },
                     ..
                 }),
                 poem_ir::Attn::PoolLse { positions, .. }
@@ -1110,13 +1115,18 @@ impl Run<'_> {
                 ratio,
                 entries,
             },
-            poem_ir::Elemwise::RopePartialLast {
+            poem_ir::Elemwise::Rope {
                 positions,
-                rotary_dim,
                 theta,
-                interleaved,
-                inverse,
-                yarn,
+                k: None,
+                turn:
+                    poem_ir::Turn::Last {
+                        rotary_dim,
+                        interleaved,
+                        inverse,
+                        yarn,
+                        ..
+                    },
                 ..
             },
             poem_ir::Attn::PoolKvAppend { pool: into, .. },
@@ -1186,15 +1196,20 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         if let (
-            poem_ir::Elemwise::RopePartialLast {
+            poem_ir::Elemwise::Rope {
                 q,
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                interleaved: true,
-                inverse: false,
-                yarn,
+                k: None,
+                turn:
+                    poem_ir::Turn::Last {
+                        rotary_dim,
+                        interleaved: true,
+                        inverse: false,
+                        yarn,
+                        ..
+                    },
                 ..
             },
             poem_ir::Attn::IndexTopk {

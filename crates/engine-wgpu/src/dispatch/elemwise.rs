@@ -78,10 +78,7 @@ impl Run<'_> {
             }),
             // A rotation at its own frequencies (a checkpoint's rope scaling) is
             // served on CUDA.
-            Elemwise::RopeFull { freqs: Some(_), .. }
-            | Elemwise::RopePartial { freqs: Some(_), .. }
-            | Elemwise::RopePartialQ { freqs: Some(_), .. }
-            | Elemwise::RopeMrope { freqs: Some(_), .. } => {
+            Elemwise::Rope { freqs: Some(_), .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
             Elemwise::Rmsnorm {
@@ -449,16 +446,17 @@ impl Run<'_> {
                 .map_err(crate::encode::from_slang)
             }
 
-            Elemwise::RopeFull {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
                 head_dim,
                 theta,
-                interleaved,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn: poem_ir::Turn::Full { interleaved, .. },
+                ..
             } => kernels_slang::elemwise::rope::full(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -469,17 +467,20 @@ impl Run<'_> {
                 *interleaved,
             )
             .map_err(crate::encode::from_slang),
-            Elemwise::RopePartial {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                span,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } => kernels_slang::elemwise::rope::partial(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -491,18 +492,23 @@ impl Run<'_> {
                 *span,
             )
             .map_err(crate::encode::from_slang),
-            Elemwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form: MropeForm::Interleaved,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form: MropeForm::Interleaved,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => kernels_slang::elemwise::rope::mrope_interleaved(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -515,18 +521,23 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Elemwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form: MropeForm::Split,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form: MropeForm::Split,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => kernels_slang::elemwise::rope::mrope_split(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -539,18 +550,23 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Elemwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form: MropeForm::Blocked,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form: MropeForm::Blocked,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => kernels_slang::elemwise::rope::mrope_blocked(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -562,15 +578,19 @@ impl Run<'_> {
                 *theta,
             )
             .map_err(crate::encode::from_slang),
-            Elemwise::RopePartialQ {
+            Elemwise::Rope {
                 q,
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                span,
                 freqs: None,
                 q_out: _,
+                k: None,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } => kernels_slang::elemwise::rope::partial_q(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -581,16 +601,22 @@ impl Run<'_> {
                 *span,
             )
             .map_err(crate::encode::from_slang),
-            Elemwise::RopePartialLast {
+            Elemwise::Rope {
                 q,
                 positions,
-                rotary_dim,
                 head_dim,
                 theta,
-                interleaved,
-                inverse,
-                yarn,
                 q_out: _,
+                k: None,
+                turn:
+                    poem_ir::Turn::Last {
+                        rotary_dim,
+                        interleaved,
+                        inverse,
+                        yarn,
+                        ..
+                    },
+                ..
             } => kernels_slang::elemwise::rope::partial_last(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -608,20 +634,29 @@ impl Run<'_> {
                 }),
             )
             .map_err(crate::encode::from_slang),
-            Elemwise::RopeYarn {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
                 head_dim,
                 theta,
-                factor,
-                beta_fast,
-                beta_slow,
-                attention_factor,
-                original_max_position,
-                interleaved,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Yarn {
+                        yarn:
+                            poem_ir::Yarn {
+                                factor,
+                                beta_fast,
+                                beta_slow,
+                                original_max_position,
+                                ..
+                            },
+                        attention_factor,
+                        interleaved,
+                        ..
+                    },
+                ..
             } => kernels_slang::elemwise::rope::yarn(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*q)),
@@ -638,6 +673,8 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
+            // The pairs no builder makes.
+            Elemwise::Rope { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
                 kernels_slang::elemwise::pointwise::sigmoid_mul(
                     &self.slang(),
