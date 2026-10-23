@@ -4,19 +4,15 @@
 //! in bf16 and in f32 (an odd row there), and the averaged downsample (time
 //! padded), over two clips, with rows past every clip landing zero.
 
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::conv::slang_alone;
+use crate::gpu::landed;
 use crate::gpu::{Gpu, noise};
 
 /// Two clips: (t, h, w).
 const CLIPS: [[usize; 3]; 2] = [[3, 4, 4], [1, 2, 2]];
 const EXTRA: usize = 2;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
@@ -180,7 +176,7 @@ fn the_resamplers_answer_the_reference() {
         let r = R.map(|n| n as u32);
         let n = rows_out * width;
         let f32 = dtype == Dtype::F32;
-        slang_alone(
+        landed(
             &mut gpu,
             &format!("{op:?} {dtype:?}"),
             &|g| {
@@ -198,8 +194,8 @@ fn the_resamplers_answer_the_reference() {
             &[want],
             &|g, o| {
                 use kernels_slang::conv::resample as sr;
-                let (x, grid, o_grid, y) = (st(x), st(grid), st(o_grid), st(y(o[0].0)));
-                g.run_slang(|c| match op {
+                let (x, grid, o_grid, y) = (x, grid, o_grid, y(o[0].0));
+                g.run(|c| match op {
                     Op::Upsample { keep_first } => {
                         sr::upsample_nearest(c, x, grid, r, keep_first, o_grid, y)
                     }

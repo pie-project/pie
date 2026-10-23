@@ -2,7 +2,7 @@
 //! rows (channel- and pixel-major, repeated in time), and the position-table
 //! taps of each patch (bilinear and by axis).
 
-use crate::gpu::{Gpu, both};
+use crate::gpu::{Gpu, landed};
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
@@ -40,7 +40,7 @@ fn the_pixels_answer_the_reference() {
             })
             .collect();
         let yt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
-        both(
+        landed(
             &mut gpu,
             &format!("pixels channel-major {channel_major}"),
             &|g| vec![(g.zeros(rows * width), rows * width, false)],

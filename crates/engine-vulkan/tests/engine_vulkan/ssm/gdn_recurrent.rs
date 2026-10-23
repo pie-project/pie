@@ -2,7 +2,7 @@
 //! host reference: the decode step, the chunked walk (an empty request among
 //! them) and the committed window (replayed rows, a partial commit, a commit
 //! of none, a lane with no slot), with 128-wide keys (the register-state
-//! kernels) and 32-wide ones (the state walked in memory), at both tiers.
+//! kernels) and 32-wide ones (the state walked in memory), at landed tiers.
 //! The f32 outputs and every slot's state are compared.
 
 use kernels_slang::Tier;
@@ -10,7 +10,7 @@ use kernels_slang::ssm::gdn_recurrent::Tactic;
 use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, both, noise};
+use crate::gpu::{Gpu, Out, landed, noise};
 
 const SLOTS: usize = 3;
 
@@ -166,7 +166,7 @@ fn the_gdn_recurrence_answers_the_reference() {
                 let s = s as usize;
                 sh.token(&qr, &gr, r, &mut want_s[s * slab..][..slab], &mut want_y);
             }
-            both(
+            landed(
                 &mut gpu,
                 &what("step"),
                 &fresh(2, 0),
@@ -207,7 +207,7 @@ fn the_gdn_recurrence_answers_the_reference() {
                 data: qkv,
                 indptr: t(ib, 4, 1, Dtype::I32),
             };
-            both(
+            landed(
                 &mut gpu,
                 &what("chunked"),
                 &fresh(rows, 0),
@@ -274,7 +274,7 @@ fn the_gdn_recurrence_answers_the_reference() {
             let window = i32s(ib, 5);
             let work = 5 * slab;
             let work_t = |buf: u32| t(buf, 5, slab, Dtype::F32);
-            both(
+            landed(
                 &mut gpu,
                 &what("committed"),
                 &fresh(rows, work),

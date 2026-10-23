@@ -1,5 +1,4 @@
-//! Paged attention on the first wgpu adapter against an f64 host reference,
-//! beside the hand-written arm each form stands for:
+//! Paged attention on the first wgpu adapter against an f64 host reference:
 //! decode a row a workgroup on the baseline tier, 256 and 128 invocations, plain, windowed, masked,
 //! with its LSE, and split into key ranges folded by their LSEs (rows a
 //! single split covers among them); the selected form over named key
@@ -9,14 +8,10 @@
 //! LSE.
 
 use kernels_slang::attn::sdpa;
-use kernels_wgpu::{KvPool, Tensor};
+use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, close, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -151,8 +146,6 @@ fn paged_attention_answers_the_reference() {
     };
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
     let subgroups = gpu.device.chip().subgroups_32();
-    let (profile, _) = engine_wgpu::chip::resolve(&gpu.device.chip(), None);
-    let tn = kernels_wgpu::Tuning::new(profile, gpu.device.cores(), gpu.device.storage_buffers());
     let slots = 6 * PAGE;
     let (pi, pp) = (gpu.up_u32(&PAGES), gpu.up_u32(&INDPTR));
     let decode = Batch {
@@ -190,10 +183,10 @@ fn paged_attention_answers_the_reference() {
             head_stride: hd as u64,
         };
         let spool = kernels_slang::KvPool {
-            keys: st(pool.keys),
-            values: st(pool.values),
-            page_indices: st(pool.page_indices),
-            page_indptr: st(pool.page_indptr),
+            keys: pool.keys,
+            values: pool.values,
+            page_indices: pool.page_indices,
+            page_indptr: pool.page_indptr,
             page_size: pool.page_size,
             seq_stride: pool.seq_stride,
             head_stride: pool.head_stride,
@@ -227,20 +220,12 @@ fn paged_attention_answers_the_reference() {
             };
             let (mb, eb) = (gpu.up_u32(&pack(&mask)), gpu.up_u32(&pack(&enabled)));
             let tables = sdpa::Tables {
-                positions: st(t(pos, rows, 1, Dtype::I32)),
-                request_of_token: st(t(own, rows, 1, Dtype::I32)),
-                mask: st(t(mb, rows, MASK_STRIDE, Dtype::U8)),
-                mask_enabled: st(t(eb, rows, 1, Dtype::U8)),
-                mask_stride: MASK_STRIDE as u32,
-            };
-            let plan = kernels_wgpu::DecodePlan {
                 positions: t(pos, rows, 1, Dtype::I32),
                 request_of_token: t(own, rows, 1, Dtype::I32),
                 mask: t(mb, rows, MASK_STRIDE, Dtype::U8),
                 mask_enabled: t(eb, rows, 1, Dtype::U8),
                 mask_stride: MASK_STRIDE as u32,
             };
-            let qi = gpu.up_i32(&[0, 26, 37]);
             let n = rows * QH * hd;
             let qt = t(q, rows, QH * hd, Dtype::Bf16);
             let (part_out, part_lse) = (
@@ -248,8 +233,8 @@ fn paged_attention_answers_the_reference() {
                 gpu.up_f32(&vec![0.0; SPLITS * rows * QH]),
             );
             let split = sdpa::Split {
-                part_out: st(t(part_out, SPLITS * rows * QH, hd, Dtype::F32)),
-                part_lse: st(t(part_lse, SPLITS * rows, QH, Dtype::F32)),
+                part_out: t(part_out, SPLITS * rows * QH, hd, Dtype::F32),
+                part_lse: t(part_lse, SPLITS * rows, QH, Dtype::F32),
             };
 
             let forms: &[Form] = if prefilling {
@@ -270,63 +255,6 @@ fn paged_attention_answers_the_reference() {
                     let (want_o, want_l) = reference(batch, &keys, &qr, &kr, &vr, hd, scale);
                     let win = window.map(|w| w as u32);
                     let shape = format!("{what} {form:?} d {hd} window {window:?}");
-
-                    // The hand-written arm it stands for.
-                    let o = gpu.zeros(n);
-                    let ot = t(o, rows, QH * hd, Dtype::Bf16);
-                    gpu.run(|c| match form {
-                        Form::Tiled => {
-                            let pplan = kernels_wgpu::PrefillPlan {
-                                positions: plan.positions,
-                                request_of_token: plan.request_of_token,
-                                mask: plan.mask,
-                                mask_enabled: plan.mask_enabled,
-                                mask_stride: plan.mask_stride,
-                            };
-                            let rag = kernels_wgpu::RaggedTensor {
-                                data: qt,
-                                indptr: t(qi, 3, 1, Dtype::I32),
-                            };
-                            kernels_wgpu::attn::arbiter::prefill(
-                                c,
-                                rag,
-                                &pplan,
-                                &pool,
-                                win,
-                                hd as u32,
-                                KVH as u32,
-                                scale as f32,
-                                ot,
-                                2,
-                                &tn,
-                            )
-                        }
-                        Form::Selected => kernels_wgpu::attn::decode_selected(
-                            c,
-                            qt,
-                            &plan,
-                            t(sel, rows, TOP_K, Dtype::I32),
-                            &pool,
-                            None,
-                            hd as u32,
-                            scale as f32,
-                            RATIO as u32,
-                            ot,
-                        ),
-                        Form::Decode | Form::Split => kernels_wgpu::attn::decode(
-                            c,
-                            &tn,
-                            qt,
-                            &plan,
-                            &pool,
-                            win,
-                            hd as u32,
-                            scale as f32,
-                            ot,
-                            None,
-                        ),
-                    });
-                    close(&gpu.down(o, n), &want_o, &shape);
 
                     // At the subgroup tier the 16-lane tile folds by
                     // shuffles; decode stays the baseline's on WGSL.
@@ -369,13 +297,13 @@ fn paged_attention_answers_the_reference() {
                         };
                         for &with_lse in lses {
                             let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
-                            let lse = with_lse.then(|| st(t(l, rows, QH, Dtype::F32)));
-                            let ot = st(t(o, rows, QH * hd, Dtype::Bf16));
-                            gpu.run_slang(|c| match form {
+                            let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
+                            let ot = t(o, rows, QH * hd, Dtype::Bf16);
+                            gpu.run(|c| match form {
                                 Form::Tiled => sdpa::prefill(
                                     c,
                                     tactic,
-                                    st(qt),
+                                    qt,
                                     &tables,
                                     &spool,
                                     win,
@@ -387,19 +315,19 @@ fn paged_attention_answers_the_reference() {
                                 Form::Selected => sdpa::selected(
                                     c,
                                     tactic,
-                                    st(qt),
+                                    qt,
                                     &tables,
                                     &spool,
                                     hd as u32,
                                     scale as f32,
                                     RATIO as u32,
-                                    st(t(sel, rows, TOP_K, Dtype::I32)),
+                                    t(sel, rows, TOP_K, Dtype::I32),
                                     ot,
                                 ),
                                 Form::Decode | Form::Split => sdpa::decode(
                                     c,
                                     tactic,
-                                    st(qt),
+                                    qt,
                                     &tables,
                                     &spool,
                                     win,
@@ -411,7 +339,7 @@ fn paged_attention_answers_the_reference() {
                                 ),
                             });
                             let label = format!(
-                                "slang {shape} subgroup {subgroup} threads {threads} rows {tile} lanes {lanes} lse {with_lse}"
+                                "{shape} subgroup {subgroup} threads {threads} rows {tile} lanes {lanes} lse {with_lse}"
                             );
                             close(&gpu.down(o, n), &want_o, &label);
                             if with_lse {

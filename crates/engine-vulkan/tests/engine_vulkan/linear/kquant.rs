@@ -7,7 +7,7 @@ use kernels_slang::Tensor;
 use kernels_slang::linear::kquant::{Scheme, Tactic};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 const SUPER: usize = 256;
 
@@ -190,7 +190,7 @@ fn the_kquants_answer_the_reference() {
                 },
                 slices,
             };
-            both(
+            landed(
                 &mut gpu,
                 &format!("{scheme:?} subgroup {subgroup} slices {slices}"),
                 &|g| vec![(g.zeros(m * n), m * n, false)],

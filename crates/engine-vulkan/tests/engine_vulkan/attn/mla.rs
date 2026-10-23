@@ -6,7 +6,7 @@
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -43,7 +43,7 @@ fn mla_answers_the_reference() {
         want_c.extend(lat.iter().zip(&wr).map(|(v, w)| v * inv * w));
         want_pe.extend_from_slice(&ar[r * width + RANK..][..ROPE]);
     }
-    both(
+    landed(
         &mut gpu,
         "mla latents",
         &|g| {
@@ -78,7 +78,7 @@ fn mla_answers_the_reference() {
     let want_p: Vec<f64> = (0..rows * HEADS * ROPE)
         .map(|i| qbr[(i / ROPE) * per + NOPE + i % ROPE])
         .collect();
-    both(
+    landed(
         &mut gpu,
         "mla split q",
         &|g| {
@@ -119,7 +119,7 @@ fn mla_answers_the_reference() {
                 .sum()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "mla absorb q",
         &|g| vec![(g.zeros(rows * HEADS * RANK), rows * HEADS * RANK, false)],
@@ -149,7 +149,7 @@ fn mla_answers_the_reference() {
                 .sum()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "mla absorb out",
         &|g| vec![(g.zeros(rows * HEADS * VDIM), rows * HEADS * VDIM, false)],
@@ -199,7 +199,7 @@ fn mla_answers_the_reference() {
         want_ckv[slot * RANK..][..RANK].copy_from_slice(&kcr[r * RANK..][..RANK]);
         want_kpe[slot * ROPE..][..ROPE].copy_from_slice(&kpr[r * ROPE..][..ROPE]);
     }
-    both(
+    landed(
         &mut gpu,
         "mla kv append",
         &|g| {
@@ -299,7 +299,7 @@ fn mla_answers_the_reference() {
     };
     let cache = pool(ckv, kpe);
     let (hs, rk, sc) = (HEADS as u32, RANK as u32, scale as f32);
-    both(
+    landed(
         &mut gpu,
         "mla decode",
         &|g| vec![(g.zeros(n), n, false)],
@@ -321,7 +321,7 @@ fn mla_answers_the_reference() {
             })
         },
     );
-    both(
+    landed(
         &mut gpu,
         "mla prefill",
         &|g| vec![(g.zeros(n), n, false)],
@@ -343,7 +343,7 @@ fn mla_answers_the_reference() {
             })
         },
     );
-    both(
+    landed(
         &mut gpu,
         "mla decode selected",
         &|g| vec![(g.zeros(n), n, false)],
@@ -366,7 +366,7 @@ fn mla_answers_the_reference() {
             })
         },
     );
-    both(
+    landed(
         &mut gpu,
         "mla prefill selected",
         &|g| vec![(g.zeros(n), n, false)],
@@ -414,7 +414,7 @@ fn mla_answers_the_reference() {
             1.0 / (lat.iter().map(|v| v * v).sum::<f64>() / RANK as f64 + f64::from(eps)).sqrt();
         latent_want.extend(lat.iter().zip(&wr).map(|(v, w)| v * inv * w));
     }
-    both(
+    landed(
         &mut gpu,
         "mla latents rope",
         &|g| {

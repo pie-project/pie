@@ -6,7 +6,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 const C: usize = 6;
 const GROUPS: usize = 2;
@@ -71,7 +71,7 @@ fn the_group_norm_answers_the_reference() {
         let grid = t(gb, CLIPS.len(), 4, Dtype::I32);
         let (w, b) = (t(wb, 1, C, Dtype::F32), t(bb, 1, C, Dtype::F32));
         let plane = |buf: u32, n: usize| t(buf, 1, n, Dtype::F32);
-        both(
+        landed(
             &mut gpu,
             &format!("group norm, silu {silu}"),
             &|g| {

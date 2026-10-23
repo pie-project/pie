@@ -7,7 +7,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 const C_OUT: usize = 6;
 /// Two clips: (t, h, w).
@@ -176,7 +176,7 @@ fn the_conv3d_answers_the_reference() {
             },
         };
         let n = rows_out * C_OUT;
-        both(
+        landed(
             &mut gpu,
             &format!(
                 "conv3d c_in {}, causal {}, bias {}",

@@ -1,4 +1,4 @@
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 use poem_compiler::Budget;
 use poem_ir::Dtype;
 

@@ -1,16 +1,12 @@
-//! Attention mass capture on the first wgpu adapter, beside the hand-written kernel,
-//! against an f64 host reference: two requests over a paged pool with pages
-//! out of order, the mean causal softmax of each request's last query rows
-//! landed per key in its lane's planes of an f32 slab.
+//! Attention mass capture on the first wgpu adapter, against an f64 host
+//! reference: two requests over a paged pool with pages out of order, the
+//! mean causal softmax of each request's last query rows landed per key in
+//! its lane's planes of an f32 slab.
 
-use kernels_wgpu::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
+use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, close, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[test]
 fn score_capture_answers_the_reference() {
@@ -87,84 +83,40 @@ fn score_capture_answers_the_reference() {
         indptr: t(qp, 3, 1, Dtype::I32),
     };
     let post = t(pos, 4, 1, Dtype::I32);
-    let plan = PrefillPlan {
-        positions: post,
-        request_of_token: post,
-        mask: post,
-        mask_enabled: post,
-        mask_stride: 0,
-    };
-    for slang in [false, true] {
-        let slab = gpu.up_f32(&vec![7.0; slab_rows * kv_max]);
-        let sl = t(slab, slab_rows, kv_max, Dtype::F32);
-        let args = (
-            hd as u32,
-            kvh as u32,
-            scale as f32,
-            observe as u32,
-            lane_offset as u32,
-            plane_stride as u32,
-        );
-        if slang {
-            let sp = kernels_slang::KvPool {
-                keys: st(pool.keys),
-                values: st(pool.values),
-                page_indices: st(pool.page_indices),
-                page_indptr: st(pool.page_indptr),
-                page_size: pool.page_size,
-                seq_stride: pool.seq_stride,
-                head_stride: pool.head_stride,
-            };
-            let sq = kernels_slang::RaggedTensor {
-                data: st(qrag.data),
-                indptr: st(qrag.indptr),
-            };
-            gpu.run_slang(|c| {
-                kernels_slang::attn::score::capture(
-                    c,
-                    sq,
-                    st(post),
-                    &sp,
-                    None,
-                    args.0,
-                    args.1,
-                    args.2,
-                    args.3,
-                    args.4,
-                    args.5,
-                    0,
-                    kv_max as u32,
-                    2,
-                    st(sl),
-                )
-            });
-        } else {
-            gpu.run(|c| {
-                attn::score::capture(
-                    c,
-                    qrag,
-                    &plan,
-                    &pool,
-                    None,
-                    args.0,
-                    args.1,
-                    args.2,
-                    args.3,
-                    args.4,
-                    args.5,
-                    0,
-                    kv_max as u32,
-                    2,
-                    sl,
-                )
-            });
-        }
-        let who = if slang { "slang " } else { "" };
-        // Lane 0's planes are not this capture's and keep their sevens.
-        close(
-            &gpu.down_f32(slab, slab_rows * kv_max),
-            &want,
-            &format!("{who}score capture"),
-        );
-    }
+    let slab = gpu.up_f32(&vec![7.0; slab_rows * kv_max]);
+    let sl = t(slab, slab_rows, kv_max, Dtype::F32);
+    let args = (
+        hd as u32,
+        kvh as u32,
+        scale as f32,
+        observe as u32,
+        lane_offset as u32,
+        plane_stride as u32,
+    );
+    gpu.run(|c| {
+        kernels_slang::attn::score::capture(
+            c,
+            qrag,
+            post,
+            &pool,
+            None,
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            0,
+            kv_max as u32,
+            2,
+            sl,
+        )
+    });
+
+    // Lane 0's planes are not this capture's and keep their sevens.
+    close(
+        &gpu.down_f32(slab, slab_rows * kv_max),
+        &want,
+        "score capture",
+    );
 }

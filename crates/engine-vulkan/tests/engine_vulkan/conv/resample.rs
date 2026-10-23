@@ -7,7 +7,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 /// Two clips: (t, h, w).
 const CLIPS: [[usize; 3]; 2] = [[3, 4, 4], [1, 2, 2]];
@@ -175,7 +175,7 @@ fn the_resamplers_answer_the_reference() {
         let r = R.map(|n| n as u32);
         let n = rows_out * width;
         let f32 = dtype == Dtype::F32;
-        both(
+        landed(
             &mut gpu,
             &format!("{op:?} {dtype:?}"),
             &|g| {

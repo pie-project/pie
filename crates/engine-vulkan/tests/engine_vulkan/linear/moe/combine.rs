@@ -5,7 +5,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -38,7 +38,7 @@ fn the_moe_combines_answer_the_reference() {
         })
         .collect();
     let b16 = |b: u32, r: usize, wd: usize| t(b, r, wd, Dtype::Bf16);
-    both(
+    landed(
         &mut gpu,
         "moe weighted sum",
         &|g| vec![(g.zeros(n + 1), n, false)],
@@ -77,7 +77,7 @@ fn the_moe_combines_answer_the_reference() {
                     .sum::<f64>()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "moe bias sum",
         &|g| vec![(g.zeros(n + 1), n, false)],
@@ -99,7 +99,7 @@ fn the_moe_combines_answer_the_reference() {
     let (gt, gtr) = gpu.up(&noise(9, rows));
     let (shr, gtr) = (f64s(&shr), f64s(&gtr));
     let want: Vec<f64> = (0..n).map(|i| xr[i] + sig(gtr[i / w]) * shr[i]).collect();
-    both(
+    landed(
         &mut gpu,
         "moe sigmoid gate add",
         &|g| vec![(g.zeros(n + 1), n, false)],

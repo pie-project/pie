@@ -26,6 +26,7 @@ mod scratch;
 pub mod serve;
 pub mod settle;
 pub mod store;
+pub mod tuning;
 pub mod weight_store;
 pub mod weights;
 pub mod window;
@@ -42,8 +43,8 @@ pub use boot::open;
 pub use boot::{open_with_device, request_device};
 pub use device::{Buffer, Context, Handed, Handles, Pipelines};
 pub use encode::{
-    Sink, Slang, host_copies, host_encode_ns, host_io, host_read_phases, host_submit_ns,
-    host_wait_calls, kernel_profile, profile_shapes, profile_timing, reset_kernel_profile,
+    Sink, host_copies, host_encode_ns, host_io, host_read_phases, host_submit_ns, host_wait_calls,
+    kernel_profile, profile_shapes, profile_timing, reset_kernel_profile,
 };
 pub use error::{Fault, Result, kernel};
 pub use inputs::Inputs;

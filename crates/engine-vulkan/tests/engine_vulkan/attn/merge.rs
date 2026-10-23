@@ -5,7 +5,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -51,7 +51,7 @@ fn the_attention_epilogues_answer_the_reference() {
             want_o[i] = r1[i] * w1 + r2[i] * w2;
         }
     }
-    both(
+    landed(
         &mut gpu,
         "merge lse",
         &|g| {
@@ -97,7 +97,7 @@ fn the_attention_epilogues_answer_the_reference() {
         })
         .collect();
     let sink_t = Tensor::new(sinks, 1, heads as u32, Dtype::Bf16);
-    both(
+    landed(
         &mut gpu,
         "sink",
         &|g| vec![(g.up(&noise(1, n)).0, n, false)],
@@ -115,7 +115,7 @@ fn the_attention_epilogues_answer_the_reference() {
     let mut want: Vec<f64> = held.iter().map(|v| cap * (v / cap).tanh()).collect();
     want[21] = 5.0;
     let xt = |buf: u32| Tensor::new(buf, 3, 7, Dtype::Bf16);
-    both(
+    landed(
         &mut gpu,
         "logit softcap",
         &|g| vec![(g.up(&xv).0, 22, false)],

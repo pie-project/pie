@@ -1950,8 +1950,6 @@ dependencies = [
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
- "kernels-vulkan",
- "kernels-wgpu",
  "libc",
  "memmap2",
  "naga",

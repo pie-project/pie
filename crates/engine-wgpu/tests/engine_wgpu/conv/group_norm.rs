@@ -3,10 +3,10 @@
 //! of three (a lane's channel pair straddles two groups), with and without
 //! the SiLU, and rows past every clip landing zero.
 
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::conv::slang_alone;
+use crate::gpu::landed;
 use crate::gpu::{Gpu, noise};
 
 const C: usize = 6;
@@ -14,10 +14,6 @@ const GROUPS: usize = 2;
 const EPS: f32 = 1e-5;
 /// Two clips of 40 and 9 voxels.
 const CLIPS: [[usize; 3]; 2] = [[2, 4, 5], [1, 3, 3]];
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[test]
 fn the_group_norm_answers_the_reference() {
@@ -76,7 +72,7 @@ fn the_group_norm_answers_the_reference() {
         let grid = t(gb, CLIPS.len(), 4, Dtype::I32);
         let (w, b) = (t(wb, 1, C, Dtype::F32), t(bb, 1, C, Dtype::F32));
         let plane = |buf: u32, n: usize| t(buf, 1, n, Dtype::F32);
-        slang_alone(
+        landed(
             &mut gpu,
             &format!("group norm, silu {silu}"),
             &|g| {
@@ -89,19 +85,19 @@ fn the_group_norm_answers_the_reference() {
             &[want],
             &|g, o| {
                 let (p, s) = (plane(o[1].0, parts), plane(o[2].0, scratch - parts));
-                g.run_slang(|c| {
+                g.run(|c| {
                     kernels_slang::conv::group_norm::group_norm(
                         c,
-                        st(x),
-                        st(grid),
+                        x,
+                        grid,
                         GROUPS as u32,
-                        st(w),
-                        st(b),
+                        w,
+                        b,
                         EPS,
                         silu,
-                        st(p),
-                        st(s),
-                        st(t(o[0].0, rows, C, Dtype::Bf16)),
+                        p,
+                        s,
+                        t(o[0].0, rows, C, Dtype::Bf16),
                     )
                 })
             },

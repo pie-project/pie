@@ -7,7 +7,7 @@
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -129,7 +129,7 @@ fn the_compressed_pool_answers_the_reference() {
     let pool_pages = pool_of(pi, HD);
     let u = |b: u32| t(b, 3, 1, Dtype::U32);
     let bt = |b: u32, r: usize, w: usize| t(b, r, w, Dtype::Bf16);
-    both(
+    landed(
         &mut gpu,
         "pool state write",
         &|g| {
@@ -201,7 +201,7 @@ fn the_compressed_pool_answers_the_reference() {
             })
             .collect();
         let apet = with_ape.then(|| t(ape, RATIO, ape_w, Dtype::F32));
-        both(
+        landed(
             &mut gpu,
             &format!("pool gather coff {coff} ape {with_ape}"),
             &|g| vec![(g.zeros(3 * HD), 3 * HD, false)],
@@ -244,7 +244,7 @@ fn the_compressed_pool_answers_the_reference() {
                 / RATIO as f64
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "pool block mean",
         &|g| vec![(g.zeros(3 * HD), 3 * HD, false)],
@@ -272,7 +272,7 @@ fn the_compressed_pool_answers_the_reference() {
             want[s * HD..][..HD].copy_from_slice(&entr[c * HD..][..HD]);
         }
     }
-    both(
+    landed(
         &mut gpu,
         "pool store",
         &|g| vec![(g.zeros(slots * HD), slots * HD, false)],
@@ -367,7 +367,7 @@ fn the_compressed_pool_answers_the_reference() {
         ]
     };
     let (hs, hd, rt) = (heads as u32, HD as u32, RATIO as u32);
-    both(
+    landed(
         &mut gpu,
         "pool attention lse",
         &outs,
@@ -391,7 +391,7 @@ fn the_compressed_pool_answers_the_reference() {
         },
     );
     let selt = t(sel, 3, 4, Dtype::I32);
-    both(
+    landed(
         &mut gpu,
         "pool attention lse selected",
         &outs,

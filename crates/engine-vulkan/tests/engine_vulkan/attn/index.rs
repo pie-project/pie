@@ -7,7 +7,7 @@
 use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, close, noise};
+use crate::gpu::{Gpu, close, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -58,7 +58,7 @@ fn the_indexer_answers_the_reference() {
         turn(&mut y, rope, positions[r], f64::from(theta));
         want.extend(y);
     }
-    both(
+    landed(
         &mut gpu,
         "index key norm rope",
         &|g| vec![(g.up(&kv).0, rows * d, false)],
@@ -94,7 +94,7 @@ fn the_indexer_answers_the_reference() {
             );
         }
     }
-    both(
+    landed(
         &mut gpu,
         "index q rope",
         &|g| vec![(g.up(&qv).0, rows * heads * d, false)],
@@ -225,7 +225,7 @@ fn the_indexer_answers_the_reference() {
         let slot = wpg[r] as usize * page + wof[r] as usize;
         want[slot * d..][..d].copy_from_slice(&knr[r * d..][..d]);
     }
-    both(
+    landed(
         &mut gpu,
         "index kv append",
         &|g| vec![(g.zeros(slots * d), slots * d, false)],

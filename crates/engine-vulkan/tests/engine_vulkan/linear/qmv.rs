@@ -9,7 +9,7 @@ use kernels_slang::linear::qmm::{self, Qmm};
 use kernels_slang::{Bank, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -82,7 +82,7 @@ fn the_vector_point_answers_the_reference() {
             let (x, xr) = gpu.up(&noise(7 + m as u64, m * k));
             let xt = t(x, m, k, Dtype::Bf16);
             let want = reference(&xr, &weights, m, n, k);
-            both(
+            landed(
                 &mut gpu,
                 &format!("qmv {bits} bits, group {group}, {m} x {n}, {vecs} a workgroup"),
                 &|g| vec![(g.zeros(m * n), m * n, false)],
@@ -113,7 +113,7 @@ fn the_one_row_point_answers_the_reference() {
             if lanes > width {
                 continue;
             }
-            both(
+            landed(
                 &mut gpu,
                 &format!(
                     "qmv row {bits} bits, group {group}, {n} columns, {lanes} lanes, {rows} a lane"

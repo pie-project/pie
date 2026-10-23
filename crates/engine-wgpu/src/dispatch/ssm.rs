@@ -1,4 +1,3 @@
-use crate::encode::{from_slang, slang_ragged, slang_tensor};
 use crate::run::Run;
 use kernels_slang::Tier;
 use kernels_slang::ssm::{StatePool, conv1d, gdn_prep, gdn_recurrent, kda};
@@ -23,13 +22,13 @@ impl Run<'_> {
     fn state_pool(&self, id: ValueId) -> StatePool {
         let pool = self.recurrent(id);
         StatePool {
-            bank: slang_tensor(pool.state),
-            slots: slang_tensor(pool.slots),
+            bank: pool.state,
+            slots: pool.slots,
         }
     }
 
     fn slang_of(&self, id: ValueId) -> kernels_slang::Tensor {
-        slang_tensor(self.tensor(id))
+        self.tensor(id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -56,15 +55,15 @@ impl Run<'_> {
         }
     }
 
-    fn ssm(&mut self, op: &Ssm) -> Result<(), kernels_wgpu::Error> {
-        let ctx = self.slang();
+    fn ssm(&mut self, op: &Ssm) -> Result<(), kernels_slang::Error> {
+        let ctx = self.ctx;
         match op {
             Ssm::Mamba2 { .. }
             | Ssm::Mamba2Chunked { .. }
             | Ssm::DynConv { .. }
             | Ssm::ShortConv { .. }
             | Ssm::ShortConvChunked { .. } => {
-                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Ssm::CausalConv1d {
                 x,
@@ -89,17 +88,16 @@ impl Run<'_> {
                 let ext_x = self.rs_extend(OP, &seat, *x)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 conv1d::conv1d_committed(
-                    &ctx,
-                    slang_tensor(ext_x),
-                    slang_tensor(self.qo_indptr()),
+                    ctx,
+                    ext_x,
+                    self.qo_indptr(),
                     &self.rs_committed(&seat),
                     self.slang_of(*weight),
                     &self.state_pool(*state),
                     *conv_width,
                     *dilation,
-                    slang_tensor(ext_y),
-                )
-                .map_err(from_slang)?;
+                    ext_y,
+                )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
             Ssm::GdnGates {
@@ -113,13 +111,12 @@ impl Run<'_> {
                 let ext_ba = self.rs_extend(OP, &seat, *ba)?;
                 let ext_gates = self.rs_out(OP, &seat, *gates)?;
                 gdn_prep::gdn_prep(
-                    &ctx,
-                    slang_tensor(ext_ba),
+                    ctx,
+                    ext_ba,
                     self.slang_of(*dt_bias),
                     self.slang_of(*a_log),
-                    slang_tensor(ext_gates),
-                )
-                .map_err(from_slang)?;
+                    ext_gates,
+                )?;
                 self.rs_land(OP, &seat, ext_gates, *gates)
             }
             Ssm::GatedDelta {
@@ -150,21 +147,20 @@ impl Run<'_> {
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 gdn_recurrent::gated_delta_committed(
-                    &ctx,
+                    ctx,
                     RECURRENT,
-                    slang_tensor(ext_qkv),
-                    slang_tensor(self.qo_indptr()),
+                    ext_qkv,
+                    self.qo_indptr(),
                     &self.rs_committed(&seat),
-                    slang_tensor(ext_gates),
+                    ext_gates,
                     &self.state_pool(*state),
-                    slang_tensor(seat.work),
+                    seat.work,
                     *k_heads,
                     *v_heads,
                     *k_dim,
                     *v_dim,
-                    slang_tensor(ext_y),
-                )
-                .map_err(from_slang)?;
+                    ext_y,
+                )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
             Ssm::Kda {
@@ -200,8 +196,8 @@ impl Run<'_> {
                 let ext_b = self.rs_extend(OP, &seat, *b)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let gates = self.kda_gates(
-                    slang_tensor(ext_f),
-                    slang_tensor(ext_b),
+                    ext_f,
+                    ext_b,
                     *dt_bias,
                     *a_log,
                     *heads,
@@ -210,17 +206,16 @@ impl Run<'_> {
                     *gate_floor,
                 );
                 kda::kda_committed(
-                    &ctx,
+                    ctx,
                     RECURRENT.tier,
-                    slang_tensor(ext_mixed),
-                    slang_tensor(self.qo_indptr()),
+                    ext_mixed,
+                    self.qo_indptr(),
                     &self.rs_committed(&seat),
                     &gates,
                     &self.state_pool(*state),
-                    slang_tensor(seat.work),
-                    slang_tensor(ext_y),
-                )
-                .map_err(from_slang)?;
+                    seat.work,
+                    ext_y,
+                )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
             Ssm::CausalConv1d {
@@ -232,15 +227,14 @@ impl Run<'_> {
                 y,
                 ..
             } => conv1d::conv1d(
-                &ctx,
+                ctx,
                 self.slang_of(*x),
                 self.slang_of(*weight),
                 &self.state_pool(*state),
                 *conv_width,
                 *dilation,
                 self.slang_of(*y),
-            )
-            .map_err(from_slang),
+            ),
             Ssm::CausalConv1dChunked {
                 x,
                 weight,
@@ -250,28 +244,26 @@ impl Run<'_> {
                 y,
                 ..
             } => conv1d::conv1d_chunked(
-                &ctx,
-                slang_ragged(self.ragged(*x)),
+                ctx,
+                self.ragged(*x),
                 self.slang_of(*weight),
                 &self.state_pool(*state),
                 *conv_width,
                 *dilation,
                 self.slang_of(*y),
-            )
-            .map_err(from_slang),
+            ),
             Ssm::GdnGates {
                 ba,
                 dt_bias,
                 a_log,
                 gates,
             } => gdn_prep::gdn_prep(
-                &ctx,
+                ctx,
                 self.slang_of(*ba),
                 self.slang_of(*dt_bias),
                 self.slang_of(*a_log),
                 self.slang_of(*gates),
-            )
-            .map_err(from_slang),
+            ),
             Ssm::GatedDelta {
                 qkv,
                 gates,
@@ -283,7 +275,7 @@ impl Run<'_> {
                 y,
                 ..
             } => gdn_recurrent::gated_delta(
-                &ctx,
+                ctx,
                 RECURRENT,
                 self.slang_of(*qkv),
                 self.slang_of(*gates),
@@ -293,8 +285,7 @@ impl Run<'_> {
                 *k_dim,
                 *v_dim,
                 self.slang_of(*y),
-            )
-            .map_err(from_slang),
+            ),
             Ssm::GatedDeltaChunked {
                 qkv,
                 gates,
@@ -306,9 +297,9 @@ impl Run<'_> {
                 y,
                 ..
             } => gdn_recurrent::gated_delta_chunked(
-                &ctx,
+                ctx,
                 RECURRENT,
-                slang_ragged(self.ragged(*qkv)),
+                self.ragged(*qkv),
                 self.slang_of(*gates),
                 &self.state_pool(*state),
                 *k_heads,
@@ -316,8 +307,7 @@ impl Run<'_> {
                 *k_dim,
                 *v_dim,
                 self.slang_of(*y),
-            )
-            .map_err(from_slang),
+            ),
             Ssm::Kda {
                 mixed,
                 f,
@@ -342,14 +332,13 @@ impl Run<'_> {
                     *gate_floor,
                 );
                 kda::kda(
-                    &ctx,
+                    ctx,
                     RECURRENT.tier,
                     self.slang_of(*mixed),
                     &gates,
                     &self.state_pool(*state),
                     self.slang_of(*y),
                 )
-                .map_err(from_slang)
             }
             Ssm::KdaChunked {
                 mixed,
@@ -375,14 +364,13 @@ impl Run<'_> {
                     *gate_floor,
                 );
                 kda::kda_chunked(
-                    &ctx,
+                    ctx,
                     RECURRENT.tier,
-                    slang_ragged(self.ragged(*mixed)),
+                    self.ragged(*mixed),
                     &gates,
                     &self.state_pool(*state),
                     self.slang_of(*y),
                 )
-                .map_err(from_slang)
             }
         }
     }

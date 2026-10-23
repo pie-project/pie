@@ -6,7 +6,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 /// Two clips: (t, h, w).
 const CLIPS: [[usize; 3]; 2] = [[3, 2, 3], [1, 2, 2]];
@@ -76,7 +76,7 @@ fn the_voxel_attention_answers_the_reference() {
                 t(vb, rows, c, Dtype::Bf16),
             );
             let n = rows * c;
-            both(
+            landed(
                 &mut gpu,
                 &format!("voxel attention c {c}, frames {frames}"),
                 &|g| vec![(g.up(&vec![7.0; n]).0, n, false)],

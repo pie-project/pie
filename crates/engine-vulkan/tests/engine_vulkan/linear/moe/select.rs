@@ -9,7 +9,7 @@ use kernels_slang::linear::moe::select;
 use kernels_slang::{Bank, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -90,7 +90,7 @@ fn the_routed_selects_answer_the_reference() {
             &|e, n, k| f64::from(br[(e * N + n) * K + k]),
             &|_, _| 0.0,
         );
-        both(
+        landed(
             &mut gpu,
             &format!(
                 "select dense, a row a {}",
@@ -138,7 +138,7 @@ fn the_routed_selects_answer_the_reference() {
                         0.0
                     }
                 });
-                both(
+                landed(
                     &mut gpu,
                     &format!(
                         "select affine {group}/{bits}, biased {biased}, a row a route {per_route}"
@@ -198,7 +198,7 @@ fn the_routed_selects_answer_the_reference() {
             e2m1(nibble) * 2f64.powi(i32::from(exps[i / 32]) - 127)
         };
         let want = reference(&xr, per_route, &weight, &|_, _| 0.0);
-        both(
+        landed(
             &mut gpu,
             &format!("select mxfp4, a row a route {per_route}"),
             &|g| vec![(g.zeros(out), out, false)],
@@ -223,7 +223,7 @@ mod batched {
     use kernels_slang::{Bank, Tensor};
     use poem_ir::Dtype;
 
-    use crate::gpu::{Gpu, both, noise};
+    use crate::gpu::{Gpu, landed, noise};
 
     fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
         Tensor::new(b, r as u32, w as u32, d)
@@ -412,7 +412,7 @@ mod batched {
                         Ok(())
                     });
                 };
-                both(
+                landed(
                     &mut gpu,
                     &label,
                     &|g| vec![(g.zeros(pairs * N), pairs * N, false)],

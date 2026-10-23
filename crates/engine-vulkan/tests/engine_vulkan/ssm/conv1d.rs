@@ -7,7 +7,7 @@
 use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, both, noise};
+use crate::gpu::{Gpu, Out, landed, noise};
 
 const C: usize = 6;
 const W: usize = 4;
@@ -92,7 +92,7 @@ fn the_conv1d_answers_the_reference() {
             want_s[s * slab..][..slab].copy_from_slice(&kept);
         }
         let x = t(xb, 2, C, Dtype::Bf16);
-        both(
+        landed(
             &mut gpu,
             &format!("conv1d step, dilation {dil}"),
             &fresh(2),
@@ -141,7 +141,7 @@ fn the_conv1d_answers_the_reference() {
             data: t(xb, rows, C, Dtype::Bf16),
             indptr: t(ib, 4, 1, Dtype::I32),
         };
-        both(
+        landed(
             &mut gpu,
             &format!("conv1d chunked, dilation {dil}"),
             &fresh(rows),
@@ -207,7 +207,7 @@ fn the_conv1d_answers_the_reference() {
         };
         let x = t(xb, rows, C, Dtype::Bf16);
         let window = i32s(ib, 4);
-        both(
+        landed(
             &mut gpu,
             &format!("conv1d committed, dilation {dil}"),
             &fresh(rows),

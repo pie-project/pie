@@ -8,7 +8,7 @@ use kernels_slang::Tensor;
 use kernels_slang::linear::gemm::{self, Tactic};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -66,7 +66,7 @@ fn the_dense_matmuls_answer_the_reference() {
             |v| v
         };
         let want = reference(&xr, &wr, (m, n, k), op);
-        both(
+        landed(
             &mut gpu,
             &format!("gemm {m} x {n} x {k} at {}", tier.name()),
             &|g| vec![(g.zeros(m * n), m * n, false)],
@@ -97,7 +97,7 @@ fn the_dense_matmuls_answer_the_reference() {
         let wt = t(w, n, k, wd);
         let want = reference(&xv, &held, (m, n, k), |v| v);
         let f32_out = yd == Dtype::F32;
-        both(
+        landed(
             &mut gpu,
             &format!("gemm lane {wd:?} weight into {yd:?}"),
             &|g| vec![(g.zeros(2 * m * n), m * n, f32_out)],

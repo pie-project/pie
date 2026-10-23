@@ -3,7 +3,7 @@
 //! folds, a layer's slice, the splits, and a flat word copy. The movers are
 //! exact, so the reference is the moved values themselves.
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
@@ -34,7 +34,7 @@ fn the_row_movers_answer_the_reference() {
             .iter()
             .flat_map(|&r| vals[r as usize * W..][..W].to_vec())
             .collect();
-        both(
+        landed(
             &mut gpu,
             &format!("gather rows {dtype:?}"),
             &|g| vec![(g.zeros(words * k * W), k * W, f32)],
@@ -55,7 +55,7 @@ fn the_row_movers_answer_the_reference() {
         for (i, &r) in pick.iter().enumerate() {
             want[r as usize * W..][..W].copy_from_slice(&vals[i * W..][..W]);
         }
-        both(
+        landed(
             &mut gpu,
             &format!("scatter rows {dtype:?}"),
             &|g| vec![(g.zeros(words * rows * W), rows * W, f32)],
@@ -82,7 +82,7 @@ fn the_row_movers_answer_the_reference() {
             want[r as usize * W..][..W].copy_from_slice(&xr[i * W..][..W]);
         }
     }
-    both(
+    landed(
         &mut gpu,
         "scatter live rows",
         &|g| vec![(g.zeros(rows * W), rows * W, false)],
@@ -138,7 +138,7 @@ fn the_row_movers_answer_the_reference() {
                 / 4.0
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "pool rows",
         &|g| vec![(g.zeros(2 * W), 2 * W, false)],
@@ -154,7 +154,7 @@ fn the_row_movers_answer_the_reference() {
             })
         },
     );
-    both(
+    landed(
         &mut gpu,
         "merge rows",
         &|g| vec![(g.zeros(8 * W), 8 * W, false)],
@@ -175,7 +175,7 @@ fn the_row_movers_answer_the_reference() {
     let want: Vec<f64> = (0..rows * 16)
         .map(|i| xr[(i / 16) * W + 16 + i % 16])
         .collect();
-    both(
+    landed(
         &mut gpu,
         "select",
         &|g| vec![(g.zeros(rows * 16), rows * 16, false)],
@@ -197,7 +197,7 @@ fn the_row_movers_answer_the_reference() {
     let cut = |a: usize, w: usize| -> Vec<f64> {
         (0..rows * w).map(|i| xr[(i / w) * W + a + i % w]).collect()
     };
-    both(
+    landed(
         &mut gpu,
         "split rows",
         &|g| {
@@ -224,7 +224,7 @@ fn the_row_movers_answer_the_reference() {
             .map(|_| (g.zeros(rows * 16), rows * 16, false))
             .collect::<Vec<_>>()
     };
-    both(
+    landed(
         &mut gpu,
         "split qkv",
         &three,
@@ -253,7 +253,7 @@ fn the_row_movers_answer_the_reference() {
             .map(|i| xr[(i / 24) * W + ((i % 24) / 8) * 16 + 8 + i % 8])
             .collect(),
     );
-    both(
+    landed(
         &mut gpu,
         "split q gate",
         &|g| {
@@ -277,7 +277,7 @@ fn the_row_movers_answer_the_reference() {
     );
 
     // a flat copy of the f32 rows
-    both(
+    landed(
         &mut gpu,
         "copy words",
         &|g| vec![(g.zeros(2 * rows * W), rows * W, true)],

@@ -2,13 +2,13 @@
 //! reference: the decode step, the chunked walk (an empty request among
 //! them) and the committed window (replayed rows, a partial commit, a lane
 //! with no slot), with the softplus gate and the floored sigmoid gate, at
-//! both tiers. The f32 outputs and every slot's state are compared.
+//! landed tiers. The f32 outputs and every slot's state are compared.
 
 use kernels_slang::Tier;
 use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, both, noise};
+use crate::gpu::{Gpu, Out, landed, noise};
 
 const SLOTS: usize = 3;
 const HEADS: usize = 2;
@@ -169,7 +169,7 @@ fn the_kda_answers_the_reference() {
                 let s = s as usize;
                 host.token(r, &mut want_s[s * slab..][..slab], &mut want_y);
             }
-            both(
+            landed(
                 &mut gpu,
                 &what("step"),
                 &fresh(2, 0),
@@ -206,7 +206,7 @@ fn the_kda_answers_the_reference() {
                 data: p.mixed,
                 indptr: t(ib, 4, 1, Dtype::I32),
             };
-            both(
+            landed(
                 &mut gpu,
                 &what("chunked"),
                 &fresh(rows, 0),
@@ -269,7 +269,7 @@ fn the_kda_answers_the_reference() {
             let window = i32s(ib, 4);
             let work = 4 * slab;
             let work_t = |buf: u32| t(buf, 4, slab, Dtype::F32);
-            both(
+            landed(
                 &mut gpu,
                 &what("committed"),
                 &fresh(rows, work),

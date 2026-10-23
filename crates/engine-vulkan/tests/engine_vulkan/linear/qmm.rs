@@ -1,15 +1,15 @@
 //! The tiled points of the affine-quantized matmul on the first Vulkan
 //! device against an f64 host reference:
 //! the tiled rung at every row tile (a batch padded into its capacity
-//! included) and both column tiles, the register-tiled rung at both row
-//! tiles and both K steps, and the cooperative-matrix rung where the device
+//! included) and landed column tiles, the register-tiled rung at landed row
+//! tiles and landed K steps, and the cooperative-matrix rung where the device
 //! has cooperative matrices.
 
 use kernels_slang::linear::qmm::{self, Qmm};
 use kernels_slang::{Bank, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -71,7 +71,7 @@ fn the_tiled_points_answer_the_reference() {
         // (rows, capacity, the rung)
         let mut cases: Vec<(usize, usize, Qmm)> = Vec::new();
         // Row tiles of 8, 16, 32 and 64 (the second padded into its
-        // capacity), at both column tiles.
+        // capacity), at landed column tiles.
         for (m, cap) in [(8usize, 8usize), (20, 32), (32, 32), (70, 128)] {
             for crossover in [1u32, u32::MAX] {
                 cases.push((
@@ -108,7 +108,7 @@ fn the_tiled_points_answer_the_reference() {
                         .sum()
                 })
                 .collect();
-            both(
+            landed(
                 &mut gpu,
                 &format!("qmm {rung:?} {bits} bits, group {group}, {m} x {n}"),
                 &|g| vec![(g.zeros(cap * n), m * n, false)],

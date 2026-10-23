@@ -1,4 +1,3 @@
-use kernels_wgpu::linear;
 use poem_exec::{DispatchLinear, KernelError};
 use poem_ir::{Linear, Operands};
 
@@ -17,9 +16,9 @@ impl DispatchLinear for Run<'_> {
 }
 
 impl Run<'_> {
-    fn linear(&mut self, op: &Linear) -> Result<(), kernels_wgpu::Error> {
+    fn linear(&mut self, op: &Linear) -> Result<(), kernels_slang::Error> {
         match op {
-            Linear::Relu2 { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            Linear::Relu2 { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Linear::Matmul {
                 act,
                 w,
@@ -32,34 +31,24 @@ impl Run<'_> {
                     let capacity = self.capacity(*act).min(self.capacity(*y));
                     let (act, y) = (self.tensor(*act), self.tensor(*y));
                     let ladder = qmm_ladder(self.tuning(), act.rows, y.width, act.width, bank);
-                    kernels_slang::linear::qmm::matmul(
-                        &self.slang(),
-                        &ladder,
-                        crate::encode::slang_tensor(act),
-                        crate::encode::slang_bank(bank),
-                        crate::encode::slang_tensor(y),
-                        capacity,
-                    )
-                    .map_err(crate::encode::from_slang)
+                    kernels_slang::linear::qmm::matmul(self.ctx, &ladder, act, bank, y, capacity)
                 }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::matmul(
-                        &self.slang(),
+                        self.ctx,
                         KQUANT,
-                        crate::encode::slang_tensor(self.tensor(*act)),
-                        crate::encode::slang_tensor(block),
-                        crate::encode::slang_tensor(self.tensor(*y)),
-                    )
-                    .map_err(crate::encode::from_slang),
+                        self.tensor(*act),
+                        block,
+                        self.tensor(*y),
+                    ),
                     None => kernels_slang::linear::gemm::matmul(
-                        &self.slang(),
+                        self.ctx,
                         self.gemm_tactic(),
-                        crate::encode::slang_tensor(self.tensor(*act)),
-                        crate::encode::slang_tensor(self.tensor(*w)),
-                        crate::encode::slang_tensor(self.tensor(*y)),
-                    )
-                    .map_err(crate::encode::from_slang),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        self.tensor(*y),
+                    ),
                 },
             },
             Linear::Matmul {
@@ -74,34 +63,24 @@ impl Run<'_> {
                     let capacity = self.capacity(*act).min(self.capacity(*y));
                     let (act, y) = (self.tensor(*act), self.tensor(*y));
                     let ladder = qmm_ladder(self.tuning(), act.rows, y.width, act.width, bank);
-                    kernels_slang::linear::qmm::lm_head(
-                        &self.slang(),
-                        &ladder,
-                        crate::encode::slang_tensor(act),
-                        crate::encode::slang_bank(bank),
-                        crate::encode::slang_tensor(y),
-                        capacity,
-                    )
-                    .map_err(crate::encode::from_slang)
+                    kernels_slang::linear::qmm::lm_head(self.ctx, &ladder, act, bank, y, capacity)
                 }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::lm_head(
-                        &self.slang(),
+                        self.ctx,
                         KQUANT,
-                        crate::encode::slang_tensor(self.tensor(*act)),
-                        crate::encode::slang_tensor(block),
-                        crate::encode::slang_tensor(self.tensor(*y)),
-                    )
-                    .map_err(crate::encode::from_slang),
+                        self.tensor(*act),
+                        block,
+                        self.tensor(*y),
+                    ),
                     None => kernels_slang::linear::gemm::lm_head(
-                        &self.slang(),
+                        self.ctx,
                         self.gemm_tactic(),
-                        crate::encode::slang_tensor(self.tensor(*act)),
-                        crate::encode::slang_tensor(self.tensor(*w)),
-                        crate::encode::slang_tensor(self.tensor(*y)),
-                    )
-                    .map_err(crate::encode::from_slang),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        self.tensor(*y),
+                    ),
                 },
             },
 
@@ -115,12 +94,11 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => kernels_slang::linear::glu::swiglu(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*packed)),
+                self.ctx,
+                self.tensor(*packed),
                 *intermediate,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
@@ -131,13 +109,12 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => kernels_slang::linear::glu::swiglu_clamp(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*packed)),
+                self.ctx,
+                self.tensor(*packed),
                 *intermediate,
                 *limit,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
@@ -148,14 +125,13 @@ impl Run<'_> {
                 act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
                 ..
             } => kernels_slang::linear::glu::swiglu_clamp_alpha(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*packed)),
+                self.ctx,
+                self.tensor(*packed),
                 *intermediate,
                 *limit,
                 *alpha,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
 
             Linear::Glu {
                 gate: Some(gate),
@@ -167,13 +143,12 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => kernels_slang::linear::glu::swiglu_clamp_split(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*gate)),
-                crate::encode::slang_tensor(self.tensor(*up)),
+                self.ctx,
+                self.tensor(*gate),
+                self.tensor(*up),
                 *limit,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
@@ -184,18 +159,14 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => kernels_slang::linear::glu::geglu_tanh(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*gate)),
-                crate::encode::slang_tensor(self.tensor(*up)),
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
-            Linear::GeluTanh { x, y } => kernels_slang::linear::glu::gelu_tanh(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*x)),
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*gate),
+                self.tensor(*up),
+                self.tensor(*y),
+            ),
+            Linear::GeluTanh { x, y } => {
+                kernels_slang::linear::glu::gelu_tanh(self.ctx, self.tensor(*x), self.tensor(*y))
+            }
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
             Linear::RelBias { .. }
@@ -225,9 +196,9 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             }
-            | Linear::MoeSumAdd { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            | Linear::MoeSumAdd { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             // The forms no builder makes.
-            Linear::Matmul { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            Linear::Matmul { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
@@ -238,12 +209,11 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => kernels_slang::linear::glu::geglu_tanh_packed(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*packed)),
+                self.ctx,
+                self.tensor(*packed),
                 *intermediate,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
@@ -254,17 +224,16 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Situ { beta, up_cap, .. },
                 ..
             } => kernels_slang::linear::glu::situ(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*packed)),
+                self.ctx,
+                self.tensor(*packed),
                 *intermediate,
                 *beta,
                 *up_cap,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
 
             // The forms no builder makes.
-            Linear::Glu { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            Linear::Glu { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Linear::MoeRoute {
                 logits,
                 experts,
@@ -275,14 +244,13 @@ impl Run<'_> {
                 score: poem_ir::RouteScore::Softmax,
                 ..
             } => kernels_slang::linear::moe::route::topk_softmax(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*logits)),
+                self.ctx,
+                self.tensor(*logits),
                 *experts,
                 *top_k,
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.tensor(*weights)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*routes),
+                self.tensor(*weights),
+            ),
             Linear::MoeRoute {
                 logits,
                 scale: Some(scale),
@@ -293,15 +261,14 @@ impl Run<'_> {
                 score: poem_ir::RouteScore::Softmax,
                 ..
             } => kernels_slang::linear::moe::route::topk_softmax_scaled(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*logits)),
-                crate::encode::slang_tensor(self.tensor(*scale)),
+                self.ctx,
+                self.tensor(*logits),
+                self.tensor(*scale),
                 *experts,
                 *top_k,
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.tensor(*weights)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*routes),
+                self.tensor(*weights),
+            ),
 
             Linear::MoeRoute {
                 logits,
@@ -320,28 +287,26 @@ impl Run<'_> {
                 ..
             } => match bias {
                 Some(bias) => kernels_slang::linear::moe::route::topk_sigmoid_biased(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*logits)),
-                    crate::encode::slang_tensor(self.tensor(*bias)),
+                    self.ctx,
+                    self.tensor(*logits),
+                    self.tensor(*bias),
                     *experts,
                     *top_k,
                     *renormalize,
                     *scaling,
-                    crate::encode::slang_tensor(self.tensor(*routes)),
-                    crate::encode::slang_tensor(self.tensor(*weights)),
-                )
-                .map_err(crate::encode::from_slang),
+                    self.tensor(*routes),
+                    self.tensor(*weights),
+                ),
                 None => kernels_slang::linear::moe::route::topk_sigmoid(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*logits)),
+                    self.ctx,
+                    self.tensor(*logits),
                     *experts,
                     *top_k,
                     *renormalize,
                     *scaling,
-                    crate::encode::slang_tensor(self.tensor(*routes)),
-                    crate::encode::slang_tensor(self.tensor(*weights)),
-                )
-                .map_err(crate::encode::from_slang),
+                    self.tensor(*routes),
+                    self.tensor(*weights),
+                ),
             },
             Linear::MoeRoute {
                 logits,
@@ -353,15 +318,14 @@ impl Run<'_> {
                 score: poem_ir::RouteScore::Predict,
                 ..
             } => kernels_slang::linear::moe::route::predict_route(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*logits)),
-                crate::encode::slang_tensor(self.tensor(*bias)),
+                self.ctx,
+                self.tensor(*logits),
+                self.tensor(*bias),
                 *experts,
                 *top_k,
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.tensor(*weights)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*routes),
+                self.tensor(*weights),
+            ),
 
             Linear::MoeRoute {
                 logits,
@@ -379,17 +343,16 @@ impl Run<'_> {
                     },
                 ..
             } => kernels_slang::linear::moe::route::topk_sqrt_softplus(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*logits)),
-                crate::encode::slang_tensor(self.tensor(*bias)),
+                self.ctx,
+                self.tensor(*logits),
+                self.tensor(*bias),
                 *experts,
                 *top_k,
                 *renormalize,
                 *scaling,
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.tensor(*weights)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*routes),
+                self.tensor(*weights),
+            ),
 
             Linear::MoeRoute {
                 ids: Some(ids),
@@ -408,27 +371,25 @@ impl Run<'_> {
                     },
                 ..
             } => kernels_slang::linear::moe::route::hash_route(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*ids)),
-                crate::encode::slang_tensor(self.tensor(*tid2eid)),
-                crate::encode::slang_tensor(self.tensor(*logits)),
+                self.ctx,
+                self.tensor(*ids),
+                self.tensor(*tid2eid),
+                self.tensor(*logits),
                 *vocab,
                 *top_k,
                 *renormalize,
                 *scaling,
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.tensor(*weights)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*routes),
+                self.tensor(*weights),
+            ),
             // The forms no builder makes.
-            Linear::MoeRoute { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            Linear::MoeRoute { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Linear::GroupRoutes { groups, routes } => {
                 kernels_slang::linear::moe::route::group_routes(
-                    &self.slang(),
+                    self.ctx,
                     *groups,
-                    crate::encode::slang_tensor(self.tensor(*routes)),
+                    self.tensor(*routes),
                 )
-                .map_err(crate::encode::from_slang)
             }
 
             Linear::MatmulGrouped {
@@ -438,32 +399,28 @@ impl Run<'_> {
                 groups,
                 y,
             } => kernels_slang::linear::moe::select::matmul_grouped(
-                &self.slang(),
+                self.ctx,
                 self.tier(),
-                crate::encode::slang_tensor(self.tensor(*x)),
+                self.tensor(*x),
                 match self.banked(*w) {
-                    Some(bank) => kernels_slang::linear::moe::select::GroupedPlane::Bank(
-                        crate::encode::slang_bank(bank),
-                    ),
-                    None => kernels_slang::linear::moe::select::GroupedPlane::Dense(
-                        crate::encode::slang_tensor(self.tensor(*w)),
-                    ),
+                    Some(bank) => kernels_slang::linear::moe::select::GroupedPlane::Bank(bank),
+                    None => {
+                        kernels_slang::linear::moe::select::GroupedPlane::Dense(self.tensor(*w))
+                    }
                 },
-                crate::encode::slang_tensor(self.tensor(*routes)),
+                self.tensor(*routes),
                 *groups,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
             Linear::MoeMatmulSelect { x, bank, routes, y } => {
                 kernels_slang::linear::moe::select::matmul_select(
-                    &self.slang(),
+                    self.ctx,
                     self.tier(),
-                    crate::encode::slang_tensor(self.tensor(*x)),
-                    crate::encode::slang_tensor(self.tensor(*bank)),
-                    crate::encode::slang_tensor(self.tensor(*routes)),
-                    crate::encode::slang_tensor(self.tensor(*y)),
+                    self.tensor(*x),
+                    self.tensor(*bank),
+                    self.tensor(*routes),
+                    self.tensor(*y),
                 )
-                .map_err(crate::encode::from_slang)
             }
 
             Linear::MoeMatmulSelectBias {
@@ -505,15 +462,14 @@ impl Run<'_> {
                     return Ok(());
                 }
                 kernels_slang::linear::moe::select::matmul_select_bias(
-                    &self.slang(),
+                    self.ctx,
                     self.tier(),
-                    crate::encode::slang_tensor(self.tensor(*x)),
-                    crate::encode::slang_bank(planes),
-                    crate::encode::slang_tensor(bias_plane),
-                    crate::encode::slang_tensor(routed),
-                    crate::encode::slang_tensor(self.tensor(*y)),
+                    self.tensor(*x),
+                    planes,
+                    bias_plane,
+                    routed,
+                    self.tensor(*y),
                 )
-                .map_err(crate::encode::from_slang)
             }
 
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
@@ -541,14 +497,13 @@ impl Run<'_> {
                     return Ok(());
                 }
                 kernels_slang::linear::moe::select::matmul_select_quant(
-                    &self.slang(),
+                    self.ctx,
                     self.tier(),
-                    crate::encode::slang_tensor(self.tensor(*x)),
-                    crate::encode::slang_bank(planes),
-                    crate::encode::slang_tensor(routed),
-                    crate::encode::slang_tensor(self.tensor(*y)),
+                    self.tensor(*x),
+                    planes,
+                    routed,
+                    self.tensor(*y),
                 )
-                .map_err(crate::encode::from_slang)
             }
 
             Linear::LoraCorrect {
@@ -559,23 +514,21 @@ impl Run<'_> {
                 y: _,
                 y_out,
             } => kernels_slang::linear::lora::correct(
-                &self.slang(),
+                self.ctx,
                 kernels_slang::Tier::Baseline,
-                crate::encode::slang_tensor(self.tensor(*x)),
-                crate::encode::slang_tensor(self.tensor(*bank_a)),
-                crate::encode::slang_tensor(self.tensor(*bank_b)),
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.tensor(*y_out)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*x),
+                self.tensor(*bank_a),
+                self.tensor(*bank_b),
+                self.tensor(*routes),
+                self.tensor(*y_out),
+            ),
             Linear::MoeWeightedSum { routed, weights, y } => {
                 kernels_slang::linear::moe::combine::weighted_sum(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*routed)),
-                    crate::encode::slang_tensor(self.tensor(*weights)),
-                    crate::encode::slang_tensor(self.tensor(*y)),
+                    self.ctx,
+                    self.tensor(*routed),
+                    self.tensor(*weights),
+                    self.tensor(*y),
                 )
-                .map_err(crate::encode::from_slang)
             }
 
             Linear::MoeBiasSum {
@@ -593,14 +546,13 @@ impl Run<'_> {
                         None => (self.tensor(*bias), self.tensor(*routes)),
                     };
                 kernels_slang::linear::moe::combine::bias_sum(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*x)),
-                    crate::encode::slang_tensor(bias_plane),
-                    crate::encode::slang_tensor(routed),
-                    crate::encode::slang_tensor(self.tensor(*weights)),
-                    crate::encode::slang_tensor(self.tensor(*y)),
+                    self.ctx,
+                    self.tensor(*x),
+                    bias_plane,
+                    routed,
+                    self.tensor(*weights),
+                    self.tensor(*y),
                 )
-                .map_err(crate::encode::from_slang)
             }
             Linear::MoeSigmoidGateAdd {
                 routed,
@@ -608,13 +560,12 @@ impl Run<'_> {
                 gate,
                 y,
             } => kernels_slang::linear::moe::combine::sigmoid_gate_add(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*routed)),
-                crate::encode::slang_tensor(self.tensor(*shared)),
-                crate::encode::slang_tensor(self.tensor(*gate)),
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*routed),
+                self.tensor(*shared),
+                self.tensor(*gate),
+                self.tensor(*y),
+            ),
         }
     }
 }
@@ -624,14 +575,14 @@ impl Run<'_> {
 /// beat kernels-wgpu's one-row kernel at every row count from 1 to 11 where
 /// four rows lost at two (kernels-slang.md §17).
 fn qmm_ladder(
-    tuning: &kernels_wgpu::Tuning,
+    tuning: &crate::tuning::Tuning,
     rows: u32,
     columns: u32,
     contraction: u32,
-    bank: kernels_wgpu::Bank,
+    bank: kernels_slang::Bank,
 ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    use crate::tuning::Qmm;
     use kernels_slang::linear::qmm::Qmm as Rung;
-    use kernels_wgpu::tuning::Qmm;
     let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
     tuning
         .qmm(&at)
@@ -658,42 +609,23 @@ impl Run<'_> {
     fn batched(
         &self,
         op: &'static str,
-        x: kernels_wgpu::Tensor,
-        bank: kernels_wgpu::Bank,
-        bias: Option<kernels_wgpu::Tensor>,
-        routes: kernels_wgpu::Tensor,
+        x: kernels_slang::Tensor,
+        bank: kernels_slang::Bank,
+        bias: Option<kernels_slang::Tensor>,
+        routes: kernels_slang::Tensor,
         experts: u32,
-        scratch: linear::moe::RoutedScratch,
-        y: kernels_wgpu::Tensor,
-    ) -> Result<bool, kernels_wgpu::Error> {
-        use crate::encode::slang_tensor as st;
+        scratch: kernels_slang::linear::moe::select::RoutedScratch,
+        y: kernels_slang::Tensor,
+    ) -> Result<bool, kernels_slang::Error> {
         let pairs = y.rows;
         let batch = kernels_slang::linear::moe::select::Batch {
-            tile: linear::moe::tile_rows(pairs, experts, self.tuning()),
-            padded: linear::moe::sorted_rows(pairs, experts, self.tuning()),
+            tile: self.tuning().moe_tile_rows(pairs, experts),
+            padded: self.tuning().moe_sorted_rows(pairs, experts),
             tier: kernels_slang::Tier::Baseline,
             sort_lanes: 256,
         };
-        let scratch = kernels_slang::linear::moe::select::RoutedScratch {
-            perm: st(scratch.perm),
-            row_expert: st(scratch.row_expert),
-            tile_expert: st(scratch.tile_expert),
-            inv: st(scratch.inv),
-            x: st(scratch.x),
-            y: st(scratch.y),
-        };
         kernels_slang::linear::moe::select::matmul_select_batched(
-            &self.slang(),
-            op,
-            st(x),
-            crate::encode::slang_bank(bank),
-            bias.map(st),
-            st(routes),
-            experts,
-            scratch,
-            st(y),
-            batch,
+            self.ctx, op, x, bank, bias, routes, experts, scratch, y, batch,
         )
-        .map_err(crate::encode::from_slang)
     }
 }

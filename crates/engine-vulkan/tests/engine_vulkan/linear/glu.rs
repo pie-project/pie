@@ -5,7 +5,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 /// A unit of the gate and the up, as the reference reads it.
 type Unit = Box<dyn Fn(f64, f64) -> f64>;
@@ -70,7 +70,7 @@ fn the_glus_answer_the_reference() {
                 })
                 .collect();
             let (pt, iu) = (b(p, rows, 2 * inter), inter as u32);
-            both(
+            landed(
                 &mut gpu,
                 &format!("{what} {inter}"),
                 &|g| vec![(g.zeros(n), n, false)],
@@ -113,7 +113,7 @@ fn the_glus_answer_the_reference() {
         let mut want: Vec<f64> = (0..n).map(|i| f(gr[i], ur[i])).collect();
         want.push(7.0);
         let (gt, ut) = (b(gate, r, w), b(up, r, w));
-        both(
+        landed(
             &mut gpu,
             what,
             &|g| vec![(g.up(&vec![7.0; n + 1]).0, n + 1, false)],

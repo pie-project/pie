@@ -4,7 +4,7 @@
 //! serves no communicator, so the test plays the rank; the rendezvous is
 //! the frame's own ordering.
 
-use engine_wgpu::Slang;
+use engine_wgpu::Sink;
 use kernels_slang::{ArgValue, Encode, Error, Fire, Tensor, collective::band};
 use poem_ir::Dtype;
 
@@ -16,7 +16,7 @@ const SLOT_BYTES: u32 = 8192 * 4;
 
 /// A context that is rank `RANK` of a `WORLD`-rank communicator over `band`.
 struct Ranked<'a> {
-    inner: &'a Slang<'a>,
+    inner: &'a Sink<'a>,
     band: u32,
 }
 
@@ -106,7 +106,7 @@ fn case(gpu: &mut Gpu, op: Op, dtype: Dtype, n: usize) {
     };
     let xt = Tensor::new(x, 1, n as u32, dtype);
     let yt = Tensor::new(y, 1, out_n as u32, dtype);
-    gpu.run_slang(|inner| {
+    gpu.run(|inner| {
         let c = &Ranked { inner, band };
         match op {
             Op::Reduce => band::all_reduce(c, xt),
@@ -114,14 +114,13 @@ fn case(gpu: &mut Gpu, op: Op, dtype: Dtype, n: usize) {
             Op::Scatter => band::reduce_scatter(c, xt, yt),
         }
     });
-    let who = "slang ";
     let got = down(gpu, dtype, y, out_n);
     if matches!(op, Op::Gather) {
         let exact: Vec<f32> = want.iter().map(|w| *w as f32).collect();
-        assert_eq!(got, exact, "{who}{op:?} {dtype:?} {n}");
-        eprintln!("{who}{op:?} {dtype:?} {n}: exact");
+        assert_eq!(got, exact, "{op:?} {dtype:?} {n}");
+        eprintln!("{op:?} {dtype:?} {n}: exact");
     } else {
-        close(&got, &want, &format!("{who}{op:?} {dtype:?} {n}"));
+        close(&got, &want, &format!("{op:?} {dtype:?} {n}"));
     }
     // The band's other slots are the other ranks': the collective leaves them.
     let after = down(gpu, dtype, band, slot * WORLD as usize);
@@ -129,7 +128,7 @@ fn case(gpu: &mut Gpu, op: Op, dtype: Dtype, n: usize) {
         assert_eq!(
             after[r * slot..][..slot],
             held[r * slot..][..slot],
-            "{who}{op:?} {dtype:?} {n}: rank {r}'s slot"
+            "{op:?} {dtype:?} {n}: rank {r}'s slot"
         );
     }
 }

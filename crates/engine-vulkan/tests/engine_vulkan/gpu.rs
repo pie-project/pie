@@ -157,7 +157,7 @@ pub type Fires<'a> = &'a dyn Fn(&Gpu, &[Out]);
 
 /// Run `fires` on the outputs `fresh` makes, and compare each landed output
 /// with its reference.
-pub fn both(
+pub fn landed(
     gpu: &mut Gpu,
     what: &str,
     fresh: &dyn Fn(&mut Gpu) -> Vec<Out>,

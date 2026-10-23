@@ -1,4 +1,4 @@
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 use poem_compiler::CompiledModel;
 use poem_exec::fire::{MaskSpan, WindowTable, fallback};
 use poem_exec::store::check::{self, rebase};

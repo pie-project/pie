@@ -3,7 +3,7 @@
 //! (Sinkhorn-balanced), fold, collapse, and the trunk's mix, inject and PLE
 //! gate.
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
@@ -37,7 +37,7 @@ fn the_hyper_connections_answer_the_reference() {
 
     // expand
     let want: Vec<f64> = (0..N * wide).map(|i| xr[(i / wide) * H + i % H]).collect();
-    both(
+    landed(
         &mut gpu,
         "hc expand",
         &|g| vec![(g.zeros(N * wide), N * wide, false)],
@@ -55,7 +55,7 @@ fn the_hyper_connections_answer_the_reference() {
             sr[i] / (ms + f64::from(eps)).sqrt()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc rmsnorm f32",
         &|g| vec![(g.zeros(2 * N * wide), N * wide, true)],
@@ -134,7 +134,7 @@ fn the_hyper_connections_answer_the_reference() {
                 .sum::<f64>()
         }));
     }
-    both(
+    landed(
         &mut gpu,
         "hc gates",
         &|g| {
@@ -178,7 +178,7 @@ fn the_hyper_connections_answer_the_reference() {
             acc
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc fold",
         &|g| vec![(g.zeros(N * wide), N * wide, false)],
@@ -213,7 +213,7 @@ fn the_hyper_connections_answer_the_reference() {
                 .sum()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc collapse",
         &|g| vec![(g.zeros(N * H), N * H, false)],
@@ -246,7 +246,7 @@ fn the_hyper_connections_answer_the_reference() {
                 / M as f64
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc mix",
         &|g| vec![(g.zeros(N * H), N * H, false)],
@@ -275,7 +275,7 @@ fn the_hyper_connections_answer_the_reference() {
             hr[i] + 2.0 * sigmoid(sgr[n * M + s] / M as f64) * xr[n * H + k]
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc inject",
         &|g| vec![(g.up(&hv).0, N * wide, false)],
@@ -313,7 +313,7 @@ fn the_hyper_connections_answer_the_reference() {
             sigmoid(damped) * xr[n * H + k]
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "ple gate",
         &|g| vec![(g.zeros(N * wide), N * wide, false)],

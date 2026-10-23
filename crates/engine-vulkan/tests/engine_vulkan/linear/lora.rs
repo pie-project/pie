@@ -6,7 +6,7 @@ use kernels_slang::Tensor;
 use kernels_slang::Tier;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -53,7 +53,7 @@ fn the_lora_correction_answers_the_reference() {
     let bt = t(b, adapters, out * rank, Dtype::Bf16);
     let rt = t(routes, rows, 1, Dtype::I32);
     for tier in [Tier::Subgroup, Tier::Baseline] {
-        both(
+        landed(
             &mut gpu,
             &format!("lora at {}", tier.name()),
             &|g| vec![(g.up(&y0).0, rows * out, false)],

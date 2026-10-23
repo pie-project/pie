@@ -1,11 +1,11 @@
 //! The paged KV append on the first Vulkan device, against a host reference:
 //! keys and values written into their pages, and the shared form that writes
-//! the keys to both.
+//! the keys to landed.
 
 use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -47,7 +47,7 @@ fn the_kv_append_answers_the_reference() {
     };
     let kt = Tensor::new(k, 3, row as u32, Dtype::Bf16);
     let vt = Tensor::new(v, 3, row as u32, Dtype::Bf16);
-    both(
+    landed(
         &mut gpu,
         "kv append",
         &|g| {
@@ -70,7 +70,7 @@ fn the_kv_append_answers_the_reference() {
             })
         },
     );
-    both(
+    landed(
         &mut gpu,
         "kv append shared",
         &|g| {

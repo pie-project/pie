@@ -1,8 +1,7 @@
 //! The port cast on the first wgpu device against an exact host reference:
 //! f32 cells cast into bf16 seats of one store, seats starting and ending
 //! mid-word and sharing words with their neighbours, all in one frame, the
-//! store's other elements left as they were. engine-wgpu has no
-//! hand-written twin.
+//! store's other elements left as they were.
 
 use poem_ir::Dtype;
 
@@ -35,7 +34,7 @@ fn the_port_cast_answers_the_reference() {
                 want[at + i] = widen(bf16(*x));
             }
         }
-        gpu.run_slang(|c| {
+        gpu.run(|c| {
             for (cell, at, v) in &cells {
                 kernels_slang::runtime::port::cast(
                     c,
@@ -47,7 +46,7 @@ fn the_port_cast_answers_the_reference() {
             Ok(())
         });
         let got = gpu.down(store, STORE);
-        assert_eq!(got, want, "slang port cast {frames:?}");
-        eprintln!("slang port cast {frames:?}: exact");
+        assert_eq!(got, want, "port cast {frames:?}");
+        eprintln!("port cast {frames:?}: exact");
     }
 }

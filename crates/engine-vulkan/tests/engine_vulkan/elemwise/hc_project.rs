@@ -1,7 +1,7 @@
 //! The hyper-connection mix projection on the first Vulkan device against an
 //! f64 host reference: f32 normed streams into a layer's mix row.
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
@@ -29,7 +29,7 @@ fn the_hc_projection_answers_the_reference() {
                 .sum()
         })
         .collect();
-    both(
+    landed(
         &mut gpu,
         "hc project",
         &|g| vec![(g.zeros(2 * N * mix_hc), N * mix_hc, true)],

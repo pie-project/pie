@@ -1,17 +1,13 @@
 //! The vector point of the affine-quantized matmul on the first wgpu
-//! adapter, beside the hand-written kernel, against an f64 host reference:
+//! adapter against an f64 host reference:
 //! 2, 4 and 8 bits, groups of 32 to 128, one to eight activation rows a
 //! workgroup over row counts that leave a workgroup part full.
 
 use kernels_slang::linear::qmm::{self, Qmm};
-use kernels_wgpu::{Arg, Bank, Encode, Fire, Tensor};
+use kernels_slang::{Bank, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
+use crate::gpu::{Gpu, landed, noise};
 
 /// Random codes, `bits` wide, packed low first.
 fn codes(seed: u64, words: usize) -> Vec<u32> {
@@ -57,13 +53,6 @@ fn the_vector_point_answers_the_reference() {
             group: group as u32,
             bits,
         };
-        let sbank = kernels_slang::Bank {
-            codes: st(bank.codes),
-            scales: st(bank.scales),
-            biases: bank.biases.map(st),
-            group: bank.group,
-            bits,
-        };
         for (m, vecs) in [(1usize, 1u32), (3, 2), (5, 4), (9, 8), (6, 4)] {
             let (x, xr) = gpu.up(&noise(7 + m as u64, m * k));
             let xt = t(x, m, k, Dtype::Bf16);
@@ -75,38 +64,14 @@ fn the_vector_point_answers_the_reference() {
                         .sum()
                 })
                 .collect();
-            // The WGSL kernel reads one activation row a workgroup.
-            let hand: &'static str =
-                Box::leak(format!("affine_qmv_bf16_gs_{group}_b_{bits}").into_boxed_str());
-            both(
+            landed(
                 &mut gpu,
                 &format!("qmv {bits} bits, group {group}, {m} x {n}, {vecs} a workgroup"),
                 &|g| vec![(g.zeros(m * n), m * n, false)],
                 std::slice::from_ref(&want),
                 &|g, o| {
                     let y = t(o[0].0, m, n, Dtype::Bf16);
-                    g.run(|c| {
-                        c.fire(
-                            Fire::at("quant/qmv.wgsl", hand)
-                                .groups([m as u32, (n as u32).div_ceil(8), 1])
-                                .group([32, 2, 1]),
-                            &[
-                                bank.codes.arg(),
-                                bank.scales.arg(),
-                                bank.biases.expect("affine").arg(),
-                                xt.arg(),
-                                y.arg_mut(),
-                                (k as i32).arg(),
-                                (n as i32).arg(),
-                            ],
-                        )
-                    });
-                },
-                &|g, o| {
-                    let y = st(t(o[0].0, m, n, Dtype::Bf16));
-                    g.run_slang(|c| {
-                        qmm::matmul(c, &[Qmm::Qmv { vecs }], st(xt), sbank, y, m as u32)
-                    });
+                    g.run(|c| qmm::matmul(c, &[Qmm::Qmv { vecs }], xt, bank, y, m as u32));
                 },
             );
         }

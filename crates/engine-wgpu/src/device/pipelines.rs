@@ -2,8 +2,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kernels_wgpu::Fire;
-
 use crate::error::{Fault, Result};
 
 use super::ctx::{Context, Core};
@@ -11,7 +9,6 @@ use super::ctx::{Context, Core};
 pub struct Pipeline {
     pub name: &'static str,
 
-    pub tier: kernels_wgpu::Capability,
     pub(crate) pipeline: wgpu::ComputePipeline,
     pub(crate) layout: wgpu::BindGroupLayout,
 
@@ -212,10 +209,6 @@ impl Pipelines {
         self.compiles.get()
     }
 
-    pub fn warm(&self, device: &Context, fire: Fire) -> Result<()> {
-        self.get(device, fire).map(|_| ())
-    }
-
     #[must_use]
     pub fn bind_traffic(&self) -> (u64, u64) {
         (self.bind_hits.get(), self.bind_misses.get())
@@ -301,84 +294,29 @@ impl Pipelines {
         group
     }
 
-    pub fn get(&self, device: &Context, fire: Fire) -> Result<Arc<Pipeline>> {
-        let entrypoint = fire.entrypoint;
-        if let Some(pipeline) = self.built.borrow().get(entrypoint) {
+    /// The pipeline of kernels-slang's module `key` (an instantiation at a
+    /// tier, `kernels_slang::key`), from `file`; built on first use.
+    pub fn get(
+        &self,
+        device: &Context,
+        file: &'static str,
+        key: &'static str,
+    ) -> Result<Arc<Pipeline>> {
+        if let Some(pipeline) = self.built.borrow().get(key) {
             return Ok(Arc::clone(pipeline));
         }
-
+        let wgsl = kernels_slang::wgsl(key).ok_or(Fault::Shader {
+            file,
+            entrypoint: key,
+            why: "kernels-slang holds no WGSL module by that key (built without \
+                  `kernels-slang/wgsl`, or the instantiation is limited to SPIR-V)"
+                .to_string(),
+        })?;
+        let wgsl = without_subgroup_enable(&promote_storage(wgsl));
         let cache = self.cache(device);
-        // kernels-slang's entries come compiled: one WGSL module, no tiers.
-        if let Some(wgsl) = kernels_slang::wgsl(entrypoint) {
-            let wgsl = without_subgroup_enable(&promote_storage(wgsl));
-            let pipeline = Arc::new(build(
-                device.core(),
-                cache.as_ref(),
-                fire,
-                entrypoint,
-                kernels_wgpu::Capability::Baseline,
-                &wgsl,
-            )?);
-            self.compiles.set(self.compiles.get() + 1);
-            self.built
-                .borrow_mut()
-                .insert(entrypoint, Arc::clone(&pipeline));
-            return Ok(pipeline);
-        }
-
-        let mut tiers = device.tiers();
-        tiers.push(kernels_wgpu::Capability::Baseline);
-        let mut last = None;
-        let mut built = None;
-        for tier in tiers {
-            let Ok(expanded) = kernels_wgpu::sources::at(entrypoint, tier) else {
-                continue;
-            };
-            let name: &'static str = match tier {
-                kernels_wgpu::Capability::Baseline => entrypoint,
-                other => Box::leak(other.variant(entrypoint).into_boxed_str()),
-            };
-            // A variant past the adapter's workgroup limits is not
-            // built: a lower tier stands in, and the baseline says why.
-            let invocations: u32 = expanded.workgroup.iter().product();
-            let bytes = kernels_wgpu::sources::workgroup_bytes(&expanded.wgsl);
-            let (max_invocations, max_bytes) = device.workgroup_limits();
-            if invocations > max_invocations || bytes > u64::from(max_bytes) {
-                let fault = Fault::Shader {
-                    file: fire.file,
-                    entrypoint,
-                    why: format!(
-                        "{invocations} invocations and {bytes} B of workgroup memory, past this \
-                         adapter's {max_invocations} and {max_bytes} B"
-                    ),
-                };
-                if tier == kernels_wgpu::Capability::Baseline {
-                    return Err(fault);
-                }
-                last = Some(fault);
-                continue;
-            }
-            let wgsl = promote_storage(&expanded.wgsl);
-            match build(device.core(), cache.as_ref(), fire, name, tier, &wgsl) {
-                Ok(pipeline) => {
-                    built = Some(pipeline);
-                    break;
-                }
-                Err(fault) if tier != kernels_wgpu::Capability::Baseline => last = Some(fault),
-                Err(fault) => return Err(fault),
-            }
-        }
-        let pipeline = Arc::new(built.ok_or_else(|| {
-            last.unwrap_or(Fault::Shader {
-                file: fire.file,
-                entrypoint,
-                why: "the kernel table holds no variant by that name".to_string(),
-            })
-        })?);
+        let pipeline = Arc::new(build(device.core(), cache.as_ref(), file, key, &wgsl)?);
         self.compiles.set(self.compiles.get() + 1);
-        self.built
-            .borrow_mut()
-            .insert(entrypoint, Arc::clone(&pipeline));
+        self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
     }
 
@@ -453,16 +391,14 @@ fn compile(
     core: &Arc<Core>,
     cache: Option<&wgpu::PipelineCache>,
     name: &'static str,
-    tier: kernels_wgpu::Capability,
     wgsl: &str,
 ) -> std::result::Result<wgpu::ComputePipeline, String> {
-    let wgsl = kernels_wgpu::with_enables(wgsl, tier);
     crate::guest::validated(core, "create_compute_pipeline", || {
         let module = core
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(name),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&wgsl)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(wgsl)),
             });
         core.device
             .create_compute_pipeline(&descriptor(name, &module, cache))
@@ -472,22 +408,20 @@ fn compile(
 fn build(
     core: &Arc<Core>,
     cache: Option<&wgpu::PipelineCache>,
-    fire: Fire,
+    file: &'static str,
     name: &'static str,
-    tier: kernels_wgpu::Capability,
     wgsl: &str,
 ) -> Result<Pipeline> {
     let shader = |why: String| Fault::Shader {
-        file: fire.file,
-        entrypoint: fire.entrypoint,
+        file,
+        entrypoint: name,
         why,
     };
     let declared = reflect(wgsl).map_err(shader)?;
-    let pipeline = compile(core, cache, name, tier, wgsl).map_err(shader)?;
+    let pipeline = compile(core, cache, name, wgsl).map_err(shader)?;
     let layout = pipeline.get_bind_group_layout(0);
     Ok(Pipeline {
         name,
-        tier,
         pipeline,
         layout,
         bindings: declared.bindings,

@@ -1,11 +1,10 @@
-//! The rotary kernels on the first wgpu adapter against an f64 host reference,
-//! beside the hand-written kernels: by halves at a span (full, partial,
-//! proportional), the rotated tail (halves or interleaved, forward or back,
-//! with and without a YaRN ramp), and whole-head YaRN.
+//! The rotary kernels on the first wgpu adapter against an f64 host
+//! reference: by halves at a span (full, partial, proportional), the rotated
+//! tail (halves or interleaved, forward or back, with and without a YaRN
+//! ramp), and whole-head YaRN.
 
 use crate::gpu::{Gpu, close, noise};
-use kernels_wgpu::Tensor;
-use kernels_wgpu::elemwise::{rope, rope_mrope};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 const ROWS: usize = 3;
@@ -58,7 +57,6 @@ fn the_ropes_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let pos = gpu.up_i32(&POSITIONS);
     let pt = Tensor::new(pos, ROWS as u32, 1, Dtype::I32);
     let theta = 10_000.0f32;
@@ -79,49 +77,21 @@ fn the_ropes_answer_the_reference() {
         let wq = turn(&qr, head_dim, pairs, rotary / 2, angle, 1.0);
         let wk = turn(&kr, head_dim, pairs, rotary / 2, angle, 1.0);
         let shape = format!("head {head_dim}, rotary {rotary}, span {span}");
-        for slang in [false, true] {
-            let who = if slang { "slang " } else { "" };
-            let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
-            let (hd, rd, sp) = (head_dim as u32, rotary as u32, span as u32);
-            match (slang, rotary == head_dim) {
-                (false, true) => gpu.run(|c| rope::full(c, t(q), t(k), pt, hd, theta, false)),
-                (false, false) => gpu.run(|c| rope::partial(c, t(q), t(k), pt, rd, hd, theta, sp)),
-                (true, true) => gpu.run_slang(|c| {
-                    kernels_slang::elemwise::rope::full(
-                        c,
-                        st(t(q)),
-                        st(t(k)),
-                        st(pt),
-                        hd,
-                        theta,
-                        false,
-                    )
-                }),
-                (true, false) => gpu.run_slang(|c| {
-                    kernels_slang::elemwise::rope::partial(
-                        c,
-                        st(t(q)),
-                        st(t(k)),
-                        st(pt),
-                        rd,
-                        hd,
-                        theta,
-                        sp,
-                    )
-                }),
-            }
-            close(&gpu.down(q, n), &wq, &format!("{who}rope q {shape}"));
-            close(&gpu.down(k, n), &wk, &format!("{who}rope k {shape}"));
-            let (q, _) = gpu.up(&qv);
-            if slang {
-                gpu.run_slang(|c| {
-                    kernels_slang::elemwise::rope::partial_q(c, st(t(q)), st(pt), rd, hd, theta, sp)
-                });
-            } else {
-                gpu.run(|c| rope::partial_q(c, t(q), pt, rd, hd, theta, sp));
-            }
-            close(&gpu.down(q, n), &wq, &format!("{who}rope q alone {shape}"));
+        let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+        let (hd, rd, sp) = (head_dim as u32, rotary as u32, span as u32);
+        match rotary == head_dim {
+            true => gpu
+                .run(|c| kernels_slang::elemwise::rope::full(c, t(q), t(k), pt, hd, theta, false)),
+            false => gpu.run(|c| {
+                kernels_slang::elemwise::rope::partial(c, t(q), t(k), pt, rd, hd, theta, sp)
+            }),
         }
+        close(&gpu.down(q, n), &wq, &format!("rope q {shape}"));
+        close(&gpu.down(k, n), &wk, &format!("rope k {shape}"));
+        let (q, _) = gpu.up(&qv);
+        gpu.run(|c| kernels_slang::elemwise::rope::partial_q(c, t(q), pt, rd, hd, theta, sp));
+
+        close(&gpu.down(q, n), &wq, &format!("rope q alone {shape}"));
     }
 
     // The rotated tail.
@@ -131,7 +101,7 @@ fn the_ropes_answer_the_reference() {
     let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
     let qv = noise(77, n);
     let (_, qr) = gpu.up(&qv);
-    let yarn = rope::Yarn {
+    let yarn = kernels_slang::elemwise::rope::Yarn {
         factor: 4.0,
         beta_fast: 32.0,
         beta_slow: 1.0,
@@ -177,7 +147,7 @@ fn the_ropes_answer_the_reference() {
                 let (hd, rd) = (head_dim as u32, rotary as u32);
                 let (q, _) = gpu.up(&qv);
                 gpu.run(|c| {
-                    rope::partial_last(
+                    kernels_slang::elemwise::rope::partial_last(
                         c,
                         t(q),
                         pt,
@@ -190,27 +160,6 @@ fn the_ropes_answer_the_reference() {
                     )
                 });
                 close(&gpu.down(q, n), &want, &format!("rope tail {shape}"));
-                let (q, _) = gpu.up(&qv);
-                let sy = kernels_slang::elemwise::rope::Yarn {
-                    factor: yarn.factor,
-                    beta_fast: yarn.beta_fast,
-                    beta_slow: yarn.beta_slow,
-                    original_max_position: yarn.original_max_position,
-                };
-                gpu.run_slang(|c| {
-                    kernels_slang::elemwise::rope::partial_last(
-                        c,
-                        st(t(q)),
-                        st(pt),
-                        rd,
-                        hd,
-                        theta,
-                        interleaved,
-                        inverse,
-                        ramped_tail.then_some(sy),
-                    )
-                });
-                close(&gpu.down(q, n), &want, &format!("slang rope tail {shape}"));
             }
         }
     }
@@ -246,55 +195,34 @@ fn the_ropes_answer_the_reference() {
         let wq = turn(&qr, head_dim, pairs, half, angle, f64::from(mscale));
         let wk = turn(&kr, head_dim, pairs, half, angle, f64::from(mscale));
         let hd = head_dim as u32;
-        for slang in [false, true] {
-            let who = if slang { "slang " } else { "" };
-            let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
-            if slang {
-                gpu.run_slang(|c| {
-                    kernels_slang::elemwise::rope::yarn(
-                        c,
-                        st(t(q)),
-                        st(t(k)),
-                        st(pt),
-                        hd,
-                        theta,
-                        4.0,
-                        32.0,
-                        1.0,
-                        mscale,
-                        4096,
-                        interleaved,
-                    )
-                });
-            } else {
-                gpu.run(|c| {
-                    rope::yarn(
-                        c,
-                        t(q),
-                        t(k),
-                        pt,
-                        hd,
-                        theta,
-                        4.0,
-                        32.0,
-                        1.0,
-                        mscale,
-                        4096,
-                        interleaved,
-                    )
-                });
-            }
-            close(
-                &gpu.down(q, n),
-                &wq,
-                &format!("{who}rope yarn q interleaved {interleaved}"),
-            );
-            close(
-                &gpu.down(k, n),
-                &wk,
-                &format!("{who}rope yarn k interleaved {interleaved}"),
-            );
-        }
+        let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+        gpu.run(|c| {
+            kernels_slang::elemwise::rope::yarn(
+                c,
+                t(q),
+                t(k),
+                pt,
+                hd,
+                theta,
+                4.0,
+                32.0,
+                1.0,
+                mscale,
+                4096,
+                interleaved,
+            )
+        });
+
+        close(
+            &gpu.down(q, n),
+            &wq,
+            &format!("rope yarn q interleaved {interleaved}"),
+        );
+        close(
+            &gpu.down(k, n),
+            &wk,
+            &format!("rope yarn k interleaved {interleaved}"),
+        );
     }
 }
 
@@ -384,7 +312,6 @@ fn the_mropes_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let triples: [[i32; 3]; ROWS] = [[0, 0, 0], [5, 2, 3], [900, 31, 17]];
     let flat: Vec<i32> = triples.iter().flatten().copied().collect();
     let pos = gpu.up_i32(&flat);
@@ -428,33 +355,23 @@ fn the_mropes_answer_the_reference() {
         let s3 = sections.map(|s| s as u32);
         let (rd, hd) = (rotary as u32, head_dim as u32);
         let shape = format!("sections {sections:?}, rotary {rotary}, head {head_dim}");
-        for slang in [false, true] {
-            let who = if slang { "slang " } else { "" };
-            let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
-            let (qt, kt) = (t(q, q_heads), t(k, k_heads));
-            if slang {
-                let (qt, kt, pt) = (st(qt), st(kt), st(pt));
-                gpu.run_slang(|c| match form {
-                    Mrope::Interleaved => kernels_slang::elemwise::rope::mrope_interleaved(
-                        c, qt, kt, pt, s3, rd, hd, theta,
-                    ),
-                    Mrope::Blocked => kernels_slang::elemwise::rope::mrope_blocked(
-                        c, qt, kt, pt, s3, rd, hd, theta,
-                    ),
-                    Mrope::Split => {
-                        kernels_slang::elemwise::rope::mrope_split(c, qt, kt, pt, s3, rd, hd, theta)
-                    }
-                });
-            } else {
-                gpu.run(|c| match form {
-                    Mrope::Interleaved => rope_mrope::interleaved(c, qt, kt, pt, s3, rd, hd, theta),
-                    Mrope::Blocked => rope_mrope::blocked(c, qt, kt, pt, s3, rd, hd, theta),
-                    Mrope::Split => rope_mrope::split(c, qt, kt, pt, s3, rd, hd, theta),
-                });
+        let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+        let (qt, kt) = (t(q, q_heads), t(k, k_heads));
+        let (qt, kt, pt) = (qt, kt, pt);
+        gpu.run(|c| match form {
+            Mrope::Interleaved => {
+                kernels_slang::elemwise::rope::mrope_interleaved(c, qt, kt, pt, s3, rd, hd, theta)
             }
-            close(&gpu.down(q, qn), &wq, &format!("{who}mrope q {shape}"));
-            close(&gpu.down(k, kn), &wk, &format!("{who}mrope k {shape}"));
-        }
+            Mrope::Blocked => {
+                kernels_slang::elemwise::rope::mrope_blocked(c, qt, kt, pt, s3, rd, hd, theta)
+            }
+            Mrope::Split => {
+                kernels_slang::elemwise::rope::mrope_split(c, qt, kt, pt, s3, rd, hd, theta)
+            }
+        });
+
+        close(&gpu.down(q, qn), &wq, &format!("mrope q {shape}"));
+        close(&gpu.down(k, kn), &wk, &format!("mrope k {shape}"));
     }
 }
 
@@ -535,7 +452,6 @@ fn the_axis_ropes_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st = |t: Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let heads = 4usize;
     for (form, dims, rotary, head_dim) in [
         (0u8, vec![16usize, 24, 24], 64usize, 80usize),
@@ -579,20 +495,16 @@ fn the_axis_ropes_answer_the_reference() {
             _ => kernels_slang::elemwise::rope::RopeForm::SplitLadder,
         };
         let (y, _) = gpu.up(&xv);
-        gpu.run_slang(|c| {
-            kernels_slang::elemwise::rope::axes(c, st(t(y)), st(pt), dims, thetas, sf, rd, hd)
-        });
-        close(&gpu.down(y, n), &want, &format!("slang rope axes {shape}"));
+        gpu.run(|c| kernels_slang::elemwise::rope::axes(c, t(y), pt, dims, thetas, sf, rd, hd));
+        close(&gpu.down(y, n), &want, &format!("rope axes {shape}"));
         let y = gpu.up_f32(&xv);
         let ft = Tensor::new(y, ROWS as u32, width as u32, Dtype::F32);
-        gpu.run_slang(|c| {
-            kernels_slang::elemwise::rope::axes(c, st(ft), st(pt), dims, thetas, sf, rd, hd)
-        });
+        gpu.run(|c| kernels_slang::elemwise::rope::axes(c, ft, pt, dims, thetas, sf, rd, hd));
         let want = axes_reference(&xv, heads, head_dim, &dims_u, &th64, form, rotary, &posv);
         close(
             &gpu.down_f32(y, n),
             &want,
-            &format!("slang rope axes f32 {shape}"),
+            &format!("rope axes f32 {shape}"),
         );
     }
 }

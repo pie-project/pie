@@ -5,7 +5,7 @@
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, both, noise};
+use crate::gpu::{Gpu, landed, noise};
 
 #[test]
 fn the_gdn_gates_answer_the_reference() {
@@ -37,7 +37,7 @@ fn the_gdn_gates_answer_the_reference() {
     let dtt = t(dtb, 1, heads, Dtype::Bf16);
     let alt = t(alb, 1, heads, Dtype::F32);
     let n = rows * 2 * heads;
-    both(
+    landed(
         &mut gpu,
         "gdn gates",
         &|g| vec![(g.up_f32(&vec![0.0; n]), n, true)],
