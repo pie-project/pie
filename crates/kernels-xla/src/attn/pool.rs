@@ -8,10 +8,10 @@
 
 use dtype::Dtype;
 
-use super::ssm::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 /// Keys per step of the pooled readers' flash loop.

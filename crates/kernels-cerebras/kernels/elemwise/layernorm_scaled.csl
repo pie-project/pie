@@ -1,0 +1,25 @@
+// y = (x - mean) / sqrt(var + eps) * w + b over rows of a column block:
+// row r's block sums sit in st[r * 2 * parts ..][0..parts] and its sums of
+// squares in the parts after, over `full` columns.
+fn k_layernorm_scaled(x: [*]f32, w: [*]f32, b: [*]f32, st: [*]f32, y: [*]f32, rows: i32, width: i32, parts: i32, full: i32, eps: f32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var sum: f32 = 0.0;
+    var ss: f32 = 0.0;
+    var c: i32 = 0;
+    while (c < parts) : (c += 1) {
+      sum = sum + st[r * 2 * parts + c];
+      ss = ss + st[r * 2 * parts + parts + c];
+    }
+    var mean: f32 = sum / @as(f32, full);
+    var variance: f32 = ss / @as(f32, full) - mean * mean;
+    if (variance < 0.0) { variance = 0.0; }
+    var inv: f32 = 1.0 / math.sqrt_f32(variance + eps);
+    var base: i32 = r * width;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) {
+      y[base + i] = (x[base + i] - mean) * inv * w[i] + b[i];
+    }
+  }
+}
+

@@ -1,14 +1,17 @@
 pub mod attn;
 pub mod collective;
+pub mod conv;
 pub mod cx;
 pub mod elemwise;
 pub mod error;
+pub mod gather;
 pub mod hlo;
-pub mod layout;
+pub mod lanes;
 pub mod linear;
 pub mod mosaic;
 pub mod pack;
-pub mod spatial;
+pub mod sampling;
+pub mod ssm;
 pub mod tensor;
 pub mod tuning;
 

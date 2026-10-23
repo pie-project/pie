@@ -81,7 +81,7 @@ pub fn topk_softmax(
             cx.shard(&wb, tile);
         }
         let _ = lrows;
-        cx.library("k_topk_softmax");
+        cx.library("linear/topk_softmax");
         cx.call(
             "k_topk_softmax",
             vec![
@@ -120,7 +120,7 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
             cx.over(rg);
             cx.shard(&rb, Shard::Rows(rg));
         }
-        cx.library("k_group_routes");
+        cx.library("linear/group_routes");
         cx.call(
             "k_group_routes",
             vec![
@@ -326,7 +326,7 @@ fn select_impl(
             cx.read(y)?;
             let yb = cx.write(y)?;
             let yb = cx.view_as(&yb, yd.rows, yd.width)?;
-            cx.library("k_moe_select");
+            cx.library("linear/moe_select");
             cx.call(
                 "k_moe_select",
                 vec![
@@ -453,7 +453,7 @@ fn select_impl(
         };
         let y_words = plan.plane_words(&plan.cols[1]);
         let hdr = cx.lanes(plan)?;
-        cx.library("k_moe_select");
+        cx.library("linear/moe_select");
         cx.call(
             "k_moe_select",
             vec![
@@ -571,7 +571,7 @@ pub fn weighted_sum(
                 },
             );
         }
-        cx.library("k_moe_weighted_sum");
+        cx.library("linear/moe_weighted_sum");
         cx.call(
             "k_moe_weighted_sum",
             vec![
@@ -638,7 +638,7 @@ pub fn sigmoid_gate_add(
                 },
             );
         }
-        cx.library("k_moe_gate_add");
+        cx.library("linear/moe_gate_add");
         cx.call(
             "k_moe_gate_add",
             vec![

@@ -673,7 +673,7 @@ fn fold_of(rows: u64, row: u64) -> (u64, u64) {
 /// The sub-byte bank codes planes every reader of which is an embedding
 /// gather. They land folded, codes as the packed bytes of their rows
 /// (`u8 [V/128, 128·bytes]`), scales and zero points `[V/128, 128·groups]`
-/// (`kernels_xla::layout::folding`): the TPU lays a 2-D array out with the
+/// (`kernels_xla::gather::folding`): the TPU lays a 2-D array out with the
 /// axis that tiles evenly minor, so a `[V, row]` table lands column-major and
 /// every gather relayouts all of it first (gpt-oss's 201088-row embedding:
 /// 1.75 ms a step as `u4` codes, 0.78 ms as bytes).

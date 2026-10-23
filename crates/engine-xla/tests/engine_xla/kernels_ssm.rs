@@ -2,7 +2,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::attn::ssm::{self, Committed};
+use kernels_xla::lanes::Committed;
+use kernels_xla::ssm;
 use kernels_xla::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
@@ -931,7 +932,7 @@ fn the_block_dyn_conv_moves_its_taps_per_row() {
         let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
         if !b
             .run(|ctx| {
-                ssm::block_dyn_conv(
+                ssm::dyn_conv::block_dyn_conv(
                     ctx,
                     RaggedTensor {
                         data: x,

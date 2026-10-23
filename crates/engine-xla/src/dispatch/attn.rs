@@ -1,15 +1,14 @@
 use kernels_xla::attn;
-use kernels_xla::spatial;
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::VoxelSegment;
 use poem_ir::{Attn, IndexScore, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
-fn segment(segment: VoxelSegment) -> spatial::Segment {
+fn segment(segment: VoxelSegment) -> kernels_xla::attn::voxel::Segment {
     match segment {
-        VoxelSegment::Clip => spatial::Segment::Lane,
-        VoxelSegment::Frames(n) => spatial::Segment::Frames(n),
+        VoxelSegment::Clip => kernels_xla::attn::voxel::Segment::Lane,
+        VoxelSegment::Frames(n) => kernels_xla::attn::voxel::Segment::Frames(n),
     }
 }
 
@@ -35,7 +34,7 @@ impl Run<'_> {
                 segment: how,
                 sm_scale,
                 o,
-            } => spatial::attention(
+            } => kernels_xla::attn::voxel::attention(
                 self.ctx(),
                 self.tensor(*q),
                 self.tensor(*k),

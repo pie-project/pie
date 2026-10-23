@@ -1,0 +1,11 @@
+// y[m, n] = sum_k a[m, k] * w[n, k]; a is [m, k], w is [n, k], y is [m, n].
+fn k_matmul(a: [*]f32, w: [*]f32, y: [*]f32, m: i32, k: i32, n: i32) void {
+  var i: i32 = 0;
+  while (i < m) : (i += 1) {
+    var j: i32 = 0;
+    while (j < n) : (j += 1) {
+      y[i * n + j] = k_dot(a, i * k, w, j * k, k);
+    }
+  }
+}
+

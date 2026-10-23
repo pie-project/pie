@@ -1,0 +1,9 @@
+// routes[r][g] = g: the identity routing of `groups` slices a row.
+fn k_group_routes(routes: [*]i32, rows: i32, groups: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var g: i32 = 0;
+    while (g < groups) : (g += 1) { routes[r * groups + g] = g; }
+  }
+}
+

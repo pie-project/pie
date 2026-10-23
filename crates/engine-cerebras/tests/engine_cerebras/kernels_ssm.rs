@@ -5,7 +5,7 @@ use crate::common;
 use common::data;
 use dtype::Dtype;
 use engine_cerebras::bench::{Bench, assert_close, round_bf16};
-use kernels_cerebras::attn::ssm;
+use kernels_cerebras::ssm;
 use kernels_cerebras::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;

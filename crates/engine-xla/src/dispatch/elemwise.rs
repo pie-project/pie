@@ -41,54 +41,58 @@ impl Run<'_> {
                 eps,
                 y,
                 axis: NormAxis::Row,
-            } => elemwise::norm::rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm(l.f(), x_v, weight_v, *eps)?;
+                l.land(o_y, v)
+            }),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::Scale(weight),
                 axis: NormAxis::Head(head_dim),
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_per_head(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm_per_head(l.f(), x_v, weight_v, *head_dim, *eps)?;
+                l.land(o_y, v)
+            }),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),
                 eps,
                 y,
                 axis: NormAxis::Row,
-            } => elemwise::norm::rmsnorm_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm_plus_one(l.f(), x_v, weight_v, *eps)?;
+                l.land(o_y, v)
+            }),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),
                 axis: NormAxis::Head(head_dim),
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_per_head_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm_per_head_plus_one(
+                    l.f(),
+                    x_v,
+                    weight_v,
+                    *head_dim,
+                    *eps,
+                )?;
+                l.land(o_y, v)
+            }),
             // Muse Spark's post-norm gate is served on CUDA.
             Elemwise::NormGate { .. } => Err(kernels_xla::Error::Unsupported {
                 op: "elemwise.norm_gate",
@@ -107,13 +111,12 @@ impl Run<'_> {
                 eps,
                 y,
                 weight: NormWeight::None,
-            } => elemwise::norm::rmsnorm_no_scale(
-                self.ctx(),
-                self.tensor(*x),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm_no_scale(l.f(), x_v, *head_dim, *eps)?;
+                l.land(o_y, v)
+            }),
 
             Elemwise::Layernorm {
                 x,
@@ -121,33 +124,40 @@ impl Run<'_> {
                 bias: Some(bias),
                 eps,
                 y,
-            } => elemwise::norm::layernorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                self.tensor(*bias),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let bias_v = l.read(self.tensor(*bias))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::layernorm(l.f(), x_v, weight_v, bias_v, *eps)?;
+                l.land(o_y, v)
+            }),
 
             Elemwise::Clamp {
                 x,
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp(self.ctx(), *lo, *hi, self.tensor(*x)),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::clip::clamp(l.f(), *lo, *hi, x_v)?;
+                l.land(o_x, v)
+            }),
 
             Elemwise::ClampLearned {
                 x,
                 lo,
                 hi,
                 x_out: _,
-            } => elemwise::clip::clamp_learned(
-                self.ctx(),
-                self.tensor(*lo),
-                self.tensor(*hi),
-                self.tensor(*x),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let lo_v = l.read(self.tensor(*lo))?;
+                let hi_v = l.read(self.tensor(*hi))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::clip::clamp_learned(l.f(), lo_v, hi_v, x_v)?;
+                l.land(o_x, v)
+            }),
 
             Elemwise::Layernorm {
                 x,
@@ -155,26 +165,33 @@ impl Run<'_> {
                 y,
                 weight: None,
                 bias: None,
-            } => elemwise::norm::layernorm_no_scale(
-                self.ctx(),
-                self.tensor(*x),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::layernorm_no_scale(l.f(), x_v, *eps, o_y.landing())?;
+                l.land(o_y, v)
+            }),
             Elemwise::Modulate {
                 x,
                 m,
                 lane_of_row,
                 form,
                 y,
-            } => elemwise::act::modulate(
-                self.ctx(),
-                modulate_form(*form),
-                self.tensor(*x),
-                self.per_lane(*m, *lane_of_row),
-                lane_of_row.map(|lanes| self.tensor(lanes)),
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let m_v = l.read(self.per_lane(*m, *lane_of_row))?;
+                let lane_of_row_v = l.read_opt(lane_of_row.map(|lanes| self.tensor(lanes)))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::act::modulate(
+                    l.f(),
+                    modulate_form(*form),
+                    x_v,
+                    m_v,
+                    lane_of_row_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Elemwise::GatedResidualAdd {
                 r,
                 g,
@@ -183,14 +200,22 @@ impl Run<'_> {
                 r_out: _,
             } => {
                 let r = self.tensor(*r);
-                elemwise::act::gated_residual_add(
-                    self.ctx(),
-                    r,
-                    self.per_lane(*g, *lane_of_row),
-                    self.tensor(*y),
-                    lane_of_row.map(|lanes| self.tensor(lanes)),
-                    r,
-                )
+                crate::lower::lower(self.ctx(), |l| {
+                    let r_v = l.read(r)?;
+                    let g_v = l.read(self.per_lane(*g, *lane_of_row))?;
+                    let y_v = l.read(self.tensor(*y))?;
+                    let lane_of_row_v = l.read_opt(lane_of_row.map(|lanes| self.tensor(lanes)))?;
+                    let o_r_out = r;
+                    let v = elemwise::act::gated_residual_add(
+                        l.f(),
+                        r_v,
+                        g_v,
+                        y_v,
+                        lane_of_row_v,
+                        o_r_out.landing(),
+                    )?;
+                    l.land(o_r_out, v)
+                })
             }
             Elemwise::Sinusoid {
                 t,
@@ -199,15 +224,20 @@ impl Run<'_> {
                 flip_sin_cos,
                 scale,
                 y,
-            } => elemwise::act::sinusoid(
-                self.ctx(),
-                self.tensor(*t),
-                *dim,
-                *max_period,
-                *flip_sin_cos,
-                *scale,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let t_v = l.read(self.tensor(*t))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::act::sinusoid(
+                    l.f(),
+                    t_v,
+                    *dim,
+                    *max_period,
+                    *flip_sin_cos,
+                    *scale,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Elemwise::RelativeBucketBias {
                 embedding,
                 max_len,
@@ -215,43 +245,70 @@ impl Run<'_> {
                 max_distance,
                 bidirectional,
                 y,
-            } => elemwise::act::relative_bucket_bias(
-                self.ctx(),
-                self.tensor(*embedding),
-                *max_len,
-                *num_buckets,
-                *max_distance,
-                *bidirectional,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let embedding_v = l.read(self.tensor(*embedding))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::act::relative_bucket_bias(
+                    l.f(),
+                    embedding_v,
+                    *max_len,
+                    *num_buckets,
+                    *max_distance,
+                    *bidirectional,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Elemwise::Silu { x, x_out: _ } => {
                 let x = self.tensor(*x);
-                elemwise::act::silu(self.ctx(), x, x)
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(x)?;
+                    let o_o = x;
+                    let v = elemwise::act::silu(l.f(), x_v, o_o.landing())?;
+                    l.land(o_o, v)
+                })
             }
             Elemwise::Gelu { x, tanh, x_out: _ } => {
                 let x = self.tensor(*x);
                 if *tanh {
-                    elemwise::act::gelu_tanh(self.ctx(), x, x)
+                    crate::lower::lower(self.ctx(), |l| {
+                        let x_v = l.read(x)?;
+                        let o_o = x;
+                        let v = elemwise::act::gelu_tanh(l.f(), x_v, o_o.landing())?;
+                        l.land(o_o, v)
+                    })
                 } else {
-                    elemwise::act::gelu_erf(self.ctx(), x, x)
+                    crate::lower::lower(self.ctx(), |l| {
+                        let x_v = l.read(x)?;
+                        let o_o = x;
+                        let v = elemwise::act::gelu_erf(l.f(), x_v, o_o.landing())?;
+                        l.land(o_o, v)
+                    })
                 }
             }
             Elemwise::Tanh { x, x_out: _ } => {
                 let x = self.tensor(*x);
-                elemwise::act::tanh(self.ctx(), x, x)
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(x)?;
+                    let o_o = x;
+                    let v = elemwise::act::tanh(l.f(), x_v, o_o.landing())?;
+                    l.land(o_o, v)
+                })
             }
-            Elemwise::Mul { x, y, z } => elemwise::act::mul(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*z),
-            ),
-            Elemwise::Add { x, y, z } => elemwise::act::add(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*z),
-            ),
+            Elemwise::Mul { x, y, z } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let y_v = l.read(self.tensor(*y))?;
+                let o_z = self.tensor(*z);
+                let v = elemwise::act::mul(l.f(), x_v, y_v, o_z.landing())?;
+                l.land(o_z, v)
+            }),
+            Elemwise::Add { x, y, z } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let y_v = l.read(self.tensor(*y))?;
+                let o_z = self.tensor(*z);
+                let v = elemwise::act::add(l.f(), x_v, y_v, o_z.landing())?;
+                l.land(o_z, v)
+            }),
             Elemwise::RopeAxes {
                 x,
                 positions,
@@ -263,22 +320,28 @@ impl Run<'_> {
                 x_out: _,
             } => {
                 let x = self.tensor(*x);
-                elemwise::act::rope_axes(
-                    self.ctx(),
-                    x,
-                    self.tensor(*positions),
-                    *dims,
-                    *thetas,
-                    match form {
-                        RopeForm::Interleaved => elemwise::act::RopeForm::Interleaved,
-                        RopeForm::Neox => elemwise::act::RopeForm::Neox,
-                        RopeForm::Split => elemwise::act::RopeForm::Split,
-                        RopeForm::SplitLadder => elemwise::act::RopeForm::SplitLadder,
-                    },
-                    *rotary_dim,
-                    *head_dim,
-                    x,
-                )
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(x)?;
+                    let positions_v = l.read(self.tensor(*positions))?;
+                    let o_o = x;
+                    let v = elemwise::act::rope_axes(
+                        l.f(),
+                        x_v,
+                        positions_v,
+                        *dims,
+                        *thetas,
+                        match form {
+                            RopeForm::Interleaved => elemwise::act::RopeForm::Interleaved,
+                            RopeForm::Neox => elemwise::act::RopeForm::Neox,
+                            RopeForm::Split => elemwise::act::RopeForm::Split,
+                            RopeForm::SplitLadder => elemwise::act::RopeForm::SplitLadder,
+                        },
+                        *rotary_dim,
+                        *head_dim,
+                        o_o.landing(),
+                    )?;
+                    l.land(o_o, v)
+                })
             }
             Elemwise::GateSigmoidMulHeads {
                 x,
@@ -286,13 +349,13 @@ impl Run<'_> {
                 head_dim,
                 scale,
                 x_out: _,
-            } => elemwise::gate::sigmoid_mul_heads(
-                self.ctx(),
-                self.tensor(*gate),
-                *head_dim,
-                *scale,
-                self.tensor(*x),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gate_v = l.read(self.tensor(*gate))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::gate::sigmoid_mul_heads(l.f(), gate_v, *head_dim, *scale, x_v)?;
+                l.land(o_x, v)
+            }),
 
             Elemwise::Rmsnorm {
                 x,
@@ -300,56 +363,67 @@ impl Run<'_> {
                 axis: NormAxis::Group(group),
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_grouped_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *group,
-                *eps,
-                self.tensor(*y),
-            ),
-            Elemwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::norm::silu_scaled(self.ctx(), *s, self.tensor(*x))
-            }
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let o_y = self.tensor(*y);
+                let v =
+                    elemwise::norm::rmsnorm_grouped_plus_one(l.f(), x_v, weight_v, *group, *eps)?;
+                l.land(o_y, v)
+            }),
+            Elemwise::SiluScaled { s, x, x_out: _ } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::norm::silu_scaled(l.f(), *s, x_v)?;
+                l.land(o_x, v)
+            }),
             Elemwise::HcMix {
                 gates,
                 normed,
                 streams,
                 y,
-            } => elemwise::hc::mix(
-                self.ctx(),
-                self.tensor(*gates),
-                self.tensor(*normed),
-                *streams,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gates_v = l.read(self.tensor(*gates))?;
+                let normed_v = l.read(self.tensor(*normed))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::hc::mix(l.f(), gates_v, normed_v, *streams, o_y.landing())?;
+                l.land(o_y, v)
+            }),
             Elemwise::HcInject {
                 o,
                 gates,
                 streams,
                 hyper,
                 hyper_out: _,
-            } => elemwise::hc::inject(
-                self.ctx(),
-                self.tensor(*o),
-                self.tensor(*gates),
-                *streams,
-                self.tensor(*hyper),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gates_v = l.read(self.tensor(*gates))?;
+                let o_v = l.read(self.tensor(*o))?;
+                let hyper_v = l.read(self.tensor(*hyper))?;
+                let o_hyper = self.tensor(*hyper);
+                let v = elemwise::hc::inject(l.f(), o_v, gates_v, *streams, hyper_v)?;
+                l.land(o_hyper, v)
+            }),
             Elemwise::PleGate {
                 key,
                 query,
                 value,
                 streams,
                 y,
-            } => elemwise::hc::ple_gate(
-                self.ctx(),
-                self.tensor(*key),
-                self.tensor(*query),
-                self.tensor(*value),
-                *streams,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let value_v = l.read(self.tensor(*value))?;
+                let key_v = l.read(self.tensor(*key))?;
+                let query_v = l.read(self.tensor(*query))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::hc::ple_gate(
+                    l.f(),
+                    key_v,
+                    query_v,
+                    value_v,
+                    *streams,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
 
             // A scaleless gated norm runs on CUDA alone (Muse Spark's).
             Elemwise::RmsnormGated { weight: None, .. } => {
@@ -363,16 +437,23 @@ impl Run<'_> {
                 eps,
                 act,
                 y,
-            } => elemwise::norm::rmsnorm_gated(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                matches!(act, poem_ir::GateActivation::Sigmoid),
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let gate_v = l.read(self.tensor(*gate))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm_gated(
+                    l.f(),
+                    x_v,
+                    gate_v,
+                    weight_v,
+                    *head_dim,
+                    *eps,
+                    matches!(act, poem_ir::GateActivation::Sigmoid),
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Elemwise::RmsnormGatedBy {
                 x,
                 gate,
@@ -380,15 +461,22 @@ impl Run<'_> {
                 heads,
                 eps,
                 y,
-            } => elemwise::norm::rmsnorm_gated_by(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
-                *heads,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let gate_v = l.read(self.tensor(*gate))?;
+                let weight_v = l.read(self.tensor(*weight))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm_gated_by(
+                    l.f(),
+                    x_v,
+                    gate_v,
+                    weight_v,
+                    *heads,
+                    *eps,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Elemwise::ResidualAdd { x, y, y_out: _ } => {
                 // A readout-rowed `x` into a token-rowed `y` (an MTP head
                 // over the trunk's hidden rows): the GPU kernel adds row
@@ -400,31 +488,52 @@ impl Run<'_> {
                 } else {
                     y
                 };
-                elemwise::norm::residual_add(self.ctx(), x, y)
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(x)?;
+                    let y_v = l.read(y)?;
+                    let o_y = y;
+                    let v = elemwise::norm::residual_add(l.f(), x_v, y_v)?;
+                    l.land(o_y, v)
+                })
             }
             Elemwise::AddBias {
                 bias,
                 out,
                 out_out: _,
-            } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let bias_v = l.read(self.tensor(*bias))?;
+                let out_v = l.read(self.tensor(*out))?;
+                let o_out = self.tensor(*out);
+                let v = elemwise::norm::add_bias(l.f(), bias_v, out_v)?;
+                l.land(o_out, v)
+            }),
 
             Elemwise::Standardize {
                 x,
                 bias,
                 scale,
                 x_out: _,
-            } => elemwise::norm::standardize(
-                self.ctx(),
-                self.tensor(*bias),
-                self.tensor(*scale),
-                self.tensor(*x),
-            ),
-            Elemwise::MulScalar { s, x, x_out: _ } => {
-                elemwise::norm::mul_scalar(self.ctx(), *s, self.tensor(*x))
-            }
-            Elemwise::Scale { s, x, x_out: _ } => {
-                elemwise::norm::scale(self.ctx(), self.tensor(*s), self.tensor(*x))
-            }
+            } => crate::lower::lower(self.ctx(), |l| {
+                let bias_v = l.read(self.tensor(*bias))?;
+                let scale_v = l.read(self.tensor(*scale))?;
+                let out_v = l.read(self.tensor(*x))?;
+                let o_out = self.tensor(*x);
+                let v = elemwise::norm::standardize(l.f(), bias_v, scale_v, out_v)?;
+                l.land(o_out, v)
+            }),
+            Elemwise::MulScalar { s, x, x_out: _ } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::norm::mul_scalar(l.f(), *s, x_v)?;
+                l.land(o_x, v)
+            }),
+            Elemwise::Scale { s, x, x_out: _ } => crate::lower::lower(self.ctx(), |l| {
+                let s_v = l.read(self.tensor(*s))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::norm::scale(l.f(), s_v, x_v)?;
+                l.land(o_x, v)
+            }),
             Elemwise::ResBlend {
                 prefix,
                 blocks,
@@ -435,15 +544,26 @@ impl Run<'_> {
             } => {
                 let y = self.tensor(*y);
                 let blocks = self.stacked_blocks(blocks, y)?;
-                elemwise::norm::res_blend(
-                    self.ctx(),
-                    self.tensor(*prefix),
-                    &blocks,
-                    self.tensor(*weight),
-                    *eps,
-                    self.tensor(*proj),
-                    y,
-                )
+                crate::lower::lower(self.ctx(), |l| {
+                    let blocks_v = blocks
+                        .iter()
+                        .map(|t| l.read(*t))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let prefix_v = l.read(self.tensor(*prefix))?;
+                    let weight_v = l.read(self.tensor(*weight))?;
+                    let proj_v = l.read(self.tensor(*proj))?;
+                    let o_y = y;
+                    let v = elemwise::norm::res_blend(
+                        l.f(),
+                        prefix_v,
+                        &blocks_v,
+                        weight_v,
+                        *eps,
+                        proj_v,
+                        o_y.landing(),
+                    )?;
+                    l.land(o_y, v)
+                })
             }
 
             Elemwise::RopeFull {
@@ -456,15 +576,29 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope::full(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *head_dim,
-                *theta,
-                *interleaved,
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let k_v = l.read(self.tensor(*k))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                let o_k = self.tensor(*k);
+                let vs = elemwise::rope::full(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    *head_dim,
+                    *theta,
+                    *interleaved,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            }),
             Elemwise::RopePartial {
                 q,
                 k,
@@ -476,16 +610,30 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope::partial(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *rotary_dim,
-                *head_dim,
-                *theta,
-                *span,
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let k_v = l.read(self.tensor(*k))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                let o_k = self.tensor(*k);
+                let vs = elemwise::rope::partial(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                    *span,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            }),
             Elemwise::RopeMrope {
                 q,
                 k,
@@ -498,16 +646,30 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::interleaved(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *sections,
-                *rotary_dim,
-                *head_dim,
-                *theta,
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let k_v = l.read(self.tensor(*k))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                let o_k = self.tensor(*k);
+                let vs = elemwise::rope_mrope::interleaved(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    *sections,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            }),
 
             Elemwise::RopeMrope {
                 q,
@@ -521,16 +683,30 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::split(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *sections,
-                *rotary_dim,
-                *head_dim,
-                *theta,
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let k_v = l.read(self.tensor(*k))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                let o_k = self.tensor(*k);
+                let vs = elemwise::rope_mrope::split(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    *sections,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            }),
 
             Elemwise::RopeMrope {
                 q,
@@ -544,16 +720,30 @@ impl Run<'_> {
                 freqs: None,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope_mrope::blocked(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *sections,
-                *rotary_dim,
-                *head_dim,
-                *theta,
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let k_v = l.read(self.tensor(*k))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                let o_k = self.tensor(*k);
+                let vs = elemwise::rope_mrope::blocked(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    *sections,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            }),
             Elemwise::RopePartialQ {
                 q,
                 positions,
@@ -563,15 +753,23 @@ impl Run<'_> {
                 span,
                 freqs: None,
                 q_out: _,
-            } => elemwise::rope::partial_q(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
-                *rotary_dim,
-                *head_dim,
-                *theta,
-                *span,
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                if let Some(v) = elemwise::rope::partial_q(
+                    l.f(),
+                    q_v,
+                    positions_v,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                    *span,
+                )? {
+                    l.land(o_q, v)?;
+                }
+                Ok(())
+            }),
             Elemwise::RopePartialLast {
                 q,
                 positions,
@@ -582,22 +780,30 @@ impl Run<'_> {
                 inverse,
                 yarn,
                 q_out: _,
-            } => elemwise::rope::partial_last(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
-                *rotary_dim,
-                *head_dim,
-                *theta,
-                *interleaved,
-                *inverse,
-                yarn.map(|y| elemwise::rope::Yarn {
-                    factor: y.factor,
-                    beta_fast: y.beta_fast,
-                    beta_slow: y.beta_slow,
-                    original_max_position: y.original_max_position,
-                }),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                if let Some(v) = elemwise::rope::partial_last(
+                    l.f(),
+                    q_v,
+                    positions_v,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                    *interleaved,
+                    *inverse,
+                    yarn.map(|y| elemwise::rope::Yarn {
+                        factor: y.factor,
+                        beta_fast: y.beta_fast,
+                        beta_slow: y.beta_slow,
+                        original_max_position: y.original_max_position,
+                    }),
+                )? {
+                    l.land(o_q, v)?;
+                }
+                Ok(())
+            }),
             Elemwise::RopeYarn {
                 q,
                 k,
@@ -612,43 +818,75 @@ impl Run<'_> {
                 interleaved,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope::yarn(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *head_dim,
-                *theta,
-                *factor,
-                *beta_fast,
-                *beta_slow,
-                *attention_factor,
-                *original_max_position,
-                *interleaved,
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let q_v = l.read(self.tensor(*q))?;
+                let k_v = l.read(self.tensor(*k))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_q = self.tensor(*q);
+                let o_k = self.tensor(*k);
+                let vs = elemwise::rope::yarn(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    *head_dim,
+                    *theta,
+                    *factor,
+                    *beta_fast,
+                    *beta_slow,
+                    *attention_factor,
+                    *original_max_position,
+                    *interleaved,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            }),
 
             Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
+                crate::lower::lower(self.ctx(), |l| {
+                    let gate_v = l.read(self.tensor(*gate))?;
+                    let x_v = l.read(self.tensor(*x))?;
+                    let o_x = self.tensor(*x);
+                    let v = elemwise::gate::sigmoid_mul(l.f(), gate_v, x_v)?;
+                    l.land(o_x, v)
+                })
             }
 
-            Elemwise::HcExpand { x, streams, y } => {
-                elemwise::hc::expand(self.ctx(), self.tensor(*x), *streams, self.tensor(*y))
-            }
-            Elemwise::HcRmsnormF32 { streams, eps, y } => {
-                elemwise::hc::rmsnorm_f32(self.ctx(), self.tensor(*streams), *eps, self.tensor(*y))
-            }
+            Elemwise::HcExpand { x, streams, y } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::hc::expand(l.f(), x_v, *streams, o_y.landing())?;
+                l.land(o_y, v)
+            }),
+            Elemwise::HcRmsnormF32 { streams, eps, y } => crate::lower::lower(self.ctx(), |l| {
+                let streams_v = l.read(self.tensor(*streams))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::hc::rmsnorm_f32(l.f(), streams_v, *eps, o_y.landing())?;
+                l.land(o_y, v)
+            }),
             Elemwise::HcProject {
                 normed,
                 weight,
                 stream_count,
                 mixes,
-            } => elemwise::hc::project(
-                self.ctx(),
-                self.tensor(*normed),
-                self.tensor(*weight),
-                *stream_count,
-                self.tensor(*mixes),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let normed_v = l.read(self.tensor(*normed))?;
+                let hc_fn_v = l.read(self.tensor(*weight))?;
+                let o_mixes = self.tensor(*mixes);
+                let v = elemwise::hc::project(
+                    l.f(),
+                    normed_v,
+                    hc_fn_v,
+                    *stream_count,
+                    o_mixes.landing(),
+                )?;
+                l.land(o_mixes, v)
+            }),
             // The independent form (no combine) is landed on CUDA alone.
             Elemwise::HcGates { comb: false, .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
@@ -666,20 +904,33 @@ impl Run<'_> {
                 x,
                 post_mix,
                 comb_mix,
-            } => elemwise::hc::gates(
-                self.ctx(),
-                self.tensor(*normed),
-                self.tensor(*streams),
-                self.tensor(*scale),
-                self.tensor(*base),
-                *stream_count,
-                *gate_eps,
-                *alpha,
-                *sinkhorn,
-                self.tensor(*x),
-                self.tensor(*post_mix),
-                self.tensor(*comb_mix),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let normed_v = l.read(self.tensor(*normed))?;
+                let scale_v = l.read(self.tensor(*scale))?;
+                let base_v = l.read(self.tensor(*base))?;
+                let streams_v = l.read(self.tensor(*streams))?;
+                let o_x = self.tensor(*x);
+                let o_post_mix = self.tensor(*post_mix);
+                let o_comb_mix = self.tensor(*comb_mix);
+                let (v0, v1, v2) = elemwise::hc::gates(
+                    l.f(),
+                    normed_v,
+                    streams_v,
+                    scale_v,
+                    base_v,
+                    *stream_count,
+                    *gate_eps,
+                    *alpha,
+                    *sinkhorn,
+                    o_x.landing(),
+                    o_post_mix.landing(),
+                    o_comb_mix.landing(),
+                )?;
+                l.land(o_post_mix, v0)?;
+                l.land(o_comb_mix, v1)?;
+                l.land(o_x, v2)?;
+                Ok(())
+            }),
             Elemwise::HcCollapse {
                 mixes,
                 streams,
@@ -688,30 +939,46 @@ impl Run<'_> {
                 stream_count,
                 hc_eps,
                 y,
-            } => elemwise::hc::collapse(
-                self.ctx(),
-                self.tensor(*mixes),
-                self.tensor(*streams),
-                self.tensor(*scale),
-                self.tensor(*base),
-                *stream_count,
-                *hc_eps,
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let mixes_v = l.read(self.tensor(*mixes))?;
+                let streams_v = l.read(self.tensor(*streams))?;
+                let scale_v = l.read(self.tensor(*scale))?;
+                let base_v = l.read(self.tensor(*base))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::hc::collapse(
+                    l.f(),
+                    mixes_v,
+                    streams_v,
+                    scale_v,
+                    base_v,
+                    *stream_count,
+                    *hc_eps,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Elemwise::HcFold {
                 x,
                 streams,
                 post_mix,
                 comb_mix,
                 y,
-            } => elemwise::hc::fold(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*streams),
-                self.tensor(*post_mix),
-                self.tensor(*comb_mix),
-                self.tensor(*y),
-            ),
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let post_mix_v = l.read(self.tensor(*post_mix))?;
+                let comb_mix_v = l.read(self.tensor(*comb_mix))?;
+                let streams_v = l.read(self.tensor(*streams))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::hc::fold(
+                    l.f(),
+                    x_v,
+                    streams_v,
+                    post_mix_v,
+                    comb_mix_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             // The XLA backend has no Hadamard/FWHT kernel; report it as
             // unsupported, the same way the wgpu and vulkan backends do.
             Elemwise::Hadamard { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),

@@ -11,7 +11,7 @@ use dtype::Dtype;
 
 use crate::error::{Error, refuse};
 use crate::hlo::{Elem, Func, Val};
-use crate::tensor::Tensor;
+use crate::tensor::{Stored, Tensor};
 
 /// What a kernel entry emits into: the engine's sink for one node (or one
 /// fire). An entry hands its body to [`Emit::emit`], which lends it a [`Cx`]
@@ -141,24 +141,34 @@ pub fn elem_of(op: &'static str, dtype: Dtype) -> Result<Elem, Error> {
 }
 
 /// Refuses unless `t` is one of `dtypes`.
-pub fn expect(op: &'static str, t: Tensor, dtypes: &[Dtype]) -> Result<(), Error> {
-    if dtypes.contains(&t.dtype) {
+pub fn expect(op: &'static str, t: impl Stored, dtypes: &[Dtype]) -> Result<(), Error> {
+    if dtypes.contains(&t.dtype()) {
         Ok(())
     } else {
-        Err(Error::DtypeUnsupported { op, dtype: t.dtype })
+        Err(Error::DtypeUnsupported {
+            op,
+            dtype: t.dtype(),
+        })
     }
 }
 
 /// Refuses unless `t` is `[rows, width]`.
-pub fn shaped(op: &'static str, what: &str, t: Tensor, rows: u32, width: u32) -> Result<(), Error> {
-    if t.rows == rows && t.width == width {
+pub fn shaped(
+    op: &'static str,
+    what: &str,
+    t: impl Stored,
+    rows: u32,
+    width: u32,
+) -> Result<(), Error> {
+    if t.rows() == rows && t.width() == width {
         Ok(())
     } else {
         Err(refuse(
             op,
             format!(
                 "the {what} is {}x{}, and this op wants {rows}x{width}",
-                t.rows, t.width
+                t.rows(),
+                t.width()
             ),
         ))
     }

@@ -6,7 +6,8 @@ use crate::common;
 
 use common::data;
 use engine_cerebras::bench::{Bench, assert_close, round_bf16};
-use kernels_cerebras::attn::dynconv;
+use kernels_cerebras::sampling::selector_walk::selector_walk;
+use kernels_cerebras::ssm::dyn_conv::block_dyn_conv;
 use kernels_cerebras::tensor::RaggedTensor;
 
 fn reference(
@@ -75,8 +76,8 @@ fn conv_case(c: usize, taps: usize, group: usize, seed: u32) {
                 data: x,
                 indptr: ip,
             };
-            dynconv::block_dyn_conv(ctx, ragged, co, ba, 0, taps as u32, group as u32, y0)?;
-            dynconv::block_dyn_conv(ctx, ragged, co, ba, 1, taps as u32, group as u32, y1)
+            block_dyn_conv(ctx, ragged, co, ba, 0, taps as u32, group as u32, y0)?;
+            block_dyn_conv(ctx, ragged, co, ba, 1, taps as u32, group as u32, y1)
         })
         .unwrap();
     if !ran {
@@ -119,7 +120,7 @@ fn a_selector_walk_picks_each_rows_best_candidate_under_the_previous_pick() {
                 data: cd,
                 indptr: ip,
             };
-            dynconv::selector_walk(ctx, ragged, un, Some(hb), tk, pr, sc, 1, picks)
+            selector_walk(ctx, ragged, un, Some(hb), tk, pr, sc, 1, picks)
         })
         .unwrap();
     if !ran {

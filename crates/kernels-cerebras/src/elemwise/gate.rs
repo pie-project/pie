@@ -29,7 +29,7 @@ pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
                 },
             );
         }
-        cx.library("k_silu_scaled");
+        cx.library("elemwise/silu_scaled");
         cx.call(
             "k_silu_scaled",
             vec![Arg::Ptr(xb), Arg::Int(n as i64), Arg::Float(s)],
@@ -72,7 +72,7 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
             cx.shard(&gb, tile);
             cx.shard(&xb, tile);
         }
-        cx.library("k_sigmoid_mul");
+        cx.library("elemwise/sigmoid_mul");
         cx.call(
             "k_sigmoid_mul",
             vec![Arg::Ptr(xb), Arg::Ptr(gb), Arg::Int(n as i64)],

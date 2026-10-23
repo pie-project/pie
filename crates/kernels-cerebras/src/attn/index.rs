@@ -100,7 +100,7 @@ pub fn kv_append(
             });
             return Ok(());
         }
-        cx.library("k_index_page_write");
+        cx.library("attn/index_page_write");
         cx.call(
             "k_index_page_write",
             vec![
@@ -179,7 +179,7 @@ fn boundary(
             });
             return Ok(());
         }
-        cx.library("k_boundary");
+        cx.library("attn/boundary");
         cx.call(
             "k_boundary",
             vec![
@@ -310,8 +310,8 @@ pub fn block_mean(
             });
             return Ok(());
         }
-        cx.library("k_index_cell");
-        cx.library("k_index_block_mean");
+        cx.library("attn/index_cell");
+        cx.library("attn/index_block_mean");
         cx.call(
             "k_index_block_mean",
             vec![
@@ -391,8 +391,8 @@ pub fn pool_kv_append(
             });
             return Ok(());
         }
-        cx.library("k_index_cell");
-        cx.library("k_index_pool_write");
+        cx.library("attn/index_cell");
+        cx.library("attn/index_pool_write");
         cx.call(
             "k_index_pool_write",
             vec![
@@ -518,8 +518,8 @@ pub fn topk(
             Some(w) => (Arg::Ptr(w.clone()), true),
             None => (Arg::Dummy("f32"), false),
         };
-        cx.library("k_index_cell");
-        cx.library("k_index_topk");
+        cx.library("attn/index_cell");
+        cx.library("attn/index_topk");
         cx.call(
             "k_index_topk",
             vec![

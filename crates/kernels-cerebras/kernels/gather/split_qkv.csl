@@ -1,0 +1,11 @@
+// packed = [q | k | v] rows cut into q (qw), k and v (kw each).
+fn k_split_qkv(src: [*]f32, q: [*]f32, k: [*]f32, v: [*]f32, rows: i32, qw: i32, kw: i32) void {
+  var width: i32 = qw + 2 * kw;
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    k_copy(q, r * qw, src, r * width, qw);
+    k_copy(k, r * kw, src, r * width + qw, kw);
+    k_copy(v, r * kw, src, r * width + qw + kw, kw);
+  }
+}
+

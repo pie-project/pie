@@ -112,7 +112,7 @@ pub fn rmsnorm_grouped_plus_one(
                 cx.shard(&wb, gain);
             }
         }
-        cx.library("k_rmsnorm_banked");
+        cx.library("elemwise/rmsnorm_banked");
         cx.call(
             "k_rmsnorm_banked",
             vec![
@@ -205,7 +205,7 @@ fn rms_row(
                 cx.shard(&xb, tile);
                 cx.shard(&yb, tile);
             }
-            cx.library("k_rmsnorm");
+            cx.library("elemwise/rmsnorm");
             cx.call(
                 "k_rmsnorm",
                 vec![
@@ -237,7 +237,7 @@ fn rms_row(
         };
         cx.shard(&xb, tile);
         cx.shard(&ss, tile);
-        cx.library("k_rowsq");
+        cx.library("elemwise/rowsq");
         cx.call(
             "k_rowsq",
             vec![
@@ -285,7 +285,7 @@ fn rms_row(
                 period: cg,
             },
         );
-        cx.library("k_rmsnorm_scaled");
+        cx.library("elemwise/rmsnorm_scaled");
         cx.call(
             "k_rmsnorm_scaled",
             vec![
@@ -377,7 +377,7 @@ pub fn rmsnorm_gated(
                 );
             }
         }
-        cx.library("k_rmsnorm_gated");
+        cx.library("elemwise/rmsnorm_gated");
         cx.call(
             "k_rmsnorm_gated",
             vec![
@@ -426,7 +426,7 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
             cx.shard(&xb, tile);
             cx.shard(&yb, tile);
         }
-        cx.library("k_residual_add");
+        cx.library("elemwise/residual_add");
         cx.call(
             "k_residual_add",
             vec![Arg::Ptr(xb), Arg::Ptr(yb), Arg::Int(n as i64)],
@@ -469,7 +469,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
             );
             cx.shard(&bb, column_split(&bb, cg));
         }
-        cx.library("k_add_bias");
+        cx.library("elemwise/add_bias");
         cx.call(
             "k_add_bias",
             vec![
@@ -556,7 +556,7 @@ pub fn layernorm(
                 cx.shard(&xb, tile);
                 cx.shard(&yb, tile);
             }
-            cx.library("k_layernorm");
+            cx.library("elemwise/layernorm");
             cx.call(
                 "k_layernorm",
                 vec![
@@ -595,7 +595,7 @@ pub fn layernorm(
                 segments: 2,
             },
         );
-        cx.library("k_rowstats");
+        cx.library("elemwise/rowstats");
         cx.call(
             "k_rowstats",
             vec![
@@ -632,7 +632,7 @@ pub fn layernorm(
                 period: cg,
             },
         );
-        cx.library("k_layernorm_scaled");
+        cx.library("elemwise/layernorm_scaled");
         cx.call(
             "k_layernorm_scaled",
             vec![

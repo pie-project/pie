@@ -51,10 +51,35 @@ fn expand_mix_inject_and_ple_gate_answer_the_host() {
     let pg = b.zeros(Dtype::Bf16, r, mh);
     if !b
         .run(|ctx| {
-            hc::expand(ctx, xt, M as u32, ex)?;
-            hc::mix(ctx, gt, nt, M as u32, mx)?;
-            hc::inject(ctx, ot, gl, M as u32, hy)?;
-            hc::ple_gate(ctx, kt, qt, xt, M as u32, pg)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xt)?;
+                let o_y = ex;
+                let v = hc::expand(l.f(), x_v, M as u32, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let gates_v = l.read(gt)?;
+                let normed_v = l.read(nt)?;
+                let o_y = mx;
+                let v = hc::mix(l.f(), gates_v, normed_v, M as u32, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let gates_v = l.read(gl)?;
+                let o_v = l.read(ot)?;
+                let hyper_v = l.read(hy)?;
+                let o_hyper = hy;
+                let v = hc::inject(l.f(), o_v, gates_v, M as u32, hyper_v)?;
+                l.land(o_hyper, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let value_v = l.read(xt)?;
+                let key_v = l.read(kt)?;
+                let query_v = l.read(qt)?;
+                let o_y = pg;
+                let v = hc::ple_gate(l.f(), key_v, query_v, value_v, M as u32, o_y.landing())?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -161,14 +186,80 @@ fn the_mhc_chain_norms_projects_gates_folds_and_collapses() {
     let col = b.zeros(Dtype::Bf16, r, h);
     if !b
         .run(|ctx| {
-            hc::rmsnorm_f32(ctx, st, 1e-6, normed)?;
-            hc::project(ctx, normed, fw, M as u32, mixes)?;
-            hc::gates(
-                ctx, mixes, st, sc, bs, M as u32, gate_eps, alpha, iters, li, post, comb,
-            )?;
-            hc::fold(ctx, xt, st, post, comb, folded)?;
-            hc::project(ctx, normed, fc, M as u32, cm)?;
-            hc::collapse(ctx, cm, st, sc, bs, M as u32, gate_eps, col)
+            engine_xla::lower::lower(ctx, |l| {
+                let streams_v = l.read(st)?;
+                let o_y = normed;
+                let v = hc::rmsnorm_f32(l.f(), streams_v, 1e-6, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let normed_v = l.read(normed)?;
+                let hc_fn_v = l.read(fw)?;
+                let o_mixes = mixes;
+                let v = hc::project(l.f(), normed_v, hc_fn_v, M as u32, o_mixes.landing())?;
+                l.land(o_mixes, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let normed_v = l.read(mixes)?;
+                let scale_v = l.read(sc)?;
+                let base_v = l.read(bs)?;
+                let streams_v = l.read(st)?;
+                let o_x = li;
+                let o_post_mix = post;
+                let o_comb_mix = comb;
+                let (v0, v1, v2) = hc::gates(
+                    l.f(),
+                    normed_v,
+                    streams_v,
+                    scale_v,
+                    base_v,
+                    M as u32,
+                    gate_eps,
+                    alpha,
+                    iters,
+                    o_x.landing(),
+                    o_post_mix.landing(),
+                    o_comb_mix.landing(),
+                )?;
+                l.land(o_post_mix, v0)?;
+                l.land(o_comb_mix, v1)?;
+                l.land(o_x, v2)?;
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xt)?;
+                let post_mix_v = l.read(post)?;
+                let comb_mix_v = l.read(comb)?;
+                let streams_v = l.read(st)?;
+                let o_y = folded;
+                let v = hc::fold(l.f(), x_v, streams_v, post_mix_v, comb_mix_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let normed_v = l.read(normed)?;
+                let hc_fn_v = l.read(fc)?;
+                let o_mixes = cm;
+                let v = hc::project(l.f(), normed_v, hc_fn_v, M as u32, o_mixes.landing())?;
+                l.land(o_mixes, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let mixes_v = l.read(cm)?;
+                let streams_v = l.read(st)?;
+                let scale_v = l.read(sc)?;
+                let base_v = l.read(bs)?;
+                let o_y = col;
+                let v = hc::collapse(
+                    l.f(),
+                    mixes_v,
+                    streams_v,
+                    scale_v,
+                    base_v,
+                    M as u32,
+                    gate_eps,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {

@@ -4,12 +4,11 @@ pub mod index;
 pub mod merge;
 pub mod mla;
 pub mod paged;
-pub mod ple;
 pub mod pool;
 pub mod ragged;
 pub mod rel;
 pub mod score;
-pub mod ssm;
+pub mod voxel;
 
 #[allow(unused_imports)]
 pub use paged::*;

@@ -1,5 +1,4 @@
-use kernels_cerebras::attn;
-use kernels_cerebras::layout;
+use kernels_cerebras::gather;
 use poem_exec::{DispatchGather, KernelError};
 use poem_ir::{Gather, Operands};
 
@@ -25,7 +24,7 @@ impl Run<'_> {
                 heads_per_ngram,
                 map,
                 ngram_ids,
-            } => attn::ple::ngram_ids(
+            } => gather::ngram::ngram_ids(
                 self.ctx(),
                 self.tensor(*ids),
                 &self.recurrent(*state),
@@ -47,7 +46,7 @@ impl Run<'_> {
                 heads_per_ngram,
                 map,
                 ngram_ids,
-            } => attn::ple::ngram_ids_chunked(
+            } => gather::ngram::ngram_ids_chunked(
                 self.ctx(),
                 self.ragged(*ids),
                 &self.recurrent(*state),
@@ -65,7 +64,7 @@ impl Run<'_> {
                 scales: None,
                 vocab,
                 y,
-            } => layout::embed_concat(
+            } => gather::embed_concat(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*table),
@@ -77,7 +76,7 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
-            } => layout::embed(
+            } => gather::embed(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*table),
@@ -89,7 +88,7 @@ impl Run<'_> {
                 head_dim,
                 q,
                 gate,
-            } => layout::split_q_gate(
+            } => gather::split_q_gate(
                 self.ctx(),
                 self.tensor(*packed),
                 *head_dim,
@@ -101,7 +100,7 @@ impl Run<'_> {
                 width,
                 left,
                 right,
-            } => layout::split_rows(
+            } => gather::split_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *width,
@@ -109,20 +108,20 @@ impl Run<'_> {
                 self.tensor(*right),
             ),
             Gather::MergeRows { x, side, y } => {
-                layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+                gather::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
             Gather::ScatterLiveRows {
                 src,
                 routes,
                 y,
                 y_out: _,
-            } => layout::scatter_live_rows(
+            } => gather::scatter_live_rows(
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
                 self.uncut(*y),
             ),
-            Gather::Rows { x, rows, y } => layout::gather_rows(
+            Gather::Rows { x, rows, y } => gather::gather_rows(
                 self.ctx(),
                 self.uncut(*x),
                 self.tensor(*rows),
@@ -135,7 +134,7 @@ impl Run<'_> {
                 q,
                 k,
                 v,
-            } => layout::split_qkv(
+            } => gather::split_qkv(
                 self.ctx(),
                 self.tensor(*packed),
                 *q_width,
@@ -150,7 +149,7 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
-            } => layout::embed_weighted(
+            } => gather::embed_weighted(
                 self.ctx(),
                 self.tensor(*ids),
                 self.tensor(*weights),

@@ -1,5 +1,5 @@
 use crate::run::Run;
-use kernels_xla::attn;
+use kernels_xla::ssm;
 use poem_exec::{DispatchSsm, KernelError};
 use poem_ir::{Operands, Ssm};
 
@@ -38,7 +38,7 @@ impl Run<'_> {
                 let seat = self.rs_seat().expect("guarded");
                 let ext_x = self.rs_extend(OP, &seat, *x)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::causal_conv1d_committed(
+                ssm::causal_conv1d_committed(
                     self.ctx(),
                     ext_x,
                     self.qo_indptr(),
@@ -61,7 +61,7 @@ impl Run<'_> {
                 let seat = self.rs_seat().expect("guarded");
                 let ext_ba = self.rs_extend(OP, &seat, *ba)?;
                 let ext_gates = self.rs_out(OP, &seat, *gates)?;
-                attn::ssm::gdn_prep(
+                ssm::gdn_prep(
                     self.ctx(),
                     ext_ba,
                     self.tensor(*dt_bias),
@@ -98,7 +98,7 @@ impl Run<'_> {
                 let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::gated_delta_committed(
+                ssm::gated_delta_committed(
                     self.ctx(),
                     ext_qkv,
                     self.qo_indptr(),
@@ -145,7 +145,7 @@ impl Run<'_> {
                 let ext_f = self.rs_extend(OP, &seat, *f)?;
                 let ext_b = self.rs_extend(OP, &seat, *b)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::kda_committed(
+                ssm::kda_committed(
                     self.ctx(),
                     ext_mixed,
                     self.qo_indptr(),
@@ -171,7 +171,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } => attn::ssm::causal_conv1d(
+            } => ssm::causal_conv1d(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
@@ -188,7 +188,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } => attn::ssm::causal_conv1d_chunked(
+            } => ssm::causal_conv1d_chunked(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
@@ -202,7 +202,7 @@ impl Run<'_> {
                 dt_bias,
                 a_log,
                 gates,
-            } => attn::ssm::gdn_prep(
+            } => ssm::gdn_prep(
                 self.ctx(),
                 self.tensor(*ba),
                 self.tensor(*dt_bias),
@@ -219,7 +219,7 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta(
+            } => ssm::gated_delta(
                 self.ctx(),
                 self.tensor(*qkv),
                 self.tensor(*z),
@@ -241,7 +241,7 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta_chunked(
+            } => ssm::gated_delta_chunked(
                 self.ctx(),
                 self.ragged(*qkv),
                 self.tensor(*z),
@@ -265,7 +265,7 @@ impl Run<'_> {
                 norm_eps,
                 gate_floor,
                 y,
-            } => attn::ssm::kda_step(
+            } => ssm::kda_step(
                 self.ctx(),
                 self.tensor(*mixed),
                 self.tensor(*f),
@@ -291,7 +291,7 @@ impl Run<'_> {
                 norm_eps,
                 gate_floor,
                 y,
-            } => attn::ssm::kda_chunked(
+            } => ssm::kda_chunked(
                 self.ctx(),
                 self.ragged(*mixed),
                 self.tensor(*f),
@@ -311,7 +311,7 @@ impl Run<'_> {
                 state,
                 conv_width,
                 y,
-            } => attn::ssm::short_conv(
+            } => ssm::short_conv(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
@@ -325,7 +325,7 @@ impl Run<'_> {
                 state,
                 conv_width,
                 y,
-            } => attn::ssm::short_conv_chunked(
+            } => ssm::short_conv_chunked(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
@@ -341,7 +341,7 @@ impl Run<'_> {
                 taps,
                 group,
                 y,
-            } => attn::ssm::block_dyn_conv(
+            } => ssm::dyn_conv::block_dyn_conv(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*coeff),

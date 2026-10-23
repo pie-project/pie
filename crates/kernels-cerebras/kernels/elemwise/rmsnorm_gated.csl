@@ -1,0 +1,34 @@
+fn k_sig_gate(v: f32, z: f32) f32 {
+  return v / (1.0 + math.exp_f32(-z));
+}
+fn k_silu_gate(v: f32, z: f32) f32 {
+  return v * z / (1.0 + math.exp_f32(-z));
+}
+// Every width-wide run: y = x * rsqrt(mean(x^2) + eps) * w * gate(z).
+fn k_rmsnorm_gated(x: [*]f32, z: [*]f32, w: [*]f32, y: [*]f32, runs: i32, width: i32, eps: f32, sigmoid: bool) void {
+  var dw = @set_dsd_base_addr(k_base_f32, w);
+  dw = @set_dsd_length(dw, @bitcast(u16, @as(i16, width)));
+  var r: i32 = 0;
+  while (r < runs) : (r += 1) {
+    var base: i32 = r * width;
+    var ss: f32 = k_dot(x, base, x, base, width);
+    var inv: f32 = 1.0 / math.sqrt_f32(ss / @as(f32, width) + eps);
+    var dx = @set_dsd_base_addr(k_base_f32, x);
+    dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, width)));
+    dx = @increment_dsd_offset(dx, @as(i16, base), f32);
+    var dz = @set_dsd_base_addr(k_base_f32, z);
+    dz = @set_dsd_length(dz, @bitcast(u16, @as(i16, width)));
+    dz = @increment_dsd_offset(dz, @as(i16, base), f32);
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, base), f32);
+    @fmuls(dy, dx, inv);
+    @fmuls(dy, dy, dw);
+    if (sigmoid) {
+      @map(k_sig_gate, dy, dz, dy);
+    } else {
+      @map(k_silu_gate, dy, dz, dy);
+    }
+  }
+}
+

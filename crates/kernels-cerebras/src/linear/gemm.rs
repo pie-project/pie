@@ -162,10 +162,10 @@ fn act_x_wt(
             cx.shard(&yb, Shard::Cols(cg));
         }
         let kernel = if packed {
-            cx.library("k_half");
-            cx.library("k_matmul_packed")
+            cx.library("prim/half");
+            cx.library("linear/matmul_packed")
         } else {
-            cx.library("k_matmul")
+            cx.library("linear/matmul")
         };
         let count = u64::from(m / rg) * u64::from(n / cg);
         let out = if fabric {
@@ -276,10 +276,10 @@ fn resident_matmul(
         let yb = cx.write(y)?;
         cx.over(pes);
         let kernel = if packed {
-            cx.library("k_half");
-            cx.library("k_matmul_packed")
+            cx.library("prim/half");
+            cx.library("linear/matmul_packed")
         } else {
-            cx.library("k_matmul")
+            cx.library("linear/matmul")
         };
         if !split {
             cx.call(
@@ -299,7 +299,7 @@ fn resident_matmul(
         cx.shard(&wb, Shard::Rows(pes));
         let part = cx.scratch("part", m64 * u64::from(nl));
         let all = cx.scratch("all", y_words);
-        cx.library("k_cols_unblock");
+        cx.library("linear/cols_unblock");
         cx.call(
             kernel,
             vec![

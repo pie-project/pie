@@ -1,0 +1,20 @@
+// waist[r][k - k0] = dot(A[routes[r]][k][i0..i1], x[r][i0..i1]) for the PE's
+// rows [r0, r1), ranks [k0, k1) and input slice [c0, c1): its down bank
+// slots are [k1 - k0][c1 - c0], its x rows (c1 - c0) wide, its waist rows
+// (k1 - k0) wide (a partial over input slices).
+fn k_lora_down(x: [*]f32, a: [*]f32, routes: [*]i32, waist: [*]f32,
+               r0: i32, r1: i32, k0: i32, k1: i32, c0: i32, c1: i32, adapters: i32) void {
+  var rl: i32 = k1 - k0;
+  var il: i32 = c1 - c0;
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var ad: i32 = routes[r];
+    if (ad >= 0 and ad < adapters) {
+      var k: i32 = 0;
+      while (k < rl) : (k += 1) {
+        waist[r * rl + k] = k_dot(a, ad * rl * il + k * il, x, r * il, il);
+      }
+    }
+  }
+}
+

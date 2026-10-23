@@ -9,10 +9,10 @@
 use dtype::Dtype;
 
 use super::pool::{cell_of, first, paging, put_cols, write_cell};
-use super::ssm::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero};
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero};
 use crate::tensor::{KvPool, Tensor};
 
 /// Keys per step of the scoring loop.
@@ -111,8 +111,8 @@ pub fn layernorm_rope(
     let (n, hd) = (i64::from(rows), i64::from(hd));
     ctx.emit(&mut |cx| {
         let x = cx.read_f32(k)?;
-        let w = super::ssm::flat_f32(cx, weight)?;
-        let b = super::ssm::flat_f32(cx, bias)?;
+        let w = crate::lanes::flat_f32(cx, weight)?;
+        let b = crate::lanes::flat_f32(cx, bias)?;
         let pos = flat_i32(cx, positions)?;
         let f = cx.func();
         let pos = first(f, pos, n)?;

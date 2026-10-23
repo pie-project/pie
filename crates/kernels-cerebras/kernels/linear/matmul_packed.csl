@@ -1,0 +1,20 @@
+// y[m, n] = sum_k a[m, k] * w[n, k] with w packed; a is [m, k] f32. Each
+// weight row is widened chunk by chunk once and dotted with every row of a.
+fn k_matmul_packed(a: [*]f32, w: [*]u32, y: [*]f32, m: i32, k: i32, n: i32) void {
+  var j: i32 = 0;
+  while (j < n) : (j += 1) {
+    var i: i32 = 0;
+    while (i < m) : (i += 1) { y[i * n + j] = 0.0; }
+    var at: i32 = 0;
+    while (at < k) : (at += K_DOT_CHUNK) {
+      var len: i32 = k - at;
+      if (len > K_DOT_CHUNK) { len = K_DOT_CHUNK; }
+      k_unpack_bf16(@ptrcast([*]f32, &k_half_tmp), w, j * k + at, len);
+      i = 0;
+      while (i < m) : (i += 1) {
+        y[i * n + j] = y[i * n + j] + k_dot(a, i * k + at, @ptrcast([*]f32, &k_half_tmp), 0, len);
+      }
+    }
+  }
+}
+

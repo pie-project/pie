@@ -72,7 +72,7 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
             cx.shard(&xb, tile(rg, cg, 1));
             cx.shard(&yb, tile(rg, cg, m));
         }
-        cx.library("k_hc_expand");
+        cx.library("elemwise/hc_expand");
         cx.call(
             "k_hc_expand",
             vec![
@@ -120,7 +120,7 @@ pub fn mix(
             cx.shard(&vb, tile(rg, cg, m));
             cx.shard(&yb, tile(rg, cg, 1));
         }
-        cx.library("k_hc_mix");
+        cx.library("elemwise/hc_mix");
         cx.call(
             "k_hc_mix",
             vec![
@@ -182,7 +182,7 @@ pub fn inject(
                 },
             );
         }
-        cx.library("k_hc_inject");
+        cx.library("elemwise/hc_inject");
         cx.call(
             "k_hc_inject",
             vec![
@@ -243,7 +243,7 @@ pub fn ple_gate(
                     cx.shard(b, Shard::Rows(rg));
                 }
             }
-            cx.library("k_ple_gate");
+            cx.library("elemwise/ple_gate");
             cx.call(
                 "k_ple_gate",
                 vec![
@@ -272,7 +272,7 @@ pub fn ple_gate(
         cx.shard(&kb, tile(rg, cg, m));
         cx.shard(&qb, tile(rg, cg, m));
         cx.shard(&pd, tile(rg, cg, m));
-        cx.library("k_ple_dot");
+        cx.library("elemwise/ple_dot");
         cx.call(
             "k_ple_dot",
             vec![
@@ -302,7 +302,7 @@ pub fn ple_gate(
                 period: cg,
             },
         );
-        cx.library("k_ple_gate_scaled");
+        cx.library("elemwise/ple_gate_scaled");
         cx.call(
             "k_ple_gate_scaled",
             vec![

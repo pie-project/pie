@@ -4,7 +4,7 @@
 //! rows land back where the plan reads them. Every move is a gather or a
 //! scatter over the index maps staged for the window (`rs::WindowMap`).
 
-use kernels_xla::attn::ssm::Committed;
+use kernels_xla::lanes::Committed;
 use kernels_xla::{Error, Tensor};
 use poem_ir::ValueId;
 

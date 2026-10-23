@@ -1,0 +1,21 @@
+// y[r * y_width + column] = the index of the greatest value among the cg
+// column blocks' pairs all[c * 2 * rows + 2r] (value), [.. + 1] (local
+// index as i32 bits, -1 when the block had no lane): the block's base
+// c * block plus the local index, the lowest block on ties, 0 when none.
+fn k_argmax_merge(all: [*]f32, y: [*]i32, cg: i32, rows: i32, block: i32, column: i32, y_width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var best: f32 = 0.0; var bi: i32 = -1;
+    var c: i32 = 0;
+    while (c < cg) : (c += 1) {
+      var v: f32 = all[c * 2 * rows + 2 * r];
+      var li: i32 = @bitcast(i32, all[c * 2 * rows + 2 * r + 1]);
+      if (li >= 0 and !math.isNaN_f32(v)) {
+        if (bi < 0 or v > best) { best = v; bi = c * block + li; }
+      }
+    }
+    if (bi < 0) { bi = 0; }
+    y[r * y_width + column] = bi;
+  }
+}
+

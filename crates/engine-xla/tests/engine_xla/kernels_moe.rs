@@ -610,7 +610,7 @@ fn e5m2_data(n: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-/// The grouped-matmul kernel (`kernels_xla::mosaic::gmm`) at the three
+/// The grouped-matmul kernel (`kernels_xla::linear::moe_gmm`) at the three
 /// cuts it makes of a bank: the TPU's `E·N`-minor layout in whole
 /// 128-lane blocks and in per-expert element windows (N not whole lane
 /// tiles: gpt-oss's down bank), and a row-major bank; e5m2 and bf16
