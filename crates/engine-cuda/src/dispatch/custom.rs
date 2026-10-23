@@ -8,10 +8,13 @@ use crate::run::Run;
 /// The fused ops this backend's dispatch turns away. Its rules form none of
 /// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
 pub(crate) fn refuses(op: &Fused) -> bool {
-    matches!(
-        op,
-        Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. }
-    )
+    match op {
+        Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => true,
+        Fused::MatmulGlu { glu, .. } => {
+            !matches!(glu, poem_ir::GluAct::Swiglu | poem_ir::GluAct::GegluTanh)
+        }
+        _ => false,
+    }
 }
 
 impl DispatchFused for Run<'_> {
@@ -40,8 +43,7 @@ impl DispatchFused for Run<'_> {
             Fused::HcGatesNorm { .. } => self.hc_gates_norm(op),
             Fused::ResBlendRmsnorm { .. } => self.res_blend_rmsnorm(op),
             Fused::HcPre { .. } => self.hc_pre(op),
-            Fused::MatmulGeglu { .. }
-            | Fused::MatmulSwiglu { .. }
+            Fused::MatmulGlu { .. }
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. }

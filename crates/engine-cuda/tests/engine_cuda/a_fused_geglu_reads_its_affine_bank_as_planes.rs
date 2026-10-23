@@ -231,13 +231,15 @@ fn a_fused_geglu_reads_its_affine_bank_as_planes() {
 
     let fused = poem_compiler::fuse::fuse(
         fixture.trace.clone(),
-        [&poem_compiler::fuse::rules::matmul_geglu()],
+        [&poem_compiler::fuse::rules::matmul_glu(&[
+            poem_ir::GluAct::GegluTanh,
+        ])],
     );
     assert!(
         fused
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulGeglu { .. }))),
+            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulGlu { .. }))),
         "the gate-up matmul and the geglu over it fold into one epilogue, or this fires \
          nothing the row-major arm does not"
     );

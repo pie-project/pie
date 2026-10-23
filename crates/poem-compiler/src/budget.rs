@@ -234,8 +234,7 @@ impl FamilyCosts {
                 | poem_ir::Fused::PoolCompress { .. }
                 | poem_ir::Fused::MlaPrefillExpanded { .. }
                 | poem_ir::Fused::IndexTopkRope { .. } => self.attn,
-                poem_ir::Fused::MatmulGeglu { .. }
-                | poem_ir::Fused::MatmulSwiglu { .. }
+                poem_ir::Fused::MatmulGlu { .. }
                 | poem_ir::Fused::MatmulSwigluMatmul { .. }
                 | poem_ir::Fused::MatmulSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. }

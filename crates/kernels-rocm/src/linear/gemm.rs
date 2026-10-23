@@ -64,7 +64,7 @@ pub fn matmul_swiglu(
     gate_up: Tensor,
     h: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "fused.matmul_swiglu";
+    const OP: &str = "fused.matmul_glu";
     dtype_dispatch!(OP, act.dtype, { Bf16 => () });
     if gate_up.dtype != dtype::Dtype::Bf16 || gate_up.rows != 2 * h.width || h.rows == 0 {
         return Ok(false);

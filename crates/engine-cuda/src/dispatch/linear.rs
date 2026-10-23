@@ -104,10 +104,11 @@ impl Run<'_> {
                     None => Ok(()),
                 }
             }
-            Fused::MatmulSwiglu {
+            Fused::MatmulGlu {
                 act,
                 w,
                 intermediate,
+                glu: poem_ir::GluAct::Swiglu,
                 packed,
                 y,
             } => {
@@ -131,10 +132,11 @@ impl Run<'_> {
                     up: None,
                 })
             }
-            Fused::MatmulGeglu {
+            Fused::MatmulGlu {
                 act,
                 w,
                 intermediate,
+                glu: poem_ir::GluAct::GegluTanh,
                 packed,
                 y,
             } => {

@@ -54,6 +54,7 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
         use poem_compiler::fuse::rules;
+        use poem_ir::GluAct;
         vec![
             rules::split_qkv_fused(),
             rules::qkv_fused_qknorm_rope_vnorm_write(),
@@ -61,10 +62,9 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
             rules::residual_add_rmsnorm(),
-            rules::matmul_geglu(),
+            rules::matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
             rules::moe_experts(),
             rules::moe_select_glu(),
-            rules::matmul_swiglu(),
             rules::matmul_softcap(),
             rules::matmul_bias(),
             rules::matmul_split_rows(),
@@ -92,13 +92,14 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
         use poem_compiler::fuse::rules;
+        use poem_ir::GluAct;
         vec![
             rules::qkv_fused_qknorm_rope_vnorm_write(),
             rules::rmsnorm_residual_add(),
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
             rules::residual_add_rmsnorm(),
-            rules::matmul_geglu(),
+            rules::matmul_glu(&[GluAct::GegluTanh]),
             rules::matmul_softcap(),
             rules::matmul_bias(),
             rules::matmul_swiglu_matmul(),

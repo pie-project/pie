@@ -237,13 +237,15 @@ fn a_fused_swiglu_sizes_the_decoded_tile_to_its_packed_plane() {
 
     let fused = poem_compiler::fuse::fuse(
         fixture.trace.clone(),
-        [&poem_compiler::fuse::rules::matmul_swiglu()],
+        [&poem_compiler::fuse::rules::matmul_glu(&[
+            poem_ir::GluAct::Swiglu,
+        ])],
     );
     assert!(
         fused
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulSwiglu { .. }))),
+            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulGlu { .. }))),
         "the gate-up matmul and the swiglu over it fold into one node"
     );
 

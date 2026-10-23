@@ -16,10 +16,11 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
-            Fused::MatmulGeglu {
+            Fused::MatmulGlu {
                 act,
                 w,
                 intermediate,
+                glu: poem_ir::GluAct::GegluTanh,
                 packed,
                 y,
             } => {

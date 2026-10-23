@@ -59,10 +59,9 @@ pub fn all() -> Vec<Rule> {
         embed_scale_add(),
         residual_add_rmsnorm(),
         matmul_swiglu_matmul(),
-        matmul_geglu(),
+        matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
         moe_experts(),
         moe_select_glu(),
-        matmul_swiglu(),
         matmul_softcap(),
         matmul_bias(),
         matmul_split_rows(),
@@ -1399,52 +1398,30 @@ pub fn moe_select_glu() -> Rule {
     })
 }
 
+/// The packed gate-up projection and its GLU under each of `acts`, where
+/// the MLP's down projection stays apart (a backend that holds
+/// `matmul_swiglu_matmul` forms that first).
 #[must_use]
-pub fn matmul_geglu() -> Rule {
-    let pattern = template(|p| {
-        let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
-        p.name("packed", &packed);
-        let y = linear::glu(
-            &packed,
-            GluAct::GegluTanh,
-            Some(p.u32("intermediate")),
-            None,
-            None,
-            None,
-        );
-        p.export("y", &y);
-    });
-    Rule::new("fused.matmul_geglu", [pattern], |m| Fused::MatmulGeglu {
+pub fn matmul_glu(acts: &[GluAct]) -> Rule {
+    let alternatives: Vec<Template> = acts
+        .iter()
+        .map(|&act| {
+            template(|p| {
+                let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
+                p.name("packed", &packed);
+                let y = linear::glu(&packed, act, Some(p.u32("intermediate")), None, None, None);
+                p.export("y", &y);
+            })
+        })
+        .collect();
+    Rule::new("fused.matmul_glu", alternatives, |m| Fused::MatmulGlu {
         act: m.value("act"),
         w: m.value("w"),
         intermediate: m.u32("intermediate"),
-        packed: m.value("packed"),
-        y: m.value("y"),
-    })
-}
-
-/// The packed gate-up projection and its SwiGLU, where the MLP's down
-/// projection stays apart (a backend that ships `fused.matmul_swiglu_matmul` forms
-/// that first).
-#[must_use]
-pub fn matmul_swiglu() -> Rule {
-    let pattern = template(|p| {
-        let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
-        p.name("packed", &packed);
-        let y = linear::glu(
-            &packed,
-            GluAct::Swiglu,
-            Some(p.u32("intermediate")),
-            None,
-            None,
-            None,
-        );
-        p.export("y", &y);
-    });
-    Rule::new("fused.matmul_swiglu", [pattern], |m| Fused::MatmulSwiglu {
-        act: m.value("act"),
-        w: m.value("w"),
-        intermediate: m.u32("intermediate"),
+        glu: match m.op("y") {
+            Operation::Linear(poem_ir::Linear::Glu { act, .. }) => *act,
+            other => panic!("`y` is computed by {other:?}, not a glu"),
+        },
         packed: m.value("packed"),
         y: m.value("y"),
     })

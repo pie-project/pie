@@ -4,7 +4,7 @@ use crate::Op;
 use crate::operands::Part;
 use crate::ops::attn::Attn;
 use crate::ops::elemwise::{Elemwise, ModulateForm, Yarn};
-use crate::ops::linear::Linear;
+use crate::ops::linear::{GluAct, Linear};
 use crate::value::ValueId;
 
 /// The norm a [`Fused::RmsnormResidualAdd`] also lands over its last row:
@@ -356,25 +356,15 @@ pub enum Fused {
         #[input(I32)]
         write_offset: ValueId,
     },
-    MatmulGeglu {
+    /// The packed gate-up projection (a `Matmul` into `packed`) and its
+    /// `Glu` under `glu`; `packed` still an output, read by nothing else.
+    MatmulGlu {
         #[input]
         act: ValueId,
         #[input]
         w: ValueId,
         intermediate: u32,
-        #[output]
-        packed: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    /// The packed gate-up projection and its SwiGLU; `packed` still an
-    /// output, read by nothing else.
-    MatmulSwiglu {
-        #[input]
-        act: ValueId,
-        #[input]
-        w: ValueId,
-        intermediate: u32,
+        glu: GluAct,
         #[output]
         packed: ValueId,
         #[output]

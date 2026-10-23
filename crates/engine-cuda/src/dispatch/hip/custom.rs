@@ -35,14 +35,17 @@ impl DispatchFused for Run<'_> {
             Fused::GdnStep { .. } => return self.gdn_step(op),
             Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
-            Fused::MatmulGeglu { .. }
+            Fused::MatmulGlu {
+                glu: poem_ir::GluAct::GegluTanh,
+                ..
+            }
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. } => self.fused_linear(op),
             // Kernels this backend does not ship as one: never formed for it,
             // and run as the primitives they stand for where a trace states
             // them.
-            Fused::MatmulSwiglu { .. }
+            Fused::MatmulGlu { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
@@ -341,10 +344,11 @@ impl Run<'_> {
         use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather, DispatchLinear};
         use poem_ir::{Attn, Elemwise, Gather, Linear};
         match op {
-            Fused::MatmulSwiglu {
+            Fused::MatmulGlu {
                 act,
                 w,
                 intermediate,
+                glu,
                 packed,
                 y,
             } => {
@@ -369,7 +373,7 @@ impl Run<'_> {
                         gate: None,
                         weights: None,
                         limit: None,
-                        act: poem_ir::GluAct::Swiglu,
+                        act: *glu,
                         up: None,
                     },
                 )

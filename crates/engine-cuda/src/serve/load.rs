@@ -1357,8 +1357,7 @@ fn decoded_weight_planes(
                 // takes it, and decodes the same plane that matmul would.
                 poem_ir::Operation::Linear(_)
                 | poem_ir::Operation::Fused(
-                    poem_ir::Fused::MatmulSwiglu { .. }
-                    | poem_ir::Fused::MatmulGeglu { .. }
+                    poem_ir::Fused::MatmulGlu { .. }
                     | poem_ir::Fused::MatmulSwigluMatmul { .. }
                     | poem_ir::Fused::MatmulBias { .. }
                     | poem_ir::Fused::MatmulSplitRows { .. }
