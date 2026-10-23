@@ -173,3 +173,26 @@ pub use blob::{
 pub use engine::fire::LayerScores;
 pub use weights::{AdapterPlane, BankSeat};
 pub use window::{Cursor, Window, WindowShape, Windows};
+
+#[cfg(test)]
+mod tests {
+    use poem_ir::Operation;
+
+    /// Every table this backend keys by op name names an op: an entry under
+    /// a name no op carries is never read, and the op it meant falls to the
+    /// table's default without a word.
+    #[test]
+    fn every_name_keyed_entry_names_an_op() {
+        let stale: Vec<&str> = kernels_cuda::seat::ENTRIES
+            .iter()
+            .map(|entry| entry.name)
+            .chain(super::FUSED)
+            .chain(super::UNCHAINED)
+            .chain(super::GROUPED)
+            .chain(super::PLANNED)
+            .chain(super::EXCLUSIVE)
+            .filter(|name| !Operation::names_an_op(name))
+            .collect();
+        assert!(stale.is_empty(), "named by no op: {stale:?}");
+    }
+}

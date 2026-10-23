@@ -593,3 +593,44 @@ fn held_like(
         pass.maker(out),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every op name this file keys a rule on names an op: a rule under a
+    /// name no op carries never applies, and its op falls to `Whole`.
+    #[test]
+    fn every_op_a_rule_names_is_an_op() {
+        const GROUPS: [&str; 9] = [
+            "attn",
+            "linear",
+            "elemwise",
+            "gather",
+            "collective",
+            "sampling",
+            "ssm",
+            "fused",
+            "conv",
+        ];
+        let quote = char::from(34);
+        let named: Vec<&str> = include_str!("rules.rs")
+            .split(quote)
+            .skip(1)
+            .step_by(2)
+            .filter(|lit| {
+                lit.split_once('.').is_some_and(|(group, op)| {
+                    GROUPS.contains(&group)
+                        && !op.is_empty()
+                        && op
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                })
+            })
+            .collect();
+        assert!(named.len() > 20, "the rules name {} ops", named.len());
+        let stale: Vec<&&str> = named
+            .iter()
+            .filter(|name| !poem_ir::Operation::names_an_op(name))
+            .collect();
+        assert!(stale.is_empty(), "named by no op: {stale:?}");
+    }
+}

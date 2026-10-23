@@ -99,6 +99,10 @@ mod tests {
         }
         for (id, kernel) in ALL {
             assert_eq!(id.strip_prefix("fuse."), kernel.rsplit('.').next());
+            assert!(
+                poem_ir::Fused::NAMES.contains(kernel),
+                "`{kernel}` names no fused op"
+            );
         }
     }
 

@@ -40,6 +40,30 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Every op the IR has, by name: each group's, in group order.
+    pub fn vocabulary() -> impl Iterator<Item = &'static str> {
+        [
+            Attn::NAMES,
+            Linear::NAMES,
+            Elemwise::NAMES,
+            Gather::NAMES,
+            Collective::NAMES,
+            Sampling::NAMES,
+            Ssm::NAMES,
+            Fused::NAMES,
+            Conv::NAMES,
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+    }
+
+    /// Whether `name` is an op's name.
+    #[must_use]
+    pub fn names_an_op(name: &str) -> bool {
+        Self::vocabulary().any(|op| op == name)
+    }
+
     fn operands(&self) -> &dyn Operands {
         match self {
             Self::Attn(op) => op,
@@ -116,5 +140,48 @@ impl From<Fused> for Operation {
 impl From<Conv> for Operation {
     fn from(op: Conv) -> Self {
         Self::Conv(op)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each op's name is its group's prefix and its variant in snake case,
+    /// and no two ops share one: a name keys every table that keys on ops.
+    #[test]
+    fn every_op_has_a_name_of_its_own() {
+        let groups = [
+            ("attn", Attn::NAMES),
+            ("linear", Linear::NAMES),
+            ("elemwise", Elemwise::NAMES),
+            ("gather", Gather::NAMES),
+            ("collective", Collective::NAMES),
+            ("sampling", Sampling::NAMES),
+            ("ssm", Ssm::NAMES),
+            ("fused", Fused::NAMES),
+            ("conv", Conv::NAMES),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (group, names) in groups {
+            assert!(!names.is_empty(), "`{group}` names no op");
+            for name in names {
+                let variant = name
+                    .strip_prefix(group)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .unwrap_or_else(|| panic!("`{name}` is not under `{group}.`"));
+                assert!(
+                    !variant.is_empty()
+                        && variant
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                    "`{name}` is not snake case"
+                );
+                assert!(seen.insert(*name), "two ops are named `{name}`");
+            }
+        }
+        assert_eq!(seen.len(), Operation::vocabulary().count());
+        assert!(Operation::names_an_op("elemwise.residual_add"));
+        assert!(!Operation::names_an_op("elemwise.gated_residual_add"));
     }
 }
