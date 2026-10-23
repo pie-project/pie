@@ -104,7 +104,9 @@ fn the_vector_point_answers_the_reference() {
                 },
                 &|g, o| {
                     let y = st(t(o[0].0, m, n, Dtype::Bf16));
-                    g.run_slang(|c| qmm::matmul(c, &[Qmm::Qmv { vecs }], st(xt), sbank, y));
+                    g.run_slang(|c| {
+                        qmm::matmul(c, &[Qmm::Qmv { vecs }], st(xt), sbank, y, m as u32)
+                    });
                 },
             );
         }

@@ -142,7 +142,9 @@ fn the_vector_point_answers_the_reference() {
                 },
                 &|g, o| {
                     let y = st(t(o[0].0, m, n, Dtype::Bf16));
-                    g.run_slang(|c| qmm::matmul(c, &[Qmm::Qmv { vecs }], st(xt), slang_bank, y));
+                    g.run_slang(|c| {
+                        qmm::matmul(c, &[Qmm::Qmv { vecs }], st(xt), slang_bank, y, m as u32)
+                    });
                 },
             );
         }
@@ -194,7 +196,7 @@ fn the_one_row_point_answers_the_reference() {
                 &|g, o| {
                     let y = st(t(o[0].0, 1, n, Dtype::Bf16));
                     g.run_slang(|c| {
-                        qmm::matmul(c, &[Qmm::OneRow { lanes, rows }], st(xt), slang_bank, y)
+                        qmm::matmul(c, &[Qmm::OneRow { lanes, rows }], st(xt), slang_bank, y, 1)
                     });
                 },
             );
