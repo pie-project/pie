@@ -29,7 +29,7 @@ fn while_continue_division_and_computed_indexing_behave() {
                 let mb = cx.read(m)?;
                 let hb = cx.read(h)?;
                 let ob = cx.write(out)?;
-                cx.for_range("r", rows, |blk| {
+                cx.statements().for_range("r", rows, |blk| {
                     blk.line(format!("var hi: i32 = {}[r];", hb.name));
                     blk.line("var count: f32 = 0.0;");
                     blk.line("var divs: f32 = 0.0;");
@@ -92,7 +92,7 @@ fn a_hoisted_row_offset_survives_three_loop_levels() {
             ctx.emit(&mut |cx| {
                 let mb = cx.read(m)?;
                 let ob = cx.write(out)?;
-                cx.for_range("r", rows, |blk| {
+                cx.statements().for_range("r", rows, |blk| {
                     blk.line(format!("var mrow: i32 = @as(i32, r) * {width};"));
                     blk.line(format!("var obase: i32 = @as(i32, r) * {heads};"));
                     blk.for_range("h", heads, |blk| {
@@ -151,57 +151,60 @@ fn dsd_reductions_into_a_scalar() {
                 let ob = cx.write(out)?;
                 let tmp = cx.scratch("tmp", u64::from(n));
                 cx.global("var g_acc: f32 = 0.0;".to_string());
-                cx.line(format!(
+                cx.statements().line(format!(
                     "var dx = @set_dsd_base_addr(k_base_f32, {});",
                     xb.ptr()
                 ));
-                cx.line(format!("dx = @set_dsd_length(dx, {n});"));
-                cx.line(format!(
+                cx.statements()
+                    .line(format!("dx = @set_dsd_length(dx, {n});"));
+                cx.statements().line(format!(
                     "var dy = @set_dsd_base_addr(k_base_f32, {});",
                     yb.ptr()
                 ));
-                cx.line(format!("dy = @set_dsd_length(dy, {n});"));
-                cx.line(format!(
+                cx.statements()
+                    .line(format!("dy = @set_dsd_length(dy, {n});"));
+                cx.statements().line(format!(
                     "var dt = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &{tmp}));"
                 ));
-                cx.line(format!("dt = @set_dsd_length(dt, {n});"));
+                cx.statements()
+                    .line(format!("dt = @set_dsd_length(dt, {n});"));
                 // 0: sum of x, local accumulator.
-                cx.line("var s0: f32 = 0.0;");
-                cx.line("@fadds(&s0, s0, dx);");
-                cx.line(format!("{}[0] = s0;", ob.name));
+                cx.statements().line("var s0: f32 = 0.0;");
+                cx.statements().line("@fadds(&s0, s0, dx);");
+                cx.statements().line(format!("{}[0] = s0;", ob.name));
                 // 1: sum of x, global accumulator.
-                cx.line("g_acc = 0.0;");
-                cx.line("@fadds(&g_acc, g_acc, dx);");
-                cx.line(format!("{}[1] = g_acc;", ob.name));
+                cx.statements().line("g_acc = 0.0;");
+                cx.statements().line("@fadds(&g_acc, g_acc, dx);");
+                cx.statements().line(format!("{}[1] = g_acc;", ob.name));
                 // 2: sum of x, local, called three times.
-                cx.line("var s2: f32 = 0.0;");
-                cx.line("@fadds(&s2, s2, dx);");
-                cx.line("@fadds(&s2, s2, dx);");
-                cx.line("@fadds(&s2, s2, dx);");
-                cx.line(format!("{}[2] = s2;", ob.name));
+                cx.statements().line("var s2: f32 = 0.0;");
+                cx.statements().line("@fadds(&s2, s2, dx);");
+                cx.statements().line("@fadds(&s2, s2, dx);");
+                cx.statements().line("@fadds(&s2, s2, dx);");
+                cx.statements().line(format!("{}[2] = s2;", ob.name));
                 // 3: products into scratch, then the sum, local.
-                cx.line("@fmuls(dt, dx, dy);");
-                cx.line("var s3: f32 = 0.0;");
-                cx.line("@fadds(&s3, s3, dt);");
-                cx.line(format!("{}[3] = s3;", ob.name));
+                cx.statements().line("@fmuls(dt, dx, dy);");
+                cx.statements().line("var s3: f32 = 0.0;");
+                cx.statements().line("@fadds(&s3, s3, dt);");
+                cx.statements().line(format!("{}[3] = s3;", ob.name));
                 // 4: the same, global.
-                cx.line("g_acc = 0.0;");
-                cx.line("@fadds(&g_acc, g_acc, dt);");
-                cx.line(format!("{}[4] = g_acc;", ob.name));
+                cx.statements().line("g_acc = 0.0;");
+                cx.statements().line("@fadds(&g_acc, g_acc, dt);");
+                cx.statements().line(format!("{}[4] = g_acc;", ob.name));
                 // 5: plain loop over the products.
-                cx.line("var s5: f32 = 0.0;");
-                cx.line(format!(
+                cx.statements().line("var s5: f32 = 0.0;");
+                cx.statements().line(format!(
                     "var i: i32 = 0; while (i < {n}) : (i += 1) {{ s5 = s5 + {tmp}[i]; }}"
                 ));
-                cx.line(format!("{}[5] = s5;", ob.name));
+                cx.statements().line(format!("{}[5] = s5;", ob.name));
                 // 6: local accumulator initialised from a global read (not a constant).
-                cx.line("var s6: f32 = g_acc * 0.0;");
-                cx.line("@fadds(&s6, s6, dx);");
-                cx.line(format!("{}[6] = s6;", ob.name));
+                cx.statements().line("var s6: f32 = g_acc * 0.0;");
+                cx.statements().line("@fadds(&s6, s6, dx);");
+                cx.statements().line(format!("{}[6] = s6;", ob.name));
                 // 7: sum of x with a 1.0 start.
-                cx.line("var s7: f32 = 1.0;");
-                cx.line("@fadds(&s7, s7, dx);");
-                cx.line(format!("{}[7] = s7;", ob.name));
+                cx.statements().line("var s7: f32 = 1.0;");
+                cx.statements().line("@fadds(&s7, s7, dx);");
+                cx.statements().line(format!("{}[7] = s7;", ob.name));
                 Ok(())
             })
         })

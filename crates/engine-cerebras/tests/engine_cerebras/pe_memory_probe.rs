@@ -20,7 +20,7 @@ fn compiles(cslc: &Cslc, words: u32, arrays: u32) -> Result<(), String> {
         let yb = cx.write(y)?;
         for x in &xs {
             let xb = cx.read(*x)?;
-            cx.line(format!(
+            cx.statements().line(format!(
                 "{}[0] = {}[0] + {}[{}];",
                 yb.name,
                 yb.name,

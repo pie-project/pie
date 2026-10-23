@@ -20,19 +20,19 @@ fn bf16_arrays_round_trip_through_f32() {
                 let (o, fn_) = (ob.name.clone(), fb.name.clone());
                 cx.global("var hb: [4]bf16;");
                 cx.global("var hw: [4]bf16;");
-                cx.line("var i: i32 = 0;");
-                cx.line(format!("while (i < 4) : (i += 1) {{ hb[i] = @as(bf16, {fn_}[i]); hw[i] = @as(bf16, 2.0); }}"));
-                cx.line("i = 0;");
-                cx.line(format!("while (i < 4) : (i += 1) {{ {o}[i] = @as(f32, hb[i]); }}"));
+                cx.statements().line("var i: i32 = 0;");
+                cx.statements().line(format!("while (i < 4) : (i += 1) {{ hb[i] = @as(bf16, {fn_}[i]); hw[i] = @as(bf16, 2.0); }}"));
+                cx.statements().line("i = 0;");
+                cx.statements().line(format!("while (i < 4) : (i += 1) {{ {o}[i] = @as(f32, hb[i]); }}"));
                 // bf16 arithmetic widened to f32.
-                cx.line(format!("{o}[4] = @as(f32, hb[0]) * @as(f32, hw[0]) + @as(f32, hb[1]);"));
+                cx.statements().line(format!("{o}[4] = @as(f32, hb[0]) * @as(f32, hw[0]) + @as(f32, hb[1]);"));
                 // A DSD over a bf16 array moved into f32 copies the raw
                 // halves, two a word: a DSD does not convert (found here),
                 // so a half array is widened element by element.
-                cx.line("const dsb = @get_dsd(mem1d_dsd, .{ .tensor_access = |j|{4} -> hb[j] });");
-                cx.line(format!("const dso = @get_dsd(mem1d_dsd, .{{ .tensor_access = |j|{{4}} -> {o}[j + 5] }});"));
-                cx.line("@fmovs(dso, dsb);");
-                cx.line(format!("{o}[9] = @as(f32, @bitcast(u16, hb[2]));"));
+                cx.statements().line("const dsb = @get_dsd(mem1d_dsd, .{ .tensor_access = |j|{4} -> hb[j] });");
+                cx.statements().line(format!("const dso = @get_dsd(mem1d_dsd, .{{ .tensor_access = |j|{{4}} -> {o}[j + 5] }});"));
+                cx.statements().line("@fmovs(dso, dsb);");
+                cx.statements().line(format!("{o}[9] = @as(f32, @bitcast(u16, hb[2]));"));
                 Ok(())
             })
         })

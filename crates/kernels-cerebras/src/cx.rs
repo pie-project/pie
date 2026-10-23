@@ -5,8 +5,6 @@
 //! names which handles it wrote. The engine's [`Sink`] decides what a handle
 //! is and takes the phase when it closes.
 
-use std::ops::{Deref, DerefMut};
-
 use dtype::Dtype;
 
 use crate::csl::{Block, Dsd1, Func};
@@ -47,7 +45,7 @@ pub struct View {
 }
 
 /// A kernel's view: the phase under construction and the engine's sink.
-/// Derefs to the phase body [`Block`], so a kernel emits with `cx.line(..)`.
+/// An entry emits kernel calls ([`Cx::call`]); the phase is its call list.
 pub struct Cx<'a> {
     p: &'a mut dyn Sink,
     phase: Func,
@@ -348,6 +346,13 @@ impl<'a> Cx<'a> {
         self.phase.body.call(crate::csl::Call { kernel, args });
     }
 
+    /// Raw CSL statements in this phase, for the device probes of CSL's own
+    /// semantics; no entry writes them, and a table-driven program refuses
+    /// a phase that has them.
+    pub fn statements(&mut self) -> &mut Block {
+        &mut self.phase.body
+    }
+
     /// Declares `kernel`'s unit and the units it calls into, once each; the
     /// prelude is in every program already.
     fn unit(&mut self, kernel: Kernel) {
@@ -462,19 +467,6 @@ impl<'a> Cx<'a> {
             host: None,
             reduce,
         });
-    }
-}
-
-impl Deref for Cx<'_> {
-    type Target = Block;
-    fn deref(&self) -> &Block {
-        &self.phase.body
-    }
-}
-
-impl DerefMut for Cx<'_> {
-    fn deref_mut(&mut self) -> &mut Block {
-        &mut self.phase.body
     }
 }
 
