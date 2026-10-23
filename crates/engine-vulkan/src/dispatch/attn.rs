@@ -1,5 +1,4 @@
 use kernels_slang::attn::sdpa;
-use kernels_vulkan::attn;
 use kernels_vulkan::spatial;
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::{Attn, IndexScore, Operands, StructKind};
@@ -27,29 +26,15 @@ impl Run<'_> {
         }
     }
 
-    fn decode_tables(&self, plan: poem_ir::ValueId) -> sdpa::Tables {
-        let plan = self.decode_plan(plan);
-        sdpa::Tables {
-            positions: slang_tensor(plan.positions),
-            request_of_token: slang_tensor(plan.request_of_token),
-            mask: slang_tensor(plan.mask),
-            mask_enabled: slang_tensor(plan.mask_enabled),
-            mask_stride: plan.mask_stride,
-        }
-    }
-
     fn prefill_tables(
         &self,
         plan: poem_ir::ValueId,
         mask: Option<kernels_vulkan::Tensor>,
     ) -> sdpa::Tables {
-        let plan = self.prefill_plan(plan);
+        let plan = *self.prefill_plan(plan);
         sdpa::Tables {
-            positions: slang_tensor(plan.positions),
-            request_of_token: slang_tensor(plan.request_of_token),
-            mask: slang_tensor(mask.unwrap_or(plan.mask)),
-            mask_enabled: slang_tensor(plan.mask_enabled),
-            mask_stride: plan.mask_stride,
+            mask: mask.map_or(plan.mask, slang_tensor),
+            ..plan
         }
     }
 
@@ -153,22 +138,18 @@ impl Run<'_> {
         o: poem_ir::ValueId,
         lse: Option<poem_ir::ValueId>,
     ) -> Result<(), kernels_vulkan::Error> {
-        let split = self.split_scratch().map(|s| sdpa::Split {
-            part_out: slang_tensor(s.part_out),
-            part_lse: slang_tensor(s.part_lse),
-        });
         sdpa::decode(
             &self.slang(),
             self.sdpa_tactic(head_dim),
             slang_tensor(self.tensor(q)),
-            &self.decode_tables(plan),
+            self.decode_plan(plan),
             &slang_pool(self.pool(cache)),
             window,
             head_dim,
             sm_scale,
             slang_tensor(self.tensor(o)),
             lse.map(|l| slang_tensor(self.tensor(l))),
-            split,
+            self.split_scratch(),
         )
         .map_err(from_slang)
     }
@@ -239,7 +220,7 @@ impl Run<'_> {
         kernels_slang::attn::score::capture(
             &self.slang(),
             crate::encode::slang_ragged(self.ragged(q)),
-            crate::encode::slang_tensor(self.prefill_plan(plan).positions),
+            self.prefill_plan(plan).positions,
             &crate::encode::slang_pool(self.pool(cache)),
             window,
             head_dim,
@@ -283,7 +264,7 @@ impl Run<'_> {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
-                kv_len,
+                kv_len: _,
                 q_heads: _,
                 kv_heads: _,
                 head_dim: _,
@@ -297,19 +278,19 @@ impl Run<'_> {
                          decode plan kind"
                     ),
                 }
-                let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
-
-                let built = attn::plan_decode(
-                    self.ctx(),
-                    kv_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
-                    t.mask_stride,
-                )?;
+                let built = sdpa::Tables::plan(
+                    "attn.plan_decode",
+                    sdpa::Tables {
+                        positions: slang_tensor(self.cut_rows(positions)),
+                        request_of_token: slang_tensor(self.cut_rows(t.request_of_token)),
+                        mask: slang_tensor(self.cut_rows(t.mask)),
+                        mask_enabled: slang_tensor(self.cut_rows(t.mask_enabled)),
+                        mask_stride: t.mask_stride,
+                    },
+                )
+                .map_err(from_slang)?;
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
             }
@@ -318,7 +299,7 @@ impl Run<'_> {
                 kv_indptr: _,
                 kv_indices: _,
                 last_page_len: _,
-                kv_len,
+                kv_len: _,
                 q_heads: _,
                 kv_heads: _,
                 head_dim: _,
@@ -332,19 +313,19 @@ impl Run<'_> {
                          prefill plan kind"
                     ),
                 }
-                let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
-
-                let built = attn::plan_prefill(
-                    self.ctx(),
-                    kv_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
-                    t.mask_stride,
-                )?;
+                let built = sdpa::Tables::plan(
+                    "attn.plan_prefill",
+                    sdpa::Tables {
+                        positions: slang_tensor(self.cut_rows(positions)),
+                        request_of_token: slang_tensor(self.cut_rows(t.request_of_token)),
+                        mask: slang_tensor(self.cut_rows(t.mask)),
+                        mask_enabled: slang_tensor(self.cut_rows(t.mask_enabled)),
+                        mask_stride: t.mask_stride,
+                    },
+                )
+                .map_err(from_slang)?;
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
             }
@@ -408,7 +389,7 @@ impl Run<'_> {
             } => self.selected_attention(
                 "attn.decode_selected",
                 self.tensor(*q),
-                &self.decode_tables(*plan),
+                self.decode_plan(*plan),
                 *selection,
                 *cache,
                 *window,

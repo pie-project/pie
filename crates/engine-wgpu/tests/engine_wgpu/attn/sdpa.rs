@@ -1,4 +1,5 @@
-//! Paged attention on the first wgpu adapter against an f64 host reference:
+//! Paged attention on the first wgpu adapter against an f64 host reference,
+//! beside the hand-written arm each form stands for:
 //! decode a row a workgroup on the baseline tier, 256 and 128 invocations, plain, windowed, masked,
 //! with its LSE, and split into key ranges folded by their LSEs (rows a
 //! single split covers among them); the selected form over named key
@@ -148,6 +149,8 @@ fn paged_attention_answers_the_reference() {
         return;
     };
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
+    let (profile, _) = engine_wgpu::chip::resolve(&gpu.device.chip(), None);
+    let tn = kernels_wgpu::Tuning::new(profile, gpu.device.cores(), gpu.device.storage_buffers());
     let slots = 6 * PAGE;
     let (pi, pp) = (gpu.up_u32(&PAGES), gpu.up_u32(&INDPTR));
     let decode = Batch {
@@ -228,6 +231,14 @@ fn paged_attention_answers_the_reference() {
                 mask_enabled: st(t(eb, rows, 1, Dtype::U8)),
                 mask_stride: MASK_STRIDE as u32,
             };
+            let plan = kernels_wgpu::DecodePlan {
+                positions: t(pos, rows, 1, Dtype::I32),
+                request_of_token: t(own, rows, 1, Dtype::I32),
+                mask: t(mb, rows, MASK_STRIDE, Dtype::U8),
+                mask_enabled: t(eb, rows, 1, Dtype::U8),
+                mask_stride: MASK_STRIDE as u32,
+            };
+            let qi = gpu.up_i32(&[0, 26, 37]);
             let n = rows * QH * hd;
             let qt = t(q, rows, QH * hd, Dtype::Bf16);
             let (part_out, part_lse) = (
@@ -257,6 +268,63 @@ fn paged_attention_answers_the_reference() {
                     let (want_o, want_l) = reference(batch, &keys, &qr, &kr, &vr, hd, scale);
                     let win = window.map(|w| w as u32);
                     let shape = format!("{what} {form:?} d {hd} window {window:?}");
+
+                    // The hand-written arm it stands for.
+                    let o = gpu.zeros(n);
+                    let ot = t(o, rows, QH * hd, Dtype::Bf16);
+                    gpu.run(|c| match form {
+                        Form::Tiled => {
+                            let pplan = kernels_wgpu::PrefillPlan {
+                                positions: plan.positions,
+                                request_of_token: plan.request_of_token,
+                                mask: plan.mask,
+                                mask_enabled: plan.mask_enabled,
+                                mask_stride: plan.mask_stride,
+                            };
+                            let rag = kernels_wgpu::RaggedTensor {
+                                data: qt,
+                                indptr: t(qi, 3, 1, Dtype::I32),
+                            };
+                            kernels_wgpu::attn::arbiter::prefill(
+                                c,
+                                rag,
+                                &pplan,
+                                &pool,
+                                win,
+                                hd as u32,
+                                KVH as u32,
+                                scale as f32,
+                                ot,
+                                2,
+                                &tn,
+                            )
+                        }
+                        Form::Selected => kernels_wgpu::attn::decode_selected(
+                            c,
+                            qt,
+                            &plan,
+                            t(sel, rows, TOP_K, Dtype::I32),
+                            &pool,
+                            None,
+                            hd as u32,
+                            scale as f32,
+                            RATIO as u32,
+                            ot,
+                        ),
+                        Form::Decode | Form::Split => kernels_wgpu::attn::decode(
+                            c,
+                            &tn,
+                            qt,
+                            &plan,
+                            &pool,
+                            win,
+                            hd as u32,
+                            scale as f32,
+                            ot,
+                            None,
+                        ),
+                    });
+                    close(&gpu.down(o, n), &want_o, &shape);
 
                     let tactics: &[(bool, u32, u32)] = if matches!(form, Form::Tiled) {
                         &[(false, 256, 32), (false, 256, 16), (false, 256, 8)]

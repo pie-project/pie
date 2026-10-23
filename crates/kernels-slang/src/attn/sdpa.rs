@@ -59,6 +59,41 @@ pub struct Tables {
     pub mask_stride: u32,
 }
 
+impl Tables {
+    /// `attn.plan_decode` and `attn.plan_prefill`: the fire's tables, refused
+    /// where a kernel would read them as something else.
+    pub fn plan(op: &'static str, tables: Tables) -> Result<Tables, Error> {
+        let stated = [
+            ("position table", tables.positions, Dtype::I32),
+            ("owning-request table", tables.request_of_token, Dtype::I32),
+            ("mask planes", tables.mask, Dtype::U8),
+            ("mask-enabled flags", tables.mask_enabled, Dtype::U8),
+        ];
+        for (what, t, want) in stated {
+            if t.dtype != want {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the fire's {what} is {:?}, and a plan carries {want:?}",
+                        t.dtype
+                    ),
+                ));
+            }
+        }
+        if tables.positions.rows != tables.request_of_token.rows {
+            return Err(refuse(
+                op,
+                format!(
+                    "the fire tables disagree: {} positions beside {} owning requests, and \
+                     both are one entry per token",
+                    tables.positions.rows, tables.request_of_token.rows
+                ),
+            ));
+        }
+        Ok(tables)
+    }
+}
+
 struct Shape {
     q_heads: u32,
     kv_heads: u32,
