@@ -490,7 +490,7 @@ pub(super) fn order_mxfp4_banks(
             let (c, e) = (codes + first * n * k / 2, exps + first * n * k / 32);
             kernels_cuda::linear::moe::mxfp4_lanes(
                 &ctx,
-                "linear.moe_matmul_select_quant",
+                "linear.moe_select",
                 c,
                 staged_codes,
                 e,

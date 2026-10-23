@@ -1687,7 +1687,7 @@ pub fn matmul_select(
 ) -> Result<Val, Error> {
     select_entry(
         f,
-        "linear.moe_matmul_select",
+        "linear.moe_select",
         x,
         Form::Dense(bank),
         None,
@@ -1706,7 +1706,7 @@ pub fn matmul_select_bias(
     y: Operand,
     tuning: Tuning,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.moe_matmul_select_bias";
+    const OP: &str = "linear.moe_select";
     let form = form_of(OP, bank)?;
     select_entry(f, OP, x, form, Some(bias), routes, y, tuning)
 }
@@ -1719,7 +1719,7 @@ pub fn matmul_select_quant(
     y: Operand,
     tuning: Tuning,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     let form = form_of(OP, bank)?;
     select_entry(f, OP, x, form, None, routes, y, tuning)
 }
@@ -1781,7 +1781,7 @@ pub fn weighted_sum(
     weights: Operand,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     expect(OP, routed, &[Dtype::Bf16])?;
     expect(OP, weights, &[Dtype::F32])?;
     nonzero(OP, "the token rows", y.rows)?;

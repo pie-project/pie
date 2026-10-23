@@ -15,7 +15,7 @@ pub fn embed_concat(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = nonzero(OP, "the hashed head count", ids.width)?;
@@ -62,7 +62,7 @@ pub fn embed_concat_mlxu4(
     seat: crate::linear::moe::GroupSeat,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let Some(biases) = biases else {

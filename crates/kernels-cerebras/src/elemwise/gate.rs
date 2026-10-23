@@ -10,7 +10,7 @@ use crate::tensor::Tensor;
 
 /// `x = silu(s · x)`, in place.
 pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.silu_scaled";
+    const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     let (rg, cg) = tile_split(OP, x.rows, x.width, u64::from(x.width), 0, 0, 1)?;
     let pes = rg * cg;

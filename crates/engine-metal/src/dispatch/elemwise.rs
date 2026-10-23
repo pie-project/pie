@@ -297,7 +297,7 @@ impl Run<'_> {
             } => {
                 if !*tanh {
                     return Err(kernels_metal::Error::Backend {
-                        op: "elemwise.gelu",
+                        op: "elemwise.act",
                         detail: "the erf gelu has no shader here; the tanh approximation \
                                  (`gelu(x, tanh = true)`) is what every DiT under study runs"
                             .to_string(),

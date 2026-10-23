@@ -435,7 +435,7 @@ pub fn embed_concat(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     expect(OP, ids, &[Dtype::I32])?;
     if table.dtype != y.dtype {
         return Err(refuse(
@@ -588,7 +588,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_weighted";
+    const OP: &str = "gather.embed";
     expect(OP, ids, &[Dtype::I32])?;
     expect(OP, weights, &[Dtype::Bf16, Dtype::F32])?;
     if table.dtype != y.dtype || table.width != y.width {

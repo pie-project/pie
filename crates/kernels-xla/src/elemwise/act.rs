@@ -47,24 +47,24 @@ fn unary(
 
 /// `o = x·σ(x)`. Reference: kernels-metal `act_silu`.
 pub fn silu(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
-    unary(f, "elemwise.silu", x, o, |f, v| Ok(f.silu(v)?))
+    unary(f, "elemwise.act", x, o, |f, v| Ok(f.silu(v)?))
 }
 
 /// `o = tanh(x)`. Reference: kernels-metal `act_tanh`.
 pub fn tanh(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
-    unary(f, "elemwise.tanh", x, o, |f, v| Ok(f.tanh(v)))
+    unary(f, "elemwise.act", x, o, |f, v| Ok(f.tanh(v)))
 }
 
 /// `o = ½x(1 + tanh(√(2/π)(x + 0.044715x³)))`. Reference: kernels-metal
 /// `act_gelu_tanh`.
 pub fn gelu_tanh(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
-    unary(f, "elemwise.gelu", x, o, |f, v| Ok(f.gelu_tanh(v)?))
+    unary(f, "elemwise.act", x, o, |f, v| Ok(f.gelu_tanh(v)?))
 }
 
 /// `o = ½x(1 + erf(x/√2))`, erf to 1.5e-7 (A&S 7.1.26), well under bf16.
 /// The GPUs refuse `Gelu { tanh: false }`; this serves it.
 pub fn gelu_erf(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
-    unary(f, "elemwise.gelu", x, o, |f, v| Ok(f.gelu_erf(v)?))
+    unary(f, "elemwise.act", x, o, |f, v| Ok(f.gelu_erf(v)?))
 }
 
 fn binary(
@@ -86,12 +86,12 @@ fn binary(
 
 /// `z = x + y`. Reference: kernels-metal `binary_add`.
 pub fn add(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
-    binary(f, "elemwise.add", x, y, z, false)
+    binary(f, "elemwise.binary", x, y, z, false)
 }
 
 /// `z = x · y`. Reference: kernels-metal `binary_mul`.
 pub fn mul(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
-    binary(f, "elemwise.mul", x, y, z, true)
+    binary(f, "elemwise.binary", x, y, z, true)
 }
 
 // ------------------------------------------------------------- modulation

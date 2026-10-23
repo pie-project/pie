@@ -104,3 +104,33 @@ fn a_rotation_at_f32_positions_is_refused_by_its_field_name() {
         "{faults:?}"
     );
 }
+
+/// The folded lookup names its ids port, whichever form it takes.
+#[test]
+fn a_lookup_of_f32_ids_is_refused_by_its_field_name() {
+    let mut trace = traced();
+    let ids = trace
+        .nodes
+        .iter()
+        .find_map(|node| match &node.op {
+            Operation::Gather(poem_ir::Gather::Embed { ids, .. }) => Some(*ids),
+            _ => None,
+        })
+        .expect("the trace holds its lookup");
+    let Ty::Tensor { dtype, .. } = &mut trace.values[ids.0 as usize].ty else {
+        panic!("ids are a tensor");
+    };
+    *dtype = Dtype::F32;
+    let faults = poem_ir::check(&trace).expect_err("f32 ids are refused");
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            Fault::PortDtype {
+                port: Port("ids"),
+                want: Dtype::I32,
+                ..
+            }
+        )),
+        "{faults:?}"
+    );
+}

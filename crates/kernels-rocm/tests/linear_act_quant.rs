@@ -463,7 +463,7 @@ fn an_fp8_bank_on_the_matrix_core_folds_each_route() {
         let routes: Vec<i32> = (0..tokens * top_k)
             .map(|i| ((i / top_k * 5 + (i % top_k) * 7 + i / 3) % experts) as i32)
             .collect();
-        let op = "linear.moe_matmul_select_act_quant";
+        let op = "linear.moe_select";
         let xt = gpu.tensor(&x, tokens as u32, k as u32, Dtype::Bf16);
         let _ = op;
         let (host, host_s) = host_scaled(&x, k, 128);

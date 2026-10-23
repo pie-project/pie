@@ -95,7 +95,7 @@ pub fn matmul_select(
     y: &mut Tensor,
     experts: ExpertTable,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select";
+    const OP: &str = "linear.moe_select";
 
     #[cfg(feature = "cuda")]
     {
@@ -689,7 +689,7 @@ pub fn matmul_select_bias(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_bias";
+    const OP: &str = "linear.moe_select";
     matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
 }
 
@@ -704,7 +704,7 @@ pub fn matmul_select_quant(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     match biases {
         None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat),
         Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat),

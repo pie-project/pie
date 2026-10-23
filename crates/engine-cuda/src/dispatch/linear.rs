@@ -1039,7 +1039,7 @@ impl Run<'_> {
                 let (codes, scales, affine, seat) = self.planes(*bank);
                 if codes.dtype == Dtype::Nvfp4 {
                     return Err(kernels_cuda::Error::Backend {
-                        op: "linear.moe_matmul_select_bias",
+                        op: "linear.moe_select",
                         detail: "an nvfp4 bank's biased select has no cuda point; its \
                                  select reads no expert bias"
                             .to_string(),
@@ -1585,9 +1585,9 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
-        per_tensor_e4m3_is_a_table("linear.moe_matmul_select_quant", codes)?;
+        per_tensor_e4m3_is_a_table("linear.moe_select", codes)?;
         if codes.dtype == Dtype::Nvfp4 {
-            let tensor_scales = tensor_scales("linear.moe_matmul_select_quant", biases)?;
+            let tensor_scales = tensor_scales("linear.moe_select", biases)?;
             let (codes, scales, tensor_scales, routes, seat) =
                 match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
                     Some((codes, scales, Some(tensor_scales), routes)) => {
@@ -1635,7 +1635,7 @@ impl Run<'_> {
         _: Option<ValueId>,
         _: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        lowp("linear.moe_matmul_select_act_quant")
+        lowp("linear.moe_select")
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -1663,7 +1663,7 @@ impl Run<'_> {
         input_scales: Option<ValueId>,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        const OP: &str = "linear.moe_matmul_select_act_quant";
+        const OP: &str = "linear.moe_select";
         if !linear::gemm_sm100::supported() {
             return self.select_a16(OP, x, bank, routes, y);
         }

@@ -1,4 +1,4 @@
-//! Routed matmuls a route at a time (`linear.moe_matmul_select`, its bias
+//! Routed matmuls a route at a time (`linear.moe_select`, its bias
 //! and quantized forms, and `linear.matmul_grouped` over them) from
 //! `kernels/linear/moe/select.slang`: eight output rows of one route a
 //! workgroup. At `Tier::Subgroup` (WGSL) a strip folds by shuffles and the
@@ -125,7 +125,7 @@ pub fn matmul_select(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select";
+    const OP: &str = "linear.moe_select";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "linear_moe_select_dense_bf16" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = fan(OP, x, routes, y)?;
@@ -264,7 +264,7 @@ pub fn matmul_select_bias(
     );
     quantized(
         ctx,
-        "linear.moe_matmul_select_bias",
+        "linear.moe_select",
         tier,
         x,
         bank,
@@ -283,16 +283,7 @@ pub fn matmul_select_quant(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    quantized(
-        ctx,
-        "linear.moe_matmul_select_quant",
-        tier,
-        x,
-        bank,
-        None,
-        routes,
-        y,
-    )
+    quantized(ctx, "linear.moe_select", tier, x, bank, None, routes, y)
 }
 
 /// A grouped plane: an expert bank, quantized or dense.

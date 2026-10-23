@@ -865,7 +865,7 @@ impl<'c> Run<'c> {
         };
         rows.stage(self.handles, host, bank, ids)
             .map_err(|why| kernels_vulkan::Error::Backend {
-                op: "gather.embed_concat",
+                op: "gather.embed",
                 detail: why.to_string(),
             })
     }

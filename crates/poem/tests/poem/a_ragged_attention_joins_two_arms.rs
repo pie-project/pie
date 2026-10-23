@@ -180,7 +180,7 @@ fn every_other_op_still_refuses_two_arms() {
             .unwrap_or_default(),
     };
     assert!(
-        message.contains("elemwise.add") && message.contains("different split arms"),
+        message.contains("elemwise.binary") && message.contains("different split arms"),
         "the refusal names the op and the rule: {message}"
     );
 }

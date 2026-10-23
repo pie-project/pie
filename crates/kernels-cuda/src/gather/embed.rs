@@ -236,7 +236,7 @@ pub fn embed_concat(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = nonzero(OP, "the hashed head count", ids.width)?;
@@ -283,7 +283,7 @@ pub fn embed_concat_mlxu4(
     seat: crate::linear::moe::GroupSeat,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let Some(biases) = biases else {
@@ -515,7 +515,7 @@ pub fn embed_concat_e4m3(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     let (heads, width) = head_width(OP, ids, y)?;
     let held = u64::from(codes.rows) * u64::from(codes.width);
     if held != u64::from(vocab) * u64::from(width) || scale.rows * scale.width != 4 {
@@ -559,7 +559,7 @@ pub fn embed_concat_mxfp8(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     let (heads, width) = head_width(OP, ids, y)?;
     if !width.is_multiple_of(32) || !codes.ptr.is_multiple_of(16) {
         return Err(refuse(
@@ -603,7 +603,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_weighted";
+    const OP: &str = "gather.embed";
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
         y.dtype, table.dtype,

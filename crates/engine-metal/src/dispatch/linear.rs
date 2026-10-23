@@ -997,7 +997,7 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                const OP: &str = "linear.moe_matmul_select_bias";
+                const OP: &str = "linear.moe_select";
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
@@ -1043,7 +1043,7 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                const OP: &str = "linear.moe_matmul_select_quant";
+                const OP: &str = "linear.moe_select";
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(

@@ -148,7 +148,7 @@ impl Run<'_> {
                 #[cfg(not(feature = "rocm"))]
                 Some((codes, ..)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
                     Err(kernels_cuda::Error::Backend {
-                        op: "gather.embed_concat",
+                        op: "gather.embed",
                         detail: "an nvfp4 table has no cuda gather; its rows are read as \
                                  bf16 or affine codes"
                             .to_string(),

@@ -714,7 +714,7 @@ pub fn select_nvfp4(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = selected(OP, x, routes, y)?;
     let Planes { n, k } = planes(OP, codes, scales, tensor_scales, y.width, x.width)?;

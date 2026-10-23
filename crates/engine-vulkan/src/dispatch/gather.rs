@@ -117,7 +117,7 @@ impl Run<'_> {
                 concat: true,
                 ..
             } => Err(kernels_vulkan::Error::Unsupported {
-                op: "gather.embed_concat(mxfp8)",
+                op: "gather.embed(mxfp8)",
             }),
             Gather::Embed {
                 ids,

@@ -43,7 +43,7 @@ fn a_value_read_past_the_match_keeps_the_pair_apart() {
     });
     assert_eq!(
         ops(&fuse(t, &["fused.matmul_bias"])),
-        ["linear.matmul", "elemwise.add_bias", "elemwise.silu"]
+        ["linear.matmul", "elemwise.add_bias", "elemwise.act"]
     );
 }
 
@@ -56,7 +56,7 @@ fn an_op_between_the_pair_stays_ahead_of_the_fused_one() {
     });
     assert_eq!(
         ops(&fuse(t, &["fused.matmul_bias"])),
-        ["elemwise.silu", "fused.matmul_bias"]
+        ["elemwise.act", "fused.matmul_bias"]
     );
 }
 
@@ -114,7 +114,7 @@ fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
             "linear.matmul",
             "linear.glu",
             "linear.matmul",
-            "elemwise.silu"
+            "elemwise.act"
         ]
     );
 }
@@ -148,7 +148,7 @@ fn the_qkv_write_folds_when_its_norms_share_an_epsilon() {
     );
     assert_eq!(
         ops(&fused),
-        ["fused.qkv_fused_qknorm_rope_vnorm_write", "elemwise.silu"]
+        ["fused.qkv_fused_qknorm_rope_vnorm_write", "elemwise.act"]
     );
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::QkvFusedQknormRopeVnormWrite {
         kv_heads,
@@ -284,7 +284,7 @@ fn a_yarn_rotation_and_its_cache_write_fold_into_one_op() {
             trace(|p| yarn_write(p, interleaved)),
             &["fused.rope_yarn_append"],
         );
-        assert_eq!(ops(&fused), ["fused.rope_yarn_append", "elemwise.silu"]);
+        assert_eq!(ops(&fused), ["fused.rope_yarn_append", "elemwise.act"]);
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::RopeYarnAppend {
             head_dim,
             theta,
@@ -344,7 +344,7 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
         let fused = fuse(packed_write(interleaved, false), &kernels);
         assert_eq!(
             ops(&fused),
-            ["fused.split_rope_yarn_append", "elemwise.silu"]
+            ["fused.split_rope_yarn_append", "elemwise.act"]
         );
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::SplitRopeYarnAppend {
             q_width,
@@ -376,8 +376,8 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
         [
             "gather.split_qkv",
             "fused.rope_yarn_append",
-            "elemwise.silu",
-            "elemwise.silu"
+            "elemwise.act",
+            "elemwise.act"
         ],
         "a split read past the rotation stays a split"
     );
@@ -420,7 +420,7 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
     let kernels = ["fused.pool_attention", "fused.lse_sink"];
     for selected in [true, false] {
         let fused = fuse(layer(selected, true), &kernels);
-        assert_eq!(ops(&fused), ["fused.pool_attention", "elemwise.silu"]);
+        assert_eq!(ops(&fused), ["fused.pool_attention", "elemwise.act"]);
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolAttention {
             window,
             pool,
@@ -447,7 +447,7 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
     }
     assert_eq!(
         ops(&fuse(layer(false, false), &kernels)),
-        ["fused.lse_sink", "elemwise.silu"]
+        ["fused.lse_sink", "elemwise.act"]
     );
 }
 
@@ -482,7 +482,7 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
     };
     for decode in [true, false] {
         let fused = fuse(sinked(decode, false), &["fused.lse_sink"]);
-        assert_eq!(ops(&fused), ["fused.lse_sink", "elemwise.silu"]);
+        assert_eq!(ops(&fused), ["fused.lse_sink", "elemwise.act"]);
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::LseSink { attn, head_dim, .. })) =
             fused.nodes.first().map(|node| &node.op)
         else {
@@ -515,7 +515,7 @@ fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
     });
     assert_eq!(
         ops(&fuse(t, &["fused.matmul_split_rows"])),
-        ["fused.matmul_split_rows", "elemwise.silu", "elemwise.silu"]
+        ["fused.matmul_split_rows", "elemwise.act", "elemwise.act"]
     );
 }
 
@@ -548,8 +548,8 @@ fn qwens_attention_prologue_lands_as_one_fused_op() {
         ops(&fuse(t, &["fused.qg_qknorm_rope_append"])),
         [
             "fused.qg_qknorm_rope_append",
-            "elemwise.silu",
-            "elemwise.silu"
+            "elemwise.act",
+            "elemwise.act"
         ]
     );
 }
@@ -571,7 +571,7 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
         elemwise::silu(&q);
     });
     let fused = fuse(q, &kernels);
-    assert_eq!(ops(&fused), ["fused.norm_rope_last", "elemwise.silu"]);
+    assert_eq!(ops(&fused), ["fused.norm_rope_last", "elemwise.act"]);
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::NormRopeLast {
         weight,
         head_dim,
@@ -595,7 +595,7 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     });
     assert_eq!(
         ops(&fuse(plane, &kernels)),
-        ["fused.norm_rope_last", "elemwise.silu"]
+        ["fused.norm_rope_last", "elemwise.act"]
     );
     // A row of several heads normed whole is not a head's norm.
     let wide = trace(|p| {
@@ -606,7 +606,7 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     });
     assert_eq!(
         ops(&fuse(wide, &kernels)),
-        ["elemwise.rmsnorm", "elemwise.rope", "elemwise.silu"]
+        ["elemwise.rmsnorm", "elemwise.rope", "elemwise.act"]
     );
 }
 
@@ -670,14 +670,14 @@ fn a_hyper_connection_pre_mix_lands_as_one_op() {
     ];
     assert_eq!(
         ops(&fuse(sublayer(false), &all)),
-        ["fused.hc_pre", "elemwise.silu", "elemwise.hc_fold"]
+        ["fused.hc_pre", "elemwise.act", "elemwise.hc_fold"]
     );
     assert_eq!(
         ops(&fuse(sublayer(false), &all[1..])),
         [
             "fused.hc_prenorm_project",
             "fused.hc_gates_norm",
-            "elemwise.silu",
+            "elemwise.act",
             "elemwise.hc_fold"
         ]
     );
@@ -747,7 +747,7 @@ fn deepseeks_q_and_kv_plane_land_as_one_op() {
             "linear.matmul",
             "linear.matmul",
             "fused.norm_rope_pair",
-            "elemwise.silu"
+            "elemwise.act"
         ]
     );
 }
@@ -773,7 +773,7 @@ fn deepseeks_attention_lands_its_output_turned_back() {
         elemwise::silu(&turned);
     });
     let fused = fuse(layer, &["fused.pool_attention"]);
-    assert_eq!(ops(&fused), ["fused.pool_attention", "elemwise.silu"]);
+    assert_eq!(ops(&fused), ["fused.pool_attention", "elemwise.act"]);
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolAttention { rotate, .. })) =
         fused.nodes.first().map(|node| &node.op)
     else {
@@ -821,7 +821,7 @@ fn an_index_ranking_lands_its_queries_turn() {
     });
     assert_eq!(
         ops(&fuse(t, &["fused.index_topk_rope"])),
-        ["fused.index_topk_rope", "elemwise.silu"]
+        ["fused.index_topk_rope", "elemwise.act"]
     );
 }
 
@@ -885,7 +885,7 @@ fn a_matmul_and_the_split_of_its_row_fold_into_one_op() {
     );
     assert_eq!(
         ops(&fused),
-        ["fused.matmul_split_rows", "elemwise.silu", "elemwise.silu"]
+        ["fused.matmul_split_rows", "elemwise.act", "elemwise.act"]
     );
 }
 
@@ -928,7 +928,7 @@ fn an_mhc_norm_read_elsewhere_stays_written() {
         [
             "elemwise.hc_rmsnorm_f32",
             "elemwise.hc_project",
-            "elemwise.silu"
+            "elemwise.act"
         ]
     );
 }
@@ -965,7 +965,7 @@ fn a_gated_delta_step_folds_into_one_launch() {
         }),
         &["fused.gdn_step"],
     );
-    assert_eq!(ops(&fused), ["fused.gdn_step", "elemwise.silu"]);
+    assert_eq!(ops(&fused), ["fused.gdn_step", "elemwise.act"]);
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::GdnStep {
         width,
         conv_width,
@@ -989,7 +989,7 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
             "ssm.causal_conv1d",
             "ssm.gdn_gates",
             "ssm.gated_delta",
-            "elemwise.silu"
+            "elemwise.act"
         ]
     );
 }

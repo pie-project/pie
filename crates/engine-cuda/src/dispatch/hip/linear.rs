@@ -469,7 +469,7 @@ impl Run<'_> {
                 quantized: true,
                 ..
             } => {
-                const OP: &str = "linear.moe_matmul_select_act_quant";
+                const OP: &str = "linear.moe_select";
                 // The routes' rows read x's rows, so x's rows are what quantize.
                 // An fp8 bank (f32 factors) reads e4m3 rows under f32 scales
                 // a 1x128 block; any other bank, ue8m0 ones.
@@ -1045,7 +1045,7 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (q, act_scales) = self.fp8_quantized("linear.moe_matmul_select_act_quant", x, false)?;
+        let (q, act_scales) = self.fp8_quantized("linear.moe_select", x, false)?;
         let x = self.tensor(x);
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);

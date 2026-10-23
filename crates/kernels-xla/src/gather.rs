@@ -198,7 +198,7 @@ pub fn embed_concat(
     vocab: u32,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     i32_ids(OP, "token ids", ids)?;
     same_dtype(OP, table, y)?;
     nonzero(OP, "the row count this embedding table states", vocab)?;
@@ -515,7 +515,7 @@ pub fn embed_concat_mb_4bit(
     vocab: u32,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     let (heads, width) = concat_shape(OP, ids, y)?;
     gather_affine(f, OP, ids, table, vocab, y, y.rows * heads, width)
 }
@@ -530,7 +530,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "gather.embed_weighted";
+    const OP: &str = "gather.embed";
     i32_ids(OP, "taps", ids)?;
     same_dtype(OP, table, y)?;
     if weights.dtype != Dtype::F32 {

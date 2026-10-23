@@ -49,7 +49,7 @@ pub fn clamp(f: &mut Func, lo: f32, hi: f32, x: Operand) -> Result<Val, Error> {
 /// `x = min(max(x, lo[0]), hi[0])` with one-scalar bound planes in `x`'s
 /// element. Reference: kernels-wgpu `clamp_learned_bf16`.
 pub fn clamp_learned(f: &mut Func, lo: Operand, hi: Operand, x: Operand) -> Result<Val, Error> {
-    const OP: &str = "elemwise.clamp_learned";
+    const OP: &str = "elemwise.clamp";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     for (what, bound) in [("lower", lo), ("upper", hi)] {
         if bound.dtype != x.dtype {

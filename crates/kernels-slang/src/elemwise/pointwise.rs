@@ -1,4 +1,4 @@
-//! Elementwise kernels with no algorithm of their own (`elemwise.add`,
+//! Elementwise kernels with no algorithm of their own (`elemwise.binary`,
 //! `residual_add`, `add_bias`, `mul_scalar`, `scale`, `silu`, `silu_scaled`,
 //! `tanh`, `cast`, `clamp`, `clamp_learned`, `gate_sigmoid_mul`) from
 //! `kernels/elemwise/pointwise.slang`, a pair of elements a lane. A
@@ -29,7 +29,7 @@ fn flat(op: &'static str, x: Tensor) -> Result<(u32, Grid), Error> {
 
 /// `z = x + y`.
 pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.add";
+    const OP: &str = "elemwise.binary";
     if x.dtype != z.dtype || y.dtype != z.dtype {
         return Err(refuse(
             OP,
@@ -86,7 +86,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
 
 /// `x *= s`, `s` rounded as `x` holds it.
 pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.mul_scalar";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "elemwise_pointwise_scale_bf16",
         F32 => "elemwise_pointwise_scale_f32",
@@ -100,7 +100,7 @@ pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 
 /// `x *= s[0]`.
 pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.scale";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_pointwise_scale_read_bf16" });
     let (n, grid) = flat(OP, x)?;
     ctx.fire(
@@ -111,12 +111,12 @@ pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
 
 /// `x = silu(x * s)`.
 pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    silu_at(ctx, "elemwise.silu_scaled", s, x)
+    silu_at(ctx, "elemwise.act", s, x)
 }
 
 /// `x = silu(x)`.
 pub fn silu(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
-    silu_at(ctx, "elemwise.silu", 1.0, x)
+    silu_at(ctx, "elemwise.act", 1.0, x)
 }
 
 fn silu_at(ctx: &Ctx<'_>, op: &'static str, s: f32, x: Tensor) -> Result<(), Error> {
@@ -133,7 +133,7 @@ fn silu_at(ctx: &Ctx<'_>, op: &'static str, s: f32, x: Tensor) -> Result<(), Err
 
 /// `x = tanh(x)`.
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.tanh";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "elemwise_pointwise_tanh_bf16",
         F32 => "elemwise_pointwise_tanh_f32",
@@ -179,7 +179,7 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
 
 /// `x` clamped between one-element bound tensors of its element.
 pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.clamp_learned";
+    const OP: &str = "elemwise.clamp";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_pointwise_clamp_learned_bf16" });
     for (what, bound) in [("lower", lo), ("upper", hi)] {
         if bound.dtype != x.dtype {

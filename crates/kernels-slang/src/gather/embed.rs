@@ -1,5 +1,5 @@
-//! Embedding lookups (`gather.embed`, `gather.embed_concat`,
-//! `gather.embed_weighted`) from `kernels/gather/embed.slang`, into bf16 rows
+//! Embedding lookups (`gather.embed`, `gather.embed`,
+//! `gather.embed`) from `kernels/gather/embed.slang`, into bf16 rows
 //! a word a lane: from a bf16 table or an affine-quantized bank.
 
 use dtype::Dtype;
@@ -93,7 +93,7 @@ pub fn embed_concat(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "gather_embed_concat_bf16" });
     nonzero(OP, "the row count this embedding table states", vocab)?;
@@ -139,7 +139,7 @@ pub fn embed_concat_banked(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     let (slices, width) = concat_slices(OP, ids, y)?;
     banked(ctx, OP, ids, table, vocab, y, slices, width)
 }
@@ -222,7 +222,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_weighted";
+    const OP: &str = "gather.embed";
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "gather_embed_weighted_bf16" });
     debug_assert_eq!(
         y.dtype, table.dtype,

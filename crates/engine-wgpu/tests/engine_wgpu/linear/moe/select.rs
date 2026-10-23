@@ -529,7 +529,7 @@ mod batched {
                         };
                         let ran = select::matmul_select_batched(
                             c,
-                            "linear.moe_matmul_select_quant",
+                            "linear.moe_select",
                             st(xt),
                             sbank,
                             bias.map(st),
@@ -567,7 +567,7 @@ mod batched {
                         g.run(|c| {
                             let ran = moe::matmul_select_batched(
                                 c,
-                                "linear.moe_matmul_select_quant",
+                                "linear.moe_select",
                                 xt,
                                 bank,
                                 bias,

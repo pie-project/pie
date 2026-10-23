@@ -309,7 +309,7 @@ pub fn standardize(
 /// `x * s`, `s` rounded to `x`'s element first, as the stated scalar lands
 /// (kernels-cuda `elemwise::mul_scalar<T>`: bf16, f16, f32); the new `x`.
 pub fn mul_scalar(f: &mut Func, s: f32, x: Operand) -> Result<Val, Error> {
-    const OP: &str = "elemwise.mul_scalar";
+    const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16, Dtype::F16, Dtype::F32])?;
     let s = match x.dtype {
         Dtype::Bf16 => f32::from_bits(u32::from(crate::hlo::bf16_bits(s)) << 16),
@@ -322,7 +322,7 @@ pub fn mul_scalar(f: &mut Func, s: f32, x: Operand) -> Result<Val, Error> {
 
 /// `silu(x * s)`, the new `x`.
 pub fn silu_scaled(f: &mut Func, s: f32, x: Operand) -> Result<Val, Error> {
-    const OP: &str = "elemwise.silu_scaled";
+    const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16])?;
     let v = x.f32(f);
     let v = f.scale(v, f64::from(s))?;
@@ -331,7 +331,7 @@ pub fn silu_scaled(f: &mut Func, s: f32, x: Operand) -> Result<Val, Error> {
 
 /// `x * s[0]`, a device scalar; the new `x`.
 pub fn scale(f: &mut Func, s: Operand, x: Operand) -> Result<Val, Error> {
-    const OP: &str = "elemwise.scale";
+    const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16])?;
     let sv = s.f32(f);
     let n = f.ty(sv).elements();

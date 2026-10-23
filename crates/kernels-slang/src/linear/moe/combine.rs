@@ -1,4 +1,4 @@
-//! Mixture-of-experts combines (`linear.moe_weighted_sum`, `moe_bias_sum`,
+//! Mixture-of-experts combines (`linear.moe_combine`, `moe_bias_sum`,
 //! `moe_sigmoid_gate_add`) from `kernels/linear/moe/combine.slang`, a pair
 //! of elements a lane.
 
@@ -28,7 +28,7 @@ pub fn weighted_sum(
     weights: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     let entry =
         dtype_dispatch!(OP, routed.dtype, { Bf16 => "linear_moe_combine_weighted_sum_bf16" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");

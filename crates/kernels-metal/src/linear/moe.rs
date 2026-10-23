@@ -517,7 +517,7 @@ pub fn matmul_select(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select";
+    const OP: &str = "linear.moe_select";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "select_gemv" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(OP, x, routes, y)?;
@@ -593,7 +593,7 @@ pub fn matmul_select_bias(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_bias";
+    const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let entry = routed_point(OP, bank, true)?;
     debug_assert_eq!(
@@ -631,7 +631,7 @@ pub fn matmul_select_quant(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let entry = routed_point(OP, bank, false)?;
     let fan = selected(OP, x, routes, y)?;
@@ -1098,7 +1098,7 @@ pub fn weighted_sum(
     weights: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     let entry = dtype_dispatch!(OP, routed.dtype, { Bf16 => "expert_combine" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
@@ -1143,7 +1143,7 @@ pub fn weighted_sum_sorted(
     top_k: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     dtype_dispatch!(OP, sorted.dtype, { Bf16 => () });
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
     debug_assert_eq!(

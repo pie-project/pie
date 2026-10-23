@@ -19,7 +19,7 @@ pub fn weighted_sum(
     weights: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
@@ -68,7 +68,7 @@ pub fn weighted_sum(
 /// Each token's weighted routed rows summed in f32, plus its `shared` row,
 /// rounded once.
 pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.moe_sum_add";
+    const OP: &str = "linear.moe_combine";
     let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
     if !routed.rows.is_multiple_of(y.rows)

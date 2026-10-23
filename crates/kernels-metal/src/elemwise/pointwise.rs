@@ -29,7 +29,7 @@ fn binary(
 }
 
 pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.add";
+    const OP: &str = "elemwise.binary";
     let entry = dtype_dispatch!(OP, z.dtype, {
         Bf16 => "binary_add_bfloat16",
         F32 => "binary_add_float32",
@@ -38,7 +38,7 @@ pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
 }
 
 pub fn mul(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.mul";
+    const OP: &str = "elemwise.binary";
     let entry = dtype_dispatch!(OP, z.dtype, {
         Bf16 => "binary_mul_bfloat16",
         F32 => "binary_mul_float32",
@@ -64,7 +64,7 @@ fn activation(
 }
 
 pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.silu";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_silu_bfloat16",
         F32 => "act_silu_float32",
@@ -73,7 +73,7 @@ pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.tanh";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_tanh_bfloat16",
         F32 => "act_tanh_float32",
@@ -82,7 +82,7 @@ pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 }
 
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.gelu";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_gelu_tanh_bfloat16",
         F32 => "act_gelu_tanh_float32",
@@ -201,7 +201,7 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.clamp_learned";
+    const OP: &str = "elemwise.clamp";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "clamp_learned_bfloat16",
         F32 => "clamp_learned_float32",
@@ -357,7 +357,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
 }
 
 pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.mul_scalar";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "layer_scalar_mul_stated_bfloat16",
         F32 => "layer_scalar_mul_stated_float32",
@@ -369,7 +369,7 @@ pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.silu_scaled";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "silu_scaled_bfloat16",
         F32 => "silu_scaled_float32",
@@ -381,7 +381,7 @@ pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 }
 
 pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elemwise.scale";
+    const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "layer_scalar_mul_bfloat16",
         F32 => "layer_scalar_mul_float32",

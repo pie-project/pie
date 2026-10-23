@@ -69,7 +69,7 @@ pub fn embed_concat(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "embed_concat_bfloat16" });
     nonzero(OP, "the row count this embedding table states", vocab)?;
@@ -94,7 +94,7 @@ pub fn embed_concat_mb_4bit(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_concat";
+    const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let (slices, width) = concat_slices(OP, ids, y)?;
     gather_mb_4bit(ctx, OP, ids, table, vocab, y, slices, width)
@@ -671,7 +671,7 @@ pub fn embed_weighted(
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "gather.embed_weighted";
+    const OP: &str = "gather.embed";
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "embed_weighted_bfloat16" });
     debug_assert_eq!(
         y.dtype, table.dtype,

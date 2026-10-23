@@ -224,7 +224,7 @@ pub fn matmul_select(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    select_impl(ctx, "linear.moe_matmul_select", x, bank, routes, y, None)
+    select_impl(ctx, "linear.moe_select", x, bank, routes, y, None)
 }
 
 /// A plane's extent as a phase sees it: the tensor's, or a view's.
@@ -507,7 +507,7 @@ pub fn weighted_sum(
     weights: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     expect(OP, routed, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, weights, &[Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;

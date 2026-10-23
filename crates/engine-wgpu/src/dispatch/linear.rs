@@ -492,7 +492,7 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                const OP: &str = "linear.moe_matmul_select_bias";
+                const OP: &str = "linear.moe_select";
 
                 let (planes, bias_plane, routed, staged) = match self.staged(
                     Some(self.planes(*bank)),
@@ -545,7 +545,7 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                const OP: &str = "linear.moe_matmul_select_quant";
+                const OP: &str = "linear.moe_select";
                 let (planes, routed, staged) =
                     match self.staged(Some(self.planes(*bank)), None, self.tensor(*routes))? {
                         Some((planes, _, routed)) => {
