@@ -16,7 +16,10 @@ fn the_neural_engine_bridge_resolves() {
     assert_eq!(surface.stride(), 128);
     assert_eq!(surface.bytes(), 16384);
     assert_eq!(surface.strides(3), "[384, 384, 128, 1]");
+    // SAFETY: row 2, column 99 of a 3-row surface whose stride the line above
+    // asserted is 128: inside its 16 KB, and nothing else touches it.
     unsafe { *surface.base().add(2 * 128 + 99) = 0x5a };
+    // SAFETY: the byte just written.
     assert_eq!(unsafe { *surface.base().add(2 * 128 + 99) }, 0x5a);
 
     let halves = Surface::new(1, 2048, Element::Fp16).unwrap();

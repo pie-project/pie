@@ -63,6 +63,8 @@ pub struct Sparse {
 // made on it (queue operations, event reads and waits, residency edits), and
 // the only mutable state is behind a `Mutex`.
 unsafe impl Send for Sparse {}
+// SAFETY: as `Send`: `&Sparse` reaches only those thread-safe calls and the
+// `Mutex`-guarded ticks.
 unsafe impl Sync for Sparse {}
 
 impl std::fmt::Debug for Sparse {

@@ -160,9 +160,8 @@ impl Buffer {
                     ),
                 });
             }
-            // SAFETY: `Mapping` is a page-aligned live `mmap` of `span()`
-            // bytes, matching what `newBufferWithBytesNoCopy` requires; the
-            // window checked above lies inside it.
+            // SAFETY: the window checked above lies inside the live mapping,
+            // so `cut.base()` stays within its `span()` bytes.
             let at = unsafe { map.base().add(cut.base()) };
             if crate::diag::on().copy_resident {
                 let started = std::time::Instant::now();
@@ -205,6 +204,9 @@ impl Buffer {
                 owned.bytes = cut.bytes();
                 return Ok(owned);
             }
+            // SAFETY: `cut` builds windows on page boundaries of a page-rounded
+            // `mmap`, so `at` and `span` are page-aligned and inside it; the
+            // buffer keeps the `Arc<Mapping>` in `keep`, so the pages outlive it.
             let slab = unsafe { device.no_copy(at, cut.span()) }.map_err(|why| Fault::Mapped {
                 step: "bind",
                 what: map.path().display().to_string(),
@@ -236,6 +238,7 @@ impl Buffer {
         at: std::ptr::NonNull<u8>,
         bytes: u64,
     ) -> Result<Buffer> {
+        // SAFETY: this function's own contract is `no_copy`'s, passed through.
         let slab = unsafe { device.no_copy(at, bytes as usize) }?;
         Ok(Buffer {
             slab,
@@ -384,11 +387,11 @@ impl FileWriter {
                     let failed = &failed;
                     scope.spawn(move || {
                         for &(into, from, len) in chunk {
-                            // SAFETY: destinations are disjoint and inside the
-                            // live mapping, per `file_writer`.
                             let dst = (base
                                 + usize::try_from(into).expect("an offset inside a live mapping"))
                                 as *mut u8;
+                            // SAFETY: destinations are disjoint and inside the
+                            // live mapping, per `file_writer`.
                             if let Err(why) = unsafe { pread_all(fd, dst, from, len) } {
                                 *failed.lock().expect("failed lock poisoned") = Some(why);
                                 return;

@@ -170,6 +170,9 @@ impl Icb {
                 None => {
                     for index in slots {
                         if self.built[*index].live || forced {
+                            // SAFETY: `held` indexes `self.built`, which
+                            // `Builder::finish` sized to the commands the
+                            // buffer was made with.
                             unsafe { self.icb.indirectComputeCommandAtIndex(*index).reset() };
                             self.built[*index].live = false;
                             moved.turned_off += 1;
@@ -218,6 +221,8 @@ impl Icb {
         forced: bool,
         moved: &mut Rebound,
     ) -> Result<()> {
+        // SAFETY: `index` comes from `held` in `rebind`, so it is below
+        // `self.built.len()`, the buffer's command count.
         let command = unsafe { self.icb.indirectComputeCommandAtIndex(index) };
         let revived = forced || !self.built[index].live;
         let rearmed = revived || self.built[index].point != wanted.point;
@@ -289,6 +294,11 @@ impl Icb {
                              one"
                         ),
                     })?;
+                    // SAFETY: `at` is below the encoded slot's argument count,
+                    // which `Builder::encode` held to `MAX_BINDINGS`; `to` was
+                    // bound through `Handles`, which keeps it inside `slab`; and
+                    // `self.slabs` retains `slab` for as long as the buffer,
+                    // which does not retain what it binds.
                     unsafe {
                         command.setKernelBuffer_offset_atIndex(
                             &slab,
@@ -321,6 +331,9 @@ impl Icb {
                         });
                     }
                     if revived {
+                        // SAFETY: `at` is below `MAX_BINDINGS` as above; `cell`
+                        // was written inside the scalar arena when the slot was
+                        // built, and `self` owns the arena.
                         unsafe {
                             command.setKernelBuffer_offset_atIndex(
                                 self.constants.slab(),
@@ -339,6 +352,8 @@ impl Icb {
                 }
                 (Bound::Absent, Arg::Absent) => {
                     if revived {
+                        // SAFETY: `at` is below `MAX_BINDINGS` as above, and
+                        // offset 0 of the arena `self` owns.
                         unsafe {
                             command.setKernelBuffer_offset_atIndex(self.constants.slab(), 0, at);
                         }
@@ -535,6 +550,8 @@ impl Builder<'_> {
             });
         }
         let pipeline = self.pipelines.at(self.device.device(), fire)?;
+        // SAFETY: `index` was checked against `ceiling` above, and the buffer
+        // holds `ceiling.max(1)` commands.
         let command = unsafe { self.icb.indirectComputeCommandAtIndex(index) };
         command.setComputePipelineState(&pipeline);
 
@@ -578,6 +595,8 @@ impl Builder<'_> {
                 let bytes = scalar_bytes_of(scalar);
                 let cell = self.cell(&bytes)?;
                 let constants = self.constants.borrow();
+                // SAFETY: `encode` held `at` below `MAX_BINDINGS`; `cell` wrote
+                // its bytes inside the arena, which the finished `Icb` owns.
                 unsafe {
                     command.setKernelBuffer_offset_atIndex(
                         constants.slab(),
@@ -593,6 +612,8 @@ impl Builder<'_> {
         };
         if handle == NIL {
             let constants = self.constants.borrow();
+            // SAFETY: `encode` held `at` below `MAX_BINDINGS`; offset 0 of the
+            // arena the finished `Icb` owns.
             unsafe { command.setKernelBuffer_offset_atIndex(constants.slab(), 0, at) };
             return Ok(Bound::Absent);
         }
@@ -606,6 +627,9 @@ impl Builder<'_> {
         let offset = binding.offset();
         drop(binding);
         self.slabs.borrow_mut().insert(slab_id(&slab), slab.clone());
+        // SAFETY: `encode` held `at` below `MAX_BINDINGS`; `Handles::bind`
+        // kept `offset` inside `slab`; and `slabs` retains `slab` into the
+        // finished `Icb`, since the buffer does not retain what it binds.
         unsafe {
             command.setKernelBuffer_offset_atIndex(
                 &slab,

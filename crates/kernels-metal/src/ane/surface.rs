@@ -38,7 +38,12 @@ pub struct Surface {
     element: Element,
 }
 
+// SAFETY: the fields are an `IOSurfaceRef` (a CoreFoundation object, retained
+// and released from any thread), its base address and two integers, all set
+// once in `new`; dropping on another thread releases the same reference.
 unsafe impl Send for Surface {}
+// SAFETY: `&Surface` only reads those fields; touching the memory behind
+// `base` takes the caller's own `unsafe`.
 unsafe impl Sync for Surface {}
 
 impl Surface {
@@ -54,6 +59,8 @@ impl Surface {
         };
         let mut err = sys::message();
         let int8 = c_int::from(element == Element::Int8);
+        // SAFETY: `raw` is a live `RawSurface` the call fills, and `err` a
+        // `CAP`-byte buffer, the length the call is told.
         let made = unsafe {
             sys::pie_ane_surface(
                 rows,
@@ -123,6 +130,8 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        // SAFETY: `new` returned this surface with one reference, which only
+        // this drop releases.
         unsafe { sys::pie_ane_surface_free(self.raw.surface) };
     }
 }

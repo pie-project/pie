@@ -10,6 +10,8 @@ static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 pub fn free_bytes(at: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(at.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is a C struct of integers, for which all zero bytes
+    // is a valid value.
     let mut said: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: a `statvfs` of a NUL-terminated path into a zeroed struct this
     // frame owns; the call reads the path and writes only that struct.

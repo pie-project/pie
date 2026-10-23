@@ -71,11 +71,6 @@ impl Metal {
         }
     }
 
-    #[must_use]
-    pub fn shell(&self) -> Option<&Shell> {
-        self.shell.as_ref()
-    }
-
     pub fn shell_mut(&mut self) -> Option<&mut Shell> {
         self.shell.as_mut()
     }
@@ -97,13 +92,6 @@ impl Metal {
                 what: "instance",
                 id,
             })
-    }
-
-    #[allow(dead_code)]
-    fn loaded(&self) -> EngineResult<&Shell> {
-        self.shell
-            .as_ref()
-            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))
     }
 
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
@@ -975,7 +963,7 @@ impl Metal {
 
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
-            let Some(element) = self.loaded()?.patch_element() else {
+            let Some(element) = self.loaded_mut()?.patch_element() else {
                 return Err(fault(crate::error::Fault::from(poem_exec::Error::Fire(
                     poem_exec::fire::Fault::Towerless {
                         lane: submission.media[0].lane,
@@ -993,7 +981,7 @@ impl Metal {
             }
         }
         let mut voxel_payloads: Vec<Vec<u8>> = Vec::with_capacity(submission.voxels.len());
-        if !submission.voxels.is_empty() && self.loaded()?.voxel_element().is_none() {
+        if !submission.voxels.is_empty() && self.loaded_mut()?.voxel_element().is_none() {
             return Err(Error::Invalid(
                 "this step submits VAE clips and the loaded plan states no voxel row; a \
                  model with no autoencoder has nothing to decode them with"
@@ -1001,7 +989,7 @@ impl Metal {
             ));
         }
         let voxel_element = self
-            .loaded()?
+            .loaded_mut()?
             .voxel_element()
             .unwrap_or(poem_ir::Dtype::Bf16);
         for row in &submission.voxels {
@@ -1180,9 +1168,16 @@ fn readouts_of(step: &PendingStep, seam: engine::fire::ReadoutSeam) -> Vec<LaneR
         .collect()
 }
 
-// SAFETY: `Engine` requires `Send + Sync`; a loaded `Shell` holds retained Objective-C
-// objects `objc2` doesn't mark `Send`, plus `RefCell`s written through `&self`. Sound
-// because every verb that reaches the shell takes `&mut self`; `kind`/`device_facts`
-// (the only `&self` verbs) never touch the shell.
+// SAFETY: a loaded `Shell` holds retained Metal objects `objc2` doesn't mark
+// `Send`, plus `RefCell`s and no `Rc` or thread-local state. Moving the engine
+// moves sole ownership of all of them, and Metal's device, queue, pipeline and
+// resource objects are documented usable from any thread.
 unsafe impl Send for Metal {}
+// SAFETY: `Engine` demands `Sync`. Every path to the shell, the adapters and
+// the pending step takes `&mut self`; through `&Metal` there are only `kind`,
+// `device_facts`, `capabilities` (plain data in `caps`) and
+// `settles_asynchronously`, which reads `Arms`' plain `Vec` length and touches
+// no `RefCell` or Objective-C object. Shared `&Metal`s therefore only read
+// memory nothing can write while they live. Held by convention: a new `&self`
+// verb that reaches the shell would break it.
 unsafe impl Sync for Metal {}

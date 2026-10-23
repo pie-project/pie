@@ -26,7 +26,13 @@ struct State {
     ledger: Ledger<(Program, Binding)>,
 }
 
+// SAFETY: `MTLSharedEvent` is Metal's cross-thread (and cross-process)
+// signal, documented safe to read, set and wait on from any thread, and an
+// `MTLSharedEventListener` only names the dispatch queue notifications run on.
+// The rest is the `Ledger`, which is atomics and a `Mutex`.
 unsafe impl Send for State {}
+// SAFETY: as `Send`: `&State` reaches only those thread-safe calls and the
+// `Ledger`.
 unsafe impl Sync for State {}
 
 #[derive(Clone)]
@@ -114,6 +120,11 @@ fn listen(state: &Arc<State>, at: Allotment) {
             let report = Box::new(move |ok: bool| {
                 back(&state, at, ok, "an evaluation failed");
             });
+            // SAFETY: the surfaces the binding names live in the `Memory` of the
+            // site that started this hand-off. That site's GPU work joins on
+            // `at.done`, which rises only once this evaluation reports, so
+            // they outlive it as long as the site is not dropped with a frame
+            // in flight. Nothing in this crate ties them to the payload.
             if let Err(why) = unsafe {
                 program.enqueue(
                     &binding,

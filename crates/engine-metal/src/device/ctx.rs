@@ -925,6 +925,8 @@ pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
 fn available_memory() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: `vm_statistics64` is a C struct of integers, for which all
+        // zero bytes is a valid value.
         let mut stats: libc::vm_statistics64 = unsafe { core::mem::zeroed() };
         let mut count = libc::HOST_VM_INFO64_COUNT;
         // SAFETY: `stats` is a live vm_statistics64 and `count` states its
