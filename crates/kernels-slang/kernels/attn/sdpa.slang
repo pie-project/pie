@@ -298,7 +298,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #if !defined(PIE_MIN_LANES)
 #define PIE_MIN_LANES 32
 #endif
-#define DPL ((PIE_HEAD_DIM + PIE_MIN_LANES - 1) / PIE_MIN_LANES)
+// Dim pairs a lane holds: pair `lane + j * width`, dims `2p` and `2p + 1`,
+// so one word load serves two dims.
+#define PPL ((PIE_HEAD_DIM / 2 + PIE_MIN_LANES - 1) / PIE_MIN_LANES)
 
 groupshared float sdpa_acc[MAX_WALKERS][PIE_HEAD_DIM];
 groupshared float sdpa_max[MAX_WALKERS];
@@ -328,16 +330,17 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
     walkers = uint(MAX_WALKERS);
 #endif
     bool walks = walker < walkers;
-    // Dims a lane covers, rounded up: a subgroup wider than the head leaves
-    // its upper lanes idle.
-    uint per_lane = (uint(PIE_HEAD_DIM) + width - 1u) / width;
+    // Pairs a lane covers, rounded up: a subgroup wider than the head's
+    // pairs leaves its upper lanes idle.
+    uint pairs = uint(PIE_HEAD_DIM) / 2u;
+    uint per_lane = (pairs + width - 1u) / width;
 
-    float qreg[DPL];
-    float acc[DPL];
-    [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
-        uint dd = lane + j * width;
-        qreg[j] = (j < per_lane && dd < uint(PIE_HEAD_DIM)) ? params.scale * bf16_at(queries, base_row + dd) : 0.0;
-        acc[j] = 0.0;
+    float2 qreg[PPL];
+    float2 acc[PPL];
+    [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
+        uint pp = lane + j * width;
+        qreg[j] = (j < per_lane && pp < pairs) ? params.scale * word_pair(queries[(base_row >> 1) + pp]) : float2(0.0, 0.0);
+        acc[j] = float2(0.0, 0.0);
     }
 
     float max_score = NEG_INF;
@@ -378,10 +381,10 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         float partial = 0.0;
         if (take) {
             base = (page_slot(req, kp) * uint(params.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
-            [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
-                uint dd = lane + j * width;
-                if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
-                    partial += qreg[j] * bf16_at(k_pages, base + dd);
+            [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
+                uint pp = lane + j * width;
+                if (j < per_lane && pp < pairs) {
+                    partial += dot(qreg[j], word_pair(k_pages[(base >> 1) + pp]));
                 }
             }
         }
@@ -402,19 +405,20 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         if (take) {
             float hist, w;
             online_update(score, max_score, sum_exp, hist, w);
-            [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
-                uint dd = lane + j * width;
-                if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
-                    acc[j] = acc[j] * hist + w * bf16_at(v_pages, base + dd);
+            [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
+                uint pp = lane + j * width;
+                if (j < per_lane && pp < pairs) {
+                    acc[j] = acc[j] * hist + w * word_pair(v_pages[(base >> 1) + pp]);
                 }
             }
         }
     }
     if (walks) {
-        [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
-            uint dd = lane + j * width;
-            if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
-                sdpa_acc[walker][dd] = acc[j];
+        [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
+            uint pp = lane + j * width;
+            if (j < per_lane && pp < pairs) {
+                sdpa_acc[walker][2u * pp] = acc[j].x;
+                sdpa_acc[walker][2u * pp + 1u] = acc[j].y;
             }
         }
         if (lane == 0u) {
