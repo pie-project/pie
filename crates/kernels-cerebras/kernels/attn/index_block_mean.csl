@@ -1,0 +1,29 @@
+// Each boundary row's mean of the ratio cached keys ending at its position
+// (positions before 0 add nothing, the divisor stays ratio); 0 for a row
+// closing no block.
+fn k_index_block_mean(bpos: [*]i32, breq: [*]i32, table: [*]f32, indices: [*]i32, indptr: [*]i32, nidx: i32, nptr: i32,
+                      entries: [*]f32, rows: i32, hd: i32, ratio: i32, ps: i32, cells: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var j: i32 = 0;
+    while (j < hd) : (j += 1) { entries[r * hd + j] = 0.0; }
+    var bp: i32 = bpos[r];
+    if (bp >= 0) {
+      var i: i32 = 0;
+      while (i < ratio) : (i += 1) {
+        var pos: i32 = bp + i - (ratio - 1);
+        if (pos >= 0) {
+          var cell: i32 = k_index_cell(indices, indptr, nidx, nptr, breq[r], pos, ps, cells);
+          if (cell >= 0) {
+            j = 0;
+            while (j < hd) : (j += 1) { entries[r * hd + j] = entries[r * hd + j] + table[cell * hd + j]; }
+          }
+        }
+      }
+      var inv: f32 = 1.0 / @as(f32, ratio);
+      j = 0;
+      while (j < hd) : (j += 1) { entries[r * hd + j] = entries[r * hd + j] * inv; }
+    }
+  }
+}
+

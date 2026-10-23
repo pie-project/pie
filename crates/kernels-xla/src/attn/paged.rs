@@ -1,4 +1,4 @@
-//! Paged attention (kernels-wgpu's `attn::` root), and the flash core every
+//! Paged attention (kernels-slang's `attn::sdpa`), and the flash core every
 //! attention family here shares.
 //!
 //! The core reads keys through a *flat key index*: for a paged pool, key
@@ -8,9 +8,9 @@
 //! the flat index is the key row. Two drivers walk it with an online softmax
 //! in f32:
 //!
-//! - [`per_row`]: every query row gathers its own lane's keys, chunk by chunk
+//! - `per_row`: every query row gathers its own lane's keys, chunk by chunk
 //!   (the decode shape, and any per-row key list such as a selection);
-//! - [`blocked`]: query rows in blocks, each block walking only the key
+//! - `blocked`: query rows in blocks, each block walking only the key
 //!   chunks its rows' `[lo, hi)` ranges span (a data-dependent trip count), as
 //!   one dense `dot_general` per chunk (the prefill shape).
 //!
@@ -25,11 +25,12 @@
 use dtype::Dtype;
 
 use super::{DecodePlan, PrefillPlan};
-use crate::cx::{Ctx, Cx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Val};
-use crate::tensor::{KvPool, RaggedTensor, Tensor};
+use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored};
 use crate::tuning::Chunks;
+use crate::tuning::Tuning;
 
 // ------------------------------------------------------------------ helpers
 
@@ -412,7 +413,7 @@ pub(crate) struct Rows {
     pub rel: Option<Val>,
     /// Reference tag per row, i32.
     pub tag: Option<Val>,
-    /// Attention class per row, i32.
+    /// Attn class per row, i32.
     pub class: Option<Val>,
     /// Row index within its segment, i32 (ragged bias).
     pub qi: Option<Val>,
@@ -1252,36 +1253,39 @@ pub(crate) fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error
     Ok(v)
 }
 
-fn tables_agree(
+fn tables_agree<T: Stored>(
     op: &'static str,
-    positions: Tensor,
-    request_of_token: Tensor,
-    mask: Tensor,
-    mask_enabled: Tensor,
+    positions: T,
+    request_of_token: T,
+    mask: T,
+    mask_enabled: T,
 ) -> Result<(), Error> {
-    if positions.dtype != Dtype::I32 {
+    if positions.dtype() != Dtype::I32 {
         return Err(refuse(
             op,
             format!(
                 "the fire's position table is {:?}; this plan carries i32 positions",
-                positions.dtype
+                positions.dtype()
             ),
         ));
     }
-    if request_of_token.dtype != Dtype::I32 {
+    if request_of_token.dtype() != Dtype::I32 {
         return Err(refuse(
             op,
             format!(
                 "the fire's owning-request table is {:?}; this plan carries an i32 request per token",
-                request_of_token.dtype
+                request_of_token.dtype()
             ),
         ));
     }
     for (what, t) in [("mask plane", mask), ("mask-enabled flags", mask_enabled)] {
-        if !matches!(t.dtype, Dtype::U8 | Dtype::Bool) {
+        if !matches!(t.dtype(), Dtype::U8 | Dtype::Bool) {
             return Err(refuse(
                 op,
-                format!("the fire's {what} are {:?}; this plan carries u8", t.dtype),
+                format!(
+                    "the fire's {what} are {:?}; this plan carries u8",
+                    t.dtype()
+                ),
             ));
         }
     }
@@ -1300,18 +1304,17 @@ fn tables_agree(
 
 /// Validates the fire tables; the plan carries them into the attention.
 /// `kv_len` is not read: the pool's CSR and the positions carry the lengths.
-pub fn plan_decode(
-    ctx: &Ctx<'_>,
-    kv_len: Tensor,
-    positions: Tensor,
-    request_of_token: Tensor,
-    mask: Tensor,
-    mask_enabled: Tensor,
+pub fn plan_decode<T: Stored>(
+    kv_len: T,
+    positions: T,
+    request_of_token: T,
+    mask: T,
+    mask_enabled: T,
     mask_stride: u32,
-) -> Result<DecodePlan, Error> {
-    let _ = (ctx, kv_len);
+) -> Result<DecodePlan<T>, Error> {
+    let _ = kv_len;
     tables_agree(
-        "attention.plan_decode",
+        "attn.plan_decode",
         positions,
         request_of_token,
         mask,
@@ -1326,18 +1329,17 @@ pub fn plan_decode(
     })
 }
 
-pub fn plan_prefill(
-    ctx: &Ctx<'_>,
-    kv_len: Tensor,
-    positions: Tensor,
-    request_of_token: Tensor,
-    mask: Tensor,
-    mask_enabled: Tensor,
+pub fn plan_prefill<T: Stored>(
+    kv_len: T,
+    positions: T,
+    request_of_token: T,
+    mask: T,
+    mask_enabled: T,
     mask_stride: u32,
-) -> Result<PrefillPlan, Error> {
-    let _ = (ctx, kv_len);
+) -> Result<PrefillPlan<T>, Error> {
+    let _ = kv_len;
     tables_agree(
-        "attention.plan_prefill",
+        "attn.plan_prefill",
         positions,
         request_of_token,
         mask,
@@ -1354,16 +1356,16 @@ pub fn plan_prefill(
 
 /// The fire tables an attention reads, whichever plan carried them.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Tables {
-    pub positions: Tensor,
-    pub request_of_token: Tensor,
-    pub mask: Tensor,
-    pub mask_enabled: Tensor,
+pub struct Tables<T> {
+    pub positions: T,
+    pub request_of_token: T,
+    pub mask: T,
+    pub mask_enabled: T,
     pub mask_stride: u32,
 }
 
-impl Tables {
-    pub(crate) const fn decode(p: &DecodePlan) -> Self {
+impl<T: Copy> Tables<T> {
+    pub(crate) const fn decode(p: &DecodePlan<T>) -> Self {
         Self {
             positions: p.positions,
             request_of_token: p.request_of_token,
@@ -1373,7 +1375,7 @@ impl Tables {
         }
     }
 
-    pub(crate) const fn prefill(p: &PrefillPlan) -> Self {
+    pub(crate) const fn prefill(p: &PrefillPlan<T>) -> Self {
         Self {
             positions: p.positions,
             request_of_token: p.request_of_token,
@@ -1383,7 +1385,7 @@ impl Tables {
         }
     }
 
-    pub(crate) fn with_mask(mut self, mask: Tensor) -> Self {
+    pub(crate) fn with_mask(mut self, mask: T) -> Self {
         self.mask = mask;
         self
     }
@@ -1407,7 +1409,11 @@ pub(crate) fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u
     Ok(width / head_dim)
 }
 
-pub(crate) fn pool_heads(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<u32, Error> {
+pub(crate) fn pool_heads(
+    op: &'static str,
+    pool: &KvPool<impl Stored>,
+    head_dim: u32,
+) -> Result<u32, Error> {
     nonzero(op, "the head width", head_dim)?;
     if pool.head_stride != u64::from(head_dim) {
         return Err(refuse(
@@ -1433,7 +1439,7 @@ pub(crate) fn pool_heads(op: &'static str, pool: &KvPool, head_dim: u32) -> Resu
 
 pub(crate) fn kv_heads_agree(
     op: &'static str,
-    pool: &KvPool,
+    pool: &KvPool<impl Stored>,
     head_dim: u32,
     kv_heads: u32,
 ) -> Result<(), Error> {
@@ -1450,7 +1456,7 @@ pub(crate) fn kv_heads_agree(
 }
 
 /// Refuses a pool this backend cannot page through.
-pub(crate) fn pool_paging(op: &'static str, pool: &KvPool) -> Result<(), Error> {
+pub(crate) fn pool_paging(op: &'static str, pool: &KvPool<impl Stored>) -> Result<(), Error> {
     if pool.page_size <= 0 {
         return Err(refuse(op, "the kv page size is zero"));
     }
@@ -1466,10 +1472,10 @@ pub(crate) fn pool_paging(op: &'static str, pool: &KvPool) -> Result<(), Error> 
         return Err(refuse(op, "the page CSR holds no page"));
     }
     for t in [pool.page_indptr, pool.page_indices] {
-        if !matches!(t.dtype, Dtype::I32 | Dtype::U32) {
+        if !matches!(t.dtype(), Dtype::I32 | Dtype::U32) {
             return Err(refuse(
                 op,
-                format!("a page table is {:?}; it is i32", t.dtype),
+                format!("a page table is {:?}; it is i32", t.dtype()),
             ));
         }
     }
@@ -1477,13 +1483,11 @@ pub(crate) fn pool_paging(op: &'static str, pool: &KvPool) -> Result<(), Error> 
 }
 
 /// Reads the pool's paging into a dense page table.
-pub(crate) fn read_geometry(cx: &mut Cx<'_>, pool: &KvPool) -> Result<Geom, Error> {
-    let indptr = cx.read(pool.page_indptr)?;
-    let indptr = flat_i32(cx, indptr)?;
-    let indices = cx.read(pool.page_indices)?;
-    let indices = flat_i32(cx, indices)?;
+pub(crate) fn read_geometry(f: &mut Func, pool: &KvPool<Operand>) -> Result<Geom, Error> {
+    let indptr = flat_i32(f, pool.page_indptr.val)?;
+    let indices = flat_i32(f, pool.page_indices.val)?;
     Ok(geometry(
-        cx,
+        f,
         indptr,
         indices,
         i64::from(pool.page_size),
@@ -1493,9 +1497,9 @@ pub(crate) fn read_geometry(cx: &mut Cx<'_>, pool: &KvPool) -> Result<Geom, Erro
 
 /// A per-row i32 table cut to the fire's `r` rows.
 pub(crate) fn read_rows_i32(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     op: &'static str,
-    t: Tensor,
+    t: Operand,
     r: u32,
 ) -> Result<Val, Error> {
     if t.elements() < u64::from(r) {
@@ -1507,9 +1511,8 @@ pub(crate) fn read_rows_i32(
             ),
         ));
     }
-    let v = cx.read(t)?;
-    let v = flat_i32(cx, v)?;
-    Ok(head(cx, v, i64::from(r))?)
+    let v = flat_i32(f, t.val)?;
+    Ok(head(f, v, i64::from(r))?)
 }
 
 /// How a paged attention walks its keys.
@@ -1523,28 +1526,107 @@ pub(crate) enum Walk {
     Auto,
 }
 
-/// One paged attention call, all semantics stated.
+/// One paged attention call, all semantics stated: a description over
+/// handles (`T`) and landings (`L`), read by [`Paged::try_map`] into the
+/// operands [`attend`] takes.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Paged {
+pub struct Paged<T, L = T> {
     pub op: &'static str,
-    pub q: Tensor,
-    pub tables: Tables,
+    pub q: T,
+    pub tables: Tables<T>,
     /// Read the custom mask (rel reads none).
     pub masked: bool,
     pub window: Option<u32>,
     pub causal: bool,
     pub head_dim: u32,
     pub sm_scale: f32,
-    pub o: Tensor,
-    pub lse: Option<Tensor>,
-    pub walk: Walk,
+    pub o: L,
+    pub lse: Option<L>,
+    pub(crate) walk: Walk,
     /// `(selection [rows, top_k] i32 block ids, ratio)`.
-    pub selection: Option<(Tensor, u32)>,
+    pub selection: Option<(T, u32)>,
     /// `(bias [rows, qh · extent] f32, extent, log_floor, log_alpha)`.
-    pub rel: Option<(Tensor, u32, u32, f32)>,
+    pub rel: Option<(T, u32, u32, f32)>,
 }
 
-pub(crate) fn attend(ctx: &Ctx<'_>, call: Paged, pool: &KvPool) -> Result<(), Error> {
+impl<T: Stored> Paged<T> {
+    /// The call and its pool with every plane [`attend`] consumes read by
+    /// `read`, in the order it consumes them: the page tables, the row
+    /// tables (the mask's only when masked), the query, the key and value
+    /// planes, the relative bias, the selection. A plane not read keeps its
+    /// shape over the query's value, which [`attend`] never reads.
+    pub fn try_map<O: Copy, E>(
+        self,
+        pool: &KvPool<T>,
+        mut read: impl FnMut(T) -> Result<O, E>,
+    ) -> Result<(Paged<O, Landing>, KvPool<O>), E> {
+        let page_indptr = read(pool.page_indptr)?;
+        let page_indices = read(pool.page_indices)?;
+        let positions = read(self.tables.positions)?;
+        let request_of_token = read(self.tables.request_of_token)?;
+        let masks = if self.masked {
+            let enabled = read(self.tables.mask_enabled)?;
+            Some((read(self.tables.mask)?, enabled))
+        } else {
+            None
+        };
+        let q = read(self.q)?;
+        let keys = read(pool.keys)?;
+        let values = read(pool.values)?;
+        let rel = match self.rel {
+            Some((b, e, fl, a)) => Some((read(b)?, e, fl, a)),
+            None => None,
+        };
+        let selection = match self.selection {
+            Some((s, ratio)) => Some((read(s)?, ratio)),
+            None => None,
+        };
+        let (mask, mask_enabled) = masks.unwrap_or((positions, positions));
+        Ok((
+            Paged {
+                op: self.op,
+                q,
+                tables: Tables {
+                    positions,
+                    request_of_token,
+                    mask,
+                    mask_enabled,
+                    mask_stride: self.tables.mask_stride,
+                },
+                masked: self.masked,
+                window: self.window,
+                causal: self.causal,
+                head_dim: self.head_dim,
+                sm_scale: self.sm_scale,
+                o: self.o.shape(),
+                lse: self.lse.map(Stored::shape),
+                walk: self.walk,
+                selection,
+                rel,
+            },
+            KvPool {
+                keys,
+                values,
+                page_indices,
+                page_indptr,
+                page_size: pool.page_size,
+                max_pages: pool.max_pages,
+                seq_stride: pool.seq_stride,
+                head_stride: pool.head_stride,
+            },
+        ))
+    }
+}
+
+/// The attention a [`Paged`] call states, its operands read: `(o, lse)`, the
+/// log-sum-exp when the call lands one.
+pub fn attend(
+    f: &mut Func,
+    call: Paged<Operand, Landing>,
+    pool: KvPool<Operand>,
+    tuning: Tuning,
+) -> Result<(Val, Option<Val>), Error> {
+    let pool = &pool;
     let op = call.op;
     expect(op, call.q, &[Dtype::Bf16])?;
     expect(op, pool.keys, &[Dtype::Bf16])?;
@@ -1642,141 +1724,129 @@ pub(crate) fn attend(ctx: &Ctx<'_>, call: Paged, pool: &KvPool) -> Result<(), Er
         dv: i64::from(call.head_dim),
     };
     let r = i64::from(rows);
-    ctx.emit(&mut |cx| {
-        let geom = read_geometry(cx, pool)?;
-        let walk = match call.walk {
-            _ if call.selection.is_some() => Walk::PerRow,
-            Walk::Auto if r <= cx.tuning().attn_per_row_max * geom.lanes => Walk::PerRow,
-            Walk::Auto => Walk::Blocked,
-            w => w,
-        };
-        let qpos = read_rows_i32(cx, op, t.positions, rows)?;
-        let req = read_rows_i32(cx, op, t.request_of_token, rows)?;
-        let enabled = if call.masked {
-            Some(read_rows_i32(cx, op, t.mask_enabled, rows)?)
-        } else {
-            None
-        };
-        let mask = if call.masked {
-            let m = cx.read(t.mask)?;
-            Some(cx.slice_axis(m, 0, 0, r)?)
-        } else {
-            None
-        };
-        let q = cx.read(call.q)?;
-        let keys = cx.read(pool.keys)?;
-        let values = cx.read(pool.values)?;
-        let f = cx.func();
-        let q4 = f.reshape(q, &[r, heads.kvh, heads.g, heads.d])?;
-        let lane = geom.lane_of(f, req)?;
-        let cap = geom.capacity(f, lane)?;
-        // Window start.
-        let lo = if window > 0 {
-            let past = cmp_i(f, Cmp::Ge, qpos, window)?;
-            let s = with_i(f, qpos, window - 1, Func::sub)?;
-            let z = f.like_i(qpos, 0);
-            f.select(past, s, z)?
-        } else {
-            f.like_i(qpos, 0)
-        };
-        // Causal end (exclusive), or the lane's whole capacity for a wide
-        // row (non-causal, or a row whose mask flag is 2).
-        let upto = with_i(f, qpos, 1, Func::add)?;
-        let causal_hi = f.min(upto, cap)?;
-        let hi = match (call.causal, enabled) {
-            (false, _) => cap,
-            (true, Some(en)) => {
-                let wide = cmp_i(f, Cmp::Eq, en, 2)?;
-                f.select(wide, cap, causal_hi)?
-            }
-            (true, None) => causal_hi,
-        };
-        let hi = f.max(hi, lo)?;
-        let mut rule = Rule {
-            bound: i64::from(t.mask_stride),
-            window: (window > 0).then_some(window),
-            ..Rule::default()
-        };
-        let planes = Planes::Paged {
-            keys,
-            values,
-            geom,
-            latent: false,
-        };
-        let (lo_w, hi_w) = if walk == Walk::Blocked {
-            let base = with_i(f, lane, geom.span, Func::mul)?;
-            rule.kp_span = Some(geom.span);
-            (f.add(base, lo)?, f.add(base, hi)?)
-        } else {
-            (lo, hi)
-        };
-        let mut rs = Rows::new(q4, lo_w, hi_w);
-        rs.lane = Some(lane);
-        if call.masked {
-            rs.enabled = enabled;
-            rs.mask = mask;
+    let geom = read_geometry(f, pool)?;
+    let walk = match call.walk {
+        _ if call.selection.is_some() => Walk::PerRow,
+        Walk::Auto if r <= tuning.attn_per_row_max * geom.lanes => Walk::PerRow,
+        Walk::Auto => Walk::Blocked,
+        w => w,
+    };
+    let qpos = read_rows_i32(f, op, t.positions, rows)?;
+    let req = read_rows_i32(f, op, t.request_of_token, rows)?;
+    let enabled = if call.masked {
+        Some(read_rows_i32(f, op, t.mask_enabled, rows)?)
+    } else {
+        None
+    };
+    let mask = if call.masked {
+        Some(f.slice_axis(t.mask.val, 0, 0, r)?)
+    } else {
+        None
+    };
+    let q = call.q.val;
+    let keys = pool.keys.val;
+    let values = pool.values.val;
+    let q4 = f.reshape(q, &[r, heads.kvh, heads.g, heads.d])?;
+    let lane = geom.lane_of(f, req)?;
+    let cap = geom.capacity(f, lane)?;
+    // Window start.
+    let lo = if window > 0 {
+        let past = cmp_i(f, Cmp::Ge, qpos, window)?;
+        let s = with_i(f, qpos, window - 1, Func::sub)?;
+        let z = f.like_i(qpos, 0);
+        f.select(past, s, z)?
+    } else {
+        f.like_i(qpos, 0)
+    };
+    // Causal end (exclusive), or the lane's whole capacity for a wide
+    // row (non-causal, or a row whose mask flag is 2).
+    let upto = with_i(f, qpos, 1, Func::add)?;
+    let causal_hi = f.min(upto, cap)?;
+    let hi = match (call.causal, enabled) {
+        (false, _) => cap,
+        (true, Some(en)) => {
+            let wide = cmp_i(f, Cmp::Eq, en, 2)?;
+            f.select(wide, cap, causal_hi)?
         }
-        let rel_plane = match call.rel {
-            Some((bias, extent, floor, alpha)) => {
-                rule.rel = Some((i64::from(extent), floor, alpha));
-                rs.qpos = Some(qpos);
-                Some(bias)
-            }
-            None => None,
-        };
-        let selection = call.selection;
-        let _ = f;
-        if let Some(bias) = rel_plane {
-            let b = cx.read(bias)?;
-            rs.rel = Some(cx.slice_axis(b, 0, 0, r)?);
+        (true, None) => causal_hi,
+    };
+    let hi = f.max(hi, lo)?;
+    let mut rule = Rule {
+        bound: i64::from(t.mask_stride),
+        window: (window > 0).then_some(window),
+        ..Rule::default()
+    };
+    let planes = Planes::Paged {
+        keys,
+        values,
+        geom,
+        latent: false,
+    };
+    let (lo_w, hi_w) = if walk == Walk::Blocked {
+        let base = with_i(f, lane, geom.span, Func::mul)?;
+        rule.kp_span = Some(geom.span);
+        (f.add(base, lo)?, f.add(base, hi)?)
+    } else {
+        (lo, hi)
+    };
+    let mut rs = Rows::new(q4, lo_w, hi_w);
+    rs.lane = Some(lane);
+    if call.masked {
+        rs.enabled = enabled;
+        rs.mask = mask;
+    }
+    let rel_plane = match call.rel {
+        Some((bias, extent, floor, alpha)) => {
+            rule.rel = Some((i64::from(extent), floor, alpha));
+            rs.qpos = Some(qpos);
+            Some(bias)
         }
-        let sel = match selection {
-            Some((sel, ratio)) => {
-                let s = cx.read(sel)?;
-                let s = cx.slice_axis(s, 0, 0, r)?;
-                Some((cx.convert(s, Elem::I32), i64::from(ratio)))
-            }
-            None => None,
-        };
-        let ch = cx.tuning().chunks;
-        let f = cx.func();
-        let scale = f64::from(call.sm_scale);
-        let flashed = match (walk, sel) {
-            (_, Some((sel, ratio))) => {
-                let table = selected_positions(f, sel, qpos, ratio)?;
-                per_row(
-                    f,
-                    &planes,
-                    &heads,
-                    &rule,
-                    &rs,
-                    KeyList::Table(table),
-                    scale,
-                    ch,
-                )?
-            }
-            (Walk::Blocked, None) => blocked(
+        None => None,
+    };
+    let selection = call.selection;
+    if let Some(bias) = rel_plane {
+        rs.rel = Some(f.slice_axis(bias.val, 0, 0, r)?);
+    }
+    let sel = match selection {
+        Some((sel, ratio)) => {
+            let s = f.slice_axis(sel.val, 0, 0, r)?;
+            Some((f.convert(s, Elem::I32), i64::from(ratio)))
+        }
+        None => None,
+    };
+    let ch = tuning.chunks;
+    let scale = f64::from(call.sm_scale);
+    let flashed = match (walk, sel) {
+        (_, Some((sel, ratio))) => {
+            let table = selected_positions(f, sel, qpos, ratio)?;
+            per_row(
                 f,
                 &planes,
                 &heads,
                 &rule,
                 &rs,
-                geom.lanes * geom.span,
+                KeyList::Table(table),
                 scale,
                 ch,
-            )?,
-            _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
-        };
-        let lse = match call.lse {
-            Some(_) => Some(flashed.lse2(f)?),
-            None => None,
-        };
-        cx.write(call.o, flashed.o)?;
-        if let (Some(t), Some(v)) = (call.lse, lse) {
-            cx.write(t, v)?;
+            )?
         }
-        Ok(())
-    })
+        (Walk::Blocked, None) => blocked(
+            f,
+            &planes,
+            &heads,
+            &rule,
+            &rs,
+            geom.lanes * geom.span,
+            scale,
+            ch,
+        )?,
+        _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
+    };
+    let lse = match call.lse {
+        Some(_) => Some(flashed.lse2(f)?),
+        None => None,
+    };
+    Ok((flashed.o, lse))
 }
 
 /// The key positions a block selection names, per row: the named blocks
@@ -1814,17 +1884,17 @@ fn selected_positions(f: &mut Func, sel: Val, qpos: Val, ratio: i64) -> Built<Va
     f.select(in_sel, kp_sel, tail)
 }
 
-fn plain(
+fn plain<T>(
     op: &'static str,
-    q: Tensor,
-    tables: Tables,
+    q: T,
+    tables: Tables<T>,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-    lse: Option<Tensor>,
+    o: T,
+    lse: Option<T>,
     walk: Walk,
-) -> Paged {
+) -> Paged<T> {
     Paged {
         op,
         q,
@@ -1842,18 +1912,16 @@ fn plain(
     }
 }
 
-pub fn decode(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    plan: &DecodePlan,
-    pool: &KvPool,
+pub fn decode<T: Stored>(
+    q: T,
+    plan: &DecodePlan<T>,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
+    o: T,
+) -> Result<Paged<T>, Error> {
     let call = plain(
-        "attention.decode",
+        "attn.decode",
         q,
         Tables::decode(plan),
         window,
@@ -1863,22 +1931,20 @@ pub fn decode(
         None,
         Walk::PerRow,
     );
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
-pub fn decode_lse(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    plan: &DecodePlan,
-    pool: &KvPool,
+pub fn decode_lse<T: Stored>(
+    q: T,
+    plan: &DecodePlan<T>,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
+    o: T,
+    lse: T,
+) -> Result<Paged<T>, Error> {
     let call = plain(
-        "attention.decode_lse",
+        "attn.decode",
         q,
         Tables::decode(plan),
         window,
@@ -1888,21 +1954,20 @@ pub fn decode_lse(
         Some(lse),
         Walk::PerRow,
     );
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
-pub fn prefill(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
+pub fn prefill<T: Stored>(
+    q: RaggedTensor<T>,
+    plan: &PrefillPlan<T>,
+    pool: &KvPool<T>,
     window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    o: T,
+) -> Result<Paged<T>, Error> {
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = plain(
         OP,
@@ -1915,22 +1980,21 @@ pub fn prefill(
         None,
         Walk::Auto,
     );
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
-pub fn prefill_lse(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
+pub fn prefill_lse<T: Stored>(
+    q: RaggedTensor<T>,
+    plan: &PrefillPlan<T>,
+    pool: &KvPool<T>,
     window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    o: T,
+    lse: T,
+) -> Result<Paged<T>, Error> {
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = plain(
         OP,
@@ -1943,26 +2007,24 @@ pub fn prefill_lse(
         Some(lse),
         Walk::Auto,
     );
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
 /// A prefill whose custom mask is `mask` rather than the plan's (the plan's
 /// per-row enable flags still gate it). Causal; see
 /// [`super::arbiter::masked`] for the non-causal form.
-pub fn masked(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    mask: Tensor,
-    pool: &KvPool,
+pub fn masked<T: Stored>(
+    q: RaggedTensor<T>,
+    plan: &PrefillPlan<T>,
+    mask: T,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
+    o: T,
+) -> Result<Paged<T>, Error> {
     let tables = Tables::prefill(plan).with_mask(mask);
     let call = plain(
-        "attention.masked",
+        "attn.prefill",
         q.data,
         tables,
         window,
@@ -1972,25 +2034,23 @@ pub fn masked(
         None,
         Walk::Auto,
     );
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
 /// Selected-block decode (DeepSeek sparse attention): `selection` names
 /// `ratio`-wide key blocks per row.
-pub fn decode_selected(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    plan: &DecodePlan,
-    selection: Tensor,
-    pool: &KvPool,
+pub fn decode_selected<T: Stored>(
+    q: T,
+    plan: &DecodePlan<T>,
+    selection: T,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
     ratio: u32,
-    o: Tensor,
-) -> Result<(), Error> {
+    o: T,
+) -> Result<Paged<T>, Error> {
     let mut call = plain(
-        "attention.decode_selected",
+        "attn.decode",
         q,
         Tables::decode(plan),
         window,
@@ -2001,23 +2061,22 @@ pub fn decode_selected(
         Walk::PerRow,
     );
     call.selection = Some((selection, ratio));
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
-pub fn prefill_selected(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    selection: Tensor,
-    pool: &KvPool,
+pub fn prefill_selected<T: Stored>(
+    q: RaggedTensor<T>,
+    plan: &PrefillPlan<T>,
+    selection: T,
+    pool: &KvPool<T>,
     window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_selected";
+    o: T,
+) -> Result<Paged<T>, Error> {
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let mut call = plain(
         OP,
@@ -2031,19 +2090,19 @@ pub fn prefill_selected(
         Walk::PerRow,
     );
     call.selection = Some((selection, ratio));
-    attend(ctx, call, pool)
+    Ok(call)
 }
 
-/// Folds a per-head attention sink into an lse-carrying reading, in place:
-/// `o *= σ(lse · ln 2 − sink[h])` where the lse is finite.
+/// Folds a per-head attention sink into an lse-carrying reading: the new
+/// `o = o · σ(lse · ln 2 − sink[h])` where the lse is finite.
 pub fn sink(
-    ctx: &Ctx<'_>,
-    o: Tensor,
-    lse: Tensor,
-    sink: Tensor,
+    f: &mut Func,
+    o: Operand,
+    lse: Operand,
+    sink: Operand,
     head_dim: u32,
-) -> Result<(), Error> {
-    const OP: &str = "attention.sink";
+) -> Result<Val, Error> {
+    const OP: &str = "attn.sink";
     expect(OP, o, &[Dtype::Bf16])?;
     let heads = row_heads(OP, o.width, head_dim)?;
     if lse.dtype != Dtype::F32 || lse.rows != o.rows || lse.width != heads {
@@ -2056,79 +2115,61 @@ pub fn sink(
         return Err(refuse(OP, "the sink bank is not one value per head"));
     }
     let (r, h, d) = (i64::from(o.rows), i64::from(heads), i64::from(head_dim));
-    ctx.emit(&mut |cx| {
-        let ov = cx.read_f32(o)?;
-        let lv = cx.read_f32(lse)?;
-        let sv = cx.read_f32(sink)?;
-        let n = cx.ty(sv).elements();
-        let sv = cx.reshape(sv, &[n])?;
-        let sv = cx.slice(sv, &[0], &[h], &[1])?;
-        let sv = cx.broadcast(sv, &[r, h], &[1])?;
-        let x = cx.scale(lv, std::f64::consts::LN_2)?;
-        let x = cx.sub(x, sv)?;
-        let s = cx.sigmoid(x);
-        let fin = cx.is_finite(lv);
-        let one = cx.like_f(s, 1.0);
-        let s = cx.select(fin, s, one)?;
-        let s = cx.broadcast(s, &[r, h, d], &[0, 1])?;
-        let ov = cx.reshape(ov, &[r, h, d])?;
-        let y = cx.mul(ov, s)?;
-        cx.write(o, y)
-    })
+    let ov = o.f32(f);
+    let lv = lse.f32(f);
+    let sv = sink.f32(f);
+    let n = f.ty(sv).elements();
+    let sv = f.reshape(sv, &[n])?;
+    let sv = f.slice(sv, &[0], &[h], &[1])?;
+    let sv = f.broadcast(sv, &[r, h], &[1])?;
+    let x = f.scale(lv, std::f64::consts::LN_2)?;
+    let x = f.sub(x, sv)?;
+    let s = f.sigmoid(x);
+    let fin = f.is_finite(lv);
+    let one = f.like_f(s, 1.0);
+    let s = f.select(fin, s, one)?;
+    let s = f.broadcast(s, &[r, h, d], &[0, 1])?;
+    let ov = f.reshape(ov, &[r, h, d])?;
+    let y = f.mul(ov, s)?;
+    Ok(y)
 }
 
-pub fn merge_lse(
-    ctx: &Ctx<'_>,
-    o1: Tensor,
-    lse1: Tensor,
-    o2: Tensor,
-    lse2: Tensor,
-    heads: u32,
-    head_dim: u32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
-    super::merge::merge_lse(ctx, o1, lse1, o2, lse2, heads, head_dim, o, lse)
-}
-
-/// `x = cap · tanh(x / cap)`, in place.
-pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
-    const OP: &str = "attention.logit_softcap";
+/// `cap · tanh(x / cap)`, the new `x`.
+pub fn logit_softcap(f: &mut Func, x: Operand, cap: f32) -> Result<Val, Error> {
+    const OP: &str = "elemwise.softcap";
     expect(OP, x, &[Dtype::Bf16])?;
     if cap == 0.0 {
         return Err(refuse(OP, "the cap is zero"));
     }
-    ctx.emit(&mut |cx| {
-        let v = cx.read_f32(x)?;
-        let v = cx.scale(v, 1.0 / f64::from(cap))?;
-        let v = cx.tanh(v);
-        let v = cx.scale(v, f64::from(cap))?;
-        cx.write(x, v)
-    })
+    let v = x.f32(f);
+    let v = f.scale(v, 1.0 / f64::from(cap))?;
+    let v = f.tanh(v);
+    Ok(f.scale(v, f64::from(cap))?)
 }
 
 /// Scatters `src` rows into `plane` at `write_page · page_size +
-/// write_offset`; a row whose page or offset is out of range (a padded row)
-/// is dropped.
+/// write_offset`, for each `(src, plane)`; a row whose page or offset is out
+/// of range (a padded row) is dropped. The new planes, in order; a plane
+/// that is the one before it (one value) takes the scatter on top of it.
 pub(crate) fn scatter_slots(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     op: &'static str,
-    pairs: &[(Tensor, Tensor)],
+    pairs: &[(Operand, Operand)],
     page_size: i32,
-    write_page: Tensor,
-    write_offset: Tensor,
-) -> Result<(), Error> {
+    write_page: Operand,
+    write_offset: Operand,
+) -> Result<Vec<Val>, Error> {
     let Some(&(first, _)) = pairs.first() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let n = first.rows;
-    let page = read_rows_i32(cx, op, write_page, n)?;
-    let off = read_rows_i32(cx, op, write_offset, n)?;
-    for &(src, plane) in pairs {
+    let page = read_rows_i32(f, op, write_page, n)?;
+    let off = read_rows_i32(f, op, write_offset, n)?;
+    let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
+    for (at, &(src, plane)) in pairs.iter().enumerate() {
         let ps = i64::from(page_size);
         let slots = i64::from(plane.rows);
         let pages = slots / ps;
-        let f = cx.func();
         let a = cmp_i(f, Cmp::Ge, page, 0)?;
         let b = cmp_i(f, Cmp::Lt, page, pages)?;
         let c = cmp_i(f, Cmp::Ge, off, 0)?;
@@ -2138,20 +2179,22 @@ pub(crate) fn scatter_slots(
         let ok = f.and(ok, d)?;
         let s = with_i(f, page, ps, Func::mul)?;
         let s = f.add(s, off)?;
-        let out = f.like_i(s, slots);
-        let slot = f.select(ok, s, out)?;
-        let rows = cx.read(src)?;
-        let table = cx.read(plane)?;
-        let elem = cx.elem(table);
-        let rows = cx.convert(rows, elem);
-        let new = cx.put_rows(table, slot, rows, crate::hlo::Combine::Set)?;
-        cx.write(plane, new)?;
+        let far = f.like_i(s, slots);
+        let slot = f.select(ok, s, far)?;
+        let rows = src.val;
+        let table = match at.checked_sub(1) {
+            Some(prev) if pairs[prev].1.val == plane.val => out[prev],
+            _ => plane.val,
+        };
+        let elem = f.elem(table);
+        let rows = f.convert(rows, elem);
+        out.push(f.put_rows(table, slot, rows, crate::hlo::Combine::Set)?);
     }
-    Ok(())
+    Ok(out)
 }
 
-fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(), Error> {
-    let hd = u32::try_from(pool.head_stride)
+fn head_split(op: &'static str, seq_stride: u64, head_stride: u64, row: u32) -> Result<(), Error> {
+    let hd = u32::try_from(head_stride)
         .ok()
         .filter(|&d| d > 0)
         .ok_or_else(|| {
@@ -2159,7 +2202,7 @@ fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(), Error> {
                 op,
                 format!(
                     "the pool's head stride {} spells no head width",
-                    pool.head_stride
+                    head_stride
                 ),
             )
         })?;
@@ -2169,29 +2212,34 @@ fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(), Error> {
             format!("the {row}-wide appended row does not divide by the head stride {hd}"),
         ));
     }
-    if pool.seq_stride != u64::from(row) {
+    if seq_stride != u64::from(row) {
         return Err(refuse(
             op,
             format!(
                 "the pool's sequence stride {} is not the {row}-wide row this appender writes",
-                pool.seq_stride
+                seq_stride
             ),
         ));
     }
     Ok(())
 }
 
+/// `(keys, values)`, the pool planes with the rows appended.
 fn append(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    k: Tensor,
-    v: Tensor,
-    pool: &KvPool,
-    write_page: Tensor,
-    write_offset: Tensor,
-) -> Result<(), Error> {
+    k: Operand,
+    v: Operand,
+    keys: Operand,
+    values: Operand,
+    page_size: i32,
+    seq_stride: u64,
+    head_stride: u64,
+    write_page: Operand,
+    write_offset: Operand,
+) -> Result<(Val, Val), Error> {
     expect(op, k, &[Dtype::Bf16])?;
-    if pool.page_size <= 0 {
+    if page_size <= 0 {
         return Err(refuse(op, "the kv page size is zero"));
     }
     if v.rows != k.rows || v.width != k.width {
@@ -2200,57 +2248,73 @@ fn append(
             "the value plane is appended beside the key plane, one rectangle",
         ));
     }
-    head_split(op, pool, k.width)?;
-    if pool.keys.width != k.width || pool.values.width != v.width {
+    head_split(op, seq_stride, head_stride, k.width)?;
+    if keys.width != k.width || values.width != v.width {
         return Err(refuse(
             op,
             "the appended rows are not as wide as the pool planes",
         ));
     }
-    ctx.emit(&mut |cx| {
-        scatter_slots(
-            cx,
-            op,
-            &[(k, pool.keys), (v, pool.values)],
-            pool.page_size,
-            write_page,
-            write_offset,
-        )
-    })
+    let planes = scatter_slots(
+        f,
+        op,
+        &[(k, keys), (v, values)],
+        page_size,
+        write_page,
+        write_offset,
+    )?;
+    Ok((planes[0], planes[1]))
 }
 
+/// Appends `k` and `v` into the pool's planes `keys` and `values` (`pool`
+/// gives the paging; its page tables are not read): the new `(keys,
+/// values)`.
 pub fn kv_append(
-    ctx: &Ctx<'_>,
-    k: Tensor,
-    v: Tensor,
-    pool: &KvPool,
-    write_page: Tensor,
-    write_offset: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    k: Operand,
+    v: Operand,
+    keys: Operand,
+    values: Operand,
+    pool: &KvPool<impl Stored>,
+    write_page: Operand,
+    write_offset: Operand,
+) -> Result<(Val, Val), Error> {
     append(
-        ctx,
-        "attention.kv_append",
+        f,
+        "attn.kv_append",
         k,
         v,
-        pool,
+        keys,
+        values,
+        pool.page_size,
+        pool.seq_stride,
+        pool.head_stride,
         write_page,
         write_offset,
     )
 }
 
+/// One plane appended into both of the pool's planes: the new `(keys,
+/// values)`.
 pub fn kv_append_shared(
-    ctx: &Ctx<'_>,
-    plane: Tensor,
-    pool: &KvPool,
-    write_page: Tensor,
-    write_offset: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    plane: Operand,
+    keys: Operand,
+    values: Operand,
+    pool: &KvPool<impl Stored>,
+    write_page: Operand,
+    write_offset: Operand,
+) -> Result<(Val, Val), Error> {
     append(
-        ctx,
-        "attention.kv_append_shared",
+        f,
+        "attn.kv_append",
         plane,
         plane,
-        pool,
+        keys,
+        values,
+        pool.page_size,
+        pool.seq_stride,
+        pool.head_stride,
         write_page,
         write_offset,
     )

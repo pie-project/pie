@@ -206,62 +206,70 @@ pub struct DeviceProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FamilyCosts {
-    pub attention: f32,
+    pub attn: f32,
     pub linear: f32,
-    pub elementwise: f32,
-    pub layout: f32,
+    pub elemwise: f32,
+    pub gather: f32,
     pub collective: f32,
+    pub sampling: f32,
+    pub ssm: f32,
     pub custom: f32,
-    pub spatial: f32,
+    pub conv: f32,
 }
 
 impl FamilyCosts {
     #[must_use]
     pub fn of(&self, op: &poem_ir::Operation) -> f32 {
         match op {
-            poem_ir::Operation::Attention(_) => self.attention,
+            poem_ir::Operation::Attn(_) => self.attn,
             poem_ir::Operation::Linear(_) => self.linear,
-            poem_ir::Operation::Elementwise(_) => self.elementwise,
-            poem_ir::Operation::Layout(_) => self.layout,
+            poem_ir::Operation::Elemwise(_) => self.elemwise,
+            poem_ir::Operation::Gather(_) => self.gather,
             poem_ir::Operation::Collective(_) => self.collective,
+            poem_ir::Operation::Sampling(_) => self.sampling,
+            poem_ir::Operation::Ssm(_) => self.ssm,
             poem_ir::Operation::Fused(op) => match op {
                 poem_ir::Fused::LseSink { .. }
                 | poem_ir::Fused::PoolAttention { .. }
                 | poem_ir::Fused::PoolCompress { .. }
                 | poem_ir::Fused::MlaPrefillExpanded { .. }
-                | poem_ir::Fused::IndexTopkRope { .. } => self.attention,
-                poem_ir::Fused::MatmulGeglu { .. }
-                | poem_ir::Fused::MatmulSwiglu { .. }
-                | poem_ir::Fused::MlpSwiglu { .. }
-                | poem_ir::Fused::LmHeadSoftcap { .. }
+                | poem_ir::Fused::IndexTopkRope { .. } => self.attn,
+                poem_ir::Fused::MatmulGlu { .. }
+                | poem_ir::Fused::MatmulSwigluMatmul { .. }
+                | poem_ir::Fused::MatmulSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. }
                 | poem_ir::Fused::MatmulSplitRows { .. }
                 | poem_ir::Fused::MoeSelectGlu { .. }
                 | poem_ir::Fused::MoeExperts { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
                 | poem_ir::Fused::SplitQkvFused { .. } => self.custom,
-                poem_ir::Fused::GdnStep { .. } => self.attention,
-                poem_ir::Fused::QGateNormRopeAppend { .. } => self.attention,
+                poem_ir::Fused::GdnStep { .. } => self.attn,
+                poem_ir::Fused::QGateNormRopeAppend {
+                    intermediates: poem_ir::ops::fused::Intermediates::Written,
+                    ..
+                } => self.attn,
                 poem_ir::Fused::ResidualAddRmsnorm { .. }
                 | poem_ir::Fused::RmsnormResidualAdd { .. }
                 | poem_ir::Fused::EmbedScaleAdd { .. }
                 | poem_ir::Fused::EmbedScaleAddSelect { .. }
-                | poem_ir::Fused::RmsnormRopePartialQ { .. }
+                | poem_ir::Fused::NormRope { .. }
                 | poem_ir::Fused::HcNormProject { .. }
-                | poem_ir::Fused::NormRopeLast { .. }
                 | poem_ir::Fused::NormRopeLastAppend { .. }
                 | poem_ir::Fused::NormRopePair { .. }
                 | poem_ir::Fused::RopeYarnAppend { .. }
                 | poem_ir::Fused::SplitRopeYarnAppend { .. }
-                | poem_ir::Fused::QgQknormRopeAppend { .. }
+                | poem_ir::Fused::QGateNormRopeAppend {
+                    intermediates: poem_ir::ops::fused::Intermediates::Unwritten,
+                    ..
+                }
                 | poem_ir::Fused::NormModulate { .. }
                 | poem_ir::Fused::HcPrenormProject { .. }
                 | poem_ir::Fused::HcGatesNorm { .. }
                 | poem_ir::Fused::ResBlendRmsnorm { .. }
                 | poem_ir::Fused::HcPre { .. }
-                | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elementwise,
+                | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elemwise,
             },
-            poem_ir::Operation::Spatial(_) => self.spatial,
+            poem_ir::Operation::Conv(_) => self.conv,
         }
     }
 }
@@ -269,13 +277,15 @@ impl FamilyCosts {
 impl Default for FamilyCosts {
     fn default() -> FamilyCosts {
         FamilyCosts {
-            attention: 60.0,
+            attn: 60.0,
             linear: 40.0,
-            elementwise: 4.0,
-            layout: 4.0,
+            elemwise: 4.0,
+            gather: 4.0,
             collective: 50.0,
+            sampling: 4.0,
+            ssm: 60.0,
             custom: 20.0,
-            spatial: 40.0,
+            conv: 40.0,
         }
     }
 }

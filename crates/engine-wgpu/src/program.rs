@@ -79,6 +79,7 @@ pub(crate) struct Pass<'a> {
     pub mtp_logits: Option<&'a [f32]>,
     pub mtp_width: u32,
     pub readout: Option<crate::guest::run::Readout<'a>>,
+    pub pixels: Option<crate::guest::run::Readout<'a>>,
 }
 
 #[cfg(feature = "wgpu")]
@@ -118,7 +119,8 @@ impl Half {
             attn_score: None,
         };
         let mut runner =
-            crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout);
+            crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout)
+                .with_pixels(pass.pixels);
         let outcome = eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner);
         let ran = runner.ran().len();
         if self.inst.poisoned {
@@ -245,6 +247,7 @@ pub(crate) type Job = Box<dyn FnOnce() -> Result<(), Refusal> + Send + 'static>;
 
 #[cfg(feature = "wgpu")]
 impl Guests {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn jobs(
         self,
         rows: &[Vec<f32>],
@@ -253,6 +256,7 @@ impl Guests {
         layout: &[(u32, u32)],
         out_width: u32,
         mtp_width: u32,
+        pixels: Option<&(crate::device::Buffer, u32)>,
     ) -> Vec<Job> {
         let Guests {
             device,
@@ -318,6 +322,7 @@ impl Guests {
                         })
                     };
                     let seat = seat.clone();
+                    let pixels = pixels.cloned();
                     let device = device.clone();
                     let widen = Arc::clone(&widen);
                     let tally = Arc::clone(&tally);
@@ -347,6 +352,13 @@ impl Guests {
                                     mtp_logits: mtp.as_deref(),
                                     mtp_width,
                                     readout,
+                                    pixels: pixels.as_ref().map(|(plane, count)| {
+                                        crate::guest::run::Readout {
+                                            seat: plane,
+                                            at: 0,
+                                            width: *count,
+                                        }
+                                    }),
                                 },
                             )
                     });

@@ -629,7 +629,7 @@ impl Context {
                 .unwrap_or(false)
         };
 
-        let cores = kernels_vulkan::cores::shader_cores(&device_exts, &mut |p2| unsafe {
+        let cores = kernels_slang::cores::shader_cores(&device_exts, &mut |p2| unsafe {
             instance.get_physical_device_properties2(physical, p2);
         });
 
@@ -875,8 +875,8 @@ impl Context {
     }
 
     #[must_use]
-    pub fn limits(&self) -> kernels_vulkan::tuning::Limits {
-        kernels_vulkan::tuning::Limits {
+    pub fn limits(&self) -> crate::tuning::Limits {
+        crate::tuning::Limits {
             cores: self.cores(),
             lanes: self.lanes(),
             shared_bytes: self.core.limits.max_compute_shared_memory_size,

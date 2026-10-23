@@ -9,6 +9,7 @@ use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::chatml::{JSON_GRAMMAR, tool_names};
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder};
+use crate::json::tojson;
 use crate::{
     ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special,
     specials,
@@ -21,9 +22,6 @@ const DATES: &str = "Cutting Knowledge Date: December 2023\nToday Date: 26 Jul 2
 
 /// The reference template's tool preamble (`tools_in_user_message = false`).
 const TOOLS: &str = "You have access to the following functions. To call a function, please respond with JSON for a function call.Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n";
-
-const TOOL_CALL_OPEN: &str = "<tool_call>";
-const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
 pub struct Llama {
     tokenizer: Arc<Tokenizer>,
@@ -81,40 +79,25 @@ impl Llama {
     /// `<tool_call>{"name", "arguments"}</tool_call>` spelling, rewritten as
     /// the reference writes them: `{"name": …, "parameters": …}`.
     fn replay_body(msg: &str) -> String {
-        let mut rest = msg;
-        let mut text = String::new();
-        let mut calls = Vec::new();
-        while let Some(at) = rest.find(TOOL_CALL_OPEN) {
-            text.push_str(&rest[..at]);
-            let after = &rest[at + TOOL_CALL_OPEN.len()..];
-            let Some(end) = crate::chatml::closer_outside_string(after, TOOL_CALL_CLOSE) else {
-                text.push_str(&rest[at..]);
-                rest = "";
-                break;
-            };
-            let call = after[..end].trim();
-            match serde_json::from_str::<serde_json::Value>(call) {
-                Ok(parsed) if parsed["name"].is_string() => {
-                    let parameters = parsed
-                        .get("arguments")
-                        .or_else(|| parsed.get("parameters"))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                    calls.push(format!(
-                        "{{\"name\": \"{}\", \"parameters\": {}}}",
-                        parsed["name"].as_str().unwrap_or_default(),
-                        pythonic(&parameters)
-                    ));
-                }
-                _ => text
-                    .push_str(&rest[at..at + TOOL_CALL_OPEN.len() + end + TOOL_CALL_CLOSE.len()]),
-            }
-            rest = &after[end + TOOL_CALL_CLOSE.len()..];
-        }
-        text.push_str(rest);
+        let (text, calls) = crate::chatml::split_calls(msg);
         if calls.is_empty() {
             return text.trim().to_string();
         }
+        let calls: Vec<String> = calls
+            .iter()
+            .map(|call| {
+                let parameters = call
+                    .get("arguments")
+                    .or_else(|| call.get("parameters"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                format!(
+                    "{{\"name\": \"{}\", \"parameters\": {}}}",
+                    call["name"].as_str().unwrap_or_default(),
+                    tojson(&parameters)
+                )
+            })
+            .collect();
         calls.join("\n")
     }
 }
@@ -183,7 +166,7 @@ impl Instruct for Llama {
     fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
         self.turn(
             "ipython",
-            &pythonic(&serde_json::Value::String(value.to_string())),
+            &tojson(&serde_json::Value::String(value.to_string())),
         )
     }
 
@@ -220,25 +203,6 @@ tool-name ::= {alternatives}
 {JSON_GRAMMAR}"#
         );
         Some(ToolGrammar { source })
-    }
-}
-
-/// `value` as the reference's `tojson` writes it on one line: Python's
-/// `json.dumps` separators, `", "` and `": "`, non-ASCII kept.
-pub(crate) fn pythonic(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Array(items) => {
-            let items: Vec<String> = items.iter().map(pythonic).collect();
-            format!("[{}]", items.join(", "))
-        }
-        serde_json::Value::Object(map) => {
-            let pairs: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{}: {}", serde_json::Value::String(k.clone()), pythonic(v)))
-                .collect();
-            format!("{{{}}}", pairs.join(", "))
-        }
-        other => other.to_string(),
     }
 }
 

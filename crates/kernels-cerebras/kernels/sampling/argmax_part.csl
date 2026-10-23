@@ -1,0 +1,18 @@
+// The greatest value of each row of x (NaN never wins) and its index, as a
+// pair out[2r] (the value), out[2r + 1] (the index as i32 bits; -1 when
+// every lane is NaN).
+fn k_argmax_part(x: [*]f32, out: [*]f32, rows: i32, width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var best: f32 = 0.0; var bi: i32 = -1;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) {
+      var v: f32 = x[r * width + i];
+      if (math.isNaN_f32(v)) { continue; }
+      if (bi < 0 or v > best) { best = v; bi = i; }
+    }
+    out[2 * r] = best;
+    out[2 * r + 1] = @bitcast(f32, bi);
+  }
+}
+

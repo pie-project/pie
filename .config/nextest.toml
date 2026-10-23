@@ -1,9 +1,0 @@
-# A policy's call runs under a wall-clock deadline (its manifest's
-# `deadline-ms`), so the tests that run policy programs take turns rather
-# than overrun it on a loaded host.
-[test-groups]
-policy = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = '(package(gateway) | package(runtime)) & test(/^policy::/)'
-test-group = 'policy'

@@ -1,17 +1,19 @@
 use crate::declare::Weight;
 use crate::record::{Recorder, Value};
 use poem_ir::{
-    ActQuant, Attention, Collective, Dim, Dtype, Elementwise, GateActivation, IndexScore, Layout,
-    Linear, ModulateForm, MropeForm, PixelOrder, RaggedMask, RopeForm, StructKind, TapKind, Ty,
-    ValueId,
+    ActQuant, Attn, Collective, Dim, Dtype, Elemwise, GateActivation, Gather, IndexScore, Linear,
+    ModulateForm, MropeForm, PixelOrder, RaggedMask, RopeForm, Sampling, Ssm, StructKind, TapKind,
+    Ty, ValueId,
 };
 
 pub mod attn;
 pub mod collective;
+pub mod conv;
 pub mod elemwise;
-pub mod layout;
+pub mod gather;
 pub mod linear;
-pub mod spatial;
+pub mod sampling;
+pub mod ssm;
 
 fn tensor(rows: Dim, width: impl Into<u64>, dtype: Dtype) -> Ty {
     Ty::Tensor {

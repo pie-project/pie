@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::encode::{Ctx, Fire, Grid, dtype_dispatch, head_grid, head_group, refuse};
 use crate::tensor::Tensor;
 
-const FILE: &str = "attn/merge_lse.metal";
+const FILE: &str = "attn/merge.metal";
 
 const MERGE_HEAD_MAX: u32 = 1024;
 
@@ -20,7 +20,7 @@ pub fn merge_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.merge_lse";
+    const OP: &str = "attn.merge_lse";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "merge_lse_combine_bfloat16" });
     debug_assert!(
         o1.dtype == o.dtype && o2.dtype == o.dtype,

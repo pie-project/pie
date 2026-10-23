@@ -2,7 +2,7 @@
 //! the post-norm gate op, its first layer's experts stay bf16 in the FP4
 //! rows, and the routed rest are NVFP4 or MXFP4.
 
-use poem::{Elementwise, Operation, Platform};
+use poem::{Elemwise, Operation, Platform};
 
 #[test]
 fn the_muse_spark_rows_bake() {
@@ -20,12 +20,7 @@ fn the_muse_spark_rows_bake() {
         let gates = trace
             .nodes
             .iter()
-            .filter(|node| {
-                matches!(
-                    node.op,
-                    Operation::Elementwise(Elementwise::NormGate { .. })
-                )
-            })
+            .filter(|node| matches!(node.op, Operation::Elemwise(Elemwise::NormGate { .. })))
             .count();
         // Two residual gates and one expert norm a layer.
         let layers = trace

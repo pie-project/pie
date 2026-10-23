@@ -16,14 +16,7 @@ scripts/imagegen/
   zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
-  ltx2_golden.py      M4  LTX-2.5 miniature: one joint video+audio step; `--vae`
-                          dumps the REAL video VAE decoder over a fixed latent
-  ltx2_parity.py      M4  drives pie's `ltx25-mini` row against it
-  vendor/ltx_2/       M4  the LTX-2.5 reference, transcribed (see its header)
-  h3_golden.py        M5  MiniMax H3 miniature forward (vendored reference)
-  h3_parity.py        M5  drives pie's `minimax-h3-mini` row against it
-  vendor/minimax_h3/      a dependency-free transcription of H3's DiT --
-                          sglang's own package cannot be imported here
+  ltx2_golden.py      M4  the REAL LTX-2.5 video VAE decoder over a fixed latent
   hy3_golden.py       M6  HunyuanImage 3 miniature: one prefill + one denoise step
   hy3_parity.py       M6  drives pie's `hunyuanimage3-mini` row against it
   golden_common.py        shared tap/hook/manifest plumbing
@@ -319,17 +312,17 @@ latents).  The row is served with `engine.graphs = "off"` pinned in a user profi
 (`$PIE_HOME/profiles/cuda/user/<device>.toml`), so the parity walks eagerly.
 
 **Bisecting a mismatch.**  `--tap <dump key>` on `run`, `collect` and
-`compare` reads an INTERMEDIATE out in the velocity's place: `run` sets the
-family's `PIE_MINI_DIT_TAP` knob (`models/mini_dit/model.poem`,
-`tap`) — the plan plants its readout seam on that rectangle, so the artifact
-must be re-imported under the same environment — `collect` lays the pie rows
+`compare` reads an INTERMEDIATE out in the velocity's place. The tap is part
+of the deployment's name (`-tap.{key}`, read as `deploy.tap` in
+`models/mini_dit/model.poem`): the plan plants its readout seam on that
+rectangle, so the artifact is imported under the tapped deployment — `collect` lays the pie rows
 out the way the golden's tensor is shaped (a `[B, H, N, DH]` head tensor is
 transposed back; a joint `[txt || img]` rectangle takes its caption rows from
 the guest's caption-lane readout), and `compare` diffs that one key.
 
 ```bash
-PIE_MINI_DIT_TAP=b0.norm1_out pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" \
-    --deployment mini-dit-bf16-kv-bf16 --out ~/.cache/pie-imagegen/mini-dit.zt --force
+pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" \
+    --deployment mini-dit-bf16-kv-bf16-tap.b0.norm1_out --out ~/.cache/pie-imagegen/mini-dit.zt --force
 python mini_dit_parity.py run     --out /tmp/mini-dit-parity --tap b0.norm1_out --config ...
 python mini_dit_parity.py collect --out /tmp/mini-dit-parity --tap b0.norm1_out
 python mini_dit_parity.py compare --out /tmp/mini-dit-parity --tap b0.norm1_out
@@ -608,76 +601,7 @@ CUDA_VISIBLE_DEVICES=3 python wan22_golden.py --vae     # needs `--full` to have
 | decode | 5×30×52 → 17×480×832 | 0.999986 | 0.00244 | `the_wan_2_vae_answers_the_reference` |
 | encode | 17×480×832 → 5×30×52 | 0.999988 | 0.00492 | `the_wan_2_vae_encodes_the_reference` |
 
-### `ltx2_golden.py` → `/root/.cache/pie-imagegen/golden/ltx25/`
-
-**No `--full`.** The flagship needs the 201 GB snapshot and sglang's serving
-environment, and `import sglang` needs the whole stack (starlette, orjson, …)
-this box does not have. `vendor/ltx_2/modeling.py` is a self-contained
-transcription of the reference classes — provenance at the top of the file,
-the HUGGING FACE checkpoint's module names throughout, so ONE
-`models/ltx_2/formats.poem` reads both this miniature and
-`Lightricks/LTX-2.5-Diffusers`.
-
-`--mini` writes a random-init miniature (two blocks, two heads a side at the
-REAL head widths — video 128, audio 64 — the real 128-channel latents, a
-16-wide caption, one connector layer apiece) under the pipeline's own
-prefixes (`dit.`, `connectors.`), and dumps one joint video+audio denoise
-step (72 video rows over a 3x4x6 latent grid, 8 audio rows, 16 text rows at
-σ = 0.909375) plus one connector pass.
-
-**The fixture's initialisation is chosen to DISCRIMINATE**, not to imitate
-the reference's: the modulation tables are drawn at unit scale rather than
-`randn / sqrt(dim)` so every gate is O(1), and the across-heads QK gains sit
-at one rather than at 0.06 — under the reference's own init every gate is a
-whisper, every softmax is nearly uniform, and a dropped fold or a wrong rope
-hides under the tolerance. The trained tables are O(1) too.
-
-Keys: `mini.dit.in.{latents,audio_latents,context,audio_context,timestep,
-audio_timestep,positions,audio_positions}`, `mini.dit.out.{velocity,
-audio_velocity}`, `mini.conn.in.{text,positions}`, `mini.conn.out.{video,
-audio}`.
-
-**Positions are dumped already normalised** — `(2·midpoint/max − 1)·π/2`, in
-seconds and pixels — because that product is exactly what the pie port takes:
-`RopeForm::SplitLadder` multiplies it by `theta^(f/(F−1))` and nothing else.
-
-#### The pie side — `ltx2_parity.py`
-
-`examples/ltx2-parity` is the `ltx25-mini` row's guest. A denoise case
-is FOUR lanes of one group, each on its own pipeline: `Video` (latents,
-three coordinates, timestep), `Audio` (latents, one coordinate, timestep),
-`Context` (the video text context, timestep) and `Reference` (the audio text
-context, timestep) — the two context lanes carry a timestep because they
-modulate their own rows. A `--refine` case is the two connector passes over
-one rectangle of packed trunk rows.
-
-```bash
-python ltx2_golden.py --mini
-# the golden dir needs a `config.json` and a tokenizer beside the weights
-pie model import "$PIE_IMAGEGEN_GOLDEN/ltx25/" --deployment ltx25-mini-bf16-kv-bf16 \
-    --out ~/.cache/pie-imagegen/ltx2-mini.zt
-python ltx2_parity.py all          --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
-python ltx2_parity.py all --refine --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
-python ltx2_parity.py matters      --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
-```
-
-Measured (bf16 pie vs the fp32 golden), under the mini-dit gate
-(`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`):
-
-| case | max-abs | rel | cos |
-|---|---:|---:|---|
-| joint step, video velocity | 0.0247 | 0.0064 | 0.99998 |
-| joint step, audio velocity | 0.0266 | 0.0061 | 0.99998 |
-| `refine.video` | 0.0204 | 0.0043 | 0.99999 |
-| `refine.audio` | 0.0345 | 0.0047 | 0.99999 |
-
-The FLAGSHIP row's import is checked against the real 201 GB snapshot:
-`pie model import <snapshot> --deployment ltx25-bf16-kv-bf16 --dry-run` lands every
-plane the flagship declares (13.0 GiB decoded — the reordered tables and the
-doubled head projection — and 28.3 GiB copied through). Nothing runs the
-DiT yet: the arm has no `text` reading. The VIDEO VAE DECODER runs, below.
-
-#### The video VAE — `ltx2_golden.py --vae` → `ltx25/ltx2_vae/`
+### `ltx2_golden.py` → `/root/.cache/pie-imagegen/golden/ltx25/ltx2_vae/`
 
 The real thing, not a miniature: diffusers 0.40's `AutoencoderKLLTX2Video`
 over the snapshot's `vae/` (1.4 GB, bf16), run in fp32 over a fixed random
@@ -686,11 +610,11 @@ DiT-space latent (`torch.randn(1, 128, 3, 8, 12)` at seed 7, denormalised by
 in ONE call — the decoder is non-causal, so there is no per-frame loop and no
 cache. Dumps `latent.f32` (`[T·h·w, 128]`, DiT space), `denorm.f32`,
 `pixels.f32` (`[(8T−7)·32h·32w, 3]`, UNCLAMPED, rows in `(t, h, w)` order)
-and `shapes.json`; `--vae-shape T,H,W` writes another size beside it as
+and `shapes.json`; `--shape T,H,W` writes another size beside it as
 `ltx2_vae_TxHxW/`.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python ltx2_golden.py --vae
+CUDA_VISIBLE_DEVICES=1 python ltx2_golden.py
 CUDA_VISIBLE_DEVICES=1 cargo test -p engine-cuda --features cuda \
     --test the_ltx_2_vae_answers_the_reference -- --nocapture
 # or, through the roster:
@@ -708,76 +632,11 @@ against the fp32 reference:
 | clip | pixels | cos | mean abs err | max abs err | fire |
 |---|---|---|---:|---:|---:|
 | 3×8×12 (the gate's) | 17 × 256 × 384 | 0.999985 | 0.0019 | 0.034 | 0.19 s |
-| 4×17×30 (`--vae-shape 4,17,30`, `PIE_LTX2_VAE_GOLDEN=ltx2_vae_4x17x30`) | 25 × 544 × 960 | 0.999985 | 0.0020 | 0.048 | 1.39 s |
+| 4×17×30 (`--shape 4,17,30`, `PIE_LTX2_VAE_GOLDEN=ltx2_vae_4x17x30`) | 25 × 544 × 960 | 0.999985 | 0.0020 | 0.048 | 1.39 s |
 
 Every frame of both clips sits between 0.999980 and 0.999989 — the same
 distance Wan's (0.999986) and FLUX.2's (0.999994) decoders read, i.e. the
 bf16 floor. What is NOT covered: the encoder, the audio VAE, the vocoder.
-
-`matters` is the claim a parity gate cannot make on its own: **every
-conditioning stream moves the answer.** It perturbs each in turn and demands
-the velocity move by more than ten times the gate's own slack — the video by
-its text context (1.8e-2) and by the audio latents through the a2v fold
-(1.3e-2), the audio by its own text context (1.8e-2) and by the video
-latents through v2a (4.8e-3). A lane that never joined the fire's attention
-group would show zero there and still pass the tolerance gate.
-### `h3_golden.py` → `/root/.cache/pie-imagegen/golden/minimax_h3/`
-
-**Miniature only, and the reference is VENDORED.** `sglang.multimodal_gen`
-cannot be imported in this checkout (its `__init__` pulls in starlette and the
-rest of the serving stack), so `vendor/minimax_h3/modeling.py` transcribes the
-eager arithmetic of `runtime/models/dits/minimax_h3.py` from sglang commit
-`6cee9285a3dd43e1f0270818aef7bf01a0568863`, class by class, with the upstream
-line numbers in its header. Only eager branches are kept: no TP, no
-quantization, no fused kernels, no adaLN cache, no sparse attention.
-
-`--mini` builds the study's §D.3 configuration (2 blocks, 1 refiner, dim 128,
-2 heads x 64, ffn 256, text_dim 64, 8 rope frequencies → 48 of 64 rotated;
-863,048 params) over a 21-row packed sequence: 3 text rows, 8 video rows
-(a 2 x 4 x 4 latent under the (1,2,2) patch), 6 audio rows (3 ticks, stereo,
-channel-major) and 4 keyframe rows. The four unique timesteps are
-`[0.35, 0.999, 0.62, 1.0]` — video, the pinned visual condition, audio, and the
-ref2va audio-reference slot nothing in FL2VA claims.
-
-It also **checks** the claim `models/minimax_h3/forward.poem` makes
-about the packed row order: pie's `[text | video | audio | reference]` (lanes by
-stream code) and the reference's `[text | refs | audio | video]` answer at
-cos 1.0, because the joint attention is unmasked and every row's rotary
-coordinates travel with it.
-
-The checkpoint it writes uses the OFFICIAL tensor spellings — `qkv_proj`
-re-interleaved per head — so pie's import runs the same de-interleave the 66 GB
-flagship needs.
-
-Keys: `mini.in.{text_hidden,refined_text,video_rows,audio_rows,reference_rows,
-positions,token_tags,inverse_indices,unique_timesteps}`,
-`mini.out.{video,audio}`.
-
-### The pie side — `h3_parity.py`
-
-```bash
-python h3_golden.py --mini
-pie model import <dir with h3_mini.safetensors> --deployment minimax-h3-mini-bf16-kv-bf16
-python h3_parity.py all --out /tmp/h3-parity --config ~/.pie/config.h3-mini.toml
-```
-
-The guest (`examples/h3-parity`) runs the `refine` pass (the text lane
-alone) and then one `denoise` step of FOUR lanes in one attention group — text,
-video, audio, reference — one pipeline each, one timestep cell per pass. Use a
-PRIVATE config with its own `[server] listen` and an `[engine] max_model_len` at
-least the packed row count times the submit depth.
-
-Measured (fp32 reference vs pie's bf16 trunk, one denoise step on one GPU):
-
-| tensor | shape | max-abs | rel | cos |
-|---|---|---:|---:|---:|
-| `mini.out.refined_text` | (3, 128) | 0.00025 | 0.0039 | 0.99999254 |
-| `mini.out.video` | (8, 96) | 0.00025 | 0.0027 | 0.99999653 |
-| `mini.out.audio` | (6, 32) | 0.00020 | 0.0025 | 0.99999699 |
-
-Gate: `--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`.
-
----
 
 ## 4b. `hy3_golden.py` / `hy3_parity.py` (M6) -> `$PIE_IMAGEGEN_GOLDEN/hy3/`
 
@@ -972,9 +831,7 @@ file is the roster, the plumbing and the reaper.
 | `flux2-vae` | `cargo test -p engine-cuda --features cuda --test engine_cuda the_flux_2_vae_answers_the_reference` | decode 0.99999, encode 0.99995 | the autoencoder alone, host-fed, against the fp32 diffusers reference. |
 | `zimage-vae` | `zimage_vae_parity.py all`, then `the_z_image_vae_answers_the_reference` | 0.99998 | the same VAE reading twice: once fired FROM A GUEST through the real runtime, once from the host. The two roads must agree with the reference to the same distance. |
 | `wan-mini` | `wan22_parity.py all`, `all --pertoken` | 0.999982, and the conditioning must MOVE | the `d128` miniature under both timestep forms (scalar, and TI2V's per-token one), each followed by the `conditioning` claim: zeroing the umT5 context must move the velocity by more than the gate's own slack. |
-| `h3-mini` | `h3_parity.py all` | refined-text / video / audio ≥ 0.9999 | MiniMax H3's `refine` pass and one four-lane `denoise` step, three readouts. |
 | `hy3-mini` | `hy3_parity.py all` | velocity 0.999997, plus two claims | HunyuanImage 3's whole denoise step in three fires, plus `the prefix conditions the canvas` and `the prefix K/V is reused exactly` (D10's claim: after step 0 the prefix is never recomputed). |
-| `ltx2-mini` | `ltx2_parity.py all`, `all --refine`, `matters` | 0.999982 | the LTX-2.5 miniature's four-lane joint step, its two connector passes, and the claim that every conditioning stream moves the answer. 0.999982 is the figure measured 2026-09-06, recorded here because the family landed without one; the harness gates at `--cos-tol 0.9999`. |
 | `text-to-image` | the model-agnostic guest on `flux2-klein-4b.zt` | a real PNG | 4 steps at 1024², seed 0. FLUX.2 hands back the final latent (its VAE is traced, not a declared reading), so the gate finishes with `decode_latent.py` and then checks the PNG magic, its box and its size. |
 
 **The endpoint gates for distilled trajectories are BELOW the bf16 floor by
@@ -1049,5 +906,5 @@ named refusal ("attention group 0 never composed: 3 live forward passes name
 the group and only 1 of them reached the runtime on a lane of its own"); the
 0.99999 predates it, when the same shape silently fired the image lane alone
 and a random-init miniature's missing caption sat under the tolerance.  Its
-siblings — `mini-dit-parity`, `zimage-parity`, `flux2-klein-parity`,
-`ltx2-parity` — already give each lane a pipeline of its own.
+siblings — `mini-dit-parity`, `zimage-parity`, `flux2-klein-parity`
+— already give each lane a pipeline of its own.

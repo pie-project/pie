@@ -1,4 +1,4 @@
-use poem_ir::{Attention, Operands, Operation, StructKind, Trace, Ty, ValueId};
+use poem_ir::{Attn, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 
@@ -175,11 +175,11 @@ struct Carving {
 }
 
 fn carves(op: &Operation) -> Option<Carving> {
-    let Operation::Attention(op) = op else {
+    let Operation::Attn(op) = op else {
         return None;
     };
     match op {
-        Attention::PlanDecode {
+        Attn::PlanDecode {
             q_heads,
             kv_heads,
             head_dim,
@@ -187,7 +187,7 @@ fn carves(op: &Operation) -> Option<Carving> {
             plan,
             ..
         }
-        | Attention::PlanPrefill {
+        | Attn::PlanPrefill {
             q_heads,
             kv_heads,
             head_dim,
@@ -203,7 +203,7 @@ fn carves(op: &Operation) -> Option<Carving> {
                 window: *window,
             },
         }),
-        Attention::MlaPlan {
+        Attn::MlaPlan {
             heads,
             kv_lora_rank,
             plan,
@@ -296,32 +296,36 @@ struct LatentReader {
 }
 
 fn latents(op: &Operation) -> Option<LatentReader> {
-    let Operation::Attention(op) = op else {
+    let Operation::Attn(op) = op else {
         return None;
     };
     match op {
-        Attention::MlaDecode {
+        Attn::MlaDecode {
             plan,
             heads,
             kv_lora_rank,
+            selection: None,
             ..
         }
-        | Attention::MlaPrefill {
+        | Attn::MlaPrefill {
             plan,
             heads,
             kv_lora_rank,
+            selection: None,
             ..
         }
-        | Attention::MlaDecodeSelected {
+        | Attn::MlaDecode {
             plan,
             heads,
             kv_lora_rank,
+            selection: Some(_),
             ..
         }
-        | Attention::MlaPrefillSelected {
+        | Attn::MlaPrefill {
             plan,
             heads,
             kv_lora_rank,
+            selection: Some(_),
             ..
         } => Some(LatentReader {
             plan: *plan,

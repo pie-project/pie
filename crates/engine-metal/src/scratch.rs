@@ -1,11 +1,11 @@
 use kernels_metal::Tensor;
-use kernels_metal::attn::ple;
-use kernels_metal::linear::moe::{self, RoutedScratch};
-use kernels_metal::linear::quant;
+use kernels_metal::gather::ngram;
+use kernels_metal::linear::moe::{self, RegisterRooms, RoutedScratch};
+use kernels_metal::linear::qmm;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -76,6 +76,19 @@ struct Routed {
     sums: Room,
 }
 
+/// The rooms of a routed MLP on the register tile ([`RegisterRooms`]).
+#[derive(Clone, Copy, Debug)]
+struct Register {
+    tiles: Room,
+    rows: Room,
+    inv: Room,
+    table: Room,
+    hidden: Room,
+    y: Room,
+    mix: Room,
+    grids: Room,
+}
+
 #[derive(Debug)]
 pub struct Scratch {
     plane: Buffer,
@@ -83,6 +96,7 @@ pub struct Scratch {
     precast: Option<Room>,
     partials: Option<Room>,
     routed: Option<Routed>,
+    register: Option<Register>,
     index: Option<Room>,
     copy: Option<CopyRoom>,
 
@@ -151,6 +165,10 @@ impl Scratch {
         let mut dense: Vec<(u32, u32)> = Vec::new();
         let (mut act_rows, mut act_k) = (0u64, 0u64);
         let (mut sorted, mut pairs, mut routed_k, mut routed_n) = (0u64, 0u64, 0u64, 0u64);
+        // The register expert tiles: the most tiles and routes a fire of its
+        // tokens fills, and the widest input and output a pass of them takes.
+        let (mut register_tiles, mut register_routes, mut register_k, mut register_n) =
+            (0u64, 0u64, 0u64, 0u64);
         for node in &trace.nodes {
             for (act, w, y) in crate::legs::matmuls(&node.op) {
                 if !banked(w) {
@@ -170,14 +188,47 @@ impl Scratch {
                 continue;
             };
             match op {
-                Linear::MoeMatmulSelectBias { x, routes, y, .. }
-                | Linear::MoeMatmulSelectQuant { x, routes, y, .. } => {
+                Linear::MoeSelect {
+                    x,
+                    routes,
+                    y,
+                    bias: Some(_),
+                    quantized: false,
+                    quant: None,
+                    ..
+                }
+                | Linear::MoeSelect {
+                    x,
+                    routes,
+                    y,
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                } => {
                     let (Some(x), Some(y)) = (of(*x), of(*y)) else {
                         continue;
                     };
                     let experts = routers.get(routes.0 as usize).copied().unwrap_or(0);
                     if experts == 0 {
                         continue;
+                    }
+                    if tuning.moe_register()
+                        && matches!(
+                            op,
+                            Linear::MoeSelect {
+                                quantized: true,
+                                ..
+                            }
+                        )
+                        && let Some(fan) = of(*routes).map(|r| r.width).filter(|w| *w > 0)
+                    {
+                        let tokens = moe::REGISTER_TOKENS;
+                        register_tiles = register_tiles
+                            .max(u64::from(moe::register_tiles(tokens, fan, experts, true)));
+                        register_routes = register_routes.max(u64::from(tokens * fan));
+                        register_k = register_k.max(u64::from(x.width));
+                        register_n = register_n.max(u64::from(y.width));
                     }
                     if moe::tile_rows(y.rows, experts, tuning) <= 1 {
                         continue;
@@ -203,7 +254,7 @@ impl Scratch {
                     return false;
                 };
                 let limit = tuning.qmm_splitk();
-                quant::splitk(n, 8, 8, k, 32, 4, limit) > 1 || (tuning.qmm_mpp() && n <= 65536)
+                qmm::tiled::splitk(n, 8, 8, k, 32, 4, limit) > 1 || (tuning.qmm_mpp() && n <= 65536)
             })
             .map(|&(n, _)| u64::from(n))
             .max()
@@ -235,11 +286,27 @@ impl Scratch {
             }
         });
 
+        let register = (register_tiles > 0).then(|| {
+            let mut at = 0u64;
+            let table = register_tiles
+                * moe::register_table_width(u32::try_from(register_k).unwrap_or(u32::MAX));
+            Register {
+                tiles: Room::lay(&mut at, 1, register_tiles + 1, Dtype::I32),
+                rows: Room::lay(&mut at, 1, register_tiles * 8, Dtype::I32),
+                inv: Room::lay(&mut at, 1, register_routes, Dtype::I32),
+                table: Room::lay(&mut at, 1, table, Dtype::Bf16),
+                hidden: Room::lay(&mut at, 1, table, Dtype::Bf16),
+                y: Room::lay(&mut at, register_tiles * 8, register_n, Dtype::Bf16),
+                mix: Room::lay(&mut at, 1, u64::from(moe::REGISTER_MIX), Dtype::F32),
+                grids: Room::lay(&mut at, 1, u64::from(moe::REGISTER_GRIDS), Dtype::I32),
+            }
+        });
+
         let index = trace
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Attention(Attention::IndexTopk { selection, .. }) => of(*selection),
+                Operation::Attn(Attn::IndexTopk { selection, .. }) => of(*selection),
                 _ => None,
             })
             .map(|rect| u64::from(rect.rows))
@@ -257,14 +324,14 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Spatial(poem_ir::Spatial::GroupNorm { groups, .. }) => Some(*groups),
+                Operation::Conv(poem_ir::Conv::GroupNorm { groups, .. }) => Some(*groups),
                 _ => None,
             })
             .max()
             .filter(|groups| *groups > 0)
             .map(|groups| {
                 let clips = budgets.max_clips().max(1);
-                let floats = kernels_metal::spatial::norm::scratch_floats(clips, groups);
+                let floats = kernels_metal::conv::group_norm::scratch_floats(clips, groups);
                 let mut at = 0u64;
                 Room::lay(&mut at, floats.div_ceil(4).max(1), 4, Dtype::F32)
             });
@@ -273,6 +340,7 @@ impl Scratch {
             .map_or(0, |r| r.at + r.bytes())
             .max(partials.map_or(0, |r| r.at + r.bytes()))
             .max(routed.map_or(0, |r| r.sums.at + r.sums.bytes()))
+            .max(register.map_or(0, |r| r.grids.at + r.grids.bytes()))
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
         let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
@@ -284,14 +352,14 @@ impl Scratch {
 
         let mut ple: Vec<PleHash> = Vec::new();
         for node in &trace.nodes {
-            let Operation::Attention(
-                Attention::PleNgramIds {
+            let Operation::Gather(
+                Gather::NgramIds {
                     mults,
                     primes,
                     offsets,
                     ..
                 }
-                | Attention::PleNgramIdsChunked {
+                | Gather::NgramIdsChunked {
                     mults,
                     primes,
                     offsets,
@@ -301,7 +369,7 @@ impl Scratch {
             else {
                 continue;
             };
-            let key: Box<[u64]> = ple::hash_constants(mults, primes, offsets).into();
+            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
             if key.is_empty() || ple.iter().any(|held| held.key == key) {
                 continue;
             }
@@ -320,6 +388,7 @@ impl Scratch {
             precast,
             partials,
             routed,
+            register,
             index,
             copy,
             spatial,
@@ -371,7 +440,7 @@ impl Scratch {
         groups: u32,
     ) -> Option<Result<(Tensor, Tensor)>> {
         let room = self.spatial?;
-        let splits = kernels_metal::spatial::norm::SPLITS;
+        let splits = kernels_metal::conv::group_norm::SPLITS;
         let partial_floats = u64::from(clips) * u64::from(splits) * u64::from(groups) * 4;
         let stat_floats = u64::from(clips) * u64::from(groups) * 2;
         if partial_floats + stat_floats > u64::from(room.rows) * u64::from(room.width) {
@@ -447,6 +516,25 @@ impl Scratch {
         Some(mint())
     }
 
+    /// The register expert tiles' rooms, where the load runs them; they
+    /// overlap the precast and routed rooms.
+    pub fn register(&self, handles: &Handles) -> Option<Result<RegisterRooms>> {
+        let r = self.register?;
+        let mint = || {
+            Ok(RegisterRooms {
+                tiles: r.tiles.bind(handles, &self.plane)?,
+                rows: r.rows.bind(handles, &self.plane)?,
+                inv: r.inv.bind(handles, &self.plane)?,
+                table: r.table.bind(handles, &self.plane)?,
+                hidden: r.hidden.bind(handles, &self.plane)?,
+                y: r.y.bind(handles, &self.plane)?,
+                mix: r.mix.bind(handles, &self.plane)?,
+                grids: r.grids.bind(handles, &self.plane)?,
+            })
+        };
+        Some(mint())
+    }
+
     pub fn index_scores(&self, handles: &Handles) -> Option<Result<Tensor>> {
         Some(self.index?.bind(handles, &self.plane))
     }
@@ -458,7 +546,7 @@ impl Scratch {
         primes: &[u64],
         offsets: &[u64],
     ) -> Option<Result<Tensor>> {
-        let want = ple::hash_constants(mults, primes, offsets);
+        let want = ngram::hash_constants(mults, primes, offsets);
         let held = self.ple.iter().find(|h| *h.key == *want)?;
         Some(held.room.bind(handles, &self.plane))
     }
@@ -531,20 +619,37 @@ fn routers(trace: &Trace) -> Vec<u32> {
             continue;
         };
         let (routes, experts) = match op {
-            Linear::MoeTopkSoftmax {
-                routes, experts, ..
+            Linear::MoeRoute {
+                routes,
+                experts,
+                scale: None,
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSoftmaxScaled {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                scale: Some(_),
+                score: poem_ir::RouteScore::Softmax,
+                ..
             }
-            | Linear::MoeTopkSigmoid {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Sigmoid { .. },
+                ..
             }
-            | Linear::MoeTopkSqrtSoftplus {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::SqrtSoftplus { .. },
+                ..
             }
-            | Linear::MoeHashRoute {
-                routes, experts, ..
+            | Linear::MoeRoute {
+                routes,
+                experts,
+                score: poem_ir::RouteScore::Hash { .. },
+                ..
             } => (*routes, *experts),
             _ => continue,
         };

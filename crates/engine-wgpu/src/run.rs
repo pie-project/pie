@@ -1,8 +1,9 @@
-use kernels_wgpu::attn::mla::MlaPlan;
-use kernels_wgpu::linear::moe::RoutedScratch;
-use kernels_wgpu::{
-    Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
-};
+use kernels_slang::attn::mla::MlaPlan;
+use kernels_slang::attn::sdpa::Tables;
+use kernels_slang::linear::moe::select::RoutedScratch;
+use kernels_slang::{Bank, Ctx, KvPool, RaggedTensor, Tensor};
+
+use crate::store::RecurrentPool;
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
@@ -105,19 +106,21 @@ pub struct FireBindings {
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
     pub scores: Option<crate::scores::ScoreSeat>,
+
+    pub voxels: Option<crate::inputs::VoxelHandles>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum StructSlot {
-    Decode(DecodePlan),
+    Decode(Tables),
 
-    Prefill(PrefillPlan),
+    Prefill(Tables),
 
     Mla(MlaPlan),
 }
 
 pub struct Run<'c> {
-    ctx: &'c Ctx<'c>,
+    pub(crate) ctx: &'c Ctx<'c>,
 
     handles: &'c Handles,
 
@@ -155,7 +158,11 @@ pub struct Run<'c> {
 
     scratch: &'c Scratch,
 
-    tuning: &'c kernels_wgpu::Tuning,
+    tuning: &'c crate::tuning::Tuning,
+
+    /// The highest kernels-slang tier the adapter runs: the subgroup tier
+    /// where every subgroup is at least 32 lanes.
+    tier: kernels_slang::Tier,
 }
 
 #[derive(Default)]
@@ -165,7 +172,7 @@ pub(crate) struct StageCache {
 }
 
 impl<'c> Run<'c> {
-    pub(crate) fn tuning(&self) -> &'c kernels_wgpu::Tuning {
+    pub(crate) fn tuning(&self) -> &'c crate::tuning::Tuning {
         self.tuning
     }
 
@@ -183,7 +190,8 @@ impl<'c> Run<'c> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch,
-        tuning: &'c kernels_wgpu::Tuning,
+        tuning: &'c crate::tuning::Tuning,
+        tier: kernels_slang::Tier,
         seats: Option<&'c crate::experts::Seats>,
         rows: Option<&'c crate::experts::Gathered>,
         host: Option<&'c crate::experts::HostTier>,
@@ -210,7 +218,12 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             scratch,
             tuning,
+            tier,
         }
+    }
+
+    pub(crate) fn tier(&self) -> kernels_slang::Tier {
+        self.tier
     }
 
     pub(crate) fn window(&self) -> &'c Window {
@@ -307,10 +320,6 @@ impl<'c> Run<'c> {
         )
     }
 
-    pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
-        self.ctx
-    }
-
     pub(crate) fn bindings(&self) -> &FireBindings {
         &self.fire
     }
@@ -377,12 +386,10 @@ impl<'c> Run<'c> {
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
-            Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
-                panic!(
-                    "value {} lives on the voxel axis, which this shell does not seat",
-                    id.0
-                )
-            }
+            Some(Dim::Voxels) => (seated.voxel.row_offset, seated.voxel.rows),
+            Some(Dim::VoxelsTimes(k)) => (seated.voxel.row_offset * k, seated.voxel.rows * k),
+            Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
+            Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
         };
         self.slice(handle, skip, keep)
     }
@@ -508,11 +515,15 @@ impl<'c> Run<'c> {
                 | RuntimeInput::Latents { .. }
                 | RuntimeInput::LaneVector { .. }
                 | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }
-                | RuntimeInput::Grid
-                | RuntimeInput::Voxels { .. }
-                | RuntimeInput::TokenGrid { .. }),
+                | RuntimeInput::AxisPositions { .. }),
             ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
+            Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
+            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::TokenGrid { .. }) => {
+                self.voxel_seat(at).token_grid.unwrap_or_else(|| {
+                    panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
+                })
+            }
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;
                 let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
@@ -650,7 +661,7 @@ impl<'c> Run<'c> {
         bank: Option<Bank>,
         bias: Option<Tensor>,
         routes: Tensor,
-    ) -> Result<Option<Seated>, kernels_wgpu::Error> {
+    ) -> Result<Option<Seated>, kernels_slang::Error> {
         use crate::experts::Kind;
         const OP: &str = "linear.expert_stage";
         let (Some(seats), Some(host)) = (self.seats, self.host) else {
@@ -661,7 +672,7 @@ impl<'c> Run<'c> {
         if codes.is_none() && bias_plane.is_none() {
             return Ok(None);
         }
-        let fail = |detail: String| kernels_wgpu::Error::Backend { op: OP, detail };
+        let fail = |detail: String| kernels_slang::Error::Backend { op: OP, detail };
         let key = (routes.buf, routes.rows, routes.width);
         if self.stage.borrow().key != Some(key) {
             let n = u64::from(routes.rows) * u64::from(routes.width);
@@ -741,13 +752,13 @@ impl<'c> Run<'c> {
         &self,
         bank: Bank,
         ids: Tensor,
-    ) -> Result<Option<(Bank, Tensor)>, kernels_wgpu::Error> {
+    ) -> Result<Option<(Bank, Tensor)>, kernels_slang::Error> {
         let (Some(rows), Some(host)) = (self.rows, self.host) else {
             return Ok(None);
         };
         rows.stage(self.handles, host, bank, ids)
-            .map_err(|why| kernels_wgpu::Error::Backend {
-                op: "layout.embed_concat",
+            .map_err(|why| kernels_slang::Error::Backend {
+                op: "gather.embed",
                 detail: why.to_string(),
             })
     }
@@ -762,7 +773,23 @@ impl<'c> Run<'c> {
         }))
     }
 
-    pub(crate) fn sdpa_split(&self) -> Option<kernels_wgpu::attn::Split> {
+    pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Option<(Tensor, Tensor)> {
+        Some(
+            self.scratch
+                .spatial_moments(self.handles, clips, groups)?
+                .unwrap_or_else(|fault| {
+                    panic!("the moment planes this load reserved do not mint: {fault}")
+                }),
+        )
+    }
+
+    fn voxel_seat(&self, at: usize) -> crate::inputs::VoxelHandles {
+        self.fire.voxels.unwrap_or_else(|| {
+            panic!("value {at} reads the voxel axis, and no lane of this fire submitted a clip")
+        })
+    }
+
+    pub(crate) fn sdpa_split(&self) -> Option<kernels_slang::attn::sdpa::Split> {
         Some(
             self.scratch
                 .sdpa_split(self.handles)?
@@ -869,7 +896,7 @@ impl<'c> Run<'c> {
         self.structs[at] = Some(built);
     }
 
-    pub(crate) fn decode_plan(&self, id: ValueId) -> &DecodePlan {
+    pub(crate) fn decode_plan(&self, id: ValueId) -> &Tables {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Decode(plan)) => plan,
             Some(_) => panic!(
@@ -884,7 +911,7 @@ impl<'c> Run<'c> {
         }
     }
 
-    pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {
+    pub(crate) fn prefill_plan(&self, id: ValueId) -> &Tables {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Prefill(plan)) => plan,
             Some(_) => panic!(

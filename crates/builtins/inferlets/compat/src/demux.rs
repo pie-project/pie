@@ -52,14 +52,17 @@ pub(crate) struct Demux {
     /// a blank line after a thinking block or a tool call, and that is
     /// formatting, not an answer.
     strip_leading: bool,
+    /// The request's choice, which the tool-call ids name.
+    choice: u32,
     pub reasoning_text: String,
     pub tool_calls: Vec<ToolCall>,
 }
 
 impl Demux {
     /// `cue` is the generation cue the prompt ends with: a cue that opens a
-    /// thinking block puts the first token inside it.
-    pub fn new(cue: &[u32]) -> Self {
+    /// thinking block puts the first token inside it. `choice` is the
+    /// request's ([`crate::Request::choice`]).
+    pub fn new(cue: &[u32], choice: u32) -> Self {
         let reasoning = reasoning::Decoder::for_cue(cue);
         let in_reasoning = reasoning.starts_inside();
         Self {
@@ -72,6 +75,7 @@ impl Demux {
             in_tool_call: false,
             content_filter: HoldBack::new(vec!["<tool_call>".to_string()]),
             strip_leading: true,
+            choice,
             reasoning_text: String::new(),
             tool_calls: Vec::new(),
         }
@@ -141,7 +145,7 @@ impl Demux {
                 self.strip_leading = true;
                 self.content_filter.flush();
                 let call = ToolCall {
-                    id: crate::call_id(self.tool_calls.len()),
+                    id: crate::call_id(self.choice, self.tool_calls.len()),
                     name: call.name,
                     arguments: call.arguments_json,
                 };

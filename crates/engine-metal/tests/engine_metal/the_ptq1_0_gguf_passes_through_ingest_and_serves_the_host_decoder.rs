@@ -2,7 +2,7 @@
 
 //! M1c: a REAL PTQ1_0 (ternary, `g128_t3_f16_n`, ggml type 143) tensor loads into
 //! pie as a servable `Ptq1_0` bank by NATIVE PASS-THROUGH — the ternary block bytes
-//! are kept verbatim (no decode to fp, no re-encode to MLX affine) — and the M1b
+//! are kept verbatim (no decode to fp, no re-encode to affine) — and the M1b
 //! Metal kernel serves that ingested bank bit-exact against the M1a host decoder.
 //!
 //! The loop this closes is file -> ingest -> bank -> kernel, on real data:
@@ -46,7 +46,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmv;
 use poem_ir::Dtype as IrDtype;
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], .. }` +
@@ -56,7 +56,7 @@ include!("../../../checkpoint/src/codec/ptq1_0_fixture.rs");
 const PTQ1_0_TYPE_ID: u32 = 143;
 const BLOCK: usize = 128;
 const BLOCK_BYTES: usize = 28;
-const PTQ1_0_FILE: &str = "linear/quant_ptq1_0.metal";
+const PTQ1_0_FILE: &str = "linear/qmv_ptq1_0.metal";
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
 /// One declared tensor: a name, its logical `[rows, k]` shape, and the raw ternary
@@ -437,7 +437,7 @@ fn serve_and_check(
     let sink = Sink::new(device, &frame, pipelines, handles);
     sink.fire(
         Fire::at(PTQ1_0_FILE, "ptq1_0_qmv_bfloat16_f32").apply(Grid::of(
-            quant::qmv_grid("m1c.readback", mi, ni).expect("grid"),
+            qmv::qmv_grid("m1c.readback", mi, ni).expect("grid"),
             QMV_GROUP,
         )),
         &[

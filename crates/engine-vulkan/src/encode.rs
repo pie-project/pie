@@ -1,4 +1,4 @@
-use kernels_vulkan::{ArgValue, Encode, Error, Fire};
+use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
 use crate::device::handles::NIL;
@@ -245,7 +245,11 @@ impl Encode for Sink<'_> {
         Ok(ArgValue::Buffer(NIL))
     }
 
-    fn comm(&self, op: &'static str) -> Result<kernels_vulkan::Comm, Error> {
+    fn target(&self) -> Target {
+        Target::Spirv
+    }
+
+    fn comm(&self, op: &'static str) -> Result<kernels_slang::Comm, Error> {
         let comm = self.comm.ok_or(Error::Unsupported { op })?;
 
         let band = self
@@ -259,11 +263,10 @@ impl Encode for Sink<'_> {
             op,
             detail: fault.to_string(),
         })?;
-        Ok(kernels_vulkan::Comm {
+        Ok(kernels_slang::Comm {
             rank: comm.rank(),
             world: comm.world(),
-
-            band: kernels_vulkan::Tensor::new(band, 1, 0, poem_ir::Dtype::Bf16),
+            band,
             slot_bytes,
         })
     }
@@ -285,9 +288,15 @@ impl Sink<'_> {
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         use ash::vk;
 
+        let key = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
+            Sink::backend(
+                fire,
+                format!("not instantiated at the {} tier", fire.tier.name()),
+            )
+        })?;
         let pipeline = self
             .pipelines
-            .get(self.device, fire)
+            .get(self.device, fire.file, key)
             .map_err(|fault| Sink::refuse(fire, fault))?;
 
         let dummy = &self.device.dummy;
@@ -482,7 +491,7 @@ impl Sink<'_> {
                 match slot.as_mut() {
                     Some(t) if (t.names.len() as u32) < t.capacity => {
                         let at = t.names.len() as u32;
-                        t.names.push(fire.entrypoint);
+                        t.names.push(key);
                         Some((t.pool, at))
                     }
                     _ => None,
@@ -507,14 +516,14 @@ impl Sink<'_> {
             }
         }
         self.frame.dispatches.set(self.frame.dispatches.get() + 1);
-        record_kernel(fire.entrypoint);
+        record_kernel(key);
         if CAPTURING.load(std::sync::atomic::Ordering::Acquire) {
             use ash::vk::Handle;
             SHAPES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(DispatchShape {
-                    entrypoint: fire.entrypoint,
+                    entrypoint: key,
                     bindings: infos
                         .iter()
                         .take(declared)
@@ -572,4 +581,32 @@ impl Encode for Sink<'_> {
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
     }
+
+    fn target(&self) -> Target {
+        Target::Spirv
+    }
+}
+
+/// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs.
+pub(crate) fn qmm_ladder(
+    tuning: &crate::tuning::Tuning,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+    bank: kernels_slang::Bank,
+) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    use crate::tuning::Qmm;
+    use kernels_slang::linear::qmm::Qmm as Rung;
+    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning
+        .qmm(&at)
+        .iter()
+        .map(|q| match *q {
+            Qmm::Coopmat => Rung::Coopmat,
+            Qmm::RegisterTiled { bm, k16 } => Rung::RegisterTiled { bm, k16 },
+            Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+            Qmm::OneRow { lanes, rows } => Rung::OneRow { lanes, rows },
+            Qmm::Qmv { vecs } => Rung::Qmv { vecs },
+        })
+        .collect()
 }

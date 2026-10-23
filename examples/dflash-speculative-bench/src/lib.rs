@@ -19,6 +19,10 @@ use inferlet::eta::prelude::*;
 use inferlet::{chat, monotonic_now_ns, session};
 use serde::{Deserialize, Serialize};
 
+mod budget;
+
+use budget::Budget;
+
 #[derive(Deserialize)]
 struct Input {
     #[serde(default = "default_prompt")]
@@ -61,6 +65,11 @@ struct Input {
     /// Off by default in a crowd, where a lane's clock prices the batch it waited for.
     #[serde(default)]
     priced: Option<bool>,
+    /// Every round drafts, and verifies the rows its draft's confidence pays
+    /// for at the rows' measured prices; see `budget`. Overrides `priced`,
+    /// `auto_width` and the yield floor; `verify_rows` still caps the block.
+    #[serde(default)]
+    verify_budget: bool,
     #[serde(default = "default_drafter")]
     drafter: String,
     #[serde(default = "default_ngram_n")]
@@ -160,6 +169,10 @@ struct Output {
     plain_fires: usize,
     /// Keyed by width: `0` is the draft fire, `1` the plain fire.
     prices_ms: Vec<(u32, f64)>,
+    /// Under `verify_budget`: the acceptance model as last fit (slope, carry,
+    /// intercepts), and the tokens it expected its rounds to emit.
+    budget_model: Vec<f64>,
+    budget_expected: f64,
     intertoken_us: Vec<u32>,
 }
 
@@ -224,6 +237,28 @@ impl Prices {
             .rev()
             .find_map(|w| Self::median(&self.verify[w]))?;
         Some(draft + verify)
+    }
+
+    /// A round of `width` rows for the verify budget: the draft and the
+    /// verify at that width. A width not yet fired prices on the line between
+    /// the fired widths around it, or, past the last, at the rate its nearest
+    /// fired neighbour does on `seed`, the shape a round's cost takes in its
+    /// rows; `None` until the draft and some verify are priced.
+    fn budget_round(&self, width: u32) -> Option<f64> {
+        let draft = Self::median(&self.draft)?;
+        let w = width as usize;
+        let fired = |v: usize| Self::median(&self.verify[v]).map(|p| (v, p));
+        let below = (1..=w).rev().find_map(fired);
+        let above = (w..self.verify.len()).find_map(fired);
+        let verify = match (below, above) {
+            (Some((v, p)), _) if v == w => p,
+            (Some((lo, p)), Some((hi, q))) => p + (q - p) * (w - lo) as f64 / (hi - lo) as f64,
+            (Some((v, p)), None) | (None, Some((v, p))) => {
+                (draft + p) * seed(w as u32) / seed(v as u32) - draft
+            }
+            (None, None) => return None,
+        };
+        Some(draft + verify.max(0.0))
     }
 
     fn report(&self) -> Vec<(u32, f64)> {
@@ -453,6 +488,17 @@ impl Gate {
     }
 }
 
+/// What a round of `rows` rows costs against one of eight: the mean shape of
+/// the measured MoE targets' decode cycles, Splash's seed for a lone lane,
+/// between knots at 1, 2, 4 and 8 rows (and past 8 on the last segment).
+fn seed(rows: u32) -> f64 {
+    const KNOTS: [(f64, f64); 4] = [(1.0, 0.60), (2.0, 0.69), (4.0, 0.85), (8.0, 1.0)];
+    let r = f64::from(rows.max(1));
+    let upper = KNOTS.iter().position(|(k, _)| r <= *k).unwrap_or(3).max(1);
+    let ((k0, s0), (k1, s1)) = (KNOTS[upper - 1], KNOTS[upper]);
+    s0 + (s1 - s0) * (r - k0) / (k1 - k0)
+}
+
 fn wide_enough(confidence: &[f32]) -> bool {
     let head = &confidence[..confidence.len().min(NARROW as usize - 1)];
     let mean = head.iter().map(|c| f64::from(*c)).sum::<f64>() / head.len().max(1) as f64;
@@ -560,6 +606,8 @@ async fn main(input: Input) -> Result<Output> {
     let priced = input.priced.unwrap_or(!crowded);
     let mut gate = Gate::new(floor, input.auto_width, crowded);
     let mut prices = Prices::new(block);
+    let mut budget = Budget::new(widest.saturating_sub(1).max(1) as usize);
+    let mut budget_expected = 0.0;
     let mut plain_fires: usize = 0;
     // Drafting rounds since the plain fire was last priced, and plain fires
     // still owed to the current re-pricing; see `REPRICE`.
@@ -607,7 +655,10 @@ async fn main(input: Input) -> Result<Output> {
         } else {
             Vec::new()
         };
-        let planned = if floor.is_infinite() {
+        let planned = if input.verify_budget && !ngram {
+            // The width is the draft's to choose; see below.
+            Some(pinned.unwrap_or(widest))
+        } else if floor.is_infinite() {
             None
         } else if ngram {
             // A match drafts as many rows as it found; none is a plain fire.
@@ -638,6 +689,9 @@ async fn main(input: Input) -> Result<Output> {
         let drafting = planned.is_some();
         let fold_len = Channel::from([survivors]).named("fold_len_v");
         let mut proposals_owned: Vec<i32> = Vec::new();
+        // The draft's confidence at each proposal, under the verify budget.
+        let mut confidence: Vec<f32> = Vec::new();
+        let mut draft_ns: u64 = 0;
         if !drafting {
             verify = 1;
             plain_fires += 1;
@@ -665,7 +719,11 @@ async fn main(input: Input) -> Result<Output> {
             let conf = Channel::new([shown * 2], dtype::f32)
                 .capacity(channel_capacity() as u32)
                 .named("conf_d");
-            let want_margin = input.margin_width;
+            let want_margin = input.margin_width && !input.verify_budget;
+            let sure = Channel::new([shown], dtype::f32)
+                .capacity(channel_capacity() as u32)
+                .named("sure_d");
+            let want_sure = input.verify_budget;
 
             let fwd = ForwardPass::new();
             fwd.set_drafting_block(true)
@@ -691,6 +749,14 @@ async fn main(input: Input) -> Result<Output> {
                         let (value, _) = top_k(intrinsics::logits(), 2);
                         conf.put(&reshape(value, [shown * 2]));
                     }
+                    if want_sure {
+                        // Each row's largest probability at temperature 1,
+                        // 1 / sum(exp(logit - max)): two passes over the row.
+                        let logits = intrinsics::logits();
+                        let top = broadcast(reduce_max(&logits), [shown, intrinsics::vocab()]);
+                        let mass = reduce_sum(exp(&logits - top));
+                        sure.put(reshape(recip(mass), [shown]));
+                    }
                 });
             }
             let drafted_at = monotonic_now_ns();
@@ -700,8 +766,19 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<Vec<i32>>()
                 .await
                 .context("draft readback")?;
-            prices.drafted(monotonic_now_ns().saturating_sub(drafted_at));
+            draft_ns = monotonic_now_ns().saturating_sub(drafted_at);
+            prices.drafted(draft_ns);
             proposals_owned = picks[from..shown as usize].to_vec();
+            if want_sure {
+                let value = sure
+                    .take_host::<Vec<f32>>()
+                    .await
+                    .context("confidence readback")?;
+                confidence = value[from..shown as usize].to_vec();
+                // `verify` holds the widest the block (or `verify_rows`) allows.
+                verify = budget.width(&confidence, verify, |w| prices.budget_round(w));
+                budget_expected += budget.expected(&confidence, verify);
+            }
             if want_margin {
                 let value = conf
                     .take_host::<Vec<f32>>()
@@ -758,8 +835,9 @@ async fn main(input: Input) -> Result<Output> {
             .await
             .context("verify readback")?;
         // A plain fire is priced only with nothing buffered behind it, the baseline's geometry.
+        let verify_ns = monotonic_now_ns().saturating_sub(verified_at);
         if drafting || survivors == 0 {
-            prices.verified(verify, monotonic_now_ns().saturating_sub(verified_at));
+            prices.verified(verify, verify_ns);
         }
 
         // ── what the target kept ────────────────────────────────────────
@@ -775,6 +853,14 @@ async fn main(input: Input) -> Result<Output> {
             drafted += verify as usize - 1;
             accepted += kept;
             gate.yielded(kept as u32 + 1, verify);
+            if !confidence.is_empty() {
+                budget.observe(
+                    &confidence,
+                    verify,
+                    kept as u32,
+                    (draft_ns + verify_ns) as f64,
+                );
+            }
         }
         replayed += survivors as usize;
         // A drafting round leaves its accepted prefix buffered for the next
@@ -831,6 +917,12 @@ async fn main(input: Input) -> Result<Output> {
         replayed,
         plain_fires,
         prices_ms: prices.report(),
+        budget_model: if input.verify_budget {
+            budget.model().to_vec()
+        } else {
+            Vec::new()
+        },
+        budget_expected,
         intertoken_us,
     })
 }

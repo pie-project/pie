@@ -39,7 +39,7 @@ elemwise.hc_tile = true
 elemwise.hc_mma = true
 elemwise.qg_prologue_until = 64
 elemwise.norm_emit = true
-sdpa.dsv4_decode_until = 64
+sdpa.compressed_decode_until = 64
 gemm.bias_epilogue = true
 gemm.rows_m = 8
 mla.expanded_from = 256
@@ -52,7 +52,7 @@ moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
 moe.bf16_mma_from = 16
 moe.bf16_mma_until = 65536
-sdpa.dsv4_replay = true
+sdpa.compressed_replay = true
 ssm.gdn_fused_scan = true
 ssm.conv_vec4 = true
 ssm.gdn_out_bf16 = true
@@ -115,7 +115,7 @@ measured = [
   "kernel.elemwise.hc_mma",
   "kernel.elemwise.qg_prologue_until",
   "kernel.elemwise.norm_emit",
-  "kernel.sdpa.dsv4_decode_until",
+  "kernel.sdpa.compressed_decode_until",
   "kernel.gemm.bias_epilogue",
   "kernel.gemm.rows_m",
   "kernel.mla.expanded_from",

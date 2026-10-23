@@ -2,21 +2,27 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
+use crate::attn::mla;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
+#[cfg(feature = "cuda")]
+use logits::{TC5_FROM, ranked_tc5};
 
-const FILE: &str = "attn/index.cuh";
+#[cfg(feature = "cuda")]
+mod logits;
+
+const INDEX: &str = "attn/index/index.cu";
 
 const K_BLOCK: u32 = 256;
 
-const POOL_BLOCK: u32 = 256;
+pub(crate) const POOL_BLOCK: u32 = 256;
 
 #[must_use]
 fn q_rope_block(n_heads: i32) -> u32 {
     (n_heads.unsigned_abs().div_ceil(32) * 32).max(32)
 }
 
-fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
+pub(crate) fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
     // A row of bf16 keys written into a narrower plane would spill into the
     // next cell's; an index's keys stay bf16 at any kv.
     if pool.keys.dtype != Dtype::Bf16 {
@@ -62,7 +68,7 @@ pub fn layernorm_rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_layernorm_rope";
+    const OP: &str = "attn.index_layernorm_rope";
     dtype_dispatch!(OP, k.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
     let head_dim = count(OP, "the index key row's width", k.width)?;
@@ -71,10 +77,13 @@ pub fn layernorm_rope(
         OP,
         // A warp a row where the profile says (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(FILE, "::pie::attn::index_knorm_rope_warp<::pie::bf16>")
-                .apply(Launch::per_row(k.rows, 32))
+            Fire::at(
+                INDEX,
+                "::pie::attn::index::index_knorm_rope_warp<::pie::bf16>",
+            )
+            .apply(Launch::per_row(k.rows, 32))
         } else {
-            Fire::at(FILE, "::pie::attn::index_knorm_rope<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index::index_knorm_rope<::pie::bf16>")
                 .apply(Launch::per_row(k.rows, K_BLOCK))
         },
         &[
@@ -100,7 +109,7 @@ pub fn rope(
     rope_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_rope";
+    const OP: &str = "attn.index_rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
     let n_heads = count(OP, "the head count this rotation states", heads)?;
@@ -111,10 +120,10 @@ pub fn rope(
         // A thread a (head, pair) where the profile says
         // (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(FILE, "::pie::attn::index_q_rope_pairs<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index::index_q_rope_pairs<::pie::bf16>")
                 .apply(Launch::per_row(q.rows, K_BLOCK))
         } else {
-            Fire::at(FILE, "::pie::attn::index_q_rope<::pie::bf16>")
+            Fire::at(INDEX, "::pie::attn::index::index_q_rope<::pie::bf16>")
                 .apply(Launch::per_row(q.rows, q_rope_block(n_heads)))
         },
         &[
@@ -152,7 +161,7 @@ pub fn store_fp4(
     boundary_req: Tensor,
     keys: &KvPool,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     if !fp4_keys(keys) {
         return Err(refuse(OP, "the pool does not hold FP4 index keys"));
     }
@@ -165,10 +174,10 @@ pub fn store_fp4(
     if entries.rows == 0 {
         return Ok(());
     }
-    let div = crate::attn::pool::packing(OP, keys, i64::from(FP4_ROW))?;
+    let div = crate::attn::compressed::pool::packing(OP, keys, i64::from(FP4_ROW))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_store_fp4")
+        Fire::at(INDEX, "::pie::attn::index::index_store_fp4")
             .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             entries.arg(),
@@ -199,7 +208,7 @@ fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTen
         let lanes = u32::try_from(runs).map_err(|_| refuse(op, "the queries overflow a launch"))?;
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::index_q_fp4").apply(Launch::flat(lanes, 256)),
+            Fire::at(INDEX, "::pie::attn::index::index_q_fp4").apply(Launch::flat(lanes, 256)),
             &[
                 q.data.arg(),
                 ArgValue::Ptr(out),
@@ -221,7 +230,7 @@ fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTen
 fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error> {
     // A compact pool's keys a row each, `page_size / div` a page: staged a
     // row a key, the staged pool as compact (128 / div wide a position).
-    let div = crate::attn::pool::packing(op, keys, i64::from(FP4_ROW))?;
+    let div = crate::attn::compressed::pool::packing(op, keys, i64::from(FP4_ROW))?;
     let pages = keys.page_indices.rows;
     let page = u32::try_from(keys.page_size / div).unwrap_or(0);
     let cells = pages.saturating_mul(page);
@@ -232,7 +241,7 @@ fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error
     if pages > 0 {
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::index_stage_fp4")
+            Fire::at(INDEX, "::pie::attn::index::index_stage_fp4")
                 .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
             &[
                 keys.keys.arg(),
@@ -263,11 +272,11 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_kv_append";
+    const OP: &str = "attn.index_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, k.data.dtype, { Bf16 => () });
     pool_pitch(OP, keys, stated(OP, k.data.width)?)?;
-    kv::write_mla_to_pages(
+    mla::prep::write_mla_to_pages(
         ctx,
         OP,
         k.data,
@@ -278,55 +287,6 @@ pub fn kv_append(
         stated(OP, k.data.width)?,
         0,
     )
-}
-
-pub fn block_mean(
-    ctx: &Ctx,
-    boundary_pos: Tensor,
-    boundary_req: Tensor,
-    keys: &KvPool,
-    head_dim: u32,
-    ratio: u32,
-    entries: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.index_block_mean";
-    dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
-    debug_assert!(
-        boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
-        "`{OP}` reads the i32 block tables `attention.pool_boundary_*` published"
-    );
-    let head_dim = count(OP, "the key width this mean states", head_dim)?;
-    pool_pitch(OP, keys, head_dim)?;
-    if stated(OP, entries.width)? != head_dim {
-        return Err(refuse(
-            OP,
-            "the stated head width is not the entry this mean sized",
-        ));
-    }
-    let ratio = count(OP, "the block width this mean pools over", ratio)?;
-    let rows = count(OP, "rows", boundary_pos.rows)?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/pool.cuh",
-            "::pie::attn::index_block_mean_paged<::pie::bf16>",
-        )
-        .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
-        &[
-            keys.keys.arg(),
-            entries.arg(),
-            boundary_pos.arg(),
-            boundary_req.arg(),
-            keys.page_indices.arg(),
-            keys.page_indptr.arg(),
-            head_dim.arg(),
-            ratio.arg(),
-            keys.page_size.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    let _ = rows;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -389,7 +349,7 @@ pub fn topk_turned(
 
 /// [`topk`]'s blocks read back as the tokens each stands for, then the
 /// row's own open block's (`top_k * ratio + ratio - 1` a row, -1 unused):
-/// `attention.index_topk` scored `pooled_tokens`.
+/// `attn.index_topk` scored `pooled_tokens`.
 #[allow(clippy::too_many_arguments)]
 pub fn topk_tokens(
     ctx: &Ctx,
@@ -402,7 +362,7 @@ pub fn topk_tokens(
     ratio: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     let ratio = ratio.max(1);
     let width = top_k
         .checked_mul(ratio)
@@ -438,7 +398,7 @@ pub fn topk_tokens(
     let num_requests = kv::lanes_of(OP, q.indptr)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_pool_tokens")
+        Fire::at(INDEX, "::pie::attn::index::index_pool_tokens")
             .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             ArgValue::Ptr(blocks_at),
@@ -468,7 +428,7 @@ fn ranked(
     turn: Option<QueryTurn>,
     selection: &mut Tensor,
 ) -> Result<bool, Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");
     let heads = count(OP, "the head count this ranking states", heads)?;
@@ -505,13 +465,13 @@ fn ranked(
         }
         q
     } else {
-        if !crate::attn::pool::compact(keys, ratio.max(1), i64::from(head_dim)) {
+        if !crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(head_dim)) {
             pool_pitch(OP, keys, head_dim)?;
         }
         q
     };
     // The keys a row each (`page_size / ratio` a page) in a compact pool.
-    let compact = crate::attn::pool::compact(
+    let compact = crate::attn::compressed::pool::compact(
         keys,
         ratio.max(1),
         if fp4 {
@@ -603,7 +563,9 @@ fn ranked(
                 _ => 4,
             };
             (
-                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}, {fp4}>"),
+                format!(
+                    "::pie::attn::index::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}, {fp4}>"
+                ),
                 // The query, 16 rows a tile, and each warp's two chunks of 16
                 // keys, at 128 + 8 bf16 a row.
                 (16 * tiles + 2 * (K_BLOCK / 32) * 16) * (128 + 8) * 2,
@@ -611,7 +573,7 @@ fn ranked(
         }
         _ if turn.is_some() => return Ok(false),
         _ => (
-            format!("::pie::attn::index_topk_paged<::pie::bf16, {radix}>"),
+            format!("::pie::attn::index::index_topk_paged<::pie::bf16, {radix}>"),
             0,
         ),
     };
@@ -652,7 +614,7 @@ fn ranked(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
+        Fire::at(INDEX, symbol(&entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
         &[
             q.data.arg(),
             ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),
@@ -684,7 +646,7 @@ const MAX_BLOCK_MAX_HEADS: i32 = 8;
 
 const MAX_BLOCK_MAX_PER: i32 = 8;
 
-/// `attention.index_topk` scored block by block: each head ranks the blocks
+/// `attn.index_topk` scored block by block: each head ranks the blocks
 /// a row sees by their best key, keeps the row's own, and writes its run of
 /// `top_k` ascending into `selection`, `heads * top_k` wide.
 #[allow(clippy::too_many_arguments)]
@@ -698,7 +660,7 @@ pub fn topk_block_max(
     block: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 block ids");
     let heads = count(OP, "the head count this ranking states", heads)?;
@@ -765,8 +727,11 @@ pub fn topk_block_max(
 
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_topk_block_max<::pie::bf16>")
-            .apply(Launch::per_row(selection.rows, K_BLOCK)),
+        Fire::at(
+            INDEX,
+            "::pie::attn::index::index_topk_block_max<::pie::bf16>",
+        )
+        .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             q.data.arg(),
             keys.keys.arg(),
@@ -786,186 +751,4 @@ pub fn topk_block_max(
             ctx.stage(),
         ],
     )
-}
-
-/// A prefill's rows, from which the pooled index scores on tcgen05 where
-/// `kernel.sdpa.index_tc5` says.
-#[cfg(feature = "cuda")]
-const TC5_FROM: u32 = 512;
-
-/// `pie::attn::index_tc5::Params`, field for field.
-#[cfg(feature = "cuda")]
-#[repr(C)]
-struct Tc5Params {
-    q: u64,
-    w: u64,
-    qo_indptr: u64,
-    page_indices: u64,
-    page_indptr: u64,
-    last_page_lens: u64,
-    scores: u64,
-    turn_pos: u64,
-    win: u64,
-    requests: i32,
-    heads: i32,
-    page_size: i32,
-    score_stride: i32,
-    top_k: i32,
-    ratio: i32,
-    per: i32,
-    rows: i32,
-    turn_dim: i32,
-    turn_theta: f32,
-    turn_factor: f32,
-    turn_low: f32,
-    turn_high: f32,
-    sub: i32,
-}
-
-/// `pie::attn::index_tc5::smem_bytes`: two Q buffers and three key tiles of
-/// 32 KB, the warps' sums, the weights, barriers and the alignment.
-#[cfg(feature = "cuda")]
-const TC5_SMEM: u32 = (2 + 3) * 32768 + 8 * 128 * 4 + 2 * 128 * 4 + 256 + 1024;
-
-/// The pooled index scored on tcgen05 (`index_logits_tc5`) and ranked a
-/// block a row (`index_select_rows`): `Ok(false)` where the pool's pages do
-/// not land as the kernel reads them (a page's entries whole boxes of 4 to
-/// 128 that tile 128 blocks), and the caller scores as before.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn ranked_tc5(
-    ctx: &Ctx,
-    q: RaggedTensor,
-    weights: Option<Tensor>,
-    keys: &KvPool,
-    heads: i32,
-    top_k: i32,
-    ratio: i32,
-    turn: Option<QueryTurn>,
-    score_stride: i32,
-    scores: u64,
-    num_requests: i32,
-    compact: bool,
-    selection: &mut Tensor,
-) -> Result<bool, Error> {
-    use crate::linear::tc5::supported;
-
-    const OP: &str = "attention.index_topk";
-    const TC5_FILE: &str = "attn/index_tc5.cuh";
-    let page = keys.page_size;
-    let cells = keys.keys.rows;
-    let per = if ratio > 0 && page % ratio == 0 {
-        page / ratio
-    } else {
-        0
-    };
-    if !supported()
-        || !matches!(per, 4 | 8 | 16 | 32 | 64 | 128)
-        || !cells.is_multiple_of(ratio.unsigned_abs())
-        || keys.seq_stride * if compact { i64::from(ratio) } else { 1 } != 128
-        || !keys.keys.ptr.is_multiple_of(16)
-        || !q.data.ptr.is_multiple_of(16)
-    {
-        return Ok(false);
-    }
-    let (turn_pos, turn_dim, turn_theta, turn_factor, turn_low, turn_high) = match turn {
-        Some(t) if t.dim > 0 && t.dim <= 128 && t.dim.is_multiple_of(8) => {
-            let dim = stated(OP, t.dim)?;
-            let (factor, low, high) = match t.yarn {
-                Some(y) => {
-                    let (low, high) = crate::elemwise::rope::ramp_bounds(
-                        dim,
-                        t.theta,
-                        y.beta_fast,
-                        y.beta_slow,
-                        i32::try_from(y.original_max_position).unwrap_or(i32::MAX),
-                    );
-                    (y.factor, low, high)
-                }
-                None => (1.0, 0.0, 0.0),
-            };
-            (t.positions.ptr, dim, t.theta, factor, low, high)
-        }
-        Some(_) => return Ok(false),
-        None => (0, 0, 0.0, 1.0, 0.0, 0.0),
-    };
-    // A page's keys `ratio` rows apart at each group's last row, viewed as
-    // [ratio, cells / ratio] rows; a compact pool's a row each.
-    let ratio_u = ratio.unsigned_abs();
-    let step = if compact { 1 } else { ratio_u };
-    let map = crate::attn::bf16_map(
-        keys.keys.ptr,
-        [128, step, cells / ratio_u],
-        [256, 256 * u64::from(step)],
-        [64, 1, per.unsigned_abs()],
-    )?;
-    // Eight consecutive pages' entries a box, where a tile holds eight pages.
-    let map8 = crate::attn::bf16_map(
-        keys.keys.ptr,
-        [128, step, cells / ratio_u],
-        [256, 256 * u64::from(step)],
-        [64, 1, (8 * per.unsigned_abs()).min(256)],
-    )?;
-    let win = match ctx.stage() {
-        ArgValue::Ptr(at) => at,
-        _ => 0,
-    };
-    let rows = stated(OP, selection.rows)?;
-    let params = Tc5Params {
-        q: q.data.ptr,
-        w: weights.map_or(0, |w| w.ptr),
-        qo_indptr: q.indptr.ptr,
-        page_indices: keys.page_indices.ptr,
-        page_indptr: keys.page_indptr.ptr,
-        last_page_lens: keys.last_page_lens.ptr,
-        scores,
-        turn_pos,
-        win,
-        requests: num_requests,
-        heads,
-        page_size: page,
-        score_stride,
-        top_k,
-        ratio,
-        per,
-        rows,
-        turn_dim,
-        turn_theta,
-        turn_factor,
-        turn_low,
-        turn_high,
-        sub: if compact { 0 } else { ratio - 1 },
-    };
-    let bytes = ArgValue::of(&params);
-    // A pass's 128 lanes hold two rows of 64 heads, or four of 32.
-    let h = if heads <= 32 { 32 } else { 64 };
-    let groups = selection.rows.div_ceil(128 / h);
-    ctx.fire(
-        OP,
-        Fire::at(
-            TC5_FILE,
-            symbol(&format!("::pie::attn::index_tc5::index_logits_tc5<{h}>")),
-        )
-        .apply(
-            Launch::grid(
-                [groups.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
-                [384, 1, 1],
-            )
-            .smem(TC5_SMEM),
-        ),
-        &[ArgValue::of(&map), ArgValue::of(&map8), bytes],
-    )?;
-    let radix = ctx.tuning().index_radix;
-    ctx.fire(
-        OP,
-        Fire::at(
-            TC5_FILE,
-            symbol(&format!(
-                "::pie::attn::index_tc5::index_select_rows<{radix}>"
-            )),
-        )
-        .apply(Launch::grid([selection.rows, 1, 1], [K_BLOCK, 1, 1])),
-        &[bytes, selection.arg()],
-    )?;
-    Ok(true)
 }

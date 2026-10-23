@@ -31,7 +31,7 @@ impl ForwardHybrid for MergedBlock {
         let ada = Weight::sym("ada", [3 * u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
         let ada_bias = Weight::sym("ada_bias", [3 * u64::from(WIDTH)], Dtype::Bf16);
         let m = ops::elemwise::add_bias(&ada_bias, &ops::linear::matmul(&emb, &ada));
-        let (ss, gate) = ops::layout::split_rows(&m, 2 * WIDTH);
+        let (ss, gate) = ops::gather::split_rows(&m, 2 * WIDTH);
         let lanes = inputs.request_of_token();
         let h = ops::elemwise::modulate(
             &ops::elemwise::layernorm_no_scale(&x, 1e-6),

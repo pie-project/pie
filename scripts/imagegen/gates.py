@@ -381,13 +381,6 @@ def hy3_readout(text: str) -> str:
     bits += claims(text)
     return "  ".join(bits)
 
-def ltx_readout(text: str) -> str:
-    bits = [worst_cos(text)]
-    if "MUST MOVE" in text:
-        bits.append("conditioning moves" if "FAILED" not in text
-                    else "conditioning DID NOT move")
-    return "  ".join(bits)
-
 def wan_video_readout(text: str) -> str:
     bits = []
     host = rust_cos_readout(text)
@@ -896,20 +889,6 @@ def roster() -> list[Gate]:
             timeout=2400,
         ),
         Gate(
-            name="h3-mini",
-            wraps="h3_parity.py all",
-            expected="refined-text / video / audio >= 0.9999",
-            needs=[(g("minimax_h3", "h3_mini.npz"), "python scripts/imagegen/h3_golden.py --mini"),
-                   (a("h3-mini.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/minimax_h3/ "
-                    f"--deployment minimax-h3-mini-bf16-kv-bf16 --out {a('h3-mini.zt')}")],
-            config=dict(port=8608, model=a("h3-mini.zt"), rows=65536, mem=0.60),
-            steps=[("refine + denoise", harness("h3_parity.py", "all", "--out", "{out}",
-                                                "--config", "{config}"))],
-            readout=plain,
-            timeout=1800,
-        ),
-        Gate(
             name="hy3-mini",
             wraps="hy3_parity.py all",
             expected="velocity 0.999997, prefix-conditions claim, prefix-KV-reuse exact",
@@ -924,29 +903,11 @@ def roster() -> list[Gate]:
             timeout=1800,
         ),
         Gate(
-            name="ltx2-mini",
-            wraps="ltx2_parity.py all, all --refine, matters",
-            expected="cos >= 0.9999 (the harness's own gate; the README states no number)",
-            needs=[(g("ltx25", "ltx2_mini.npz"), "python scripts/imagegen/ltx2_golden.py --mini"),
-                   (a("ltx2-mini.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/ltx25 --deployment ltx25-mini-bf16-kv-bf16 "
-                    f"--out {a('ltx2-mini.zt')}")],
-            config=dict(port=8610, model=a("ltx2-mini.zt"), rows=4096, mem=0.40),
-            steps=[("joint step", harness("ltx2_parity.py", "all", "--out", "{out}",
-                                          "--config", "{config}")),
-                   ("connectors", harness("ltx2_parity.py", "all", "--refine",
-                                          "--out", "{out}", "--config", "{config}")),
-                   ("conditioning moves", harness("ltx2_parity.py", "matters",
-                                                  "--out", "{out}", "--config", "{config}"))],
-            readout=ltx_readout,
-            timeout=2400,
-        ),
-        Gate(
             name="ltx2-vae",
             wraps="cargo test -p engine-cuda --test engine_cuda the_ltx_2_vae_answers_the_reference -- --ignored",
             expected="decode cos >= 0.9999 per frame and clip (landed 0.999985, mean |err| 0.0019)",
             needs=[(g("ltx25", "ltx2_vae", "shapes.json"),
-                    "CUDA_VISIBLE_DEVICES=<n> python scripts/imagegen/ltx2_golden.py --vae"),
+                    "CUDA_VISIBLE_DEVICES=<n> python scripts/imagegen/ltx2_golden.py"),
                    (os.path.expanduser("~/.cache/huggingface/hub/models--Lightricks--LTX-2.5-Diffusers/"
                                        "snapshots/*/vae/diffusion_pytorch_model.safetensors"),
                     "huggingface-cli download Lightricks/LTX-2.5-Diffusers --include 'vae/*'")],

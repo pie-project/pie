@@ -6,6 +6,8 @@ use crate::attn::plan::MlaPlan;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
+pub mod prep;
+
 const BLOCK: u32 = 256;
 
 const fn rms(rows: u32) -> Launch {
@@ -131,7 +133,7 @@ pub fn latents(
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents";
+    const OP: &str = "attn.mla_latents";
     debug_assert_eq!(
         kv_c.width, kv_lora_rank,
         "the latent output is the stated rank wide"
@@ -152,7 +154,7 @@ pub fn latents_rope(
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_latents_rope";
+    const OP: &str = "attn.mla_latents_rope";
     dtype_dispatch!(OP, kv_a.dtype, { Bf16 => () });
     debug_assert_eq!(
         kv_c.width, kv_lora_rank,
@@ -170,50 +172,6 @@ pub fn latents_rope(
     )
 }
 
-pub fn split_q_b(
-    ctx: &Ctx,
-    q_b: Tensor,
-    heads: u32,
-    nope_dim: u32,
-    rope_dim: u32,
-    q_nope: &mut Tensor,
-    q_pe: &mut Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.mla_split_q_b";
-    let t = dtype_dispatch!(OP, q_b.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let heads = count(OP, "the head count this cut states", heads)?;
-    let nope = stated(OP, nope_dim)?;
-    let rope = stated(OP, rope_dim)?;
-    let width = i64::from(heads) * (i64::from(nope) + i64::from(rope));
-    // Eight elements a thread when both widths are whole eights.
-    let vec = if nope % 8 == 0 && rope % 8 == 0 { 8 } else { 1 };
-    let total = i64::from(q_b.rows) * width / vec;
-    let total = i32::try_from(total).map_err(|_| {
-        refuse(
-            OP,
-            format!("{total} split elements do not fit the kernel's int"),
-        )
-    })?;
-    ctx.fire(
-        OP,
-        Fire::at(
-            "attn/mla.hip",
-            crate::jit::symbol(&format!("::pie::attn::mla_split_q_b<{t}, {vec}>")),
-        )
-        .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
-        &[
-            q_b.arg(),
-            q_nope.arg(),
-            q_pe.arg(),
-            total.arg(),
-            heads.arg(),
-            nope.arg(),
-            rope.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn absorb_q(
     ctx: &Ctx,
@@ -225,7 +183,7 @@ pub fn absorb_q(
     v_head_dim: u32,
     q_latent: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_q";
+    const OP: &str = "attn.mla_absorb_q";
     dtype_dispatch!(OP, q_nope.dtype, { Bf16 => () });
     if q_nope.rows <= ctx.tuning().mla_absorb_q_until {
         return absorb_native(
@@ -288,7 +246,7 @@ pub fn absorb_out(
     nope_dim: u32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_absorb_out";
+    const OP: &str = "attn.mla_absorb_out";
     dtype_dispatch!(OP, latent.dtype, { Bf16 => () });
     let t = ctx.tuning();
     if (t.mla_absorb_out_from..=t.mla_absorb_out_until).contains(&latent.rows) {
@@ -460,7 +418,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_kv_append";
+    const OP: &str = "attn.mla_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, kv_c.data.dtype, { Bf16 => () });
     debug_assert_eq!(
@@ -671,13 +629,6 @@ pub(crate) mod latent {
         (rank == RANK || rank == 2 * RANK) && (rope == 0 || rope == 64)
     }
 
-    fn by_value<P>(params: &P) -> ArgValue {
-        ArgValue::Bytes {
-            ptr: core::ptr::from_ref(params).cast::<u8>(),
-            len: core::mem::size_of::<P>(),
-        }
-    }
-
     const fn at(base: u64, off: Option<u32>) -> u64 {
         match off {
             Some(off) => base + off as u64,
@@ -831,7 +782,7 @@ pub(crate) mod latent {
         ctx.fire(
             op,
             Fire::at(FILE, entry).apply(Launch::grid(grid, [THREADS, 1, 1])),
-            &[by_value(&work)],
+            &[ArgValue::of(&work)],
         )?;
         let merge = Merge {
             start: at(int, info.merge_packed_offset_start_offset),
@@ -849,7 +800,7 @@ pub(crate) mod latent {
             op,
             Fire::at(FILE, "::pie::attn::mla::mla_merge")
                 .apply(Launch::grid([plan.device.num_sm.max(1), 1, 1], [256, 1, 1])),
-            &[by_value(&merge)],
+            &[ArgValue::of(&merge)],
         )
     }
 
@@ -913,7 +864,7 @@ pub(crate) mod latent {
                 [heads.div_ceil(BLOCK_ROWS), rows, splits * halves],
                 [THREADS, 1, 1],
             )),
-            &[by_value(&g)],
+            &[ArgValue::of(&g)],
         )?;
         if splits == 1 {
             return Ok(());
@@ -940,7 +891,7 @@ pub(crate) mod latent {
 
 /// Where a scoring lands its rows' per-head base-2 log-sum-exp, if asked:
 /// an f32 plane of one entry per head per row.
-fn lse_plane(
+pub(crate) fn lse_plane(
     op: &'static str,
     lse: Option<&mut Tensor>,
     rows: u32,
@@ -1092,7 +1043,7 @@ pub fn attention_decode(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_decode";
+    const OP: &str = "attn.mla_decode";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
@@ -1117,7 +1068,7 @@ pub fn attention_prefill(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.mla_prefill";
+    const OP: &str = "attn.mla_prefill";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
@@ -1243,7 +1194,7 @@ pub fn attention_decode_selected(
     let _ = plan;
     selected(
         ctx,
-        "attention.mla_decode_selected",
+        "attn.mla_decode",
         q,
         q_pe,
         selection,
@@ -1274,7 +1225,7 @@ pub fn attention_prefill_selected(
     let _ = plan;
     selected(
         ctx,
-        "attention.mla_prefill_selected",
+        "attn.mla_prefill",
         q,
         q_pe,
         selection,

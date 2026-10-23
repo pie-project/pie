@@ -27,6 +27,7 @@ pub struct Qwen3Coder {
 impl Qwen3Coder {
     #[must_use]
     pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
+        // The tokenizer must spell this as a special.
         let _ = special(&tokenizer, "<|im_start|>");
         Self {
             stop_ids: specials(&tokenizer, STOP_TOKENS),
@@ -47,7 +48,7 @@ fn python_str(value: &Value) -> String {
         Value::Bool(true) => "True".to_string(),
         Value::Bool(false) => "False".to_string(),
         Value::Null => "None".to_string(),
-        other => crate::llama::pythonic(other),
+        other => crate::json::tojson(other),
     }
 }
 
@@ -59,7 +60,7 @@ fn extra_keys(map: &serde_json::Map<String, Value>, handled: &[&str], out: &mut 
             continue;
         }
         let text = match value {
-            Value::Object(_) | Value::Array(_) => crate::llama::pythonic(value),
+            Value::Object(_) | Value::Array(_) => crate::json::tojson(value),
             other => python_str(other),
         };
         out.push_str(&format!("\n<{key}>{text}</{key}>"));
@@ -122,7 +123,7 @@ fn tools_section(tools: &[String]) -> String {
 /// An earlier assistant turn: its text, and each call it made (in ChatML's
 /// `<tool_call>{"name", "arguments"}</tool_call>`) in the coder's XML.
 fn assistant_body(msg: &str) -> String {
-    let (text, calls) = crate::minimax::lift_calls(msg);
+    let (text, calls) = crate::chatml::lift_calls(msg);
     if calls.is_empty() {
         return format!("\n{msg}");
     }
@@ -136,7 +137,7 @@ fn assistant_body(msg: &str) -> String {
         if let Value::Object(map) = arguments {
             for (key, value) in map {
                 let text = match value {
-                    Value::Object(_) | Value::Array(_) => crate::llama::pythonic(&value),
+                    Value::Object(_) | Value::Array(_) => crate::json::tojson(&value),
                     other => python_str(&other),
                 };
                 out.push_str(&format!("<parameter={key}>\n{text}\n</parameter>\n"));

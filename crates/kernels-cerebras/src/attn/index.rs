@@ -16,7 +16,9 @@ use dtype::Dtype;
 use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
-use crate::program::HostOp;
+use crate::library::Kernel;
+use crate::phase::HostOp;
+use crate::plan::Held;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn paged(op: &'static str, pool: &KvPool) -> Result<u32, Error> {
@@ -29,11 +31,10 @@ fn paged(op: &'static str, pool: &KvPool) -> Result<u32, Error> {
     Ok(pool.page_size as u32)
 }
 
-/// Whether one PE holds these buffers' words (each within an array, all
-/// within the data budget); otherwise the op runs on the host.
-fn one_pe(words: &[u64]) -> bool {
-    use crate::linear::gemm::{ARRAY_WORDS, pe_words};
-    words.iter().all(|w| *w <= ARRAY_WORDS) && words.iter().sum::<u64>() + 64 <= pe_words()
+/// Whether one PE holds these buffers' words (and a few scalars);
+/// otherwise the op runs on the host.
+fn one_pe(ctx: &Ctx<'_>, words: &[u64]) -> bool {
+    ctx.plan().holds(Held::arrays(words, 64))
 }
 
 fn long_enough(op: &'static str, what: &str, t: Tensor, n: u32) -> Result<(), Error> {
@@ -58,7 +59,7 @@ pub fn kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_kv_append";
+    const OP: &str = "attn.index_kv_append";
     expect(OP, k, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, write_page, &[Dtype::I32])?;
     expect(OP, write_offset, &[Dtype::I32])?;
@@ -75,12 +76,15 @@ pub fn kv_append(
     long_enough(OP, "write page table", write_page, k.rows)?;
     long_enough(OP, "write offset table", write_offset, k.rows)?;
     let (rows, width, table_rows) = (k.rows, k.width, keys.keys.rows);
-    let on_pe = one_pe(&[
-        k.elements(),
-        keys.keys.elements(),
-        write_page.elements(),
-        write_offset.elements(),
-    ]);
+    let on_pe = one_pe(
+        ctx,
+        &[
+            k.elements(),
+            keys.keys.elements(),
+            write_page.elements(),
+            write_offset.elements(),
+        ],
+    );
     ctx.emit(&mut |cx| {
         let kb = cx.read(k)?;
         let pb = cx.read(write_page)?;
@@ -100,9 +104,8 @@ pub fn kv_append(
             });
             return Ok(());
         }
-        cx.library("k_index_page_write");
         cx.call(
-            "k_index_page_write",
+            Kernel::IndexPageWrite,
             vec![
                 Arg::Ptr(kb),
                 Arg::Ptr(tb),
@@ -154,11 +157,18 @@ fn boundary(
     long_enough(op, "row-valid table", row_valid, rows)?;
     // One PE marks every row (the tables are small: a few words a row); a
     // fire whose tables outgrow a PE marks on the host.
-    let words = positions.elements()
-        + request_of_token.elements()
-        + row_valid.elements()
-        + 3 * u64::from(rows);
-    let on_pe = words <= crate::linear::gemm::pe_words();
+    let rows64 = u64::from(rows);
+    let on_pe = ctx.plan().holds(Held::arrays(
+        &[
+            positions.elements(),
+            request_of_token.elements(),
+            row_valid.elements(),
+            rows64,
+            rows64,
+            rows64,
+        ],
+        0,
+    ));
     ctx.emit(&mut |cx| {
         let p = cx.read(positions)?;
         let r = cx.read(request_of_token)?;
@@ -179,9 +189,8 @@ fn boundary(
             });
             return Ok(());
         }
-        cx.library("k_boundary");
         cx.call(
-            "k_boundary",
+            Kernel::Boundary,
             vec![
                 Arg::Ptr(p),
                 Arg::Ptr(r),
@@ -212,7 +221,7 @@ pub fn boundary_decode(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attention.pool_boundary_decode",
+        "attn.pool_boundary",
         positions,
         request_of_token,
         row_valid,
@@ -235,7 +244,7 @@ pub fn boundary_prefill(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attention.pool_boundary_prefill",
+        "attn.pool_boundary",
         positions.data,
         request_of_token,
         row_valid,
@@ -258,7 +267,7 @@ pub fn block_mean(
     ratio: u32,
     entries: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_block_mean";
+    const OP: &str = "attn.index_block_mean";
     expect(OP, entries, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, boundary_pos, &[Dtype::I32])?;
     expect(OP, boundary_req, &[Dtype::I32])?;
@@ -280,14 +289,17 @@ pub fn block_mean(
         ));
     }
     long_enough(OP, "boundary request table", boundary_req, rows)?;
-    let on_pe = one_pe(&[
-        boundary_pos.elements(),
-        boundary_req.elements(),
-        keys.keys.elements(),
-        keys.page_indices.elements(),
-        keys.page_indptr.elements(),
-        entries.elements(),
-    ]);
+    let on_pe = one_pe(
+        ctx,
+        &[
+            boundary_pos.elements(),
+            boundary_req.elements(),
+            keys.keys.elements(),
+            keys.page_indices.elements(),
+            keys.page_indptr.elements(),
+            entries.elements(),
+        ],
+    );
     ctx.emit(&mut |cx| {
         let bp = cx.read(boundary_pos)?;
         let br = cx.read(boundary_req)?;
@@ -310,10 +322,8 @@ pub fn block_mean(
             });
             return Ok(());
         }
-        cx.library("k_index_cell");
-        cx.library("k_index_block_mean");
         cx.call(
-            "k_index_block_mean",
+            Kernel::IndexBlockMean,
             vec![
                 Arg::Ptr(bp),
                 Arg::Ptr(br),
@@ -345,7 +355,7 @@ pub fn pool_kv_append(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.pool_kv_append";
+    const OP: &str = "attn.pool_kv_append";
     let _ = (write_page, write_offset);
     expect(OP, entries, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, boundary_pos, &[Dtype::I32])?;
@@ -361,14 +371,17 @@ pub fn pool_kv_append(
     long_enough(OP, "boundary position table", boundary_pos, rows)?;
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let width = entries.width;
-    let on_pe = one_pe(&[
-        entries.elements(),
-        boundary_pos.elements(),
-        boundary_req.elements(),
-        pool.keys.elements(),
-        pool.page_indices.elements(),
-        pool.page_indptr.elements(),
-    ]);
+    let on_pe = one_pe(
+        ctx,
+        &[
+            entries.elements(),
+            boundary_pos.elements(),
+            boundary_req.elements(),
+            pool.keys.elements(),
+            pool.page_indices.elements(),
+            pool.page_indptr.elements(),
+        ],
+    );
     ctx.emit(&mut |cx| {
         let eb = cx.read(entries)?;
         let bp = cx.read(boundary_pos)?;
@@ -391,10 +404,8 @@ pub fn pool_kv_append(
             });
             return Ok(());
         }
-        cx.library("k_index_cell");
-        cx.library("k_index_pool_write");
         cx.call(
-            "k_index_pool_write",
+            Kernel::IndexPoolWrite,
             vec![
                 Arg::Ptr(eb),
                 Arg::Ptr(bp),
@@ -433,7 +444,7 @@ pub fn topk(
     ratio: u32,
     selection: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.index_topk";
+    const OP: &str = "attn.index_topk";
     expect(OP, q, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, selection, &[Dtype::I32])?;
     expect(OP, positions, &[Dtype::I32])?;
@@ -470,17 +481,20 @@ pub fn topk(
         return Err(refuse(OP, "the pool's page bound holds no key"));
     }
     let nk = u64::from(keys.max_pages) * u64::from(ps) / u64::from(ratio.max(1));
-    let on_pe = one_pe(&[
-        q.elements(),
-        weights.map_or(0, |w| w.elements()),
-        keys.keys.elements(),
-        keys.page_indices.elements(),
-        keys.page_indptr.elements(),
-        positions.elements(),
-        request_of_token.elements(),
-        selection.elements(),
-        nk,
-    ]);
+    let on_pe = one_pe(
+        ctx,
+        &[
+            q.elements(),
+            weights.map_or(0, |w| w.elements()),
+            keys.keys.elements(),
+            keys.page_indices.elements(),
+            keys.page_indptr.elements(),
+            positions.elements(),
+            request_of_token.elements(),
+            selection.elements(),
+            nk,
+        ],
+    );
     ctx.emit(&mut |cx| {
         let qb = cx.read(q)?;
         let wb = match weights {
@@ -518,10 +532,8 @@ pub fn topk(
             Some(w) => (Arg::Ptr(w.clone()), true),
             None => (Arg::Dummy("f32"), false),
         };
-        cx.library("k_index_cell");
-        cx.library("k_index_topk");
         cx.call(
-            "k_index_topk",
+            Kernel::IndexTopk,
             vec![
                 Arg::Ptr(qb),
                 w_ptr,

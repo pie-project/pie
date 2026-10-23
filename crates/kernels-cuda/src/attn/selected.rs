@@ -2,13 +2,15 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::attn::mla::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
+use crate::attn::mla::decode::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/sdpa_selected.cuh";
+const SELECTED_SM80: &str = "attn/selected_sm80.cu";
 
-const ENTRY: &str = "::pie::attn::sdpa_selected::sdpa_paged_selected_kernel<::pie::bf16>";
+const FILE: &str = "attn/selected_sm80.cu";
+
+const ENTRY: &str = "::pie::attn::selected::sdpa_paged_selected_kernel<::pie::bf16>";
 
 #[must_use]
 const fn smem_bytes(head_dim: i32) -> u32 {
@@ -149,6 +151,7 @@ fn selected(
     if let Some(dim) = mma_dim(ctx, head_dim, q_heads / kv_heads)
         && q_heads / kv_heads <= TILE_GROUP
         && max_blocks <= TILE_MAX_BLOCKS
+        && ctx.smem_fits(tile_smem_bytes(dim))
         && total_tokens >= TILE_ROWS * num_requests.max(1)
     {
         #[allow(clippy::cast_sign_loss)]
@@ -164,9 +167,9 @@ fn selected(
         return ctx.fire(
             op,
             Fire::at(
-                FILE,
+                SELECTED_SM80,
                 symbol(&format!(
-                    "::pie::attn::sdpa_selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"
+                    "::pie::attn::selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"
                 )),
             )
             .apply(launch),
@@ -203,9 +206,9 @@ fn selected(
         return ctx.fire(
             op,
             Fire::at(
-                FILE,
+                SELECTED_SM80,
                 symbol(&format!(
-                    "::pie::attn::sdpa_selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"
+                    "::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"
                 )),
             )
             .apply(launch),
@@ -286,7 +289,7 @@ pub fn attention_decode_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
-        "attention.decode_selected",
+        "attn.decode",
         q,
         selection,
         pool,
@@ -316,7 +319,7 @@ pub fn attention_prefill_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
-        "attention.prefill_selected",
+        "attn.prefill",
         q,
         selection,
         pool,

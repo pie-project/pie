@@ -1,35 +1,43 @@
 use poem_ir::{
-    Attention, Collective, Elementwise, Fused, Layout, Linear, Node, Operation, Spatial,
+    Attn, Collective, Conv, Elemwise, Fused, Gather, Linear, Node, Operation, Sampling, Ssm,
 };
 
 use crate::error::KernelError;
 
-pub trait DispatchAttention {
-    fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError>;
+pub trait DispatchAttn {
+    fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError>;
 }
 
 pub trait DispatchLinear {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError>;
 }
 
-pub trait DispatchElementwise {
-    fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError>;
+pub trait DispatchElemwise {
+    fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError>;
 }
 
-pub trait DispatchLayout {
-    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError>;
+pub trait DispatchGather {
+    fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError>;
 }
 
 pub trait DispatchCollective {
     fn dispatch(&mut self, op: &Collective) -> Result<(), KernelError>;
 }
 
+pub trait DispatchSampling {
+    fn dispatch(&mut self, op: &Sampling) -> Result<(), KernelError>;
+}
+
+pub trait DispatchSsm {
+    fn dispatch(&mut self, op: &Ssm) -> Result<(), KernelError>;
+}
+
 pub trait DispatchFused {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError>;
 }
 
-pub trait DispatchSpatial {
-    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError>;
+pub trait DispatchConv {
+    fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError>;
 }
 
 pub trait DispatchProbe {
@@ -37,24 +45,28 @@ pub trait DispatchProbe {
 }
 
 pub trait Dispatch:
-    DispatchAttention
+    DispatchAttn
     + DispatchLinear
-    + DispatchElementwise
-    + DispatchLayout
+    + DispatchElemwise
+    + DispatchGather
     + DispatchCollective
+    + DispatchSampling
+    + DispatchSsm
     + DispatchFused
-    + DispatchSpatial
+    + DispatchConv
     + DispatchProbe
 {
     fn exec(&mut self, node: &Node) -> Result<(), KernelError> {
         let outcome = match &node.op {
-            Operation::Attention(op) => DispatchAttention::dispatch(self, op),
+            Operation::Attn(op) => DispatchAttn::dispatch(self, op),
             Operation::Linear(op) => DispatchLinear::dispatch(self, op),
-            Operation::Elementwise(op) => DispatchElementwise::dispatch(self, op),
-            Operation::Layout(op) => DispatchLayout::dispatch(self, op),
+            Operation::Elemwise(op) => DispatchElemwise::dispatch(self, op),
+            Operation::Gather(op) => DispatchGather::dispatch(self, op),
             Operation::Collective(op) => DispatchCollective::dispatch(self, op),
+            Operation::Sampling(op) => DispatchSampling::dispatch(self, op),
+            Operation::Ssm(op) => DispatchSsm::dispatch(self, op),
             Operation::Fused(op) => DispatchFused::dispatch(self, op),
-            Operation::Spatial(op) => DispatchSpatial::dispatch(self, op),
+            Operation::Conv(op) => DispatchConv::dispatch(self, op),
         };
         if outcome.is_ok() {
             self.probe(node);
@@ -64,13 +76,15 @@ pub trait Dispatch:
 }
 
 impl<T> Dispatch for T where
-    T: DispatchAttention
+    T: DispatchAttn
         + DispatchLinear
-        + DispatchElementwise
-        + DispatchLayout
+        + DispatchElemwise
+        + DispatchGather
         + DispatchCollective
+        + DispatchSampling
+        + DispatchSsm
         + DispatchFused
-        + DispatchSpatial
+        + DispatchConv
         + DispatchProbe
 {
 }

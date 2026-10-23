@@ -38,9 +38,10 @@ fire over whichever lanes were quick enough.
 
 BISECTION
 ---------
-`--tap <dump key>` (e.g. `b0.attn_out`) re-imports nothing: the family reads
-`PIE_MINI_DIT_TAP` at IMPORT time and plants the velocity export on that
-intermediate, so re-import the artifact under the env first, then `run
+`--tap <dump key>` (e.g. `b0.attn_out`) re-imports nothing: the tap is part
+of the deployment (`mini-dit-bf16-kv-bf16-tap.b0.attn_out`), which plants the
+velocity export on that intermediate, so re-import the artifact under that
+`--deployment` first, then `run
 --tap KEY`, `collect --tap KEY`, `compare --tap KEY` diff that one tensor.
 `pie_<b>.stderr` is kept beside each answer.
 """
@@ -556,7 +557,7 @@ def main() -> int:
     ap.add_argument("--case_file", action="store_true", help="pass the case as a scratch file instead of argv pieces")
     ap.add_argument("--keys", action="append", default=None)
     ap.add_argument("--tap", default=None,
-                    help="the dump key the artifact was imported to export (PIE_MINI_DIT_TAP)")
+                    help="the dump key the artifact was imported to export (its deployment's `-tap.{key}`)")
     ap.add_argument("--cfg", action="store_true",
                     help="classifier-free guidance ON THE DEVICE: six lanes, two "
                          "attention groups, one fire, combined in the epilogue")

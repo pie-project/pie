@@ -1,0 +1,44 @@
+// Arrays kept two bf16 a u32 word: element e is the low half of word e / 2
+// when e is even, the high half when odd. `k_unpack_bf16` widens a run into
+// f32, `k_pack_bf16` lands f32 (bf16-valued) words as halves, and
+// `k_dot_packed` dots an f32 run with a packed one through widened chunks.
+var k_half_tmp: [K_DOT_CHUNK]f32;
+fn k_unpack_bf16(dst: [*]f32, w: [*]u32, off: i32, n: i32) void {
+  var i: i32 = 0;
+  while (i < n) : (i += 1) {
+    var e: i32 = off + i;
+    var word: u32 = w[e >> 1];
+    if ((e & 1) == 0) {
+      dst[i] = @bitcast(f32, word << 16);
+    } else {
+      dst[i] = @bitcast(f32, word & 0xFFFF0000);
+    }
+  }
+}
+fn k_dot_packed(a: [*]f32, aoff: i32, w: [*]u32, woff: i32, n: i32) f32 {
+  var s: f32 = 0.0;
+  var at: i32 = 0;
+  while (at < n) : (at += K_DOT_CHUNK) {
+    var len: i32 = n - at;
+    if (len > K_DOT_CHUNK) { len = K_DOT_CHUNK; }
+    k_unpack_bf16(@ptrcast([*]f32, &k_half_tmp), w, woff + at, len);
+    s = s + k_dot(a, aoff + at, @ptrcast([*]f32, &k_half_tmp), 0, len);
+  }
+  return s;
+}
+// dst (two bf16 a u32 word) elements [doff, doff + n) = src[soff ..] (bf16
+// values held as f32), the low half first in a word.
+fn k_pack_bf16(dst: [*]u32, doff: i32, src: [*]f32, soff: i32, n: i32) void {
+  var i: i32 = 0;
+  while (i < n) : (i += 1) {
+    var e: i32 = doff + i;
+    var h: u32 = @bitcast(u32, src[soff + i]) >> 16;
+    var word: u32 = dst[e >> 1];
+    if ((e & 1) == 0) {
+      dst[e >> 1] = (word & 0xFFFF0000) | h;
+    } else {
+      dst[e >> 1] = (word & 0xFFFF) | (h << 16);
+    }
+  }
+}
+

@@ -1,0 +1,18 @@
+// y[t][j] = sum over s of weights[t][s] * routed[t * top_k + s][j].
+fn k_moe_weighted_sum(routed: [*]f32, weights: [*]f32, y: [*]f32, rows: i32, top_k: i32, width: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, t * width), f32);
+    @fmuls(dy, dy, 0.0);
+    var s: i32 = 0;
+    while (s < top_k) : (s += 1) {
+      var dr = @set_dsd_base_addr(k_base_f32, routed);
+      dr = @set_dsd_length(dr, @bitcast(u16, @as(i16, width)));
+      dr = @increment_dsd_offset(dr, @as(i16, (t * top_k + s) * width), f32);
+      @fmacs(dy, dy, dr, weights[t * top_k + s]);
+    }
+  }
+}
+

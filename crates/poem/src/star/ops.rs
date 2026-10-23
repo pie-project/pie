@@ -3,7 +3,7 @@
 //!
 //! Every op and `Input` method a package can spell the arguments and
 //! result of. Not bound:
-//! `spatial::grid`
+//! `conv::grid`
 
 use crate::ops;
 use crate::star::bind::spelled::*;
@@ -13,10 +13,12 @@ use crate::star::forward::dsl;
 pub(crate) const MODULES: &[&str] = &[
     "attn",
     "collective",
+    "conv",
     "elemwise",
-    "layout",
+    "gather",
     "linear",
-    "spatial",
+    "sampling",
+    "ssm",
 ];
 
 #[cfg(test)]
@@ -62,7 +64,21 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "attn",
         name: "decode",
-        params: &["q", "plan", "pages", "window", "head_dim", "sm_scale"],
+        params: &[
+            "q",
+            "plan",
+            "pages",
+            "window",
+            "head_dim",
+            "sm_scale",
+            "lse",
+            "selection",
+            "ratio",
+            "per_head",
+            "bias",
+            "extent",
+            "log_scaling",
+        ],
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
@@ -70,10 +86,31 @@ pub(crate) static OPS: &[Op] = &[
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let ratio: Option<u32> = a.next()?;
+            let per_head: Option<bool> = a.next()?;
+            let bias: Option<Value> = a.next()?;
+            let extent: Option<u32> = a.next()?;
+            let log_scaling: Option<(u32, f32)> = a.next()?;
             result(
                 heap,
                 dsl("attn.decode", || {
-                    ops::attn::decode(&q, &plan, pages, window, head_dim, sm_scale)
+                    ops::attn::decode(
+                        &q,
+                        &plan,
+                        pages,
+                        window,
+                        head_dim,
+                        sm_scale,
+                        lse.unwrap_or(false),
+                        selection.as_ref(),
+                        ratio,
+                        per_head.unwrap_or(false),
+                        bias.as_ref(),
+                        extent,
+                        log_scaling,
+                    )
                 })?,
             )
         },
@@ -82,7 +119,23 @@ pub(crate) static OPS: &[Op] = &[
         module: "attn",
         name: "prefill",
         params: &[
-            "q", "plan", "pages", "window", "head_dim", "kv_heads", "sm_scale",
+            "q",
+            "plan",
+            "pages",
+            "window",
+            "head_dim",
+            "kv_heads",
+            "sm_scale",
+            "lse",
+            "mask",
+            "causal",
+            "floor",
+            "selection",
+            "ratio",
+            "per_head",
+            "bias",
+            "extent",
+            "log_scaling",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -92,278 +145,20 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let mask: Option<Value> = a.next()?;
+            let causal: Option<bool> = a.next()?;
+            let floor: Option<Value> = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let ratio: Option<u32> = a.next()?;
+            let per_head: Option<bool> = a.next()?;
+            let bias: Option<Value> = a.next()?;
+            let extent: Option<u32> = a.next()?;
+            let log_scaling: Option<(u32, f32)> = a.next()?;
             result(
                 heap,
                 dsl("attn.prefill", || {
-                    ops::attn::prefill(&q, &plan, pages, window, head_dim, kv_heads, sm_scale)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "decode_selected",
-        params: &[
-            "q",
-            "plan",
-            "selection",
-            "pages",
-            "window",
-            "head_dim",
-            "sm_scale",
-            "ratio",
-            "per_head",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let ratio: u32 = a.next()?;
-            let per_head: Option<bool> = a.next()?;
-            result(
-                heap,
-                dsl("attn.decode_selected", || {
-                    ops::attn::decode_selected(
-                        &q,
-                        &plan,
-                        &selection,
-                        pages,
-                        window,
-                        head_dim,
-                        sm_scale,
-                        ratio,
-                        per_head.unwrap_or(false),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "prefill_selected",
-        params: &[
-            "q",
-            "plan",
-            "selection",
-            "pages",
-            "window",
-            "head_dim",
-            "kv_heads",
-            "sm_scale",
-            "ratio",
-            "per_head",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let ratio: u32 = a.next()?;
-            let per_head: Option<bool> = a.next()?;
-            result(
-                heap,
-                dsl("attn.prefill_selected", || {
-                    ops::attn::prefill_selected(
-                        &q,
-                        &plan,
-                        &selection,
-                        pages,
-                        window,
-                        head_dim,
-                        kv_heads,
-                        sm_scale,
-                        ratio,
-                        per_head.unwrap_or(false),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "decode_rel",
-        params: &[
-            "q",
-            "plan",
-            "pages",
-            "bias",
-            "window",
-            "head_dim",
-            "extent",
-            "sm_scale",
-            "log_scaling",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let bias: Value = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let extent: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let log_scaling: Option<(u32, f32)> = a.next()?;
-            result(
-                heap,
-                dsl("attn.decode_rel", || {
-                    ops::attn::decode_rel(
-                        &q,
-                        &plan,
-                        pages,
-                        &bias,
-                        window,
-                        head_dim,
-                        extent,
-                        sm_scale,
-                        log_scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "prefill_rel",
-        params: &[
-            "q",
-            "plan",
-            "pages",
-            "bias",
-            "window",
-            "head_dim",
-            "kv_heads",
-            "extent",
-            "sm_scale",
-            "log_scaling",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let bias: Value = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let extent: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let log_scaling: Option<(u32, f32)> = a.next()?;
-            result(
-                heap,
-                dsl("attn.prefill_rel", || {
-                    ops::attn::prefill_rel(
-                        &q,
-                        &plan,
-                        pages,
-                        &bias,
-                        window,
-                        head_dim,
-                        kv_heads,
-                        extent,
-                        sm_scale,
-                        log_scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "masked",
-        params: &[
-            "q", "plan", "mask", "pages", "window", "head_dim", "kv_heads", "causal", "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let mask: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let causal: bool = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.masked", || {
-                    ops::attn::masked(
-                        &q, &plan, &mask, pages, window, head_dim, kv_heads, causal, sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "masked_lse",
-        params: &[
-            "q", "plan", "mask", "pages", "window", "head_dim", "kv_heads", "causal", "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let mask: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let causal: bool = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.masked_lse", || {
-                    ops::attn::masked_lse(
-                        &q, &plan, &mask, pages, window, head_dim, kv_heads, causal, sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "decode_lse",
-        params: &["q", "plan", "pages", "window", "head_dim", "sm_scale"],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.decode_lse", || {
-                    ops::attn::decode_lse(&q, &plan, pages, window, head_dim, sm_scale)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "prefill_lse",
-        params: &[
-            "q", "plan", "pages", "window", "head_dim", "kv_heads", "sm_scale", "floor",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let window: Option<u32> = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let floor: Option<Value> = a.next()?;
-            result(
-                heap,
-                dsl("attn.prefill_lse", || {
-                    ops::attn::prefill_lse(
+                    ops::attn::prefill(
                         &q,
                         &plan,
                         pages,
@@ -371,7 +166,16 @@ pub(crate) static OPS: &[Op] = &[
                         head_dim,
                         kv_heads,
                         sm_scale,
+                        lse.unwrap_or(false),
+                        mask.as_ref(),
+                        causal.unwrap_or(true),
                         floor.as_ref(),
+                        selection.as_ref(),
+                        ratio,
+                        per_head.unwrap_or(false),
+                        bias.as_ref(),
+                        extent,
+                        log_scaling,
                     )
                 })?,
             )
@@ -446,454 +250,67 @@ pub(crate) static OPS: &[Op] = &[
         params: &["k", "v", "pages", "write_page", "write_offset"],
         call: |a, heap| {
             let k: Value = a.next()?;
-            let v: Value = a.next()?;
+            let v: Option<Value> = a.next()?;
             let pages: ValueId = a.next()?;
             let write_page: Value = a.next()?;
             let write_offset: Value = a.next()?;
             result(
                 heap,
                 dsl("attn.kv_append", || {
-                    ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset)
+                    ops::attn::kv_append(&k, v.as_ref(), pages, &write_page, &write_offset)
                 })?,
             )
         },
     },
     Op {
         module: "attn",
-        name: "kv_append_shared",
-        params: &["plane", "pages", "write_page", "write_offset"],
+        name: "kv_ends",
+        params: &["request_of_token", "pages"],
         call: |a, heap| {
-            let plane: Value = a.next()?;
+            let request_of_token: Value = a.next()?;
             let pages: ValueId = a.next()?;
-            let write_page: Value = a.next()?;
-            let write_offset: Value = a.next()?;
             result(
                 heap,
-                dsl("attn.kv_append_shared", || {
-                    ops::attn::kv_append_shared(&plane, pages, &write_page, &write_offset)
+                dsl("attn.kv_ends", || {
+                    ops::attn::kv_ends(&request_of_token, pages)
                 })?,
             )
         },
     },
     Op {
         module: "attn",
-        name: "ssm_causal_conv1d",
-        params: &["x", "weight", "state", "conv_width", "bias"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let weight: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let conv_width: u32 = a.next()?;
-            let bias: Option<Weight> = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_causal_conv1d", || {
-                    ops::attn::ssm_causal_conv1d(&x, &weight, bias.as_ref(), state, conv_width)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_causal_conv1d_dilated",
-        params: &["x", "weight", "state", "conv_width", "dilation"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let weight: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let conv_width: u32 = a.next()?;
-            let dilation: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_causal_conv1d_dilated", || {
-                    ops::attn::ssm_causal_conv1d_dilated(
-                        &x, &weight, None, state, conv_width, dilation,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_causal_conv1d_chunked",
-        params: &["x", "weight", "state", "conv_width", "bias"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let weight: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let conv_width: u32 = a.next()?;
-            let bias: Option<Weight> = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_causal_conv1d_chunked", || {
-                    ops::attn::ssm_causal_conv1d_chunked(
-                        &x,
-                        &weight,
-                        bias.as_ref(),
-                        state,
-                        conv_width,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_causal_conv1d_chunked_dilated",
-        params: &["x", "weight", "state", "conv_width", "dilation"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let weight: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let conv_width: u32 = a.next()?;
-            let dilation: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_causal_conv1d_chunked_dilated", || {
-                    ops::attn::ssm_causal_conv1d_chunked_dilated(
-                        &x, &weight, None, state, conv_width, dilation,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "short_conv",
-        params: &["x", "weight", "state", "conv_width"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let weight: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let conv_width: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.short_conv", || {
-                    ops::attn::short_conv(&x, &weight, state, conv_width)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "short_conv_chunked",
-        params: &["x", "weight", "state", "conv_width"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let weight: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let conv_width: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.short_conv_chunked", || {
-                    ops::attn::short_conv_chunked(&x, &weight, state, conv_width)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "block_dyn_conv",
-        params: &["x", "coeff", "base", "side", "taps", "group"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let coeff: Value = a.next()?;
-            let base: Weight = a.next()?;
-            let side: u32 = a.next()?;
-            let taps: u32 = a.next()?;
-            let group: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.block_dyn_conv", || {
-                    ops::attn::block_dyn_conv(&x, &coeff, &base, side, taps, group)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "selector_walk",
-        params: &["cand", "unary", "hp", "tokens", "pred", "succ", "first"],
-        call: |a, heap| {
-            let cand: Value = a.next()?;
-            let unary: Value = a.next()?;
-            let hp: Option<Value> = a.next()?;
-            let tokens: Value = a.next()?;
-            let pred: Weight = a.next()?;
-            let succ: Weight = a.next()?;
-            let first: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.selector_walk", || {
-                    ops::attn::selector_walk(
-                        &cand,
-                        &unary,
-                        hp.as_ref(),
-                        &tokens,
-                        &pred,
-                        &succ,
-                        first,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ple_ngram_ids",
+        name: "window_sink",
         params: &[
-            "ids",
-            "state",
-            "eos",
-            "mults",
-            "primes",
-            "offsets",
-            "heads_per_ngram",
-            "map",
-        ],
-        call: |a, heap| {
-            let ids: Value = a.next()?;
-            let state: ValueId = a.next()?;
-            let eos: u32 = a.next()?;
-            let mults: Vec<u64> = a.next()?;
-            let primes: Vec<u64> = a.next()?;
-            let offsets: Vec<u64> = a.next()?;
-            let heads_per_ngram: u32 = a.next()?;
-            let map: Option<Weight> = a.next()?;
-            result(
-                heap,
-                dsl("attn.ple_ngram_ids", || {
-                    ops::attn::ple_ngram_ids(
-                        &ids,
-                        state,
-                        eos,
-                        &mults,
-                        &primes,
-                        &offsets,
-                        heads_per_ngram,
-                        map.as_ref(),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ple_ngram_ids_chunked",
-        params: &[
-            "ids",
-            "state",
-            "eos",
-            "mults",
-            "primes",
-            "offsets",
-            "heads_per_ngram",
-            "map",
-        ],
-        call: |a, heap| {
-            let ids: Value = a.next()?;
-            let state: ValueId = a.next()?;
-            let eos: u32 = a.next()?;
-            let mults: Vec<u64> = a.next()?;
-            let primes: Vec<u64> = a.next()?;
-            let offsets: Vec<u64> = a.next()?;
-            let heads_per_ngram: u32 = a.next()?;
-            let map: Option<Weight> = a.next()?;
-            result(
-                heap,
-                dsl("attn.ple_ngram_ids_chunked", || {
-                    ops::attn::ple_ngram_ids_chunked(
-                        &ids,
-                        state,
-                        eos,
-                        &mults,
-                        &primes,
-                        &offsets,
-                        heads_per_ngram,
-                        map.as_ref(),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_gdn_prep",
-        params: &["ba", "dt_bias", "a_log"],
-        call: |a, heap| {
-            let ba: Value = a.next()?;
-            let dt_bias: Weight = a.next()?;
-            let a_log: Weight = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_gdn_prep", || {
-                    ops::attn::ssm_gdn_prep(&ba, &dt_bias, &a_log)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_gated_delta",
-        params: &[
-            "qkv", "z", "gates", "state", "k_heads", "v_heads", "k_dim", "v_dim",
-        ],
-        call: |a, heap| {
-            let qkv: Value = a.next()?;
-            let z: Value = a.next()?;
-            let gates: Value = a.next()?;
-            let state: ValueId = a.next()?;
-            let k_heads: u32 = a.next()?;
-            let v_heads: u32 = a.next()?;
-            let k_dim: u32 = a.next()?;
-            let v_dim: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_gated_delta", || {
-                    ops::attn::ssm_gated_delta(
-                        &qkv, &z, &gates, state, k_heads, v_heads, k_dim, v_dim,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_gated_delta_chunked",
-        params: &[
-            "qkv", "z", "gates", "state", "k_heads", "v_heads", "k_dim", "v_dim",
-        ],
-        call: |a, heap| {
-            let qkv: Value = a.next()?;
-            let z: Value = a.next()?;
-            let gates: Value = a.next()?;
-            let state: ValueId = a.next()?;
-            let k_heads: u32 = a.next()?;
-            let v_heads: u32 = a.next()?;
-            let k_dim: u32 = a.next()?;
-            let v_dim: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_gated_delta_chunked", || {
-                    ops::attn::ssm_gated_delta_chunked(
-                        &qkv, &z, &gates, state, k_heads, v_heads, k_dim, v_dim,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_kda_step",
-        params: &[
-            "mixed",
-            "f",
-            "b",
-            "dt_bias",
-            "a_log",
-            "state",
-            "heads",
+            "q",
+            "positions",
+            "request_of_token",
+            "pages",
+            "sink",
+            "window",
             "head_dim",
-            "norm_eps",
-            "gate_floor",
+            "sm_scale",
         ],
         call: |a, heap| {
-            let mixed: Value = a.next()?;
-            let f: Value = a.next()?;
-            let b: Value = a.next()?;
-            let dt_bias: Weight = a.next()?;
-            let a_log: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
+            let q: Value = a.next()?;
+            let positions: Value = a.next()?;
+            let request_of_token: Value = a.next()?;
+            let pages: ValueId = a.next()?;
+            let sink: Weight = a.next()?;
+            let window: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
-            let norm_eps: f32 = a.next()?;
-            let gate_floor: f32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
             result(
                 heap,
-                dsl("attn.ssm_kda_step", || {
-                    ops::attn::ssm_kda_step(
-                        &mixed, &f, &b, &dt_bias, &a_log, state, heads, head_dim, norm_eps,
-                        gate_floor,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_kda_chunked",
-        params: &[
-            "mixed",
-            "f",
-            "b",
-            "dt_bias",
-            "a_log",
-            "state",
-            "heads",
-            "head_dim",
-            "norm_eps",
-            "gate_floor",
-        ],
-        call: |a, heap| {
-            let mixed: Value = a.next()?;
-            let f: Value = a.next()?;
-            let b: Value = a.next()?;
-            let dt_bias: Weight = a.next()?;
-            let a_log: Weight = a.next()?;
-            let state: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let norm_eps: f32 = a.next()?;
-            let gate_floor: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_kda_chunked", || {
-                    ops::attn::ssm_kda_chunked(
-                        &mixed, &f, &b, &dt_bias, &a_log, state, heads, head_dim, norm_eps,
-                        gate_floor,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "ssm_mamba2",
-        params: &[
-            "xbc",
-            "dt",
-            "z",
-            "a_log",
-            "dt_bias",
-            "d",
-            "norm",
-            "eps",
-            "state",
-            "heads",
-            "groups",
-            "state_dim",
-            "chunked",
-        ],
-        call: |a, heap| {
-            let xbc: Value = a.next()?;
-            let dt: Value = a.next()?;
-            let z: Value = a.next()?;
-            let a_log: Weight = a.next()?;
-            let dt_bias: Weight = a.next()?;
-            let d: Weight = a.next()?;
-            let norm: Weight = a.next()?;
-            let eps: f32 = a.next()?;
-            let state: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let groups: u32 = a.next()?;
-            let state_dim: u32 = a.next()?;
-            let chunked: bool = a.next()?;
-            result(
-                heap,
-                dsl("attn.ssm_mamba2", || {
-                    ops::attn::ssm_mamba2(
-                        &xbc, &dt, &z, &a_log, &dt_bias, &d, &norm, eps, state, heads, groups,
-                        state_dim, chunked,
+                dsl("attn.window_sink", || {
+                    ops::attn::window_sink(
+                        &q,
+                        &positions,
+                        &request_of_token,
+                        pages,
+                        &sink,
+                        window,
+                        head_dim,
+                        sm_scale,
                     )
                 })?,
             )
@@ -1081,6 +498,8 @@ pub(crate) static OPS: &[Op] = &[
             "kv_lora_rank",
             "sm_scale",
             "window",
+            "lse",
+            "selection",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1091,6 +510,8 @@ pub(crate) static OPS: &[Op] = &[
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             let window: Option<u32> = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let selection: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_decode", || {
@@ -1103,6 +524,8 @@ pub(crate) static OPS: &[Op] = &[
                         kv_lora_rank,
                         sm_scale,
                         window,
+                        lse.unwrap_or(false),
+                        selection.as_ref(),
                     )
                 })?,
             )
@@ -1120,6 +543,8 @@ pub(crate) static OPS: &[Op] = &[
             "kv_lora_rank",
             "sm_scale",
             "window",
+            "lse",
+            "selection",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1130,6 +555,8 @@ pub(crate) static OPS: &[Op] = &[
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             let window: Option<u32> = a.next()?;
+            let lse: Option<bool> = a.next()?;
+            let selection: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_prefill", || {
@@ -1142,240 +569,8 @@ pub(crate) static OPS: &[Op] = &[
                         kv_lora_rank,
                         sm_scale,
                         window,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_decode_selected",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_decode_selected", || {
-                    ops::attn::mla_decode_selected(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_prefill_selected",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_prefill_selected", || {
-                    ops::attn::mla_prefill_selected(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_decode_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-            "window",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let window: Option<u32> = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_decode_lse", || {
-                    ops::attn::mla_decode_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                        window,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_prefill_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-            "window",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let window: Option<u32> = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_prefill_lse", || {
-                    ops::attn::mla_prefill_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                        window,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_decode_selected_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_decode_selected_lse", || {
-                    ops::attn::mla_decode_selected_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "mla_prefill_selected_lse",
-        params: &[
-            "q",
-            "plan",
-            "q_pe",
-            "selection",
-            "pages",
-            "heads",
-            "kv_lora_rank",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let plan: Value = a.next()?;
-            let q_pe: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let heads: u32 = a.next()?;
-            let kv_lora_rank: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.mla_prefill_selected_lse", || {
-                    ops::attn::mla_prefill_selected_lse(
-                        &q,
-                        &plan,
-                        &q_pe,
-                        &selection,
-                        pages,
-                        heads,
-                        kv_lora_rank,
-                        sm_scale,
+                        lse.unwrap_or(false),
+                        selection.as_ref(),
                     )
                 })?,
             )
@@ -1506,32 +701,17 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "attn",
-        name: "pool_boundary_decode",
-        params: &["positions", "row_valid", "ratio"],
+        name: "pool_boundary",
+        params: &["positions", "row_valid", "ratio", "decode"],
         call: |a, heap| {
             let positions: Value = a.next()?;
             let row_valid: Value = a.next()?;
             let ratio: u32 = a.next()?;
+            let decode: bool = a.next()?;
             result(
                 heap,
-                dsl("attn.pool_boundary_decode", || {
-                    ops::attn::pool_boundary_decode(&positions, &row_valid, ratio)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "pool_boundary_prefill",
-        params: &["positions", "row_valid", "ratio"],
-        call: |a, heap| {
-            let positions: Value = a.next()?;
-            let row_valid: Value = a.next()?;
-            let ratio: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.pool_boundary_prefill", || {
-                    ops::attn::pool_boundary_prefill(&positions, &row_valid, ratio)
+                dsl("attn.pool_boundary", || {
+                    ops::attn::pool_boundary(&positions, &row_valid, ratio, decode)
                 })?,
             )
         },
@@ -1653,6 +833,8 @@ pub(crate) static OPS: &[Op] = &[
             "heads",
             "head_dim",
             "sm_scale",
+            "selection",
+            "top_k",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1663,6 +845,8 @@ pub(crate) static OPS: &[Op] = &[
             let heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let top_k: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("attn.pool_lse", || {
@@ -1675,51 +859,8 @@ pub(crate) static OPS: &[Op] = &[
                         heads,
                         head_dim,
                         sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "pool_lse_selected",
-        params: &[
-            "q",
-            "positions",
-            "request_of_token",
-            "selection",
-            "entries",
-            "ratio",
-            "top_k",
-            "heads",
-            "head_dim",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let request_of_token: Value = a.next()?;
-            let selection: Value = a.next()?;
-            let entries: ValueId = a.next()?;
-            let ratio: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let heads: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.pool_lse_selected", || {
-                    ops::attn::pool_lse_selected(
-                        &q,
-                        &positions,
-                        &request_of_token,
-                        &selection,
-                        entries,
-                        ratio,
+                        selection.as_ref(),
                         top_k,
-                        heads,
-                        head_dim,
-                        sm_scale,
                     )
                 })?,
             )
@@ -1790,6 +931,151 @@ pub(crate) static OPS: &[Op] = &[
         },
     },
     Op {
+        module: "attn",
+        name: "voxel",
+        params: &["q", "k", "v", "grid", "sm_scale"],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let k: Value = a.next()?;
+            let v: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.voxel", || {
+                    ops::attn::voxel(&q, &k, &v, &grid, sm_scale)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "voxel_over",
+        params: &["q", "k", "v", "grid", "segment", "sm_scale"],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let k: Value = a.next()?;
+            let v: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let segment: VoxelSegment = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.voxel_over", || {
+                    ops::attn::voxel_over(&q, &k, &v, &grid, segment, sm_scale)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "attend",
+        params: &[
+            "q",
+            "inputs",
+            "kv",
+            "q_heads",
+            "kv_heads",
+            "head_dim",
+            "sm_scale",
+            "window",
+            "sinks",
+            "mask",
+            "scores",
+            "scores_seam",
+            "selection",
+            "ratio",
+            "per_head",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let inputs: Input = a.next()?;
+            let kv: String = a.next()?;
+            let q_heads: u32 = a.next()?;
+            let kv_heads: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            let window: Option<u32> = a.next()?;
+            let sinks: Option<Weight> = a.next()?;
+            let mask: Option<bool> = a.next()?;
+            let scores: Option<bool> = a.next()?;
+            let scores_seam: Option<bool> = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let ratio: Option<u32> = a.next()?;
+            let per_head: Option<bool> = a.next()?;
+            result(
+                heap,
+                dsl("attn.attend", || {
+                    ops::attn::attend(
+                        &q,
+                        &inputs,
+                        &kv,
+                        q_heads,
+                        kv_heads,
+                        head_dim,
+                        sm_scale,
+                        window,
+                        sinks.as_ref(),
+                        mask.unwrap_or(false),
+                        scores.unwrap_or(false),
+                        scores_seam,
+                        selection.as_ref(),
+                        ratio,
+                        per_head.unwrap_or(false),
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "attend_mla",
+        params: &[
+            "q",
+            "q_pe",
+            "inputs",
+            "kv",
+            "heads",
+            "kv_lora_rank",
+            "sm_scale",
+            "window",
+            "selection",
+            "sinks",
+            "whole",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let q_pe: Value = a.next()?;
+            let inputs: Input = a.next()?;
+            let kv: String = a.next()?;
+            let heads: u32 = a.next()?;
+            let kv_lora_rank: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            let window: Option<u32> = a.next()?;
+            let selection: Option<Value> = a.next()?;
+            let sinks: Option<Weight> = a.next()?;
+            let whole: Option<bool> = a.next()?;
+            result(
+                heap,
+                dsl("attn.attend_mla", || {
+                    ops::attn::attend_mla(
+                        &q,
+                        &q_pe,
+                        &inputs,
+                        &kv,
+                        heads,
+                        kv_lora_rank,
+                        sm_scale,
+                        window,
+                        selection.as_ref(),
+                        sinks.as_ref(),
+                        whole.unwrap_or(false),
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
         module: "collective",
         name: "all_reduce",
         params: &["buf"],
@@ -1829,6 +1115,143 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("collective.reduce_scatter", || {
                     ops::collective::reduce_scatter(&x, world)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "group_norm",
+        params: &["x", "grid", "groups", "weight", "bias", "eps", "silu"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let groups: u32 = a.next()?;
+            let weight: Weight = a.next()?;
+            let bias: Weight = a.next()?;
+            let eps: f32 = a.next()?;
+            let silu: bool = a.next()?;
+            result(
+                heap,
+                dsl("conv.group_norm", || {
+                    ops::conv::group_norm(&x, &grid, groups, &weight, &bias, eps, silu)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "pixel_shuffle",
+        params: &["x", "grid", "r"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let r: [u32; 3] = a.next()?;
+            result(
+                heap,
+                dsl("conv.pixel_shuffle", || {
+                    ops::conv::pixel_shuffle(&x, &grid, r)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "pixel_shuffle_trimming",
+        params: &["x", "grid", "r", "trim_t"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let r: [u32; 3] = a.next()?;
+            let trim_t: u32 = a.next()?;
+            result(
+                heap,
+                dsl("conv.pixel_shuffle_trimming", || {
+                    ops::conv::pixel_shuffle_trimming(&x, &grid, r, trim_t)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "pixel_unshuffle",
+        params: &["x", "grid", "r"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let r: [u32; 3] = a.next()?;
+            result(
+                heap,
+                dsl("conv.pixel_unshuffle", || {
+                    ops::conv::pixel_unshuffle(&x, &grid, r)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "avg_down",
+        params: &["x", "grid", "factor", "group"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let factor: [u32; 3] = a.next()?;
+            let group: u32 = a.next()?;
+            result(
+                heap,
+                dsl("conv.avg_down", || {
+                    ops::conv::avg_down(&x, &grid, factor, group)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "store_frames",
+        params: &["x", "grid", "cache", "frames"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let cache: ValueId = a.next()?;
+            let frames: u32 = a.next()?;
+            result(
+                heap,
+                dsl("conv.store_frames", || {
+                    ops::conv::store_frames(&x, &grid, cache, frames)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "patchify",
+        params: &["x", "grid", "p", "tgrid"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let grid: Value = a.next()?;
+            let p: [u32; 3] = a.next()?;
+            let tgrid: Value = a.next()?;
+            result(
+                heap,
+                dsl("conv.patchify", || {
+                    ops::conv::patchify(&x, &grid, p, &tgrid)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "unpatchify",
+        params: &["x", "tgrid", "p", "grid"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let tgrid: Value = a.next()?;
+            let p: [u32; 3] = a.next()?;
+            let grid: Value = a.next()?;
+            result(
+                heap,
+                dsl("conv.unpatchify", || {
+                    ops::conv::unpatchify(&x, &tgrid, p, &grid)
                 })?,
             )
         },
@@ -1897,45 +1320,6 @@ pub(crate) static OPS: &[Op] = &[
                     ops::elemwise::rmsnorm_per_head_plus_one(&x, &weight, head_dim, eps)
                 })?,
             )
-        },
-    },
-    Op {
-        module: "elemwise",
-        name: "norm_gate",
-        params: &[
-            "x",
-            "scale",
-            "res",
-            "gate",
-            "eps",
-            "temperature",
-            "next",
-            "next_plus_one",
-        ],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let scale: Option<Weight> = a.next()?;
-            let res: Option<Value> = a.next()?;
-            let gate: Option<Weight> = a.next()?;
-            let eps: f32 = a.next()?;
-            let temperature: f32 = a.next()?;
-            let next: Option<(Weight, f32)> = a.next()?;
-            let plus_one: Option<bool> = a.next()?;
-            let joined = match (&res, &gate) {
-                (Some(stream), Some(gate)) => Some((stream, gate)),
-                (None, None) => None,
-                _ => anyhow::bail!("`elemwise.norm_gate` takes a residual and its gate together"),
-            };
-            let next = next
-                .as_ref()
-                .map(|(w, e)| (w, *e, plus_one.unwrap_or(true)));
-            let (y, z) = dsl("elemwise.norm_gate", || {
-                ops::elemwise::norm_gate(&x, scale.as_ref(), joined, eps, temperature, next)
-            })?;
-            match z {
-                Some(z) => result(heap, (y, z)),
-                None => result(heap, y),
-            }
         },
     },
     Op {
@@ -2182,218 +1566,28 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
-        name: "rope_full",
+        name: "rope",
         params: &[
             "q",
+            "positions",
+            "head_dim",
+            "theta",
+            "turn",
             "k",
-            "positions",
-            "head_dim",
-            "theta",
-            "interleaved",
-            "scaling",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let k: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let theta: f32 = a.next()?;
-            let interleaved: bool = a.next()?;
-            let scaling: Option<RopeScaling> = a.next()?;
-            result(
-                heap,
-                dsl("elemwise.rope_full", || {
-                    ops::elemwise::rope_full(
-                        &q,
-                        &k,
-                        &positions,
-                        head_dim,
-                        theta,
-                        interleaved,
-                        scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "elemwise",
-        name: "rope_partial",
-        params: &[
-            "q",
-            "k",
-            "positions",
-            "rotary_dim",
-            "head_dim",
-            "theta",
-            "span",
-            "scaling",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let k: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let rotary_dim: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let theta: f32 = a.next()?;
-            let span: Option<u32> = a.next()?;
-            let scaling: Option<RopeScaling> = a.next()?;
-            result(
-                heap,
-                dsl("elemwise.rope_partial", || {
-                    ops::elemwise::rope_partial(
-                        &q, &k, &positions, rotary_dim, head_dim, theta, span, scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "elemwise",
-        name: "rope_partial_q",
-        params: &[
-            "q",
-            "positions",
-            "rotary_dim",
-            "head_dim",
-            "theta",
-            "span",
             "scaling",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
             let positions: Value = a.next()?;
-            let rotary_dim: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
-            let span: Option<u32> = a.next()?;
+            let turn: Turn = a.next()?;
+            let k: Option<Value> = a.next()?;
             let scaling: Option<RopeScaling> = a.next()?;
             result(
                 heap,
-                dsl("elemwise.rope_partial_q", || {
-                    ops::elemwise::rope_partial_q(
-                        &q, &positions, rotary_dim, head_dim, theta, span, scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "elemwise",
-        name: "rope_partial_last",
-        params: &[
-            "q",
-            "positions",
-            "rotary_dim",
-            "head_dim",
-            "theta",
-            "interleaved",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let rotary_dim: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let theta: f32 = a.next()?;
-            let interleaved: bool = a.next()?;
-            result(
-                heap,
-                dsl("elemwise.rope_partial_last", || {
-                    ops::elemwise::rope_partial_last(
-                        &q,
-                        &positions,
-                        rotary_dim,
-                        head_dim,
-                        theta,
-                        interleaved,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "elemwise",
-        name: "rope_partial_last_yarn",
-        params: &[
-            "q",
-            "positions",
-            "rotary_dim",
-            "head_dim",
-            "theta",
-            "interleaved",
-            "inverse",
-            "yarn",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let rotary_dim: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let theta: f32 = a.next()?;
-            let interleaved: bool = a.next()?;
-            let inverse: bool = a.next()?;
-            let yarn: Option<Yarn> = a.next()?;
-            result(
-                heap,
-                dsl("elemwise.rope_partial_last_yarn", || {
-                    ops::elemwise::rope_partial_last_yarn(
-                        &q,
-                        &positions,
-                        rotary_dim,
-                        head_dim,
-                        theta,
-                        interleaved,
-                        inverse,
-                        yarn,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "elemwise",
-        name: "rope_yarn",
-        params: &[
-            "q",
-            "k",
-            "positions",
-            "head_dim",
-            "theta",
-            "factor",
-            "beta_fast",
-            "beta_slow",
-            "attention_factor",
-            "original_max_position",
-            "interleaved",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let k: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let theta: f32 = a.next()?;
-            let factor: f32 = a.next()?;
-            let beta_fast: f32 = a.next()?;
-            let beta_slow: f32 = a.next()?;
-            let attention_factor: f32 = a.next()?;
-            let original_max_position: u32 = a.next()?;
-            let interleaved: bool = a.next()?;
-            result(
-                heap,
-                dsl("elemwise.rope_yarn", || {
-                    ops::elemwise::rope_yarn(
-                        &q,
-                        &k,
-                        &positions,
-                        head_dim,
-                        theta,
-                        factor,
-                        beta_fast,
-                        beta_slow,
-                        attention_factor,
-                        original_max_position,
-                        interleaved,
-                    )
+                dsl("elemwise.rope", || {
+                    ops::elemwise::rope(&q, &positions, head_dim, theta, turn, k.as_ref(), scaling)
                 })?,
             )
         },
@@ -2653,40 +1847,6 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
-        name: "rope_mrope",
-        params: &[
-            "q",
-            "k",
-            "positions",
-            "sections",
-            "form",
-            "rotary_dim",
-            "head_dim",
-            "theta",
-            "scaling",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let k: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let sections: [u32; 3] = a.next()?;
-            let form: MropeForm = a.next()?;
-            let rotary_dim: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let theta: f32 = a.next()?;
-            let scaling: Option<RopeScaling> = a.next()?;
-            result(
-                heap,
-                dsl("elemwise.rope_mrope", || {
-                    ops::elemwise::rope_mrope(
-                        &q, &k, &positions, sections, form, rotary_dim, head_dim, theta, scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "elemwise",
         name: "modulate",
         params: &["x", "m", "lane_of_row", "form"],
         call: |a, heap| {
@@ -2899,7 +2059,7 @@ pub(crate) static OPS: &[Op] = &[
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "embed_concat",
         params: &["ids", "table", "vocab"],
         call: |a, heap| {
@@ -2908,14 +2068,14 @@ pub(crate) static OPS: &[Op] = &[
             let vocab: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.embed_concat", || {
-                    ops::layout::embed_concat(&ids, &table, vocab)
+                dsl("gather.embed_concat", || {
+                    ops::gather::embed_concat(&ids, &table, vocab)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "embed",
         params: &["ids", "table", "vocab"],
         call: |a, heap| {
@@ -2924,12 +2084,12 @@ pub(crate) static OPS: &[Op] = &[
             let vocab: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.embed", || ops::layout::embed(&ids, &table, vocab))?,
+                dsl("gather.embed", || ops::gather::embed(&ids, &table, vocab))?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "embed_weighted",
         params: &["ids", "weights", "table", "vocab"],
         call: |a, heap| {
@@ -2939,14 +2099,14 @@ pub(crate) static OPS: &[Op] = &[
             let vocab: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.embed_weighted", || {
-                    ops::layout::embed_weighted(&ids, &weights, &table, vocab)
+                dsl("gather.embed_weighted", || {
+                    ops::gather::embed_weighted(&ids, &weights, &table, vocab)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "split_qkv",
         params: &["packed", "q_width", "kv_width"],
         call: |a, heap| {
@@ -2955,33 +2115,14 @@ pub(crate) static OPS: &[Op] = &[
             let kv_width: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.split_qkv", || {
-                    ops::layout::split_qkv(&packed, q_width, kv_width)
+                dsl("gather.split_qkv", || {
+                    ops::gather::split_qkv(&packed, q_width, kv_width)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
-        name: "split_qkv_padded",
-        params: &[
-            "packed", "q_heads", "kv_heads", "qk_width", "v_width", "head_dim",
-        ],
-        call: |a, heap| {
-            let packed: Value = a.next()?;
-            let heads: [u32; 2] = [a.next()?, a.next()?];
-            let widths: [u32; 2] = [a.next()?, a.next()?];
-            let head_dim: u32 = a.next()?;
-            result(
-                heap,
-                dsl("layout.split_qkv_padded", || {
-                    ops::layout::split_qkv_padded(&packed, heads, widths, head_dim)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "layout",
+        module: "gather",
         name: "split_q_gate",
         params: &["packed", "head_dim"],
         call: |a, heap| {
@@ -2989,14 +2130,14 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.split_q_gate", || {
-                    ops::layout::split_q_gate(&packed, head_dim)
+                dsl("gather.split_q_gate", || {
+                    ops::gather::split_q_gate(&packed, head_dim)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "split_rows",
         params: &["x", "width"],
         call: |a, heap| {
@@ -3004,25 +2145,12 @@ pub(crate) static OPS: &[Op] = &[
             let width: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.split_rows", || ops::layout::split_rows(&x, width))?,
+                dsl("gather.split_rows", || ops::gather::split_rows(&x, width))?,
             )
         },
     },
     Op {
-        module: "layout",
-        name: "gather_rows",
-        params: &["x", "rows"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let rows: Value = a.next()?;
-            result(
-                heap,
-                dsl("layout.gather_rows", || ops::layout::gather_rows(&x, &rows))?,
-            )
-        },
-    },
-    Op {
-        module: "layout",
+        module: "gather",
         name: "select",
         params: &["table", "layer", "width"],
         call: |a, heap| {
@@ -3031,14 +2159,14 @@ pub(crate) static OPS: &[Op] = &[
             let width: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.select", || {
-                    ops::layout::select(&table, layer, width)
+                dsl("gather.select", || {
+                    ops::gather::select(&table, layer, width)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "pool_rows",
         params: &["x", "side"],
         call: |a, heap| {
@@ -3046,12 +2174,12 @@ pub(crate) static OPS: &[Op] = &[
             let side: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.pool_rows", || ops::layout::pool_rows(&x, side))?,
+                dsl("gather.pool_rows", || ops::gather::pool_rows(&x, side))?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "merge_rows",
         params: &["x", "side"],
         call: |a, heap| {
@@ -3059,134 +2187,26 @@ pub(crate) static OPS: &[Op] = &[
             let side: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.merge_rows", || ops::layout::merge_rows(&x, side))?,
+                dsl("gather.merge_rows", || ops::gather::merge_rows(&x, side))?,
             )
         },
     },
     Op {
-        module: "layout",
-        name: "argmax",
-        params: &["xs"],
-        call: |a, heap| {
-            let xs: Vec<Value> = a.next()?;
-            result(
-                heap,
-                dsl("layout.argmax", || {
-                    ops::layout::argmax(&xs.iter().collect::<Vec<_>>())
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "layout",
+        module: "gather",
         name: "concat_cols",
         params: &["xs"],
         call: |a, heap| {
             let xs: Vec<Value> = a.next()?;
             result(
                 heap,
-                dsl("layout.concat_cols", || {
-                    ops::layout::concat_cols(&xs.iter().collect::<Vec<_>>())
+                dsl("gather.concat_cols", || {
+                    ops::gather::concat_cols(&xs.iter().collect::<Vec<_>>())
                 })?,
             )
         },
     },
     Op {
-        module: "attn",
-        name: "kv_ends",
-        params: &["request_of_token", "pages"],
-        call: |a, heap| {
-            let request_of_token: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            result(
-                heap,
-                dsl("attn.kv_ends", || {
-                    ops::attn::kv_ends(&request_of_token, pages)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "window_sink",
-        params: &[
-            "q",
-            "positions",
-            "request_of_token",
-            "pages",
-            "sink",
-            "window",
-            "head_dim",
-            "sm_scale",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let request_of_token: Value = a.next()?;
-            let pages: ValueId = a.next()?;
-            let sink: Weight = a.next()?;
-            let window: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.window_sink", || {
-                    ops::attn::window_sink(
-                        &q,
-                        &positions,
-                        &request_of_token,
-                        pages,
-                        &sink,
-                        window,
-                        head_dim,
-                        sm_scale,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
-        name: "markov_walk",
-        params: &[
-            "logits",
-            "tokens",
-            "positions",
-            "ends",
-            "embed",
-            "head",
-            "block",
-        ],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let tokens: Value = a.next()?;
-            let positions: Value = a.next()?;
-            let ends: Value = a.next()?;
-            let embed: Weight = a.next()?;
-            let head: Weight = a.next()?;
-            let block: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.markov_walk", || {
-                    ops::attn::markov_walk(
-                        &logits, &tokens, &positions, &ends, &embed, &head, block,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "layout",
-        name: "topk",
-        params: &["x", "k"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let k: u32 = a.next()?;
-            result(heap, dsl("layout.topk", || ops::layout::topk(&x, k))?)
-        },
-    },
-    Op {
-        module: "layout",
+        module: "gather",
         name: "scatter_live_rows",
         params: &["src", "routes", "y"],
         call: |a, heap| {
@@ -3195,14 +2215,14 @@ pub(crate) static OPS: &[Op] = &[
             let y: Value = a.next()?;
             result(
                 heap,
-                dsl("layout.scatter_live_rows", || {
-                    ops::layout::scatter_live_rows(&src, &routes, &y)
+                dsl("gather.scatter_live_rows", || {
+                    ops::gather::scatter_live_rows(&src, &routes, &y)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "scatter_rows",
         params: &["src", "routes", "y"],
         call: |a, heap| {
@@ -3211,14 +2231,14 @@ pub(crate) static OPS: &[Op] = &[
             let y: Value = a.next()?;
             result(
                 heap,
-                dsl("layout.scatter_rows", || {
-                    ops::layout::scatter_rows(&src, &routes, &y)
+                dsl("gather.scatter_rows", || {
+                    ops::gather::scatter_rows(&src, &routes, &y)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "pack_rows",
         params: &["x", "perm"],
         call: |a, heap| {
@@ -3226,12 +2246,12 @@ pub(crate) static OPS: &[Op] = &[
             let perm: Value = a.next()?;
             result(
                 heap,
-                dsl("layout.pack_rows", || ops::layout::pack_rows(&x, &perm))?,
+                dsl("gather.pack_rows", || ops::gather::pack_rows(&x, &perm))?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "unpack_rows",
         params: &["x", "perm"],
         call: |a, heap| {
@@ -3239,12 +2259,12 @@ pub(crate) static OPS: &[Op] = &[
             let perm: Value = a.next()?;
             result(
                 heap,
-                dsl("layout.unpack_rows", || ops::layout::unpack_rows(&x, &perm))?,
+                dsl("gather.unpack_rows", || ops::gather::unpack_rows(&x, &perm))?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "pixels",
         params: &["x", "mean", "std", "order", "temporal"],
         call: |a, heap| {
@@ -3255,14 +2275,14 @@ pub(crate) static OPS: &[Op] = &[
             let temporal: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.pixels", || {
-                    ops::layout::pixels(&x, mean, std, order, temporal)
+                dsl("gather.pixels", || {
+                    ops::gather::pixels(&x, mean, std, order, temporal)
                 })?,
             )
         },
     },
     Op {
-        module: "layout",
+        module: "gather",
         name: "grid_taps",
         params: &["positions", "grids", "segments", "kind", "side"],
         call: |a, heap| {
@@ -3273,8 +2293,86 @@ pub(crate) static OPS: &[Op] = &[
             let side: u32 = a.next()?;
             result(
                 heap,
-                dsl("layout.grid_taps", || {
-                    ops::layout::grid_taps(&positions, &grids, &segments, kind, side)
+                dsl("gather.grid_taps", || {
+                    ops::gather::grid_taps(&positions, &grids, &segments, kind, side)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "gather",
+        name: "ngram_ids",
+        params: &[
+            "ids",
+            "state",
+            "eos",
+            "mults",
+            "primes",
+            "offsets",
+            "heads_per_ngram",
+            "map",
+        ],
+        call: |a, heap| {
+            let ids: Value = a.next()?;
+            let state: ValueId = a.next()?;
+            let eos: u32 = a.next()?;
+            let mults: Vec<u64> = a.next()?;
+            let primes: Vec<u64> = a.next()?;
+            let offsets: Vec<u64> = a.next()?;
+            let heads_per_ngram: u32 = a.next()?;
+            let map: Option<Weight> = a.next()?;
+            result(
+                heap,
+                dsl("gather.ngram_ids", || {
+                    ops::gather::ngram_ids(
+                        &ids,
+                        state,
+                        eos,
+                        &mults,
+                        &primes,
+                        &offsets,
+                        heads_per_ngram,
+                        map.as_ref(),
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "gather",
+        name: "ngram_ids_chunked",
+        params: &[
+            "ids",
+            "state",
+            "eos",
+            "mults",
+            "primes",
+            "offsets",
+            "heads_per_ngram",
+            "map",
+        ],
+        call: |a, heap| {
+            let ids: Value = a.next()?;
+            let state: ValueId = a.next()?;
+            let eos: u32 = a.next()?;
+            let mults: Vec<u64> = a.next()?;
+            let primes: Vec<u64> = a.next()?;
+            let offsets: Vec<u64> = a.next()?;
+            let heads_per_ngram: u32 = a.next()?;
+            let map: Option<Weight> = a.next()?;
+            result(
+                heap,
+                dsl("gather.ngram_ids_chunked", || {
+                    ops::gather::ngram_ids_chunked(
+                        &ids,
+                        state,
+                        eos,
+                        &mults,
+                        &primes,
+                        &offsets,
+                        heads_per_ngram,
+                        map.as_ref(),
+                    )
                 })?,
             )
         },
@@ -3320,220 +2418,81 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu",
-        params: &["packed", "intermediate"],
+        name: "glu",
+        params: &["x", "gating", "intermediate", "up", "weights", "limit"],
         call: |a, heap| {
-            let packed: Value = a.next()?;
-            let intermediate: u32 = a.next()?;
+            let x: Value = a.next()?;
+            let gating: GluAct = a.next()?;
+            let intermediate: Option<u32> = a.next()?;
+            let up: Option<Value> = a.next()?;
+            let weights: Option<Value> = a.next()?;
+            let limit: Option<f32> = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_swiglu", || {
-                    ops::linear::mlp_swiglu(&packed, intermediate)
+                dsl("linear.glu", || {
+                    ops::linear::glu(
+                        &x,
+                        gating,
+                        intermediate,
+                        up.as_ref(),
+                        weights.as_ref(),
+                        limit,
+                    )
                 })?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_swiglu_clamp",
-        params: &["packed", "intermediate", "limit"],
-        call: |a, heap| {
-            let packed: Value = a.next()?;
-            let intermediate: u32 = a.next()?;
-            let limit: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_swiglu_clamp", || {
-                    ops::linear::mlp_swiglu_clamp(&packed, intermediate, limit)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "mlp_swiglu_clamp_alpha",
-        params: &["packed", "intermediate", "limit", "alpha"],
-        call: |a, heap| {
-            let packed: Value = a.next()?;
-            let intermediate: u32 = a.next()?;
-            let limit: f32 = a.next()?;
-            let alpha: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_swiglu_clamp_alpha", || {
-                    ops::linear::mlp_swiglu_clamp_alpha(&packed, intermediate, limit, alpha)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "mlp_swiglu_clamp_split",
-        params: &["gate", "up", "limit"],
-        call: |a, heap| {
-            let gate: Value = a.next()?;
-            let up: Value = a.next()?;
-            let limit: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_swiglu_clamp_split", || {
-                    ops::linear::mlp_swiglu_clamp_split(&gate, &up, limit)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "mlp_swiglu_clamp_split_routed",
-        params: &["gate", "up", "weights", "limit"],
-        call: |a, heap| {
-            let gate: Value = a.next()?;
-            let up: Value = a.next()?;
-            let weights: Value = a.next()?;
-            let limit: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_swiglu_clamp_split_routed", || {
-                    ops::linear::mlp_swiglu_clamp_split_routed(&gate, &up, &weights, limit)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "mlp_swiglu_clamp_routed",
-        params: &["packed", "intermediate", "weights", "limit"],
-        call: |a, heap| {
-            let packed: Value = a.next()?;
-            let intermediate: u32 = a.next()?;
-            let weights: Value = a.next()?;
-            let limit: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_swiglu_clamp_routed", || {
-                    ops::linear::mlp_swiglu_clamp_routed(&packed, intermediate, &weights, limit)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "mlp_geglu_tanh",
-        params: &["gate", "up"],
-        call: |a, heap| {
-            let gate: Value = a.next()?;
-            let up: Value = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_geglu_tanh", || {
-                    ops::linear::mlp_geglu_tanh(&gate, &up)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "mlp_gelu_tanh",
+        name: "gelu_tanh",
         params: &["x"],
         call: |a, heap| {
             let x: Value = a.next()?;
             result(
                 heap,
-                dsl("linear.mlp_gelu_tanh", || ops::linear::mlp_gelu_tanh(&x))?,
+                dsl("linear.gelu_tanh", || ops::linear::gelu_tanh(&x))?,
             )
         },
     },
     Op {
         module: "linear",
-        name: "mlp_relu2",
+        name: "relu2",
         params: &["x"],
         call: |a, heap| {
             let x: Value = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_relu2", || ops::linear::mlp_relu2(&x))?,
-            )
+            result(heap, dsl("linear.relu2", || ops::linear::relu2(&x))?)
         },
     },
     Op {
         module: "linear",
-        name: "mlp_geglu_tanh_packed",
-        params: &["packed", "intermediate"],
-        call: |a, heap| {
-            let packed: Value = a.next()?;
-            let intermediate: u32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_geglu_tanh_packed", || {
-                    ops::linear::mlp_geglu_tanh_packed(&packed, intermediate)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "mlp_situ",
-        params: &["packed", "intermediate", "beta", "up_cap"],
-        call: |a, heap| {
-            let packed: Value = a.next()?;
-            let intermediate: u32 = a.next()?;
-            let beta: f32 = a.next()?;
-            let up_cap: Option<f32> = a.next()?;
-            result(
-                heap,
-                dsl("linear.mlp_situ", || {
-                    ops::linear::mlp_situ(&packed, intermediate, beta, up_cap)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_softmax",
-        params: &["logits", "experts", "top_k"],
+        name: "moe_route",
+        params: &[
+            "logits", "experts", "top_k", "routing", "bias", "scale", "hint", "ids", "table",
+        ],
         call: |a, heap| {
             let logits: Value = a.next()?;
             let experts: u32 = a.next()?;
             let top_k: u32 = a.next()?;
+            let routing: RouteScore = a.next()?;
+            let bias: Option<Weight> = a.next()?;
+            let scale: Option<Weight> = a.next()?;
+            let hint: Option<Value> = a.next()?;
+            let ids: Option<Value> = a.next()?;
+            let table: Option<Weight> = a.next()?;
             result(
                 heap,
-                dsl("linear.moe_topk_softmax", || {
-                    ops::linear::moe_topk_softmax(&logits, experts, top_k)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_softmax_scaled",
-        params: &["logits", "scale", "experts", "top_k"],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let scale: Weight = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_topk_softmax_scaled", || {
-                    ops::linear::moe_topk_softmax_scaled(&logits, &scale, experts, top_k)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_sigmoid",
-        params: &["logits", "experts", "top_k", "renormalize", "scaling"],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let renormalize: bool = a.next()?;
-            let scaling: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_topk_sigmoid", || {
-                    ops::linear::moe_topk_sigmoid(&logits, experts, top_k, renormalize, scaling)
+                dsl("linear.moe_route", || {
+                    ops::linear::moe_route(
+                        &logits,
+                        experts,
+                        top_k,
+                        routing,
+                        bias.as_ref(),
+                        scale.as_ref(),
+                        hint.as_ref(),
+                        ids.as_ref(),
+                        table.as_ref(),
+                    )
                 })?,
             )
         },
@@ -3552,230 +2511,6 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("linear.rel_bias", || {
                     ops::linear::rel_bias(&x, &w, heads, d_rel, extent)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_sigmoid_sink",
-        params: &[
-            "logits", "bias", "scale", "experts", "top_k", "sink", "scaling",
-        ],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let bias: Weight = a.next()?;
-            let scale: Option<Weight> = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let sink: u32 = a.next()?;
-            let scaling: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_topk_sigmoid_sink", || {
-                    ops::linear::moe_topk_sigmoid_sink(
-                        &logits,
-                        &bias,
-                        scale.as_ref(),
-                        experts,
-                        top_k,
-                        sink,
-                        scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_sigmoid_biased",
-        params: &[
-            "logits",
-            "bias",
-            "experts",
-            "top_k",
-            "renormalize",
-            "scaling",
-        ],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let bias: Weight = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let renormalize: bool = a.next()?;
-            let scaling: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_topk_sigmoid_biased", || {
-                    ops::linear::moe_topk_sigmoid_biased(
-                        &logits,
-                        &bias,
-                        experts,
-                        top_k,
-                        renormalize,
-                        scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_sigmoid_biased_hinted",
-        params: &[
-            "logits",
-            "bias",
-            "experts",
-            "top_k",
-            "renormalize",
-            "scaling",
-            "hint",
-        ],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let bias: Weight = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let renormalize: bool = a.next()?;
-            let scaling: f32 = a.next()?;
-            let hint: Option<Value> = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_topk_sigmoid_biased_hinted", || {
-                    ops::linear::moe_topk_sigmoid_biased_hinted(
-                        &logits,
-                        &bias,
-                        experts,
-                        top_k,
-                        renormalize,
-                        scaling,
-                        hint.as_ref(),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_sqrt_softplus",
-        params: &[
-            "logits",
-            "bias",
-            "experts",
-            "top_k",
-            "renormalize",
-            "scaling",
-        ],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let bias: Weight = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let renormalize: bool = a.next()?;
-            let scaling: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_topk_sqrt_softplus", || {
-                    ops::linear::moe_topk_sqrt_softplus(
-                        &logits,
-                        &bias,
-                        experts,
-                        top_k,
-                        renormalize,
-                        scaling,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_topk_sqrt_softplus_hinted",
-        params: &[
-            "logits",
-            "bias",
-            "experts",
-            "top_k",
-            "renormalize",
-            "scaling",
-            "hint",
-        ],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let bias: Weight = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let renormalize: bool = a.next()?;
-            let scaling: f32 = a.next()?;
-            let hint: Option<Value> = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_topk_sqrt_softplus_hinted", || {
-                    ops::linear::moe_topk_sqrt_softplus_hinted(
-                        &logits,
-                        &bias,
-                        experts,
-                        top_k,
-                        renormalize,
-                        scaling,
-                        hint.as_ref(),
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_predict_route",
-        params: &["logits", "bias", "experts", "top_k"],
-        call: |a, heap| {
-            let logits: Value = a.next()?;
-            let bias: Weight = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_predict_route", || {
-                    ops::linear::moe_predict_route(&logits, &bias, experts, top_k)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_hash_route",
-        params: &[
-            "ids",
-            "tid2eid",
-            "logits",
-            "vocab",
-            "experts",
-            "top_k",
-            "renormalize",
-            "scaling",
-        ],
-        call: |a, heap| {
-            let ids: Value = a.next()?;
-            let tid2eid: Weight = a.next()?;
-            let logits: Value = a.next()?;
-            let vocab: u32 = a.next()?;
-            let experts: u32 = a.next()?;
-            let top_k: u32 = a.next()?;
-            let renormalize: bool = a.next()?;
-            let scaling: f32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_hash_route", || {
-                    ops::linear::moe_hash_route(
-                        &ids,
-                        &tid2eid,
-                        &logits,
-                        vocab,
-                        experts,
-                        top_k,
-                        renormalize,
-                        scaling,
-                    )
                 })?,
             )
         },
@@ -3946,211 +2681,317 @@ pub(crate) static OPS: &[Op] = &[
         },
     },
     Op {
-        module: "spatial",
-        name: "conv3d",
-        params: &["x", "grid", "w", "bias", "conv", "cache"],
+        module: "sampling",
+        name: "argmax",
+        params: &["xs"],
         call: |a, heap| {
-            let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let w: Weight = a.next()?;
-            let bias: Option<Weight> = a.next()?;
-            let conv: Conv = a.next()?;
-            let cache: Option<ValueId> = a.next()?;
+            let xs: Vec<Value> = a.next()?;
             result(
                 heap,
-                dsl("spatial.conv3d", || {
-                    ops::spatial::conv3d(&x, &grid, &w, bias.as_ref(), conv, cache)
+                dsl("sampling.argmax", || {
+                    ops::sampling::argmax(&xs.iter().collect::<Vec<_>>())
                 })?,
             )
         },
     },
     Op {
-        module: "spatial",
-        name: "group_norm",
-        params: &["x", "grid", "groups", "weight", "bias", "eps", "silu"],
+        module: "sampling",
+        name: "top_k",
+        params: &["x", "k"],
         call: |a, heap| {
             let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let groups: u32 = a.next()?;
+            let k: u32 = a.next()?;
+            result(heap, dsl("sampling.top_k", || ops::sampling::top_k(&x, k))?)
+        },
+    },
+    Op {
+        module: "sampling",
+        name: "markov_walk",
+        params: &[
+            "logits",
+            "tokens",
+            "positions",
+            "ends",
+            "embed",
+            "head",
+            "block",
+        ],
+        call: |a, heap| {
+            let logits: Value = a.next()?;
+            let tokens: Value = a.next()?;
+            let positions: Value = a.next()?;
+            let ends: Value = a.next()?;
+            let embed: Weight = a.next()?;
+            let head: Weight = a.next()?;
+            let block: u32 = a.next()?;
+            result(
+                heap,
+                dsl("sampling.markov_walk", || {
+                    ops::sampling::markov_walk(
+                        &logits, &tokens, &positions, &ends, &embed, &head, block,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "sampling",
+        name: "selector_walk",
+        params: &["cand", "unary", "hp", "tokens", "pred", "succ", "first"],
+        call: |a, heap| {
+            let cand: Value = a.next()?;
+            let unary: Value = a.next()?;
+            let hp: Option<Value> = a.next()?;
+            let tokens: Value = a.next()?;
+            let pred: Weight = a.next()?;
+            let succ: Weight = a.next()?;
+            let first: u32 = a.next()?;
+            result(
+                heap,
+                dsl("sampling.selector_walk", || {
+                    ops::sampling::selector_walk(
+                        &cand,
+                        &unary,
+                        hp.as_ref(),
+                        &tokens,
+                        &pred,
+                        &succ,
+                        first,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "ssm",
+        name: "short_conv",
+        params: &["x", "weight", "state", "conv_width"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
             let weight: Weight = a.next()?;
-            let bias: Weight = a.next()?;
-            let eps: f32 = a.next()?;
-            let silu: bool = a.next()?;
+            let state: ValueId = a.next()?;
+            let conv_width: u32 = a.next()?;
             result(
                 heap,
-                dsl("spatial.group_norm", || {
-                    ops::spatial::group_norm(&x, &grid, groups, &weight, &bias, eps, silu)
+                dsl("ssm.short_conv", || {
+                    ops::ssm::short_conv(&x, &weight, state, conv_width)
                 })?,
             )
         },
     },
     Op {
-        module: "spatial",
-        name: "attention",
-        params: &["q", "k", "v", "grid", "sm_scale"],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let k: Value = a.next()?;
-            let v: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("spatial.attention", || {
-                    ops::spatial::attention(&q, &k, &v, &grid, sm_scale)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "spatial",
-        name: "attention_over",
-        params: &["q", "k", "v", "grid", "segment", "sm_scale"],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let k: Value = a.next()?;
-            let v: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let segment: VoxelSegment = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            result(
-                heap,
-                dsl("spatial.attention_over", || {
-                    ops::spatial::attention_over(&q, &k, &v, &grid, segment, sm_scale)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "spatial",
-        name: "upsample_nearest",
-        params: &["x", "grid", "factor", "keep_first_frame"],
+        module: "ssm",
+        name: "short_conv_chunked",
+        params: &["x", "weight", "state", "conv_width"],
         call: |a, heap| {
             let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let factor: [u32; 3] = a.next()?;
-            let keep_first_frame: bool = a.next()?;
+            let weight: Weight = a.next()?;
+            let state: ValueId = a.next()?;
+            let conv_width: u32 = a.next()?;
             result(
                 heap,
-                dsl("spatial.upsample_nearest", || {
-                    ops::spatial::upsample_nearest(&x, &grid, factor, keep_first_frame)
+                dsl("ssm.short_conv_chunked", || {
+                    ops::ssm::short_conv_chunked(&x, &weight, state, conv_width)
                 })?,
             )
         },
     },
     Op {
-        module: "spatial",
-        name: "pixel_shuffle",
-        params: &["x", "grid", "r"],
+        module: "ssm",
+        name: "dyn_conv",
+        params: &["x", "coeff", "base", "side", "taps", "group"],
         call: |a, heap| {
             let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let r: [u32; 3] = a.next()?;
-            result(
-                heap,
-                dsl("spatial.pixel_shuffle", || {
-                    ops::spatial::pixel_shuffle(&x, &grid, r)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "spatial",
-        name: "pixel_shuffle_trimming",
-        params: &["x", "grid", "r", "trim_t"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let r: [u32; 3] = a.next()?;
-            let trim_t: u32 = a.next()?;
-            result(
-                heap,
-                dsl("spatial.pixel_shuffle_trimming", || {
-                    ops::spatial::pixel_shuffle_trimming(&x, &grid, r, trim_t)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "spatial",
-        name: "pixel_unshuffle",
-        params: &["x", "grid", "r"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let r: [u32; 3] = a.next()?;
-            result(
-                heap,
-                dsl("spatial.pixel_unshuffle", || {
-                    ops::spatial::pixel_unshuffle(&x, &grid, r)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "spatial",
-        name: "avg_down",
-        params: &["x", "grid", "factor", "group"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let factor: [u32; 3] = a.next()?;
+            let coeff: Value = a.next()?;
+            let base: Weight = a.next()?;
+            let side: u32 = a.next()?;
+            let taps: u32 = a.next()?;
             let group: u32 = a.next()?;
             result(
                 heap,
-                dsl("spatial.avg_down", || {
-                    ops::spatial::avg_down(&x, &grid, factor, group)
+                dsl("ssm.dyn_conv", || {
+                    ops::ssm::dyn_conv(&x, &coeff, &base, side, taps, group)
                 })?,
             )
         },
     },
     Op {
-        module: "spatial",
-        name: "store_frames",
-        params: &["x", "grid", "cache", "frames"],
+        module: "ssm",
+        name: "gdn_gates",
+        params: &["ba", "dt_bias", "a_log"],
         call: |a, heap| {
-            let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let cache: ValueId = a.next()?;
-            let frames: u32 = a.next()?;
+            let ba: Value = a.next()?;
+            let dt_bias: Weight = a.next()?;
+            let a_log: Weight = a.next()?;
             result(
                 heap,
-                dsl("spatial.store_frames", || {
-                    ops::spatial::store_frames(&x, &grid, cache, frames)
+                dsl("ssm.gdn_gates", || {
+                    ops::ssm::gdn_gates(&ba, &dt_bias, &a_log)
                 })?,
             )
         },
     },
     Op {
-        module: "spatial",
-        name: "patchify",
-        params: &["x", "grid", "p", "tgrid"],
+        module: "ssm",
+        name: "gated_delta",
+        params: &[
+            "qkv", "z", "gates", "state", "k_heads", "v_heads", "k_dim", "v_dim",
+        ],
         call: |a, heap| {
-            let x: Value = a.next()?;
-            let grid: Value = a.next()?;
-            let p: [u32; 3] = a.next()?;
-            let tgrid: Value = a.next()?;
+            let qkv: Value = a.next()?;
+            let z: Value = a.next()?;
+            let gates: Value = a.next()?;
+            let state: ValueId = a.next()?;
+            let k_heads: u32 = a.next()?;
+            let v_heads: u32 = a.next()?;
+            let k_dim: u32 = a.next()?;
+            let v_dim: u32 = a.next()?;
             result(
                 heap,
-                dsl("spatial.patchify", || {
-                    ops::spatial::patchify(&x, &grid, p, &tgrid)
+                dsl("ssm.gated_delta", || {
+                    ops::ssm::gated_delta(&qkv, &z, &gates, state, k_heads, v_heads, k_dim, v_dim)
                 })?,
             )
         },
     },
     Op {
-        module: "spatial",
-        name: "unpatchify",
-        params: &["x", "tgrid", "p", "grid"],
+        module: "ssm",
+        name: "gated_delta_chunked",
+        params: &[
+            "qkv", "z", "gates", "state", "k_heads", "v_heads", "k_dim", "v_dim",
+        ],
         call: |a, heap| {
-            let x: Value = a.next()?;
-            let tgrid: Value = a.next()?;
-            let p: [u32; 3] = a.next()?;
-            let grid: Value = a.next()?;
+            let qkv: Value = a.next()?;
+            let z: Value = a.next()?;
+            let gates: Value = a.next()?;
+            let state: ValueId = a.next()?;
+            let k_heads: u32 = a.next()?;
+            let v_heads: u32 = a.next()?;
+            let k_dim: u32 = a.next()?;
+            let v_dim: u32 = a.next()?;
             result(
                 heap,
-                dsl("spatial.unpatchify", || {
-                    ops::spatial::unpatchify(&x, &tgrid, p, &grid)
+                dsl("ssm.gated_delta_chunked", || {
+                    ops::ssm::gated_delta_chunked(
+                        &qkv, &z, &gates, state, k_heads, v_heads, k_dim, v_dim,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "ssm",
+        name: "kda",
+        params: &[
+            "mixed",
+            "f",
+            "b",
+            "dt_bias",
+            "a_log",
+            "state",
+            "heads",
+            "head_dim",
+            "norm_eps",
+            "gate_floor",
+        ],
+        call: |a, heap| {
+            let mixed: Value = a.next()?;
+            let f: Value = a.next()?;
+            let b: Value = a.next()?;
+            let dt_bias: Weight = a.next()?;
+            let a_log: Weight = a.next()?;
+            let state: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let norm_eps: f32 = a.next()?;
+            let gate_floor: f32 = a.next()?;
+            result(
+                heap,
+                dsl("ssm.kda", || {
+                    ops::ssm::kda(
+                        &mixed, &f, &b, &dt_bias, &a_log, state, heads, head_dim, norm_eps,
+                        gate_floor,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "ssm",
+        name: "kda_chunked",
+        params: &[
+            "mixed",
+            "f",
+            "b",
+            "dt_bias",
+            "a_log",
+            "state",
+            "heads",
+            "head_dim",
+            "norm_eps",
+            "gate_floor",
+        ],
+        call: |a, heap| {
+            let mixed: Value = a.next()?;
+            let f: Value = a.next()?;
+            let b: Value = a.next()?;
+            let dt_bias: Weight = a.next()?;
+            let a_log: Weight = a.next()?;
+            let state: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let norm_eps: f32 = a.next()?;
+            let gate_floor: f32 = a.next()?;
+            result(
+                heap,
+                dsl("ssm.kda_chunked", || {
+                    ops::ssm::kda_chunked(
+                        &mixed, &f, &b, &dt_bias, &a_log, state, heads, head_dim, norm_eps,
+                        gate_floor,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "ssm",
+        name: "mamba2",
+        params: &[
+            "xbc",
+            "dt",
+            "z",
+            "a_log",
+            "dt_bias",
+            "d",
+            "norm",
+            "eps",
+            "state",
+            "heads",
+            "groups",
+            "state_dim",
+            "chunked",
+        ],
+        call: |a, heap| {
+            let xbc: Value = a.next()?;
+            let dt: Value = a.next()?;
+            let z: Value = a.next()?;
+            let a_log: Weight = a.next()?;
+            let dt_bias: Weight = a.next()?;
+            let d: Weight = a.next()?;
+            let norm: Weight = a.next()?;
+            let eps: f32 = a.next()?;
+            let state: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let groups: u32 = a.next()?;
+            let state_dim: u32 = a.next()?;
+            let chunked: bool = a.next()?;
+            result(
+                heap,
+                dsl("ssm.mamba2", || {
+                    ops::ssm::mamba2(
+                        &xbc, &dt, &z, &a_log, &dt_bias, &d, &norm, eps, state, heads, groups,
+                        state_dim, chunked,
+                    )
                 })?,
             )
         },
@@ -4344,24 +3185,6 @@ pub(crate) static INPUTS: &[Op] = &[
         call: |a, heap| {
             let inputs: Input = a.next()?;
             result(heap, dsl("inputs.row_valid", || inputs.row_valid())?)
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "route_hints",
-        params: &["inputs"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            Ok(heap.alloc(inputs.route_hints()))
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "readout_attention",
-        params: &["inputs"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            Ok(heap.alloc(inputs.readout_attention()))
         },
     },
     Op {

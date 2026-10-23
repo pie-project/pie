@@ -2,10 +2,10 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Elem, Fold, Val};
-use crate::tensor::Tensor;
+use crate::hlo::{Elem, Fold, Func, Val};
+use crate::tensor::{Landing, Operand};
 
 fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
     if v == 0 {
@@ -17,13 +17,13 @@ fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
 /// `x / rms(x)` over each `axis`-wide run of an f32 `[rows, width]`; the mean
 /// square is taken in f32, as the GPU kernels take it.
 pub(crate) fn inv_rms_rows(
-    cx: &mut Cx<'_>,
+    f: &mut Func,
     op: &'static str,
     x: Val,
     axis: u32,
     eps: f32,
 ) -> Result<Val, Error> {
-    let dims = cx.dims(x).to_vec();
+    let dims = f.dims(x).to_vec();
     let (rows, width) = (dims[0], dims[1]);
     let axis = i64::from(nonzero(op, "the normed axis", axis)?);
     if width % axis != 0 {
@@ -33,39 +33,38 @@ pub(crate) fn inv_rms_rows(
         ));
     }
     let heads = width / axis;
-    let x3 = cx.reshape(x, &[rows, heads, axis])?;
-    let sq = cx.mul(x3, x3)?;
-    let sum = cx.reduce(sq, &[2], Fold::Sum)?;
-    let mean = cx.scale(sum, 1.0 / axis as f64)?;
-    let mean = cx.offset(mean, f64::from(eps))?;
-    let inv = cx.rsqrt(mean);
-    let inv = cx.broadcast(inv, &[rows, heads, axis], &[0, 1])?;
-    let y = cx.mul(x3, inv)?;
-    Ok(cx.reshape(y, &[rows, width])?)
+    let x3 = f.reshape(x, &[rows, heads, axis])?;
+    let sq = f.mul(x3, x3)?;
+    let sum = f.reduce(sq, &[2], Fold::Sum)?;
+    let mean = f.scale(sum, 1.0 / axis as f64)?;
+    let mean = f.offset(mean, f64::from(eps))?;
+    let inv = f.rsqrt(mean);
+    let inv = f.broadcast(inv, &[rows, heads, axis], &[0, 1])?;
+    let y = f.mul(x3, inv)?;
+    Ok(f.reshape(y, &[rows, width])?)
 }
 
 /// A `[axis]` gain row broadcast over `[rows, width]` (`width / axis` heads
 /// share it), optionally `1 + w`.
-fn gain(cx: &mut Cx<'_>, weight: Val, rows: i64, width: i64, plus_one: bool) -> Result<Val, Error> {
-    let w = cx.convert(weight, Elem::F32);
-    let n = cx.ty(w).elements();
-    let w = cx.reshape(w, &[n])?;
-    let w = if plus_one { cx.offset(w, 1.0)? } else { w };
+fn gain(f: &mut Func, weight: Val, rows: i64, width: i64, plus_one: bool) -> Result<Val, Error> {
+    let w = f.convert(weight, Elem::F32);
+    let n = f.ty(w).elements();
+    let w = f.reshape(w, &[n])?;
+    let w = if plus_one { f.offset(w, 1.0)? } else { w };
     let heads = width / n;
-    let w = cx.broadcast(w, &[rows, heads, n], &[2])?;
-    Ok(cx.reshape(w, &[rows, width])?)
+    let w = f.broadcast(w, &[rows, heads, n], &[2])?;
+    Ok(f.reshape(w, &[rows, width])?)
 }
 
 fn rms_row(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    x: Tensor,
-    weight: Tensor,
-    y: Tensor,
+    x: Operand,
+    weight: Operand,
     eps: f32,
     axis: u32,
     plus_one: bool,
-) -> Result<(), Error> {
+) -> Result<Val, Error> {
     expect(op, x, &[Dtype::Bf16])?;
     if u64::from(weight.rows) * u64::from(weight.width) != u64::from(axis) {
         return Err(refuse(
@@ -76,99 +75,56 @@ fn rms_row(
             ),
         ));
     }
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = inv_rms_rows(cx, op, xv, axis, eps)?;
-        let w = cx.read(weight)?;
-        let g = gain(cx, w, i64::from(x.rows), i64::from(x.width), plus_one)?;
-        let out = cx.mul(n, g)?;
-        cx.write(y, out)
-    })
+    let xv = x.f32(f);
+    let n = inv_rms_rows(f, op, xv, axis, eps)?;
+    let g = gain(
+        f,
+        weight.val,
+        i64::from(x.rows),
+        i64::from(x.width),
+        plus_one,
+    )?;
+    Ok(f.mul(n, g)?)
 }
 
-pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm",
-        x,
-        weight,
-        y,
-        eps,
-        x.width,
-        false,
-    )
+pub fn rmsnorm(f: &mut Func, x: Operand, weight: Operand, eps: f32) -> Result<Val, Error> {
+    rms_row(f, "elemwise.rmsnorm", x, weight, eps, x.width, false)
 }
 
 pub fn rmsnorm_per_head(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
+    f: &mut Func,
+    x: Operand,
+    weight: Operand,
     head_dim: u32,
     eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_per_head",
-        x,
-        weight,
-        y,
-        eps,
-        head_dim,
-        false,
-    )
+) -> Result<Val, Error> {
+    rms_row(f, "elemwise.rmsnorm", x, weight, eps, head_dim, false)
 }
 
-pub fn rmsnorm_plus_one(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
-    eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_plus_one",
-        x,
-        weight,
-        y,
-        eps,
-        x.width,
-        true,
-    )
+pub fn rmsnorm_plus_one(f: &mut Func, x: Operand, weight: Operand, eps: f32) -> Result<Val, Error> {
+    rms_row(f, "elemwise.rmsnorm", x, weight, eps, x.width, true)
 }
 
 pub fn rmsnorm_per_head_plus_one(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
+    f: &mut Func,
+    x: Operand,
+    weight: Operand,
     head_dim: u32,
     eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    rms_row(
-        ctx,
-        "elementwise.rmsnorm_per_head_plus_one",
-        x,
-        weight,
-        y,
-        eps,
-        head_dim,
-        true,
-    )
+) -> Result<Val, Error> {
+    rms_row(f, "elemwise.rmsnorm", x, weight, eps, head_dim, true)
 }
 
 /// Norms each `group`-wide run on its own, and gains the whole row by a
 /// row-wide `1 + w` bank (group `g` reads its own slice of it).
 pub fn rmsnorm_grouped_plus_one(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
+    f: &mut Func,
+    x: Operand,
+    weight: Operand,
     group: u32,
     eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.rmsnorm";
     expect(OP, x, &[Dtype::Bf16])?;
     let bank = weight.width * weight.rows.max(1);
     if bank != x.width {
@@ -180,45 +136,32 @@ pub fn rmsnorm_grouped_plus_one(
             ),
         ));
     }
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = inv_rms_rows(cx, OP, xv, group, eps)?;
-        let w = cx.read(weight)?;
-        let g = gain(cx, w, i64::from(x.rows), i64::from(x.width), true)?;
-        let out = cx.mul(n, g)?;
-        cx.write(y, out)
-    })
+    let xv = x.f32(f);
+    let n = inv_rms_rows(f, OP, xv, group, eps)?;
+    let g = gain(f, weight.val, i64::from(x.rows), i64::from(x.width), true)?;
+    Ok(f.mul(n, g)?)
 }
 
-pub fn rmsnorm_no_scale(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    head_dim: u32,
-    eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_no_scale";
+pub fn rmsnorm_no_scale(f: &mut Func, x: Operand, head_dim: u32, eps: f32) -> Result<Val, Error> {
+    const OP: &str = "elemwise.rmsnorm";
     expect(OP, x, &[Dtype::Bf16])?;
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = inv_rms_rows(cx, OP, xv, head_dim, eps)?;
-        cx.write(y, n)
-    })
+    let xv = x.f32(f);
+    inv_rms_rows(f, OP, xv, head_dim, eps)
 }
 
 /// `rms(x) * w * gate(z)` per `vd`-wide head of an f32 accumulator, with a
 /// `vd`-wide f32 weight; `gate` is `z·σ(z)` or `σ(z)`.
 fn gated_rms(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    x: Tensor,
-    gate: Tensor,
-    weight: Tensor,
+    x: Operand,
+    gate: Operand,
+    weight: Operand,
     vd: u32,
     eps: f32,
     sigmoid: bool,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     expect(op, gate, &[Dtype::Bf16])?;
     if gate.rows != x.rows || gate.width != x.width || y.rows != x.rows || y.width != x.width {
         return Err(refuse(
@@ -226,45 +169,41 @@ fn gated_rms(
             "the gate and the landing ride the normed rectangle",
         ));
     }
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = inv_rms_rows(cx, op, xv, vd, eps)?;
-        let w = cx.read(weight)?;
-        let g = gain(cx, w, i64::from(x.rows), i64::from(x.width), false)?;
-        let n = cx.mul(n, g)?;
-        let z = cx.read_f32(gate)?;
-        let s = cx.sigmoid(z);
-        let gate = if sigmoid { s } else { cx.mul(z, s)? };
-        let out = cx.mul(n, gate)?;
-        cx.write(y, out)
-    })
+    let xv = x.f32(f);
+    let n = inv_rms_rows(f, op, xv, vd, eps)?;
+    let g = gain(f, weight.val, i64::from(x.rows), i64::from(x.width), false)?;
+    let n = f.mul(n, g)?;
+    let z = gate.f32(f);
+    let s = f.sigmoid(z);
+    let gate = if sigmoid { s } else { f.mul(z, s)? };
+    Ok(f.mul(n, gate)?)
 }
 
 pub fn rmsnorm_gated(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    gate: Tensor,
-    weight: Tensor,
+    f: &mut Func,
+    x: Operand,
+    gate: Operand,
+    weight: Operand,
     head_dim: u32,
     eps: f32,
     sigmoid_gate: bool,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated";
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.rmsnorm_gated";
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
-    gated_rms(ctx, OP, x, gate, weight, vd, eps, sigmoid_gate, y)
+    gated_rms(f, OP, x, gate, weight, vd, eps, sigmoid_gate, y)
 }
 
 pub fn rmsnorm_gated_by(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    gate: Tensor,
-    weight: Tensor,
+    f: &mut Func,
+    x: Operand,
+    gate: Operand,
+    weight: Operand,
     heads: u32,
     eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated_by";
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.rmsnorm_gated_by";
     nonzero(OP, "the stated head count", heads)?;
     if x.width == 0 || !x.width.is_multiple_of(heads) {
         return Err(refuse(
@@ -275,84 +214,79 @@ pub fn rmsnorm_gated_by(
             ),
         ));
     }
-    gated_rms(ctx, OP, x, gate, weight, x.width / heads, eps, true, y)
+    gated_rms(f, OP, x, gate, weight, x.width / heads, eps, true, y)
 }
 
-/// `y += x`.
-pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add";
+/// `y + x`, the new `y`.
+pub fn residual_add(f: &mut Func, x: Operand, y: Operand) -> Result<Val, Error> {
+    const OP: &str = "elemwise.residual_add";
     expect(OP, y, &[Dtype::Bf16])?;
-    ctx.emit(&mut |cx| {
-        let a = cx.read_f32(x)?;
-        let b = cx.read_f32(y)?;
-        let s = cx.add(a, b)?;
-        cx.write(y, s)
-    })
+    let a = x.f32(f);
+    let b = y.f32(f);
+    Ok(f.add(a, b)?)
 }
 
 /// A `[width]` row broadcast down `[rows, width]`, in f32.
-pub(crate) fn row_of(cx: &mut Cx<'_>, t: Tensor, rows: u32, width: u32) -> Result<Val, Error> {
-    let v = cx.read_f32(t)?;
-    let v = cx.reshape(v, &[i64::from(width)])?;
-    Ok(cx.broadcast(v, &[i64::from(rows), i64::from(width)], &[1])?)
+pub(crate) fn row_of(f: &mut Func, t: Operand, rows: u32, width: u32) -> Result<Val, Error> {
+    let v = t.f32(f);
+    let v = f.reshape(v, &[i64::from(width)])?;
+    Ok(f.broadcast(v, &[i64::from(rows), i64::from(width)], &[1])?)
 }
 
-/// `out += bias` per column.
-pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add_bias";
+/// `out + bias` per column, the new `out`.
+pub fn add_bias(f: &mut Func, bias: Operand, out: Operand) -> Result<Val, Error> {
+    const OP: &str = "elemwise.add_bias";
     expect(OP, out, &[Dtype::Bf16, Dtype::F32])?;
     if bias.elements() != u64::from(out.width) {
         return Err(refuse(OP, "the bias is not one value per column"));
     }
-    ctx.emit(&mut |cx| {
-        let b = row_of(cx, bias, out.rows, out.width)?;
-        let o = cx.read_f32(out)?;
-        let s = cx.add(o, b)?;
-        cx.write(out, s)
-    })
+    let b = row_of(f, bias, out.rows, out.width)?;
+    let o = out.f32(f);
+    Ok(f.add(o, b)?)
 }
 
 pub fn layernorm(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
-    bias: Tensor,
+    f: &mut Func,
+    x: Operand,
+    weight: Operand,
+    bias: Operand,
     eps: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm";
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.layernorm";
     expect(OP, x, &[Dtype::Bf16])?;
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = centered(cx, xv, eps)?;
-        let w = row_of(cx, weight, x.rows, x.width)?;
-        let b = row_of(cx, bias, x.rows, x.width)?;
-        let out = cx.mul(n, w)?;
-        let out = cx.add(out, b)?;
-        cx.write(y, out)
-    })
+    let xv = x.f32(f);
+    let n = centered(f, xv, eps)?;
+    let w = row_of(f, weight, x.rows, x.width)?;
+    let b = row_of(f, bias, x.rows, x.width)?;
+    let out = f.mul(n, w)?;
+    Ok(f.add(out, b)?)
 }
 
 /// `(x - mean) / sqrt(var + eps)` per row of an f32 `[rows, width]`.
-pub(crate) fn centered(cx: &mut Cx<'_>, x: Val, eps: f32) -> Result<Val, Error> {
-    let dims = cx.dims(x).to_vec();
+pub(crate) fn centered(f: &mut Func, x: Val, eps: f32) -> Result<Val, Error> {
+    let dims = f.dims(x).to_vec();
     let n = dims[1] as f64;
-    let sum = cx.reduce(x, &[1], Fold::Sum)?;
-    let mean = cx.scale(sum, 1.0 / n)?;
-    let mean = cx.broadcast(mean, &dims, &[0])?;
-    let c = cx.sub(x, mean)?;
-    let sq = cx.mul(c, c)?;
-    let var = cx.reduce(sq, &[1], Fold::Sum)?;
-    let var = cx.scale(var, 1.0 / n)?;
-    let var = cx.offset(var, f64::from(eps))?;
-    let inv = cx.rsqrt(var);
-    let inv = cx.broadcast(inv, &dims, &[0])?;
-    Ok(cx.mul(c, inv)?)
+    let sum = f.reduce(x, &[1], Fold::Sum)?;
+    let mean = f.scale(sum, 1.0 / n)?;
+    let mean = f.broadcast(mean, &dims, &[0])?;
+    let c = f.sub(x, mean)?;
+    let sq = f.mul(c, c)?;
+    let var = f.reduce(sq, &[1], Fold::Sum)?;
+    let var = f.scale(var, 1.0 / n)?;
+    let var = f.offset(var, f64::from(eps))?;
+    let inv = f.rsqrt(var);
+    let inv = f.broadcast(inv, &dims, &[0])?;
+    Ok(f.mul(c, inv)?)
 }
 
-/// `out = (out - bias) * scale` per column.
-pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.standardize";
+/// `(out - bias) * scale` per column, the new `out`.
+pub fn standardize(
+    f: &mut Func,
+    bias: Operand,
+    scale: Operand,
+    out: Operand,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.standardize";
     expect(OP, out, &[Dtype::Bf16])?;
     for (what, plane) in [("bias", bias), ("scale", scale)] {
         if plane.elements() != u64::from(out.width) {
@@ -365,104 +299,88 @@ pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> R
             ));
         }
     }
-    ctx.emit(&mut |cx| {
-        let b = row_of(cx, bias, out.rows, out.width)?;
-        let s = row_of(cx, scale, out.rows, out.width)?;
-        let o = cx.read_f32(out)?;
-        let o = cx.sub(o, b)?;
-        let o = cx.mul(o, s)?;
-        cx.write(out, o)
-    })
+    let b = row_of(f, bias, out.rows, out.width)?;
+    let s = row_of(f, scale, out.rows, out.width)?;
+    let o = out.f32(f);
+    let o = f.sub(o, b)?;
+    Ok(f.mul(o, s)?)
 }
 
-/// `x *= s`, `s` rounded to `x`'s element first, as the stated scalar
-/// lands (kernels-cuda `elemwise::mul_scalar<T>`: bf16, f16, f32).
-pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul_scalar";
+/// `x * s`, `s` rounded to `x`'s element first, as the stated scalar lands
+/// (kernels-cuda `elemwise::mul_scalar<T>`: bf16, f16, f32); the new `x`.
+pub fn mul_scalar(f: &mut Func, s: f32, x: Operand) -> Result<Val, Error> {
+    const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16, Dtype::F16, Dtype::F32])?;
     let s = match x.dtype {
         Dtype::Bf16 => f32::from_bits(u32::from(crate::hlo::bf16_bits(s)) << 16),
         Dtype::F16 => f16_value(crate::hlo::f16_bits(s)),
         _ => s,
     };
-    ctx.emit(&mut |cx| {
-        let v = cx.read_f32(x)?;
-        let v = cx.scale(v, f64::from(s))?;
-        cx.write(x, v)
-    })
+    let v = x.f32(f);
+    Ok(f.scale(v, f64::from(s))?)
 }
 
-/// `x = silu(x * s)`.
-pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu_scaled";
+/// `silu(x * s)`, the new `x`.
+pub fn silu_scaled(f: &mut Func, s: f32, x: Operand) -> Result<Val, Error> {
+    const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16])?;
-    ctx.emit(&mut |cx| {
-        let v = cx.read_f32(x)?;
-        let v = cx.scale(v, f64::from(s))?;
-        let v = cx.silu(v)?;
-        cx.write(x, v)
-    })
+    let v = x.f32(f);
+    let v = f.scale(v, f64::from(s))?;
+    Ok(f.silu(v)?)
 }
 
-/// `x *= s[0]`, a device scalar.
-pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.scale";
+/// `x * s[0]`, a device scalar; the new `x`.
+pub fn scale(f: &mut Func, s: Operand, x: Operand) -> Result<Val, Error> {
+    const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16])?;
-    ctx.emit(&mut |cx| {
-        let sv = cx.read_f32(s)?;
-        let n = cx.ty(sv).elements();
-        let sv = cx.reshape(sv, &[n])?;
-        let sv = cx.slice(sv, &[0], &[1], &[1])?;
-        let sv = cx.reshape(sv, &[])?;
-        let sv = cx.splat(sv, &[i64::from(x.rows), i64::from(x.width)])?;
-        let v = cx.read_f32(x)?;
-        let v = cx.mul(v, sv)?;
-        cx.write(x, v)
-    })
+    let sv = s.f32(f);
+    let n = f.ty(sv).elements();
+    let sv = f.reshape(sv, &[n])?;
+    let sv = f.slice(sv, &[0], &[1], &[1])?;
+    let sv = f.reshape(sv, &[])?;
+    let sv = f.splat(sv, &[i64::from(x.rows), i64::from(x.width)])?;
+    let v = x.f32(f);
+    Ok(f.mul(v, sv)?)
 }
 
 /// `(x - mean) / sqrt(var + eps)` per row, no gain or bias. Reference:
 /// kernels-metal / kernels-cuda `layernorm_no_scale` (wgpu refuses it).
-pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm_no_scale";
+pub fn layernorm_no_scale(f: &mut Func, x: Operand, eps: f32, y: Landing) -> Result<Val, Error> {
+    const OP: &str = "elemwise.layernorm";
     expect(OP, x, &[Dtype::Bf16, Dtype::F16, Dtype::F32])?;
     if x.rows != y.rows || x.width != y.width {
         return Err(refuse(OP, "the normed row lands the rectangle it reads"));
     }
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = centered(cx, xv, eps)?;
-        cx.write(y, n)
-    })
+    let xv = x.f32(f);
+    centered(f, xv, eps)
 }
 
 /// The first element of `s`, an f32 scalar.
-pub(crate) fn scalar_of(cx: &mut Cx<'_>, s: Tensor) -> Result<Val, Error> {
-    let sv = cx.read_f32(s)?;
-    let n = cx.ty(sv).elements();
-    let sv = cx.reshape(sv, &[n])?;
-    let sv = cx.slice(sv, &[0], &[1], &[1])?;
-    Ok(cx.reshape(sv, &[])?)
+pub(crate) fn scalar_of(f: &mut Func, s: Operand) -> Result<Val, Error> {
+    let sv = s.f32(f);
+    let n = f.ty(sv).elements();
+    let sv = f.reshape(sv, &[n])?;
+    let sv = f.slice(sv, &[0], &[1], &[1])?;
+    Ok(f.reshape(sv, &[])?)
 }
 
 pub const MAX_BLEND_BLOCKS: usize = 32;
 
-/// Attention over depth: each candidate (every block, then the prefix) is
+/// Attn over depth: each candidate (every block, then the prefix) is
 /// rms-normed, gained by `weight` and dotted with `proj` into a logit; the
 /// softmax over candidates weights their sum. `blocks` are separate
-/// `[rows, hidden]` handles (the wgpu engine hands one stacked plane instead;
-/// here each block is read on its own). Reference: kernels-wgpu
-/// `norm/res_blend.wgsl`.
+/// `[rows, hidden]` operands (the wgpu engine hands one stacked plane
+/// instead). Reference: kernels-slang `elemwise/norm.slang`.
 pub fn res_blend(
-    ctx: &Ctx<'_>,
-    prefix: Tensor,
-    blocks: &[Tensor],
-    weight: Tensor,
+    f: &mut Func,
+    prefix: Operand,
+    blocks: &[Operand],
+    weight: Operand,
     eps: f32,
-    proj: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.res_blend";
+    proj: Operand,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.res_blend";
     expect(OP, y, &[Dtype::Bf16])?;
     if blocks.len() > MAX_BLEND_BLOCKS {
         return Err(refuse(
@@ -473,7 +391,7 @@ pub fn res_blend(
             ),
         ));
     }
-    let same = |p: Tensor| p.rows == y.rows && p.width == y.width;
+    let same = |p: Operand| p.rows == y.rows && p.width == y.width;
     if !same(prefix) || !blocks.iter().all(|b| same(*b)) {
         return Err(refuse(
             OP,
@@ -490,35 +408,32 @@ pub fn res_blend(
     }
     let (rows, hidden) = (i64::from(y.rows), i64::from(y.width));
     let c = blocks.len() as i64 + 1;
-    ctx.emit(&mut |cx| {
-        let mut cands = Vec::with_capacity(c as usize);
-        for b in blocks.iter().chain(std::iter::once(&prefix)) {
-            let v = cx.read_f32(*b)?;
-            cands.push(cx.reshape(v, &[rows, 1, hidden])?);
-        }
-        let all = cx.concat(&cands, 1)?;
-        let sq = cx.mul(all, all)?;
-        let ss = cx.reduce(sq, &[2], Fold::Sum)?;
-        let ms = cx.scale(ss, 1.0 / hidden as f64)?;
-        let ms = cx.offset(ms, f64::from(eps))?;
-        let inv = cx.rsqrt(ms);
-        let inv = cx.broadcast(inv, &[rows, c, hidden], &[0, 1])?;
-        let n = cx.mul(all, inv)?;
-        let nw = cx.read_f32(weight)?;
-        let nw = cx.reshape(nw, &[hidden])?;
-        let nw = cx.broadcast(nw, &[rows, c, hidden], &[2])?;
-        let pw = cx.read_f32(proj)?;
-        let pw = cx.reshape(pw, &[hidden])?;
-        let pw = cx.broadcast(pw, &[rows, c, hidden], &[2])?;
-        let d = cx.mul(n, nw)?;
-        let d = cx.mul(d, pw)?;
-        let logits = cx.reduce(d, &[2], Fold::Sum)?;
-        let p = cx.softmax(logits, 1)?;
-        let p = cx.broadcast(p, &[rows, c, hidden], &[0, 1])?;
-        let blend = cx.mul(all, p)?;
-        let out = cx.reduce(blend, &[1], Fold::Sum)?;
-        cx.write(y, out)
-    })
+    let mut cands = Vec::with_capacity(c as usize);
+    for b in blocks.iter().chain(std::iter::once(&prefix)) {
+        let v = b.f32(f);
+        cands.push(f.reshape(v, &[rows, 1, hidden])?);
+    }
+    let all = f.concat(&cands, 1)?;
+    let sq = f.mul(all, all)?;
+    let ss = f.reduce(sq, &[2], Fold::Sum)?;
+    let ms = f.scale(ss, 1.0 / hidden as f64)?;
+    let ms = f.offset(ms, f64::from(eps))?;
+    let inv = f.rsqrt(ms);
+    let inv = f.broadcast(inv, &[rows, c, hidden], &[0, 1])?;
+    let n = f.mul(all, inv)?;
+    let nw = weight.f32(f);
+    let nw = f.reshape(nw, &[hidden])?;
+    let nw = f.broadcast(nw, &[rows, c, hidden], &[2])?;
+    let pw = proj.f32(f);
+    let pw = f.reshape(pw, &[hidden])?;
+    let pw = f.broadcast(pw, &[rows, c, hidden], &[2])?;
+    let d = f.mul(n, nw)?;
+    let d = f.mul(d, pw)?;
+    let logits = f.reduce(d, &[2], Fold::Sum)?;
+    let p = f.softmax(logits, 1)?;
+    let p = f.broadcast(p, &[rows, c, hidden], &[0, 1])?;
+    let blend = f.mul(all, p)?;
+    Ok(f.reduce(blend, &[1], Fold::Sum)?)
 }
 
 /// The value of f16 bits.

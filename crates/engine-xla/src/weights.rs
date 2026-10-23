@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::handle::{Bank, Tensor};
 use checkpoint::contract::ModelContract;
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
@@ -14,7 +15,6 @@ use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
-use kernels_xla::{Bank, Tensor};
 use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::chip::{Engine, Mxfp4Prescale};
@@ -606,9 +606,22 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            // XLA ships no fused kernels (`crate::FUSED` is empty), so no
+            // XLA ships no fused kernels (`crate::FUSIONS` is empty), so no
             // `Fused` op reaches a trace this reads.
-            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. }) => Some(*w),
+            Operation::Linear(
+                Linear::Matmul {
+                    w,
+                    quant: None,
+                    logits: false,
+                    ..
+                }
+                | Linear::Matmul {
+                    w,
+                    quant: None,
+                    logits: true,
+                    ..
+                },
+            ) => Some(*w),
             _ => None,
         };
         for &v in &inputs {
@@ -673,7 +686,7 @@ fn fold_of(rows: u64, row: u64) -> (u64, u64) {
 /// The sub-byte bank codes planes every reader of which is an embedding
 /// gather. They land folded, codes as the packed bytes of their rows
 /// (`u8 [V/128, 128·bytes]`), scales and zero points `[V/128, 128·groups]`
-/// (`kernels_xla::layout::folding`): the TPU lays a 2-D array out with the
+/// (`kernels_xla::gather::folding`): the TPU lays a 2-D array out with the
 /// axis that tiles evenly minor, so a `[V, row]` table lands column-major and
 /// every gather relayouts all of it first (gpt-oss's 201088-row embedding:
 /// 1.75 ms a step as `u4` codes, 0.78 ms as bytes).
@@ -682,7 +695,7 @@ fn gather_only(
     codes: &std::collections::BTreeSet<usize>,
     engine: &Engine,
 ) -> std::collections::BTreeSet<usize> {
-    use poem_ir::{Def, Layout, Operands, Operation};
+    use poem_ir::{Def, Gather, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
     if !engine.embed_fold {
         return out;
@@ -697,9 +710,21 @@ fn gather_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let table = match &node.op {
-            Operation::Layout(Layout::Embed { table, .. } | Layout::EmbedConcat { table, .. }) => {
-                Some(*table)
-            }
+            Operation::Gather(
+                Gather::Embed {
+                    table,
+                    weights: None,
+                    scales: None,
+                    concat: false,
+                    ..
+                }
+                | Gather::Embed {
+                    table,
+                    weights: None,
+                    concat: true,
+                    ..
+                },
+            ) => Some(*table),
             _ => None,
         };
         for &v in &inputs {
@@ -803,7 +828,7 @@ impl Landing<'_> {
         let dtype = self.trace.params[at].dtype;
         let (rows, width) = (self.shape_of)(at);
         if self.transposed.contains(&at)
-            && let Some(codes) = kernels_xla::pack::land(dtype, bytes)
+            && let Some(codes) = crate::pack::land(dtype, bytes)
         {
             // `[N, K]` codes, one per byte, as `[K, N']`, N padded to whole
             // tiles with zero codes.
@@ -854,7 +879,7 @@ impl Landing<'_> {
             self.stored[at] = dtype;
             return Ok(());
         }
-        match kernels_xla::pack::land(dtype, bytes) {
+        match crate::pack::land(dtype, bytes) {
             Some(codes) => self.upload(at, dtype, width, &codes),
             None => self.upload(at, dtype, width, bytes),
         }
@@ -865,7 +890,7 @@ impl Landing<'_> {
     fn prescaled(&mut self, codes_at: usize, codes: &[u8], scales: &[u8]) -> Result<()> {
         let dtype = self.trace.params[codes_at].dtype;
         let (_, width) = (self.shape_of)(codes_at);
-        match kernels_xla::pack::mxfp4_e5m2(codes, scales) {
+        match crate::pack::mxfp4_e5m2(codes, scales) {
             Some(w) => {
                 let per_row = kernels_xla::pack::codes_per_row(dtype, width).unwrap_or(width);
                 self.upload(codes_at, Dtype::E5m2, per_row, &w)

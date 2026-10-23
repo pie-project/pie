@@ -6,7 +6,7 @@
 // sees. A wavefront a (row, head), keys 64 a tile: a lane scores a key, then
 // each lane accumulates its columns with the key's weight broadcast.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 #include "attn/kv.hip"
 #include "attn/mla.hip"
 

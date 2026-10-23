@@ -40,7 +40,7 @@ lints, which is the same as not firing.
 
 The gates cannot reach the crates where this bug hides best. `pie`,
 `runtime` and `worker` are ungated on warning count; `engine-cuda` and
-`kernels-cuda` need `nvcc`; `kernels-vulkan` and `engine-vulkan` need
+`kernels-cuda` need `nvcc`; `kernels-slang` and its two engines need
 `slangc`; `engine-metal` and `kernels-metal` need a Mac. That is nine of
 thirty-five members where `unexpected_cfgs` will not be denied on this
 job, and they are disproportionately the ones with interesting `cfg`s --

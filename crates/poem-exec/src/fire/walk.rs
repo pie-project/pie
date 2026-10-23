@@ -124,9 +124,22 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                         matches!(
                             node.op,
                             Operation::Linear(
-                                poem_ir::Linear::MoeMatmulSelect { .. }
-                                    | poem_ir::Linear::MoeMatmulSelectQuant { .. }
-                                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. }
+                                poem_ir::Linear::MoeSelect {
+                                    bias: None,
+                                    quantized: false,
+                                    quant: None,
+                                    ..
+                                } | poem_ir::Linear::MoeSelect {
+                                    bias: None,
+                                    quantized: true,
+                                    quant: None,
+                                    ..
+                                } | poem_ir::Linear::MoeSelect {
+                                    bias: None,
+                                    quantized: true,
+                                    quant: Some(_),
+                                    ..
+                                }
                             )
                         )
                     })

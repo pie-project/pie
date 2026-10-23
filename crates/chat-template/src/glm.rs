@@ -102,7 +102,7 @@ impl Glm {
             Some(at) => msg[at + THINK_CLOSE.len()..].trim_start_matches('\n'),
             None => msg,
         };
-        let (text, calls) = split_calls(answer);
+        let (text, calls) = crate::chatml::lift_calls(answer);
         let nl = self.gap();
         let mut body = if self.style == Style::Glm45 {
             format!("\n{THINK_OPEN}{THINK_CLOSE}")
@@ -122,7 +122,7 @@ impl Glm {
                 for (key, value) in map {
                     let value = match value {
                         serde_json::Value::String(s) => s,
-                        other => crate::llama::pythonic(&other),
+                        other => crate::json::tojson(&other),
                     };
                     body.push_str(&format!(
                         "{nl}<arg_key>{key}</arg_key>{nl}<arg_value>{value}</arg_value>"
@@ -142,7 +142,7 @@ impl Glm {
         );
         for tool in tools {
             let line = serde_json::from_str::<serde_json::Value>(tool)
-                .map(|v| crate::llama::pythonic(&v))
+                .map(|v| crate::json::tojson(&v))
                 .unwrap_or_else(|_| tool.clone());
             prompt.push_str(&line);
             prompt.push('\n');
@@ -160,38 +160,14 @@ impl Glm {
     }
 }
 
-/// `msg`'s text and the calls written in it as ChatML's
-/// `<tool_call>{"name", "arguments"}</tool_call>`.
-fn split_calls(msg: &str) -> (String, Vec<(String, serde_json::Value)>) {
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    let mut rest = msg;
-    while let Some(at) = rest.find(TOOL_CALL_OPEN) {
-        text.push_str(&rest[..at]);
-        let after = &rest[at + TOOL_CALL_OPEN.len()..];
-        let Some(end) = crate::chatml::closer_outside_string(after, TOOL_CALL_CLOSE) else {
-            text.push_str(&rest[at..]);
-            rest = "";
-            break;
-        };
-        match serde_json::from_str::<serde_json::Value>(after[..end].trim()) {
-            Ok(parsed) if parsed["name"].is_string() => calls.push((
-                parsed["name"].as_str().unwrap_or_default().to_string(),
-                parsed
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-            )),
-            _ => text.push_str(&rest[at..at + TOOL_CALL_OPEN.len() + end + TOOL_CALL_CLOSE.len()]),
-        }
-        rest = &after[end + TOOL_CALL_CLOSE.len()..];
-    }
-    text.push_str(rest);
-    (text, calls)
-}
-
 impl Instruct for Glm {
+    /// What a raw prompt goes after: `[gMASK]<sop>`, and nothing for
+    /// GLM-5.3, whose opening is a system turn (its effort line) a raw
+    /// prompt would continue.
     fn prefix(&self) -> Vec<u32> {
+        if self.style == Style::Glm5 {
+            return Vec::new();
+        }
         self.prefix.clone()
     }
 
@@ -339,15 +315,8 @@ impl Instruct for Glm {
     }
 }
 
-/// GLM's calls: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>
-/// …</tool_call>` (GLM-4.5 with newlines between), each value JSON where it
-/// parses as JSON and a string where it does not.
-struct GlmToolDecoder {
-    decoder: TokenizerDecoder,
-    accumulated: String,
-    inside: bool,
-}
-
+/// One call's body, what sits between `<tool_call>` and `</tool_call>`, as
+/// its name and its arguments' JSON; none where it does not read.
 fn parse_call(call: &str) -> Option<(String, String)> {
     let (name, mut rest) = match call.find("<arg_key>") {
         Some(at) => (call[..at].trim(), &call[at..]),
@@ -375,6 +344,15 @@ fn parse_call(call: &str) -> Option<(String, String)> {
         name.to_string(),
         serde_json::Value::Object(arguments).to_string(),
     ))
+}
+
+/// GLM's calls: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>
+/// …</tool_call>` (GLM-4.5 with newlines between), each value JSON where it
+/// parses as JSON and a string where it does not.
+struct GlmToolDecoder {
+    decoder: TokenizerDecoder,
+    accumulated: String,
+    inside: bool,
 }
 
 impl ToolDecoder for GlmToolDecoder {

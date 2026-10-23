@@ -10,7 +10,8 @@ mod common;
 
 use common::{Gpu, KV, bf16s, close_abs, close_bf16, round_bf16};
 use dtype::Dtype;
-use kernels_rocm::attn::{index, pool};
+use kernels_rocm::attn::compressed::pool;
+use kernels_rocm::attn::index;
 use kernels_rocm::{KvPool, RaggedTensor, Tensor};
 
 /// Page tables for `cells[r]` cells of request r at `ps` a page, pages in
@@ -397,7 +398,16 @@ fn index_keys_append_and_block_mean() {
     let bpos = gpu.column(&[7, -1, 2]);
     let breq = gpu.column(&[0, 0, 1]);
     let mut out = gpu.zeros(3, d as u32, Dtype::Bf16);
-    index::block_mean(&ctx, bpos, breq, &p.pool, d as u32, ratio as u32, &mut out).unwrap();
+    kernels_rocm::attn::compressed::pool::block_mean(
+        &ctx,
+        bpos,
+        breq,
+        &p.pool,
+        d as u32,
+        ratio as u32,
+        &mut out,
+    )
+    .unwrap();
     let got = gpu.read(&out);
     let at = |r: usize, pos: usize| {
         let c = p.cell(r, pos);
@@ -558,7 +568,7 @@ fn pool_state_gather_and_store() {
     }
 }
 
-/// Attention over a pool of `d`-wide entries (one every `ratio` tokens) for
+/// Attn over a pool of `d`-wide entries (one every `ratio` tokens) for
 /// tokens at `positions` of requests `req`, all entries they see or the
 /// ones `top_k`-wide selections list.
 fn run_pool_lse(
@@ -835,7 +845,7 @@ fn block_max_ranks_each_heads_blocks() {
     run_block_max(8, 64, 8, 5, &[1, 20], &[300, 70]);
 }
 
-/// A selection row as `attention.index_topk` writes it: every visible
+/// A selection row as `attn.index_topk` writes it: every visible
 /// position when they fit the budget, else a budget's worth of distinct ones,
 /// ascending either way, `-1` past them.
 fn topk_row(visible: usize, top_k: usize, seed: u64) -> Vec<i32> {

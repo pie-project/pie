@@ -1,4 +1,4 @@
-//! Kimi Delta Attention against a host reference: the staging (norms, gates)
+//! Kimi Delta Attn against a host reference: the staging (norms, gates)
 //! and the serial per-channel-decay recurrence in f64. The decode step (a
 //! block a row and head, and the tiled step), the token-by-token prefill and
 //! the chunk-parallel prefill, with commits, interior begins, fold masks,
@@ -10,7 +10,7 @@ mod common;
 
 use common::{Gpu, STATE, round_bf16, sigmoid, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm;
+use kernels_rocm::ssm;
 use kernels_rocm::{Ctx, RaggedTensor, RecurrentPool, Tensor};
 
 /// The fires share the context's named scratch planes, so the tests in this
@@ -229,7 +229,7 @@ fn bind(gpu: &Gpu, g: Geo, inp: &Inputs, rows: usize, seats: &Seats) -> Bound {
 }
 
 fn step(gpu: &Gpu, ctx: &Ctx, g: Geo, bd: &mut Bound) {
-    ssm::kda_step(
+    ssm::kda(
         ctx,
         bd.mixed,
         bd.f,

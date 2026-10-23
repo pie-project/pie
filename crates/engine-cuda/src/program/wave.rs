@@ -1,4 +1,4 @@
-use kernels_cuda::channel::{self, BumpLane, PublishLane, PullLane, SettleLane, Ticket};
+use kernels_cuda::runtime::channel::{self, BumpLane, PublishLane, PullLane, SettleLane, Ticket};
 
 use crate::device::{Buffer, Context};
 use crate::error::Result;
@@ -206,7 +206,7 @@ impl Wave {
 #[cfg(test)]
 mod tests {
     use super::Wave;
-    use kernels_cuda::channel::{BumpLane, PublishLane, PullLane, SettleLane, Ticket};
+    use kernels_cuda::runtime::channel::{BumpLane, PublishLane, PullLane, SettleLane, Ticket};
 
     fn ticket(slot: u32) -> Ticket {
         Ticket {

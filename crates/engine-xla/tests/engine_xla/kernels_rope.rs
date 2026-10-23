@@ -89,8 +89,47 @@ fn partial_rope_turns_only_the_rotary_pairs_of_q_and_k() {
     let q2 = b.bf16(rows as u32, (qh * hd) as u32, &qs);
     if !b
         .run(|ctx| {
-            rope::partial(ctx, q, k, p, rot as u32, hd as u32, theta, rot as u32 / 2)?;
-            rope::partial_q(ctx, q2, p, rot as u32, hd as u32, theta, rot as u32 / 2)
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(q)?;
+                let k_v = l.read(k)?;
+                let positions_v = l.read(p)?;
+                let o_q = q;
+                let o_k = k;
+                let vs = rope::partial(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    rot as u32 / 2,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(q2)?;
+                let positions_v = l.read(p)?;
+                let o_q = q2;
+                if let Some(v) = rope::partial_q(
+                    l.f(),
+                    q_v,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    rot as u32 / 2,
+                )? {
+                    l.land(o_q, v)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -126,8 +165,36 @@ fn full_rope_turns_halves_and_interleaved_pairs() {
     let p = b.i32(rows as u32, 1, &pos);
     if !b
         .run(|ctx| {
-            rope::full(ctx, q, k, p, hd as u32, theta, false)?;
-            rope::full(ctx, qi, ki, p, hd as u32, theta, true)
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(q)?;
+                let k_v = l.read(k)?;
+                let positions_v = l.read(p)?;
+                let o_q = q;
+                let o_k = k;
+                let vs = rope::full(l.f(), q_v, k_v, positions_v, hd as u32, theta, false)?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(qi)?;
+                let k_v = l.read(ki)?;
+                let positions_v = l.read(p)?;
+                let o_q = qi;
+                let o_k = ki;
+                let vs = rope::full(l.f(), q_v, k_v, positions_v, hd as u32, theta, true)?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -199,19 +266,63 @@ fn the_tail_rope_turns_inverse_interleaved_and_yarn_ramped() {
     let d = b.bf16(rows as u32, w, &xs);
     if !b
         .run(|ctx| {
-            rope::partial_last(ctx, a, p, rot as u32, hd as u32, theta, false, false, None)?;
-            rope::partial_last(ctx, c, p, rot as u32, hd as u32, theta, true, true, None)?;
-            rope::partial_last(
-                ctx,
-                d,
-                p,
-                rot as u32,
-                hd as u32,
-                theta,
-                false,
-                false,
-                Some(yarn),
-            )
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(a)?;
+                let positions_v = l.read(p)?;
+                let o_q = a;
+                if let Some(v) = rope::partial_last(
+                    l.f(),
+                    q_v,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    false,
+                    false,
+                    None,
+                )? {
+                    l.land(o_q, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(c)?;
+                let positions_v = l.read(p)?;
+                let o_q = c;
+                if let Some(v) = rope::partial_last(
+                    l.f(),
+                    q_v,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    true,
+                    true,
+                    None,
+                )? {
+                    l.land(o_q, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(d)?;
+                let positions_v = l.read(p)?;
+                let o_q = d;
+                if let Some(v) = rope::partial_last(
+                    l.f(),
+                    q_v,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    false,
+                    false,
+                    Some(yarn),
+                )? {
+                    l.land(o_q, v)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -264,12 +375,62 @@ fn yarn_rope_bends_frequencies_and_scales_both_halves() {
     let ki = b.bf16(rows as u32, hd as u32, &ks);
     if !b
         .run(|ctx| {
-            rope::yarn(
-                ctx, q, k, p, hd as u32, theta, 40.0, 32.0, 1.0, 1.2, 4096, false,
-            )?;
-            rope::yarn(
-                ctx, qi, ki, p, hd as u32, theta, 40.0, 32.0, 1.0, 1.2, 4096, true,
-            )
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(q)?;
+                let k_v = l.read(k)?;
+                let positions_v = l.read(p)?;
+                let o_q = q;
+                let o_k = k;
+                let vs = rope::yarn(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    hd as u32,
+                    theta,
+                    40.0,
+                    32.0,
+                    1.0,
+                    1.2,
+                    4096,
+                    false,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(qi)?;
+                let k_v = l.read(ki)?;
+                let positions_v = l.read(p)?;
+                let o_q = qi;
+                let o_k = ki;
+                let vs = rope::yarn(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    hd as u32,
+                    theta,
+                    40.0,
+                    32.0,
+                    1.0,
+                    1.2,
+                    4096,
+                    true,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -329,36 +490,78 @@ fn mrope_reads_each_pairs_axis_in_all_three_forms() {
     }
     if !b
         .run(|ctx| {
-            rope_mrope::interleaved(
-                ctx,
-                planes[0].0,
-                planes[0].1,
-                p,
-                sections,
-                rot as u32,
-                hd as u32,
-                theta,
-            )?;
-            rope_mrope::blocked(
-                ctx,
-                planes[1].0,
-                planes[1].1,
-                p,
-                sections,
-                rot as u32,
-                hd as u32,
-                theta,
-            )?;
-            rope_mrope::split(
-                ctx,
-                planes[2].0,
-                planes[2].1,
-                p,
-                sections,
-                rot as u32,
-                hd as u32,
-                theta,
-            )
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(planes[0].0)?;
+                let k_v = l.read(planes[0].1)?;
+                let positions_v = l.read(p)?;
+                let o_q = planes[0].0;
+                let o_k = planes[0].1;
+                let vs = rope_mrope::interleaved(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    sections,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(planes[1].0)?;
+                let k_v = l.read(planes[1].1)?;
+                let positions_v = l.read(p)?;
+                let o_q = planes[1].0;
+                let o_k = planes[1].1;
+                let vs = rope_mrope::blocked(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    sections,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(planes[2].0)?;
+                let k_v = l.read(planes[2].1)?;
+                let positions_v = l.read(p)?;
+                let o_q = planes[2].0;
+                let o_k = planes[2].1;
+                let vs = rope_mrope::split(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    sections,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(o_q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(o_k, v)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -454,19 +657,41 @@ fn rope_axes_turns_each_form_and_the_ladder() {
     if !b
         .run(|ctx| {
             for (f, o) in forms.iter().zip(&outs) {
-                act::rope_axes(ctx, src, p, dims, thetas, *f, rot as u32, hd as u32, *o)?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = l.read(src)?;
+                    let positions_v = l.read(p)?;
+                    let o_o = *o;
+                    let v = act::rope_axes(
+                        l.f(),
+                        x_v,
+                        positions_v,
+                        dims,
+                        thetas,
+                        *f,
+                        rot as u32,
+                        hd as u32,
+                        o_o.landing(),
+                    )?;
+                    l.land(o_o, v)
+                })?;
             }
-            act::rope_axes(
-                ctx,
-                lsrc,
-                p,
-                ldims,
-                thetas,
-                act::RopeForm::SplitLadder,
-                lrot as u32,
-                lhd as u32,
-                lsrc,
-            )
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(lsrc)?;
+                let positions_v = l.read(p)?;
+                let o_o = lsrc;
+                let v = act::rope_axes(
+                    l.f(),
+                    x_v,
+                    positions_v,
+                    ldims,
+                    thetas,
+                    act::RopeForm::SplitLadder,
+                    lrot as u32,
+                    lhd as u32,
+                    o_o.landing(),
+                )?;
+                l.land(o_o, v)
+            })
         })
         .unwrap()
     {

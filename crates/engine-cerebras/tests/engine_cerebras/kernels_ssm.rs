@@ -5,7 +5,7 @@ use crate::common;
 use common::data;
 use dtype::Dtype;
 use engine_cerebras::bench::{Bench, assert_close, round_bf16};
-use kernels_cerebras::attn::ssm;
+use kernels_cerebras::ssm;
 use kernels_cerebras::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
@@ -456,7 +456,7 @@ fn a_wide_delta_bank_splits_its_lanes_over_pes() {
         }))
         .collect();
     let rows: usize = runs.iter().map(|r| r.1).sum();
-    let slots_n = 6usize; // 6 x 1024 = 6144 words > shard_words()
+    let slots_n = 6usize; // 6 x 1024 = 6144 words > the default shard_words
     let qkv = data(rows * g.width(), 81);
     let gates = gates_for(rows, g.hv, 82);
     let bank: Vec<f32> = data(slots_n * g.stride(), 83)
@@ -529,7 +529,7 @@ fn a_big_slot_state_splits_into_blocks_over_pes() {
         hv: 2,
         dk: 64,
         dv: 64,
-    }; // 8192 words per slot > shard_words()
+    }; // 8192 words per slot > the default shard_words
     let rows = 3usize;
     let slots_n = 3usize;
     let qkv = data(rows * g.width(), 91);

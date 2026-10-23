@@ -1,0 +1,21 @@
+// y[r] = sum over taps of weights[r][t] * table[ids[r][t]] over the ids in
+// this PE's table rows (an id outside [0, limit) reads row 0), in tap
+// order; the PEs' parts add up to the whole.
+fn k_embed_weighted_part(ids: [*]i32, weights: [*]f32, table: [*]f32, y: [*]f32, rows: i32, taps: i32, width: i32, limit: i32, lo: i32, share: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var i: i32 = 0;
+    while (i < width) : (i += 1) { y[r * width + i] = 0.0; }
+    var t: i32 = 0;
+    while (t < taps) : (t += 1) {
+      var id: i32 = ids[r * taps + t];
+      if (id < 0 or id >= limit) { id = 0; }
+      if (id >= lo and id < lo + share) {
+        var g: f32 = weights[r * taps + t];
+        i = 0;
+        while (i < width) : (i += 1) { y[r * width + i] = y[r * width + i] + g * table[(id - lo) * width + i]; }
+      }
+    }
+  }
+}
+

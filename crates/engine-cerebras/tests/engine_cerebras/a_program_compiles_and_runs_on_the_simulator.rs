@@ -75,12 +75,12 @@ fn a_parameterised_gemv_round_trips() {
             return;
         }
     };
-    std::fs::write(dir.path().join("layout.csl"), LAYOUT).unwrap();
+    std::fs::write(dir.path().join("gather.csl"), LAYOUT).unwrap();
     std::fs::write(dir.path().join("pe.csl"), PE).unwrap();
 
     let (m, n) = (3usize, 5usize);
     let out = dir.path().join("out");
-    let compile = Compile::memcpy(Arch::Wse3, dir.path().join("layout.csl"), 1, 1, &out)
+    let compile = Compile::memcpy(Arch::Wse3, dir.path().join("gather.csl"), 1, 1, &out)
         .param("M", m)
         .param("N", n);
     Cslc::find().unwrap().compile(&compile).unwrap();

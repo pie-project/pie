@@ -318,7 +318,7 @@ pub(crate) fn host_grid(
     port_grid: &[i32],
     grid: poem_ir::ValueId,
 ) -> Option<Vec<i32>> {
-    use poem_ir::{Def, Operation, RuntimeInput, Spatial};
+    use poem_ir::{Conv, Def, Operation, RuntimeInput};
 
     let mut rules = Vec::new();
     let mut at = grid;
@@ -330,7 +330,7 @@ pub(crate) fn host_grid(
             break;
         }
         let step = trace.nodes.iter().find_map(|node| match &node.op {
-            Operation::Spatial(Spatial::Grid { grid, rule, y }) if *y == at => Some((*grid, *rule)),
+            Operation::Conv(Conv::Grid { grid, rule, y }) if *y == at => Some((*grid, *rule)),
             _ => None,
         })?;
         rules.push(step.1);
@@ -389,7 +389,7 @@ pub(crate) fn relabel_conv_weights(
         crate::device::alloc::copy_d2d(device.stream(), aside.ptr(), handle.ptr, bytes)?;
         let natural = Tensor::new(aside.ptr(), handle.rows, handle.width, handle.dtype);
         let mut relabelled = handle;
-        kernels_cuda::spatial::conv_weight_taps_major(
+        kernels_cuda::conv::conv_weight_taps_major(
             device.ctx(),
             natural,
             c_in,

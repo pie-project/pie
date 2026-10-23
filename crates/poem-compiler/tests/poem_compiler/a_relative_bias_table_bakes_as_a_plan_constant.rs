@@ -2,7 +2,7 @@ use crate::common;
 
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam, trace_hybrid};
 use poem_compiler::Placement;
-use poem_ir::{Attention, Elementwise, Operation, RaggedMask};
+use poem_ir::{Attn, Elemwise, Operation, RaggedMask};
 
 const WIDTH: u32 = 64;
 const HEADS: u32 = 4;
@@ -44,16 +44,16 @@ impl ForwardHybrid for Encoder {
             let k = ops::linear::matmul(&h, &w(&format!("l{l}.k"), HEADS * HEAD_DIM, WIDTH));
             let v = ops::linear::matmul(&h, &w(&format!("l{l}.v"), HEADS * HEAD_DIM, WIDTH));
             let o = ops::attn::ragged(
-                &ops::layout::pack_rows(&q, &perm),
-                &ops::layout::pack_rows(&k, &perm),
-                &ops::layout::pack_rows(&v, &perm),
+                &ops::gather::pack_rows(&q, &perm),
+                &ops::gather::pack_rows(&k, &perm),
+                &ops::gather::pack_rows(&v, &perm),
                 &indptr,
                 &indptr,
                 HEAD_DIM,
                 1.0,
                 ops::attn::relative_bias(&table, MAX_LEN),
             );
-            let o = ops::layout::unpack_rows(&o, &perm);
+            let o = ops::gather::unpack_rows(&o, &perm);
             let y = ops::linear::matmul(&o, &w(&format!("l{l}.o"), WIDTH, HEADS * HEAD_DIM));
             x = ops::elemwise::residual_add(&x, &y);
         }
@@ -77,7 +77,7 @@ fn the_tables_are_fixed_rectangles_alive_through_their_attention() {
 
         let mut seen = 0;
         for (at, node) in trace.nodes.iter().enumerate() {
-            let Operation::Elementwise(Elementwise::RelativeBucketBias { y, .. }) = &node.op else {
+            let Operation::Elemwise(Elemwise::RelativeBucketBias { y, .. }) = &node.op else {
                 continue;
             };
             seen += 1;
@@ -99,7 +99,7 @@ fn the_tables_are_fixed_rectangles_alive_through_their_attention() {
                 .position(|node| {
                     matches!(
                         &node.op,
-                        Operation::Attention(Attention::Ragged {
+                        Operation::Attn(Attn::Ragged {
                             mask: RaggedMask::RelativeBias { table, .. },
                             ..
                         }) if table == y

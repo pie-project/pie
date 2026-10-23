@@ -16,8 +16,8 @@ def kda(x, inputs, k):
     seam.at(seam.RECURRENT, [qkv])
 
     one = fact.single_token()
-    step = ops.attn.ssm_kda_step(
-        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
+    step = ops.ssm.kda(
+        ops.ssm.causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
         f.on(one),
         b.on(one),
         k.dt_bias,
@@ -28,8 +28,8 @@ def kda(x, inputs, k):
         k.norm_eps,
         k.gate_floor,
     )
-    chunked = ops.attn.ssm_kda_chunked(
-        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
+    chunked = ops.ssm.kda_chunked(
+        ops.ssm.causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
         f.on(~one),
         b.on(~one),
         k.dt_bias,
@@ -85,12 +85,8 @@ def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
 def arm(decode, q_nope, plan, q_pe, selection, pages, a):
     """One arm's rows absorbed, scored and absorbed back out."""
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    if selection == None:
-        score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
-        scored = score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
-    else:
-        score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
-        scored = score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+    score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
+    scored = score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale, selection = selection)
     return ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
 
 def caches(m, c):
@@ -107,7 +103,7 @@ def opens_block(m, l):
 
 def forward(m, inputs):
     plan = plans(inputs, m.mla_heads, m.kv_lora_rank)
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     every = m.attn_res == "every"
     routes = inputs.adapter_routes()
 
@@ -155,29 +151,33 @@ def forward(m, inputs):
     if r != None and blocks:
         y = ops.elemwise.res_blend(y, blocks, r.norm, r.norm_eps, r.proj)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.mlp_situ(ops.linear.matmul(x, f.gate_up), f.inter, f.beta, f.up_cap)
+        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.situ(f.beta, up_cap = f.up_cap), f.inter)
         return ops.linear.matmul(act, f.down)
     logits = ops.linear.matmul(x, f.router)
     if f.bias != None:
-        routes, weights = ops.linear.moe_topk_sigmoid_biased(
+        routes, weights = ops.linear.moe_route(
             logits,
-            f.bias,
             f.experts,
             f.top_k,
-            f.renorm,
-            f.routed_scaling,
+            routing.sigmoid(renormalize = f.renorm, scaling = f.routed_scaling),
+            bias = f.bias,
         )
     else:
-        routes, weights = ops.linear.moe_topk_sigmoid(logits, f.experts, f.top_k, f.renorm, f.routed_scaling)
+        routes, weights = ops.linear.moe_route(
+            logits,
+            f.experts,
+            f.top_k,
+            routing.sigmoid(renormalize = f.renorm, scaling = f.routed_scaling),
+        )
     lat = f.latent
     z = ops.linear.matmul(x, lat.down) if lat != None else x
     hidden = ops.linear.moe_matmul_select_quant(z, f.gate_up, routes, f.top_k)
-    act = ops.linear.mlp_situ(hidden, f.inter, f.beta, f.up_cap)
+    act = ops.linear.glu(hidden, gating.situ(f.beta, up_cap = f.up_cap), f.inter)
     routed = ops.linear.moe_weighted_sum(
         ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k),
         weights,
@@ -186,7 +186,7 @@ def mlp(x, f):
         r = ops.elemwise.rmsnorm(routed, lat.norm, lat.norm_eps) if lat.norm != None else routed
         routed = ops.linear.matmul(r, lat.up)
     s = f.shared
-    act = ops.linear.mlp_situ(ops.linear.matmul(x, s.gate_up), s.inter, f.beta, f.up_cap)
+    act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.situ(f.beta, up_cap = f.up_cap), s.inter)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def mla_mixer(x, inputs, plan, a):

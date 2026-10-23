@@ -23,17 +23,17 @@ use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
     dead_code,
     reason = "the router's dispatch no longer cuts; kept as the name of the seam"
 )]
-const ROUTER_FILE: &str = "linear/moe_route.metal";
+const ROUTER_FILE: &str = "linear/moe/route.metal";
 
 #[cfg(target_vendor = "apple")]
 #[allow(dead_code, reason = "see ROUTER_FILE")]
 const ROUTER_POINTS: [&str; 2] = ["router_topk", "hash_route_gather"];
 
 #[cfg(target_vendor = "apple")]
-const HASHER_FILE: &str = "attn/ple.metal";
+const HASHER_FILE: &str = "gather/ngram.metal";
 
 #[cfg(target_vendor = "apple")]
-const HASHER_POINT: &str = "ple_ngram_ids";
+const HASHER_POINT: &str = "ngram_ids";
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Sink<'a> {
@@ -371,21 +371,7 @@ impl Encode for Sink<'_> {
                     for (at, arg) in args.iter().enumerate() {
                         self.bind(&encoder, fire, at, *arg)?;
                     }
-                    let lanes = MTLSize {
-                        width: fire.lanes[0].max(1) as usize,
-                        height: fire.lanes[1].max(1) as usize,
-                        depth: fire.lanes[2].max(1) as usize,
-                    };
-                    let group = if fire.group == [0, 0, 0] {
-                        crate::device::ctx::threadgroup(&pipeline, fire.lanes)
-                    } else {
-                        MTLSize {
-                            width: fire.group[0].max(1) as usize,
-                            height: fire.group[1].max(1) as usize,
-                            depth: fire.group[2].max(1) as usize,
-                        }
-                    };
-                    encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
+                    self.dispatch(&encoder, &pipeline, fire)?;
                 }
                 let seconds = own.commit_timed().map_err(refuse)?;
                 record_kernel(&profile_key(fire.entrypoint, args), seconds);
@@ -397,22 +383,7 @@ impl Encode for Sink<'_> {
                 for (at, arg) in args.iter().enumerate() {
                     self.bind(&encoder, fire, at, *arg)?;
                 }
-                let lanes = MTLSize {
-                    width: fire.lanes[0].max(1) as usize,
-                    height: fire.lanes[1].max(1) as usize,
-                    depth: fire.lanes[2].max(1) as usize,
-                };
-                let group = if fire.group == [0, 0, 0] {
-                    crate::device::ctx::threadgroup(&pipeline, fire.lanes)
-                } else {
-                    MTLSize {
-                        width: fire.group[0].max(1) as usize,
-                        height: fire.group[1].max(1) as usize,
-                        depth: fire.group[2].max(1) as usize,
-                    }
-                };
-                encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
-                Ok(())
+                self.dispatch(&encoder, &pipeline, fire)
             })?;
             if let Held::Borrowed(frame) = &self.frame
                 && let left = self.flush_in.get()
@@ -526,6 +497,58 @@ impl<'a> Sink<'a> {
 
 #[cfg(target_vendor = "apple")]
 impl Sink<'_> {
+    /// Launches `fire` on `encoder`: the threadgroup counts its indirect
+    /// buffer holds, where it names one, else its lanes.
+    #[cfg(target_vendor = "apple")]
+    fn dispatch(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,
+        pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        fire: Fire,
+    ) -> Result<(), Error> {
+        let group = if fire.group == [0, 0, 0] {
+            crate::device::ctx::threadgroup(pipeline, fire.lanes)
+        } else {
+            MTLSize {
+                width: fire.group[0].max(1) as usize,
+                height: fire.group[1].max(1) as usize,
+                depth: fire.group[2].max(1) as usize,
+            }
+        };
+        if let Some(indirect) = fire.indirect {
+            let binding = self.handles.get(indirect.buf).ok_or_else(|| {
+                Sink::refuse(
+                    fire,
+                    Fault::Unbound {
+                        what: format!(
+                            "handle {}, the fire's grid, which this fire minted no row for",
+                            indirect.buf
+                        ),
+                    },
+                )
+            })?;
+            let offset = usize::try_from(binding.offset() + u64::from(indirect.offset))
+                .expect("an offset inside a reservation");
+            // SAFETY: the row retains its buffer, and an earlier fire of the
+            // frame wrote three threadgroup counts at the offset.
+            unsafe {
+                encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    &binding.slab().clone(),
+                    offset,
+                    group,
+                );
+            }
+            return Ok(());
+        }
+        let lanes = MTLSize {
+            width: fire.lanes[0].max(1) as usize,
+            height: fire.lanes[1].max(1) as usize,
+            depth: fire.lanes[2].max(1) as usize,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
+        Ok(())
+    }
+
     fn bind(
         &self,
         encoder: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,

@@ -1,6 +1,6 @@
 use core::fmt;
 
-use crate::source::{self, ALL_HEADERS, DEVICE_HEADERS, Header};
+use crate::source::{self, DEVICE_HEADERS, Header};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Toolchain {
@@ -37,37 +37,12 @@ impl fmt::Display for Toolchain {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Headers {
-    Library,
-    LibraryAndUpstream,
-}
-
-impl Headers {
-    #[must_use]
-    pub const fn set(self) -> &'static [Header] {
-        match self {
-            Headers::Library => DEVICE_HEADERS,
-            Headers::LibraryAndUpstream => ALL_HEADERS,
-        }
-    }
-
-    #[must_use]
-    pub const fn tag(self) -> &'static str {
-        match self {
-            Headers::Library => "lib",
-            Headers::LibraryAndUpstream => "lib+upstream",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Root {
     pub name: &'static str,
     pub text: &'static str,
     pub file: &'static str,
     pub options: &'static [&'static str],
-    pub headers: Headers,
     pub floor: Toolchain,
     /// Compiled for the device's arch-specific target (`sm_100a`), not the
     /// plain one: tcgen05, TMEM and the block-scaled MMAs exist only there,
@@ -79,23 +54,21 @@ pub struct Root {
     pub tcgen05_twin: bool,
 }
 
-const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
+const CONFIGURED: &[(&str, &[&str], Toolchain)] = &[
     (
-        "attn/mla.cuh",
+        "attn/mla/decode_sm80.cu",
         &["--device-as-default-execution-space"],
-        Headers::LibraryAndUpstream,
+        Toolchain::ANY,
+    ),
+    ("collective/all_reduce.cu", &[], Toolchain::ANY),
+    (
+        "attn/merge.cu",
+        &["--device-as-default-execution-space"],
         Toolchain::ANY,
     ),
     (
-        "collective/all_reduce.cuh",
-        &[],
-        Headers::LibraryAndUpstream,
-        Toolchain::ANY,
-    ),
-    (
-        "attn/attention.cuh",
+        "attn/fa2.cu",
         &["--device-as-default-execution-space"],
-        Headers::LibraryAndUpstream,
         Toolchain::ANY,
     ),
 ];
@@ -103,19 +76,20 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
 /// The units compiled for the arch-specific target, each with the NVRTC
 /// that first spells everything it asks of it (`.block16` is 12.9's).
 const SPECIFIC: &[(&str, Toolchain)] = &[
-    ("linear/tc5.cuh", Toolchain::new(12, 9)),
-    ("attn/tc5_fmha.cuh", Toolchain::new(12, 9)),
-    ("attn/dsv4_sparse.cuh", Toolchain::new(12, 9)),
-    ("attn/index_tc5.cuh", Toolchain::new(12, 9)),
-    ("attn/mla_sparse.cuh", Toolchain::new(12, 9)),
-    ("attn/gdn_tc5.cuh", Toolchain::new(12, 9)),
-    ("linear/moe_w4_cvt.cuh", Toolchain::new(12, 9)),
-    ("linear/moe_wgmma.cuh", Toolchain::ANY),
+    ("linear/gemm_sm100.cu", Toolchain::new(12, 9)),
+    ("attn/prefill_sm100.cu", Toolchain::new(12, 9)),
+    ("attn/compressed/prefill_sm100.cu", Toolchain::new(12, 9)),
+    ("attn/index/logits_sm100.cu", Toolchain::new(12, 9)),
+    ("attn/mla/sparse_sm100.cu", Toolchain::new(12, 9)),
+    ("ssm/gdn_chunk_sm100.cu", Toolchain::new(12, 9)),
+    ("linear/moe/select_fp4_sm100.cu", Toolchain::new(12, 9)),
+    ("linear/moe/select_sm90.cu", Toolchain::ANY),
+    ("linear/w8a16_sm90.cu", Toolchain::ANY),
 ];
 
 /// The units compiled for the arch-specific target on a tcgen05 chip and the
 /// plain one elsewhere: the per-route NVFP4 quant's e2m1 conversion.
-const TCGEN05_TWIN: &[&str] = &["linear/act_quant.cuh"];
+const TCGEN05_TWIN: &[&str] = &["linear/act_quant.cu"];
 
 const fn specific_for(file: &str) -> Option<Toolchain> {
     let mut i = 0;
@@ -129,24 +103,26 @@ const fn specific_for(file: &str) -> Option<Toolchain> {
     None
 }
 
-const fn configured_for(file: &str) -> (&'static [&'static str], Headers, Toolchain) {
+const fn configured_for(file: &str) -> (&'static [&'static str], Toolchain) {
     let mut i = 0;
     while i < CONFIGURED.len() {
-        let (name, options, headers, floor) = CONFIGURED[i];
+        let (name, options, floor) = CONFIGURED[i];
         if source::str_eq(name, file) {
-            return (options, headers, floor);
+            return (options, floor);
         }
         i += 1;
     }
-    (&[], Headers::Library, Toolchain::ANY)
+    (&[], Toolchain::ANY)
 }
 
 impl Root {
     #[must_use]
     pub fn of(file: &'static str) -> Option<Self> {
         let text = source::text_of(file)?;
-        let name = file.strip_suffix(".cuh")?;
-        let (options, headers, floor) = configured_for(file);
+        let name = file
+            .strip_suffix(".cuh")
+            .or_else(|| file.strip_suffix(".cu"))?;
+        let (options, floor) = configured_for(file);
         let (specific, floor) = specific_for(file).map_or((false, floor), |floor| (true, floor));
         let tcgen05_twin = TCGEN05_TWIN.contains(&file);
         Some(Self {
@@ -154,7 +130,6 @@ impl Root {
             text,
             file,
             options,
-            headers,
             floor,
             specific,
             tcgen05_twin,
@@ -164,12 +139,6 @@ impl Root {
     #[must_use]
     pub const fn options(mut self, options: &'static [&'static str]) -> Self {
         self.options = options;
-        self
-    }
-
-    #[must_use]
-    pub const fn upstream(mut self) -> Self {
-        self.headers = Headers::LibraryAndUpstream;
         self
     }
 
@@ -200,7 +169,7 @@ impl Root {
 
     #[must_use]
     pub fn header_set(&self) -> &'static [Header] {
-        self.headers.set()
+        DEVICE_HEADERS
     }
 
     #[must_use]
@@ -218,11 +187,10 @@ impl Root {
 
         static PREFIXES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
         let identity = format!(
-            "{}\u{1f}{arch}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:p}",
+            "{}\u{1f}{arch}\u{1f}{}\u{1f}{}\u{1f}{:p}",
             self.name,
             self.options.join(","),
             self.floor,
-            self.headers.tag(),
             self.text.as_ptr(),
         );
         let cache = PREFIXES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -234,11 +202,10 @@ impl Root {
         }
         let prefix: &'static str = Box::leak(
             format!(
-                "jit/{}/{arch}/{FLOAT_CONTRACT}/{}/nvrtc>={}/{}/r{:016x}/h{:016x}",
+                "jit/{}/{arch}/{FLOAT_CONTRACT}/{}/nvrtc>={}/r{:016x}/h{:016x}",
                 self.name,
                 self.options.join(","),
                 self.floor,
-                self.headers.tag(),
                 source::fnv1a64(self.text.as_bytes()),
                 source::digest(self.header_set()),
             )
@@ -329,7 +296,7 @@ mod tests {
 
     #[test]
     fn an_arch_specific_unit_keys_apart_from_the_plain_one() {
-        let plain = Root::of("linear/skinny.cuh").expect("a carried unit");
+        let plain = Root::of("linear/gemv.cu").expect("a carried unit");
         let specific = plain.arch_specific();
         let a = plain.key("x", &plain.target("sm_100", true).expect("plain"));
         let b = specific.key("x", &specific.target("sm_100", true).expect("twin"));

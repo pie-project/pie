@@ -14,8 +14,8 @@ use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
+use kernels_cuda::linear::affine::OffsetKind;
 use kernels_cuda::linear::moe::GroupSeat;
-use kernels_cuda::linear::quant::OffsetKind;
 use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Buffer;
@@ -924,7 +924,7 @@ impl Weights {
                     let plane = Buffer::zeroed(bytes)?;
                     // SAFETY: `stream` is the load's stream, live for the load.
                     let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
-                    let tile = kernels_cuda::linear::quant::decode_into(
+                    let tile = kernels_cuda::linear::dequant::decode_into(
                         &ctx,
                         "linear.matmul",
                         codes,
@@ -1089,7 +1089,7 @@ impl Weights {
             {
                 continue;
             }
-            let atom_bytes = kernels_cuda::linear::tc5::atom_bytes(rows, k, 128);
+            let atom_bytes = kernels_cuda::linear::gemm_sm100::atom_bytes(rows, k, 128);
             let staged = Buffer::zeroed(rows * k + atom_bytes)?;
             kernels_cuda::linear::moe::quantize_fp8b128(
                 &ctx,
@@ -1152,9 +1152,11 @@ impl Weights {
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
         let mut done = 0;
         for node in &trace.nodes {
-            let Operation::Linear(Linear::MatmulActQuant {
+            let Operation::Linear(Linear::Matmul {
                 w,
                 scales: Some(scales),
+                quant: Some(_),
+                logits: false,
                 ..
             }) = &node.op
             else {
@@ -1574,9 +1576,19 @@ impl TensorSink for Landing<'_> {
 fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
     use poem_ir::{Def, Fused, Linear, Operation};
     let lowp = |op: &Linear| match op {
-        Linear::MatmulActQuant { w, .. } | Linear::MoeMatmulSelectActQuant { bank: w, .. } => {
-            Some(*w)
+        Linear::Matmul {
+            w,
+            quant: Some(_),
+            logits: false,
+            ..
         }
+        | Linear::MoeSelect {
+            bank: w,
+            bias: None,
+            quantized: true,
+            quant: Some(_),
+            ..
+        } => Some(*w),
         _ => None,
     };
     let mut banks = BTreeMap::new();
@@ -1636,9 +1648,11 @@ fn share_input_scales(
 ) -> Result<()> {
     use poem_ir::{ActQuant, Def, Fused, Linear, Operation};
     let scales_of = |op: &Linear| match op {
-        Linear::MoeMatmulSelectActQuant {
-            quant: ActQuant::Nvfp4,
+        Linear::MoeSelect {
+            quant: Some(ActQuant::Nvfp4),
             input_scales: Some(s),
+            bias: None,
+            quantized: true,
             ..
         } => Some(*s),
         _ => None,
@@ -1697,7 +1711,7 @@ fn lay_atoms(
     // Where there are no tcgen05 GEMMs its products read bf16 activations
     // (W4A16, W8A16), and its 4-bit banks keep their row-major scales for
     // the selects that read them so.
-    if !kernels_cuda::linear::tc5::supported() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
         return Ok(());
     }
     let mut temp: Option<Buffer> = None;
@@ -1814,7 +1828,8 @@ fn lay_tile_banks(
             continue;
         }
         let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
-        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, gran as usize);
+        let bytes =
+            kernels_cuda::linear::gemm_sm100::atom_bytes(rows as usize, k as usize, gran as usize);
         let laid = Buffer::zeroed(bytes)?;
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
@@ -1894,9 +1909,11 @@ fn lay_block_atoms(
         _ => None,
     };
     for node in &trace.nodes {
-        let Operation::Linear(Linear::MatmulActQuant {
+        let Operation::Linear(Linear::Matmul {
             w,
             scales: Some(scales),
+            quant: Some(_),
+            logits: false,
             ..
         }) = &node.op
         else {
@@ -1923,7 +1940,7 @@ fn lay_block_atoms(
         };
         let (rows, cols) = (n, k.div_ceil(block));
         let bytes =
-            kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, block as usize);
+            kernels_cuda::linear::gemm_sm100::atom_bytes(rows as usize, k as usize, block as usize);
         let atoms = Buffer::zeroed(bytes)?;
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };

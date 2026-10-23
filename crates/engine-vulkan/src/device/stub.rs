@@ -73,7 +73,7 @@ impl Context {
     }
 
     #[must_use]
-    pub fn limits(&self) -> kernels_vulkan::tuning::Limits {
+    pub fn limits(&self) -> crate::tuning::Limits {
         match self.never {}
     }
 
@@ -422,14 +422,14 @@ impl Pipelines {
         self.compiles.get()
     }
 
-    pub fn warm(&self, _device: &Context, _fire: kernels_vulkan::Fire) -> Result<()> {
+    pub fn warm(&self, _device: &Context, _fire: kernels_slang::Fire) -> Result<()> {
         Err(Fault::Deviceless)
     }
 
     pub fn get(
         &self,
         _device: &Context,
-        _fire: kernels_vulkan::Fire,
+        _fire: kernels_slang::Fire,
     ) -> Result<std::sync::Arc<Pipeline>> {
         Err(Fault::Deviceless)
     }

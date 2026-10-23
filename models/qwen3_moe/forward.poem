@@ -10,21 +10,13 @@ def caches(m, c):
         c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
 
 def forward(m, inputs):
-    ([input_m, input_s, input_d], input_p) = inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
-    plans = struct(
-        m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
-        d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
-        p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
-        s = ops.attn.plan_prefill(input_s, m.q_heads, m.kv_heads, m.head_dim, None),
-    )
-    mask = inputs.mask()
     positions = inputs.positions()
-    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, plans, mask, positions, w)
+        o = attention(x, inputs, m, positions, w)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
@@ -33,41 +25,38 @@ def forward(m, inputs):
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
     return ops.linear.lm_head(x, m.head)
 
 def moe(x, m, w):
     """`m.top_k` of `m.experts`, weighted by the router's softmax over them."""
-    experts, weights = ops.linear.moe_topk_softmax(ops.linear.matmul(x, w.router), m.experts, m.top_k)
+    experts, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, w.router),
+        m.experts,
+        m.top_k,
+        routing.softmax(),
+    )
 
     def select(act, bank):
         if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
             return ops.linear.moe_matmul_select(act, bank, experts, m.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, experts, m.top_k)
 
-    hidden = ops.linear.mlp_swiglu(select(x, w.gate_up), m.inter)
+    hidden = ops.linear.glu(select(x, w.gate_up), gating.swiglu(), m.inter)
     return ops.linear.moe_weighted_sum(select(hidden, w.down), weights)
 
-def attention(x, inputs, m, plans, mask, positions, w):
+def attention(x, inputs, m, positions, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.layout.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
     seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
     k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
-    q, k = ops.elemwise.rope_full(q, k, positions, d, m.theta, False)
+    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
     seam.at(seam.ATTN_Q, [q])
 
-    def scored(q):
-        o, lse = ops.attn.prefill_lse(q, plans.s, pages, None, d, m.kv_heads, m.sm_scale)
-        seam.at(seam.SCORES, [lse])
-        return o
-
-    o = switch(q, [
-        (fact.has(fact.Mask), lambda q: ops.attn.masked(q, plans.m, mask, pages, None, d, m.kv_heads, True, m.sm_scale)),
-        (fact.scores(), scored),
-        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
-    ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, w.o)

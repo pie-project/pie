@@ -9,7 +9,7 @@ use poem_compiler::{
 use poem_exec::fire::{
     At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
 };
-use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
+use poem_ir::{Dtype, Gather, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
 use crate::device::ctx::Frame;
@@ -103,7 +103,7 @@ fn patch_fold(trace: &Trace) -> u32 {
         .nodes
         .iter()
         .filter_map(|node| match node.op {
-            Operation::Layout(Layout::PoolRows { side, .. } | Layout::MergeRows { side, .. }) => {
+            Operation::Gather(Gather::PoolRows { side, .. } | Gather::MergeRows { side, .. }) => {
                 Some(side.saturating_mul(side))
             }
             _ => None,
@@ -286,7 +286,7 @@ struct LandedSeat {
 }
 
 pub struct Shell {
-    tuning: kernels_vulkan::Tuning,
+    tuning: crate::tuning::Tuning,
     device: Context,
 
     pipelines: Pipelines,
@@ -390,12 +390,12 @@ impl Shell {
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
-        let tuning = kernels_vulkan::Tuning::new(chip, device.limits());
+        let tuning = crate::tuning::Tuning::new(chip, device.limits());
         let chip = tuning.profile();
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                &poem_compiler::fuse::flags::kernels(chip),
+                poem_compiler::fuse::flags::on(chip, &crate::FUSIONS),
             ),
             ..boot
         };
@@ -426,8 +426,20 @@ impl Shell {
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attention(
-                        poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
+                    Some(poem_ir::Operation::Attn(
+                        poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: None,
+                            ..
+                        } | poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: Some(_),
+                            ..
+                        }
                     ))
                 )
             });
@@ -567,7 +579,7 @@ impl Shell {
             .trace
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Layout(Layout::ScatterLiveRows { .. })));
+            .any(|node| matches!(node.op, Operation::Gather(Gather::ScatterLiveRows { .. })));
         let feeds = crate::feeds::Feeds::of(&boot.trace, &compiled);
         if let Some(value) = feeds.unlanded.first() {
             return Err(Fault::Program {
@@ -1257,7 +1269,7 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn tuning(&self) -> &kernels_vulkan::Tuning {
+    pub fn tuning(&self) -> &crate::tuning::Tuning {
         &self.tuning
     }
 
@@ -1619,15 +1631,26 @@ impl Shell {
         }
         let casts: Vec<&PortCopy<'_>> = p.port_copies.iter().filter(|copy| copy.cast).collect();
         if !casts.is_empty() {
+            // A seat may sit at any bf16 element of the store, past what a
+            // descriptor's offset may name: the store binds whole and the
+            // kernel takes the seat's element.
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            let elements = u32::try_from(store.bytes() / 2).map_err(|_| Fault::Ceiling {
+                what: "bf16 elements of an input store",
+                need: store.bytes() / 2,
+                have: u64::from(u32::MAX),
+            })?;
+            let whole = self.handles.bind(store, 0, store.bytes())?;
+            let into = kernels_slang::Tensor::new(whole, 1, elements, Dtype::Bf16);
             for copy in casts {
                 let values = u32::try_from(copy.bytes / 2).unwrap_or(u32::MAX);
                 let source = self.handles.bind(copy.cell, 0, u64::from(values) * 4)?;
-                let into = self.handles.bind(store, copy.at, copy.bytes)?;
-                kernels_vulkan::elemwise::pointwise::cast_f32_to_bf16(
+                let at = u32::try_from(copy.at / 2).unwrap_or(u32::MAX);
+                kernels_slang::runtime::port::cast(
                     &sink,
-                    kernels_vulkan::Tensor::new(source, values, 1, Dtype::F32),
-                    kernels_vulkan::Tensor::new(into, values, 1, Dtype::Bf16),
+                    kernels_slang::Tensor::new(source, 1, values, Dtype::F32),
+                    into,
+                    at,
                 )
                 .map_err(crate::error::kernel)?;
             }
@@ -3394,21 +3417,25 @@ enum Encoded<'a> {
     Live(Sink<'a>),
 }
 
-impl kernels_vulkan::Encode for Encoded<'_> {
+impl kernels_slang::Encode for Encoded<'_> {
     fn fire(
         &self,
-        fire: kernels_vulkan::Fire,
-        args: &[kernels_vulkan::ArgValue],
-    ) -> std::result::Result<(), kernels_vulkan::Error> {
+        fire: kernels_slang::Fire,
+        args: &[kernels_slang::ArgValue],
+    ) -> std::result::Result<(), kernels_slang::Error> {
         match self {
             Encoded::Live(sink) => sink.fire(fire, args),
         }
     }
 
-    fn absent(&self) -> std::result::Result<kernels_vulkan::ArgValue, kernels_vulkan::Error> {
+    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
         match self {
             Encoded::Live(sink) => sink.absent(),
         }
+    }
+
+    fn target(&self) -> kernels_slang::Target {
+        kernels_slang::Target::Spirv
     }
 }
 

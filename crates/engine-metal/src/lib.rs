@@ -82,5 +82,36 @@ pub use store::Pools;
 pub use weights::{AdapterPlane, BankSeat, Weights};
 pub use window::{Copies, Gathered, GatheredSpace, Window, Windows};
 
-/// The fused kernels this backend ships; the compiler forms only these.
-pub const FUSED: [&str; 2] = ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"];
+/// The fusions this backend implements: the compiler runs these rules alone.
+pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
+    std::sync::LazyLock::new(|| {
+        use poem_compiler::fuse::rules;
+        vec![rules::residual_add_rmsnorm(), rules::matmul_swiglu_matmul()]
+    });
+
+#[cfg(test)]
+mod tests {
+    use poem_ir::Operation;
+
+    /// Every fused op this backend's rules form on a catalog deployment is
+    /// one its dispatch fires: a rule it holds and a form its dispatch turns
+    /// away cannot both stand.
+    #[test]
+    fn every_fused_op_its_rules_form_is_one_dispatch_fires() {
+        let mut refused = std::collections::BTreeSet::new();
+        for row in poem_compiler::catalog::deployments() {
+            let Ok(trace) = row.try_trace(poem_ir::Platform::Metal) else {
+                continue;
+            };
+            let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
+            for node in &fused.nodes {
+                if let Operation::Fused(op) = &node.op
+                    && crate::dispatch::refuses(op)
+                {
+                    refused.insert(format!("{}: {}", row.name, poem_ir::Operands::name(op)));
+                }
+            }
+        }
+        assert!(refused.is_empty(), "formed, then refused: {refused:?}");
+    }
+}

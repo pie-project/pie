@@ -8,8 +8,8 @@
 // an e4m3 pool (attn/kv.hip's `Kv`): the host folds its unit into
 // `scale_log2`, the kernels into their output rows.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 #include "attn/kv.hip"
 
 namespace pie::attn {

@@ -79,6 +79,9 @@ class RequestResult:
     # pie only: guest prologue step durations in us, ordered
     # [main_pre, tokenize, setup, reserve, build_submit].
     prologue_us: list[int] | None = None
+    # pie speculative programs only: the rounds, what they drafted and kept,
+    # how many rows each verified, and what each fire shape cost.
+    speculation: dict[str, Any] | None = None
     # SHA-256 over emitted u32 token ids in little-endian order. Pie's
     # multi-process throughput path records this for every measured request.
     output_token_sha256: str | None = None

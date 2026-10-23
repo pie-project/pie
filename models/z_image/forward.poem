@@ -14,7 +14,7 @@ def chunks(x, widths):
     whatever remains."""
     out = []
     for width in widths[:-1]:
-        head, x = ops.layout.split_rows(x, width)
+        head, x = ops.gather.split_rows(x, width)
         out.append(head)
     out.append(x)
     return out
@@ -23,16 +23,16 @@ def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
     """`q`'s rows attending `k` and `v`'s, each side grouped by its own
     `perm` and `csr`."""
     o = ops.attn.ragged(
-        ops.layout.pack_rows(q, rows.perm),
-        ops.layout.pack_rows(k, over.perm),
-        ops.layout.pack_rows(v, over.perm),
+        ops.gather.pack_rows(q, rows.perm),
+        ops.gather.pack_rows(k, over.perm),
+        ops.gather.pack_rows(v, over.perm),
         rows.csr,
         over.csr,
         head_dim,
         sm_scale,
         mask,
     )
-    return ops.layout.unpack_rows(o, rows.perm)
+    return ops.gather.unpack_rows(o, rows.perm)
 
 GN_GROUPS = 32
 
@@ -42,10 +42,10 @@ RGB = 3
 
 def convolve(x, grid, c):
     shape = conv([1, 1], [1, 1], [0, 0]) if c.taps == 1 else conv([3, 3], [1, 1], [1, 1])
-    return ops.spatial.conv3d(x, grid, c.w, c.bias, shape, None)[0]
+    return ops.conv.conv3d(x, grid, c.w, c.bias, shape, None)[0]
 
 def group_norm(x, grid, n, silu):
-    return ops.spatial.group_norm(x, grid, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+    return ops.conv.group_norm(x, grid, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
 
 def resnet(x, grid, r):
     h = group_norm(x, grid, r.norm1, True)
@@ -60,7 +60,7 @@ def attention(x, grid, a):
     q = linear(a.q, h)
     k = linear(a.k, h)
     v = linear(a.v, h)
-    o = ops.spatial.attention(q, k, v, grid, f32(1.0 / f32(sqrt(a.width))))
+    o = ops.attn.voxel(q, k, v, grid, f32(1.0 / f32(sqrt(a.width))))
     return ops.elemwise.add(x, linear(a.out, o))
 
 def mid(x, grid, m):
@@ -77,7 +77,7 @@ def vae_decode(vae, z, grid):
         for res in block.resnets:
             h = resnet(h, grid, res)
         if block.upsample != None:
-            up, grid = ops.spatial.upsample_nearest(h, grid, [1, 2, 2], False)
+            up, grid = ops.conv.upsample_nearest(h, grid, [1, 2, 2], False)
             h = convolve(up, grid, block.upsample)
     h = group_norm(h, grid, d.norm_out, True)
     y = convolve(h, grid, d.conv_out)
@@ -95,7 +95,7 @@ def vae_encode(vae, arm):
             h = resnet(h, grid, res)
         if block.downsample != None:
             c = block.downsample
-            h, grid = ops.spatial.conv3d(h, grid, c.w, c.bias, conv([3, 3], [2, 2], [0, 0], pad_back = [0, 1, 1]), None)
+            h, grid = ops.conv.conv3d(h, grid, c.w, c.bias, conv([3, 3], [2, 2], [0, 0], pad_back = [0, 1, 1]), None)
     h = mid(h, grid, e.mid)
     h = group_norm(h, grid, e.norm_out, True)
     return convolve(h, grid, e.conv_out), grid
@@ -113,7 +113,7 @@ def qwen3_encode(arm, te, tap = None):
     plan = ops.attn.plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None)
     ids = arm.tokens()
     positions = arm.positions()
-    y = ops.layout.embed(ids, te.embed, te.vocab)
+    y = ops.gather.embed(ids, te.embed, te.vocab)
     last = len(te.layers) - 1
 
     def layer(l, w, y):
@@ -124,13 +124,16 @@ def qwen3_encode(arm, te, tap = None):
         v = ops.linear.matmul(x, w.v)
         q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, te.head_dim, te.eps)
         k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, te.head_dim, te.eps)
-        q, k = ops.elemwise.rope_full(q, k, positions, te.head_dim, te.theta, False)
+        q, k = ops.elemwise.rope(q, positions, te.head_dim, te.theta, rotary.full(), k = k)
         ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
         o = ops.attn.prefill(q, plan, pages, None, te.head_dim, te.kv_heads, te.sm_scale)
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, w.gate_up), te.inter), w.down)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), te.inter),
+            w.down,
+        )
         y = ops.elemwise.residual_add(f, y)
         if tap != None:
             tap(l, y)
@@ -199,7 +202,7 @@ def seam_tapped(image, context):
     velocity at a tap."""
     width = image.width()
     if width < context.width():
-        context = ops.layout.split_rows(context, width)[0]
+        context = ops.gather.split_rows(context, width)[0]
     both = merge([image, context])
     seam.at(seam.VELOCITY, [both])
     return both
@@ -294,6 +297,8 @@ def denoise(arm, m):
     v = linear(dit.final_linear, h)
     if tap == "final_linear":
         return seam_tapped(v, context)
+    if tap:
+        fail("the tap {} names no intermediate of z-image".format(tap))
     velocity = ops.elemwise.mul_scalar(-1.0, v)
     seam.at(seam.VELOCITY, [velocity])
     return velocity
@@ -312,7 +317,7 @@ def run_block(x, b, mods, m, g, tap):
     h = ops.elemwise.rmsnorm(x, b.attn_norm1, NORM_EPS)
     if mods != None:
         h = ops.elemwise.modulate(h, mods[0].scale_msa, mods[1], "scale")
-    q, k, v = ops.layout.split_qkv(ops.linear.matmul(h, b.attn.qkv), dim, dim)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(h, b.attn.qkv), dim, dim)
 
     def turn(x, gain):
         return ops.elemwise.rope_axes(
@@ -345,7 +350,10 @@ def run_block(x, b, mods, m, g, tap):
     h = ops.elemwise.rmsnorm(x, b.ffn_norm1, NORM_EPS)
     if mods != None:
         h = ops.elemwise.modulate(h, mods[0].scale_mlp, mods[1], "scale")
-    f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(h, b.mlp.gate_up), d.inter), b.mlp.down)
+    f = ops.linear.matmul(
+        ops.linear.glu(ops.linear.matmul(h, b.mlp.gate_up), gating.swiglu(), d.inter),
+        b.mlp.down,
+    )
     at("b0.ffn", f)
     f = ops.elemwise.rmsnorm(f, b.ffn_norm2, NORM_EPS)
     at("b0.ffn_norm2", f)

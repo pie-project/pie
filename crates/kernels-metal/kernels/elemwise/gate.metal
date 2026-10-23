@@ -1,5 +1,5 @@
 #include <metal_stdlib>
-#include "../common/register_table.metal"
+#include "../prim/register_table.h"
 using namespace metal;
 
 template <typename T>
@@ -25,7 +25,7 @@ template <typename T>
 }
 
 template <typename T>
-inline T sigmoid_mlx(T x) {
+inline T sigmoid_stable(T x) {
   float xf = float(x);
   float y = 1.0f / (1.0f + metal::exp(-metal::fabs(xf)));
   float s = (xf < 0.0f) ? (1.0f - y) : y;
@@ -42,7 +42,7 @@ template <typename T>
   const size_t row = row_stride > 0 ? size_t(tid.y) * size_t(row_stride)
                                     : size_t(tid.y) * size_t(grid.x);
   const size_t i = row + size_t(tid.x);
-  attn[i] = attn[i] * sigmoid_mlx(gate[i]);
+  attn[i] = attn[i] * sigmoid_stable(gate[i]);
 }
 
 #define instantiate_q_gate_split(name, itype)                     \
@@ -111,7 +111,7 @@ instantiate_gate_sigmoid_mul_heads(bfloat16, bfloat)
   for (uint k = lid; k < n; k += threads) {
     bfloat v = bfloat(0.0f);
     if (live) {
-      v = x[k] * sigmoid_mlx(g[k]);
+      v = x[k] * sigmoid_stable(g[k]);
       x[k] = v;
     }
     table[register_table::slot(k, row)] = v;

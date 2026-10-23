@@ -3,7 +3,7 @@ pub mod kv;
 
 use engine::transfer::KvRun;
 use kernels_metal::{KvPool, RecurrentPool, Tensor};
-use poem_ir::{Attention, CacheRow, Def, Dtype, Operation, Trace};
+use poem_ir::{Attn, CacheRow, Def, Dtype, Operation, Trace};
 
 use crate::device::ctx::Frame;
 use crate::device::elastic;
@@ -1179,7 +1179,7 @@ impl PoolDemand {
 fn compressed_spaces(trace: &Trace) -> Vec<(u32, u64)> {
     let mut spaces: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
-        let Operation::Attention(Attention::PoolGather {
+        let Operation::Attn(Attn::PoolGather {
             pages,
             head_dim,
             ratio,

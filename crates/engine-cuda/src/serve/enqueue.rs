@@ -353,7 +353,7 @@ impl FireCtx<'_> {
             self.predicate
                 .write(self.device.stream(), &commits, &p.rs.lens)?;
             if p.rs.predicated {
-                kernels_cuda::channel::mask_from_commit(
+                kernels_cuda::runtime::channel::mask_from_commit(
                     self.device.ctx(),
                     self.predicate.commits(),
                     self.predicate.indptr(),
@@ -440,7 +440,7 @@ impl FireCtx<'_> {
                 let at = dest.ptr + u64::from(feed.first) * row_bytes;
                 let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
                 if feed.cast {
-                    kernels_cuda::linear::quant::cast_fp32_to(
+                    kernels_cuda::linear::cast::cast_fp32_to(
                         self.device.ctx(),
                         kernels_cuda::Tensor::new(source, feed.rows, feed.width, Dtype::F32),
                         &mut kernels_cuda::Tensor::new(at, feed.rows, feed.width, Dtype::Bf16),
@@ -508,7 +508,7 @@ impl FireCtx<'_> {
                 })?;
             let at = rectangle.ptr + u64::from(feed.first) * feed.seat.row_bytes();
             if feed.cast {
-                kernels_cuda::linear::quant::cast_fp32_to(
+                kernels_cuda::linear::cast::cast_fp32_to(
                     self.device.ctx(),
                     kernels_cuda::Tensor::new(source, feed.rows, feed.seat.width, Dtype::F32),
                     &mut kernels_cuda::Tensor::new(at, feed.rows, feed.seat.width, Dtype::Bf16),

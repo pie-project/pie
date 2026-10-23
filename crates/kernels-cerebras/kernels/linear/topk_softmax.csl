@@ -1,0 +1,40 @@
+// routes[t][s], weights[t][s] for s < top_k: the top_k largest of the first
+// `experts` lanes of row t (ties to the lowest index, NaN never picked) and
+// the softmax over them; picks past the row's lanes hold -1 and 0.
+fn k_topk_softmax(logits: [*]f32, routes: [*]i32, weights: [*]f32, rows: i32, width: i32, experts: i32, top_k: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var n: i32 = experts;
+    if (n > width) { n = width; }
+    var picked: i32 = 0;
+    var s: i32 = 0;
+    while (s < top_k) : (s += 1) {
+      var bi: i32 = -1; var bv: f32 = 0.0;
+      var i: i32 = 0;
+      while (i < n) : (i += 1) {
+        var v: f32 = logits[t * width + i];
+        if (math.isNaN_f32(v)) { continue; }
+        var taken: bool = false;
+        var q: i32 = 0;
+        while (q < picked) : (q += 1) { if (routes[t * top_k + q] == i) { taken = true; } }
+        if (taken) { continue; }
+        if (bi < 0 or v > bv) { bi = i; bv = v; }
+      }
+      if (bi < 0) { break; }
+      routes[t * top_k + s] = bi;
+      weights[t * top_k + s] = bv;
+      picked += 1;
+    }
+    var m: f32 = 0.0;
+    var q: i32 = 0;
+    while (q < picked) : (q += 1) { if (q == 0 or weights[t * top_k + q] > m) { m = weights[t * top_k + q]; } }
+    var z: f32 = 0.0;
+    q = 0;
+    while (q < picked) : (q += 1) { var e: f32 = math.exp_f32(weights[t * top_k + q] - m); weights[t * top_k + q] = e; z = z + e; }
+    q = 0;
+    while (q < picked) : (q += 1) { weights[t * top_k + q] = weights[t * top_k + q] / z; }
+    q = picked;
+    while (q < top_k) : (q += 1) { routes[t * top_k + q] = -1; weights[t * top_k + q] = 0.0; }
+  }
+}
+

@@ -25,11 +25,29 @@ fn one_replica_reduces_to_itself_and_copies_its_band() {
     let two = b.zeros(Dtype::Bf16, 3, 20);
     if !b
         .run(|ctx| {
-            collective::all_reduce(ctx, buf)?;
-            collective::all_gather(ctx, buf, y)?;
-            collective::reduce_scatter(ctx, buf, z)?;
+            collective::all_reduce(buf)?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(buf)?;
+                let o_y = y;
+                let v = collective::all_gather(l.f(), x_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(buf)?;
+                let o_y = z;
+                let v = collective::reduce_scatter(l.f(), x_v, o_y.landing())?;
+                l.land(o_y, v)
+            })?;
             // A two-rank gather is refused, not approximated.
-            assert!(collective::all_gather(ctx, buf, two).is_err());
+            assert!(
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = l.read(buf)?;
+                    let o_y = two;
+                    let v = collective::all_gather(l.f(), x_v, o_y.landing())?;
+                    l.land(o_y, v)
+                })
+                .is_err()
+            );
             Ok(())
         })
         .unwrap()

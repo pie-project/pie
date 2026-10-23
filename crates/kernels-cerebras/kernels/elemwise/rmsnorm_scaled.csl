@@ -1,0 +1,19 @@
+// y = x * rsqrt(mean of squares + eps) * w over rows of a column block:
+// the sums of squares of each row's `parts` blocks sit in ss[r * parts ..].
+fn k_rmsnorm_scaled(x: [*]f32, w: [*]f32, ss: [*]f32, y: [*]f32, rows: i32, width: i32, parts: i32, full: i32, eps: f32, plus_one: bool) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var total: f32 = 0.0;
+    var c: i32 = 0;
+    while (c < parts) : (c += 1) { total = total + ss[r * parts + c]; }
+    var inv: f32 = 1.0 / math.sqrt_f32(total / @as(f32, full) + eps);
+    var base: i32 = r * width;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) {
+      var g: f32 = w[i];
+      if (plus_one) { g = g + 1.0; }
+      y[base + i] = x[base + i] * inv * g;
+    }
+  }
+}
+

@@ -1,0 +1,61 @@
+fn k_silu(z: f32) f32 {
+  return z / (1.0 + math.exp_f32(-z));
+}
+// The causal conv over lanes [l0, l1) and channels [ch0, ch1): per lane,
+// y = silu(conv(win ++ x rows)), then the window rolls to the last hist
+// rows. per_row: one row per lane, slot slots[l]; else lanes from indptr
+// with slot slots[indptr[l]]. The bank holds, per local slot, hist rows of
+// the block's channels (stride = hist * (ch1 - ch0)); x, y, w are global.
+fn k_conv1d(x: [*]f32, w: [*]f32, bank: [*]f32, slots: [*]i32, indptr: [*]i32, y: [*]f32, win: [*]f32,
+            l0: i32, l1: i32, ch0: i32, ch1: i32, per_row: bool, c: i32, hist: i32, width: i32, dil: i32, slots_rows: i32, sharded: bool) void {
+  var cb: i32 = ch1 - ch0;
+  var stride: i32 = hist * cb;
+  // x and y rows are `c` wide and w has `c` rows, or just this PE's `cb`
+  // channels when sharded.
+  var xw: i32 = c;
+  var xoff: i32 = 0;
+  if (sharded) { xw = cb; xoff = ch0; }
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var start: i32 = l;
+    var n: i32 = 1;
+    var slot: i32 = 0;
+    if (per_row) {
+      slot = slots[l];
+    } else {
+      start = indptr[l];
+      n = indptr[l + 1] - start;
+      if (n > 0) { slot = slots[start]; }
+    }
+    if (n > 0 and slot >= 0 and slot < slots_rows) {
+      k_copy(win, 0, bank, slot * stride, stride);
+      var t: i32 = 0;
+      while (t < n) : (t += 1) {
+        var ch: i32 = ch0;
+        while (ch < ch1) : (ch += 1) {
+          var acc: f32 = 0.0;
+          var tap: i32 = 0;
+          while (tap < width) : (tap += 1) {
+            var src: i32 = t - (width - 1 - tap) * dil;
+            var val: f32 = 0.0;
+            if (src < 0) { val = win[(hist + src) * cb + (ch - ch0)]; } else { val = x[(start + src) * xw + (ch - xoff)]; }
+            acc = acc + val * w[(ch - xoff) * width + tap];
+          }
+          y[(start + t) * xw + (ch - xoff)] = k_silu(acc);
+        }
+      }
+      var s: i32 = 0;
+      while (s < hist) : (s += 1) {
+        var src: i32 = n - hist + s;
+        var ch: i32 = ch0;
+        while (ch < ch1) : (ch += 1) {
+          var val: f32 = 0.0;
+          if (src < 0) { val = win[(hist + src) * cb + (ch - ch0)]; } else { val = x[(start + src) * xw + (ch - xoff)]; }
+          win[s * cb + (ch - ch0)] = val;
+        }
+      }
+      k_copy(bank, slot * stride, win, 0, stride);
+    }
+  }
+}
+

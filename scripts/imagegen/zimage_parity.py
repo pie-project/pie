@@ -58,14 +58,15 @@ which runs `text`, `turbo`, `chain` and the eight-step `steps` trajectory in
 that order and then decodes both final latents.
 
 BISECTING A FAILURE. `zimage_golden.py --taps` records every stage of the
-Turbo transformer over the step-0 inputs, and the family's own
-`PIE_Z_IMAGE_TAP=<key>` knob (`crates/models/src/z_image/forward.rs`,
-`Tap`) makes the `denoise` reading read one of them back instead of the
-velocity. `--mode tiny` is the 32-row case those taps were cut for, and
+Turbo transformer over the step-0 inputs, and a tapped deployment
+(`z-image-mini-bf16-kv-bf16-tap.<key>`, read as `deploy.tap` in
+`models/z_image/model.poem`) makes the `denoise` reading read one of them
+back instead of the velocity; import the artifact under it first. `--mode tiny` is the 32-row case those taps were cut for, and
 `--ctx_tap` reads the caption half of a `layer{l}` tap off the context
 lane:
 
-    PIE_Z_IMAGE_TAP=layer0 python zimage_parity.py run --mode tiny --ctx_tap ...
+    pie model import <golden dir> --deployment z-image-mini-bf16-kv-bf16-tap.layer0 ...
+    python zimage_parity.py run --mode tiny --ctx_tap ...
 
 WHAT THE HARNESS CONVERTS
 -------------------------

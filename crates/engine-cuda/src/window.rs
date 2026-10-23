@@ -6,7 +6,7 @@ use kernels_cuda::Tensor;
 use poem_compiler::{CompiledModel, Lowering, Phase, Region};
 use poem_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use poem_exec::store::check::{self, rebase};
-use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
+use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, RuntimeInput, Trace, Ty};
 
 use crate::error::{Fault, Result};
 use crate::store::kv::Geometry;
@@ -238,21 +238,8 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
         let Some(node) = trace.nodes.get(node as usize) else {
             return false;
         };
-        macro_rules! collect {
-            ($op:expr) => {{
-                $op.inputs(&mut operands);
-                $op.outputs(&mut operands);
-            }};
-        }
-        match &node.op {
-            Operation::Attention(op) => collect!(op),
-            Operation::Linear(op) => collect!(op),
-            Operation::Elementwise(op) => collect!(op),
-            Operation::Layout(op) => collect!(op),
-            Operation::Collective(op) => collect!(op),
-            Operation::Fused(op) => collect!(op),
-            Operation::Spatial(op) => collect!(op),
-        }
+        node.op.inputs(&mut operands);
+        node.op.outputs(&mut operands);
     }
     operands.iter().all(|id| {
         let Some(decl) = trace.values.get(id.0 as usize) else {
@@ -717,7 +704,7 @@ impl Windows {
 
 /// The regions whose DeepSeek attention stages its quantized rows
 /// (`exports::regions_staging`), and the rows from which it does
-/// (`kernel.sdpa.dsv4_prefill_from`; 0: none does).
+/// (`kernel.sdpa.compressed_prefill_from`; 0: none does).
 #[derive(Debug, Clone, Copy)]
 pub struct Staging<'a> {
     pub regions: &'a [bool],
@@ -1174,13 +1161,13 @@ impl Sink for Cursor<'_> {
             match kind {
                 Kind::If => {
                     let (indptr, lanes, absent, win) = self.count_of(cond, region);
-                    kernels_cuda::graph::set_conditional(
+                    kernels_cuda::runtime::graph::set_conditional(
                         cond.setter,
                         handle,
                         indptr,
                         lanes,
                         absent,
-                        kernels_cuda::graph::Arm::Set,
+                        kernels_cuda::runtime::graph::Arm::Set,
                         win,
                     )
                     .map_err(|why| Fault::Unbound {
@@ -1195,13 +1182,13 @@ impl Sink for Cursor<'_> {
                         if absent {
                             return Err(unlowered(lowering));
                         }
-                        kernels_cuda::graph::set_switch(
+                        kernels_cuda::runtime::graph::set_switch(
                             cond.setter,
                             handle,
                             arm,
                             indptr,
                             lanes,
-                            kernels_cuda::graph::Arm::Set,
+                            kernels_cuda::runtime::graph::Arm::Set,
                             win,
                         )
                         .map_err(|why| Fault::Unbound {
