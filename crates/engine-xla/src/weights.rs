@@ -803,7 +803,7 @@ impl Landing<'_> {
         let dtype = self.trace.params[at].dtype;
         let (rows, width) = (self.shape_of)(at);
         if self.transposed.contains(&at)
-            && let Some(codes) = kernels_xla::pack::land(dtype, bytes)
+            && let Some(codes) = crate::pack::land(dtype, bytes)
         {
             // `[N, K]` codes, one per byte, as `[K, N']`, N padded to whole
             // tiles with zero codes.
@@ -854,7 +854,7 @@ impl Landing<'_> {
             self.stored[at] = dtype;
             return Ok(());
         }
-        match kernels_xla::pack::land(dtype, bytes) {
+        match crate::pack::land(dtype, bytes) {
             Some(codes) => self.upload(at, dtype, width, &codes),
             None => self.upload(at, dtype, width, bytes),
         }
@@ -865,7 +865,7 @@ impl Landing<'_> {
     fn prescaled(&mut self, codes_at: usize, codes: &[u8], scales: &[u8]) -> Result<()> {
         let dtype = self.trace.params[codes_at].dtype;
         let (_, width) = (self.shape_of)(codes_at);
-        match kernels_xla::pack::mxfp4_e5m2(codes, scales) {
+        match crate::pack::mxfp4_e5m2(codes, scales) {
             Some(w) => {
                 let per_row = kernels_xla::pack::codes_per_row(dtype, width).unwrap_or(width);
                 self.upload(codes_at, Dtype::E5m2, per_row, &w)

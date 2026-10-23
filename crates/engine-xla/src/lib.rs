@@ -15,6 +15,7 @@ pub mod handle;
 pub mod inputs;
 pub mod lower;
 pub mod mask;
+pub mod pack;
 pub mod pjrt;
 pub mod program;
 pub mod readout;

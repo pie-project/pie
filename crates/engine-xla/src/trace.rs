@@ -71,7 +71,7 @@ pub struct Root {
 
 /// The storage type of a root: plain dtypes as themselves; a quantized
 /// bank's codes one per element in their native narrow type
-/// (`kernels_xla::pack::storage`); other packed formats (K-quant blocks) as
+/// (`crate::pack::storage`); other packed formats (K-quant blocks) as
 /// `u8 [rows, bytes per row]`.
 #[must_use]
 pub fn storage(dtype: Dtype, rows: u32, width: u32) -> Option<Ty> {
@@ -93,7 +93,7 @@ pub fn storage(dtype: Dtype, rows: u32, width: u32) -> Option<Ty> {
         Dtype::U16 => plain(Elem::U16),
         Dtype::U8 | Dtype::Bool => plain(Elem::U8),
         packed if kernels_xla::pack::code_elem(packed).is_some() => {
-            kernels_xla::pack::storage(packed, rows, width)
+            crate::pack::storage(packed, rows, width)
         }
         packed => {
             let bytes = packed_row_bytes(packed, u64::from(width))?;
