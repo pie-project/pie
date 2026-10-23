@@ -2,7 +2,7 @@ use crate::handle::Tensor;
 use kernels_xla::elemwise;
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, ModulateForm, MropeForm, RopeForm, ValueId};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use poem_ir::Operands;
 
@@ -196,12 +196,11 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Elemwise::GatedResidualAdd {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
+            Elemwise::ResidualAdd {
+                x: y,
+                gate: Some(ResidualGate { g, lane_of_row }),
+                y: r,
+                y_out: _,
             } => {
                 let r = self.tensor(*r);
                 crate::lower::lower(self.ctx(), |l| {
@@ -220,6 +219,9 @@ impl Run<'_> {
                     )?;
                     l.land(o_r_out, v)
                 })
+            }
+            Elemwise::Softcap { x, cap, x_out: _ } => {
+                crate::lower::attn::logit_softcap(self.ctx(), self.tensor(*x), *cap)
             }
             Elemwise::Sinusoid {
                 t,
@@ -380,11 +382,10 @@ impl Run<'_> {
                     l.land(o_o, v)
                 })
             }
-            Elemwise::GateSigmoidMulHeads {
+            Elemwise::GateSigmoidMul {
                 x,
                 gate,
-                head_dim,
-                scale,
+                heads: Some(GateHeads { head_dim, scale }),
                 x_out: _,
             } => crate::lower::lower(self.ctx(), |l| {
                 let gate_v = l.read(self.tensor(*gate))?;
@@ -521,7 +522,12 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => {
                 // A readout-rowed `x` into a token-rowed `y` (an MTP head
                 // over the trunk's hidden rows): the GPU kernel adds row
                 // for row from the first, and only the readout rows mean
@@ -947,15 +953,18 @@ impl Run<'_> {
 
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                crate::lower::lower(self.ctx(), |l| {
-                    let gate_v = l.read(self.tensor(*gate))?;
-                    let x_v = l.read(self.tensor(*x))?;
-                    let o_x = self.tensor(*x);
-                    let v = elemwise::gate::sigmoid_mul(l.f(), gate_v, x_v)?;
-                    l.land(o_x, v)
-                })
-            }
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gate_v = l.read(self.tensor(*gate))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::gate::sigmoid_mul(l.f(), gate_v, x_v)?;
+                l.land(o_x, v)
+            }),
 
             Elemwise::HcExpand { x, streams, y } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;

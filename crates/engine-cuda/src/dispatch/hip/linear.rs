@@ -74,7 +74,7 @@ impl Run<'_> {
             }
             // A decode's few rows take the projection and the swiglu as one
             // skinny fire; any other shape takes the three primitives.
-            Fused::MlpSwiglu {
+            Fused::MatmulSwigluMatmul {
                 act,
                 gate_up,
                 down,
@@ -171,7 +171,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Fused::LmHeadSoftcap {
+            Fused::MatmulSoftcap {
                 act,
                 w,
                 cap,

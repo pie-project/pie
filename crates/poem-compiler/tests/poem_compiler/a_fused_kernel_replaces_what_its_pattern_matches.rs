@@ -89,10 +89,14 @@ fn dense_mlp(p: &Pattern) -> (poem::Value, poem::Value) {
 
 #[test]
 fn a_dense_mlp_folds_into_one_op() {
-    let fused = fuse(trace(|p| drop(dense_mlp(p))), &["fused.mlp_swiglu"]);
-    assert_eq!(ops(&fused), ["fused.mlp_swiglu"]);
-    let Some(poem_ir::Operation::Fused(poem_ir::Fused::MlpSwiglu { intermediate, .. })) =
-        fused.nodes.first().map(|node| &node.op)
+    let fused = fuse(
+        trace(|p| drop(dense_mlp(p))),
+        &["fused.matmul_swiglu_matmul"],
+    );
+    assert_eq!(ops(&fused), ["fused.matmul_swiglu_matmul"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::MatmulSwigluMatmul {
+        intermediate, ..
+    })) = fused.nodes.first().map(|node| &node.op)
     else {
         panic!("the op is the fused mlp");
     };
@@ -108,7 +112,7 @@ fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
             let (h, _) = dense_mlp(p);
             elemwise::silu(&h);
         }),
-        &["fused.mlp_swiglu"],
+        &["fused.matmul_swiglu_matmul"],
     );
     assert_eq!(
         ops(&fused),
@@ -427,16 +431,47 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
                 "plan",
                 poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
             );
-            let (o, lse) = both(attn::prefill(&q, &plan, cache, Some(128), 512, 1, 0.04, true, None, true, None, None, None, false, None, None, None));
+            let (o, lse) = both(attn::prefill(
+                &q,
+                &plan,
+                cache,
+                Some(128),
+                512,
+                1,
+                0.04,
+                true,
+                None,
+                true,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            ));
             let (o, lse) = if pooled {
                 let positions = p.indices("positions");
                 let requests = p.indices("requests");
                 let entries = p.cache("entries");
                 let (po, plse) = if selected {
                     let selection = p.rows("selection", 512);
-                    attn::pool_lse(&q, &positions, &requests, entries, 4, 64, 512, 0.04, Some(&selection), Some(512))
+                    attn::pool_lse(
+                        &q,
+                        &positions,
+                        &requests,
+                        entries,
+                        4,
+                        64,
+                        512,
+                        0.04,
+                        Some(&selection),
+                        Some(512),
+                    )
                 } else {
-                    attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None)
+                    attn::pool_lse(
+                        &q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None,
+                    )
                 };
                 attn::merge_lse(&o, &lse, &po, &plse, 64, 512)
             } else {
@@ -490,13 +525,30 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnDecodePlan),
                 );
-                both(attn::decode(&q, &plan, cache, Some(128), 64, 0.125, true, None, None, false, None, None, None))
+                both(attn::decode(
+                    &q,
+                    &plan,
+                    cache,
+                    Some(128),
+                    64,
+                    0.125,
+                    true,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
             } else {
                 let plan = p.value(
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
                 );
-                both(attn::prefill(&q, &plan, cache, None, 64, 8, 0.125, true, None, true, None, None, None, false, None, None, None))
+                both(attn::prefill(
+                    &q, &plan, cache, None, 64, 8, 0.125, true, None, true, None, None, None,
+                    false, None, None, None,
+                ))
             };
             let out = attn::sink(&o, &lse, &p.weight("sinks", [8]), 64);
             elemwise::silu(&out);
@@ -894,11 +946,31 @@ fn deepseeks_attention_lands_its_output_turned_back() {
             "plan",
             poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
         );
-        let (o, lse) = both(attn::prefill(&q, &plan, cache, Some(128), 512, 1, 0.04, true, None, true, None, None, None, false, None, None, None));
+        let (o, lse) = both(attn::prefill(
+            &q,
+            &plan,
+            cache,
+            Some(128),
+            512,
+            1,
+            0.04,
+            true,
+            None,
+            true,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        ));
         let positions = p.indices("positions");
         let requests = p.indices("requests");
         let entries = p.cache("entries");
-        let (po, plse) = attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None);
+        let (po, plse) = attn::pool_lse(
+            &q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None,
+        );
         let (o, lse) = attn::merge_lse(&o, &lse, &po, &plse, 64, 512);
         let out = attn::sink(&o, &lse, &p.weight("sinks", [64]), 512);
         let turned = elemwise::rope(

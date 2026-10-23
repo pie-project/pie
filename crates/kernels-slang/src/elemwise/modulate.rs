@@ -1,4 +1,4 @@
-//! Per-row modulation (`elemwise.modulate`, `elemwise.gated_residual_add`)
+//! Per-row modulation (`elemwise.modulate`, a gated `elemwise.residual_add`)
 //! from `kernels/elemwise/modulate.slang`, a pair of columns a lane: each row
 //! reads its own modulation row, or the one a lane map names.
 
@@ -143,7 +143,7 @@ pub fn gated_residual_add(
     y: Tensor,
     lane_of_row: Option<Tensor>,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.gated_residual_add";
+    const OP: &str = "elemwise.residual_add";
     let width = nonzero(OP, "the folded width", r.width)?;
     let rows = nonzero(OP, "rows", r.rows)?;
     let entry = [

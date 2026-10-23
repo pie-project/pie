@@ -1,7 +1,7 @@
 use kernels_metal::{Tensor, elemwise};
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, Operands, RopeForm};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
 
@@ -246,12 +246,11 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 self.tensor(*y),
             ),
-            Elemwise::GatedResidualAdd {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
+            Elemwise::ResidualAdd {
+                x: y,
+                gate: Some(ResidualGate { g, lane_of_row }),
+                y: r,
+                y_out: _,
             } => elemwise::modulate::gated_residual_add(
                 self.ctx(),
                 self.tensor(*r),
@@ -263,6 +262,9 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 self.tensor(*r),
             ),
+            Elemwise::Softcap { x, cap, x_out: _ } => {
+                kernels_metal::attn::logit_softcap(self.ctx(), self.tensor(*x), *cap)
+            }
             Elemwise::Sinusoid {
                 t,
                 dim,
@@ -389,11 +391,10 @@ impl Run<'_> {
                 *bidirectional,
                 self.tensor(*y),
             ),
-            Elemwise::GateSigmoidMulHeads {
+            Elemwise::GateSigmoidMul {
                 x,
                 gate,
-                head_dim,
-                scale,
+                heads: Some(GateHeads { head_dim, scale }),
                 x_out: _,
             } => elemwise::gate::sigmoid_mul_heads(
                 self.ctx(),
@@ -540,9 +541,12 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
-                elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y)),
             Elemwise::AddBias {
                 bias,
                 out,
@@ -848,7 +852,12 @@ impl Run<'_> {
 
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out } => {
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out,
+            } => {
                 // The gated rows' projection on the register tile reads its
                 // input table as the gate lays it.
                 match self.producer_table(*x_out) {

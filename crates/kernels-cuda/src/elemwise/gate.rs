@@ -61,7 +61,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(gate.dtype, x.dtype, "the gate rides the rectangle's dtype");
     let rows = nonzero(OP, "rows", x.rows)?;

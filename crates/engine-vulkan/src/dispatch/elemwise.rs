@@ -1,7 +1,7 @@
 use kernels_slang::{Error, Tensor};
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, MropeForm, Operands};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
 
@@ -168,12 +168,11 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 self.tensor(*y),
             ),
-            Elemwise::GatedResidualAdd {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
+            Elemwise::ResidualAdd {
+                x: y,
+                gate: Some(ResidualGate { g, lane_of_row }),
+                y: r,
+                y_out: _,
             } => kernels_slang::elemwise::modulate::gated_residual_add(
                 self.ctx,
                 self.tensor(*r),
@@ -184,6 +183,9 @@ impl Run<'_> {
                 self.tensor(*y),
                 lane_of_row.map(|lanes| self.tensor(lanes)),
             ),
+            Elemwise::Softcap { x, cap, x_out: _ } => {
+                kernels_slang::attn::merge::logit_softcap(self.ctx, self.tensor(*x), *cap)
+            }
             Elemwise::Sinusoid {
                 t,
                 dim,
@@ -268,7 +270,7 @@ impl Run<'_> {
                 op: poem_ir::BinaryOp::Mul,
                 ..
             }
-            | Elemwise::GateSigmoidMulHeads { .. } => {
+            | Elemwise::GateSigmoidMul { heads: Some(_), .. } => {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
 
@@ -372,13 +374,16 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
-                kernels_slang::elemwise::pointwise::residual_add(
-                    self.ctx,
-                    self.tensor(*x),
-                    self.tensor(*y),
-                )
-            }
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => kernels_slang::elemwise::pointwise::residual_add(
+                self.ctx,
+                self.tensor(*x),
+                self.tensor(*y),
+            ),
             Elemwise::AddBias {
                 bias,
                 out,
@@ -664,13 +669,16 @@ impl Run<'_> {
 
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                kernels_slang::elemwise::pointwise::sigmoid_mul(
-                    self.ctx,
-                    self.tensor(*gate),
-                    self.tensor(*x),
-                )
-            }
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => kernels_slang::elemwise::pointwise::sigmoid_mul(
+                self.ctx,
+                self.tensor(*gate),
+                self.tensor(*x),
+            ),
 
             Elemwise::HcExpand { x, streams, y } => kernels_slang::elemwise::hc::expand(
                 self.ctx,

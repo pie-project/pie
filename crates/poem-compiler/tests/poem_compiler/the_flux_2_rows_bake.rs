@@ -464,7 +464,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
     for node in &plan.nodes {
         if !matches!(
             &node.op,
-            Operation::Elemwise(Elemwise::GatedResidualAdd { .. })
+            Operation::Elemwise(Elemwise::ResidualAdd { gate: Some(_), .. })
         ) {
             continue;
         }

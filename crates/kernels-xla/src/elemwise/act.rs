@@ -232,7 +232,7 @@ pub fn gated_residual_add(
     lane_of_row: Option<Operand>,
     r_out: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "elemwise.gated_residual_add";
+    const OP: &str = "elemwise.residual_add";
     expect(OP, r, FLOATS)?;
     same_shape(OP, r, y)?;
     same_shape(OP, r, r_out)?;

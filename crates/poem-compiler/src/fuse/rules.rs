@@ -38,12 +38,12 @@ pub(super) fn all() -> Vec<Rule> {
         embed_scale_add_select(),
         embed_scale_add(),
         residual_add_rmsnorm(),
-        mlp_swiglu(),
+        matmul_swiglu_matmul(),
         matmul_geglu(),
         moe_experts(),
         moe_select_glu(),
         matmul_swiglu(),
-        lm_head_softcap(),
+        matmul_softcap(),
         matmul_bias(),
         matmul_split_rows(),
         gated_residual_norm_modulate(),
@@ -224,7 +224,25 @@ fn pool_attention() -> Rule {
             let sm_scale = p.f32("sm_scale");
             p.free("window");
             let floor = floored.then(|| p.indices("floor"));
-            let (o, lse) = both(attn::prefill(&q, &plan, cache, None, d, p.u32("kv_heads"), sm_scale, true, None, true, floor.as_ref(), None, None, false, None, None, None));
+            let (o, lse) = both(attn::prefill(
+                &q,
+                &plan,
+                cache,
+                None,
+                d,
+                p.u32("kv_heads"),
+                sm_scale,
+                true,
+                None,
+                true,
+                floor.as_ref(),
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            ));
             p.name("o", &o);
             p.name("lse", &lse);
             let positions = p.indices("positions");
@@ -233,9 +251,22 @@ fn pool_attention() -> Rule {
             let (ratio, heads) = (p.u32("ratio"), p.u32("heads"));
             let (po, plse) = if selected {
                 let selection = p.rows("selection", W);
-                attn::pool_lse(&q, &positions, &requests, entries, ratio, heads, d, sm_scale, Some(&selection), Some(p.u32("top_k")))
+                attn::pool_lse(
+                    &q,
+                    &positions,
+                    &requests,
+                    entries,
+                    ratio,
+                    heads,
+                    d,
+                    sm_scale,
+                    Some(&selection),
+                    Some(p.u32("top_k")),
+                )
             } else {
-                attn::pool_lse(&q, &positions, &requests, entries, ratio, heads, d, sm_scale, None, None)
+                attn::pool_lse(
+                    &q, &positions, &requests, entries, ratio, heads, d, sm_scale, None, None,
+                )
             };
             p.name("po", &po);
             p.name("plse", &plse);
@@ -329,7 +360,19 @@ fn mla_prefill_expanded() -> Rule {
             let plan = p.value("plan", Ty::Struct(StructKind::MlaPlan));
             let pages = p.cache("pages");
             p.free("window");
-            let scored = attn::mla_prefill(&q, &plan, &q_pe, pages, heads, rank, p.f32("sm_scale"), None, false, None).0;
+            let scored = attn::mla_prefill(
+                &q,
+                &plan,
+                &q_pe,
+                pages,
+                heads,
+                rank,
+                p.f32("sm_scale"),
+                None,
+                false,
+                None,
+            )
+            .0;
             p.name("scored", &scored);
             let o = attn::mla_absorb_out(&scored, &kv_b, heads, rank, nope, v);
             p.export("o", &o);
@@ -365,10 +408,42 @@ fn lse_sink() -> Rule {
             p.free("window");
             let (o, lse) = if decode {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
-                both(attn::decode(&q, &plan, cache, None, d, p.f32("sm_scale"), true, None, None, false, None, None, None))
+                both(attn::decode(
+                    &q,
+                    &plan,
+                    cache,
+                    None,
+                    d,
+                    p.f32("sm_scale"),
+                    true,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
             } else {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
-                both(attn::prefill(&q, &plan, cache, None, d, p.u32("kv_heads"), p.f32("sm_scale"), true, None, true, None, None, None, false, None, None, None))
+                both(attn::prefill(
+                    &q,
+                    &plan,
+                    cache,
+                    None,
+                    d,
+                    p.u32("kv_heads"),
+                    p.f32("sm_scale"),
+                    true,
+                    None,
+                    true,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
             };
             p.name("o", &o);
             p.name("lse", &lse);
@@ -955,7 +1030,7 @@ fn residual_add_rmsnorm() -> Rule {
 /// projection. Both intermediates stay inside the match, so a chain that
 /// reads one of them elsewhere (Bonsai rotates `h` before `down`) stays as
 /// its three primitives.
-fn mlp_swiglu() -> Rule {
+fn matmul_swiglu_matmul() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("gate_up", [2 * W, W]));
         p.name("packed", &packed);
@@ -971,14 +1046,16 @@ fn mlp_swiglu() -> Rule {
         let y = linear::matmul(&h, &p.weight("down", [W, W]));
         p.export("y", &y);
     });
-    Rule::new("fused.mlp_swiglu", [pattern], |m| Fused::MlpSwiglu {
-        act: m.value("act"),
-        gate_up: m.value("gate_up"),
-        down: m.value("down"),
-        intermediate: m.u32("intermediate"),
-        packed: m.value("packed"),
-        h: m.value("h"),
-        y: m.value("y"),
+    Rule::new("fused.matmul_swiglu_matmul", [pattern], |m| {
+        Fused::MatmulSwigluMatmul {
+            act: m.value("act"),
+            gate_up: m.value("gate_up"),
+            down: m.value("down"),
+            intermediate: m.u32("intermediate"),
+            packed: m.value("packed"),
+            h: m.value("h"),
+            y: m.value("y"),
+        }
     })
 }
 
@@ -1307,7 +1384,7 @@ fn matmul_geglu() -> Rule {
 }
 
 /// The packed gate-up projection and its SwiGLU, where the MLP's down
-/// projection stays apart (a backend that ships `fused.mlp_swiglu` forms
+/// projection stays apart (a backend that ships `fused.matmul_swiglu_matmul` forms
 /// that first).
 fn matmul_swiglu() -> Rule {
     let pattern = template(|p| {
@@ -1332,15 +1409,15 @@ fn matmul_swiglu() -> Rule {
     })
 }
 
-fn lm_head_softcap() -> Rule {
+fn matmul_softcap() -> Rule {
     let pattern = template(|p| {
         let y = linear::lm_head(&p.rows("act", W), &p.weight("w", [W, W]));
         p.name("y", &y);
         let y_out = attn::logit_softcap(&y, p.f32("cap"));
         p.export("y_out", &y_out);
     });
-    Rule::new("fused.lm_head_softcap", [pattern], |m| {
-        Fused::LmHeadSoftcap {
+    Rule::new("fused.matmul_softcap", [pattern], |m| {
+        Fused::MatmulSoftcap {
             act: m.value("act"),
             w: m.value("w"),
             cap: m.f32("cap"),
