@@ -15,12 +15,13 @@ set -euo pipefail
 out=$1
 shift
 mkdir -p "$out/bin"
+target=${CARGO_TARGET_DIR:-target}
 cargo build --release -q -p pie-poem-compiler --example shard_dump
-cp target/release/examples/shard_dump "$out/bin/shard_dump"
+cp "$target"/release/examples/shard_dump "$out/bin/shard_dump"
 cargo build --release -q -p engine-xla --example coverage
-cp target/release/examples/coverage "$out/bin/xla"
+cp "$target"/release/examples/coverage "$out/bin/xla"
 cargo build --release -q -p engine-cerebras --example coverage
-cp target/release/examples/coverage "$out/bin/cerebras"
+cp "$target"/release/examples/coverage "$out/bin/cerebras"
 
 run() {
     local name=$1 exe=$2
