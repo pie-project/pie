@@ -243,13 +243,7 @@ pub fn correct(
                     Arg::Int(w_words as i64),
                 ],
             );
-            cx.fabric_sum_with(
-                &partial,
-                &wb,
-                w_words,
-                (group, pes / group),
-                ctx.plan().fabric().resident_pes.is_some(),
-            );
+            cx.fabric_sum(&partial, &wb, w_words, (group, pes / group));
         }
         Ok(())
     })?;
@@ -317,13 +311,7 @@ pub fn correct(
                     Arg::Int(y_words as i64),
                 ],
             );
-            cx.fabric_sum_with(
-                &partial,
-                &yb,
-                y_words,
-                (group, pes / group),
-                ctx.plan().fabric().resident_pes.is_some(),
-            );
+            cx.fabric_sum(&partial, &yb, y_words, (group, pes / group));
         }
         Ok(())
     })

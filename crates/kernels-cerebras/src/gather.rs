@@ -92,10 +92,7 @@ fn embed_over(
         },
     );
     let partial = cx.scratch("partial", y_words);
-    // Under the resident placement every PE reads `y` in place after:
-    // the sum comes back to the row.
-    let resident = cx.plan().fabric().resident_pes.is_some();
-    cx.fabric_sum_with(&partial, y, y_words, (n, 1), resident);
+    cx.fabric_sum(&partial, y, y_words, (n, 1));
     Arg::Scratch(partial, "f32")
 }
 

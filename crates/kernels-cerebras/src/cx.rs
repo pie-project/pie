@@ -172,22 +172,10 @@ impl<'a> Cx<'a> {
 
     /// After the phase's statements, the fabric adds every PE's `partial`
     /// (`count` f32 words) along each row of the `rect` rectangle into the
-    /// row's first PE's share of `into` (sharded [`Shard::Roots`]).
+    /// row's first PE's share of `into` (sharded [`Shard::Roots`]). Under
+    /// the resident placement the sum is broadcast back over the row, so
+    /// every PE holds it: the next phase reads a whole activation in place.
     pub fn fabric_sum(&mut self, partial: &str, into: &Buf, count: u64, rect: (u32, u32)) {
-        self.fabric_sum_with(partial, into, count, rect, false);
-    }
-
-    /// [`Cx::fabric_sum`], then (`everywhere`) the sum broadcast back over
-    /// the row so every PE holds it: what a whole activation needs under
-    /// the resident placement, where the next phase reads it in place.
-    pub fn fabric_sum_with(
-        &mut self,
-        partial: &str,
-        into: &Buf,
-        count: u64,
-        rect: (u32, u32),
-        everywhere: bool,
-    ) {
         let mut steps = vec![FabricStep {
             calls: Vec::new(),
             op: FabricOp::Reduce {
@@ -196,7 +184,7 @@ impl<'a> Cx<'a> {
                 count,
             },
         }];
-        if everywhere {
+        if self.p.plan().fabric().resident_pes.is_some() {
             steps.push(FabricStep {
                 calls: Vec::new(),
                 op: FabricOp::Broadcast {

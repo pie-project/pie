@@ -483,13 +483,7 @@ fn select_impl(
                     Arg::Int(y_words as i64),
                 ],
             );
-            cx.fabric_sum_with(
-                &partial,
-                &yb,
-                y_words,
-                (group, split.pes / group),
-                ctx.plan().fabric().resident_pes.is_some(),
-            );
+            cx.fabric_sum(&partial, &yb, y_words, (group, split.pes / group));
         }
         Ok(())
     })
