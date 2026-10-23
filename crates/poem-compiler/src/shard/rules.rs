@@ -109,7 +109,8 @@ fn heads(name: &str) -> Option<Heads> {
         | "layout.gather_rows"
         | "layout.pack_rows"
         | "layout.unpack_rows"
-        | "linear.mlp_gelu_tanh" => Heads::of(&["x"], &[]),
+        | "linear.mlp_gelu_tanh"
+        | "linear.mlp_relu2" => Heads::of(&["x"], &[]),
         "elementwise.mul" => Heads::of(&["x", "y"], &[]),
         "elementwise.gate_sigmoid_mul"
         | "elementwise.gate_sigmoid_mul_heads"
@@ -165,6 +166,9 @@ fn heads(name: &str) -> Option<Heads> {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
         "attention.ssm_gdn_prep" => Heads::of(&["ba"], &[]),
+        "attention.ssm_mamba2_step" | "attention.ssm_mamba2_chunked" => {
+            Heads::of(&["xbc", "dt", "z"], &["heads", "groups"]).cache(Cache::Split)
+        }
         "attention.ssm_gated_delta" | "attention.ssm_gated_delta_chunked" => {
             Heads::of(&["qkv", "z", "gates"], &["k_heads", "v_heads"]).cache(Cache::Split)
         }
