@@ -444,7 +444,8 @@ fn the_derived_grids_are_the_hosts() {
         causal_t: true,
         time_pad: TimePad::Zero,
     };
-    let cases: [(GridRule, Box<dyn Fn(Box3) -> Box3>); 4] = [
+    let each = |shape: fn(Box3) -> Box3| boxes.map(shape).to_vec();
+    let cases = [
         (
             GridRule::Conv {
                 k: conv.k,
@@ -453,26 +454,25 @@ fn the_derived_grids_are_the_hosts() {
                 pad_back: conv.pad_back,
                 causal_t: conv.causal_t,
             },
-            Box::new(move |b: Box3| out_boxes(&conv, &[b])[0]),
+            out_boxes(&conv, &boxes),
         ),
         (
             GridRule::Upsample {
                 factor: [2, 2, 2],
                 keep_first_frame: true,
             },
-            Box::new(|b: Box3| Box3::new(1 + (b.t - 1) * 2, b.h * 2, b.w * 2)),
+            each(|b| Box3::new(1 + (b.t - 1) * 2, b.h * 2, b.w * 2)),
         ),
         (
             GridRule::Unshuffle { r: [1, 2, 2] },
-            Box::new(|b: Box3| Box3::new(b.t, b.h / 2, b.w / 2)),
+            each(|b| Box3::new(b.t, b.h / 2, b.w / 2)),
         ),
         (
             GridRule::AvgDown { factor: [2, 2, 2] },
-            Box::new(|b: Box3| Box3::new(b.t.div_ceil(2), b.h / 2, b.w / 2)),
+            each(|b| Box3::new(b.t.div_ceil(2), b.h / 2, b.w / 2)),
         ),
     ];
-    for (rule, shape) in cases {
-        let want: Vec<Box3> = boxes.iter().map(|&b| shape(b)).collect();
+    for (rule, want) in cases {
         let mut og = gpu.ints_shaped(&[-1; 12], 3, 4);
         derive_grid(&gpu.ctx(), g, rule, &mut og).expect("the rule fires");
         assert_eq!(
