@@ -12,6 +12,124 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// Prefill attention. A tiled prefill (the arbiter's own choice) fires
+    /// kernels-slang's, 11% faster than engine-vulkan's on an RTX 4090
+    /// (kernels-slang.md, the SDPA benchmark); a few rows a request stay on
+    /// engine-vulkan's per-row arm, whose Slang twin measured slower.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_attention(
+        &self,
+        q: poem_ir::ValueId,
+        plan: poem_ir::ValueId,
+        mask: Option<kernels_vulkan::Tensor>,
+        cache: poem_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        o: kernels_vulkan::Tensor,
+        lse: Option<kernels_vulkan::Tensor>,
+    ) -> Result<(), kernels_vulkan::Error> {
+        let q = self.ragged(q);
+        let plan = self.prefill_plan(plan);
+        let pool = self.pool(cache);
+        let tuning = self.tuning();
+        if !attn::arbiter::should_tile(q.data.rows, self.requests(), tuning) {
+            return match (mask, lse) {
+                (None, None) => attn::arbiter::prefill(
+                    self.ctx(),
+                    q,
+                    plan,
+                    pool,
+                    window,
+                    head_dim,
+                    kv_heads,
+                    sm_scale,
+                    o,
+                    self.requests(),
+                    tuning,
+                ),
+                (None, Some(lse)) => attn::arbiter::prefill_lse(
+                    self.ctx(),
+                    q,
+                    plan,
+                    pool,
+                    window,
+                    head_dim,
+                    kv_heads,
+                    sm_scale,
+                    o,
+                    lse,
+                    self.requests(),
+                    tuning,
+                ),
+                (Some(mask), None) => attn::arbiter::masked(
+                    self.ctx(),
+                    q,
+                    plan,
+                    mask,
+                    pool,
+                    window,
+                    head_dim,
+                    sm_scale,
+                    o,
+                    self.requests(),
+                    tuning,
+                ),
+                (Some(mask), Some(lse)) => attn::arbiter::masked_lse(
+                    self.ctx(),
+                    q,
+                    plan,
+                    mask,
+                    pool,
+                    window,
+                    head_dim,
+                    sm_scale,
+                    o,
+                    lse,
+                    self.requests(),
+                    tuning,
+                ),
+            };
+        }
+        if pool.head_stride == 0 || pool.seq_stride / pool.head_stride != u64::from(kv_heads) {
+            return Err(kernels_vulkan::Error::Backend {
+                op: "attn.prefill",
+                detail: format!(
+                    "the stated kv head count {kv_heads} is not the one the pool row's strides \
+                     spell ({} / {})",
+                    pool.seq_stride, pool.head_stride
+                ),
+            });
+        }
+        let tier = kernels_slang::attn::sdpa::Tier {
+            subgroup: true,
+            narrow: tuning.limits().lanes < 32,
+            decode_threads: tuning.sdpa_decode_threads(head_dim),
+            tile_rows: tuning.sdpa_tile_rows(),
+        };
+        let tables = kernels_slang::attn::sdpa::Tables {
+            positions: crate::encode::slang_tensor(plan.positions),
+            request_of_token: crate::encode::slang_tensor(plan.request_of_token),
+            mask: crate::encode::slang_tensor(mask.unwrap_or(plan.mask)),
+            mask_enabled: crate::encode::slang_tensor(plan.mask_enabled),
+            mask_stride: plan.mask_stride,
+        };
+        kernels_slang::attn::sdpa::prefill(
+            &self.slang(),
+            tier,
+            crate::encode::slang_tensor(q.data),
+            &tables,
+            &crate::encode::slang_pool(pool),
+            window,
+            head_dim,
+            sm_scale,
+            crate::encode::slang_tensor(o),
+            lse.map(crate::encode::slang_tensor),
+        )
+        .map_err(crate::encode::from_slang)
+    }
+
     fn requests(&self) -> u32 {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
@@ -179,18 +297,17 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-            } => attn::arbiter::prefill(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                None,
+                *cache,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.requests(),
-                self.tuning(),
+                None,
             ),
 
             Attn::DecodeSelected { per_head: true, .. }
@@ -322,22 +439,21 @@ impl Run<'_> {
                 cache,
                 window,
                 head_dim,
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 sm_scale,
                 o,
-            } => attn::arbiter::masked(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                Some(self.cut_rows(self.tensor(*mask))),
+                *cache,
                 *window,
                 *head_dim,
+                *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.requests(),
-                self.tuning(),
+                None,
             ),
             Attn::MaskedLse {
                 q,
@@ -346,24 +462,22 @@ impl Run<'_> {
                 cache,
                 window,
                 head_dim,
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 sm_scale,
                 o,
                 lse,
-            } => attn::arbiter::masked_lse(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
-                self.pool(*cache),
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                Some(self.cut_rows(self.tensor(*mask))),
+                *cache,
                 *window,
                 *head_dim,
+                *kv_heads,
                 *sm_scale,
                 self.tensor(*o),
-                self.tensor(*lse),
-                self.requests(),
-                self.tuning(),
+                Some(self.tensor(*lse)),
             ),
             Attn::DecodeLse {
                 q,
@@ -400,19 +514,17 @@ impl Run<'_> {
                 // This backend splits no prompt's rows, so a replay floor stays 0.
                 floor: _,
             } => {
-                attn::arbiter::prefill_lse(
-                    self.ctx(),
-                    self.ragged(*q),
-                    self.prefill_plan(*plan),
-                    self.pool(*cache),
+                self.prefill_attention(
+                    *q,
+                    *plan,
+                    None,
+                    *cache,
                     *window,
                     *head_dim,
                     *kv_heads,
                     *sm_scale,
                     self.tensor(*o),
-                    self.tensor(*lse),
-                    self.requests(),
-                    self.tuning(),
+                    Some(self.tensor(*lse)),
                 )?;
 
                 self.capture_scores(
