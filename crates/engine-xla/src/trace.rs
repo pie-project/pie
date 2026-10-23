@@ -122,8 +122,9 @@ struct Binding {
     row_offset: u32,
 }
 
-/// The root and handle tables. Roots and handles minted before [`seal`]
-/// live for the load; the rest are the fire's and go at [`rewind`].
+/// The root and handle tables. Roots and handles minted before [`seal`](Self::seal)
+/// live for the load; the rest are the fire's and go at
+/// [`rewind`](Self::rewind).
 #[derive(Debug, Default)]
 pub struct Handles {
     roots: RefCell<Vec<Root>>,

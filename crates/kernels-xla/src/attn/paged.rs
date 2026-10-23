@@ -8,9 +8,9 @@
 //! the flat index is the key row. Two drivers walk it with an online softmax
 //! in f32:
 //!
-//! - [`per_row`]: every query row gathers its own lane's keys, chunk by chunk
+//! - `per_row`: every query row gathers its own lane's keys, chunk by chunk
 //!   (the decode shape, and any per-row key list such as a selection);
-//! - [`blocked`]: query rows in blocks, each block walking only the key
+//! - `blocked`: query rows in blocks, each block walking only the key
 //!   chunks its rows' `[lo, hi)` ranges span (a data-dependent trip count), as
 //!   one dense `dot_general` per chunk (the prefill shape).
 //!

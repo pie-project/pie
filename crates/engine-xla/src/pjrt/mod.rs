@@ -2,7 +2,7 @@
 //!
 //! The plugin (`libtpu.so`, or any PJRT plugin) is dlopened at runtime, so the
 //! crate builds and links on a box without one. Every C call goes through
-//! [`Api::call`], which checks the function pointer is inside the plugin's
+//! the `call!` macro, which checks the function pointer is inside the plugin's
 //! `struct_size` before calling it and turns a returned `PJRT_Error` into an
 //! owned [`Error`]. Handles own their C object and destroy it on drop.
 

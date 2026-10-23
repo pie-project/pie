@@ -3,7 +3,7 @@
 //! it lands. `rel_bias` folds its epilogue into the same f32 result before
 //! the one rounding.
 //!
-//! [`project`] is the contraction every linear family here shares: the
+//! `project` is the contraction every linear family here shares: the
 //! quantized families decode their planes to a dense `[n, k]` value and hand
 //! it to the same dot, so XLA can fuse the decode into the matmul.
 
