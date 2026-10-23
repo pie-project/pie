@@ -29,7 +29,7 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
 }
 
 pub struct Gpu {
-    device: Context,
+    pub device: Context,
     handles: Handles,
     pipelines: Pipelines,
     held: Vec<Buffer>,

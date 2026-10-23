@@ -10,6 +10,7 @@ pub mod merge;
 pub mod mla;
 pub mod pool;
 pub mod score;
+pub mod sdpa;
 
 /// The heads a `width`-wide row of `head_dim`-wide heads holds.
 pub(crate) fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {

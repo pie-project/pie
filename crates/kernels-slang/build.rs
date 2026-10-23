@@ -1,8 +1,10 @@
 //! Compile every `// pie:instantiate NAME KEY=VALUE...` line under
 //! `kernels/` with slangc, once a target the features ask for: SPIR-V
 //! (`spirv`, engine-vulkan's) and WGSL (`wgsl`, engine-wgpu's, with
-//! `PIE_WGSL` defined). The tables land in OUT_DIR as `census.rs`,
-//! `spirv.rs` and `wgsl.rs`; a target not asked for is an empty table.
+//! `PIE_WGSL` defined). An instantiation naming `PIE_TARGET=spirv` (or
+//! `wgsl`) is built for that target alone: a subgroup tier the other target
+//! cannot express. The tables land in OUT_DIR as `census.rs`, `spirv.rs` and
+//! `wgsl.rs`; a target not asked for is an empty table.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +13,14 @@ use std::process::Command;
 struct Variant {
     file: PathBuf,
     defines: Vec<(String, String)>,
+    /// The one target this instantiation is built for, when it names one.
+    only: Option<String>,
+}
+
+impl Variant {
+    fn builds_for(&self, target: Target) -> bool {
+        self.only.as_deref().is_none_or(|t| t == target.slang())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +73,7 @@ fn main() {
             compile_all(&slangc, &kernels, &dir, &variants, target);
             variants
                 .iter()
+                .filter(|(_, v)| v.builds_for(target))
                 .map(|(name, v)| {
                     (
                         name.clone(),
@@ -85,7 +96,10 @@ fn compile_all(
     variants: &BTreeMap<String, Variant>,
     target: Target,
 ) {
-    let jobs: Vec<(&String, &Variant)> = variants.iter().collect();
+    let jobs: Vec<(&String, &Variant)> = variants
+        .iter()
+        .filter(|(_, v)| v.builds_for(target))
+        .collect();
     let width = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failures = std::sync::Mutex::new(Vec::<String>::new());
@@ -215,7 +229,7 @@ fn collect(kernels: &Path) -> BTreeMap<String, Variant> {
                 .next()
                 .unwrap_or_else(|| panic!("{at}: a `pie:instantiate` names its entrypoint first"))
                 .to_string();
-            let defines = words
+            let mut defines: Vec<(String, String)> = words
                 .map(|w| {
                     let (k, v) = w
                         .split_once('=')
@@ -223,8 +237,25 @@ fn collect(kernels: &Path) -> BTreeMap<String, Variant> {
                     (k.to_string(), v.to_string())
                 })
                 .collect();
+            let only = defines
+                .iter()
+                .position(|(k, _)| k == "PIE_TARGET")
+                .map(|i| defines.remove(i).1);
+            if let Some(t) = &only {
+                assert!(
+                    t == "spirv" || t == "wgsl",
+                    "{at}: `PIE_TARGET={t}` names no target (spirv, wgsl)"
+                );
+            }
             let file = rel.clone();
-            if let Some(prior) = out.insert(name.clone(), Variant { file, defines }) {
+            if let Some(prior) = out.insert(
+                name.clone(),
+                Variant {
+                    file,
+                    defines,
+                    only,
+                },
+            ) {
                 panic!(
                     "`{name}` is instantiated twice: {} and {}",
                     prior.file.display(),
