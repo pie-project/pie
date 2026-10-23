@@ -25,6 +25,10 @@ wgsl = []
 # `cores`: the device's core count, read through Vulkan (ash).
 probe = ["dep:ash"]
 
+[[example]]
+name = "dump_wgsl"
+required-features = ["wgsl"]
+
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
 ash = { version = "0.38", default-features = false, optional = true }

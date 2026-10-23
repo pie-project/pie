@@ -1,4 +1,4 @@
-use kernels_slang::{ArgValue, Comm, Encode, Error, Fire, Target};
+use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
 use crate::device::handles::NIL;
@@ -249,7 +249,7 @@ impl Encode for Sink<'_> {
         Target::Spirv
     }
 
-    fn comm(&self, op: &'static str) -> Result<Comm, Error> {
+    fn comm(&self, op: &'static str) -> Result<kernels_slang::Comm, Error> {
         let comm = self.comm.ok_or(Error::Unsupported { op })?;
 
         let band = self
@@ -263,7 +263,7 @@ impl Encode for Sink<'_> {
             op,
             detail: fault.to_string(),
         })?;
-        Ok(Comm {
+        Ok(kernels_slang::Comm {
             rank: comm.rank(),
             world: comm.world(),
             band,
@@ -283,6 +283,7 @@ impl Encode for Sink<'_> {
     }
 }
 
+#[cfg(feature = "vulkan")]
 impl Sink<'_> {
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         use ash::vk;

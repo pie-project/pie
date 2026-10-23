@@ -3166,24 +3166,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernels-vulkan"
-version = "0.5.4"
-dependencies = [
- "ash",
- "pie-dtype",
- "pie-profile",
-]
-
-[[package]]
-name = "kernels-wgpu"
-version = "0.5.4"
-dependencies = [
- "pie-dtype",
- "pie-profile",
- "serde_json",
-]
-
-[[package]]
 name = "kernels-xla"
 version = "0.5.4"
 dependencies = [
