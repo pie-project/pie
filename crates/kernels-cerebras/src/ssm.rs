@@ -17,7 +17,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Segment};
+use crate::phase::{BankSplit, BlockPlan, ColPlane, Fabric, LaneKind, LanePlan, Segment};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const MAX_OFFSET: u64 = i16::MAX as u64;
@@ -115,6 +115,7 @@ fn conv(
     };
     // The window needs every history row: only the channels split.
     let split = lane_split(
+        &ctx.fabric(),
         op,
         state.conv_state.elements(),
         lanes_n,
@@ -204,13 +205,14 @@ struct Split {
 
 /// How a recurrent bank of `elements` over `lanes` lanes (slot state
 /// `[a][b][w]`, `stride = a·b·w`) spreads over PEs: whole slots per PE when
-/// the bank and the phase's other words fit [`pe_words`], else each slot
+/// the bank and the phase's other words fit [`Fabric::pe_words`], else each slot
 /// split along `b` and then (when `a_splits`) `a` until one block plus
 /// `extra(a_groups, b_groups)` (the words the phase holds per PE besides
 /// its bank rows: scratch, its planes, whole buffers) fits, as many lanes
 /// per PE as the rest allows. Returns the PE count, the lanes per PE, and
 /// the block (if split).
 fn lane_split(
+    fab: &Fabric,
     op: &'static str,
     elements: u64,
     lanes: u32,
@@ -220,8 +222,8 @@ fn lane_split(
     a_splits: bool,
     extra: impl Fn(u32, u32) -> u64,
 ) -> Result<Split, Error> {
-    use crate::linear::gemm::{ARRAY_WORDS, pe_words};
-    if lanes == 0 || (elements + extra(1, 1) <= pe_words() && elements <= ARRAY_WORDS) {
+    use crate::linear::gemm::ARRAY_WORDS;
+    if lanes == 0 || (elements + extra(1, 1) <= fab.pe_words && elements <= ARRAY_WORDS) {
         return Ok(Split {
             pes: 1,
             lanes_per_pe: lanes.max(1),
@@ -233,14 +235,14 @@ fn lane_split(
     let mut found = None;
     'search: for bg in divisors(b) {
         for ag in divisors(if a_splits { a } else { 1 }) {
-            if block_words(ag, bg) + extra(ag, bg) <= pe_words() {
+            if block_words(ag, bg) + extra(ag, bg) <= fab.pe_words {
                 found = Some((ag, bg));
                 break 'search;
             }
         }
     }
     let Some((a_groups, b_groups)) = found else {
-        let budget = pe_words();
+        let budget = fab.pe_words;
         return Err(refuse(
             op,
             format!(
@@ -258,7 +260,8 @@ fn lane_split(
     };
     let words = plan.words().max(1);
     // The bank is one array: its slot rows within ARRAY_WORDS too.
-    let room = pe_words()
+    let room = fab
+        .pe_words
         .saturating_sub(extra(a_groups, b_groups))
         .min(ARRAY_WORDS);
     let lanes_per_pe = (room / words).clamp(1, u64::from(lanes)) as u32;
@@ -538,7 +541,17 @@ fn delta(
             + u64::from(y.rows) * cells
             + 2 * u64::from(dk)
     };
-    let split = lane_split(op, state.state.elements(), lanes_n, hv, dv, dk, true, extra)?;
+    let split = lane_split(
+        &ctx.fabric(),
+        op,
+        state.state.elements(),
+        lanes_n,
+        hv,
+        dv,
+        dk,
+        true,
+        extra,
+    )?;
     let sharded = split.block.is_some();
     ctx.emit(&mut |cx| {
         let qb = cx.read(qkv)?;

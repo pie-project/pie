@@ -13,7 +13,16 @@ use crate::tensor::Tensor;
 pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.silu_scaled";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
-    let (rg, cg) = tile_split(OP, x.rows, x.width, u64::from(x.width), 0, 0, 1)?;
+    let (rg, cg) = tile_split(
+        &ctx.fabric(),
+        OP,
+        x.rows,
+        x.width,
+        u64::from(x.width),
+        0,
+        0,
+        1,
+    )?;
     let pes = rg * cg;
     let n = x.elements() / u64::from(pes);
     ctx.emit(&mut |cx| {
@@ -52,7 +61,16 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
         ));
     }
     let (rg, cg) = if gate.rows == x.rows {
-        tile_split(OP, x.rows, x.width, 2 * u64::from(x.width), 0, 0, 1)?
+        tile_split(
+            &ctx.fabric(),
+            OP,
+            x.rows,
+            x.width,
+            2 * u64::from(x.width),
+            0,
+            0,
+            1,
+        )?
     } else {
         (1, 1)
     };

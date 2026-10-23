@@ -62,7 +62,16 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
         return Err(refuse(OP, "the expansion lands one wide row per row"));
     }
     let h = x.width;
-    let (rg, cg) = tile_split(OP, x.rows, h, u64::from(h + y.width), 0, 0, 1)?;
+    let (rg, cg) = tile_split(
+        &ctx.fabric(),
+        OP,
+        x.rows,
+        h,
+        u64::from(h + y.width),
+        0,
+        0,
+        1,
+    )?;
     let pes = rg * cg;
     let (rows, h_local) = (x.rows / rg, h / cg);
     ctx.emit(&mut |cx| {
@@ -107,7 +116,16 @@ pub fn mix(
         ));
     }
     let h = y.width;
-    let (rg, cg) = tile_split(OP, y.rows, h, u64::from(2 * normed.width + h), 0, 0, 1)?;
+    let (rg, cg) = tile_split(
+        &ctx.fabric(),
+        OP,
+        y.rows,
+        h,
+        u64::from(2 * normed.width + h),
+        0,
+        0,
+        1,
+    )?;
     let pes = rg * cg;
     let (rows, h_local) = (y.rows / rg, h / cg);
     ctx.emit(&mut |cx| {
@@ -158,7 +176,16 @@ pub fn inject(
     // The gates split by rows alone, every column group holding its row
     // group's; a gate plane taller than the rows rides whole on one PE.
     let (rg, cg) = if gates.rows == hyper.rows {
-        tile_split(OP, hyper.rows, h, u64::from(hyper.width + h), 0, 0, 1)?
+        tile_split(
+            &ctx.fabric(),
+            OP,
+            hyper.rows,
+            h,
+            u64::from(hyper.width + h),
+            0,
+            0,
+            1,
+        )?
     } else {
         (1, 1)
     };
@@ -226,7 +253,16 @@ pub fn ple_gate(
     // Rows past a PE split over row groups; a row past a PE over column
     // groups of every stream, the dot then gathered from the blocks'
     // partials in a second phase (like the wide rmsnorm).
-    let (rg, cg) = tile_split(OP, y.rows, h, u64::from(3 * y.width + h), 0, 0, 1)?;
+    let (rg, cg) = tile_split(
+        &ctx.fabric(),
+        OP,
+        y.rows,
+        h,
+        u64::from(3 * y.width + h),
+        0,
+        0,
+        1,
+    )?;
     let pes = rg * cg;
     let (rows, h_local) = (y.rows / rg, h / cg);
     if cg == 1 {

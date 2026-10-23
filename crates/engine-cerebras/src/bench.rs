@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use dtype::Dtype;
+use kernels_cerebras::phase::Fabric;
 use kernels_cerebras::{Cx, Emit, Error, Tensor, View};
 
 use crate::fabric::{Emitting, Operands, Program, Rendered};
@@ -212,8 +213,10 @@ impl Bench {
 }
 
 /// The bench's operands: every handle is one exported buffer, `b{handle}`.
-#[derive(Debug, Default)]
-pub struct Roots;
+#[derive(Debug)]
+pub struct Roots {
+    pub fabric: Fabric,
+}
 
 impl Operands for Roots {
     fn read(&mut self, p: &mut Program, t: Tensor) -> Result<View, Error> {
@@ -239,10 +242,7 @@ impl Operands for Roots {
     /// packed name, a pool (asked through `Cx::pool_half`) under its plain
     /// name, read and written.
     fn read_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
-        if !kernels_cerebras::linear::gemm::half_weights()
-            || t.dtype != Dtype::Bf16
-            || !t.width.is_multiple_of(2)
-        {
+        if !self.fabric.half_weights || t.dtype != Dtype::Bf16 || !t.width.is_multiple_of(2) {
             return Ok(None);
         }
         let whole = p.declare_packed(&format!("b{}h", t.buf), t.dtype, t.rows, t.width)?;
@@ -254,10 +254,7 @@ impl Operands for Roots {
     }
 
     fn pool_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
-        if !kernels_cerebras::linear::gemm::half_pool()
-            || t.dtype != Dtype::Bf16
-            || !t.width.is_multiple_of(2)
-        {
+        if !self.fabric.half_pool || t.dtype != Dtype::Bf16 || !t.width.is_multiple_of(2) {
             return Ok(None);
         }
         let whole = p.declare_packed(&format!("b{}", t.buf), t.dtype, t.rows, t.width)?;
@@ -274,13 +271,15 @@ impl Operands for Roots {
 pub struct Recorder {
     program: std::cell::RefCell<Program>,
     operands: std::cell::RefCell<Box<dyn Operands>>,
+    fabric: Fabric,
 }
 
 impl Recorder {
-    pub fn new(operands: impl Operands + 'static) -> Self {
+    pub fn new(operands: impl Operands + 'static, fabric: Fabric) -> Self {
         Recorder {
             program: std::cell::RefCell::new(Program::new()),
             operands: std::cell::RefCell::new(Box::new(operands)),
+            fabric,
         }
     }
 
@@ -290,18 +289,25 @@ impl Recorder {
 }
 
 impl Default for Recorder {
+    /// Over the bench's operands, on the terms the environment sets.
     fn default() -> Self {
-        Self::new(Roots)
+        let fabric = crate::fabric::terms();
+        Self::new(Roots { fabric }, fabric)
     }
 }
 
 impl Emit for Recorder {
+    fn fabric(&self) -> Fabric {
+        self.fabric
+    }
+
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {
         let mut program = self.program.borrow_mut();
         let mut operands = self.operands.borrow_mut();
         let mut sink = Emitting {
             program: &mut program,
             operands: operands.as_mut(),
+            fabric: self.fabric,
         };
         let mut cx = Cx::new(&mut sink, "op");
         body(&mut cx)?;

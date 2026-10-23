@@ -10,7 +10,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::linear::gemm::{ARRAY_WORDS, pe_words};
+use crate::linear::gemm::ARRAY_WORDS;
 use crate::phase::{
     BankSplit, BlockPlan, ColPlane, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
 };
@@ -56,6 +56,7 @@ pub fn topk_softmax(
     }
     // Rows over PEs; a row's logits and its picks on one.
     let (rg, _) = tile_split(
+        &ctx.fabric(),
         OP,
         logits.rows,
         1,
@@ -113,7 +114,16 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
         ));
     }
     let rows = routes.rows;
-    let (rg, _) = crate::cx::tile_split(OP, rows, groups, u64::from(groups), 0, 0, groups)?;
+    let (rg, _) = crate::cx::tile_split(
+        &ctx.fabric(),
+        OP,
+        rows,
+        groups,
+        u64::from(groups),
+        0,
+        0,
+        groups,
+    )?;
     ctx.emit(&mut |cx| {
         let rb = cx.write(routes)?;
         if rg > 1 {
@@ -314,7 +324,7 @@ fn select_impl(
     let xdiv = if per_pair { 1 } else { top_k };
     let lanes = pairs as u32;
     let whole = bd.elements() + xd.elements() + yd.elements();
-    if whole <= pe_words() && bd.elements() <= ARRAY_WORDS {
+    if whole <= ctx.fabric().pe_words && bd.elements() <= ARRAY_WORDS {
         return ctx.emit(&mut |cx| {
             let xb = cx.read(x)?;
             let xb = cx.view_as(&xb, xd.rows, xd.width)?;
@@ -351,10 +361,10 @@ fn select_impl(
     // A lane plan over the pairs: a PE holds a block `[o0, o1) × [c0, c1)`
     // of its lanes' experts, that slice of every x row (a column plane)
     // and its columns of y, a partial over the slices the host adds.
-    let budget = pe_words();
+    let budget = ctx.fabric().pe_words;
     let divisors = |v: u32| (1..=v).filter(move |d| v.is_multiple_of(*d));
     let mut best: Option<(u32, u32, u32, u32)> = None;
-    let fabric = crate::linear::gemm::fabric_sum();
+    let fabric = ctx.fabric().fabric_sum;
     for kg in divisors(k) {
         for og in divisors(n) {
             let block = u64::from(n / og) * u64::from(k / kg);
@@ -490,7 +500,7 @@ fn select_impl(
                 &yb,
                 y_words,
                 (kg, pes / kg),
-                crate::linear::gemm::resident_pes().is_some(),
+                ctx.fabric().resident_pes.is_some(),
             );
         }
         Ok(())
@@ -529,6 +539,7 @@ pub fn weighted_sum(
     }
     let (rows, width) = (y.rows, y.width);
     let (rg, cg) = tile_split(
+        &ctx.fabric(),
         OP,
         rows,
         width,
@@ -607,7 +618,16 @@ pub fn sigmoid_gate_add(
         ));
     }
     let (rows, width) = (y.rows, y.width);
-    let (rg, cg) = tile_split(OP, rows, width, 3 * u64::from(width) + 1, 0, 0, 1)?;
+    let (rg, cg) = tile_split(
+        &ctx.fabric(),
+        OP,
+        rows,
+        width,
+        3 * u64::from(width) + 1,
+        0,
+        0,
+        1,
+    )?;
     let pes = rg * cg;
     ctx.emit(&mut |cx| {
         let rb = cx.read(routed)?;

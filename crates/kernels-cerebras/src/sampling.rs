@@ -41,6 +41,7 @@ pub fn topk(
     // Rows over PEs (a row whole on its PE); a row past a PE ranks on the
     // host.
     let split = crate::cx::tile_split(
+        &ctx.fabric(),
         OP,
         rows,
         width,
@@ -115,13 +116,22 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     // Each column block's PE finds its greatest lane and index (a pair a
     // row); the blocks of a row group (one rectangle row) gather those on
     // the row's first PE, which picks among them into its rows of y.
-    let fabric = crate::linear::gemm::fabric_sum();
+    let fabric = ctx.fabric().fabric_sum;
     let whole = if fabric {
         crate::linear::gemm::FABRIC_SUM_WORDS
     } else {
         0
     };
-    let (rg, cg) = crate::cx::tile_split(OP, x.rows, x.width, u64::from(x.width) + 4, 0, whole, 1)?;
+    let (rg, cg) = crate::cx::tile_split(
+        &ctx.fabric(),
+        OP,
+        x.rows,
+        x.width,
+        u64::from(x.width) + 4,
+        0,
+        whole,
+        1,
+    )?;
     let (rows_local, width_local) = (x.rows / rg, x.width / cg);
     let pes = rg * cg;
     if cg > 1 && !fabric {
@@ -196,13 +206,13 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
                 Arg::Int(i64::from(y.width)),
             ],
         )];
-        cx.fabric((cg, rg), steps, finish);
+        cx.collectives((cg, rg), steps, finish);
         Ok(())
     })
 }
 
-/// The argmax with the blocks' pairs merged on the host
-/// (`PIE_CEREBRAS_FABRIC_SUM=0`).
+/// The argmax with the blocks' pairs merged on the host (`Fabric::fabric_sum`
+/// off).
 fn argmax_host_merge(
     ctx: &Ctx<'_>,
     x: Tensor,

@@ -18,7 +18,6 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::linear::gemm::pe_words;
 use crate::phase::{BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
 use crate::tensor::Tensor;
 
@@ -74,10 +73,10 @@ pub fn bidirectional(
     let (rows, keys) = (q.rows, k.rows);
     // The attention kernel's code takes a good part of a PE: plan below the
     // data budget by that much.
-    let budget = pe_words().saturating_sub(CODE_WORDS);
+    let budget = ctx.fabric().pe_words.saturating_sub(CODE_WORDS);
     // Words a PE holds for a window of `n` query rows with the keys split
     // `ag` ways and the kv heads `hg` ways.
-    let fabric = super::paged::fabric_sum();
+    let fabric = ctx.fabric().fabric_sum;
     let words = |n: u32, ag: u32, hg: u32| -> u64 {
         let kv = 2 * u64::from(keys.div_ceil(ag)) * u64::from(kvh / hg) * u64::from(d);
         let qo = 2 * u64::from(n) * u64::from(qh / hg) * u64::from(d);

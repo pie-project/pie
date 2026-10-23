@@ -21,10 +21,60 @@ use kernels_cerebras::cx::View as Placed;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
-    Buf, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, PageSource, Phase, Shard, Sink,
+    Buf, Fabric, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, PageSource, Phase, Shard,
+    Sink,
 };
 
 mod table;
+
+/// The fabric's terms as this process sets them: each from its
+/// environment variable, else the default.
+///
+/// - `PIE_CEREBRAS_PE_WORDS`: the data words one phase places on a PE.
+/// - `PIE_CEREBRAS_SHARD_WORDS`: the elements of one buffer a PE holds
+///   before it is split (a small budget makes a small model take every
+///   split form).
+/// - `PIE_CEREBRAS_MAX_PES`: the PEs one phase spreads over (a wafer takes
+///   hundreds of thousands).
+/// - `PIE_CEREBRAS_RESIDENT_PES=N` (N > 1): the resident placement, every
+///   phase of a fire on one row of N PEs.
+/// - `PIE_CEREBRAS_FABRIC_SUM=0`: partials add on the host, not the fabric.
+/// - `PIE_CEREBRAS_HALF_WEIGHTS=1`, `PIE_CEREBRAS_HALF_POOL=1`: bf16
+///   weights, kv pools, packed two halves a word on the device.
+/// - `PIE_CEREBRAS_ATTN_ROWS`: the most rows one attention phase takes.
+#[must_use]
+pub fn terms() -> Fabric {
+    let number = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    };
+    let on = |var: &str| std::env::var(var).is_ok_and(|v| v != "0");
+    let default = Fabric::default();
+    Fabric {
+        pe_words: number("PIE_CEREBRAS_PE_WORDS").unwrap_or(default.pe_words),
+        shard_words: number("PIE_CEREBRAS_SHARD_WORDS").unwrap_or(default.shard_words),
+        max_pes: std::env::var("PIE_CEREBRAS_MAX_PES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default.max_pes),
+        resident_pes: std::env::var("PIE_CEREBRAS_RESIDENT_PES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 1),
+        fabric_sum: std::env::var("PIE_CEREBRAS_FABRIC_SUM")
+            .ok()
+            .is_none_or(|v| v != "0"),
+        half_weights: on("PIE_CEREBRAS_HALF_WEIGHTS"),
+        half_pool: on("PIE_CEREBRAS_HALF_POOL"),
+        attn_rows: std::env::var("PIE_CEREBRAS_ATTN_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0),
+    }
+}
 
 /// What places a fire's operand handles on the program's buffers: the
 /// tracer's handle tables, or the bench's one buffer a handle.
@@ -52,10 +102,12 @@ pub trait Operands {
     }
 }
 
-/// What an entry emits into: a program and the operands it places.
+/// What an entry emits into: a program, the operands it places, and the
+/// terms the entry plans by.
 pub struct Emitting<'a> {
     pub program: &'a mut Program,
     pub operands: &'a mut dyn Operands,
+    pub fabric: Fabric,
 }
 
 impl Sink for Emitting<'_> {
@@ -119,6 +171,10 @@ impl Sink for Emitting<'_> {
 
     fn phase(&mut self, phase: Phase) {
         self.program.push(phase);
+    }
+
+    fn fabric(&self) -> Fabric {
+        self.fabric
     }
 }
 

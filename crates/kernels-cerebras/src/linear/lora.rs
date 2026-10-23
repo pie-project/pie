@@ -13,7 +13,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::linear::gemm::{ARRAY_WORDS, pe_words};
+use crate::linear::gemm::ARRAY_WORDS;
 use crate::phase::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
 use crate::tensor::Tensor;
 
@@ -89,7 +89,7 @@ pub fn correct(
     let whole = u64::from(adapters) * (a_words + b_words)
         + u64::from(rows) * u64::from(in_width + out_width)
         + u64::from(rank);
-    if whole <= pe_words() && u64::from(adapters) * a_words.max(b_words) <= ARRAY_WORDS {
+    if whole <= ctx.fabric().pe_words && u64::from(adapters) * a_words.max(b_words) <= ARRAY_WORDS {
         return ctx.emit(&mut |cx| {
             let xb = cx.read(x)?;
             let ab = cx.read(bank_a)?;
@@ -126,8 +126,8 @@ pub fn correct(
             Ok(())
         });
     }
-    let budget = pe_words();
-    let fabric = crate::linear::gemm::fabric_sum();
+    let budget = ctx.fabric().pe_words;
+    let fabric = ctx.fabric().fabric_sum;
     let divisors = |x: u32| (1..=x).filter(move |d| x.is_multiple_of(*d));
     // The fewest PEs whose lane (rows) times a bank block, plus the planes,
     // fit (a depth split summed on the fabric adds the output plane again
@@ -283,7 +283,7 @@ pub fn correct(
                 &wb,
                 w_words,
                 (ig, pes / ig),
-                crate::linear::gemm::resident_pes().is_some(),
+                ctx.fabric().resident_pes.is_some(),
             );
         }
         Ok(())
@@ -359,7 +359,7 @@ pub fn correct(
                 &yb,
                 y_words,
                 (rg_b, pes / rg_b),
-                crate::linear::gemm::resident_pes().is_some(),
+                ctx.fabric().resident_pes.is_some(),
             );
         }
         Ok(())

@@ -109,7 +109,7 @@ fn ngram(
         + state.state.elements()
         + out.elements()
         + 3 * (mults.len() + primes.len()) as u64;
-    let on_pe = words <= crate::linear::gemm::pe_words();
+    let on_pe = words <= ctx.fabric().pe_words;
     ctx.emit(&mut |cx| {
         let ib = cx.read(ids)?;
         let ipb = match indptr {

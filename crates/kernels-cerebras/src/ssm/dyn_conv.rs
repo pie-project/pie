@@ -9,7 +9,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::linear::gemm::{ARRAY_WORDS, max_pes, pe_words};
+use crate::linear::gemm::ARRAY_WORDS;
 use crate::phase::Shard;
 use crate::tensor::{RaggedTensor, Tensor};
 
@@ -71,7 +71,7 @@ pub fn block_dyn_conv(
     }
     let lanes = x.indptr.elements().saturating_sub(1);
     let rows = u64::from(x.data.rows);
-    let budget = pe_words();
+    let budget = ctx.fabric().pe_words;
     let words = |cg: u32| {
         let cb = u64::from(channels / cg);
         let gl = u64::from(groups / cg);
@@ -83,7 +83,7 @@ pub fn block_dyn_conv(
         )
     };
     let cg = (1..=groups)
-        .filter(|cg| groups.is_multiple_of(*cg) && *cg <= max_pes())
+        .filter(|cg| groups.is_multiple_of(*cg) && *cg <= ctx.fabric().max_pes)
         .find(|cg| {
             let (total, largest) = words(*cg);
             total <= budget && largest <= ARRAY_WORDS

@@ -6,7 +6,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{HostOp, Shard};
+use crate::phase::{Fabric, HostOp, Shard};
 use crate::tensor::Tensor;
 
 /// `y[m, n] = Σ_k act[m, k] · w[n, k]` over the first `y.rows` rows of `act`,
@@ -56,7 +56,7 @@ fn act_x_wt(
     // vocabulary projection), or one whose extents divide into no grid
     // within a PE (a 4304-wide projection: 4304 = 16 · 269), is multiplied
     // on the host.
-    if let Some(pes) = resident_pes() {
+    if let Some(pes) = ctx.fabric().resident_pes {
         return resident_matmul(ctx, op, act, w, y, m, k, n, pes);
     }
     ctx.emit(&mut |cx| {
@@ -70,10 +70,11 @@ fn act_x_wt(
         } else {
             w.elements()
         };
-        let grid = if w_words > u64::from(max_pes()) * shard_words() {
+        let fab = cx.fabric();
+        let grid = if w_words > u64::from(fab.max_pes) * fab.shard_words {
             None
         } else {
-            grid(m, k, n, packed)
+            grid(&fab, m, k, n, packed)
         };
         let Some((rg, cg, kg)) = grid else {
             let wb = cx.read(w)?;
@@ -97,7 +98,7 @@ fn act_x_wt(
         // fabric, the `kg` PEs of a block form one row of a `kg × (rg · cg)`
         // rectangle and add their partials into the row's first PE; else
         // every partial comes down and the host adds them.
-        let fabric = kg > 1 && fabric_sum();
+        let fabric = kg > 1 && fab.fabric_sum;
         if rg > 1 {
             // PE `x` of the `rg × cg × kg` grid: rows `x / (cg·kg)`, output
             // columns `(x / kg) % cg`, depth slice `x % kg`.
@@ -190,40 +191,6 @@ fn act_x_wt(
     })
 }
 
-/// Whether bf16 weights live on the device packed two halves a word
-/// (`PIE_CEREBRAS_HALF_WEIGHTS=1`): half the memory, the kernels widening
-/// as they read.
-pub fn half_weights() -> bool {
-    std::env::var("PIE_CEREBRAS_HALF_WEIGHTS").is_ok_and(|v| v != "0")
-}
-
-/// Whether bf16 kv pools live on the device packed two halves a word
-/// (`PIE_CEREBRAS_HALF_POOL=1`): half the memory a page, attention widening
-/// a key or value row as it reads it, `kv_append` packing as it lands.
-pub fn half_pool() -> bool {
-    std::env::var("PIE_CEREBRAS_HALF_POOL").is_ok_and(|v| v != "0")
-}
-
-/// The resident placement: every phase of a fire on one row of this many
-/// PEs (`PIE_CEREBRAS_RESIDENT_PES`), activations whole on every PE, the
-/// weights by rows across the row, a matmul's column blocks gathered back
-/// to every PE, lanes padded to the row; `None` is the per-phase
-/// placement.
-pub fn resident_pes() -> Option<u32> {
-    std::env::var("PIE_CEREBRAS_RESIDENT_PES")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 1)
-}
-
-/// Whether a depth-split matmul adds its partials on the fabric
-/// (`PIE_CEREBRAS_FABRIC_SUM=0` leaves the adding to the host).
-pub fn fabric_sum() -> bool {
-    std::env::var("PIE_CEREBRAS_FABRIC_SUM")
-        .ok()
-        .is_none_or(|v| v != "0")
-}
-
 /// Words the collectives library and a reduce's partial copy cost a PE
 /// beside its shares: a depth-split grid on the fabric fits its `y` twice
 /// (the partial and the sum) and the library's buffers and code.
@@ -248,7 +215,7 @@ fn resident_matmul(
     pes: u32,
 ) -> Result<(), Error> {
     use crate::phase::{FabricOp, FabricStep, Guarded};
-    let budget = pe_words();
+    let budget = ctx.fabric().pe_words;
     let (m64, k64, n64) = (u64::from(m), u64::from(k), u64::from(n));
     let a_words = u64::from(act.rows) * k64;
     let y_words = m64 * n64;
@@ -336,7 +303,7 @@ fn resident_matmul(
                 Arg::Int(i64::from(nl)),
             ],
         )];
-        cx.fabric((pes, 1), steps, finish);
+        cx.collectives((pes, 1), steps, finish);
         // `y` lands with the broadcast: its rounding follows the steps.
         cx.round_after_steps(&yb);
         Ok(())
@@ -349,16 +316,16 @@ fn resident_matmul(
 /// partial sum of output block `(r, c)`, which the host adds over `d`: the
 /// words moved are the activations once per column group, the weight once
 /// per row group, and the output once per depth group. The grid moving the
-/// fewest words whose shares fit [`pe_words`] (arrays within
-/// [`ARRAY_WORDS`]) on at most [`MAX_PES`] PEs wins, the fewer PEs the
+/// fewest words whose shares fit [`Fabric::pe_words`] (arrays within
+/// [`ARRAY_WORDS`]) on at most [`Fabric::max_pes`] PEs wins, the fewer PEs the
 /// better among equals.
 /// A grid `(rg, cg, kg)` with its `(words moved, PEs)` key.
 type GridPick = ((u32, u32, u32), (u64, u32));
 
-fn grid(m: u32, k: u32, n: u32, packed: bool) -> Option<(u32, u32, u32)> {
-    let budget = pe_words();
-    let most = max_pes();
-    let fabric = fabric_sum();
+fn grid(fab: &Fabric, m: u32, k: u32, n: u32, packed: bool) -> Option<(u32, u32, u32)> {
+    let budget = fab.pe_words;
+    let most = fab.max_pes;
+    let fabric = fab.fabric_sum;
     let per = if packed { 2 } else { 1 };
     let divisors = |x: u32| (1..=x).filter(move |d| x.is_multiple_of(*d));
     let (m64, k64, n64) = (u64::from(m), u64::from(k), u64::from(n));
@@ -396,53 +363,6 @@ fn grid(m: u32, k: u32, n: u32, packed: bool) -> Option<(u32, u32, u32)> {
     }
     best.map(|(g, _)| g)
 }
-
-/// The most elements of one buffer a PE holds before it is split
-/// (`PIE_CEREBRAS_SHARD_WORDS` overrides it: a small budget makes a small
-/// model take every split form).
-pub fn shard_words() -> u64 {
-    env_budget("PIE_CEREBRAS_SHARD_WORDS", SHARD_WORDS_DEFAULT)
-}
-
-const SHARD_WORDS_DEFAULT: u64 = 4096;
-
-/// The most data words one phase places on a PE altogether
-/// (`PIE_CEREBRAS_PE_WORDS` overrides it).
-pub fn pe_words() -> u64 {
-    env_budget("PIE_CEREBRAS_PE_WORDS", PE_WORDS_DEFAULT)
-}
-
-fn env_budget(var: &str, default: u64) -> u64 {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
-}
-
-/// The most PEs one phase spreads over (a rectangle up to 16 rows tall:
-/// `rect_of`); a weight past `max_pes() × shard_words()` (the vocabulary
-/// projection, under the default) runs on the host. The default suits the
-/// simulator; a wafer takes `PIE_CEREBRAS_MAX_PES` in the hundreds of
-/// thousands, and the projection with it.
-pub const MAX_PES: u32 = 2048;
-
-/// `MAX_PES`, or `PIE_CEREBRAS_MAX_PES`.
-#[must_use]
-pub fn max_pes() -> u32 {
-    std::env::var("PIE_CEREBRAS_MAX_PES")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(MAX_PES)
-}
-
-/// The most data words one phase places on a PE altogether (its share of
-/// every buffer plus scratch). A probe (`tests/pe_memory_probe.rs`) links
-/// 10240 words of data beside the memcpy module alone; the rest of a PE's
-/// memory is code, stack and the task tables, and the kernels' code takes
-/// its share below that.
-const PE_WORDS_DEFAULT: u64 = 8704;
 
 /// The most words one array holds: a word address of 16 bits (the probe's
 /// 8448-word array fails a 14-bit-plus-shift relocation).

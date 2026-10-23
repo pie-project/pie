@@ -13,8 +13,8 @@ use crate::csl::{Block, Dsd1, Func};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan, PagePlan,
-    PageSource, Phase, Reduce, Shard, Sink,
+    Buf, Fabric, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan,
+    PagePlan, PageSource, Phase, Reduce, Shard, Sink,
 };
 use crate::tensor::Tensor;
 
@@ -23,6 +23,9 @@ use crate::tensor::Tensor;
 /// for the duration.
 pub trait Emit {
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error>;
+
+    /// The engine's terms for the fabric (what the entry plans its splits by).
+    fn fabric(&self) -> Fabric;
 
     /// Names what is emitted next (the op a dispatch is lowering).
     fn scope(&self, name: &str) {
@@ -79,6 +82,11 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// The engine's terms for the fabric.
+    pub fn fabric(&self) -> Fabric {
+        self.p.fabric()
+    }
+
     /// Makes this phase a host phase running `op` (statements emitted into
     /// it are dropped).
     pub fn host(&mut self, op: HostOp) {
@@ -91,7 +99,7 @@ impl<'a> Cx<'a> {
         // The resident placement runs every phase on its row of PEs: a
         // lane plan takes the row (idle PEs past its own), and a lane whose
         // state would split over PEs (a merge) does not fit it.
-        if let Some(pes) = crate::linear::gemm::resident_pes() {
+        if let Some(pes) = self.p.fabric().resident_pes {
             if plan.pes > pes {
                 return Err(refuse(
                     "lanes",
@@ -195,7 +203,7 @@ impl<'a> Cx<'a> {
                 },
             });
         }
-        self.fabric(rect, steps, Vec::new());
+        self.collectives(rect, steps, Vec::new());
     }
 
     /// `buf` is filled by this phase's fabric steps, not its function: its
@@ -207,7 +215,7 @@ impl<'a> Cx<'a> {
     /// After the phase's statements, the `steps` run on every PE of the
     /// `rect` rectangle, each ending in a collective along the PE's row;
     /// `finish` runs when the last lands.
-    pub fn fabric(&mut self, rect: (u32, u32), steps: Vec<FabricStep>, finish: Vec<Guarded>) {
+    pub fn collectives(&mut self, rect: (u32, u32), steps: Vec<FabricStep>, finish: Vec<Guarded>) {
         for g in steps.iter().flat_map(|s| &s.calls).chain(&finish) {
             self.unit(g.call.kernel);
         }
@@ -481,7 +489,7 @@ impl<'a> Cx<'a> {
         // The resident placement: every phase on the row of PEs (whole
         // buffers replicated; a phase on fewer PEs stays as it is only when
         // it already spans the row).
-        let pes = match crate::linear::gemm::resident_pes() {
+        let pes = match self.p.fabric().resident_pes {
             Some(n) if lane.is_none() && self.pes == 1 => n,
             _ => self.pes,
         };
@@ -509,30 +517,14 @@ impl DerefMut for Cx<'_> {
     }
 }
 
-/// The fewest PEs (a divisor of `rows`) a row-wise phase spreads its rows
-/// over so that its `per_row` words a row plus `whole` words (weights,
-/// scratch) fit one PE's [`pe_words`](crate::linear::gemm::pe_words).
-pub fn rows_split(op: &'static str, rows: u32, per_row: u64, whole: u64) -> Result<u32, Error> {
-    use crate::linear::gemm::pe_words;
-    let rows = rows.max(1);
-    let budget = pe_words();
-    (1..=rows)
-        .filter(|d| rows.is_multiple_of(*d))
-        .find(|d| per_row * u64::from(rows / d) + whole <= budget)
-        .ok_or_else(|| {
-            refuse(
-                op,
-                format!("one row's {per_row} words and the phase's {whole} other words exceed a PE's {budget}"),
-            )
-        })
-}
-
 /// The `(row groups, column groups)` a row-wise phase over `rows × width`
 /// spreads over so that one PE's share fits: `per_row` words a row that
 /// split with the columns, `per_col` words a column (a gain) that split
 /// with the columns, `whole` words that do not split; columns split only
 /// in multiples of `unit` (a head). The fewest PEs win, rows first.
+#[allow(clippy::too_many_arguments)]
 pub fn tile_split(
+    fabric: &Fabric,
     op: &'static str,
     rows: u32,
     width: u32,
@@ -541,11 +533,11 @@ pub fn tile_split(
     whole: u64,
     unit: u32,
 ) -> Result<(u32, u32), Error> {
-    use crate::linear::gemm::{ARRAY_WORDS, pe_words, resident_pes};
-    let budget = pe_words();
+    use crate::linear::gemm::ARRAY_WORDS;
+    let budget = fabric.pe_words;
     let (rows, width, unit) = (rows.max(1), width.max(1), unit.max(1));
     // The resident placement runs a row-wise phase whole on every PE.
-    if resident_pes().is_some() {
+    if fabric.resident_pes.is_some() {
         let words = per_row * u64::from(rows) + per_col * u64::from(width) + whole;
         return if words <= budget && per_row * u64::from(rows) <= ARRAY_WORDS {
             Ok((1, 1))

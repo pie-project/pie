@@ -185,6 +185,7 @@ pub const PHASE_SEPARATOR: &str = "\n=====phase\n";
 /// The tracer: one CSL program under construction for one fire.
 pub struct Tracer<'h> {
     handles: &'h Handles,
+    fabric: kernels_cerebras::phase::Fabric,
     state: RefCell<State>,
 }
 
@@ -229,6 +230,7 @@ impl<'h> Tracer<'h> {
     pub fn new(handles: &'h Handles) -> Self {
         Self {
             handles,
+            fabric: crate::fabric::terms(),
             state: RefCell::new(State {
                 pack_len: 0,
                 program: Program::new(),
@@ -1242,6 +1244,7 @@ fn root_buf(
 /// The tracer's `Operands`: the handle tables plus the state's maps.
 struct Lens<'a> {
     handles: &'a Handles,
+    fabric: kernels_cerebras::phase::Fabric,
     pack_len: u32,
     current: &'a mut BTreeMap<u32, Buf>,
     params: &'a mut Vec<(u32, Source)>,
@@ -1314,7 +1317,7 @@ impl Operands for Lens<'_> {
         p: &mut Program,
         t: Tensor,
     ) -> Result<Option<View>, kernels_cerebras::Error> {
-        if !kernels_cerebras::linear::gemm::half_weights() {
+        if !self.fabric.half_weights {
             return Ok(None);
         }
         let Some((root, offset)) = self.handles.locate(t.buf) else {
@@ -1350,7 +1353,7 @@ impl Operands for Lens<'_> {
         p: &mut Program,
         t: Tensor,
     ) -> Result<Option<View>, kernels_cerebras::Error> {
-        if !kernels_cerebras::linear::gemm::half_pool() {
+        if !self.fabric.half_pool {
             return Ok(None);
         }
         let Some((root, offset)) = self.handles.locate(t.buf) else {
@@ -1392,6 +1395,10 @@ impl Operands for Lens<'_> {
 }
 
 impl Emit for Tracer<'_> {
+    fn fabric(&self) -> kernels_cerebras::phase::Fabric {
+        self.fabric
+    }
+
     fn scope(&self, name: &str) {
         self.state.borrow_mut().program.scope(name);
     }
@@ -1413,6 +1420,7 @@ impl Emit for Tracer<'_> {
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
+            fabric: self.fabric,
             pack_len: *pack_len,
             current,
             params,
@@ -1424,6 +1432,7 @@ impl Emit for Tracer<'_> {
         let mut sink = Emitting {
             program,
             operands: &mut lens,
+            fabric: self.fabric,
         };
         let mut cx = Cx::new(&mut sink, &scope);
         body(&mut cx)?;

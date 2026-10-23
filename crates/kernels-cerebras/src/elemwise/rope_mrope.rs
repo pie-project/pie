@@ -257,6 +257,7 @@ fn rotate(
         let unit = head_dim * (first.width / head_dim).max(1) / heads_gcd;
         let per_row: u64 = ts.iter().map(|t| u64::from(t.width)).sum::<u64>() + u64::from(AXES);
         tile_split(
+            &ctx.fabric(),
             OP,
             first.rows,
             first.width,

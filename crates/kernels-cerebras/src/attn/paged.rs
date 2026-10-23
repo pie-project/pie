@@ -23,7 +23,8 @@ use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, PagePlan, PageSource, Reduce, Segment,
+    BankSplit, BlockPlan, ColPlane, Fabric, LaneKind, LanePlan, PagePlan, PageSource, Reduce,
+    Segment,
 };
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -174,15 +175,6 @@ fn pool_shape(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<(u32, u3
     Ok((kv_heads, width))
 }
 
-/// The most rows one attention phase takes, when capped
-/// (`PIE_CEREBRAS_ATTN_ROWS`).
-fn rows_per_phase_cap() -> Option<u32> {
-    std::env::var("PIE_CEREBRAS_ATTN_ROWS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 0)
-}
-
 /// How a paged pool spreads over PEs.
 #[derive(Clone)]
 struct PageSplit {
@@ -204,6 +196,7 @@ struct PageSplit {
 /// lane's pages past that split over page groups; a page past that splits
 /// its kv heads. The fewest PEs win.
 fn page_split(
+    fab: &Fabric,
     op: &'static str,
     elements: u64,
     lanes: u32,
@@ -213,8 +206,8 @@ fn page_split(
     page_rows: u32,
     extra: impl Fn(u32) -> u64,
 ) -> Result<Option<PageSplit>, Error> {
-    use crate::linear::gemm::{ARRAY_WORDS, pe_words};
-    if lanes == 0 || (elements + extra(1) <= pe_words() && elements <= ARRAY_WORDS) {
+    use crate::linear::gemm::ARRAY_WORDS;
+    if lanes == 0 || (elements + extra(1) <= fab.pe_words && elements <= ARRAY_WORDS) {
         return Ok(None);
     }
     let max_pages = max_pages.max(1);
@@ -223,7 +216,7 @@ fn page_split(
     for hg in (1..=kv_heads.max(1)).filter(|g| kv_heads.max(1).is_multiple_of(*g)) {
         for ag in (1..=page_rows).filter(|g| page_rows.is_multiple_of(*g)) {
             // A bank plane is one array: its pages within ARRAY_WORDS too.
-            let room = pe_words().saturating_sub(extra(hg)).min(2 * ARRAY_WORDS);
+            let room = fab.pe_words.saturating_sub(extra(hg)).min(2 * ARRAY_WORDS);
             let pair = (page_pair / u64::from(hg) / u64::from(ag)).max(1);
             let pages_per_pe = u32::try_from(room / pair).unwrap_or(u32::MAX);
             if pages_per_pe == 0 {
@@ -247,7 +240,7 @@ fn page_split(
             break;
         }
     }
-    let budget = pe_words();
+    let budget = fab.pe_words;
     match best {
         Some(b) => Ok(Some(b)),
         None => Err(refuse(
@@ -263,12 +256,6 @@ fn page_split(
 /// The most PEs one lane block's partials spread over for the fabric to
 /// merge them (the root gathers that many lse copies).
 pub const MERGE_GROUPS: u32 = 16;
-
-/// Whether split attention merges its partials on the fabric
-/// (`PIE_CEREBRAS_FABRIC_SUM=0` leaves the merge to the host).
-pub fn fabric_sum() -> bool {
-    crate::linear::gemm::fabric_sum()
-}
 
 /// Words a PE spends on the fabric merge of its `o` (`o_words`) and lse
 /// (`l_words`) partials: the partial's copy, the gathered lse copies and
@@ -386,23 +373,24 @@ pub fn lse_merge_with(
             Arg::Int(l_words as i64),
         ],
     )];
-    cx.fabric((group, pes / group), steps, finish);
+    cx.collectives((group, pes / group), steps, finish);
 }
 
 /// The resident placement of a pool over a row of `pes` PEs: every PE runs
 /// every lane over the pages it holds (page `g` on PE `g % pes`), `None`
 /// when the share and the phase's other words do not fit a PE.
 fn resident_split(
+    fab: &Fabric,
     pes: u32,
     pool_pages: u32,
     page_pair: u64,
     lanes: u32,
     extra: u64,
 ) -> Option<(PageSplit, u32)> {
-    use crate::linear::gemm::{ARRAY_WORDS, pe_words};
+    use crate::linear::gemm::ARRAY_WORDS;
     let share = pool_pages.div_ceil(pes).max(1);
     let words = u64::from(share) * page_pair;
-    (words / 2 <= ARRAY_WORDS && words + extra <= pe_words()).then_some((
+    (words / 2 <= ARRAY_WORDS && words + extra <= fab.pe_words).then_some((
         PageSplit {
             pes,
             lanes_per_pe: lanes,
@@ -498,14 +486,14 @@ fn attend(
     // lse, the tables, the mask and the scratch, for the rows of one phase:
     // all the rows when that fits, else a window of them, halved until it
     // does, each window its own phase over views of the row-shaped buffers.
-    let packed = crate::linear::gemm::half_pool()
-        && pool.keys.dtype == Dtype::Bf16
-        && pool.keys.width.is_multiple_of(2);
+    let fab = ctx.fabric();
+    let packed =
+        fab.half_pool && pool.keys.dtype == Dtype::Bf16 && pool.keys.width.is_multiple_of(2);
     let page_pair = u64::from(ps) * u64::from(pool.keys.width) * 2 / if packed { 2 } else { 1 };
     let (top_k, ratio) = selection.map_or((0, 0), |(s, r)| (s.width, r));
     let sblk_words = u64::from(span.checked_div(ratio).map_or(1, |b| b + 1));
-    let fabric = fabric_sum();
-    let resident = crate::linear::gemm::resident_pes();
+    let fabric = fab.fabric_sum;
+    let resident = fab.resident_pes;
     let pool_pages = pool.keys.rows / ps.max(1);
     let extra_for = |r: u32| {
         move |hg: u32| -> u64 {
@@ -530,15 +518,13 @@ fn attend(
         }
     };
     let pool_words = pool.keys.elements() + pool.values.elements();
-    let mut chunk = rows
-        .max(1)
-        .min(rows_per_phase_cap().unwrap_or(u32::MAX))
-        .max(1);
+    let mut chunk = rows.max(1).min(fab.attn_rows.unwrap_or(u32::MAX)).max(1);
     let mut strided_pages = 0;
     let split = loop {
         if let Some(pes) = resident {
             // The resident row: the pool strided over it, all rows at once.
             match resident_split(
+                &fab,
                 pes,
                 pool_pages,
                 page_pair,
@@ -564,6 +550,7 @@ fn attend(
             }
         }
         match page_split(
+            &fab,
             op,
             pool_words,
             lanes as u32,
@@ -645,8 +632,9 @@ fn attend(
                     } else {
                         page_groups * row_groups
                     };
-                    let fabric =
-                        merge_group > 1 && (strided || merge_group <= MERGE_GROUPS) && fabric_sum();
+                    let fabric = merge_group > 1
+                        && (strided || merge_group <= MERGE_GROUPS)
+                        && fab.fabric_sum;
                     if page_groups > 1 || row_groups > 1 || strided {
                         if lse_buf.is_none() {
                             let name = cx.unique("lse");
@@ -1089,7 +1077,8 @@ fn append(
         let vb = cx.read(v)?;
         let pb = cx.read(write_page)?;
         let obf = cx.read(write_offset)?;
-        let packed_ok = crate::linear::gemm::half_pool() && pool.keys.dtype == Dtype::Bf16 && w.is_multiple_of(2);
+        let fab = cx.fabric();
+        let packed_ok = fab.half_pool && pool.keys.dtype == Dtype::Bf16 && w.is_multiple_of(2);
         let keys = match cx.pool_half(pool.keys)? {
             Some(k) if packed_ok => k,
             _ => {
@@ -1122,12 +1111,12 @@ fn append(
                 + 2 * u64::from(k.rows)
                 + 16
         };
-        let resident = crate::linear::gemm::resident_pes();
+        let resident = fab.resident_pes;
         let mut strided_pages = 0;
         let split = match resident {
             Some(pes) => {
                 let pair = if shared { page_words } else { page_words * 2 };
-                match resident_split(pes, pages, pair, k.rows, extra(1)) {
+                match resident_split(&fab, pes, pages, pair, k.rows, extra(1)) {
                     Some((split, share)) => {
                         strided_pages = share;
                         Some(split)
@@ -1141,6 +1130,7 @@ fn append(
                 }
             }
             None => page_split(
+                &fab,
                 op,
                 planes,
                 k.rows,

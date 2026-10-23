@@ -79,7 +79,16 @@ pub fn rmsnorm_grouped_plus_one(
     }
     // Rows past a PE spread over row groups, a row past a PE over whole
     // groups, the gain bank split with the columns.
-    let (rg, cg) = tile_split(OP, y.rows, width, 2 * u64::from(width), 1, 0, group)?;
+    let (rg, cg) = tile_split(
+        &ctx.fabric(),
+        OP,
+        y.rows,
+        width,
+        2 * u64::from(width),
+        1,
+        0,
+        group,
+    )?;
     let pes = rg * cg;
     let (rows, width_local) = (y.rows / rg, width / cg);
     ctx.emit(&mut |cx| {
@@ -172,6 +181,7 @@ fn rms_row(
     let (rg, cg) = if x.rows == y.rows {
         if per_head {
             tile_split(
+                &ctx.fabric(),
                 op,
                 y.rows,
                 width,
@@ -181,7 +191,16 @@ fn rms_row(
                 axis,
             )?
         } else {
-            tile_split(op, y.rows, width, 2 * u64::from(width), 1, 0, 1)?
+            tile_split(
+                &ctx.fabric(),
+                op,
+                y.rows,
+                width,
+                2 * u64::from(width),
+                1,
+                0,
+                1,
+            )?
         }
     } else {
         (1, 1)
@@ -339,6 +358,7 @@ pub fn rmsnorm_gated(
     // heads; the gain (one head) rides whole.
     let (rg, cg) = if x.rows == y.rows && gate.rows == y.rows {
         tile_split(
+            &ctx.fabric(),
             OP,
             y.rows,
             x.width,
@@ -398,7 +418,16 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
         ));
     }
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(OP, x.rows, x.width, 2 * u64::from(x.width), 0, 0, 1)?
+        tile_split(
+            &ctx.fabric(),
+            OP,
+            x.rows,
+            x.width,
+            2 * u64::from(x.width),
+            0,
+            0,
+            1,
+        )?
     } else {
         (1, 1)
     };
@@ -442,7 +471,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
         ));
     }
     let (rows, width) = (out.rows, out.width);
-    let (rg, cg) = tile_split(OP, rows, width, u64::from(width), 1, 0, 1)?;
+    let (rg, cg) = tile_split(&ctx.fabric(), OP, rows, width, u64::from(width), 1, 0, 1)?;
     let pes = rg * cg;
     ctx.emit(&mut |cx| {
         let bb = cx.read(bias)?;
@@ -524,7 +553,16 @@ pub fn layernorm(
     // Rows over row groups; a row past a PE over column groups too, the
     // row's sum and sum of squares gathered from every block first.
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(OP, y.rows, width, 2 * u64::from(width), 2, 0, 1)?
+        tile_split(
+            &ctx.fabric(),
+            OP,
+            y.rows,
+            width,
+            2 * u64::from(width),
+            2,
+            0,
+            1,
+        )?
     } else {
         (1, 1)
     };

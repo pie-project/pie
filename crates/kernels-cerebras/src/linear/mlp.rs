@@ -26,6 +26,7 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
     // groups: the same block of `g` and of `u` lands on one PE.
     let (rg, cg) = if packed.rows == y.rows {
         tile_split(
+            &ctx.fabric(),
             OP,
             y.rows,
             intermediate,
@@ -87,7 +88,16 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
         ));
     }
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(OP, y.rows, x.width, 2 * u64::from(x.width), 0, 0, 1)?
+        tile_split(
+            &ctx.fabric(),
+            OP,
+            y.rows,
+            x.width,
+            2 * u64::from(x.width),
+            0,
+            0,
+            1,
+        )?
     } else {
         (1, 1)
     };

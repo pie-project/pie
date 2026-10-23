@@ -1,13 +1,13 @@
 //! How many data words one PE takes: compiles phases holding big arrays
 //! and reports where `cslc` fails. Run with `--nocapture` to read the
 //! boundary; the assertion pins the budget the kernels plan with
-//! (`kernels_cerebras::linear::gemm::pe_words()`).
+//! (`engine_cerebras::fabric::terms().pe_words`).
 
 use dtype::Dtype;
 use engine_cerebras::bench::Recorder;
+use engine_cerebras::fabric::terms;
 use engine_cerebras::sdk::{Arch, Compile, Cslc};
 use kernels_cerebras::Tensor;
-use kernels_cerebras::linear::gemm::pe_words;
 
 /// Compiles a phase holding `arrays` arrays of `words` f32 each.
 fn compiles(cslc: &Cslc, words: u32, arrays: u32) -> Result<(), String> {
@@ -84,8 +84,8 @@ fn a_pe_holds_the_budget_the_kernels_plan_with() {
         }
     }
     assert!(
-        u64::from(last_ok) >= pe_words(),
+        u64::from(last_ok) >= terms().pe_words,
         "a PE holds {last_ok} words, under the planned {}",
-        pe_words()
+        terms().pe_words
     );
 }
