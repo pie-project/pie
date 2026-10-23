@@ -117,14 +117,14 @@ impl Run<'_> {
         let x = self.tensor(act);
         let out = self.tensor(y);
         ane.before_columns(self.ctx(), plan, x)?;
-        linear::quant::matmul_columns(
+        linear::qmm::matmul_columns(
             self.ctx(),
             self.tuning(),
             x,
             plan.view,
             out,
             plan.keep,
-            linear::quant::Scratch {
+            linear::qmm::Scratch {
                 precast: &|rows, contraction| self.precast(rows, contraction),
                 partials: &|rows, width| self.partials(rows, width),
                 table: None,
@@ -159,13 +159,13 @@ impl Run<'_> {
         let room = |id: poem_ir::ValueId| self.capacity(id).saturating_sub(head);
         let precast = |rows, contraction| self.precast(rows, contraction);
         let partials = |rows, width| self.partials(rows, width);
-        let scratch = || linear::quant::Scratch {
+        let scratch = || linear::qmm::Scratch {
             precast: &precast,
             partials: &partials,
             table: None,
         };
         let (x, gate, hidden, out) = (at(act), at(packed), at(h), at(y));
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             x,
@@ -175,7 +175,7 @@ impl Run<'_> {
             room(act).min(room(packed)),
         )?;
         linear::mlp::swiglu(self.ctx(), gate, intermediate, hidden)?;
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             hidden,
@@ -224,13 +224,13 @@ impl Run<'_> {
         ane.before(self.ctx(), plan, x)?;
         let precast = |rows, contraction| self.precast(rows, contraction);
         let partials = |rows, width| self.partials(rows, width);
-        let scratch = || linear::quant::Scratch {
+        let scratch = || linear::qmm::Scratch {
             precast: &precast,
             partials: &partials,
             table: None,
         };
         let rows = self.capacity(act);
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             x,
@@ -239,7 +239,7 @@ impl Run<'_> {
             scratch(),
             rows.min(self.capacity(packed)),
         )?;
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             x,
@@ -249,7 +249,7 @@ impl Run<'_> {
             rows,
         )?;
         linear::mlp::swiglu_clamp_split(self.ctx(), gate, plan.up_rows, f32::MAX, h_gpu)?;
-        linear::quant::matmul(
+        linear::qmm::matmul(
             self.ctx(),
             self.tuning(),
             h_gpu,
@@ -282,7 +282,7 @@ impl Run<'_> {
         w: poem_ir::ValueId,
         y: poem_ir::ValueId,
     ) -> Result<bool, kernels_metal::Error> {
-        use linear::quant::{Segment, register_split};
+        use linear::qmm::sg::{Segment, register_split};
         use poem_ir::Operation;
         let Some((nodes, one_pass)) = self.region_nodes() else {
             return Ok(false);
@@ -439,7 +439,7 @@ impl Run<'_> {
                 return Ok(false);
             }
         }
-        let (counters, floats) = linear::quant::segments_scratch(&segments, m);
+        let (counters, floats) = linear::qmm::sg::segments_scratch(&segments, m);
         // Each split segment sums as its own launch would, or they run alone.
         let partials = if floats > 0 {
             match self.partials(1, floats) {
@@ -460,9 +460,9 @@ impl Run<'_> {
             return Ok(false);
         };
         if !laid {
-            linear::quant::register_table(self.ctx(), x, table, m, k, counters)?;
+            linear::qmm::sg::register_table(self.ctx(), x, table, m, k, counters)?;
         }
-        linear::quant::register_segments(self.ctx(), &segments, table, m, k, partials)?;
+        linear::qmm::sg::register_segments(self.ctx(), &segments, table, m, k, partials)?;
         self.land_ahead([
             members.get(1).map(|s| s.1),
             members.get(2).map(|s| s.1),
@@ -504,13 +504,13 @@ impl Run<'_> {
                     }
                     // The matmuls of one activation (a layer's projections of
                     // its normed rows) share the register tile's input table.
-                    linear::quant::matmul(
+                    linear::qmm::matmul(
                         self.ctx(),
                         self.tuning(),
                         x,
                         bank,
                         self.tensor(*y),
-                        linear::quant::Scratch {
+                        linear::qmm::Scratch {
                             precast: &|rows, contraction| self.precast(rows, contraction),
                             partials: &|rows, width| self.partials(rows, width),
                             table: Some(&|rows, contraction, counters| {
@@ -528,13 +528,13 @@ impl Run<'_> {
                 ),
             },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::lm_head(
+                Some(bank) => linear::qmm::lm_head(
                     self.ctx(),
                     self.tuning(),
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
-                    linear::quant::Scratch {
+                    linear::qmm::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
                         partials: &|rows, width| self.partials(rows, width),
                         table: Some(&|rows, contraction, counters| {

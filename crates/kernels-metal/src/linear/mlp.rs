@@ -50,7 +50,7 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
 
 /// [`swiglu`] over at most eight rows that also lays the register tile's
 /// input table of `y` in `table`, with `counters` arrival counters zeroed:
-/// the table `linear::quant`'s register matmul lays over `y`, bit for bit,
+/// the table `linear::qmm::sg`'s register matmul lays over `y`, bit for bit,
 /// so the down projection reads it and runs no table pass.
 pub fn swiglu_table(
     ctx: &Ctx<'_>,

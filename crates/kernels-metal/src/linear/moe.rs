@@ -731,15 +731,15 @@ fn batched_point(
     bm: u32,
     bn: u32,
     fp16: bool,
-) -> Result<Option<crate::linear::quant::Point>, Error> {
+) -> Result<Option<crate::linear::qmm::Point>, Error> {
     let (bm, bn) = (stated(op, bm)?, stated(op, bn)?);
     match (bank.affine(), bank.group, bank.bits, biased) {
-        (true, 64, 4, false) if fp16 => Ok(Some(crate::linear::quant::Point {
-            entry: crate::linear::quant::routed_fp16_point(op, bm, bn)?,
+        (true, 64, 4, false) if fp16 => Ok(Some(crate::linear::qmm::Point {
+            entry: crate::linear::qmm::tiled::routed_fp16_point(op, bm, bn)?,
             stamp: "",
         })),
-        (true, group, bits, false) if crate::linear::quant::qmm_stamps_width(bits) => {
-            Ok(Some(crate::linear::quant::qmm_point(
+        (true, group, bits, false) if crate::linear::qmm::tiled::qmm_stamps_width(bits) => {
+            Ok(Some(crate::linear::qmm::tiled::qmm_point(
                 op,
                 "_routed",
                 "PIE_STAMP_qmm_t_routed",
@@ -749,8 +749,8 @@ fn batched_point(
                 bn,
             )?))
         }
-        (false, MXFP4_BLOCK, 4, biased) => Ok(Some(crate::linear::quant::Point {
-            entry: crate::linear::quant::mxfp4_routed_point(
+        (false, MXFP4_BLOCK, 4, biased) => Ok(Some(crate::linear::qmm::Point {
+            entry: crate::linear::qmm::tiled::mxfp4_routed_point(
                 op,
                 if biased { "_bias" } else { "" },
                 bm,
@@ -947,11 +947,11 @@ pub fn matmul_select_batched(
     if let Some((m, n, simdgroups)) = mxfp4 {
         const FILE: &str = "linear/qmm_mpp.metal";
         let biased = bias.is_some();
-        let entry = crate::linear::quant::symbol(&format!(
+        let entry = crate::linear::qmm::symbol(&format!(
             "mxfp4_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}_b{}",
             u8::from(biased)
         ));
-        let stamp = crate::linear::quant::symbol(&format!(
+        let stamp = crate::linear::qmm::symbol(&format!(
             "PIE_MPP_MXFP4_POINT(\"{entry}\",{m},{n},{simdgroups},{tile},{biased})"
         ));
         ctx.fire(
@@ -990,10 +990,10 @@ pub fn matmul_select_batched(
                 &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
             )?;
         }
-        let entry = crate::linear::quant::symbol(&format!(
+        let entry = crate::linear::qmm::symbol(&format!(
             "affine_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}"
         ));
-        let stamp = crate::linear::quant::symbol(&format!(
+        let stamp = crate::linear::qmm::symbol(&format!(
             "PIE_MPP_ROUTED_POINT(\"{entry}\",{m},{n},{simdgroups},{tile})"
         ));
         ctx.fire(
@@ -1031,7 +1031,7 @@ pub fn matmul_select_batched(
             args.push(ctx.absent()?);
         }
         args.push(scratch.tile_expert.arg());
-        let mut grid = crate::linear::quant::qmm_grid(
+        let mut grid = crate::linear::qmm::tiled::qmm_grid(
             op,
             stated(op, y.width)?,
             stated(op, bn)?,
@@ -1042,11 +1042,11 @@ pub fn matmul_select_batched(
         // The stamped affine kernel is the gemm tile's own; the MXFP4 and fp16 ones
         // take the routed threadgroup.
         let group = if point.stamp.is_empty() {
-            let group = crate::linear::quant::routed_group(stated(op, tile)?);
+            let group = crate::linear::qmm::tiled::routed_group(stated(op, tile)?);
             grid[2] = group[2];
             group
         } else {
-            crate::linear::quant::qmm_group(stated(op, tile)?)
+            crate::linear::qmm::tiled::qmm_group(stated(op, tile)?)
         };
         ctx.fire(
             Fire::at(QMM_FILE, point.entry)

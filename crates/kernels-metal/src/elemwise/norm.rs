@@ -130,7 +130,7 @@ pub fn residual_add_rmsnorm(
 
 /// [`residual_add_rmsnorm`] that also lays the register tile's input table of
 /// the normed rows in `table`, with `counters` arrival counters zeroed: the
-/// table `linear::quant`'s register matmul lays over `out`, bit for bit, so
+/// table `linear::qmm::sg`'s register matmul lays over `out`, bit for bit, so
 /// the projections of `out` read it and run no table pass. At most eight bf16
 /// rows, a whole number of 64-input groups wide.
 #[allow(clippy::too_many_arguments)]
@@ -193,7 +193,7 @@ pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) ->
 
 /// [`rmsnorm`] (or [`rmsnorm_plus_one`]) over at most eight bf16 rows that also lays the register
 /// tile's input table of the normed rows in `table`, with `counters` arrival
-/// counters zeroed: the table `linear::quant`'s register matmul lays over `y`,
+/// counters zeroed: the table `linear::qmm::sg`'s register matmul lays over `y`,
 /// bit for bit, so the projections of `y` run no table pass.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_table(
@@ -466,7 +466,7 @@ pub fn rmsnorm_gated(
 
 /// [`rmsnorm_gated`] with the SiLU gate over at most eight rows that also
 /// lays the register tile's input table of `y` in `table`, with `counters`
-/// arrival counters zeroed: the table `linear::quant`'s register matmul lays
+/// arrival counters zeroed: the table `linear::qmm::sg`'s register matmul lays
 /// over `y`, bit for bit, so the out projection runs no table pass.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_gated_table(

@@ -69,7 +69,7 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
 
 /// [`sigmoid_mul`] over at most eight rows that also lays the register tile's
 /// input table of the gated rows in `table`, with `counters` arrival counters
-/// zeroed: the table `linear::quant`'s register matmul lays over `x`, bit for
+/// zeroed: the table `linear::qmm::sg`'s register matmul lays over `x`, bit for
 /// bit, so the out projection runs no table pass.
 pub fn sigmoid_mul_table(
     ctx: &Ctx<'_>,

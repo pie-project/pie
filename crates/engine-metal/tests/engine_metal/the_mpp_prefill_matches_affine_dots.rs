@@ -3,7 +3,7 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -174,13 +174,13 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                 };
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(
+                qmm::matmul(
                     &sink,
                     &tuning,
                     Tensor::new(ha, m, k, Dtype::Bf16),
                     bank,
                     Tensor::new(ho, m, n, Dtype::Bf16),
-                    quant::Scratch {
+                    qmm::Scratch {
                         precast: &precast,
                         partials: &partials,
                         table: None,
