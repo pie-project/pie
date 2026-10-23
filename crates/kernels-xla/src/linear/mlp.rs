@@ -92,7 +92,7 @@ fn pie_tanh(f: &mut Func, x: Val) -> Result<Val, Error> {
 }
 
 pub fn swiglu(f: &mut Func, packed: Operand, intermediate: u32, y: Landing) -> Result<Val, Error> {
-    const OP: &str = "linear.swiglu";
+    const OP: &str = "linear.glu";
     halves(OP, packed, intermediate, y)?;
     let (g, u) = read_halves(f, packed, intermediate)?;
     let s = silu(f, g)?;
@@ -107,7 +107,7 @@ pub fn swiglu_clamp(
     limit: f32,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.swiglu_clamp";
+    const OP: &str = "linear.glu";
     halves(OP, packed, intermediate, y)?;
     let (g, u) = read_halves(f, packed, intermediate)?;
     let (g, u) = clamped(f, g, u, limit)?;
@@ -125,7 +125,7 @@ pub fn swiglu_clamp_alpha(
     alpha: f32,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.swiglu_clamp_alpha";
+    const OP: &str = "linear.glu";
     halves(OP, packed, intermediate, y)?;
     let (g, u) = read_halves(f, packed, intermediate)?;
     let (g, u) = clamped(f, g, u, limit)?;
@@ -146,7 +146,7 @@ pub fn swiglu_clamp_split(
     limit: f32,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.swiglu_clamp_split";
+    const OP: &str = "linear.glu";
     split(OP, gate, up, y)?;
     let g = gate.f32(f);
     let u = up.f32(f);
@@ -157,7 +157,7 @@ pub fn swiglu_clamp_split(
 }
 
 pub fn geglu_tanh(f: &mut Func, gate: Operand, up: Operand, y: Landing) -> Result<Val, Error> {
-    const OP: &str = "linear.geglu_tanh";
+    const OP: &str = "linear.glu";
     split(OP, gate, up, y)?;
     let g = gate.f32(f);
     let u = up.f32(f);
@@ -186,7 +186,7 @@ pub fn geglu_tanh_packed(
     intermediate: u32,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     halves(OP, packed, intermediate, y)?;
     let (g, u) = read_halves(f, packed, intermediate)?;
     let g = f.gelu_tanh(g)?;
@@ -204,7 +204,7 @@ pub fn situ(
     up_cap: Option<f32>,
     y: Landing,
 ) -> Result<Val, Error> {
-    const OP: &str = "linear.situ";
+    const OP: &str = "linear.glu";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }

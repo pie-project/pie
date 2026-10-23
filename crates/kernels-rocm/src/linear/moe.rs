@@ -84,7 +84,7 @@ pub fn topk_softmax(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
@@ -118,7 +118,7 @@ pub fn topk_softmax_scaled(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax_scaled";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
         scale.dtype, logits.dtype,
@@ -198,7 +198,7 @@ pub fn topk_sigmoid(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     ranked_router(
         ctx,
@@ -229,7 +229,7 @@ pub fn topk_sigmoid_sink(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid_sink";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = top_k
         .checked_add(sink)
@@ -303,7 +303,7 @@ pub fn topk_sqrt_softplus(
     routes: &mut Tensor,
     weights: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sqrt_softplus";
+    const OP: &str = "linear.moe_route";
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
         bias.dtype,

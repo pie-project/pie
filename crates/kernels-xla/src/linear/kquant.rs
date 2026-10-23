@@ -109,7 +109,7 @@ pub fn matmul(f: &mut Func, act: Operand, w: Operand, y: Landing) -> Result<Opti
 }
 
 pub fn lm_head(f: &mut Func, act: Operand, w: Operand, y: Landing) -> Result<Option<Val>, Error> {
-    act_x_wt(f, "linear.lm_head", act, w, y)
+    act_x_wt(f, "linear.matmul", act, w, y)
 }
 
 fn act_x_wt(

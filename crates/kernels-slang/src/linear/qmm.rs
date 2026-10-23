@@ -1,4 +1,4 @@
-//! Affine-quantized matmuls (`linear.matmul`, `linear.lm_head` over a bank):
+//! Affine-quantized matmuls (`linear.matmul`, `linear.matmul` over a bank):
 //! the engine's `kernel.qmm` ladder, its rungs in order, and the first that
 //! fits the shape runs. The tiled rung is `kernels/linear/qmm_tiled.slang`
 //! on SPIR-V (with its cooperative-matrix tier) and `qmm_quad.slang` on
@@ -135,7 +135,7 @@ pub fn lm_head(
     y: Tensor,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    fire(ctx, "linear.lm_head", ladder, act, w, y, capacity_rows)
+    fire(ctx, "linear.matmul", ladder, act, w, y, capacity_rows)
 }
 
 fn fire(

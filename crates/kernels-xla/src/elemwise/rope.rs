@@ -304,7 +304,7 @@ pub fn full(
     theta: f32,
     interleaved: bool,
 ) -> Result<[Option<Val>; 2], Error> {
-    const OP: &str = "elemwise.rope_full";
+    const OP: &str = "elemwise.rope";
     int_positions(OP, positions)?;
     rotary_within(OP, head_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
@@ -328,7 +328,7 @@ pub fn partial(
     theta: f32,
     span: u32,
 ) -> Result<[Option<Val>; 2], Error> {
-    const OP: &str = "elemwise.rope_partial";
+    const OP: &str = "elemwise.rope";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
@@ -347,7 +347,7 @@ pub fn partial_q(
     theta: f32,
     span: u32,
 ) -> Result<Option<Val>, Error> {
-    const OP: &str = "elemwise.rope_partial_q";
+    const OP: &str = "elemwise.rope";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
@@ -404,7 +404,7 @@ pub fn partial_last(
     inverse: bool,
     yarn: Option<Yarn>,
 ) -> Result<Option<Val>, Error> {
-    const OP: &str = "elemwise.rope_partial_last";
+    const OP: &str = "elemwise.rope";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
@@ -463,7 +463,7 @@ pub fn yarn(
     original_max_position: u32,
     interleaved: bool,
 ) -> Result<[Option<Val>; 2], Error> {
-    const OP: &str = "elemwise.rope_yarn";
+    const OP: &str = "elemwise.rope";
     int_positions(OP, positions)?;
     rotary_within(OP, head_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;

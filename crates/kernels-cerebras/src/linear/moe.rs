@@ -27,7 +27,7 @@ pub fn topk_softmax(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax";
+    const OP: &str = "linear.moe_route";
     expect(OP, logits, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, routes, &[Dtype::I32])?;
     expect(OP, weights, &[Dtype::F32])?;

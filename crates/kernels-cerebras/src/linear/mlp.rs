@@ -9,7 +9,7 @@ use crate::program::Shard;
 use crate::tensor::Tensor;
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu";
+    const OP: &str = "linear.glu";
     expect(OP, packed, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
     if packed.width != 2 * intermediate || y.width != intermediate || y.rows > packed.rows {

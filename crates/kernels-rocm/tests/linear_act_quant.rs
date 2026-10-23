@@ -163,7 +163,7 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
                 .collect();
             let (q, s) = act_quant::quantized_codes(
                 &ctx,
-                "linear.matmul_act_quant",
+                "linear.matmul",
                 gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
                 128,
                 true,
@@ -172,7 +172,7 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
             .unwrap();
             act_quant::matmul_fp8_quantized(
                 &ctx,
-                "linear.matmul_act_quant",
+                "linear.matmul",
                 q,
                 s,
                 wt,
@@ -183,7 +183,7 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
         } else {
             act_quant::matmul_fp8b32_lanes(
                 &ctx,
-                "linear.matmul_act_quant",
+                "linear.matmul",
                 gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
                 wt,
                 gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
@@ -203,7 +203,7 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
     }
     act_quant::matmul_fp8b128(
         &ctx,
-        "linear.matmul_act_quant",
+        "linear.matmul",
         gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
         gpu.upload(&codes, n as u32, k as u32, Dtype::E4m3),
         gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
@@ -393,7 +393,7 @@ fn run_fp8_mfma_tuned(m: usize, n: usize, k: usize, edge_codes: bool, tall: usiz
     assert_eq!(nans, 0);
     act_quant::matmul_fp8(
         &ctx,
-        "linear.matmul_act_quant",
+        "linear.matmul",
         gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
         wt,
         gpu.tensor(&factors, nb as u32, kb as u32, Dtype::F32),

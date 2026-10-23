@@ -1,4 +1,4 @@
-//! A projection over a quantized bank (`linear.matmul`, `linear.lm_head`):
+//! A projection over a quantized bank (`linear.matmul`, `linear.matmul`):
 //! the profile's `kernel.qmm` ladder picks a kernel for the shape, each rung
 //! running if it finds its scratch. The matrix kernels are this module's
 //! (`mpp`, `staged`, `sg`, `tiled`, one per `linear/qmm_*.metal` unit); the
@@ -138,7 +138,7 @@ pub fn lm_head(
     act_x_wt(
         ctx,
         tuning,
-        "linear.lm_head",
+        "linear.matmul",
         act,
         w,
         y,

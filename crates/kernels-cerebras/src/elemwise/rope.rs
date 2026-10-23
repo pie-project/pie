@@ -25,7 +25,7 @@ pub fn partial(
 ) -> Result<(), Error> {
     rotate(
         ctx,
-        "elemwise.rope_partial",
+        "elemwise.rope",
         &[q, k],
         positions,
         rotary_dim,
@@ -45,7 +45,7 @@ pub fn partial_q(
 ) -> Result<(), Error> {
     rotate(
         ctx,
-        "elemwise.rope_partial_q",
+        "elemwise.rope",
         &[q],
         positions,
         rotary_dim,

@@ -290,7 +290,7 @@ pub fn topk_softmax(
 ) -> Result<(Val, Val), Error> {
     softmax_router(
         f,
-        "linear.moe_topk_softmax",
+        "linear.moe_route",
         logits,
         None,
         experts,
@@ -311,7 +311,7 @@ pub fn topk_softmax_scaled(
 ) -> Result<(Val, Val), Error> {
     softmax_router(
         f,
-        "linear.moe_topk_softmax_scaled",
+        "linear.moe_route",
         logits,
         Some(scale),
         experts,
@@ -414,7 +414,7 @@ pub fn topk_sigmoid(
 ) -> Result<(Val, Val), Error> {
     scored_router(
         f,
-        "linear.moe_topk_sigmoid",
+        "linear.moe_route",
         Score::Sigmoid,
         logits,
         None,
@@ -440,7 +440,7 @@ pub fn topk_sigmoid_biased(
 ) -> Result<(Val, Val), Error> {
     scored_router(
         f,
-        "linear.moe_topk_sigmoid",
+        "linear.moe_route",
         Score::Sigmoid,
         logits,
         Some(bias),
@@ -466,7 +466,7 @@ pub fn topk_sqrt_softplus(
 ) -> Result<(Val, Val), Error> {
     scored_router(
         f,
-        "linear.moe_topk_sqrt_softplus",
+        "linear.moe_route",
         Score::SqrtSoftplus,
         logits,
         Some(bias),
@@ -490,7 +490,7 @@ pub fn predict_route(
 ) -> Result<(Val, Val), Error> {
     scored_router(
         f,
-        "linear.moe_predict_route",
+        "linear.moe_route",
         Score::SqrtSoftplus,
         logits,
         Some(bias),
@@ -520,7 +520,7 @@ pub fn topk_sigmoid_sink(
     routes: Landing,
     weights: Landing,
 ) -> Result<(Val, Val), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid_sink";
+    const OP: &str = "linear.moe_route";
     expect(OP, logits, &[Dtype::Bf16])?;
     nonzero(OP, "the expert count", experts)?;
     nonzero(OP, "the fan-out", top_k)?;
@@ -614,7 +614,7 @@ pub fn hash_route(
     routes: Landing,
     weights: Landing,
 ) -> Result<(Val, Val), Error> {
-    const OP: &str = "linear.moe_hash_route";
+    const OP: &str = "linear.moe_route";
     expect(OP, ids, &[Dtype::U32, Dtype::I32])?;
     expect(OP, tid2eid, &[Dtype::I64])?;
     expect(OP, logits, &[Dtype::Bf16])?;

@@ -1,5 +1,5 @@
-//! Gated linear units (`linear.swiglu` and its clamped, GPT-OSS and SiTU
-//! forms, `linear.geglu_tanh` packed and split, `linear.gelu_tanh`) from
+//! Gated linear units (`linear.glu` and its clamped, GPT-OSS and SiTU
+//! forms, `linear.glu` packed and split, `linear.gelu_tanh`) from
 //! `kernels/linear/glu.slang`, a pair of columns a lane.
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, refuse};
@@ -66,7 +66,7 @@ fn split_grid(
 }
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_swiglu_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -82,7 +82,7 @@ pub fn swiglu_clamp(
     limit: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_swiglu_clamp_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -104,7 +104,7 @@ pub fn swiglu_clamp_alpha(
     alpha: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp_alpha";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_swiglu_clamp_alpha_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -126,7 +126,7 @@ pub fn swiglu_clamp_split(
     limit: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp_split";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_glu_swiglu_clamp_split_bf16" });
     let (lanes, n) = split_grid(OP, gate, up, y)?;
     ctx.fire(
@@ -136,7 +136,7 @@ pub fn swiglu_clamp_split(
 }
 
 pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_glu_geglu_tanh_bf16" });
     let (lanes, n) = split_grid(OP, gate, up, y)?;
     ctx.fire(
@@ -161,7 +161,7 @@ pub fn geglu_tanh_packed(
     intermediate: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_geglu_tanh_packed_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -178,7 +178,7 @@ pub fn situ(
     up_cap: Option<f32>,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.situ";
+    const OP: &str = "linear.glu";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }

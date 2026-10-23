@@ -226,7 +226,7 @@ pub fn lm_head_via_dense(
 ) -> Result<(), Error> {
     dense_affine_via_dense(
         ctx,
-        "linear.lm_head",
+        "linear.matmul",
         act,
         codes,
         scales,

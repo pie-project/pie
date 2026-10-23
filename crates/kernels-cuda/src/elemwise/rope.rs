@@ -75,7 +75,7 @@ pub fn full(
     theta: f32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_full";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -132,7 +132,7 @@ pub fn partial(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_partial";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
@@ -150,7 +150,7 @@ pub fn partial_q(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_partial_q";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
     let k = Tensor::new(q.ptr, q.rows, 0, q.dtype);
@@ -205,7 +205,7 @@ pub fn partial_last(
     inverse: bool,
     yarn: Option<Yarn>,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_partial_last";
+    const OP: &str = "elemwise.rope";
     let (factor, low_dim, high_dim) = match yarn {
         Some(y) => {
             let max_position = nonzero(
@@ -333,7 +333,7 @@ pub fn yarn(
     positions: Tensor,
     r: YarnRope,
 ) -> Result<(), Error> {
-    yarn_fire(ctx, "elemwise.rope_yarn", q, k, positions, r, None)
+    yarn_fire(ctx, "elemwise.rope", q, k, positions, r, None)
 }
 
 /// Where a YaRN rotation also lands the rotated keys and the values in a
@@ -850,7 +850,7 @@ fn fire_mrope(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_mrope";
+    const OP: &str = "elemwise.rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
 

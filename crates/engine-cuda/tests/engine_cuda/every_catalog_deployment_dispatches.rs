@@ -56,7 +56,7 @@ fn ops_of(deployment: &str) -> BTreeSet<String> {
         .collect()
 }
 
-const SPLIT_MROPE: &str = "elemwise.rope_mrope(form=Split)";
+const SPLIT_MROPE: &str = "elemwise.rope(turn=Mrope, form=Split)";
 
 fn refused() -> BTreeMap<&'static str, &'static Refusal> {
     let mut refused: BTreeMap<&'static str, &'static Refusal> =
