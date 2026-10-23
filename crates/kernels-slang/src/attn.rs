@@ -8,6 +8,7 @@ pub mod index;
 pub mod kv_append;
 pub mod merge;
 pub mod mla;
+pub mod pool;
 pub mod score;
 
 /// The heads a `width`-wide row of `head_dim`-wide heads holds.

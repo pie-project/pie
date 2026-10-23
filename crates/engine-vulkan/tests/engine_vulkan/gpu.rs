@@ -142,6 +142,10 @@ impl Gpu {
 pub fn close(got: &[f32], want: &[f64], what: &str) {
     let mut worst = 0.0f64;
     for (g, w) in got.iter().zip(want) {
+        // An exact match, an empty reading's infinite LSE included.
+        if f64::from(*g) == *w {
+            continue;
+        }
         // bf16 output: half an ulp of the value, plus a floor near zero.
         let tol = w.abs() * 2f64.powi(-8) + 1e-3;
         let err = (f64::from(*g) - w).abs();

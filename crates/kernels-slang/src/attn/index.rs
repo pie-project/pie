@@ -11,6 +11,11 @@ use crate::tensor::{KvPool, Tensor};
 
 const INDEX: &str = "attn/index.slang";
 
+/// The block mean lives with the pool it averages.
+const POOL: &str = "attn/pool.slang";
+
+const POOL_GROUP: u32 = 256;
+
 const K_BLOCK: u32 = 256;
 
 const Q_ROPE_GROUP: u32 = 32;
@@ -132,6 +137,59 @@ pub fn kv_append(
     pool_pitch(OP, keys, k.width)?;
     let no_rope = Tensor::new(k.buf, k.rows, 0, k.dtype);
     super::mla::kv_append(ctx, k, no_rope, keys, write_page, write_offset)
+}
+
+/// Each closed block's index keys averaged, for the indexer to rank.
+pub fn block_mean(
+    ctx: &Ctx<'_>,
+    boundary_pos: Tensor,
+    boundary_req: Tensor,
+    keys: &KvPool,
+    head_dim: u32,
+    ratio: u32,
+    entries: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attn.index_block_mean";
+    let entry = dtype_dispatch!(OP, entries.dtype, { Bf16 => "attn_pool_block_mean_bf16" });
+    debug_assert!(
+        boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
+        "`{OP}` reads the i32 block tables `attn.pool_boundary_*` published"
+    );
+    if keys.page_size <= 0 {
+        return Err(refuse(OP, "the index cache page size is zero"));
+    }
+    let head_dim = nonzero(OP, "the key width this mean states", head_dim)?;
+    super::even_lanes(OP, "index key", head_dim)?;
+    pool_pitch(OP, keys, head_dim)?;
+    if entries.width != head_dim {
+        return Err(refuse(
+            OP,
+            format!(
+                "the stated head width {head_dim} is not the {}-wide entry it sized",
+                entries.width
+            ),
+        ));
+    }
+    let ratio = nonzero(OP, "the block width this mean pools over", ratio)?;
+    let rows = nonzero(OP, "rows", boundary_pos.rows)?;
+    ctx.fire(
+        Fire::at(POOL, entry).apply(Grid::of(
+            [head_dim.div_ceil(2), rows, 1],
+            [POOL_GROUP, 1, 1],
+        )),
+        &[
+            keys.keys.arg(),
+            entries.arg_mut(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            keys.page_indices.arg(),
+            keys.page_indptr.arg(),
+            stated(OP, head_dim)?.arg(),
+            stated(OP, ratio)?.arg(),
+            keys.page_size.arg(),
+            stated(OP, rows)?.arg(),
+        ],
+    )
 }
 
 pub fn topk(
