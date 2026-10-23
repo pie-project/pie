@@ -429,3 +429,168 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
       constant int &, constant int &, constant int &, constant int &, constant int &,              \
       constant int &, constant int &, constant int &, constant int &, constant int &,              \
       constant int &, uint, uint, uint);
+
+// diag: affine_qmm_sg with its prefetch depth U, fragments a simdgroup NF, simdgroups a
+// threadgroup SIMDS and, VS, its U groups' scales and biases as one load each.
+template <int SPLIT, int U, int NF, int SIMDS, int VS>
+[[kernel]] void
+affine_qmm_sgx(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
+               const device bfloat *biases [[buffer(2)]], const device bfloat *table [[buffer(3)]],
+               device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+               constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
+               constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+               uint2 position [[threadgroup_position_in_grid]],
+               uint lane [[thread_index_in_simdgroup]],
+               uint simd [[simdgroup_index_in_threadgroup]]) {
+  using namespace qmm_sg;
+  const uint qid = lane >> 2;
+  const uint fm = (qid & 4) | ((lane >> 1) & 3);
+  const uint fn = ((qid & 2) << 1) | ((lane & 1) << 1);
+  const uint c = fn >> 1;
+  const uint column = position.x * 8 * NF * SIMDS + simd * 8 * NF + fm;
+  const ulong words = ulong(stride) / 8, groups = ulong(stride) / 64;
+  const device uint2 *w0 = reinterpret_cast<const device uint2 *>(weights + ulong(column) * words) + c;
+  const ulong apart = 8 * words / 2;
+  const device bfloat *s0 = scales + ulong(column) * groups, *b0 = biases + ulong(column) * groups;
+  const device vec<bfloat, 16> *xt =
+      reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
+  const device float *sums = reinterpret_cast<const device float *>(table + 8 * ulong(width));
+  const int units = width / kSpan;
+  const int first = int(position.y) * units / SPLIT * 4, last = (int(position.y) + 1) * units / SPLIT * 4;
+  float2 acc[NF];
+  uint2 q[U][NF];
+  float qs[U][NF], qb[U][NF];
+#pragma unroll
+  for (int f = 0; f < NF; ++f)
+    acc[f] = float2(0.0f);
+  auto load = [&](int at) {
+#pragma unroll
+    for (int f = 0; f < NF; ++f) {
+#pragma unroll
+      for (int u = 0; u < U; ++u)
+        q[u][f] = w0[f * apart + ulong(at + u) * 4];
+      if constexpr (VS && U == 2) {
+        const bfloat2 s = *reinterpret_cast<const device bfloat2 *>(s0 + 8 * f * groups + at);
+        const bfloat2 b = *reinterpret_cast<const device bfloat2 *>(b0 + 8 * f * groups + at);
+        qs[0][f] = float(s[0]); qs[U - 1][f] = float(s[1]);
+        qb[0][f] = float(b[0]); qb[U - 1][f] = float(b[1]);
+      } else if constexpr (VS && U == 4) {
+        const vec<bfloat, 4> s = *reinterpret_cast<const device vec<bfloat, 4> *>(s0 + 8 * f * groups + at);
+        const vec<bfloat, 4> b = *reinterpret_cast<const device vec<bfloat, 4> *>(b0 + 8 * f * groups + at);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          qs[u][f] = float(s[u & 3]);
+          qb[u][f] = float(b[u & 3]);
+        }
+      } else {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          qs[u][f] = float(s0[8 * f * groups + at + u]);
+          qb[u][f] = float(b0[8 * f * groups + at + u]);
+        }
+      }
+    }
+  };
+  load(first);
+  for (int h0 = first; h0 < last; h0 += U) {
+    uint2 cw[U][NF];
+    float2 ck[U][NF];
+#pragma unroll
+    for (int u = 0; u < U; ++u)
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        cw[u][f] = q[u][f];
+        ck[u][f] = float2(qs[u][f], fma(-128.0f, qs[u][f], qb[u][f]));
+      }
+    if (h0 + U < last)
+      load(h0 + U);
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int h = h0 + u;
+      const vec<bfloat, 16> x = xt[ulong(h) * 32];
+      float2 d[NF];
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
+        d[f] = float2(0.0f);
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (uint p = 0; p < 4; ++p) {
+          const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
+#pragma unroll
+          for (int f = 0; f < NF; ++f) {
+            if constexpr (VS == 3) { if (p & 1) continue; }
+            const uint sh = VS == 2 ? 0 : 4 * p;
+            mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> sh) & 0x000F000Fu) | 0x43004300u), b);
+          }
+        }
+      const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
+                        *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        acc[f] = fma(d[f], ck[u][f].x, acc[f]);
+        acc[f] = fma(sm, ck[u][f].y, acc[f]);
+      }
+    }
+  }
+  if constexpr (SPLIT > 1) {
+    device coherent(device) float *plane = partials;
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
+        plane[ulong(position.y) * rows * columns + o + 8 * f] = acc[f][i];
+    }
+    threadgroup uint arrival;
+    device atomic_uint *count = reinterpret_cast<device atomic_uint *>(
+                                    const_cast<device bfloat *>(table) + 8 * ulong(width)) +
+                                width / 4 + position.x;
+    const uint me = simd * 32 + lane;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (me == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      arrival = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (arrival != SPLIT - 1)
+      return;
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        float total = 0.0f;
+        for (int s = 0; s < SPLIT; ++s)
+          total += s == int(position.y) ? acc[f][i] : plane[ulong(s) * rows * columns + o + 8 * f];
+        output[o + 8 * f] = bfloat(total);
+      }
+    }
+    if (me == 0)
+      atomic_store_explicit(count, 0u, memory_order_relaxed);
+  } else {
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
+        output[o + 8 * f] = bfloat(acc[f][i]);
+    }
+  }
+}
+
+#define PIE_SGX(name, split, u, nf, simds, vs)                                                     \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_sgx<split, u, nf, simds, vs>(            \
+      const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
+      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
+      constant int &, uint2, uint, uint);
