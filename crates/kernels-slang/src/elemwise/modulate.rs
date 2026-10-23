@@ -147,9 +147,9 @@ pub fn gated_residual_add(
     let width = nonzero(OP, "the folded width", r.width)?;
     let rows = nonzero(OP, "rows", r.rows)?;
     let entry = [
-        "elemwise_gated_residual_add_bf16",
-        "elemwise_gated_residual_add_bf16_f32",
-        "elemwise_gated_residual_add_f32",
+        "elemwise_modulate_gated_residual_add_bf16",
+        "elemwise_modulate_gated_residual_add_bf16_f32",
+        "elemwise_modulate_gated_residual_add_f32",
     ][stamp(OP, r.dtype, g, width, width)?];
     if lane_of_row.is_none() && g.rows < rows {
         return Err(refuse(OP, format!("{} gates for {rows} rows", g.rows)));

@@ -133,5 +133,5 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
 
 // pie:instantiate attn_merge_lse_bf16 PIE_MERGE=1 PIE_GROUP_X=256
-// pie:instantiate attn_sink_bf16 PIE_SINK=1 PIE_GROUP_X=64
-// pie:instantiate attn_softcap_bf16 PIE_SOFTCAP=1 PIE_GROUP_X=256
+// pie:instantiate attn_merge_sink_bf16 PIE_SINK=1 PIE_GROUP_X=64
+// pie:instantiate attn_merge_softcap_bf16 PIE_SOFTCAP=1 PIE_GROUP_X=256

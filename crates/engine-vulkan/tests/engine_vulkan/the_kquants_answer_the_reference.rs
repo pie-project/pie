@@ -4,7 +4,7 @@
 //! odd scheme starts off a word; ten columns, so the last workgroup is part
 //! empty.
 
-use kernels_slang::linear::kquant::{Scheme, Tier};
+use kernels_slang::linear::kquant::{Scheme, Tactic};
 use kernels_vulkan::{Tensor, linear::kquant};
 use poem_ir::Dtype;
 
@@ -187,7 +187,14 @@ fn the_kquants_answer_the_reference() {
             if subgroup && !wide {
                 continue;
             }
-            let tier = Tier { subgroup, slices };
+            let tier = Tactic {
+                tier: if subgroup {
+                    kernels_slang::Tier::Subgroup
+                } else {
+                    kernels_slang::Tier::Baseline
+                },
+                slices,
+            };
             both(
                 &mut gpu,
                 &format!("{scheme:?} subgroup {subgroup} slices {slices}"),

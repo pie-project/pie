@@ -99,6 +99,6 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // pie:instantiate elemwise_modulate_bf16 PIE_MODULATE=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_modulate_bf16_f32 PIE_MODULATE=1 PIE_GROUP_X=256 PIE_MOD_F32=1
 // pie:instantiate elemwise_modulate_f32 PIE_MODULATE=1 PIE_GROUP_X=256 PIE_ACT_F32=1 PIE_MOD_F32=1
-// pie:instantiate elemwise_gated_residual_add_bf16 PIE_GATED=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_gated_residual_add_bf16_f32 PIE_GATED=1 PIE_GROUP_X=256 PIE_MOD_F32=1
-// pie:instantiate elemwise_gated_residual_add_f32 PIE_GATED=1 PIE_GROUP_X=256 PIE_ACT_F32=1 PIE_MOD_F32=1
+// pie:instantiate elemwise_modulate_gated_residual_add_bf16 PIE_GATED=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_modulate_gated_residual_add_bf16_f32 PIE_GATED=1 PIE_GROUP_X=256 PIE_MOD_F32=1
+// pie:instantiate elemwise_modulate_gated_residual_add_f32 PIE_GATED=1 PIE_GROUP_X=256 PIE_ACT_F32=1 PIE_MOD_F32=1

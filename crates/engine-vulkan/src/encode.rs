@@ -290,9 +290,19 @@ impl kernels_slang::Encode for Slang<'_> {
         fire: kernels_slang::Fire,
         args: &[kernels_slang::ArgValue],
     ) -> std::result::Result<(), kernels_slang::Error> {
+        let entrypoint = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
+            kernels_slang::Error::Backend {
+                op: "slang.fire",
+                detail: format!(
+                    "`{}` is not instantiated at the {} tier",
+                    fire.entrypoint,
+                    fire.tier.name()
+                ),
+            }
+        })?;
         let fire = Fire {
             file: fire.file,
-            entrypoint: fire.entrypoint,
+            entrypoint,
             groups: fire.groups,
             group: fire.group,
         };

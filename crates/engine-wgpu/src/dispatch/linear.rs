@@ -5,8 +5,8 @@ use poem_ir::{Linear, Operands};
 use crate::run::Run;
 
 /// WGSL has no subgroup tier; two strips a workgroup.
-const KQUANT: kernels_slang::linear::kquant::Tier = kernels_slang::linear::kquant::Tier {
-    subgroup: false,
+const KQUANT: kernels_slang::linear::kquant::Tactic = kernels_slang::linear::kquant::Tactic {
+    tier: kernels_slang::Tier::Baseline,
     slices: 2,
 };
 

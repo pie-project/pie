@@ -113,7 +113,8 @@ pub fn grid_taps(
     }
     let kind: i32 = if bilinear { 0 } else { 1 };
     ctx.fire(
-        Fire::at(PIXELS, "gather_grid_taps").apply(Grid::of([positions.rows, 1, 1], [GROUP, 1, 1])),
+        Fire::at(PIXELS, "gather_pixels_grid_taps")
+            .apply(Grid::of([positions.rows, 1, 1], [GROUP, 1, 1])),
         &[
             positions.arg(),
             grids.arg(),

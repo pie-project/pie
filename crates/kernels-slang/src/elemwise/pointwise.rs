@@ -37,8 +37,8 @@ pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
         ));
     }
     let entry = dtype_dispatch!(OP, z.dtype, {
-        Bf16 => "elemwise_add_bf16",
-        F32 => "elemwise_add_f32",
+        Bf16 => "elemwise_pointwise_add_bf16",
+        F32 => "elemwise_pointwise_add_f32",
     });
     let (n, grid) = flat(OP, z)?;
     ctx.fire(
@@ -51,8 +51,8 @@ pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
 pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.residual_add";
     let entry = dtype_dispatch!(OP, y.dtype, {
-        Bf16 => "elemwise_residual_add_bf16",
-        F32 => "elemwise_residual_add_f32",
+        Bf16 => "elemwise_pointwise_residual_add_bf16",
+        F32 => "elemwise_pointwise_residual_add_f32",
     });
     let (n, grid) = flat(OP, y)?;
     ctx.fire(
@@ -66,9 +66,9 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
 pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.add_bias";
     let entry = match (out.dtype, bias.dtype) {
-        (Dtype::Bf16, Dtype::Bf16) => "elemwise_add_bias_bf16",
-        (Dtype::F32, Dtype::F32) => "elemwise_add_bias_f32",
-        (Dtype::F32, Dtype::Bf16) => "elemwise_add_bias_f32_bf16",
+        (Dtype::Bf16, Dtype::Bf16) => "elemwise_pointwise_add_bias_bf16",
+        (Dtype::F32, Dtype::F32) => "elemwise_pointwise_add_bias_f32",
+        (Dtype::F32, Dtype::Bf16) => "elemwise_pointwise_add_bias_f32_bf16",
         (row, bank) => return Err(refuse(OP, format!("a {bank:?} bias on a {row:?} row"))),
     };
     let [width, rows, _] = elementwise_rows(OP, out.width, out.rows)?;
@@ -88,8 +88,8 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
 pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.mul_scalar";
     let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "elemwise_scale_bf16",
-        F32 => "elemwise_scale_f32",
+        Bf16 => "elemwise_pointwise_scale_bf16",
+        F32 => "elemwise_pointwise_scale_f32",
     });
     let (n, grid) = flat(OP, x)?;
     ctx.fire(
@@ -101,7 +101,7 @@ pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
 /// `x *= s[0]`.
 pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.scale";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_scale_read_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_pointwise_scale_read_bf16" });
     let (n, grid) = flat(OP, x)?;
     ctx.fire(
         Fire::at(POINTWISE, entry).apply(grid),
@@ -121,8 +121,8 @@ pub fn silu(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
 
 fn silu_at(ctx: &Ctx<'_>, op: &'static str, s: f32, x: Tensor) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, {
-        Bf16 => "elemwise_silu_scaled_bf16",
-        F32 => "elemwise_silu_scaled_f32",
+        Bf16 => "elemwise_pointwise_silu_scaled_bf16",
+        F32 => "elemwise_pointwise_silu_scaled_f32",
     });
     let (n, grid) = flat(op, x)?;
     ctx.fire(
@@ -135,8 +135,8 @@ fn silu_at(ctx: &Ctx<'_>, op: &'static str, s: f32, x: Tensor) -> Result<(), Err
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.tanh";
     let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "elemwise_tanh_bf16",
-        F32 => "elemwise_tanh_f32",
+        Bf16 => "elemwise_pointwise_tanh_bf16",
+        F32 => "elemwise_pointwise_tanh_f32",
     });
     let (n, grid) = flat(OP, x)?;
     ctx.fire(
@@ -153,7 +153,7 @@ pub fn cast_f32_to_bf16(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error
     }
     let (n, grid) = flat(OP, o)?;
     ctx.fire(
-        Fire::at(POINTWISE, "elemwise_cast_f32_to_bf16").apply(grid),
+        Fire::at(POINTWISE, "elemwise_pointwise_cast_f32_to_bf16").apply(grid),
         &[x.arg(), o.arg_mut(), n.arg()],
     )
 }
@@ -161,7 +161,7 @@ pub fn cast_f32_to_bf16(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error
 /// `x = min(max(x, lo), hi)`, the bounds rounded as `x` holds them.
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.clamp";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_clamp_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_pointwise_clamp_bf16" });
     if !matches!(lo.partial_cmp(&hi), Some(Ordering::Less | Ordering::Equal)) {
         return Err(refuse(
             OP,
@@ -180,7 +180,7 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
 /// `x` clamped between one-element bound tensors of its element.
 pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.clamp_learned";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_clamp_learned_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_pointwise_clamp_learned_bf16" });
     for (what, bound) in [("lower", lo), ("upper", hi)] {
         if bound.dtype != x.dtype {
             return Err(refuse(
@@ -212,7 +212,7 @@ pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result
 /// `x *= sigmoid(gate)`, the gate a tensor of `x`'s shape.
 pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.gate_sigmoid_mul";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_sigmoid_mul_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_pointwise_sigmoid_mul_bf16" });
     if (gate.rows, gate.width, gate.dtype) != (x.rows, x.width, x.dtype) {
         return Err(refuse(
             OP,

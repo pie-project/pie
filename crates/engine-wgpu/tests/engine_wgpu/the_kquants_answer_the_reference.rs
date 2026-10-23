@@ -4,7 +4,7 @@
 //! odd scheme starts off a word; ten columns, so the last workgroup is part
 //! empty.
 
-use kernels_slang::linear::kquant::{Scheme, Tier};
+use kernels_slang::linear::kquant::{Scheme, Tactic};
 use kernels_wgpu::{Tensor, linear::kquant};
 use poem_ir::Dtype;
 
@@ -184,8 +184,8 @@ fn the_kquants_answer_the_reference() {
             .collect();
         // The subgroup tier is SPIR-V's.
         for slices in [2, 4] {
-            let tier = Tier {
-                subgroup: false,
+            let tier = Tactic {
+                tier: kernels_slang::Tier::Baseline,
                 slices,
             };
             both(

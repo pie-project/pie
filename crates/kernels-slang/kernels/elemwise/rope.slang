@@ -376,11 +376,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #error "elemwise/rope.slang: no kernel selected"
 #endif
 
-// pie:instantiate elemwise_neox_bf16 PIE_NEOX=1 PIE_GROUP_X=64
-// pie:instantiate elemwise_tail_bf16 PIE_TAIL=1 PIE_GROUP_X=64
-// pie:instantiate elemwise_yarn_bf16 PIE_YARN=1 PIE_GROUP_X=64
-// pie:instantiate elemwise_mrope_interleaved_bf16 PIE_MROPE=1 PIE_GROUP_X=64
-// pie:instantiate elemwise_mrope_blocked_bf16 PIE_MROPE=1 PIE_GROUP_X=64 PIE_BLOCKED=1
-// pie:instantiate elemwise_mrope_split_bf16 PIE_MROPE=1 PIE_GROUP_X=64 PIE_SPLIT=1
-// pie:instantiate elemwise_axes_bf16 PIE_AXES=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_axes_f32 PIE_AXES=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_rope_neox_bf16 PIE_NEOX=1 PIE_GROUP_X=64
+// pie:instantiate elemwise_rope_tail_bf16 PIE_TAIL=1 PIE_GROUP_X=64
+// pie:instantiate elemwise_rope_yarn_bf16 PIE_YARN=1 PIE_GROUP_X=64
+// pie:instantiate elemwise_rope_mrope_interleaved_bf16 PIE_MROPE=1 PIE_GROUP_X=64
+// pie:instantiate elemwise_rope_mrope_blocked_bf16 PIE_MROPE=1 PIE_GROUP_X=64 PIE_BLOCKED=1
+// pie:instantiate elemwise_rope_mrope_split_bf16 PIE_MROPE=1 PIE_GROUP_X=64 PIE_SPLIT=1
+// pie:instantiate elemwise_rope_axes_bf16 PIE_AXES=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_rope_axes_f32 PIE_AXES=1 PIE_GROUP_X=256 PIE_ACT_F32=1

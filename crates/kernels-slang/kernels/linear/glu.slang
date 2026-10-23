@@ -131,11 +131,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 #endif
 
-// pie:instantiate linear_swiglu_bf16 PIE_PACKED=1 PIE_GROUP_X=256
-// pie:instantiate linear_geglu_tanh_packed_bf16 PIE_PACKED=1 PIE_GEGLU=1 PIE_GROUP_X=256
-// pie:instantiate linear_swiglu_clamp_bf16 PIE_PACKED=1 PIE_CLAMP=1 PIE_GROUP_X=256
-// pie:instantiate linear_swiglu_clamp_alpha_bf16 PIE_PACKED=1 PIE_GPTOSS=1 PIE_GROUP_X=256
-// pie:instantiate linear_situ_bf16 PIE_PACKED=1 PIE_SITU=1 PIE_GROUP_X=256
-// pie:instantiate linear_geglu_tanh_bf16 PIE_GROUP_X=256
-// pie:instantiate linear_swiglu_clamp_split_bf16 PIE_CLAMP=1 PIE_GROUP_X=256
-// pie:instantiate linear_gelu_tanh_bf16 PIE_GELU=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_swiglu_bf16 PIE_PACKED=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_geglu_tanh_packed_bf16 PIE_PACKED=1 PIE_GEGLU=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_swiglu_clamp_bf16 PIE_PACKED=1 PIE_CLAMP=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_swiglu_clamp_alpha_bf16 PIE_PACKED=1 PIE_GPTOSS=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_situ_bf16 PIE_PACKED=1 PIE_SITU=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_geglu_tanh_bf16 PIE_GROUP_X=256
+// pie:instantiate linear_glu_swiglu_clamp_split_bf16 PIE_CLAMP=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_gelu_tanh_bf16 PIE_GELU=1 PIE_GROUP_X=256

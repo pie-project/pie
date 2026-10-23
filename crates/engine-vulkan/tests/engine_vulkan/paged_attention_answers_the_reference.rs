@@ -257,8 +257,12 @@ fn paged_attention_answers_the_reference() {
                     ]
                 };
                 for &(subgroup, threads, tile) in tiers {
-                    let tier = kernels_slang::attn::sdpa::Tier {
-                        subgroup,
+                    let tier = kernels_slang::attn::sdpa::Tactic {
+                        tier: if subgroup {
+                            kernels_slang::Tier::Subgroup
+                        } else {
+                            kernels_slang::Tier::Baseline
+                        },
                         narrow: gpu.device.chip().subgroup < 32,
                         decode_threads: threads,
                         tile_rows: tile,

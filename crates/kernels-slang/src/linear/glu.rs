@@ -67,7 +67,7 @@ fn split_grid(
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.swiglu";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_swiglu_bf16" });
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_swiglu_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(cut.grid),
@@ -83,7 +83,7 @@ pub fn swiglu_clamp(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.swiglu_clamp";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_swiglu_clamp_bf16" });
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_swiglu_clamp_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(cut.grid),
@@ -105,7 +105,7 @@ pub fn swiglu_clamp_alpha(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.swiglu_clamp_alpha";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_swiglu_clamp_alpha_bf16" });
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_swiglu_clamp_alpha_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(cut.grid),
@@ -127,7 +127,7 @@ pub fn swiglu_clamp_split(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.swiglu_clamp_split";
-    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_swiglu_clamp_split_bf16" });
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_glu_swiglu_clamp_split_bf16" });
     let (lanes, n) = split_grid(OP, gate, up, y)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(Grid::of(lanes, [GROUP, 1, 1])),
@@ -137,7 +137,7 @@ pub fn swiglu_clamp_split(
 
 pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.geglu_tanh";
-    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_geglu_tanh_bf16" });
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_glu_geglu_tanh_bf16" });
     let (lanes, n) = split_grid(OP, gate, up, y)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(Grid::of(lanes, [GROUP, 1, 1])),
@@ -147,7 +147,7 @@ pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<
 
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.gelu_tanh";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "linear_gelu_tanh_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "linear_glu_gelu_tanh_bf16" });
     let lanes = elementwise(OP, x.width, x.rows)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(Grid::of([lanes[0].div_ceil(2), 1, 1], [GROUP, 1, 1])),
@@ -162,7 +162,7 @@ pub fn geglu_tanh_packed(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.geglu_tanh_packed";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_geglu_tanh_packed_bf16" });
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_geglu_tanh_packed_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(cut.grid),
@@ -182,7 +182,7 @@ pub fn situ(
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_situ_bf16" });
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "linear_glu_situ_bf16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
         Fire::at(GLU, entry).apply(cut.grid),

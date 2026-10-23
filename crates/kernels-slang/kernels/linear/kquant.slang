@@ -247,13 +247,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate linear_kquant_s4_q4k_bf16 PIE_SCHEME=4 PIE_BLOCK_BYTES=144 PIE_SLICES=4
 // pie:instantiate linear_kquant_s4_q5k_bf16 PIE_SCHEME=5 PIE_BLOCK_BYTES=176 PIE_SLICES=4
 // pie:instantiate linear_kquant_s4_q6k_bf16 PIE_SCHEME=6 PIE_BLOCK_BYTES=210 PIE_SLICES=4
-// pie:instantiate linear_kquant_sg_q2k_bf16 PIE_SCHEME=2 PIE_BLOCK_BYTES=84 PIE_SLICES=2 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_q3k_bf16 PIE_SCHEME=3 PIE_BLOCK_BYTES=110 PIE_SLICES=2 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_q4k_bf16 PIE_SCHEME=4 PIE_BLOCK_BYTES=144 PIE_SLICES=2 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_q5k_bf16 PIE_SCHEME=5 PIE_BLOCK_BYTES=176 PIE_SLICES=2 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_q6k_bf16 PIE_SCHEME=6 PIE_BLOCK_BYTES=210 PIE_SLICES=2 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_s4_q2k_bf16 PIE_SCHEME=2 PIE_BLOCK_BYTES=84 PIE_SLICES=4 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_s4_q3k_bf16 PIE_SCHEME=3 PIE_BLOCK_BYTES=110 PIE_SLICES=4 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_s4_q4k_bf16 PIE_SCHEME=4 PIE_BLOCK_BYTES=144 PIE_SLICES=4 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_s4_q5k_bf16 PIE_SCHEME=5 PIE_BLOCK_BYTES=176 PIE_SLICES=4 PIE_SUBGROUP=1 PIE_TARGET=spirv
-// pie:instantiate linear_kquant_sg_s4_q6k_bf16 PIE_SCHEME=6 PIE_BLOCK_BYTES=210 PIE_SLICES=4 PIE_SUBGROUP=1 PIE_TARGET=spirv
+// pie:instantiate linear_kquant_q2k_bf16 PIE_SCHEME=2 PIE_BLOCK_BYTES=84 PIE_SLICES=2 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_q3k_bf16 PIE_SCHEME=3 PIE_BLOCK_BYTES=110 PIE_SLICES=2 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_q4k_bf16 PIE_SCHEME=4 PIE_BLOCK_BYTES=144 PIE_SLICES=2 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_q5k_bf16 PIE_SCHEME=5 PIE_BLOCK_BYTES=176 PIE_SLICES=2 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_q6k_bf16 PIE_SCHEME=6 PIE_BLOCK_BYTES=210 PIE_SLICES=2 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_s4_q2k_bf16 PIE_SCHEME=2 PIE_BLOCK_BYTES=84 PIE_SLICES=4 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_s4_q3k_bf16 PIE_SCHEME=3 PIE_BLOCK_BYTES=110 PIE_SLICES=4 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_s4_q4k_bf16 PIE_SCHEME=4 PIE_BLOCK_BYTES=144 PIE_SLICES=4 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_s4_q5k_bf16 PIE_SCHEME=5 PIE_BLOCK_BYTES=176 PIE_SLICES=4 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate linear_kquant_s4_q6k_bf16 PIE_SCHEME=6 PIE_BLOCK_BYTES=210 PIE_SLICES=4 PIE_TIER=subgroup PIE_TARGET=spirv

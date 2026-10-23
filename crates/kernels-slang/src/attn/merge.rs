@@ -72,7 +72,7 @@ pub fn sink(
     head_dim: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attn.sink";
-    let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_bf16" });
+    let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_merge_sink_bf16" });
     if sink.dtype != o.dtype {
         return Err(Error::DtypeUnsupported {
             op: OP,
@@ -101,7 +101,7 @@ pub fn sink(
 /// `x = cap * tanh(x / cap)` in place.
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
     const OP: &str = "attn.logit_softcap";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "attn_softcap_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "attn_merge_softcap_bf16" });
     let [n, _, _] = elementwise(OP, x.width, x.rows)?;
     let groups = n.div_ceil(2).div_ceil(256);
     let fold = groups.div_ceil(MAX_GROUPS_PER_AXIS);

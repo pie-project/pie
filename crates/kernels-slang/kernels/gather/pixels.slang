@@ -132,4 +132,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
 
 // pie:instantiate gather_pixels_bf16 PIE_PIXELS=1 PIE_GROUP_X=256
-// pie:instantiate gather_grid_taps PIE_GRID_TAPS=1 PIE_GROUP_X=256
+// pie:instantiate gather_pixels_grid_taps PIE_GRID_TAPS=1 PIE_GROUP_X=256

@@ -29,7 +29,8 @@ pub fn weighted_sum(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_weighted_sum";
-    let entry = dtype_dispatch!(OP, routed.dtype, { Bf16 => "linear_moe_weighted_sum_bf16" });
+    let entry =
+        dtype_dispatch!(OP, routed.dtype, { Bf16 => "linear_moe_combine_weighted_sum_bf16" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
     if !routed.rows.is_multiple_of(y.rows) {
@@ -73,7 +74,7 @@ pub fn bias_sum(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_bias_sum";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "linear_moe_bias_sum_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "linear_moe_combine_bias_sum_bf16" });
     debug_assert_eq!(
         bias.dtype, x.dtype,
         "the expert bias rides the activation's dtype"
@@ -121,7 +122,8 @@ pub fn sigmoid_gate_add(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_sigmoid_gate_add";
-    let entry = dtype_dispatch!(OP, routed.dtype, { Bf16 => "linear_moe_sigmoid_gate_add_bf16" });
+    let entry =
+        dtype_dispatch!(OP, routed.dtype, { Bf16 => "linear_moe_combine_sigmoid_gate_add_bf16" });
     debug_assert!(
         shared.rows == routed.rows && shared.width == routed.width,
         "the shared expert's rectangle is the routed one"

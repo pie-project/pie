@@ -168,9 +168,9 @@ pub fn ragged(
         (Dtype::Bf16, 64 | 128) => (
             DENSE_TILED,
             if head_dim == 64 {
-                "attn_ragged_tiled_bf16_d_64"
+                "attn_dense_tiled_ragged_bf16_d_64"
             } else {
-                "attn_ragged_tiled_bf16_d_128"
+                "attn_dense_tiled_ragged_bf16_d_128"
             },
             Grid::of(
                 [q_heads * TILED_THREADS, rows.div_ceil(TILED_ROWS), 1],
@@ -181,14 +181,14 @@ pub fn ragged(
             let at = stamp_for(OP, head_dim)?;
             let entry = match dtype {
                 Dtype::Bf16 => [
-                    "attn_ragged_bf16_d_64",
-                    "attn_ragged_bf16_d_128",
-                    "attn_ragged_bf16_d_256",
+                    "attn_dense_ragged_bf16_d_64",
+                    "attn_dense_ragged_bf16_d_128",
+                    "attn_dense_ragged_bf16_d_256",
                 ][at],
                 Dtype::F32 => [
-                    "attn_ragged_f32_d_64",
-                    "attn_ragged_f32_d_128",
-                    "attn_ragged_f32_d_256",
+                    "attn_dense_ragged_f32_d_64",
+                    "attn_dense_ragged_f32_d_128",
+                    "attn_dense_ragged_f32_d_256",
                 ][at],
                 other => {
                     return Err(Error::DtypeUnsupported {

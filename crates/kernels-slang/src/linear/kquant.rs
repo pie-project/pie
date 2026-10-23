@@ -2,7 +2,7 @@
 //! Q2_K to Q6_K plane) from `kernels/linear/kquant.slang`: a 32-lane strip
 //! lands two columns of a row, walking the row's super-blocks.
 
-use crate::encode::{Arg, Ctx, Fire, dtype_dispatch, instantiated, refuse};
+use crate::encode::{Arg, Ctx, Fire, Tier, dtype_dispatch, instantiated, refuse};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -13,10 +13,10 @@ const SUPER: u32 = 256;
 
 /// How an engine runs the K-quant matmuls on its device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Tier {
-    /// A strip folds its sums inside a subgroup (SPIR-V, subgroups at least
-    /// 32 wide).
-    pub subgroup: bool,
+pub struct Tactic {
+    /// At `Tier::Subgroup` a strip folds its sums inside a subgroup (SPIR-V,
+    /// subgroups at least 32 wide); else through workgroup memory.
+    pub tier: Tier,
     /// Strips a workgroup: 2 or 4.
     pub slices: u32,
 }
@@ -89,18 +89,30 @@ pub fn scheme(op: &'static str, k: u32, row_bytes: u32) -> Result<Scheme, Error>
     ))
 }
 
-pub fn matmul(ctx: &Ctx<'_>, tier: Tier, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
-    fire(ctx, "linear.matmul", tier, act, w, y)
+pub fn matmul(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    fire(ctx, "linear.matmul", tactic, act, w, y)
 }
 
-pub fn lm_head(ctx: &Ctx<'_>, tier: Tier, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
-    fire(ctx, "linear.lm_head", tier, act, w, y)
+pub fn lm_head(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    fire(ctx, "linear.lm_head", tactic, act, w, y)
 }
 
 fn fire(
     ctx: &Ctx<'_>,
     op: &'static str,
-    tier: Tier,
+    tactic: Tactic,
     act: Tensor,
     w: Tensor,
     y: Tensor,
@@ -139,10 +151,10 @@ fn fire(
             ),
         ));
     }
-    if !matches!(tier.slices, 2 | 4) {
+    if !matches!(tactic.slices, 2 | 4) {
         return Err(refuse(
             op,
-            format!("{} strips a workgroup is not 2 or 4", tier.slices),
+            format!("{} strips a workgroup is not 2 or 4", tactic.slices),
         ));
     }
     let scheme = scheme(op, k, w.width)?;
@@ -152,16 +164,16 @@ fn fire(
     let entry = instantiated(
         op,
         format!(
-            "linear_kquant{}{}_{}_bf16",
-            if tier.subgroup { "_sg" } else { "" },
-            if tier.slices == 4 { "_s4" } else { "" },
+            "linear_kquant{}_{}_bf16",
+            if tactic.slices == 4 { "_s4" } else { "" },
             scheme.tag()
         ),
     )?;
     ctx.fire(
         Fire::at(KQUANT, entry)
-            .groups([n.div_ceil(2 * tier.slices), m, 1])
-            .group([32, tier.slices, 1]),
+            .tier(tactic.tier)
+            .groups([n.div_ceil(2 * tactic.slices), m, 1])
+            .group([32, tactic.slices, 1]),
         &[w.arg(), act.arg(), y.arg_mut(), n.arg(), k.arg()],
     )
 }

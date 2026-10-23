@@ -341,7 +341,7 @@ pub fn ple_gate(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.ple_gate";
-    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "elemwise_ple_gate_bf16" });
+    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "elemwise_hc_ple_gate_bf16" });
     let fan = stream_fan(OP, y.width, value.width)?;
     if fan != streams {
         return Err(refuse(

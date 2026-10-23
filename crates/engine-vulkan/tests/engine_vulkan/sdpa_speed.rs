@@ -119,8 +119,12 @@ fn sdpa_speed() {
                     Ok(())
                 })
             });
-            let tier = |subgroup| kernels_slang::attn::sdpa::Tier {
-                subgroup,
+            let tier = |subgroup| kernels_slang::attn::sdpa::Tactic {
+                tier: if subgroup {
+                    kernels_slang::Tier::Subgroup
+                } else {
+                    kernels_slang::Tier::Baseline
+                },
                 narrow,
                 decode_threads: threads,
                 tile_rows: tile,
@@ -200,8 +204,8 @@ fn sdpa_speed() {
                 Ok(())
             })
         });
-        let tier = kernels_slang::attn::sdpa::Tier {
-            subgroup: true,
+        let tier = kernels_slang::attn::sdpa::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
             narrow,
             decode_threads: threads,
             tile_rows: tile,

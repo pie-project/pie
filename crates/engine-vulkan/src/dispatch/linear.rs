@@ -38,7 +38,7 @@ impl Run<'_> {
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::matmul(
                         &self.slang(),
-                        self.kquant_tier(),
+                        self.kquant_tactic(),
                         crate::encode::slang_tensor(self.tensor(*act)),
                         crate::encode::slang_tensor(block),
                         crate::encode::slang_tensor(self.tensor(*y)),
@@ -66,7 +66,7 @@ impl Run<'_> {
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::lm_head(
                         &self.slang(),
-                        self.kquant_tier(),
+                        self.kquant_tactic(),
                         crate::encode::slang_tensor(self.tensor(*act)),
                         crate::encode::slang_tensor(block),
                         crate::encode::slang_tensor(self.tensor(*y)),
@@ -502,9 +502,13 @@ impl Run<'_> {
 impl Run<'_> {
     /// The subgroup tier where every subgroup holds a 32-lane strip; two
     /// strips a workgroup.
-    fn kquant_tier(&self) -> kernels_slang::linear::kquant::Tier {
-        kernels_slang::linear::kquant::Tier {
-            subgroup: self.tuning().limits().lanes >= 32,
+    fn kquant_tactic(&self) -> kernels_slang::linear::kquant::Tactic {
+        kernels_slang::linear::kquant::Tactic {
+            tier: if self.tuning().limits().lanes >= 32 {
+                kernels_slang::Tier::Subgroup
+            } else {
+                kernels_slang::Tier::Baseline
+            },
             slices: 2,
         }
     }

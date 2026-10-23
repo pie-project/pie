@@ -95,7 +95,7 @@ pub fn embed_concat(
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed_concat";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
-    let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "gather_concat_bf16" });
+    let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "gather_embed_concat_bf16" });
     nonzero(OP, "the row count this embedding table states", vocab)?;
     let (slices, width) = concat_slices(OP, ids, y)?;
     let words = words(OP, "table row", width)?;
@@ -168,15 +168,15 @@ fn banked(
         ));
     };
     let entry = match (table.group, table.bits) {
-        (32, 2) => "gather_affine_bf16_gs_32_b_2",
-        (32, 4) => "gather_affine_bf16_gs_32_b_4",
-        (32, 8) => "gather_affine_bf16_gs_32_b_8",
-        (64, 2) => "gather_affine_bf16_gs_64_b_2",
-        (64, 4) => "gather_affine_bf16_gs_64_b_4",
-        (64, 8) => "gather_affine_bf16_gs_64_b_8",
-        (128, 2) => "gather_affine_bf16_gs_128_b_2",
-        (128, 4) => "gather_affine_bf16_gs_128_b_4",
-        (128, 8) => "gather_affine_bf16_gs_128_b_8",
+        (32, 2) => "gather_embed_affine_bf16_gs_32_b_2",
+        (32, 4) => "gather_embed_affine_bf16_gs_32_b_4",
+        (32, 8) => "gather_embed_affine_bf16_gs_32_b_8",
+        (64, 2) => "gather_embed_affine_bf16_gs_64_b_2",
+        (64, 4) => "gather_embed_affine_bf16_gs_64_b_4",
+        (64, 8) => "gather_embed_affine_bf16_gs_64_b_8",
+        (128, 2) => "gather_embed_affine_bf16_gs_128_b_2",
+        (128, 4) => "gather_embed_affine_bf16_gs_128_b_4",
+        (128, 8) => "gather_embed_affine_bf16_gs_128_b_8",
         (group, bits) => {
             return Err(refuse(
                 op,
@@ -223,7 +223,7 @@ pub fn embed_weighted(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed_weighted";
-    let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "gather_weighted_bf16" });
+    let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "gather_embed_weighted_bf16" });
     debug_assert_eq!(
         y.dtype, table.dtype,
         "`{OP}` gathers into the table's element"

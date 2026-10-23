@@ -43,7 +43,7 @@ pub fn sinusoid(
         ));
     }
     ctx.fire(
-        Fire::at(POSENC, "elemwise_sinusoid_f32").apply(Grid::of(
+        Fire::at(POSENC, "elemwise_posenc_sinusoid_f32").apply(Grid::of(
             elementwise_rows(OP, dim / 2, rows)?,
             [GROUP, 1, 1],
         )),
