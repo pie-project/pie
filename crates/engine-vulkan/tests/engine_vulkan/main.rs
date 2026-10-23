@@ -7,3 +7,4 @@ mod gather;
 mod gpu;
 mod linear;
 mod sampling;
+mod ssm;

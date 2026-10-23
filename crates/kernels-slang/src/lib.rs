@@ -12,6 +12,7 @@ pub mod gather;
 pub mod linear;
 pub mod sampling;
 pub mod sources;
+pub mod ssm;
 pub mod tensor;
 
 pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid, Tier};
