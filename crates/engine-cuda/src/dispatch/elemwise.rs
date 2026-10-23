@@ -1,7 +1,7 @@
 use kernels_cuda::{Tensor, elemwise};
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
-use poem_ir::{NormAxis, NormWeight, ResidualGate};
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
 
@@ -928,7 +928,12 @@ impl Run<'_> {
             }
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => {
                 let fan = self.plane_fan(self.tensor(*x).rows);
                 elemwise::gate::sigmoid_mul(
                     self.ctx(),
@@ -937,11 +942,10 @@ impl Run<'_> {
                     &mut self.tensor(*x),
                 )
             }
-            Elemwise::GateSigmoidMulHeads {
+            Elemwise::GateSigmoidMul {
                 x,
                 gate,
-                head_dim,
-                scale,
+                heads: Some(GateHeads { head_dim, scale }),
                 x_out: _,
             } => elemwise::gate::sigmoid_mul_heads(
                 self.ctx(),

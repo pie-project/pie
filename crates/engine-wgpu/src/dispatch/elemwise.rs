@@ -271,7 +271,7 @@ impl Run<'_> {
                 op: poem_ir::BinaryOp::Mul,
                 ..
             }
-            | Elemwise::GateSigmoidMulHeads { .. } => {
+            | Elemwise::GateSigmoidMul { heads: Some(_), .. } => {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
 
@@ -670,13 +670,16 @@ impl Run<'_> {
 
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                kernels_slang::elemwise::pointwise::sigmoid_mul(
-                    self.ctx,
-                    self.tensor(*gate),
-                    self.tensor(*x),
-                )
-            }
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => kernels_slang::elemwise::pointwise::sigmoid_mul(
+                self.ctx,
+                self.tensor(*gate),
+                self.tensor(*x),
+            ),
 
             Elemwise::HcExpand { x, streams, y } => kernels_slang::elemwise::hc::expand(
                 self.ctx,

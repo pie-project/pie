@@ -256,21 +256,14 @@ pub enum Elemwise {
         #[output(alias = k)]
         k_out: Option<ValueId>,
     },
+    /// `x ⊙ sigmoid(gate)`, in place: the gate as wide as `x`, or under
+    /// `heads` one logit a head.
     GateSigmoidMul {
         #[input]
         x: ValueId,
         #[input]
         gate: ValueId,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
-    GateSigmoidMulHeads {
-        #[input]
-        x: ValueId,
-        #[input]
-        gate: ValueId,
-        head_dim: u32,
-        scale: f32,
+        heads: Option<GateHeads>,
         #[output(alias = x)]
         x_out: ValueId,
     },
@@ -455,6 +448,14 @@ impl ModulateForm {
             ModulateForm::Scale | ModulateForm::TanhGate => 1,
         }
     }
+}
+
+/// A [`Elemwise::GateSigmoidMul`] gating by head: `x[n, h·d + i] *= scale ·
+/// σ(gate[n, h])`, `d` the `head_dim`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GateHeads {
+    pub head_dim: u32,
+    pub scale: f32,
 }
 
 /// What an [`Elemwise::Binary`] computes.

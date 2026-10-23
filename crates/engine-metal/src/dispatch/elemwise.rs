@@ -1,7 +1,7 @@
 use kernels_metal::{Tensor, elemwise};
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, Operands, RopeForm};
-use poem_ir::{NormAxis, NormWeight, ResidualGate};
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
 
@@ -388,11 +388,10 @@ impl Run<'_> {
                 *bidirectional,
                 self.tensor(*y),
             ),
-            Elemwise::GateSigmoidMulHeads {
+            Elemwise::GateSigmoidMul {
                 x,
                 gate,
-                head_dim,
-                scale,
+                heads: Some(GateHeads { head_dim, scale }),
                 x_out: _,
             } => elemwise::gate::sigmoid_mul_heads(
                 self.ctx(),
@@ -850,7 +849,12 @@ impl Run<'_> {
 
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out } => {
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out,
+            } => {
                 // The gated rows' projection on the register tile reads its
                 // input table as the gate lays it.
                 match self.producer_table(*x_out) {

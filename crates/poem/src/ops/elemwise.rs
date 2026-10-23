@@ -1,5 +1,5 @@
 use super::*;
-use poem_ir::{NormAxis, NormWeight, ResidualGate, Turn};
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate, Turn};
 
 pub use poem_ir::ops::elemwise::Yarn;
 
@@ -544,6 +544,7 @@ pub fn gate_sigmoid_mul(x: &Value, gate: &Value) -> Value {
         Elemwise::GateSigmoidMul {
             x: x.id(),
             gate: gate.id(),
+            heads: None,
             x_out: x_out.id(),
         },
         &[x, gate],
@@ -572,11 +573,10 @@ pub fn gate_sigmoid_mul_heads(x: &Value, gate: &Value, head_dim: u32, scale: f32
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::GateSigmoidMulHeads {
+        Elemwise::GateSigmoidMul {
             x: x.id(),
             gate: gate.id(),
-            head_dim,
-            scale,
+            heads: Some(GateHeads { head_dim, scale }),
             x_out: x_out.id(),
         },
         &[x, gate],

@@ -186,9 +186,12 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
-            }
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x)),
             Elemwise::Act {
                 scale: Some(s),
                 x,

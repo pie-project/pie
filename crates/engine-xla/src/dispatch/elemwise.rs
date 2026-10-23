@@ -2,7 +2,7 @@ use crate::handle::Tensor;
 use kernels_xla::elemwise;
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, ModulateForm, MropeForm, RopeForm, ValueId};
-use poem_ir::{NormAxis, NormWeight, ResidualGate};
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use poem_ir::Operands;
 
@@ -379,11 +379,10 @@ impl Run<'_> {
                     l.land(o_o, v)
                 })
             }
-            Elemwise::GateSigmoidMulHeads {
+            Elemwise::GateSigmoidMul {
                 x,
                 gate,
-                head_dim,
-                scale,
+                heads: Some(GateHeads { head_dim, scale }),
                 x_out: _,
             } => crate::lower::lower(self.ctx(), |l| {
                 let gate_v = l.read(self.tensor(*gate))?;
@@ -951,15 +950,18 @@ impl Run<'_> {
 
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                crate::lower::lower(self.ctx(), |l| {
-                    let gate_v = l.read(self.tensor(*gate))?;
-                    let x_v = l.read(self.tensor(*x))?;
-                    let o_x = self.tensor(*x);
-                    let v = elemwise::gate::sigmoid_mul(l.f(), gate_v, x_v)?;
-                    l.land(o_x, v)
-                })
-            }
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gate_v = l.read(self.tensor(*gate))?;
+                let x_v = l.read(self.tensor(*x))?;
+                let o_x = self.tensor(*x);
+                let v = elemwise::gate::sigmoid_mul(l.f(), gate_v, x_v)?;
+                l.land(o_x, v)
+            }),
 
             Elemwise::HcExpand { x, streams, y } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;

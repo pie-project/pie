@@ -98,9 +98,7 @@ fn heads(name: &str) -> Option<Heads> {
     Some(match name {
         "elemwise.act" | "elemwise.rope_axes" | "gather.rows" | "gather.pack_rows"
         | "gather.unpack_rows" | "linear.gelu_tanh" => Heads::of(&["x"], &[]),
-        "elemwise.gate_sigmoid_mul"
-        | "elemwise.gate_sigmoid_mul_heads"
-        | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
+        "elemwise.gate_sigmoid_mul" | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
         "elemwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
         // q, and k where the rotation turns one.
         "elemwise.rope" => Heads::of(&["q", "k"], &[]),
