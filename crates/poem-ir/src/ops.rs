@@ -22,7 +22,7 @@ pub use elemwise::{
 };
 pub use fused::{Fused, NormKind};
 pub use gather::{Gather, PixelOrder, TapKind};
-pub use linear::{ActQuant, Linear};
+pub use linear::{ActQuant, GluAct, Linear};
 pub use sampling::Sampling;
 pub use ssm::Ssm;
 

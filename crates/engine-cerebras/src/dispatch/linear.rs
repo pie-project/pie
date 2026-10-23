@@ -26,10 +26,15 @@ impl Run<'_> {
                 self.tensor(*w),
                 self.tensor(*y),
             ),
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => linear::mlp::swiglu(
                 self.ctx(),
                 self.tensor(*packed),

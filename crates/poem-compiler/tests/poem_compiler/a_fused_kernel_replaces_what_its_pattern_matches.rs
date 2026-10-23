@@ -112,7 +112,7 @@ fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
         ops(&fused),
         [
             "linear.matmul",
-            "linear.swiglu",
+            "linear.glu",
             "linear.matmul",
             "elemwise.silu"
         ]

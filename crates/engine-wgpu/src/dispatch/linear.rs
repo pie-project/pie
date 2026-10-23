@@ -75,10 +75,15 @@ impl Run<'_> {
                 },
             },
 
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => kernels_slang::linear::glu::swiglu(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*packed)),
@@ -86,11 +91,15 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*y)),
             )
             .map_err(crate::encode::from_slang),
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => kernels_slang::linear::glu::swiglu_clamp(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*packed)),
@@ -99,12 +108,15 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*y)),
             )
             .map_err(crate::encode::from_slang),
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => kernels_slang::linear::glu::swiglu_clamp_alpha(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*packed)),
@@ -115,17 +127,33 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Linear::SwigluClampSplit { gate, up, limit, y } => {
-                kernels_slang::linear::glu::swiglu_clamp_split(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*gate)),
-                    crate::encode::slang_tensor(self.tensor(*up)),
-                    *limit,
-                    crate::encode::slang_tensor(self.tensor(*y)),
-                )
-                .map_err(crate::encode::from_slang)
-            }
-            Linear::GegluTanh { gate, up, y } => kernels_slang::linear::glu::geglu_tanh(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit: Some(limit),
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => kernels_slang::linear::glu::swiglu_clamp_split(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*gate)),
+                crate::encode::slang_tensor(self.tensor(*up)),
+                *limit,
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => kernels_slang::linear::glu::geglu_tanh(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*gate)),
                 crate::encode::slang_tensor(self.tensor(*up)),
@@ -144,13 +172,32 @@ impl Run<'_> {
             | Linear::MoeTopkSigmoidSink { .. }
             | Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
-            | Linear::SwigluClampSplitRouted { .. }
-            | Linear::SwigluClampRouted { .. }
+            | Linear::Glu {
+                packed: None,
+                gate: Some(_),
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
+            | Linear::Glu {
+                packed: Some(_),
+                gate: None,
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
             | Linear::MoeSumAdd { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
-            Linear::GegluTanhPacked {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => kernels_slang::linear::glu::geglu_tanh_packed(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*packed)),
@@ -158,12 +205,15 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*y)),
             )
             .map_err(crate::encode::from_slang),
-            Linear::Situ {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                beta,
-                up_cap,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => kernels_slang::linear::glu::situ(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*packed)),
@@ -174,6 +224,8 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
+            // The forms no builder makes.
+            Linear::Glu { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Linear::MoeTopkSoftmax {
                 logits,
                 experts,

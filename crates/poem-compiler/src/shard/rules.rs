@@ -2,7 +2,7 @@
 //! rule here gets every value whole and stays as it is; it may not read a
 //! weight or a cache the ranks split.
 
-use poem_ir::{Elemwise, NormAxis, Operands, Operation, Shard, ValueId};
+use poem_ir::{Elemwise, Linear, NormAxis, Operands, Operation, Shard, ValueId};
 
 use super::{Dist, Pass};
 use crate::tree::{self, Tree};
@@ -118,12 +118,6 @@ fn heads(name: &str) -> Option<Heads> {
         "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
-        "linear.swiglu"
-        | "linear.swiglu_clamp"
-        | "linear.swiglu_clamp_alpha"
-        | "linear.geglu_tanh_packed"
-        | "linear.situ" => Heads::of(&["packed"], &["intermediate"]),
-        "linear.swiglu_clamp_split" | "linear.geglu_tanh" => Heads::of(&["gate", "up"], &[]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
         "attn.decode" | "attn.decode_lse" | "attn.decode_selected" => {
             Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)
@@ -172,6 +166,18 @@ fn rule(op: &Operation) -> Rule {
             NormAxis::Row => Rule::Norm,
             NormAxis::Head(_) => Rule::Heads(Heads::of(&["x"], &[])),
             NormAxis::Group(_) => Rule::Whole,
+        };
+    }
+    // A gated unit splits with its columns, packed or as two planes; one of
+    // routed rows (each times its route's weight) reads them whole.
+    if let Operation::Linear(Linear::Glu {
+        packed, weights, ..
+    }) = op
+    {
+        return match (packed, weights) {
+            (_, Some(_)) => Rule::Whole,
+            (Some(_), None) => Rule::Heads(Heads::of(&["packed"], &["intermediate"])),
+            (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
         };
     }
     let name = op.name();

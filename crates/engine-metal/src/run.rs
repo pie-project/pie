@@ -490,14 +490,32 @@ impl<'c> Run<'c> {
         self.chain.set(None);
         let (packed, hidden) = match self.sole_reader(y).map(|n| &n.op) {
             Some(Operation::Linear(
-                Linear::Swiglu {
-                    packed, y: hidden, ..
+                Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::Swiglu,
+                    ..
                 }
-                | Linear::SwigluClampAlpha {
-                    packed, y: hidden, ..
+                | Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: Some(_),
+                    act: poem_ir::GluAct::SwigluAlpha { .. },
+                    ..
                 }
-                | Linear::GegluTanhPacked {
-                    packed, y: hidden, ..
+                | Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::GegluTanh,
+                    ..
                 },
             )) => (packed, hidden),
             _ => return Sorted::default(),

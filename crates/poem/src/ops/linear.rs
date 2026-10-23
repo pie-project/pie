@@ -1,4 +1,5 @@
 use super::*;
+use poem_ir::GluAct;
 
 /// `act . w^T`; a weight whose precision quantizes its activations has
 /// them quantized first.
@@ -96,9 +97,14 @@ pub fn swiglu(packed: &Value, intermediate: u32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::Swiglu {
-            packed: packed.id(),
+        Linear::Glu {
+            packed: Some(packed.id()),
+            gate: None,
+            up: None,
+            weights: None,
             intermediate,
+            act: GluAct::Swiglu,
+            limit: None,
             y: y.id(),
         },
         &[packed],
@@ -110,10 +116,14 @@ pub fn swiglu_clamp(packed: &Value, intermediate: u32, limit: f32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::SwigluClamp {
-            packed: packed.id(),
+        Linear::Glu {
+            packed: Some(packed.id()),
+            gate: None,
+            up: None,
+            weights: None,
             intermediate,
-            limit,
+            act: GluAct::Swiglu,
+            limit: Some(limit),
             y: y.id(),
         },
         &[packed],
@@ -125,11 +135,14 @@ pub fn swiglu_clamp_alpha(packed: &Value, intermediate: u32, limit: f32, alpha: 
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::SwigluClampAlpha {
-            packed: packed.id(),
+        Linear::Glu {
+            packed: Some(packed.id()),
+            gate: None,
+            up: None,
+            weights: None,
             intermediate,
-            limit,
-            alpha,
+            act: GluAct::SwigluAlpha { alpha },
+            limit: Some(limit),
             y: y.id(),
         },
         &[packed],
@@ -141,10 +154,14 @@ pub fn swiglu_clamp_split(gate: &Value, up: &Value, limit: f32) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Linear::SwigluClampSplit {
-            gate: gate.id(),
-            up: up.id(),
-            limit,
+        Linear::Glu {
+            packed: None,
+            gate: Some(gate.id()),
+            up: Some(up.id()),
+            weights: None,
+            intermediate: u32::try_from(gate.width()).expect("a gate plane is narrower than 2^32"),
+            act: GluAct::Swiglu,
+            limit: Some(limit),
             y: y.id(),
         },
         &[gate, up],
@@ -158,11 +175,14 @@ pub fn swiglu_clamp_split_routed(gate: &Value, up: &Value, weights: &Value, limi
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Linear::SwigluClampSplitRouted {
-            gate: gate.id(),
-            up: up.id(),
-            weights: weights.id(),
-            limit,
+        Linear::Glu {
+            packed: None,
+            gate: Some(gate.id()),
+            up: Some(up.id()),
+            weights: Some(weights.id()),
+            intermediate: u32::try_from(gate.width()).expect("a gate plane is narrower than 2^32"),
+            act: GluAct::Swiglu,
+            limit: Some(limit),
             y: y.id(),
         },
         &[gate, up, weights],
@@ -181,11 +201,14 @@ pub fn swiglu_clamp_routed(
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::SwigluClampRouted {
-            packed: packed.id(),
+        Linear::Glu {
+            packed: Some(packed.id()),
+            gate: None,
+            up: None,
+            weights: Some(weights.id()),
             intermediate,
-            weights: weights.id(),
-            limit,
+            act: GluAct::Swiglu,
+            limit: Some(limit),
             y: y.id(),
         },
         &[packed, weights],
@@ -197,9 +220,14 @@ pub fn geglu_tanh(gate: &Value, up: &Value) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
-        Linear::GegluTanh {
-            gate: gate.id(),
-            up: up.id(),
+        Linear::Glu {
+            packed: None,
+            gate: Some(gate.id()),
+            up: Some(up.id()),
+            weights: None,
+            intermediate: u32::try_from(gate.width()).expect("a gate plane is narrower than 2^32"),
+            act: GluAct::GegluTanh,
+            limit: None,
             y: y.id(),
         },
         &[gate, up],
@@ -237,9 +265,14 @@ pub fn geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::GegluTanhPacked {
-            packed: packed.id(),
+        Linear::Glu {
+            packed: Some(packed.id()),
+            gate: None,
+            up: None,
+            weights: None,
             intermediate,
+            act: GluAct::GegluTanh,
+            limit: None,
             y: y.id(),
         },
         &[packed],
@@ -251,11 +284,14 @@ pub fn situ(packed: &Value, intermediate: u32, beta: f32, up_cap: Option<f32>) -
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
     r.push(
-        Linear::Situ {
-            packed: packed.id(),
+        Linear::Glu {
+            packed: Some(packed.id()),
+            gate: None,
+            up: None,
+            weights: None,
             intermediate,
-            beta,
-            up_cap,
+            act: GluAct::Situ { beta, up_cap },
+            limit: None,
             y: y.id(),
         },
         &[packed],

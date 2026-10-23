@@ -19,8 +19,22 @@ impl Run<'_> {
             // tcgen05 GEMMs.
             Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
-            | Linear::SwigluClampSplitRouted { .. }
-            | Linear::SwigluClampRouted { .. }
+            | Linear::Glu {
+                packed: None,
+                gate: Some(_),
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
+            | Linear::Glu {
+                packed: Some(_),
+                gate: None,
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
             | Linear::MoeSumAdd { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => {
@@ -63,21 +77,30 @@ impl Run<'_> {
                 },
             },
 
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => linear::mlp::swiglu(
                 self.ctx(),
                 self.tensor(*packed),
                 *intermediate,
                 self.tensor(*y),
             ),
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => linear::mlp::swiglu_clamp(
                 self.ctx(),
                 self.tensor(*packed),
@@ -85,12 +108,15 @@ impl Run<'_> {
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => linear::mlp::swiglu_clamp_alpha(
                 self.ctx(),
                 self.tensor(*packed),
@@ -100,14 +126,32 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
-            Linear::SwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit: Some(limit),
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::GegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => linear::mlp::geglu_tanh(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
@@ -154,22 +198,30 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            Linear::GegluTanhPacked {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => linear::mlp::geglu_tanh_packed(
                 self.ctx(),
                 self.tensor(*packed),
                 *intermediate,
                 self.tensor(*y),
             ),
-            Linear::Situ {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                beta,
-                up_cap,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => linear::mlp::situ(
                 self.ctx(),
                 self.tensor(*packed),
@@ -179,6 +231,8 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            // The forms no builder makes.
+            Linear::Glu { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::MoeTopkSoftmax {
                 logits,
                 experts,

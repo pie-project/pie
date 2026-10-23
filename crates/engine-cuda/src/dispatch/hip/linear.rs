@@ -57,10 +57,15 @@ impl Run<'_> {
                     w: *w,
                     y: *packed,
                 })?;
-                self.linear(&Linear::GegluTanhPacked {
-                    packed: *packed,
+                self.linear(&Linear::Glu {
+                    packed: Some(*packed),
                     intermediate: *intermediate,
                     y: *y,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::GegluTanh,
+                    up: None,
                 })
             }
             // A decode's few rows take the projection and the swiglu as one
@@ -103,10 +108,15 @@ impl Run<'_> {
                     w: *gate_up,
                     y: *packed,
                 })?;
-                self.linear(&Linear::Swiglu {
-                    packed: *packed,
+                self.linear(&Linear::Glu {
+                    packed: Some(*packed),
                     intermediate: *intermediate,
                     y: *h,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::Swiglu,
+                    up: None,
                 })?;
                 self.linear(&Linear::Matmul {
                     act: *h,
@@ -264,10 +274,15 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu(
@@ -278,11 +293,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp(
@@ -294,12 +313,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp_alpha(
@@ -312,12 +334,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClampSplitRouted {
-                gate,
-                up,
-                weights,
-                limit,
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                weights: Some(weights),
+                limit: Some(limit),
                 y,
+                packed: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp_split_routed(
@@ -330,12 +355,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClampRouted {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                weights,
-                limit,
+                weights: Some(weights),
+                limit: Some(limit),
                 y,
+                gate: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp_routed(
@@ -398,14 +426,32 @@ impl Run<'_> {
                     poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
                 }
             }
-            Linear::SwigluClampSplit { gate, up, limit, y } => linear::glu::swiglu_clamp_split(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit: Some(limit),
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => linear::glu::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 *limit,
                 &mut self.tensor(*y),
             ),
-            Linear::GegluTanh { gate, up, y } => {
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::geglu_tanh(
                     self.ctx(),
@@ -423,10 +469,15 @@ impl Run<'_> {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
-            Linear::GegluTanhPacked {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::geglu_tanh_packed(
@@ -437,12 +488,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::Situ {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                beta,
-                up_cap,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::situ(
@@ -455,6 +509,8 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            // The forms no builder makes.
+            Linear::Glu { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Linear::MoeTopkSoftmax {
                 logits,
                 experts,

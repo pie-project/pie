@@ -394,7 +394,19 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         let swiglus = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Linear(Linear::Swiglu { .. })))
+            .filter(|node| {
+                matches!(
+                    &node.op,
+                    Operation::Linear(Linear::Glu {
+                        packed: Some(_),
+                        gate: None,
+                        weights: None,
+                        limit: None,
+                        act: poem_ir::GluAct::Swiglu,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             swiglus,

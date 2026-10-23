@@ -53,7 +53,15 @@ impl Run<'_> {
                     );
                     let read_back = match (&**glu, &**down) {
                         (
-                            Linear::SwigluClampRouted { y: rows, .. },
+                            Linear::Glu {
+                                y: rows,
+                                packed: Some(_),
+                                gate: None,
+                                weights: Some(_),
+                                limit: Some(_),
+                                act: poem_ir::GluAct::Swiglu,
+                                ..
+                            },
                             Linear::MoeMatmulSelectActQuant {
                                 x,
                                 quant: ActQuant::E4m3 { gran: 128 },
@@ -104,10 +112,15 @@ impl Run<'_> {
                     w: *w,
                     y: *packed,
                 })?;
-                self.linear(&Linear::Swiglu {
-                    packed: *packed,
+                self.linear(&Linear::Glu {
+                    packed: Some(*packed),
                     intermediate: *intermediate,
                     y: *y,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::Swiglu,
+                    up: None,
                 })
             }
             Fused::MatmulGeglu {
@@ -151,10 +164,15 @@ impl Run<'_> {
                     w: *w,
                     y: *packed,
                 })?;
-                self.linear(&Linear::GegluTanhPacked {
-                    packed: *packed,
+                self.linear(&Linear::Glu {
+                    packed: Some(*packed),
                     intermediate: *intermediate,
                     y: *y,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::GegluTanh,
+                    up: None,
                 })
             }
             // Not in `FUSED`, so never formed here; whole, it is its three
@@ -173,10 +191,15 @@ impl Run<'_> {
                     w: *gate_up,
                     y: *packed,
                 })?;
-                self.linear(&Linear::Swiglu {
-                    packed: *packed,
+                self.linear(&Linear::Glu {
+                    packed: Some(*packed),
                     intermediate: *intermediate,
                     y: *h,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::Swiglu,
+                    up: None,
                 })?;
                 self.linear(&Linear::Matmul {
                     act: *h,
@@ -377,10 +400,15 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu(
@@ -391,11 +419,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp(
@@ -407,12 +439,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp_alpha(
@@ -425,12 +460,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClampSplitRouted {
-                gate,
-                up,
-                weights,
-                limit,
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                weights: Some(weights),
+                limit: Some(limit),
                 y,
+                packed: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp_split_routed(
@@ -443,12 +481,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::SwigluClampRouted {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                weights,
-                limit,
+                weights: Some(weights),
+                limit: Some(limit),
                 y,
+                gate: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 // Read back through e4m3 here, for the W4A8 select that
@@ -483,7 +524,16 @@ impl Run<'_> {
                 self.tensor(*shared),
                 &mut self.tensor(*y),
             ),
-            Linear::SwigluClampSplit { gate, up, limit, y } => {
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit: Some(limit),
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::swiglu_clamp_split(
                     self.ctx(),
@@ -494,7 +544,16 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::GegluTanh { gate, up, y } => {
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::geglu_tanh(
                     self.ctx(),
@@ -512,10 +571,15 @@ impl Run<'_> {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
-            Linear::GegluTanhPacked {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::geglu_tanh_packed(
@@ -526,12 +590,15 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::Situ {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                beta,
-                up_cap,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::glu::situ(
@@ -544,6 +611,8 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            // The forms no builder makes.
+            Linear::Glu { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Linear::MoeTopkSoftmax {
                 logits,
                 experts,
@@ -963,18 +1032,42 @@ impl Run<'_> {
             return Ok(false);
         }
         let (packed, y, glu) = match *glu {
-            Linear::Swiglu { packed, y, .. } => (packed, y, Glu::Swiglu),
-            Linear::SwigluClamp {
-                packed, y, limit, ..
-            } => (packed, y, Glu::SwigluClamp { limit }),
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 y,
-                limit,
-                alpha,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => (packed, y, Glu::Swiglu),
+            Linear::Glu {
+                packed: Some(packed),
+                y,
+                limit: Some(limit),
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => (packed, y, Glu::SwigluClamp { limit }),
+            Linear::Glu {
+                packed: Some(packed),
+                y,
+                limit: Some(limit),
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
                 ..
             } => (packed, y, Glu::SwigluClampAlpha { limit, alpha }),
-            Linear::GegluTanhPacked { packed, y, .. } => (packed, y, Glu::GegluTanh),
+            Linear::Glu {
+                packed: Some(packed),
+                y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => (packed, y, Glu::GegluTanh),
             _ => return Ok(false),
         };
         let Some((x, routes, sy, bank, experts)) = self.routed_bank(select) else {
@@ -1176,12 +1269,15 @@ impl Run<'_> {
         // DeepSeek's form: the route weights scale the GLU's rows before the
         // down leg, and the routes sum plainly with the shared row added.
         if let (
-            Linear::SwigluClampRouted {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                weights,
-                limit,
+                weights: Some(weights),
+                limit: Some(limit),
                 y: hidden,
+                gate: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             },
             Linear::MoeSumAdd {
                 routed: summed,
@@ -1215,40 +1311,60 @@ impl Run<'_> {
             return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out);
         }
         let (packed, hidden, intermediate, glu) = match *glu {
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 y,
                 intermediate,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => (packed, y, intermediate, Glu::Swiglu),
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 y,
                 intermediate,
-                limit,
+                limit: Some(limit),
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => (packed, y, intermediate, Glu::SwigluClamp { limit }),
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 y,
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => (
                 packed,
                 y,
                 intermediate,
                 Glu::SwigluClampAlpha { limit, alpha },
             ),
-            Linear::GegluTanhPacked {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 y,
                 intermediate,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => (packed, y, intermediate, Glu::GegluTanh),
-            Linear::Situ {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 y,
                 intermediate,
-                beta,
-                up_cap,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => (
                 packed,
                 y,

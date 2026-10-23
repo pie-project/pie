@@ -100,16 +100,25 @@ impl Run<'_> {
             return None;
         };
         let (intermediate, limit, glu_in, glu_out) = match glu {
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => (*intermediate, None, *packed, *y),
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => (*intermediate, Some(*limit), *packed, *y),
             _ => return None,
         };
@@ -319,10 +328,15 @@ impl Run<'_> {
                 )?;
                 DispatchLinear::dispatch(
                     self,
-                    &Linear::Swiglu {
-                        packed: *packed,
+                    &Linear::Glu {
+                        packed: Some(*packed),
                         intermediate: *intermediate,
                         y: *y,
+                        gate: None,
+                        weights: None,
+                        limit: None,
+                        act: poem_ir::GluAct::Swiglu,
+                        up: None,
                     },
                 )
             }

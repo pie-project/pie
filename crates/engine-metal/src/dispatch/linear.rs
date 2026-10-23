@@ -58,10 +58,15 @@ impl Run<'_> {
                             table,
                             counters,
                         )?,
-                        None => self.linear(&Linear::Swiglu {
-                            packed: *packed,
+                        None => self.linear(&Linear::Glu {
+                            packed: Some(*packed),
                             intermediate: *intermediate,
                             y: *h,
+                            gate: None,
+                            weights: None,
+                            limit: None,
+                            act: poem_ir::GluAct::Swiglu,
+                            up: None,
                         })?,
                     }
                     self.linear(&Linear::Matmul {
@@ -551,10 +556,15 @@ impl Run<'_> {
                 ),
             },
 
-            Linear::Swiglu {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => match self.chain_swiglu(*packed, *y) {
                 // The chain's gate-up rows sit sorted in the routed stack's
                 // output: the swiglu runs there and lands in its input.
@@ -586,11 +596,15 @@ impl Run<'_> {
                     }
                 }
             },
-            Linear::SwigluClamp {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
             } => linear::mlp::swiglu_clamp(
                 self.ctx(),
                 self.tensor(*packed),
@@ -598,12 +612,15 @@ impl Run<'_> {
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::SwigluClampAlpha {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                limit,
-                alpha,
+                limit: Some(limit),
                 y,
+                gate: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
             } => match self.chain_swiglu(*packed, *y) {
                 Some((sorted_packed, sorted_h, perm)) => linear::mlp::swiglu_clamp_alpha_sorted(
                     self.ctx(),
@@ -623,14 +640,32 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Linear::SwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit: Some(limit),
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 *limit,
                 self.tensor(*y),
             ),
-            Linear::GegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
+            } => linear::mlp::geglu_tanh(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
@@ -645,13 +680,32 @@ impl Run<'_> {
             | Linear::MoeTopkSigmoidSink { .. }
             | Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
-            | Linear::SwigluClampSplitRouted { .. }
-            | Linear::SwigluClampRouted { .. }
+            | Linear::Glu {
+                packed: None,
+                gate: Some(_),
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
+            | Linear::Glu {
+                packed: Some(_),
+                gate: None,
+                weights: Some(_),
+                limit: Some(_),
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            }
             | Linear::MoeSumAdd { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            Linear::GegluTanhPacked {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::GegluTanh,
+                ..
             } => match self.chain_swiglu(*packed, *y) {
                 Some((sorted_packed, sorted_h, perm)) => match self.chain_sums() {
                     Some((sums, tile)) => linear::mlp::geglu_tanh_sorted_sums(
@@ -678,12 +732,15 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
-            Linear::Situ {
-                packed,
+            Linear::Glu {
+                packed: Some(packed),
                 intermediate,
-                beta,
-                up_cap,
                 y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
             } => linear::mlp::situ(
                 self.ctx(),
                 self.tensor(*packed),
@@ -693,6 +750,8 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            // The forms no builder makes.
+            Linear::Glu { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::MoeTopkSoftmax {
                 logits,
                 experts,
