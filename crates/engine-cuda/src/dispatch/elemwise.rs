@@ -1,6 +1,6 @@
 use kernels_cuda::{Tensor, elemwise};
 use poem_exec::{DispatchElemwise, KernelError};
-use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
+use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, NormKind, Operands, RopeForm, Turn};
 use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
@@ -205,15 +205,14 @@ impl Run<'_> {
                 *out_scale,
                 &mut self.tensor(*y_scaled),
             ),
-            Fused::RmsnormRopePartialQ {
+            Fused::NormRope {
                 x,
-                weight,
+                weight: Some(weight),
                 head_dim,
                 eps,
                 positions,
-                rotary_dim,
                 theta,
-                span,
+                turn: Turn::Partial { rotary_dim, span },
                 y,
                 q_out: _,
             } => elemwise::norm_rope::rmsnorm_rope_partial_q(
@@ -243,17 +242,20 @@ impl Run<'_> {
                 *stream_count,
                 &mut self.tensor(*mixes),
             ),
-            Fused::NormRopeLast {
+            Fused::NormRope {
                 x,
                 weight,
                 head_dim,
                 eps,
                 positions,
-                rotary_dim,
                 theta,
-                interleaved,
-                inverse,
-                yarn,
+                turn:
+                    Turn::Last {
+                        rotary_dim,
+                        interleaved,
+                        inverse,
+                        yarn,
+                    },
                 y,
                 q_out: _,
             } => elemwise::norm_rope::norm_rope_last(

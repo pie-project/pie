@@ -660,7 +660,7 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
         beta_slow: 1.0,
         original_max_position: 65536,
     });
-    let kernels = ["fused.norm_rope_last"];
+    let kernels = ["fused.norm_rope"];
     // q: a scale-free norm a 512-wide head, its tail turned.
     let q = trace(|p| {
         let positions = p.indices("positions");
@@ -683,12 +683,15 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
         elemwise::silu(&q);
     });
     let fused = fuse(q, &kernels);
-    assert_eq!(ops(&fused), ["fused.norm_rope_last", "elemwise.act"]);
-    let Some(poem_ir::Operation::Fused(poem_ir::Fused::NormRopeLast {
+    assert_eq!(ops(&fused), ["fused.norm_rope", "elemwise.act"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::NormRope {
         weight,
         head_dim,
-        interleaved,
-        yarn: got,
+        turn: Turn::Last {
+            interleaved,
+            yarn: got,
+            ..
+        },
         ..
     })) = fused.nodes.first().map(|node| &node.op)
     else {
@@ -721,7 +724,7 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     });
     assert_eq!(
         ops(&fuse(plane, &kernels)),
-        ["fused.norm_rope_last", "elemwise.act"]
+        ["fused.norm_rope", "elemwise.act"]
     );
     // A row of several heads normed whole is not a head's norm.
     let wide = trace(|p| {
@@ -782,7 +785,7 @@ fn deepseeks_kv_plane_norm_rotation_and_write_land_as_one_op() {
     assert_eq!(
         ops(&fuse(
             kv,
-            &["fused.norm_rope_last_append", "fused.norm_rope_last"]
+            &["fused.norm_rope_last_append", "fused.norm_rope"]
         )),
         ["fused.norm_rope_last_append"]
     );
@@ -882,7 +885,7 @@ fn deepseeks_compressor_lands_as_one_op() {
             attn::pool_kv_append(&k, &bpos, &breq, pool, &p.rows("wp", 1), &p.rows("wo", 1));
         })
     };
-    let kernels = ["fused.pool_compress", "fused.norm_rope_last"];
+    let kernels = ["fused.pool_compress", "fused.norm_rope"];
     assert_eq!(ops(&fuse(chain(false), &kernels)), ["fused.pool_compress"]);
     // A latent read past the match keeps the compressor apart.
     assert!(!ops(&fuse(chain(true), &kernels)).contains(&"fused.pool_compress"));
@@ -934,7 +937,7 @@ fn deepseeks_q_and_kv_plane_land_as_one_op() {
     let kernels = [
         "fused.norm_rope_pair",
         "fused.norm_rope_last_append",
-        "fused.norm_rope_last",
+        "fused.norm_rope",
     ];
     assert_eq!(
         ops(&fuse(layer, &kernels)),

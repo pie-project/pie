@@ -23,6 +23,9 @@ use search::{Binding, Shape};
 /// matches and how a match is replaced.
 pub struct Rule {
     kernel: &'static str,
+    /// Which of its op's forms the rule forms, where it forms one of several
+    /// (`""` where its op has one): the rules of one op may run apart.
+    form: &'static str,
     shapes: Vec<Shape>,
     when: fn(&Match) -> bool,
     replace: fn(&Match) -> Fused,
@@ -50,6 +53,7 @@ impl Rule {
         assert!(!shapes.is_empty(), "`{kernel}` states no pattern");
         Rule {
             kernel,
+            form: "",
             shapes,
             when: |_| true,
             replace,
@@ -61,6 +65,12 @@ impl Rule {
     /// folding the value it marks.
     fn through_markers(mut self) -> Rule {
         self.through_markers = true;
+        self
+    }
+
+    /// The rule forms its op's `form`; it runs at that form's place.
+    fn form(mut self, form: &'static str) -> Rule {
+        self.form = form;
         self
     }
 
@@ -166,10 +176,14 @@ impl Match<'_> {
     }
 }
 
-/// Every fused op's label in the order its rules run: a rule that forms a
+/// Every rule's op and form in the order rules run: a rule that forms a
 /// longer chain runs before one that forms a piece of it.
-static ORDER: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| rules::all().iter().map(|rule| rule.kernel).collect());
+static ORDER: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
+    rules::all()
+        .iter()
+        .map(|rule| (rule.kernel, rule.form))
+        .collect()
+});
 
 /// `trace` with every match of `rules` replaced by its fused op. The rules
 /// run in [`rules::all`]'s order whatever order they are given in.
@@ -178,8 +192,8 @@ pub fn fuse<'r>(mut trace: Trace, rules: impl IntoIterator<Item = &'r Rule>) -> 
     let rank = |rule: &&Rule| {
         ORDER
             .iter()
-            .position(|kernel| *kernel == rule.kernel)
-            .unwrap_or_else(|| panic!("`{}` is a fused op no rule forms", rule.kernel))
+            .position(|at| *at == (rule.kernel, rule.form))
+            .unwrap_or_else(|| panic!("`{}` ({}) is a form no rule forms", rule.kernel, rule.form))
     };
     let mut ordered: Vec<&Rule> = rules.into_iter().collect();
     ordered.sort_by_key(rank);

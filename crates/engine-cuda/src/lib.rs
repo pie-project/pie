@@ -53,7 +53,7 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 #[cfg(not(feature = "rocm"))]
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
-        use poem_compiler::fuse::rules;
+        use poem_compiler::fuse::rules::{self, Rotated};
         use poem_ir::GluAct;
         use poem_ir::ops::fused::Intermediates;
         vec![
@@ -71,8 +71,8 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::matmul_split_rows(),
             rules::gated_residual_norm_modulate(),
             rules::norm_modulate(),
-            rules::rmsnorm_rope_partial_q(),
-            rules::norm_rope_last(),
+            rules::norm_rope(Rotated::First),
+            rules::norm_rope(Rotated::Last),
             rules::norm_rope_last_append(),
             rules::split_rope_yarn_append(),
             rules::rope_yarn_append(),
@@ -92,7 +92,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 #[cfg(feature = "rocm")]
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
-        use poem_compiler::fuse::rules;
+        use poem_compiler::fuse::rules::{self, Rotated};
         use poem_ir::GluAct;
         use poem_ir::ops::fused::Intermediates;
         vec![
@@ -108,7 +108,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::moe_experts(),
             rules::gated_residual_norm_modulate(),
             rules::norm_modulate(),
-            rules::rmsnorm_rope_partial_q(),
+            rules::norm_rope(Rotated::First),
             rules::hc_norm_project(),
             rules::gdn_step(),
             rules::q_gate_norm_rope_append(Intermediates::Written),

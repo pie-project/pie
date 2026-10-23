@@ -18,6 +18,11 @@ pub(crate) fn refuses(op: &Fused) -> bool {
         Fused::MatmulGlu { glu, .. } => {
             !matches!(glu, poem_ir::GluAct::Swiglu | poem_ir::GluAct::GegluTanh)
         }
+        Fused::NormRope { weight, turn, .. } => match turn {
+            poem_ir::Turn::Partial { .. } => weight.is_none(),
+            poem_ir::Turn::Last { .. } => false,
+            _ => true,
+        },
         _ => false,
     }
 }
@@ -61,9 +66,8 @@ impl DispatchFused for Run<'_> {
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }
-            | Fused::RmsnormRopePartialQ { .. }
+            | Fused::NormRope { .. }
             | Fused::HcNormProject { .. }
-            | Fused::NormRopeLast { .. }
             | Fused::NormModulate { .. }
             | Fused::GatedResidualNormModulate { .. } => {
                 let mut outputs = Vec::new();
@@ -1350,17 +1354,20 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         let (
-            Fused::NormRopeLast {
+            Fused::NormRope {
                 x: qx,
                 weight: None,
                 head_dim: q_dim,
                 eps: q_eps,
                 positions,
-                rotary_dim,
                 theta,
-                interleaved: q_interleaved,
-                inverse: q_inverse,
-                yarn: q_yarn,
+                turn:
+                    poem_ir::Turn::Last {
+                        rotary_dim,
+                        interleaved: q_interleaved,
+                        inverse: q_inverse,
+                        yarn: q_yarn,
+                    },
                 y: qy,
                 ..
             },

@@ -10,10 +10,12 @@ use poem_ir::ValueId;
 /// hyper-connection and Qwen prologue kernels. Its rules form none of them
 /// (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
 pub(crate) fn refuses(op: &Fused) -> bool {
+    if let Fused::NormRope { weight, turn, .. } = op {
+        return !(matches!(turn, poem_ir::Turn::Partial { .. }) && weight.is_some());
+    }
     matches!(
         op,
-        Fused::NormRopeLast { .. }
-            | Fused::NormRopeLastAppend { .. }
+        Fused::NormRopeLastAppend { .. }
             | Fused::NormRopePair { .. }
             | Fused::IndexTopkRope { .. }
             | Fused::PoolCompress { .. }
@@ -55,8 +57,7 @@ impl DispatchFused for Run<'_> {
             | Fused::LseSink { .. }
             | Fused::RopeYarnAppend { .. }
             | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
-            Fused::NormRopeLast { .. }
-            | Fused::NormRopeLastAppend { .. }
+            Fused::NormRopeLastAppend { .. }
             | Fused::NormRopePair { .. }
             | Fused::IndexTopkRope { .. }
             | Fused::PoolCompress { .. }
@@ -71,7 +72,7 @@ impl DispatchFused for Run<'_> {
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }
-            | Fused::RmsnormRopePartialQ { .. }
+            | Fused::NormRope { .. }
             | Fused::HcNormProject { .. }
             | Fused::NormModulate { .. }
             | Fused::GatedResidualNormModulate { .. } => {

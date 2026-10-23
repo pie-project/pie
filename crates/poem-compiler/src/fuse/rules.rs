@@ -67,7 +67,7 @@ pub fn all() -> Vec<Rule> {
         matmul_split_rows(),
         gated_residual_norm_modulate(),
         norm_modulate(),
-        rmsnorm_rope_partial_q(),
+        norm_rope(Rotated::First),
         hc_norm_project(),
         gdn_step(),
         q_gate_norm_rope_append(Intermediates::Written),
@@ -75,7 +75,7 @@ pub fn all() -> Vec<Rule> {
         norm_rope_pair(),
         index_topk_rope(),
         norm_rope_last_append(),
-        norm_rope_last(),
+        norm_rope(Rotated::Last),
         q_gate_norm_rope_append(Intermediates::Unwritten),
         split_rope_yarn_append(),
         rope_yarn_append(),
@@ -1560,79 +1560,111 @@ pub fn norm_modulate() -> Rule {
     })
 }
 
-/// A head's RMS norm, scaled (the whole row one head) or scale-free (per
-/// head), its last dims rotated: DeepSeek-V4's q, kv plane, compressed
-/// latent and index keys.
+/// The part of each head a [`norm_rope`] turns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rotated {
+    /// Its first dims (`Turn::Partial`), the norm scaled per head: Qwen's q.
+    First,
+    /// Its last dims (`Turn::Last`), the norm scaled over a row one head
+    /// wide or scale-free per head: DeepSeek-V4's q, kv plane, compressed
+    /// latent and index keys.
+    Last,
+}
+
+/// A head's RMS norm and the rotation of the part of each head `rotated`
+/// names, the rotated heads the norm's plane.
 #[must_use]
-pub fn norm_rope_last() -> Rule {
-    let rope = |p: &poem::pattern::Pattern, y: &poem::Value| {
-        p.free("interleaved");
-        p.free("inverse");
-        p.free("yarn");
-        let positions = p.indices("positions");
-        elemwise::rope(
-            y,
-            &positions,
-            p.u32("head_dim"),
-            p.f32("theta"),
-            Turn::Last {
-                rotary_dim: p.u32("rotary_dim"),
-                interleaved: false,
-                inverse: false,
-                yarn: None,
-            },
-            None,
-            None,
-        )
-        .0
-    };
-    let scale_free = template(move |p| {
-        let y = elemwise::rmsnorm_no_scale(&p.rows("x", W), p.u32("norm_dim"), p.f32("eps"));
-        p.name("y", &y);
-        let q_out = rope(p, &y);
-        p.export("q_out", &q_out);
-    });
-    let scaled = template(move |p| {
-        let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
-        p.name("y", &y);
-        let q_out = rope(p, &y);
-        p.export("q_out", &q_out);
-    });
-    Rule::new("fused.norm_rope_last", [scale_free, scaled], |m| {
-        let Operation::Elemwise(Elemwise::Rope {
-            turn:
-                Turn::Last {
-                    interleaved,
-                    inverse,
-                    yarn,
-                    ..
-                },
-            ..
-        }) = *m.op("q_out")
-        else {
+pub fn norm_rope(rotated: Rotated) -> Rule {
+    fn replace(m: &Match) -> Fused {
+        let Operation::Elemwise(Elemwise::Rope { turn, .. }) = m.op("q_out") else {
             unreachable!("the pattern's last op is the rotation")
         };
-        Fused::NormRopeLast {
+        Fused::NormRope {
             x: m.value("x"),
             weight: m.get("weight"),
             head_dim: m.u32("head_dim"),
             eps: m.f32("eps"),
             positions: m.value("positions"),
-            rotary_dim: m.u32("rotary_dim"),
             theta: m.f32("theta"),
-            interleaved,
-            inverse,
-            yarn,
+            turn: *turn,
             y: m.value("y"),
             q_out: m.value("q_out"),
         }
-    })
-    // The norm's heads are the rotation's: a scale-free norm per head of
-    // the rotation's width, a scaled one over a row one head wide.
-    .when(|m| match m.get_u32("norm_dim") {
-        Some(norm_dim) => norm_dim == m.u32("head_dim"),
-        None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
-    })
+    }
+    match rotated {
+        Rotated::First => {
+            let pattern = template(|p| {
+                let positions = p.indices("positions");
+                let d = p.u32("head_dim");
+                let y = elemwise::rmsnorm_per_head(
+                    &p.rows("x", W),
+                    &p.weight("weight", [W]),
+                    d,
+                    p.f32("eps"),
+                );
+                p.name("y", &y);
+                let (rotary_dim, theta, span) =
+                    (p.u32("rotary_dim"), p.f32("theta"), p.u32("span"));
+                let q_out = elemwise::rope(
+                    &y,
+                    &positions,
+                    d,
+                    theta,
+                    Turn::Partial { rotary_dim, span },
+                    None,
+                    None,
+                )
+                .0;
+                p.export("q_out", &q_out);
+            });
+            Rule::new("fused.norm_rope", [pattern], replace).form("first")
+        }
+        Rotated::Last => {
+            let rope = |p: &poem::pattern::Pattern, y: &poem::Value| {
+                p.free("interleaved");
+                p.free("inverse");
+                p.free("yarn");
+                let positions = p.indices("positions");
+                elemwise::rope(
+                    y,
+                    &positions,
+                    p.u32("head_dim"),
+                    p.f32("theta"),
+                    Turn::Last {
+                        rotary_dim: p.u32("rotary_dim"),
+                        interleaved: false,
+                        inverse: false,
+                        yarn: None,
+                    },
+                    None,
+                    None,
+                )
+                .0
+            };
+            let scale_free = template(move |p| {
+                let y =
+                    elemwise::rmsnorm_no_scale(&p.rows("x", W), p.u32("norm_dim"), p.f32("eps"));
+                p.name("y", &y);
+                let q_out = rope(p, &y);
+                p.export("q_out", &q_out);
+            });
+            let scaled = template(move |p| {
+                let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
+                p.name("y", &y);
+                let q_out = rope(p, &y);
+                p.export("q_out", &q_out);
+            });
+            Rule::new("fused.norm_rope", [scale_free, scaled], replace)
+                .form("last")
+                // The norm's heads are the rotation's: a scale-free norm per
+                // head of the rotation's width, a scaled one over a row one
+                // head wide.
+                .when(|m| match m.get_u32("norm_dim") {
+                    Some(norm_dim) => norm_dim == m.u32("head_dim"),
+                    None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
+                })
+        }
+    }
 }
 
 /// An index's queries rotated and ranked, the rotated queries read by the
@@ -1758,17 +1790,19 @@ pub fn norm_rope_pair() -> Rule {
         let (q_interleaved, q_inverse, q_yarn) = rope("q_out");
         let (kv_interleaved, kv_inverse, kv_yarn) = rope("kv_y");
         Fused::NormRopePair {
-            q: Box::new(Fused::NormRopeLast {
+            q: Box::new(Fused::NormRope {
                 x: m.value("q"),
                 weight: None,
                 head_dim: m.u32("head_dim"),
                 eps: m.f32("q_eps"),
                 positions: m.value("positions"),
-                rotary_dim: m.u32("rotary_dim"),
                 theta: m.f32("theta"),
-                interleaved: q_interleaved,
-                inverse: q_inverse,
-                yarn: q_yarn,
+                turn: Turn::Last {
+                    rotary_dim: m.u32("rotary_dim"),
+                    interleaved: q_interleaved,
+                    inverse: q_inverse,
+                    yarn: q_yarn,
+                },
                 y: m.value("q_y"),
                 q_out: m.value("q_out"),
             }),
@@ -1973,44 +2007,6 @@ pub fn norm_rope_last_append() -> Rule {
     .when(|m| m.width("x") == Some(u64::from(m.u32("head_dim"))))
 }
 
-/// A per-head norm of q, rotated.
-#[must_use]
-pub fn rmsnorm_rope_partial_q() -> Rule {
-    let pattern = template(|p| {
-        let positions = p.indices("positions");
-        let d = p.u32("head_dim");
-        let y =
-            elemwise::rmsnorm_per_head(&p.rows("x", W), &p.weight("weight", [W]), d, p.f32("eps"));
-        p.name("y", &y);
-        let (rotary_dim, theta, span) = (p.u32("rotary_dim"), p.f32("theta"), p.u32("span"));
-        let q_out = elemwise::rope(
-            &y,
-            &positions,
-            d,
-            theta,
-            Turn::Partial { rotary_dim, span },
-            None,
-            None,
-        )
-        .0;
-        p.export("q_out", &q_out);
-    });
-    Rule::new("fused.rmsnorm_rope_partial_q", [pattern], |m| {
-        Fused::RmsnormRopePartialQ {
-            x: m.value("x"),
-            weight: m.value("weight"),
-            head_dim: m.u32("head_dim"),
-            eps: m.f32("eps"),
-            positions: m.value("positions"),
-            rotary_dim: m.u32("rotary_dim"),
-            theta: m.f32("theta"),
-            span: m.u32("span"),
-            y: m.value("y"),
-            q_out: m.value("q_out"),
-        }
-    })
-}
-
 /// mHC's f32 stream norm read only by its mix projection.
 #[must_use]
 pub fn hc_norm_project() -> Rule {
@@ -2174,10 +2170,12 @@ pub fn q_gate_norm_rope_append(intermediates: Intermediates) -> Rule {
         Rule::new("fused.q_gate_norm_rope_append", [pattern], |m| {
             replace(m, Intermediates::Written)
         })
+        .form("written")
     } else {
         Rule::new("fused.q_gate_norm_rope_append", [pattern], |m| {
             replace(m, Intermediates::Unwritten)
         })
+        .form("unwritten")
         .through_markers()
         .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
     }

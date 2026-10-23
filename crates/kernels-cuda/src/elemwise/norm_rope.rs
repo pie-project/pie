@@ -24,7 +24,7 @@ pub fn rmsnorm_rope_partial_q(
     span: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "fused.rmsnorm_rope_partial_q";
+    const OP: &str = "fused.norm_rope";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     positions_stream(OP, positions, &x);
     if head_dim == 0
@@ -132,7 +132,7 @@ pub fn norm_rope_last(
     yarn: Option<Yarn>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "fused.norm_rope_last";
+    const OP: &str = "fused.norm_rope";
     let tail = Tail {
         head_dim,
         eps,

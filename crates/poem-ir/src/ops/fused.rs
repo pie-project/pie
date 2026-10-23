@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::Op;
 use crate::operands::Part;
 use crate::ops::attn::Attn;
-use crate::ops::elemwise::{Elemwise, ModulateForm, Yarn};
+use crate::ops::elemwise::{Elemwise, ModulateForm, Turn, Yarn};
 use crate::ops::linear::{GluAct, Linear};
 use crate::value::ValueId;
 
@@ -136,27 +136,11 @@ pub enum Fused {
         #[output]
         y_scaled: ValueId,
     },
-    RmsnormRopePartialQ {
-        #[input]
-        x: ValueId,
-        #[input]
-        weight: ValueId,
-        head_dim: u32,
-        eps: f32,
-        #[input(I32)]
-        positions: ValueId,
-        rotary_dim: u32,
-        theta: f32,
-        span: u32,
-        #[output]
-        y: ValueId,
-        #[output(alias = y)]
-        q_out: ValueId,
-    },
-    /// A head's RMS norm (scaled by `weight`, or scale-free) and the
-    /// rotation of its last `rotary_dim` dims (a `Rope` turning `Last`), the
-    /// normed heads the rotation's own plane.
-    NormRopeLast {
+    /// A head's RMS norm (scaled by `weight`, or scale-free) and the rotation
+    /// of part of each head (a `Rope` under `turn`: its first dims,
+    /// `Partial`, or its last, `Last`), the normed heads the rotation's own
+    /// plane.
+    NormRope {
         #[input]
         x: ValueId,
         #[input]
@@ -165,17 +149,14 @@ pub enum Fused {
         eps: f32,
         #[input(I32)]
         positions: ValueId,
-        rotary_dim: u32,
         theta: f32,
-        interleaved: bool,
-        inverse: bool,
-        yarn: Option<Yarn>,
+        turn: Turn,
         #[output]
         y: ValueId,
         #[output(alias = y)]
         q_out: ValueId,
     },
-    /// `NormRopeLast` over a row one head wide (scaled), the rotated row
+    /// A `NormRope` turning `Last` over a row one head wide (scaled), the rotated row
     /// then written to the cache at its page and offset
     /// (`KvAppend` of one plane); `y` is read by nothing else.
     NormRopeLastAppend {
@@ -210,7 +191,7 @@ pub enum Fused {
         #[part]
         rank: Box<Attn>,
     },
-    /// DeepSeek-V4's q (`NormRopeLast`, scale-free) and its kv plane
+    /// DeepSeek-V4's q (`NormRope` turning `Last`, scale-free) and its kv plane
     /// (`NormRopeLastAppend`) of one layer, landed together.
     NormRopePair {
         #[part]

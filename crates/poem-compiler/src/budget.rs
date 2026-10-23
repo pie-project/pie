@@ -252,9 +252,8 @@ impl FamilyCosts {
                 | poem_ir::Fused::RmsnormResidualAdd { .. }
                 | poem_ir::Fused::EmbedScaleAdd { .. }
                 | poem_ir::Fused::EmbedScaleAddSelect { .. }
-                | poem_ir::Fused::RmsnormRopePartialQ { .. }
+                | poem_ir::Fused::NormRope { .. }
                 | poem_ir::Fused::HcNormProject { .. }
-                | poem_ir::Fused::NormRopeLast { .. }
                 | poem_ir::Fused::NormRopeLastAppend { .. }
                 | poem_ir::Fused::NormRopePair { .. }
                 | poem_ir::Fused::RopeYarnAppend { .. }
