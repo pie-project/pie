@@ -251,7 +251,7 @@ mod tests {
         .unwrap();
 
         let tokenizer = from_file(&model_path).unwrap();
-        assert_eq!(tokenizer.get_split_regex(), KIMI_TIKTOKEN_REGEX);
+        assert_eq!(tokenizer.split_regex(), Some(KIMI_TIKTOKEN_REGEX));
         assert_eq!(
             tokenizer.vocab_size(),
             (base_vocab_size + KIMI_RESERVED_SPECIAL_TOKENS) as usize

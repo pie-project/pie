@@ -519,12 +519,13 @@ impl Tokenizer {
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     }
 
-    pub fn get_split_regex(&self) -> String {
+    /// The pre-tokenizer's split regex, when it splits by exactly one.
+    pub fn split_regex(&self) -> Option<&str> {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { splitters, .. } if splitters.len() == 1 => {
-                splitters[0].regex.as_str().to_string()
+                Some(splitters[0].regex.as_str())
             }
-            _ => String::new(),
+            _ => None,
         }
     }
 
@@ -537,16 +538,11 @@ impl Tokenizer {
         }
     }
 
-    pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        let mut ids = Vec::with_capacity(self.special_token_ids.len());
-        let mut bytes = Vec::with_capacity(self.special_token_ids.len());
-        for &id in &self.special_token_ids {
-            if let Some(tok_bytes) = self.bpe.id_to_bytes(id) {
-                ids.push(id);
-                bytes.push(tok_bytes.to_vec());
-            }
-        }
-        (ids, bytes)
+    /// The special tokens the vocabulary spells, each with its bytes.
+    pub fn special_tokens(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        self.special_token_ids
+            .iter()
+            .filter_map(|&id| self.bpe.id_to_bytes(id).map(|bytes| (id, bytes)))
     }
 
     pub fn decoded_token_bytes(&self, token_id: u32) -> Option<&[u8]> {
