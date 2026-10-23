@@ -312,17 +312,17 @@ latents).  The config the row is served under keeps `[engine] graphs = "off"`
 so the parity walks eagerly.
 
 **Bisecting a mismatch.**  `--tap <dump key>` on `run`, `collect` and
-`compare` reads an INTERMEDIATE out in the velocity's place: `run` sets the
-family's `PIE_MINI_DIT_TAP` knob (`models/mini_dit/model.poem`,
-`tap`) — the plan plants its readout seam on that rectangle, so the artifact
-must be re-imported under the same environment — `collect` lays the pie rows
+`compare` reads an INTERMEDIATE out in the velocity's place. The tap is part
+of the deployment's name (`-tap.{key}`, read as `deploy.tap` in
+`models/mini_dit/model.poem`): the plan plants its readout seam on that
+rectangle, so the artifact is imported under the tapped deployment — `collect` lays the pie rows
 out the way the golden's tensor is shaped (a `[B, H, N, DH]` head tensor is
 transposed back; a joint `[txt || img]` rectangle takes its caption rows from
 the guest's caption-lane readout), and `compare` diffs that one key.
 
 ```bash
-PIE_MINI_DIT_TAP=b0.norm1_out pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" \
-    --deployment mini-dit-bf16-kv-bf16 --out ~/.cache/pie-imagegen/mini-dit.zt --force
+pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" \
+    --deployment mini-dit-bf16-kv-bf16-tap.b0.norm1_out --out ~/.cache/pie-imagegen/mini-dit.zt --force
 python mini_dit_parity.py run     --out /tmp/mini-dit-parity --tap b0.norm1_out --config ...
 python mini_dit_parity.py collect --out /tmp/mini-dit-parity --tap b0.norm1_out
 python mini_dit_parity.py compare --out /tmp/mini-dit-parity --tap b0.norm1_out

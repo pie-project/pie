@@ -127,6 +127,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::decode(
@@ -149,6 +154,14 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
+                mask: None,
+                selection: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected: None,
+                rel: None,
+                lse: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::arbiter::prefill(
@@ -165,8 +178,21 @@ impl Run<'_> {
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
 
-            Attn::DecodeSelected { per_head: true, .. }
-            | Attn::PrefillSelected { per_head: true, .. }
+            Attn::Decode {
+                selection: Some(_),
+                bias: None,
+                selected: Some(poem_ir::Blocks { per_head: true, .. }),
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                mask: None,
+                selection: Some(_),
+                bias: None,
+                selected: Some(poem_ir::Blocks { per_head: true, .. }),
+                lse: None,
+                ..
+            }
             | Attn::IndexTopk {
                 score: IndexScore::BlockMax,
                 ..
@@ -179,17 +205,23 @@ impl Run<'_> {
             Attn::ReplayFloor { .. } | Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
             }
-            Attn::DecodeSelected {
+            Attn::Decode {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                bias: None,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::decode_selected(
@@ -204,18 +236,27 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
-            Attn::PrefillSelected {
+            Attn::Prefill {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 kv_heads,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                mask: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::prefill_selected(
@@ -329,18 +370,24 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attn::DecodeRel {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
-                bias,
+                bias: Some(bias),
                 window,
                 head_dim,
-                extent,
                 sm_scale,
-                log_floor,
-                log_alpha,
                 o,
+                selection: None,
+                selected: None,
+                rel:
+                    Some(poem_ir::Relative {
+                        extent,
+                        log_floor,
+                        log_alpha,
+                    }),
+                lse: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::rel::decode_rel(
@@ -359,19 +406,28 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
-            Attn::PrefillRel {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
-                bias,
+                bias: Some(bias),
                 window,
                 head_dim,
                 kv_heads,
-                extent,
                 sm_scale,
-                log_floor,
-                log_alpha,
                 o,
+                mask: None,
+                selection: None,
+                floor: None,
+                causal: true,
+                selected: None,
+                rel:
+                    Some(poem_ir::Relative {
+                        extent,
+                        log_floor,
+                        log_alpha,
+                    }),
+                lse: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::rel::prefill_rel(
@@ -392,10 +448,10 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
-            Attn::Masked {
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -403,6 +459,12 @@ impl Run<'_> {
                 causal,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::arbiter::masked(
@@ -418,10 +480,10 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
-            Attn::MaskedLse {
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -429,7 +491,12 @@ impl Run<'_> {
                 causal,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::arbiter::masked_lse(
@@ -446,7 +513,7 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
-            Attn::DecodeLse {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -454,7 +521,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::decode_lse(
@@ -468,7 +539,7 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
-            Attn::PrefillLse {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -477,9 +548,15 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
                 // This backend splits no prompt's rows, so a replay floor stays 0.
                 floor: _,
+                mask: None,
+                selection: None,
+                bias: None,
+                causal: true,
+                selected: None,
+                rel: None,
             } => {
                 let pool = *self.pool(*cache);
                 let call = attn::arbiter::prefill_lse(
@@ -534,7 +611,7 @@ impl Run<'_> {
             }
             Attn::KvAppend {
                 k,
-                v,
+                v: Some(v),
                 cache,
                 write_page,
                 write_offset,
@@ -546,8 +623,9 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attn::KvAppendShared {
-                plane,
+            Attn::KvAppend {
+                k: plane,
+                v: None,
                 cache,
                 write_page,
                 write_offset,
@@ -693,17 +771,35 @@ impl Run<'_> {
             ),
 
             // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
-            Attn::MlaDecode { lse: Some(_), .. }
-            | Attn::MlaPrefill { lse: Some(_), .. }
-            | Attn::MlaDecodeSelected { lse: Some(_), .. }
-            | Attn::MlaPrefillSelected { lse: Some(_), .. } => {
-                Err(kernels_xla::Error::Unsupported { op: op.name() })
-            }
             Attn::MlaDecode {
-                window: Some(_), ..
+                lse: Some(_),
+                selection: None,
+                ..
             }
             | Attn::MlaPrefill {
-                window: Some(_), ..
+                lse: Some(_),
+                selection: None,
+                ..
+            }
+            | Attn::MlaDecode {
+                lse: Some(_),
+                selection: Some(_),
+                ..
+            }
+            | Attn::MlaPrefill {
+                lse: Some(_),
+                selection: Some(_),
+                ..
+            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Attn::MlaDecode {
+                window: Some(_),
+                selection: None,
+                ..
+            }
+            | Attn::MlaPrefill {
+                window: Some(_),
+                selection: None,
+                ..
             } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Attn::MlaDecode {
                 q,
@@ -716,6 +812,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse: _,
+                selection: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -744,6 +841,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse: _,
+                selection: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -761,17 +859,18 @@ impl Run<'_> {
                 );
                 crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
             }
-            Attn::MlaDecodeSelected {
+            Attn::MlaDecode {
                 q,
                 plan: _,
                 q_pe,
-                selection,
+                selection: Some(selection),
                 cache,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
                 lse: _,
+                window: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -790,17 +889,18 @@ impl Run<'_> {
                 );
                 crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
             }
-            Attn::MlaPrefillSelected {
+            Attn::MlaPrefill {
                 q,
                 plan: _,
                 q_pe,
-                selection,
+                selection: Some(selection),
                 cache,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
                 lse: _,
+                window: None,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -913,13 +1013,14 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*entries),
             ),
-            Attn::PoolBoundaryDecode {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: true,
             } => crate::lower::attn::pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
@@ -930,13 +1031,14 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attn::PoolBoundaryPrefill {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: false,
             } => crate::lower::attn::pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
@@ -1028,6 +1130,8 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse,
+                selection: None,
+                top_k: None,
             } => {
                 let pool = *self.pool(*entries);
                 let call = attn::pool::attention_lse(
@@ -1044,14 +1148,14 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::pool::lse(self.ctx(), call, pool)
             }
-            Attn::PoolLseSelected {
+            Attn::PoolLse {
                 q,
                 positions,
                 request_of_token,
-                selection,
+                selection: Some(selection),
                 entries,
                 ratio,
-                top_k,
+                top_k: Some(top_k),
                 heads,
                 head_dim,
                 sm_scale,
@@ -1075,6 +1179,13 @@ impl Run<'_> {
                 )?;
                 crate::lower::attn::pool::lse(self.ctx(), call, pool)
             }
+            // A selection, a window, a relative bias and a mask no kernel here
+            // combines.
+            Attn::Decode { .. }
+            | Attn::Prefill { .. }
+            | Attn::MlaDecode { .. }
+            | Attn::MlaPrefill { .. }
+            | Attn::PoolLse { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
         }
     }
 }

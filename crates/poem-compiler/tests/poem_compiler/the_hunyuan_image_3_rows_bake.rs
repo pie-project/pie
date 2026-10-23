@@ -324,10 +324,14 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
         let (mut masked, mut prefill, mut decode, mut appends) = (0usize, 0usize, 0usize, 0usize);
         for node in &plan.nodes {
             match &node.op {
-                Operation::Attn(Attn::Masked {
+                Operation::Attn(Attn::Prefill {
                     causal,
                     head_dim,
                     sm_scale,
+                    mask: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: None,
                     ..
                 }) => {
                     masked += 1;
@@ -338,8 +342,19 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
                     assert_eq!(*head_dim, d.head_dim);
                     assert!((sm_scale - d.sm_scale()).abs() < 1e-7);
                 }
-                Operation::Attn(Attn::Prefill { .. }) => prefill += 1,
-                Operation::Attn(Attn::Decode { .. }) => decode += 1,
+                Operation::Attn(Attn::Prefill {
+                    mask: None,
+                    selection: None,
+                    bias: None,
+                    lse: None,
+                    ..
+                }) => prefill += 1,
+                Operation::Attn(Attn::Decode {
+                    selection: None,
+                    bias: None,
+                    lse: None,
+                    ..
+                }) => decode += 1,
                 Operation::Attn(Attn::KvAppend { .. }) => appends += 1,
                 _ => {}
             }

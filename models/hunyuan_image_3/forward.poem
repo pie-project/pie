@@ -92,17 +92,22 @@ def trunk(all, den, m):
 
 def moe(x, w, m):
     d = m.dims
-    routes, weights = ops.linear.moe_topk_softmax(ops.linear.matmul(x, w.router), d.experts, d.top_k)
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, w.router),
+        d.experts,
+        d.top_k,
+        routing.softmax(),
+    )
 
     def select(act, bank):
         if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
             return ops.linear.moe_matmul_select(act, bank, routes, d.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, d.top_k)
 
-    act = ops.linear.swiglu(select(x, w.experts_gate_up), d.moe_inter)
+    act = ops.linear.glu(select(x, w.experts_gate_up), gating.swiglu(), d.moe_inter)
     routed = ops.linear.moe_weighted_sum(select(act, w.experts_down), weights)
     shared = ops.linear.matmul(
-        ops.linear.swiglu(ops.linear.matmul(x, w.shared_gate_up), d.shared_inter),
+        ops.linear.glu(ops.linear.matmul(x, w.shared_gate_up), gating.swiglu(), d.shared_inter),
         w.shared_down,
     )
     return ops.elemwise.residual_add(shared, routed)

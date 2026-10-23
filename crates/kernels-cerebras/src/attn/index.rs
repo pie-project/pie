@@ -221,7 +221,7 @@ pub fn boundary_decode(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attn.pool_boundary_decode",
+        "attn.pool_boundary",
         positions,
         request_of_token,
         row_valid,
@@ -244,7 +244,7 @@ pub fn boundary_prefill(
 ) -> Result<(), Error> {
     boundary(
         ctx,
-        "attn.pool_boundary_prefill",
+        "attn.pool_boundary",
         positions.data,
         request_of_token,
         row_valid,

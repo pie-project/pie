@@ -160,24 +160,28 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.situ(ops.linear.matmul(x, f.gate_up), f.inter, f.beta, f.up_cap)
+        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.situ(f.beta, up_cap = f.up_cap), f.inter)
         return ops.linear.matmul(act, f.down)
     logits = ops.linear.matmul(x, f.router)
     if f.bias != None:
-        routes, weights = ops.linear.moe_topk_sigmoid_biased(
+        routes, weights = ops.linear.moe_route(
             logits,
-            f.bias,
             f.experts,
             f.top_k,
-            f.renorm,
-            f.routed_scaling,
+            routing.sigmoid(renormalize = f.renorm, scaling = f.routed_scaling),
+            bias = f.bias,
         )
     else:
-        routes, weights = ops.linear.moe_topk_sigmoid(logits, f.experts, f.top_k, f.renorm, f.routed_scaling)
+        routes, weights = ops.linear.moe_route(
+            logits,
+            f.experts,
+            f.top_k,
+            routing.sigmoid(renormalize = f.renorm, scaling = f.routed_scaling),
+        )
     lat = f.latent
     z = ops.linear.matmul(x, lat.down) if lat != None else x
     hidden = ops.linear.moe_matmul_select_quant(z, f.gate_up, routes, f.top_k)
-    act = ops.linear.situ(hidden, f.inter, f.beta, f.up_cap)
+    act = ops.linear.glu(hidden, gating.situ(f.beta, up_cap = f.up_cap), f.inter)
     routed = ops.linear.moe_weighted_sum(
         ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k),
         weights,
@@ -186,7 +190,7 @@ def mlp(x, f):
         r = ops.elemwise.rmsnorm(routed, lat.norm, lat.norm_eps) if lat.norm != None else routed
         routed = ops.linear.matmul(r, lat.up)
     s = f.shared
-    act = ops.linear.situ(ops.linear.matmul(x, s.gate_up), s.inter, f.beta, f.up_cap)
+    act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.situ(f.beta, up_cap = f.up_cap), s.inter)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def mla_mixer(x, inputs, plan, a):

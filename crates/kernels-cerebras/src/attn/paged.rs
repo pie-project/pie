@@ -665,7 +665,7 @@ pub fn decode_lse(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attn.decode_lse",
+        "attn.decode",
         q,
         &t,
         t.mask,
@@ -722,7 +722,7 @@ pub fn prefill_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.prefill_lse";
+    const OP: &str = "attn.prefill";
     heads_agree(OP, pool, head_dim, kv_heads)?;
     let t = Tables::from(plan);
     attend(
@@ -760,7 +760,7 @@ pub fn masked(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attn.masked",
+        "attn.prefill",
         q.data,
         &t,
         mask,
@@ -791,7 +791,7 @@ pub fn masked_lse(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attn.masked_lse",
+        "attn.prefill",
         q.data,
         &t,
         mask,
@@ -824,7 +824,7 @@ pub fn decode_selected(
     let t = Tables::from(plan);
     attend(
         ctx,
-        "attn.decode_selected",
+        "attn.decode",
         q,
         &t,
         t.mask,
@@ -852,7 +852,7 @@ pub fn prefill_selected(
     ratio: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.prefill_selected";
+    const OP: &str = "attn.prefill";
     heads_agree(OP, pool, head_dim, kv_heads)?;
     let t = Tables::from(plan);
     attend(
@@ -1100,7 +1100,7 @@ pub fn kv_append_shared(
 ) -> Result<(), Error> {
     append(
         ctx,
-        "attn.kv_append_shared",
+        "attn.kv_append",
         plane,
         plane,
         pool,

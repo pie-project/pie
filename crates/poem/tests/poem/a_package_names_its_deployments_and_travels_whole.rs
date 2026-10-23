@@ -1,4 +1,4 @@
-//! `package.poem` states a package's models and the deployments it lists,
+//! `MODELS` and `DEPLOYMENTS` state a package's models and the deployments it lists,
 //! each named by the one grammar every deployment is named by; and its
 //! digest follows its files.
 

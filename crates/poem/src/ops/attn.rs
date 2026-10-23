@@ -82,6 +82,11 @@ pub fn decode(
             head_dim,
             sm_scale,
             o: o.id(),
+            selection: None,
+            bias: None,
+            selected: None,
+            rel: None,
+            lse: None,
         },
         &[q, plan],
     );
@@ -109,6 +114,14 @@ pub fn prefill(
             kv_heads,
             sm_scale,
             o: o.id(),
+            mask: None,
+            selection: None,
+            bias: None,
+            floor: None,
+            causal: true,
+            selected: None,
+            rel: None,
+            lse: None,
         },
         &[q, plan],
     );
@@ -130,17 +143,19 @@ pub fn decode_selected(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attn::DecodeSelected {
+        Attn::Decode {
             q: q.id(),
             plan: plan.id(),
-            selection: selection.id(),
+            selection: Some(selection.id()),
             cache: pages,
             window,
             head_dim,
             sm_scale,
-            ratio,
-            per_head,
             o: o.id(),
+            bias: None,
+            selected: Some(poem_ir::Blocks { ratio, per_head }),
+            rel: None,
+            lse: None,
         },
         &[q, plan, selection],
     );
@@ -163,18 +178,23 @@ pub fn prefill_selected(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attn::PrefillSelected {
+        Attn::Prefill {
             q: q.id(),
             plan: plan.id(),
-            selection: selection.id(),
+            selection: Some(selection.id()),
             cache: pages,
             window,
             head_dim,
             kv_heads,
             sm_scale,
-            ratio,
-            per_head,
             o: o.id(),
+            mask: None,
+            bias: None,
+            floor: None,
+            causal: true,
+            selected: Some(poem_ir::Blocks { ratio, per_head }),
+            rel: None,
+            lse: None,
         },
         &[q, plan, selection],
     );
@@ -197,18 +217,23 @@ pub fn decode_rel(
     let o = r.fresh(q.ty().clone());
     let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
     r.push(
-        Attn::DecodeRel {
+        Attn::Decode {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
-            bias: bias.id(),
+            bias: Some(bias.id()),
             window,
             head_dim,
-            extent,
             sm_scale,
-            log_floor,
-            log_alpha,
             o: o.id(),
+            selection: None,
+            selected: None,
+            rel: Some(poem_ir::Relative {
+                extent,
+                log_floor,
+                log_alpha,
+            }),
+            lse: None,
         },
         &[q, plan, bias],
     );
@@ -232,19 +257,27 @@ pub fn prefill_rel(
     let o = r.fresh(q.ty().clone());
     let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
     r.push(
-        Attn::PrefillRel {
+        Attn::Prefill {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
-            bias: bias.id(),
+            bias: Some(bias.id()),
             window,
             head_dim,
             kv_heads,
-            extent,
             sm_scale,
-            log_floor,
-            log_alpha,
             o: o.id(),
+            mask: None,
+            selection: None,
+            floor: None,
+            causal: true,
+            selected: None,
+            rel: Some(poem_ir::Relative {
+                extent,
+                log_floor,
+                log_alpha,
+            }),
+            lse: None,
         },
         &[q, plan, bias],
     );
@@ -265,10 +298,10 @@ pub fn masked(
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
     r.push(
-        Attn::Masked {
+        Attn::Prefill {
             q: q.id(),
             plan: plan.id(),
-            mask: mask.id(),
+            mask: Some(mask.id()),
             cache: pages,
             window,
             head_dim,
@@ -276,6 +309,12 @@ pub fn masked(
             causal,
             sm_scale,
             o: o.id(),
+            selection: None,
+            bias: None,
+            floor: None,
+            selected: None,
+            rel: None,
+            lse: None,
         },
         &[q, plan, mask],
     );
@@ -302,10 +341,10 @@ pub fn masked_lse(
         Dtype::F32,
     ));
     r.push(
-        Attn::MaskedLse {
+        Attn::Prefill {
             q: q.id(),
             plan: plan.id(),
-            mask: mask.id(),
+            mask: Some(mask.id()),
             cache: pages,
             window,
             head_dim,
@@ -313,7 +352,12 @@ pub fn masked_lse(
             causal,
             sm_scale,
             o: o.id(),
-            lse: lse.id(),
+            lse: Some(lse.id()),
+            selection: None,
+            bias: None,
+            floor: None,
+            selected: None,
+            rel: None,
         },
         &[q, plan, mask],
     );
@@ -336,7 +380,7 @@ pub fn decode_lse(
         Dtype::F32,
     ));
     r.push(
-        Attn::DecodeLse {
+        Attn::Decode {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -344,7 +388,11 @@ pub fn decode_lse(
             head_dim,
             sm_scale,
             o: o.id(),
-            lse: lse.id(),
+            lse: Some(lse.id()),
+            selection: None,
+            bias: None,
+            selected: None,
+            rel: None,
         },
         &[q, plan],
     );
@@ -370,7 +418,7 @@ pub fn prefill_lse(
         Dtype::F32,
     ));
     r.push(
-        Attn::PrefillLse {
+        Attn::Prefill {
             q: q.id(),
             plan: plan.id(),
             cache: pages,
@@ -379,8 +427,14 @@ pub fn prefill_lse(
             kv_heads,
             sm_scale,
             o: o.id(),
-            lse: lse.id(),
+            lse: Some(lse.id()),
             floor: floor.map(Value::id),
+            mask: None,
+            selection: None,
+            bias: None,
+            causal: true,
+            selected: None,
+            rel: None,
         },
         &match floor {
             Some(floor) => vec![q, plan, floor],
@@ -465,30 +519,28 @@ pub fn logit_softcap(x: &Value, cap: f32) -> Value {
     x_out
 }
 
-pub fn kv_append(k: &Value, v: &Value, pages: ValueId, write_page: &Value, write_offset: &Value) {
+/// Each row's key and value written to `pages` at its page and offset;
+/// without `v`, `k` is one plane the pool reads as both.
+pub fn kv_append(
+    k: &Value,
+    v: Option<&Value>,
+    pages: ValueId,
+    write_page: &Value,
+    write_offset: &Value,
+) {
     let r = k.rec();
+    let mut ins = vec![k];
+    ins.extend(v);
+    ins.extend([write_page, write_offset]);
     r.push(
         Attn::KvAppend {
             k: k.id(),
-            v: v.id(),
+            v: v.map(Value::id),
             cache: pages,
             write_page: write_page.id(),
             write_offset: write_offset.id(),
         },
-        &[k, v, write_page, write_offset],
-    );
-}
-
-pub fn kv_append_shared(plane: &Value, pages: ValueId, write_page: &Value, write_offset: &Value) {
-    let r = plane.rec();
-    r.push(
-        Attn::KvAppendShared {
-            plane: plane.id(),
-            cache: pages,
-            write_page: write_page.id(),
-            write_offset: write_offset.id(),
-        },
-        &[plane, write_page, write_offset],
+        &ins,
     );
 }
 
@@ -761,6 +813,7 @@ fn mla_scored(
             sm_scale,
             o: o_id,
             lse: lse_id,
+            selection: None,
         },
         (None, false) => Attn::MlaPrefill {
             q: q_id,
@@ -773,30 +826,33 @@ fn mla_scored(
             sm_scale,
             o: o_id,
             lse: lse_id,
+            selection: None,
         },
-        (Some(selection), true) => Attn::MlaDecodeSelected {
+        (Some(selection), true) => Attn::MlaDecode {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
-            selection: selection.id(),
+            selection: Some(selection.id()),
             cache: pages,
             heads,
             kv_lora_rank,
             sm_scale,
             o: o_id,
             lse: lse_id,
+            window: None,
         },
-        (Some(selection), false) => Attn::MlaPrefillSelected {
+        (Some(selection), false) => Attn::MlaPrefill {
             q: q_id,
             plan: plan_id,
             q_pe: q_pe_id,
-            selection: selection.id(),
+            selection: Some(selection.id()),
             cache: pages,
             heads,
             kv_lora_rank,
             sm_scale,
             o: o_id,
             lse: lse_id,
+            window: None,
         },
     };
     let mut deps = vec![q, plan, q_pe];
@@ -1164,13 +1220,14 @@ pub fn pool_boundary_decode(
     let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     r.push(
-        Attn::PoolBoundaryDecode {
+        Attn::PoolBoundary {
             positions: positions.id(),
             row_valid: row_valid.id(),
             ratio,
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
             boundary_rope: boundary_rope.id(),
+            decode: true,
         },
         &[positions, row_valid],
     );
@@ -1187,13 +1244,14 @@ pub fn pool_boundary_prefill(
     let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     r.push(
-        Attn::PoolBoundaryPrefill {
+        Attn::PoolBoundary {
             positions: positions.id(),
             row_valid: row_valid.id(),
             ratio,
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
             boundary_rope: boundary_rope.id(),
+            decode: false,
         },
         &[positions, row_valid],
     );
@@ -1303,6 +1361,8 @@ pub fn pool_lse(
             sm_scale,
             o: o.id(),
             lse: lse.id(),
+            selection: None,
+            top_k: None,
         },
         &[q, positions, request_of_token],
     );
@@ -1326,14 +1386,14 @@ pub fn pool_lse_selected(
     let o = r.fresh(q.ty().clone());
     let lse = r.fresh(tensor(q.rows(), heads, Dtype::F32));
     r.push(
-        Attn::PoolLseSelected {
+        Attn::PoolLse {
             q: q.id(),
             positions: positions.id(),
             request_of_token: request_of_token.id(),
-            selection: selection.id(),
+            selection: Some(selection.id()),
             entries,
             ratio,
-            top_k,
+            top_k: Some(top_k),
             heads,
             head_dim,
             sm_scale,
@@ -1490,4 +1550,276 @@ pub fn voxel_over(
         &[q, k, v, grid],
     );
     o
+}
+
+/// Attention of `q` over the kv row `kv`, each lane by its kind: a lane with
+/// its own mask by that mask (when the model opens `mask`), a lane capturing
+/// scores by its own arm (when it opens `scores`), its log-sum-exp read out
+/// at the scores seam where `scores_seam` holds, a lane querying one token by
+/// decode, and the rest by prefill. The kinds are taken in that order, each
+/// lane by the first that holds. With `sinks`, every kind is attended with
+/// its log-sum-exp and the sink logits folded in. With a `selection` (the
+/// key blocks an indexer picked a row, `ratio` keys a block, one pick a head
+/// when `per_head`), decode and prefill lanes read only those blocks; a
+/// masked or score-capturing lane reads every key.
+///
+/// The host plans are the compiler's: each kind's is built once a trace,
+/// over the lanes of that kind and outside any layer, and every layer asking
+/// for the same one reads it.
+#[allow(clippy::too_many_arguments)]
+pub fn attend(
+    q: &Value,
+    inputs: &Input,
+    kv: &str,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    window: Option<u32>,
+    sinks: Option<&Weight>,
+    mask: bool,
+    scores: bool,
+    scores_seam: Option<bool>,
+    selection: Option<&Value>,
+    ratio: Option<u32>,
+    per_head: bool,
+) -> Value {
+    // Scores a model opens go out at their seam unless it says otherwise.
+    let scores_seam = scores_seam.unwrap_or(scores);
+    let selected = selection.map(|selection| {
+        assert!(
+            sinks.is_none(),
+            "`attn.attend` attends a selection without sinks; no kernel folds both"
+        );
+        let ratio = ratio.expect("`attn.attend` with a `selection` names its `ratio`");
+        (selection, ratio)
+    });
+    use crate::fact;
+    use crate::record::{FirstMatch, Refine};
+
+    let pages = inputs.kv(kv);
+    let rec = inputs.recorder();
+    let plan = |decode: bool, lanes: &Input| {
+        let kind = if decode { "decode" } else { "prefill" };
+        let key = format!(
+            "attn.plan_{kind} {:?} {q_heads} {kv_heads} {head_dim} {window:?}",
+            lanes.rows()
+        );
+        rec.once(key, || {
+            if decode {
+                plan_decode(lanes, q_heads, kv_heads, head_dim, window)
+            } else {
+                plan_prefill(lanes, q_heads, kv_heads, head_dim, window)
+            }
+        })
+    };
+    // The lanes of the kind `kind` names, or of none of them.
+    let lanes = |kind: Option<fact::Predicate>| {
+        let mut first = FirstMatch::default();
+        let mut cases = Vec::new();
+        if mask {
+            cases.push(fact::has(fact::Mask));
+        }
+        if scores {
+            cases.push(fact::scores());
+        }
+        cases.push(fact::single_token());
+        let mut picked = None;
+        for case in &cases {
+            let rows = first.case(rec.guard_of(case));
+            if kind.as_ref() == Some(case) {
+                picked = Some(rows);
+            }
+        }
+        inputs.refined(picked.unwrap_or_else(|| first.rest()))
+    };
+    // An arm's output, the sinks folded in when the model has them.
+    let sunk = |(o, lse): (Value, Value)| match sinks {
+        Some(sinks) => sink(&o, &lse, sinks, head_dim),
+        None => o,
+    };
+
+    // Each kind's rows of `q`: the first kind each lane is, within the rows
+    // `q` is over. A kind no lane of `q` can be is not attended (`q` may
+    // already be the lanes of some kinds alone). Every arm keeps `q`'s rows
+    // spelled in its guard, so the merge reads as over them.
+    let domain = q.cond();
+    let rows_of = |rows: poem_ir::Guard| {
+        let rows = poem_ir::Guard::and(domain.clone(), rows);
+        possible(q, rows.clone()).then(|| q.refined(rows))
+    };
+    // A selection's rows of a kind, as `q`'s are.
+    let picks = |rows: &poem_ir::Guard| {
+        selected.map(|(selection, ratio)| {
+            let over = poem_ir::Guard::and(selection.cond(), rows.clone());
+            (selection.refined(over), ratio)
+        })
+    };
+    let mut first = FirstMatch::default();
+    let mut arms = Vec::new();
+    if mask && let Some(q) = rows_of(first.case(rec.guard_of(&fact::has(fact::Mask)))) {
+        let masks = inputs.whole_mask();
+        let p = plan(false, &lanes(Some(fact::has(fact::Mask))));
+        arms.push(match sinks {
+            Some(_) => sunk(masked_lse(
+                &q, &p, &masks, pages, window, head_dim, kv_heads, true, sm_scale,
+            )),
+            None => masked(
+                &q, &p, &masks, pages, window, head_dim, kv_heads, true, sm_scale,
+            ),
+        });
+    }
+    if scores && let Some(q) = rows_of(first.case(rec.guard_of(&fact::scores()))) {
+        let p = plan(false, &lanes(Some(fact::scores())));
+        // The log-sum-exp only where something reads it.
+        arms.push(if !scores_seam && sinks.is_none() {
+            prefill(&q, &p, pages, window, head_dim, kv_heads, sm_scale)
+        } else {
+            let (o, lse) = prefill_lse(&q, &p, pages, window, head_dim, kv_heads, sm_scale, None);
+            if scores_seam {
+                crate::seam::at(crate::seam::SCORES, &[&lse]);
+            }
+            sunk((o, lse))
+        });
+    }
+    let single = first.case(rec.guard_of(&fact::single_token()));
+    if let Some(q) = rows_of(single.clone()) {
+        let p = plan(true, &lanes(Some(fact::single_token())));
+        arms.push(match (sinks, picks(&single)) {
+            (_, Some((sel, ratio))) => decode_selected(
+                &q, &p, &sel, pages, window, head_dim, sm_scale, ratio, per_head,
+            ),
+            (Some(_), None) => sunk(decode_lse(&q, &p, pages, window, head_dim, sm_scale)),
+            (None, None) => decode(&q, &p, pages, window, head_dim, sm_scale),
+        });
+    }
+    let rest = first.rest();
+    if let Some(q) = rows_of(rest.clone()) {
+        let p = plan(false, &lanes(None));
+        arms.push(match (sinks, picks(&rest)) {
+            (_, Some((sel, ratio))) => prefill_selected(
+                &q, &p, &sel, pages, window, head_dim, kv_heads, sm_scale, ratio, per_head,
+            ),
+            (Some(_), None) => sunk(prefill_lse(
+                &q, &p, pages, window, head_dim, kv_heads, sm_scale, None,
+            )),
+            (None, None) => prefill(&q, &p, pages, window, head_dim, kv_heads, sm_scale),
+        });
+    }
+    if arms.len() == 1 {
+        return arms.remove(0);
+    }
+    Value::merge(arms)
+}
+
+/// Whether any row of `x` can be one `rows` holds for.
+fn possible(x: &Value, rows: poem_ir::Guard) -> bool {
+    use poem_ir::Guard;
+    !Guard::and(x.cond(), rows).implies(&Guard::not(Guard::Always))
+}
+
+/// Latent attention of the absorbed queries `q` (and their rotated part
+/// `q_pe`) over the latent kv row `kv`: a lane querying one token by decode,
+/// the rest by prefill; with `whole`, every lane by prefill (rows that read
+/// their keys whole, as a draft head's). With a `selection`, each lane reads
+/// only the keys its indexer picked; `window` bounds what a lane without one
+/// reads. With `sinks`, the arms' log-sum-exps are merged and the sink
+/// logits folded in once. What comes back is still in the latent space, for
+/// the model to absorb out.
+///
+/// The host plans are the compiler's, as [`attend`]'s are.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_mla(
+    q: &Value,
+    q_pe: &Value,
+    inputs: &Input,
+    kv: &str,
+    heads: u32,
+    kv_lora_rank: u32,
+    sm_scale: f32,
+    window: Option<u32>,
+    selection: Option<&Value>,
+    sinks: Option<&Weight>,
+    whole: bool,
+) -> Value {
+    use crate::fact;
+    use crate::record::Refine;
+    use poem_ir::Guard;
+
+    let pages = inputs.kv(kv);
+    let rec = inputs.recorder();
+    let plan = |lanes: &Input| {
+        let key = format!("attn.mla_plan {:?} {heads} {kv_lora_rank}", lanes.rows());
+        rec.once(key, || mla_plan(lanes, heads, kv_lora_rank))
+    };
+    // The arm over `rows` of the lanes (and the plan) `lanes` are.
+    let arm = |decode: bool, rows: Guard, lanes: &Input| {
+        let within = |x: &Value| x.refined(Guard::and(x.cond(), rows.clone()));
+        let (q, q_pe) = (within(q), within(q_pe));
+        let selection = selection.map(within);
+        let p = plan(lanes);
+        match (selection, sinks.is_some()) {
+            (Some(s), true) => {
+                let score = if decode {
+                    mla_decode_selected_lse
+                } else {
+                    mla_prefill_selected_lse
+                };
+                let (o, lse) = score(&q, &p, &q_pe, &s, pages, heads, kv_lora_rank, sm_scale);
+                (o, Some(lse))
+            }
+            (Some(s), false) => {
+                let score = if decode {
+                    mla_decode_selected
+                } else {
+                    mla_prefill_selected
+                };
+                (
+                    score(&q, &p, &q_pe, &s, pages, heads, kv_lora_rank, sm_scale),
+                    None,
+                )
+            }
+            (None, false) => {
+                let score = if decode { mla_decode } else { mla_prefill };
+                (
+                    score(&q, &p, &q_pe, pages, heads, kv_lora_rank, sm_scale, window),
+                    None,
+                )
+            }
+            (None, true) => panic!(
+                "`attn.attend_mla` folds sinks into a selection's scores; no dense kernel returns \
+                 the log-sum-exp they need"
+            ),
+        }
+    };
+    let arms = if whole {
+        vec![arm(false, Guard::Always, inputs)]
+    } else {
+        let one = rec.guard_of(&fact::single_token());
+        let (decode, prefill) = (one.clone(), Guard::not(one));
+        vec![
+            arm(true, decode.clone(), &inputs.refined(decode)),
+            arm(false, prefill.clone(), &inputs.refined(prefill)),
+        ]
+    };
+    let join = |mut parts: Vec<Value>| {
+        if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Value::merge(parts)
+        }
+    };
+    let (outs, lses): (Vec<Value>, Vec<Option<Value>>) = arms.into_iter().unzip();
+    let scored = join(outs);
+    match sinks {
+        Some(sinks) => {
+            let lse = join(
+                lses.into_iter()
+                    .map(|l| l.expect("an lse a sunk arm"))
+                    .collect(),
+            );
+            sink(&scored, &lse, sinks, kv_lora_rank)
+        }
+        None => scored,
+    }
 }

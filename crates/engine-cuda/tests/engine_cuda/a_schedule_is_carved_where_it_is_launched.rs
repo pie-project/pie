@@ -50,7 +50,7 @@ impl ForwardHybrid for TokensAndLatents {
         let pages = txt.kv(KV_ROW);
         ops::attn::kv_append(
             &k,
-            &v,
+            Some(&v),
             pages,
             &txt.write_page(KV_ROW),
             &txt.write_offset(KV_ROW),

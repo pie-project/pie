@@ -166,7 +166,7 @@ pub enum Fused {
     },
     /// `NormRopeLast` over a row one head wide (scaled), the rotated row
     /// then written to the cache at its page and offset
-    /// (`KvAppendShared`); `y` is read by nothing else.
+    /// (`KvAppend` of one plane); `y` is read by nothing else.
     NormRopeLastAppend {
         #[input]
         x: ValueId,

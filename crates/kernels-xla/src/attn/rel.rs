@@ -35,7 +35,7 @@ pub fn decode_rel<T: Stored>(
     o: T,
 ) -> Result<Paged<T>, Error> {
     let call = rel_call(
-        "attn.decode_rel",
+        "attn.decode",
         q,
         Tables::decode(plan),
         rel,
@@ -59,7 +59,7 @@ pub fn prefill_rel<T: Stored>(
     sm_scale: f32,
     o: T,
 ) -> Result<Paged<T>, Error> {
-    const OP: &str = "attn.prefill_rel";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let call = rel_call(
         OP,

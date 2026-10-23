@@ -20,16 +20,7 @@ def cache(c, space, a, fp8 = False):
         return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
-def plans(inputs, heads, kv_lora_rank):
-    """The decode and prefill arms' plans over `inputs`."""
-    one = fact.single_token()
-    decode, prefill = inputs.on(one), inputs.on(~one)
-    return struct(
-        decode = ops.attn.mla_plan(decode, heads, kv_lora_rank),
-        prefill = ops.attn.mla_plan(prefill, heads, kv_lora_rank),
-    )
-
-def attention(x, inputs, plan, a, positions = None, select = None):
+def attention(x, inputs, a, positions = None, select = None, whole = False):
     """Latent attention of the rows `x`, and the selection it read through.
     `select(q_a)`, if given, picks the keys each query reads; `positions`
     default to the rows' own."""
@@ -49,7 +40,13 @@ def attention(x, inputs, plan, a, positions = None, select = None):
 
     if a.theta != None and a.interleaved:
         kv_c, k_pe = ops.attn.mla_latents(kv_a, a.kv_a_norm, a.kv_a_norm_eps, a.kv_lora_rank)
-        k_pe = ops.elemwise.rope_partial_last(k_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta, True)
+        k_pe = ops.elemwise.rope(
+            k_pe,
+            positions,
+            a.qk_rope_head_dim,
+            a.theta,
+            rotary.last(a.qk_rope_head_dim, interleaved = True),
+        )
     elif a.theta != None:
         kv_c, k_pe = ops.attn.mla_latents_rope(
             kv_a,
@@ -66,44 +63,37 @@ def attention(x, inputs, plan, a, positions = None, select = None):
 
     q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
     if a.theta != None and a.interleaved:
-        q_pe = ops.elemwise.rope_partial_last(q_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta, True)
+        q_pe = ops.elemwise.rope(
+            q_pe,
+            positions,
+            a.qk_rope_head_dim,
+            a.theta,
+            rotary.last(a.qk_rope_head_dim, interleaved = True),
+        )
     elif a.theta != None:
-        q_pe = ops.elemwise.rope_partial_q(q_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta)
-    return attend(x, q_nope, q_pe, pages, plan, a, selection), selection
+        q_pe = ops.elemwise.rope(
+            q_pe,
+            positions,
+            a.qk_rope_head_dim,
+            a.theta,
+            rotary.partial(a.qk_rope_head_dim),
+        )
+    return attend(x, inputs, q_nope, q_pe, a, selection, whole), selection
 
-def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
+def attend(x, inputs, q_nope, q_pe, a, selection = None, whole = False):
     """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
-    latent `pages` (or the `selection` of them), through `a`'s output
-    projection. A plan with no decode arm reads its rows whole."""
+    latent kv (or the `selection` of it), through `a`'s output projection;
+    `whole` rows read their keys whole, as the draft head's do."""
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     seam.at(seam.ATTN_Q, [q])
-
-    if plan.decode == None:
-        scored = arm(False, q, plan.prefill, q_pe, selection, pages, a)
-    else:
-        one = fact.single_token()
-        on = lambda rows, holds: rows.on(holds) if rows != None else None
-        scored = merge([
-            arm(True, q.on(one), plan.decode, q_pe.on(one), on(selection, one), pages, a),
-            arm(False, q.on(~one), plan.prefill, q_pe.on(~one), on(selection, ~one), pages, a),
-        ])
+    scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
+                                 selection = selection, whole = whole)
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     if a.gate != None:
         o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj)
-
-def arm(decode, q, plan, q_pe, selection, pages, a):
-    if selection == None:
-        score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
-        return score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
-    score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
-    return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
-
-def whole(inputs, heads, kv_lora_rank):
-    """A plan that reads every row of `inputs` through the prefill arm."""
-    return struct(decode = None, prefill = ops.attn.mla_plan(inputs, heads, kv_lora_rank))
 
 def caches(m, c):
     fp8 = fp8_rows(m)
@@ -118,7 +108,6 @@ def caches(m, c):
             c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
-    plan = plans(inputs, m.heads, m.kv_lora_rank)
     positions = inputs.positions()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
@@ -135,7 +124,7 @@ def forward(m, inputs):
         else:
             ranked = selection
             select = lambda q_a: ranked
-        o, selection = attention(x, inputs, plan, a, positions = positions, select = select)
+        o, selection = attention(x, inputs, a, positions = positions, select = select)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
@@ -156,7 +145,6 @@ def draft(m, inputs, y, positions, logits):
     and the token its logits pick."""
     mtp = m.mtp
     drafted = inputs.on(fact.drafts())
-    plan = whole(drafted, m.heads, m.kv_lora_rank)
     hidden = y.on(fact.drafts())
     positions = positions.on(fact.drafts())
     token = ops.sampling.argmax([logits.on(fact.drafts())])
@@ -171,7 +159,7 @@ def draft(m, inputs, y, positions, logits):
     x = ops.elemwise.rmsnorm(fused, mtp.attn_norm, mtp.norm_eps)
     keys = index_keys(x, drafted, positions, mtp.attn.indexer)
     select = lambda q_a: index_select(x, q_a, keys, positions, mtp.attn.indexer)
-    o, _ = attention(x, drafted, plan, mtp.attn, positions = positions, select = select)
+    o, _ = attention(x, drafted, mtp.attn, positions = positions, select = select, whole = True)
     r = ops.elemwise.residual_add(o, fused)
     x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
@@ -181,28 +169,35 @@ def draft(m, inputs, y, positions, logits):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(ops.linear.swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
+        return ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
+            f.down,
+        )
     logits = ops.linear.matmul(x, f.router)
     if f.bias != None:
-        routes, weights = ops.linear.moe_topk_sigmoid_biased(
+        routes, weights = ops.linear.moe_route(
             logits,
-            f.bias,
             f.experts,
             f.top_k,
-            f.norm_weights,
-            f.scaling,
+            routing.sigmoid(renormalize = f.norm_weights, scaling = f.scaling),
+            bias = f.bias,
         )
     else:
-        routes, weights = ops.linear.moe_topk_sigmoid(logits, f.experts, f.top_k, f.norm_weights, f.scaling)
+        routes, weights = ops.linear.moe_route(
+            logits,
+            f.experts,
+            f.top_k,
+            routing.sigmoid(renormalize = f.norm_weights, scaling = f.scaling),
+        )
 
     def select(act, bank):
         if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
             return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
 
-    act = ops.linear.swiglu(ops.linear.matmul(x, f.shared.gate_up), f.shared.inter)
+    act = ops.linear.glu(ops.linear.matmul(x, f.shared.gate_up), gating.swiglu(), f.shared.inter)
     shared = ops.linear.matmul(act, f.shared.down)
-    act = ops.linear.swiglu(select(x, f.gate_up), f.inter)
+    act = ops.linear.glu(select(x, f.gate_up), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     return ops.elemwise.residual_add(shared, routed)
 

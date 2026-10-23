@@ -92,7 +92,7 @@ pub fn prefill_lse<T: Stored>(
     lse: T,
     _requests: u32,
 ) -> Result<Paged<T>, Error> {
-    const OP: &str = "attn.prefill_lse";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     let c = call(
         OP,
@@ -123,7 +123,7 @@ pub fn masked<T: Stored>(
     o: T,
     _requests: u32,
 ) -> Result<Paged<T>, Error> {
-    const OP: &str = "attn.masked";
+    const OP: &str = "attn.prefill";
     u8_mask(OP, mask)?;
     let tables = Tables::prefill(plan).with_mask(mask);
     let c = call(OP, q, tables, window, causal, head_dim, sm_scale, o, None);
@@ -142,7 +142,7 @@ pub fn masked_lse<T: Stored>(
     lse: T,
     _requests: u32,
 ) -> Result<Paged<T>, Error> {
-    const OP: &str = "attn.masked_lse";
+    const OP: &str = "attn.prefill";
     u8_mask(OP, mask)?;
     let tables = Tables::prefill(plan).with_mask(mask);
     let c = call(

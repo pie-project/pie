@@ -380,6 +380,7 @@ impl Run<'_> {
                 window: None,
                 sm_scale,
                 lse: None,
+                selection: None,
                 ..
             },
             poem_ir::Attn::MlaAbsorbOut { o, .. },
@@ -497,8 +498,16 @@ impl Run<'_> {
                         },
                     ..
                 }),
-                poem_ir::Attn::PoolLse { positions, .. }
-                | poem_ir::Attn::PoolLseSelected { positions, .. },
+                poem_ir::Attn::PoolLse {
+                    positions,
+                    selection: None,
+                    ..
+                }
+                | poem_ir::Attn::PoolLse {
+                    positions,
+                    selection: Some(_),
+                    ..
+                },
             ) if q == o_out && at == positions && d == head_dim => {
                 Some(kernels_cuda::attn::compressed::decode::Turn {
                     dim: *rotary_dim,
@@ -516,7 +525,16 @@ impl Run<'_> {
         // A window held above a replay floor the profile may raise
         // (`kernel.sdpa.compressed_replay`): only the fused kernels read the floor.
         let floored = self.ctx().tuning().compressed_replay
-            && matches!(**window, poem_ir::Attn::PrefillLse { floor: Some(_), .. });
+            && matches!(
+                **window,
+                poem_ir::Attn::Prefill {
+                    mask: None,
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                }
+            );
         // A decode's rows, up to what the profile says
         // (`kernel.sdpa.compressed_decode_until`): the four in one launch.
         let rows = self.tensor(*o_out).rows;
@@ -533,13 +551,17 @@ impl Run<'_> {
         // (`kernel.sdpa.compressed_prefill_from`): the four in one tcgen05 pass.
         #[cfg(feature = "cuda")]
         if let (
-            poem_ir::Attn::PrefillLse {
+            poem_ir::Attn::Prefill {
                 q,
                 cache,
                 window: span,
                 head_dim: d,
                 sm_scale,
                 floor,
+                mask: None,
+                selection: None,
+                bias: None,
+                lse: Some(_),
                 ..
             },
             poem_ir::Attn::PoolLse {
@@ -548,14 +570,16 @@ impl Run<'_> {
                 entries,
                 ratio,
                 heads,
+                selection: None,
                 ..
             }
-            | poem_ir::Attn::PoolLseSelected {
+            | poem_ir::Attn::PoolLse {
                 positions,
                 request_of_token,
                 entries,
                 ratio,
                 heads,
+                selection: Some(_),
                 ..
             },
         ) = (&**window, &**pool)
@@ -569,8 +593,10 @@ impl Run<'_> {
                     (self.pool_whole(*cache), self.pool_whole(*entries))
             {
                 let selection = match &**pool {
-                    poem_ir::Attn::PoolLseSelected {
-                        selection, top_k, ..
+                    poem_ir::Attn::PoolLse {
+                        selection: Some(selection),
+                        top_k: Some(top_k),
+                        ..
                     } => Some((self.tensor(*selection), *top_k)),
                     _ => None,
                 };
@@ -620,7 +646,7 @@ impl Run<'_> {
         let from = self.ctx().tuning().compressed_fp4_pass_from;
         from > 0
             && rows >= from
-            && matches!(*window, poem_ir::Attn::PrefillLse { cache, .. }
+            && matches!(*window, poem_ir::Attn::Prefill { cache, mask: None, selection: None, bias: None, lse: Some(_), .. }
                 if matches!(kernels_cuda::attn::compressed::decode::rows_of(&self.pool(cache)),
                     Some(kernels_cuda::attn::compressed::decode::Rows::Mx8)))
     }
@@ -628,9 +654,14 @@ impl Run<'_> {
     /// Whether `window`'s cache holds DeepSeek's quantized rows.
     fn fp8_rows(&self, window: &poem_ir::Attn) -> bool {
         match *window {
-            poem_ir::Attn::PrefillLse { cache, .. } => {
-                kernels_cuda::attn::compressed::decode::ds_rows(&self.pool(cache))
-            }
+            poem_ir::Attn::Prefill {
+                cache,
+                mask: None,
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            } => kernels_cuda::attn::compressed::decode::ds_rows(&self.pool(cache)),
             _ => false,
         }
     }
@@ -655,13 +686,17 @@ impl Run<'_> {
         turn: Option<kernels_cuda::attn::compressed::decode::Turn>,
     ) -> Option<Result<(), kernels_cuda::Error>> {
         use kernels_cuda::attn::compressed::decode;
-        let poem_ir::Attn::PrefillLse {
+        let poem_ir::Attn::Prefill {
             q,
             cache,
             window: Some(span),
             head_dim,
             sm_scale,
             floor,
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: Some(_),
             ..
         } = *window
         else {
@@ -674,19 +709,23 @@ impl Run<'_> {
                     request_of_token,
                     entries,
                     ratio,
+                    selection: None,
                     ..
                 }
-                | poem_ir::Attn::PoolLseSelected {
+                | poem_ir::Attn::PoolLse {
                     positions,
                     request_of_token,
                     entries,
                     ratio,
+                    selection: Some(_),
                     ..
                 },
             ) => {
                 let selection = match pool {
-                    Some(poem_ir::Attn::PoolLseSelected {
-                        selection, top_k, ..
+                    Some(poem_ir::Attn::PoolLse {
+                        selection: Some(selection),
+                        top_k: Some(top_k),
+                        ..
                     }) => Some((self.tensor(*selection), *top_k)),
                     _ => None,
                 };
@@ -752,12 +791,16 @@ impl Run<'_> {
         o_out: poem_ir::ValueId,
     ) -> Option<Result<(), kernels_cuda::Error>> {
         use kernels_cuda::attn::compressed::prefill;
-        let poem_ir::Attn::PrefillLse {
+        let poem_ir::Attn::Prefill {
             q,
             cache,
             window: span,
             head_dim,
             sm_scale,
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: Some(_),
             ..
         } = *window
         else {
@@ -806,7 +849,14 @@ impl Run<'_> {
         // DeepSeek-V4's window and sinks (its layers without a pool, its
         // draft head): the one launch at a decode's rows; over fp8 rows that
         // or a refusal, never the FA2 kernels reading them as bf16.
-        if let poem_ir::Attn::PrefillLse { .. } = **attn {
+        if let poem_ir::Attn::Prefill {
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: Some(_),
+            ..
+        } = **attn
+        {
             // A prefill's rows, where the profile says
             // (`kernel.sdpa.compressed_prefill_from`): the window in the tcgen05 pass.
             #[cfg(feature = "cuda")]
@@ -827,7 +877,7 @@ impl Run<'_> {
         }
         let sinks = self.tensor(*sink);
         match **attn {
-            poem_ir::Attn::DecodeLse {
+            poem_ir::Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -835,7 +885,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o: _,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
             } => kernels_cuda::attn::decode_lse_sink(
                 self.ctx(),
                 self.ragged_q(q),
@@ -848,7 +902,7 @@ impl Run<'_> {
                 &mut self.tensor(lse),
                 sinks,
             ),
-            poem_ir::Attn::PrefillLse {
+            poem_ir::Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -857,9 +911,15 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o: _,
-                lse,
+                lse: Some(lse),
                 // (A floored window is no `lse_sink`'s: the rule takes none.)
                 floor: _,
+                mask: None,
+                selection: None,
+                bias: None,
+                causal: true,
+                selected: None,
+                rel: None,
             } => {
                 kernels_cuda::attn::prefill_lse_sink(
                     self.ctx(),

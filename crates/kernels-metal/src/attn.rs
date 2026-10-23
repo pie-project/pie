@@ -568,7 +568,7 @@ pub fn decode_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
-        "attn.decode_selected",
+        "attn.decode",
         q,
         pool,
         plan.positions,
@@ -599,7 +599,7 @@ pub fn prefill_selected(
     ratio: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.prefill_selected";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     selected(
         ctx,
@@ -762,7 +762,7 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     vector(
         ctx,
-        "attn.decode_lse",
+        "attn.decode",
         q,
         pool,
         plan,
@@ -810,7 +810,7 @@ pub fn prefill_lse(
     o: Tensor,
     lse: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.prefill_lse";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
         ctx,
@@ -843,7 +843,7 @@ pub fn masked(
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attn.masked";
+    const OP: &str = "attn.prefill";
     if mask.dtype != Dtype::U8 {
         return Err(refuse(
             OP,
@@ -1058,7 +1058,7 @@ pub fn kv_append_shared(
 ) -> Result<(), Error> {
     append_paged(
         ctx,
-        "attn.kv_append_shared",
+        "attn.kv_append",
         plane,
         plane,
         pool,
@@ -1716,7 +1716,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         flash(
             ctx,
-            "attn.mla_decode_selected",
+            "attn.mla_decode",
             q,
             q_pe,
             Some(selection),
@@ -1746,7 +1746,7 @@ pub mod mla {
     ) -> Result<(), Error> {
         flash(
             ctx,
-            "attn.mla_prefill_selected",
+            "attn.mla_prefill",
             q.data,
             q_pe,
             Some(selection),
@@ -2594,7 +2594,7 @@ pub mod pool {
         boundary_req: Tensor,
         boundary_rope: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attn.pool_boundary_decode";
+        const OP: &str = "attn.pool_boundary";
         boundary_tables(OP, &boundary_pos, &boundary_req);
         boundary_rope_table(OP, &boundary_pos, &boundary_rope);
         let n = stated(OP, nonzero(OP, "rows", boundary_pos.rows)?)?;
@@ -2626,7 +2626,7 @@ pub mod pool {
         boundary_req: Tensor,
         boundary_rope: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attn.pool_boundary_prefill";
+        const OP: &str = "attn.pool_boundary";
         boundary_tables(OP, &boundary_pos, &boundary_req);
         boundary_rope_table(OP, &boundary_pos, &boundary_rope);
         let n = stated(OP, nonzero(OP, "rows", boundary_pos.rows)?)?;
@@ -2973,7 +2973,7 @@ pub mod pool {
         o: Tensor,
         lse: Tensor,
     ) -> Result<(), Error> {
-        const OP: &str = "attn.pool_lse_selected";
+        const OP: &str = "attn.pool_lse";
         dtype_dispatch!(OP, q.dtype, { Bf16 => () });
         debug_assert_eq!(
             lse.dtype,

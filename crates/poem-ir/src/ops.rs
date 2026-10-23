@@ -13,7 +13,7 @@ pub mod linear;
 pub mod sampling;
 pub mod ssm;
 
-pub use attn::{Attn, IndexScore, RaggedMask};
+pub use attn::{Attn, Blocks, IndexScore, RaggedMask, Relative};
 pub use collective::Collective;
 pub use conv::{Conv, GridRule, TimePad, VoxelSegment};
 pub use elemwise::{

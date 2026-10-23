@@ -73,6 +73,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => attn::decode(
                 self.ctx(),
                 self.tensor(*q),
@@ -83,7 +88,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attn::DecodeLse {
+            Attn::Decode {
                 q,
                 plan,
                 cache,
@@ -91,7 +96,11 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                selected: None,
+                rel: None,
             } => attn::decode_lse(
                 self.ctx(),
                 self.tensor(*q),
@@ -112,6 +121,14 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
+                mask: None,
+                selection: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected: None,
+                rel: None,
+                lse: None,
             } => attn::prefill(
                 self.ctx(),
                 self.ragged(*q),
@@ -123,7 +140,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attn::PrefillLse {
+            Attn::Prefill {
                 q,
                 plan,
                 cache,
@@ -132,8 +149,14 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
                 floor: None,
+                mask: None,
+                selection: None,
+                bias: None,
+                causal: true,
+                selected: None,
+                rel: None,
             } => attn::prefill_lse(
                 self.ctx(),
                 self.ragged(*q),
@@ -146,10 +169,10 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
             ),
-            Attn::Masked {
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -157,6 +180,12 @@ impl Run<'_> {
                 causal,
                 sm_scale,
                 o,
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
+                lse: None,
             } => {
                 let mask = self.cut_rows(self.tensor(*mask));
                 attn::masked(
@@ -172,10 +201,10 @@ impl Run<'_> {
                     self.tensor(*o),
                 )
             }
-            Attn::MaskedLse {
+            Attn::Prefill {
                 q,
                 plan,
-                mask,
+                mask: Some(mask),
                 cache,
                 window,
                 head_dim,
@@ -183,7 +212,12 @@ impl Run<'_> {
                 causal,
                 sm_scale,
                 o,
-                lse,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
             } => {
                 let mask = self.cut_rows(self.tensor(*mask));
                 attn::masked_lse(
@@ -202,7 +236,7 @@ impl Run<'_> {
             }
             Attn::KvAppend {
                 k,
-                v,
+                v: Some(v),
                 cache,
                 write_page,
                 write_offset,
@@ -214,8 +248,9 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            Attn::KvAppendShared {
-                plane,
+            Attn::KvAppend {
+                k: plane,
+                v: None,
                 cache,
                 write_page,
                 write_offset,
@@ -244,17 +279,23 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            Attn::DecodeSelected {
+            Attn::Decode {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                bias: None,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => attn::decode_selected(
                 self.ctx(),
                 self.tensor(*q),
@@ -267,18 +308,27 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*o),
             ),
-            Attn::PrefillSelected {
+            Attn::Prefill {
                 q,
                 plan,
-                selection,
+                selection: Some(selection),
                 cache,
                 window,
                 head_dim,
                 kv_heads,
                 sm_scale,
-                ratio,
-                per_head: false,
                 o,
+                mask: None,
+                bias: None,
+                floor: None,
+                causal: true,
+                selected:
+                    Some(poem_ir::Blocks {
+                        ratio,
+                        per_head: false,
+                    }),
+                rel: None,
+                lse: None,
             } => attn::prefill_selected(
                 self.ctx(),
                 self.ragged(*q),
@@ -347,13 +397,14 @@ impl Run<'_> {
                     self.tensor(*selection),
                 )
             }
-            Attn::PoolBoundaryDecode {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: true,
             } => attn::index::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
@@ -364,13 +415,14 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            Attn::PoolBoundaryPrefill {
+            Attn::PoolBoundary {
                 positions,
                 row_valid,
                 ratio,
                 boundary_pos,
                 boundary_req,
                 boundary_rope,
+                decode: false,
             } => attn::index::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
