@@ -794,6 +794,9 @@ async fn main(input: Input) -> Result<Output> {
             }
         }
         let proposals = proposals_owned.as_slice();
+        if pinned == Some(8) {
+            verify = 5 + widths.len() as u32 % 4;
+        }
         widths.push(verify);
 
         // ── the verify: ONE trunk fire over `[anchor, proposals]` ────────
