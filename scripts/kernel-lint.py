@@ -9,7 +9,12 @@ The checks, the ones the rest of the convention leans on:
     and name, a kernel its unit (or a header the unit includes) defines;
   * kernels-cerebras: every `library("<group>/<name>")` the host writes is
     a unit under `kernels/`, every unit outside `prim/` is named by one, and
-    every unit sits in one of the convention's groups.
+    every unit sits in one of the convention's groups;
+  * kernels-slang: every unit sits in one of the convention's groups and
+    has its host module at the mirrored path; every `pie:instantiate` entry
+    is named by host code (kernels-slang's `src/` or an engine's dispatch);
+    every entry and unit the host names exists; every host module has its
+    test at the mirrored path in each engine's tests.
 
 A CUDA entry is a `__global__` function; the host names it in a symbol
 string (`"::pie::attn::kv_append<...>"`), sometimes with a placeholder
@@ -389,6 +394,91 @@ def csl_units():
     return findings
 
 
+# kernels-slang: one Slang tree both engines fire from. An entry is a
+# `// pie:instantiate NAME ...` line; the host names it in a literal
+# (`"gather_rows_copy_words"`) or splices it with `format!`
+# (`"linear_kquant{}_{}_bf16"`), and names a unit in a `const` (`"linear/kquant.slang"`).
+SLANG_TREE = "crates/kernels-slang/kernels"
+SLANG_SRC = "crates/kernels-slang/src"
+SLANG_HOSTS = [SLANG_SRC, "crates/engine-vulkan/src/dispatch", "crates/engine-wgpu/src/dispatch"]
+SLANG_TESTS = ["crates/engine-vulkan/tests/engine_vulkan", "crates/engine-wgpu/tests/engine_wgpu"]
+SLANG_INSTANTIATE = re.compile(r"(?m)^\s*// pie:instantiate (\w+)")
+SLANG_UNIT = re.compile(r'"([a-z_0-9/]+\.slang)"')
+SLANG_ENTRY = re.compile(
+    r'"((?:prim|attn|ssm|linear|elemwise|conv|gather|sampling|collective|runtime)_[\w{}:]*)"'
+)
+
+
+def slang_tree():
+    tree = REPO / SLANG_TREE
+    units = {}
+    for path in sorted(tree.rglob("*.slang")):
+        unit = path.relative_to(tree).with_suffix("").as_posix()
+        units[unit] = SLANG_INSTANTIATE.findall(path.read_text())
+    return units
+
+
+def slang_pattern(literal):
+    """A literal's entry pattern: a `format!` placeholder stands for any
+    identifier fragment. `None` when its fixed text is too short to name a
+    kernel."""
+    parts = re.split(r"\{[^}]*\}", literal)
+    if len(parts) > 1 and max(map(len, parts)) < 3:
+        return None
+    return re.compile(r"\w*".join(map(re.escape, parts)))
+
+
+def slang_host(unit):
+    """The host module that owns `unit`: its mirror, or, for a tier or
+    algorithm unit (`attn/dense_tiled`), its family's (`attn/dense.rs`)."""
+    head, _, stem = unit.rpartition("/")
+    words = stem.split("_")
+    for n in range(len(words), 0, -1):
+        path = REPO / SLANG_SRC / head / ("_".join(words[:n]) + ".rs")
+        if path.exists():
+            return path
+    return None
+
+
+def slang_checks():
+    units = slang_tree()
+    entries = {name for names in units.values() for name in names}
+    findings = []
+    for unit in units:
+        group = unit.split("/")[0]
+        if "/" not in unit or group not in CSL_GROUPS:
+            findings.append(f"{SLANG_TREE}/{unit}.slang: `{group}` is not one of the convention's groups")
+        elif group != "prim" and slang_host(unit) is None:
+            findings.append(f"{SLANG_TREE}/{unit}.slang: no host module at {SLANG_SRC}/{unit}.rs")
+        elif group != "prim":
+            host = slang_host(unit).relative_to(REPO / SLANG_SRC).as_posix()
+            for tests in SLANG_TESTS:
+                if not (REPO / tests / host).exists():
+                    findings.append(f"{SLANG_SRC}/{host}: no test at {tests}/{host}")
+    patterns = []
+    for root in SLANG_HOSTS:
+        for path in sorted((REPO / root).rglob("*.rs")):
+            text = path.read_text()
+            rel = path.relative_to(REPO)
+            for m in SLANG_UNIT.finditer(text):
+                if m.group(1)[: -len(".slang")] not in units:
+                    line = text.count("\n", 0, m.start()) + 1
+                    findings.append(f"{rel}:{line}: `{m.group(1)}` is no unit under {SLANG_TREE}")
+            for m in SLANG_ENTRY.finditer(text):
+                pattern = slang_pattern(m.group(1))
+                if pattern is None:
+                    continue
+                patterns.append(pattern)
+                if not any(pattern.fullmatch(e) for e in entries):
+                    line = text.count("\n", 0, m.start()) + 1
+                    findings.append(f"{rel}:{line}: `{m.group(1)}` names no `pie:instantiate` entry")
+    for unit, names in units.items():
+        for name in names:
+            if not any(p.fullmatch(name) for p in patterns):
+                findings.append(f"{SLANG_TREE}/{unit}.slang: `{name}` is named by no host code")
+    return findings
+
+
 def main():
     findings = []
     for crate in CRATES:
@@ -399,6 +489,7 @@ def main():
         findings += metal_unnamed_entries(crate)
         findings += metal_misdirected_launches(crate)
     findings += csl_units()
+    findings += slang_checks()
     for f in findings:
         print(f)
     print(f"kernel-lint: {len(findings)} finding(s)", file=sys.stderr)

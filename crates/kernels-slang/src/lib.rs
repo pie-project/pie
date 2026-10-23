@@ -14,7 +14,7 @@ pub mod sampling;
 pub mod sources;
 pub mod tensor;
 
-pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid};
+pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid, Tier};
 pub use error::Error;
-pub use sources::{CENSUS, SPIRV, WGSL, spirv, wgsl};
+pub use sources::{CENSUS, SPIRV, WGSL, key, spirv, wgsl};
 pub use tensor::{Bank, KvPool, RaggedTensor, Tensor};

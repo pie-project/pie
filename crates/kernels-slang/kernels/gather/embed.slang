@@ -117,14 +117,14 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
 
 // pie:instantiate gather_embed_bf16 PIE_EMBED=1 PIE_GROUP_X=256
-// pie:instantiate gather_concat_bf16 PIE_CONCAT=1 PIE_GROUP_X=256
-// pie:instantiate gather_weighted_bf16 PIE_WEIGHTED=1 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_32_b_2 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=2 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_32_b_4 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=4 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_32_b_8 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=8 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_64_b_2 PIE_AFFINE=1 PIE_GROUP=64 PIE_BITS=2 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_64_b_4 PIE_AFFINE=1 PIE_GROUP=64 PIE_BITS=4 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_64_b_8 PIE_AFFINE=1 PIE_GROUP=64 PIE_BITS=8 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_128_b_2 PIE_AFFINE=1 PIE_GROUP=128 PIE_BITS=2 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_128_b_4 PIE_AFFINE=1 PIE_GROUP=128 PIE_BITS=4 PIE_GROUP_X=256
-// pie:instantiate gather_affine_bf16_gs_128_b_8 PIE_AFFINE=1 PIE_GROUP=128 PIE_BITS=8 PIE_GROUP_X=256
+// pie:instantiate gather_embed_concat_bf16 PIE_CONCAT=1 PIE_GROUP_X=256
+// pie:instantiate gather_embed_weighted_bf16 PIE_WEIGHTED=1 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_32_b_2 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=2 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_32_b_4 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=4 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_32_b_8 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=8 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_64_b_2 PIE_AFFINE=1 PIE_GROUP=64 PIE_BITS=2 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_64_b_4 PIE_AFFINE=1 PIE_GROUP=64 PIE_BITS=4 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_64_b_8 PIE_AFFINE=1 PIE_GROUP=64 PIE_BITS=8 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_128_b_2 PIE_AFFINE=1 PIE_GROUP=128 PIE_BITS=2 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_128_b_4 PIE_AFFINE=1 PIE_GROUP=128 PIE_BITS=4 PIE_GROUP_X=256
+// pie:instantiate gather_embed_affine_bf16_gs_128_b_8 PIE_AFFINE=1 PIE_GROUP=128 PIE_BITS=8 PIE_GROUP_X=256

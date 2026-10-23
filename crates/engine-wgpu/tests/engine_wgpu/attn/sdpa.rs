@@ -1,17 +1,12 @@
-//! Paged attention on the first Vulkan device against an f64 host reference, beside the hand-written kernels:
-//! decode a row a workgroup on the subgroup tier and the baseline, 256 and 128 invocations, plain, windowed,
+//! Paged attention on the first wgpu adapter against an f64 host reference:
+//! decode a row a workgroup on the baseline tier, 256 and 128 invocations, plain, windowed,
 //! masked and with its LSE; prefill tiled at 32, 16 and 8 rows, a request
 //! straddling a tile, with and without its LSE.
 
-use kernels_vulkan::{KvPool, Tensor};
+use kernels_wgpu::{KvPool, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, close, noise};
-
-fn tuning(gpu: &Gpu) -> kernels_vulkan::Tuning {
-    let (profile, _) = engine_vulkan::chip::resolve(&gpu.device.chip(), None);
-    kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::ASSUMED)
-}
 
 fn st(t: Tensor) -> kernels_slang::Tensor {
     kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
@@ -184,82 +179,20 @@ fn paged_attention_answers_the_reference() {
                 let (want_o, want_l) = reference(batch, &qr, &kr, &vr, hd, scale, window);
                 let win = window.map(|w| w as u32);
                 let shape = format!("{what} d {hd} window {window:?}");
-                {
-                    let tn = tuning(&gpu);
-                    let o = gpu.zeros(n);
-                    let pt = t(pos, rows, 1, Dtype::I32);
-                    let ow = t(own, rows, 1, Dtype::I32);
-                    let mt = t(mb, rows, MASK_STRIDE, Dtype::U8);
-                    let et = t(eb, rows, 1, Dtype::U8);
-                    let ot = t(o, rows, QH * hd, Dtype::Bf16);
-                    if prefilling {
-                        let plan = kernels_vulkan::PrefillPlan {
-                            positions: pt,
-                            request_of_token: ow,
-                            mask: mt,
-                            mask_enabled: et,
-                            mask_stride: MASK_STRIDE as u32,
-                        };
-                        let qi = gpu.up_i32(&[0, 26, 37]);
-                        let rag = kernels_vulkan::RaggedTensor {
-                            data: qt,
-                            indptr: t(qi, 3, 1, Dtype::I32),
-                        };
-                        gpu.run(|c| {
-                            kernels_vulkan::attn::arbiter::prefill(
-                                c,
-                                rag,
-                                &plan,
-                                &pool,
-                                win,
-                                hd as u32,
-                                KVH as u32,
-                                scale as f32,
-                                ot,
-                                2,
-                                &tn,
-                            )
-                        });
-                    } else {
-                        let plan = kernels_vulkan::DecodePlan {
-                            positions: pt,
-                            request_of_token: ow,
-                            mask: mt,
-                            mask_enabled: et,
-                            mask_stride: MASK_STRIDE as u32,
-                        };
-                        gpu.run(|c| {
-                            kernels_vulkan::attn::decode(
-                                c,
-                                &tn,
-                                qt,
-                                &plan,
-                                &pool,
-                                win,
-                                hd as u32,
-                                scale as f32,
-                                ot,
-                                None,
-                            )
-                        });
-                    }
-                    close(&gpu.down(o, n), &want_o, &shape);
-                }
 
                 let tiers: &[(bool, u32, u32)] = if prefilling {
                     &[(false, 256, 32), (false, 256, 16), (false, 256, 8)]
                 } else {
-                    &[
-                        (true, 256, 32),
-                        (true, 128, 32),
-                        (false, 256, 32),
-                        (false, 128, 32),
-                    ]
+                    &[(false, 256, 32), (false, 128, 32)]
                 };
                 for &(subgroup, threads, tile) in tiers {
-                    let tier = kernels_slang::attn::sdpa::Tier {
-                        subgroup,
-                        narrow: gpu.device.chip().subgroup < 32,
+                    let tier = kernels_slang::attn::sdpa::Tactic {
+                        tier: if subgroup {
+                            kernels_slang::Tier::Subgroup
+                        } else {
+                            kernels_slang::Tier::Baseline
+                        },
+                        narrow: false,
                         decode_threads: threads,
                         tile_rows: tile,
                     };

@@ -40,4 +40,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
 }
 
-// pie:instantiate elemwise_sinusoid_f32 PIE_GROUP_X=256
+// pie:instantiate elemwise_posenc_sinusoid_f32 PIE_GROUP_X=256

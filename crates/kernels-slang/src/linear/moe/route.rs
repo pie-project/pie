@@ -83,7 +83,7 @@ pub fn topk_softmax(
     weights: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_topk_softmax";
-    let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "linear_moe_topk_softmax_bf16" });
+    let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "linear_moe_route_topk_softmax_bf16" });
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
         Fire::at(ROUTE, entry).apply(grid),
@@ -110,7 +110,7 @@ pub fn topk_softmax_scaled(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_topk_softmax_scaled";
     let entry =
-        dtype_dispatch!(OP, logits.dtype, { Bf16 => "linear_moe_topk_softmax_scaled_bf16" });
+        dtype_dispatch!(OP, logits.dtype, { Bf16 => "linear_moe_route_topk_softmax_scaled_bf16" });
     debug_assert_eq!(
         scale.dtype, logits.dtype,
         "the gain is read at the router's own width"
@@ -147,7 +147,7 @@ pub fn topk_sigmoid(
     weights: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_topk_sigmoid";
-    let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "linear_moe_topk_sigmoid_bf16" });
+    let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "linear_moe_route_topk_sigmoid_bf16" });
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
         Fire::at(ROUTE, entry).apply(grid),
@@ -213,7 +213,7 @@ pub fn topk_sigmoid_biased(
     biased_router(
         ctx,
         OP,
-        "linear_moe_topk_sigmoid_biased_bf16",
+        "linear_moe_route_topk_sigmoid_biased_bf16",
         logits,
         bias,
         experts,
@@ -241,7 +241,7 @@ pub fn topk_sqrt_softplus(
     biased_router(
         ctx,
         OP,
-        "linear_moe_topk_sqrt_softplus_bf16",
+        "linear_moe_route_topk_sqrt_softplus_bf16",
         logits,
         bias,
         experts,
@@ -267,7 +267,7 @@ pub fn predict_route(
     biased_router(
         ctx,
         OP,
-        "linear_moe_topk_sqrt_softplus_bf16",
+        "linear_moe_route_topk_sqrt_softplus_bf16",
         logits,
         bias,
         experts,
@@ -316,7 +316,7 @@ pub fn hash_route(
     let experts = nonzero(OP, "the expert count the logits span", logits.width)?;
     let rows = nonzero(OP, "rows", routes.rows)?;
     ctx.fire(
-        Fire::at(ROUTE, "linear_moe_hash_route_bf16").apply(Grid::of([rows, 1, 1], ROUTE_GROUP)),
+        Fire::at(ROUTE, "linear_moe_route_hash_bf16").apply(Grid::of([rows, 1, 1], ROUTE_GROUP)),
         &[
             ids.arg(),
             tid2eid.arg(),
@@ -339,7 +339,7 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
     debug_assert_eq!(routes.width, groups, "the routes are one slot per group");
     let groups = nonzero(OP, "the group count", groups)?;
     ctx.fire(
-        Fire::at(ROUTE, "linear_moe_group_routes")
+        Fire::at(ROUTE, "linear_moe_route_group_routes")
             .apply(Grid::of([groups, routes.rows, 1], ROUTE_GROUP)),
         &[routes.arg_mut(), groups.arg()],
     )

@@ -255,10 +255,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #error "linear/moe/route.slang: no kernel selected"
 #endif
 
-// pie:instantiate linear_moe_topk_softmax_bf16 PIE_SOFTMAX=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_topk_softmax_scaled_bf16 PIE_SOFTMAX=1 PIE_SCALED=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_topk_sigmoid_bf16 PIE_SIGMOID=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_topk_sigmoid_biased_bf16 PIE_SIGMOID=1 PIE_BIASED=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_topk_sqrt_softplus_bf16 PIE_SIGMOID=1 PIE_BIASED=1 PIE_SQRT_SOFTPLUS=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_hash_route_bf16 PIE_HASH=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_group_routes PIE_GROUP_ROUTES=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_route_topk_softmax_bf16 PIE_SOFTMAX=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_route_topk_softmax_scaled_bf16 PIE_SOFTMAX=1 PIE_SCALED=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_route_topk_sigmoid_bf16 PIE_SIGMOID=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_route_topk_sigmoid_biased_bf16 PIE_SIGMOID=1 PIE_BIASED=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_route_topk_sqrt_softplus_bf16 PIE_SIGMOID=1 PIE_BIASED=1 PIE_SQRT_SOFTPLUS=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_route_hash_bf16 PIE_HASH=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_route_group_routes PIE_GROUP_ROUTES=1 PIE_GROUP_X=256

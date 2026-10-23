@@ -183,9 +183,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_dense_bf16_d_64 PIE_HEAD_DIM_MAX=64
 // pie:instantiate attn_dense_bf16_d_128 PIE_HEAD_DIM_MAX=128
 // pie:instantiate attn_dense_bf16_d_256 PIE_HEAD_DIM_MAX=256
-// pie:instantiate attn_ragged_bf16_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1
-// pie:instantiate attn_ragged_bf16_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1
-// pie:instantiate attn_ragged_bf16_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1
-// pie:instantiate attn_ragged_f32_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1 PIE_ACT_F32=1
-// pie:instantiate attn_ragged_f32_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1 PIE_ACT_F32=1
-// pie:instantiate attn_ragged_f32_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1 PIE_ACT_F32=1
+// pie:instantiate attn_dense_ragged_bf16_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1
+// pie:instantiate attn_dense_ragged_bf16_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1
+// pie:instantiate attn_dense_ragged_bf16_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1
+// pie:instantiate attn_dense_ragged_f32_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1 PIE_ACT_F32=1
+// pie:instantiate attn_dense_ragged_f32_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1 PIE_ACT_F32=1
+// pie:instantiate attn_dense_ragged_f32_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1 PIE_ACT_F32=1

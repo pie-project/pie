@@ -7,7 +7,7 @@
 
 use dtype::Dtype;
 
-use crate::encode::{Arg, ArgValue, Ctx, Fire, nonzero, refuse, stated};
+use crate::encode::{Arg, ArgValue, Ctx, Fire, Tier, instantiated, nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{KvPool, Tensor};
 
@@ -18,9 +18,10 @@ const WIDTHS: [u32; 4] = [64, 128, 256, 512];
 
 /// How an engine runs paged attention on its device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Tier {
-    /// Decode reduces with subgroup operations (SPIR-V only).
-    pub subgroup: bool,
+pub struct Tactic {
+    /// Decode reduces with subgroup operations at `Tier::Subgroup` (SPIR-V
+    /// only); prefill runs at the baseline whatever this says.
+    pub tier: Tier,
     /// The device's subgroups run narrower than 32 lanes.
     pub narrow: bool,
     /// Invocations a decode workgroup walks with: 256, or 128.
@@ -39,15 +40,6 @@ pub struct Tables {
     /// One byte a row: whether the row reads its mask.
     pub mask_enabled: Tensor,
     pub mask_stride: u32,
-}
-
-/// The instantiation named `name`, as its census spells it.
-fn entry(op: &'static str, name: String) -> Result<&'static str, Error> {
-    crate::CENSUS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(n, _)| *n)
-        .ok_or_else(|| refuse(op, format!("no sdpa kernel is instantiated as `{name}`")))
 }
 
 struct Shape {
@@ -157,7 +149,7 @@ fn args(
 /// one workgroup a (head, row); with `lse`, the row's base-2 LSE lands too.
 pub fn decode(
     ctx: &Ctx<'_>,
-    tier: Tier,
+    tactic: Tactic,
     q: Tensor,
     tables: &Tables,
     pool: &KvPool,
@@ -169,37 +161,46 @@ pub fn decode(
 ) -> Result<(), Error> {
     const OP: &str = "attn.decode";
     let shape = shape(OP, q, pool, window, head_dim)?;
-    let threads = if tier.decode_threads >= 256 { 256 } else { 128 };
+    let threads = if tactic.decode_threads >= 256 {
+        256
+    } else {
+        128
+    };
+    let subgroup = tactic.tier == Tier::Subgroup;
     let name = format!(
-        "attn_sdpa_{}{}{}{}_bf16_d_{head_dim}",
+        "attn_sdpa_{}{}{}_bf16_d_{head_dim}",
         if lse.is_some() {
             "decode_lse"
         } else {
             "decode"
         },
-        if tier.subgroup { "_sg" } else { "" },
         if threads < 256 { "_t128" } else { "" },
-        if tier.subgroup && tier.narrow {
-            "_narrow"
+        if subgroup && tactic.narrow {
+            "_lanes_8"
         } else {
             ""
         },
     );
-    let entry = entry(OP, name)?;
+    let entry = instantiated(OP, name)?;
     let args = args(OP, q, pool, tables, &shape, sm_scale, o, lse)?;
     ctx.fire(
         Fire::at(SDPA, entry)
+            .tier(if subgroup {
+                Tier::Subgroup
+            } else {
+                Tier::Baseline
+            })
             .groups([shape.q_heads, shape.rows, 1])
             .group([threads, 1, 1]),
         &args,
     )
 }
 
-/// Query rows tiled `tier.tile_rows` a workgroup of one head, each attending
+/// Query rows tiled `tactic.tile_rows` a workgroup of one head, each attending
 /// its request's cached keys, causal; with `lse`, each row's base-2 LSE.
 pub fn prefill(
     ctx: &Ctx<'_>,
-    tier: Tier,
+    tactic: Tactic,
     q: Tensor,
     tables: &Tables,
     pool: &KvPool,
@@ -211,7 +212,7 @@ pub fn prefill(
 ) -> Result<(), Error> {
     const OP: &str = "attn.prefill";
     let shape = shape(OP, q, pool, window, head_dim)?;
-    let tile = match tier.tile_rows {
+    let tile = match tactic.tile_rows {
         32.. => 32,
         16..=31 => 16,
         _ => 8,
@@ -225,7 +226,7 @@ pub fn prefill(
             format!("_r{tile}")
         },
     );
-    let entry = entry(OP, name)?;
+    let entry = instantiated(OP, name)?;
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, lse)?;
     args.push(stated(OP, shape.rows)?.arg());
     ctx.fire(

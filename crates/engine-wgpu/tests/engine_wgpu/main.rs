@@ -1,22 +1,8 @@
 #![cfg(feature = "wgpu")]
 
-mod argmax_answers_the_reference;
-mod dense_attention_answers_the_reference;
+mod attn;
+mod elemwise;
+mod gather;
 mod gpu;
-mod mla_answers_the_reference;
-mod moe_routing_answers_the_reference;
-mod paged_attention_answers_the_reference;
-mod score_capture_answers_the_reference;
-mod the_attention_epilogues_answer_the_reference;
-mod the_compressed_pool_answers_the_reference;
-mod the_embeddings_answer_the_reference;
-mod the_glus_answer_the_reference;
-mod the_hyper_connections_answer_the_reference;
-mod the_indexer_answers_the_reference;
-mod the_modulations_answer_the_reference;
-mod the_ngram_hashers_answer_the_reference;
-mod the_norms_answer_the_reference;
-mod the_pixels_answer_the_reference;
-mod the_pointwise_kernels_answer_the_reference;
-mod the_ropes_answer_the_reference;
-mod the_row_movers_answer_the_reference;
+mod linear;
+mod sampling;

@@ -7,6 +7,35 @@ use crate::error::Error;
 
 pub const ABSENT: u32 = u32::MAX;
 
+/// The architecture tier an instantiation is built at: a build variant of
+/// one entry name, never part of the name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Tier {
+    #[default]
+    Baseline,
+    /// Subgroup operations.
+    Subgroup,
+    /// Half-precision arithmetic.
+    Fp16,
+    /// Cooperative matrices.
+    Coopmat,
+}
+
+impl Tier {
+    pub const ALL: [Self; 4] = [Self::Baseline, Self::Subgroup, Self::Fp16, Self::Coopmat];
+
+    /// The tier as `PIE_TIER` spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Subgroup => "subgroup",
+            Self::Fp16 => "fp16",
+            Self::Coopmat => "coopmat",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArgValue {
     Buffer(u32),
@@ -65,6 +94,8 @@ pub struct Fire {
 
     pub entrypoint: &'static str,
 
+    pub tier: Tier,
+
     pub groups: [u32; 3],
 
     pub group: [u32; 3],
@@ -76,9 +107,16 @@ impl Fire {
         Self {
             file,
             entrypoint,
+            tier: Tier::Baseline,
             groups: [1, 1, 1],
             group: [1, 1, 1],
         }
+    }
+
+    #[must_use]
+    pub const fn tier(mut self, tier: Tier) -> Self {
+        self.tier = tier;
+        self
     }
 
     #[must_use]
@@ -191,6 +229,15 @@ pub(crate) fn nonzero(op: &'static str, axis: &'static str, v: u32) -> Result<u3
         return Err(refuse(op, format!("`{axis}` is zero")));
     }
     Ok(v)
+}
+
+/// The instantiation named `name`, as the census spells it.
+pub(crate) fn instantiated(op: &'static str, name: String) -> Result<&'static str, Error> {
+    crate::CENSUS
+        .iter()
+        .find(|(_, n, _, _)| *n == name)
+        .map(|(_, n, _, _)| *n)
+        .ok_or_else(|| refuse(op, format!("no kernel is instantiated as `{name}`")))
 }
 
 #[allow(dead_code)]

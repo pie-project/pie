@@ -362,4 +362,4 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate elemwise_hc_collapse_bf16 PIE_COLLAPSE=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_hc_mix_bf16 PIE_MIX=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_hc_inject_bf16 PIE_INJECT=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_ple_gate_bf16 PIE_PLE_GATE=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_hc_ple_gate_bf16 PIE_PLE_GATE=1 PIE_GROUP_X=256

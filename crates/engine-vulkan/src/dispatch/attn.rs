@@ -102,8 +102,8 @@ impl Run<'_> {
                 ),
             });
         }
-        let tier = kernels_slang::attn::sdpa::Tier {
-            subgroup: true,
+        let tier = kernels_slang::attn::sdpa::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
             narrow: tuning.limits().lanes < 32,
             decode_threads: tuning.sdpa_decode_threads(head_dim),
             tile_rows: tuning.sdpa_tile_rows(),

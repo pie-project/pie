@@ -215,12 +215,12 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #error "gather/rows.slang: no kernel selected"
 #endif
 
-// pie:instantiate gather_copy_words PIE_COPY=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_copy_words PIE_COPY=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_words PIE_GATHER=1 PIE_GROUP_X=256
-// pie:instantiate gather_scatter_words PIE_SCATTER=1 PIE_GROUP_X=256
-// pie:instantiate gather_scatter_live_words PIE_SCATTER_LIVE=1 PIE_GROUP_X=256
-// pie:instantiate gather_pool_bf16 PIE_POOL=1 PIE_GROUP_X=256
-// pie:instantiate gather_select_words PIE_SELECT=1 PIE_GROUP_X=256
-// pie:instantiate gather_split_words PIE_SPLIT=1 PIE_GROUP_X=256
-// pie:instantiate gather_split_qkv_words PIE_SPLIT_QKV=1 PIE_GROUP_X=256
-// pie:instantiate gather_split_q_gate_words PIE_SPLIT_Q_GATE=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_scatter_words PIE_SCATTER=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_scatter_live_words PIE_SCATTER_LIVE=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_pool_bf16 PIE_POOL=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_select_words PIE_SELECT=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_split_words PIE_SPLIT=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_split_qkv_words PIE_SPLIT_QKV=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_split_q_gate_words PIE_SPLIT_Q_GATE=1 PIE_GROUP_X=256

@@ -54,7 +54,7 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
         )
     })?;
     ctx.fire(
-        Fire::at(ROWS, "gather_copy_words").threads([words, 1, 1], [GROUP, 1, 1]),
+        Fire::at(ROWS, "gather_rows_copy_words").threads([words, 1, 1], [GROUP, 1, 1]),
         &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
     )
 }
@@ -133,7 +133,7 @@ pub fn scatter_rows(
     move_rows(
         ctx,
         "gather.scatter_rows",
-        "gather_scatter_words",
+        "gather_rows_scatter_words",
         wide,
         tight,
         index,
@@ -151,7 +151,7 @@ pub fn scatter_live_rows(
     move_rows(
         ctx,
         "gather.scatter_live_rows",
-        "gather_scatter_live_words",
+        "gather_rows_scatter_live_words",
         y,
         src,
         routes,
@@ -233,7 +233,7 @@ pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), E
     }
     let pitch = words(OP, "folded row", x.dtype, x.width)?;
     ctx.fire(
-        Fire::at(ROWS, "gather_pool_bf16").apply(grid(OP, pitch, out)?),
+        Fire::at(ROWS, "gather_rows_pool_bf16").apply(grid(OP, pitch, out)?),
         &[x.arg(), y.arg_mut(), pitch.arg(), block.arg(), out.arg()],
     )
 }
@@ -277,7 +277,7 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
         .checked_mul(out)
         .ok_or_else(|| refuse(OP, format!("{out} rows of {pitch} words will not launch")))?;
     ctx.fire(
-        Fire::at(ROWS, "gather_copy_words").threads([total, 1, 1], [GROUP, 1, 1]),
+        Fire::at(ROWS, "gather_rows_copy_words").threads([total, 1, 1], [GROUP, 1, 1]),
         &[x.arg(), y.arg_mut(), stated(OP, total)?.arg()],
     )
 }
@@ -319,7 +319,7 @@ pub fn select(
     let start = words(OP, "slice offset", table.dtype, offset)?;
     let stride = words(OP, "relayed row", table.dtype, table.width)?;
     ctx.fire(
-        Fire::at(ROWS, "gather_select_words").apply(grid(OP, slice, y.rows)?),
+        Fire::at(ROWS, "gather_rows_select_words").apply(grid(OP, slice, y.rows)?),
         &[
             table.arg(),
             y.arg_mut(),
@@ -358,7 +358,7 @@ pub fn split_rows(
     let lw = words(OP, "left half", x.dtype, left.width)?;
     let rw = words(OP, "right half", x.dtype, right.width)?;
     ctx.fire(
-        Fire::at(ROWS, "gather_split_words").apply(grid(OP, lw + rw, x.rows)?),
+        Fire::at(ROWS, "gather_rows_split_words").apply(grid(OP, lw + rw, x.rows)?),
         &[x.arg(), left.arg_mut(), right.arg_mut(), lw.arg(), rw.arg()],
     )
 }
@@ -387,7 +387,7 @@ pub fn split_qkv(
     let qw = words(OP, "q part", packed.dtype, q_width)?;
     let kvw = words(OP, "kv part", packed.dtype, kv_width)?;
     ctx.fire(
-        Fire::at(ROWS, "gather_split_qkv_words").apply(grid(OP, qw + 2 * kvw, packed.rows)?),
+        Fire::at(ROWS, "gather_rows_split_qkv_words").apply(grid(OP, qw + 2 * kvw, packed.rows)?),
         &[
             packed.arg(),
             q.arg_mut(),
@@ -425,7 +425,7 @@ pub fn split_q_gate(
     let q_words = words(OP, "query half", packed.dtype, q.width)?;
     let lanes = head_grid(OP, head, q.width / head_dim, packed.rows)?;
     ctx.fire(
-        Fire::at(ROWS, "gather_split_q_gate_words").apply(Grid::of(lanes, [GROUP, 1, 1])),
+        Fire::at(ROWS, "gather_rows_split_q_gate_words").apply(Grid::of(lanes, [GROUP, 1, 1])),
         &[
             packed.arg(),
             q.arg_mut(),

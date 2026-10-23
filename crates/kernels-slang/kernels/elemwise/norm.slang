@@ -318,13 +318,13 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #error "elemwise/norm.slang: no kernel selected"
 #endif
 
-// pie:instantiate elemwise_rms_bf16 PIE_RMS=1 PIE_GROUP_X=256 N_READS=4
-// pie:instantiate elemwise_rms_grouped_bf16 PIE_RMS=1 PIE_GROUP_X=256 N_READS=4 PIE_GROUPED=1
-// pie:instantiate elemwise_rms_unscaled_bf16 PIE_RMS=1 PIE_GROUP_X=256 N_READS=4 PIE_UNSCALED=1
-// pie:instantiate elemwise_gated_rms_bf16 PIE_GATED_RMS=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_gated_rms_sigmoid_bf16 PIE_GATED_RMS=1 PIE_GROUP_X=256 PIE_SIGMOID=1
-// pie:instantiate elemwise_layernorm_bf16 PIE_LAYERNORM=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_layernorm_unscaled_bf16 PIE_LAYERNORM=1 PIE_GROUP_X=256 PIE_UNSCALED=1
-// pie:instantiate elemwise_layernorm_unscaled_f32 PIE_LAYERNORM=1 PIE_GROUP_X=256 PIE_UNSCALED=1 PIE_ACT_F32=1
-// pie:instantiate elemwise_res_blend_bf16 PIE_RES_BLEND=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_standardize_bf16 PIE_STANDARDIZE=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_norm_rms_bf16 PIE_RMS=1 PIE_GROUP_X=256 N_READS=4
+// pie:instantiate elemwise_norm_rms_grouped_bf16 PIE_RMS=1 PIE_GROUP_X=256 N_READS=4 PIE_GROUPED=1
+// pie:instantiate elemwise_norm_rms_unscaled_bf16 PIE_RMS=1 PIE_GROUP_X=256 N_READS=4 PIE_UNSCALED=1
+// pie:instantiate elemwise_norm_gated_rms_bf16 PIE_GATED_RMS=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_norm_gated_rms_sigmoid_bf16 PIE_GATED_RMS=1 PIE_GROUP_X=256 PIE_SIGMOID=1
+// pie:instantiate elemwise_norm_layernorm_bf16 PIE_LAYERNORM=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_norm_layernorm_unscaled_bf16 PIE_LAYERNORM=1 PIE_GROUP_X=256 PIE_UNSCALED=1
+// pie:instantiate elemwise_norm_layernorm_unscaled_f32 PIE_LAYERNORM=1 PIE_GROUP_X=256 PIE_UNSCALED=1 PIE_ACT_F32=1
+// pie:instantiate elemwise_norm_res_blend_bf16 PIE_RES_BLEND=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_norm_standardize_bf16 PIE_STANDARDIZE=1 PIE_GROUP_X=256

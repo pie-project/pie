@@ -162,5 +162,5 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
 }
 
-// pie:instantiate attn_ragged_tiled_bf16_d_64 PIE_D=64
-// pie:instantiate attn_ragged_tiled_bf16_d_128 PIE_D=128
+// pie:instantiate attn_dense_tiled_ragged_bf16_d_64 PIE_D=64
+// pie:instantiate attn_dense_tiled_ragged_bf16_d_128 PIE_D=128

@@ -284,21 +284,21 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #error "elemwise/pointwise.slang: no kernel selected"
 #endif
 
-// pie:instantiate elemwise_add_bf16 PIE_ADD=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_add_f32 PIE_ADD=1 PIE_GROUP_X=256 PIE_ACT_F32=1
-// pie:instantiate elemwise_residual_add_bf16 PIE_RESIDUAL_ADD=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_residual_add_f32 PIE_RESIDUAL_ADD=1 PIE_GROUP_X=256 PIE_ACT_F32=1
-// pie:instantiate elemwise_add_bias_bf16 PIE_ADD_BIAS=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_add_bias_f32 PIE_ADD_BIAS=1 PIE_GROUP_X=256 PIE_ACT_F32=1
-// pie:instantiate elemwise_add_bias_f32_bf16 PIE_ADD_BIAS=1 PIE_GROUP_X=256 PIE_ACT_F32=1 PIE_BIAS_BF16=1
-// pie:instantiate elemwise_scale_bf16 PIE_SCALE=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_scale_f32 PIE_SCALE=1 PIE_GROUP_X=256 PIE_ACT_F32=1
-// pie:instantiate elemwise_scale_read_bf16 PIE_SCALE=1 PIE_GROUP_X=256 PIE_READ=1
-// pie:instantiate elemwise_silu_scaled_bf16 PIE_SILU_SCALED=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_silu_scaled_f32 PIE_SILU_SCALED=1 PIE_GROUP_X=256 PIE_ACT_F32=1
-// pie:instantiate elemwise_tanh_bf16 PIE_TANH=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_tanh_f32 PIE_TANH=1 PIE_GROUP_X=256 PIE_ACT_F32=1
-// pie:instantiate elemwise_cast_f32_to_bf16 PIE_CAST=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_clamp_bf16 PIE_CLAMP=1 PIE_GROUP_X=256
-// pie:instantiate elemwise_clamp_learned_bf16 PIE_CLAMP=1 PIE_GROUP_X=256 PIE_LEARNED=1
-// pie:instantiate elemwise_sigmoid_mul_bf16 PIE_SIGMOID_MUL=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_add_bf16 PIE_ADD=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_add_f32 PIE_ADD=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_residual_add_bf16 PIE_RESIDUAL_ADD=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_residual_add_f32 PIE_RESIDUAL_ADD=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_add_bias_bf16 PIE_ADD_BIAS=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_add_bias_f32 PIE_ADD_BIAS=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_add_bias_f32_bf16 PIE_ADD_BIAS=1 PIE_GROUP_X=256 PIE_ACT_F32=1 PIE_BIAS_BF16=1
+// pie:instantiate elemwise_pointwise_scale_bf16 PIE_SCALE=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_scale_f32 PIE_SCALE=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_scale_read_bf16 PIE_SCALE=1 PIE_GROUP_X=256 PIE_READ=1
+// pie:instantiate elemwise_pointwise_silu_scaled_bf16 PIE_SILU_SCALED=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_silu_scaled_f32 PIE_SILU_SCALED=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_tanh_bf16 PIE_TANH=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_tanh_f32 PIE_TANH=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_cast_f32_to_bf16 PIE_CAST=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_clamp_bf16 PIE_CLAMP=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_clamp_learned_bf16 PIE_CLAMP=1 PIE_GROUP_X=256 PIE_LEARNED=1
+// pie:instantiate elemwise_pointwise_sigmoid_mul_bf16 PIE_SIGMOID_MUL=1 PIE_GROUP_X=256

@@ -57,7 +57,7 @@ fn rms(
     plus_one: bool,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_rms_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_rms_bf16" });
     ctx.fire(
         Fire::at(NORM, entry).apply(grid(OP, x.width, axis, x.rows)?),
         &[
@@ -145,7 +145,7 @@ pub fn rmsnorm_grouped_plus_one(
             ),
         ));
     }
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_rms_grouped_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_rms_grouped_bf16" });
     ctx.fire(
         Fire::at(NORM, entry).apply(grid(OP, x.width, axis, x.rows)?),
         &[
@@ -171,7 +171,7 @@ pub fn rmsnorm_no_scale(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_rms_unscaled_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_rms_unscaled_bf16" });
     ctx.fire(
         Fire::at(NORM, entry).apply(grid(OP, x.width, head_dim, x.rows)?),
         &[x.arg(), y.arg_mut(), eps.arg(), stated(OP, head_dim)?.arg()],
@@ -240,9 +240,9 @@ pub fn rmsnorm_gated(
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm_gated";
     let entry = if sigmoid_gate {
-        dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_gated_rms_sigmoid_bf16" })
+        dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_norm_gated_rms_sigmoid_bf16" })
     } else {
-        dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_gated_rms_bf16" })
+        dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_norm_gated_rms_bf16" })
     };
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
     gated(ctx, OP, entry, x, gate, weight, vd, eps, y)
@@ -259,7 +259,7 @@ pub fn rmsnorm_gated_by(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm_gated_by";
-    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_gated_rms_sigmoid_bf16" });
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_norm_gated_rms_sigmoid_bf16" });
     nonzero(OP, "the stated head count", heads)?;
     if x.width == 0 || !x.width.is_multiple_of(heads) {
         return Err(refuse(
@@ -301,7 +301,7 @@ pub fn layernorm(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.layernorm";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_layernorm_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_layernorm_bf16" });
     ctx.fire(
         Fire::at(NORM, entry).apply(row_grid(OP, x)?),
         &[
@@ -319,8 +319,8 @@ pub fn layernorm(
 pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.layernorm";
     let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "elemwise_layernorm_unscaled_bf16",
-        F32 => "elemwise_layernorm_unscaled_f32",
+        Bf16 => "elemwise_norm_layernorm_unscaled_bf16",
+        F32 => "elemwise_norm_layernorm_unscaled_f32",
     });
     ctx.fire(
         Fire::at(NORM, entry).apply(row_grid(OP, x)?),
@@ -343,7 +343,7 @@ pub fn res_blend(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.res_blend";
-    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "elemwise_res_blend_bf16" });
+    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "elemwise_norm_res_blend_bf16" });
     if blocks.len() > MAX_BLEND_BLOCKS {
         return Err(refuse(
             OP,
@@ -385,7 +385,7 @@ pub fn res_blend(
 
 pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.standardize";
-    let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "elemwise_standardize_bf16" });
+    let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "elemwise_norm_standardize_bf16" });
     let [width, rows, _] = elementwise_rows(OP, out.width, out.rows)?;
     if !width.is_multiple_of(2) {
         return Err(refuse(

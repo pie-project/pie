@@ -78,6 +78,6 @@ void main(uint3 gid : SV_DispatchThreadID) {
     pair_put(y, i, both, float2(combined(i), both ? combined(i + 1u) : 0.0));
 }
 
-// pie:instantiate linear_moe_weighted_sum_bf16 PIE_WEIGHTED=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_bias_sum_bf16 PIE_BIAS=1 PIE_GROUP_X=256
-// pie:instantiate linear_moe_sigmoid_gate_add_bf16 PIE_SHARED=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_combine_weighted_sum_bf16 PIE_WEIGHTED=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_combine_bias_sum_bf16 PIE_BIAS=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_combine_sigmoid_gate_add_bf16 PIE_SHARED=1 PIE_GROUP_X=256

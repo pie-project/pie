@@ -85,7 +85,7 @@ fn rotate(
     rotary: u32,
     span: u32,
 ) -> Result<(), Error> {
-    let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "elemwise_neox_bf16" });
+    let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "elemwise_rope_neox_bf16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
     if !span.is_multiple_of(2) {
@@ -191,7 +191,7 @@ pub fn partial_last(
             ),
         ));
     }
-    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_tail_bf16" });
+    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_tail_bf16" });
     positions_stream(OP, positions, q);
     let lanes = rope_grid(OP, rotary_dim, q.width, head_dim, q.rows)?;
     let (factor, low, high) = match yarn {
@@ -265,7 +265,7 @@ fn rotate_ramped(
     mscale: f32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "elemwise_yarn_bf16" });
+    let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "elemwise_rope_yarn_bf16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, head_dim, x.width, head_dim, x.rows)?;
     ctx.fire(
@@ -520,7 +520,7 @@ pub fn mrope_interleaved(
     theta: f32,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rope_mrope";
-    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_mrope_interleaved_bf16" });
+    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_mrope_interleaved_bf16" });
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     sections_both(
         ctx,
@@ -548,7 +548,7 @@ pub fn mrope_blocked(
     theta: f32,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rope_mrope";
-    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_mrope_blocked_bf16" });
+    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_mrope_blocked_bf16" });
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;
     sections_both(
@@ -567,7 +567,7 @@ pub fn mrope_split(
     theta: f32,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rope_mrope";
-    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_mrope_split_bf16" });
+    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_mrope_split_bf16" });
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;
     sections_both(
@@ -617,8 +617,8 @@ pub fn axes(
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rope_axes";
     let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "elemwise_axes_bf16",
-        F32 => "elemwise_axes_f32",
+        Bf16 => "elemwise_rope_axes_bf16",
+        F32 => "elemwise_rope_axes_f32",
     });
     if positions.dtype != Dtype::F32 {
         return Err(refuse(
