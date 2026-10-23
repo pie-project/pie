@@ -55,6 +55,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
         use poem_compiler::fuse::rules;
         use poem_ir::GluAct;
+        use poem_ir::ops::fused::Intermediates;
         vec![
             rules::split_qkv_fused(),
             rules::qkv_fused_qknorm_rope_vnorm_write(),
@@ -75,7 +76,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::norm_rope_last_append(),
             rules::split_rope_yarn_append(),
             rules::rope_yarn_append(),
-            rules::qg_qknorm_rope_append(),
+            rules::q_gate_norm_rope_append(Intermediates::Unwritten),
             rules::lse_sink(),
             rules::pool_attention(),
             rules::pool_compress(),
@@ -93,6 +94,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
         use poem_compiler::fuse::rules;
         use poem_ir::GluAct;
+        use poem_ir::ops::fused::Intermediates;
         vec![
             rules::qkv_fused_qknorm_rope_vnorm_write(),
             rules::rmsnorm_residual_add(),
@@ -109,7 +111,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::rmsnorm_rope_partial_q(),
             rules::hc_norm_project(),
             rules::gdn_step(),
-            rules::q_gate_norm_rope_append(),
+            rules::q_gate_norm_rope_append(Intermediates::Written),
         ]
     });
 

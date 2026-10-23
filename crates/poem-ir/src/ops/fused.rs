@@ -43,6 +43,17 @@ impl Part for Scaled {
     }
 }
 
+/// What a fused op writes of the values between its primitives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Intermediates {
+    /// Every intermediate keeps its value: one may be read past the op (a
+    /// seam's), and a backend that cannot take the op whole runs its
+    /// primitives over them.
+    Written,
+    /// Nothing reads them past the op, so they may be left unwritten.
+    Unwritten,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NormKind {
     Layernorm { eps: f32 },
@@ -316,11 +327,12 @@ pub enum Fused {
     /// projection `qg` into `q` and `gate`, q and k normed per head (`w + 1`)
     /// into `qn` and `kn`, both turned by the partial rotation into `q_out`
     /// and `k_out` (in place, as the rotation lands them), and `k_out` and
-    /// `v` appended to `cache`. Every intermediate keeps its value, so a
-    /// backend that cannot take the step whole runs the primitives over them.
+    /// `v` appended to `cache`. `intermediates` says whether `q`, `qn`, `kn`
+    /// and `k_out` keep their values.
     QGateNormRopeAppend {
         #[input]
         qg: ValueId,
+        intermediates: Intermediates,
         head_dim: u32,
         #[output]
         q: ValueId,
@@ -558,48 +570,6 @@ pub enum Fused {
         #[output(alias = k)]
         k_out: ValueId,
     },
-    /// Qwen3.5's attention prologue: q cut from `[q | gate]` (`split_q_gate`),
-    /// q and k normed per head (`rmsnorm_per_head_plus_one`), their rotary
-    /// prefixes turned (`rope_partial`) and k with v cached (`kv_append`).
-    /// `q_split`, `q_normed`, `k_normed` and `k_out` may be left unwritten.
-    QgQknormRopeAppend {
-        #[input]
-        qg: ValueId,
-        #[input]
-        k: ValueId,
-        #[input]
-        v: ValueId,
-        #[input(I32)]
-        positions: ValueId,
-        #[input]
-        q_norm: ValueId,
-        #[input]
-        k_norm: ValueId,
-        head_dim: u32,
-        q_eps: f32,
-        k_eps: f32,
-        rotary_dim: u32,
-        theta: f32,
-        span: u32,
-        #[input(CACHE)]
-        cache: ValueId,
-        #[input(I32)]
-        write_page: ValueId,
-        #[input(I32)]
-        write_offset: ValueId,
-        #[output]
-        q_split: ValueId,
-        #[output]
-        gate: ValueId,
-        #[output]
-        q_normed: ValueId,
-        #[output]
-        k_normed: ValueId,
-        #[output(alias = q_normed)]
-        q_out: ValueId,
-        #[output(alias = k_normed)]
-        k_out: ValueId,
-    },
     /// `RopeYarnAppend` reading q, k and v straight from a packed row split by
     /// `split_qkv`. `k_out` and `v_out` (the split's k and v) may be left
     /// unwritten.
@@ -755,33 +725,34 @@ mod tests {
     /// The rotation lands over the normed heads, an output of the same op.
     #[test]
     fn a_rotation_lands_over_the_heads_it_normed() {
-        let op = Fused::QgQknormRopeAppend {
+        let op = Fused::QGateNormRopeAppend {
             qg: v(1),
-            k: v(2),
-            v: v(3),
-            positions: v(4),
-            q_norm: v(5),
-            k_norm: v(6),
+            intermediates: Intermediates::Unwritten,
             head_dim: 128,
+            q: v(10),
+            gate: v(11),
+            q_norm: v(5),
             q_eps: 1e-6,
+            qn: v(12),
+            k: v(2),
+            k_norm: v(6),
             k_eps: 1e-6,
+            kn: v(13),
+            positions: v(4),
             rotary_dim: 64,
             theta: 1e7,
             span: 32,
+            q_out: v(14),
+            k_out: v(15),
+            v: v(3),
             cache: v(7),
             write_page: v(8),
             write_offset: v(9),
-            q_split: v(10),
-            gate: v(11),
-            q_normed: v(12),
-            k_normed: v(13),
-            q_out: v(14),
-            k_out: v(15),
         };
         assert_eq!(
             operands(&op),
             (
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+                vec![1, 5, 2, 6, 4, 3, 7, 8, 9],
                 vec![10, 11, 12, 13, 14, 15],
                 vec![(14, 12), (15, 13)]
             )

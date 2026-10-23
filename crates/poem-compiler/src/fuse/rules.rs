@@ -5,7 +5,7 @@
 use poem::declare::Precision;
 use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, Template, template};
-use poem_ir::ops::fused::{PostNorm, Scaled};
+use poem_ir::ops::fused::{Intermediates, PostNorm, Scaled};
 use poem_ir::{
     ActQuant, Dim, Dtype, Elemwise, Fused, Gather, ModulateForm, NormKind, Operation, StructKind,
     Ty,
@@ -70,13 +70,13 @@ pub fn all() -> Vec<Rule> {
         rmsnorm_rope_partial_q(),
         hc_norm_project(),
         gdn_step(),
-        q_gate_norm_rope_append(),
+        q_gate_norm_rope_append(Intermediates::Written),
         pool_compress(),
         norm_rope_pair(),
         index_topk_rope(),
         norm_rope_last_append(),
         norm_rope_last(),
-        qg_qknorm_rope_append(),
+        q_gate_norm_rope_append(Intermediates::Unwritten),
         split_rope_yarn_append(),
         rope_yarn_append(),
         pool_attention(),
@@ -488,73 +488,6 @@ pub fn lse_sink() -> Rule {
             o_out: m.value("o_out"),
         }
     })
-}
-
-/// Qwen3.5's attention prologue: q cut from its gate, q and k normed per
-/// head (plus-one weights), turned, and k with its v written to the cache,
-/// through the `attn.qv` marker the model sets on the cut q and v.
-#[must_use]
-pub fn qg_qknorm_rope_append() -> Rule {
-    let pattern = template(|p| {
-        let qg = p.rows("qg", 2 * W);
-        let k = p.rows("k", W);
-        let v = p.rows("v", W);
-        let positions = p.indices("positions");
-        let d = p.u32("d");
-        let (q, gate) = gather::split_q_gate(&qg, d);
-        p.name("q_split", &q);
-        p.export("gate", &gate);
-        let qn =
-            elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [W]), d, p.f32("q_eps"));
-        p.name("q_normed", &qn);
-        let kn =
-            elemwise::rmsnorm_per_head_plus_one(&k, &p.weight("k_norm", [W]), d, p.f32("k_eps"));
-        p.name("k_normed", &kn);
-        let (q_out, k_out) = both(elemwise::rope(
-            &qn,
-            &positions,
-            d,
-            p.f32("theta"),
-            Turn::Partial {
-                rotary_dim: p.u32("rotary"),
-                span: p.u32("span"),
-            },
-            Some(&kn),
-            None,
-        ));
-        p.name("k_out", &k_out);
-        let cache = p.cache("cache");
-        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-        attn::kv_append(&k_out, Some(&v), cache, &write_page, &write_offset);
-        p.export("q_out", &q_out);
-    });
-    Rule::new("fused.qg_qknorm_rope_append", [pattern], |m| {
-        Fused::QgQknormRopeAppend {
-            qg: m.value("qg"),
-            k: m.value("k"),
-            v: m.value("v"),
-            positions: m.value("positions"),
-            q_norm: m.value("q_norm"),
-            k_norm: m.value("k_norm"),
-            head_dim: m.u32("d"),
-            q_eps: m.f32("q_eps"),
-            k_eps: m.f32("k_eps"),
-            rotary_dim: m.u32("rotary"),
-            theta: m.f32("theta"),
-            span: m.u32("span"),
-            cache: m.value("cache"),
-            write_page: m.value("write_page"),
-            write_offset: m.value("write_offset"),
-            q_split: m.value("q_split"),
-            gate: m.value("gate"),
-            q_normed: m.value("q_normed"),
-            k_normed: m.value("k_normed"),
-            q_out: m.value("q_out"),
-            k_out: m.value("k_out"),
-        }
-    })
-    .through_markers()
-    .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
 }
 
 /// `rope_yarn_append` reading q, k and v straight from a packed q/k/v row
@@ -2160,13 +2093,23 @@ pub fn gdn_step() -> Rule {
 
 /// Qwen's gated attention prologue: the q/gate split, the two per-head
 /// norms, the partial rotation and the kv append, all under one guard.
+/// Qwen's gated attention prologue: q cut from its gate, q and k normed per
+/// head (plus-one weights), turned, and k with its v written to the cache.
+/// Under `Intermediates::Written` the cut q may be read past it (a seam's,
+/// `ATTN_QV`) and every intermediate lands. Under `Unwritten` nothing reads
+/// them, though a marker seam (`attn.qv`) may name them, and the gated row is
+/// bf16.
 #[must_use]
-pub fn q_gate_norm_rope_append() -> Rule {
+pub fn q_gate_norm_rope_append(intermediates: Intermediates) -> Rule {
+    let written = intermediates == Intermediates::Written;
     let pattern = template(|p| {
         let d = p.u32("d");
         let (q, gate) = gather::split_q_gate(&p.rows("qg", 2 * W), d);
-        // The split q is a seam's (`ATTN_QV`), so it still lands.
-        p.export("q", &q);
+        if written {
+            p.export("q", &q);
+        } else {
+            p.name("q", &q);
+        }
         p.export("gate", &gate);
         let qn =
             elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [W]), d, p.f32("q_eps"));
@@ -2201,9 +2144,10 @@ pub fn q_gate_norm_rope_append() -> Rule {
             &write_offset,
         );
     });
-    Rule::new("fused.q_gate_norm_rope_append", [pattern], |m| {
+    fn replace(m: &Match, intermediates: Intermediates) -> Fused {
         Fused::QGateNormRopeAppend {
             qg: m.value("qg"),
+            intermediates,
             head_dim: m.u32("d"),
             q: m.value("q"),
             gate: m.value("gate"),
@@ -2225,7 +2169,18 @@ pub fn q_gate_norm_rope_append() -> Rule {
             write_page: m.value("write_page"),
             write_offset: m.value("write_offset"),
         }
-    })
+    }
+    if written {
+        Rule::new("fused.q_gate_norm_rope_append", [pattern], |m| {
+            replace(m, Intermediates::Written)
+        })
+    } else {
+        Rule::new("fused.q_gate_norm_rope_append", [pattern], |m| {
+            replace(m, Intermediates::Unwritten)
+        })
+        .through_markers()
+        .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
+    }
 }
 
 /// An op's two outputs, its second asked for: a rope's queries and the

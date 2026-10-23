@@ -244,7 +244,10 @@ impl FamilyCosts {
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
                 | poem_ir::Fused::SplitQkvFused { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attn,
-                poem_ir::Fused::QGateNormRopeAppend { .. } => self.attn,
+                poem_ir::Fused::QGateNormRopeAppend {
+                    intermediates: poem_ir::ops::fused::Intermediates::Written,
+                    ..
+                } => self.attn,
                 poem_ir::Fused::ResidualAddRmsnorm { .. }
                 | poem_ir::Fused::RmsnormResidualAdd { .. }
                 | poem_ir::Fused::EmbedScaleAdd { .. }
@@ -256,7 +259,10 @@ impl FamilyCosts {
                 | poem_ir::Fused::NormRopePair { .. }
                 | poem_ir::Fused::RopeYarnAppend { .. }
                 | poem_ir::Fused::SplitRopeYarnAppend { .. }
-                | poem_ir::Fused::QgQknormRopeAppend { .. }
+                | poem_ir::Fused::QGateNormRopeAppend {
+                    intermediates: poem_ir::ops::fused::Intermediates::Unwritten,
+                    ..
+                }
                 | poem_ir::Fused::NormModulate { .. }
                 | poem_ir::Fused::HcPrenormProject { .. }
                 | poem_ir::Fused::HcGatesNorm { .. }

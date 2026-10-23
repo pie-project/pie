@@ -358,7 +358,7 @@ pub fn qg_qknorm_rope_append(
     gate: &mut Tensor,
     append: YarnAppend<'_>,
 ) -> Result<(), Error> {
-    const OP: &str = "fused.qg_qknorm_rope_append";
+    const OP: &str = "fused.q_gate_norm_rope_append";
     dtype_dispatch!(OP, qg.dtype, { Bf16 => () });
     positions_stream(OP, positions, q_out);
     if !append.fits()

@@ -458,7 +458,10 @@ fn writes_cache(op: &Operation) -> bool {
                 | Fused::PoolCompress { .. }
                 | Fused::NormRopePair { .. }
                 | Fused::SplitRopeYarnAppend { .. }
-                | Fused::QgQknormRopeAppend { .. }
+                | Fused::QGateNormRopeAppend {
+                    intermediates: crate::ops::fused::Intermediates::Unwritten,
+                    ..
+                }
         ),
         Operation::Conv(op) => match op {
             Conv::Conv3d { cache, .. } => cache.is_some(),

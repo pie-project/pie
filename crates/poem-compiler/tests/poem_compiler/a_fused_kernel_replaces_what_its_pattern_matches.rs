@@ -638,9 +638,14 @@ fn qwens_attention_prologue_lands_as_one_fused_op() {
         elemwise::silu(&gate);
     });
     assert_eq!(
-        ops(&fuse(t, &["fused.qg_qknorm_rope_append"])),
+        ops(&poem_compiler::fuse::fuse(
+            t,
+            [&rules::q_gate_norm_rope_append(
+                poem_ir::ops::fused::Intermediates::Unwritten
+            )]
+        )),
         [
-            "fused.qg_qknorm_rope_append",
+            "fused.q_gate_norm_rope_append",
             "elemwise.act",
             "elemwise.act"
         ]

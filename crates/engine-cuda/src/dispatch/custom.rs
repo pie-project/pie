@@ -1,5 +1,6 @@
 use kernels_cuda::attn::qkv_append;
 use poem_exec::{DispatchFused, KernelError};
+use poem_ir::ops::fused::Intermediates;
 use poem_ir::{Fused, Operands};
 use poem_ir::{NormAxis, NormWeight};
 
@@ -9,7 +10,11 @@ use crate::run::Run;
 /// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
-        Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => true,
+        Fused::GdnStep { .. }
+        | Fused::QGateNormRopeAppend {
+            intermediates: Intermediates::Written,
+            ..
+        } => true,
         Fused::MatmulGlu { glu, .. } => {
             !matches!(glu, poem_ir::GluAct::Swiglu | poem_ir::GluAct::GegluTanh)
         }
@@ -21,9 +26,11 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => {
-                unreachable!("`refuses` names it")
-            }
+            Fused::GdnStep { .. }
+            | Fused::QGateNormRopeAppend {
+                intermediates: Intermediates::Written,
+                ..
+            } => unreachable!("`refuses` names it"),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op, None),
             Fused::SplitQkvFused { rest, qkv, .. } => {
                 let rest = self.tensor(*rest);
@@ -35,7 +42,7 @@ impl DispatchFused for Run<'_> {
             Fused::NormRopePair { .. } => self.norm_rope_pair(op),
             Fused::IndexTopkRope { .. } => self.index_topk_rope(op),
             Fused::SplitRopeYarnAppend { .. } => self.split_rope_yarn_append(op),
-            Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
+            Fused::QGateNormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
             Fused::PoolAttention { .. } => self.pool_attention(op),
             Fused::MlaPrefillExpanded { .. } => self.mla_prefill_expanded(op),
@@ -956,8 +963,9 @@ impl Run<'_> {
     /// `kernel.elemwise.qg_prologue_until` rows on a bf16 NHD pool, else as traced.
     fn qg_qknorm_rope_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         use kernels_cuda::elemwise::{norm, norm_rope, rope};
-        let Fused::QgQknormRopeAppend {
+        let Fused::QGateNormRopeAppend {
             qg,
+            intermediates: _,
             k,
             v,
             positions,
@@ -972,10 +980,10 @@ impl Run<'_> {
             cache,
             write_page,
             write_offset,
-            q_split,
+            q: q_split,
             gate,
-            q_normed,
-            k_normed,
+            qn: q_normed,
+            kn: k_normed,
             q_out,
             k_out: _,
         } = op

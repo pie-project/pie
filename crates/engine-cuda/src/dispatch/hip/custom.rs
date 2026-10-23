@@ -23,7 +23,10 @@ pub(crate) fn refuses(op: &Fused) -> bool {
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
             | Fused::ResBlendRmsnorm { .. }
-            | Fused::QgQknormRopeAppend { .. }
+            | Fused::QGateNormRopeAppend {
+                intermediates: poem_ir::ops::fused::Intermediates::Unwritten,
+                ..
+            }
             | Fused::SplitQkvFused { .. }
     )
 }
@@ -63,7 +66,6 @@ impl DispatchFused for Run<'_> {
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
             | Fused::ResBlendRmsnorm { .. }
-            | Fused::QgQknormRopeAppend { .. }
             | Fused::SplitQkvFused { .. } => unreachable!("`refuses` names it"),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
@@ -712,6 +714,7 @@ impl Run<'_> {
         use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather};
         let Fused::QGateNormRopeAppend {
             qg,
+            intermediates: _,
             head_dim,
             q,
             gate,

@@ -64,7 +64,6 @@ flags! {
     IndexTopkRope = "fuse.index_topk_rope" => "fused.index_topk_rope",
     SplitRopeYarnAppend = "fuse.split_rope_yarn_append" => "fused.split_rope_yarn_append",
     RopeYarnAppend = "fuse.rope_yarn_append" => "fused.rope_yarn_append",
-    QgQknormRopeAppend = "fuse.qg_qknorm_rope_append" => "fused.qg_qknorm_rope_append",
     LseSink = "fuse.lse_sink" => "fused.lse_sink",
     PoolAttention = "fuse.pool_attention" => "fused.pool_attention",
     MlaPrefillExpanded = "fuse.mla_prefill_expanded" => "fused.mla_prefill_expanded",
