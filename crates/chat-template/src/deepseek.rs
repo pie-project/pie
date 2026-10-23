@@ -5,7 +5,7 @@ use tokenizer::{Tokenizer, TokenizerDecoder};
 use crate::chatml::{JSON_GRAMMAR, tool_names};
 use crate::decode::{GenericChatDecoder, ThinkingDecoder};
 use crate::{
-    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special,
+    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special, specials,
 };
 
 const END_OF_SENTENCE: &str = "<｜end▁of▁sentence｜>";
@@ -35,28 +35,24 @@ pub struct DeepSeek {
 }
 
 impl DeepSeek {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        let end_of_sentence = special(&tokenizer, END_OF_SENTENCE);
-        let mut think_open = vec![special(&tokenizer, "<think>")];
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        let end_of_sentence = special(&tokenizer, END_OF_SENTENCE)?;
+        let mut think_open = vec![special(&tokenizer, "<think>")?];
         think_open.extend(tokenizer.encode("\n"));
 
-        Self {
-            user_prefix: special(&tokenizer, "<｜User｜>"),
-            assistant_prefix: special(&tokenizer, "<｜Assistant｜>"),
+        Ok(Self {
+            user_prefix: special(&tokenizer, "<｜User｜>")?,
+            assistant_prefix: special(&tokenizer, "<｜Assistant｜>")?,
             end_of_sentence,
-            stop_ids: STOP_TOKENS
-                .iter()
-                .map(|marker| special(&tokenizer, marker))
-                .collect(),
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             think_open,
-            think_close: special(&tokenizer, "</think>"),
-            tool_outputs_begin: special(&tokenizer, "<｜tool▁outputs▁begin｜>"),
-            tool_outputs_end: special(&tokenizer, "<｜tool▁outputs▁end｜>"),
-            tool_output_begin: special(&tokenizer, "<｜tool▁output▁begin｜>"),
-            tool_output_end: special(&tokenizer, "<｜tool▁output▁end｜>"),
+            think_close: special(&tokenizer, "</think>")?,
+            tool_outputs_begin: special(&tokenizer, "<｜tool▁outputs▁begin｜>")?,
+            tool_outputs_end: special(&tokenizer, "<｜tool▁outputs▁end｜>")?,
+            tool_output_begin: special(&tokenizer, "<｜tool▁output▁begin｜>")?,
+            tool_output_end: special(&tokenizer, "<｜tool▁output▁end｜>")?,
             tokenizer,
-        }
+        })
     }
 
     fn without_thinking(msg: &str) -> &str {

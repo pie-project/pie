@@ -38,20 +38,19 @@ pub struct Dots {
 }
 
 impl Dots {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self {
-            system: special(&tokenizer, SYSTEM),
-            end_of_system: special(&tokenizer, END_OF_SYSTEM),
-            user: special(&tokenizer, USER),
-            end_of_user: special(&tokenizer, END_OF_USER),
-            assistant: special(&tokenizer, ASSISTANT),
-            end_of_assistant: special(&tokenizer, END_OF_ASSISTANT),
-            think_open: special(&tokenizer, THINK_OPEN),
-            think_close: special(&tokenizer, THINK_CLOSE),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        Ok(Self {
+            system: special(&tokenizer, SYSTEM)?,
+            end_of_system: special(&tokenizer, END_OF_SYSTEM)?,
+            user: special(&tokenizer, USER)?,
+            end_of_user: special(&tokenizer, END_OF_USER)?,
+            assistant: special(&tokenizer, ASSISTANT)?,
+            end_of_assistant: special(&tokenizer, END_OF_ASSISTANT)?,
+            think_open: special(&tokenizer, THINK_OPEN)?,
+            think_close: special(&tokenizer, THINK_CLOSE)?,
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn turn(&self, open: u32, text: &str, close: u32) -> Vec<u32> {

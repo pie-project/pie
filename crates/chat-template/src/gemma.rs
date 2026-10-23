@@ -19,14 +19,13 @@ pub struct Gemma {
 }
 
 impl Gemma {
-    #[must_use]
     /// `thinking`: the reference template's cue closes an empty thought
     /// channel when the turn does not think (26B-A4B and 31B; E4B's does not).
-    pub fn new(tokenizer: Arc<Tokenizer>, thinking: bool) -> Self {
-        let stop_ids = specials(&tokenizer, STOP_TOKENS);
+    pub fn try_new(tokenizer: Arc<Tokenizer>, thinking: bool) -> Result<Self, String> {
+        let stop_ids = specials(&tokenizer, STOP_TOKENS)?;
 
-        let open_turn = special(&tokenizer, "<|turn>");
-        let close_turn = special(&tokenizer, "<turn|>");
+        let open_turn = special(&tokenizer, "<|turn>")?;
+        let close_turn = special(&tokenizer, "<turn|>")?;
         let newline = tokenizer.encode("\n");
 
         let header = |role: &str| -> Vec<u32> {
@@ -41,22 +40,22 @@ impl Gemma {
 
         let mut cue = header("model");
         if thinking {
-            cue.push(special(&tokenizer, "<|channel>"));
+            cue.push(special(&tokenizer, "<|channel>")?);
             cue.extend(tokenizer.encode("thought"));
             cue.extend(&newline);
-            cue.push(special(&tokenizer, "<channel|>"));
+            cue.push(special(&tokenizer, "<channel|>")?);
         }
 
-        Self {
+        Ok(Self {
             system_prefix: header("system"),
             user_prefix: header("user"),
             model_prefix: header("model"),
             cue,
             turn_suffix,
-            bos: special(&tokenizer, "<bos>"),
+            bos: special(&tokenizer, "<bos>")?,
             stop_ids,
             tokenizer,
-        }
+        })
     }
 
     fn turn(&self, prefix: &[u32], msg: &str) -> Vec<u32> {

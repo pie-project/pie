@@ -73,26 +73,25 @@ pub struct Hy {
 }
 
 impl Hy {
-    #[must_use]
     /// `thinking`: the reference template's `reasoning_effort: high`; without
     /// it, `no_think`, which every turn's thinking block is written empty in.
-    pub fn new(tokenizer: Arc<Tokenizer>, thinking: bool) -> Self {
+    pub fn try_new(tokenizer: Arc<Tokenizer>, thinking: bool) -> Result<Self, String> {
         let effort = if thinking { "high" } else { "no_think" };
-        let mut mode = vec![special(&tokenizer, REASONING_MODE)];
+        let mut mode = vec![special(&tokenizer, REASONING_MODE)?];
         mode.extend(tokenizer.encode(&format!("reasoning_effort:{effort}")));
-        Self {
+        Ok(Self {
             thinking,
-            start: special(&tokenizer, START),
-            middle: special(&tokenizer, MIDDLE),
-            end: special(&tokenizer, END),
+            start: special(&tokenizer, START)?,
+            middle: special(&tokenizer, MIDDLE)?,
+            end: special(&tokenizer, END)?,
             mode,
-            think_open: special(&tokenizer, THINK_OPEN),
-            think_close: special(&tokenizer, THINK_CLOSE),
-            tool_response_open: special(&tokenizer, TOOL_RESPONSE_OPEN),
-            tool_response_close: special(&tokenizer, TOOL_RESPONSE_CLOSE),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+            think_open: special(&tokenizer, THINK_OPEN)?,
+            think_close: special(&tokenizer, THINK_CLOSE)?,
+            tool_response_open: special(&tokenizer, TOOL_RESPONSE_OPEN)?,
+            tool_response_close: special(&tokenizer, TOOL_RESPONSE_CLOSE)?,
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn header(&self, role: &str) -> Vec<u32> {

@@ -34,17 +34,16 @@ pub struct Llama {
 }
 
 impl Llama {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self {
-            bos: special(&tokenizer, "<|begin_of_text|>"),
-            start_header: special(&tokenizer, "<|start_header_id|>"),
-            end_header: special(&tokenizer, "<|end_header_id|>"),
-            eot: special(&tokenizer, "<|eot_id|>"),
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        Ok(Self {
+            bos: special(&tokenizer, "<|begin_of_text|>")?,
+            start_header: special(&tokenizer, "<|start_header_id|>")?,
+            end_header: special(&tokenizer, "<|end_header_id|>")?,
+            eot: special(&tokenizer, "<|eot_id|>")?,
             python_tag: tokenizer.token_to_id("<|python_tag|>"),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn header(&self, role: &str) -> Vec<u32> {

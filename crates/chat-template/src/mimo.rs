@@ -33,17 +33,16 @@ pub struct Mimo {
 }
 
 impl Mimo {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self {
-            im_start: special(&tokenizer, "<|im_start|>"),
-            im_end: special(&tokenizer, "<|im_end|>"),
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        Ok(Self {
+            im_start: special(&tokenizer, "<|im_start|>")?,
+            im_end: special(&tokenizer, "<|im_end|>")?,
             newline: tokenizer.encode("\n"),
-            think_open: special(&tokenizer, THINK_OPEN),
-            think_close: special(&tokenizer, THINK_CLOSE),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+            think_open: special(&tokenizer, THINK_OPEN)?,
+            think_close: special(&tokenizer, THINK_CLOSE)?,
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn header(&self, role: &str) -> Vec<u32> {
