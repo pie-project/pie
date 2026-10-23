@@ -101,7 +101,7 @@ impl Run<'_> {
                 ..
             } = &**project
             && self.tensor(*streams).rows >= kernels_cuda::elemwise::hc::PRE_WIDE_FROM
-            && kernels_cuda::elemwise::hc::prenorm_project(
+            && kernels_cuda::elemwise::hc_project::prenorm_project(
                 self.ctx(),
                 self.tensor(*streams),
                 *eps,
@@ -334,7 +334,7 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         if self.ctx().tuning().hc_tile {
-            let landed = kernels_cuda::elemwise::hc::prenorm_project(
+            let landed = kernels_cuda::elemwise::hc_project::prenorm_project(
                 self.ctx(),
                 self.tensor(*streams),
                 *eps,

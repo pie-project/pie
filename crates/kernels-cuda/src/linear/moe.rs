@@ -13,7 +13,6 @@ pub use route::*;
 pub use select::*;
 #[cfg(feature = "cuda")]
 pub use select_bf16::*;
-#[cfg(feature = "cuda")]
 pub use select_fp4::*;
 pub use select_fp8::*;
 
@@ -28,7 +27,6 @@ const ROUTE: &str = "linear/moe/route.cu";
 const SELECT: &str = "linear/moe/select.cu";
 #[cfg(feature = "cuda")]
 const SELECT_FP4_SM100: &str = "linear/moe/select_fp4_sm100.cu";
-#[cfg(feature = "cuda")]
 const SELECT_FP4_SM80: &str = "linear/moe/select_fp4_sm80.cu";
 const SELECT_SM80: &str = "linear/moe/select_sm80.cu";
 #[cfg(feature = "cuda")]

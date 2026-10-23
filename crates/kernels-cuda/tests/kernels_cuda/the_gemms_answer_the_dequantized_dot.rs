@@ -22,7 +22,7 @@ fn dense(x: &[f64], w: &[f64], [m, n, k]: [usize; 3], bias: Option<&[f64]>) -> V
 
 #[test]
 fn the_few_rows_and_narrow_gemms_land_the_dot() {
-    use kernels_cuda::linear::{gemm_narrow_bf16, gemm_rows_bf16};
+    use kernels_cuda::linear::gemv::{gemm_narrow_bf16, gemm_rows_bf16};
     // (few rows, m, n, k, bias): the rows kernel at each K split (8, 4, 2,
     // 1 warps a row) and over a cluster (a router's few columns), the narrow
     // one at column counts of its template.
@@ -161,7 +161,7 @@ fn the_strided_grouped_projection_answers_each_group() {
 
 #[test]
 fn the_quantized_dense_projections_answer_the_dequantized_dot() {
-    use kernels_cuda::linear::{nvfp4, quant};
+    use kernels_cuda::linear::{affine, dequant};
     // (NVFP4, bits, rows): the affine kernel at eight bits and four; NVFP4
     // by route at one row, through a decoded bf16 tile past it.
     for (nv, bits, rows) in [(false, 8, 5), (false, 4, 26), (true, 4, 1), (true, 4, 7)] {
@@ -174,15 +174,16 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
             let ts = tab(n, |r| 0.5 + (r % 9) as f32 / 8.0);
             let (c, sc, tt) = (b.up(&s.bytes), b.up(&s.codes), b.up(&ts));
             let (c, sc, tt) = (t(c, n, k / 2, Nvfp4), t(sc, n, k / 16, U8), t(tt, n, 4, U8));
-            nvfp4::matmul(&ctx, "linear.matmul", xt, c, sc, tt, &mut y, seat).expect("fires");
+            dequant::nvfp4_matmul(&ctx, "linear.matmul", xt, c, sc, tt, &mut y, seat)
+                .expect("fires");
             tab(n * k, |i| f64::from(s.value(i / k, k, i % k) * ts[i / k]))
         } else {
             let (s, f, z) = affine(&mut b.lcg, [n, k, 64, bits]);
             let (c, f, z) = (b.up(&s.bytes), b.up(&f), b.up(&z));
             let c = t(c, n, k * bits / 8, U8);
             let (f, z) = (t(f, n, k / 32, U8), t(z, n, k / 32, U8));
-            let post = quant::OffsetKind::Post;
-            quant::matmul(&ctx, xt, c, f, post, Some(z), Bf16, &mut y, seat).expect("fires");
+            let post = affine::OffsetKind::Post;
+            affine::matmul(&ctx, xt, c, f, post, Some(z), Bf16, &mut y, seat).expect("fires");
             tab(n * k, |i| f64::from(s.values[i]))
         };
         let want = dense(&xv, &w, [rows, n, k], None);
@@ -196,7 +197,7 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
 /// tile's rows and a part of one, a plane whose columns end mid-block.
 #[test]
 fn the_affine_gemv_on_the_tensor_cores_answers_the_dequantized_dot() {
-    use kernels_cuda::linear::quant;
+    use kernels_cuda::linear::affine;
     for (rows, n, k) in [
         (1usize, 320usize, 1024usize),
         (2, 4096, 4096),
@@ -215,8 +216,8 @@ fn the_affine_gemv_on_the_tensor_cores_answers_the_dequantized_dot() {
         let (c, f, z) = (b.up(&s.bytes), b.up(&f), b.up(&z));
         let c = t(c, n, k / 2, U8);
         let (f, z) = (t(f, n, k / 32, U8), t(z, n, k / 32, U8));
-        let post = quant::OffsetKind::Post;
-        quant::matmul(&ctx, xt, c, f, post, Some(z), Bf16, &mut y, seat).expect("fires");
+        let post = affine::OffsetKind::Post;
+        affine::matmul(&ctx, xt, c, f, post, Some(z), Bf16, &mut y, seat).expect("fires");
         let w = tab(n * k, |i| f64::from(s.values[i]));
         let want = dense(&xv, &w, [rows, n, k], None);
         b.check(y.ptr, &want, TOL, &format!("{rows} rows, {n} x {k}"));
@@ -290,9 +291,9 @@ fn the_fp8_block_projections_answer_the_dot() {
                 let bank = act_quant::Bank { codes, atoms, experts, n: n32, k: k32, elem, gran, alpha_e: 0, alpha_from };
                 act_quant::select(&ctx, "test", fmt, xr, routes, None, bank, &mut yr)
             }
-            3 => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, 128, &mut y).map(|took| assert!(took)),
+            3 => kernels_cuda::linear::gemv_fp8::fp8_block_gemv(&ctx, xt, codes, atoms, 128, &mut y).map(|took| assert!(took)),
             4 => matmul_fp8_w8a8(&ctx, xt, codes, atoms, &mut y),
-            6 => kernels_cuda::linear::lt_fp8::matmul(&ctx, "test", xt, codes, atoms, &mut y)
+            6 => kernels_cuda::linear::gemm::cublas_lt_fp8::matmul(&ctx, "test", xt, codes, atoms, &mut y)
                 .map(|took| assert!(took, "cuBLASLt takes {rows}x{n}x{k}")),
             _ => {
                 let mut routes = t(b.zeros(rg * 4), rows, groups, I32);
@@ -414,9 +415,15 @@ fn the_w8a16_projections_answer_the_dot() {
         let atoms = &s.scales.as_ref().expect("scaled").0;
         let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
         let (mut y, ctx) = (b.out(m, n), b.ctx().with_tuning(GEMV));
-        let took =
-            act_quant::fp8_block_gemv(&ctx, t(x, m, k, Bf16), codes, atoms, gran as u32, &mut y)
-                .expect("the GEMV fires");
+        let took = kernels_cuda::linear::gemv_fp8::fp8_block_gemv(
+            &ctx,
+            t(x, m, k, Bf16),
+            codes,
+            atoms,
+            gran as u32,
+            &mut y,
+        )
+        .expect("the GEMV fires");
         assert!(took, "{m}x{n}x{k} in {gran}s is a shape the GEMV reads");
         let want = dot(
             [m, n, k],

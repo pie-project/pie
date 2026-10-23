@@ -1318,7 +1318,7 @@ impl Run<'_> {
             }
             #[cfg(not(feature = "rocm"))]
             Some((codes, scales, biases, seat)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
-                kernels_cuda::linear::nvfp4::decoded_plane(
+                kernels_cuda::linear::dequant::nvfp4_plane(
                     self.ctx(),
                     op,
                     codes,
@@ -1329,12 +1329,12 @@ impl Run<'_> {
                     seat,
                 )
             }
-            Some((codes, scales, biases, seat)) => kernels_cuda::linear::quant::decoded_plane(
+            Some((codes, scales, biases, seat)) => kernels_cuda::linear::dequant::decoded_plane(
                 self.ctx(),
                 op,
                 codes,
                 scales,
-                kernels_cuda::linear::quant::OffsetKind::Post,
+                kernels_cuda::linear::affine::OffsetKind::Post,
                 biases,
                 poem_ir::Dtype::Bf16,
                 n,

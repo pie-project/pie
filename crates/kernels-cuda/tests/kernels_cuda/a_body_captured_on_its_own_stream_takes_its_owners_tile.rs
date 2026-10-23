@@ -19,7 +19,7 @@ const TILE: u64 = 4 << 20;
 fn a_body_captured_on_its_own_stream_takes_its_owners_tile() {
     let gpu = Gpu::open();
     let main = gpu.ctx();
-    kernels_cuda::linear::quant::warm_decoded_weight(&main, TILE).expect("the main tile warms");
+    kernels_cuda::linear::dequant::warm_decoded_weight(&main, TILE).expect("the main tile warms");
     let warmed = main
         .scratch_stream("test", DECODED_WEIGHT, TILE as usize)
         .expect("the warmed tile is there");

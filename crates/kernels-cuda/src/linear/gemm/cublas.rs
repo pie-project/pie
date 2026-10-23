@@ -23,9 +23,9 @@ use cudarc::runtime::sys::{
     cudaStreamSynchronize,
 };
 
-use super::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
+use crate::linear::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
 
 const fn dev(address: u64) -> *const c_void {
     address as usize as *const c_void

@@ -1,5 +1,6 @@
 pub mod gate;
 pub mod hc;
+pub mod hc_project;
 pub mod modulate;
 pub mod norm;
 pub mod norm_residual;

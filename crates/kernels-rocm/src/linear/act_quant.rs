@@ -10,8 +10,8 @@ use dtype::Dtype;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
+use crate::linear::dequant::DECODED_WEIGHT;
 use crate::linear::gemm;
-use crate::linear::quant::DECODED_WEIGHT;
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/act_quant.hip";

@@ -659,7 +659,7 @@ pub struct MoeMxfp4SelectLean;
 #[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
 pub struct GemmGroupedGemv;
 
-/// Whether a decode's few rows (`linear::quant::AFFINE_MMA_UNTIL`) of a
+/// Whether a decode's few rows (`linear::affine::AFFINE_MMA_UNTIL`) of a
 /// 4-bit MLX plane run on the mma.sync GEMV (`affine_w4a16_mma`), its codes
 /// read once for every row, rather than the per-row affine kernel. Off but
 /// where a chip's profile turns it on (A100's).

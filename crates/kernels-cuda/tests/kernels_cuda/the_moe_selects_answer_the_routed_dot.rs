@@ -10,7 +10,6 @@ use dtype::Dtype::{Bf16, E4m3, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{AlphaFrom, Bank, Format, Source, read_back, select};
 use kernels_cuda::linear::gemm_sm100::{Elem, Glu, supported};
 use kernels_cuda::linear::moe::{self, ExpertTable, GluBank, GroupSeat};
-use kernels_cuda::linear::nvfp4;
 use kernels_cuda::tuning::Tuning;
 
 const RES: ExpertTable = ExpertTable::RESIDENT;
@@ -123,7 +122,7 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
             let bias = t(bias, ex, n, Bf16);
             moe::matmul_select_bias(&ctx, x, mx, sc, bias, r, &mut y, SEAT)
         }
-        (K::Nv, _) => nvfp4::matmul_select(&ctx, x, nvc, sc, nvt, r, &mut y, SEAT),
+        (K::Nv, _) => moe::select_nvfp4(&ctx, x, nvc, sc, nvt, r, &mut y, SEAT),
         (K::Atoms, _) => {
             let xb = read_back(&ctx, "test", fmt, Source::rows(x, None), back).expect("reads");
             a = b.read(back, rows_x * k);
@@ -641,7 +640,7 @@ fn nvfp4_select_rate() {
                 };
                 moe::select_glu(&ctx, xt, bank, rt, y, Glu::Swiglu, RES).map(|_| ())
             } else {
-                nvfp4::matmul_select(&ctx, xt, c, s, tt, rt, y, SEAT)
+                moe::select_nvfp4(&ctx, xt, c, s, tt, rt, y, SEAT)
             }
         };
         fire(&mut y).expect("fires");
