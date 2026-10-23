@@ -79,7 +79,8 @@ pub trait Sink {
 
 /// The engine's terms an entry plans its splits within: what a PE holds,
 /// how far a phase spreads, the placement in force and how bf16 operands
-/// are stored. Entries choose their splits by these; the engine sets them.
+/// are stored. The engine sets them, and chooses tiles and grids by them;
+/// the planners still in the entries read them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fabric {
     /// The most data words one phase places on a PE altogether (its share
@@ -128,6 +129,17 @@ pub struct Footprint {
     pub per_col: u64,
     pub whole: u64,
     pub unit: u32,
+}
+
+/// A product `y[m, n] = act[m, k] · w[n, k]ᵀ`, for the engine to choose the
+/// grid of PEs it spreads over; `packed` when the weight is held two bf16
+/// a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Product {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub packed: bool,
 }
 
 impl Default for Fabric {

@@ -22,7 +22,7 @@ use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
     Buf, Fabric, FabricOp, FabricReduce, Footprint, Guarded, HostPhase, LanePlan, PageSource,
-    Phase, Shard, Sink,
+    Phase, Product, Shard, Sink,
 };
 
 mod table;
@@ -129,6 +129,67 @@ pub fn tile(fabric: &Fabric, op: &'static str, footprint: Footprint) -> Result<(
             ),
         )
     })
+}
+
+/// A grid `(rg, cg, kg)` with its `(words moved, PEs)` key.
+type GridPick = ((u32, u32, u32), (u64, u32));
+
+/// The `(row groups, column groups, depth groups)` grid of PEs a `m × k`
+/// by `n × k` product spreads over. PE `(r, c, d)` holds rows `r` and depth
+/// slice `d` of the activations, weight rows `c` at depth `d`, and a
+/// partial sum of output block `(r, c)`, which the host adds over `d`: the
+/// words moved are the activations once per column group, the weight once
+/// per row group, and the output once per depth group. The grid moving the
+/// fewest words whose shares fit [`Fabric::pe_words`] (arrays within
+/// `ARRAY_WORDS`) on at most [`Fabric::max_pes`] PEs wins, the fewer PEs the
+/// better among equals.
+pub fn grid(fab: &Fabric, product: Product) -> Option<(u32, u32, u32)> {
+    use kernels_cerebras::linear::gemm::{ARRAY_WORDS, FABRIC_SUM_WORDS};
+    let Product { m, k, n, packed } = product;
+    // A weight no row of PEs holds (the vocabulary projection, by default)
+    // is multiplied on the host.
+    let per = if packed { 2 } else { 1 };
+    if u64::from(n) * u64::from(k) / per > u64::from(fab.max_pes) * fab.shard_words {
+        return None;
+    }
+    let budget = fab.pe_words;
+    let most = fab.max_pes;
+    let fabric = fab.fabric_sum;
+    let divisors = |x: u32| (1..=x).filter(move |d| x.is_multiple_of(*d));
+    let (m64, k64, n64) = (u64::from(m), u64::from(k), u64::from(n));
+    let mut best: Option<GridPick> = None;
+    for rg in divisors(m) {
+        for cg in divisors(n) {
+            for kg in divisors(k) {
+                if packed && !(k / kg).is_multiple_of(2) {
+                    continue;
+                }
+                let a = (m64 / u64::from(rg)) * (k64 / u64::from(kg));
+                let w = (n64 / u64::from(cg)) * (k64 / u64::from(kg)) / per;
+                let y = (m64 / u64::from(rg)) * (n64 / u64::from(cg));
+                let extra = if kg > 1 && fabric {
+                    y + FABRIC_SUM_WORDS
+                } else {
+                    0
+                };
+                if a.max(w).max(y) > ARRAY_WORDS
+                    || a + w + y + extra > budget
+                    || rg * cg * kg > most
+                {
+                    continue;
+                }
+                let moved = m64 * k64 * u64::from(cg)
+                    + n64 * k64 * u64::from(rg)
+                    + m64 * n64 * u64::from(kg);
+                let key = (moved, rg * cg * kg);
+                if best.is_none_or(|(_, k)| key < k) {
+                    best = Some(((rg, cg, kg), key));
+                }
+                break;
+            }
+        }
+    }
+    best.map(|(g, _)| g)
 }
 
 /// What places a fire's operand handles on the program's buffers: the

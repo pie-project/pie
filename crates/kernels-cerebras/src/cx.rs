@@ -14,7 +14,7 @@ use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
     Buf, Fabric, FabricOp, FabricReduce, FabricStep, Footprint, Guarded, HostOp, HostPhase,
-    LanePlan, PagePlan, PageSource, Phase, Reduce, Shard, Sink,
+    LanePlan, PagePlan, PageSource, Phase, Product, Reduce, Shard, Sink,
 };
 use crate::tensor::Tensor;
 
@@ -30,6 +30,10 @@ pub trait Emit {
     /// The `(row groups, column groups)` the engine spreads a row-wise op of
     /// this footprint over.
     fn tile(&self, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error>;
+
+    /// The `(row groups, column groups, depth groups)` the engine spreads a
+    /// product over; `None` multiplies it on the host.
+    fn grid(&self, product: Product) -> Option<(u32, u32, u32)>;
 
     /// Names what is emitted next (the op a dispatch is lowering).
     fn scope(&self, name: &str) {
@@ -48,8 +52,8 @@ pub struct View {
     pub rows: u32,
 }
 
-/// A kernel's view: the phase under construction and the engine's sink. Derefs to the phase body [`Block`], so a kernel emits with
-/// `cx.line(..)`.
+/// A kernel's view: the phase under construction and the engine's sink.
+/// Derefs to the phase body [`Block`], so a kernel emits with `cx.line(..)`.
 pub struct Cx<'a> {
     p: &'a mut dyn Sink,
     phase: Func,

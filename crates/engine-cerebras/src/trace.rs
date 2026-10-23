@@ -18,10 +18,11 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use crate::fabric::{Emitting, Operands, Program, Rendered, elem_of};
 use dtype::Dtype;
 use kernels_cerebras::phase::{BankSplit, Buf, ColPlane, HostOp, HostPhase, Reduce, Segment};
 use kernels_cerebras::{Cx, Emit, Tensor, View};
+
+use crate::fabric::{Emitting, Operands, Program, Rendered, elem_of};
 
 /// Where a root's value comes from when the program first reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1405,6 +1406,10 @@ impl Emit for Tracer<'_> {
         footprint: kernels_cerebras::phase::Footprint,
     ) -> Result<(u32, u32), kernels_cerebras::Error> {
         crate::fabric::tile(&self.fabric, op, footprint)
+    }
+
+    fn grid(&self, product: kernels_cerebras::phase::Product) -> Option<(u32, u32, u32)> {
+        crate::fabric::grid(&self.fabric, product)
     }
 
     fn scope(&self, name: &str) {

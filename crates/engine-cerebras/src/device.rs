@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::fabric::{Manifest, Rendered};
 use dtype::Dtype;
 use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, HostPhase, Reduce, Segment, picks};
 
 use crate::error::{Fault, Result};
+use crate::fabric::{Manifest, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Target};
 use crate::trace::Signature;
 

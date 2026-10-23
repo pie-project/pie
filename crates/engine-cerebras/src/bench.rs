@@ -10,11 +10,10 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use dtype::Dtype;
-use kernels_cerebras::phase::{Fabric, Footprint};
+use kernels_cerebras::phase::{Fabric, Footprint, Product};
 use kernels_cerebras::{Cx, Emit, Error, Tensor, View};
 
 use crate::fabric::{Emitting, Operands, Program, Rendered};
-
 use crate::sdk::{Arch, Compile, Cslc, Sdk};
 
 /// One simulator at a time on this box: runs are serialised across threads
@@ -303,6 +302,10 @@ impl Emit for Recorder {
 
     fn tile(&self, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error> {
         crate::fabric::tile(&self.fabric, op, footprint)
+    }
+
+    fn grid(&self, product: Product) -> Option<(u32, u32, u32)> {
+        crate::fabric::grid(&self.fabric, product)
     }
 
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {
