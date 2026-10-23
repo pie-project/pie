@@ -3,3 +3,5 @@
 pub mod glu;
 pub mod kquant;
 pub mod moe;
+pub mod qmm;
+pub mod qmv;

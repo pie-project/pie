@@ -80,10 +80,23 @@ impl Arg for f32 {
     }
 }
 
+/// The language an engine runs kernels-slang's modules in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// engine-vulkan.
+    Spirv,
+    /// engine-wgpu.
+    Wgsl,
+}
+
 pub trait Encode {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error>;
 
     fn absent(&self) -> Result<ArgValue, Error>;
+
+    /// The target this engine's modules are built for: a WGSL kernel lands
+    /// bf16 a word at a time, so its host refuses what a word would tear.
+    fn target(&self) -> Target;
 }
 
 pub type Ctx<'a> = dyn Encode + 'a;

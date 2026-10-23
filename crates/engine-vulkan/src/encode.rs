@@ -310,6 +310,10 @@ impl kernels_slang::Encode for Slang<'_> {
         self.0.fire(fire, &args).map_err(slang_error)
     }
 
+    fn target(&self) -> kernels_slang::Target {
+        kernels_slang::Target::Spirv
+    }
+
     fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
         match self.0.absent().map_err(slang_error)? {
             ArgValue::Buffer(h) => Ok(kernels_slang::ArgValue::Buffer(h)),
