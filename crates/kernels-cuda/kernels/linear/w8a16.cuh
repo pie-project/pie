@@ -2,6 +2,7 @@
 
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
+#include "prim/smem.cuh"
 
 #include <cuda_bf16.h>
 
@@ -16,10 +17,6 @@ __device__ __forceinline__ long long atom_offset(int row, int col, int cols) {
     const int atoms_k = (cols + 3) / 4;
     return (static_cast<long long>(row / 128) * atoms_k + col / 4) * 512 + (row % 32) * 16
         + ((row / 32) % 4) * 4 + col % 4;
-}
-
-__device__ __forceinline__ unsigned smem_addr(const void* p) {
-    return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
 
 __device__ __forceinline__ void cp_async16(unsigned dst, const void* src, int bytes) {

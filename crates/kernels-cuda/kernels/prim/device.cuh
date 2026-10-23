@@ -51,6 +51,9 @@ __device__ __forceinline__ unsigned int pack_bf16x2(float lo, float hi) {
 
 __device__ __forceinline__ unsigned short bf16_as_u16(bf16 v) { return v.raw; }
 __device__ __forceinline__ bf16 u16_as_bf16(unsigned short v) { return bf16{v}; }
+__device__ __forceinline__ unsigned int bf16x2_as_u32(bf16 lo, bf16 hi) {
+    return (static_cast<unsigned int>(hi.raw) << 16) | lo.raw;
+}
 
 __device__ __forceinline__ bf16 f32_to_bf16_rd(float f) {
     const unsigned int b = __float_as_int(f);

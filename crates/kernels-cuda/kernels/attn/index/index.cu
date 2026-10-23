@@ -475,10 +475,6 @@ constexpr int kWarps = kBlock / 32;
 constexpr int kKeys = 16;
 constexpr int kNt = kKeys / 8;  // a chunk's 8-key mma column tiles
 
-__device__ __forceinline__ std::uint32_t smem_addr(const void* p) {
-    return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
-}
-
 }
 
 // namespace index_mma
@@ -649,19 +645,11 @@ __global__ void index_topk_paged_mma(
 #pragma unroll
         for (int k0 = 0; k0 < kD; k0 += 16) {
             std::uint32_t a[4];
-            {
-                const T* rp = q_s + (ht * 16 + (lane & 15)) * kLd + k0 + ((lane & 16) ? 8 : 0);
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-                             : "r"(smem_addr(rp)));
-            }
+            ld_a(a, q_s + ht * 16 * kLd + k0, kLd, lane);
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 std::uint32_t b[2];
-                const T* rp = ks + (nt * 8 + (lane & 7)) * kLd + k0 + ((lane & 8) ? 8 : 0);
-                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                             : "=r"(b[0]), "=r"(b[1])
-                             : "r"(smem_addr(rp)));
+                ld_b(b, ks + nt * 8 * kLd + k0, kLd, lane);
                 mma_m16n8k16(acc[nt], a, b);
             }
         }

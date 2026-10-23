@@ -1,4 +1,5 @@
 #include "prim/device.cuh"
+#include "prim/mma.cuh"
 
 // A paged decode on tensor cores, a whole GQA group a tile: one block reads
 // one (request, kv head, kv chunk) of the decode plan the FA2 decode kernel
@@ -60,34 +61,6 @@ __device__ __forceinline__ void mma(float (&d)[4], const unsigned (&a)[4], unsig
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void ldsm4(unsigned (&r)[4], const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void ldsm4_t(unsigned (&r)[4], const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void ldsm2(unsigned& r0, unsigned& r1, const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                 : "=r"(r0), "=r"(r1)
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void ldsm2_t(unsigned& r0, unsigned& r1, const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
-                 : "=r"(r0), "=r"(r1)
-                 : "r"(addr));
-}
-
 __device__ __forceinline__ void cp16(void* dst, const void* src, bool live) {
     const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
@@ -101,12 +74,6 @@ __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_grou
 template <int N>
 __device__ __forceinline__ void cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
-}
-
-__device__ __forceinline__ unsigned pack(float lo, float hi) {
-    unsigned bits;
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(bits) : "f"(lo), "f"(hi));
-    return bits;
 }
 
 template <int HEAD_DIM, int MT, int WARPS, int STAGES, bool FP8 = false, bool SWZ = false>
@@ -293,8 +260,8 @@ __device__ __forceinline__ void decode_body(
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 const unsigned x = words[u];
-                out[2 * u] = pack(e4m3_to_f32(x & 0xff), e4m3_to_f32((x >> 8) & 0xff));
-                out[2 * u + 1] = pack(e4m3_to_f32((x >> 16) & 0xff), e4m3_to_f32(x >> 24));
+                out[2 * u] = pack_bf16x2(e4m3_to_f32(x & 0xff), e4m3_to_f32((x >> 8) & 0xff));
+                out[2 * u + 1] = pack_bf16x2(e4m3_to_f32((x >> 16) & 0xff), e4m3_to_f32(x >> 24));
             }
             uint4* dst = reinterpret_cast<uint4*>(ks + half * Sh::TILE_ELEMS + r * LD + c * 16);
             dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
@@ -344,13 +311,13 @@ __device__ __forceinline__ void decode_body(
             for (int x = 0; x < 4; ++x) s[mt][x] = 0.f;
 #pragma unroll
             for (int kc = 0; kc < DT; ++kc) {
-                unsigned a[4], b0, b1;
-                ldsm4(a, ks + kv_at(mt * 16 + (lane & 15), kc * 2 + (lane >> 4)));
-                ldsm2(b0, b1, qs + (lane & 7) * LD + kc * 16 + (((lane >> 3) & 1) << 3));
+                unsigned a[4], b[2];
+                ldmatrix_x4(a, ks + kv_at(mt * 16 + (lane & 15), kc * 2 + (lane >> 4)));
+                ld_b(b, qs + kc * 16, LD, lane);
                 if (kc & 1) {
-                    mma(s2, a, b0, b1);
+                    mma(s2, a, b[0], b[1]);
                 } else {
-                    mma(s[mt], a, b0, b1);
+                    mma(s[mt], a, b[0], b[1]);
                 }
             }
 #pragma unroll
@@ -395,21 +362,21 @@ __device__ __forceinline__ void decode_body(
             l0 += p0 + p2;
             l1 += p1 + p3;
             // P as [key][head] bf16, the B operand's storage.
-            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g) * 8 + 2 * t) = pack(p0, p1);
-            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g + 8) * 8 + 2 * t) = pack(p2, p3);
+            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g) * 8 + 2 * t) = pack_bf16x2(p0, p1);
+            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g + 8) * 8 + 2 * t) = pack_bf16x2(p2, p3);
         }
         __syncwarp();
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
-            unsigned b0, b1;
-            ldsm2_t(b0, b1, ps + (mt * 16 + (lane & 7) + (((lane >> 3) & 1) << 3)) * 8);
+            unsigned b[2];
+            ld_b_trans(b, ps + mt * 16 * 8, 8, lane);
 #pragma unroll
             for (int d = 0; d < DT; ++d) {
                 unsigned a[4];
                 // V^T as the A operand: V's rows are keys (k), its columns
                 // the value dims (m).
-                ldsm4_t(a, vs + kv_at(mt * 16 + (lane & 7) + ((lane >> 4) << 3), d * 2 + ((lane >> 3) & 1)));
-                mma(o_acc[d], a, b0, b1);
+                ldmatrix_x4_trans(a, vs + kv_at(mt * 16 + (lane & 7) + ((lane >> 4) << 3), d * 2 + ((lane >> 3) & 1)));
+                mma(o_acc[d], a, b[0], b[1]);
             }
         }
         __syncwarp();
@@ -510,8 +477,8 @@ __device__ __forceinline__ void decode_body(
             for (int x = 0; x < 4; ++x) out[x] *= sc;
         }
         uint2 packed;
-        packed.x = pack(out[0], out[1]);
-        packed.y = pack(out[2], out[3]);
+        packed.x = pack_bf16x2(out[0], out[1]);
+        packed.y = pack_bf16x2(out[2], out[3]);
         *reinterpret_cast<uint2*>(o + row * HEAD_DIM + d) = packed;
         if (lse != nullptr && d == 0) lse[row] = lse_v;
     }

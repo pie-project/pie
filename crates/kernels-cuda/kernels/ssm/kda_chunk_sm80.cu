@@ -56,7 +56,7 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) kda_chunk_prep(
     float* xch = As + KDA_CH * (KDA_CH + 1);
 
     auto store4 = [&](bf16* at, float a, float b, float cc, float d) {
-        *reinterpret_cast<uint2*>(at) = make_uint2(gdn_pack(a, b), gdn_pack(cc, d));
+        *reinterpret_cast<uint2*>(at) = make_uint2(pack_bf16x2(a, b), pack_bf16x2(cc, d));
     };
     auto row_at = [&](int i) { return static_cast<long long>(ta + (i < L ? i : 0) + row0); };
     // The task's rows land in shared memory at once, each in the tile it
@@ -214,16 +214,12 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) kda_chunk_prep(
         float qkc[4] = {};
         #pragma unroll
         for (int kk = 0; kk < D / 16; ++kk) {
-            unsigned a[4], aq[4], b0, b1;
-            gdn_ldsm(a, gdn_at_a(kr, GDN_LD, 0, kk * 16, l));
-            gdn_ldsm(aq, gdn_at_a(qr, GDN_LD, 0, kk * 16, l));
-            const bf16* brow = kc + (hw * 8 + (l & 7)) * GDN_LD + kk * 16 + (((l >> 3) & 1) << 3);
-            const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(brow));
-            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                         : "=r"(b0), "=r"(b1)
-                         : "r"(addr));
-            gdn_mma(acc, a, b0, b1);
-            gdn_mma(qkc, aq, b0, b1);
+            unsigned a[4], aq[4], b[2];
+            ldmatrix_x4(a, gdn_at_a(kr, GDN_LD, 0, kk * 16, l));
+            ldmatrix_x4(aq, gdn_at_a(qr, GDN_LD, 0, kk * 16, l));
+            ld_b(b, kc + hw * 8 * GDN_LD + kk * 16, GDN_LD, l);
+            gdn_mma(acc, a, b[0], b[1]);
+            gdn_mma(qkc, aq, b[0], b[1]);
         }
         bf16* pd = p_out + (static_cast<long long>(s) * H + h) * KDA_CH * KDA_CH;
         #pragma unroll
@@ -234,7 +230,7 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) kda_chunk_prep(
             const bool live = i < L;
             const float p0 = live && jj <= i ? qkc[2 * half] : 0.f;
             const float p1 = live && jj + 1 <= i ? qkc[2 * half + 1] : 0.f;
-            *reinterpret_cast<unsigned*>(pd + i * KDA_CH + jj) = gdn_pack(p0, p1);
+            *reinterpret_cast<unsigned*>(pd + i * KDA_CH + jj) = pack_bf16x2(p0, p1);
             As[i * (KDA_CH + 1) + jj] = live && jj < i ? acc[2 * half] * bi : 0.f;
             As[i * (KDA_CH + 1) + jj + 1] = live && jj + 1 < i ? acc[2 * half + 1] * bi : 0.f;
         }
@@ -453,14 +449,14 @@ __device__ __forceinline__ void kda16_walk(
         #pragma unroll
         for (int kk = 0; kk < BK / 16; ++kk) {
             unsigned bq[4], bw[4];
-            gdn_ldsm(bq, at_tok(sq, GDN_LD, kk * 16));
-            gdn_ldsm(bw, at_tok(sw, GDN_LD, kk * 16));
+            ldmatrix_x4(bq, at_tok(sq, GDN_LD, kk * 16));
+            ldmatrix_x4(bw, at_tok(sw, GDN_LD, kk * 16));
             #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
-                const unsigned a[4] = {gdn_pack(hacc[nb][2 * kk][0], hacc[nb][2 * kk][1]),
-                                       gdn_pack(hacc[nb][2 * kk][2], hacc[nb][2 * kk][3]),
-                                       gdn_pack(hacc[nb][2 * kk + 1][0], hacc[nb][2 * kk + 1][1]),
-                                       gdn_pack(hacc[nb][2 * kk + 1][2], hacc[nb][2 * kk + 1][3])};
+                const unsigned a[4] = {pack_bf16x2(hacc[nb][2 * kk][0], hacc[nb][2 * kk][1]),
+                                       pack_bf16x2(hacc[nb][2 * kk][2], hacc[nb][2 * kk][3]),
+                                       pack_bf16x2(hacc[nb][2 * kk + 1][0], hacc[nb][2 * kk + 1][1]),
+                                       pack_bf16x2(hacc[nb][2 * kk + 1][2], hacc[nb][2 * kk + 1][3])};
                 gdn_mma(oh[nb][0], a, bq[0], bq[1]);
                 gdn_mma(oh[nb][1], a, bq[2], bq[3]);
                 gdn_mma(wh[nb][0], a, bw[0], bw[1]);
@@ -472,17 +468,17 @@ __device__ __forceinline__ void kda16_walk(
         unsigned vn[NB][4];
         {
             unsigned bt[4];
-            gdn_ldsm(bt, at_tok(st, KDA16_LDT, 0));
+            ldmatrix_x4(bt, at_tok(st, KDA16_LDT, 0));
             #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 unsigned x[4];
-                gdn_ldsm_t(x, at_tok(su, LDV, cw + 16 * nb));
+                ldmatrix_x4_trans(x, at_tok(su, LDV, cw + 16 * nb));
                 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
                     #pragma unroll
                     for (int half = 0; half < 2; ++half) {
                         const float2 vv = gdn_unpack(x[2 * nt + half]);
-                        x[2 * nt + half] = gdn_pack(vv.x - wh[nb][nt][2 * half], vv.y - wh[nb][nt][2 * half + 1]);
+                        x[2 * nt + half] = pack_bf16x2(vv.x - wh[nb][nt][2 * half], vv.y - wh[nb][nt][2 * half + 1]);
                     }
                 }
                 float o[2][4] = {};
@@ -492,7 +488,7 @@ __device__ __forceinline__ void kda16_walk(
                 for (int nt = 0; nt < 2; ++nt) {
                     #pragma unroll
                     for (int half = 0; half < 2; ++half) {
-                        vn[nb][2 * nt + half] = gdn_pack(o[nt][2 * half], o[nt][2 * half + 1]);
+                        vn[nb][2 * nt + half] = pack_bf16x2(o[nt][2 * half], o[nt][2 * half + 1]);
                     }
                 }
             }
@@ -501,7 +497,7 @@ __device__ __forceinline__ void kda16_walk(
         // `+ v_new^T P^T`, out.
         {
             unsigned bp[4];
-            gdn_ldsm(bp, at_tok(sp, KDA16_LDT, 0));
+            ldmatrix_x4(bp, at_tok(sp, KDA16_LDT, 0));
             #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 gdn_mma(oh[nb][0], vn[nb], bp[0], bp[1]);
@@ -524,7 +520,7 @@ __device__ __forceinline__ void kda16_walk(
         #pragma unroll
         for (int np = 0; np < BK / 16; ++np) {
             unsigned b[4];
-            gdn_ldsm_t(b, gdn_at_b(sk, GDN_LD, 0, np * 16, l));
+            ldmatrix_x4_trans(b, gdn_at_b(sk, GDN_LD, 0, np * 16, l));
             #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 const float2 d = *reinterpret_cast<const float2*>(sg + (2 * np + j) * 8 + 2 * t);

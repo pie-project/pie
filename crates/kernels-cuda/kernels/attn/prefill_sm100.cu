@@ -382,7 +382,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 u32 out[16];
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
-                    out[i] = pack_bf16(__uint_as_float(v[2 * i]) * inv,
+                    out[i] = pack_bf16x2(__uint_as_float(v[2 * i]) * inv,
                                        __uint_as_float(v[2 * i + 1]) * inv);
                 }
                 // 32 bytes a store, a whole sector.
@@ -646,7 +646,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                     const float e0 = fma_pipe ? ex2_fma(x0) : ex2(x0);
                     const float e1 = fma_pipe ? ex2_fma(x1) : ex2(x1);
                     s2[(c >> 1) & 3] = add_f32x2(s2[(c >> 1) & 3], f32x2(e0, e1));
-                    pk[c / 2] = pack_bf16(e0, e1);
+                    pk[c / 2] = pack_bf16x2(e0, e1);
                 }
                 float sum = 0.f;
 #pragma unroll
@@ -1160,7 +1160,7 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill_wide(
                     const float e0 = ex2(fmaf(s[c + i], p.scale_log2, -base));
                     const float e1 = ex2(fmaf(s[c + i + 1], p.scale_log2, -base));
                     s4[(i >> 1) & 3] += e0 + e1;
-                    pk[i / 2] = pack_bf16(e0, e1);
+                    pk[i / 2] = pack_bf16x2(e0, e1);
                 }
                 tmem_st32(tmem + lane_base + kColS + st * kBKV + c / 2, pk);
             }
@@ -1232,7 +1232,7 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill_wide(
                 u32 out[16];
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
-                    out[i] = pack_bf16(__uint_as_float(v[2 * i]) * inv,
+                    out[i] = pack_bf16x2(__uint_as_float(v[2 * i]) * inv,
                                        __uint_as_float(v[2 * i + 1]) * inv);
                 }
                 uint4* o4 = reinterpret_cast<uint4*>(dst + c);

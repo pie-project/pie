@@ -492,11 +492,11 @@ __global__ void moe_matmul_select_nvfp4_mma(
 #pragma unroll
         for (int kk = 0; kk < kTileK; kk += 16) {
             unsigned bfrag[4];
-            pie_ldmatrix_x4(bfrag, &w_tile[warp * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + (((lane >> 3) & 1) << 3)]);
+            ldmatrix_x4(bfrag, &w_tile[warp * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + (((lane >> 3) & 1) << 3)]);
 #pragma unroll
             for (int bt = 0; bt < kBatches; ++bt) {
                 unsigned afrag[4];
-                pie_ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
+                ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
                 pie_mma_bf16_16816(acc[bt][0], afrag, bfrag[0], bfrag[1]);
                 pie_mma_bf16_16816(acc[bt][1], afrag, bfrag[2], bfrag[3]);
             }

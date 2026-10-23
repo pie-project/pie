@@ -27,45 +27,6 @@ constexpr int kWarps = 4;
 constexpr int kThreads = kWarps * 32;
 constexpr int kKeys = 16;
 
-__device__ __forceinline__ std::uint32_t pack2(float lo, float hi) {
-    const __nv_bfloat16 l = __float2bfloat16(lo), h = __float2bfloat16(hi);
-    std::uint16_t a, b;
-    std::memcpy(&a, &l, 2);
-    std::memcpy(&b, &h, 2);
-    return static_cast<std::uint32_t>(a) | (static_cast<std::uint32_t>(b) << 16);
-}
-
-__device__ __forceinline__ std::uint32_t smem_addr(const void* p) {
-    return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
-}
-
-// A: 16 rows of `base` (row pitch `ld`), 16 columns from `k0`.
-__device__ __forceinline__ void ld_a(std::uint32_t (&a)[4], const __nv_bfloat16* base, int ld,
-                                     int lane, int k0) {
-    const __nv_bfloat16* r = base + (lane & 15) * ld + k0 + ((lane & 16) ? 8 : 0);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-                 : "r"(smem_addr(r)));
-}
-
-// B of S = Q K^T: 8 keys (rows of `base`) by 16 dims from `k0`.
-__device__ __forceinline__ void ld_b_k(std::uint32_t (&b)[2], const __nv_bfloat16* base, int ld,
-                                       int lane, int k0) {
-    const __nv_bfloat16* r = base + (lane & 7) * ld + k0 + ((lane & 8) ? 8 : 0);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                 : "=r"(b[0]), "=r"(b[1])
-                 : "r"(smem_addr(r)));
-}
-
-// B of O = P V: 16 keys (rows of `base`) by 8 dims from `n0`.
-__device__ __forceinline__ void ld_b_v(std::uint32_t (&b)[2], const __nv_bfloat16* base, int ld,
-                                       int lane, int n0) {
-    const __nv_bfloat16* r = base + (lane & 15) * ld + n0;
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
-                 : "=r"(b[0]), "=r"(b[1])
-                 : "r"(smem_addr(r)));
-}
-
 template <int D>
 struct Shape {
     static constexpr int kLd = D + 8;
@@ -197,11 +158,11 @@ __global__ __launch_bounds__(kThreads) void sdpa_paged_selected_mma_kernel(
 #pragma unroll 4
         for (int k0 = 0; k0 < D; k0 += 16) {
             std::uint32_t a[4];
-            ld_a(a, sQ, kLd, lane, k0);
+            ld_a(a, sQ + k0, kLd, lane);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
                 std::uint32_t b[2];
-                ld_b_k(b, sK + nt * 8 * kLd, kLd, lane, k0);
+                ld_b(b, sK + nt * 8 * kLd + k0, kLd, lane);
                 mma_m16n8k16(sacc[nt], a, b);
             }
         }
@@ -241,10 +202,10 @@ __global__ __launch_bounds__(kThreads) void sdpa_paged_selected_mma_kernel(
         l_lo = l_lo * c_lo + pr[0][0] + pr[0][1] + pr[1][0] + pr[1][1];
         l_hi = l_hi * c_hi + pr[0][2] + pr[0][3] + pr[1][2] + pr[1][3];
         const std::uint32_t pa[4] = {
-            pack2(pr[0][0], pr[0][1]),
-            pack2(pr[0][2], pr[0][3]),
-            pack2(pr[1][0], pr[1][1]),
-            pack2(pr[1][2], pr[1][3]),
+            pack_bf16x2(pr[0][0], pr[0][1]),
+            pack_bf16x2(pr[0][2], pr[0][3]),
+            pack_bf16x2(pr[1][0], pr[1][1]),
+            pack_bf16x2(pr[1][2], pr[1][3]),
         };
 #pragma unroll
         for (int n = 0; n < kNTiles; ++n) {
@@ -253,7 +214,7 @@ __global__ __launch_bounds__(kThreads) void sdpa_paged_selected_mma_kernel(
             oacc[n][2] *= c_hi;
             oacc[n][3] *= c_hi;
             std::uint32_t b[2];
-            ld_b_v(b, sV, kLd, lane, n * 8);
+            ld_b_trans(b, sV + n * 8, kLd, lane);
             mma_m16n8k16(oacc[n], pa, b);
         }
         __syncwarp();
@@ -513,11 +474,11 @@ __global__ __launch_bounds__(Tile<D>::kThreads) void sdpa_paged_selected_tile_ke
 #pragma unroll 4
             for (int k0 = 0; k0 < D; k0 += 16) {
                 std::uint32_t a[4];
-                ld_a(a, sQ + warp * 16 * kLd, kLd, lane, k0);
+                ld_a(a, sQ + warp * 16 * kLd + k0, kLd, lane);
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
                     std::uint32_t b[2];
-                    ld_b_k(b, sK + nt * 8 * kLd, kLd, lane, k0);
+                    ld_b(b, sK + nt * 8 * kLd + k0, kLd, lane);
                     mma_m16n8k16(sacc[nt], a, b);
                 }
             }
@@ -562,10 +523,10 @@ __global__ __launch_bounds__(Tile<D>::kThreads) void sdpa_paged_selected_tile_ke
             l_lo = l_lo * c_lo + pr[0][0] + pr[0][1] + pr[1][0] + pr[1][1];
             l_hi = l_hi * c_hi + pr[0][2] + pr[0][3] + pr[1][2] + pr[1][3];
             const std::uint32_t pa[4] = {
-                pack2(pr[0][0], pr[0][1]),
-                pack2(pr[0][2], pr[0][3]),
-                pack2(pr[1][0], pr[1][1]),
-                pack2(pr[1][2], pr[1][3]),
+                pack_bf16x2(pr[0][0], pr[0][1]),
+                pack_bf16x2(pr[0][2], pr[0][3]),
+                pack_bf16x2(pr[1][0], pr[1][1]),
+                pack_bf16x2(pr[1][2], pr[1][3]),
             };
 #pragma unroll
             for (int n = 0; n < kNTiles; ++n) {
@@ -574,7 +535,7 @@ __global__ __launch_bounds__(Tile<D>::kThreads) void sdpa_paged_selected_tile_ke
                 oacc[n][2] *= c_hi;
                 oacc[n][3] *= c_hi;
                 std::uint32_t b[2];
-                ld_b_v(b, sV, kLd, lane, n * 8);
+                ld_b_trans(b, sV + n * 8, kLd, lane);
                 mma_m16n8k16(oacc[n], pa, b);
             }
             __syncthreads();

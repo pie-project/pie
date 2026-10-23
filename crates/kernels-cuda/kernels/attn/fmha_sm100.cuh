@@ -1,5 +1,6 @@
 #pragma once
 
+#include "prim/device.cuh"
 #include "prim/mma_sm100.cuh"
 
 namespace pie::attn::fmha {
@@ -42,12 +43,6 @@ struct Params {
 __host__ __device__ constexpr u32 smem_bytes(int d, int bkv, int stages, int dv = 0) {
     // The K and V rings, then barriers and O's scales; 1024-aligned.
     return u32(stages) * u32(d / 64 + (dv > 0 ? dv : d) / 64) * u32(bkv) * 128u + 1024u + 1024u;
-}
-
-__device__ __forceinline__ u32 pack_bf16(float lo, float hi) {
-    u32 bits;
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(bits) : "f"(lo), "f"(hi));
-    return bits;
 }
 
 __device__ __forceinline__ float neg_inf() { return __int_as_float(0xff800000); }

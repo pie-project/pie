@@ -10,6 +10,8 @@
 // (lane << 16) | column. A warp reaches the 32 lanes of its own quarter,
 // warp % 4, and no others.
 
+#include "prim/smem.cuh"
+
 namespace pie::tc5 {
 
 typedef unsigned int u32;
@@ -19,10 +21,6 @@ typedef unsigned long long u64;
 struct alignas(64) TmaMap {
     u64 raw[16];
 };
-
-__device__ __forceinline__ u32 smem_addr(const void* p) {
-    return static_cast<u32>(__cvta_generic_to_shared(p));
-}
 
 __device__ __forceinline__ u32 lane_id() {
     u32 lane;

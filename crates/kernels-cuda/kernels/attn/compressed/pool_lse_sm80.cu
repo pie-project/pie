@@ -160,11 +160,11 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
 #pragma unroll
         for (int k0 = warp * kWarpDims; k0 < (warp + 1) * kWarpDims; k0 += 16) {
             std::uint32_t a[4];
-            ld_a(a, sQ, kLd, lane, k0);
+            ld_a(a, sQ + k0, kLd, lane);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
                 std::uint32_t b[2];
-                ld_b_k(b, sK + nt * 8 * kLd, kLd, lane, k0);
+                ld_b(b, sK + nt * 8 * kLd + k0, kLd, lane);
                 mma_m16n8k16(sacc[nt], a, b);
             }
         }
@@ -226,10 +226,10 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
         l_lo = l_lo * c_lo + rl;
         l_hi = l_hi * c_hi + rh;
         const std::uint32_t pa[4] = {
-            pack2(pr[0][0], pr[0][1]),
-            pack2(pr[0][2], pr[0][3]),
-            pack2(pr[1][0], pr[1][1]),
-            pack2(pr[1][2], pr[1][3]),
+            pack_bf16x2(pr[0][0], pr[0][1]),
+            pack_bf16x2(pr[0][2], pr[0][3]),
+            pack_bf16x2(pr[1][0], pr[1][1]),
+            pack_bf16x2(pr[1][2], pr[1][3]),
         };
 #pragma unroll
         for (int n = 0; n < kWarpTiles; ++n) {
@@ -238,7 +238,7 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
             oacc[n][2] *= c_hi;
             oacc[n][3] *= c_hi;
             std::uint32_t b[2];
-            ld_b_v(b, sK, kLd, lane, warp * kWarpDims + n * 8);
+            ld_b_trans(b, sK + warp * kWarpDims + n * 8, kLd, lane);
             mma_m16n8k16(oacc[n], pa, b);
         }
         // Every warp is past this chunk's scores and keys before they are

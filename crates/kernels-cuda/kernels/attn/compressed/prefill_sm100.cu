@@ -587,12 +587,12 @@ __global__ __launch_bounds__(384, 1) void sparse(
                     const float b = __uint_as_float(v[2 * i + 1]) * scale;
                     const float cs = __shfl_sync(0xffffffffu, turn_c, first + i);
                     const float sn = __shfl_sync(0xffffffffu, turn_s, first + i);
-                    out[i] = pack_bf16(a * cs - b * sn, b * cs + a * sn);
+                    out[i] = pack_bf16x2(a * cs - b * sn, b * cs + a * sn);
                 }
             } else {
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
-                    out[i] = pack_bf16(__uint_as_float(v[2 * i]) * scale, __uint_as_float(v[2 * i + 1]) * scale);
+                    out[i] = pack_bf16x2(__uint_as_float(v[2 * i]) * scale, __uint_as_float(v[2 * i + 1]) * scale);
                 }
             }
             // A thread's 64 bytes as two whole 32-byte sectors.

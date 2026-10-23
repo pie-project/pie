@@ -295,11 +295,11 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
         for (int kk = 0; kk < kBK; kk += 16) {
             unsigned bk[kNb][2];
 #pragma unroll
-            for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kPad + kk, kPad, lane);
+            for (int b = 0; b < kNb; ++b) ld_b(bk[b], sX + 8 * b * kPad + kk, kPad, lane);
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) {
                 unsigned a[4];
-                bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad + kk, kPad, lane);
+                ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad + kk, kPad, lane);
 #pragma unroll
                 for (int b = 0; b < kNb; ++b) {
                     w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
@@ -1078,15 +1078,13 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
             unsigned bk[kNb][2];
 #pragma unroll
             for (int b = 0; b < kNb; ++b) {
-                bf16mma::ld_b(bk[b], reinterpret_cast<const bf16*>(sX + 8 * b * kPad + kk),
-                              kPad / 2, lane);
+                ld_b(bk[b], reinterpret_cast<const bf16*>(sX + 8 * b * kPad + kk), kPad / 2, lane);
             }
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) {
                 unsigned a[4];
-                bf16mma::ld_a(a,
-                              reinterpret_cast<const bf16*>(sW + (warp * kRowsWarp + 16 * t) * kPad + kk),
-                              kPad / 2, lane);
+                ld_a(a, reinterpret_cast<const bf16*>(sW + (warp * kRowsWarp + 16 * t) * kPad + kk),
+                     kPad / 2, lane);
 #pragma unroll
                 for (int b = 0; b < kNb; ++b) {
                     gfp8::mma(blk[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
@@ -1376,13 +1374,13 @@ __global__ void moe_matmul_select_mxfp4_wmma(
             for (int kk = 0; kk < kTileK; kk += 16) {
 
                 unsigned bfrag[4];
-                pie_ldmatrix_x4(bfrag, &w_tile[warp * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + (((lane >> 3) & 1) << 3)]);
+                ldmatrix_x4(bfrag, &w_tile[warp * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + (((lane >> 3) & 1) << 3)]);
 
 #pragma unroll
                 for (int bt = 0; bt < kBatches; ++bt) {
 
                     unsigned afrag[4];
-                    pie_ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
+                    ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
                     pie_mma_bf16_16816(acc[bt][0], afrag, bfrag[0], bfrag[1]);
                     pie_mma_bf16_16816(acc[bt][1], afrag, bfrag[2], bfrag[3]);
                 }
@@ -1641,13 +1639,13 @@ __global__ void moe_matmul_select_mlxu4_wmma(
             for (int kk = 0; kk < kTileK; kk += 16) {
 
                 unsigned bfrag[4];
-                pie_ldmatrix_x4(bfrag, &w_tile[warp * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + (((lane >> 3) & 1) << 3)]);
+                ldmatrix_x4(bfrag, &w_tile[warp * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + (((lane >> 3) & 1) << 3)]);
 
 #pragma unroll
                 for (int bt = 0; bt < kBatches; ++bt) {
 
                     unsigned afrag[4];
-                    pie_ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
+                    ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
                     pie_mma_bf16_16816(acc[bt][0], afrag, bfrag[0], bfrag[1]);
                     pie_mma_bf16_16816(acc[bt][1], afrag, bfrag[2], bfrag[3]);
                 }

@@ -1,4 +1,5 @@
 #include "prim/device.cuh"
+#include "prim/mma.cuh"
 #include "elemwise/row.cuh"
 
 namespace pie::elemwise {
@@ -583,22 +584,14 @@ __global__ void __launch_bounds__(128) hc_prenorm_project_mma_t(
             u32 a[3][4];
 #pragma unroll
             for (int mt = 0; mt < 3; ++mt) {
-                const bf16* rp = wt + (mt * 16 + (lane & 15)) * LD + k0 + ((lane & 16) ? 8 : 0);
-                const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(rp));
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                             : "=r"(a[mt][0]), "=r"(a[mt][1]), "=r"(a[mt][2]), "=r"(a[mt][3])
-                             : "r"(at));
+                ld_a(a[mt], wt + mt * 16 * LD + k0, LD, lane);
             }
 #pragma unroll
             for (int np = 0; np < NT / 2; ++np) {
                 // Two row tiles a load: lanes 0-7 / 8-15 tile 2np at k0 / k0 + 8,
                 // lanes 16-23 / 24-31 tile 2np + 1.
                 u32 b[4];
-                const bf16* rp = xt + ((2 * np + (lane >> 4)) * 8 + (lane & 7)) * LD + k0 + ((lane & 8) ? 8 : 0);
-                const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(rp));
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                             : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
-                             : "r"(at));
+                ldmatrix_x4(b, xt + ((2 * np + (lane >> 4)) * 8 + (lane & 7)) * LD + k0 + ((lane & 8) ? 8 : 0));
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     const int nt = 2 * np + h;

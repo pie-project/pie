@@ -2,6 +2,7 @@
 #include "linear/quant.cuh"
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
+#include "prim/smem.cuh"
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 
@@ -180,13 +181,6 @@ __device__ __forceinline__ unsigned splat(bf16 v) {
 __device__ __forceinline__ unsigned fold_post(unsigned dq, unsigned s2, unsigned b2) {
     const __nv_bfloat162 code = __hsub2(as_pair(dq), as_pair(kTiledMagic));
     return as_bits(__hfma2(code, as_pair(s2), as_pair(b2)));
-}
-
-__device__ __forceinline__ void ldmatrix_a(unsigned (&reg)[4], const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(reg[0]), "=r"(reg[1]), "=r"(reg[2]), "=r"(reg[3])
-                 : "r"(addr));
 }
 
 template <class T, int kBits, int kGroup, int kM, int kN, int kThreads, int kStages>
@@ -371,7 +365,7 @@ __global__ __launch_bounds__(kThreads) void matmul_affine_tiled(
 #pragma unroll
             for (int mt = 0; mt < kMFrags; ++mt) {
                 unsigned a[4];
-                ldmatrix_a(
+                ldmatrix_x4(
                     a,
                     src + (mt * kMmaM + (lane & 15)) * kTiledLdA + kk * kMmaK
                         + ((lane >> 4) << 3));

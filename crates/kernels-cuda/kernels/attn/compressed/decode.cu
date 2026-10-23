@@ -30,6 +30,7 @@
 
 #include "prim/kv_rows.cuh"
 #include "prim/device.cuh"
+#include "prim/mma.cuh"
 
 namespace pie::attn::compressed {
 
@@ -71,15 +72,6 @@ struct Shape {
     static_assert(kGroup * kOLd * 4 <= kQBytes + kRingBytes, "the fold fits where Q and the ring were");
 };
 
-__device__ __forceinline__ std::uint32_t saddr(const void* p) {
-    return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
-}
-
-__device__ __forceinline__ std::uint32_t pack2(float lo, float hi) {
-    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<const std::uint32_t*>(&v);
-}
-
 __device__ __forceinline__ void mma16816(float (&d)[4], const std::uint32_t (&a)[4],
                                          std::uint32_t b0, std::uint32_t b1) {
     asm volatile(
@@ -89,22 +81,10 @@ __device__ __forceinline__ void mma16816(float (&d)[4], const std::uint32_t (&a)
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void ldsm4(std::uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(saddr(p)));
-}
-
-__device__ __forceinline__ void ldsm4t(std::uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(saddr(p)));
-}
-
 __device__ __forceinline__ float ld_rank(const float* at, unsigned rank) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     unsigned remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(saddr(at)), "r"(rank));
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(smem_addr(at)), "r"(rank));
     float v;
     asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
     return v;
@@ -116,7 +96,7 @@ __device__ __forceinline__ float ld_rank(const float* at, unsigned rank) {
 __device__ __forceinline__ float4 ld_rank4(const float* at, unsigned rank) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     unsigned remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(saddr(at)), "r"(rank));
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(smem_addr(at)), "r"(rank));
     float4 v;
     asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];"
                  : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
@@ -328,7 +308,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     __syncthreads();
 #pragma unroll
     for (int k = 0; k < kHalf / 16; ++k)
-        ldsm4(qa[k], sQ + (lane & 15) * kLd + dh * kHalf + k * 16 + ((lane & 16) ? 8 : 0));
+        ld_a(qa[k], sQ + dh * kHalf + k * 16, kLd, lane);
 
     constexpr int kNT = kCols / 8;
     float oacc[kNT][4];
@@ -391,7 +371,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
 #pragma unroll
             for (int k = 0; k < kHalf / 16; k += 2) {
                 std::uint32_t b[4];
-                ldsm4(b, krow + k * 16);
+                ldmatrix_x4(b, krow + k * 16);
                 mma16816(s0, qa[k], b[0], b[1]);
                 mma16816(s1, qa[k + 1], b[2], b[3]);
             }
@@ -440,8 +420,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
             const float p2 = exp2f(sacc[nt][2] - b_hi), p3 = exp2f(sacc[nt][3] - b_hi);
             rl += p0 + p1;
             rh += p2 + p3;
-            pa[nt >> 1][(nt & 1) * 2] = pack2(p0, p1);
-            pa[nt >> 1][(nt & 1) * 2 + 1] = pack2(p2, p3);
+            pa[nt >> 1][(nt & 1) * 2] = pack_bf16x2(p0, p1);
+            pa[nt >> 1][(nt & 1) * 2 + 1] = pack_bf16x2(p2, p3);
         }
 #pragma unroll
         for (int sh = 1; sh < 4; sh <<= 1) {
@@ -464,7 +444,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
 #pragma unroll
             for (int np = 0; np < kNT / 2; ++np) {
                 std::uint32_t b[4];
-                ldsm4t(b, vrow + np * 16);
+                ldmatrix_x4_trans(b, vrow + np * 16);
                 mma16816(oacc[2 * np], pa[kk], b[0], b[1]);
                 mma16816(oacc[2 * np + 1], pa[kk], b[2], b[3]);
             }
@@ -499,8 +479,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
             float b0 = oacc[n][2] * s_hi, b1 = oacc[n][3] * s_hi;
             turn_back(a0, a1, d, D, turn_pos, turn, s_turn);
             turn_back(b0, b1, d, D, turn_pos, turn, s_turn);
-            *reinterpret_cast<std::uint32_t*>(orow + h_lo * D + d) = pack2(a0, a1);
-            *reinterpret_cast<std::uint32_t*>(orow + h_hi * D + d) = pack2(b0, b1);
+            *reinterpret_cast<std::uint32_t*>(orow + h_lo * D + d) = pack_bf16x2(a0, a1);
+            *reinterpret_cast<std::uint32_t*>(orow + h_hi * D + d) = pack_bf16x2(b0, b1);
         }
     } else {
         // The ranks' fold: every rank's (max, sum) a head, then its output
@@ -567,8 +547,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
                 turn_back(acc.z, acc.w, d + 2, D, turn_pos, turn, s_turn);
             }
             uint2 packed;
-            packed.x = pack2(acc.x, acc.y);
-            packed.y = pack2(acc.z, acc.w);
+            packed.x = pack_bf16x2(acc.x, acc.y);
+            packed.y = pack_bf16x2(acc.z, acc.w);
             *reinterpret_cast<uint2*>(orow + h * D + d) = packed;
         }
         // No block leaves while another still reads its shared memory.

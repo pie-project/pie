@@ -370,7 +370,7 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                                 const float cs = turn_c[rr][pr];
                                 const float a = __uint_as_float(static_cast<u32>(e[2 * u]) << 16);
                                 const float b = __uint_as_float(static_cast<u32>(e[2 * u + 1]) << 16);
-                                const u32 packed = fmha::pack_bf16(a * cs - b * sn, b * cs + a * sn);
+                                const u32 packed = fmha::pack_bf16x2(a * cs - b * sn, b * cs + a * sn);
                                 e[2 * u] = static_cast<unsigned short>(packed & 0xffffu);
                                 e[2 * u + 1] = static_cast<unsigned short>(packed >> 16);
                             }

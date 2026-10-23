@@ -36,7 +36,6 @@ using tc5::u64;
 using fmha::u16;
 using fmha::ex2;
 using fmha::neg_inf;
-using fmha::pack_bf16;
 using fmha::sdesc_sw128_mn;
 using compressed::sm100::atom_at;
 using compressed::sm100::gather4;
@@ -686,10 +685,10 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                         const u32 (&v)[32] = vv[i / 4];
                         const int j = (i % 4) * 8;
                         stage[run * 8 + (i ^ (run & 7))] = make_uint4(
-                            pack_bf16(__uint_as_float(v[j]) * scale, __uint_as_float(v[j + 1]) * scale),
-                            pack_bf16(__uint_as_float(v[j + 2]) * scale, __uint_as_float(v[j + 3]) * scale),
-                            pack_bf16(__uint_as_float(v[j + 4]) * scale, __uint_as_float(v[j + 5]) * scale),
-                            pack_bf16(__uint_as_float(v[j + 6]) * scale, __uint_as_float(v[j + 7]) * scale));
+                            pack_bf16x2(__uint_as_float(v[j]) * scale, __uint_as_float(v[j + 1]) * scale),
+                            pack_bf16x2(__uint_as_float(v[j + 2]) * scale, __uint_as_float(v[j + 3]) * scale),
+                            pack_bf16x2(__uint_as_float(v[j + 4]) * scale, __uint_as_float(v[j + 5]) * scale),
+                            pack_bf16x2(__uint_as_float(v[j + 6]) * scale, __uint_as_float(v[j + 7]) * scale));
                     }
                     pair_sync(warp);
 #pragma unroll
@@ -722,7 +721,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                 u32 out[16];
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
-                    out[i] = pack_bf16(__uint_as_float(v[2 * i]) * scale,
+                    out[i] = pack_bf16x2(__uint_as_float(v[2 * i]) * scale,
                                        __uint_as_float(v[2 * i + 1]) * scale);
                 }
                 uint4* o4 = reinterpret_cast<uint4*>(dst + d0);
@@ -795,8 +794,8 @@ __global__ __launch_bounds__(128) void mla_sparse_fold(
             }
         }
         uint2 packed;
-        packed.x = pack_bf16(acc.x, acc.y);
-        packed.y = pack_bf16(acc.z, acc.w);
+        packed.x = pack_bf16x2(acc.x, acc.y);
+        packed.y = pack_bf16x2(acc.z, acc.w);
         *reinterpret_cast<uint2*>(dst + d) = packed;
     }
     if (lse != nullptr && threadIdx.x == 0) {
@@ -1307,7 +1306,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                 u32 out[16];
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
-                    out[i] = pack_bf16(__uint_as_float(o[2 * i]) * scale, __uint_as_float(o[2 * i + 1]) * scale);
+                    out[i] = pack_bf16x2(__uint_as_float(o[2 * i]) * scale, __uint_as_float(o[2 * i + 1]) * scale);
                 }
                 uint4* o4 = reinterpret_cast<uint4*>(dst + d0);
 #pragma unroll

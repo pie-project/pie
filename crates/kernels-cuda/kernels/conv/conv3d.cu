@@ -1,5 +1,6 @@
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
+#include "prim/smem.cuh"
 #include "prim/voxels.cuh"
 
 #include <cuda_pipeline.h>
@@ -96,7 +97,6 @@ __device__ __forceinline__ void tap_of(const ConvGeom& g, int tap, int& it, int&
     ih = rest / g.kw;
     iw = rest - ih * g.kw;
 }
-
 
 constexpr int kDirectTM = 64;
 constexpr int kDirectTN = 64;
@@ -229,7 +229,6 @@ __global__ __launch_bounds__(kDirectThreads) void conv3d_direct(
     }
 }
 
-
 constexpr int kMmaTM = 128;
 constexpr int kMmaTN = 128;
 constexpr int kMmaBK = 32;
@@ -253,13 +252,6 @@ __device__ __forceinline__ void conv_cp_async16(void* dst, const void* src, int 
                  :
                  : "r"(d), "l"(src), "r"(bytes)
                  : "memory");
-}
-
-__device__ __forceinline__ void conv_ldmatrix_x4(unsigned (&reg)[4], const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(reg[0]), "=r"(reg[1]), "=r"(reg[2]), "=r"(reg[3])
-                 : "r"(addr));
 }
 
 template <int kStages>
@@ -373,12 +365,12 @@ __global__ __launch_bounds__(kMmaThreads) void conv3d_mma(
             unsigned a[4][4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                conv_ldmatrix_x4(a[i], asrc + i * 16 * kMmaLd + kk * 16);
+                ldmatrix_x4(a[i], asrc + i * 16 * kMmaLd + kk * 16);
             }
 #pragma unroll
             for (int pair = 0; pair < 2; ++pair) {
                 unsigned b[4];
-                conv_ldmatrix_x4(b, bsrc + pair * 16 * kMmaLd + kk * 16);
+                ldmatrix_x4(b, bsrc + pair * 16 * kMmaLd + kk * 16);
                 const unsigned b_lo[2] = {b[0], b[2]};
                 const unsigned b_hi[2] = {b[1], b[3]};
 #pragma unroll
@@ -443,7 +435,6 @@ __global__ __launch_bounds__(kMmaThreads) void conv3d_mma(
         }
     }
 }
-
 
 __global__ void conv_weight_taps_major(
     const bf16* __restrict__ src,

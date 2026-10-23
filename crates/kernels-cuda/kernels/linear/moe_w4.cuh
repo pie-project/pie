@@ -4,23 +4,9 @@
 
 #include "prim/device.cuh"
 #include "prim/act.cuh"
+#include "prim/mma.cuh"
 
 namespace pie::linear {
-
-namespace bf16mma {
-__device__ __forceinline__ void ld_a(unsigned (&a)[4], const bf16* base, int ld, int lane) {
-    const bf16* r = base + static_cast<long long>(lane & 15) * ld + ((lane & 16) ? 8 : 0);
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(r));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
-}
-__device__ __forceinline__ void ld_b(unsigned (&b)[2], const bf16* base, int ld, int lane) {
-    const bf16* q = base + static_cast<long long>(lane & 7) * ld + ((lane & 8) ? 8 : 0);
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(q));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                 : "=r"(b[0]), "=r"(b[1]) : "r"(addr));
-}
-}
 
 namespace w4mma {
 

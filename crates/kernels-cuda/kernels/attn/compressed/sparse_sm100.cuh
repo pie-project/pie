@@ -17,8 +17,6 @@ using fmha::ex2;
 
 using fmha::neg_inf;
 
-using fmha::pack_bf16;
-
 using fmha::sdesc_sw128_mn;
 
 struct Params {
@@ -121,8 +119,8 @@ __device__ __forceinline__ void gather4(void* dst, u64* bar, const tc5::TmaMap* 
                                         int r0, int r1, int r2, int r3) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes "
-        "[%0], [%1, {%2, %3, %4, %5, %6}], [%7];" ::"r"(tc5::smem_addr(dst)),
-        "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(tc5::smem_addr(bar))
+        "[%0], [%1, {%2, %3, %4, %5, %6}], [%7];" ::"r"(pie::smem_addr(dst)),
+        "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(pie::smem_addr(bar))
         : "memory");
 }
 
@@ -238,7 +236,7 @@ __device__ __forceinline__ void tile_softmax(const u32 (&vm)[32], const u32 (&vt
             s[i] = e0;
             s[i + 1] = e1;
         } else {
-            pk[i / 2] = fmha::pack_bf16(e0, e1);
+            pk[i / 2] = fmha::pack_bf16x2(e0, e1);
         }
     }
     if constexpr (kE4) {

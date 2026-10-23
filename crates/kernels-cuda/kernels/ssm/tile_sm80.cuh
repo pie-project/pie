@@ -1,6 +1,7 @@
 #pragma once
 
 #include "prim/mma_sm80.cuh"
+#include "prim/mma.cuh"
 #include "ssm/chunk.cuh"
 #include "ssm/copy.cuh"
 
@@ -15,20 +16,6 @@ __device__ __forceinline__ void gdn_mma(
         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ void gdn_ldsm(unsigned (&r)[4], const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void gdn_ldsm_t(unsigned (&r)[4], const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
 }
 
 // Lane `l`'s row address for each fragment an x4 `ldmatrix` lands, over a

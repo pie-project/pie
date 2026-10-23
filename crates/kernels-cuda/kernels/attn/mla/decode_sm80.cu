@@ -194,50 +194,6 @@ constexpr int kSNTiles = kBK / 8 / kWarps;
 static_assert(kSNTiles >= 1, "kBK must be at least 8 * kWarps");
 static_assert(kBK % 16 == 0, "kBK must be a multiple of the mma k step");
 
-__device__ __forceinline__ std::uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
-    std::uint32_t l, h;
-    std::memcpy(&l, &lo, 2);
-    std::memcpy(&h, &hi, 2);
-    return (l & 0xffffu) | ((h & 0xffffu) << 16);
-}
-
-__device__ __forceinline__ void ld_a(std::uint32_t (&a)[4], const __nv_bfloat16* base,
-                                     int ld, int lane, int k0) {
-    const __nv_bfloat16* r =
-        base + static_cast<long long>(lane & 15) * ld + k0 + ((lane & 16) ? 8 : 0);
-    const std::uint32_t addr =
-        static_cast<std::uint32_t>(__cvta_generic_to_shared(r));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-        : "r"(addr));
-}
-
-__device__ __forceinline__ void ld_b_k(std::uint32_t (&b)[2], const __nv_bfloat16* base,
-                                       int ld, int lane, int k0) {
-    const __nv_bfloat16* q =
-        base + static_cast<long long>(lane & 7) * ld + k0 + ((lane & 8) ? 8 : 0);
-    const std::uint32_t addr =
-        static_cast<std::uint32_t>(__cvta_generic_to_shared(q));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(b[0]), "=r"(b[1])
-        : "r"(addr));
-}
-
-__device__ __forceinline__ void ld_b_v(std::uint32_t (&b)[2], const __nv_bfloat16* sK,
-                                       int ld, int lane, int k0, int nbase) {
-
-    const __nv_bfloat16* q =
-        sK + static_cast<long long>(k0 + (lane & 15)) * ld + nbase;
-    const std::uint32_t addr =
-        static_cast<std::uint32_t>(__cvta_generic_to_shared(q));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(b[0]), "=r"(b[1])
-        : "r"(addr));
-}
-
 // With `kFp8` the pool is vLLM's fp8 MLA rows (`mla_kv_append_fp8`): one u8
 // plane, a cell's latent and rotated e4m3 codes in one row under a scale of
 // 1, at `ckv_pages`; each staged chunk is widened to bf16 as it lands (the
@@ -445,12 +401,11 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
             #pragma unroll 2
             for (int k0 = 0; k0 < kD; k0 += 16) {
                 std::uint32_t a[4];
-                ld_a(a, sQ, kLdD, lane, k0);
+                ld_a(a, sQ + k0, kLdD, lane);
                 #pragma unroll
                 for (int n = 0; n < kSNTiles; ++n) {
                     std::uint32_t b[2];
-                    ld_b_k(b, kbase + static_cast<long long>(n * 8) * kLdD,
-                           kLdD, lane, k0);
+                    ld_b(b, kbase + static_cast<long long>(n * 8) * kLdD + k0, kLdD, lane);
                     mma_m16n8k16(sacc[n], a, b);
                 }
             }
@@ -522,11 +477,11 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         #pragma unroll
         for (int k0 = 0; k0 < kBK; k0 += 16) {
             std::uint32_t a[4];
-            ld_a(a, sP, kLdP, lane, k0);
+            ld_a(a, sP + k0, kLdP, lane);
             #pragma unroll
             for (int n = 0; n < kNTiles; ++n) {
                 std::uint32_t b[2];
-                ld_b_v(b, sK, kLdD, lane, k0, dbase + n * 8);
+                ld_b_trans(b, sK + static_cast<long long>(k0) * kLdD + dbase + n * 8, kLdD, lane);
                 mma_m16n8k16(oacc[n], a, b);
             }
         }
@@ -624,6 +579,5 @@ __device__ unsigned smem_bytes_mla =
     static_cast<unsigned>(sizeof(typename KTraits::SharedStorage));
 
 }
-
 
 }

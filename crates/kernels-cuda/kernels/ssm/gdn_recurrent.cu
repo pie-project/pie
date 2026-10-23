@@ -379,7 +379,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_fused(
                     uint4 packed;
                     unsigned* w32 = reinterpret_cast<unsigned*>(&packed);
                     #pragma unroll
-                    for (int u = 0; u < 4; ++u) w32[u] = gdn_pack(s[m][2 * u], s[m][2 * u + 1]);
+                    for (int u = 0; u < 4; ++u) w32[u] = pack_bf16x2(s[m][2 * u], s[m][2 * u + 1]);
                     *reinterpret_cast<uint4*>(cur.cell + (long long)(i0 + 16 * m) * V_d) = packed;
                 }
             }

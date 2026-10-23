@@ -125,15 +125,15 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
         const float2 k23 = gdn_unpack(kr.y);
         const float kinv = rsqrtf(
             warp_sum(k01.x * k01.x + k01.y * k01.y + k23.x * k23.x + k23.y * k23.y) + 1e-6f);
-        const uint2 kw = make_uint2(gdn_pack(k01.x * kinv, k01.y * kinv),
-                                    gdn_pack(k23.x * kinv, k23.y * kinv));
+        const uint2 kw = make_uint2(pack_bf16x2(k01.x * kinv, k01.y * kinv),
+                                    pack_bf16x2(k23.x * kinv, k23.y * kinv));
         *kp = kw;
         uint2* vp = reinterpret_cast<uint2*>(vs + i * GDN_LD + l * 4);
         const uint2 vr = *vp;
         const float beta = B[i];
         const float2 v01 = gdn_unpack(vr.x);
         const float2 v23 = gdn_unpack(vr.y);
-        *vp = make_uint2(gdn_pack(v01.x * beta, v01.y * beta), gdn_pack(v23.x * beta, v23.y * beta));
+        *vp = make_uint2(pack_bf16x2(v01.x * beta, v01.y * beta), pack_bf16x2(v23.x * beta, v23.y * beta));
         uint2* qp = reinterpret_cast<uint2*>(qs + i * GDN_LD + l * 4);
         const uint2 qr = *qp;
         const float2 q01 = gdn_unpack(qr.x);
@@ -141,8 +141,8 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
         const float qinv = rsqrtf(
             warp_sum(q01.x * q01.x + q01.y * q01.y + q23.x * q23.x + q23.y * q23.y) + 1e-6f)
             * q_scale;
-        const uint2 qw = make_uint2(gdn_pack(q01.x * qinv, q01.y * qinv),
-                                    gdn_pack(q23.x * qinv, q23.y * qinv));
+        const uint2 qw = make_uint2(pack_bf16x2(q01.x * qinv, q01.y * qinv),
+                                    pack_bf16x2(q23.x * qinv, q23.y * qinv));
         *qp = qw;
         if (writer && in) {
             const long long at = (static_cast<long long>(ta + i) * K_h + hk) * BK + l * 4;
@@ -193,12 +193,12 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
         for (int kk = 0; kk < BK / 16; ++kk) {
             unsigned a[4];
             unsigned aq[4];
-            gdn_ldsm(a, gdn_at_a(ks, GDN_LD, m0, kk * 16, l));
-            gdn_ldsm(aq, gdn_at_a(qs, GDN_LD, m0, kk * 16, l));
+            ldmatrix_x4(a, gdn_at_a(ks, GDN_LD, m0, kk * 16, l));
+            ldmatrix_x4(aq, gdn_at_a(qs, GDN_LD, m0, kk * 16, l));
             #pragma unroll
             for (int np = 0; np < 2; ++np) {
                 unsigned b[4];
-                gdn_ldsm(b, gdn_at_bt(ks, GDN_LD, j0 + np * 16, kk * 16, l));
+                ldmatrix_x4(b, gdn_at_bt(ks, GDN_LD, j0 + np * 16, kk * 16, l));
                 gdn_mma(acc[2 * np], a, b[0], b[1]);
                 gdn_mma(acc[2 * np + 1], a, b[2], b[3]);
                 gdn_mma(qkc[2 * np], aq, b[0], b[1]);
@@ -216,7 +216,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
                     ? qkc[nt][2 * half] * __expf(G[i] - G[jj]) : 0.f;
                 const float p1 = (jj + 1 <= i && i < L)
                     ? qkc[nt][2 * half + 1] * __expf(G[i] - G[jj + 1]) : 0.f;
-                *reinterpret_cast<unsigned*>(pd + i * GDN_CH + jj) = gdn_pack(p0, p1);
+                *reinterpret_cast<unsigned*>(pd + i * GDN_CH + jj) = pack_bf16x2(p0, p1);
             }
         }
         __syncthreads();
@@ -334,11 +334,11 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
         #pragma unroll
         for (int kk = 0; kk < GDN_CH / 16; ++kk) {
             unsigned a[4];
-            gdn_ldsm(a, gdn_at_a(tm, GDN_LDC, m0, kk * 16, l));
+            ldmatrix_x4(a, gdn_at_a(tm, GDN_LDC, m0, kk * 16, l));
             #pragma unroll
             for (int np = 0; np < 4; ++np) {
                 unsigned b[4];
-                gdn_ldsm_t(b, gdn_at_b(rhs, GDN_LD, kk * 16, n0 + np * 16, l));
+                ldmatrix_x4_trans(b, gdn_at_b(rhs, GDN_LD, kk * 16, n0 + np * 16, l));
                 gdn_mma(acc[2 * np], a, b[0], b[1]);
                 gdn_mma(acc[2 * np + 1], a, b[2], b[3]);
             }
@@ -351,7 +351,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
             #pragma unroll
             for (int nt = 0; nt < 8; ++nt) {
                 *reinterpret_cast<unsigned*>(o + nt * 8) =
-                    gdn_pack(acc[nt][2 * half], acc[nt][2 * half + 1]);
+                    pack_bf16x2(acc[nt][2 * half], acc[nt][2 * half + 1]);
             }
         }
     }
@@ -522,7 +522,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
         #pragma unroll
         for (int half = 0; half < 2; ++half) {
             *reinterpret_cast<unsigned*>(hs + h_row(q, half) * LDV + h_col(q)) =
-                gdn_pack(hacc[q][2 * half], hacc[q][2 * half + 1]);
+                pack_bf16x2(hacc[q][2 * half], hacc[q][2 * half + 1]);
         }
     }
 
@@ -555,12 +555,12 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
         for (int kk = 0; kk < BK / 16; ++kk) {
             unsigned aq[4];
             unsigned aw[4];
-            gdn_ldsm(aq, gdn_at_a(sq, GDN_LD, m0, kk * 16, l));
-            gdn_ldsm(aw, gdn_at_a(sw, GDN_LD, m0, kk * 16, l));
+            ldmatrix_x4(aq, gdn_at_a(sq, GDN_LD, m0, kk * 16, l));
+            ldmatrix_x4(aw, gdn_at_a(sw, GDN_LD, m0, kk * 16, l));
             #pragma unroll
             for (int np = 0; np < CT / 2; ++np) {
                 unsigned b[4];
-                gdn_ldsm_t(b, gdn_at_b(hs, LDV, kk * 16, c0 + np * 16, l));
+                ldmatrix_x4_trans(b, gdn_at_b(hs, LDV, kk * 16, c0 + np * 16, l));
                 gdn_mma(qh[2 * np], aq, b[0], b[1]);
                 gdn_mma(qh[2 * np + 1], aq, b[2], b[3]);
                 gdn_mma(wh[2 * np], aw, b[0], b[1]);
@@ -577,9 +577,9 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
                 const float2 uu = gdn_unpack(*reinterpret_cast<const unsigned*>(su + i * LDV + c));
                 const float n0 = in ? uu.x - wh[nt][2 * half] : 0.f;
                 const float n1 = in ? uu.y - wh[nt][2 * half + 1] : 0.f;
-                *reinterpret_cast<unsigned*>(vn + i * LDV + c) = gdn_pack(n0, n1);
+                *reinterpret_cast<unsigned*>(vn + i * LDV + c) = pack_bf16x2(n0, n1);
                 const float d = in ? __expf(g_last - sg[i]) : 0.f;
-                *reinterpret_cast<unsigned*>(vsc + i * LDV + c) = gdn_pack(n0 * d, n1 * d);
+                *reinterpret_cast<unsigned*>(vsc + i * LDV + c) = pack_bf16x2(n0 * d, n1 * d);
             }
         }
         __syncthreads();
@@ -599,11 +599,11 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
         #pragma unroll
         for (int kk = 0; kk < GDN_CH / 16; ++kk) {
             unsigned pa[4];
-            gdn_ldsm(pa, gdn_at_a(sp, GDN_LDC, m0, kk * 16, l));
+            ldmatrix_x4(pa, gdn_at_a(sp, GDN_LDC, m0, kk * 16, l));
             #pragma unroll
             for (int np = 0; np < CT / 2; ++np) {
                 unsigned b[4];
-                gdn_ldsm_t(b, gdn_at_b(vn, LDV, kk * 16, c0 + np * 16, l));
+                ldmatrix_x4_trans(b, gdn_at_b(vn, LDV, kk * 16, c0 + np * 16, l));
                 gdn_mma(qh[2 * np], pa, b[0], b[1]);
                 gdn_mma(qh[2 * np + 1], pa, b[2], b[3]);
             }
@@ -639,12 +639,12 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
             unsigned a[2][4];
             #pragma unroll
             for (int mt = 0; mt < 2; ++mt) {
-                gdn_ldsm_t(a[mt], gdn_at_at(sk, GDN_LD, kk * 16, kr0 + mt * 16, l));
+                ldmatrix_x4_trans(a[mt], gdn_at_at(sk, GDN_LD, kk * 16, kr0 + mt * 16, l));
             }
             #pragma unroll
             for (int np = 0; np < CT / 2; ++np) {
                 unsigned b[4];
-                gdn_ldsm_t(b, gdn_at_b(vsc, LDV, kk * 16, c0 + np * 16, l));
+                ldmatrix_x4_trans(b, gdn_at_b(vsc, LDV, kk * 16, c0 + np * 16, l));
                 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) {
                     gdn_mma(hacc[mt * CT + 2 * np], a[mt], b[0], b[1]);
@@ -659,7 +659,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
         for (int q = 0; q < NT; ++q) {
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const unsigned packed = gdn_pack(hacc[q][2 * half], hacc[q][2 * half + 1]);
+                const unsigned packed = pack_bf16x2(hacc[q][2 * half], hacc[q][2 * half + 1]);
                 *reinterpret_cast<unsigned*>(hs + h_row(q, half) * LDV + h_col(q)) = packed;
                 if (at_snap >= 0) {
                     const float2 f = gdn_unpack(packed);
@@ -686,7 +686,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
                 const int kk = h_row(q, half);
                 const int vv = v0 + h_col(q);
                 *reinterpret_cast<unsigned*>(state + static_cast<long long>(kk) * V + vv) =
-                    gdn_pack(hacc[q][2 * half], hacc[q][2 * half + 1]);
+                    pack_bf16x2(hacc[q][2 * half], hacc[q][2 * half + 1]);
             }
         }
     }

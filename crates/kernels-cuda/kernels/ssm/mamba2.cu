@@ -182,7 +182,7 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                 #pragma unroll
                 for (int half = 0; half < 2; ++half) {
                     *reinterpret_cast<unsigned*>(hs + (kr0 + mt * 16 + g + 8 * half) * LDV + nt * 8 + 2 * t) =
-                        gdn_pack(hacc[mt][nt][2 * half], hacc[mt][nt][2 * half + 1]);
+                        pack_bf16x2(hacc[mt][nt][2 * half], hacc[mt][nt][2 * half + 1]);
                 }
             }
         }
@@ -273,14 +273,10 @@ __global__ void __launch_bounds__(128) mamba2_scan(
             float acc[4] = {};
             #pragma unroll
             for (int kk = 0; kk < N / 16; ++kk) {
-                unsigned a[4], b0, b1;
-                gdn_ldsm(a, gdn_at_a(sc, GDN_LD, 0, kk * 16, l));
-                const bf16* brow = sb + (warp * 8 + (l & 7)) * GDN_LD + kk * 16 + (((l >> 3) & 1) << 3);
-                const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(brow));
-                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                             : "=r"(b0), "=r"(b1)
-                             : "r"(addr));
-                gdn_mma(acc, a, b0, b1);
+                unsigned a[4], b[2];
+                ldmatrix_x4(a, gdn_at_a(sc, GDN_LD, 0, kk * 16, l));
+                ld_b(b, sb + warp * 8 * GDN_LD + kk * 16, GDN_LD, l);
+                gdn_mma(acc, a, b[0], b[1]);
             }
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
@@ -289,7 +285,7 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                 const bool live = i < L;
                 const float p0 = live && j <= i ? acc[2 * half] * __expf(sG[i] - sG[j]) : 0.f;
                 const float p1 = live && j + 1 <= i ? acc[2 * half + 1] * __expf(sG[i] - sG[j + 1]) : 0.f;
-                *reinterpret_cast<unsigned*>(sp + i * KDA16_LDT + j) = gdn_pack(p0, p1);
+                *reinterpret_cast<unsigned*>(sp + i * KDA16_LDT + j) = pack_bf16x2(p0, p1);
             }
         }
         __syncthreads();
@@ -300,8 +296,8 @@ __global__ void __launch_bounds__(128) mamba2_scan(
             #pragma unroll
             for (int kk = 0; kk < N / 16; ++kk) {
                 unsigned aq[4], b[4];
-                gdn_ldsm(aq, gdn_at_a(sc, GDN_LD, 0, kk * 16, l));
-                gdn_ldsm_t(b, gdn_at_b(hs, LDV, kk * 16, c0, l));
+                ldmatrix_x4(aq, gdn_at_a(sc, GDN_LD, 0, kk * 16, l));
+                ldmatrix_x4_trans(b, gdn_at_b(hs, LDV, kk * 16, c0, l));
                 gdn_mma(qh[0], aq, b[0], b[1]);
                 gdn_mma(qh[1], aq, b[2], b[3]);
             }
@@ -315,8 +311,8 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                 }
             }
             unsigned pa[4], b[4];
-            gdn_ldsm(pa, gdn_at_a(sp, KDA16_LDT, 0, 0, l));
-            gdn_ldsm_t(b, gdn_at_b(su, LDV, 0, c0, l));
+            ldmatrix_x4(pa, gdn_at_a(sp, KDA16_LDT, 0, 0, l));
+            ldmatrix_x4_trans(b, gdn_at_b(su, LDV, 0, c0, l));
             gdn_mma(qh[0], pa, b[0], b[1]);
             gdn_mma(qh[1], pa, b[2], b[3]);
             #pragma unroll
@@ -330,7 +326,7 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                     const float2 xv = gdn_unpack(*reinterpret_cast<const unsigned*>(sx + i * LDV + c));
                     const float2 zv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(z + o + c));
                     *reinterpret_cast<unsigned*>(y + o + c) =
-                        gdn_pack((qh[nt][2 * half] + skip * xv.x) * silu_f(zv.x),
+                        pack_bf16x2((qh[nt][2 * half] + skip * xv.x) * silu_f(zv.x),
                                  (qh[nt][2 * half + 1] + skip * xv.y) * silu_f(zv.y));
                 }
             }
@@ -349,11 +345,11 @@ __global__ void __launch_bounds__(128) mamba2_scan(
         {
             unsigned a[2][4];
             #pragma unroll
-            for (int mt = 0; mt < 2; ++mt) gdn_ldsm_t(a[mt], gdn_at_at(sb, GDN_LD, 0, kr0 + mt * 16, l));
+            for (int mt = 0; mt < 2; ++mt) ldmatrix_x4_trans(a[mt], gdn_at_at(sb, GDN_LD, 0, kr0 + mt * 16, l));
             #pragma unroll
             for (int np = 0; np < P / 16; ++np) {
                 unsigned b[4];
-                gdn_ldsm_t(b, gdn_at_b(su2, LDV, 0, np * 16, l));
+                ldmatrix_x4_trans(b, gdn_at_b(su2, LDV, 0, np * 16, l));
                 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) {
                     gdn_mma(hacc[mt][2 * np], a[mt], b[0], b[1]);

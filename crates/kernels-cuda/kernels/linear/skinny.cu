@@ -1,5 +1,6 @@
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
+#include "prim/smem.cuh"
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 
@@ -10,13 +11,6 @@ constexpr int kSkinnyM = 64;
 template <int kBK>
 __host__ __device__ constexpr int skinny_ld() {
     return kBK + 8;
-}
-
-__device__ __forceinline__ void skinny_ldmatrix_x4(unsigned (&reg)[4], const bf16* at) {
-    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(reg[0]), "=r"(reg[1]), "=r"(reg[2]), "=r"(reg[3])
-                 : "r"(addr));
 }
 
 __device__ __forceinline__ unsigned long long skinny_policy(bool keep) {
@@ -178,11 +172,11 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
 #pragma unroll
         for (int kk = 0; kk < kQuad; ++kk) {
             unsigned a[4];
-            skinny_ldmatrix_x4(a, wsrc + a_row * kSkinnyLd + kk * 16 + a_col);
+            ldmatrix_x4(a, wsrc + a_row * kSkinnyLd + kk * 16 + a_col);
 #pragma unroll
             for (int pair = 0; pair < kNSubs / 2; ++pair) {
                 unsigned b[4];
-                skinny_ldmatrix_x4(b, asrc + (pair * 16 + a_row) * kSkinnyLd + kk * 16 + a_col);
+                ldmatrix_x4(b, asrc + (pair * 16 + a_row) * kSkinnyLd + kk * 16 + a_col);
                 const unsigned b_lo[2] = {b[0], b[2]};
                 const unsigned b_hi[2] = {b[1], b[3]};
                 ::nvcuda::wmma::detail::mma_m16n8k16(acc[2 * pair], a, b_lo, acc[2 * pair]);

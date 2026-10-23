@@ -6,6 +6,7 @@
 #include "prim/half2.cuh"
 #include "prim/fp8.cuh"
 #include "prim/mma_sm80.cuh"
+#include "prim/smem.cuh"
 #else
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -69,12 +70,6 @@ __device__ __forceinline__ float e2m1x8_dot_lean(unsigned wd, const float (&xv)[
         acc = fmaf(__uint_as_float(b2 & 0xFFFF0000u), xv[7 - p], acc);
     }
     return acc;
-}
-
-__device__ __forceinline__ void pie_ldmatrix_x4(unsigned (&r)[4], const void* row) {
-    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(row));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at));
 }
 
 __device__ __forceinline__ uint4 pie_ld_line(const uint4* p) {

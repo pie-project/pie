@@ -1,6 +1,7 @@
 #include "ssm/chunk.cuh"
 #include "ssm/copy.cuh"
 #include "prim/mma_sm100.cuh"
+#include "prim/smem.cuh"
 
 // The chunked gated delta rule's prefill on tcgen05, one block a (request,
 // value head) walking the request's 64-token chunks in order, the state in
@@ -181,29 +182,15 @@ __device__ __forceinline__ void mma_h(float (&d)[4], const u32 (&a)[4], u32 b0, 
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void ldsm4(u32 (&r)[4], const unsigned short* at) {
-    const u32 addr = static_cast<u32>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void ldsm4t(u32 (&r)[4], const unsigned short* at) {
-    const u32 addr = static_cast<u32>(__cvta_generic_to_shared(at));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
-}
-
 // A 16 x 16 A operand at rows m0.., columns k0.. of a row-major f16 tile.
 __device__ __forceinline__ void frag_a(u32 (&a)[4], const unsigned short* s, int ld, int m0, int k0, int l) {
-    ldsm4(a, s + (m0 + (l & 15)) * ld + k0 + ((l >> 4) << 3));
+    ldmatrix_x4(a, s + (m0 + (l & 15)) * ld + k0 + ((l >> 4) << 3));
 }
 
 // The B operand of two eight-wide column tiles n0, n0 + 8 over k0..k0+16 of
 // a row-major [k][n] f16 tile: b[0], b[1] the first, b[2], b[3] the second.
 __device__ __forceinline__ void frag_b(u32 (&b)[4], const unsigned short* s, int ld, int k0, int n0, int l) {
-    ldsm4t(b, s + (k0 + (l & 7) + (((l >> 3) & 1) << 3)) * ld + n0 + ((l >> 4) << 3));
+    ldmatrix_x4_trans(b, s + (k0 + (l & 7) + (((l >> 3) & 1) << 3)) * ld + n0 + ((l >> 4) << 3));
 }
 
 // A 16 x 8 accumulator tile, negated, as f16 at Z[r0.., n0..].
@@ -259,7 +246,7 @@ __device__ __forceinline__ void tma_store_3d(const tc5::TmaMap* map, const void*
     asm volatile(
         "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0, {%2, %3, %4}], [%1];" ::"l"(
             reinterpret_cast<tc5::u64>(map)),
-        "r"(tc5::smem_addr(src)), "r"(x), "r"(y), "r"(0)
+        "r"(pie::smem_addr(src)), "r"(x), "r"(y), "r"(0)
         : "memory");
 }
 
@@ -542,7 +529,7 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                                     const float qk = __uint_as_float(jj < 32 ? r0[jj] : r1[jj - 32]);
                                     v2[x] = (jj <= i && i < L) ? qk * f * rj[u] * ex2(gi - gj[u]) : 0.f;
                                 }
-                                pk[e] = gdn_pack(v2[0], v2[1]);
+                                pk[e] = pack_bf16x2(v2[0], v2[1]);
                             }
                         }
 #pragma unroll
@@ -684,8 +671,8 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                         const float4 b1 = reinterpret_cast<const float4*>(B)[2 * cj + 1];
                         const float2 x0 = h2f(t4.x), x1 = h2f(t4.y), x2 = h2f(t4.z), x3 = h2f(t4.w);
                         *reinterpret_cast<uint4*>(tb + i * 128 + (((cj ^ (i & 7))) << 4)) = make_uint4(
-                            gdn_pack(x0.x * b0.x, x0.y * b0.y), gdn_pack(x1.x * b0.z, x1.y * b0.w),
-                            gdn_pack(x2.x * b1.x, x2.y * b1.y), gdn_pack(x3.x * b1.z, x3.y * b1.w));
+                            pack_bf16x2(x0.x * b0.x, x0.y * b0.y), pack_bf16x2(x1.x * b0.z, x1.y * b0.w),
+                            pack_bf16x2(x2.x * b1.x, x2.y * b1.y), pack_bf16x2(x3.x * b1.z, x3.y * b1.w));
                     }
                     fence_async_shared();
                 }
@@ -753,9 +740,9 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                     tmem_wait_ld();
 #pragma unroll
                     for (int i = 0; i < 16; ++i) {
-                        pk[i] = gdn_pack(__uint_as_float(a[2 * i]), __uint_as_float(a[2 * i + 1]));
+                        pk[i] = pack_bf16x2(__uint_as_float(a[2 * i]), __uint_as_float(a[2 * i + 1]));
                         pk[16 + i] =
-                            gdn_pack(__uint_as_float(b[2 * i]), __uint_as_float(b[2 * i + 1]));
+                            pack_bf16x2(__uint_as_float(b[2 * i]), __uint_as_float(b[2 * i + 1]));
                     }
                     tmem_st32(tb + kColSI + hq * 32, pk);
                 }
@@ -800,9 +787,9 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                     tmem_wait_ld();
 #pragma unroll
                     for (int i = 0; i < 16; ++i) {
-                        pk[i] = gdn_pack(__uint_as_float(k0[2 * i]) * FK[2 * i],
+                        pk[i] = pack_bf16x2(__uint_as_float(k0[2 * i]) * FK[2 * i],
                                          __uint_as_float(k0[2 * i + 1]) * FK[2 * i + 1]);
-                        pk[16 + i] = gdn_pack(__uint_as_float(k1[2 * i]) * FK[32 + 2 * i],
+                        pk[16 + i] = pack_bf16x2(__uint_as_float(k1[2 * i]) * FK[32 + 2 * i],
                                               __uint_as_float(k1[2 * i + 1]) * FK[32 + 2 * i + 1]);
                     }
                     tmem_st32(tb + kColU, pk);
@@ -855,10 +842,10 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                         const float a1 = __uint_as_float(n0[2 * i + 1]);
                         const float c0 = __uint_as_float(n1[2 * i]);
                         const float c1 = __uint_as_float(n1[2 * i + 1]);
-                        pk[i] = gdn_pack(a0, a1);
-                        pk[16 + i] = gdn_pack(c0, c1);
-                        pd[i] = gdn_pack(a0 * FD[2 * i], a1 * FD[2 * i + 1]);
-                        pd[16 + i] = gdn_pack(c0 * FD[32 + 2 * i], c1 * FD[32 + 2 * i + 1]);
+                        pk[i] = pack_bf16x2(a0, a1);
+                        pk[16 + i] = pack_bf16x2(c0, c1);
+                        pd[i] = pack_bf16x2(a0 * FD[2 * i], a1 * FD[2 * i + 1]);
+                        pd[16 + i] = pack_bf16x2(c0 * FD[32 + 2 * i], c1 * FD[32 + 2 * i + 1]);
                     }
                     tmem_st32(tb + kColU, pk);
                     tmem_st32(tb + kColD, pd);
@@ -906,11 +893,11 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                             unsigned short* oh = reinterpret_cast<unsigned short*>(ob);
 #pragma unroll
                             for (int t = 0; t < 32; ++t)
-                                oh[t * 128 + v] = static_cast<unsigned short>(gdn_pack(__uint_as_float(o0[t]), 0.f) & 0xffffu);
+                                oh[t * 128 + v] = static_cast<unsigned short>(pack_bf16x2(__uint_as_float(o0[t]), 0.f) & 0xffffu);
 #pragma unroll
                             for (int t = 0; t < 32; ++t)
                                 oh[(32 + t) * 128 + v] =
-                                    static_cast<unsigned short>(gdn_pack(__uint_as_float(o1[t]), 0.f) & 0xffffu);
+                                    static_cast<unsigned short>(pack_bf16x2(__uint_as_float(o1[t]), 0.f) & 0xffffu);
                         } else {
 #pragma unroll
                             for (int t = 0; t < 32; ++t) ob[t * 128 + v] = __uint_as_float(o0[t]);
@@ -930,13 +917,13 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                         for (int t = 0; t < 32; ++t) {
                             if (t < L)
                                 orow[static_cast<long long>(t) * stride_row] =
-                                    static_cast<unsigned short>(gdn_pack(__uint_as_float(o0[t]), 0.f) & 0xffffu);
+                                    static_cast<unsigned short>(pack_bf16x2(__uint_as_float(o0[t]), 0.f) & 0xffffu);
                         }
 #pragma unroll
                         for (int t = 0; t < 32; ++t) {
                             if (32 + t < L)
                                 orow[static_cast<long long>(32 + t) * stride_row] =
-                                    static_cast<unsigned short>(gdn_pack(__uint_as_float(o1[t]), 0.f) & 0xffffu);
+                                    static_cast<unsigned short>(pack_bf16x2(__uint_as_float(o1[t]), 0.f) & 0xffffu);
                         }
                     } else {
                         float* orow =
@@ -967,7 +954,7 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                             tmem_wait_ld();
 #pragma unroll
                             for (int i = 0; i < 32; ++i) {
-                                const u32 bits = gdn_pack(__uint_as_float(x[i]), 0.f);
+                                const u32 bits = pack_bf16x2(__uint_as_float(x[i]), 0.f);
                                 reinterpret_cast<unsigned short*>(st)[(q * 32 + i) * 128 + v] =
                                     static_cast<unsigned short>(bits & 0xffffu);
                             }

@@ -27,10 +27,6 @@ __device__ __forceinline__ int lane_group() { return static_cast<int>(threadIdx.
 
 __device__ __forceinline__ int lane_in_group() { return static_cast<int>(threadIdx.x % 32u) & 3; }
 
-__device__ __forceinline__ unsigned pack(pie::bf16 low, pie::bf16 high) {
-    return (static_cast<unsigned>(high.raw) << 16) | static_cast<unsigned>(low.raw);
-}
-
 __device__ __forceinline__ void mma_m16n8k16(
     float (&d)[4],
     const unsigned (&a)[4],
@@ -103,8 +99,8 @@ __device__ __forceinline__ void load_matrix_sync(
         const int col = 2 * t + 8 * half;
         const int top = g * stride + col;
         const int bottom = (g + 8) * stride + col;
-        frag.reg[2 * half + 0] = detail::pack(ptr[top], ptr[top + 1]);
-        frag.reg[2 * half + 1] = detail::pack(ptr[bottom], ptr[bottom + 1]);
+        frag.reg[2 * half + 0] = ::pie::bf16x2_as_u32(ptr[top], ptr[top + 1]);
+        frag.reg[2 * half + 1] = ::pie::bf16x2_as_u32(ptr[bottom], ptr[bottom + 1]);
     }
 }
 
@@ -121,8 +117,8 @@ __device__ __forceinline__ void load_matrix_sync(
     for (int half = 0; half < 2; ++half) {
 
         const int base = (8 * half + g) * stride + 2 * t;
-        frag.reg[2 * half + 0] = detail::pack(ptr[base], ptr[base + 1]);
-        frag.reg[2 * half + 1] = detail::pack(ptr[base + 8], ptr[base + 9]);
+        frag.reg[2 * half + 0] = ::pie::bf16x2_as_u32(ptr[base], ptr[base + 1]);
+        frag.reg[2 * half + 1] = ::pie::bf16x2_as_u32(ptr[base + 8], ptr[base + 9]);
     }
 }
 

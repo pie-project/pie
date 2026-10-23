@@ -38,11 +38,6 @@ __device__ __forceinline__ void gdn_store8(
 }
 
 // A bf16 pair packed from two floats (round to nearest even) and unpacked.
-__device__ __forceinline__ unsigned gdn_pack(float lo, float hi) {
-    unsigned bits;
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(bits) : "f"(lo), "f"(hi));
-    return bits;
-}
 
 __device__ __forceinline__ float2 gdn_unpack(unsigned bits) {
     return make_float2(__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u));
