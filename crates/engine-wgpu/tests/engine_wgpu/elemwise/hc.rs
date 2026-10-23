@@ -1,6 +1,6 @@
 //! The hyper-connection kernels on the first wgpu adapter against an f64 host
 //! reference, beside the hand-written kernels: expand, the f32 stream norm,
-//! the mix projection, the gates (Sinkhorn-balanced), fold, collapse, and the
+//! the gates (Sinkhorn-balanced), fold, collapse, and the
 //! trunk's mix, inject and PLE gate.
 
 use crate::gpu::{Gpu, both, noise};
@@ -78,10 +78,9 @@ fn the_hyper_connections_answer_the_reference() {
         },
     );
 
-    // project, into a layer's mix row
+    // the mix row a layer's projection lands (elemwise/hc_project.rs)
     let nv = noise(3, N * wide);
     let fv: Vec<f32> = noise(4, mix_hc * wide).iter().map(|v| v * 0.05).collect();
-    let (normed, hc_fn) = (gpu.up_f32(&nv), gpu.up_f32(&fv));
     let mixes_want: Vec<f64> = (0..N * mix_hc)
         .map(|i| {
             let (n, o) = (i / mix_hc, i % mix_hc);
@@ -90,35 +89,6 @@ fn the_hyper_connections_answer_the_reference() {
                 .sum()
         })
         .collect();
-    both(
-        &mut gpu,
-        "hc project",
-        &|g| vec![(g.zeros(2 * N * mix_hc), N * mix_hc, true)],
-        std::slice::from_ref(&mixes_want),
-        &|g, o| {
-            g.run(|c| {
-                hc::project(
-                    c,
-                    f(normed, N, wide),
-                    f(hc_fn, mix_hc, wide),
-                    M as u32,
-                    f(o[0].0, N, mix_hc),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::elemwise::hc_project::project(
-                    c,
-                    st(f(normed, N, wide)),
-                    st(f(hc_fn, mix_hc, wide)),
-                    M as u32,
-                    st(f(o[0].0, N, mix_hc)),
-                )
-            })
-        },
-    );
-
     // gates, from the reference mix row
     let mixes_v: Vec<f32> = mixes_want.iter().map(|v| *v as f32).collect();
     let mixes = gpu.up_f32(&mixes_v);
