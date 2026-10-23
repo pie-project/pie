@@ -205,16 +205,21 @@ fn rule(op: &Operation) -> Rule {
             BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
         };
     }
+    // An expert product at the activations' precision contracts with its
+    // bank's split; one that quantizes them first reads its bank whole.
+    if let Operation::Linear(Linear::MoeSelect { quant, .. }) = op {
+        return match quant {
+            None => Rule::Contract {
+                act: "x",
+                w: "bank",
+                out: 1,
+                input: 2,
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
     let name = op.name();
     match name {
-        "linear.moe_matmul_select"
-        | "linear.moe_matmul_select_bias"
-        | "linear.moe_matmul_select_quant" => Rule::Contract {
-            act: "x",
-            w: "bank",
-            out: 1,
-            input: 2,
-        },
         "linear.moe_weighted_sum" => Rule::Linear {
             follow: &["routed"],
         },

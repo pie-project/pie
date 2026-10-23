@@ -107,8 +107,26 @@ impl Run<'_> {
                 *groups,
                 self.tensor(*y),
             ),
-            Linear::MoeMatmulSelect { x, bank, routes, y }
-            | Linear::MoeMatmulSelectQuant { x, bank, routes, y } => linear::moe::matmul_select(
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            }
+            | Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => linear::moe::matmul_select(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*bank),

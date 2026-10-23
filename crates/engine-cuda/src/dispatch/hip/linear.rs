@@ -452,13 +452,16 @@ impl Run<'_> {
             } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
             // The forms no builder makes.
             Linear::Matmul { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Linear::MoeMatmulSelectActQuant {
+            Linear::MoeSelect {
                 x,
                 bank,
                 routes,
-                quant,
+                quant: Some(quant),
                 input_scales: _,
                 y,
+                bias: None,
+                quantized: true,
+                ..
             } => {
                 const OP: &str = "linear.moe_matmul_select_act_quant";
                 // The routes' rows read x's rows, so x's rows are what quantize.
@@ -811,7 +814,16 @@ impl Run<'_> {
                     identity,
                 )
             }
-            Linear::MoeMatmulSelect { x, bank, routes, y } => {
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            } => {
                 let (bank, experts) = self.expert_bank(*bank);
                 linear::moe::matmul_select(
                     self.ctx(),
@@ -822,12 +834,15 @@ impl Run<'_> {
                     experts,
                 )
             }
-            Linear::MoeMatmulSelectBias {
+            Linear::MoeSelect {
                 x,
                 bank,
-                bias,
+                bias: Some(bias),
                 routes,
                 y,
+                quantized: false,
+                quant: None,
+                ..
             } => {
                 let (codes, scales, affine, seat) = self.planes(*bank);
                 debug_assert!(
@@ -846,10 +861,21 @@ impl Run<'_> {
                     seat,
                 )
             }
-            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => {
                 let x = self.tensor(*x);
                 self.select_quant(x, *bank, *routes, *y)
             }
+            // The forms no builder makes.
+            Linear::MoeSelect { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),

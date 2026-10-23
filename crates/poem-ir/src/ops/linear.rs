@@ -182,51 +182,24 @@ pub enum Linear {
         #[output]
         y: ValueId,
     },
-    MoeMatmulSelect {
-        #[input]
-        x: ValueId,
-        #[input]
-        bank: ValueId,
-        #[input(I32)]
-        routes: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    MoeMatmulSelectBias {
+    /// Each routed row of `x` times its expert's plane of `bank` (`bias`
+    /// added where given): a plain bank, or a `quantized` one (codes and
+    /// their planes), whose routes are quantized as `quant` states first
+    /// where it does, each under its expert's `input_scales` when the format
+    /// has a static global.
+    MoeSelect {
         #[input]
         x: ValueId,
         #[input]
         bank: ValueId,
         #[input]
-        bias: ValueId,
-        #[input(I32)]
-        routes: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    MoeMatmulSelectQuant {
-        #[input]
-        x: ValueId,
-        #[input]
-        bank: ValueId,
-        #[input(I32)]
-        routes: ValueId,
-        #[output]
-        y: ValueId,
-    },
-    /// [`Linear::MoeMatmulSelectQuant`] whose activations are quantized as
-    /// `quant` states first, each route's under its expert's `input_scales`
-    /// when the format has a static global.
-    MoeMatmulSelectActQuant {
-        #[input]
-        x: ValueId,
-        #[input]
-        bank: ValueId,
+        bias: Option<ValueId>,
         #[input(I32)]
         routes: ValueId,
         #[input(F32)]
         input_scales: Option<ValueId>,
-        quant: ActQuant,
+        quantized: bool,
+        quant: Option<ActQuant>,
         #[output]
         y: ValueId,
     },

@@ -231,7 +231,12 @@ impl Run<'_> {
                 logits: false,
                 ..
             }
-            | Linear::MoeMatmulSelectActQuant { .. }
+            | Linear::MoeSelect {
+                bias: None,
+                quantized: true,
+                quant: Some(_),
+                ..
+            }
             | Linear::Glu {
                 packed: None,
                 gate: Some(_),
@@ -477,24 +482,34 @@ impl Run<'_> {
                 crate::encode::slang_tensor(self.tensor(*y)),
             )
             .map_err(crate::encode::from_slang),
-            Linear::MoeMatmulSelect { x, bank, routes, y } => {
-                kernels_slang::linear::moe::select::matmul_select(
-                    &self.slang(),
-                    kernels_slang::Tier::Baseline,
-                    crate::encode::slang_tensor(self.tensor(*x)),
-                    crate::encode::slang_tensor(self.tensor(*bank)),
-                    crate::encode::slang_tensor(self.tensor(*routes)),
-                    crate::encode::slang_tensor(self.tensor(*y)),
-                )
-                .map_err(crate::encode::from_slang)
-            }
-
-            Linear::MoeMatmulSelectBias {
+            Linear::MoeSelect {
                 x,
                 bank,
-                bias,
                 routes,
                 y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            } => kernels_slang::linear::moe::select::matmul_select(
+                &self.slang(),
+                kernels_slang::Tier::Baseline,
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*bank)),
+                crate::encode::slang_tensor(self.tensor(*routes)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+
+            Linear::MoeSelect {
+                x,
+                bank,
+                bias: Some(bias),
+                routes,
+                y,
+                quantized: false,
+                quant: None,
+                ..
             } => {
                 const OP: &str = "linear.moe_matmul_select_bias";
 
@@ -539,7 +554,16 @@ impl Run<'_> {
                 .map_err(crate::encode::from_slang)
             }
 
-            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
                 let (planes, routed, staged) =
                     match self.staged(Some(self.planes(*bank)), None, self.tensor(*routes))? {
@@ -574,6 +598,8 @@ impl Run<'_> {
                 .map_err(crate::encode::from_slang)
             }
 
+            // The forms no builder makes.
+            Linear::MoeSelect { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Linear::LoraCorrect {
                 x,
                 bank_a,

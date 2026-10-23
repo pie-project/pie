@@ -25,7 +25,16 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
     for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
         let trace = row.trace(Platform::Cuda);
         for node in &trace.nodes {
-            let Operation::Linear(Linear::MoeMatmulSelect { x, bank, y, .. }) = &node.op else {
+            let Operation::Linear(Linear::MoeSelect {
+                x,
+                bank,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            }) = &node.op
+            else {
                 continue;
             };
             let (Some(bank_shape), Some(k), Some(n)) = (

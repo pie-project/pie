@@ -78,17 +78,25 @@ impl Run<'_> {
     ) -> Option<(kernels_cuda::linear::moe::RoutedMlp, ValueId)> {
         use poem_ir::Linear;
         let (
-            Linear::MoeMatmulSelect {
+            Linear::MoeSelect {
                 x,
                 bank: gate_up,
                 routes,
                 y: packed,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
             },
-            Linear::MoeMatmulSelect {
+            Linear::MoeSelect {
                 x: h,
                 bank: down_bank,
                 routes: down_routes,
                 y: routed,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
             },
             Linear::MoeWeightedSum {
                 routed: summed,
@@ -223,7 +231,8 @@ impl Run<'_> {
         else {
             return None;
         };
-        if !matches!(**select, Linear::MoeMatmulSelect { x, .. } if x == act) {
+        if !matches!(**select, Linear::MoeSelect { x, bias: None, quantized: false, quant: None, .. } if x == act)
+        {
             return None;
         }
         let (p, y) = self.routed_mlp(select, glu, down, sum)?;

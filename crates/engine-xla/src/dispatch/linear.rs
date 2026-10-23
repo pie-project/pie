@@ -22,7 +22,12 @@ impl Run<'_> {
                 logits: false,
                 ..
             }
-            | Linear::MoeMatmulSelectActQuant { .. }
+            | Linear::MoeSelect {
+                bias: None,
+                quantized: true,
+                quant: Some(_),
+                ..
+            }
             | Linear::Glu {
                 packed: None,
                 gate: Some(_),
@@ -569,24 +574,34 @@ impl Run<'_> {
                     l.land(y, v)
                 })
             }
-            Linear::MoeMatmulSelect { x, bank, routes, y } => {
-                crate::lower::lower(self.ctx(), |l| {
-                    let x_v = l.read(self.tensor(*x))?;
-                    let routes_v = l.read(self.tensor(*routes))?;
-                    let y_v = l.read(self.tensor(*y))?;
-                    let bank_v = l.read(self.tensor(*bank))?;
-                    let o_y = self.tensor(*y);
-                    let tuning = l.tuning();
-                    let v = linear::moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
-                    l.land(o_y, v)
-                })
-            }
-            Linear::MoeMatmulSelectBias {
+            Linear::MoeSelect {
                 x,
                 bank,
-                bias,
                 routes,
                 y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let routes_v = l.read(self.tensor(*routes))?;
+                let y_v = l.read(self.tensor(*y))?;
+                let bank_v = l.read(self.tensor(*bank))?;
+                let o_y = self.tensor(*y);
+                let tuning = l.tuning();
+                let v = linear::moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                l.land(o_y, v)
+            }),
+            Linear::MoeSelect {
+                x,
+                bank,
+                bias: Some(bias),
+                routes,
+                y,
+                quantized: false,
+                quant: None,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
                 let routes_v = l.read(self.tensor(*routes))?;
@@ -606,25 +621,28 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
-                crate::lower::lower(self.ctx(), |l| {
-                    let x_v = l.read(self.tensor(*x))?;
-                    let routes_v = l.read(self.tensor(*routes))?;
-                    let y_v = l.read(self.tensor(*y))?;
-                    let bank_v = l.bank(self.planes(*bank))?;
-                    let o_y = self.tensor(*y);
-                    let tuning = l.tuning();
-                    let v = linear::moe::matmul_select_quant(
-                        l.f(),
-                        x_v,
-                        bank_v,
-                        routes_v,
-                        y_v,
-                        tuning,
-                    )?;
-                    l.land(o_y, v)
-                })
-            }
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let routes_v = l.read(self.tensor(*routes))?;
+                let y_v = l.read(self.tensor(*y))?;
+                let bank_v = l.bank(self.planes(*bank))?;
+                let o_y = self.tensor(*y);
+                let tuning = l.tuning();
+                let v =
+                    linear::moe::matmul_select_quant(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                l.land(o_y, v)
+            }),
+            // The forms no builder makes.
+            Linear::MoeSelect { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::MoeWeightedSum { routed, weights, y } => crate::lower::lower(self.ctx(), |l| {
                 let routed_v = l.read(self.tensor(*routed))?;
                 let weights_v = l.read(self.tensor(*weights))?;

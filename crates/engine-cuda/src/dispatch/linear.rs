@@ -64,9 +64,11 @@ impl Run<'_> {
                                 act: poem_ir::GluAct::Swiglu,
                                 ..
                             },
-                            Linear::MoeMatmulSelectActQuant {
+                            Linear::MoeSelect {
                                 x,
-                                quant: ActQuant::E4m3 { gran: 128 },
+                                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                                bias: None,
+                                quantized: true,
                                 ..
                             },
                         ) if x == rows => Some(*rows),
@@ -998,7 +1000,16 @@ impl Run<'_> {
                     experts,
                 )
             }
-            Linear::MoeMatmulSelect { x, bank, routes, y } => {
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            } => {
                 let (bank, experts) = self.expert_bank(*bank);
                 linear::moe::matmul_select(
                     self.ctx(),
@@ -1009,12 +1020,15 @@ impl Run<'_> {
                     experts,
                 )
             }
-            Linear::MoeMatmulSelectBias {
+            Linear::MoeSelect {
                 x,
                 bank,
-                bias,
+                bias: Some(bias),
                 routes,
                 y,
+                quantized: false,
+                quant: None,
+                ..
             } => {
                 let (codes, scales, affine, seat) = self.planes(*bank);
                 if codes.dtype == Dtype::Nvfp4 {
@@ -1041,18 +1055,32 @@ impl Run<'_> {
                     seat,
                 )
             }
-            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
-                let x = self.tensor(*x);
-                self.select_quant(x, *bank, *routes, *y)
-            }
-            Linear::MoeMatmulSelectActQuant {
+            Linear::MoeSelect {
                 x,
                 bank,
                 routes,
-                quant,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => {
+                let x = self.tensor(*x);
+                self.select_quant(x, *bank, *routes, *y)
+            }
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                quant: Some(quant),
                 input_scales,
                 y,
+                bias: None,
+                quantized: true,
+                ..
             } => self.select_act_quant(*x, *bank, *routes, *quant, *input_scales, *y),
+            // The forms no builder makes.
+            Linear::MoeSelect { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
@@ -1181,21 +1209,28 @@ impl Run<'_> {
     )> {
         use linear::moe::{ExpertTable, GluBank};
         Some(match *select {
-            Linear::MoeMatmulSelect {
+            Linear::MoeSelect {
                 x,
                 bank,
                 routes,
                 y: sy,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
             } => {
                 let (bank, experts) = self.expert_bank(bank);
                 (x, routes, sy, GluBank::Bf16(bank), experts)
             }
-            Linear::MoeMatmulSelectBias {
+            Linear::MoeSelect {
                 x,
                 bank,
-                bias,
+                bias: Some(bias),
                 routes,
                 y: sy,
+                quantized: false,
+                quant: None,
+                ..
             } => {
                 let (codes, scales, affine, seat) = self.planes(bank);
                 if codes.dtype == Dtype::Nvfp4
@@ -1218,11 +1253,15 @@ impl Run<'_> {
                     ExpertTable::RESIDENT,
                 )
             }
-            Linear::MoeMatmulSelectQuant {
+            Linear::MoeSelect {
                 x,
                 bank,
                 routes,
                 y: sy,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
             } => {
                 let (codes, scales, biases, seat) = self.planes(bank);
                 if seat.streams()
@@ -1255,13 +1294,15 @@ impl Run<'_> {
             }
             // An NVFP4 bank against NVFP4 activations (W4A4), its scales laid
             // in atoms and its input scales stated.
-            Linear::MoeMatmulSelectActQuant {
+            Linear::MoeSelect {
                 x,
                 bank,
                 routes,
-                quant: ActQuant::Nvfp4,
+                quant: Some(ActQuant::Nvfp4),
                 input_scales: Some(input_scales),
                 y: sy,
+                bias: None,
+                quantized: true,
             } => {
                 let (codes, atoms, biases, seat) = self.planes(bank);
                 if codes.dtype != Dtype::Nvfp4
@@ -1287,13 +1328,15 @@ impl Run<'_> {
             }
             // An MXFP4 bank against e4m3 activations in 1x128 blocks (W4A8),
             // its scales laid in atoms.
-            Linear::MoeMatmulSelectActQuant {
+            Linear::MoeSelect {
                 x,
                 bank,
                 routes,
-                quant: ActQuant::E4m3 { gran: 128 },
+                quant: Some(ActQuant::E4m3 { gran: 128 }),
                 input_scales: None,
                 y: sy,
+                bias: None,
+                quantized: true,
             } => {
                 let (codes, atoms, biases, seat) = self.planes(bank);
                 if !matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8 | Dtype::E4m3)
@@ -2380,10 +2423,34 @@ fn staging(name: &'static str, bytes: usize) -> Option<u64> {
 #[cfg(feature = "cuda")]
 fn routes_of(op: &Linear) -> Option<ValueId> {
     match op {
-        Linear::MoeMatmulSelect { routes, .. }
-        | Linear::MoeMatmulSelectBias { routes, .. }
-        | Linear::MoeMatmulSelectQuant { routes, .. }
-        | Linear::MoeMatmulSelectActQuant { routes, .. } => Some(*routes),
+        Linear::MoeSelect {
+            routes,
+            bias: None,
+            quantized: false,
+            quant: None,
+            ..
+        }
+        | Linear::MoeSelect {
+            routes,
+            bias: Some(_),
+            quantized: false,
+            quant: None,
+            ..
+        }
+        | Linear::MoeSelect {
+            routes,
+            bias: None,
+            quantized: true,
+            quant: None,
+            ..
+        }
+        | Linear::MoeSelect {
+            routes,
+            bias: None,
+            quantized: true,
+            quant: Some(_),
+            ..
+        } => Some(*routes),
         _ => None,
     }
 }

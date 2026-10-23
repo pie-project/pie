@@ -720,7 +720,12 @@ impl Run<'_> {
                 logits: false,
                 ..
             }
-            | Linear::MoeMatmulSelectActQuant { .. }
+            | Linear::MoeSelect {
+                bias: None,
+                quantized: true,
+                quant: Some(_),
+                ..
+            }
             | Linear::Glu {
                 packed: None,
                 gate: Some(_),
@@ -962,19 +967,31 @@ impl Run<'_> {
                 *groups,
                 self.tensor(*y),
             ),
-            Linear::MoeMatmulSelect { x, bank, routes, y } => linear::moe::matmul_select(
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            } => linear::moe::matmul_select(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*bank),
                 self.tensor(*routes),
                 self.tensor(*y),
             ),
-            Linear::MoeMatmulSelectBias {
+            Linear::MoeSelect {
                 x,
                 bank,
-                bias,
+                bias: Some(bias),
                 routes,
                 y,
+                quantized: false,
+                quant: None,
+                ..
             } => {
                 const OP: &str = "linear.moe_matmul_select_bias";
                 if let Some(scratch) = self.routed_rooms() {
@@ -1012,7 +1029,16 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
-            Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
@@ -1048,6 +1074,8 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
+            // The forms no builder makes.
+            Linear::MoeSelect { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::LoraCorrect {
                 x,
                 bank_a,

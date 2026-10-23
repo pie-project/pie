@@ -147,8 +147,24 @@ impl Scratch {
                 continue;
             };
             match op {
-                Linear::MoeMatmulSelectBias { x, routes, y, .. }
-                | Linear::MoeMatmulSelectQuant { x, routes, y, .. } => {
+                Linear::MoeSelect {
+                    x,
+                    routes,
+                    y,
+                    bias: Some(_),
+                    quantized: false,
+                    quant: None,
+                    ..
+                }
+                | Linear::MoeSelect {
+                    x,
+                    routes,
+                    y,
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                } => {
                     let (Some(x), Some(y)) = (of(*x), of(*y)) else {
                         continue;
                     };

@@ -1303,13 +1303,27 @@ fn decoded_weight_planes(
                         logits: false,
                         ..
                     }
-                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
+                    | poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: true,
+                        quant: Some(_),
+                        ..
+                    },
                 ) => continue,
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Fused(
                     poem_ir::Fused::MoeSelectGlu { select, .. }
                     | poem_ir::Fused::MoeExperts { select, .. },
-                ) if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) => {
+                ) if matches!(
+                    **select,
+                    poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: true,
+                        quant: Some(_),
+                        ..
+                    }
+                ) =>
+                {
                     continue;
                 }
                 // A routed select reads its bank's codes as they are, whatever
@@ -1317,9 +1331,24 @@ fn decoded_weight_planes(
                 // grouped and per-route ones): it decodes no bf16 tile.
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Linear(
-                    poem_ir::Linear::MoeMatmulSelect { .. }
-                    | poem_ir::Linear::MoeMatmulSelectBias { .. }
-                    | poem_ir::Linear::MoeMatmulSelectQuant { .. },
+                    poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: false,
+                        quant: None,
+                        ..
+                    }
+                    | poem_ir::Linear::MoeSelect {
+                        bias: Some(_),
+                        quantized: false,
+                        quant: None,
+                        ..
+                    }
+                    | poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: true,
+                        quant: None,
+                        ..
+                    },
                 )
                 | poem_ir::Operation::Fused(
                     poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },

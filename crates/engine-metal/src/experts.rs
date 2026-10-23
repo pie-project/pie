@@ -320,10 +320,29 @@ fn found(
             continue;
         };
         let (routes, indexed) = match op {
-            Linear::MoeMatmulSelect { bank, routes, .. }
-            | Linear::MoeMatmulSelectQuant { bank, routes, .. } => (*routes, vec![*bank]),
-            Linear::MoeMatmulSelectBias {
-                bank, bias, routes, ..
+            Linear::MoeSelect {
+                bank,
+                routes,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            }
+            | Linear::MoeSelect {
+                bank,
+                routes,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => (*routes, vec![*bank]),
+            Linear::MoeSelect {
+                bank,
+                bias: Some(bias),
+                routes,
+                quantized: false,
+                quant: None,
+                ..
             } => (*routes, vec![*bank, *bias]),
             Linear::MoeBiasSum { bias, routes, .. } => (*routes, vec![*bias]),
             _ => continue,

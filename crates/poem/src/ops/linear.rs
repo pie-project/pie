@@ -656,11 +656,15 @@ pub fn moe_matmul_select(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -
     let r = x.rec();
     let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
     r.push(
-        Linear::MoeMatmulSelect {
+        Linear::MoeSelect {
             x: x.id(),
             bank: r.weight(bank),
             routes: routes.id(),
             y: y.id(),
+            bias: None,
+            input_scales: None,
+            quantized: false,
+            quant: None,
         },
         &[x, routes],
     );
@@ -678,12 +682,15 @@ pub fn moe_matmul_select_bias(
     let r = x.rec();
     let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
     r.push(
-        Linear::MoeMatmulSelectBias {
+        Linear::MoeSelect {
             x: x.id(),
             bank: r.weight(bank),
-            bias: r.weight(bias),
+            bias: Some(r.weight(bias)),
             routes: routes.id(),
             y: y.id(),
+            input_scales: None,
+            quantized: false,
+            quant: None,
         },
         &[x, routes],
     );
@@ -697,22 +704,28 @@ pub fn moe_matmul_select_quant(x: &Value, bank: &Weight, routes: &Value, top_k: 
     let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
     match bank.act {
         None => r.push(
-            Linear::MoeMatmulSelectQuant {
+            Linear::MoeSelect {
                 x: x.id(),
                 bank: r.weight(bank),
                 routes: routes.id(),
                 y: y.id(),
+                bias: None,
+                input_scales: None,
+                quantized: true,
+                quant: None,
             },
             &[x, routes],
         ),
         Some(quant) => r.push(
-            Linear::MoeMatmulSelectActQuant {
+            Linear::MoeSelect {
                 x: x.id(),
                 bank: r.weight(bank),
                 routes: routes.id(),
-                quant,
+                quant: Some(quant),
                 input_scales: input_scales(r, bank, quant),
                 y: y.id(),
+                bias: None,
+                quantized: true,
             },
             &[x, routes],
         ),

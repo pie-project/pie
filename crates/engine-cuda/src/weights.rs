@@ -1582,7 +1582,13 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
             logits: false,
             ..
         }
-        | Linear::MoeMatmulSelectActQuant { bank: w, .. } => Some(*w),
+        | Linear::MoeSelect {
+            bank: w,
+            bias: None,
+            quantized: true,
+            quant: Some(_),
+            ..
+        } => Some(*w),
         _ => None,
     };
     let mut banks = BTreeMap::new();
@@ -1642,9 +1648,11 @@ fn share_input_scales(
 ) -> Result<()> {
     use poem_ir::{ActQuant, Def, Fused, Linear, Operation};
     let scales_of = |op: &Linear| match op {
-        Linear::MoeMatmulSelectActQuant {
-            quant: ActQuant::Nvfp4,
+        Linear::MoeSelect {
+            quant: Some(ActQuant::Nvfp4),
             input_scales: Some(s),
+            bias: None,
+            quantized: true,
             ..
         } => Some(*s),
         _ => None,

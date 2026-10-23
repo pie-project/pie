@@ -385,11 +385,20 @@ fn lane_banks(
         };
         for leg in legs {
             let (x, bank) = match leg {
-                Linear::MoeMatmulSelectQuant { x, bank, .. } => (*x, *bank),
-                Linear::MoeMatmulSelectActQuant {
+                Linear::MoeSelect {
                     x,
                     bank,
-                    quant: ActQuant::E4m3 { .. },
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                } => (*x, *bank),
+                Linear::MoeSelect {
+                    x,
+                    bank,
+                    quant: Some(ActQuant::E4m3 { .. }),
+                    bias: None,
+                    quantized: true,
                     ..
                 } => (*x, *bank),
                 _ => continue,

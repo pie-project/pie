@@ -533,11 +533,15 @@ impl<'c> Run<'c> {
             )) => (packed, hidden),
             _ => return Sorted::default(),
         };
-        let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
+        let Some(Operation::Linear(Linear::MoeSelect {
             x: down_x,
             bank: down_bank,
             routes: down_routes,
             y: routed,
+            bias: None,
+            quantized: true,
+            quant: None,
+            ..
         })) = self.sole_reader(*hidden).map(|n| &n.op)
         else {
             return Sorted::default();

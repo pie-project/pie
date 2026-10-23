@@ -374,8 +374,18 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
                     routers += 1;
                     assert_eq!((*experts, *top_k), (d.experts, d.top_k), "{deployment}");
                 }
-                Operation::Linear(Linear::MoeMatmulSelect { .. }) => selects += 1,
-                Operation::Linear(Linear::MoeMatmulSelectQuant { .. }) => {
+                Operation::Linear(Linear::MoeSelect {
+                    bias: None,
+                    quantized: false,
+                    quant: None,
+                    ..
+                }) => selects += 1,
+                Operation::Linear(Linear::MoeSelect {
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                }) => {
                     selects += 1;
                     quant += 1;
                 }
