@@ -1,4 +1,4 @@
-//! Dense matmuls (`linear.matmul`, `linear.lm_head` over a bf16 weight, and
+//! Dense matmuls (`linear.matmul`, `linear.matmul` over a bf16 weight, and
 //! an f32 activation's lane form). SPIR-V fires `kernels/linear/gemm.slang`
 //! (the vector kernels below four rows, the tiled kernel or its
 //! cooperative-matrix tier above) and `gemm_lane.slang` for f32
@@ -49,7 +49,7 @@ pub fn lm_head(
     w: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, tactic, "linear.lm_head", act, w, y)
+    act_x_wt(ctx, tactic, "linear.matmul", act, w, y)
 }
 
 /// `y = act * w^T` on bf16.

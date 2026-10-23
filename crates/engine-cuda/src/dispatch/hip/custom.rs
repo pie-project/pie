@@ -11,7 +11,7 @@ impl DispatchFused for Run<'_> {
         match op {
             Fused::GdnStep { .. } => return self.gdn_step(op),
             Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
-            Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
+            Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
             Fused::MatmulGeglu { .. }
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
@@ -768,7 +768,7 @@ impl Run<'_> {
         )
     }
 
-    fn custom_cuda(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+    fn qkv_write(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite {
                 packed,

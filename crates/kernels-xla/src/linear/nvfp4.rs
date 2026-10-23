@@ -67,7 +67,7 @@ pub fn lm_head(
 ) -> Result<Option<Val>, Error> {
     fire(
         f,
-        "linear.lm_head",
+        "linear.matmul",
         act,
         codes,
         scales,

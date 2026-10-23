@@ -69,7 +69,7 @@ pub fn swiglu(
     fan: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu";
+    const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     let (entry, launch) = vec8(packed, intermediate, y).map_or(
@@ -97,7 +97,7 @@ pub fn swiglu_clamp(
     limit: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp";
+    const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
@@ -127,7 +127,7 @@ pub fn swiglu_clamp_alpha(
     alpha: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp_alpha";
+    const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
@@ -226,16 +226,7 @@ pub fn swiglu_clamp_split(
     limit: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    swiglu_clamp_lanes(
-        ctx,
-        "linear.swiglu_clamp_split",
-        gate,
-        Some(up),
-        None,
-        1,
-        limit,
-        y,
-    )
+    swiglu_clamp_lanes(ctx, "linear.glu", gate, Some(up), None, 1, limit, y)
 }
 
 /// [`swiglu_clamp_split`] of routed rows, each row times its route's
@@ -251,7 +242,7 @@ pub fn swiglu_clamp_split_routed(
 ) -> Result<(), Error> {
     swiglu_clamp_lanes(
         ctx,
-        "linear.swiglu_clamp_split_routed",
+        "linear.glu",
         gate,
         Some(up),
         Some(weights),
@@ -272,7 +263,7 @@ pub fn swiglu_clamp_routed(
     limit: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp_routed";
+    const OP: &str = "linear.glu";
     if packed.width != 2 * intermediate || y.width != intermediate || packed.rows != y.rows {
         return Err(refuse(
             OP,
@@ -292,7 +283,7 @@ pub fn geglu_tanh(
     fan: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh";
+    const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let n = y.elements();
     let lanes = u32::try_from(n).map_err(|_| {
@@ -372,7 +363,7 @@ pub fn geglu_tanh_packed(
     fan: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     let (entry, launch) = vec8(packed, intermediate, y).map_or(
@@ -406,7 +397,7 @@ pub fn situ(
     up_cap: Option<f32>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.situ";
+    const OP: &str = "linear.glu";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }

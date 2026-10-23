@@ -155,7 +155,7 @@ pub fn lm_head(
     let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
     tiled_launch(
         ctx,
-        "linear.lm_head",
+        "linear.matmul",
         act,
         codes,
         scales,
@@ -367,7 +367,7 @@ pub fn lm_head_gemv(
 ) -> Result<(), Error> {
     gemv_with(
         ctx,
-        "linear.lm_head",
+        "linear.matmul",
         act,
         codes,
         scales,

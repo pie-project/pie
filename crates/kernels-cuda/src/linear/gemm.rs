@@ -62,7 +62,7 @@ pub fn matmul_bias(
 }
 
 pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, None, y)
+    act_x_wt(ctx, "linear.matmul", act, w, None, y)
 }
 
 pub fn act_x_wt(

@@ -39,7 +39,7 @@ fn halves(op: &'static str, packed: Tensor, intermediate: u32, y: Tensor) -> Res
 }
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -60,7 +60,7 @@ pub fn swiglu_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     if y.rows > 8 || !intermediate.is_multiple_of(64) || intermediate > TABLE_WIDEST {
@@ -98,7 +98,7 @@ pub fn swiglu_sorted(
     perm: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -122,7 +122,7 @@ pub fn swiglu_clamp_alpha_sorted(
     perm: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp_alpha";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -150,7 +150,7 @@ pub fn geglu_tanh_sorted(
     perm: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -176,7 +176,7 @@ pub fn geglu_tanh_sorted_sums(
     sums: Tensor,
     tile: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     let cut = halves(OP, packed, intermediate, y)?;
     debug_assert!(intermediate.is_multiple_of(64), "whole 64-wide groups");
@@ -201,7 +201,7 @@ pub fn swiglu_clamp(
     limit: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_clamp_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -223,7 +223,7 @@ pub fn swiglu_clamp_alpha(
     alpha: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp_alpha";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_clamp_alpha_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -245,7 +245,7 @@ pub fn swiglu_clamp_split(
     limit: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.swiglu_clamp_split";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "swiglu_clamp_bfloat16" });
     debug_assert_eq!(
         (up.rows, up.width),
@@ -267,7 +267,7 @@ pub fn swiglu_clamp_split(
 }
 
 pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "geglu_tanh_bfloat16" });
     ctx.fire(
         Fire::at("linear/glu_split.metal", entry).apply(Grid::of(
@@ -294,7 +294,7 @@ pub fn geglu_tanh_packed(
     intermediate: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.geglu_tanh_packed";
+    const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_geglu_tanh_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -311,7 +311,7 @@ pub fn situ(
     up_cap: Option<f32>,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.situ";
+    const OP: &str = "linear.glu";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }

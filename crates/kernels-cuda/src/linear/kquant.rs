@@ -90,7 +90,7 @@ pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), E
 }
 
 pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    kquant(ctx, "linear.lm_head", act, w, y)
+    kquant(ctx, "linear.matmul", act, w, y)
 }
 
 fn kquant(

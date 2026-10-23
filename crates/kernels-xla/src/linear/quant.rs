@@ -682,7 +682,7 @@ pub fn lm_head(
     y: Landing,
     tuning: Tuning,
 ) -> Result<Option<Val>, Error> {
-    act_x_wt(f, "linear.lm_head", act, w, y, tuning)
+    act_x_wt(f, "linear.matmul", act, w, y, tuning)
 }
 
 pub fn act_x_wt(

@@ -84,7 +84,7 @@ pub fn matmul_swiglu(
 }
 
 pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, None, y)
+    act_x_wt(ctx, "linear.matmul", act, w, None, y)
 }
 
 /// [`lm_head`] over a body's padded readouts, `live` a device word holding
@@ -97,7 +97,7 @@ pub fn lm_head_live(
     live: u64,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.lm_head";
+    const OP: &str = "linear.matmul";
     #[cfg(feature = "rocm")]
     {
         let from = ctx.tuning().gemm_live_from;

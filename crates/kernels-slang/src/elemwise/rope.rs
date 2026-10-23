@@ -1,5 +1,5 @@
 //! Rotary embeddings from `kernels/elemwise/rope.slang`, in place on rows:
-//! neox halves at a span (`elemwise.rope_full`, `rope_partial`,
+//! neox halves at a span (`elemwise.rope`, `rope_partial`,
 //! `rope_partial_q`), each head's rotated tail (`rope_partial_last`),
 //! whole-head YaRN (`rope_yarn`), on bf16 two pairs a lane so a lane owns
 //! whole words; M-RoPE sections (`rope_mrope`) and position axes
@@ -117,7 +117,7 @@ pub fn full(
     theta: f32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_full";
+    const OP: &str = "elemwise.rope";
     if interleaved {
         return Err(refuse(
             OP,
@@ -141,7 +141,7 @@ pub fn partial(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_partial";
+    const OP: &str = "elemwise.rope";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
     rotate(ctx, OP, q, positions, base, head_dim, rotary_dim, span)?;
@@ -157,7 +157,7 @@ pub fn partial_q(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_partial_q";
+    const OP: &str = "elemwise.rope";
     rotate(
         ctx,
         OP,
@@ -181,7 +181,7 @@ pub fn partial_last(
     inverse: bool,
     yarn: Option<Yarn>,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_partial_last";
+    const OP: &str = "elemwise.rope";
     if rotary_dim > head_dim {
         return Err(refuse(
             OP,
@@ -300,7 +300,7 @@ pub fn yarn(
     original_max_position: u32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_yarn";
+    const OP: &str = "elemwise.rope";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let max_position = stated(
         OP,
@@ -519,7 +519,7 @@ pub fn mrope_interleaved(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_mrope";
+    const OP: &str = "elemwise.rope";
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_mrope_interleaved_bf16" });
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     sections_both(
@@ -547,7 +547,7 @@ pub fn mrope_blocked(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_mrope";
+    const OP: &str = "elemwise.rope";
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_mrope_blocked_bf16" });
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;
@@ -566,7 +566,7 @@ pub fn mrope_split(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elemwise.rope_mrope";
+    const OP: &str = "elemwise.rope";
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_mrope_split_bf16" });
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;

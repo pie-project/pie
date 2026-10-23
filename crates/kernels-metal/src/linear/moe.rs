@@ -129,7 +129,7 @@ pub fn topk_softmax(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_f32w_bfloat16" });
     debug_assert_eq!(
         logits.width, experts,
@@ -164,7 +164,7 @@ pub fn topk_softmax_scaled(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax_scaled";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_scaled_f32w_bfloat16" });
     debug_assert_eq!(
         scale.dtype, logits.dtype,
@@ -202,7 +202,7 @@ pub fn topk_sigmoid(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid" });
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
@@ -231,7 +231,7 @@ pub fn topk_sigmoid_biased(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid_biased" });
     debug_assert_eq!(
         bias.dtype,
@@ -266,7 +266,7 @@ pub fn topk_sqrt_softplus(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sqrt_softplus";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sqrt_softplus" });
     debug_assert_eq!(
         bias.dtype,
@@ -298,7 +298,7 @@ pub fn predict_route(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_predict_route";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_predict_sqrt_softplus" });
     debug_assert_eq!(
         bias.dtype,
@@ -334,7 +334,7 @@ pub fn hash_route(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_hash_route";
+    const OP: &str = "linear.moe_route";
     debug_assert!(
         matches!(ids.dtype, Dtype::U32 | Dtype::I32),
         "`{OP}` gathers by a 32-bit token id column"

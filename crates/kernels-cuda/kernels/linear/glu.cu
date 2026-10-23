@@ -4,7 +4,7 @@
 
 namespace pie::linear {
 
-// `linear.swiglu_clamp_routed` landing its rows as the e4m3 read-back
+// `linear.glu` landing its rows as the e4m3 read-back
 // (`act_quant_e4m3_v8`'s values mode) of the bf16 rows it would land: eight
 // columns a lane, a 128-wide block's 16 lanes adjacent. A select reading
 // them back again lands the same values (each block's values sit on its

@@ -1,4 +1,4 @@
-//! GGUF K-quant matmuls (`linear.matmul`, `linear.lm_head` over a stored
+//! GGUF K-quant matmuls (`linear.matmul`, `linear.matmul` over a stored
 //! Q2_K to Q6_K plane) from `kernels/linear/kquant.slang`: a 32-lane strip
 //! lands two columns of a row, walking the row's super-blocks.
 
@@ -106,7 +106,7 @@ pub fn lm_head(
     w: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    fire(ctx, "linear.lm_head", tactic, act, w, y)
+    fire(ctx, "linear.matmul", tactic, act, w, y)
 }
 
 fn fire(

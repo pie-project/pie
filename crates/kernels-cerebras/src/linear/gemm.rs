@@ -16,7 +16,7 @@ pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Er
 
 /// The vocabulary projection; same contract as [`matmul`].
 pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y)
+    act_x_wt(ctx, "linear.matmul", act, w, y)
 }
 
 fn act_x_wt(
