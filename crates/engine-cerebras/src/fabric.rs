@@ -407,12 +407,18 @@ impl Sink for Emitting<'_> {
         self.program.scratch_of(hint, len, elem)
     }
 
-    fn table(&mut self, name: &str, elem: &str, lits: &[String]) {
-        self.program.global(format!(
-            "var {name} = [{}]{elem} {{ {} }};",
-            lits.len(),
-            lits.join(", ")
-        ));
+    /// Named by its contents, so equal tables share one global and one
+    /// kept slot across every program of a model.
+    fn table(&mut self, hint: &str, elem: &str, lits: &[String]) -> String {
+        use std::hash::{Hash, Hasher};
+        let body = lits.join(", ");
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        elem.hash(&mut h);
+        body.hash(&mut h);
+        let name = format!("{hint}_{:016x}", h.finish());
+        self.program
+            .global(format!("var {name} = [{}]{elem} {{ {body} }};", lits.len()));
+        name
     }
 
     fn global(&mut self, line: String) {

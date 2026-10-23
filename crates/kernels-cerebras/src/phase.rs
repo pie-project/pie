@@ -69,9 +69,9 @@ pub trait Sink {
     /// A private array of `len` elements of `elem` (`f32`, `i32`, `u32`).
     fn scratch(&mut self, hint: &str, len: u64, elem: &'static str) -> String;
 
-    /// The constant table `name`: `lits.len()` elements of `elem`, the
-    /// same contents under the same name (declared once).
-    fn table(&mut self, name: &str, elem: &str, lits: &[String]);
+    /// A constant table of `lits.len()` elements of `elem`, by its name
+    /// (`hint` in it): equal contents share one name, declared once.
+    fn table(&mut self, hint: &str, elem: &str, lits: &[String]) -> String;
 
     /// A raw global declaration line, once (the device probes of CSL's own
     /// semantics only).

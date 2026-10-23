@@ -280,18 +280,9 @@ impl<'a> Cx<'a> {
         self.p.unique(hint)
     }
 
-    /// A constant table (`var NAME = [n]elem { lits };`) named by its
-    /// contents, so equal tables share one global (declared once) and one
-    /// kept slot across every program of a model.
+    /// A constant table (`var NAME = [n]elem { lits };`), by its name.
     pub fn table(&mut self, hint: &str, elem: &str, lits: &[String]) -> String {
-        use std::hash::{Hash, Hasher};
-        let body = lits.join(", ");
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        elem.hash(&mut h);
-        body.hash(&mut h);
-        let name = format!("{hint}_{:016x}", h.finish());
-        self.p.table(&name, elem, lits);
-        name
+        self.p.table(hint, elem, lits)
     }
 
     /// Declares (or finds) the buffer `name` of `rows × width` elements of
