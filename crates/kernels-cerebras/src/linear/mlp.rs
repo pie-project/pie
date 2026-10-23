@@ -3,10 +3,10 @@
 use dtype::Dtype;
 
 use crate::csl::Arg;
-use crate::cx::{Ctx, expect, tile_split};
+use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::Shard;
+use crate::phase::{Footprint, Shard};
 use crate::tensor::Tensor;
 
 pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
@@ -25,15 +25,16 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
     // Rows past a PE spread over row groups, a row past a PE over column
     // groups: the same block of `g` and of `u` lands on one PE.
     let (rg, cg) = if packed.rows == y.rows {
-        tile_split(
-            &ctx.fabric(),
+        ctx.tile(
             OP,
-            y.rows,
-            intermediate,
-            u64::from(packed.width + y.width),
-            0,
-            0,
-            1,
+            Footprint {
+                rows: y.rows,
+                width: intermediate,
+                per_row: u64::from(packed.width + y.width),
+                per_col: 0,
+                whole: 0,
+                unit: 1,
+            },
         )?
     } else {
         (1, 1)
@@ -88,15 +89,16 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
         ));
     }
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(
-            &ctx.fabric(),
+        ctx.tile(
             OP,
-            y.rows,
-            x.width,
-            2 * u64::from(x.width),
-            0,
-            0,
-            1,
+            Footprint {
+                rows: y.rows,
+                width: x.width,
+                per_row: 2 * u64::from(x.width),
+                per_col: 0,
+                whole: 0,
+                unit: 1,
+            },
         )?
     } else {
         (1, 1)

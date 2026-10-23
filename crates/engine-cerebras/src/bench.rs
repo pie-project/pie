@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use dtype::Dtype;
-use kernels_cerebras::phase::Fabric;
+use kernels_cerebras::phase::{Fabric, Footprint};
 use kernels_cerebras::{Cx, Emit, Error, Tensor, View};
 
 use crate::fabric::{Emitting, Operands, Program, Rendered};
@@ -299,6 +299,10 @@ impl Default for Recorder {
 impl Emit for Recorder {
     fn fabric(&self) -> Fabric {
         self.fabric
+    }
+
+    fn tile(&self, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error> {
+        crate::fabric::tile(&self.fabric, op, footprint)
     }
 
     fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {

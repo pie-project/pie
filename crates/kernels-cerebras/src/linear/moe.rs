@@ -7,12 +7,12 @@
 use dtype::Dtype;
 
 use crate::csl::Arg;
-use crate::cx::{Ctx, expect, tile_split};
+use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::linear::gemm::ARRAY_WORDS;
 use crate::phase::{
-    BankSplit, BlockPlan, ColPlane, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
+    BankSplit, BlockPlan, ColPlane, Footprint, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
 };
 use crate::tensor::Tensor;
 
@@ -55,15 +55,16 @@ pub fn topk_softmax(
         ));
     }
     // Rows over PEs; a row's logits and its picks on one.
-    let (rg, _) = tile_split(
-        &ctx.fabric(),
+    let (rg, _) = ctx.tile(
         OP,
-        logits.rows,
-        1,
-        u64::from(logits.width) + 2 * u64::from(top_k),
-        0,
-        0,
-        1,
+        Footprint {
+            rows: logits.rows,
+            width: 1,
+            per_row: u64::from(logits.width) + 2 * u64::from(top_k),
+            per_col: 0,
+            whole: 0,
+            unit: 1,
+        },
     )?;
     let rows_local = logits.rows / rg;
     let (width, lrows) = (logits.width, logits.rows);
@@ -114,15 +115,16 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
         ));
     }
     let rows = routes.rows;
-    let (rg, _) = crate::cx::tile_split(
-        &ctx.fabric(),
+    let (rg, _) = ctx.tile(
         OP,
-        rows,
-        groups,
-        u64::from(groups),
-        0,
-        0,
-        groups,
+        Footprint {
+            rows,
+            width: groups,
+            per_row: u64::from(groups),
+            per_col: 0,
+            whole: 0,
+            unit: groups,
+        },
     )?;
     ctx.emit(&mut |cx| {
         let rb = cx.write(routes)?;
@@ -538,15 +540,16 @@ pub fn weighted_sum(
         ));
     }
     let (rows, width) = (y.rows, y.width);
-    let (rg, cg) = tile_split(
-        &ctx.fabric(),
+    let (rg, cg) = ctx.tile(
         OP,
-        rows,
-        width,
-        u64::from(width) * u64::from(top_k + 1) + u64::from(top_k),
-        0,
-        0,
-        1,
+        Footprint {
+            rows,
+            width,
+            per_row: u64::from(width) * u64::from(top_k + 1) + u64::from(top_k),
+            per_col: 0,
+            whole: 0,
+            unit: 1,
+        },
     )?;
     let pes = rg * cg;
     ctx.emit(&mut |cx| {
@@ -618,15 +621,16 @@ pub fn sigmoid_gate_add(
         ));
     }
     let (rows, width) = (y.rows, y.width);
-    let (rg, cg) = tile_split(
-        &ctx.fabric(),
+    let (rg, cg) = ctx.tile(
         OP,
-        rows,
-        width,
-        3 * u64::from(width) + 1,
-        0,
-        0,
-        1,
+        Footprint {
+            rows,
+            width,
+            per_row: 3 * u64::from(width) + 1,
+            per_col: 0,
+            whole: 0,
+            unit: 1,
+        },
     )?;
     let pes = rg * cg;
     ctx.emit(&mut |cx| {

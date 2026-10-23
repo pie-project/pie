@@ -13,8 +13,8 @@ use crate::csl::{Block, Dsd1, Func};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
-    Buf, Fabric, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan,
-    PagePlan, PageSource, Phase, Reduce, Shard, Sink,
+    Buf, Fabric, FabricOp, FabricReduce, FabricStep, Footprint, Guarded, HostOp, HostPhase,
+    LanePlan, PagePlan, PageSource, Phase, Reduce, Shard, Sink,
 };
 use crate::tensor::Tensor;
 
@@ -26,6 +26,10 @@ pub trait Emit {
 
     /// The engine's terms for the fabric (what the entry plans its splits by).
     fn fabric(&self) -> Fabric;
+
+    /// The `(row groups, column groups)` the engine spreads a row-wise op of
+    /// this footprint over.
+    fn tile(&self, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error>;
 
     /// Names what is emitted next (the op a dispatch is lowering).
     fn scope(&self, name: &str) {
@@ -515,65 +519,6 @@ impl DerefMut for Cx<'_> {
     fn deref_mut(&mut self) -> &mut Block {
         &mut self.phase.body
     }
-}
-
-/// The `(row groups, column groups)` a row-wise phase over `rows × width`
-/// spreads over so that one PE's share fits: `per_row` words a row that
-/// split with the columns, `per_col` words a column (a gain) that split
-/// with the columns, `whole` words that do not split; columns split only
-/// in multiples of `unit` (a head). The fewest PEs win, rows first.
-#[allow(clippy::too_many_arguments)]
-pub fn tile_split(
-    fabric: &Fabric,
-    op: &'static str,
-    rows: u32,
-    width: u32,
-    per_row: u64,
-    per_col: u64,
-    whole: u64,
-    unit: u32,
-) -> Result<(u32, u32), Error> {
-    use crate::linear::gemm::ARRAY_WORDS;
-    let budget = fabric.pe_words;
-    let (rows, width, unit) = (rows.max(1), width.max(1), unit.max(1));
-    // The resident placement runs a row-wise phase whole on every PE.
-    if fabric.resident_pes.is_some() {
-        let words = per_row * u64::from(rows) + per_col * u64::from(width) + whole;
-        return if words <= budget && per_row * u64::from(rows) <= ARRAY_WORDS {
-            Ok((1, 1))
-        } else {
-            Err(refuse(
-                op,
-                format!("the phase's {words} words exceed a resident PE's {budget}"),
-            ))
-        };
-    }
-    let units = width / unit;
-    let fits = |rg: u32, cg: u32| {
-        let words = per_row * u64::from(rows / rg) / u64::from(cg)
-            + per_col * u64::from(width / cg)
-            + whole;
-        words <= budget && per_row * u64::from(rows / rg) / u64::from(cg) <= ARRAY_WORDS
-    };
-    let mut best: Option<(u32, u32)> = None;
-    for cg in (1..=units).filter(|d| units.is_multiple_of(*d)) {
-        for rg in (1..=rows).filter(|d| rows.is_multiple_of(*d)) {
-            if fits(rg, cg) {
-                if best.is_none_or(|(br, bc)| rg * cg < br * bc) {
-                    best = Some((rg, cg));
-                }
-                break;
-            }
-        }
-    }
-    best.ok_or_else(|| {
-        refuse(
-            op,
-            format!(
-                "one row of {width} ({per_row} words with its planes) does not fit a PE's {budget} even one column of {unit} at a time"
-            ),
-        )
-    })
 }
 
 /// Refuses unless `t` is one of `dtypes`.

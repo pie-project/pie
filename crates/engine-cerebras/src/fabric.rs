@@ -21,8 +21,8 @@ use kernels_cerebras::cx::View as Placed;
 use kernels_cerebras::error::{Error, refuse};
 use kernels_cerebras::library::Kernel;
 use kernels_cerebras::phase::{
-    Buf, Fabric, FabricOp, FabricReduce, Guarded, HostPhase, LanePlan, PageSource, Phase, Shard,
-    Sink,
+    Buf, Fabric, FabricOp, FabricReduce, Footprint, Guarded, HostPhase, LanePlan, PageSource,
+    Phase, Shard, Sink,
 };
 
 mod table;
@@ -74,6 +74,61 @@ pub fn terms() -> Fabric {
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0),
     }
+}
+
+/// The `(row groups, column groups)` a row-wise op of `footprint` spreads
+/// over so that one PE's share fits the terms' budget, each share's rows
+/// within an array: the fewest PEs win, rows first; the resident placement
+/// runs it whole on every PE of its row.
+pub fn tile(fabric: &Fabric, op: &'static str, footprint: Footprint) -> Result<(u32, u32), Error> {
+    use kernels_cerebras::linear::gemm::ARRAY_WORDS;
+    let Footprint {
+        rows,
+        width,
+        per_row,
+        per_col,
+        whole,
+        unit,
+    } = footprint;
+    let budget = fabric.pe_words;
+    let (rows, width, unit) = (rows.max(1), width.max(1), unit.max(1));
+    if fabric.resident_pes.is_some() {
+        let words = per_row * u64::from(rows) + per_col * u64::from(width) + whole;
+        return if words <= budget && per_row * u64::from(rows) <= ARRAY_WORDS {
+            Ok((1, 1))
+        } else {
+            Err(refuse(
+                op,
+                format!("the phase's {words} words exceed a resident PE's {budget}"),
+            ))
+        };
+    }
+    let units = width / unit;
+    let fits = |rg: u32, cg: u32| {
+        let words = per_row * u64::from(rows / rg) / u64::from(cg)
+            + per_col * u64::from(width / cg)
+            + whole;
+        words <= budget && per_row * u64::from(rows / rg) / u64::from(cg) <= ARRAY_WORDS
+    };
+    let mut best: Option<(u32, u32)> = None;
+    for cg in (1..=units).filter(|d| units.is_multiple_of(*d)) {
+        for rg in (1..=rows).filter(|d| rows.is_multiple_of(*d)) {
+            if fits(rg, cg) {
+                if best.is_none_or(|(br, bc)| rg * cg < br * bc) {
+                    best = Some((rg, cg));
+                }
+                break;
+            }
+        }
+    }
+    best.ok_or_else(|| {
+        refuse(
+            op,
+            format!(
+                "one row of {width} ({per_row} words with its planes) does not fit a PE's {budget} even one column of {unit} at a time"
+            ),
+        )
+    })
 }
 
 /// What places a fire's operand handles on the program's buffers: the

@@ -8,7 +8,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{Fabric, HostOp, Shard};
+use crate::phase::{Fabric, Footprint, HostOp, Shard};
 use crate::tensor::Tensor;
 
 /// The most PEs an embedding table spreads over for a fabric gather (one
@@ -45,18 +45,29 @@ fn embed_pes(fab: &Fabric, table: Tensor, beside: u64) -> Option<u32> {
 /// has `rows` rows and a group's words fit a PE, else one PE when the
 /// whole fits, else `None` (the host copies).
 fn copy_split(
-    fab: &Fabric,
+    ctx: &Ctx<'_>,
     op: &'static str,
     rows: u32,
     per_row: u64,
     same_rows: bool,
 ) -> Option<u32> {
     if same_rows {
-        return crate::cx::tile_split(fab, op, rows, 1, per_row, 0, 0, 1)
+        return ctx
+            .tile(
+                op,
+                Footprint {
+                    rows,
+                    width: 1,
+                    per_row,
+                    per_col: 0,
+                    whole: 0,
+                    unit: 1,
+                },
+            )
             .ok()
             .map(|(rg, _)| rg);
     }
-    (per_row * u64::from(rows) <= fab.pe_words).then_some(1)
+    (per_row * u64::from(rows) <= ctx.fabric().pe_words).then_some(1)
 }
 
 /// A gather of `table` rows into `y` (`y_words` a PE) over `n` PEs holding
@@ -198,7 +209,7 @@ pub fn split_q_gate(
     }
     let rows = packed.rows;
     let split = copy_split(
-        &ctx.fabric(),
+        ctx,
         OP,
         rows,
         2 * u64::from(packed.width),
@@ -267,7 +278,7 @@ pub fn split_rows(
     }
     let rows = x.rows;
     let split = copy_split(
-        &ctx.fabric(),
+        ctx,
         OP,
         rows,
         2 * u64::from(x.width),
@@ -534,7 +545,7 @@ pub fn split_qkv(
     }
     let rows = packed.rows;
     let split = copy_split(
-        &ctx.fabric(),
+        ctx,
         OP,
         rows,
         2 * u64::from(packed.width),

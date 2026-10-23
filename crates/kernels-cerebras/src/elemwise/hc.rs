@@ -10,10 +10,10 @@
 use dtype::Dtype;
 
 use crate::csl::Arg;
-use crate::cx::{Ctx, expect, tile_split};
+use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::Shard;
+use crate::phase::{Footprint, Shard};
 use crate::tensor::Tensor;
 
 const MAX_HC_MULT: u32 = 8;
@@ -62,15 +62,16 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
         return Err(refuse(OP, "the expansion lands one wide row per row"));
     }
     let h = x.width;
-    let (rg, cg) = tile_split(
-        &ctx.fabric(),
+    let (rg, cg) = ctx.tile(
         OP,
-        x.rows,
-        h,
-        u64::from(h + y.width),
-        0,
-        0,
-        1,
+        Footprint {
+            rows: x.rows,
+            width: h,
+            per_row: u64::from(h + y.width),
+            per_col: 0,
+            whole: 0,
+            unit: 1,
+        },
     )?;
     let pes = rg * cg;
     let (rows, h_local) = (x.rows / rg, h / cg);
@@ -116,15 +117,16 @@ pub fn mix(
         ));
     }
     let h = y.width;
-    let (rg, cg) = tile_split(
-        &ctx.fabric(),
+    let (rg, cg) = ctx.tile(
         OP,
-        y.rows,
-        h,
-        u64::from(2 * normed.width + h),
-        0,
-        0,
-        1,
+        Footprint {
+            rows: y.rows,
+            width: h,
+            per_row: u64::from(2 * normed.width + h),
+            per_col: 0,
+            whole: 0,
+            unit: 1,
+        },
     )?;
     let pes = rg * cg;
     let (rows, h_local) = (y.rows / rg, h / cg);
@@ -176,15 +178,16 @@ pub fn inject(
     // The gates split by rows alone, every column group holding its row
     // group's; a gate plane taller than the rows rides whole on one PE.
     let (rg, cg) = if gates.rows == hyper.rows {
-        tile_split(
-            &ctx.fabric(),
+        ctx.tile(
             OP,
-            hyper.rows,
-            h,
-            u64::from(hyper.width + h),
-            0,
-            0,
-            1,
+            Footprint {
+                rows: hyper.rows,
+                width: h,
+                per_row: u64::from(hyper.width + h),
+                per_col: 0,
+                whole: 0,
+                unit: 1,
+            },
         )?
     } else {
         (1, 1)
@@ -253,15 +256,16 @@ pub fn ple_gate(
     // Rows past a PE split over row groups; a row past a PE over column
     // groups of every stream, the dot then gathered from the blocks'
     // partials in a second phase (like the wide rmsnorm).
-    let (rg, cg) = tile_split(
-        &ctx.fabric(),
+    let (rg, cg) = ctx.tile(
         OP,
-        y.rows,
-        h,
-        u64::from(3 * y.width + h),
-        0,
-        0,
-        1,
+        Footprint {
+            rows: y.rows,
+            width: h,
+            per_row: u64::from(3 * y.width + h),
+            per_col: 0,
+            whole: 0,
+            unit: 1,
+        },
     )?;
     let pes = rg * cg;
     let (rows, h_local) = (y.rows / rg, h / cg);

@@ -115,6 +115,21 @@ pub struct Fabric {
     pub attn_rows: Option<u32>,
 }
 
+/// What a row-wise op holds on a PE, for the engine to choose its tile:
+/// `rows × width`, with `per_row` words a row that split with the columns,
+/// `per_col` words a column (a gain) that split with the columns, `whole`
+/// words that do not split; columns split only in multiples of `unit` (a
+/// head).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    pub rows: u32,
+    pub width: u32,
+    pub per_row: u64,
+    pub per_col: u64,
+    pub whole: u64,
+    pub unit: u32,
+}
+
 impl Default for Fabric {
     fn default() -> Self {
         Fabric {

@@ -8,7 +8,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::{FabricOp, FabricStep, Guarded, HostOp, Shard};
+use crate::phase::{FabricOp, FabricStep, Footprint, Guarded, HostOp, Shard};
 use crate::tensor::Tensor;
 
 /// The `k` largest of each row of `x`, largest first: ties go to the lower
@@ -40,17 +40,19 @@ pub fn topk(
     }
     // Rows over PEs (a row whole on its PE); a row past a PE ranks on the
     // host.
-    let split = crate::cx::tile_split(
-        &ctx.fabric(),
-        OP,
-        rows,
-        width,
-        u64::from(width) + 2 * u64::from(k),
-        0,
-        0,
-        width,
-    )
-    .ok();
+    let split = ctx
+        .tile(
+            OP,
+            Footprint {
+                rows,
+                width,
+                per_row: u64::from(width) + 2 * u64::from(k),
+                per_col: 0,
+                whole: 0,
+                unit: width,
+            },
+        )
+        .ok();
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
         let vb = cx.write(values)?;
@@ -122,15 +124,16 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     } else {
         0
     };
-    let (rg, cg) = crate::cx::tile_split(
-        &ctx.fabric(),
+    let (rg, cg) = ctx.tile(
         OP,
-        x.rows,
-        x.width,
-        u64::from(x.width) + 4,
-        0,
-        whole,
-        1,
+        Footprint {
+            rows: x.rows,
+            width: x.width,
+            per_row: u64::from(x.width) + 4,
+            per_col: 0,
+            whole,
+            unit: 1,
+        },
     )?;
     let (rows_local, width_local) = (x.rows / rg, x.width / cg);
     let pes = rg * cg;

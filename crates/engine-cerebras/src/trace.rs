@@ -1399,6 +1399,14 @@ impl Emit for Tracer<'_> {
         self.fabric
     }
 
+    fn tile(
+        &self,
+        op: &'static str,
+        footprint: kernels_cerebras::phase::Footprint,
+    ) -> Result<(u32, u32), kernels_cerebras::Error> {
+        crate::fabric::tile(&self.fabric, op, footprint)
+    }
+
     fn scope(&self, name: &str) {
         self.state.borrow_mut().program.scope(name);
     }

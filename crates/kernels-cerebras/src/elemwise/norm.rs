@@ -5,10 +5,10 @@
 use dtype::Dtype;
 
 use crate::csl::Arg;
-use crate::cx::{Ctx, expect, tile_split};
+use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::phase::Shard;
+use crate::phase::{Footprint, Shard};
 use crate::tensor::Tensor;
 
 /// `y = rmsnorm(x) * weight`: each row of `x` scaled by
@@ -79,15 +79,16 @@ pub fn rmsnorm_grouped_plus_one(
     }
     // Rows past a PE spread over row groups, a row past a PE over whole
     // groups, the gain bank split with the columns.
-    let (rg, cg) = tile_split(
-        &ctx.fabric(),
+    let (rg, cg) = ctx.tile(
         OP,
-        y.rows,
-        width,
-        2 * u64::from(width),
-        1,
-        0,
-        group,
+        Footprint {
+            rows: y.rows,
+            width,
+            per_row: 2 * u64::from(width),
+            per_col: 1,
+            whole: 0,
+            unit: group,
+        },
     )?;
     let pes = rg * cg;
     let (rows, width_local) = (y.rows / rg, width / cg);
@@ -180,26 +181,28 @@ fn rms_row(
     let per_head = axis < width;
     let (rg, cg) = if x.rows == y.rows {
         if per_head {
-            tile_split(
-                &ctx.fabric(),
+            ctx.tile(
                 op,
-                y.rows,
-                width,
-                2 * u64::from(width),
-                0,
-                weight.elements(),
-                axis,
+                Footprint {
+                    rows: y.rows,
+                    width,
+                    per_row: 2 * u64::from(width),
+                    per_col: 0,
+                    whole: weight.elements(),
+                    unit: axis,
+                },
             )?
         } else {
-            tile_split(
-                &ctx.fabric(),
+            ctx.tile(
                 op,
-                y.rows,
-                width,
-                2 * u64::from(width),
-                1,
-                0,
-                1,
+                Footprint {
+                    rows: y.rows,
+                    width,
+                    per_row: 2 * u64::from(width),
+                    per_col: 1,
+                    whole: 0,
+                    unit: 1,
+                },
             )?
         }
     } else {
@@ -357,15 +360,16 @@ pub fn rmsnorm_gated(
     // Rows past a PE spread over row groups, a row past a PE over its
     // heads; the gain (one head) rides whole.
     let (rg, cg) = if x.rows == y.rows && gate.rows == y.rows {
-        tile_split(
-            &ctx.fabric(),
+        ctx.tile(
             OP,
-            y.rows,
-            x.width,
-            3 * u64::from(x.width),
-            0,
-            weight.elements(),
-            head_dim,
+            Footprint {
+                rows: y.rows,
+                width: x.width,
+                per_row: 3 * u64::from(x.width),
+                per_col: 0,
+                whole: weight.elements(),
+                unit: head_dim,
+            },
         )?
     } else {
         (1, 1)
@@ -418,15 +422,16 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
         ));
     }
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(
-            &ctx.fabric(),
+        ctx.tile(
             OP,
-            x.rows,
-            x.width,
-            2 * u64::from(x.width),
-            0,
-            0,
-            1,
+            Footprint {
+                rows: x.rows,
+                width: x.width,
+                per_row: 2 * u64::from(x.width),
+                per_col: 0,
+                whole: 0,
+                unit: 1,
+            },
         )?
     } else {
         (1, 1)
@@ -471,7 +476,17 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
         ));
     }
     let (rows, width) = (out.rows, out.width);
-    let (rg, cg) = tile_split(&ctx.fabric(), OP, rows, width, u64::from(width), 1, 0, 1)?;
+    let (rg, cg) = ctx.tile(
+        OP,
+        Footprint {
+            rows,
+            width,
+            per_row: u64::from(width),
+            per_col: 1,
+            whole: 0,
+            unit: 1,
+        },
+    )?;
     let pes = rg * cg;
     ctx.emit(&mut |cx| {
         let bb = cx.read(bias)?;
@@ -553,15 +568,16 @@ pub fn layernorm(
     // Rows over row groups; a row past a PE over column groups too, the
     // row's sum and sum of squares gathered from every block first.
     let (rg, cg) = if x.rows == y.rows {
-        tile_split(
-            &ctx.fabric(),
+        ctx.tile(
             OP,
-            y.rows,
-            width,
-            2 * u64::from(width),
-            2,
-            0,
-            1,
+            Footprint {
+                rows: y.rows,
+                width,
+                per_row: 2 * u64::from(width),
+                per_col: 2,
+                whole: 0,
+                unit: 1,
+            },
         )?
     } else {
         (1, 1)
