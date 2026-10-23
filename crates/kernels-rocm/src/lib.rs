@@ -17,6 +17,7 @@ pub mod seat;
 pub mod source;
 pub mod ssm;
 pub mod tensor;
+mod voxels;
 
 pub use error::Error;
 pub use jit::{Arg, ArgValue, Ctx, Fire, Launch, Pad, Slabs};
