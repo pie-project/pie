@@ -9,6 +9,7 @@ mod score_capture_answers_the_reference;
 mod the_attention_epilogues_answer_the_reference;
 mod the_compressed_pool_answers_the_reference;
 mod the_embeddings_answer_the_reference;
+mod the_glus_answer_the_reference;
 mod the_hyper_connections_answer_the_reference;
 mod the_indexer_answers_the_reference;
 mod the_modulations_answer_the_reference;

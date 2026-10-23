@@ -69,55 +69,65 @@ impl Run<'_> {
                 packed,
                 intermediate,
                 y,
-            } => linear::mlp::swiglu(
-                self.ctx(),
-                self.tensor(*packed),
+            } => kernels_slang::linear::glu::swiglu(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*packed)),
                 *intermediate,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Linear::SwigluClamp {
                 packed,
                 intermediate,
                 limit,
                 y,
-            } => linear::mlp::swiglu_clamp(
-                self.ctx(),
-                self.tensor(*packed),
+            } => kernels_slang::linear::glu::swiglu_clamp(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*packed)),
                 *intermediate,
                 *limit,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Linear::SwigluClampAlpha {
                 packed,
                 intermediate,
                 limit,
                 alpha,
                 y,
-            } => linear::mlp::swiglu_clamp_alpha(
-                self.ctx(),
-                self.tensor(*packed),
+            } => kernels_slang::linear::glu::swiglu_clamp_alpha(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*packed)),
                 *intermediate,
                 *limit,
                 *alpha,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
-            Linear::SwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
-                self.ctx(),
-                self.tensor(*gate),
-                self.tensor(*up),
-                *limit,
-                self.tensor(*y),
-            ),
-            Linear::GegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
-                self.ctx(),
-                self.tensor(*gate),
-                self.tensor(*up),
-                self.tensor(*y),
-            ),
-            Linear::GeluTanh { x, y } => {
-                linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
+            Linear::SwigluClampSplit { gate, up, limit, y } => {
+                kernels_slang::linear::glu::swiglu_clamp_split(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*gate)),
+                    crate::encode::slang_tensor(self.tensor(*up)),
+                    *limit,
+                    crate::encode::slang_tensor(self.tensor(*y)),
+                )
+                .map_err(crate::encode::from_slang)
             }
+            Linear::GegluTanh { gate, up, y } => kernels_slang::linear::glu::geglu_tanh(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*gate)),
+                crate::encode::slang_tensor(self.tensor(*up)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+            Linear::GeluTanh { x, y } => kernels_slang::linear::glu::gelu_tanh(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*x)),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
             Linear::RelBias { .. }
@@ -131,26 +141,28 @@ impl Run<'_> {
                 packed,
                 intermediate,
                 y,
-            } => linear::mlp::geglu_tanh_packed(
-                self.ctx(),
-                self.tensor(*packed),
+            } => kernels_slang::linear::glu::geglu_tanh_packed(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*packed)),
                 *intermediate,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
             Linear::Situ {
                 packed,
                 intermediate,
                 beta,
                 up_cap,
                 y,
-            } => linear::mlp::situ(
-                self.ctx(),
-                self.tensor(*packed),
+            } => kernels_slang::linear::glu::situ(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*packed)),
                 *intermediate,
                 *beta,
                 *up_cap,
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Linear::MoeTopkSoftmax {
                 logits,
