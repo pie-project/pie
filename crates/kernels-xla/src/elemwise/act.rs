@@ -6,22 +6,26 @@
 
 use dtype::Dtype;
 
-use crate::cx::{Ctx, Cx, expect};
+use crate::cx::expect;
 use crate::error::{Error, refuse};
+use crate::hlo::Func;
 use crate::hlo::{Elem, Val};
-use crate::tensor::Tensor;
+use crate::tensor::{Landing, Operand, Stored};
 
 use super::rope::{Turn, positions_f32, turn};
 
 const FLOATS: &[Dtype] = &[Dtype::Bf16, Dtype::F16, Dtype::F32];
 
-fn same_shape(op: &'static str, a: Tensor, b: Tensor) -> Result<(), Error> {
-    if a.rows != b.rows || a.width != b.width {
+fn same_shape(op: &'static str, a: impl Stored, b: impl Stored) -> Result<(), Error> {
+    if a.rows() != b.rows() || a.width() != b.width() {
         return Err(refuse(
             op,
             format!(
                 "a {}x{} rectangle against a {}x{} one",
-                a.rows, a.width, b.rows, b.width
+                a.rows(),
+                a.width(),
+                b.rows(),
+                b.width()
             ),
         ));
     }
@@ -29,70 +33,65 @@ fn same_shape(op: &'static str, a: Tensor, b: Tensor) -> Result<(), Error> {
 }
 
 fn unary(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    x: Tensor,
-    o: Tensor,
-    f: fn(&mut Cx<'_>, Val) -> Result<Val, Error>,
-) -> Result<(), Error> {
+    x: Operand,
+    o: Landing,
+    act: fn(&mut Func, Val) -> Result<Val, Error>,
+) -> Result<Val, Error> {
     expect(op, o, FLOATS)?;
     same_shape(op, x, o)?;
-    ctx.emit(&mut |cx| {
-        let v = cx.read_f32(x)?;
-        let v = f(cx, v)?;
-        cx.write(o, v)
-    })
+    let v = x.f32(f);
+    act(f, v)
 }
 
 /// `o = x·σ(x)`. Reference: kernels-metal `act_silu`.
-pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elemwise.silu", x, o, |cx, v| Ok(cx.silu(v)?))
+pub fn silu(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
+    unary(f, "elemwise.silu", x, o, |f, v| Ok(f.silu(v)?))
 }
 
 /// `o = tanh(x)`. Reference: kernels-metal `act_tanh`.
-pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elemwise.tanh", x, o, |cx, v| Ok(cx.tanh(v)))
+pub fn tanh(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
+    unary(f, "elemwise.tanh", x, o, |f, v| Ok(f.tanh(v)))
 }
 
 /// `o = ½x(1 + tanh(√(2/π)(x + 0.044715x³)))`. Reference: kernels-metal
 /// `act_gelu_tanh`.
-pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elemwise.gelu", x, o, |cx, v| Ok(cx.gelu_tanh(v)?))
+pub fn gelu_tanh(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
+    unary(f, "elemwise.gelu", x, o, |f, v| Ok(f.gelu_tanh(v)?))
 }
 
 /// `o = ½x(1 + erf(x/√2))`, erf to 1.5e-7 (A&S 7.1.26), well under bf16.
 /// The GPUs refuse `Gelu { tanh: false }`; this serves it.
-pub fn gelu_erf(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
-    unary(ctx, "elemwise.gelu", x, o, |cx, v| Ok(cx.gelu_erf(v)?))
+pub fn gelu_erf(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
+    unary(f, "elemwise.gelu", x, o, |f, v| Ok(f.gelu_erf(v)?))
 }
 
 fn binary(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    x: Tensor,
-    y: Tensor,
-    z: Tensor,
+    x: Operand,
+    y: Operand,
+    z: Landing,
     mul: bool,
-) -> Result<(), Error> {
+) -> Result<Val, Error> {
     expect(op, z, FLOATS)?;
     same_shape(op, x, z)?;
     same_shape(op, y, z)?;
-    ctx.emit(&mut |cx| {
-        let a = cx.read_f32(x)?;
-        let b = cx.read_f32(y)?;
-        let v = if mul { cx.mul(a, b)? } else { cx.add(a, b)? };
-        cx.write(z, v)
-    })
+    let a = x.f32(f);
+    let b = y.f32(f);
+    let v = if mul { f.mul(a, b)? } else { f.add(a, b)? };
+    Ok(v)
 }
 
 /// `z = x + y`. Reference: kernels-metal `binary_add`.
-pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    binary(ctx, "elemwise.add", x, y, z, false)
+pub fn add(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
+    binary(f, "elemwise.add", x, y, z, false)
 }
 
 /// `z = x · y`. Reference: kernels-metal `binary_mul`.
-pub fn mul(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
-    binary(ctx, "elemwise.mul", x, y, z, true)
+pub fn mul(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
+    binary(f, "elemwise.mul", x, y, z, true)
 }
 
 // ------------------------------------------------------------- modulation
@@ -120,41 +119,43 @@ impl Form {
 /// Checks a `vectors · width`-wide modulation plane `m` for `rows` rows.
 fn modulation(
     op: &'static str,
-    m: Tensor,
-    lane_of_row: Option<Tensor>,
-    x: Tensor,
+    m: impl Stored,
+    lane_of_row: Option<impl Stored>,
+    x: impl Stored,
     vectors: u32,
 ) -> Result<(), Error> {
-    if m.dtype != x.dtype && m.dtype != Dtype::F32 {
+    if m.dtype() != x.dtype() && m.dtype() != Dtype::F32 {
         return Err(refuse(
             op,
             format!(
                 "the modulation plane is {:?} and the rows it modulates are {:?}; a vector rides \
                  the activation's element or stays f32",
-                m.dtype, x.dtype
+                m.dtype(),
+                x.dtype()
             ),
         ));
     }
-    if m.width != vectors * x.width {
+    if m.width() != vectors * x.width() {
         return Err(refuse(
             op,
             format!(
                 "the modulation plane is {} wide, and this form reads {vectors} x {}",
-                m.width, x.width
+                m.width(),
+                x.width()
             ),
         ));
     }
     match lane_of_row {
         Some(map) => {
-            if map.dtype != Dtype::I32 || map.elements() != u64::from(x.rows) {
+            if map.dtype() != Dtype::I32 || map.elements() != u64::from(x.rows()) {
                 return Err(refuse(op, "the lane map is one i32 lane per row"));
             }
         }
         None => {
-            if m.rows < x.rows {
+            if m.rows() < x.rows() {
                 return Err(refuse(
                     op,
-                    format!("{} modulation vectors for {} rows", m.rows, x.rows),
+                    format!("{} modulation vectors for {} rows", m.rows(), x.rows()),
                 ));
             }
         }
@@ -165,39 +166,39 @@ fn modulation(
 /// `m`'s vector for each of `rows` rows (row `n` reads `lane_of_row[n]`,
 /// else `n`), f32 `[rows, m.width]`.
 fn vectors_of(
-    cx: &mut Cx<'_>,
-    m: Tensor,
-    lane_of_row: Option<Tensor>,
+    f: &mut Func,
+    m: Operand,
+    lane_of_row: Option<Operand>,
     rows: u32,
 ) -> Result<Val, Error> {
-    let mv = cx.read_f32(m)?;
+    let mv = m.f32(f);
     Ok(match lane_of_row {
         Some(map) => {
-            let ids = cx.read(map)?;
-            let ids = cx.reshape(ids, &[i64::from(rows)])?;
-            cx.take_rows(mv, ids)?
+            let ids = map.val;
+            let ids = f.reshape(ids, &[i64::from(rows)])?;
+            f.take_rows(mv, ids)?
         }
-        None => cx.slice_axis(mv, 0, 0, i64::from(rows))?,
+        None => f.slice_axis(mv, 0, 0, i64::from(rows))?,
     })
 }
 
-fn bend(cx: &mut Cx<'_>, x: Val, mv: Val, form: Form) -> Result<Val, Error> {
-    let w = cx.dims(x)[1];
-    let sc = cx.slice_axis(mv, 1, 0, w)?;
+fn bend(f: &mut Func, x: Val, mv: Val, form: Form) -> Result<Val, Error> {
+    let w = f.dims(x)[1];
+    let sc = f.slice_axis(mv, 1, 0, w)?;
     Ok(match form {
         Form::ScaleShift => {
-            let sh = cx.slice_axis(mv, 1, w, 2 * w)?;
-            let s1 = cx.offset(sc, 1.0)?;
-            let v = cx.mul(x, s1)?;
-            cx.add(v, sh)?
+            let sh = f.slice_axis(mv, 1, w, 2 * w)?;
+            let s1 = f.offset(sc, 1.0)?;
+            let v = f.mul(x, s1)?;
+            f.add(v, sh)?
         }
         Form::Scale => {
-            let s1 = cx.offset(sc, 1.0)?;
-            cx.mul(x, s1)?
+            let s1 = f.offset(sc, 1.0)?;
+            f.mul(x, s1)?
         }
         Form::TanhGate => {
-            let t = cx.tanh(sc);
-            cx.mul(t, x)?
+            let t = f.tanh(sc);
+            f.mul(t, x)?
         }
     })
 }
@@ -205,57 +206,53 @@ fn bend(cx: &mut Cx<'_>, x: Val, mv: Val, form: Form) -> Result<Val, Error> {
 /// `y = form(x, m[lane])`. Reference: kernels-cuda `modulate` (the Metal
 /// twin agrees). With `lane_of_row`, `m` is the uncut per-lane plane.
 pub fn modulate(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     form: Form,
-    x: Tensor,
-    m: Tensor,
-    lane_of_row: Option<Tensor>,
-    y: Tensor,
-) -> Result<(), Error> {
+    x: Operand,
+    m: Operand,
+    lane_of_row: Option<Operand>,
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "elemwise.modulate";
     expect(OP, x, FLOATS)?;
     same_shape(OP, x, y)?;
     modulation(OP, m, lane_of_row, x, form.vectors())?;
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let mv = vectors_of(cx, m, lane_of_row, x.rows)?;
-        let v = bend(cx, xv, mv, form)?;
-        cx.write(y, v)
-    })
+    let xv = x.f32(f);
+    let mv = vectors_of(f, m, lane_of_row, x.rows)?;
+    let v = bend(f, xv, mv, form)?;
+    Ok(v)
 }
 
 /// `r_out = g[lane] · y + r`. Reference: kernels-cuda `gated_residual_add`.
 pub fn gated_residual_add(
-    ctx: &Ctx<'_>,
-    r: Tensor,
-    g: Tensor,
-    y: Tensor,
-    lane_of_row: Option<Tensor>,
-    r_out: Tensor,
-) -> Result<(), Error> {
+    f: &mut Func,
+    r: Operand,
+    g: Operand,
+    y: Operand,
+    lane_of_row: Option<Operand>,
+    r_out: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "elemwise.gated_residual_add";
     expect(OP, r, FLOATS)?;
     same_shape(OP, r, y)?;
     same_shape(OP, r, r_out)?;
     modulation(OP, g, lane_of_row, r, 1)?;
-    ctx.emit(&mut |cx| {
-        let v = gated_sum(cx, r, g, y, lane_of_row)?;
-        cx.write(r_out, v)
-    })
+    let v = gated_sum(f, r, g, y, lane_of_row)?;
+    Ok(v)
 }
 
 fn gated_sum(
-    cx: &mut Cx<'_>,
-    r: Tensor,
-    g: Tensor,
-    y: Tensor,
-    lane_of_row: Option<Tensor>,
+    f: &mut Func,
+    r: Operand,
+    g: Operand,
+    y: Operand,
+    lane_of_row: Option<Operand>,
 ) -> Result<Val, Error> {
-    let gv = vectors_of(cx, g, lane_of_row, r.rows)?;
-    let yv = cx.read_f32(y)?;
-    let rv = cx.read_f32(r)?;
-    let p = cx.mul(gv, yv)?;
-    Ok(cx.add(p, rv)?)
+    let gv = vectors_of(f, g, lane_of_row, r.rows)?;
+    let yv = y.f32(f);
+    let rv = r.f32(f);
+    let p = f.mul(gv, yv)?;
+    Ok(f.add(p, rv)?)
 }
 
 // ------------------------------------------------------------------ tables
@@ -265,14 +262,14 @@ fn gated_sum(
 /// an odd `dim` zeroes the last column. `t` is f32, read flat (`t[n]`).
 /// Reference: kernels-metal / kernels-cuda `sinusoid`.
 pub fn sinusoid(
-    ctx: &Ctx<'_>,
-    t: Tensor,
+    f: &mut Func,
+    t: Operand,
     dim: u32,
     max_period: f32,
     flip_sin_cos: bool,
     scale: f32,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "elemwise.sinusoid";
     if t.dtype != Dtype::F32 || y.dtype != Dtype::F32 {
         return Err(refuse(
@@ -298,23 +295,21 @@ pub fn sinusoid(
         .map(|i| f64::from((-log_period * i as f32 / half as f32).exp()))
         .collect();
     let (rows, h) = (i64::from(y.rows), i64::from(half));
-    ctx.emit(&mut |cx| {
-        let tv = positions_f32(cx, OP, t, y.rows, 1)?;
-        let tv = cx.reshape(tv, &[rows])?;
-        let tv = cx.broadcast(tv, &[rows, h], &[0])?;
-        let f = cx.const_floats(Elem::F32, &freqs, &[h])?;
-        let f = cx.broadcast(f, &[rows, h], &[1])?;
-        let a = cx.mul(tv, f)?;
-        let a = cx.scale(a, f64::from(scale))?;
-        let s = cx.sin(a);
-        let c = cx.cos(a);
-        let mut parts = if flip_sin_cos { vec![c, s] } else { vec![s, c] };
-        if dim % 2 == 1 {
-            parts.push(cx.const_f(Elem::F32, 0.0, &[rows, 1]));
-        }
-        let v = cx.concat(&parts, 1)?;
-        cx.write(y, v)
-    })
+    let tv = positions_f32(f, OP, t, y.rows, 1)?;
+    let tv = f.reshape(tv, &[rows])?;
+    let tv = f.broadcast(tv, &[rows, h], &[0])?;
+    let fq = f.const_floats(Elem::F32, &freqs, &[h])?;
+    let fq = f.broadcast(fq, &[rows, h], &[1])?;
+    let a = f.mul(tv, fq)?;
+    let a = f.scale(a, f64::from(scale))?;
+    let s = f.sin(a);
+    let c = f.cos(a);
+    let mut parts = if flip_sin_cos { vec![c, s] } else { vec![s, c] };
+    if dim % 2 == 1 {
+        parts.push(f.const_f(Elem::F32, 0.0, &[rows, 1]));
+    }
+    let v = f.concat(&parts, 1)?;
+    Ok(v)
 }
 
 /// T5's bucket for a relative distance `d` (key minus query).
@@ -347,14 +342,14 @@ fn relative_bucket(d: i32, bidirectional: bool, num_buckets: i32, log_ratio: f32
 /// here and the table is one gather. Reference: kernels-metal
 /// `relative_bucket_bias`.
 pub fn relative_bucket_bias(
-    ctx: &Ctx<'_>,
-    embedding: Tensor,
+    f: &mut Func,
+    embedding: Operand,
     max_len: u32,
     num_buckets: u32,
     max_distance: f32,
     bidirectional: bool,
-    y: Tensor,
-) -> Result<(), Error> {
+    y: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "elemwise.relative_bucket_bias";
     expect(OP, embedding, &[Dtype::Bf16, Dtype::F32])?;
     let heads = y.rows;
@@ -412,14 +407,12 @@ pub fn relative_bucket_bias(
             ))
         })
         .collect();
-    ctx.emit(&mut |cx| {
-        let e = cx.read_f32(embedding)?;
-        let ids = cx.const_ints(Elem::I32, &ids, &[i64::from(span)])?;
-        let g = cx.take_rows(e, ids)?;
-        let g = cx.slice_axis(g, 1, 0, i64::from(heads))?;
-        let g = cx.transpose(g, &[1, 0])?;
-        cx.write(y, g)
-    })
+    let e = embedding.f32(f);
+    let ids = f.const_ints(Elem::I32, &ids, &[i64::from(span)])?;
+    let g = f.take_rows(e, ids)?;
+    let g = f.slice_axis(g, 1, 0, i64::from(heads))?;
+    let g = f.transpose(g, &[1, 0])?;
+    Ok(g)
 }
 
 // ------------------------------------------------------------ multi-axis rope
@@ -448,16 +441,16 @@ fn theta_pow(base: f32, e: f32) -> f32 {
 /// axes take them round-robin at `theta_a^(f/(dims[a]/2 − 1))`. Columns past
 /// the rotary prefix are copied. Reference: kernels-metal `rope_axes`.
 pub fn rope_axes(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    positions: Tensor,
+    f: &mut Func,
+    x: Operand,
+    positions: Operand,
     dims: [u32; 4],
     thetas: [f32; 4],
     form: RopeForm,
     rotary_dim: u32,
     head_dim: u32,
-    o: Tensor,
-) -> Result<(), Error> {
+    o: Landing,
+) -> Result<Val, Error> {
     const OP: &str = "elemwise.rope_axes";
     expect(OP, o, FLOATS)?;
     same_shape(OP, x, o)?;
@@ -570,12 +563,10 @@ pub fn rope_axes(
         }
         t
     };
-    ctx.emit(&mut |cx| {
-        let pos = positions_f32(cx, OP, positions, o.rows, axes as u32)?;
-        let v = cx.read_f32(x)?;
-        let v = turn(cx, v, pos, &table)?;
-        cx.write(o, v)
-    })
+    let pos = positions_f32(f, OP, positions, o.rows, axes as u32)?;
+    let v = x.f32(f);
+    let v = turn(f, v, pos, &table)?;
+    Ok(v)
 }
 
 // ------------------------------------------------------------ embed + scale

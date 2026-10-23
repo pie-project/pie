@@ -41,8 +41,20 @@ fn rmsnorm_and_its_per_head_plus_one_form_answer_the_host() {
     let z = b.zeros(dtype::Dtype::Bf16, rows, width);
     if !b
         .run(|ctx| {
-            norm::rmsnorm(ctx, x, w, 1e-6, y)?;
-            norm::rmsnorm_per_head_plus_one(ctx, x, h, head, 1e-6, z)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let weight_v = l.read(w)?;
+                let o_y = y;
+                let v = norm::rmsnorm(l.f(), x_v, weight_v, 1e-6)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let weight_v = l.read(h)?;
+                let o_y = z;
+                let v = norm::rmsnorm_per_head_plus_one(l.f(), x_v, weight_v, head, 1e-6)?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -69,7 +81,18 @@ fn a_residual_add_lands_in_its_second_operand() {
     let mut b = Bench::new();
     let x = b.bf16(4, 16, &xs);
     let y = b.bf16(4, 16, &ys);
-    if !b.run(|ctx| norm::residual_add(ctx, x, y)).unwrap() {
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let y_v = l.read(y)?;
+                let o_y = y;
+                let v = norm::residual_add(l.f(), x_v, y_v)?;
+                l.land(o_y, v)
+            })
+        })
+        .unwrap()
+    {
         return;
     }
     let want: Vec<f32> = xs.iter().zip(&ys).map(|(a, b)| round_bf16(a + b)).collect();

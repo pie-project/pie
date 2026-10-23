@@ -162,9 +162,24 @@ fn mul_scalar_rounds_its_scalar_to_the_row_element() {
     let xh = b.raw(Dtype::F16, rows as u32, width as u32, f16_bytes);
     let ran = b
         .run(|ctx| {
-            norm::mul_scalar(ctx, s, xf)?;
-            norm::mul_scalar(ctx, s, xb)?;
-            norm::mul_scalar(ctx, s, xh)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xf)?;
+                let o_x = xf;
+                let v = norm::mul_scalar(l.f(), s, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xb)?;
+                let o_x = xb;
+                let v = norm::mul_scalar(l.f(), s, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xh)?;
+                let o_x = xh;
+                let v = norm::mul_scalar(l.f(), s, x_v)?;
+                l.land(o_x, v)
+            })
         })
         .unwrap();
     if !ran {

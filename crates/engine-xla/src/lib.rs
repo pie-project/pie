@@ -11,6 +11,7 @@ mod error;
 pub mod exec;
 pub mod guest;
 pub mod inputs;
+pub mod lower;
 pub mod mask;
 pub mod pjrt;
 pub mod program;

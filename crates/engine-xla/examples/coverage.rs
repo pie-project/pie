@@ -44,7 +44,12 @@ fn main() {
     let mut tally = [0usize; 3];
     let catalog = poem_compiler::catalog::deployments()
         .filter(|d| d.deploy.tp == 1)
-        .map(|d| (d.name.clone(), Box::new(|| d.trace(Platform::Xla)) as TraceFn));
+        .map(|d| {
+            (
+                d.name.clone(),
+                Box::new(|| d.trace(Platform::Xla)) as TraceFn,
+            )
+        });
     for (name, trace) in catalog.chain(dev_models()) {
         if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
             continue;
