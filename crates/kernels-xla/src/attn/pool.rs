@@ -81,8 +81,14 @@ pub(crate) fn paging(
     if pool.page_size <= 0 {
         return Err(refuse(op, "the pool's page size is zero"));
     }
-    let indices = flat_i32(cx, pool.page_indices)?;
-    let indptr = flat_i32(cx, pool.page_indptr)?;
+    let indices = {
+        let o = cx.operand(pool.page_indices)?;
+        flat_i32(cx, o)
+    }?;
+    let indptr = {
+        let o = cx.operand(pool.page_indptr)?;
+        flat_i32(cx, o)
+    }?;
     Ok((indices, indptr, i64::from(pool.page_size)))
 }
 
@@ -133,9 +139,18 @@ fn boundary(
     long_enough(op, "row-valid table", row_valid, n)?;
     let n = i64::from(n);
     ctx.emit(&mut |cx| {
-        let p = flat_i32(cx, positions)?;
-        let r = flat_i32(cx, request_of_token)?;
-        let v = flat_i32(cx, row_valid)?;
+        let p = {
+            let o = cx.operand(positions)?;
+            flat_i32(cx, o)
+        }?;
+        let r = {
+            let o = cx.operand(request_of_token)?;
+            flat_i32(cx, o)
+        }?;
+        let v = {
+            let o = cx.operand(row_valid)?;
+            flat_i32(cx, o)
+        }?;
         let f = cx.func();
         let p = first(f, p, n)?;
         let r = first(f, r, n)?;
@@ -255,8 +270,14 @@ pub fn state_write(
     long_enough(OP, "write-offset table", write_offset, rows)?;
     let (n, ps) = (i64::from(rows), i64::from(pages.page_size));
     ctx.emit(&mut |cx| {
-        let wp = flat_i32(cx, write_page)?;
-        let wo = flat_i32(cx, write_offset)?;
+        let wp = {
+            let o = cx.operand(write_page)?;
+            flat_i32(cx, o)
+        }?;
+        let wo = {
+            let o = cx.operand(write_offset)?;
+            flat_i32(cx, o)
+        }?;
         let k = cx.read(kv)?;
         let s = cx.read(score)?;
         let sk = cx.read(state_kv)?;
@@ -364,8 +385,14 @@ pub fn gather(
     let window = coff * r;
     ctx.emit(&mut |cx| {
         let (indices, indptr, ps) = paging(cx, OP, pages)?;
-        let bpos = flat_i32(cx, boundary_pos)?;
-        let breq = flat_i32(cx, boundary_req)?;
+        let bpos = {
+            let o = cx.operand(boundary_pos)?;
+            flat_i32(cx, o)
+        }?;
+        let breq = {
+            let o = cx.operand(boundary_req)?;
+            flat_i32(cx, o)
+        }?;
         let sk = cx.read(state_kv)?;
         let ss = cx.read(state_score)?;
         let ape = match ape {
@@ -479,8 +506,14 @@ pub fn kv_append(
     let n = i64::from(rows);
     ctx.emit(&mut |cx| {
         let (indices, indptr, ps) = paging(cx, OP, pool)?;
-        let bpos = flat_i32(cx, boundary_pos)?;
-        let breq = flat_i32(cx, boundary_req)?;
+        let bpos = {
+            let o = cx.operand(boundary_pos)?;
+            flat_i32(cx, o)
+        }?;
+        let breq = {
+            let o = cx.operand(boundary_req)?;
+            flat_i32(cx, o)
+        }?;
         let e = cx.read(entries)?;
         let keys = cx.read(pool.keys)?;
         let f = cx.func();
@@ -708,8 +741,14 @@ fn reader(
     ctx.emit(&mut |cx| {
         let (indices, indptr, ps) = paging(cx, op, entries)?;
         let qv = cx.read(q)?;
-        let pos = flat_i32(cx, positions)?;
-        let req = flat_i32(cx, request_of_token)?;
+        let pos = {
+            let o = cx.operand(positions)?;
+            flat_i32(cx, o)
+        }?;
+        let req = {
+            let o = cx.operand(request_of_token)?;
+            flat_i32(cx, o)
+        }?;
         let table = cx.read(entries.keys)?;
         let sel = match selection {
             Some((s, _)) => {

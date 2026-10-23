@@ -6,10 +6,9 @@
 
 use dtype::Dtype;
 
-use crate::cx::Cx;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, GatherDims, ScatterDims, Val};
-use crate::tensor::Tensor;
+use crate::tensor::{Operand, Stored, Tensor};
 
 /// The slot a write that must not land is routed to.
 pub(crate) const DROP: i64 = i32::MAX as i64;
@@ -18,12 +17,12 @@ pub(crate) const DROP: i64 = i32::MAX as i64;
 /// lane's own rows, the `commit` prefix whose state lands, the lane's `slots`
 /// (negative: no state), all indexed from `lane0`.
 #[derive(Clone, Copy, Debug)]
-pub struct Committed {
-    pub replay: Tensor,
+pub struct Committed<T = Tensor> {
+    pub replay: T,
 
-    pub commit: Tensor,
+    pub commit: T,
 
-    pub slots: Tensor,
+    pub slots: T,
 
     pub lane0: u32,
 }
@@ -38,18 +37,18 @@ pub(crate) fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error
 }
 
 /// A handle's elements as a flat i32 vector.
-pub(crate) fn flat_i32(cx: &mut Cx<'_>, t: Tensor) -> Result<Val, Error> {
-    let v = cx.read(t)?;
-    let v = cx.convert(v, Elem::I32);
-    let n = cx.ty(v).elements();
-    Ok(cx.reshape(v, &[n])?)
+pub(crate) fn flat_i32(f: &mut Func, t: Operand) -> Result<Val, Error> {
+    let v = t.val;
+    let v = f.convert(v, Elem::I32);
+    let n = f.ty(v).elements();
+    Ok(f.reshape(v, &[n])?)
 }
 
 /// A handle's elements as a flat f32 vector.
-pub(crate) fn flat_f32(cx: &mut Cx<'_>, t: Tensor) -> Result<Val, Error> {
-    let v = cx.read_f32(t)?;
-    let n = cx.ty(v).elements();
-    Ok(cx.reshape(v, &[n])?)
+pub(crate) fn flat_f32(f: &mut Func, t: Operand) -> Result<Val, Error> {
+    let v = t.f32(f);
+    let n = f.ty(v).elements();
+    Ok(f.reshape(v, &[n])?)
 }
 
 pub(crate) fn ci(f: &mut Func, x: i64) -> Val {
@@ -195,16 +194,16 @@ pub(crate) fn land_rows(f: &mut Func, slab: Val, slot: Val, write: Val, rows: Va
 pub(crate) fn slot_rows(
     op: &'static str,
     what: &str,
-    bank: Tensor,
+    bank: impl Stored,
     stride: u64,
 ) -> Result<i64, Error> {
-    let width = u64::from(bank.width);
+    let width = u64::from(bank.width());
     if width == stride {
         return Ok(1);
     }
     if width != 0 && stride.is_multiple_of(width) {
         let per = stride / width;
-        if u64::from(bank.rows).is_multiple_of(per) {
+        if u64::from(bank.rows()).is_multiple_of(per) {
             return Ok(per as i64);
         }
     }
@@ -213,7 +212,8 @@ pub(crate) fn slot_rows(
         format!(
             "the {what} bank is {}x{}, and a slot keeps {stride}: neither one row per slot nor \
              whole blocks of rows",
-            bank.rows, bank.width
+            bank.rows(),
+            bank.width()
         ),
     ))
 }
@@ -408,13 +408,13 @@ pub(crate) fn committed_lanes(
     })
 }
 
-pub(crate) fn csr_lanes(op: &'static str, indptr: Tensor) -> Result<(), Error> {
-    if indptr.dtype != Dtype::I32 {
+pub(crate) fn csr_lanes(op: &'static str, indptr: impl Stored) -> Result<(), Error> {
+    if indptr.dtype() != Dtype::I32 {
         return Err(refuse(
             op,
             format!(
                 "the query CSR's boundaries are {:?}, and this scan walks an i32 indptr",
-                indptr.dtype
+                indptr.dtype()
             ),
         ));
     }

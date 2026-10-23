@@ -111,9 +111,18 @@ pub fn layernorm_rope(
     let (n, hd) = (i64::from(rows), i64::from(hd));
     ctx.emit(&mut |cx| {
         let x = cx.read_f32(k)?;
-        let w = crate::lanes::flat_f32(cx, weight)?;
-        let b = crate::lanes::flat_f32(cx, bias)?;
-        let pos = flat_i32(cx, positions)?;
+        let w = {
+            let o = cx.operand(weight)?;
+            crate::lanes::flat_f32(cx, o)
+        }?;
+        let b = {
+            let o = cx.operand(bias)?;
+            crate::lanes::flat_f32(cx, o)
+        }?;
+        let pos = {
+            let o = cx.operand(positions)?;
+            flat_i32(cx, o)
+        }?;
         let f = cx.func();
         let pos = first(f, pos, n)?;
         let sum = f.reduce(x, &[1], Fold::Sum)?;
@@ -165,7 +174,10 @@ pub fn rope(
     let n = i64::from(rows);
     ctx.emit(&mut |cx| {
         let x = cx.read_f32(q)?;
-        let pos = flat_i32(cx, positions)?;
+        let pos = {
+            let o = cx.operand(positions)?;
+            flat_i32(cx, o)
+        }?;
         let f = cx.func();
         let pos = first(f, pos, n)?;
         let x = f.reshape(x, &[n, i64::from(h), i64::from(hd)])?;
@@ -203,8 +215,14 @@ pub fn kv_append(
     }
     let (n, ps) = (i64::from(rows), i64::from(keys.page_size));
     ctx.emit(&mut |cx| {
-        let wp = flat_i32(cx, write_page)?;
-        let wo = flat_i32(cx, write_offset)?;
+        let wp = {
+            let o = cx.operand(write_page)?;
+            flat_i32(cx, o)
+        }?;
+        let wo = {
+            let o = cx.operand(write_offset)?;
+            flat_i32(cx, o)
+        }?;
         let kv = cx.read(k)?;
         let table = cx.read(keys.keys)?;
         let f = cx.func();
@@ -249,8 +267,14 @@ pub fn block_mean(
     let (n, hd) = (i64::from(rows), i64::from(hd));
     ctx.emit(&mut |cx| {
         let (indices, indptr, ps) = paging(cx, OP, keys)?;
-        let bpos = flat_i32(cx, boundary_pos)?;
-        let breq = flat_i32(cx, boundary_req)?;
+        let bpos = {
+            let o = cx.operand(boundary_pos)?;
+            flat_i32(cx, o)
+        }?;
+        let breq = {
+            let o = cx.operand(boundary_req)?;
+            flat_i32(cx, o)
+        }?;
         let table = cx.read(keys.keys)?;
         let f = cx.func();
         let bpos = first(f, bpos, n)?;
@@ -346,8 +370,14 @@ pub fn topk(
             Some(w) => Some(cx.read_f32(w)?),
             None => None,
         };
-        let pos = flat_i32(cx, positions)?;
-        let req = flat_i32(cx, request_of_token)?;
+        let pos = {
+            let o = cx.operand(positions)?;
+            flat_i32(cx, o)
+        }?;
+        let req = {
+            let o = cx.operand(request_of_token)?;
+            flat_i32(cx, o)
+        }?;
         let table = cx.read(keys.keys)?;
         let f = cx.func();
         let qv = f.slice_axis(qv, 0, 0, n)?;

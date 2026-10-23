@@ -69,7 +69,10 @@ pub fn block_dyn_conv(
     let side = i64::from(side);
     ctx.emit(&mut |cx| {
         let xv = cx.read_f32(x.data)?;
-        let ip = flat_i32(cx, x.indptr)?;
+        let ip = {
+            let o = cx.operand(x.indptr)?;
+            flat_i32(cx, o)
+        }?;
         let co = cx.read_f32(coeff)?;
         let ba = cx.read_f32(base)?;
         let f = cx.func();

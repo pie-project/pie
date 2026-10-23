@@ -10,14 +10,13 @@
 
 use dtype::Dtype;
 
-use crate::cx::Ctx;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Func, Val};
 use crate::lanes::{
     Committed, Lanes, clamp_i, cmp_i, committed_lanes, count_le, csr_lanes, decode_lanes, flat_i32,
     land_rows, nonzero, ragged_lanes, take,
 };
-use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
+use crate::tensor::{Landing, Operand, RaggedTensor, Stored};
 
 const MAX_NGRAM: usize = 4;
 
@@ -100,41 +99,42 @@ fn hash<'a>(
 fn planes(
     op: &'static str,
     h: &Hash<'_>,
-    ids: Tensor,
-    state: &RecurrentPool,
-    map: Option<Tensor>,
-    out: Tensor,
+    ids: impl Stored,
+    state: impl Stored,
+    map: Option<impl Stored>,
+    out: impl Stored,
 ) -> Result<(), Error> {
-    if ids.dtype != Dtype::I32 || out.dtype != Dtype::I32 {
+    if ids.dtype() != Dtype::I32 || out.dtype() != Dtype::I32 {
         return Err(refuse(
             op,
             format!(
                 "the hasher reads i32 token ids and lands i32 table rows, not {:?} into {:?}",
-                ids.dtype, out.dtype
+                ids.dtype(),
+                out.dtype()
             ),
         ));
     }
-    if i64::from(out.width) != h.heads() {
+    if i64::from(out.width()) != h.heads() {
         return Err(refuse(op, "the landing is not one column per hashed head"));
     }
-    if state.state.dtype != Dtype::I32 || i64::from(state.state.width) != h.span() {
+    if state.dtype() != Dtype::I32 || i64::from(state.width()) != h.span() {
         return Err(refuse(
             op,
             "the window a lane keeps is the n-gram context, one i32 per trailing id",
         ));
     }
     if let Some(m) = map
-        && m.dtype != Dtype::I64
+        && m.dtype() != Dtype::I64
     {
         return Err(refuse(
             op,
             format!(
                 "the id map is {:?}, and the hasher maps through i64",
-                m.dtype
+                m.dtype()
             ),
         ));
     }
-    nonzero(op, "rows", ids.rows)?;
+    nonzero(op, "rows", ids.rows())?;
     Ok(())
 }
 
@@ -272,179 +272,182 @@ fn hash_lanes(
     Ok((out, next))
 }
 
+/// How a fire's rows fall into lanes, with the tables that say so.
 #[derive(Clone, Copy)]
 enum PleLanes {
-    Decode,
-    Ragged(Tensor),
-    Committed(Tensor, Committed),
+    /// One row a lane; `slots` is the lane's state row.
+    Decode { slots: Operand },
+    /// A query CSR's lanes; `slots` is per row.
+    Ragged { indptr: Operand, slots: Operand },
+    /// A rollback seat's extended lanes.
+    Committed {
+        indptr: Operand,
+        seat: Committed<Operand>,
+    },
 }
 
+/// `(out, state)`: the hashed rows, and the slab with each lane's window
+/// pushed.
 fn ngram(
-    ctx: &Ctx<'_>,
+    f: &mut Func,
     op: &'static str,
-    ids: Tensor,
+    ids: Operand,
     lanes: PleLanes,
-    state: &RecurrentPool,
+    state: Operand,
     h: &Hash<'_>,
-    map: Option<Tensor>,
-    out: Tensor,
-) -> Result<(), Error> {
+    map: Option<Operand>,
+    out: Landing,
+) -> Result<(Val, Val), Error> {
     planes(op, h, ids, state, map, out)?;
     match lanes {
-        PleLanes::Decode => {
-            if state.slots.elements() < u64::from(ids.rows) || out.rows != ids.rows {
+        PleLanes::Decode { slots } => {
+            if slots.elements() < u64::from(ids.rows) || out.rows != ids.rows {
                 return Err(refuse(op, "the slots and the landing ride the fire's rows"));
             }
         }
-        PleLanes::Ragged(indptr) => {
+        PleLanes::Ragged { indptr, .. } => {
             csr_lanes(op, indptr)?;
             if out.rows != ids.rows {
                 return Err(refuse(op, "the landing rides the fire's rows"));
             }
         }
-        PleLanes::Committed(indptr, _) => csr_lanes(op, indptr)?,
+        PleLanes::Committed { indptr, .. } => csr_lanes(op, indptr)?,
     }
     let t = i64::from(ids.rows);
-    ctx.emit(&mut |cx| {
-        let idv = flat_i32(cx, ids)?;
-        let slab = cx.read(state.state)?;
-        let m = match map {
-            Some(m) => {
-                let v = cx.read(m)?;
-                let n = cx.ty(v).elements();
-                Some(cx.reshape(v, &[n])?)
-            }
-            None => None,
-        };
-        let (lanes, own) = match lanes {
-            PleLanes::Decode => {
-                let slots = flat_i32(cx, state.slots)?;
-                (decode_lanes(cx.func(), slots, t)?, None)
-            }
-            PleLanes::Ragged(indptr) => {
-                let ip = flat_i32(cx, indptr)?;
-                let slots = flat_i32(cx, state.slots)?;
-                (ragged_lanes(cx.func(), ip, slots)?, None)
-            }
-            PleLanes::Committed(indptr, cm) => {
-                let ip = flat_i32(cx, indptr)?;
-                let rep = flat_i32(cx, cm.replay)?;
-                let com = flat_i32(cx, cm.commit)?;
-                let sl = flat_i32(cx, cm.slots)?;
-                let f = cx.func();
-                let lanes = committed_lanes(op, f, ip, rep, com, sl, cm.lane0)?;
-                let l = lanes.count(f);
-                let lane0 = i64::from(cm.lane0);
-                let rep = f.slice_axis(rep, 0, lane0, lane0 + l)?;
-                (lanes, Some((ip, rep)))
-            }
-        };
-        let f = cx.func();
-        let past = f.take_rows(slab, lanes.slot)?;
-        let (rows, next) = hash_lanes(f, h, idv, past, &lanes, m)?;
-        let slab = land_rows(f, slab, lanes.slot, lanes.write, next)?;
-        let rows = match own {
-            None => rows,
-            Some((ip, rep)) => {
-                // Own row o of lane r is extended row
-                // ext_begin[r] + replay[r] + (o - indptr[r]).
-                let l = lanes.count(f);
-                let n = i64::from(out.rows);
-                let o = f.iota(Elem::I32, &[n], 0);
-                let lo = f.slice_axis(ip, 0, 0, l)?;
-                let lane = count_le(f, lo, o)?;
-                let one = f.like_i(lane, 1);
-                let lane = f.sub(lane, one)?;
-                let lane = clamp_i(f, lane, 0, l - 1)?;
-                let own0 = take(f, lo, lane)?;
-                let ext0 = take(f, lanes.begin, lane)?;
-                let skip = take(f, rep, lane)?;
-                let at = f.sub(o, own0)?;
-                let at = f.add(at, ext0)?;
-                let at = f.add(at, skip)?;
-                let at = clamp_i(f, at, 0, t - 1)?;
-                f.take_rows(rows, at)?
-            }
-        };
-        cx.write(out, rows)?;
-        cx.write(state.state, slab)
-    })
+    let idv = flat_i32(f, ids)?;
+    let slab = state.val;
+    let m = match map {
+        Some(m) => {
+            let v = m.val;
+            let n = f.ty(v).elements();
+            Some(f.reshape(v, &[n])?)
+        }
+        None => None,
+    };
+    let (lanes, own) = match lanes {
+        PleLanes::Decode { slots } => {
+            let slots = flat_i32(f, slots)?;
+            (decode_lanes(f, slots, t)?, None)
+        }
+        PleLanes::Ragged { indptr, slots } => {
+            let ip = flat_i32(f, indptr)?;
+            let slots = flat_i32(f, slots)?;
+            (ragged_lanes(f, ip, slots)?, None)
+        }
+        PleLanes::Committed { indptr, seat } => {
+            let ip = flat_i32(f, indptr)?;
+            let rep = flat_i32(f, seat.replay)?;
+            let com = flat_i32(f, seat.commit)?;
+            let sl = flat_i32(f, seat.slots)?;
+            let lanes = committed_lanes(op, f, ip, rep, com, sl, seat.lane0)?;
+            let l = lanes.count(f);
+            let lane0 = i64::from(seat.lane0);
+            let rep = f.slice_axis(rep, 0, lane0, lane0 + l)?;
+            (lanes, Some((ip, rep)))
+        }
+    };
+    let past = f.take_rows(slab, lanes.slot)?;
+    let (rows, next) = hash_lanes(f, h, idv, past, &lanes, m)?;
+    let slab = land_rows(f, slab, lanes.slot, lanes.write, next)?;
+    let rows = match own {
+        None => rows,
+        Some((ip, rep)) => {
+            // Own row o of lane r is extended row
+            // ext_begin[r] + replay[r] + (o - indptr[r]).
+            let l = lanes.count(f);
+            let n = i64::from(out.rows);
+            let o = f.iota(Elem::I32, &[n], 0);
+            let lo = f.slice_axis(ip, 0, 0, l)?;
+            let lane = count_le(f, lo, o)?;
+            let one = f.like_i(lane, 1);
+            let lane = f.sub(lane, one)?;
+            let lane = clamp_i(f, lane, 0, l - 1)?;
+            let own0 = take(f, lo, lane)?;
+            let ext0 = take(f, lanes.begin, lane)?;
+            let skip = take(f, rep, lane)?;
+            let at = f.sub(o, own0)?;
+            let at = f.add(at, ext0)?;
+            let at = f.add(at, skip)?;
+            let at = clamp_i(f, at, 0, t - 1)?;
+            f.take_rows(rows, at)?
+        }
+    };
+    Ok((rows, slab))
 }
 
 /// One row per lane: hash `[id, window..]`, then push `id` into the window.
+/// Returns `(ngram_ids, state)`: the hashed rows and the new slab.
 pub fn ngram_ids(
-    ctx: &Ctx<'_>,
-    ids: Tensor,
-    state: &RecurrentPool,
+    f: &mut Func,
+    ids: Operand,
+    state: Operand,
+    slots: Operand,
     eos: u32,
     mults: &[u64],
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
-    map: Option<Tensor>,
-    ngram_ids: Tensor,
-) -> Result<(), Error> {
+    map: Option<Operand>,
+    ngram_ids: Landing,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "gather.ngram_ids";
     let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
-    ngram(ctx, OP, ids, PleLanes::Decode, state, &h, map, ngram_ids)
-}
-
-/// Every row of a query CSR's lanes; `state.slots` is per row.
-pub fn ngram_ids_chunked(
-    ctx: &Ctx<'_>,
-    ids: RaggedTensor,
-    state: &RecurrentPool,
-    eos: u32,
-    mults: &[u64],
-    primes: &[u64],
-    offsets: &[u64],
-    heads_per_ngram: u32,
-    map: Option<Tensor>,
-    ngram_ids: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "gather.ngram_ids_chunked";
-    let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     ngram(
-        ctx,
+        f,
         OP,
-        ids.data,
-        PleLanes::Ragged(ids.indptr),
+        ids,
+        PleLanes::Decode { slots },
         state,
         &h,
         map,
         ngram_ids,
     )
+}
+
+/// Every row of a query CSR's lanes; `slots` is per row.
+pub fn ngram_ids_chunked(
+    f: &mut Func,
+    ids: RaggedTensor<Operand>,
+    state: Operand,
+    slots: Operand,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+    map: Option<Operand>,
+    ngram_ids: Landing,
+) -> Result<(Val, Val), Error> {
+    const OP: &str = "gather.ngram_ids_chunked";
+    let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
+    let lanes = PleLanes::Ragged {
+        indptr: ids.indptr,
+        slots,
+    };
+    ngram(f, OP, ids.data, lanes, state, &h, map, ngram_ids)
 }
 
 /// A rollback seat's extended ids: the own rows (past each lane's replay)
 /// land in `ngram_ids` at their own positions, the window after each lane's
 /// committed prefix lands in the state.
 pub fn ngram_ids_committed(
-    ctx: &Ctx<'_>,
-    ids: Tensor,
-    indptr: Tensor,
-    committed: &Committed,
-    state: &RecurrentPool,
+    f: &mut Func,
+    ids: Operand,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    state: Operand,
     eos: u32,
     mults: &[u64],
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
-    map: Option<Tensor>,
-    ngram_ids: Tensor,
-) -> Result<(), Error> {
+    map: Option<Operand>,
+    ngram_ids: Landing,
+) -> Result<(Val, Val), Error> {
     const OP: &str = "gather.ngram_ids_committed";
     let h = hash(OP, eos, mults, primes, offsets, heads_per_ngram)?;
-    ngram(
-        ctx,
-        OP,
-        ids,
-        PleLanes::Committed(indptr, *committed),
-        state,
-        &h,
-        map,
-        ngram_ids,
-    )
+    let lanes = PleLanes::Committed { indptr, seat };
+    ngram(f, OP, ids, lanes, state, &h, map, ngram_ids)
 }
 
 // ------------------------------------------------------------ selector walk

@@ -360,7 +360,16 @@ fn an_embedding_gathers_native_codes() {
         width as u32,
         &vec![0.0; ids.len() * width],
     );
-    if !nat.run(|ctx| gather::embed_gather_mb_4bit(ctx, it, bank, vocab as u32, y)) {
+    if !nat.run(|ctx| {
+        engine_xla::lower::lower(ctx, |l| {
+            let ids_v = l.read(it)?;
+            let table_v = (bank).try_map(|t| l.read(t))?;
+            let o_y = y;
+            let v =
+                gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, vocab as u32, o_y.landing())?;
+            l.land(o_y, v)
+        })
+    }) {
         return;
     }
     let want: Vec<f32> = ids

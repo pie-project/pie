@@ -215,19 +215,40 @@ fn conv(
         let slab = cx.read(state.conv_state)?;
         let lanes = match lanes {
             ConvLanes::Decode => {
-                let slots = flat_i32(cx, state.slots)?;
+                let slots = {
+                    let o = cx.operand(state.slots)?;
+                    flat_i32(cx, o)
+                }?;
                 decode_lanes(cx.func(), slots, t)?
             }
             ConvLanes::Ragged(indptr) => {
-                let ip = flat_i32(cx, indptr)?;
-                let slots = flat_i32(cx, state.slots)?;
+                let ip = {
+                    let o = cx.operand(indptr)?;
+                    flat_i32(cx, o)
+                }?;
+                let slots = {
+                    let o = cx.operand(state.slots)?;
+                    flat_i32(cx, o)
+                }?;
                 ragged_lanes(cx.func(), ip, slots)?
             }
             ConvLanes::Committed(indptr, cm) => {
-                let ip = flat_i32(cx, indptr)?;
-                let rep = flat_i32(cx, cm.replay)?;
-                let com = flat_i32(cx, cm.commit)?;
-                let sl = flat_i32(cx, cm.slots)?;
+                let ip = {
+                    let o = cx.operand(indptr)?;
+                    flat_i32(cx, o)
+                }?;
+                let rep = {
+                    let o = cx.operand(cm.replay)?;
+                    flat_i32(cx, o)
+                }?;
+                let com = {
+                    let o = cx.operand(cm.commit)?;
+                    flat_i32(cx, o)
+                }?;
+                let sl = {
+                    let o = cx.operand(cm.slots)?;
+                    flat_i32(cx, o)
+                }?;
                 committed_lanes(op, cx.func(), ip, rep, com, sl, cm.lane0)?
             }
         };
@@ -405,8 +426,14 @@ pub fn gdn_prep(
     let rows = i64::from(ba.rows);
     ctx.emit(&mut |cx| {
         let v = cx.read_f32(ba)?;
-        let db = flat_f32(cx, dt_bias)?;
-        let al = flat_f32(cx, a_log)?;
+        let db = {
+            let o = cx.operand(dt_bias)?;
+            flat_f32(cx, o)
+        }?;
+        let al = {
+            let o = cx.operand(a_log)?;
+            flat_f32(cx, o)
+        }?;
         let f = cx.func();
         let b = f.slice_axis(v, 1, 0, vh)?;
         let a = f.slice_axis(v, 1, vh, 2 * vh)?;
@@ -1048,7 +1075,16 @@ impl DeltaIn {
                 ..
             } => Raw {
                 rows: vec![cx.read(mixed)?, cx.read(f)?, cx.read(b)?],
-                fixed: vec![flat_f32(cx, dt_bias)?, flat_f32(cx, a_log)?],
+                fixed: vec![
+                    {
+                        let o = cx.operand(dt_bias)?;
+                        flat_f32(cx, o)
+                    }?,
+                    {
+                        let o = cx.operand(a_log)?;
+                        flat_f32(cx, o)
+                    }?,
+                ],
             },
         })
     }
@@ -1123,7 +1159,10 @@ fn delta(
         let slab = cx.read(state.state)?;
         let (yv, slab) = match lanes {
             DeltaLanes::Decode => {
-                let slots = flat_i32(cx, state.slots)?;
+                let slots = {
+                    let o = cx.operand(state.slots)?;
+                    flat_i32(cx, o)
+                }?;
                 let f = cx.func();
                 let lanes = decode_lanes(f, slots, t)?;
                 let heads = input.heads_from(f, &raw.rows, &raw.fixed)?;
@@ -1173,17 +1212,32 @@ fn delta(
                 (yv, slab)
             }
             DeltaLanes::Ragged(indptr) | DeltaLanes::Committed(indptr, _) => {
-                let ip = flat_i32(cx, indptr)?;
+                let ip = {
+                    let o = cx.operand(indptr)?;
+                    flat_i32(cx, o)
+                }?;
                 let (lanes, segs) = if let DeltaLanes::Committed(_, cm) = lanes {
-                    let rep = flat_i32(cx, cm.replay)?;
-                    let com = flat_i32(cx, cm.commit)?;
-                    let sl = flat_i32(cx, cm.slots)?;
+                    let rep = {
+                        let o = cx.operand(cm.replay)?;
+                        flat_i32(cx, o)
+                    }?;
+                    let com = {
+                        let o = cx.operand(cm.commit)?;
+                        flat_i32(cx, o)
+                    }?;
+                    let sl = {
+                        let o = cx.operand(cm.slots)?;
+                        flat_i32(cx, o)
+                    }?;
                     let f = cx.func();
                     let lanes = committed_lanes(op, f, ip, rep, com, sl, cm.lane0)?;
                     let segs = committed_segs(f, &lanes)?;
                     (lanes, segs)
                 } else {
-                    let slots = flat_i32(cx, state.slots)?;
+                    let slots = {
+                        let o = cx.operand(state.slots)?;
+                        flat_i32(cx, o)
+                    }?;
                     let f = cx.func();
                     let lanes = ragged_lanes(f, ip, slots)?;
                     let segs = whole_segs(f, &lanes);
