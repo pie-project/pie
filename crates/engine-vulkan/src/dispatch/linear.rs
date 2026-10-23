@@ -356,24 +356,34 @@ impl Run<'_> {
                 routes,
                 groups,
                 y,
-            } => linear::moe::matmul_grouped(
-                self.ctx(),
-                self.tensor(*x),
+            } => kernels_slang::linear::moe::select::matmul_grouped(
+                &self.slang(),
+                kernels_slang::Tier::Baseline,
+                crate::encode::slang_tensor(self.tensor(*x)),
                 match self.banked(*w) {
-                    Some(bank) => linear::moe::GroupedPlane::Bank(bank),
-                    None => linear::moe::GroupedPlane::Dense(self.tensor(*w)),
+                    Some(bank) => kernels_slang::linear::moe::select::GroupedPlane::Bank(
+                        crate::encode::slang_bank(bank),
+                    ),
+                    None => kernels_slang::linear::moe::select::GroupedPlane::Dense(
+                        crate::encode::slang_tensor(self.tensor(*w)),
+                    ),
                 },
-                self.tensor(*routes),
+                crate::encode::slang_tensor(self.tensor(*routes)),
                 *groups,
-                self.tensor(*y),
-            ),
-            Linear::MoeMatmulSelect { x, bank, routes, y } => linear::moe::matmul_select(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*bank),
-                self.tensor(*routes),
-                self.tensor(*y),
-            ),
+                crate::encode::slang_tensor(self.tensor(*y)),
+            )
+            .map_err(crate::encode::from_slang),
+            Linear::MoeMatmulSelect { x, bank, routes, y } => {
+                kernels_slang::linear::moe::select::matmul_select(
+                    &self.slang(),
+                    kernels_slang::Tier::Baseline,
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                    crate::encode::slang_tensor(self.tensor(*bank)),
+                    crate::encode::slang_tensor(self.tensor(*routes)),
+                    crate::encode::slang_tensor(self.tensor(*y)),
+                )
+                .map_err(crate::encode::from_slang)
+            }
 
             Linear::MoeMatmulSelectBias {
                 x,
@@ -415,14 +425,16 @@ impl Run<'_> {
                 {
                     return Ok(());
                 }
-                linear::moe::matmul_select_bias(
-                    self.ctx(),
-                    self.tensor(*x),
-                    planes,
-                    bias_plane,
-                    routed,
-                    self.tensor(*y),
+                kernels_slang::linear::moe::select::matmul_select_bias(
+                    &self.slang(),
+                    kernels_slang::Tier::Baseline,
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                    crate::encode::slang_bank(planes),
+                    crate::encode::slang_tensor(bias_plane),
+                    crate::encode::slang_tensor(routed),
+                    crate::encode::slang_tensor(self.tensor(*y)),
                 )
+                .map_err(crate::encode::from_slang)
             }
 
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
@@ -451,13 +463,15 @@ impl Run<'_> {
                 {
                     return Ok(());
                 }
-                linear::moe::matmul_select_quant(
-                    self.ctx(),
-                    self.tensor(*x),
-                    planes,
-                    routed,
-                    self.tensor(*y),
+                kernels_slang::linear::moe::select::matmul_select_quant(
+                    &self.slang(),
+                    kernels_slang::Tier::Baseline,
+                    crate::encode::slang_tensor(self.tensor(*x)),
+                    crate::encode::slang_bank(planes),
+                    crate::encode::slang_tensor(routed),
+                    crate::encode::slang_tensor(self.tensor(*y)),
                 )
+                .map_err(crate::encode::from_slang)
             }
 
             Linear::LoraCorrect {
