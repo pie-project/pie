@@ -187,7 +187,7 @@ impl Run<'_> {
                     up: None,
                 })
             }
-            // Not in `FUSED`, so never formed here; whole, it is its three
+            // Not in `FUSIONS`, so never formed here; whole, it is its three
             // primitives.
             Fused::MatmulSwigluMatmul {
                 act,

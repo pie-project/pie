@@ -5,16 +5,26 @@ use poem_ir::{NormAxis, NormWeight};
 
 use crate::run::Run;
 
+/// The fused ops this backend's dispatch turns away. Its rules form none of
+/// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
+pub(crate) fn refuses(op: &Fused) -> bool {
+    matches!(
+        op,
+        Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. }
+    )
+}
+
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
+            _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => {
+                unreachable!("`refuses` names it")
+            }
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op, None),
             Fused::SplitQkvFused { rest, qkv, .. } => {
                 let rest = self.tensor(*rest);
                 self.qkv_write(qkv, Some(rest))
-            }
-            Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => {
-                Err(kernels_cuda::Error::Unsupported { op: op.name() })
             }
             Fused::RopeYarnAppend { .. } => self.rope_yarn_append(op),
             Fused::NormRopeLastAppend { .. } => self.norm_rope_last_append(op),

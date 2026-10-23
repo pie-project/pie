@@ -612,7 +612,7 @@ fn plan_of(deployment: &str, text: &str, cores: Option<u32>) -> Option<u64> {
     let row = poem_compiler::catalog::deployment(deployment)?;
     let trace = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Metal),
-        &poem_compiler::fuse::flags::kernels(&profile),
+        poem_compiler::fuse::flags::on(&profile, &crate::FUSIONS),
     );
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(slots, CONTEXT));

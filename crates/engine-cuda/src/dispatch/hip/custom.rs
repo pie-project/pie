@@ -6,9 +6,32 @@ use poem_ir::{NormAxis, NormWeight};
 use crate::run::{HeldGate, HeldShared, Run};
 use poem_ir::ValueId;
 
+/// The fused ops this backend's dispatch turns away: CUDA's DeepSeek,
+/// hyper-connection and Qwen prologue kernels. Its rules form none of them
+/// (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
+pub(crate) fn refuses(op: &Fused) -> bool {
+    matches!(
+        op,
+        Fused::NormRopeLast { .. }
+            | Fused::NormRopeLastAppend { .. }
+            | Fused::NormRopePair { .. }
+            | Fused::IndexTopkRope { .. }
+            | Fused::PoolCompress { .. }
+            | Fused::PoolAttention { .. }
+            | Fused::MlaPrefillExpanded { .. }
+            | Fused::HcPre { .. }
+            | Fused::HcGatesNorm { .. }
+            | Fused::HcPrenormProject { .. }
+            | Fused::ResBlendRmsnorm { .. }
+            | Fused::QgQknormRopeAppend { .. }
+            | Fused::SplitQkvFused { .. }
+    )
+}
+
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
+            _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Fused::GdnStep { .. } => return self.gdn_step(op),
             Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
@@ -26,8 +49,6 @@ impl DispatchFused for Run<'_> {
             | Fused::LseSink { .. }
             | Fused::RopeYarnAppend { .. }
             | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
-            // CUDA's DeepSeek, hyper-connection and Qwen prologue kernels:
-            // never formed here.
             Fused::NormRopeLast { .. }
             | Fused::NormRopeLastAppend { .. }
             | Fused::NormRopePair { .. }
@@ -40,9 +61,7 @@ impl DispatchFused for Run<'_> {
             | Fused::HcPrenormProject { .. }
             | Fused::ResBlendRmsnorm { .. }
             | Fused::QgQknormRopeAppend { .. }
-            | Fused::SplitQkvFused { .. } => {
-                Err(kernels_cuda::Error::Unsupported { op: op.name() })
-            }
+            | Fused::SplitQkvFused { .. } => unreachable!("`refuses` names it"),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }

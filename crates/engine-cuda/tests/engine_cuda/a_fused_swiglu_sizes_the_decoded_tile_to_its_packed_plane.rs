@@ -235,7 +235,10 @@ fn a_fused_swiglu_sizes_the_decoded_tile_to_its_packed_plane() {
     }
     let fixture = fixture();
 
-    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["fused.matmul_swiglu"]);
+    let fused = poem_compiler::fuse::fuse(
+        fixture.trace.clone(),
+        [&poem_compiler::fuse::rules::matmul_swiglu()],
+    );
     assert!(
         fused
             .nodes

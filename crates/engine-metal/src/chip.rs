@@ -165,7 +165,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<ExpertsThreads>()
         .add::<KeepAliveSpin>()
         .add::<UnreportedCores>();
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // Metal forks no side streams: one queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
     r

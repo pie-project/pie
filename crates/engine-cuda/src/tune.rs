@@ -144,7 +144,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     let profile = poem_compiler::DeviceProfile::of(chip, sms, &crate::EXCLUSIVE, grouped);
     let trace = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Cuda),
-        &poem_compiler::fuse::flags::kernels(chip),
+        poem_compiler::fuse::flags::on(chip, &crate::FUSIONS),
     );
     #[cfg(not(feature = "rocm"))]
     let trace = {

@@ -46,62 +46,71 @@ pub const EXCLUSIVE: [&str; 0] = [];
 
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
-/// The fused kernels this backend ships; the compiler forms only these. A
-/// rule it does not list (`fused.matmul_swiglu_matmul`, which Metal splits across
-/// engines) leaves its primitives alone here.
+/// The fusions this backend implements: the compiler runs these rules alone,
+/// so each forms only fused ops this backend's dispatch fires. A rule it does
+/// not hold (`matmul_swiglu_matmul`, which Metal splits across engines)
+/// leaves its primitives alone here.
 #[cfg(not(feature = "rocm"))]
-pub const FUSED: [&str; 31] = [
-    "fused.split_qkv_fused",
-    "fused.qkv_fused_qknorm_rope_vnorm_write",
-    "fused.rmsnorm_residual_add",
-    "fused.embed_scale_add_select",
-    "fused.embed_scale_add",
-    "fused.residual_add_rmsnorm",
-    "fused.matmul_geglu",
-    "fused.moe_experts",
-    "fused.moe_select_glu",
-    "fused.matmul_swiglu",
-    "fused.matmul_softcap",
-    "fused.matmul_bias",
-    "fused.matmul_split_rows",
-    "fused.gated_residual_norm_modulate",
-    "fused.norm_modulate",
-    "fused.rmsnorm_rope_partial_q",
-    "fused.norm_rope_last",
-    "fused.norm_rope_last_append",
-    "fused.split_rope_yarn_append",
-    "fused.rope_yarn_append",
-    "fused.qg_qknorm_rope_append",
-    "fused.lse_sink",
-    "fused.pool_attention",
-    "fused.pool_compress",
-    "fused.mla_prefill_expanded",
-    "fused.norm_rope_pair",
-    "fused.index_topk_rope",
-    "fused.hc_prenorm_project",
-    "fused.hc_gates_norm",
-    "fused.res_blend_rmsnorm",
-    "fused.hc_pre",
-];
+pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
+    std::sync::LazyLock::new(|| {
+        use poem_compiler::fuse::rules;
+        vec![
+            rules::split_qkv_fused(),
+            rules::qkv_fused_qknorm_rope_vnorm_write(),
+            rules::rmsnorm_residual_add(),
+            rules::embed_scale_add_select(),
+            rules::embed_scale_add(),
+            rules::residual_add_rmsnorm(),
+            rules::matmul_geglu(),
+            rules::moe_experts(),
+            rules::moe_select_glu(),
+            rules::matmul_swiglu(),
+            rules::matmul_softcap(),
+            rules::matmul_bias(),
+            rules::matmul_split_rows(),
+            rules::gated_residual_norm_modulate(),
+            rules::norm_modulate(),
+            rules::rmsnorm_rope_partial_q(),
+            rules::norm_rope_last(),
+            rules::norm_rope_last_append(),
+            rules::split_rope_yarn_append(),
+            rules::rope_yarn_append(),
+            rules::qg_qknorm_rope_append(),
+            rules::lse_sink(),
+            rules::pool_attention(),
+            rules::pool_compress(),
+            rules::mla_prefill_expanded(),
+            rules::norm_rope_pair(),
+            rules::index_topk_rope(),
+            rules::hc_prenorm_project(),
+            rules::hc_gates_norm(),
+            rules::res_blend_rmsnorm(),
+            rules::hc_pre(),
+        ]
+    });
 #[cfg(feature = "rocm")]
-pub const FUSED: [&str; 16] = [
-    "fused.qkv_fused_qknorm_rope_vnorm_write",
-    "fused.rmsnorm_residual_add",
-    "fused.embed_scale_add_select",
-    "fused.embed_scale_add",
-    "fused.residual_add_rmsnorm",
-    "fused.matmul_geglu",
-    "fused.matmul_softcap",
-    "fused.matmul_bias",
-    "fused.matmul_swiglu_matmul",
-    "fused.moe_experts",
-    "fused.gated_residual_norm_modulate",
-    "fused.norm_modulate",
-    "fused.rmsnorm_rope_partial_q",
-    "fused.hc_norm_project",
-    "fused.gdn_step",
-    "fused.q_gate_norm_rope_append",
-];
+pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
+    std::sync::LazyLock::new(|| {
+        use poem_compiler::fuse::rules;
+        vec![
+            rules::qkv_fused_qknorm_rope_vnorm_write(),
+            rules::rmsnorm_residual_add(),
+            rules::embed_scale_add_select(),
+            rules::embed_scale_add(),
+            rules::residual_add_rmsnorm(),
+            rules::matmul_geglu(),
+            rules::matmul_softcap(),
+            rules::matmul_bias(),
+            rules::matmul_swiglu_matmul(),
+            rules::moe_experts(),
+            rules::gated_residual_norm_modulate(),
+            rules::norm_modulate(),
+            rules::rmsnorm_rope_partial_q(),
+            rules::hc_norm_project(),
+            rules::gdn_step(),
+            rules::q_gate_norm_rope_append(),
+        ]
+    });
 
 /// The fused kernels left on with `fuse-chains=off`.
 #[cfg(not(feature = "rocm"))]
@@ -186,7 +195,7 @@ mod tests {
         let stale: Vec<&str> = kernels_cuda::seat::ENTRIES
             .iter()
             .map(|entry| entry.name)
-            .chain(super::FUSED)
+            .chain(super::FUSIONS.iter().map(poem_compiler::fuse::Rule::kernel))
             .chain(super::UNCHAINED)
             .chain(super::GROUPED)
             .chain(super::PLANNED)
@@ -194,5 +203,29 @@ mod tests {
             .filter(|name| !Operation::names_an_op(name))
             .collect();
         assert!(stale.is_empty(), "named by no op: {stale:?}");
+    }
+
+    /// Every fused op this backend's rules form on a catalog deployment is
+    /// one its dispatch fires: a rule it holds and a form its dispatch turns
+    /// away cannot both stand.
+    #[test]
+    fn every_fused_op_its_rules_form_is_one_dispatch_fires() {
+        let mut refused = std::collections::BTreeSet::new();
+        for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
+            let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
+                continue;
+            };
+            #[cfg(feature = "rocm")]
+            let trace = crate::split_arm::split_into_arms(trace);
+            let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
+            for node in &fused.nodes {
+                if let Operation::Fused(op) = &node.op
+                    && crate::dispatch::refuses(op)
+                {
+                    refused.insert(format!("{}: {}", row.name, poem_ir::Operands::name(op)));
+                }
+            }
+        }
+        assert!(refused.is_empty(), "formed, then refused: {refused:?}");
     }
 }

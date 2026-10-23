@@ -7,6 +7,8 @@ mod custom;
 #[cfg(feature = "rocm")]
 #[path = "dispatch/hip/custom.rs"]
 mod custom;
+#[cfg(test)]
+pub(crate) use custom::refuses;
 mod elemwise;
 mod gather;
 #[cfg(not(feature = "rocm"))]

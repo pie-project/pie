@@ -1,5 +1,6 @@
-//! The fusion rules, in the order they run. A rule that forms a longer chain
-//! runs before one that forms a piece of it.
+//! The fusion rules' constructors, and [`all`]: every rule in every form, in
+//! the order rules run. A rule that forms a longer chain runs before one that
+//! forms a piece of it. A backend builds the rules it implements from these.
 
 use poem::declare::Precision;
 use poem::ops::{attn, elemwise, gather, linear, ssm};
@@ -30,10 +31,29 @@ const W4A8: Precision = Precision {
     act: Some(ActQuant::E4m3 { gran: 128 }),
 };
 
-pub(super) fn all() -> Vec<Rule> {
+/// Every rule, in every form, that forms one of the fused ops `labels`
+/// names. Panics on a label no rule forms.
+#[must_use]
+pub fn forming(labels: &[&str]) -> Vec<Rule> {
+    let rules: Vec<Rule> = all()
+        .into_iter()
+        .filter(|rule| labels.contains(&rule.kernel()))
+        .collect();
+    for label in labels {
+        assert!(
+            rules.iter().any(|rule| rule.kernel() == *label),
+            "`{label}` is a fused op no rule forms"
+        );
+    }
+    rules
+}
+
+/// Every rule in every form it takes, in the order rules run.
+#[must_use]
+pub fn all() -> Vec<Rule> {
     vec![
         split_qkv_fused(),
-        qkv_qknorm_rope_vnorm_write(),
+        qkv_fused_qknorm_rope_vnorm_write(),
         rmsnorm_residual_add(),
         embed_scale_add_select(),
         embed_scale_add(),
@@ -50,8 +70,8 @@ pub(super) fn all() -> Vec<Rule> {
         norm_modulate(),
         rmsnorm_rope_partial_q(),
         hc_norm_project(),
-        ssm_gdn_step(),
-        q_gate_k_norm_rope_append(),
+        gdn_step(),
+        q_gate_norm_rope_append(),
         pool_compress(),
         norm_rope_pair(),
         index_topk_rope(),
@@ -73,7 +93,8 @@ pub(super) fn all() -> Vec<Rule> {
 /// A sublayer's whole hyper-connection pre-mix: the stream norm read only by
 /// the mix projection, the mixes read only by the combined gates, and their
 /// pre-mixed row read only by an RMS norm.
-fn hc_pre() -> Rule {
+#[must_use]
+pub fn hc_pre() -> Rule {
     let pattern = template(|p| {
         let streams = p.rows("streams", 4 * W);
         let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("mix_eps"));
@@ -115,7 +136,8 @@ fn hc_pre() -> Rule {
 
 /// The combined hyper-connection gates whose pre-mixed row only an RMS norm
 /// reads.
-fn hc_gates_norm() -> Rule {
+#[must_use]
+pub fn hc_gates_norm() -> Rule {
     let pattern = template(|p| {
         let mixes = p.value(
             "mixes",
@@ -158,7 +180,8 @@ fn hc_gates_norm() -> Rule {
 
 /// AttnRes's blend whose row only an RMS norm reads (Kimi-K3's sublayer
 /// inputs), over however many closed blocks.
-fn res_blend_rmsnorm() -> Rule {
+#[must_use]
+pub fn res_blend_rmsnorm() -> Rule {
     let pattern = template(|p| {
         let prefix = p.rows("prefix", W);
         p.free("blocks");
@@ -188,7 +211,8 @@ fn res_blend_rmsnorm() -> Rule {
 }
 
 /// A hyper-connection stream norm read only by the mix projection over it.
-fn hc_prenorm_project() -> Rule {
+#[must_use]
+pub fn hc_prenorm_project() -> Rule {
     let pattern = template(|p| {
         let streams = p.rows("streams", W);
         let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("eps"));
@@ -214,7 +238,8 @@ fn hc_prenorm_project() -> Rule {
 /// DeepSeek-V4's attention: windowed and compressed-pool (all entries or the
 /// indexed ones) log-sum-exp attention over one q, their merge and the sinks;
 /// the window floored at each row's replay floor where it states one.
-fn pool_attention() -> Rule {
+#[must_use]
+pub fn pool_attention() -> Rule {
     let chain = |selected: bool, rotated: bool, floored: bool| {
         template(move |p| {
             let q = p.rows("q", W);
@@ -340,7 +365,8 @@ fn pool_attention() -> Rule {
 /// A latent attention's prefill: query absorb, scoring over every cached
 /// latent row and output absorb through one `kv_b`, opening on the cut of
 /// `q_b`'s rows where the query reaches it unturned, else on the two halves.
-fn mla_prefill_expanded() -> Rule {
+#[must_use]
+pub fn mla_prefill_expanded() -> Rule {
     let chain = |split: bool| {
         template(move |p| {
             let (heads, rank) = (p.u32("heads"), p.u32("rank"));
@@ -399,7 +425,8 @@ fn mla_prefill_expanded() -> Rule {
 }
 
 /// A log-sum-exp attention and the sinks over its output.
-fn lse_sink() -> Rule {
+#[must_use]
+pub fn lse_sink() -> Rule {
     let pair = |decode: bool| {
         template(move |p| {
             let q = p.rows("q", W);
@@ -467,7 +494,8 @@ fn lse_sink() -> Rule {
 /// Qwen3.5's attention prologue: q cut from its gate, q and k normed per
 /// head (plus-one weights), turned, and k with its v written to the cache,
 /// through the `attn.qv` marker the model sets on the cut q and v.
-fn qg_qknorm_rope_append() -> Rule {
+#[must_use]
+pub fn qg_qknorm_rope_append() -> Rule {
     let pattern = template(|p| {
         let qg = p.rows("qg", 2 * W);
         let k = p.rows("k", W);
@@ -532,7 +560,8 @@ fn qg_qknorm_rope_append() -> Rule {
 
 /// `rope_yarn_append` reading q, k and v straight from a packed q/k/v row
 /// rather than from a split's copies.
-fn split_rope_yarn_append() -> Rule {
+#[must_use]
+pub fn split_rope_yarn_append() -> Rule {
     let pattern = template(|p| {
         let packed = p.rows("packed", 3 * W);
         let (q, k, v) = gather::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
@@ -607,7 +636,8 @@ fn split_rope_yarn_append() -> Rule {
 }
 
 /// YaRN over q and k, and the rotated k written to the cache with its v.
-fn rope_yarn_append() -> Rule {
+#[must_use]
+pub fn rope_yarn_append() -> Rule {
     let pattern = template(|p| {
         let (q, k, v) = (p.rows("q", W), p.rows("k", W), p.rows("v", W));
         let positions = p.indices("positions");
@@ -714,7 +744,8 @@ fn plus_one(op: &Operation) -> bool {
 /// head, rotate them, and write k and v to the cache. Gemma 4's norms carry
 /// weights and v's a scaleless norm, rotated in part on a global layer;
 /// Muse Spark's are scaleless with v as it is, its global layers unturned.
-fn qkv_qknorm_rope_vnorm_write() -> Rule {
+#[must_use]
+pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
     Rule::new(
         "fused.qkv_fused_qknorm_rope_vnorm_write",
         qkv_patterns(false),
@@ -727,7 +758,8 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
 /// The fused qkv write on the first columns of a row split, the rest of each
 /// row landing as the split's second half (Muse Spark's qkv|gate): the split
 /// read in place, not copied out first.
-fn split_qkv_fused() -> Rule {
+#[must_use]
+pub fn split_qkv_fused() -> Rule {
     Rule::new("fused.split_qkv_fused", qkv_patterns(true), |m| {
         Fused::SplitQkvFused {
             rest: m.value("rest"),
@@ -889,7 +921,8 @@ fn qkv_admits(m: &Match) -> bool {
 
 /// A row norm whose output joins the residual stream, optionally scaled and
 /// normed again on the way out.
-fn rmsnorm_residual_add() -> Rule {
+#[must_use]
+pub fn rmsnorm_residual_add() -> Rule {
     let chain = |scaled: bool, post: Option<Norm>| {
         template(move |p| {
             let x = p.rows("x", W);
@@ -959,7 +992,8 @@ fn embed_chain(select: bool) -> Template {
     })
 }
 
-fn embed_scale_add_select() -> Rule {
+#[must_use]
+pub fn embed_scale_add_select() -> Rule {
     Rule::new("fused.embed_scale_add_select", [embed_chain(true)], |m| {
         Fused::EmbedScaleAddSelect {
             ids: m.value("ids"),
@@ -985,7 +1019,8 @@ fn dense_table(m: &Match<'_>) -> bool {
     m.weight_dtype("table").and_then(Dtype::elem).is_some()
 }
 
-fn embed_scale_add() -> Rule {
+#[must_use]
+pub fn embed_scale_add() -> Rule {
     Rule::new("fused.embed_scale_add", [embed_chain(false)], |m| {
         Fused::EmbedScaleAdd {
             ids: m.value("ids"),
@@ -1004,7 +1039,8 @@ fn embed_scale_add() -> Rule {
 }
 
 /// A residual add whose sum is normed.
-fn residual_add_rmsnorm() -> Rule {
+#[must_use]
+pub fn residual_add_rmsnorm() -> Rule {
     let pair = |norm: Norm| {
         template(move |p| {
             let y_out = elemwise::residual_add(&p.rows("x", W), &p.rows("y", W));
@@ -1030,7 +1066,8 @@ fn residual_add_rmsnorm() -> Rule {
 /// projection. Both intermediates stay inside the match, so a chain that
 /// reads one of them elsewhere (Bonsai rotates `h` before `down`) stays as
 /// its three primitives.
-fn matmul_swiglu_matmul() -> Rule {
+#[must_use]
+pub fn matmul_swiglu_matmul() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("gate_up", [2 * W, W]));
         p.name("packed", &packed);
@@ -1063,7 +1100,8 @@ fn matmul_swiglu_matmul() -> Rule {
 /// or SiTU; or an up select and its relu2), the down select of the GLU on the
 /// same routes (each row normed under a scale where `normed`, Muse Spark's),
 /// and the weighted sum.
-fn moe_experts() -> Rule {
+#[must_use]
+pub fn moe_experts() -> Rule {
     let mut alternatives = Vec::new();
     // Each leg's select: over a dense bank, a biased one, a quantized one,
     // or (both legs) a bank quantizing its activations: NVFP4 (W4A4) or
@@ -1280,7 +1318,8 @@ fn moe_experts() -> Rule {
 /// A routed gate-up select (over a dense, biased or quantized bank) and its
 /// GLU (SwiGLU, its clamp or clamp-alpha form, or GeGLU) over the packed
 /// gate|up rows, which stay inside the match.
-fn moe_select_glu() -> Rule {
+#[must_use]
+pub fn moe_select_glu() -> Rule {
     let mut alternatives = Vec::new();
     for select in 0..3 {
         for glu in 0..4 {
@@ -1360,7 +1399,8 @@ fn moe_select_glu() -> Rule {
     })
 }
 
-fn matmul_geglu() -> Rule {
+#[must_use]
+pub fn matmul_geglu() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
         p.name("packed", &packed);
@@ -1386,7 +1426,8 @@ fn matmul_geglu() -> Rule {
 /// The packed gate-up projection and its SwiGLU, where the MLP's down
 /// projection stays apart (a backend that ships `fused.matmul_swiglu_matmul` forms
 /// that first).
-fn matmul_swiglu() -> Rule {
+#[must_use]
+pub fn matmul_swiglu() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
         p.name("packed", &packed);
@@ -1409,7 +1450,8 @@ fn matmul_swiglu() -> Rule {
     })
 }
 
-fn matmul_softcap() -> Rule {
+#[must_use]
+pub fn matmul_softcap() -> Rule {
     let pattern = template(|p| {
         let y = linear::lm_head(&p.rows("act", W), &p.weight("w", [W, W]));
         p.name("y", &y);
@@ -1427,7 +1469,8 @@ fn matmul_softcap() -> Rule {
     })
 }
 
-fn matmul_bias() -> Rule {
+#[must_use]
+pub fn matmul_bias() -> Rule {
     let pattern = template(|p| {
         let y = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
         p.name("y", &y);
@@ -1445,7 +1488,8 @@ fn matmul_bias() -> Rule {
 
 /// A projection cut into two row halves (Qwen3.5's packed qkv|z), through
 /// the `recurrent` marker the cut's caller sets on the packed rows.
-fn matmul_split_rows() -> Rule {
+#[must_use]
+pub fn matmul_split_rows() -> Rule {
     let pattern = template(|p| {
         // The product's row as wide as `ssm_gdn_step`'s `qkvz`: the split
         // width is a pattern sentinel past any small width, and the rest of
@@ -1536,7 +1580,8 @@ fn modulation_inputs(p: &Pattern, per_lane: bool) -> (poem::Value, Option<poem::
 }
 
 /// A gated residual add, normed without a scale and modulated.
-fn gated_residual_norm_modulate() -> Rule {
+#[must_use]
+pub fn gated_residual_norm_modulate() -> Rule {
     let chain = |norm: ScaleFree, per_lane: bool| {
         template(move |p| {
             let (m, lanes, rows) = modulation_inputs(p, per_lane);
@@ -1577,7 +1622,8 @@ fn gated_residual_norm_modulate() -> Rule {
 }
 
 /// A norm without a scale, modulated.
-fn norm_modulate() -> Rule {
+#[must_use]
+pub fn norm_modulate() -> Rule {
     let pair = |norm: ScaleFree, per_lane: bool| {
         template(move |p| {
             let (m, lanes, _) = modulation_inputs(p, per_lane);
@@ -1607,7 +1653,8 @@ fn norm_modulate() -> Rule {
 /// A head's RMS norm, scaled (the whole row one head) or scale-free (per
 /// head), its last dims rotated: DeepSeek-V4's q, kv plane, compressed
 /// latent and index keys.
-fn norm_rope_last() -> Rule {
+#[must_use]
+pub fn norm_rope_last() -> Rule {
     let rope = |p: &poem::pattern::Pattern, y: &poem::Value| {
         p.free("interleaved");
         p.free("inverse");
@@ -1680,7 +1727,8 @@ fn norm_rope_last() -> Rule {
 
 /// An index's queries rotated and ranked, the rotated queries read by the
 /// ranking alone (DeepSeek-V4's indexer).
-fn index_topk_rope() -> Rule {
+#[must_use]
+pub fn index_topk_rope() -> Rule {
     let chain = |weighted: bool| {
         template(move |p| {
             p.free("interleaved");
@@ -1736,7 +1784,8 @@ fn index_topk_rope() -> Rule {
 /// DeepSeek-V4's q (scale-free per-head norm, tail rotated) and kv plane
 /// (scaled norm of a one-head row, rotated and cached) of one layer: same
 /// positions and rotation, and nothing between them reads either.
-fn norm_rope_pair() -> Rule {
+#[must_use]
+pub fn norm_rope_pair() -> Rule {
     let pattern = template(|p| {
         p.free("interleaved");
         p.free("inverse");
@@ -1838,7 +1887,8 @@ fn norm_rope_pair() -> Rule {
 /// DeepSeek-V4's compressor at its boundaries: the gathered entries normed,
 /// their tail rotated at the boundaries' rope positions, and written to the
 /// pool, the entries and the normed rows read by nothing else.
-fn pool_compress() -> Rule {
+#[must_use]
+pub fn pool_compress() -> Rule {
     let chain = |biased: bool, stated: bool| {
         template(move |p| {
             p.free("interleaved");
@@ -1951,7 +2001,8 @@ fn pool_compress() -> Rule {
 
 /// DeepSeek-V4's kv plane: a scaled norm of a row one head wide, its last
 /// dims rotated, written to the cache and read by nothing else.
-fn norm_rope_last_append() -> Rule {
+#[must_use]
+pub fn norm_rope_last_append() -> Rule {
     let pattern = template(|p| {
         p.free("interleaved");
         p.free("inverse");
@@ -2013,7 +2064,8 @@ fn norm_rope_last_append() -> Rule {
 }
 
 /// A per-head norm of q, rotated.
-fn rmsnorm_rope_partial_q() -> Rule {
+#[must_use]
+pub fn rmsnorm_rope_partial_q() -> Rule {
     let pattern = template(|p| {
         let positions = p.indices("positions");
         let d = p.u32("head_dim");
@@ -2050,7 +2102,8 @@ fn rmsnorm_rope_partial_q() -> Rule {
 }
 
 /// mHC's f32 stream norm read only by its mix projection.
-fn hc_norm_project() -> Rule {
+#[must_use]
+pub fn hc_norm_project() -> Rule {
     let pattern = template(|p| {
         let normed = elemwise::hc_rmsnorm_f32(&p.rows("streams", W), p.f32("eps"));
         let count = p.u32("stream_count");
@@ -2070,7 +2123,8 @@ fn hc_norm_project() -> Rule {
 
 /// A gated-delta layer's decode step: the split of its in-projection, the
 /// conv update, the gate prep and the recurrence, all under one guard.
-fn ssm_gdn_step() -> Rule {
+#[must_use]
+pub fn gdn_step() -> Rule {
     let pattern = template(|p| {
         let qkvz = p.rows("qkvz", 1 << 40);
         let (qkv, z) = gather::split_rows(&qkvz, p.u32("width"));
@@ -2129,7 +2183,8 @@ fn ssm_gdn_step() -> Rule {
 
 /// Qwen's gated attention prologue: the q/gate split, the two per-head
 /// norms, the partial rotation and the kv append, all under one guard.
-fn q_gate_k_norm_rope_append() -> Rule {
+#[must_use]
+pub fn q_gate_norm_rope_append() -> Rule {
     let pattern = template(|p| {
         let d = p.u32("d");
         let (q, gate) = gather::split_q_gate(&p.rows("qg", 2 * W), d);

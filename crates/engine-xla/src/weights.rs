@@ -606,7 +606,7 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            // XLA ships no fused kernels (`crate::FUSED` is empty), so no
+            // XLA ships no fused kernels (`crate::FUSIONS` is empty), so no
             // `Fused` op reaches a trace this reads.
             Operation::Linear(
                 Linear::Matmul {

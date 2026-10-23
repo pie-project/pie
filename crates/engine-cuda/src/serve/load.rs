@@ -104,15 +104,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
     let profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
-    let mut kernels = poem_compiler::fuse::flags::kernels(&chip);
+    let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
-        kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
+        kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
     }
     #[cfg(feature = "rocm")]
     {
         boot.trace = crate::split_arm::split_into_arms(boot.trace.clone());
     }
-    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
+    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), kernels);
     #[cfg(not(feature = "rocm"))]
     {
         let tuning = kernels_cuda::tuning::Tuning::of(&chip);

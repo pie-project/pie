@@ -189,7 +189,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<MixedHostRung>()
         .add::<PageFloor>()
         .add::<PrefillFloor>();
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 2);
     r
 });

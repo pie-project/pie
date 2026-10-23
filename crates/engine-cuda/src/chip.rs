@@ -157,7 +157,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<HostPlanes>()
         .add::<PrefillLatticeFrom>()
         .add::<PrefillLatticeSteps>();
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register(&mut r, 2);
     // HIP graphs have no conditional node: one is priced past any launch it
@@ -755,11 +755,12 @@ mod tests {
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile::default()
         );
-        let mut fused = poem_compiler::fuse::flags::kernels(&registry().defaults());
-        let mut shipped = crate::FUSED.to_vec();
-        fused.sort_unstable();
-        shipped.sort_unstable();
-        assert_eq!(fused, shipped);
+        let on = poem_compiler::fuse::flags::on(&registry().defaults(), &crate::FUSIONS);
+        assert_eq!(
+            on.len(),
+            crate::FUSIONS.len(),
+            "every fusion is on by default"
+        );
     }
 
     #[cfg(not(feature = "rocm"))]
@@ -1132,11 +1133,12 @@ mod hip {
                 ..poem_compiler::DeviceProfile::default()
             }
         );
-        let mut fused = poem_compiler::fuse::flags::kernels(&registry().defaults());
-        let mut shipped = crate::FUSED.to_vec();
-        fused.sort_unstable();
-        shipped.sort_unstable();
-        assert_eq!(fused, shipped);
+        let on = poem_compiler::fuse::flags::on(&registry().defaults(), &crate::FUSIONS);
+        assert_eq!(
+            on.len(),
+            crate::FUSIONS.len(),
+            "every fusion is on by default"
+        );
     }
 }
 

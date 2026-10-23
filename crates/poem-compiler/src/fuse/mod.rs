@@ -1,12 +1,15 @@
 //! Forms a backend's fused kernels from the primitive ops a model writes.
 //!
 //! Each rule is a pattern written by example with the model-writing ops
-//! (`poem::pattern`) and the fused op that replaces a match of it. A
-//! backend lists the fused kernels it ships; only the rules that form one of
-//! those run, and every match is replaced.
+//! (`poem::pattern`) and the fused op that replaces a match of it. A rule is
+//! built by its constructor in [`rules`], parameterised by the forms it
+//! forms (`rules::matmul_glu(&[GluAct::Geglu])`). A backend owns the rules
+//! it implements, so a rule it holds forms only ops its dispatch fires; the
+//! compiler runs those rules alone, in the order [`rules::all`] gives, and
+//! every match is replaced.
 
 pub mod flags;
-mod rules;
+pub mod rules;
 mod search;
 
 use std::sync::LazyLock;
@@ -16,7 +19,9 @@ use poem_ir::{Dim, Dtype, Fused, Operation, Trace, Ty, ValueId};
 
 use search::{Binding, Shape};
 
-struct Rule {
+/// One fusion: the fused op it forms (`kernel`, its label), the patterns it
+/// matches and how a match is replaced.
+pub struct Rule {
     kernel: &'static str,
     shapes: Vec<Shape>,
     when: fn(&Match) -> bool,
@@ -28,6 +33,13 @@ struct Rule {
 }
 
 impl Rule {
+    /// The label of the fused op this rule forms; its profile flag is
+    /// `fuse.<name>`.
+    #[must_use]
+    pub fn kernel(&self) -> &'static str {
+        self.kernel
+    }
+
     /// A rule whose alternatives are tried in order at each op.
     fn new(
         kernel: &'static str,
@@ -154,24 +166,24 @@ impl Match<'_> {
     }
 }
 
-static RULES: LazyLock<Vec<Rule>> = LazyLock::new(rules::all);
+/// Every fused op's label in the order its rules run: a rule that forms a
+/// longer chain runs before one that forms a piece of it.
+static ORDER: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| rules::all().iter().map(|rule| rule.kernel).collect());
 
-/// Every fused kernel some rule forms, in the order the rules run.
-pub fn kernels() -> impl Iterator<Item = &'static str> {
-    RULES.iter().map(|rule| rule.kernel)
-}
-
-/// `trace` with every match of the rules that form one of `kernels` replaced
-/// by its fused op.
+/// `trace` with every match of `rules` replaced by its fused op. The rules
+/// run in [`rules::all`]'s order whatever order they are given in.
 #[must_use]
-pub fn fuse(mut trace: Trace, kernels: &[&str]) -> Trace {
-    for kernel in kernels {
-        assert!(
-            RULES.iter().any(|rule| rule.kernel == *kernel),
-            "`{kernel}` is a fused kernel no rule forms"
-        );
-    }
-    for rule in RULES.iter().filter(|rule| kernels.contains(&rule.kernel)) {
+pub fn fuse<'r>(mut trace: Trace, rules: impl IntoIterator<Item = &'r Rule>) -> Trace {
+    let rank = |rule: &&Rule| {
+        ORDER
+            .iter()
+            .position(|kernel| *kernel == rule.kernel)
+            .unwrap_or_else(|| panic!("`{}` is a fused op no rule forms", rule.kernel))
+    };
+    let mut ordered: Vec<&Rule> = rules.into_iter().collect();
+    ordered.sort_by_key(rank);
+    for rule in ordered {
         trace = search::apply(trace, rule);
     }
     search::compact(trace)

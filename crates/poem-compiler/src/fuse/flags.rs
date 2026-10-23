@@ -1,9 +1,11 @@
-//! One profile flag per fused kernel a rule forms: `fuse.<name>` holds where
-//! the chip runs the fused kernel rather than its primitives. A backend
-//! registers flags only for the kernels it ships, so a profile can turn one
-//! off but never on a kernel the backend lacks.
+//! One profile flag per fused op a rule forms: `fuse.<name>` holds where the
+//! chip runs the fused kernel rather than its primitives. A backend registers
+//! flags only for the rules it holds, so a profile can turn one off but never
+//! on a fusion the backend lacks.
 
 use profile::{Profile, Registry};
+
+use super::Rule;
 
 macro_rules! flags {
     ($($ty:ident = $id:literal => $kernel:literal,)*) => {
@@ -17,17 +19,17 @@ macro_rules! flags {
         /// Every flag as `(profile id, fused kernel)`.
         pub const ALL: &[(&str, &str)] = &[$(($id, $kernel)),*];
 
-        /// Register a flag, on by default, for each fused kernel `shipped`
-        /// names. Panics on a name no rule forms.
-        pub fn register(registry: &mut Registry, shipped: &[&str]) {
-            for kernel in shipped {
+        /// Register a flag, on by default, for each fused op `rules` form.
+        pub fn register(registry: &mut Registry, rules: &[Rule]) {
+            for rule in rules {
                 assert!(
-                    ALL.iter().any(|(_, k)| k == kernel),
-                    "`{kernel}` is a fused kernel no rule forms"
+                    ALL.iter().any(|(_, k)| *k == rule.kernel()),
+                    "`{}` has no `fuse.*` flag",
+                    rule.kernel()
                 );
             }
             $(
-                if shipped.contains(&$kernel) {
+                if rules.iter().any(|rule| rule.kernel() == $kernel) {
                     registry.add_defaulting::<$ty>("true");
                 }
             )*
@@ -73,13 +75,16 @@ flags! {
     HcPre = "fuse.hc_pre" => "fused.hc_pre",
 }
 
-/// The fused kernels `profile` turns on, in rule order: what [`super::fuse`]
-/// forms for this load.
+/// The rules of `rules` whose flag `profile` turns on: what
+/// [`super::fuse`] runs for this load.
 #[must_use]
-pub fn kernels(profile: &Profile) -> Vec<&'static str> {
-    ALL.iter()
-        .filter(|(id, _)| profile.flag(id) == Some(true))
-        .map(|(_, kernel)| *kernel)
+pub fn on<'r>(profile: &Profile, rules: &'r [Rule]) -> Vec<&'r Rule> {
+    rules
+        .iter()
+        .filter(|rule| {
+            ALL.iter()
+                .any(|(id, kernel)| *kernel == rule.kernel() && profile.flag(id) == Some(true))
+        })
         .collect()
 }
 
@@ -89,7 +94,10 @@ mod tests {
 
     #[test]
     fn every_rule_has_a_flag_and_every_flag_a_rule() {
-        let rules: Vec<&str> = super::super::kernels().collect();
+        let rules: Vec<&str> = super::super::rules::all()
+            .iter()
+            .map(Rule::kernel)
+            .collect();
         let flagged: Vec<&str> = ALL.iter().map(|(_, k)| *k).collect();
         for k in &rules {
             assert!(flagged.contains(k), "rule `{k}` has no `fuse.*` flag");
@@ -108,19 +116,19 @@ mod tests {
 
     #[test]
     fn a_backend_registers_what_it_ships_and_a_profile_may_turn_it_off() {
+        use super::super::rules;
+        let held = [rules::residual_add_rmsnorm(), rules::matmul_swiglu_matmul()];
         let mut r = Registry::new("toy", &[], &["rows"]);
-        register(
-            &mut r,
-            &["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"],
-        );
+        register(&mut r, &held);
+        let labels = |p: &Profile| on(p, &held).iter().map(|r| r.kernel()).collect::<Vec<_>>();
         assert_eq!(
-            kernels(&r.defaults()),
+            labels(&r.defaults()),
             ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"]
         );
         let p = r
             .load_user("api = 1\nfuse = [\"residual_add_rmsnorm\"]\n", "chip.toml")
             .expect("reads");
-        assert_eq!(kernels(&p), ["fused.residual_add_rmsnorm"]);
+        assert_eq!(labels(&p), ["fused.residual_add_rmsnorm"]);
         let refused = r.load_user("api = 1\nfuse = [\"matmul_bias\"]\n", "chip.toml");
         assert!(
             refused.is_err(),

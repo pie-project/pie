@@ -10,7 +10,7 @@ use profile::{Facts, Profile, Registry, Report, Shelf};
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("wgpu", FACTS, AXES);
     crate::tuning::register(&mut r);
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 0);
     r
 });

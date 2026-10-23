@@ -241,7 +241,10 @@ mod tests {
         let row = poem_compiler::catalog::deployment("gptoss-120b-bf16-mxfp4-kv-bf16")
             .expect("gpt-oss is in the catalog");
         let plain = row.trace(poem::Platform::Cuda);
-        let fused = poem_compiler::fuse::fuse(plain.clone(), &["fused.lse_sink"]);
+        let fused = poem_compiler::fuse::fuse(
+            plain.clone(),
+            &poem_compiler::fuse::rules::forming(&["fused.lse_sink"]),
+        );
         assert!(
             fused
                 .nodes

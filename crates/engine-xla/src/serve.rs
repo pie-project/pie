@@ -416,7 +416,7 @@ impl Shell {
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                &poem_compiler::fuse::flags::kernels(&chip),
+                poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS),
             ),
             ..boot
         };

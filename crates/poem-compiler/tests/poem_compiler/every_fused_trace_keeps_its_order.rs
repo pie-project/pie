@@ -4,12 +4,12 @@ use poem_ir::{Fault, Platform};
 /// each written by the op that claims them, and read only after it.
 #[test]
 fn every_fused_trace_keeps_its_order() {
-    let kernels: Vec<&str> = poem_compiler::fuse::kernels().collect();
+    let rules = poem_compiler::fuse::rules::all();
     let mut broken = Vec::new();
     for deployment in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits())
     {
         for platform in [Platform::Cuda, Platform::Metal] {
-            let fused = poem_compiler::fuse::fuse(deployment.trace(platform), &kernels);
+            let fused = poem_compiler::fuse::fuse(deployment.trace(platform), &rules);
             let Err(faults) = poem_ir::check(&fused) else {
                 continue;
             };
@@ -74,7 +74,7 @@ fn catalog_models_fold_their_patterns_on_every_layer() {
             .unwrap_or_else(|| panic!("the catalog states {deployment}"))
             .trace(Platform::Cuda);
         let layers = count(&trace, unfused);
-        let fused = poem_compiler::fuse::fuse(trace, kernels);
+        let fused = poem_compiler::fuse::fuse(trace, &poem_compiler::fuse::rules::forming(kernels));
         assert!(layers > 0, "{deployment}: {unfused}");
         assert_eq!(
             (count(&fused, unfused), count(&fused, landed)),

@@ -1,9 +1,14 @@
 use poem::Value;
 use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, template};
-use poem_compiler::fuse::fuse;
+use poem_compiler::fuse::rules;
 use poem_ir::{GluAct, Turn};
 use poem_ir::{Operands, Trace};
+
+/// `trace` with every rule, in every form, that forms one of `kernels` run.
+fn fuse(trace: Trace, kernels: &[&str]) -> Trace {
+    poem_compiler::fuse::fuse(trace, &rules::forming(kernels))
+}
 
 fn trace(build: impl FnOnce(&Pattern)) -> Trace {
     template(build).trace
@@ -1106,7 +1111,7 @@ fn every_rule_states_its_pattern_with_widths_it_can_hold() {
     // The patterns are recorded on first use; a split past its row (the
     // matmul-split rule's sentinel width once overflowed in debug builds and
     // wrapped in release) refuses here.
-    assert!(poem_compiler::fuse::kernels().count() > 0);
+    assert!(!rules::all().is_empty());
 }
 
 #[test]

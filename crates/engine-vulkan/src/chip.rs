@@ -19,7 +19,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("vulkan", FACTS, AXES);
     crate::tuning::register(&mut r);
     r.add::<SubmitSplitRows>();
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // One queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
     r

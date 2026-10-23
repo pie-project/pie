@@ -3,9 +3,20 @@ use poem_ir::{Fused, Operands};
 
 use crate::run::Run;
 
+/// The fused ops this backend's dispatch turns away: every one but the two
+/// it fires. Its rules form none of them
+/// (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
+pub(crate) fn refuses(op: &Fused) -> bool {
+    !matches!(
+        op,
+        Fused::MatmulSwigluMatmul { .. } | Fused::ResidualAddRmsnorm { .. }
+    )
+}
+
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
+            _ if refuses(op) => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Fused::MatmulSwigluMatmul { .. } => self.fused_linear(op),
             _ => self.fused_elemwise(op),
         }

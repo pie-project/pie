@@ -229,7 +229,10 @@ fn a_fused_geglu_reads_its_affine_bank_as_planes() {
     }
     let fixture = fixture();
 
-    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["fused.matmul_geglu"]);
+    let fused = poem_compiler::fuse::fuse(
+        fixture.trace.clone(),
+        [&poem_compiler::fuse::rules::matmul_geglu()],
+    );
     assert!(
         fused
             .nodes
