@@ -174,7 +174,7 @@ fn heads(name: &str) -> Option<Heads> {
 
 fn rule(name: &str) -> Rule {
     match name {
-        "linear.matmul" | "linear.lm_head" => Rule::Contract {
+        "linear.matmul" | "linear.matmul_act_quant" | "linear.lm_head" => Rule::Contract {
             act: "act",
             w: "w",
             out: 0,
@@ -182,7 +182,8 @@ fn rule(name: &str) -> Rule {
         },
         "linear.moe_matmul_select"
         | "linear.moe_matmul_select_bias"
-        | "linear.moe_matmul_select_quant" => Rule::Contract {
+        | "linear.moe_matmul_select_quant"
+        | "linear.moe_matmul_select_act_quant" => Rule::Contract {
             act: "x",
             w: "bank",
             out: 1,
