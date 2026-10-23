@@ -709,16 +709,17 @@ impl Run<'_> {
                 rope_dim,
                 theta,
                 k_out: _,
-            } => attn::index::layernorm_rope(
-                self.ctx(),
-                self.tensor(*k),
-                self.tensor(*positions),
-                self.tensor(*weight),
-                self.tensor(*bias),
+            } => kernels_slang::attn::index::layernorm_rope(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
+                crate::encode::slang_tensor(self.tensor(*weight)),
+                crate::encode::slang_tensor(self.tensor(*bias)),
                 *eps,
                 *rope_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
             Attn::IndexRope {
                 q,
                 positions,
@@ -727,15 +728,16 @@ impl Run<'_> {
                 rope_dim,
                 theta,
                 q_out: _,
-            } => attn::index::rope(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
+            } => kernels_slang::attn::index::rope(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*q)),
+                crate::encode::slang_tensor(self.tensor(*positions)),
                 *heads,
                 *head_dim,
                 *rope_dim,
                 *theta,
-            ),
+            )
+            .map_err(crate::encode::from_slang),
 
             Attn::IndexTopk {
                 q,
@@ -755,33 +757,35 @@ impl Run<'_> {
                 };
                 let fire = self.bindings();
                 let (positions, request_of_token) = (fire.positions, fire.tables.request_of_token);
-                attn::index::topk(
-                    self.ctx(),
-                    self.tensor(*q),
-                    weights.map(|w| self.tensor(w)),
-                    self.pool(*keys),
-                    self.cut_rows(positions),
-                    self.cut_rows(request_of_token),
-                    scores,
+                kernels_slang::attn::index::topk(
+                    &self.slang(),
+                    crate::encode::slang_tensor(self.tensor(*q)),
+                    weights.map(|w| crate::encode::slang_tensor(self.tensor(w))),
+                    &crate::encode::slang_pool(self.pool(*keys)),
+                    crate::encode::slang_tensor(self.cut_rows(positions)),
+                    crate::encode::slang_tensor(self.cut_rows(request_of_token)),
+                    crate::encode::slang_tensor(scores),
                     *heads,
                     *head_dim,
                     *top_k,
                     *ratio,
-                    self.tensor(*selection),
+                    crate::encode::slang_tensor(self.tensor(*selection)),
                 )
+                .map_err(crate::encode::from_slang)
             }
             Attn::IndexKvAppend {
                 k,
                 keys,
                 write_page,
                 write_offset,
-            } => attn::index::kv_append(
-                self.ctx(),
-                self.tensor(*k),
-                self.pool(*keys),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => kernels_slang::attn::index::kv_append(
+                &self.slang(),
+                crate::encode::slang_tensor(self.tensor(*k)),
+                &crate::encode::slang_pool(self.pool(*keys)),
+                crate::encode::slang_tensor(self.tensor(*write_page)),
+                crate::encode::slang_tensor(self.tensor(*write_offset)),
+            )
+            .map_err(crate::encode::from_slang),
 
             Attn::IndexBlockMean {
                 boundary_pos,
