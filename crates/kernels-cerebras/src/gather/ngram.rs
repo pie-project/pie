@@ -14,7 +14,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::HostOp;
+use crate::phase::HostOp;
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const MAX_NGRAM: usize = 4;

@@ -4,14 +4,14 @@
 //! (`kernels_cerebras::linear::gemm::pe_words()`).
 
 use dtype::Dtype;
+use engine_cerebras::bench::Recorder;
 use engine_cerebras::sdk::{Arch, Compile, Cslc};
 use kernels_cerebras::Tensor;
-use kernels_cerebras::cx::Tracer;
 use kernels_cerebras::linear::gemm::pe_words;
 
 /// Compiles a phase holding `arrays` arrays of `words` f32 each.
 fn compiles(cslc: &Cslc, words: u32, arrays: u32) -> Result<(), String> {
-    let tracer = Tracer::default();
+    let tracer = Recorder::default();
     let xs: Vec<Tensor> = (0..arrays)
         .map(|i| Tensor::new(10 + i, 1, words, Dtype::F32))
         .collect();

@@ -17,7 +17,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Segment};
+use crate::phase::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Segment};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const MAX_OFFSET: u64 = i16::MAX as u64;
@@ -139,7 +139,7 @@ fn conv(
             Lanes::PerRow => (sb.ptr(), true),
             Lanes::Ragged(t) => (cx.read(*t)?.ptr(), false),
         };
-        let plane = |b: &crate::program::Buf, by_rows: bool| ColPlane {
+        let plane = |b: &crate::phase::Buf, by_rows: bool| ColPlane {
             name: b.name.clone(),
             rows: b.rows,
             width: b.width,
@@ -279,11 +279,11 @@ fn lane_range(
     split: &Split,
     lanes: &Lanes,
     lanes_n: u32,
-    slots: &crate::program::Buf,
-    bank: &crate::program::Buf,
+    slots: &crate::phase::Buf,
+    bank: &crate::phase::Buf,
     stride: u32,
     (a, b): (u32, u32),
-    rows_out: Option<(&crate::program::Buf, u32, u32)>,
+    rows_out: Option<(&crate::phase::Buf, u32, u32)>,
     cols: Vec<ColPlane>,
     slots_rows: u32,
 ) -> Result<(String, u32), Error> {

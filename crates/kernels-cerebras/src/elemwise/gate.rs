@@ -6,7 +6,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::Shard;
+use crate::phase::Shard;
 use crate::tensor::Tensor;
 
 /// `x = silu(s · x)`, in place.

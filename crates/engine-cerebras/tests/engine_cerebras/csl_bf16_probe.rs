@@ -18,8 +18,8 @@ fn bf16_arrays_round_trip_through_f32() {
                 let fb = cx.read(f)?;
                 let ob = cx.write(out)?;
                 let (o, fn_) = (ob.name.clone(), fb.name.clone());
-                cx.program().global("var hb: [4]bf16;");
-                cx.program().global("var hw: [4]bf16;");
+                cx.global("var hb: [4]bf16;");
+                cx.global("var hw: [4]bf16;");
                 cx.line("var i: i32 = 0;");
                 cx.line(format!("while (i < 4) : (i += 1) {{ hb[i] = @as(bf16, {fn_}[i]); hw[i] = @as(bf16, 2.0); }}"));
                 cx.line("i = 0;");

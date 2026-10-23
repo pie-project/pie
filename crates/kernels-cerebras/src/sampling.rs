@@ -8,7 +8,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::{FabricOp, FabricStep, Guarded, HostOp, Shard};
+use crate::phase::{FabricOp, FabricStep, Guarded, HostOp, Shard};
 use crate::tensor::Tensor;
 
 /// The `k` largest of each row of `x`, largest first: ties go to the lower
@@ -216,9 +216,7 @@ fn argmax_host_merge(
     let parts_name = format!("am_{}_{}_{column}", x.buf, y.buf);
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
-        let parts = cx
-            .program()
-            .declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
+        let parts = cx.declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
         if pes > 1 {
             cx.over(pes);
             let tile = Shard::Tile {
@@ -241,9 +239,7 @@ fn argmax_host_merge(
         Ok(())
     })?;
     ctx.emit(&mut |cx| {
-        let parts = cx
-            .program()
-            .declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
+        let parts = cx.declare(&parts_name, Dtype::F32, x.rows, 2 * cg, true)?;
         cx.read(y)?;
         let yb = cx.write(y)?;
         cx.host(HostOp::ArgmaxMerge {

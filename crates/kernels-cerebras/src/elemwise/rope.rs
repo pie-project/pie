@@ -10,7 +10,7 @@ use crate::csl::f32_lit;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::Shard;
+use crate::phase::Shard;
 use crate::tensor::Tensor;
 
 /// Rotates the first `rotary_dim` lanes of every `head_dim` head of `q` and

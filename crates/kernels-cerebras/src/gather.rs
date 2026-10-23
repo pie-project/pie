@@ -8,7 +8,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::{HostOp, Shard};
+use crate::phase::{HostOp, Shard};
 use crate::tensor::Tensor;
 
 /// The most PEs an embedding table spreads over for a fabric gather (one
@@ -61,8 +61,8 @@ fn copy_split(op: &'static str, rows: u32, per_row: u64, same_rows: bool) -> Opt
 fn embed_over(
     cx: &mut Cx<'_>,
     n: u32,
-    table: &crate::program::Buf,
-    y: &crate::program::Buf,
+    table: &crate::phase::Buf,
+    y: &crate::phase::Buf,
     y_words: u64,
 ) -> Arg {
     if n == 1 {

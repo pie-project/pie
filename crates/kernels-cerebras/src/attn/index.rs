@@ -17,7 +17,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::HostOp;
+use crate::phase::HostOp;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn paged(op: &'static str, pool: &KvPool) -> Result<u32, Error> {

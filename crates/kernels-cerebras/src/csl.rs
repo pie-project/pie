@@ -12,7 +12,7 @@ use std::fmt::Write;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Arg {
     /// A many-item pointer to an exported buffer.
-    Ptr(crate::program::Buf),
+    Ptr(crate::phase::Buf),
     /// A pointer to a scratch array (`name`, element type).
     Scratch(String, &'static str),
     Int(i64),

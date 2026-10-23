@@ -12,7 +12,7 @@
 //! it in `handoff_scratch`).
 
 use super::*;
-use crate::library::Param;
+use kernels_cerebras::library::Param;
 
 /// One row of a table program, built before any text is emitted.
 pub(super) struct RowBuild {
@@ -96,7 +96,7 @@ fn texts_of(group: &[&Phase]) -> Vec<String> {
             let mut t = String::new();
             p.func.render(&mut t);
             if let Some(r) = &p.reduce {
-                t.push_str(&r.mentions());
+                t.push_str(&reduce_mentions(r));
             }
             t
         })
@@ -409,7 +409,7 @@ impl Program {
             .map(|c| tables.iter().map(|t| t.chunk_words(c)).max().unwrap_or(1))
             .sum::<u64>()
             + u64::from(tables.iter().map(|t| t.ops_words).max().unwrap_or(1));
-        let fixed = lines_of(crate::library::prelude()) + 60;
+        let fixed = lines_of(kernels_cerebras::library::prelude()) + 60;
         let forced = std::env::var("PIE_CEREBRAS_WHOLE_FIRE").is_ok_and(|v| v == "force");
         for (g, row) in rows.iter().enumerate() {
             let helpers: u64 = self
@@ -534,7 +534,7 @@ impl Program {
             p.func.render(&mut body);
         }
         for r in reduces {
-            for l in r.mentions().lines() {
+            for l in reduce_mentions(r).lines() {
                 let _ = writeln!(body, "// {l}");
             }
         }
@@ -882,7 +882,7 @@ impl Program {
             pe.push_str("const step_id: local_task_id = @get_local_task_id(15);\n");
         }
         pe.push('\n');
-        pe.push_str(crate::library::prelude());
+        pe.push_str(kernels_cerebras::library::prelude());
         pe.push('\n');
         // The arena and table arrays, at the largest row's size.
         let chunks = tables.iter().map(Table::chunks).max().unwrap_or(1);

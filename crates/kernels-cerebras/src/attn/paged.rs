@@ -22,7 +22,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::{
+use crate::phase::{
     BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, PagePlan, PageSource, Reduce, Segment,
 };
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
@@ -285,8 +285,8 @@ pub fn merge_words(o_words: u64, l_words: u64) -> u64 {
 /// first PE's `o`; the total becomes the lse.
 pub fn lse_merge(
     cx: &mut Cx<'_>,
-    o: &crate::program::Buf,
-    lse: &crate::program::Buf,
+    o: &crate::phase::Buf,
+    lse: &crate::phase::Buf,
     o_words: u64,
     l_words: u64,
     group: u32,
@@ -300,15 +300,15 @@ pub fn lse_merge(
 #[allow(clippy::too_many_arguments)]
 pub fn lse_merge_with(
     cx: &mut Cx<'_>,
-    o: &crate::program::Buf,
-    lse: &crate::program::Buf,
+    o: &crate::phase::Buf,
+    lse: &crate::phase::Buf,
     o_words: u64,
     l_words: u64,
     group: u32,
     pes: u32,
     everywhere: bool,
 ) {
-    use crate::program::{FabricOp, FabricStep, Guarded};
+    use crate::phase::{FabricOp, FabricStep, Guarded};
     let all = cx.scratch("lse_all", l_words * u64::from(group));
     let total = cx.scratch("lse_total", l_words);
     let partial = cx.scratch("partial", o_words);
@@ -650,8 +650,7 @@ fn attend(
                     if page_groups > 1 || row_groups > 1 || strided {
                         if lse_buf.is_none() {
                             let name = cx.unique("lse");
-                            lse_buf =
-                                Some(cx.program().declare(&name, Dtype::F32, n, q_heads, true)?);
+                            lse_buf = Some(cx.declare(&name, Dtype::F32, n, q_heads, true)?);
                         }
                         let lse_name = lse_buf.as_ref().map(|b| b.name.clone()).unwrap_or_default();
                         if fabric {
@@ -670,7 +669,7 @@ fn attend(
                     }
                     // q, o and the lse travel by head block: the columns of the
                     // PE's kv heads' query heads.
-                    let plane = |b: &crate::program::Buf, per_head: u32| ColPlane {
+                    let plane = |b: &crate::phase::Buf, per_head: u32| ColPlane {
                         name: b.name.clone(),
                         rows: b.rows,
                         width: b.width,
@@ -1167,7 +1166,7 @@ fn append(
                 }
                 // The k and v planes' columns follow the block's `b`, which
                 // counts words of a packed page: `per` elements a word.
-                let plane = |b: &crate::program::Buf| ColPlane {
+                let plane = |b: &crate::phase::Buf| ColPlane {
                     name: b.name.clone(),
                     rows: b.rows,
                     width: b.width,

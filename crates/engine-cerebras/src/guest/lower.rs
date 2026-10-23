@@ -32,11 +32,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::fabric::{Export, Manifest, Rendered, Symbol};
 use eta_compiler::codegen::launch::{LaunchOp, LaunchPackage, LaunchStage, ValueOrigin};
 use eta_ir::op::{IntrinsicId, tags};
 use eta_ir::{Dtype, RngKind, rng};
 use kernels_cerebras::csl::Block;
-use kernels_cerebras::program::{Export, Manifest, Rendered, Shard, Symbol};
+use kernels_cerebras::phase::Shard;
 
 /// Why a stage has no CSL form.
 #[derive(Clone, Debug, PartialEq, Eq)]

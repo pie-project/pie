@@ -11,7 +11,7 @@ use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::linear::gemm::{ARRAY_WORDS, pe_words};
-use crate::program::{
+use crate::phase::{
     BankSplit, BlockPlan, ColPlane, HostOp, LaneKind, LanePlan, Reduce, Segment, Shard,
 };
 use crate::tensor::Tensor;

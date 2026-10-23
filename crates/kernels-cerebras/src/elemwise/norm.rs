@@ -8,7 +8,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::Shard;
+use crate::phase::Shard;
 use crate::tensor::Tensor;
 
 /// `y = rmsnorm(x) * weight`: each row of `x` scaled by
@@ -225,9 +225,7 @@ fn rms_row(
     let ss_name = format!("ss_{}_{}", x.buf, y.buf);
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
-        let ss = cx
-            .program()
-            .declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
+        let ss = cx.declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
         cx.over(pes);
         let tile = Shard::Tile {
             rows: rg,
@@ -251,9 +249,7 @@ fn rms_row(
         let xb = cx.read(x)?;
         let wb = cx.read(weight)?;
         let yb = cx.write(y)?;
-        let ss = cx
-            .program()
-            .declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
+        let ss = cx.declare(&ss_name, Dtype::F32, y.rows, cg, true)?;
         cx.over(pes);
         let tile = Shard::Tile {
             rows: rg,
@@ -479,7 +475,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
 
 /// How a per-column vector (`[width][1]` or `[1][width]`) splits with `cg`
 /// column groups, every row group holding it.
-fn column_split(b: &crate::program::Buf, cg: u32) -> Shard {
+fn column_split(b: &crate::phase::Buf, cg: u32) -> Shard {
     if b.rows == 1 {
         Shard::ColsBy {
             parts: cg,
@@ -568,9 +564,7 @@ pub fn layernorm(
     let st_name = format!("st_{}_{}", x.buf, y.buf);
     ctx.emit(&mut |cx| {
         let xb = cx.read(x)?;
-        let st = cx
-            .program()
-            .declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
+        let st = cx.declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
         cx.over(pes);
         cx.shard(
             &xb,
@@ -604,9 +598,7 @@ pub fn layernorm(
         let wb = cx.read(weight)?;
         let bb = cx.read(bias)?;
         let yb = cx.write(y)?;
-        let st = cx
-            .program()
-            .declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
+        let st = cx.declare(&st_name, Dtype::F32, y.rows, 2 * cg, true)?;
         cx.over(pes);
         let tile = Shard::Tile {
             rows: rg,

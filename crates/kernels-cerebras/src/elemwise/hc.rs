@@ -13,7 +13,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::Shard;
+use crate::phase::Shard;
 use crate::tensor::Tensor;
 
 const MAX_HC_MULT: u32 = 8;
@@ -262,9 +262,7 @@ pub fn ple_gate(
     ctx.emit(&mut |cx| {
         let kb = cx.read(key)?;
         let qb = cx.read(query)?;
-        let pd = cx
-            .program()
-            .declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
+        let pd = cx.declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
         cx.over(pes);
         cx.shard(&kb, tile(rg, cg, m));
         cx.shard(&qb, tile(rg, cg, m));
@@ -285,9 +283,7 @@ pub fn ple_gate(
     ctx.emit(&mut |cx| {
         let vb = cx.read(value)?;
         let yb = cx.write(y)?;
-        let pd = cx
-            .program()
-            .declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
+        let pd = cx.declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
         cx.over(pes);
         cx.shard(&vb, tile(rg, cg, 1));
         cx.shard(&yb, tile(rg, cg, m));

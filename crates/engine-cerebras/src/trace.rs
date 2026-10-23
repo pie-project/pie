@@ -18,11 +18,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+use crate::fabric::{Emitting, Operands, Program, Rendered, elem_of};
 use dtype::Dtype;
-use kernels_cerebras::program::{
-    BankSplit, Buf, ColPlane, HostOp, HostPhase, Program, Reduce, Rendered, Segment, elem_of,
-};
-use kernels_cerebras::{Cx, Emit, Env, Tensor, View};
+use kernels_cerebras::phase::{BankSplit, Buf, ColPlane, HostOp, HostPhase, Reduce, Segment};
+use kernels_cerebras::{Cx, Emit, Tensor, View};
 
 /// Where a root's value comes from when the program first reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -175,7 +174,7 @@ pub struct Signature {
     pub names: Vec<String>,
     pub outputs: Vec<(String, (Dtype, u32, u32))>,
     /// Every buffer of the fire, with its shape and element type.
-    pub buffers: Vec<kernels_cerebras::program::Export>,
+    pub buffers: Vec<crate::fabric::Export>,
     /// Buffers that are windows of the pack: `(name, word offset, words)`.
     pub packed_views: Vec<(String, u32, u32)>,
 }
@@ -214,9 +213,7 @@ struct State {
 /// right; a dry shell traced for the shape marks the pools alike, so the
 /// partition it picks already counts them).
 fn kept_pool(_program: &Program, r: &Root) -> bool {
-    kernels_cerebras::program::keep_pools()
-        && matches!(r.source, Source::Pool { .. })
-        && r.dtype == Dtype::Bf16
+    crate::fabric::keep_pools() && matches!(r.source, Source::Pool { .. }) && r.dtype == Dtype::Bf16
 }
 
 pub(crate) fn root_name(root: u32) -> String {
@@ -253,8 +250,8 @@ impl<'h> Tracer<'h> {
     }
 
     /// The model-wide shape a whole-fire program follows (see
-    /// `kernels_cerebras::program::Unified`).
-    pub fn with_unified(self, unified: Option<kernels_cerebras::program::Unified>) -> Self {
+    /// `crate::fabric::Unified`).
+    pub fn with_unified(self, unified: Option<crate::fabric::Unified>) -> Self {
         self.state.borrow_mut().program.unified = unified;
         self
     }
@@ -344,7 +341,7 @@ impl<'h> Tracer<'h> {
             )
             .collect();
         let (phases, whole) = program.render_phases_whole();
-        if kernels_cerebras::program::keep_pools() && !whole {
+        if crate::fabric::keep_pools() && !whole {
             return Err(crate::Fault::Unbound {
                 what: "the fire does not render as one whole-fire program, which kept pools need (PIE_CEREBRAS_TRACE_FUSION=1 names the refusal)".to_string(),
             });
@@ -371,7 +368,7 @@ impl<'h> Tracer<'h> {
 /// One text for a rendered program (hashed, cached and dumped as one).
 #[must_use]
 pub fn render(r: &Rendered) -> String {
-    use kernels_cerebras::program::{LaneKind, PageSource, Shard};
+    use kernels_cerebras::phase::{LaneKind, PageSource, Shard};
     let manifest = serde_json::json!({
         "entry": r.manifest.entry,
         "rect": r.manifest.rect,
@@ -531,9 +528,8 @@ pub fn render(r: &Rendered) -> String {
 /// The rendered program back from its text.
 #[must_use]
 pub fn unrender(text: &str) -> Option<Rendered> {
-    use kernels_cerebras::program::{
-        BlockPlan, Export, LaneKind, LanePlan, Manifest, PagePlan, PageSource, Shard, Symbol, View,
-    };
+    use crate::fabric::{Export, Manifest, Symbol, View};
+    use kernels_cerebras::phase::{BlockPlan, LaneKind, LanePlan, PagePlan, PageSource, Shard};
     let rest = text.strip_prefix("===manifest.json\n")?;
     let (manifest, rest) = rest.split_once("===layout.csl\n")?;
     let (layout, pe) = rest.split_once("===pe.csl\n")?;
@@ -1031,9 +1027,10 @@ pub fn unrender(text: &str) -> Option<Rendered> {
 }
 
 /// A table-driven program's table as JSON (see `table_of`).
-fn table_json(t: &kernels_cerebras::program::Table) -> serde_json::Value {
+fn table_json(t: &crate::fabric::Table) -> serde_json::Value {
+    use crate::fabric::TableOp;
     use kernels_cerebras::csl::Arg;
-    use kernels_cerebras::program::{FabricOp, TableOp};
+    use kernels_cerebras::phase::FabricOp;
     let arg = |a: &Arg| match a {
         Arg::Ptr(b) => {
             serde_json::json!({ "ptr": b.name, "rows": b.rows, "width": b.width, "elem": b.elem })
@@ -1072,9 +1069,10 @@ fn table_json(t: &kernels_cerebras::program::Table) -> serde_json::Value {
 }
 
 /// The table of a program's JSON manifest, `None` when it has none.
-fn table_of(v: &serde_json::Value) -> Option<kernels_cerebras::program::Table> {
+fn table_of(v: &serde_json::Value) -> Option<crate::fabric::Table> {
+    use crate::fabric::{Table, TableOp};
     use kernels_cerebras::csl::Arg;
-    use kernels_cerebras::program::{FabricOp, Table, TableOp};
+    use kernels_cerebras::phase::FabricOp;
     if v.is_null() {
         return None;
     }
@@ -1241,7 +1239,7 @@ fn root_buf(
     Ok(buf)
 }
 
-/// The tracer's `Env`: the handle tables plus the state's maps.
+/// The tracer's `Operands`: the handle tables plus the state's maps.
 struct Lens<'a> {
     handles: &'a Handles,
     pack_len: u32,
@@ -1288,7 +1286,7 @@ impl Lens<'_> {
     }
 }
 
-impl Env for Lens<'_> {
+impl Operands for Lens<'_> {
     fn read(&mut self, p: &mut Program, t: Tensor) -> Result<View, kernels_cerebras::Error> {
         let (_, offset, whole) = self.root(p, t)?;
         Ok(View {
@@ -1423,7 +1421,11 @@ impl Emit for Tracer<'_> {
             views,
         };
         let scope = program.take_scope();
-        let mut cx = Cx::new(program, &mut lens, &scope);
+        let mut sink = Emitting {
+            program,
+            operands: &mut lens,
+        };
+        let mut cx = Cx::new(&mut sink, &scope);
         body(&mut cx)?;
         cx.finish();
         Ok(())

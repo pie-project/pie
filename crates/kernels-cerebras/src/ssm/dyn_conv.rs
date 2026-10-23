@@ -10,7 +10,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::linear::gemm::{ARRAY_WORDS, max_pes, pe_words};
-use crate::program::Shard;
+use crate::phase::Shard;
 use crate::tensor::{RaggedTensor, Tensor};
 
 /// Row `t` of a lane is `Σ_{k ≤ t} (base[side·taps + k, c] + coeff[t,

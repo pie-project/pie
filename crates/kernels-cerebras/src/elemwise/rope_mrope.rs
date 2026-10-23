@@ -12,7 +12,7 @@ use crate::csl::f32_lit;
 use crate::cx::{Ctx, expect, tile_split};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::Shard;
+use crate::phase::Shard;
 use crate::tensor::Tensor;
 
 pub const AXES: u32 = 3;

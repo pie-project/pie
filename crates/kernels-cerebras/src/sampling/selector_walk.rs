@@ -9,7 +9,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::HostOp;
+use crate::phase::HostOp;
 use crate::tensor::{RaggedTensor, Tensor};
 
 /// The drafter's greedy walk over each lane's candidate rows: row `t` scores

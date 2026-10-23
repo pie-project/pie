@@ -150,7 +150,7 @@ fn dsd_reductions_into_a_scalar() {
                 let yb = cx.read(y)?;
                 let ob = cx.write(out)?;
                 let tmp = cx.scratch("tmp", u64::from(n));
-                cx.program().global("var g_acc: f32 = 0.0;".to_string());
+                cx.global("var g_acc: f32 = 0.0;".to_string());
                 cx.line(format!(
                     "var dx = @set_dsd_base_addr(k_base_f32, {});",
                     xb.ptr()

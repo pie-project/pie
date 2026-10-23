@@ -19,7 +19,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::linear::gemm::pe_words;
-use crate::program::{BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
+use crate::phase::{BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
 use crate::tensor::Tensor;
 
 /// Words of a PE the attention kernel's code and stack take.
@@ -162,9 +162,9 @@ pub fn bidirectional(
             }
             // Partial rows over key groups need a per-head lse to merge by.
             let lse_name = cx.unique("lse");
-            let lse = cx.program().declare(&lse_name, Dtype::F32, n, qh, true)?;
+            let lse = cx.declare(&lse_name, Dtype::F32, n, qh, true)?;
             let header = cx.unique("lanes");
-            let heads = |b: &crate::program::Buf, per_head: u32, row_block: bool| ColPlane {
+            let heads = |b: &crate::phase::Buf, per_head: u32, row_block: bool| ColPlane {
                 name: b.name.clone(),
                 rows: b.rows,
                 width: b.width,

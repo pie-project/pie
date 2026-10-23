@@ -6,7 +6,7 @@ use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::{HostOp, Shard};
+use crate::phase::{HostOp, Shard};
 use crate::tensor::Tensor;
 
 /// `y[m, n] = Σ_k act[m, k] · w[n, k]` over the first `y.rows` rows of `act`,
@@ -247,7 +247,7 @@ fn resident_matmul(
     n: u32,
     pes: u32,
 ) -> Result<(), Error> {
-    use crate::program::{FabricOp, FabricStep, Guarded};
+    use crate::phase::{FabricOp, FabricStep, Guarded};
     let budget = pe_words();
     let (m64, k64, n64) = (u64::from(m), u64::from(k), u64::from(n));
     let a_words = u64::from(act.rows) * k64;

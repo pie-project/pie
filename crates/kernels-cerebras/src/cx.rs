@@ -1,9 +1,9 @@
-//! The sink kernels emit into.
+//! What a kernel entry emits with.
 //!
-//! A kernel entry asks for the device arrays behind its operand handles,
-//! writes CSL statements into the phase under construction, and names which
-//! handles it wrote. The engine's [`Env`] decides what a handle is; the
-//! default [`Roots`] treats every handle as its own exported buffer.
+//! An entry asks for the device arrays behind its operand handles, writes
+//! CSL statements and kernel calls into the phase under construction, and
+//! names which handles it wrote. The engine's [`Sink`] decides what a handle
+//! is and takes the phase when it closes.
 
 use std::ops::{Deref, DerefMut};
 
@@ -12,9 +12,9 @@ use dtype::Dtype;
 use crate::csl::{Block, Dsd1, Func};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
-use crate::program::{
+use crate::phase::{
     Buf, FabricOp, FabricReduce, FabricStep, Guarded, HostOp, HostPhase, LanePlan, PagePlan,
-    PageSource, Program, Reduce, Shard,
+    PageSource, Phase, Reduce, Shard, Sink,
 };
 use crate::tensor::Tensor;
 
@@ -41,92 +41,10 @@ pub struct View {
     pub rows: u32,
 }
 
-/// What an engine supplies so kernels can name its handles.
-pub trait Env {
-    /// The root buffer holding `t` now.
-    fn read(&mut self, p: &mut Program, t: Tensor) -> Result<View, Error>;
-
-    /// The root buffer `t` holds from here on.
-    fn write(&mut self, p: &mut Program, t: Tensor) -> Result<View, Error>;
-
-    /// `t` as a packed bf16 buffer (two halves a word), when the engine
-    /// keeps it so (a half-precision weight under `half_weights`, a kv pool
-    /// under `half_pool`); `None` means read it as f32.
-    fn read_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
-        let _ = (p, t);
-        Ok(None)
-    }
-
-    /// A kv pool `t` as a packed bf16 buffer under its plain name (read and
-    /// written in place), when the engine keeps pools so; `None` means f32.
-    fn pool_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
-        let _ = (p, t);
-        Ok(None)
-    }
-}
-
-/// The default environment: every handle is one exported buffer.
-#[derive(Debug, Default)]
-pub struct Roots;
-
-impl Env for Roots {
-    fn read(&mut self, p: &mut Program, t: Tensor) -> Result<View, Error> {
-        let whole = p.read("read", t)?;
-        Ok(View {
-            offset: 0,
-            rows: whole.rows,
-            whole,
-        })
-    }
-
-    /// Every bf16 handle a kernel asks for packed is packed (the bench
-    /// standing in for the engine's weights): a weight under its own
-    /// packed name, a pool (asked through [`Cx::pool_half`]) under its
-    /// plain name, read and written.
-    fn read_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
-        if !crate::linear::gemm::half_weights()
-            || t.dtype != Dtype::Bf16
-            || !t.width.is_multiple_of(2)
-        {
-            return Ok(None);
-        }
-        let whole = p.declare_packed(&format!("b{}h", t.buf), t.dtype, t.rows, t.width)?;
-        Ok(Some(View {
-            offset: 0,
-            rows: whole.rows,
-            whole,
-        }))
-    }
-
-    fn pool_half(&mut self, p: &mut Program, t: Tensor) -> Result<Option<View>, Error> {
-        if !crate::linear::gemm::half_pool() || t.dtype != Dtype::Bf16 || !t.width.is_multiple_of(2)
-        {
-            return Ok(None);
-        }
-        let whole = p.declare_packed(&format!("b{}", t.buf), t.dtype, t.rows, t.width)?;
-        Ok(Some(View {
-            offset: 0,
-            rows: whole.rows,
-            whole,
-        }))
-    }
-
-    fn write(&mut self, p: &mut Program, t: Tensor) -> Result<View, Error> {
-        let whole = p.write("write", t)?;
-        Ok(View {
-            offset: 0,
-            rows: whole.rows,
-            whole,
-        })
-    }
-}
-
-/// A kernel's view: the phase under construction plus the engine's handle
-/// resolution. Derefs to the phase body [`Block`], so a kernel emits with
+/// A kernel's view: the phase under construction and the engine's sink. Derefs to the phase body [`Block`], so a kernel emits with
 /// `cx.line(..)`.
 pub struct Cx<'a> {
-    p: &'a mut Program,
-    env: &'a mut dyn Env,
+    p: &'a mut dyn Sink,
     phase: Func,
     rounds: Vec<Buf>,
     /// Row windows this phase names, by handle: exported view buffers the
@@ -145,11 +63,10 @@ pub struct Cx<'a> {
 
 impl<'a> Cx<'a> {
     /// Opens a phase named after `op`.
-    pub fn new(p: &'a mut Program, env: &'a mut dyn Env, op: &str) -> Self {
+    pub fn new(p: &'a mut dyn Sink, op: &str) -> Self {
         let name = p.unique(&format!("phase_{}", op.replace('.', "_")));
         Self {
             p,
-            env,
             phase: Func::new(name),
             rounds: Vec::new(),
             windows: Vec::new(),
@@ -313,7 +230,7 @@ impl<'a> Cx<'a> {
 
     /// The device array holding `t`, in f32.
     pub fn read(&mut self, t: Tensor) -> Result<Buf, Error> {
-        let v = self.env.read(self.p, t)?;
+        let v = self.p.read(t)?;
         self.window(t, v, false)
     }
 
@@ -321,16 +238,16 @@ impl<'a> Cx<'a> {
     /// is a whole root (no window); else `None`, and the caller reads it
     /// as f32.
     pub fn read_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error> {
-        match self.env.read_half(self.p, t)? {
+        match self.p.read_half(t)? {
             Some(v) if v.offset == 0 && v.rows == v.whole.rows => Ok(Some(v.whole)),
             _ => Ok(None),
         }
     }
 
     /// A kv pool plane packed two bf16 a word, read and written in place,
-    /// when the engine keeps pools so (see [`Env::pool_half`]).
+    /// when the engine keeps pools so (see [`Sink::pool_half`]).
     pub fn pool_half(&mut self, t: Tensor) -> Result<Option<Buf>, Error> {
-        match self.env.pool_half(self.p, t)? {
+        match self.p.pool_half(t)? {
             Some(v) if v.offset == 0 && v.rows == v.whole.rows => {
                 self.p.written(&v.whole.name);
                 Ok(Some(v.whole))
@@ -362,7 +279,7 @@ impl<'a> Cx<'a> {
     /// this compute in f32; if `t` stores bf16, the values are rounded to
     /// bf16 (nearest even) when the phase ends, so the write rounds once.
     pub fn write(&mut self, t: Tensor) -> Result<Buf, Error> {
-        let v = self.env.write(self.p, t)?;
+        let v = self.p.write(t)?;
         let b = self.window(t, v, true)?;
         match t.dtype {
             Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::U8 => {}
@@ -427,12 +344,17 @@ impl<'a> Cx<'a> {
 
     /// A private f32 array of `len` elements.
     pub fn scratch(&mut self, hint: &str, len: u64) -> String {
-        self.p.scratch(hint, len)
+        self.p.scratch(hint, len, "f32")
     }
 
     /// A private array of `len` elements of `elem`.
     pub fn scratch_of(&mut self, hint: &str, len: u64, elem: &'static str) -> String {
-        self.p.scratch_of(hint, len, elem)
+        self.p.scratch(hint, len, elem)
+    }
+
+    /// A global declaration line, once; `line` includes its `;`.
+    pub fn global(&mut self, line: impl Into<String>) {
+        self.p.global(line.into());
     }
 
     /// A global `mem1d_dsd` named after `hint`; phases copy and advance it.
@@ -480,8 +402,18 @@ impl<'a> Cx<'a> {
         name
     }
 
-    pub fn program(&mut self) -> &mut Program {
-        self.p
+    /// Declares (or finds) the buffer `name` of `rows × width` elements of
+    /// `dtype` (a phase's own partials); `input` marks it read before any
+    /// phase writes it.
+    pub fn declare(
+        &mut self,
+        name: &str,
+        dtype: Dtype,
+        rows: u32,
+        width: u32,
+        input: bool,
+    ) -> Result<Buf, Error> {
+        self.p.declare(name, dtype, rows, width, input)
     }
 
     /// Closes the phase and appends it to the program.
@@ -492,7 +424,14 @@ impl<'a> Cx<'a> {
                 .map(|b| b.name)
                 .collect();
             let phase = std::mem::replace(&mut self.phase, Func::new("closed"));
-            self.p.host_phase(phase, HostPhase { op, rounds });
+            self.p.phase(Phase {
+                func: phase,
+                pes: 1,
+                shards: Vec::new(),
+                lane: None,
+                host: Some(HostPhase { op, rounds }),
+                reduce: None,
+            });
             return;
         }
         for b in std::mem::take(&mut self.rounds) {
@@ -546,7 +485,14 @@ impl<'a> Cx<'a> {
             Some(n) if lane.is_none() && self.pes == 1 => n,
             _ => self.pes,
         };
-        self.p.phase_over(phase, pes, shards, lane, reduce);
+        self.p.phase(Phase {
+            func: phase,
+            pes,
+            shards,
+            lane,
+            host: None,
+            reduce,
+        });
     }
 }
 
@@ -659,42 +605,5 @@ pub fn shaped(op: &'static str, what: &str, t: Tensor, rows: u32, width: u32) ->
                 t.rows, t.width
             ),
         ))
-    }
-}
-
-/// A recording sink over one program: what a bench or a unit test emits
-/// into. [`Emit::emit`] opens a phase per call.
-pub struct Tracer {
-    program: std::cell::RefCell<Program>,
-    env: std::cell::RefCell<Box<dyn Env>>,
-}
-
-impl Tracer {
-    pub fn new(env: impl Env + 'static) -> Self {
-        Tracer {
-            program: std::cell::RefCell::new(Program::new()),
-            env: std::cell::RefCell::new(Box::new(env)),
-        }
-    }
-
-    pub fn into_program(self) -> Program {
-        self.program.into_inner()
-    }
-}
-
-impl Default for Tracer {
-    fn default() -> Self {
-        Self::new(Roots)
-    }
-}
-
-impl Emit for Tracer {
-    fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {
-        let mut p = self.program.borrow_mut();
-        let mut env = self.env.borrow_mut();
-        let mut cx = Cx::new(&mut p, env.as_mut(), "op");
-        body(&mut cx)?;
-        cx.finish();
-        Ok(())
     }
 }

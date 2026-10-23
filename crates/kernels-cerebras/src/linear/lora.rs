@@ -14,7 +14,7 @@ use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::linear::gemm::{ARRAY_WORDS, pe_words};
-use crate::program::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
+use crate::phase::{BankSplit, BlockPlan, ColPlane, LaneKind, LanePlan, Reduce, Segment};
 use crate::tensor::Tensor;
 
 pub fn correct(
@@ -198,7 +198,7 @@ pub fn correct(
         "up bank",
     )?;
     let waist_name = format!("waist_{}_{}", x.buf, y.buf);
-    let plane = |b: &crate::program::Buf, segments: Vec<Segment>| ColPlane {
+    let plane = |b: &crate::phase::Buf, segments: Vec<Segment>| ColPlane {
         name: b.name.clone(),
         rows: b.rows,
         width: b.width,
@@ -217,9 +217,7 @@ pub fn correct(
         let xb = cx.read(x)?;
         let ab = cx.read(bank_a)?;
         let rb = cx.read(routes)?;
-        let wb = cx
-            .program()
-            .declare(&waist_name, Dtype::F32, rows, rank, true)?;
+        let wb = cx.declare(&waist_name, Dtype::F32, rows, rank, true)?;
         let header = cx.unique("lanes");
         let reduce = if ig > 1 && fabric {
             vec![(wb.name.clone(), Reduce::FabricSum { group: ig })]
@@ -293,9 +291,7 @@ pub fn correct(
     ctx.emit(&mut |cx| {
         let bb = cx.read(bank_b)?;
         let rb = cx.read(routes)?;
-        let wb = cx
-            .program()
-            .declare(&waist_name, Dtype::F32, rows, rank, true)?;
+        let wb = cx.declare(&waist_name, Dtype::F32, rows, rank, true)?;
         cx.read(y)?;
         let yb = cx.write(y)?;
         let header = cx.unique("lanes");
