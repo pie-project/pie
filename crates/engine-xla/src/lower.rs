@@ -109,6 +109,8 @@ impl Lower<'_, '_> {
     }
 }
 
+pub mod attn;
+
 /// Lowers one kernel call into `ctx`'s function.
 pub fn lower(
     ctx: &Ctx<'_>,

@@ -2,10 +2,65 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
+use engine_xla::lower::attn as low;
 use kernels_xla::attn::{self, arbiter};
 use kernels_xla::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor};
 
 // ------------------------------------------------------------------ fixtures
+
+/// The score capture lowered from handles: the page tables, the query's
+/// indptr, the positions, its data, the keys plane, the slab.
+#[allow(clippy::too_many_arguments)]
+fn capture(
+    ctx: &kernels_xla::Ctx<'_>,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    kv: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    observe: u32,
+    lane_offset: u32,
+    plane_stride: u32,
+    plane: u32,
+    kv_max: u32,
+    requests: u32,
+    scores: Tensor,
+) -> Result<(), kernels_xla::Error> {
+    engine_xla::lower::lower(ctx, |l| {
+        let page_indptr = l.read(kv.page_indptr)?;
+        let page_indices = l.read(kv.page_indices)?;
+        let indptr = l.read(q.indptr)?;
+        let positions = l.read(plan.positions)?;
+        let data = l.read(q.data)?;
+        let keys = l.read(kv.keys)?;
+        let slab = l.read(scores)?;
+        let tuning = l.tuning();
+        let v = attn::score::capture(
+            l.f(),
+            RaggedTensor { data, indptr },
+            positions,
+            keys,
+            page_indptr,
+            page_indices,
+            kv,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            observe,
+            lane_offset,
+            plane_stride,
+            plane,
+            kv_max,
+            requests,
+            slab,
+            tuning,
+        )?;
+        l.land(scores, v)
+    })
+}
 
 struct Rng(u64);
 
@@ -267,8 +322,16 @@ fn decode_reads_each_rows_lane_through_its_pages() {
     let lse = b.zeros(Dtype::F32, rows as u32, qh as u32);
     if !b
         .run(|ctx| {
-            attn::decode_lse(ctx, qt, &plan, &kv, None, d as u32, scale as f32, o, lse)?;
-            attn::decode(ctx, qt, &plan, &kv, Some(3), d as u32, scale as f32, ow)
+            low::attend(
+                ctx,
+                attn::decode_lse(qt, &plan, None, d as u32, scale as f32, o, lse)?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                attn::decode(qt, &plan, Some(3), d as u32, scale as f32, ow)?,
+                kv,
+            )
         })
         .unwrap()
     {
@@ -374,22 +437,33 @@ fn prefill_alike(qh: usize, kvh: usize, d: usize, n0: i32) {
     let o_win = b.zeros(Dtype::Bf16, rows as u32, w);
     if !b
         .run(|ctx| {
-            attn::prefill_lse(
-                ctx, qr, &plan, &kv, None, d as u32, kvh as u32, scale, o_blocked, lse,
-            )?;
-            arbiter::prefill(
-                ctx, qr, &plan, &kv, None, d as u32, kvh as u32, scale, o_rows, 1000,
-            )?;
-            attn::prefill(
+            low::attend(
                 ctx,
-                qr,
-                &plan,
-                &kv,
-                Some(100),
-                d as u32,
-                kvh as u32,
-                scale,
-                o_win,
+                attn::prefill_lse(
+                    qr, &plan, &kv, None, d as u32, kvh as u32, scale, o_blocked, lse,
+                )?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                arbiter::prefill(
+                    qr, &plan, &kv, None, d as u32, kvh as u32, scale, o_rows, 1000,
+                )?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                attn::prefill(
+                    qr,
+                    &plan,
+                    &kv,
+                    Some(100),
+                    d as u32,
+                    kvh as u32,
+                    scale,
+                    o_win,
+                )?,
+                kv,
             )
         })
         .unwrap()
@@ -483,7 +557,13 @@ fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
     let qt = b.bf16(n as u32, (qh * d) as u32, &q);
     let o = b.zeros(Dtype::Bf16, n as u32, (qh * d) as u32);
     if !b
-        .run(|ctx| attn::decode(ctx, qt, &plan, &kv, window, d as u32, scale, o))
+        .run(|ctx| {
+            low::attend(
+                ctx,
+                attn::decode(qt, &plan, window, d as u32, scale, o)?,
+                kv,
+            )
+        })
         .unwrap()
     {
         return;
@@ -558,24 +638,37 @@ fn custom_mask(max_pages: u32) {
     let o_plain = b.zeros(Dtype::Bf16, rows as u32, w);
     if !b
         .run(|ctx| {
-            attn::masked(ctx, qr, &plan, mask, &kv, None, d as u32, scale, o_causal)?;
-            arbiter::masked_lse(
-                ctx, qr, &plan, mask, &kv, None, false, d as u32, scale, o_wide, lse_wide, 1,
-            )?;
-            arbiter::masked(
-                ctx, qr, &plan, mask, &kv, None, true, d as u32, scale, o_rows, 100,
-            )?;
-            arbiter::prefill(
+            low::attend(
                 ctx,
-                qr,
-                &plan,
-                &kv,
-                Some(5),
-                d as u32,
-                kvh as u32,
-                scale,
-                o_plain,
-                1,
+                attn::masked(qr, &plan, mask, None, d as u32, scale, o_causal)?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                arbiter::masked_lse(
+                    qr, &plan, mask, None, false, d as u32, scale, o_wide, lse_wide, 1,
+                )?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                arbiter::masked(qr, &plan, mask, None, true, d as u32, scale, o_rows, 100)?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                arbiter::prefill(
+                    qr,
+                    &plan,
+                    &kv,
+                    Some(5),
+                    d as u32,
+                    kvh as u32,
+                    scale,
+                    o_plain,
+                    1,
+                )?,
+                kv,
             )
         })
         .unwrap()
@@ -729,9 +822,17 @@ fn a_selection_reads_its_named_blocks_and_the_open_one() {
     let o2 = b.zeros(Dtype::Bf16, rows as u32, (qh * d) as u32);
     if !b
         .run(|ctx| {
-            attn::decode_selected(ctx, qt, &dplan, st, &kv, None, d as u32, scale, ratio, o1)?;
-            attn::prefill_selected(
-                ctx, qr, &pplan, st, &kv, None, d as u32, kvh as u32, scale, ratio, o2,
+            low::attend(
+                ctx,
+                attn::decode_selected(qt, &dplan, st, None, d as u32, scale, ratio, o1)?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                attn::prefill_selected(
+                    qr, &pplan, st, &kv, None, d as u32, kvh as u32, scale, ratio, o2,
+                )?,
+                kv,
             )
         })
         .unwrap()
@@ -799,9 +900,17 @@ fn a_relative_bias_adds_by_distance_and_scales_by_length() {
     };
     if !b
         .run(|ctx| {
-            attn::rel::decode_rel(ctx, qt, &dplan, &kv, rel, Some(9), d as u32, scale, o1)?;
-            attn::rel::prefill_rel(
-                ctx, qr, &pplan, &kv, rel, None, d as u32, kvh as u32, scale, o2,
+            low::attend(
+                ctx,
+                attn::rel::decode_rel(qt, &dplan, rel, Some(9), d as u32, scale, o1)?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                attn::rel::prefill_rel(
+                    qr, &pplan, &kv, rel, None, d as u32, kvh as u32, scale, o2,
+                )?,
+                kv,
             )
         })
         .unwrap()
@@ -881,9 +990,9 @@ fn sink_merge_and_softcap_fold_rows() {
     let xt = b.bf16(r, 7, &x);
     if !b
         .run(|ctx| {
-            attn::merge_lse(ctx, t1, s1, t2, s2, heads as u32, d as u32, o, lse)?;
-            attn::sink(ctx, sunk, s1, sk, d as u32)?;
-            attn::logit_softcap(ctx, xt, 12.5)
+            low::merge_lse(ctx, t1, s1, t2, s2, heads as u32, d as u32, o, lse)?;
+            low::sink(ctx, sunk, s1, sk, d as u32)?;
+            low::logit_softcap(ctx, xt, 12.5)
         })
         .unwrap()
     {
@@ -949,8 +1058,8 @@ fn kv_append_lands_each_row_in_its_slot_and_drops_the_padded_ones() {
     let ot = b.i32(n as u32, 1, &off);
     if !b
         .run(|ctx| {
-            attn::kv_append(ctx, kt, vt, &kv, pt, ot)?;
-            attn::kv_append_shared(ctx, vt, &shared, pt, ot)
+            low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
+            low::kv_append_shared(ctx, vt, &shared, pt, ot)
         })
         .unwrap()
     {
@@ -989,7 +1098,7 @@ fn dense_attends_within_each_image_segment() {
     let st = b.i32(seg.len() as u32, 1, &seg);
     let o = b.zeros(Dtype::Bf16, rows as u32, (qh * d) as u32);
     if !b
-        .run(|ctx| attn::dense::bidirectional(ctx, qt, kt, vt, st, d as u32, 0.2, o))
+        .run(|ctx| low::dense::bidirectional(ctx, qt, kt, vt, st, d as u32, 0.2, o))
         .unwrap()
     {
         return;
@@ -1019,7 +1128,8 @@ fn dense_attends_within_each_image_segment() {
 
 #[test]
 fn ragged_answers_every_mask_form() {
-    use attn::ragged::{RaggedMask, forward};
+    use attn::ragged::RaggedMask;
+    use low::ragged::forward;
     let mut rng = Rng(13);
     let (qh, kvh, d) = (4, 2, 32);
     let qi = [0i32, 3, 3, 8];
@@ -1144,7 +1254,7 @@ fn score_capture_lands_the_mean_softmax_rows() {
     let st = b.f32(slab_rows, kv_max, &slab);
     if !b
         .run(|ctx| {
-            attn::score::capture(
+            capture(
                 ctx,
                 qr,
                 &plan,
