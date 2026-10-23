@@ -121,25 +121,19 @@ pub enum Elemwise {
         #[output]
         y: ValueId,
     },
+    /// `x` clamped into `[lo, hi]`, in place: bounds stated outright, or
+    /// learned planes read as `lo` and `hi`.
     Clamp {
         #[input]
         x: ValueId,
-        lo: f32,
-        hi: f32,
+        #[input]
+        lo: Option<ValueId>,
+        #[input]
+        hi: Option<ValueId>,
+        bounds: Bounds,
         #[output(alias = x)]
         x_out: ValueId,
     },
-    ClampLearned {
-        #[input]
-        x: ValueId,
-        #[input]
-        lo: ValueId,
-        #[input]
-        hi: ValueId,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
-    /// `act(gate) * rmsnorm(x) * weight` (no weight: scaleless) per head.
     RmsnormGated {
         #[input]
         x: ValueId,
@@ -483,6 +477,17 @@ impl ModulateForm {
             ModulateForm::Scale | ModulateForm::TanhGate => 1,
         }
     }
+}
+
+/// Where a [`Elemwise::Clamp`]'s bounds come from.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Bounds {
+    Fixed {
+        lo: f32,
+        hi: f32,
+    },
+    /// The op's `lo` and `hi` planes.
+    Learned,
 }
 
 /// Which of a head's dims a [`Elemwise::Rope`] turns, and how.

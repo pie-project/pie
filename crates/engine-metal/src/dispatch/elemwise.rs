@@ -219,9 +219,11 @@ impl Run<'_> {
             ),
             Elemwise::Clamp {
                 x,
-                lo,
-                hi,
                 x_out: _,
+                lo: None,
+                hi: None,
+                bounds: poem_ir::Bounds::Fixed { lo, hi, .. },
+                ..
             } => elemwise::pointwise::clamp(self.ctx(), *lo, *hi, self.tensor(*x)),
             Elemwise::Modulate {
                 x,
@@ -371,17 +373,21 @@ impl Run<'_> {
                 *scale,
                 self.tensor(*x),
             ),
-            Elemwise::ClampLearned {
+            Elemwise::Clamp {
                 x,
-                lo,
-                hi,
+                lo: Some(lo),
+                hi: Some(hi),
                 x_out: _,
+                bounds: poem_ir::Bounds::Learned,
+                ..
             } => elemwise::pointwise::clamp_learned(
                 self.ctx(),
                 self.tensor(*lo),
                 self.tensor(*hi),
                 self.tensor(*x),
             ),
+            // The forms no builder makes.
+            Elemwise::Clamp { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),

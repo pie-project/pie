@@ -128,9 +128,11 @@ impl Run<'_> {
 
             Elemwise::Clamp {
                 x,
-                lo,
-                hi,
                 x_out: _,
+                lo: None,
+                hi: None,
+                bounds: poem_ir::Bounds::Fixed { lo, hi, .. },
+                ..
             } => kernels_slang::elemwise::pointwise::clamp(
                 &self.slang(),
                 *lo,
@@ -139,11 +141,13 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
-            Elemwise::ClampLearned {
+            Elemwise::Clamp {
                 x,
-                lo,
-                hi,
+                lo: Some(lo),
+                hi: Some(hi),
                 x_out: _,
+                bounds: poem_ir::Bounds::Learned,
+                ..
             } => kernels_slang::elemwise::pointwise::clamp_learned(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*lo)),
@@ -152,6 +156,8 @@ impl Run<'_> {
             )
             .map_err(crate::encode::from_slang),
 
+            // The forms no builder makes.
+            Elemwise::Clamp { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Elemwise::Silu { x, x_out: _ } => kernels_slang::elemwise::pointwise::silu(
                 &self.slang(),
                 crate::encode::slang_tensor(self.tensor(*x)),

@@ -123,11 +123,12 @@ pub fn clamp_learned(x: &Value, lo: &Weight, hi: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::ClampLearned {
+        Elemwise::Clamp {
             x: x.id(),
-            lo: r.weight(lo),
-            hi: r.weight(hi),
+            lo: Some(r.weight(lo)),
+            hi: Some(r.weight(hi)),
             x_out: x_out.id(),
+            bounds: poem_ir::Bounds::Learned,
         },
         &[x],
     );
@@ -140,9 +141,10 @@ pub fn clamp(x: &Value, lo: f32, hi: f32) -> Value {
     r.push(
         Elemwise::Clamp {
             x: x.id(),
-            lo,
-            hi,
             x_out: x_out.id(),
+            lo: None,
+            hi: None,
+            bounds: poem_ir::Bounds::Fixed { lo, hi },
         },
         &[x],
     );

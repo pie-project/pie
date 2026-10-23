@@ -133,9 +133,11 @@ impl Run<'_> {
 
             Elemwise::Clamp {
                 x,
-                lo,
-                hi,
                 x_out: _,
+                lo: None,
+                hi: None,
+                bounds: poem_ir::Bounds::Fixed { lo, hi, .. },
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
                 let o_x = self.tensor(*x);
@@ -143,11 +145,13 @@ impl Run<'_> {
                 l.land(o_x, v)
             }),
 
-            Elemwise::ClampLearned {
+            Elemwise::Clamp {
                 x,
-                lo,
-                hi,
+                lo: Some(lo),
+                hi: Some(hi),
                 x_out: _,
+                bounds: poem_ir::Bounds::Learned,
+                ..
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
                 let lo_v = l.read(self.tensor(*lo))?;
@@ -157,6 +161,8 @@ impl Run<'_> {
                 l.land(o_x, v)
             }),
 
+            // The forms no builder makes.
+            Elemwise::Clamp { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Elemwise::Layernorm {
                 x,
                 eps,

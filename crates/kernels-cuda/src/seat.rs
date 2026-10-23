@@ -79,7 +79,6 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elemwise.add", Reads::Rows),
     entry("elemwise.add_bias", Reads::Rows),
     entry("elemwise.clamp", Reads::Rows),
-    entry("elemwise.clamp_learned", Reads::Rows),
     entry("elemwise.gate_sigmoid_mul", Reads::Rows),
     entry("elemwise.gate_sigmoid_mul_heads", Reads::Rows),
     entry("elemwise.gated_residual_add", Reads::Rows),
