@@ -49,3 +49,30 @@ pub struct Bank {
 
     pub bits: u32,
 }
+
+/// A ragged batch: `data`'s rows split by the i32 CSR `indptr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RaggedTensor {
+    pub data: Tensor,
+
+    pub indptr: Tensor,
+}
+
+/// A paged KV cache: key and value pages, the pages each request reads
+/// (`page_indices` split by `page_indptr`), and the strides of a page row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KvPool {
+    pub keys: Tensor,
+
+    pub values: Tensor,
+
+    pub page_indices: Tensor,
+
+    pub page_indptr: Tensor,
+
+    pub page_size: i32,
+
+    pub seq_stride: u64,
+
+    pub head_stride: u64,
+}

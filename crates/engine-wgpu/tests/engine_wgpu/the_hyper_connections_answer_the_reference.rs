@@ -3,7 +3,7 @@
 //! the mix projection, the gates (Sinkhorn-balanced), fold, collapse, and the
 //! trunk's mix, inject and PLE gate.
 
-use crate::gpu::{Gpu, close, noise};
+use crate::gpu::{Gpu, both, noise};
 use kernels_wgpu::Tensor;
 use kernels_wgpu::elemwise::hc;
 use poem_ir::Dtype;
@@ -18,36 +18,6 @@ fn sigmoid(v: f64) -> f64 {
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
-}
-
-/// A landed output: its buffer, its element count, and whether it is f32.
-type Out = (u32, usize, bool);
-
-/// Fires a kernel into the outputs it is handed.
-type Fires<'a> = &'a dyn Fn(&Gpu, &[Out]);
-
-/// Run `hand` and `slang` on fresh copies of the outputs `fresh` makes, and
-/// compare each landed output with its reference.
-fn both(
-    gpu: &mut Gpu,
-    what: &str,
-    fresh: &dyn Fn(&mut Gpu) -> Vec<Out>,
-    want: &[Vec<f64>],
-    hand: Fires<'_>,
-    slang: Fires<'_>,
-) {
-    for (who, run) in [("", hand), ("slang ", slang)] {
-        let outs = fresh(gpu);
-        run(gpu, &outs);
-        for ((buf, n, f32), want) in outs.iter().zip(want) {
-            let got = if *f32 {
-                gpu.down_f32(*buf, *n)
-            } else {
-                gpu.down(*buf, *n)
-            };
-            close(&got, want, &format!("{who}{what}"));
-        }
-    }
 }
 
 #[test]
