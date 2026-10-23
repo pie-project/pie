@@ -7,7 +7,7 @@
 
 use dtype::Dtype;
 
-use crate::csl::{Block, Call, Dsd1};
+use crate::csl::{Block, Call};
 use crate::error::{Error, refuse};
 use crate::library::Kernel;
 use crate::phase::{
@@ -162,9 +162,6 @@ impl<'a> Cx<'a> {
     /// `rect` rectangle, each ending in a collective along the PE's row;
     /// `finish` runs when the last lands.
     pub fn collectives(&mut self, rect: (u32, u32), steps: Vec<FabricStep>, finish: Vec<Guarded>) {
-        for g in steps.iter().flat_map(|s| &s.calls).chain(&finish) {
-            self.unit(g.call.kernel);
-        }
         self.reduce = Some(FabricReduce {
             rect,
             steps,
@@ -306,23 +303,14 @@ impl<'a> Cx<'a> {
         self.p.scratch(hint, len, elem)
     }
 
-    /// A global declaration line, once; `line` includes its `;`.
+    /// A raw global declaration line, once; `line` includes its `;`. Like
+    /// [`Cx::statements`], for the device probes of CSL's own semantics.
     pub fn global(&mut self, line: impl Into<String>) {
         self.p.global(line.into());
     }
 
-    /// A global `mem1d_dsd` named after `hint`; phases copy and advance it.
-    pub fn dsd(&mut self, hint: &str, d: &Dsd1) -> String {
-        let name = self.p.unique(&format!("d_{hint}"));
-        self.p.global(format!("const {name} = {};", d.expr()));
-        name
-    }
-
-    /// A kernel call in this phase: rendered as a statement and kept
-    /// structured for the table-driven program; the kernel's unit (and the
-    /// units it calls into) join the program.
+    /// A kernel call in this phase.
     pub fn call(&mut self, kernel: Kernel, args: Vec<crate::csl::Arg>) {
-        self.unit(kernel);
         self.body.push(Statement::Call(Call { kernel, args }));
     }
 
@@ -336,16 +324,6 @@ impl<'a> Cx<'a> {
         match self.body.last_mut() {
             Some(Statement::Raw(b)) => b,
             _ => unreachable!("a raw block was just pushed"),
-        }
-    }
-
-    /// Declares `kernel`'s unit and the units it calls into, once each; the
-    /// prelude is in every program already.
-    fn unit(&mut self, kernel: Kernel) {
-        for u in kernel.unit().with_deps() {
-            if u.path != "prim/prelude" {
-                self.p.helper(u.name, u.text);
-            }
         }
     }
 
@@ -364,8 +342,7 @@ impl<'a> Cx<'a> {
         elem.hash(&mut h);
         body.hash(&mut h);
         let name = format!("{hint}_{:016x}", h.finish());
-        self.p
-            .global(format!("var {name} = [{}]{elem} {{ {body} }};", lits.len()));
+        self.p.table(&name, elem, lits);
         name
     }
 

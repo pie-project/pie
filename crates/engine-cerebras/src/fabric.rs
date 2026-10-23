@@ -262,12 +262,16 @@ impl Sink for Emitting<'_> {
         self.program.scratch_of(hint, len, elem)
     }
 
-    fn global(&mut self, line: String) {
-        self.program.global(line);
+    fn table(&mut self, name: &str, elem: &str, lits: &[String]) {
+        self.program.global(format!(
+            "var {name} = [{}]{elem} {{ {} }};",
+            lits.len(),
+            lits.join(", ")
+        ));
     }
 
-    fn helper(&mut self, name: &'static str, text: &'static str) {
-        self.program.helper(name, text);
+    fn global(&mut self, line: String) {
+        self.program.global(line);
     }
 
     fn lanes(&mut self, lanes: &Lanes, split: LaneSplit) -> Result<LanesAt, Error> {
@@ -275,6 +279,26 @@ impl Sink for Emitting<'_> {
     }
 
     fn phase(&mut self, phase: phase::Phase) {
+        // The library units the phase's calls name join the program (the
+        // prelude is in every program already).
+        let calls = phase.body.iter().filter_map(|s| match s {
+            phase::Statement::Call(c) => Some(c),
+            phase::Statement::Raw(_) => None,
+        });
+        let steps = phase.reduce.iter().flat_map(|r| {
+            r.steps
+                .iter()
+                .flat_map(|s| &s.calls)
+                .chain(&r.finish)
+                .map(|g| &g.call)
+        });
+        for call in calls.chain(steps) {
+            for u in call.kernel.unit().with_deps() {
+                if u.path != "prim/prelude" {
+                    self.program.helper(u.name, u.text);
+                }
+            }
+        }
         let mut phase = Phase::from(phase);
         // The resident placement runs every device phase on its row of PEs
         // (whole buffers replicated); a phase spread over PEs of its own

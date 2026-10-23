@@ -65,11 +65,13 @@ pub trait Sink {
     /// A private array of `len` elements of `elem` (`f32`, `i32`, `u32`).
     fn scratch(&mut self, hint: &str, len: u64, elem: &'static str) -> String;
 
-    /// A global declaration line (a DSD, a constant table), once.
-    fn global(&mut self, line: String);
+    /// The constant table `name`: `lits.len()` elements of `elem`, the
+    /// same contents under the same name (declared once).
+    fn table(&mut self, name: &str, elem: &str, lits: &[String]);
 
-    /// A library unit's text under its name, once.
-    fn helper(&mut self, name: &'static str, text: &'static str);
+    /// A raw global declaration line, once (the device probes of CSL's own
+    /// semantics only).
+    fn global(&mut self, line: String);
 
     /// Places a lane phase: the PEs it runs on, its header, and the share of
     /// a PE each buffer it holds by lane or block takes; or why the
