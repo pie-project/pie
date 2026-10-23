@@ -79,6 +79,7 @@ const BETA: f32 = 0.0;
 /// `handle` must be a live rocBLAS handle and `stream` a live HIP stream.
 pub unsafe fn bind(handle: Blas, stream: sys::Stream) -> Result<(), Refused> {
     let blas = blas("rocblas_set_stream")?;
+    // SAFETY: the caller guarantees `handle` and `stream` are live.
     answered("rocblas_set_stream", unsafe {
         (blas.rocblas_set_stream)(handle, stream)
     })
@@ -103,6 +104,9 @@ pub unsafe fn gemm(
 ) -> Result<(), Refused> {
     const CALL: &str = "rocblas_gemm_ex";
     let blas = blas(CALL)?;
+    // SAFETY: `ALPHA` and `BETA` are statics rocBLAS reads as host f32 scalars;
+    // the caller guarantees `handle` is live and each operand covers its shape.
+    // `C` is `D` with the same `ld` and type, the in-place form rocBLAS allows.
     answered(CALL, unsafe {
         (blas.rocblas_gemm_ex)(
             handle,
@@ -152,6 +156,8 @@ pub unsafe fn gemm_strided(
 ) -> Result<(), Refused> {
     const CALL: &str = "rocblas_gemm_strided_batched_ex";
     let blas = blas(CALL)?;
+    // SAFETY: as in [`gemm`], for each of the `batch` problems the caller
+    // guarantees lie at the given strides.
     answered(CALL, unsafe {
         (blas.rocblas_gemm_strided_batched_ex)(
             handle,
@@ -207,6 +213,8 @@ pub unsafe fn gemm_batched(
 ) -> Result<(), Refused> {
     const CALL: &str = "rocblas_gemm_batched_ex";
     let blas = blas(CALL)?;
+    // SAFETY: as in [`gemm`]; the caller guarantees each operand's array holds
+    // `batch` live device addresses.
     answered(CALL, unsafe {
         (blas.rocblas_gemm_batched_ex)(
             handle,
@@ -246,6 +254,8 @@ impl Handle {
         const CALL: &str = "rocblas_create_handle";
         let blas = blas(CALL)?;
         let mut handle: Blas = core::ptr::null_mut();
+        // SAFETY: `handle` is a live local; rocBLAS writes the new handle
+        // there.
         answered(CALL, unsafe {
             (blas.rocblas_create_handle)(&raw mut handle)
         })?;
@@ -273,6 +283,7 @@ pub fn create_raw() -> Result<Blas, Refused> {
     const CALL: &str = "rocblas_create_handle";
     let blas = blas(CALL)?;
     let mut handle: Blas = core::ptr::null_mut();
+    // SAFETY: `handle` is a live local; rocBLAS writes the new handle there.
     answered(CALL, unsafe {
         (blas.rocblas_create_handle)(&raw mut handle)
     })?;

@@ -120,7 +120,7 @@ impl Slabs {
 
     /// # Safety
     ///
-    /// `stream` must be a live CUDA stream that outlives every launch
+    /// `stream` must be a live HIP stream that outlives every launch
     /// this context is used for.
     pub unsafe fn attach(self, stream: *mut c_void) {
         #[cfg(feature = "rocm")]
@@ -194,7 +194,7 @@ pub struct Ctx {
 impl Ctx {
     /// # Safety
     ///
-    /// `stream` must be a live CUDA stream that outlives this context.
+    /// `stream` must be a live HIP stream that outlives this context.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
         Self {
@@ -504,6 +504,11 @@ impl Ctx {
 
         let mut bound = crate::jit::abi::Bound::new(args);
 
+        // SAFETY: `resolved.function` is a kernel of a module the cache never
+        // unloads; `bound` owns every cell its slots point at and outlives the
+        // call; `self.stream` is live per `Ctx::on`. That `args` has one value
+        // per kernel parameter, in order, is each entry's to keep: the
+        // instantiation's signature is not checked here.
         let fired = unsafe {
             crate::jit::launch::issue(resolved.function, launch, bound.slots_mut(), self.stream)
         };

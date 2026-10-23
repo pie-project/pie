@@ -7,6 +7,12 @@ use crate::jit::{Fault, Launch};
 /// AMD grants a kernel the whole of a CU's LDS without the per-function
 /// opt-in CUDA needs above 48 KiB, so the only check is that the launch
 /// asks for no more than the device has.
+///
+/// # Safety
+///
+/// `function` must be a kernel of a loaded module; `slots` must hold one
+/// pointer per kernel parameter, each to a live value of that parameter's
+/// type; `stream` must be a live stream on the current device.
 pub(crate) unsafe fn issue(
     function: sys::Function,
     launch: Launch,
@@ -30,6 +36,9 @@ pub(crate) unsafe fn issue(
     let [gx, gy, gz] = launch.grid;
     let [bx, by, bz] = launch.block;
     let (call, code) = if launch.cooperative {
+        // SAFETY: the caller guarantees `function`, `slots` and `stream` (this
+        // fn's contract); HIP copies the arguments out of `slots` before
+        // returning.
         ("hipModuleLaunchCooperativeKernel", unsafe {
             (api.hip.hipModuleLaunchCooperativeKernel)(
                 function,
@@ -45,6 +54,9 @@ pub(crate) unsafe fn issue(
             )
         })
     } else {
+        // SAFETY: the caller guarantees `function`, `slots` and `stream` (this
+        // fn's contract); HIP copies the arguments out of `slots` before
+        // returning, and `extra` is null.
         ("hipModuleLaunchKernel", unsafe {
             (api.hip.hipModuleLaunchKernel)(
                 function,

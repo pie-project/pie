@@ -208,6 +208,10 @@ pub fn absorb_q(
     let handle = ctx.blas(OP)?;
 
     #[cfg(feature = "rocm")]
+    // SAFETY: `handle` and `ctx.stream()` are the live rocBLAS handle and
+    // stream this `Ctx` was built over (`with_blas`/`on`); `kv_b`, `q_nope` and
+    // `q_latent` are the caller's device tensors, each holding `heads` problems
+    // at the strides passed.
     unsafe {
         absorb(
             handle,
@@ -277,6 +281,10 @@ pub fn absorb_out(
         .wrapping_add(2 * u64::from(nope.unsigned_abs()) * u64::from(rank.unsigned_abs()));
 
     #[cfg(feature = "rocm")]
+    // SAFETY: `handle` and `ctx.stream()` are the live rocBLAS handle and
+    // stream this `Ctx` was built over (`with_blas`/`on`); `wv` is the value
+    // half of `kv_b`, and `latent` and `o` are the caller's device tensors,
+    // each holding `heads` problems at the strides passed.
     unsafe {
         absorb(
             handle,
@@ -305,6 +313,11 @@ pub fn absorb_out(
     }
 }
 
+/// # Safety
+///
+/// `handle` must be a live rocBLAS handle and `stream` a live stream; `a`,
+/// `b` and `c` must be device bf16 planes holding `heads` problems of the
+/// stated shape at the stated strides.
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn absorb(

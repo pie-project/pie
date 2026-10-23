@@ -113,9 +113,12 @@ pub struct Library {
     functions: Mutex<HashMap<usize, usize>>,
 }
 
-// SAFETY: the module handle is only read (hipModuleGetFunction is
-// thread-safe); the function cache sits behind its lock.
+// SAFETY: `module` is a process-wide HIP handle any thread may use, and a
+// `Library` lives in a leaked static slot, so it is never unloaded; the
+// function cache holds plain addresses behind its own lock.
 unsafe impl Send for Library {}
+// SAFETY: `&Library` only reads the module handle (`hipModuleGetFunction`
+// is thread-safe) and reaches the function cache through its lock.
 unsafe impl Sync for Library {}
 
 /// The grouped library for `dtype` (bf16 or f16, the weight `[n, k]` rows,

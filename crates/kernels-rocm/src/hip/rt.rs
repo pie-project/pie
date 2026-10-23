@@ -4,12 +4,19 @@
 //!
 //! Generated from the prototypes in `hip/hip_runtime_api.h`; the constants
 //! and struct layouts below were read off the installed headers.
+//!
+//! # Safety
+//!
+//! Every `pub unsafe fn` here carries the safety contract of the HIP call
+//! it names, unchanged: the pointers, handles and sizes it takes must be
+//! what `hip_runtime_api.h` documents for that entry point. A shim adds no
+//! requirement of its own, and only answers `hipErrorNotInitialized`
+//! without touching its arguments when the runtime is missing.
 #![allow(unsafe_code)]
-#![allow(
-    non_snake_case,
-    non_upper_case_globals,
+#![allow(non_snake_case, non_upper_case_globals, clippy::too_many_arguments)]
+#![expect(
     clippy::missing_safety_doc,
-    clippy::too_many_arguments
+    reason = "each shim's contract is the HIP call it names, stated once in the module doc"
 )]
 
 // Struct fields carry the C names (`type` as `type_`), as the headers spell them.

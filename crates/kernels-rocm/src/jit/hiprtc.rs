@@ -18,6 +18,7 @@ pub(crate) fn version() -> Result<String, Fault> {
     let mut major = 0i32;
     let mut minor = 0i32;
 
+    // SAFETY: `major` and `minor` are live local out-parameters.
     let code = unsafe { (api()?.rtc.hiprtcVersion)(&raw mut major, &raw mut minor) };
     if code != sys::HIPRTC_SUCCESS {
         return Err(Fault::Device {
@@ -76,6 +77,9 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
 
     let mut handle: sys::Program = std::ptr::null_mut();
 
+    // SAFETY: `root` and `name` are NUL-terminated and alive across the call;
+    // the two arrays hold `count` pointers into `header_texts` and
+    // `header_names`, which outlive it, or are null when empty.
     let code = unsafe {
         (api.rtc.hiprtcCreateProgram)(
             &raw mut handle,
@@ -113,6 +117,7 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
         })
         .collect::<Result<_, Fault>>()?;
     for expr in &wanted {
+        // SAFETY: `program` is live and `expr` NUL-terminated.
         let code = unsafe { (api.rtc.hiprtcAddNameExpression)(program.0, expr.as_ptr()) };
         if code != sys::HIPRTC_SUCCESS {
             return Err(Fault::Compile {
@@ -127,6 +132,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
 
     let option_ptrs: Vec<*const c_char> = options.iter().map(|o| o.as_ptr()).collect();
 
+    // SAFETY: `program` is live and `option_ptrs` points at `options`'
+    // NUL-terminated strings, which outlive the call.
     let code = unsafe {
         (api.rtc.hiprtcCompileProgram)(
             program.0,
@@ -145,6 +152,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     for expr in &wanted {
         let mut mangled: *const c_char = std::ptr::null();
 
+        // SAFETY: `program` is live, `expr` was added before the compile, and
+        // `mangled` is a live out-parameter.
         let code =
             unsafe { (api.rtc.hiprtcGetLoweredName)(program.0, expr.as_ptr(), &raw mut mangled) };
         if code != sys::HIPRTC_SUCCESS || mangled.is_null() {
@@ -157,6 +166,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
             });
         }
 
+        // SAFETY: `mangled` is non-null and NUL-terminated, owned by `program`,
+        // which outlives this copy.
         let mangled = unsafe { CStr::from_ptr(mangled) }
             .to_string_lossy()
             .into_owned();
@@ -165,6 +176,7 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
 
     let mut size = 0usize;
 
+    // SAFETY: `program` is live and `size` a live out-parameter.
     let code = unsafe { (api.rtc.hiprtcGetCodeSize)(program.0, &raw mut size) };
     if code != sys::HIPRTC_SUCCESS {
         return Err(Fault::Device {
@@ -174,6 +186,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     }
     let mut image = vec![0u8; size];
 
+    // SAFETY: `image` holds the `size` bytes `hiprtcGetCodeSize` just reported
+    // for this program.
     let code = unsafe { (api.rtc.hiprtcGetCode)(program.0, image.as_mut_ptr().cast()) };
     if code != sys::HIPRTC_SUCCESS {
         return Err(Fault::Device {
@@ -222,6 +236,7 @@ impl Program {
     fn log(&self) -> Option<String> {
         let mut size = 0usize;
 
+        // SAFETY: `self.0` is a live program and `size` a live out-parameter.
         if unsafe { (self.1.rtc.hiprtcGetProgramLogSize)(self.0, &raw mut size) }
             != sys::HIPRTC_SUCCESS
             || size <= 1
@@ -230,6 +245,7 @@ impl Program {
         }
         let mut buf = vec![0u8; size];
 
+        // SAFETY: `buf` holds the `size` bytes the size query just reported.
         if unsafe { (self.1.rtc.hiprtcGetProgramLog)(self.0, buf.as_mut_ptr().cast()) }
             != sys::HIPRTC_SUCCESS
         {
@@ -244,6 +260,8 @@ impl Program {
 
 impl Drop for Program {
     fn drop(&mut self) {
+        // SAFETY: `self.0` came from `hiprtcCreateProgram` and `Program` owns
+        // it, so it is destroyed once.
         unsafe { (self.1.rtc.hiprtcDestroyProgram)(&raw mut self.0) };
     }
 }
