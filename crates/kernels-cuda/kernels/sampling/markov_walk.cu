@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include "prim/device.cuh"
+#include "prim/mma.cuh"
 
 // DSpark's Markov head over a drafted block's readouts (DeepSeek-V4.1): a
 // readout at depth `i` of its block takes the bias `head . embed[t]` of the
@@ -67,14 +68,6 @@ __global__ void plan(const int* __restrict__ positions, const int* __restrict__ 
         const int d = depth[r];
         if (d > 0 && (r == 0 || depth[r - 1] != d - 1 || ends[r - 1] != ends[r])) depth[r] = 0;
     }
-}
-
-__device__ __forceinline__ void mma16816(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
 template <typename T>
@@ -219,7 +212,7 @@ __global__ void __launch_bounds__(kThreads, 2) step(
                 const __nv_bfloat16* e = &emb[nt * 8 + g][ks * 16];
                 const unsigned b0 = *reinterpret_cast<const unsigned*>(e + 2 * t);
                 const unsigned b1 = *reinterpret_cast<const unsigned*>(e + 8 + 2 * t);
-                mma16816(acc[nt], a, b0, b1);
+                mma_m16n8k16(acc[nt], a, {b0, b1});
             }
         }
         // acc[nt]: vocab rows (g, g + 8) of the warp's 16 by readouts

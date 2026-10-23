@@ -72,15 +72,6 @@ struct Shape {
     static_assert(kGroup * kOLd * 4 <= kQBytes + kRingBytes, "the fold fits where Q and the ring were");
 };
 
-__device__ __forceinline__ void mma16816(float (&d)[4], const std::uint32_t (&a)[4],
-                                         std::uint32_t b0, std::uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
 __device__ __forceinline__ float ld_rank(const float* at, unsigned rank) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     unsigned remote;
@@ -372,8 +363,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
             for (int k = 0; k < kHalf / 16; k += 2) {
                 std::uint32_t b[4];
                 ldmatrix_x4(b, krow + k * 16);
-                mma16816(s0, qa[k], b[0], b[1]);
-                mma16816(s1, qa[k + 1], b[2], b[3]);
+                mma_m16n8k16(s0, qa[k], {b[0], b[1]});
+                mma_m16n8k16(s1, qa[k + 1], {b[2], b[3]});
             }
         }
         *reinterpret_cast<float2*>(mine + g * kSLd + kw * 8 + p) = make_float2(s0[0] + s1[0], s0[1] + s1[1]);
@@ -445,8 +436,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
             for (int np = 0; np < kNT / 2; ++np) {
                 std::uint32_t b[4];
                 ldmatrix_x4_trans(b, vrow + np * 16);
-                mma16816(oacc[2 * np], pa[kk], b[0], b[1]);
-                mma16816(oacc[2 * np + 1], pa[kk], b[2], b[3]);
+                mma_m16n8k16(oacc[2 * np], pa[kk], {b[0], b[1]});
+                mma_m16n8k16(oacc[2 * np + 1], pa[kk], {b[2], b[3]});
             }
         }
     }

@@ -276,7 +276,7 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                 unsigned a[4], b[2];
                 ldmatrix_x4(a, gdn_at_a(sc, GDN_LD, 0, kk * 16, l));
                 ld_b(b, sb + warp * 8 * GDN_LD + kk * 16, GDN_LD, l);
-                gdn_mma(acc, a, b[0], b[1]);
+                mma_m16n8k16(acc, a, b);
             }
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
@@ -298,8 +298,8 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                 unsigned aq[4], b[4];
                 ldmatrix_x4(aq, gdn_at_a(sc, GDN_LD, 0, kk * 16, l));
                 ldmatrix_x4_trans(b, gdn_at_b(hs, LDV, kk * 16, c0, l));
-                gdn_mma(qh[0], aq, b[0], b[1]);
-                gdn_mma(qh[1], aq, b[2], b[3]);
+                mma_m16n8k16(qh[0], aq, {b[0], b[1]});
+                mma_m16n8k16(qh[1], aq, {b[2], b[3]});
             }
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
@@ -313,8 +313,8 @@ __global__ void __launch_bounds__(128) mamba2_scan(
             unsigned pa[4], b[4];
             ldmatrix_x4(pa, gdn_at_a(sp, KDA16_LDT, 0, 0, l));
             ldmatrix_x4_trans(b, gdn_at_b(su, LDV, 0, c0, l));
-            gdn_mma(qh[0], pa, b[0], b[1]);
-            gdn_mma(qh[1], pa, b[2], b[3]);
+            mma_m16n8k16(qh[0], pa, {b[0], b[1]});
+            mma_m16n8k16(qh[1], pa, {b[2], b[3]});
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
                 const int i = g + 8 * half;
@@ -352,8 +352,8 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                 ldmatrix_x4_trans(b, gdn_at_b(su2, LDV, 0, np * 16, l));
                 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) {
-                    gdn_mma(hacc[mt][2 * np], a[mt], b[0], b[1]);
-                    gdn_mma(hacc[mt][2 * np + 1], a[mt], b[2], b[3]);
+                    mma_m16n8k16(hacc[mt][2 * np], a[mt], {b[0], b[1]});
+                    mma_m16n8k16(hacc[mt][2 * np + 1], a[mt], {b[2], b[3]});
                 }
             }
         }

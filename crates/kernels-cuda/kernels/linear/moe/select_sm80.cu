@@ -15,7 +15,6 @@
 
 namespace pie::linear {
 
-
 /// `y[r, g*n + c] = q(x[r, g*k ..]) . (w[g*n + c, ..] * 2^(s - 127))`, `s`
 /// the ue8m0 exponent of the 128x128 block (`scales` spread to the block's
 /// rows in tcgen05's atoms, as the load lays an fp8b128 plane's), `q` the
@@ -173,7 +172,6 @@ __global__ void __launch_bounds__(32 * kSplit * kTiles) grouped_mma_fp8b128(
 
 namespace wmma = ::nvcuda::wmma;
 
-
 // A routed bf16 select at decode widths: the bf16 analog of
 // `moe_select_mxfp4_mma`, without its GLU. Each expert's weight rows and the
 // routes' rows are staged a K-tile at a time into shared memory with
@@ -185,7 +183,6 @@ namespace wmma = ::nvcuda::wmma;
 constexpr int kBf16MmaBK = 64;
 
 constexpr int kBf16MmaStages = 3;
-
 
 template <int kNb>
 __global__ void __launch_bounds__(128) moe_select_bf16_mma(
@@ -302,7 +299,7 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
                 ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad + kk, kPad, lane);
 #pragma unroll
                 for (int b = 0; b < kNb; ++b) {
-                    w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
+                    mma_m16n8k16(acc[t][b], a, bk[b]);
                 }
             }
         }
@@ -349,13 +346,12 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
             const unsigned b1 = (q & 1) ? xr.w : xr.y;
 #pragma unroll
             for (int t = 0; t < kTiles; ++t)
-                w4mma::mma(acc[t][b], a[t][0], a[t][1], a[t][2], a[t][3], b0, b1);
+                mma_m16n8k16(acc[t][b], a[t], {b0, b1});
         }
     }
 }
 
 }
-
 
 /// `y[route] = x[route / act_div] . W[expert]^T` for the routes `order`
 /// lists by expert, `work` naming (expert, slice of `8 kNb` routes) per CTA
@@ -656,7 +652,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
 #pragma unroll
                 for (int j = 0; j < kNT; ++j) {
                     const uint4& wr = bw[j][c < 2 ? 0 : 1];
-                    w4mma::mma(acc[mt][j], a0, a1, a2, a3, (c & 1) ? wr.z : wr.x, (c & 1) ? wr.w : wr.y);
+                    mma_m16n8k16(acc[mt][j], {a0, a1, a2, a3}, {(c & 1) ? wr.z : wr.x, (c & 1) ? wr.w : wr.y});
                 }
             }
         }
@@ -892,7 +888,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_fp8_gemm(
 #pragma unroll
                     for (int j = 0; j < kNT; ++j) {
                         const uint4& wr = bw[j][c < 2 ? 0 : 1];
-                        w4mma::mma(acc[mt][j], a0, a1, a2, a3, (c & 1) ? wr.z : wr.x, (c & 1) ? wr.w : wr.y);
+                        mma_m16n8k16(acc[mt][j], {a0, a1, a2, a3}, {(c & 1) ? wr.z : wr.x, (c & 1) ? wr.w : wr.y});
                     }
                 }
             }
@@ -1381,8 +1377,8 @@ __global__ void moe_matmul_select_mxfp4_wmma(
 
                     unsigned afrag[4];
                     ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
-                    pie_mma_bf16_16816(acc[bt][0], afrag, bfrag[0], bfrag[1]);
-                    pie_mma_bf16_16816(acc[bt][1], afrag, bfrag[2], bfrag[3]);
+                    mma_m16n8k16(acc[bt][0], afrag, {bfrag[0], bfrag[1]});
+                    mma_m16n8k16(acc[bt][1], afrag, {bfrag[2], bfrag[3]});
                 }
             }
             __syncthreads();
@@ -1646,8 +1642,8 @@ __global__ void moe_matmul_select_mlxu4_wmma(
 
                     unsigned afrag[4];
                     ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
-                    pie_mma_bf16_16816(acc[bt][0], afrag, bfrag[0], bfrag[1]);
-                    pie_mma_bf16_16816(acc[bt][1], afrag, bfrag[2], bfrag[3]);
+                    mma_m16n8k16(acc[bt][0], afrag, {bfrag[0], bfrag[1]});
+                    mma_m16n8k16(acc[bt][1], afrag, {bfrag[2], bfrag[3]});
                 }
             }
             __syncthreads();

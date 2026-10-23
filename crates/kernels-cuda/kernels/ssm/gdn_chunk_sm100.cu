@@ -1,7 +1,7 @@
 #include "ssm/chunk.cuh"
 #include "ssm/copy.cuh"
 #include "prim/mma_sm100.cuh"
-#include "prim/smem.cuh"
+#include "prim/mma.cuh"
 
 // The chunked gated delta rule's prefill on tcgen05, one block a (request,
 // value head) walking the request's 64-token chunks in order, the state in
@@ -172,14 +172,6 @@ __device__ __forceinline__ unsigned short f2h(float f) {
     unsigned short r;
     asm("{\n\t.reg .f16 a;\n\tcvt.rn.f16.f32 a, %1;\n\tmov.b16 %0, a;\n\t}" : "=h"(r) : "f"(f));
     return r;
-}
-
-__device__ __forceinline__ void mma_h(float (&d)[4], const u32 (&a)[4], u32 b0, u32 b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
 // A 16 x 16 A operand at rows m0.., columns k0.. of a row-major f16 tile.
@@ -614,16 +606,16 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                     float d0[4] = {0.f, 0.f, 0.f, 0.f}, d1[4] = {0.f, 0.f, 0.f, 0.f};
                     frag_a(fa, Ah, LDH, b0 + 16, b0, l);
                     frag_b(fb, Th, LDH, b0, b0, l);
-                    mma_h(d0, fa, fb[0], fb[1]);
-                    mma_h(d1, fa, fb[2], fb[3]);
+                    mma_m16n8k16_f16(d0, fa, {fb[0], fb[1]});
+                    mma_m16n8k16_f16(d1, fa, {fb[2], fb[3]});
                     put_h(d0, Xb, 24, 0, 0, 1.f, l);
                     put_h(d1, Xb, 24, 0, 8, 1.f, l);
                     __syncwarp();
                     float e0[4] = {0.f, 0.f, 0.f, 0.f}, e1[4] = {0.f, 0.f, 0.f, 0.f};
                     frag_a(fa, Th, LDH, b0 + 16, b0 + 16, l);
                     frag_b(fb, Xb, 24, 0, 0, l);
-                    mma_h(e0, fa, fb[0], fb[1]);
-                    mma_h(e1, fa, fb[2], fb[3]);
+                    mma_m16n8k16_f16(e0, fa, {fb[0], fb[1]});
+                    mma_m16n8k16_f16(e1, fa, {fb[2], fb[3]});
                     put_h(e0, Th, LDH, b0 + 16, b0, -1.f, l);
                     put_h(e1, Th, LDH, b0 + 16, b0 + 8, -1.f, l);
                 }
@@ -639,8 +631,8 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                     for (int k = 0; k < 2; ++k) {
                         frag_a(fa, Ah, LDH, 32 + mt, 16 * k, l);
                         frag_b(fb, Th, LDH, 16 * k, nh, l);
-                        mma_h(d0, fa, fb[0], fb[1]);
-                        mma_h(d1, fa, fb[2], fb[3]);
+                        mma_m16n8k16_f16(d0, fa, {fb[0], fb[1]});
+                        mma_m16n8k16_f16(d1, fa, {fb[2], fb[3]});
                     }
                     put_h(d0, Xh, 40, mt, nh, 1.f, l);
                     put_h(d1, Xh, 40, mt, nh + 8, 1.f, l);
@@ -650,8 +642,8 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                     for (int k = 0; k < 2; ++k) {
                         frag_a(fa, Th, LDH, 32 + mt, 32 + 16 * k, l);
                         frag_b(fb, Xh, 40, 16 * k, nh, l);
-                        mma_h(e0, fa, fb[0], fb[1]);
-                        mma_h(e1, fa, fb[2], fb[3]);
+                        mma_m16n8k16_f16(e0, fa, {fb[0], fb[1]});
+                        mma_m16n8k16_f16(e1, fa, {fb[2], fb[3]});
                     }
                     put_h(e0, Th, LDH, 32 + mt, nh, -1.f, l);
                     put_h(e1, Th, LDH, 32 + mt, nh + 8, -1.f, l);

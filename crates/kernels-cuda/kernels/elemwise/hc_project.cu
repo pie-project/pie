@@ -603,13 +603,7 @@ __global__ void __launch_bounds__(128) hc_prenorm_project_mma_t(
                     }
 #pragma unroll
                     for (int mt = 0; mt < 3; ++mt) {
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                            : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]), "+f"(acc[mt][nt][2]),
-                              "+f"(acc[mt][nt][3])
-                            : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]), "r"(b[2 * h]),
-                              "r"(b[2 * h + 1]));
+                        mma_m16n8k16(acc[mt][nt], a[mt], {b[2 * h], b[2 * h + 1]});
                     }
                 }
             }

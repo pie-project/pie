@@ -6,6 +6,7 @@
 #include "prim/half2.cuh"
 #include "prim/fp8.cuh"
 #include "prim/mma_sm80.cuh"
+#include "prim/mma.cuh"
 #include "prim/smem.cuh"
 #else
 #include <cuda_fp16.h>
@@ -77,12 +78,6 @@ __device__ __forceinline__ uint4 pie_ld_line(const uint4* p) {
     asm volatile("ld.global.nc.L2::128B.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
-}
-
-__device__ __forceinline__ void pie_mma_bf16_16816(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
 using f32 = float;

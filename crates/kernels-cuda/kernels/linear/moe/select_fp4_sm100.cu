@@ -1,18 +1,10 @@
 #include "linear/codec.cuh"
 #include "linear/moe_w4.cuh"
+#include "prim/mma.cuh"
 
 namespace pie::linear {
 
 namespace w4cvt {
-
-__device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1, unsigned a2,
-                                    unsigned a3, unsigned b0, unsigned b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
 
 /// The four code bytes of `q` as f16 pairs, the low nibble the low half.
 __device__ __forceinline__ void e2m1x8(unsigned q, unsigned (&r)[4]) {
@@ -132,15 +124,13 @@ __device__ __forceinline__ void compute(const Codes<kTiles>& cc, const uint4* xs
                 const unsigned a3 = hmul2(r1[2 * j + 1], sc[t][1]);
 #pragma unroll
                 for (int b = 0; b < kNb; ++b)
-                    mma(acc[t][b], a0, a1, a2, a3, j == 0 ? xf[b].x : xf[b].z,
-                        j == 0 ? xf[b].y : xf[b].w);
+                    mma_m16n8k16_f16(acc[t][b], {a0, a1, a2, a3}, {j == 0 ? xf[b].x : xf[b].z, j == 0 ? xf[b].y : xf[b].w});
             }
         }
     }
 }
 
 }
-
 
 /// `moe_select_mxfp4_mma` with the e2m1 converts: the same operands (the
 /// scales row-major, or with `scale_atoms` in tcgen05's atoms), grid and

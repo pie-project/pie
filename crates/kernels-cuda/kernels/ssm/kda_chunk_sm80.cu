@@ -218,8 +218,8 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) kda_chunk_prep(
             ldmatrix_x4(a, gdn_at_a(kr, GDN_LD, 0, kk * 16, l));
             ldmatrix_x4(aq, gdn_at_a(qr, GDN_LD, 0, kk * 16, l));
             ld_b(b, kc + hw * 8 * GDN_LD + kk * 16, GDN_LD, l);
-            gdn_mma(acc, a, b[0], b[1]);
-            gdn_mma(qkc, aq, b[0], b[1]);
+            mma_m16n8k16(acc, a, b);
+            mma_m16n8k16(qkc, aq, b);
         }
         bf16* pd = p_out + (static_cast<long long>(s) * H + h) * KDA_CH * KDA_CH;
         #pragma unroll
@@ -457,10 +457,10 @@ __device__ __forceinline__ void kda16_walk(
                                        pack_bf16x2(hacc[nb][2 * kk][2], hacc[nb][2 * kk][3]),
                                        pack_bf16x2(hacc[nb][2 * kk + 1][0], hacc[nb][2 * kk + 1][1]),
                                        pack_bf16x2(hacc[nb][2 * kk + 1][2], hacc[nb][2 * kk + 1][3])};
-                gdn_mma(oh[nb][0], a, bq[0], bq[1]);
-                gdn_mma(oh[nb][1], a, bq[2], bq[3]);
-                gdn_mma(wh[nb][0], a, bw[0], bw[1]);
-                gdn_mma(wh[nb][1], a, bw[2], bw[3]);
+                mma_m16n8k16(oh[nb][0], a, {bq[0], bq[1]});
+                mma_m16n8k16(oh[nb][1], a, {bq[2], bq[3]});
+                mma_m16n8k16(wh[nb][0], a, {bw[0], bw[1]});
+                mma_m16n8k16(wh[nb][1], a, {bw[2], bw[3]});
             }
         }
 
@@ -482,8 +482,8 @@ __device__ __forceinline__ void kda16_walk(
                     }
                 }
                 float o[2][4] = {};
-                gdn_mma(o[0], x, bt[0], bt[1]);
-                gdn_mma(o[1], x, bt[2], bt[3]);
+                mma_m16n8k16(o[0], x, {bt[0], bt[1]});
+                mma_m16n8k16(o[1], x, {bt[2], bt[3]});
                 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
                     #pragma unroll
@@ -500,8 +500,8 @@ __device__ __forceinline__ void kda16_walk(
             ldmatrix_x4(bp, at_tok(sp, KDA16_LDT, 0));
             #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
-                gdn_mma(oh[nb][0], vn[nb], bp[0], bp[1]);
-                gdn_mma(oh[nb][1], vn[nb], bp[2], bp[3]);
+                mma_m16n8k16(oh[nb][0], vn[nb], {bp[0], bp[1]});
+                mma_m16n8k16(oh[nb][1], vn[nb], {bp[2], bp[3]});
                 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
                     #pragma unroll
@@ -528,7 +528,7 @@ __device__ __forceinline__ void kda16_walk(
                 for (int nb = 0; nb < NB; ++nb) {
                     float* s = hacc[nb][2 * np + j];
                     s[0] *= d.x; s[1] *= d.y; s[2] *= d.x; s[3] *= d.y;
-                    gdn_mma(hacc[nb][2 * np + j], vn[nb], b[2 * j], b[2 * j + 1]);
+                    mma_m16n8k16(hacc[nb][2 * np + j], vn[nb], {b[2 * j], b[2 * j + 1]});
                 }
             }
         }

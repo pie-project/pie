@@ -9,14 +9,6 @@ namespace pie::ssm {
 
 // The chunked scan's tensor-core pieces: a bf16 `m16n8k16` with f32
 // accumulators and `ldmatrix` fragment loads, plain and transposed.
-__device__ __forceinline__ void gdn_mma(
-    float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
 
 // Lane `l`'s row address for each fragment an x4 `ldmatrix` lands, over a
 // row-major tile with leading dimension `ld`:

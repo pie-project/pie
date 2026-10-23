@@ -199,10 +199,10 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
             for (int np = 0; np < 2; ++np) {
                 unsigned b[4];
                 ldmatrix_x4(b, gdn_at_bt(ks, GDN_LD, j0 + np * 16, kk * 16, l));
-                gdn_mma(acc[2 * np], a, b[0], b[1]);
-                gdn_mma(acc[2 * np + 1], a, b[2], b[3]);
-                gdn_mma(qkc[2 * np], aq, b[0], b[1]);
-                gdn_mma(qkc[2 * np + 1], aq, b[2], b[3]);
+                mma_m16n8k16(acc[2 * np], a, {b[0], b[1]});
+                mma_m16n8k16(acc[2 * np + 1], a, {b[2], b[3]});
+                mma_m16n8k16(qkc[2 * np], aq, {b[0], b[1]});
+                mma_m16n8k16(qkc[2 * np + 1], aq, {b[2], b[3]});
             }
         }
         bf16* pd = p_out + (static_cast<long long>(s) * V_h + h) * GDN_CH * GDN_CH;
@@ -339,8 +339,8 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
             for (int np = 0; np < 4; ++np) {
                 unsigned b[4];
                 ldmatrix_x4_trans(b, gdn_at_b(rhs, GDN_LD, kk * 16, n0 + np * 16, l));
-                gdn_mma(acc[2 * np], a, b[0], b[1]);
-                gdn_mma(acc[2 * np + 1], a, b[2], b[3]);
+                mma_m16n8k16(acc[2 * np], a, {b[0], b[1]});
+                mma_m16n8k16(acc[2 * np + 1], a, {b[2], b[3]});
             }
         }
         #pragma unroll
@@ -561,10 +561,10 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
             for (int np = 0; np < CT / 2; ++np) {
                 unsigned b[4];
                 ldmatrix_x4_trans(b, gdn_at_b(hs, LDV, kk * 16, c0 + np * 16, l));
-                gdn_mma(qh[2 * np], aq, b[0], b[1]);
-                gdn_mma(qh[2 * np + 1], aq, b[2], b[3]);
-                gdn_mma(wh[2 * np], aw, b[0], b[1]);
-                gdn_mma(wh[2 * np + 1], aw, b[2], b[3]);
+                mma_m16n8k16(qh[2 * np], aq, {b[0], b[1]});
+                mma_m16n8k16(qh[2 * np + 1], aq, {b[2], b[3]});
+                mma_m16n8k16(wh[2 * np], aw, {b[0], b[1]});
+                mma_m16n8k16(wh[2 * np + 1], aw, {b[2], b[3]});
             }
         }
         #pragma unroll
@@ -604,8 +604,8 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
             for (int np = 0; np < CT / 2; ++np) {
                 unsigned b[4];
                 ldmatrix_x4_trans(b, gdn_at_b(vn, LDV, kk * 16, c0 + np * 16, l));
-                gdn_mma(qh[2 * np], pa, b[0], b[1]);
-                gdn_mma(qh[2 * np + 1], pa, b[2], b[3]);
+                mma_m16n8k16(qh[2 * np], pa, {b[0], b[1]});
+                mma_m16n8k16(qh[2 * np + 1], pa, {b[2], b[3]});
             }
         }
         #pragma unroll
@@ -647,8 +647,8 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
                 ldmatrix_x4_trans(b, gdn_at_b(vsc, LDV, kk * 16, c0 + np * 16, l));
                 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) {
-                    gdn_mma(hacc[mt * CT + 2 * np], a[mt], b[0], b[1]);
-                    gdn_mma(hacc[mt * CT + 2 * np + 1], a[mt], b[2], b[3]);
+                    mma_m16n8k16(hacc[mt * CT + 2 * np], a[mt], {b[0], b[1]});
+                    mma_m16n8k16(hacc[mt * CT + 2 * np + 1], a[mt], {b[2], b[3]});
                 }
             }
         }

@@ -53,14 +53,6 @@ __device__ __forceinline__ void sync_cluster() {
 #endif
 }
 
-__device__ __forceinline__ void mma(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
 __device__ __forceinline__ void cp16(void* dst, const void* src, bool live) {
     const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
@@ -315,9 +307,9 @@ __device__ __forceinline__ void decode_body(
                 ldmatrix_x4(a, ks + kv_at(mt * 16 + (lane & 15), kc * 2 + (lane >> 4)));
                 ld_b(b, qs + kc * 16, LD, lane);
                 if (kc & 1) {
-                    mma(s2, a, b[0], b[1]);
+                    mma_m16n8k16(s2, a, b);
                 } else {
-                    mma(s[mt], a, b[0], b[1]);
+                    mma_m16n8k16(s[mt], a, b);
                 }
             }
 #pragma unroll
@@ -376,7 +368,7 @@ __device__ __forceinline__ void decode_body(
                 // V^T as the A operand: V's rows are keys (k), its columns
                 // the value dims (m).
                 ldmatrix_x4_trans(a, vs + kv_at(mt * 16 + (lane & 7) + ((lane >> 4) << 3), d * 2 + ((lane >> 3) & 1)));
-                mma(o_acc[d], a, b[0], b[1]);
+                mma_m16n8k16(o_acc[d], a, b);
             }
         }
         __syncwarp();

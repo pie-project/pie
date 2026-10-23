@@ -266,8 +266,7 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_bf16_held(
                         for (int t = 0; t < kTiles; ++t) {
                             const uint4& lo = ring[d].w[t][0];
                             const uint4& hi = ring[d].w[t][1];
-                            w4mma::mma(acc[t][b], q ? lo.z : lo.x, q ? hi.z : hi.x, q ? lo.w : lo.y,
-                                       q ? hi.w : hi.y, b0, b1);
+                            mma_m16n8k16(acc[t][b], {q ? lo.z : lo.x, q ? hi.z : hi.x, q ? lo.w : lo.y, q ? hi.w : hi.y}, {b0, b1});
                         }
                     }
                 }

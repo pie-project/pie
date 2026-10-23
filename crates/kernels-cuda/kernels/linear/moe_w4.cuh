@@ -12,15 +12,6 @@ namespace w4mma {
 
 using ::pie::ld_stream;
 
-__device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1, unsigned a2,
-                                    unsigned a3, unsigned b0, unsigned b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
 /// a * b, bf16 x 2, subnormals kept.
 __device__ __forceinline__ unsigned mul2(unsigned a, unsigned b) {
     unsigned d;
@@ -170,7 +161,7 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
                     a3 = mul2(a3, s2[t][1]);
                 }
 #pragma unroll
-                for (int b = 0; b < kNb; ++b) mma(acc[t][b], a0, a1, a2, a3, b0[b], b1[b]);
+                for (int b = 0; b < kNb; ++b) mma_m16n8k16(acc[t][b], {a0, a1, a2, a3}, {b0[b], b1[b]});
             }
         }
     }
@@ -317,7 +308,7 @@ __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], con
                     a3 = mul2(a3, s2[t][1]);
                 }
 #pragma unroll
-                for (int b = 0; b < kNb; ++b) mma(acc[t][b], a0, a1, a2, a3, b0[b], b1[b]);
+                for (int b = 0; b < kNb; ++b) mma_m16n8k16(acc[t][b], {a0, a1, a2, a3}, {b0[b], b1[b]});
             }
         }
     }

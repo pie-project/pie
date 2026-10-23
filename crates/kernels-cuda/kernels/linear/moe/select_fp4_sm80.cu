@@ -497,8 +497,8 @@ __global__ void moe_matmul_select_nvfp4_mma(
             for (int bt = 0; bt < kBatches; ++bt) {
                 unsigned afrag[4];
                 ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
-                pie_mma_bf16_16816(acc[bt][0], afrag, bfrag[0], bfrag[1]);
-                pie_mma_bf16_16816(acc[bt][1], afrag, bfrag[2], bfrag[3]);
+                mma_m16n8k16(acc[bt][0], afrag, {bfrag[0], bfrag[1]});
+                mma_m16n8k16(acc[bt][1], afrag, {bfrag[2], bfrag[3]});
             }
         }
         __syncthreads();
