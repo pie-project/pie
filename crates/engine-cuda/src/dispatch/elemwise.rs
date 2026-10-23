@@ -1,7 +1,7 @@
 use kernels_cuda::{Tensor, elemwise};
 use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
 
@@ -603,7 +603,12 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => {
                 elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), &mut self.tensor(*y))
             }
             Elemwise::AddBias {
@@ -923,7 +928,12 @@ impl Run<'_> {
             }
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => {
                 let fan = self.plane_fan(self.tensor(*x).rows);
                 elemwise::gate::sigmoid_mul(
                     self.ctx(),
@@ -932,11 +942,10 @@ impl Run<'_> {
                     &mut self.tensor(*x),
                 )
             }
-            Elemwise::GateSigmoidMulHeads {
+            Elemwise::GateSigmoidMul {
                 x,
                 gate,
-                head_dim,
-                scale,
+                heads: Some(GateHeads { head_dim, scale }),
                 x_out: _,
             } => elemwise::gate::sigmoid_mul_heads(
                 self.ctx(),
@@ -1005,12 +1014,11 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 &mut self.tensor(*y),
             ),
-            Elemwise::GatedResidualAdd {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
+            Elemwise::ResidualAdd {
+                x: y,
+                gate: Some(ResidualGate { g, lane_of_row }),
+                y: r,
+                y_out: _,
             } => elemwise::modulate::gated_residual_add(
                 self.ctx(),
                 self.tensor(*r),
@@ -1019,6 +1027,9 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 &mut self.tensor(*r),
             ),
+            Elemwise::Softcap { x, cap, x_out: _ } => {
+                kernels_cuda::attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*x), *cap)
+            }
             Elemwise::Sinusoid {
                 t,
                 dim,

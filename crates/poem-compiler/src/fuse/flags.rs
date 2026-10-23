@@ -42,12 +42,12 @@ flags! {
     EmbedScaleAddSelect = "fuse.embed_scale_add_select" => "fused.embed_scale_add_select",
     EmbedScaleAdd = "fuse.embed_scale_add" => "fused.embed_scale_add",
     ResidualAddRmsnorm = "fuse.residual_add_rmsnorm" => "fused.residual_add_rmsnorm",
-    MlpSwiglu = "fuse.mlp_swiglu" => "fused.mlp_swiglu",
+    MatmulSwigluMatmul = "fuse.matmul_swiglu_matmul" => "fused.matmul_swiglu_matmul",
     MatmulGeglu = "fuse.matmul_geglu" => "fused.matmul_geglu",
     MoeExperts = "fuse.moe_experts" => "fused.moe_experts",
     MoeSelectGlu = "fuse.moe_select_glu" => "fused.moe_select_glu",
     MatmulSwiglu = "fuse.matmul_swiglu" => "fused.matmul_swiglu",
-    LmHeadSoftcap = "fuse.lm_head_softcap" => "fused.lm_head_softcap",
+    MatmulSoftcap = "fuse.matmul_softcap" => "fused.matmul_softcap",
     MatmulBias = "fuse.matmul_bias" => "fused.matmul_bias",
     MatmulSplitRows = "fuse.matmul_split_rows" => "fused.matmul_split_rows",
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "fused.gated_residual_norm_modulate",
@@ -99,16 +99,23 @@ mod tests {
         }
         for (id, kernel) in ALL {
             assert_eq!(id.strip_prefix("fuse."), kernel.rsplit('.').next());
+            assert!(
+                poem_ir::Fused::NAMES.contains(kernel),
+                "`{kernel}` names no fused op"
+            );
         }
     }
 
     #[test]
     fn a_backend_registers_what_it_ships_and_a_profile_may_turn_it_off() {
         let mut r = Registry::new("toy", &[], &["rows"]);
-        register(&mut r, &["fused.residual_add_rmsnorm", "fused.mlp_swiglu"]);
+        register(
+            &mut r,
+            &["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"],
+        );
         assert_eq!(
             kernels(&r.defaults()),
-            ["fused.residual_add_rmsnorm", "fused.mlp_swiglu"]
+            ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"]
         );
         let p = r
             .load_user("api = 1\nfuse = [\"residual_add_rmsnorm\"]\n", "chip.toml")

@@ -26,7 +26,7 @@ pub(crate) fn matmuls(op: &Operation) -> impl Iterator<Item = (ValueId, ValueId,
                 ..
             },
         ) => [Some((*act, *w, *y)), None],
-        Operation::Fused(Fused::MlpSwiglu {
+        Operation::Fused(Fused::MatmulSwigluMatmul {
             act,
             gate_up,
             down,

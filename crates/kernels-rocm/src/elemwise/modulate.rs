@@ -100,7 +100,7 @@ crate::error::unsupported! {
         o: &mut Tensor);
     tanh_gate = "elemwise.modulate" (x: Tensor, m: Tensor, lane_of_row: Option<Tensor>,
         o: &mut Tensor);
-    gated_residual_add = "elemwise.gated_residual_add" (r: Tensor, g: Tensor, y: Tensor,
+    gated_residual_add = "elemwise.residual_add" (r: Tensor, g: Tensor, y: Tensor,
         lane_of_row: Option<Tensor>, r_out: &mut Tensor);
     norm_modulate = "fused.norm_modulate" (x: Tensor, m: Tensor,
         lane_of_row: Option<Tensor>, norm: NormKind, o: &mut Tensor);

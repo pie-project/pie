@@ -100,9 +100,7 @@ fn heads(name: &str) -> Option<Heads> {
     Some(match name {
         "elemwise.act" | "elemwise.rope_axes" | "gather.rows" | "gather.pack_rows"
         | "gather.unpack_rows" | "linear.gelu_tanh" => Heads::of(&["x"], &[]),
-        "elemwise.gate_sigmoid_mul"
-        | "elemwise.gate_sigmoid_mul_heads"
-        | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
+        "elemwise.gate_sigmoid_mul" | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
         "elemwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
         // q, and k where the rotation turns one.
         "elemwise.rope" => Heads::of(&["q", "k"], &[]),
@@ -191,6 +189,16 @@ fn rule(op: &Operation) -> Rule {
             BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
         };
     }
+    // A residual add is linear in its two rows; one under a gate reads its
+    // operands whole.
+    if let Operation::Elemwise(Elemwise::ResidualAdd { gate, .. }) = op {
+        return match gate {
+            None => Rule::Linear {
+                follow: &["x", "y"],
+            },
+            Some(_) => Rule::Whole,
+        };
+    }
     // An expert product contracts with its bank's split, as a product does.
     if let Operation::Linear(Linear::MoeSelect { .. }) = op {
         return Rule::Contract {
@@ -227,9 +235,6 @@ fn rule(op: &Operation) -> Rule {
     }
     let name = op.name();
     match name {
-        "elemwise.residual_add" => Rule::Linear {
-            follow: &["x", "y"],
-        },
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
             follow: &["routed", "shared"],
         },
@@ -591,4 +596,45 @@ fn held_like(
          are held by groups of ranks alike",
         pass.maker(out),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every op name this file keys a rule on names an op: a rule under a
+    /// name no op carries never applies, and its op falls to `Whole`.
+    #[test]
+    fn every_op_a_rule_names_is_an_op() {
+        const GROUPS: [&str; 9] = [
+            "attn",
+            "linear",
+            "elemwise",
+            "gather",
+            "collective",
+            "sampling",
+            "ssm",
+            "fused",
+            "conv",
+        ];
+        let quote = char::from(34);
+        let named: Vec<&str> = include_str!("rules.rs")
+            .split(quote)
+            .skip(1)
+            .step_by(2)
+            .filter(|lit| {
+                lit.split_once('.').is_some_and(|(group, op)| {
+                    GROUPS.contains(&group)
+                        && !op.is_empty()
+                        && op
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                })
+            })
+            .collect();
+        assert!(named.len() > 20, "the rules name {} ops", named.len());
+        let stale: Vec<&&str> = named
+            .iter()
+            .filter(|name| !poem_ir::Operation::names_an_op(name))
+            .collect();
+        assert!(stale.is_empty(), "named by no op: {stale:?}");
+    }
 }

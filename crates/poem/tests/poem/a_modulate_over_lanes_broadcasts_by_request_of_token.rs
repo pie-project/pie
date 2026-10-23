@@ -137,13 +137,12 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Elemwise(Elemwise::GatedResidualAdd {
-                r,
-                g,
-                lane_of_row,
-                r_out,
+            Operation::Elemwise(Elemwise::ResidualAdd {
+                gate: Some(poem_ir::ResidualGate { g, lane_of_row }),
+                y,
+                y_out,
                 ..
-            }) => Some((*r, *g, *lane_of_row, *r_out)),
+            }) => Some((*y, *g, *lane_of_row, *y_out)),
             _ => None,
         })
         .expect("the gated fold is one node");
@@ -157,7 +156,12 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
         &trace
             .nodes
             .iter()
-            .find(|n| matches!(n.op, Operation::Elemwise(Elemwise::GatedResidualAdd { .. })))
+            .find(|n| {
+                matches!(
+                    n.op,
+                    Operation::Elemwise(Elemwise::ResidualAdd { gate: Some(_), .. })
+                )
+            })
             .unwrap()
             .op,
         &mut pairs,

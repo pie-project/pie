@@ -281,7 +281,7 @@ pub fn logit_softcap(x: &Value, cap: f32) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Attn::LogitSoftcap {
+        poem_ir::Elemwise::Softcap {
             x: x.id(),
             cap,
             x_out: x_out.id(),

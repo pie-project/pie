@@ -73,7 +73,12 @@ impl Run<'_> {
                 matches!(act, GateActivation::Sigmoid),
                 self.tensor(*y),
             ),
-            Elemwise::ResidualAdd { x, y, y_out: _ } => {
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => {
                 // A readout-rowed `x` into a token-rowed `y`: the kernel adds
                 // row for row from the first.
                 let (x, y) = (self.tensor(*x), self.tensor(*y));
@@ -181,9 +186,12 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
-            }
+            Elemwise::GateSigmoidMul {
+                x,
+                gate,
+                heads: None,
+                x_out: _,
+            } => elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x)),
             Elemwise::Act {
                 scale: Some(s),
                 x,

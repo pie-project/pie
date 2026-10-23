@@ -599,7 +599,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
         let mut gates = 0usize;
         for node in &plan.nodes {
             match &node.op {
-                Operation::Elemwise(Elemwise::GatedResidualAdd { .. }) => {
+                Operation::Elemwise(Elemwise::ResidualAdd { gate: Some(_), .. }) => {
                     let mut pairs = Vec::new();
                     node.op.aliases(&mut pairs);
                     assert_eq!(
@@ -608,8 +608,9 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
                         "{deployment}: a gated fold is in place on its residual"
                     );
                 }
-                Operation::Elemwise(Elemwise::GateSigmoidMulHeads {
-                    head_dim, scale, ..
+                Operation::Elemwise(Elemwise::GateSigmoidMul {
+                    heads: Some(poem_ir::GateHeads { head_dim, scale }),
+                    ..
                 }) => {
                     gates += 1;
                     assert_eq!(

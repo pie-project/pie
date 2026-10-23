@@ -227,7 +227,7 @@ fn assert_old_tuning(
     );
     assert_eq!(
         poem_compiler::fuse::flags::kernels(&profile),
-        ["fused.residual_add_rmsnorm", "fused.mlp_swiglu"],
+        ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"],
         "{device}"
     );
 }

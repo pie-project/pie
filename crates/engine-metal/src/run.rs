@@ -412,7 +412,7 @@ impl<'c> Run<'c> {
                         ..
                     },
                 ) if *act == value => self.register_counters(value, *w, self.tensor(*y).width),
-                Operation::Fused(Fused::MlpSwiglu {
+                Operation::Fused(Fused::MatmulSwigluMatmul {
                     act,
                     gate_up,
                     packed,
@@ -894,7 +894,7 @@ impl<'c> Run<'c> {
                 .get((fold_at + n) as usize)
                 .filter(|node| node.guard == fold.guard)
         };
-        let Operation::Fused(Fused::MlpSwiglu {
+        let Operation::Fused(Fused::MatmulSwigluMatmul {
             act,
             gate_up,
             down,
