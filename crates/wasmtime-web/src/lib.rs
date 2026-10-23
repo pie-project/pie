@@ -3,7 +3,6 @@
 // cannot host them: it evacuates a suspended activation's shadow-stack frames,
 // and wasmtime hands the fiber raw pointers into the resumer's frame.
 #[cfg(target_arch = "wasm32")]
-#[allow(unsafe_code)]
 mod platform;
 
 #[cfg(target_arch = "wasm32")]

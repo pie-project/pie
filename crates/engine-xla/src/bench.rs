@@ -8,7 +8,6 @@
 //! The device is opened once per process, under an exclusive `flock` on
 //! `$TMPDIR/pie-xla-device.lock`: libtpu admits one process at a time, and
 //! test binaries run concurrently.
-#![allow(unsafe_code)]
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
