@@ -598,10 +598,12 @@ mod tests {
             let node = self.trace.nodes.len() as u32;
             let y = self.value(Def::Op(node));
             self.trace.nodes.push(Node {
-                op: Elemwise::MulScalar {
-                    s: 2.0,
+                op: Elemwise::Act {
+                    scale: Some(2.0),
                     x,
                     x_out: y,
+                    s: None,
+                    act: poem_ir::ActFn::Identity,
                 }
                 .into(),
                 guard,

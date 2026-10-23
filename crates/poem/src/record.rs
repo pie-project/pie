@@ -541,10 +541,12 @@ impl Mul<f32> for Value {
     fn mul(self, rhs: f32) -> Value {
         let y = self.rec.fresh(self.ty.clone());
         self.rec.push(
-            poem_ir::Elemwise::MulScalar {
-                s: rhs,
+            poem_ir::Elemwise::Act {
+                scale: Some(rhs),
                 x: self.id,
                 x_out: y.id(),
+                s: None,
+                act: poem_ir::ActFn::Identity,
             },
             &[&self],
         );

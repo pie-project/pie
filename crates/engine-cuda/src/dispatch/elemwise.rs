@@ -626,12 +626,22 @@ impl Run<'_> {
                 self.tensor(*scale),
                 &mut self.tensor(*x),
             ),
-            Elemwise::MulScalar { s, x, x_out: _ } => {
-                elemwise::pointwise::mul_scalar(self.ctx(), *s, &mut self.tensor(*x))
-            }
-            Elemwise::Scale { s, x, x_out: _ } => {
-                elemwise::pointwise::scale(self.ctx(), self.tensor(*s), &mut self.tensor(*x))
-            }
+            Elemwise::Act {
+                scale: Some(s),
+                x,
+                x_out: _,
+                s: None,
+                act: poem_ir::ActFn::Identity,
+                ..
+            } => elemwise::pointwise::mul_scalar(self.ctx(), *s, &mut self.tensor(*x)),
+            Elemwise::Act {
+                s: Some(s),
+                x,
+                x_out: _,
+                scale: None,
+                act: poem_ir::ActFn::Identity,
+                ..
+            } => elemwise::pointwise::scale(self.ctx(), self.tensor(*s), &mut self.tensor(*x)),
             Elemwise::ResBlend {
                 prefix,
                 blocks,
@@ -949,9 +959,14 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
-            Elemwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::pointwise::silu_scaled(self.ctx(), *s, &mut self.tensor(*x))
-            }
+            Elemwise::Act {
+                scale: Some(s),
+                x,
+                x_out: _,
+                s: None,
+                act: poem_ir::ActFn::Silu,
+                ..
+            } => elemwise::pointwise::silu_scaled(self.ctx(), *s, &mut self.tensor(*x)),
             Elemwise::HcMix {
                 gates,
                 normed,
@@ -1036,10 +1051,22 @@ impl Run<'_> {
                 *bidirectional,
                 &mut self.tensor(*y),
             ),
-            Elemwise::Silu { x, x_out: _ } => {
-                elemwise::pointwise::silu(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
-            }
-            Elemwise::Gelu { x, tanh, x_out: _ } => {
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Silu,
+                ..
+            } => elemwise::pointwise::silu(self.ctx(), self.tensor(*x), &mut self.tensor(*x)),
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Gelu { tanh, .. },
+                ..
+            } => {
                 if !*tanh {
                     return Err(kernels_cuda::Error::Backend {
                         op: "elemwise.gelu",
@@ -1050,9 +1077,16 @@ impl Run<'_> {
                 }
                 elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
             }
-            Elemwise::Tanh { x, x_out: _ } => {
-                elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
-            }
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Tanh,
+                ..
+            } => elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x)),
+            // The forms no builder makes.
+            Elemwise::Act { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Elemwise::Hadamard { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Elemwise::Mul { x, y, z } => elemwise::pointwise::mul(
                 self.ctx(),

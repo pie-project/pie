@@ -184,9 +184,14 @@ impl Run<'_> {
             Elemwise::GateSigmoidMul { x, gate, x_out: _ } => {
                 elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
             }
-            Elemwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::gate::silu_scaled(self.ctx(), *s, self.tensor(*x))
-            }
+            Elemwise::Act {
+                scale: Some(s),
+                x,
+                x_out: _,
+                s: None,
+                act: poem_ir::ActFn::Silu,
+                ..
+            } => elemwise::gate::silu_scaled(self.ctx(), *s, self.tensor(*x)),
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),

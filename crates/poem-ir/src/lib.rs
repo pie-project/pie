@@ -17,8 +17,8 @@ pub use fact::{Builtin, Fact, Facts};
 pub use guard::Guard;
 pub use operands::{Operands, Part, Slot};
 pub use ops::{
-    ActQuant, Attn, Bounds, Collective, Conv, Elemwise, Fused, GateActivation, Gather, GluAct,
-    GridRule, IndexScore, Linear, ModulateForm, MropeForm, NormAxis, NormKind, NormNext,
+    ActFn, ActQuant, Attn, Bounds, Collective, Conv, Elemwise, Fused, GateActivation, Gather,
+    GluAct, GridRule, IndexScore, Linear, ModulateForm, MropeForm, NormAxis, NormKind, NormNext,
     NormWeight, Operation, PixelOrder, RaggedMask, RopeForm, RopeFreqs, RouteScore, Sampling, Ssm,
     TapKind, TimePad, Turn, VoxelSegment, Yarn,
 };

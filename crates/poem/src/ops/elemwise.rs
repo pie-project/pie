@@ -260,10 +260,12 @@ pub fn mul_scalar(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::MulScalar {
-            s,
+        Elemwise::Act {
+            scale: Some(s),
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            act: poem_ir::ActFn::Identity,
         },
         &[x],
     );
@@ -274,10 +276,12 @@ pub fn silu_scaled(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::SiluScaled {
-            s,
+        Elemwise::Act {
+            scale: Some(s),
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            act: poem_ir::ActFn::Silu,
         },
         &[x],
     );
@@ -288,10 +292,12 @@ pub fn scale(s: &Weight, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::Scale {
-            s: r.weight(s),
+        Elemwise::Act {
+            s: Some(r.weight(s)),
             x: x.id(),
             x_out: x_out.id(),
+            scale: None,
+            act: poem_ir::ActFn::Identity,
         },
         &[x],
     );
@@ -1020,9 +1026,12 @@ pub fn silu(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::Silu {
+        Elemwise::Act {
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            scale: None,
+            act: poem_ir::ActFn::Silu,
         },
         &[x],
     );
@@ -1033,10 +1042,12 @@ pub fn gelu(x: &Value, tanh: bool) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::Gelu {
+        Elemwise::Act {
             x: x.id(),
-            tanh,
             x_out: x_out.id(),
+            s: None,
+            scale: None,
+            act: poem_ir::ActFn::Gelu { tanh },
         },
         &[x],
     );
@@ -1047,9 +1058,12 @@ pub fn tanh(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
     r.push(
-        Elemwise::Tanh {
+        Elemwise::Act {
             x: x.id(),
             x_out: x_out.id(),
+            s: None,
+            scale: None,
+            act: poem_ir::ActFn::Tanh,
         },
         &[x],
     );

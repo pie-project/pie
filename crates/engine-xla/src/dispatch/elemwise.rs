@@ -263,7 +263,14 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Elemwise::Silu { x, x_out: _ } => {
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Silu,
+                ..
+            } => {
                 let x = self.tensor(*x);
                 crate::lower::lower(self.ctx(), |l| {
                     let x_v = l.read(x)?;
@@ -272,7 +279,14 @@ impl Run<'_> {
                     l.land(o_o, v)
                 })
             }
-            Elemwise::Gelu { x, tanh, x_out: _ } => {
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Gelu { tanh, .. },
+                ..
+            } => {
                 let x = self.tensor(*x);
                 if *tanh {
                     crate::lower::lower(self.ctx(), |l| {
@@ -290,7 +304,14 @@ impl Run<'_> {
                     })
                 }
             }
-            Elemwise::Tanh { x, x_out: _ } => {
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Tanh,
+                ..
+            } => {
                 let x = self.tensor(*x);
                 crate::lower::lower(self.ctx(), |l| {
                     let x_v = l.read(x)?;
@@ -375,7 +396,14 @@ impl Run<'_> {
                     elemwise::norm::rmsnorm_grouped_plus_one(l.f(), x_v, weight_v, *group, *eps)?;
                 l.land(o_y, v)
             }),
-            Elemwise::SiluScaled { s, x, x_out: _ } => crate::lower::lower(self.ctx(), |l| {
+            Elemwise::Act {
+                scale: Some(s),
+                x,
+                x_out: _,
+                s: None,
+                act: poem_ir::ActFn::Silu,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
                 let o_x = self.tensor(*x);
                 let v = elemwise::norm::silu_scaled(l.f(), *s, x_v)?;
@@ -525,19 +553,35 @@ impl Run<'_> {
                 let v = elemwise::norm::standardize(l.f(), bias_v, scale_v, out_v)?;
                 l.land(o_out, v)
             }),
-            Elemwise::MulScalar { s, x, x_out: _ } => crate::lower::lower(self.ctx(), |l| {
+            Elemwise::Act {
+                scale: Some(s),
+                x,
+                x_out: _,
+                s: None,
+                act: poem_ir::ActFn::Identity,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
                 let o_x = self.tensor(*x);
                 let v = elemwise::norm::mul_scalar(l.f(), *s, x_v)?;
                 l.land(o_x, v)
             }),
-            Elemwise::Scale { s, x, x_out: _ } => crate::lower::lower(self.ctx(), |l| {
+            Elemwise::Act {
+                s: Some(s),
+                x,
+                x_out: _,
+                scale: None,
+                act: poem_ir::ActFn::Identity,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
                 let s_v = l.read(self.tensor(*s))?;
                 let x_v = l.read(self.tensor(*x))?;
                 let o_x = self.tensor(*x);
                 let v = elemwise::norm::scale(l.f(), s_v, x_v)?;
                 l.land(o_x, v)
             }),
+            // The forms no builder makes.
+            Elemwise::Act { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Elemwise::ResBlend {
                 prefix,
                 blocks,

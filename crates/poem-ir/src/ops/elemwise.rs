@@ -185,25 +185,15 @@ pub enum Elemwise {
         #[output(alias = x)]
         x_out: ValueId,
     },
-    MulScalar {
+    /// `act(x · k)`, in place: `k` the f32 `scale`, the first element of the
+    /// device scalar `s`, or 1.
+    Act {
+        #[input]
+        s: Option<ValueId>,
         #[input]
         x: ValueId,
-        s: f32,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
-    SiluScaled {
-        #[input]
-        x: ValueId,
-        s: f32,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
-    Scale {
-        #[input]
-        s: ValueId,
-        #[input]
-        x: ValueId,
+        act: ActFn,
+        scale: Option<f32>,
         #[output(alias = x)]
         x_out: ValueId,
     },
@@ -403,25 +393,6 @@ pub enum Elemwise {
         #[output(F32)]
         y: ValueId,
     },
-    Silu {
-        #[input]
-        x: ValueId,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
-    Gelu {
-        #[input]
-        x: ValueId,
-        tanh: bool,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
-    Tanh {
-        #[input]
-        x: ValueId,
-        #[output(alias = x)]
-        x_out: ValueId,
-    },
     Hadamard {
         #[input]
         x: ValueId,
@@ -477,6 +448,15 @@ impl ModulateForm {
             ModulateForm::Scale | ModulateForm::TanhGate => 1,
         }
     }
+}
+
+/// The function an [`Elemwise::Act`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActFn {
+    Identity,
+    Silu,
+    Gelu { tanh: bool },
+    Tanh,
 }
 
 /// Where a [`Elemwise::Clamp`]'s bounds come from.

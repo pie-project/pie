@@ -96,12 +96,7 @@ const KV_HEADS: &str = "kv_heads";
 /// How op `name` splits by head or channel, if it does.
 fn heads(name: &str) -> Option<Heads> {
     Some(match name {
-        "elemwise.silu"
-        | "elemwise.gelu"
-        | "elemwise.tanh"
-        | "elemwise.mul_scalar"
-        | "elemwise.silu_scaled"
-        | "elemwise.scale"
+        "elemwise.act"
         | "elemwise.rope_axes"
         | "gather.rows"
         | "gather.pack_rows"
