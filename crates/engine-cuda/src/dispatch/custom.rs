@@ -525,7 +525,7 @@ impl Run<'_> {
         let fp4_pass = self.fp4_pass(window, rows);
         if rows <= self.ctx().tuning().compressed_decode_until
             && !fp4_pass
-            && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out, turn)
+            && let Some(landed) = self.compressed_decode(window, Some(pool), *sink, *o_out, turn)
         {
             return landed.map(|()| turn.is_some());
         }
@@ -604,7 +604,7 @@ impl Run<'_> {
         // ops reading them as bf16 (or past the floor).
         if self.fp8_rows(window) || floored {
             return self
-                .dsv4_decode(window, Some(pool), *sink, *o_out, turn)
+                .compressed_decode(window, Some(pool), *sink, *o_out, turn)
                 .unwrap_or_else(|| Err(fp8_unread(op.name())))
                 .map(|()| turn.is_some());
         }
@@ -646,7 +646,7 @@ impl Run<'_> {
     /// DeepSeek-V4's window (`PrefillLse`), pool if any (`PoolLse[Selected]`) and
     /// sinks in one launch (`attn::compressed::decode::decode`) into `o_out`; `None` where the
     /// shape doesn't fit or the region reads gathered seats.
-    fn dsv4_decode(
+    fn compressed_decode(
         &mut self,
         window: &poem_ir::Attn,
         pool: Option<&poem_ir::Attn>,
@@ -744,7 +744,7 @@ impl Run<'_> {
     /// pass (`attn::compressed::prefill::window_only`); `None` where the profile or
     /// the shape keeps it off.
     #[cfg(feature = "cuda")]
-    fn dsv4_window_prefill(
+    fn compressed_window_prefill(
         &mut self,
         name: &'static str,
         window: &poem_ir::Attn,
@@ -810,17 +810,17 @@ impl Run<'_> {
             // A prefill's rows, where the profile says
             // (`kernel.sdpa.compressed_prefill_from`): the window in the tcgen05 pass.
             #[cfg(feature = "cuda")]
-            if let Some(landed) = self.dsv4_window_prefill(op.name(), attn, *sink, *o_out) {
+            if let Some(landed) = self.compressed_window_prefill(op.name(), attn, *sink, *o_out) {
                 return landed;
             }
             if self.fp8_rows(attn) {
                 return self
-                    .dsv4_decode(attn, None, *sink, *o_out, None)
+                    .compressed_decode(attn, None, *sink, *o_out, None)
                     .unwrap_or_else(|| Err(fp8_unread(op.name())));
             }
             let rows = self.tensor(*o_out).rows;
             if rows <= self.ctx().tuning().compressed_decode_until
-                && let Some(landed) = self.dsv4_decode(attn, None, *sink, *o_out, None)
+                && let Some(landed) = self.compressed_decode(attn, None, *sink, *o_out, None)
             {
                 return landed;
             }

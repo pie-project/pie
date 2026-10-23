@@ -1,9 +1,9 @@
 #![cfg(feature = "cuda")]
 
-//! DeepSeek-V4's attention launchers (`dsv4::decode`, `dsv4_prefill`'s pass
-//! and window-only pass, `pool::attention_lse`) against the host softmax
-//! over the window, the compressed entries and the sinks, on bf16 planes and
-//! on the rows `dsv4::append` writes.
+//! DeepSeek-V4's attention launchers (`attn::compressed::decode`,
+//! `compressed::prefill`'s pass and window-only pass, `pool::attention_lse`)
+//! against the host softmax over the window, the compressed entries and the
+//! sinks, on bf16 planes and on the rows `kv_fp8::append` writes.
 
 use crate::common::attn_ref::{Quant, YARN, attend, col, landed, near, owners, picks, pool};
 use crate::common::attn_ref::{quantized, ten, tuned, turn};
