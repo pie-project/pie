@@ -1,15 +1,11 @@
-//! The mixture-of-experts combines on the first Vulkan device, beside the
-//! hand-written kernels, against an f64 host reference: the weighted sum,
-//! the bias sum and the sigmoid-gated add over an odd width.
+//! The mixture-of-experts combines on the first Vulkan device, against an
+//! f64 host reference: the weighted sum, the bias sum and the sigmoid-gated
+//! add over an odd width.
 
-use kernels_vulkan::{Tensor, linear::moe};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -49,21 +45,11 @@ fn the_moe_combines_answer_the_reference() {
         &[want],
         &|g, o| {
             g.run(|c| {
-                moe::weighted_sum(
+                kernels_slang::linear::moe::combine::weighted_sum(
                     c,
                     b16(routed, rows * k, w),
                     t(rwb, rows, k, Dtype::F32),
                     b16(o[0].0, rows, w),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::linear::moe::combine::weighted_sum(
-                    c,
-                    st(b16(routed, rows * k, w)),
-                    st(t(rwb, rows, k, Dtype::F32)),
-                    st(b16(o[0].0, rows, w)),
                 )
             })
         },
@@ -98,25 +84,13 @@ fn the_moe_combines_answer_the_reference() {
         &[want],
         &|g, o| {
             g.run(|c| {
-                moe::bias_sum(
+                kernels_slang::linear::moe::combine::bias_sum(
                     c,
                     b16(x, rows, w),
                     b16(eb, experts, w),
                     t(rb, rows, k, Dtype::I32),
                     t(rwb, rows, k, Dtype::F32),
                     b16(o[0].0, rows, w),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::linear::moe::combine::bias_sum(
-                    c,
-                    st(b16(x, rows, w)),
-                    st(b16(eb, experts, w)),
-                    st(t(rb, rows, k, Dtype::I32)),
-                    st(t(rwb, rows, k, Dtype::F32)),
-                    st(b16(o[0].0, rows, w)),
                 )
             })
         },
@@ -132,23 +106,12 @@ fn the_moe_combines_answer_the_reference() {
         &[want],
         &|g, o| {
             g.run(|c| {
-                moe::sigmoid_gate_add(
+                kernels_slang::linear::moe::combine::sigmoid_gate_add(
                     c,
                     b16(x, rows, w),
                     b16(sh, rows, w),
                     b16(gt, rows, 1),
                     b16(o[0].0, rows, w),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::linear::moe::combine::sigmoid_gate_add(
-                    c,
-                    st(b16(x, rows, w)),
-                    st(b16(sh, rows, w)),
-                    st(b16(gt, rows, 1)),
-                    st(b16(o[0].0, rows, w)),
                 )
             })
         },

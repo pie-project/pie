@@ -1926,7 +1926,6 @@ dependencies = [
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
- "kernels-vulkan",
  "libc",
  "memmap2",
  "naga",
@@ -3164,6 +3163,7 @@ dependencies = [
 name = "kernels-slang"
 version = "0.5.4"
 dependencies = [
+ "ash",
  "pie-dtype",
 ]
 

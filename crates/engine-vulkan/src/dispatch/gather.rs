@@ -11,7 +11,7 @@ impl DispatchGather for Run<'_> {
 }
 
 impl Run<'_> {
-    fn gather(&mut self, op: &Gather) -> Result<(), kernels_vulkan::Error> {
+    fn gather(&mut self, op: &Gather) -> Result<(), kernels_slang::Error> {
         match op {
             Gather::NgramIds {
                 ids,
@@ -26,26 +26,25 @@ impl Run<'_> {
             } => {
                 if map.is_some() {
                     // Engram's id map is not carried by this backend's hasher yet.
-                    return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
+                    return Err(kernels_slang::Error::Unsupported { op: op.name() });
                 }
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
-                    return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
+                    return Err(kernels_slang::Error::Unsupported { op: op.name() });
                 };
                 let pool = self.recurrent(*state);
                 kernels_slang::gather::ngram::ngram_ids(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*ids)),
-                    crate::encode::slang_tensor(pool.state),
-                    crate::encode::slang_tensor(pool.slots),
-                    crate::encode::slang_tensor(hash),
+                    self.ctx,
+                    self.tensor(*ids),
+                    pool.state,
+                    pool.slots,
+                    hash,
                     *eos,
                     mults,
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    crate::encode::slang_tensor(self.tensor(*ngram_ids)),
+                    self.tensor(*ngram_ids),
                 )
-                .map_err(crate::encode::from_slang)
             }
             Gather::NgramIdsChunked {
                 ids,
@@ -60,28 +59,27 @@ impl Run<'_> {
             } => {
                 if map.is_some() {
                     // Engram's id map is not carried by this backend's hasher yet.
-                    return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
+                    return Err(kernels_slang::Error::Unsupported { op: op.name() });
                 }
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
-                    return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
+                    return Err(kernels_slang::Error::Unsupported { op: op.name() });
                 };
                 let ids = self.ragged(*ids);
                 let pool = self.recurrent(*state);
                 kernels_slang::gather::ngram::ngram_ids_chunked(
-                    &self.slang(),
-                    crate::encode::slang_tensor(ids.data),
-                    crate::encode::slang_tensor(ids.indptr),
-                    crate::encode::slang_tensor(pool.state),
-                    crate::encode::slang_tensor(pool.slots),
-                    crate::encode::slang_tensor(hash),
+                    self.ctx,
+                    ids.data,
+                    ids.indptr,
+                    pool.state,
+                    pool.slots,
+                    hash,
                     *eos,
                     mults,
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    crate::encode::slang_tensor(self.tensor(*ngram_ids)),
+                    self.tensor(*ngram_ids),
                 )
-                .map_err(crate::encode::from_slang)
             }
             Gather::Embed {
                 ids,
@@ -90,26 +88,24 @@ impl Run<'_> {
                 y,
             } => match self.banked(*table) {
                 Some(bank) => kernels_slang::gather::embed::embed_banked(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*ids)),
-                    crate::encode::slang_bank(bank),
+                    self.ctx,
+                    self.tensor(*ids),
+                    bank,
                     *vocab,
-                    crate::encode::slang_tensor(self.tensor(*y)),
-                )
-                .map_err(crate::encode::from_slang),
+                    self.tensor(*y),
+                ),
                 None => kernels_slang::gather::embed::embed(
-                    &self.slang(),
-                    crate::encode::slang_tensor(self.tensor(*ids)),
-                    crate::encode::slang_tensor(self.tensor(*table)),
+                    self.ctx,
+                    self.tensor(*ids),
+                    self.tensor(*table),
                     *vocab,
-                    crate::encode::slang_tensor(self.tensor(*y)),
-                )
-                .map_err(crate::encode::from_slang),
+                    self.tensor(*y),
+                ),
             },
 
             Gather::EmbedConcat {
                 scales: Some(_), ..
-            } => Err(kernels_vulkan::Error::Unsupported {
+            } => Err(kernels_slang::Error::Unsupported {
                 op: "gather.embed_concat(mxfp8)",
             }),
             Gather::EmbedConcat {
@@ -126,25 +122,23 @@ impl Run<'_> {
                     };
                     let guard = bank.codes.rows.min(*vocab);
                     kernels_slang::gather::embed::embed_concat_banked(
-                        &self.slang(),
-                        crate::encode::slang_tensor(ids),
-                        crate::encode::slang_bank(bank),
+                        self.ctx,
+                        ids,
+                        bank,
                         guard,
-                        crate::encode::slang_tensor(self.tensor(*y)),
+                        self.tensor(*y),
                     )
-                    .map_err(crate::encode::from_slang)
                 }
                 None => {
                     let plane = self.tensor(*table);
                     let guard = plane.rows.min(*vocab);
                     kernels_slang::gather::embed::embed_concat(
-                        &self.slang(),
-                        crate::encode::slang_tensor(self.tensor(*ids)),
-                        crate::encode::slang_tensor(plane),
+                        self.ctx,
+                        self.tensor(*ids),
+                        plane,
                         guard,
-                        crate::encode::slang_tensor(self.tensor(*y)),
+                        self.tensor(*y),
                     )
-                    .map_err(crate::encode::from_slang)
                 }
             },
             Gather::SplitQkv {
@@ -155,57 +149,52 @@ impl Run<'_> {
                 k,
                 v,
             } => kernels_slang::gather::rows::split_qkv(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*packed)),
+                self.ctx,
+                self.tensor(*packed),
                 *q_width,
                 *kv_width,
-                crate::encode::slang_tensor(self.tensor(*q)),
-                crate::encode::slang_tensor(self.tensor(*k)),
-                crate::encode::slang_tensor(self.tensor(*v)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+            ),
             Gather::SplitQGate {
                 packed,
                 head_dim,
                 q,
                 gate,
             } => kernels_slang::gather::rows::split_q_gate(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*packed)),
+                self.ctx,
+                self.tensor(*packed),
                 *head_dim,
-                crate::encode::slang_tensor(self.tensor(*q)),
-                crate::encode::slang_tensor(self.tensor(*gate)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*q),
+                self.tensor(*gate),
+            ),
             Gather::SplitRows {
                 x,
                 width,
                 left,
                 right,
             } => kernels_slang::gather::rows::split_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*x)),
+                self.ctx,
+                self.tensor(*x),
                 *width,
-                crate::encode::slang_tensor(self.tensor(*left)),
-                crate::encode::slang_tensor(self.tensor(*right)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*left),
+                self.tensor(*right),
+            ),
 
             Gather::PoolRows { x, side, y } => kernels_slang::gather::rows::pool_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*x)),
+                self.ctx,
+                self.tensor(*x),
                 *side,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
 
             Gather::MergeRows { x, side, y } => kernels_slang::gather::rows::merge_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*x)),
+                self.ctx,
+                self.tensor(*x),
                 *side,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
 
             Gather::Pixels {
                 x,
@@ -216,22 +205,21 @@ impl Run<'_> {
                 temporal,
                 y,
             } => kernels_slang::gather::pixels::pixels(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*x)),
+                self.ctx,
+                self.tensor(*x),
                 *patch,
                 *mean,
                 *std,
                 *order == poem_ir::PixelOrder::Chw,
                 *temporal,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
 
             // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
-            Gather::ConcatCols { .. } => Err(kernels_vulkan::Error::Unsupported {
+            Gather::ConcatCols { .. } => Err(kernels_slang::Error::Unsupported {
                 op: "gather.concat_cols",
             }),
-            Gather::SplitQkvPadded { .. } => Err(kernels_vulkan::Error::Unsupported {
+            Gather::SplitQkvPadded { .. } => Err(kernels_slang::Error::Unsupported {
                 op: "gather.split_qkv_padded",
             }),
             Gather::GridTaps {
@@ -243,16 +231,15 @@ impl Run<'_> {
                 ids,
                 weights,
             } => kernels_slang::gather::pixels::grid_taps(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*positions)),
-                crate::encode::slang_tensor(self.tensor(*grids)),
-                crate::encode::slang_tensor(self.tensor(*segments)),
+                self.ctx,
+                self.tensor(*positions),
+                self.tensor(*grids),
+                self.tensor(*segments),
                 *kind == poem_ir::TapKind::Bilinear,
                 *side,
-                crate::encode::slang_tensor(self.tensor(*ids)),
-                crate::encode::slang_tensor(self.tensor(*weights)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*ids),
+                self.tensor(*weights),
+            ),
 
             Gather::ScatterLiveRows {
                 src,
@@ -260,12 +247,11 @@ impl Run<'_> {
                 y,
                 y_out: _,
             } => kernels_slang::gather::rows::scatter_live_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*src)),
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.uncut(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*src),
+                self.tensor(*routes),
+                self.uncut(*y),
+            ),
 
             Gather::EmbedWeighted {
                 ids,
@@ -274,14 +260,13 @@ impl Run<'_> {
                 vocab,
                 y,
             } => kernels_slang::gather::embed::embed_weighted(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*ids)),
-                crate::encode::slang_tensor(self.tensor(*weights)),
-                crate::encode::slang_tensor(self.tensor(*table)),
+                self.ctx,
+                self.tensor(*ids),
+                self.tensor(*weights),
+                self.tensor(*table),
                 *vocab,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
 
             Gather::ScatterRows {
                 src,
@@ -289,47 +274,42 @@ impl Run<'_> {
                 y,
                 y_out: _,
             } => kernels_slang::gather::rows::scatter_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*src)),
-                crate::encode::slang_tensor(self.tensor(*routes)),
-                crate::encode::slang_tensor(self.uncut(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*src),
+                self.tensor(*routes),
+                self.uncut(*y),
+            ),
 
             Gather::PackRows { x, perm, y } => kernels_slang::gather::rows::pack_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.uncut(*x)),
-                crate::encode::slang_tensor(self.tensor(*perm)),
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.uncut(*x),
+                self.tensor(*perm),
+                self.tensor(*y),
+            ),
             Gather::UnpackRows { x, perm, y } => kernels_slang::gather::rows::unpack_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*x)),
-                crate::encode::slang_tensor(self.tensor(*perm)),
-                crate::encode::slang_tensor(self.uncut(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.tensor(*x),
+                self.tensor(*perm),
+                self.uncut(*y),
+            ),
             Gather::Rows { x, rows, y } => kernels_slang::gather::rows::gather_rows(
-                &self.slang(),
-                crate::encode::slang_tensor(self.uncut(*x)),
-                crate::encode::slang_tensor(self.tensor(*rows)),
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.ctx,
+                self.uncut(*x),
+                self.tensor(*rows),
+                self.tensor(*y),
+            ),
             Gather::Select {
                 table,
                 layer,
                 width,
                 y,
             } => kernels_slang::gather::rows::select(
-                &self.slang(),
-                crate::encode::slang_tensor(self.tensor(*table)),
+                self.ctx,
+                self.tensor(*table),
                 *layer,
                 *width,
-                crate::encode::slang_tensor(self.tensor(*y)),
-            )
-            .map_err(crate::encode::from_slang),
+                self.tensor(*y),
+            ),
         }
     }
 }

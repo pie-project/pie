@@ -1,10 +1,9 @@
-//! Group norm on the first Vulkan device, beside the hand-written kernels,
-//! against an f64 host reference: two clips normalized apart, channel groups
-//! of three (a lane's channel pair straddles two groups), with and without
-//! the SiLU, and rows past every clip landing zero.
+//! Group norm on the first Vulkan device, against an f64 host reference: two
+//! clips normalized apart, channel groups of three (a lane's channel pair
+//! straddles two groups), with and without the SiLU, and rows past every
+//! clip landing zero.
 
-use kernels_vulkan::Tensor;
-use kernels_vulkan::spatial::norm;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
@@ -14,10 +13,6 @@ const GROUPS: usize = 2;
 const EPS: f32 = 1e-5;
 /// Two clips of 40 and 9 voxels.
 const CLIPS: [[usize; 3]; 2] = [[2, 4, 5], [1, 3, 3]];
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[test]
 fn the_group_norm_answers_the_reference() {
@@ -42,12 +37,9 @@ fn the_group_norm_answers_the_reference() {
     let (wv, bv) = (noise(2, C), noise(3, C));
     let (wb, bb) = (gpu.up_f32(&wv), gpu.up_f32(&bv));
     let gb = gpu.up_i32(&grid);
-    let scratch = norm::scratch_floats(CLIPS.len() as u32, GROUPS as u32) as usize;
-    assert_eq!(
-        scratch as u64,
-        kernels_slang::conv::group_norm::scratch_floats(CLIPS.len() as u32, GROUPS as u32)
-    );
-    let parts = CLIPS.len() * norm::SPLITS as usize * GROUPS * 4;
+    let scratch =
+        kernels_slang::conv::group_norm::scratch_floats(CLIPS.len() as u32, GROUPS as u32) as usize;
+    let parts = CLIPS.len() * kernels_slang::conv::group_norm::SPLITS as usize * GROUPS * 4;
     for silu in [false, true] {
         let mut want = vec![0.0f64; rows * C];
         let cg = C / GROUPS;
@@ -93,7 +85,7 @@ fn the_group_norm_answers_the_reference() {
             &|g, o| {
                 let (p, s) = (plane(o[1].0, parts), plane(o[2].0, scratch - parts));
                 g.run(|c| {
-                    norm::group_norm(
+                    kernels_slang::conv::group_norm::group_norm(
                         c,
                         x,
                         grid,
@@ -105,24 +97,6 @@ fn the_group_norm_answers_the_reference() {
                         p,
                         s,
                         t(o[0].0, rows, C, Dtype::Bf16),
-                    )
-                })
-            },
-            &|g, o| {
-                let (p, s) = (plane(o[1].0, parts), plane(o[2].0, scratch - parts));
-                g.run_slang(|c| {
-                    kernels_slang::conv::group_norm::group_norm(
-                        c,
-                        st(x),
-                        st(grid),
-                        GROUPS as u32,
-                        st(w),
-                        st(b),
-                        EPS,
-                        silu,
-                        st(p),
-                        st(s),
-                        st(t(o[0].0, rows, C, Dtype::Bf16)),
                     )
                 })
             },

@@ -1,9 +1,8 @@
 //! The modulations (`elemwise.modulate` in its three forms,
-//! `gated_residual_add`) on the first Vulkan device against
-//! an f64 host reference, beside the hand-written kernels, bf16 and f32, with and without a lane map.
+//! `gated_residual_add`) on the first Vulkan device against an f64 host
+//! reference, bf16 and f32, with and without a lane map.
 
 use crate::gpu::{Gpu, close, noise};
-use kernels_vulkan::elemwise::modulate;
 use poem_ir::Dtype;
 
 fn up(gpu: &mut Gpu, v: &[f32], dtype: Dtype) -> u32 {
@@ -43,10 +42,8 @@ fn the_modulations_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    let st =
-        |t: kernels_vulkan::Tensor| kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype);
     let t = |buf: u32, rows: usize, width: usize, dtype: Dtype| {
-        kernels_vulkan::Tensor::new(buf, rows as u32, width as u32, dtype)
+        kernels_slang::Tensor::new(buf, rows as u32, width as u32, dtype)
     };
     let (rows, width) = (4usize, 96usize);
     let n = rows * width;
@@ -87,45 +84,19 @@ fn the_modulations_answer_the_reference() {
                     kernels_slang::elemwise::modulate::Form::Scale,
                     kernels_slang::elemwise::modulate::Form::TanhGate,
                 ][form];
-                let hand = Some(
-                    [
-                        modulate::Form::ScaleShift,
-                        modulate::Form::Scale,
-                        modulate::Form::TanhGate,
-                    ][form],
-                );
-
-                if let Some(hf) = hand {
-                    let y = gpu.zeros(2 * n);
-                    gpu.run(|c| {
-                        modulate::modulate(
-                            c,
-                            hf,
-                            t(x, rows, width, act),
-                            mt,
-                            lt,
-                            t(y, rows, width, act),
-                        )
-                    });
-                    close(&down(&gpu, y, n, act), &want, &format!("modulate {shape}"));
-                }
 
                 let y = gpu.zeros(2 * n);
-                gpu.run_slang(|c| {
+                gpu.run(|c| {
                     kernels_slang::elemwise::modulate::modulate(
                         c,
                         sf,
-                        st(t(x, rows, width, act)),
-                        st(mt),
-                        lt.map(st),
-                        st(t(y, rows, width, act)),
+                        t(x, rows, width, act),
+                        mt,
+                        lt,
+                        t(y, rows, width, act),
                     )
                 });
-                close(
-                    &down(&gpu, y, n, act),
-                    &want,
-                    &format!("slang modulate {shape}"),
-                );
+                close(&down(&gpu, y, n, act), &want, &format!("modulate {shape}"));
             }
         }
         for mapped in [false, true] {
@@ -150,35 +121,18 @@ fn the_modulations_answer_the_reference() {
 
             let r = up(&mut gpu, &rv, act);
             gpu.run(|c| {
-                modulate::gated_residual_add(
+                kernels_slang::elemwise::modulate::gated_residual_add(
                     c,
                     t(r, rows, width, act),
                     gt,
                     t(yb, rows, width, act),
                     lt,
-                    t(r, rows, width, act),
                 )
             });
             close(
                 &down(&gpu, r, n, act),
                 &want,
                 &format!("gated residual add {shape}"),
-            );
-
-            let r = up(&mut gpu, &rv, act);
-            gpu.run_slang(|c| {
-                kernels_slang::elemwise::modulate::gated_residual_add(
-                    c,
-                    st(t(r, rows, width, act)),
-                    st(gt),
-                    st(t(yb, rows, width, act)),
-                    lt.map(st),
-                )
-            });
-            close(
-                &down(&gpu, r, n, act),
-                &want,
-                &format!("slang gated residual add {shape}"),
             );
         }
     }

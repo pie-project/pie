@@ -1,10 +1,10 @@
 //! The device the kernel tests fire on, the first Vulkan device (a software
 //! one such as lavapipe will do): rows up and down as bf16 or f32, a frame
-//! for the hand-written kernels or the Slang ones, and the comparison with an
-//! f64 host reference every test shares.
+//! the kernels fire into, and the comparison with an f64 host reference
+//! every test shares.
 
 use engine_vulkan::api::DeviceBoot;
-use engine_vulkan::{Buffer, Context, Handles, Pipelines, Sink, Slang};
+use engine_vulkan::{Buffer, Context, Handles, Pipelines, Sink};
 
 pub fn bf16(v: f32) -> u16 {
     let bits = v.to_bits();
@@ -95,20 +95,11 @@ impl Gpu {
         handle
     }
 
-    pub fn run(&self, f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_vulkan::Error>) {
+    pub fn run(&self, f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_slang::Error>) {
         let frame = self.device.frame().expect("a frame");
         {
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
             f(&sink).expect("the kernel fires");
-        }
-        frame.commit().expect("the frame lands");
-    }
-
-    pub fn run_slang(&self, f: impl FnOnce(&Slang<'_>) -> Result<(), kernels_slang::Error>) {
-        let frame = self.device.frame().expect("a frame");
-        {
-            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
-            f(&Slang(&sink)).expect("the kernel fires");
         }
         frame.commit().expect("the frame lands");
     }
@@ -164,26 +155,23 @@ pub type Out = (u32, usize, bool);
 /// Fires a kernel into the outputs it is handed.
 pub type Fires<'a> = &'a dyn Fn(&Gpu, &[Out]);
 
-/// Run `hand` and `slang` on fresh copies of the outputs `fresh` makes, and
-/// compare each landed output with its reference.
+/// Run `fires` on the outputs `fresh` makes, and compare each landed output
+/// with its reference.
 pub fn both(
     gpu: &mut Gpu,
     what: &str,
     fresh: &dyn Fn(&mut Gpu) -> Vec<Out>,
     want: &[Vec<f64>],
-    hand: Fires<'_>,
-    slang: Fires<'_>,
+    fires: Fires<'_>,
 ) {
-    for (who, run) in [("", hand), ("slang ", slang)] {
-        let outs = fresh(gpu);
-        run(gpu, &outs);
-        for ((buf, n, f32), want) in outs.iter().zip(want) {
-            let got = if *f32 {
-                gpu.down_f32(*buf, *n)
-            } else {
-                gpu.down(*buf, *n)
-            };
-            close(&got, want, &format!("{who}{what}"));
-        }
+    let outs = fresh(gpu);
+    fires(gpu, &outs);
+    for ((buf, n, f32), want) in outs.iter().zip(want) {
+        let got = if *f32 {
+            gpu.down_f32(*buf, *n)
+        } else {
+            gpu.down(*buf, *n)
+        };
+        close(&got, want, what);
     }
 }

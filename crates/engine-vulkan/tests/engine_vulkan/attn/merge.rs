@@ -1,16 +1,11 @@
-//! The attention epilogues on the first Vulkan device, beside the hand-written
-//! kernels, against an f64 host reference: two readings merged by their
-//! log-sum-exps (one side empty in places), the sink rescale, and the logit
-//! softcap over an odd count.
+//! The attention epilogues on the first Vulkan device, against an f64 host
+//! reference: two readings merged by their log-sum-exps (one side empty in
+//! places), the sink rescale, and the logit softcap over an odd count.
 
-use kernels_vulkan::{Tensor, attn};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -68,7 +63,7 @@ fn the_attention_epilogues_answer_the_reference() {
         &[want_o, want_l],
         &|g, o| {
             g.run(|c| {
-                attn::merge_lse(
+                kernels_slang::attn::merge::merge_lse(
                     c,
                     b(o1),
                     f(lse1),
@@ -78,21 +73,6 @@ fn the_attention_epilogues_answer_the_reference() {
                     hd as u32,
                     b(o[0].0),
                     f(o[1].0),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::merge::merge_lse(
-                    c,
-                    st(b(o1)),
-                    st(f(lse1)),
-                    st(b(o2)),
-                    st(f(lse2)),
-                    heads as u32,
-                    hd as u32,
-                    st(b(o[0].0)),
-                    st(f(o[1].0)),
                 )
             })
         },
@@ -122,17 +102,8 @@ fn the_attention_epilogues_answer_the_reference() {
         "sink",
         &|g| vec![(g.up(&noise(1, n)).0, n, false)],
         &[want],
-        &|g, o| g.run(|c| attn::sink(c, b(o[0].0), f(lse), sink_t, hd as u32)),
         &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::merge::sink(
-                    c,
-                    st(b(o[0].0)),
-                    st(f(lse)),
-                    st(sink_t),
-                    hd as u32,
-                )
-            })
+            g.run(|c| kernels_slang::attn::merge::sink(c, b(o[0].0), f(lse), sink_t, hd as u32))
         },
     );
 
@@ -149,11 +120,6 @@ fn the_attention_epilogues_answer_the_reference() {
         "logit softcap",
         &|g| vec![(g.up(&xv).0, 22, false)],
         &[want],
-        &|g, o| g.run(|c| attn::logit_softcap(c, xt(o[0].0), cap as f32)),
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::attn::merge::logit_softcap(c, st(xt(o[0].0)), cap as f32)
-            })
-        },
+        &|g, o| g.run(|c| kernels_slang::attn::merge::logit_softcap(c, xt(o[0].0), cap as f32)),
     );
 }

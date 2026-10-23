@@ -1,11 +1,8 @@
 //! The port cast on the first Vulkan device against an exact host
 //! reference: f32 cells cast into bf16 seats of one store, seats starting
 //! and ending mid-word and sharing words with their neighbours, all in one
-//! frame, the store's other elements left as they were. Beside the
-//! hand-written cast where it can run: a seat at the store's start (it
-//! binds the seat itself, at an offset a descriptor may not name).
+//! frame, the store's other elements left as they were.
 
-use kernels_vulkan::{Tensor, elemwise::pointwise};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, bf16, noise, widen};
@@ -37,7 +34,7 @@ fn the_port_cast_answers_the_reference() {
                 want[at + i] = widen(bf16(*x));
             }
         }
-        gpu.run_slang(|c| {
+        gpu.run(|c| {
             for (cell, at, v) in &cells {
                 kernels_slang::runtime::port::cast(
                     c,
@@ -49,24 +46,7 @@ fn the_port_cast_answers_the_reference() {
             Ok(())
         });
         let got = gpu.down(store, STORE);
-        assert_eq!(got, want, "slang port cast {frames:?}");
-        eprintln!("slang port cast {frames:?}: exact");
+        assert_eq!(got, want, "port cast {frames:?}");
+        eprintln!("port cast {frames:?}: exact");
     }
-
-    // The hand-written cast, a seat at the store's start.
-    let v = noise(3, 13);
-    let cell = gpu.up_f32(&v);
-    let (store, mut want) = gpu.up(&noise(2, STORE));
-    for (i, x) in v.iter().enumerate() {
-        want[i] = widen(bf16(*x));
-    }
-    gpu.run(|c| {
-        pointwise::cast_f32_to_bf16(
-            c,
-            Tensor::new(cell, 13, 1, Dtype::F32),
-            Tensor::new(store, 13, 1, Dtype::Bf16),
-        )
-    });
-    assert_eq!(gpu.down(store, STORE), want, "port cast at 0");
-    eprintln!("port cast at 0: exact");
 }

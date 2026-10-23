@@ -1,18 +1,14 @@
-//! The dense matmuls on the first Vulkan device, beside the hand-written
-//! kernels, against an f64 host reference: the vector kernels below four
+//! The dense matmuls on the first Vulkan device against an f64 host
+//! reference: the vector kernels below four
 //! rows (an even contraction in eight-wide loads, an odd one), the tiled
 //! kernel over ragged tiles, the cooperative-matrix tier where the device
 //! has one, and the f32 lane form at every weight and result dtype.
 
+use kernels_slang::Tensor;
 use kernels_slang::linear::gemm::{self, Tactic};
-use kernels_vulkan::{Arg, Encode, Fire, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -51,48 +47,16 @@ fn the_dense_matmuls_answer_the_reference() {
         return;
     };
     let coopmat = gpu.device.chip().coopmat;
-    // (rows, columns, contraction, tier, the hand-written entry, groups, workgroup)
+    // (rows, columns, contraction, tier)
     let mut cases = vec![
-        (
-            1usize,
-            24usize,
-            64usize,
-            kernels_slang::Tier::Baseline,
-            "dense_gemv_t_v_bf16",
-            [3u32, 1, 1],
-            [32u32, 8, 1],
-        ),
-        (
-            3,
-            21,
-            60,
-            kernels_slang::Tier::Baseline,
-            "dense_gemv_t_bf16",
-            [1, 3, 3],
-            [32, 8, 1],
-        ),
-        (
-            40,
-            50,
-            70,
-            kernels_slang::Tier::Baseline,
-            "dense_gemm_t_bf16",
-            [2, 2, 1],
-            [32, 2, 2],
-        ),
+        (1usize, 24usize, 64usize, kernels_slang::Tier::Baseline),
+        (3, 21, 60, kernels_slang::Tier::Baseline),
+        (40, 50, 70, kernels_slang::Tier::Baseline),
     ];
     if coopmat {
-        cases.push((
-            70,
-            64,
-            96,
-            kernels_slang::Tier::Coopmat,
-            "dense_gemm_t_cm_bf16",
-            [1, 2, 1],
-            [32, 4, 1],
-        ));
+        cases.push((70, 64, 96, kernels_slang::Tier::Coopmat));
     }
-    for (m, n, k, tier, hand, groups, local) in cases {
+    for (m, n, k, tier) in cases {
         let (x, xr) = gpu.up(&noise(1 + m as u64, m * k));
         let (w, wr) = gpu.up(&noise(2 + n as u64, n * k));
         let (xt, wt) = (t(x, m, k, Dtype::Bf16), t(w, n, k, Dtype::Bf16));
@@ -109,25 +73,7 @@ fn the_dense_matmuls_answer_the_reference() {
             std::slice::from_ref(&want),
             &|g, o| {
                 let y = t(o[0].0, m, n, Dtype::Bf16);
-                g.run(|c| {
-                    c.fire(
-                        Fire::at("gemm/dense.slang", hand)
-                            .groups(groups)
-                            .group(local),
-                        &[
-                            xt.arg(),
-                            wt.arg(),
-                            y.arg_mut(),
-                            (m as i32).arg(),
-                            (n as i32).arg(),
-                            (k as i32).arg(),
-                        ],
-                    )
-                });
-            },
-            &|g, o| {
-                let y = st(t(o[0].0, m, n, Dtype::Bf16));
-                g.run_slang(|c| gemm::matmul(c, Tactic { tier }, st(xt), st(wt), y));
+                g.run(|c| gemm::matmul(c, Tactic { tier }, xt, wt, y));
             },
         );
     }
@@ -136,11 +82,11 @@ fn the_dense_matmuls_answer_the_reference() {
     let xv = noise(3, m * k);
     let x = gpu.up_f32(&xv);
     let xt = t(x, m, k, Dtype::F32);
-    for (wd, yd, hand) in [
-        (Dtype::Bf16, Dtype::F32, "lane_gemm_f32_bf16_f32"),
-        (Dtype::F32, Dtype::F32, "lane_gemm_f32_f32_f32"),
-        (Dtype::Bf16, Dtype::Bf16, "lane_gemm_f32_bf16_bf16"),
-        (Dtype::F32, Dtype::Bf16, "lane_gemm_f32_f32_bf16"),
+    for (wd, yd) in [
+        (Dtype::Bf16, Dtype::F32),
+        (Dtype::F32, Dtype::F32),
+        (Dtype::Bf16, Dtype::Bf16),
+        (Dtype::F32, Dtype::Bf16),
     ] {
         let wv = noise(4, n * k);
         let (w, held) = if wd == Dtype::Bf16 {
@@ -158,25 +104,7 @@ fn the_dense_matmuls_answer_the_reference() {
             std::slice::from_ref(&want),
             &|g, o| {
                 let y = t(o[0].0, m, n, yd);
-                g.run(|c| {
-                    c.fire(
-                        Fire::at("gemm/lane_gemm.slang", hand)
-                            .groups([1, 1, 1])
-                            .group([64, 4, 1]),
-                        &[
-                            xt.arg(),
-                            wt.arg(),
-                            y.arg_mut(),
-                            (m as i32).arg(),
-                            (n as i32).arg(),
-                            (k as i32).arg(),
-                        ],
-                    )
-                });
-            },
-            &|g, o| {
-                let y = st(t(o[0].0, m, n, yd));
-                g.run_slang(|c| gemm::lane(c, "linear.matmul", st(xt), st(wt), y));
+                g.run(|c| gemm::lane(c, "linear.matmul", xt, wt, y));
             },
         );
     }

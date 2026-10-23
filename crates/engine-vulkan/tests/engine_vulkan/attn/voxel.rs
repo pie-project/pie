@@ -1,10 +1,9 @@
-//! Voxel attention on the first Vulkan device, beside the hand-written
-//! kernels, against an f64 host reference: two clips, each row attending its
-//! whole clip or its run of frames, heads 64 and 300 wide (two of the
-//! instantiations), and rows past every clip landing zero.
+//! Voxel attention on the first Vulkan device, against an f64 host
+//! reference: two clips, each row attending its whole clip or its run of
+//! frames, heads 64 and 300 wide (two of the instantiations), and rows past
+//! every clip landing zero.
 
-use kernels_vulkan::Tensor;
-use kernels_vulkan::spatial::attn as hand;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
@@ -12,10 +11,6 @@ use crate::gpu::{Gpu, both, noise};
 /// Two clips: (t, h, w).
 const CLIPS: [[usize; 3]; 2] = [[3, 2, 3], [1, 2, 2]];
 const EXTRA: usize = 1;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[test]
 fn the_voxel_attention_answers_the_reference() {
@@ -87,13 +82,14 @@ fn the_voxel_attention_answers_the_reference() {
                 &|g| vec![(g.up(&vec![7.0; n]).0, n, false)],
                 &[want],
                 &|g, o| {
+                    use kernels_slang::attn::voxel;
                     let segment = if frames == 0 {
-                        hand::Segment::Clip
+                        voxel::Segment::Clip
                     } else {
-                        hand::Segment::Frames(frames as u32)
+                        voxel::Segment::Frames(frames as u32)
                     };
                     g.run(|x| {
-                        hand::attention(
+                        voxel::attention(
                             x,
                             q,
                             k,
@@ -102,26 +98,6 @@ fn the_voxel_attention_answers_the_reference() {
                             segment,
                             scale,
                             t(o[0].0, rows, c, Dtype::Bf16),
-                        )
-                    })
-                },
-                &|g, o| {
-                    use kernels_slang::attn::voxel;
-                    let segment = if frames == 0 {
-                        voxel::Segment::Clip
-                    } else {
-                        voxel::Segment::Frames(frames as u32)
-                    };
-                    g.run_slang(|x| {
-                        voxel::attention(
-                            x,
-                            st(q),
-                            st(k),
-                            st(v),
-                            st(grid),
-                            segment,
-                            scale,
-                            st(t(o[0].0, rows, c, Dtype::Bf16)),
                         )
                     })
                 },

@@ -1,11 +1,10 @@
-//! The 3-D convolution on the first Vulkan device, beside the hand-written
-//! kernels, against an f64 host reference: two clips (a video and an image),
-//! strided and padded, time padding zero-causal or repeated, with and without
-//! a bias, through the strip kernel (`c_in` 6) and the tiled one (`c_in` 16),
-//! and output rows past every clip landing zero.
+//! The 3-D convolution on the first Vulkan device, against an f64 host
+//! reference: two clips (a video and an image), strided and padded, time
+//! padding zero-causal or repeated, with and without a bias, through the
+//! strip kernel (`c_in` 6) and the tiled one (`c_in` 16), and output rows
+//! past every clip landing zero.
 
-use kernels_vulkan::Tensor;
-use kernels_vulkan::spatial::conv;
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
@@ -15,10 +14,6 @@ const C_OUT: usize = 6;
 const CLIPS: [[usize; 3]; 2] = [[3, 4, 5], [1, 3, 3]];
 const K: [usize; 3] = [3, 3, 3];
 const STRIDE: [usize; 3] = [1, 2, 2];
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 /// A clip table: each clip's extent and first row.
 fn table(clips: &[[usize; 3]]) -> Vec<i32> {
@@ -168,24 +163,12 @@ fn the_conv3d_answers_the_reference() {
         let b = case.bias.then(|| t(bb, 1, C_OUT, Dtype::F32));
         let (front, back) = case.pad();
         let u3 = |v: [usize; 3]| v.map(|n| n as u32);
-        let hand = conv::Conv3d {
+        let conv = kernels_slang::conv::conv3d::Conv3d {
             k: u3(K),
             stride: u3(STRIDE),
             pad: u3(front),
             pad_back: u3(back),
             causal_t: case.causal,
-            time_pad: if case.replicate {
-                conv::TimePad::Replicate
-            } else {
-                conv::TimePad::Zero
-            },
-        };
-        let slang = kernels_slang::conv::conv3d::Conv3d {
-            k: hand.k,
-            stride: hand.stride,
-            pad: hand.pad,
-            pad_back: hand.pad_back,
-            causal_t: hand.causal_t,
             time_pad: if case.replicate {
                 kernels_slang::conv::conv3d::TimePad::Replicate
             } else {
@@ -203,30 +186,15 @@ fn the_conv3d_answers_the_reference() {
             &[want],
             &|g, o| {
                 g.run(|c| {
-                    conv::conv3d(
+                    kernels_slang::conv::conv3d::conv3d(
                         c,
                         x,
                         grid,
                         w,
                         b,
-                        None,
-                        hand,
+                        conv,
                         o_grid,
                         t(o[0].0, rows_out, C_OUT, Dtype::Bf16),
-                    )
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
-                    kernels_slang::conv::conv3d::conv3d(
-                        c,
-                        st(x),
-                        st(grid),
-                        st(w),
-                        b.map(st),
-                        slang,
-                        st(o_grid),
-                        st(t(o[0].0, rows_out, C_OUT, Dtype::Bf16)),
                     )
                 })
             },

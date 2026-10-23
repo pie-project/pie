@@ -1,27 +1,11 @@
-//! The paged KV append on the first Vulkan device, beside the hand-written kernels,
-//! against a host reference: keys and values written into their pages, and
-//! the shared form that writes the keys to both.
+//! The paged KV append on the first Vulkan device, against a host reference:
+//! keys and values written into their pages, and the shared form that writes
+//! the keys to both.
 
-use kernels_vulkan::{KvPool, Tensor, attn};
+use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
-
-fn sp(p: &KvPool) -> kernels_slang::KvPool {
-    kernels_slang::KvPool {
-        keys: st(p.keys),
-        values: st(p.values),
-        page_indices: st(p.page_indices),
-        page_indptr: st(p.page_indptr),
-        page_size: p.page_size,
-        seq_stride: p.seq_stride,
-        head_stride: p.head_stride,
-    }
-}
 
 fn f64s(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
@@ -73,16 +57,15 @@ fn the_kv_append_answers_the_reference() {
             ]
         },
         &[want_k.clone(), want_v],
-        &|g, o| g.run(|c| attn::kv_append(c, kt, vt, &pool(o[0].0, o[1].0), u(wp), u(wo))),
         &|g, o| {
-            g.run_slang(|c| {
+            g.run(|c| {
                 kernels_slang::attn::kv_append::kv_append(
                     c,
-                    st(kt),
-                    st(vt),
-                    &sp(&pool(o[0].0, o[1].0)),
-                    st(u(wp)),
-                    st(u(wo)),
+                    kt,
+                    vt,
+                    &pool(o[0].0, o[1].0),
+                    u(wp),
+                    u(wo),
                 )
             })
         },
@@ -97,15 +80,14 @@ fn the_kv_append_answers_the_reference() {
             ]
         },
         &[want_k.clone(), want_k],
-        &|g, o| g.run(|c| attn::kv_append_shared(c, kt, &pool(o[0].0, o[1].0), u(wp), u(wo))),
         &|g, o| {
-            g.run_slang(|c| {
+            g.run(|c| {
                 kernels_slang::attn::kv_append::kv_append_shared(
                     c,
-                    st(kt),
-                    &sp(&pool(o[0].0, o[1].0)),
-                    st(u(wp)),
-                    st(u(wo)),
+                    kt,
+                    &pool(o[0].0, o[1].0),
+                    u(wp),
+                    u(wo),
                 )
             })
         },

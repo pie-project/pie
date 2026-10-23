@@ -1,12 +1,10 @@
-//! The causal conv1d on the first Vulkan device, beside the hand-written kernels,
-//! against an f64 host reference: the decode step, the chunked walk (an
-//! empty request among them) and the committed window (replayed rows, a
-//! partial commit, a lane with no slot), at dilations 1 and 2. Both the
-//! SiLU'd rows and the rolled history are compared.
+//! The causal conv1d on the first Vulkan device, against an f64 host
+//! reference: the decode step, the chunked walk (an empty request among
+//! them) and the committed window (replayed rows, a partial commit, a lane
+//! with no slot), at dilations 1 and 2. Both the SiLU'd rows and the rolled
+//! history are compared.
 
-use kernels_vulkan::attn::ssm;
-use kernels_vulkan::tensor::RecurrentPool;
-use kernels_vulkan::{RaggedTensor, Tensor};
+use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, Out, both, noise};
@@ -14,10 +12,6 @@ use crate::gpu::{Gpu, Out, both, noise};
 const C: usize = 6;
 const W: usize = 4;
 const SLOTS: usize = 3;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn silu(z: f64) -> f64 {
     z / (1.0 + (-z).exp())
@@ -70,15 +64,9 @@ fn the_conv1d_answers_the_reference() {
         let slab = hist * C;
         let bank0: Vec<f32> = noise(2 + dil as u64, SLOTS * slab);
         let bank64: Vec<f64> = bank0.iter().map(|v| f64::from(*v)).collect();
-        let pool = |bank: u32, slots: u32, rows: usize| RecurrentPool {
-            state: t(bank, SLOTS, slab, Dtype::F32),
+        let pool = |bank: u32, slots: u32, rows: usize| kernels_slang::ssm::StatePool {
+            bank: t(bank, SLOTS, slab, Dtype::F32),
             slots: t(slots, rows, 1, Dtype::U32),
-            conv_state: t(bank, SLOTS, slab, Dtype::F32),
-            new_conv_state: t(bank, SLOTS, slab, Dtype::F32),
-        };
-        let sp = |p: &RecurrentPool| kernels_slang::ssm::StatePool {
-            bank: st(p.state),
-            slots: st(p.slots),
         };
         let bank0 = &bank0;
         let fresh = |rows: usize| {
@@ -111,7 +99,7 @@ fn the_conv1d_answers_the_reference() {
             &[want_y, want_s],
             &|g, o| {
                 g.run(|c| {
-                    ssm::causal_conv1d(
+                    kernels_slang::ssm::conv1d::conv1d(
                         c,
                         x,
                         wt,
@@ -119,19 +107,6 @@ fn the_conv1d_answers_the_reference() {
                         W as u32,
                         dil as u32,
                         t(o[0].0, 2, C, Dtype::Bf16),
-                    )
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
-                    kernels_slang::ssm::conv1d::conv1d(
-                        c,
-                        st(x),
-                        st(wt),
-                        &sp(&pool(o[1].0, sb, 2)),
-                        W as u32,
-                        dil as u32,
-                        st(t(o[0].0, 2, C, Dtype::Bf16)),
                     )
                 })
             },
@@ -173,30 +148,17 @@ fn the_conv1d_answers_the_reference() {
             &[want_y, want_s],
             &|g, o| {
                 g.run(|c| {
-                    ssm::causal_conv1d_chunked(
+                    kernels_slang::ssm::conv1d::conv1d_chunked(
                         c,
-                        x,
+                        kernels_slang::RaggedTensor {
+                            data: x.data,
+                            indptr: x.indptr,
+                        },
                         wt,
                         &pool(o[1].0, sb, rows),
                         W as u32,
                         dil as u32,
                         t(o[0].0, rows, C, Dtype::Bf16),
-                    )
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
-                    kernels_slang::ssm::conv1d::conv1d_chunked(
-                        c,
-                        kernels_slang::RaggedTensor {
-                            data: st(x.data),
-                            indptr: st(x.indptr),
-                        },
-                        st(wt),
-                        &sp(&pool(o[1].0, sb, rows)),
-                        W as u32,
-                        dil as u32,
-                        st(t(o[0].0, rows, C, Dtype::Bf16)),
                     )
                 })
             },
@@ -237,17 +199,11 @@ fn the_conv1d_answers_the_reference() {
             begin += span;
         }
         let i32s = |buf: u32, n: usize| t(buf, n, 1, Dtype::I32);
-        let committed = ssm::Committed {
+        let committed = kernels_slang::ssm::Committed {
             replay: i32s(rb, 4),
             commit: i32s(cb, 4),
             slots: i32s(sb, 4),
             lane0: lane0 as u32,
-        };
-        let slang_committed = kernels_slang::ssm::Committed {
-            replay: st(committed.replay),
-            commit: st(committed.commit),
-            slots: st(committed.slots),
-            lane0: committed.lane0,
         };
         let x = t(xb, rows, C, Dtype::Bf16);
         let window = i32s(ib, 4);
@@ -258,7 +214,7 @@ fn the_conv1d_answers_the_reference() {
             &[want_y, want_s],
             &|g, o| {
                 g.run(|c| {
-                    ssm::causal_conv1d_committed(
+                    kernels_slang::ssm::conv1d::conv1d_committed(
                         c,
                         x,
                         window,
@@ -268,21 +224,6 @@ fn the_conv1d_answers_the_reference() {
                         W as u32,
                         dil as u32,
                         t(o[0].0, rows, C, Dtype::Bf16),
-                    )
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
-                    kernels_slang::ssm::conv1d::conv1d_committed(
-                        c,
-                        st(x),
-                        st(window),
-                        &slang_committed,
-                        st(wt),
-                        &sp(&pool(o[1].0, sb, 4)),
-                        W as u32,
-                        dil as u32,
-                        st(t(o[0].0, rows, C, Dtype::Bf16)),
                     )
                 })
             },

@@ -22,8 +22,12 @@ spirv = []
 # WGSL modules (engine-wgpu).
 wgsl = []
 
+# `cores`: the device's core count, read through Vulkan (ash).
+probe = ["dep:ash"]
+
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
+ash = { version = "0.38", default-features = false, optional = true }
 
 [lints]
 workspace = true

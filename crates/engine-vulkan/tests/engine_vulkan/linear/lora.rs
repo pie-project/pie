@@ -1,17 +1,12 @@
-//! The LoRA correction on the first Vulkan device, beside the hand-written
-//! kernel, against an f64 host reference: three rows over two adapters and
-//! a row with none, added onto a live output, at the subgroup tier and the
-//! baseline.
+//! The LoRA correction on the first Vulkan device, against an f64 host
+//! reference: three rows over two adapters and a row with none, added onto a
+//! live output, at the subgroup tier and the baseline.
 
+use kernels_slang::Tensor;
 use kernels_slang::Tier;
-use kernels_vulkan::{Arg, Encode, Fire, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, both, noise};
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 fn t(b: u32, r: usize, w: usize, d: Dtype) -> Tensor {
     Tensor::new(b, r as u32, w as u32, d)
@@ -65,29 +60,7 @@ fn the_lora_correction_answers_the_reference() {
             std::slice::from_ref(&want),
             &|g, o| {
                 let y = t(o[0].0, rows, out, Dtype::Bf16);
-                g.run(|c| {
-                    c.fire(
-                        Fire::at("gemm/lora.slang", "lora_correct_bf16")
-                            .groups([1, rows as u32, 1])
-                            .group([256, 1, 1]),
-                        &[
-                            xt.arg(),
-                            at.arg(),
-                            bt.arg(),
-                            rt.arg(),
-                            y.arg_mut(),
-                            (input as i32).arg(),
-                            (out as i32).arg(),
-                            (rank as i32).arg(),
-                        ],
-                    )
-                });
-            },
-            &|g, o| {
-                let y = st(t(o[0].0, rows, out, Dtype::Bf16));
-                g.run_slang(|c| {
-                    kernels_slang::linear::lora::correct(c, tier, st(xt), st(at), st(bt), st(rt), y)
-                });
+                g.run(|c| kernels_slang::linear::lora::correct(c, tier, xt, at, bt, rt, y));
             },
         );
     }

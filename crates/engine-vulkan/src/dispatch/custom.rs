@@ -16,15 +16,14 @@ impl poem_exec::DispatchConv for Run<'_> {
 }
 
 impl Run<'_> {
-    fn conv(&mut self, op: &poem_ir::Conv) -> Result<(), kernels_vulkan::Error> {
-        use crate::encode::{from_slang, slang_tensor};
+    fn conv(&mut self, op: &poem_ir::Conv) -> Result<(), kernels_slang::Error> {
         use kernels_slang::conv::{conv3d, group_norm, resample, rule};
         use poem_ir::Conv;
-        let ctx = self.slang();
-        let t = |id: poem_ir::ValueId| slang_tensor(self.tensor(id));
+        let ctx = self.ctx;
+        let t = |id: poem_ir::ValueId| self.tensor(id);
         match op {
             Conv::Grid { grid, rule, y } => rule::derive_grid(
-                &ctx,
+                ctx,
                 t(*grid),
                 match *rule {
                     poem_ir::GridRule::Conv {
@@ -71,12 +70,12 @@ impl Run<'_> {
                 y,
             } => {
                 if cache.is_some() {
-                    return Err(kernels_vulkan::Error::Unsupported {
+                    return Err(kernels_slang::Error::Unsupported {
                         op: "conv.conv3d (with a frame cache)",
                     });
                 }
                 conv3d::conv3d(
-                    &ctx,
+                    ctx,
                     t(*x),
                     t(*grid),
                     t(*w),
@@ -108,7 +107,7 @@ impl Run<'_> {
             } => {
                 let clips = self.tensor(*grid).rows;
                 let (partials, stats) = self.spatial_moments(clips, *groups).ok_or_else(|| {
-                    kernels_vulkan::Error::Backend {
+                    kernels_slang::Error::Backend {
                         op: "conv.group_norm",
                         detail: format!(
                             "this load reserved no moment plane for {clips} clip(s) at \
@@ -117,7 +116,7 @@ impl Run<'_> {
                     }
                 })?;
                 group_norm::group_norm(
-                    &ctx,
+                    ctx,
                     t(*x),
                     t(*grid),
                     *groups,
@@ -125,8 +124,8 @@ impl Run<'_> {
                     t(*bias),
                     *eps,
                     *silu,
-                    slang_tensor(partials),
-                    slang_tensor(stats),
+                    partials,
+                    stats,
                     t(*y),
                 )
             }
@@ -138,7 +137,7 @@ impl Run<'_> {
                 y_grid,
                 y,
             } => resample::upsample_nearest(
-                &ctx,
+                ctx,
                 t(*x),
                 t(*grid),
                 *factor,
@@ -153,14 +152,14 @@ impl Run<'_> {
                 trim_t,
                 y_grid,
                 y,
-            } => resample::pixel_shuffle(&ctx, t(*x), t(*grid), *r, *trim_t, t(*y_grid), t(*y)),
+            } => resample::pixel_shuffle(ctx, t(*x), t(*grid), *r, *trim_t, t(*y_grid), t(*y)),
             Conv::PixelUnshuffle {
                 x,
                 grid,
                 r,
                 y_grid,
                 y,
-            } => resample::pixel_unshuffle(&ctx, t(*x), t(*grid), *r, t(*y_grid), t(*y)),
+            } => resample::pixel_unshuffle(ctx, t(*x), t(*grid), *r, t(*y_grid), t(*y)),
             Conv::AvgDown {
                 x,
                 grid,
@@ -168,12 +167,11 @@ impl Run<'_> {
                 group,
                 y_grid,
                 y,
-            } => resample::avg_down(&ctx, t(*x), t(*grid), *factor, *group, t(*y_grid), t(*y)),
+            } => resample::avg_down(ctx, t(*x), t(*grid), *factor, *group, t(*y_grid), t(*y)),
             Conv::CacheStore { .. } | Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
-                return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
         }
-        .map_err(from_slang)
     }
 }
 
@@ -210,7 +208,7 @@ impl poem_exec::DispatchProbe for Run<'_> {
             };
             let t = self.tensor(id);
             let total = u64::from(t.rows) * u64::from(t.width) * elem;
-            if total == 0 || t.buf == kernels_vulkan::ABSENT {
+            if total == 0 || t.buf == kernels_slang::ABSENT {
                 continue;
             }
             let Ok(bytes) = self.handles().read(t.buf, total) else {

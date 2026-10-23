@@ -1,4 +1,4 @@
-use kernels_vulkan::{Error, Tensor};
+use kernels_slang::{Error, Tensor};
 use poem_ir::ValueId;
 
 use crate::rs::Seat;
@@ -28,9 +28,9 @@ impl Run<'_> {
 
     pub(crate) fn rs_committed(&self, seat: &Seat) -> kernels_slang::ssm::Committed {
         kernels_slang::ssm::Committed {
-            replay: crate::encode::slang_tensor(seat.replay),
-            commit: crate::encode::slang_tensor(seat.commit),
-            slots: crate::encode::slang_tensor(seat.slots),
+            replay: seat.replay,
+            commit: seat.commit,
+            slots: seat.slots,
             lane0: self.window().span.lane_offset,
         }
     }
@@ -54,12 +54,11 @@ impl Run<'_> {
             .cut(dst.0, dst.1, bytes)
             .map_err(|fault| Self::kernel(fault, op))?;
         kernels_slang::gather::rows::copy_words(
-            &self.slang(),
-            crate::encode::slang_tensor(Tensor::new(src, 1, 1, poem_ir::Dtype::U32)),
-            crate::encode::slang_tensor(Tensor::new(dst, 1, 1, poem_ir::Dtype::U32)),
+            self.ctx,
+            Tensor::new(src, 1, 1, poem_ir::Dtype::U32),
+            Tensor::new(dst, 1, 1, poem_ir::Dtype::U32),
             bytes,
         )
-        .map_err(crate::encode::from_slang)
     }
 
     #[allow(clippy::too_many_arguments)]

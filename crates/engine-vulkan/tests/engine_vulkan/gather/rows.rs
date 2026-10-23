@@ -1,17 +1,13 @@
-//! Row movement on the first Vulkan device, beside the hand-written kernels: gather,
-//! scatter (live rows skipping a negative route), permutation packing, the
-//! pool and merge folds, a layer's slice, the splits, and a flat word copy.
-//! The movers are exact, so the reference is the moved values themselves.
+//! Row movement on the first Vulkan device: gather, scatter (live rows
+//! skipping a negative route), permutation packing, the pool and merge
+//! folds, a layer's slice, the splits, and a flat word copy. The movers are
+//! exact, so the reference is the moved values themselves.
 
 use crate::gpu::{Gpu, both, noise};
-use kernels_vulkan::{Tensor, layout};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 const W: usize = 48;
-
-fn st(t: Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
 
 #[test]
 fn the_row_movers_answer_the_reference() {
@@ -45,16 +41,11 @@ fn the_row_movers_answer_the_reference() {
             &[want],
             &|g, o| {
                 g.run(|c| {
-                    layout::gather_rows(c, t(src, rows, W, dtype), it, t(o[0].0, k, W, dtype))
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
                     kernels_slang::gather::rows::gather_rows(
                         c,
-                        st(t(src, rows, W, dtype)),
-                        st(it),
-                        st(t(o[0].0, k, W, dtype)),
+                        t(src, rows, W, dtype),
+                        it,
+                        t(o[0].0, k, W, dtype),
                     )
                 })
             },
@@ -71,16 +62,11 @@ fn the_row_movers_answer_the_reference() {
             &[want],
             &|g, o| {
                 g.run(|c| {
-                    layout::scatter_rows(c, t(src, k, W, dtype), it, t(o[0].0, rows, W, dtype))
-                })
-            },
-            &|g, o| {
-                g.run_slang(|c| {
                     kernels_slang::gather::rows::scatter_rows(
                         c,
-                        st(t(src, k, W, dtype)),
-                        st(it),
-                        st(t(o[0].0, rows, W, dtype)),
+                        t(src, k, W, dtype),
+                        it,
+                        t(o[0].0, rows, W, dtype),
                     )
                 })
             },
@@ -103,21 +89,11 @@ fn the_row_movers_answer_the_reference() {
         &[want],
         &|g, o| {
             g.run(|c| {
-                layout::scatter_live_rows(
+                kernels_slang::gather::rows::scatter_live_rows(
                     c,
                     t(xb, 3, W, Dtype::Bf16),
                     rt,
                     t(o[0].0, rows, W, Dtype::Bf16),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::gather::rows::scatter_live_rows(
-                    c,
-                    st(t(xb, 3, W, Dtype::Bf16)),
-                    st(rt),
-                    st(t(o[0].0, rows, W, Dtype::Bf16)),
                 )
             })
         },
@@ -131,25 +107,25 @@ fn the_row_movers_answer_the_reference() {
         .flat_map(|&r| xr[r as usize * W..][..W].to_vec())
         .collect();
     let packed = gpu.zeros(rows * W);
-    gpu.run_slang(|c| {
+    gpu.run(|c| {
         kernels_slang::gather::rows::pack_rows(
             c,
-            st(t(xb, rows, W, Dtype::Bf16)),
-            st(pt),
-            st(t(packed, rows, W, Dtype::Bf16)),
+            t(xb, rows, W, Dtype::Bf16),
+            pt,
+            t(packed, rows, W, Dtype::Bf16),
         )
     });
-    crate::gpu::close(&gpu.down(packed, rows * W), &packed_want, "slang pack rows");
+    crate::gpu::close(&gpu.down(packed, rows * W), &packed_want, "pack rows");
     let back = gpu.zeros(rows * W);
-    gpu.run_slang(|c| {
+    gpu.run(|c| {
         kernels_slang::gather::rows::unpack_rows(
             c,
-            st(t(packed, rows, W, Dtype::Bf16)),
-            st(pt),
-            st(t(back, rows, W, Dtype::Bf16)),
+            t(packed, rows, W, Dtype::Bf16),
+            pt,
+            t(back, rows, W, Dtype::Bf16),
         )
     });
-    crate::gpu::close(&gpu.down(back, rows * W), &xr, "slang unpack rows");
+    crate::gpu::close(&gpu.down(back, rows * W), &xr, "unpack rows");
 
     // pool and merge: 4 rows of a 2 x 2 fold (an 8-row source, 2 blocks)
     let (sb, sr) = gpu.up(&noise(3, 8 * W));
@@ -169,16 +145,11 @@ fn the_row_movers_answer_the_reference() {
         &[pooled],
         &|g, o| {
             g.run(|c| {
-                layout::pool_rows(c, t(sb, 8, W, Dtype::Bf16), 2, t(o[0].0, 2, W, Dtype::Bf16))
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
                 kernels_slang::gather::rows::pool_rows(
                     c,
-                    st(t(sb, 8, W, Dtype::Bf16)),
+                    t(sb, 8, W, Dtype::Bf16),
                     2,
-                    st(t(o[0].0, 2, W, Dtype::Bf16)),
+                    t(o[0].0, 2, W, Dtype::Bf16),
                 )
             })
         },
@@ -190,21 +161,11 @@ fn the_row_movers_answer_the_reference() {
         std::slice::from_ref(&sr),
         &|g, o| {
             g.run(|c| {
-                layout::merge_rows(
+                kernels_slang::gather::rows::merge_rows(
                     c,
                     t(sb, 8, W, Dtype::Bf16),
                     2,
                     t(o[0].0, 2, 4 * W, Dtype::Bf16),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::gather::rows::merge_rows(
-                    c,
-                    st(t(sb, 8, W, Dtype::Bf16)),
-                    2,
-                    st(t(o[0].0, 2, 4 * W, Dtype::Bf16)),
                 )
             })
         },
@@ -221,23 +182,12 @@ fn the_row_movers_answer_the_reference() {
         &[want],
         &|g, o| {
             g.run(|c| {
-                layout::select(
+                kernels_slang::gather::rows::select(
                     c,
                     t(xb, rows, W, Dtype::Bf16),
                     1,
                     16,
                     t(o[0].0, rows, 16, Dtype::Bf16),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::gather::rows::select(
-                    c,
-                    st(t(xb, rows, W, Dtype::Bf16)),
-                    1,
-                    16,
-                    st(t(o[0].0, rows, 16, Dtype::Bf16)),
                 )
             })
         },
@@ -259,23 +209,12 @@ fn the_row_movers_answer_the_reference() {
         &[cut(0, 20), cut(20, 28)],
         &|g, o| {
             g.run(|c| {
-                layout::split_rows(
+                kernels_slang::gather::rows::split_rows(
                     c,
                     t(xb, rows, W, Dtype::Bf16),
                     20,
                     t(o[0].0, rows, 20, Dtype::Bf16),
                     t(o[1].0, rows, 28, Dtype::Bf16),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::gather::rows::split_rows(
-                    c,
-                    st(t(xb, rows, W, Dtype::Bf16)),
-                    20,
-                    st(t(o[0].0, rows, 20, Dtype::Bf16)),
-                    st(t(o[1].0, rows, 28, Dtype::Bf16)),
                 )
             })
         },
@@ -292,14 +231,10 @@ fn the_row_movers_answer_the_reference() {
         &[cut(0, 16), cut(16, 16), cut(32, 16)],
         &|g, o| {
             let p = |i: usize| t(o[i].0, rows, 16, Dtype::Bf16);
-            g.run(|c| layout::split_qkv(c, t(xb, rows, W, Dtype::Bf16), 16, 16, p(0), p(1), p(2)))
-        },
-        &|g, o| {
-            let p = |i: usize| st(t(o[i].0, rows, 16, Dtype::Bf16));
-            g.run_slang(|c| {
+            g.run(|c| {
                 kernels_slang::gather::rows::split_qkv(
                     c,
-                    st(t(xb, rows, W, Dtype::Bf16)),
+                    t(xb, rows, W, Dtype::Bf16),
                     16,
                     16,
                     p(0),
@@ -330,23 +265,12 @@ fn the_row_movers_answer_the_reference() {
         &[q_want, g_want],
         &|g, o| {
             g.run(|c| {
-                layout::split_q_gate(
+                kernels_slang::gather::rows::split_q_gate(
                     c,
                     t(xb, rows, W, Dtype::Bf16),
                     8,
                     t(o[0].0, rows, 24, Dtype::Bf16),
                     t(o[1].0, rows, 24, Dtype::Bf16),
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::gather::rows::split_q_gate(
-                    c,
-                    st(t(xb, rows, W, Dtype::Bf16)),
-                    8,
-                    st(t(o[0].0, rows, 24, Dtype::Bf16)),
-                    st(t(o[1].0, rows, 24, Dtype::Bf16)),
                 )
             })
         },
@@ -360,20 +284,10 @@ fn the_row_movers_answer_the_reference() {
         std::slice::from_ref(&xf64),
         &|g, o| {
             g.run(|c| {
-                layout::copy_words(
+                kernels_slang::gather::rows::copy_words(
                     c,
                     t(xf, 1, 1, Dtype::U32),
                     t(o[0].0, 1, 1, Dtype::U32),
-                    (rows * W * 4) as u64,
-                )
-            })
-        },
-        &|g, o| {
-            g.run_slang(|c| {
-                kernels_slang::gather::rows::copy_words(
-                    c,
-                    st(t(xf, 1, 1, Dtype::U32)),
-                    st(t(o[0].0, 1, 1, Dtype::U32)),
                     (rows * W * 4) as u64,
                 )
             })

@@ -1,4 +1,4 @@
-use kernels_vulkan::{ArgValue, Encode, Error, Fire};
+use kernels_slang::{ArgValue, Comm, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
 use crate::device::handles::NIL;
@@ -245,7 +245,11 @@ impl Encode for Sink<'_> {
         Ok(ArgValue::Buffer(NIL))
     }
 
-    fn comm(&self, op: &'static str) -> Result<kernels_vulkan::Comm, Error> {
+    fn target(&self) -> Target {
+        Target::Spirv
+    }
+
+    fn comm(&self, op: &'static str) -> Result<Comm, Error> {
         let comm = self.comm.ok_or(Error::Unsupported { op })?;
 
         let band = self
@@ -259,11 +263,10 @@ impl Encode for Sink<'_> {
             op,
             detail: fault.to_string(),
         })?;
-        Ok(kernels_vulkan::Comm {
+        Ok(Comm {
             rank: comm.rank(),
             world: comm.world(),
-
-            band: kernels_vulkan::Tensor::new(band, 1, 0, poem_ir::Dtype::Bf16),
+            band,
             slot_bytes,
         })
     }
@@ -280,142 +283,19 @@ impl Encode for Sink<'_> {
     }
 }
 
-/// Any kernels-vulkan context as a kernels-slang one: its `Fire` and arguments
-/// are kernels-vulkan's, field for field.
-pub struct Slang<'a>(pub &'a kernels_vulkan::Ctx<'a>);
-
-impl kernels_slang::Encode for Slang<'_> {
-    fn fire(
-        &self,
-        fire: kernels_slang::Fire,
-        args: &[kernels_slang::ArgValue],
-    ) -> std::result::Result<(), kernels_slang::Error> {
-        let entrypoint = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
-            kernels_slang::Error::Backend {
-                op: "slang.fire",
-                detail: format!(
-                    "`{}` is not instantiated at the {} tier",
-                    fire.entrypoint,
-                    fire.tier.name()
-                ),
-            }
-        })?;
-        let fire = Fire {
-            file: fire.file,
-            entrypoint,
-            groups: fire.groups,
-            group: fire.group,
-        };
-        let args: Vec<ArgValue> = args.iter().map(|a| vulkan_arg(*a)).collect();
-        self.0.fire(fire, &args).map_err(slang_error)
-    }
-
-    fn target(&self) -> kernels_slang::Target {
-        kernels_slang::Target::Spirv
-    }
-
-    fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
-        match self.0.absent().map_err(slang_error)? {
-            ArgValue::Buffer(h) => Ok(kernels_slang::ArgValue::Buffer(h)),
-            ArgValue::BufferMut(h) => Ok(kernels_slang::ArgValue::BufferMut(h)),
-            ArgValue::I32(v) => Ok(kernels_slang::ArgValue::I32(v)),
-            ArgValue::U32(v) => Ok(kernels_slang::ArgValue::U32(v)),
-            ArgValue::F32(v) => Ok(kernels_slang::ArgValue::F32(v)),
-        }
-    }
-
-    fn comm(
-        &self,
-        op: &'static str,
-    ) -> std::result::Result<kernels_slang::Comm, kernels_slang::Error> {
-        let comm = self.0.comm(op).map_err(slang_error)?;
-        Ok(kernels_slang::Comm {
-            rank: comm.rank,
-            world: comm.world,
-            band: comm.band.buf,
-            slot_bytes: comm.slot_bytes,
-        })
-    }
-
-    fn rendezvous(&self, op: &'static str) -> std::result::Result<(), kernels_slang::Error> {
-        self.0.rendezvous(op).map_err(slang_error)
-    }
-}
-
-fn vulkan_arg(arg: kernels_slang::ArgValue) -> ArgValue {
-    match arg {
-        kernels_slang::ArgValue::Buffer(h) => ArgValue::Buffer(h),
-        kernels_slang::ArgValue::BufferMut(h) => ArgValue::BufferMut(h),
-        kernels_slang::ArgValue::I32(v) => ArgValue::I32(v),
-        kernels_slang::ArgValue::U32(v) => ArgValue::U32(v),
-        kernels_slang::ArgValue::F32(v) => ArgValue::F32(v),
-    }
-}
-
-/// kernels-slang's refusal as kernels-vulkan's.
-pub fn from_slang(e: kernels_slang::Error) -> Error {
-    match e {
-        kernels_slang::Error::Backend { op, detail } => Error::Backend { op, detail },
-        kernels_slang::Error::Unsupported { op } => Error::Unsupported { op },
-        kernels_slang::Error::DtypeUnsupported { op, dtype } => {
-            Error::DtypeUnsupported { op, dtype }
-        }
-    }
-}
-
-/// A kernels-vulkan tensor as kernels-slang's: the same handle and shape.
-#[must_use]
-pub fn slang_tensor(t: kernels_vulkan::Tensor) -> kernels_slang::Tensor {
-    kernels_slang::Tensor::new(t.buf, t.rows, t.width, t.dtype)
-}
-
-pub fn slang_pool(p: &kernels_vulkan::KvPool) -> kernels_slang::KvPool {
-    kernels_slang::KvPool {
-        keys: slang_tensor(p.keys),
-        values: slang_tensor(p.values),
-        page_indices: slang_tensor(p.page_indices),
-        page_indptr: slang_tensor(p.page_indptr),
-        page_size: p.page_size,
-        seq_stride: p.seq_stride,
-        head_stride: p.head_stride,
-    }
-}
-
-pub fn slang_ragged(r: kernels_vulkan::RaggedTensor) -> kernels_slang::RaggedTensor {
-    kernels_slang::RaggedTensor {
-        data: slang_tensor(r.data),
-        indptr: slang_tensor(r.indptr),
-    }
-}
-
-pub fn slang_bank(b: kernels_vulkan::Bank) -> kernels_slang::Bank {
-    kernels_slang::Bank {
-        codes: slang_tensor(b.codes),
-        scales: slang_tensor(b.scales),
-        biases: b.biases.map(slang_tensor),
-        group: b.group,
-        bits: b.bits,
-    }
-}
-
-fn slang_error(e: Error) -> kernels_slang::Error {
-    match e {
-        Error::Backend { op, detail } => kernels_slang::Error::Backend { op, detail },
-        Error::Unsupported { op } => kernels_slang::Error::Unsupported { op },
-        Error::DtypeUnsupported { op, dtype } => {
-            kernels_slang::Error::DtypeUnsupported { op, dtype }
-        }
-    }
-}
-
-#[cfg(feature = "vulkan")]
 impl Sink<'_> {
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         use ash::vk;
 
+        let key = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
+            Sink::backend(
+                fire,
+                format!("not instantiated at the {} tier", fire.tier.name()),
+            )
+        })?;
         let pipeline = self
             .pipelines
-            .get(self.device, fire)
+            .get(self.device, fire.file, key)
             .map_err(|fault| Sink::refuse(fire, fault))?;
 
         let dummy = &self.device.dummy;
@@ -610,7 +490,7 @@ impl Sink<'_> {
                 match slot.as_mut() {
                     Some(t) if (t.names.len() as u32) < t.capacity => {
                         let at = t.names.len() as u32;
-                        t.names.push(fire.entrypoint);
+                        t.names.push(key);
                         Some((t.pool, at))
                     }
                     _ => None,
@@ -635,14 +515,14 @@ impl Sink<'_> {
             }
         }
         self.frame.dispatches.set(self.frame.dispatches.get() + 1);
-        record_kernel(fire.entrypoint);
+        record_kernel(key);
         if CAPTURING.load(std::sync::atomic::Ordering::Acquire) {
             use ash::vk::Handle;
             SHAPES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(DispatchShape {
-                    entrypoint: fire.entrypoint,
+                    entrypoint: key,
                     bindings: infos
                         .iter()
                         .take(declared)
@@ -700,18 +580,22 @@ impl Encode for Sink<'_> {
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
     }
+
+    fn target(&self) -> Target {
+        Target::Spirv
+    }
 }
 
 /// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs.
 pub(crate) fn qmm_ladder(
-    tuning: &kernels_vulkan::Tuning,
+    tuning: &crate::tuning::Tuning,
     rows: u32,
     columns: u32,
     contraction: u32,
-    bank: kernels_vulkan::Bank,
+    bank: kernels_slang::Bank,
 ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    use crate::tuning::Qmm;
     use kernels_slang::linear::qmm::Qmm as Rung;
-    use kernels_vulkan::tuning::Qmm;
     let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
     tuning
         .qmm(&at)
