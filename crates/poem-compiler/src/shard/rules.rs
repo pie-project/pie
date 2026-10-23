@@ -198,7 +198,7 @@ fn rule(name: &str) -> Rule {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
             follow: &["routed", "shared"],
         },
-        "layout.embed" => Rule::Lookup { table: "table" },
+        "layout.embed" | "layout.embed_concat" => Rule::Lookup { table: "table" },
         "attention.plan_prefill" | "attention.plan_decode" => Rule::Plan {
             scale: &["q_heads", KV_HEADS],
         },
