@@ -5,7 +5,7 @@ pub use classes::{fact_width, resolve_classes};
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
-use crate::ops::{Attn, Elemwise, Fused, Linear};
+use crate::ops::Elemwise;
 use crate::{Def, Dim, Dtype, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,12 +26,9 @@ pub enum DefKind {
     Merge,
 }
 
+/// The operand a type check names: the field the op declares it on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Port {
-    In(usize),
-    Out(usize),
-    Named(&'static str),
-}
+pub struct Port(pub &'static str);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect {
@@ -151,11 +148,6 @@ pub enum Fault {
         arm: ValueId,
         merge_ty: Ty,
         arm_ty: Ty,
-    },
-    PortMissing {
-        node: usize,
-        op: &'static str,
-        port: Port,
     },
     PortKind {
         node: usize,
@@ -309,26 +301,9 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             }
         }
 
-        let mut ports: Vec<(Port, ValueId, Expect)> = Vec::new();
-        for &(port, want) in expect(&node.op) {
-            let id = match port {
-                Port::In(i) => ins.get(i),
-                Port::Out(i) => outs.get(i),
-                Port::Named(_) => unreachable!("the table is positional"),
-            };
-            let Some(&id) = id else {
-                faults.push(Fault::PortMissing { node: j, op, port });
-                continue;
-            };
-            ports.push((port, id, want));
-        }
         named.clear();
         node.op.ports(&mut named);
-        ports.extend(
-            named
-                .iter()
-                .map(|&(name, id, want)| (Port::Named(name), id, want)),
-        );
+        let ports = named.iter().map(|&(name, id, want)| (Port(name), id, want));
         for (port, id, want) in ports {
             if !in_range(id) {
                 continue;
@@ -633,191 +608,6 @@ fn intact(
     }
 }
 
-fn expect(op: &Operation) -> &'static [(Port, Expect)] {
-    use Port::{In, Out};
-
-    const I32: Expect = Expect::I32;
-    const F32: Expect = Expect::F32;
-    const CACHE: Expect = Expect::CACHE;
-    const DECODE_PLAN: Expect = Expect::DECODE_PLAN;
-    const PREFILL_PLAN: Expect = Expect::PREFILL_PLAN;
-    const MLA_PLAN: Expect = Expect::MLA_PLAN;
-
-    match op {
-        Operation::Fused(op) => match op {
-            Fused::NormModulate {
-                lane_of_row: Some(_),
-                ..
-            } => &[(In(2), I32)],
-            Fused::GatedResidualNormModulate {
-                lane_of_row: Some(_),
-                ..
-            } => &[(In(4), I32)],
-            Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
-            Fused::HcNormProject { .. } => &[(In(1), F32), (Out(0), F32)],
-            Fused::QGateNormRopeAppend { .. } => {
-                &[(In(4), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
-            }
-            Fused::GdnStep { .. } => {
-                &[(In(2), CACHE), (In(6), CACHE), (Out(3), F32), (Out(4), F32)]
-            }
-            Fused::NormRopeLast { .. } => &[(In(1), I32)],
-            Fused::IndexTopkRope { .. } => &[(In(1), I32), (In(2), CACHE), (Out(1), I32)],
-            // q's rows and positions, then the plane's rows, weight,
-            // positions, cache and write tables.
-            Fused::NormRopePair { .. } => &[
-                (In(1), I32),
-                (In(4), I32),
-                (In(5), CACHE),
-                (In(6), I32),
-                (In(7), I32),
-            ],
-            Fused::PoolCompress { .. } => &[
-                (In(0), I32),
-                (In(1), I32),
-                (In(2), CACHE),
-                (In(4), I32),
-                (In(5), CACHE),
-                (In(6), I32),
-                (In(7), I32),
-            ],
-            Fused::NormRopeLastAppend { .. } => {
-                &[(In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
-            }
-            Fused::EmbedScaleAdd { .. } | Fused::EmbedScaleAddSelect { .. } => &[(In(0), I32)],
-            Fused::QkvFusedQknormRopeVnormWrite { .. } | Fused::SplitQkvFused { .. } => {
-                &[(In(1), CACHE), (In(2), I32), (In(3), I32)]
-            }
-            Fused::RopeYarnAppend { .. } => {
-                &[(In(3), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
-            }
-            Fused::SplitRopeYarnAppend { .. } => {
-                &[(In(1), I32), (In(2), CACHE), (In(3), I32), (In(4), I32)]
-            }
-            Fused::QgQknormRopeAppend { .. } => {
-                &[(In(3), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
-            }
-            // The window's plan and cache (inputs 1, 2), the pool's from input
-            // 4 (5 under a floored window, whose floor is input 3), and the
-            // three f32 log-sum-exp planes (outputs 1, 3, 5).
-            Fused::PoolAttention { window, pool, .. }
-                if matches!(**window, Attn::PrefillLse { floor: Some(_), .. }) =>
-            {
-                match **pool {
-                    Attn::PoolLseSelected { .. } => &[
-                        (In(1), PREFILL_PLAN),
-                        (In(2), CACHE),
-                        (In(3), I32),
-                        (In(5), I32),
-                        (In(6), I32),
-                        (In(7), I32),
-                        (In(8), CACHE),
-                        (Out(1), F32),
-                        (Out(3), F32),
-                        (Out(5), F32),
-                    ],
-                    _ => &[
-                        (In(1), PREFILL_PLAN),
-                        (In(2), CACHE),
-                        (In(3), I32),
-                        (In(5), I32),
-                        (In(6), I32),
-                        (In(7), CACHE),
-                        (Out(1), F32),
-                        (Out(3), F32),
-                        (Out(5), F32),
-                    ],
-                }
-            }
-            Fused::PoolAttention { pool, .. } => match **pool {
-                Attn::PoolLseSelected { .. } => &[
-                    (In(1), PREFILL_PLAN),
-                    (In(2), CACHE),
-                    (In(4), I32),
-                    (In(5), I32),
-                    (In(6), I32),
-                    (In(7), CACHE),
-                    (Out(1), F32),
-                    (Out(3), F32),
-                    (Out(5), F32),
-                ],
-                _ => &[
-                    (In(1), PREFILL_PLAN),
-                    (In(2), CACHE),
-                    (In(4), I32),
-                    (In(5), I32),
-                    (In(6), CACHE),
-                    (Out(1), F32),
-                    (Out(3), F32),
-                    (Out(5), F32),
-                ],
-            },
-            // The plane, then the normed rows and the mixes.
-            Fused::HcPrenormProject { .. } => &[(In(1), F32), (Out(0), F32), (Out(1), F32)],
-            // The gates' mixes, then their post and combine mixes.
-            Fused::HcGatesNorm { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
-            Fused::ResBlendRmsnorm { .. } => &[],
-            // The plane, then the normed streams, the mixes and the post and
-            // combine mixes.
-            Fused::HcPre { .. } => &[
-                (In(1), F32),
-                (Out(0), F32),
-                (Out(1), F32),
-                (Out(3), F32),
-                (Out(4), F32),
-            ],
-            // `kv_b` (input 1), the plan, then the cache: after the rope
-            // half where the rows come apart.
-            Fused::MlaPrefillExpanded { split: Some(_), .. } => {
-                &[(In(2), MLA_PLAN), (In(3), CACHE)]
-            }
-            Fused::MlaPrefillExpanded { split: None, .. } => &[(In(2), MLA_PLAN), (In(4), CACHE)],
-            // The attention's own, and the sink's f32 log-sum-exp is its.
-            Fused::LseSink { attn, .. } => match **attn {
-                Attn::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
-                Attn::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
-                _ => &[],
-            },
-            Fused::ResidualAddRmsnorm { .. }
-            | Fused::RmsnormResidualAdd { .. }
-            | Fused::NormModulate {
-                lane_of_row: None, ..
-            }
-            | Fused::GatedResidualNormModulate {
-                lane_of_row: None, ..
-            }
-            | Fused::MatmulGeglu { .. }
-            | Fused::MatmulSwiglu { .. }
-            | Fused::MlpSwiglu { .. }
-            | Fused::LmHeadSoftcap { .. }
-            | Fused::MatmulBias { .. }
-            | Fused::MatmulSplitRows { .. } => &[],
-            // The select's own: its routes are i32.
-            Fused::MoeSelectGlu { select, .. } => match select.as_ref() {
-                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
-                _ => &[(In(2), I32)],
-            },
-            // The select's routes, then the sum's weights.
-            Fused::MoeExperts { select, .. } => match select.as_ref() {
-                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32), (In(4), F32)],
-                Linear::MoeMatmulSelectActQuant {
-                    input_scales: Some(_),
-                    ..
-                } => &[(In(2), I32), (In(3), F32), (In(4), F32)],
-                _ => &[(In(2), I32), (In(3), F32)],
-            },
-        },
-        Operation::Collective(_)
-        | Operation::Sampling(_)
-        | Operation::Ssm(_)
-        | Operation::Conv(_)
-        | Operation::Gather(_)
-        | Operation::Elemwise(_)
-        | Operation::Linear(_)
-        | Operation::Attn(_) => &[],
-    }
-}
-
 impl DefKind {
     fn of(def: &Def) -> Self {
         match def {
@@ -890,11 +680,7 @@ impl Display for D {
 
 impl Display for Port {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Port::In(i) => write!(f, "input {i}"),
-            Port::Out(i) => write!(f, "output {i}"),
-            Port::Named(name) => write!(f, "`{name}`"),
-        }
+        write!(f, "`{}`", self.0)
     }
 }
 
@@ -1120,12 +906,6 @@ impl Display for Fault {
                     V(*arm),
                     T(arm_ty),
                     T(merge_ty)
-                )
-            }
-            Fault::PortMissing { node, op, port } => {
-                write!(
-                    f,
-                    "node {node} ({op}): the port table expects {port}, but the op's Operands impl does not produce it — the hand-written impl and the table have drifted"
                 )
             }
             Fault::PortKind {

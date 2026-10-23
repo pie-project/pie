@@ -96,7 +96,7 @@ impl Run<'_> {
                 scale,
                 post,
             } => {
-                let mut scaled = scale.map(|(_, scaled)| self.tensor(scaled));
+                let mut scaled = scale.map(|scale| self.tensor(scale.out));
                 let mut out = post.as_ref().map(|post| self.tensor(post.out));
                 // Under `kernel.elemwise.skip_unread` a row nothing reads past
                 // the chain goes unwritten: the normed row folded straight into
@@ -116,7 +116,7 @@ impl Run<'_> {
                 let mut t = self.tensor(*t);
                 let mut y = self.tensor(*y);
                 let scale = match (scale, scaled.as_mut()) {
-                    (Some((s, _)), Some(scaled)) => Some((self.tensor(*s), scaled)),
+                    (Some(scale), Some(scaled)) => Some((self.tensor(scale.by), scaled)),
                     _ => None,
                 };
                 let post = match (post, out.as_mut()) {

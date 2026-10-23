@@ -270,6 +270,7 @@ pub enum Attn {
         o: ValueId,
         #[input(F32)]
         lse: ValueId,
+        #[input]
         sink: ValueId,
         head_dim: u32,
         #[output(alias = o)]
@@ -697,6 +698,7 @@ pub enum Attn {
         request_of_token: ValueId,
         #[input(CACHE)]
         cache: ValueId,
+        #[input]
         sink: ValueId,
         window: u32,
         head_dim: u32,

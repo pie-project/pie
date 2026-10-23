@@ -458,15 +458,19 @@ impl Run<'_> {
             window,
             pool,
             merge,
-            sink,
-            head_dim,
-            o_out,
+            sink: sinked,
             rotate,
         } = op
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
-        let poem_ir::Attn::MergeLse { o, lse, .. } = **merge else {
+        let poem_ir::Attn::Sink {
+            sink,
+            head_dim,
+            o_out,
+            ..
+        } = &**sinked
+        else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         // The output's tail turned back with the output where the turn is
@@ -598,14 +602,7 @@ impl Run<'_> {
         self.attention(window)?;
         self.attention(pool)?;
         self.attention(merge)?;
-        self.attention(&poem_ir::Attn::Sink {
-            o,
-            lse,
-            sink: *sink,
-            head_dim: *head_dim,
-            o_out: *o_out,
-        })
-        .map(|()| false)
+        self.attention(sinked).map(|()| false)
     }
 
     /// Whether `window` reads V4.1's FP4 cache at `rows` the profile sends
