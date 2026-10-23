@@ -1,5 +1,5 @@
 //! Attn families. Paged attention lives in [`paged`] and is re-exported
-//! here, matching kernels-wgpu's `attn::` root.
+//! here, matching kernels-slang's `attn::` root.
 
 pub mod dense;
 pub mod index;

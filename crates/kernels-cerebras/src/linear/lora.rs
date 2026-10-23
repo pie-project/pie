@@ -3,7 +3,7 @@
 //!
 //! The banks are `bank_a: [adapters, rank · in]` (adapter `a`'s `[rank, in]`
 //! down projection, row-major) and `bank_b: [adapters, out · rank]` (its
-//! `[out, rank]` up projection), as kernels-wgpu `gemm/lora.wgsl` reads them.
+//! `[out, rank]` up projection), as kernels-slang `linear/lora.slang` reads them.
 //! One PE walks the rows: the waist `A[a] · x` is dotted into an f32 scratch,
 //! then each output lane dots its up row against the waist.
 

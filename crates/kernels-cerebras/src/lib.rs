@@ -8,7 +8,7 @@
 //! places the operands, assembles a fire's phases into programs, compiles
 //! and runs them.
 //!
-//! Entries follow the kernels-wgpu surface (module path, name, arguments) and
+//! Entries follow the kernels-slang surface (module path, name, arguments) and
 //! the numerics rules of `.wiki/xla/kernels.md`: compute in f32, round at the
 //! write, refuse rather than approximate.
 

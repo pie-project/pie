@@ -10,7 +10,7 @@
 //! · sm_scale`, probabilities meet values as `acc = acc · α + p · v`. A row
 //! that admits no key answers zeros and a `-inf` log-sum-exp (base 2).
 //!
-//! Reference: kernels-xla `attn::paged` (semantics), kernels-wgpu `attn::`
+//! Reference: kernels-xla `attn::paged` (semantics), kernels-slang `attn::`
 //! (signatures).
 
 #![allow(clippy::too_many_arguments)]
