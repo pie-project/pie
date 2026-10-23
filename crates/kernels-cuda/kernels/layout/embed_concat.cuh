@@ -13,6 +13,8 @@ __global__ void embed_concat(
     int heads,
     int width,
     int vocab,
+    int held,
+    int base,
     const u32* __restrict__ win)
 {
     const long long i =
@@ -30,10 +32,12 @@ __global__ void embed_concat(
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const long long at = (row * heads + h) * (long long)width + w;
 
+    // a tensor-parallel rank holds rows [base, base + held) of the table, zeros elsewhere
     const int id = ids[row * heads + h];
-    y[at] = (id < 0 || id >= vocab)
+    const int local = id - base;
+    y[at] = (id < 0 || id >= vocab || local < 0 || local >= held)
         ? Elem<T>::from_f32(0.f)
-        : table[(long long)id * width + w];
+        : table[(long long)local * width + w];
 }
 
 struct alignas(16) EmbedTableBases {
