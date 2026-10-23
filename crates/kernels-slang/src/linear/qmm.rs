@@ -284,3 +284,22 @@ fn register(ctx: &Ctx<'_>, op: &'static str, b: &Bounds, bm: u32, k16: bool) -> 
         &args(op, b)?,
     )
 }
+
+/// The `kernel.qmm` rung a fired module key belongs to, for a tuner that
+/// watches what a forced ladder ran.
+#[must_use]
+pub fn ran(key: &str) -> Option<&'static str> {
+    if key.starts_with("linear_qmm_tiled_") && key.ends_with(".coopmat") {
+        Some("coopmat")
+    } else if key.starts_with("linear_qmm_register_") {
+        Some("register_tiled")
+    } else if key.starts_with("linear_qmm_tiled_") || key.starts_with("linear_qmm_quad_") {
+        Some("tiled")
+    } else if key.starts_with("linear_qmv_row_") {
+        Some("one_row")
+    } else if key.starts_with("linear_qmv_") {
+        Some("qmv")
+    } else {
+        None
+    }
+}

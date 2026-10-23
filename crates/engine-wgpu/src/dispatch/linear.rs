@@ -21,14 +21,20 @@ impl Run<'_> {
         match op {
             Linear::Relu2 { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::matmul(
-                    self.ctx(),
-                    self.tuning(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                    self.capacity(*act).min(self.capacity(*y)),
-                ),
+                Some(bank) => {
+                    let capacity = self.capacity(*act).min(self.capacity(*y));
+                    let (act, y) = (self.tensor(*act), self.tensor(*y));
+                    let ladder = qmm_ladder(self.tuning(), act.rows, y.width, act.width, bank);
+                    kernels_slang::linear::qmm::matmul(
+                        &self.slang(),
+                        &ladder,
+                        crate::encode::slang_tensor(act),
+                        crate::encode::slang_bank(bank),
+                        crate::encode::slang_tensor(y),
+                        capacity,
+                    )
+                    .map_err(crate::encode::from_slang)
+                }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::matmul(
@@ -48,14 +54,20 @@ impl Run<'_> {
                 },
             },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::lm_head(
-                    self.ctx(),
-                    self.tuning(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                    self.capacity(*act).min(self.capacity(*y)),
-                ),
+                Some(bank) => {
+                    let capacity = self.capacity(*act).min(self.capacity(*y));
+                    let (act, y) = (self.tensor(*act), self.tensor(*y));
+                    let ladder = qmm_ladder(self.tuning(), act.rows, y.width, act.width, bank);
+                    kernels_slang::linear::qmm::lm_head(
+                        &self.slang(),
+                        &ladder,
+                        crate::encode::slang_tensor(act),
+                        crate::encode::slang_bank(bank),
+                        crate::encode::slang_tensor(y),
+                        capacity,
+                    )
+                    .map_err(crate::encode::from_slang)
+                }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::lm_head(
@@ -490,4 +502,27 @@ impl Run<'_> {
             .map_err(crate::encode::from_slang),
         }
     }
+}
+
+/// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs:
+/// the vector rung reads four activation rows a workgroup, kernels-vulkan's
+/// default.
+fn qmm_ladder(
+    tuning: &kernels_wgpu::Tuning,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+    bank: kernels_wgpu::Bank,
+) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    use kernels_slang::linear::qmm::Qmm as Rung;
+    use kernels_wgpu::tuning::Qmm;
+    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning
+        .qmm(&at)
+        .iter()
+        .map(|q| match *q {
+            Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+            Qmm::Qmv => Rung::Qmv { vecs: 4 },
+        })
+        .collect()
 }

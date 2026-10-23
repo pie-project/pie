@@ -684,3 +684,27 @@ impl Encode for Sink<'_> {
         Ok(ArgValue::Buffer(NIL))
     }
 }
+
+/// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs.
+pub(crate) fn qmm_ladder(
+    tuning: &kernels_vulkan::Tuning,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+    bank: kernels_vulkan::Bank,
+) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    use kernels_slang::linear::qmm::Qmm as Rung;
+    use kernels_vulkan::tuning::Qmm;
+    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning
+        .qmm(&at)
+        .iter()
+        .map(|q| match *q {
+            Qmm::Coopmat => Rung::Coopmat,
+            Qmm::RegisterTiled { bm, k16 } => Rung::RegisterTiled { bm, k16 },
+            Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+            Qmm::OneRow { lanes, rows } => Rung::OneRow { lanes, rows },
+            Qmm::Qmv { vecs } => Rung::Qmv { vecs },
+        })
+        .collect()
+}

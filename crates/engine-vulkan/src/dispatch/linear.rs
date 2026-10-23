@@ -26,14 +26,26 @@ impl Run<'_> {
                 )
             }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::matmul(
-                    self.ctx(),
-                    self.tuning(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                    self.capacity(*act).min(self.capacity(*y)),
-                ),
+                Some(bank) => {
+                    let capacity = self.capacity(*act).min(self.capacity(*y));
+                    let (act, y) = (self.tensor(*act), self.tensor(*y));
+                    let ladder = crate::encode::qmm_ladder(
+                        self.tuning(),
+                        act.rows,
+                        y.width,
+                        act.width,
+                        bank,
+                    );
+                    kernels_slang::linear::qmm::matmul(
+                        &self.slang(),
+                        &ladder,
+                        crate::encode::slang_tensor(act),
+                        crate::encode::slang_bank(bank),
+                        crate::encode::slang_tensor(y),
+                        capacity,
+                    )
+                    .map_err(crate::encode::from_slang)
+                }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::matmul(
@@ -54,14 +66,26 @@ impl Run<'_> {
                 },
             },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::lm_head(
-                    self.ctx(),
-                    self.tuning(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                    self.capacity(*act).min(self.capacity(*y)),
-                ),
+                Some(bank) => {
+                    let capacity = self.capacity(*act).min(self.capacity(*y));
+                    let (act, y) = (self.tensor(*act), self.tensor(*y));
+                    let ladder = crate::encode::qmm_ladder(
+                        self.tuning(),
+                        act.rows,
+                        y.width,
+                        act.width,
+                        bank,
+                    );
+                    kernels_slang::linear::qmm::lm_head(
+                        &self.slang(),
+                        &ladder,
+                        crate::encode::slang_tensor(act),
+                        crate::encode::slang_bank(bank),
+                        crate::encode::slang_tensor(y),
+                        capacity,
+                    )
+                    .map_err(crate::encode::from_slang)
+                }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::lm_head(

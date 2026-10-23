@@ -420,12 +420,14 @@ def slang_tree():
 
 def slang_pattern(literal):
     """A literal's entry pattern: a `format!` placeholder stands for any
-    identifier fragment. `None` when its fixed text is too short to name a
-    kernel."""
+    identifier fragment, and a literal ending in `_` is a prefix (a host
+    that sorts entries by family). `None` when its fixed text is too short
+    to name a kernel."""
     parts = re.split(r"\{[^}]*\}", literal)
     if len(parts) > 1 and max(map(len, parts)) < 3:
         return None
-    return re.compile(r"\w*".join(map(re.escape, parts)))
+    pattern = r"\w*".join(map(re.escape, parts))
+    return re.compile(pattern + r"\w*" if literal.endswith("_") else pattern)
 
 
 def slang_host(unit):
