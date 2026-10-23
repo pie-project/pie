@@ -54,7 +54,7 @@ pub enum AneProjections {
 
 /// How dense weights are laid out when a load makes them resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "gather.weights", default = "plain", tune = engine)]
+#[decision(id = "layout.weights", default = "plain", tune = engine)]
 pub enum WeightsLayout {
     /// As the checkpoint stores them.
     Plain,

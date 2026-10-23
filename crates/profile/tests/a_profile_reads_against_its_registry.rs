@@ -49,7 +49,7 @@ impl Qmm {
 
 /// How weights are laid out at import.
 #[derive(Clone, Debug, PartialEq, Decision)]
-#[decision(id = "gather.weights", default = "plain")]
+#[decision(id = "layout.weights", default = "plain")]
 enum Weights {
     Plain,
     #[requires("family >= 10")]
