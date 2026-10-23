@@ -60,9 +60,13 @@ pub(crate) fn release(arena: u32) {
 
 pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptureStatus> {
     let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
+    // SAFETY: `stream` is a `Ctx`'s stream, live by `Ctx::on`'s contract;
+    // `status` is a local out-pointer.
     if unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) }
         != rt::cudaError::cudaSuccess
     {
+        // SAFETY: takes no arguments; it only clears the sticky error the
+        // failed query left on this thread.
         let _ = unsafe { rt::cudaGetLastError() };
         return None;
     }
@@ -187,6 +191,8 @@ fn grow(
     // is non-zero.
     let code = unsafe { rt::cudaMalloc(&raw mut fresh, want) };
     if code == rt::cudaError::cudaErrorMemoryAllocation {
+        // SAFETY: takes no arguments; it only clears the failed allocation's
+        // error so the next call does not report it.
         let _ = unsafe { rt::cudaGetLastError() };
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: two live locals; the call only writes them.
@@ -219,6 +225,7 @@ fn grow(
 
 fn current() -> Option<i32> {
     let mut ordinal: i32 = 0;
+    // SAFETY: `ordinal` is a local out-pointer.
     (unsafe { rt::cudaGetDevice(&raw mut ordinal) } == rt::cudaError::cudaSuccess)
         .then_some(ordinal)
 }
@@ -253,11 +260,15 @@ pub(crate) fn compute_capability_major() -> Option<u32> {
         cudarc::driver::result::init().ok()?;
         let mut device: dr::CUdevice = 0;
 
+        // SAFETY: the driver was initialised just above and `device` is a
+        // local out-pointer.
         if unsafe { dr::cuDeviceGet(&raw mut device, ordinal) } != dr::CUresult::CUDA_SUCCESS {
             return None;
         }
         let mut major: i32 = 0;
 
+        // SAFETY: `major` is a local out-pointer and `device` is the handle
+        // `cuDeviceGet` just returned.
         let code = unsafe {
             dr::cuDeviceGetAttribute(
                 &raw mut major,
@@ -292,7 +303,11 @@ pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
 }
 
 pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
+    // SAFETY: `cudaDeviceProp` is a C struct of integers, arrays and a
+    // UUID, for which all-zero bytes are a valid value.
     let mut prop: rt::cudaDeviceProp = unsafe { core::mem::zeroed() };
+    // SAFETY: `prop` is a local out-pointer of the struct's own type; a bad
+    // `ordinal` comes back as an error code.
     let code = unsafe { rt::cudaGetDeviceProperties(&raw mut prop, ordinal) };
     (code == rt::cudaError::cudaSuccess).then_some(prop)
 }
@@ -300,6 +315,8 @@ pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
 fn attribute(which: rt::cudaDeviceAttr, ordinal: i32) -> Option<u32> {
     let mut value: i32 = 0;
 
+    // SAFETY: `value` is a local out-pointer; a bad attribute or ordinal
+    // comes back as an error code.
     let code = unsafe { rt::cudaDeviceGetAttribute(&raw mut value, which, ordinal) };
     (code == rt::cudaError::cudaSuccess && value > 0).then(|| value.unsigned_abs())
 }

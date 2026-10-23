@@ -76,6 +76,9 @@ fn merge_blocks_per_sm(instantiation: &'static str, smem: u32) -> u32 {
     };
     let mut blocks: core::ffi::c_int = 0;
 
+    // SAFETY: `blocks` is a local out-pointer and `resolved.function` is a
+    // handle the cache keeps loaded for the process; the query launches
+    // nothing.
     let code = unsafe {
         dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
             &raw mut blocks,

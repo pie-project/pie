@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::ffi::{CStr, c_void};
+use std::ffi::c_void;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -37,11 +37,13 @@ const fn dev_mut(address: u64) -> *mut c_void {
 }
 
 fn clear_error() {
+    // SAFETY: takes no arguments; it only clears this thread's sticky error.
     let _ = unsafe { cudaGetLastError() };
 }
 
 fn current_device() -> i32 {
     let mut device: i32 = 0;
+    // SAFETY: `device` is a local out-pointer; on an error it keeps its 0.
     let _ = unsafe { cudaGetDevice(&raw mut device) };
     device
 }
@@ -174,6 +176,7 @@ pub(crate) fn act_x_wt(
 
     if m == 1
         && gemv_bf16(
+            // SAFETY: `stream` is `ctx`'s, live by `Ctx::on`'s contract for `ctx`.
             &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             w,
             act,
@@ -240,6 +243,8 @@ fn run_tactic(
         Tactic::Gemv => {
             call.m == 1
                 && gemv_bf16(
+                    // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
+                    // only records it.
                     &unsafe { Ctx::on(stream) }.with_tuning(tuning),
                     call.w,
                     call.act,
@@ -251,6 +256,8 @@ fn run_tactic(
                 .is_ok()
         }
         Tactic::Rows => gemm_rows_bf16(
+            // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
+            // only records it.
             &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
@@ -263,6 +270,8 @@ fn run_tactic(
         )
         .is_ok(),
         Tactic::Narrow => gemm_narrow_bf16(
+            // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
+            // only records it.
             &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
@@ -295,6 +304,11 @@ fn run_tactic(
 fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublasStatus_t {
     let alpha = 1.0f32;
     let beta = 0.0f32;
+    // SAFETY: `handle` is a live cuBLAS handle (a `Ctx`'s, or the arena's
+    // borrowed one) and `alpha`/`beta` are host f32 locals, as the default
+    // pointer mode and the 32F compute type take. `call` names an `m x k`
+    // act, an `n x k` weight and an `m x n` y, all bf16: the caller's
+    // tensors, or the arena's slabs allocated at those sizes.
     unsafe {
         cublasGemmEx(
             handle,
@@ -376,11 +390,15 @@ struct LtCtx {
     workspace_bytes: usize,
 }
 
+// SAFETY: the cuBLASLt handle holds no stream or workspace (each matmul
+// names its own) and is only created or read under the device's mutex;
+// nothing in it is tied to the creating thread.
 unsafe impl Send for LtCtx {}
 
 impl LtCtx {
     fn ensure(&mut self) -> bool {
         if self.handle.is_null()
+            // SAFETY: `self.handle` is null here, so this writes a fresh handle and leaks none.
             && unsafe { lt::cublasLtCreate(&raw mut self.handle) }
                 != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
         {
@@ -398,12 +416,21 @@ struct LtPlan {
     heuristics: Vec<lt::cublasLtMatmulHeuristicResult_t>,
 }
 
+// SAFETY: the descriptors are host objects cuBLASLt allocates with no
+// thread affinity; a plan is built whole before it is shared and freed
+// once, by whichever thread drops the last `Arc`.
 unsafe impl Send for LtPlan {}
 
+// SAFETY: after `build_lt_plan` returns nothing writes a plan's
+// descriptors: `run_lt` and `cublasLtMatmulAlgoCheck` only read them,
+// and `run_lt_bias` sets its epilogue on a descriptor of its own.
 unsafe impl Sync for LtPlan {}
 
 impl Drop for LtPlan {
     fn drop(&mut self) {
+        // SAFETY: each handle is one `build_lt_plan` created for this plan alone;
+        // null ones (a build that failed part way) are skipped, and each is
+        // freed once.
         unsafe {
             if !self.c_desc.is_null() {
                 let _ = lt::cublasLtMatrixLayoutDestroy(self.c_desc);
@@ -434,6 +461,7 @@ fn build_lt_plan(
     impl Drop for Pref {
         fn drop(&mut self) {
             if !self.0.is_null() {
+                // SAFETY: a non-null preference this guard alone owns, freed once.
                 let _ = unsafe { lt::cublasLtMatmulPreferenceDestroy(self.0) };
             }
         }
@@ -447,6 +475,7 @@ fn build_lt_plan(
         c_desc: std::ptr::null_mut(),
         heuristics: Vec::new(),
     };
+    // SAFETY: `plan.op_desc` is a local out-pointer.
     if unsafe {
         lt::cublasLtMatmulDescCreate(
             &raw mut plan.op_desc,
@@ -467,6 +496,8 @@ fn build_lt_plan(
             cublasOperation_t::CUBLAS_OP_N,
         ),
     ] {
+        // SAFETY: `op_desc` was just created; `operation` is a local of the
+        // attribute's type and size, which cuBLASLt copies.
         if unsafe {
             lt::cublasLtMatmulDescSetAttribute(
                 plan.op_desc,
@@ -484,6 +515,7 @@ fn build_lt_plan(
         (&raw mut plan.b_desc, k, m, k),
         (&raw mut plan.c_desc, n, m, n),
     ] {
+        // SAFETY: `desc` points at a field of the local `plan`; the dims are plain integers.
         if unsafe {
             lt::cublasLtMatrixLayoutCreate(
                 desc,
@@ -498,9 +530,11 @@ fn build_lt_plan(
         }
     }
     let mut pref = Pref(std::ptr::null_mut());
+    // SAFETY: `pref.0` is a local out-pointer, freed by the guard.
     if unsafe { lt::cublasLtMatmulPreferenceCreate(&raw mut pref.0) } != ok {
         return None;
     }
+    // SAFETY: `pref.0` was just created; `workspace_bytes` is a usize local of the size passed.
     if unsafe {
         lt::cublasLtMatmulPreferenceSetAttribute(
             pref.0,
@@ -516,6 +550,7 @@ fn build_lt_plan(
     // and output-type schemes add them in bf16, and over a cancelling K that
     // is off by several percent (sm89 offers them at a hundred rows).
     let reductions = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+    // SAFETY: `pref.0` was just created; `reductions` is a u32 local of the size passed.
     if unsafe {
         lt::cublasLtMatmulPreferenceSetAttribute(
             pref.0,
@@ -528,8 +563,14 @@ fn build_lt_plan(
         return None;
     }
     let mut heuristics: Vec<lt::cublasLtMatmulHeuristicResult_t> =
+        // SAFETY: the heuristic result is a C struct of opaque algo words,
+        // integers, a status whose zero is SUCCESS and a float; all-zero bytes are a
+        // valid value.
         vec![unsafe { core::mem::zeroed() }; heuristics_wanted.max(1)];
     let mut returned: i32 = 0;
+    // SAFETY: `lt_handle` is the device's live handle, the descriptors and
+    // `pref.0` were created above, and `heuristics` has room for the count
+    // asked for; `returned` is a local out-pointer.
     if unsafe {
         lt::cublasLtMatmulAlgoGetHeuristic(
             lt_handle,
@@ -553,6 +594,8 @@ fn build_lt_plan(
     for heuristic in &heuristics {
         let mut supports: i32 = 0;
         let mut written: usize = 0;
+        // SAFETY: `heuristic.algo` is an algorithm cuBLASLt just returned;
+        // `supports` is an i32 local of the size passed and `written` a local.
         let asked = unsafe {
             lt::cublasLtMatmulAlgoCapGetAttribute(
                 std::ptr::from_ref(&heuristic.algo),
@@ -580,6 +623,7 @@ fn build_lt_plan(
             .flat_map(|split| schemes.iter().map(move |scheme| (split, scheme)))
         {
             let mut algo = heuristic.algo;
+            // SAFETY: `algo` is a local copy of a returned algorithm; `split` is an i32 local of the size passed.
             let set_split = unsafe {
                 lt::cublasLtMatmulAlgoConfigSetAttribute(
                     &raw mut algo,
@@ -588,6 +632,7 @@ fn build_lt_plan(
                     std::mem::size_of::<i32>(),
                 )
             };
+            // SAFETY: as above, `scheme` a local of the enum's size.
             let set_scheme = unsafe {
                 lt::cublasLtMatmulAlgoConfigSetAttribute(
                     &raw mut algo,
@@ -599,7 +644,10 @@ fn build_lt_plan(
             if set_split != ok || set_scheme != ok {
                 continue;
             }
+            // SAFETY: as for `heuristics` above: all-zero bytes are a valid value.
             let mut result: lt::cublasLtMatmulHeuristicResult_t = unsafe { core::mem::zeroed() };
+            // SAFETY: `lt_handle` and the plan's descriptors are live, `algo` is a
+            // local the calls above configured, and `result` a local out-pointer.
             let checked = unsafe {
                 lt::cublasLtMatmulAlgoCheck(
                     lt_handle,
@@ -636,6 +684,11 @@ fn run_lt(
 ) -> bool {
     let alpha = 1.0f32;
     let beta = 0.0f32;
+    // SAFETY: `lt_handle` is the device's live handle and `plan`'s
+    // descriptors were built for `call`'s `m`, `n` and `k`; `algo` is one of
+    // its heuristics; `alpha`/`beta` are host f32 locals. `ws` is a device slab
+    // of `ws_bytes` (or null and 0) and `stream` live, as `run_tactic`'s callers
+    // hold. The operands are the caller's `call`, as for `gemm_ex`.
     let status = unsafe {
         lt::cublasLtMatmul(
             lt_handle,
@@ -675,12 +728,14 @@ fn run_lt_bias(
     impl Drop for Desc {
         fn drop(&mut self) {
             if !self.0.is_null() {
+                // SAFETY: a non-null descriptor this guard alone owns, freed once.
                 let _ = unsafe { lt::cublasLtMatmulDescDestroy(self.0) };
             }
         }
     }
     let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
     let mut desc = Desc(std::ptr::null_mut());
+    // SAFETY: `desc.0` is a local out-pointer, freed by the guard.
     if unsafe {
         lt::cublasLtMatmulDescCreate(
             &raw mut desc.0,
@@ -693,6 +748,9 @@ fn run_lt_bias(
     }
     let set = |attribute: lt::cublasLtMatmulDescAttributes_t,
                value: *const c_void,
+               // SAFETY: `desc.0` was just created; every caller below passes a
+               // pointer to a local of exactly `bytes` bytes, of the attribute's type,
+               // which cuBLASLt copies.
                bytes: usize| unsafe {
         lt::cublasLtMatmulDescSetAttribute(desc.0, attribute, value, bytes) == ok
     };
@@ -729,6 +787,9 @@ fn run_lt_bias(
     }
     let alpha = 1.0f32;
     let beta = 0.0f32;
+    // SAFETY: as in `run_lt`, with `desc.0` the descriptor just set up;
+    // `call.bias` is the caller's `n`-long bf16 bias, non-zero by the caller's
+    // test.
     let status = unsafe {
         lt::cublasLtMatmul(
             lt_handle,
@@ -1078,6 +1139,8 @@ const FINAL_TIE: f32 = 1.02;
 fn splits_of(algo: &lt::cublasLtMatmulAlgo_t) -> i32 {
     let mut splits: i32 = 1;
     let mut written: usize = 0;
+    // SAFETY: `algo` is an algorithm cuBLASLt returned; `splits` is an i32
+    // local of the size passed and `written` a local.
     let asked = unsafe {
         lt::cublasLtMatmulAlgoConfigGetAttribute(
             std::ptr::from_ref(algo),
@@ -1112,6 +1175,9 @@ struct TuneArena {
 
 impl Drop for TuneArena {
     fn drop(&mut self) {
+        // SAFETY: `handle` is non-null only once `init` rebound the caller's
+        // handle to this arena's stream, so this puts it back. Every other handle
+        // is one `init` created and only this `Drop` frees; null ones never were.
         unsafe {
             if !self.handle.is_null() {
                 let _ = cublasSetStream_v2(self.handle, self.caller_stream.cast());
@@ -1172,6 +1238,10 @@ impl TuneArena {
         self.workspace_bytes = workspace_bytes;
         self.caller_stream = caller_stream;
         self.flush_bytes = flush_bytes();
+        // SAFETY: each call writes one field of `self` (all null from `empty`)
+        // with a fresh allocation, stream or event that this arena alone owns and
+        // `Drop` frees; the `cast` reinterprets `*mut *mut c_void` as the
+        // `*mut cudaStream_t` it is.
         let acquired = unsafe {
             cudaMalloc(&raw mut self.act, act_bytes) == cudaError::cudaSuccess
                 && cudaMalloc(&raw mut self.y, y_bytes) == cudaError::cudaSuccess
@@ -1189,16 +1259,21 @@ impl TuneArena {
             clear_error();
             return false;
         }
+        // SAFETY: `caller_stream` is the live stream of the `Ctx` that asked for this product.
         if unsafe { cudaStreamSynchronize(caller_stream.cast()) } != cudaError::cudaSuccess {
             clear_error();
             return false;
         }
+        // SAFETY: `caller` is that `Ctx`'s live handle and `self.stream` the
+        // stream just created; `Drop` puts the caller's stream back.
         if unsafe { cublasSetStream_v2(caller, self.stream.cast()) }
             != cublasStatus_t::CUBLAS_STATUS_SUCCESS
         {
             return false;
         }
         self.handle = caller;
+        // SAFETY: `act` and `y` are the allocations just made, `act_bytes` and
+        // `y_bytes` long, filled on the arena's own stream.
         let filled = unsafe {
             cudaMemsetAsync(self.act, 0x3C, act_bytes, self.stream.cast()) == cudaError::cudaSuccess
                 // Once outside a capture, its kernel loaded here.
@@ -1266,10 +1341,12 @@ impl TuneArena {
         };
         let stream = self.stream.cast();
         if !fire() {
+            // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
             let _ = unsafe { cudaStreamSynchronize(stream) };
             clear_error();
             return None;
         }
+        // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
         if unsafe { cudaStreamSynchronize(stream) } != cudaError::cudaSuccess {
             clear_error();
             return None;
@@ -1321,6 +1398,9 @@ impl TuneArena {
         let stream = self.stream.cast();
         let mut graph: cudaGraph_t = std::ptr::null_mut();
         let mut exec: cudaGraphExec_t = std::ptr::null_mut();
+        // SAFETY: `stream` and both events are the arena's own. Each run reads its
+        // weight from `flush`: `runs * stride <= flush_bytes / 2` and `stride` is
+        // at least the weight rounded up, so every slice is inside the slab.
         let captured = unsafe {
             cudaStreamBeginCapture(
                 stream,
@@ -1350,17 +1430,22 @@ impl TuneArena {
                     == cudaError::cudaSuccess
         };
         let ended =
+            // SAFETY: ends the capture begun on the arena's stream; `graph` is a local out-pointer.
             unsafe { cudaStreamEndCapture(stream, &raw mut graph) } == cudaError::cudaSuccess;
         if !captured || !ended || graph.is_null() {
             if !graph.is_null() {
+                // SAFETY: a non-null graph the capture above just returned, destroyed once.
                 let _ = unsafe { cudaGraphDestroy(graph) };
             }
+            // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
             let _ = unsafe { cudaStreamSynchronize(stream) };
             clear_error();
             return None;
         }
+        // SAFETY: `graph` is the live graph just captured; `exec` is a local out-pointer.
         let instantiated = unsafe { cudaGraphInstantiateWithFlags(&raw mut exec, graph, 0) }
             == cudaError::cudaSuccess;
+        // SAFETY: the instantiated `exec` no longer needs `graph`, destroyed once here.
         let _ = unsafe { cudaGraphDestroy(graph) };
         if !instantiated || exec.is_null() {
             clear_error();
@@ -1369,6 +1454,8 @@ impl TuneArena {
         let mut best: Option<f32> = None;
         for round in 0..ROUNDS {
             let mut ms = 0.0f32;
+            // SAFETY: `exec` and `stream` are live, the events are the arena's own,
+            // and `ms` is a local out-pointer.
             let timed = unsafe {
                 cudaGraphLaunch(exec, stream) == cudaError::cudaSuccess
                     && cudaEventSynchronize(self.stop) == cudaError::cudaSuccess
@@ -1377,7 +1464,9 @@ impl TuneArena {
                             == cudaError::cudaSuccess)
             };
             if !timed {
+                // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
                 let _ = unsafe { cudaStreamSynchronize(stream) };
+                // SAFETY: `exec` is idle after the sync and is destroyed once, here, before the return.
                 let _ = unsafe { cudaGraphExecDestroy(exec) };
                 clear_error();
                 return None;
@@ -1386,7 +1475,9 @@ impl TuneArena {
                 best = Some(ms);
             }
         }
+        // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
         let _ = unsafe { cudaStreamSynchronize(stream) };
+        // SAFETY: `exec` is idle after the sync and is destroyed once, here.
         let _ = unsafe { cudaGraphExecDestroy(exec) };
         best.map(|ms| ms / runs as f32)
     }
@@ -1397,6 +1488,7 @@ impl TuneArena {
         let stream = self.stream.cast();
         let mut graph: cudaGraph_t = std::ptr::null_mut();
         let mut exec: cudaGraphExec_t = std::ptr::null_mut();
+        // SAFETY: `stream` and both events are the arena's own, live until `Drop`.
         let captured = unsafe {
             cudaStreamBeginCapture(
                 stream,
@@ -1409,17 +1501,22 @@ impl TuneArena {
                     == cudaError::cudaSuccess
         };
         let ended =
+            // SAFETY: ends the capture begun on the arena's stream; `graph` is a local out-pointer.
             unsafe { cudaStreamEndCapture(stream, &raw mut graph) } == cudaError::cudaSuccess;
         if !captured || !ended || graph.is_null() {
             if !graph.is_null() {
+                // SAFETY: a non-null graph the capture above just returned, destroyed once.
                 let _ = unsafe { cudaGraphDestroy(graph) };
             }
+            // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
             let _ = unsafe { cudaStreamSynchronize(stream) };
             clear_error();
             return None;
         }
+        // SAFETY: `graph` is the live graph just captured; `exec` is a local out-pointer.
         let instantiated = unsafe { cudaGraphInstantiateWithFlags(&raw mut exec, graph, 0) }
             == cudaError::cudaSuccess;
+        // SAFETY: the instantiated `exec` no longer needs `graph`, destroyed once here.
         let _ = unsafe { cudaGraphDestroy(graph) };
         if !instantiated || exec.is_null() {
             clear_error();
@@ -1427,10 +1524,14 @@ impl TuneArena {
         }
         let mut best: Option<f32> = None;
         for round in 0..ROUNDS {
+            // SAFETY: `exec` was instantiated above and `stream` is the arena's own.
             if unsafe { cudaGraphLaunch(exec, stream) } != cudaError::cudaSuccess
+                // SAFETY: `stop` is the arena's own event.
                 || unsafe { cudaEventSynchronize(self.stop) } != cudaError::cudaSuccess
             {
+                // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
                 let _ = unsafe { cudaStreamSynchronize(stream) };
+                // SAFETY: `exec` is idle after the sync and is destroyed once, before the return.
                 let _ = unsafe { cudaGraphExecDestroy(exec) };
                 clear_error();
                 return None;
@@ -1439,9 +1540,11 @@ impl TuneArena {
                 continue;
             }
             let mut ms = 0.0f32;
+            // SAFETY: both events are the arena's own and `stop` has completed; `ms` is a local.
             if unsafe { cudaEventElapsedTime(&raw mut ms, self.start, self.stop) }
                 != cudaError::cudaSuccess
             {
+                // SAFETY: `exec` is idle (`stop`, its last node, completed) and is destroyed once, before the return.
                 let _ = unsafe { cudaGraphExecDestroy(exec) };
                 clear_error();
                 return None;
@@ -1450,7 +1553,9 @@ impl TuneArena {
                 best = Some(ms);
             }
         }
+        // SAFETY: the arena's own stream, created in `init` and live until `Drop`.
         let _ = unsafe { cudaStreamSynchronize(stream) };
+        // SAFETY: `exec` is idle after the sync and is destroyed once, here.
         let _ = unsafe { cudaGraphExecDestroy(exec) };
         best
     }
@@ -1466,6 +1571,7 @@ const STREAMED: usize = 16;
 fn flush_bytes() -> usize {
     const FALLBACK: usize = 64 << 20;
     let mut device: i32 = 0;
+    // SAFETY: `device` is a local out-pointer.
     if unsafe { cudaGetDevice(&raw mut device) } != cudaError::cudaSuccess {
         clear_error();
         return FALLBACK;
@@ -1560,6 +1666,7 @@ fn cache_path() -> Option<PathBuf> {
 
 fn signature() -> String {
     let mut device: i32 = 0;
+    // SAFETY: `device` is a local out-pointer.
     if unsafe { cudaGetDevice(&raw mut device) } != cudaError::cudaSuccess {
         clear_error();
         return String::new();
@@ -1569,10 +1676,17 @@ fn signature() -> String {
         return String::new();
     };
     let mut version: i32 = 0;
+    // SAFETY: `version` is a local out-pointer. The handle is null: this
+    // leans on cuBLAS reading the library's version without a handle.
     let _ = unsafe { cublasGetVersion_v2(std::ptr::null_mut(), &raw mut version) };
-    let name = unsafe { CStr::from_ptr(prop.name.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
+    // The driver's name, read up to its NUL without trusting one is there.
+    let name: Vec<u8> = prop
+        .name
+        .iter()
+        .map(|&c| u8::from_ne_bytes(c.to_ne_bytes()))
+        .take_while(|&b| b != 0)
+        .collect();
+    let name = String::from_utf8_lossy(&name).into_owned();
     format!(
         "# pie-dense-gemm v9 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor

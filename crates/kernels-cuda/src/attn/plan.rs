@@ -563,6 +563,11 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
         // stages ahead would wait out the card; a pinned slot leaves it
         // queued.
         let from = pinned::stage(op, bytes)?;
+        // SAFETY: `from` is a pinned slot holding a copy of `bytes`, which
+        // the ring does not reuse until an event recorded after this copy
+        // fires; the stream is `ctx`'s, live by `Ctx::on`'s contract. That
+        // `int_ptr` addresses `bytes.len()` writable device bytes is the
+        // caller's to vouch for.
         let code = unsafe {
             rt::cudaMemcpyAsync(
                 int_ptr as usize as *mut core::ffi::c_void,

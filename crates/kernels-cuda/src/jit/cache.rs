@@ -14,8 +14,13 @@ pub struct Resolved {
     pub function: dr::CUfunction,
 }
 
+// SAFETY: both fields are opaque driver handles that are written once, in
+// `load`, and only read after. The driver API is thread-safe and takes these
+// handles from any thread; nothing here is tied to the creating thread.
 unsafe impl Send for Resolved {}
 
+// SAFETY: as `Send`: `&Resolved` only hands out copies of the handles, and
+// the driver serialises whatever it does with them internally.
 unsafe impl Sync for Resolved {}
 
 type Slot = OnceLock<Result<Resolved, Fault>>;
@@ -54,6 +59,7 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
     let arch = target.as_str();
     let key = root.key(instantiation, arch);
     let mut ordinal: i32 = 0;
+    // SAFETY: `ordinal` is a local out-pointer.
     let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
     if code != rt::cudaError::cudaSuccess {
         return Err(Fault::Device {
@@ -105,6 +111,8 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
 
     let module = load_image(root.name, &cubin)?;
     let function = entry_by_name(root.name, module, instantiation, &mangled).inspect_err(|_| {
+        // SAFETY: `module` was just loaded by `load_image`, nothing has
+        // resolved a function out of it, and it is unloaded once here.
         unsafe { dr::cuModuleUnload(module) };
     })?;
     tracing::info!(
@@ -127,6 +135,11 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<dr::CUmodule, Fault> {
     }
     let mut module: dr::CUmodule = std::ptr::null_mut();
 
+    // SAFETY: `module` is a local out-pointer and `image` is a non-empty
+    // byte slice that outlives the call; the driver copies the image. The
+    // driver reads its length from the cubin's own ELF headers, so the
+    // bytes must be a whole image: NVRTC's output, or a cache file that
+    // `write_disk` renamed into place only once fully written.
     let code = unsafe { dr::cuModuleLoadData(&raw mut module, image.as_ptr().cast()) };
     if code == dr::CUresult::CUDA_SUCCESS {
         Ok(module)
@@ -152,6 +165,9 @@ fn entry_by_name(
     };
     let mut function: dr::CUfunction = std::ptr::null_mut();
 
+    // SAFETY: `module` is the live module `load_image` returned, `c_name` is
+    // a CString that outlives the call, and `function` is a local
+    // out-pointer.
     let code = unsafe { dr::cuModuleGetFunction(&raw mut function, module, c_name.as_ptr()) };
     match code {
         dr::CUresult::CUDA_SUCCESS => Ok(function),
@@ -222,6 +238,8 @@ pub(crate) fn bind_context() -> Result<(), Fault> {
         return Ok(());
     }
 
+    // SAFETY: freeing null frees nothing; the call is made only for its side
+    // effect of binding the device's primary context to this thread.
     let code = unsafe { rt::cudaFree(std::ptr::null_mut()) };
     if code != rt::cudaError::cudaSuccess {
         return Err(Fault::Device {
@@ -242,12 +260,15 @@ pub fn arch() -> Option<&'static str> {
         cudarc::driver::result::init().ok()?;
         let mut ordinal: i32 = 0;
 
+        // SAFETY: `ordinal` is a local out-pointer.
         let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
         if code != rt::cudaError::cudaSuccess {
             return None;
         }
         let mut device: dr::CUdevice = 0;
 
+        // SAFETY: the driver was initialised just above and `device` is a
+        // local out-pointer.
         let code = unsafe { dr::cuDeviceGet(&raw mut device, ordinal) };
         if code != dr::CUresult::CUDA_SUCCESS {
             return None;
@@ -270,6 +291,8 @@ pub fn features() -> crate::jit::Features {
 fn attribute(device: dr::CUdevice, which: dr::CUdevice_attribute) -> Option<i32> {
     let mut value: i32 = 0;
 
+    // SAFETY: `value` is a local out-pointer; a bad `device` or attribute
+    // comes back as an error code, not a write.
     let code = unsafe { dr::cuDeviceGetAttribute(&raw mut value, which, device) };
     (code == dr::CUresult::CUDA_SUCCESS).then_some(value)
 }

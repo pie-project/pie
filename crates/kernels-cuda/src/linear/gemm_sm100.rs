@@ -1434,6 +1434,8 @@ pub(crate) fn encode(m: Map) -> Result<[u64; 16], Error> {
     let dims = m.dims.map(u64::from);
     let steps = [1u32, 1, 1];
     let rank = if m.dims[2] == 0 { 2 } else { 3 };
+    // SAFETY: `CUtensorMap` is an opaque array of u64 words; all-zero bytes
+    // are a valid value, and the encode below overwrites them.
     let mut map: dr::CUtensorMap = unsafe { core::mem::zeroed() };
     // SAFETY: every pointer is to a live local of the length the rank says.
     let code = unsafe {

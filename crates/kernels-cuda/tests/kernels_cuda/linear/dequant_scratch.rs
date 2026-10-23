@@ -26,15 +26,18 @@ fn a_body_captured_on_its_own_stream_takes_its_owners_tile() {
         .expect("the warmed tile is there");
 
     let mut body: rt::cudaStream_t = core::ptr::null_mut();
+    // SAFETY: `body` is a local out-pointer for the new stream.
     unsafe {
         check(rt::cudaStreamCreate(&raw mut body), "cudaStreamCreate");
     }
     let body = body.cast::<c_void>();
     // SAFETY: the stream lives until the end of this test.
     let own = unsafe { Ctx::on(body).with_slabs(main.slabs()) };
+    // SAFETY: as `own`: the same stream, live until the end of this test.
     let in_order = unsafe { Ctx::on(body).with_slabs(main.slabs()) }.in_order_of(main.stream());
 
     let alone = crate::common::capturing();
+    // SAFETY: `body` is the stream created above, not yet capturing.
     unsafe {
         check(
             rt::cudaStreamBeginCapture(
@@ -47,6 +50,8 @@ fn a_body_captured_on_its_own_stream_takes_its_owners_tile() {
     let shared = in_order.scratch_stream("test", DECODED_WEIGHT, TILE as usize / 2);
     let unwarmed = own.scratch_stream("test", DECODED_WEIGHT, TILE as usize / 2);
     let mut graph: rt::cudaGraph_t = core::ptr::null_mut();
+    // SAFETY: ends the capture begun above on `body`, then frees the graph
+    // it returns and the stream, each once; nothing was enqueued on either.
     unsafe {
         check(
             rt::cudaStreamEndCapture(body.cast(), &raw mut graph),

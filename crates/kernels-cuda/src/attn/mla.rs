@@ -162,6 +162,11 @@ pub fn absorb_q(
     let handle = ctx.cublas(OP)?;
 
     #[cfg(feature = "cuda")]
+    // SAFETY: `handle` is the live cuBLAS handle `ctx` carries, bound to its
+    // stream by `Ctx::with_cublas`'s contract. The strides and leading
+    // dimensions are the shapes stated above; that `kv_b`, `q_nope` and
+    // `q_latent` are device allocations that large is the caller's to vouch
+    // for, as for every `Tensor` this crate takes.
     unsafe {
         absorb(
             handle,
@@ -214,6 +219,9 @@ pub fn absorb_out(
         .wrapping_add(2 * u64::from(nope.unsigned_abs()) * u64::from(rank.unsigned_abs()));
 
     #[cfg(feature = "cuda")]
+    // SAFETY: as in `absorb_q`: a live handle on `ctx`'s stream, and
+    // `kv_b`, `latent` and `o` are the caller's device allocations; `wv` is
+    // the V half of `kv_b`, past its `nope * rank` K half.
     unsafe {
         absorb(
             handle,
@@ -249,6 +257,11 @@ fn cublas_refused(op: &'static str, status: i32) -> Error {
     )
 }
 
+/// # Safety
+///
+/// `handle` is a live cuBLAS handle; `a`, `b` and `c` are device addresses
+/// of `heads` bf16 matrices each, at the given strides and leading
+/// dimensions, with `c` writable and not overlapping `a` or `b`.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn absorb(
@@ -276,6 +289,9 @@ unsafe fn absorb(
     let alpha = 1.0f32;
     let beta = 0.0f32;
 
+    // SAFETY: the handle and the three operands are as this fn's contract
+    // states; `alpha` and `beta` are host f32 locals, matching the default
+    // host pointer mode and the 32F compute type, and outlive the call.
     let status = unsafe {
         cublasGemmStridedBatchedEx(
             handle.cast::<cublasContext>(),

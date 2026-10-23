@@ -19,6 +19,9 @@ pub fn cuda_ok(code: rt::cudaError, call: &str) {
 /// Copies `values` over the device bytes at `at`.
 pub fn upload_to<T: Copy>(at: u64, values: &[T]) {
     let _legacy = super::legacy();
+    // SAFETY: the source is `values`, borrowed for the call, and the copy
+    // is synchronous. `at` is a device allocation of at least
+    // `size_of_val(values)` bytes: every test passes one it allocated so.
     let code = unsafe {
         rt::cudaMemcpy(
             at as *mut core::ffi::c_void,

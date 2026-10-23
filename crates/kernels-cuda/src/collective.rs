@@ -137,6 +137,10 @@ fn copy(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(
     {
         use cudarc::runtime::sys as rt;
 
+        // SAFETY: the stream is `ctx`'s, live by `Ctx::on`'s contract. The
+        // callers bound `bytes` by the peer stage's `stage_bytes`, so `dst`
+        // stays inside the stage `Ctx::with_peers` vouched for; `src` is a
+        // range of the caller's tensor.
         let code = unsafe {
             rt::cudaMemcpyAsync(
                 dst as usize as *mut core::ffi::c_void,
@@ -181,6 +185,9 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
         let Some((send, count)) = message(*buf) else {
             return Ok(());
         };
+        // SAFETY: `comm` is the live communicator `Ctx::with_comm` vouched
+        // for and the stream is `ctx`'s. The reduce is in place over the
+        // `count` elements of `buf`, a device allocation the caller owns.
         let code = unsafe {
             nccl::ncclAllReduce(
                 send,
@@ -229,6 +236,10 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         };
 
         if x.rows <= 1 {
+            // SAFETY: `comm` and the stream are `ctx`'s, live by its
+            // contracts. NCCL reads `count` elements of `x` and writes
+            // `count * world` into `y`; that `y` is that large is the
+            // caller's to keep (checked only by the debug assertion above).
             let code = unsafe {
                 nccl::ncclAllGather(
                     send,
@@ -251,6 +262,9 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let bytes = usize::try_from(y.elements().saturating_mul(y.dtype.bytes_ceil()))
             .map_err(|_| refuse(OP, "the gathered rectangle does not fit this address space"))?;
         let stage = ctx.scratch(OP, "all_gather_stage", bytes)?;
+        // SAFETY: `comm` and the stream are `ctx`'s. `stage` is a slab of
+        // `y.elements()` elements, which is `count * world` by the
+        // division above; `send` is `x`'s `count` elements.
         let code = unsafe {
             nccl::ncclAllGather(send, stage, count, dtype, comm.cast(), ctx.stream().cast())
         };
@@ -271,8 +285,11 @@ pub fn grouped<R>(op: &'static str, body: impl FnOnce() -> Result<R, Error>) -> 
     {
         use cudarc::nccl::sys as nccl;
 
+        // SAFETY: takes no arguments; it opens a group on this thread that
+        // the `ncclGroupEnd` below closes whatever `body` returns.
         answered(op, "ncclGroupStart", unsafe { nccl::ncclGroupStart() })?;
         let ran = body();
+        // SAFETY: closes the group opened above, on the same thread.
         let ended = answered(op, "ncclGroupEnd", unsafe { nccl::ncclGroupEnd() });
         let out = ran?;
         ended?;
@@ -315,6 +332,10 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
         let Some((recv, count)) = message(*y) else {
             return Ok(());
         };
+        // SAFETY: `comm` and the stream are `ctx`'s. NCCL writes `count`
+        // elements of `y` and reads `count * world` of `x`; that `x` holds
+        // that many is the caller's to keep (checked only by the debug
+        // assertion above).
         let code = unsafe {
             nccl::ncclReduceScatter(
                 x.ptr as usize as *const core::ffi::c_void,

@@ -42,6 +42,9 @@ pub fn arm_cache() {
 impl Gpu {
     pub fn open() -> Self {
         arm_cache();
+        // SAFETY: every out-pointer is a local; the handle is bound to the
+        // stream just created, and both, with the slabs attached to it, live
+        // in the `Gpu` until its `Drop` synchronizes and frees them.
         unsafe {
             check(rt::cudaSetDevice(0), "cudaSetDevice");
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();
@@ -95,6 +98,8 @@ impl Gpu {
 
     pub fn zeros(&mut self, bytes: usize) -> u64 {
         let _legacy = legacy();
+        // SAFETY: `at` is a local out-pointer, and the memset covers exactly
+        // the `bytes.max(1)` just allocated; `Drop` frees it.
         unsafe {
             let mut at: *mut c_void = core::ptr::null_mut();
             check(rt::cudaMalloc(&raw mut at, bytes.max(1)), "cudaMalloc");
@@ -109,6 +114,8 @@ impl Gpu {
         let at = self.zeros(bytes.max(1));
         if bytes > 0 {
             let _legacy = legacy();
+            // SAFETY: `at` was just allocated with `bytes` bytes and
+            // `values` is borrowed across the synchronous copy.
             unsafe {
                 check(
                     rt::cudaMemcpy(
@@ -138,6 +145,11 @@ impl Gpu {
                 "`{call}` answered {code:?}"
             );
         };
+        // SAFETY: both driver structs are plain C data, valid zeroed. Every
+        // out-pointer is a local; the mapping covers the first of the two
+        // reserved granules, which the memset fills, and `at` puts the
+        // `bytes <= granule` copy at that granule's end. `Drop` unmaps and
+        // frees each piece.
         unsafe {
             let mut prop: dr::CUmemAllocationProp = core::mem::zeroed();
             prop.type_ = dr::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -204,6 +216,9 @@ impl Gpu {
     pub fn down<T: Copy + Default>(&self, at: u64, count: usize) -> Vec<T> {
         let mut out = vec![T::default(); count];
         let _legacy = legacy();
+        // SAFETY: `out` holds `count` elements and the copy is synchronous;
+        // `at` is an allocation of this `Gpu` at least that long, which
+        // every test passes.
         unsafe {
             check(
                 rt::cudaMemcpy(
@@ -219,6 +234,7 @@ impl Gpu {
     }
 
     pub fn sync(&self) {
+        // SAFETY: the stream `open` created, live until `Drop`.
         unsafe {
             check(
                 rt::cudaStreamSynchronize(self.stream),
@@ -231,6 +247,9 @@ impl Gpu {
 impl Drop for Gpu {
     fn drop(&mut self) {
         let _legacy = legacy();
+        // SAFETY: the stream is drained first, so nothing still reads the
+        // memory; each allocation, mapping, the handle and the stream were
+        // made by this `Gpu` and are freed once, here.
         unsafe {
             rt::cudaStreamSynchronize(self.stream);
             for at in self.device.drain(..) {
@@ -362,6 +381,9 @@ pub fn captured(
     };
     let stream = ctx.stream();
     let _alone = capturing();
+    // SAFETY: `ctx`'s stream is live by its contract and no other thread
+    // touches the legacy stream while `_alone` is held. `graph` and `exec`
+    // are local out-pointers; the graph is freed once its exec is made.
     unsafe {
         ok(
             rt::cudaStreamBeginCapture(
@@ -389,6 +411,8 @@ pub fn captured(
 /// Launches a [`captured`] graph on `ctx`'s stream.
 pub fn replay(ctx: &Ctx, exec: kernels_cuda::cudarc::runtime::sys::cudaGraphExec_t) {
     use kernels_cuda::cudarc::runtime::sys as rt;
+    // SAFETY: `exec` is a graph [`captured`] made and [`forget`] has not
+    // yet freed, as every test passes; the stream is `ctx`'s.
     let code = unsafe { rt::cudaGraphLaunch(exec, ctx.stream().cast()) };
     assert_eq!(
         code,
@@ -399,6 +423,8 @@ pub fn replay(ctx: &Ctx, exec: kernels_cuda::cudarc::runtime::sys::cudaGraphExec
 
 /// Destroys a [`captured`] graph.
 pub fn forget(exec: kernels_cuda::cudarc::runtime::sys::cudaGraphExec_t) {
+    // SAFETY: `exec` is a graph [`captured`] made, which each test forgets
+    // once, after its last replay.
     unsafe {
         kernels_cuda::cudarc::runtime::sys::cudaGraphExecDestroy(exec);
     }
