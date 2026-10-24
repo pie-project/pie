@@ -28,8 +28,6 @@ mod common_two_axis;
 mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
-#[cfg(feature = "cuda")]
-mod a_joined_projection_answers_what_its_legs_answer;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_buffer_frees_after_another_context_closes;
 mod a_buffered_fold_is_the_fold_it_replaces;
@@ -46,6 +44,8 @@ mod a_fused_geglu_reads_its_affine_bank_as_planes;
 mod a_fused_swiglu_sizes_the_decoded_tile_to_its_packed_plane;
 mod a_group_with_two_reference_lanes_keeps_each_to_itself;
 mod a_grouped_window_is_one_window_and_a_segment_list;
+#[cfg(feature = "cuda")]
+mod a_joined_projection_answers_what_its_legs_answer;
 mod a_lane_sampler_draws_what_the_interpreter_draws;
 mod a_missing_or_misshapen_port_feed_is_refused_by_name;
 mod a_nucleus_cut_agrees_with_the_host_interpreter;
@@ -62,6 +62,7 @@ mod a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it;
 mod a_tower_region_reads_the_patch_window;
 mod a_two_axis_plan_arms_its_token_bodies;
 mod a_two_reading_plan_reads_each_lane_back_from_its_own_seam;
+mod a_verify_lands_what_the_point_rule_reads;
 mod a_windowed_row_reads_what_the_full_row_reads;
 mod an_adapter_is_not_a_lanes_scratch;
 mod an_epilogue_agrees_with_the_host_interpreter;

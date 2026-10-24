@@ -2350,9 +2350,11 @@ impl BatchScheduler {
                     {
                         request.completion.resolve_landed("frame settle");
                     }
+                    let latency = retired.started.elapsed();
+                    crate::pipeline::verify::record_frame(retired.total_tokens, latency);
                     stats::record_fire_stats(
                         stats,
-                        retired.started.elapsed(),
+                        latency,
                         retired.batch_size,
                         retired.total_tokens,
                     )

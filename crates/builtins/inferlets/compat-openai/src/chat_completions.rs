@@ -266,6 +266,8 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
     }
     if let Some(enabled) = body.speculative {
         req.sampling.speculative = enabled;
+        // Asked for outright, it holds above temperature zero too.
+        req.sampling.speculative_sampled = enabled;
     }
     if let Some(p) = body.top_p {
         req.sampling.top_p = p;
