@@ -703,3 +703,305 @@ pub fn pre(
     )?;
     Ok(true)
 }
+
+#[cfg(feature = "cuda")]
+const HC_SM100: &str = "elemwise/hc_sm100.cu";
+
+/// `pie::elemwise::HcMegaParams`, field for field.
+#[cfg(feature = "cuda")]
+#[repr(C)]
+struct MegaParams {
+    x: u64,
+    residual: u64,
+    post_in: u64,
+    comb_in: u64,
+    folded: u64,
+    scale: u64,
+    base: u64,
+    post_out: u64,
+    comb_out: u64,
+    weight: u64,
+    y: u64,
+    codes: u64,
+    atoms: u64,
+    part: u64,
+    sync: u64,
+    maps: u64,
+    win: u64,
+    rows: i32,
+    splits: i32,
+    sinkhorn: i32,
+    mix_eps: f32,
+    gate_eps: f32,
+    alpha: f32,
+    norm_eps: f32,
+}
+
+/// `pie::elemwise::hc_mega_smem()`: three stages of a task's streams
+/// (32 KB), x (8 KB), the weights' f32 box and its bf16 halves (12 KB
+/// each), two tasks' gates (10 KB each), then the rebased maps, barriers
+/// and scratch (8 KB) and the 1 KB alignment.
+#[cfg(feature = "cuda")]
+const MEGA_SMEM: u32 = 3 * (32768 + 8192 + 12288 + 12288) + 2 * 10240 + 8192 + 1024;
+
+/// The row maps a block rebases at a staged window (`kMegaMaps`).
+#[cfg(feature = "cuda")]
+const MEGA_MAPS: u32 = 5;
+
+/// `pie::elemwise::kMegaThreads`.
+#[cfg(feature = "cuda")]
+const MEGA_THREADS: u32 = 480;
+
+/// A task's rows (the MMA's M) and a K-block's columns of each stream.
+#[cfg(feature = "cuda")]
+const MEGA_ROWS: u32 = 128;
+#[cfg(feature = "cuda")]
+const MEGA_COLS: u32 = 32;
+
+/// The most splits a row is cut into: a task keeps two K-blocks at least,
+/// which `hc_fold_pre_tc5`'s one slot of pending gates asks.
+#[cfg(feature = "cuda")]
+const MEGA_SPLITS: u32 = 64;
+
+/// The tasks a launch aims for, a multiple of the SMs: enough that the
+/// dynamic queue's tail is a fraction of a task.
+#[cfg(feature = "cuda")]
+const MEGA_TASKS_PER_SM: u32 = 4;
+
+/// The counters' words before the per-block arrivals
+/// (`pie::elemwise::kSyncBlocks`).
+#[cfg(feature = "cuda")]
+const MEGA_SYNC_HEAD: u32 = 8;
+
+/// A sublayer's fold and the next sublayer's whole pre-mix as
+/// `hc_fold_pre_tc5` takes them.
+#[derive(Clone, Copy)]
+pub struct Seam {
+    /// The sublayer's output, `[N, H]`.
+    pub x: Tensor,
+    /// The streams it folds into, `[N, 4H]`.
+    pub streams: Tensor,
+    /// The sublayer's post and combine gates, `[N, 4]` and `[N, 16]`.
+    pub post_mix: Tensor,
+    pub comb_mix: Tensor,
+    /// The next sublayer's stream-norm eps and mix projection, `[24, 4H]`.
+    pub mix_eps: f32,
+    pub hc_fn: Tensor,
+    pub stream_count: u32,
+    pub gate: Gate,
+    /// Its input norm's weight `[H]` and eps.
+    pub weight: Tensor,
+    pub norm_eps: f32,
+}
+
+/// Whether `hc_fold_pre_tc5` takes these: tcgen05, four streams whose
+/// width is whole 1024s, the 24-mix plane, bf16 rows and f32 gates
+/// 16-byte aligned, `kernel.elemwise.hc_mega_from` to `hc_mega_until` rows.
+#[cfg(feature = "cuda")]
+fn fold_pre_fits(ctx: &Ctx, s: &Seam, folded: &Tensor, y: &Tensor) -> bool {
+    let hidden = y.width;
+    let wide = 4 * hidden;
+    crate::linear::gemm_sm100::supported()
+        && y.rows != 0
+        && (ctx.tuning().hc_mega_from..=ctx.tuning().hc_mega_until).contains(&y.rows)
+        && s.stream_count == 4
+        && hidden != 0
+        && hidden.is_multiple_of(1024)
+        && [
+            s.x.dtype,
+            s.streams.dtype,
+            folded.dtype,
+            s.weight.dtype,
+            y.dtype,
+        ]
+        .iter()
+        .all(|d| *d == Dtype::Bf16)
+        && [s.post_mix.dtype, s.comb_mix.dtype, s.hc_fn.dtype]
+            .iter()
+            .all(|d| *d == Dtype::F32)
+        && s.x.width == hidden
+        && s.streams.width == wide
+        && folded.width == wide
+        && s.post_mix.width == 4
+        && s.comb_mix.width == 16
+        && s.hc_fn.rows == 24
+        && s.hc_fn.width == wide
+        && s.weight.width == hidden
+        && [
+            s.x.ptr,
+            s.streams.ptr,
+            folded.ptr,
+            s.post_mix.ptr,
+            s.comb_mix.ptr,
+            s.hc_fn.ptr,
+            s.weight.ptr,
+            y.ptr,
+        ]
+        .iter()
+        .all(|at| at.is_multiple_of(16))
+}
+
+/// The splits a row is cut into for `rows` rows on `sms` multiprocessors:
+/// about `MEGA_TASKS_PER_SM` tasks an SM, every task two K-blocks at least.
+#[cfg(feature = "cuda")]
+fn mega_splits(rows: u32, hidden: u32, sms: u32) -> u32 {
+    let blocks = rows.div_ceil(MEGA_ROWS);
+    let most = (hidden / MEGA_COLS / 2).clamp(1, MEGA_SPLITS);
+    (MEGA_TASKS_PER_SM * sms).div_ceil(blocks).clamp(1, most)
+}
+
+/// A sublayer's fold (`fold`, bit for bit) and the next sublayer's whole
+/// pre-mix (`pre`: the gates and the normed row `y`, to the projection's
+/// rounding) in one tcgen05 launch, `folded` the folded streams. With
+/// `held` (a GEMM's e4m3 1x128 planes, codes then atoms) the normed row
+/// also lands there. `Ok(false)` where the shapes or the profile are not
+/// the kernel's (`fold_pre_fits`): the caller runs the fold and `pre`.
+pub fn fold_pre(
+    ctx: &Ctx,
+    seam: Seam,
+    folded: &mut Tensor,
+    held: Option<[u64; 2]>,
+    post_mix: &mut Tensor,
+    comb_mix: &mut Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    #[cfg(feature = "cuda")]
+    {
+        const OP: &str = "fused.hc_fold_pre";
+        use crate::jit::ArgValue;
+        use crate::linear::gemm_sm100::{Map, encode};
+        use cudarc::driver::sys as dr;
+        if !fold_pre_fits(ctx, &seam, folded, y) {
+            return Ok(false);
+        }
+        let rows = y.rows;
+        let hidden = y.width;
+        let sms = ctx.multiprocessors().unwrap_or(148);
+        let splits = mega_splits(rows, hidden, sms);
+        let blocks = rows.div_ceil(MEGA_ROWS);
+        let part = ctx.scratch_shared(
+            OP,
+            "elemwise.hc_mega_partial",
+            (blocks * splits * MEGA_ROWS * 32) as usize * core::mem::size_of::<f32>(),
+        )? as usize as u64;
+        let sync = ctx.scratch_stream_zeroed(
+            OP,
+            "elemwise.hc_mega_counts",
+            (MEGA_SYNC_HEAD + blocks) as usize * core::mem::size_of::<u32>(),
+        )? as usize as u64;
+        let grid = (blocks * splits).max(rows).min(sms);
+        // Each block's row maps rebased at a staged window.
+        let maps = ctx.scratch_shared(
+            OP,
+            "elemwise.hc_mega_maps",
+            (grid * MEGA_MAPS * 128) as usize,
+        )? as usize as u64;
+        // The weights' 32-column box of every mix of every stream: x the
+        // column, y the mix, z the stream.
+        let map_fn = encode(Map {
+            ptr: seam.hc_fn.ptr,
+            ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+            dims: [hidden, 24, 4],
+            strides: [u64::from(4 * hidden) * 4, u64::from(hidden) * 4],
+            boxes: [MEGA_COLS, 24, 4],
+            swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        })?;
+        // x's and the streams' 32-column boxes of 128 rows, the streams'
+        // stream-major (x the column, y the row, z the stream), 64-byte
+        // swizzled as the MMA reads them.
+        let bf16 = dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+        let sw64 = dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B;
+        let map_x = encode(Map {
+            ptr: seam.x.ptr,
+            ty: bf16,
+            dims: [hidden, rows, 0],
+            strides: [u64::from(hidden) * 2, 0],
+            boxes: [MEGA_COLS, MEGA_ROWS, 1],
+            swizzle: sw64,
+        })?;
+        let streams = |ptr: u64| {
+            encode(Map {
+                ptr,
+                ty: bf16,
+                dims: [hidden, rows, 4],
+                strides: [u64::from(4 * hidden) * 2, u64::from(hidden) * 2],
+                boxes: [MEGA_COLS, MEGA_ROWS, 4],
+                swizzle: sw64,
+            })
+        };
+        let (map_res, map_out) = (streams(seam.streams.ptr)?, streams(folded.ptr)?);
+        // A task's rows of the post and combine gates, unswizzled.
+        let gates = |ptr: u64, width: u32| {
+            encode(Map {
+                ptr,
+                ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+                dims: [width, rows, 0],
+                strides: [u64::from(width) * 4, 0],
+                boxes: [width, MEGA_ROWS, 1],
+                swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            })
+        };
+        let (map_post, map_comb) = (gates(seam.post_mix.ptr, 4)?, gates(seam.comb_mix.ptr, 16)?);
+        let win = match ctx.stage() {
+            ArgValue::Ptr(at) => at,
+            _ => 0,
+        };
+        let [codes, atoms] = held.unwrap_or([0, 0]);
+        let params = MegaParams {
+            x: seam.x.ptr,
+            residual: seam.streams.ptr,
+            post_in: seam.post_mix.ptr,
+            comb_in: seam.comb_mix.ptr,
+            folded: folded.ptr,
+            scale: seam.gate.scale.ptr,
+            base: seam.gate.base.ptr,
+            post_out: post_mix.ptr,
+            comb_out: comb_mix.ptr,
+            weight: seam.weight.ptr,
+            y: y.ptr,
+            codes,
+            atoms,
+            part,
+            sync,
+            maps,
+            win,
+            rows: stated(OP, rows)?,
+            splits: stated(OP, splits)?,
+            sinkhorn: stated(OP, seam.gate.sinkhorn)?,
+            mix_eps: seam.mix_eps,
+            gate_eps: seam.gate.gate_eps,
+            alpha: seam.gate.alpha,
+            norm_eps: seam.norm_eps,
+        };
+        ctx.fire(
+            OP,
+            Fire::at(kernel(
+                HC_SM100,
+                &format!(
+                    "::pie::elemwise::hc_fold_pre_tc5<{hidden}, {}>",
+                    held.is_some()
+                ),
+            ))
+            .apply(
+                Launch::grid([grid, 1, 1], [MEGA_THREADS, 1, 1])
+                    .smem(MEGA_SMEM)
+                    .programmatic(ctx.tuning().pdl),
+            ),
+            &[
+                ArgValue::of(&map_fn),
+                ArgValue::of(&map_x),
+                ArgValue::of(&map_res),
+                ArgValue::of(&map_out),
+                ArgValue::of(&map_post),
+                ArgValue::of(&map_comb),
+                ArgValue::of(&params),
+            ],
+        )?;
+        Ok(true)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ctx, seam, folded, held, post_mix, comb_mix, y);
+        Ok(false)
+    }
+}

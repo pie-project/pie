@@ -105,6 +105,16 @@ __device__ __forceinline__ void tma_load_3d(void* dst, u64* bar, const TmaMap* m
         : "memory");
 }
 
+// The same box at (x, y, z) into L2 alone: nothing lands in shared memory
+// and no barrier completes. For what a later copy will read, issued before
+// it may be (a weight before `pdl_wait`).
+__device__ __forceinline__ void tma_prefetch_3d(const TmaMap* map, int x, int y, int z) {
+    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" ::"l"(
+                     reinterpret_cast<u64>(map)),
+                 "r"(x), "r"(y), "r"(z)
+                 : "memory");
+}
+
 // ---- CTA pairs (cta_group::2) -------------------------------------------------
 // Two CTAs of a cluster run one MMA of 256 rows: each holds its 128 rows of
 // A, half of B's rows and its own half of D. Rank 0 issues; its barriers
@@ -195,6 +205,55 @@ __device__ __forceinline__ void tma_store_2d(const TmaMap* map, const void* src,
                  : "memory");
 }
 
+// A 3D box of shared memory out to (x, y, z), as `tma_store_2d`.
+__device__ __forceinline__ void tma_store_3d(const TmaMap* map, const void* src, int x, int y, int z) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0, {%2, %3, %4}], [%1];" ::"l"(
+            reinterpret_cast<u64>(map)),
+        "r"(smem_addr(src)), "r"(x), "r"(y), "r"(z)
+        : "memory");
+}
+
+// ---- tensor maps rebased on the device ----------------------------------------
+// A map the host encoded, moved by the kernel to where a runtime-only window
+// says (its base address and an extent): rewritten in shared memory, then
+// published to a global slot with the proxy fence that makes it the async
+// proxy's, and acquired there by each thread that issues through it.
+
+// Points the shared copy at `map` (128-byte aligned) at `addr`.
+__device__ __forceinline__ void tmap_set_address(TmaMap* map, u64 addr) {
+    asm volatile("tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;" ::"r"(
+                     smem_addr(map)),
+                 "l"(addr)
+                 : "memory");
+}
+
+// Sets the shared copy's extent along dimension D.
+template <int D>
+__device__ __forceinline__ void tmap_set_dim(TmaMap* map, u32 extent) {
+    asm volatile("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], %1, %2;" ::"r"(
+                     smem_addr(map)),
+                 "n"(D), "r"(extent)
+                 : "memory");
+}
+
+// Whole-warp: the shared copy out to the global slot `to`, released to the
+// tensor-map proxy at gpu scope.
+__device__ __forceinline__ void tmap_publish(TmaMap* to, const TmaMap* from) {
+    asm volatile(
+        "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned"
+        " [%0], [%1], 128;" ::"l"(reinterpret_cast<u64>(to)),
+        "r"(smem_addr(from))
+        : "memory");
+}
+
+// Before the first copy through a published map.
+__device__ __forceinline__ void tmap_acquire(const TmaMap* map) {
+    asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(
+                     reinterpret_cast<u64>(map))
+                 : "memory");
+}
+
 __device__ __forceinline__ void bulk_commit() {
     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
 }
@@ -225,6 +284,13 @@ __device__ __forceinline__ void red_add4(float* at, float a, float b, float c, f
 // Makes generic-proxy writes to shared memory visible to TMA.
 __device__ __forceinline__ void fence_async_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
+// Orders this thread's completed TMA stores to global memory (waited with
+// bulk_wait_all) before its generic operations after it: a release after it
+// publishes what the stores wrote.
+__device__ __forceinline__ void fence_async_global() {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
 }
 
 // ---- tcgen05: allocation and ordering ------------------------------------
@@ -317,7 +383,9 @@ __device__ __forceinline__ u64 sdesc_sw128(u32 saddr) {
 }
 
 // As sdesc_sw128 for the 64-byte swizzle: rows of 64 bytes (128 packed
-// e2m1), 8-row atoms 512 bytes apart, the tile 512-aligned.
+// e2m1, or 32 bf16), 8-row atoms 512 bytes apart, the tile 512-aligned; a K
+// step of 16 bf16 inside the row is an add of 2 to the start address. A
+// row's 16-byte chunk c sits at chunk c ^ ((row >> 1) & 3).
 __device__ __forceinline__ u64 sdesc_sw64(u32 saddr) {
     u64 d = 0;
     d |= static_cast<u64>((saddr & 0x3FFFFu) >> 4);
