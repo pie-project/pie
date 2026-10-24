@@ -209,6 +209,7 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         residency: engine_cuda::experts::Plan::default(),
         deferred_tier: false,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })?;
     shell.open(0).expect("slot 0 opens");

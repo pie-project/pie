@@ -112,6 +112,7 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
     .expect("a short card still holds one sequence");

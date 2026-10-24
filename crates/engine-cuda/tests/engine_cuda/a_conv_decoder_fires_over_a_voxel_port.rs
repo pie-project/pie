@@ -408,6 +408,7 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
         residency: engine_cuda::experts::Plan::default(),
         deferred_tier: true,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
     .expect("the decoder loads");
@@ -685,6 +686,7 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         residency: engine_cuda::experts::Plan::default(),
         deferred_tier: true,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
     .expect("the causal text loads");

@@ -104,5 +104,8 @@ pub struct Boot<'a> {
     pub residency: crate::experts::Plan,
     pub deferred_tier: bool,
     pub world: crate::api::World,
+    /// The rank's place in its expert-parallel group: which slots of each
+    /// routed bank its checkpoint read keeps.
+    pub expert: crate::api::World,
     pub comm: *const crate::comm::Comm,
 }

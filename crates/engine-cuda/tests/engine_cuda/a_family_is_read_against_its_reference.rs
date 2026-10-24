@@ -239,6 +239,7 @@ fn every_probe_is_dumped() {
         runahead: engine::runahead::Runahead::F1,
         residency,
         world: World::default(),
+        expert: World::default(),
         comm: core::ptr::null_mut(),
     })
     .expect("the shell loads");

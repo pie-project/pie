@@ -67,6 +67,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         runahead: engine::runahead::Runahead::F1,
         residency,
         world: crate::World::default(),
+        expert: crate::World::default(),
         comm: core::ptr::null_mut(),
     })
     .map_err(|e| e.to_string())?;

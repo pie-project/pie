@@ -201,11 +201,14 @@ impl Cuda {
     }
 
     fn target(&self) -> checkpoint::plan::StorageTarget {
-        checkpoint::plan::StorageTarget::for_backend(
-            checkpoint::types::BackendKind::Cuda,
-            self.boot.world.rank,
-            self.boot.world.size,
-        )
+        checkpoint::plan::StorageTarget {
+            ep_rank: self.expert.rank,
+            ..checkpoint::plan::StorageTarget::for_backend(
+                checkpoint::types::BackendKind::Cuda,
+                self.boot.world.rank,
+                self.boot.world.size,
+            )
+        }
     }
 
     /// A frame an expert-parallel rank brings to its group: validated, its
@@ -669,6 +672,7 @@ impl Engine for Cuda {
             residency: plan,
             deferred_tier: residency.deferred_tier,
             world: self.boot.world,
+            expert: self.expert,
             comm: self
                 .boot
                 .comm
@@ -687,7 +691,9 @@ impl Engine for Cuda {
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
                 budgets.max_context,
-                self.boot.world.size,
+                // Every rank on the host seats its own: a tensor-parallel
+                // group's and each expert-parallel rank's.
+                self.boot.world.size * self.expert.size,
             )
             .map_err(fault)?;
         // Every page the load serves is backed now, so serving maps nothing:

@@ -11,9 +11,13 @@
 //! split every step in two, each idling through the other's. The first
 //! arrival leads: it is handed every arrived frame and the step's bucket
 //! (the largest asked, which Dispatch's token count must agree on), fires
-//! the step on every rank, and posts each joined rank its result.
+//! the step on every rank, and posts each joined rank its result. Each rank
+//! fires on a thread of its own, held for the group's life ([`Firing`]): a
+//! rank's fire may wait on its device, which waits on every other rank's
+//! launches.
 
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, PendingStep};
@@ -215,6 +219,90 @@ struct Group {
     /// for the group.
     wired: Mutex<(usize, Option<Result<(), String>>)>,
     wired_cv: Condvar,
+    firing: Firing,
+}
+
+/// What a rank's thread fires: its frame's step, or an idle step.
+enum Job {
+    Step(Step, engine::StepDone, u32),
+    Idle(u32),
+}
+
+/// One thread a rank, bound to its device once, firing what the step's
+/// leader hands it. Only one step fires at a time, so the leader alone
+/// reads the answers.
+struct Firing {
+    jobs: Vec<mpsc::Sender<Job>>,
+    answers: Mutex<mpsc::Receiver<(usize, Option<Fired>)>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Firing {
+    fn start(ranks: &[Arc<Mutex<Cuda>>], ordinals: &[i32]) -> Result<Firing, String> {
+        let (answer, answers) = mpsc::channel();
+        let mut jobs = Vec::with_capacity(ranks.len());
+        let mut threads = Vec::with_capacity(ranks.len());
+        for (rank, (cuda, &ordinal)) in ranks.iter().zip(ordinals).enumerate() {
+            let (job, inbox) = mpsc::channel();
+            let (cuda, answer) = (Arc::clone(cuda), answer.clone());
+            let thread = std::thread::Builder::new()
+                .name(format!("ep-rank-{rank}"))
+                .spawn(move || serve(rank, ordinal, &cuda, &inbox, &answer))
+                .map_err(|why| format!("rank {rank}'s firing thread: {why}"))?;
+            jobs.push(job);
+            threads.push(thread);
+        }
+        Ok(Firing {
+            jobs,
+            answers: Mutex::new(answers),
+            threads,
+        })
+    }
+}
+
+impl Drop for Firing {
+    fn drop(&mut self) {
+        self.jobs.clear();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A rank's firing thread: each job it is handed, answered in turn, until
+/// the group is gone.
+fn serve(
+    rank: usize,
+    ordinal: i32,
+    cuda: &Mutex<Cuda>,
+    inbox: &mpsc::Receiver<Job>,
+    answer: &mpsc::Sender<(usize, Option<Fired>)>,
+) {
+    let bound = crate::device::ctx::bind_thread(ordinal).map_err(|f| f.to_string());
+    for job in inbox {
+        // A panic answers as a refusal: the leader waits on every rank.
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bound.clone().map_err(Error::Device)?;
+            let mut cuda = cuda.lock().expect("rank lock poisoned");
+            cuda.bind_thread()?;
+            match &job {
+                Job::Step(step, at, bucket) => cuda.fire_step_at(step, *at, *bucket).map(Some),
+                Job::Idle(bucket) => cuda.fire_idle(*bucket).map(|()| None),
+            }
+        }))
+        .unwrap_or_else(|_| Err(Error::Device(format!("rank {rank}'s fire panicked"))));
+        let fired = match fired {
+            Ok(Some(done)) => Some(Ok(done)),
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("engine-cuda: expert-parallel rank {rank} refused: {error}");
+                Some(Err(error))
+            }
+        };
+        if answer.send((rank, fired)).is_err() {
+            return;
+        }
+    }
 }
 
 struct Wiring {
@@ -316,51 +404,40 @@ impl Group {
         }
     }
 
-    /// Fires `formed` on every rank at once, each on its own thread: a
-    /// rank's fire may wait on its device, which waits on every other
-    /// rank's launches.
+    /// Fires `formed` on every rank at once, each on its own thread.
     fn fire(&self, formed: Formed<(Step, engine::StepDone)>) -> Vec<Option<Fired>> {
         let bucket = formed.bucket;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = formed
-                .frames
-                .into_iter()
-                .zip(self.ranks.iter().zip(&self.ordinals))
-                .enumerate()
-                .map(|(rank, (frame, (cuda, &ordinal)))| {
-                    scope.spawn(move || -> Option<Fired> {
-                        let fired = (|| {
-                            crate::device::ctx::bind_thread(ordinal)
-                                .map_err(|f| Error::Device(f.to_string()))?;
-                            let mut cuda = cuda.lock().expect("rank lock poisoned");
-                            cuda.bind_thread()?;
-                            match &frame {
-                                Some((step, at)) => cuda.fire_step_at(step, *at, bucket).map(Some),
-                                None => cuda.fire_idle(bucket).map(|()| None),
-                            }
-                        })();
-                        match fired {
-                            Ok(Some(done)) => Some(Ok(done)),
-                            Ok(None) => None,
-                            Err(error) => {
-                                eprintln!(
-                                    "engine-cuda: expert-parallel rank {rank} refused: {error}"
-                                );
-                                Some(Err(error))
-                            }
-                        }
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Some(Err(Error::Device("a rank's fire panicked".into())))
-                    })
-                })
-                .collect()
-        })
+        let answers = self
+            .firing
+            .answers
+            .lock()
+            .expect("lockstep answers lock poisoned");
+        let mut results: Vec<Option<Fired>> = (0..self.ranks.len()).map(|_| None).collect();
+        let mut owed = vec![false; self.ranks.len()];
+        for (rank, frame) in formed.frames.into_iter().enumerate() {
+            let job = match frame {
+                Some((step, at)) => Job::Step(step, at, bucket),
+                None => Job::Idle(bucket),
+            };
+            owed[rank] = self.firing.jobs[rank].send(job).is_ok();
+            if !owed[rank] {
+                results[rank] = Some(Err(Error::Device(format!(
+                    "rank {rank}'s firing thread is gone"
+                ))));
+            }
+        }
+        while owed.iter().any(|&o| o) {
+            let Ok((rank, fired)) = answers.recv() else {
+                for (rank, _) in owed.iter().enumerate().filter(|(_, o)| **o) {
+                    results[rank] =
+                        Some(Err(Error::Device(format!("rank {rank}'s fire panicked"))));
+                }
+                break;
+            };
+            owed[rank] = false;
+            results[rank] = fired;
+        }
+        results
     }
 }
 
@@ -391,6 +468,7 @@ pub fn open_lockstep(
         cuda.set_expert_rank(rank as u32, size as u32);
         ranks.push(Arc::new(Mutex::new(cuda)));
     }
+    let firing = Firing::start(&ranks, &ordinals)?;
     let group = Arc::new(Group {
         ranks,
         ordinals,
@@ -401,6 +479,7 @@ pub fn open_lockstep(
         }),
         wired: Mutex::new((0, None)),
         wired_cv: Condvar::new(),
+        firing,
     });
     // Each rank's load meets the group at arming. The hook holds the group
     // weakly: the group holds the ranks that hold the hooks.

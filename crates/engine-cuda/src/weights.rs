@@ -800,7 +800,10 @@ impl Weights {
         let mut store = Buffer::zeroed(usize::try_from(total).unwrap_or(usize::MAX))?;
         let serving = crate::checkpoint_serving::Serving::open(path, trace);
         let deferred = defer_tiers(serving.as_ref(), &plan, deferred_tier);
+        // A serving artifact lays out every expert: a rank holding some
+        // of a bank's slots reads its own from the checkpoint.
         let restorable = target.tp_size == 1
+            && trace.params.iter().all(|param| param.experts.is_none())
             && serving
                 .as_ref()
                 .is_some_and(|serving| serving.covers(&plan.host_layout()).is_ok());
