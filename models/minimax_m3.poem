@@ -6,6 +6,12 @@ load("//pie/codec.poem", "bank", "kept", "nvfp4_packed_bank", read_weight = "wei
 MINIMAX = template("minimax")
 TOKENIZER = tokenizer(markers = [["[e~[", "]~b]", "]~!b[", "]<]minimax[>[", "<mm:think>", "</mm:think>"]])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k and v by their heads, the dense and routed gates and ups by
+# their channels, the output and down projections by their rows. The head
+# it holds whole, as the package always has.
+CUTS = "inferred"
+
 def m3(id, **kwargs):
     return model(id, template = MINIMAX, tokenizer = TOKENIZER, arch = "minimax_m3_vl", vocab = 200064, **kwargs)
 
@@ -90,10 +96,10 @@ def attention(n, d, proj, dense, kv):
         rotary_dim = d.rotary_dim,
         theta = d.theta,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        q_proj = weight([d.q_heads * hd, d.hidden], proj).columns(),
-        k_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
-        v_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
-        o_proj = weight([d.hidden, d.q_heads * hd], proj).rows(),
+        q_proj = weight([d.q_heads * hd, d.hidden], proj),
+        k_proj = weight([d.kv_heads * hd, d.hidden], proj),
+        v_proj = weight([d.kv_heads * hd, d.hidden], proj),
+        o_proj = weight([d.hidden, d.q_heads * hd], proj),
         q_norm = weight([hd]),
         k_norm = weight([hd]),
         norm_eps = d.norm_eps,
@@ -121,9 +127,9 @@ def indexer(n, d, dense, keys, proj = None):
 def mlp(d, inter, proj):
     """A clamped SwiGLU-OAI MLP `inter` wide."""
     return struct(
-        gate = weight([inter, d.hidden], proj).columns(),
-        up = weight([inter, d.hidden], proj).columns(),
-        down = weight([d.hidden, inter], proj).rows(),
+        gate = weight([inter, d.hidden], proj),
+        up = weight([inter, d.hidden], proj),
+        down = weight([d.hidden, inter], proj),
         inter = inter,
         limit = d.swiglu_limit,
         alpha = d.swiglu_alpha,
@@ -135,8 +141,8 @@ def routed(n, d, mix, dense):
     return struct(
         router = weight([d.experts, d.hidden]),
         bias = weight([d.experts], dtype.f32),
-        gate_up = weight([d.experts, 2 * d.inter, d.hidden], mix.experts).bank([d.inter, d.inter]),
-        down = weight([d.experts, d.hidden, d.inter], mix.experts).rows(),
+        gate_up = weight([d.experts, 2 * d.inter, d.hidden], mix.experts),
+        down = weight([d.experts, d.hidden, d.inter], mix.experts),
         shared = mlp(d, d.shared_inter, mix.proj),
         experts = d.experts,
         top_k = d.top_k,
@@ -175,7 +181,7 @@ def layout(id, deploy):
         norm_eps = d.norm_eps,
         kv = deploy.kv,
         embed = weight([d.vocab, d.hidden], mix.embed),
-        head = weight([d.vocab, d.hidden], mix.head),
+        head = weight([d.vocab, d.hidden], mix.head).replicated(),
         final_norm = weight([d.hidden]),
         layers = [layer(l) for l in range(d.layers)],
     )
