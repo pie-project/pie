@@ -45,6 +45,8 @@ pub struct Region {
     /// than the f32 it is computed in and read on as rounded: the rounding
     /// points the program a region came from states (a value it stores
     /// between two ops), so a fusion lands what the ops it replaces land.
+    /// A result rounds by its store, so its plane is of the dtype it rounds
+    /// to; a body rounds only the values that do not leave.
     pub rounds: Vec<(ValueId, Dtype)>,
 }
 

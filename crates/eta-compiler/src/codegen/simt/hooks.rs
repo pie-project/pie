@@ -75,8 +75,13 @@ pub(crate) fn emit_body(
     rounds: &[(u32, Dtype)],
 ) -> Result<(String, u32), Uncovered> {
     // `expr`, the value `value`, as the region holds it: rounded where it
-    // rounds.
+    // rounds. A result is rounded by its store (`f.st` returns it as its
+    // plane holds it, the dtype it rounds to), so only a value that does
+    // not leave is rounded here.
     let held = |value: u32, expr: String| -> Result<String, Uncovered> {
+        if results.contains(&value) {
+            return Ok(expr);
+        }
         match rounds.iter().find(|(v, _)| *v == value) {
             None => Ok(expr),
             Some((_, Dtype::Bf16)) => Ok(format!("f.round_bf16({expr})")),

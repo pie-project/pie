@@ -228,8 +228,10 @@ fn an_op_no_hook_serves_leaves_the_region_without_a_body() {
             .eval(&[Value::F32(plane(1)), Value::F32(vec![2.0])])
             .is_ok()
     );
-    let refused = scalar.body().expect_err("a frame's planes are rows");
-    assert_eq!(refused.op, None);
+    let body = scalar
+        .body()
+        .expect("a scalar parameter is one element every row reads");
+    assert!(body.source.contains("f.one(1)"), "{}", body.source);
 
     let sum_out = Region {
         params: vec![row()],
@@ -266,6 +268,7 @@ template <int N_, int IN, int OUT> struct HostFrame {
   float reduce_sum(float v) { return v; }
   float reduce_max(float v) { return v; }
   float round_bf16(float v) const { return bf16(v); }
+  float one(int k) const { return in[k][0]; }
   template <int K> void flush() {}
 };
 "#;
