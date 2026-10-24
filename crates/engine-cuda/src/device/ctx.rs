@@ -457,6 +457,8 @@ impl Drop for Context {
         {
             // SAFETY: the shell is being torn down, so nothing else holds
             // either handle; both were produced by this context's `bind`.
+            // The slabs are this context's own: every `Ctx` and graph that
+            // carried them belongs to the shell going down with it.
             unsafe {
                 self.events.clear();
                 self.slabs.release();
