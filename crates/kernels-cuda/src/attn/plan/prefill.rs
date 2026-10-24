@@ -19,6 +19,10 @@ pub struct Request<'a> {
     pub enable_cuda_graph: bool,
     pub window_left: Option<u32>,
     pub ctas_per_sm: u32,
+    /// Every request on the tile [`INVARIANT_TILE_Q`] packed rows take, a
+    /// tile's keys one work item folded alone: what a request's rows sum
+    /// is its own.
+    pub invariant: bool,
 }
 
 impl Request<'_> {
@@ -62,6 +66,21 @@ const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32) -> u32 {
     }
 }
 
+/// The packed query rows a batch-invariant prefill's tile is sized for,
+/// whatever the batch's rows: a prompt's tile, not a decode's.
+const INVARIANT_TILE_Q: u64 = 64;
+
+/// The CTA tile a request's packed rows take: under `invariant` the one
+/// its head width takes at [`INVARIANT_TILE_Q`] rows, else the batch's
+/// mean.
+const fn cta_tile_q(avg_packed_qo_len: u64, head_dim: u32, invariant: bool) -> u32 {
+    if invariant {
+        determine_cta_tile_q(INVARIANT_TILE_Q, head_dim)
+    } else {
+        determine_cta_tile_q(avg_packed_qo_len, head_dim)
+    }
+}
+
 fn search_kv_chunk_size(
     enable_cuda_graph: bool,
     max_batch_size_if_split: u32,
@@ -91,10 +110,10 @@ fn search_kv_chunk_size(
     (enable_cuda_graph || low < max_kv_len, low)
 }
 
-fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32) -> (u32, u64) {
+fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32, invariant: bool) -> (u32, u64) {
     let batch = u64::from(batch.max(1));
     let max_seq_len = u64::from(rows).saturating_sub(batch - 1);
-    let tile = determine_cta_tile_q(max_seq_len * group, head_dim);
+    let tile = cta_tile_q(max_seq_len * group, head_dim, invariant);
     let tiles = (u64::from(rows) * group).div_ceil(u64::from(tile)) + batch - 1;
     (tile, tiles)
 }
@@ -110,6 +129,7 @@ pub fn partial_rows(tile: u32, num_qo_heads: u32, num_kv_heads: u32) -> u64 {
 }
 
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn graph_padding(
     rows: u32,
     lanes: u32,
@@ -118,10 +138,11 @@ pub fn graph_padding(
     head_dim: u32,
     device: &Device,
     ctas_per_sm: u32,
+    invariant: bool,
 ) -> (u32, u64) {
     let kv_heads = num_kv_heads.max(1);
     let group = u64::from((num_qo_heads / kv_heads).max(1));
-    let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim);
+    let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim, invariant);
     let floor = u64::from(ctas_per_sm.max(1) * device.num_sm.max(1)) / u64::from(kv_heads);
     (tile, floor.max(tiles))
 }
@@ -156,10 +177,16 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let min_kv_chunk_size = u64::from((128 / req.page_size).max(1));
 
     let (cta_tile_q, total_num_tiles_q) = if req.enable_cuda_graph {
-        graph_tiles(req.total_num_rows, req.batch_size, group, req.head_dim)
+        graph_tiles(
+            req.total_num_rows,
+            req.batch_size,
+            group,
+            req.head_dim,
+            req.invariant,
+        )
     } else {
         let sum: u64 = packed_qo_lens.iter().sum();
-        let tile = determine_cta_tile_q(sum / u64::from(req.batch_size), req.head_dim);
+        let tile = cta_tile_q(sum / u64::from(req.batch_size), req.head_dim, req.invariant);
         let tiles = packed_qo_lens
             .iter()
             .map(|&packed| packed.div_ceil(u64::from(tile)))
@@ -180,14 +207,19 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         })
         .collect();
 
-    let (split_kv, kv_chunk_size_in_pages) = search_kv_chunk_size(
-        req.enable_cuda_graph,
-        max_batch_size_if_split,
-        &packed_qo_lens,
-        &effective_kv_lens,
-        cta_tile_q,
-        min_kv_chunk_size,
-    );
+    let (split_kv, kv_chunk_size_in_pages) = if req.invariant {
+        let whole = effective_kv_lens.iter().copied().max().unwrap_or(0).max(1);
+        (true, whole)
+    } else {
+        search_kv_chunk_size(
+            req.enable_cuda_graph,
+            max_batch_size_if_split,
+            &packed_qo_lens,
+            &effective_kv_lens,
+            cta_tile_q,
+            min_kv_chunk_size,
+        )
+    };
 
     let mut request_indices = Vec::new();
     let mut qo_tile_indices = Vec::new();
@@ -441,7 +473,9 @@ mod tests {
         for (q_heads, kv_heads, head_dim) in [(16, 2, 512), (16, 8, 256), (32, 8, 128), (8, 8, 64)]
         {
             for qo in [vec![1u32; 64], vec![1, 7, 300, 1, 33], vec![2048]] {
-                for graph in [true, false] {
+                for (graph, invariant) in
+                    [(true, false), (false, false), (true, true), (false, true)]
+                {
                     let qo_indptr: Vec<i32> = std::iter::once(0)
                         .chain(qo.iter().scan(0, |at, len| {
                             *at += *len as i32;
@@ -470,6 +504,7 @@ mod tests {
                         enable_cuda_graph: graph,
                         window_left: None,
                         ctas_per_sm: 2,
+                        invariant,
                     };
                     let sched = schedule("test", &req, &Device::L40S).unwrap();
                     let laid = layout("test", &req, &sched, usize::MAX, usize::MAX).unwrap();
