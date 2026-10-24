@@ -16,6 +16,8 @@ pub(crate) mod device {
         None
     }
 }
+#[cfg(all(test, feature = "cuda"))]
+mod launches;
 #[cfg(feature = "cuda")]
 pub mod nvrtc;
 mod root;
