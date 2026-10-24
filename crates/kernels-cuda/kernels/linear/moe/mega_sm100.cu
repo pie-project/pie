@@ -68,6 +68,10 @@ constexpr int kSlots = 4;
 // Columns a quantizer pass reads of a row: eight 128-blocks, two at once
 // across the warp's halves, four passes' loads in flight.
 constexpr int kChunk = 1024;
+// The most tokens a fire folds in its down epilogue, the last route of a
+// column tile in folding the tile; a wider one's fold is spread over the
+// CTAs at the end.
+constexpr int kFoldInline = 16;
 
 template <int kBN>
 __host__ __device__ constexpr u32 stage_b() { return 2u * kBN * 128u; }
@@ -143,6 +147,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     int* task_slot = reinterpret_cast<int*>(task_empty + kSlots);
     u32* tmem_slot = reinterpret_cast<u32*>(task_slot + kSlots);
     u32* flag = tmem_slot + 1;
+    u32* wg_flag = flag + 1;  // an epilogue warpgroup's own, two
     float* wmax_all = reinterpret_cast<float*>(smem + kOffTail + 256);
     Routing& R = *reinterpret_cast<Routing*>(smem + kOffTail + 256 + 2 * 4 * 4 * kBN);
 
@@ -180,6 +185,9 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
         tmem_alloc(tmem_slot, kCols);
         tmem_relinquish();
     }
+    // As a programmatic dependent (`kernel.pdl`) the set-up above overlapped
+    // the producer's tail; the routes, rows and flags are read past this.
+    pdl_wait();
     {
         const int t0 = p.win != nullptr ? static_cast<int>(__ldg(&p.win[1])) : 0;
         const int tl = p.win != nullptr ? static_cast<int>(__ldg(&p.win[0])) : p.tokens;
@@ -199,6 +207,74 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     u32* xready = p.sync + ws_xready();
     u32* hready = p.sync + ws_hready();
     u32* done = p.sync + ws_done();
+
+    // Token t's 128-column tile j folded by a warp, eight columns a lane, the
+    // routes in order (with `wait`, once every route has landed there).
+    auto fold = [&](int t, int j, bool wait) {
+            const int col = 128 * j + 8 * (lane % 16);
+            const long long tok = R.t0 + t;
+            // The token's experts and weights (lane k route k's), and its
+            // shared row, read while its routes land.
+            const int e_lane = lane < K ? __ldg(&p.routes[tok * K + lane]) : -1;
+            const float w_lane = !kFirst && lane < K ? __ldg(&p.weights[tok * K + lane]) : 0.f;
+            uint4 sv = make_uint4(0, 0, 0, 0);
+            if (kFirst && p.shared != nullptr && lane < 16) {
+                sv = *reinterpret_cast<const uint4*>(p.shared + tok * H + col);
+            }
+            if (wait) {
+                if (lane == 0) wait_count(&done[j], static_cast<u32>(live_routes));
+                __syncwarp();
+            }
+            float acc[8];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) acc[c] = 0.f;
+            // Eight routes' rows in flight at once, summed in route order.
+            for (int k0 = 0; k0 < K; k0 += 8) {
+                uint4 v[8];
+                float wt[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const int k = k0 + u;
+                    const int e = __shfl_sync(0xffffffffu, e_lane, k % 32);
+                    wt[u] = __shfl_sync(0xffffffffu, w_lane, k % 32);
+                    v[u] = make_uint4(0, 0, 0, 0);
+                    if (k < K && e >= 0 && e < p.experts && lane < 16) {
+                        v[u] = __ldcg(reinterpret_cast<const uint4*>(p.routed + (tok * K + k) * H + col));
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    if (k0 + u >= K) break;
+                    const unsigned wv[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        if constexpr (kFirst) {
+                            acc[2 * c] += __uint_as_float(wv[c] << 16);
+                            acc[2 * c + 1] += __uint_as_float(wv[c] & 0xFFFF0000u);
+                        } else {
+                            acc[2 * c] += wt[u] * __uint_as_float(wv[c] << 16);
+                            acc[2 * c + 1] += wt[u] * __uint_as_float(wv[c] & 0xFFFF0000u);
+                        }
+                    }
+                }
+            }
+            if (lane < 16) {
+                if (kFirst && p.shared != nullptr) {
+                    const unsigned sw[4] = {sv.x, sv.y, sv.z, sv.w};
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        acc[2 * c] = acc[2 * c] + __uint_as_float(sw[c] << 16);
+                        acc[2 * c + 1] = acc[2 * c + 1] + __uint_as_float(sw[c] & 0xFFFF0000u);
+                    }
+                }
+                uint4 out;
+                out.x = pack_bf16x2(acc[0], acc[1]);
+                out.y = pack_bf16x2(acc[2], acc[3]);
+                out.z = pack_bf16x2(acc[4], acc[5]);
+                out.w = pack_bf16x2(acc[6], acc[7]);
+                *reinterpret_cast<uint4*>(p.y + tok * H + col) = out;
+            }
+    };
 
     // A role's walk over the claimed tasks: slot n % kSlots, its phase.
     auto claimed = [&](int n) {
@@ -579,83 +655,35 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                     __syncwarp();
                     if (lane == 0) bar_arrive(&tempty[acc]);
                     wg_sync(wg);
-                    if (i == 0) add_release(&done[x.j], static_cast<u32>(x.rows));
+                    // A narrow fire's tile is folded by the epilogue that lands
+                    // its last routes, every token's.
+                    if (i == 0) {
+                        const u32 had = add_acq_rel(&done[x.j], static_cast<u32>(x.rows));
+                        wg_flag[wg] = had + static_cast<u32>(x.rows) == static_cast<u32>(live_routes) ? 1u : 0u;
+                    }
+                    wg_sync(wg);
+                    if (R.tokens <= kFoldInline && wg_flag[wg] != 0) {
+                        fence_acquire();
+                        for (int t = q; t < R.tokens; t += 4) fold(t, x.j, false);
+                    }
                 }
             }
         }
-        // The fold: token t's 128-column tile j once every route has landed
-        // its rows there, eight columns a lane, the routes in order.
-        {
+        // The fold of a wide fire's tiles, spread over the CTAs once each
+        // tile's routes have landed (a narrow fire's ran in the down epilogue).
+        if (R.tokens > kFoldInline) {
             const int fw = warp - 3;
             const int items = R.tokens * j2;
             for (int item = static_cast<int>(blockIdx.x) + G * fw; item < items; item += kHelpers * G) {
                 const int t = item / j2, j = item - t * j2;
-                const int col = 128 * j + 8 * (lane % 16);
-                const long long tok = R.t0 + t;
-                // The token's experts and weights (lane k route k's), and its
-                // shared row, read while its routes land.
-                const int e_lane = lane < K ? __ldg(&p.routes[tok * K + lane]) : -1;
-                const float w_lane = !kFirst && lane < K ? __ldg(&p.weights[tok * K + lane]) : 0.f;
-                uint4 sv = make_uint4(0, 0, 0, 0);
-                if (kFirst && p.shared != nullptr && lane < 16) {
-                    sv = *reinterpret_cast<const uint4*>(p.shared + tok * H + col);
-                }
-                if (lane == 0) wait_count(&done[j], static_cast<u32>(live_routes));
-                __syncwarp();
-                float acc[8];
-#pragma unroll
-                for (int c = 0; c < 8; ++c) acc[c] = 0.f;
-                // Eight routes' rows in flight at once, summed in route order.
-                for (int k0 = 0; k0 < K; k0 += 8) {
-                    uint4 v[8];
-                    float wt[8];
-#pragma unroll
-                    for (int u = 0; u < 8; ++u) {
-                        const int k = k0 + u;
-                        const int e = __shfl_sync(0xffffffffu, e_lane, k % 32);
-                        wt[u] = __shfl_sync(0xffffffffu, w_lane, k % 32);
-                        v[u] = make_uint4(0, 0, 0, 0);
-                        if (k < K && e >= 0 && e < p.experts && lane < 16) {
-                            v[u] = __ldcg(reinterpret_cast<const uint4*>(p.routed + (tok * K + k) * H + col));
-                        }
-                    }
-#pragma unroll
-                    for (int u = 0; u < 8; ++u) {
-                        if (k0 + u >= K) break;
-                        const unsigned wv[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
-#pragma unroll
-                        for (int c = 0; c < 4; ++c) {
-                            if constexpr (kFirst) {
-                                acc[2 * c] += __uint_as_float(wv[c] << 16);
-                                acc[2 * c + 1] += __uint_as_float(wv[c] & 0xFFFF0000u);
-                            } else {
-                                acc[2 * c] += wt[u] * __uint_as_float(wv[c] << 16);
-                                acc[2 * c + 1] += wt[u] * __uint_as_float(wv[c] & 0xFFFF0000u);
-                            }
-                        }
-                    }
-                }
-                if (lane < 16) {
-                    if (kFirst && p.shared != nullptr) {
-                        const unsigned sw[4] = {sv.x, sv.y, sv.z, sv.w};
-#pragma unroll
-                        for (int c = 0; c < 4; ++c) {
-                            acc[2 * c] = acc[2 * c] + __uint_as_float(sw[c] << 16);
-                            acc[2 * c + 1] = acc[2 * c + 1] + __uint_as_float(sw[c] & 0xFFFF0000u);
-                        }
-                    }
-                    uint4 out;
-                    out.x = pack_bf16x2(acc[0], acc[1]);
-                    out.y = pack_bf16x2(acc[2], acc[3]);
-                    out.z = pack_bf16x2(acc[4], acc[5]);
-                    out.w = pack_bf16x2(acc[6], acc[7]);
-                    *reinterpret_cast<uint4*>(p.y + tok * H + col) = out;
-                }
+                fold(t, j, true);
                 __syncwarp();
             }
         }
     }
 
+    // This CTA's work is done: the next launch's CTAs may take its SM.
+    pdl_launch();
     // The last CTA out zeroes the flags for the next launch.
     tc_fence_before();
     __syncthreads();

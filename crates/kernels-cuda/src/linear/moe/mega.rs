@@ -343,17 +343,25 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
     };
     let kind = u32::from(w4);
     let first = u32::from(first);
+    // As a programmatic dependent (`kernel.pdl`) its set-up overlaps the
+    // producer's tail. Every wait across CTAs comes after the producer is
+    // done and its CTAs gone, so the grid is resident without a cooperative
+    // launch, which the driver would not overlap; without PDL it launches
+    // cooperatively.
+    let pdl = ctx.tuning().pdl;
+    let launch = Launch::grid([sms, 1, 1], [THREADS, 1, 1]).smem(smem);
+    let launch = if pdl {
+        launch.programmatic(true)
+    } else {
+        launch.cooperative()
+    };
     ctx.fire(
         OP,
         Fire::at(kernel(
             FILE,
             &format!("::pie::linear::mega_moe<{kind}, {bn}, {code}, {first}, {stages}>"),
         ))
-        .apply(
-            Launch::grid([sms, 1, 1], [THREADS, 1, 1])
-                .smem(smem)
-                .cooperative(),
-        ),
+        .apply(launch),
         &[
             ArgValue::of(&map_up),
             ArgValue::of(&map_down),

@@ -576,3 +576,56 @@ fn mega_moe_bf16_rate() {
         );
     }
 }
+
+/// The mega-MoE's cost in a decode's chain of launches, against the
+/// composition apart's: each timed after the same programmatic predecessor
+/// (a quantizer's read-back) under B200's launch decisions (`kernel.pdl`),
+/// the predecessor's own time taken off. `PIE_TOKENS` a comma list.
+#[test]
+#[ignore = "a rate bench: cargo test ... -- --ignored mega_moe_chain_rate --nocapture"]
+fn mega_moe_chain_rate() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let s = V4_FLASH;
+    let widths: Vec<usize> = std::env::var("PIE_TOKENS")
+        .unwrap_or_else(|_| "1,2,4,8,16,64".to_string())
+        .split(',')
+        .map(|v| v.trim().parse().expect("a count"))
+        .collect();
+    let mut b = Bench::new(0x4f1a);
+    let w = w4a8(&mut b, s, false);
+    let ctx = b
+        .ctx()
+        .with_tuning(kernels_cuda::tuning::Tuning { pdl: true, ..SM100 });
+    for tokens in widths {
+        let mut f = fire_of(&mut b, s, tokens, tokens as u64);
+        let mut a = apart_of(&mut b, s, tokens);
+        let lead = b.zeros(tokens * s.hidden * 2);
+        let fmt = Format::E4m3 { gran: 128 };
+        let x = f.x;
+        let pred = || {
+            act_quant::read_back(&ctx, "test", fmt, Source::rows(x, None), lead).expect("reads");
+        };
+        let alone = timed(&b, &ctx, 20, pred);
+        let apart_us = timed(&b, &ctx, 20, || {
+            pred();
+            apart(&ctx, s, &w, &mut f, &mut a);
+        }) - alone;
+        let mut y = b.out(tokens, s.hidden);
+        let m = mlp_of(s, &w, &f);
+        let fold = moe::Fold::First(Some(f.shared));
+        let mega = timed(&b, &ctx, 20, || {
+            pred();
+            assert!(
+                moe::mega(&ctx, m, fold, &mut y).expect("fires"),
+                "takes the fire"
+            );
+        }) - alone;
+        let speedup = apart_us / mega;
+        eprintln!(
+            "v4-flash chained {tokens} tokens: apart {apart_us:.1} us, mega {mega:.1} us ({speedup:.2}x)"
+        );
+    }
+}

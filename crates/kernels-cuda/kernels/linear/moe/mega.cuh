@@ -55,6 +55,12 @@ __device__ __forceinline__ void add_release(u32* p, u32 v) {
     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 
+__device__ __forceinline__ u32 add_acq_rel(u32* p, u32 v) {
+    u32 old;
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
+}
+
 __device__ __forceinline__ void or_release(u32* p, u32 v) {
     asm volatile("red.release.gpu.global.or.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
