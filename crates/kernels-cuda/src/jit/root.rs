@@ -139,6 +139,23 @@ impl Root {
         })
     }
 
+    /// A unit the crate does not carry: source generated at run time (a
+    /// synthesized row kernel, `crate::synth`), compiled for the plain
+    /// target with the carried headers, and cached on disk like a carried
+    /// one. `file` names it as a carried unit's path would (`synth/….cu`).
+    #[must_use]
+    pub fn generated(file: &'static str, text: &'static str) -> Self {
+        Self {
+            name: file.strip_suffix(".cu").unwrap_or(file),
+            text,
+            file,
+            options: &[],
+            floor: Toolchain::ANY,
+            specific: false,
+            tcgen05_twin: false,
+        }
+    }
+
     #[must_use]
     pub const fn options(mut self, options: &'static [&'static str]) -> Self {
         self.options = options;

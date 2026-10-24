@@ -1,8 +1,10 @@
+use kernels_cuda::Tensor;
 use kernels_cuda::attn::qkv_append;
+use kernels_cuda::synth::Plane;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::ops::fused::Intermediates;
 use poem_ir::{Fused, Operands};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{NormAxis, NormWeight, ValueId};
 
 use crate::run::Run;
 
@@ -31,8 +33,18 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            // A synthesized region's body is not launched here yet.
-            Fused::Region { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Fused::Region {
+                ins,
+                width,
+                body,
+                outs,
+            } => {
+                if outs.first().is_some_and(|out| self.lane_shaped(*out)) {
+                    self.unseated(|| self.region(ins, *width, *body, outs))
+                } else {
+                    self.region(ins, *width, *body, outs)
+                }
+            }
             Fused::GdnStep { .. }
             | Fused::QGateNormRopeAppend {
                 intermediates: Intermediates::Written,
@@ -86,6 +98,45 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A `fused.region`: the kernel the load generated for its body over the
+    /// planes of its values, a weight's one row every row reads.
+    fn region(
+        &self,
+        ins: &[ValueId],
+        width: u32,
+        body: u64,
+        outs: &[ValueId],
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "fused.region";
+        let kernel =
+            self.region_kernel(body, width)
+                .ok_or_else(|| kernels_cuda::Error::Backend {
+                    op: OP,
+                    detail: format!("the load generated no kernel for body {body:016x} at {width}"),
+                })?;
+        let landed: Vec<Tensor> = outs.iter().map(|&v| self.tensor(v)).collect();
+        let rows = landed.first().map_or(0, |t| t.rows);
+        let mut planes = Vec::with_capacity(ins.len());
+        for &v in ins {
+            let t = self.tensor(v);
+            planes.push(if crate::synth::shared(&self.values()[v.0 as usize]) {
+                Plane::shared(&t)
+            } else if t.rows >= rows {
+                Plane::rows(&t)
+            } else {
+                return Err(kernels_cuda::Error::Backend {
+                    op: OP,
+                    detail: format!(
+                        "parameter value {} holds {} rows and the region lands {rows}",
+                        v.0, t.rows
+                    ),
+                });
+            });
+        }
+        let landed: Vec<Plane> = landed.iter().map(Plane::rows).collect();
+        kernel.fire(self.ctx(), &planes, &landed, rows)
+    }
+
     /// The e4m3 1x128 planes a sublayer's pre-mix lands its normed row `y`
     /// in beside the bf16 one, for the GEMM that quantizes it next
     /// (`Run::hold_e4m3`): held only where the pre-mix will land them.

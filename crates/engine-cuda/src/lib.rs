@@ -38,6 +38,7 @@ pub mod settle;
 pub mod split_arm;
 pub mod staged_h2d;
 pub mod store;
+pub mod synth;
 pub mod tap;
 pub mod tune;
 pub mod voxels;

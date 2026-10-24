@@ -58,6 +58,7 @@ mod a_shared_adapter_is_one_slot_and_one_load;
 mod a_shifted_body_admits_the_split_that_moved;
 mod a_short_card_keeps_the_declared_context;
 mod a_stored_k_quant_row_serves_as_stored;
+mod a_synthesized_region_serves_the_logits_of_its_ops;
 mod a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it;
 mod a_tower_region_reads_the_patch_window;
 mod a_two_axis_plan_arms_its_token_bodies;
