@@ -431,6 +431,12 @@ __device__ __forceinline__ void tmem_ld32(u32 taddr, u32 (&v)[32]) {
         : "r"(taddr));
 }
 
+// Whole-warp: one column of the warp's 32 lanes, a row a thread: a loop
+// over a tile's live columns alone reads them so. Pair with tmem_wait_ld.
+__device__ __forceinline__ void tmem_ld1(u32 taddr, u32& v) {
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];" : "=r"(v) : "r"(taddr));
+}
+
 __device__ __forceinline__ void tmem_wait_ld() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }

@@ -482,111 +482,102 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                 tc_fence_after();
                 const u32 base = tmem + acc * kAcc + ((static_cast<u32>(q) * 32) << 16);
                 const long long p0 = static_cast<long long>(x.b) * kPoolStride;
-                // Lane c's route (column c0 + c) and, gate-up, its weight
-                // (DeepSeek's), read while the accumulator lands.
+                // Lane l's routes: columns l and 32 + l (and, gate-up, their
+                // weights, DeepSeek's).
                 long long r_lane[kBN / 32];
                 float w_lane[kBN / 32];
 #pragma unroll
-                for (int c0 = 0; c0 < kBN; c0 += 32) {
-                    const int n_me = c0 + lane;
-                    r_lane[c0 / 32] = n_me < x.rows ? route0 + R.sorted[x.s0 + n_me] : 0;
-                    w_lane[c0 / 32] = kFirst && !x.l2 && n_me < x.rows ? __ldg(&p.weights[r_lane[c0 / 32]]) : 1.f;
+                for (int h = 0; h < kBN / 32; ++h) {
+                    const int c = 32 * h + lane;
+                    r_lane[h] = c < x.rows ? route0 + R.sorted[x.s0 + c] : 0;
+                    w_lane[h] = kFirst && !x.l2 && c < x.rows ? __ldg(&p.weights[r_lane[h]]) : 1.f;
                 }
-                if (!x.l2) {
-                    for (int c0 = 0; c0 < kBN; c0 += 32) {
-                        u32 g[32], u[32];
-                        tmem_ld32(base + c0, g);
-                        tmem_ld32(base + kBN + c0, u);
-                        tmem_wait_ld();
-                        if (c0 + 32 == kBN) {
-                            tc_fence_before();
-                            __syncwarp();
-                            if (lane == 0) bar_arrive(&tempty[acc]);
-                        }
-                        if (c0 >= x.rows) continue;
-                        // The live columns' GLU (the rest hold another block's
-                        // garbage), the gate-up product read as the apart
-                        // select lands it, in bf16.
-                        float v[32];
-#pragma unroll
-                        for (int c = 0; c < 32; ++c) {
-                            v[c] = 0.f;
-                            if (c0 + c >= x.rows) continue;
-                            float gv = bf16_round(__uint_as_float(g[c]));
-                            float uv = bf16_round(__uint_as_float(u[c]));
-                            float y;
-                            if constexpr (kGlu == 2) {
-                                gv = fminf(gv, p.limit);
-                                uv = fminf(fmaxf(uv, -p.limit), p.limit);
-                                y = (gv / (1.f + expf(-gv))) * uv;
-                            } else {
-                                y = gv / (1.f + __expf(-gv)) * uv;
-                            }
-                            if constexpr (kFirst) {
-                                y = y * __shfl_sync(0xffffffffu, w_lane[c0 / 32], c);
-                            }
-                            v[c] = bf16_round(y);
-                        }
-                        const int col = 128 * x.j + i;
-                        if constexpr (kW4) {
-                            // A 128-column block's amax: the warps' maxima met
-                            // in shared memory.
-                            float top = 0.f;
-#pragma unroll
-                            for (int c = 0; c < 32; ++c) {
-                                if (c0 + c >= x.rows) continue;
-                                const u32 m = warp_max_u32(__float_as_uint(fabsf(v[c])));
-                                if (lane == c) top = __uint_as_float(m);
-                            }
-                            wmax[q * kBN + c0 + lane] = top;
-                            wg_sync(wg);
-#pragma unroll
-                            for (int c = 0; c < 32; ++c) {
-                                if (c0 + c >= x.rows) continue;
-                                const float amax = fmaxf(fmaxf(wmax[c0 + c], wmax[kBN + c0 + c]),
-                                                         fmaxf(wmax[2 * kBN + c0 + c], wmax[3 * kBN + c0 + c]));
-                                const int e = e4m3_block_exp(amax);
-                                const float inv = __uint_as_float(static_cast<unsigned>(127 - e) << 23);
-                                const float sv = fminf(fmaxf(v[c] * inv, -448.f), 448.f);
-                                const unsigned short code = static_cast<unsigned short>(
-                                    __nv_cvt_float2_to_fp8x2(make_float2(sv, 0.f), __NV_SATFINITE, __NV_E4M3));
-                                p.hpool[(p0 + c0 + c) * I + col] = static_cast<u8>(code & 0xFF);
-                                if (i == c) {
-                                    p.hpool_sf[atom_offset(static_cast<int>(p0 + c0 + c), x.j, I / 128)] =
-                                        static_cast<u8>(e + 127);
-                                }
-                            }
-                            wg_sync(wg);
-                        } else {
-                            bf16* hp = reinterpret_cast<bf16*>(p.hpool);
-#pragma unroll
-                            for (int c = 0; c < 32; ++c) {
-                                if (c0 + c >= x.rows) continue;
-                                hp[(p0 + c0 + c) * I + col] = f32_to_bf16(v[c]);
-                            }
-                        }
+                // Column c's own of a lane's two (a dynamic index stays in
+                // registers so).
+                auto route_of = [&](int c) -> long long {
+                    long long v = r_lane[0];
+                    if constexpr (kBN > 32) {
+                        if (c >= 32) v = r_lane[1];
                     }
+                    return __shfl_sync(0xffffffffu, v, c % 32);
+                };
+                auto weight_of = [&](int c) -> float {
+                    float v = w_lane[0];
+                    if constexpr (kBN > 32) {
+                        if (c >= 32) v = w_lane[1];
+                    }
+                    return __shfl_sync(0xffffffffu, v, c % 32);
+                };
+                const int col = 128 * x.j + i;
+                // The live columns alone, a TMEM column at a time: a loop
+                // unrolled over every column runs past the instruction cache.
+                if (!x.l2) {
+                    // Column c's GLU, the gate-up product read as the apart
+                    // select lands it, in bf16.
+                    auto glu_of = [&](int c) {
+                        u32 g, u;
+                        tmem_ld1(base + c, g);
+                        tmem_ld1(base + kBN + c, u);
+                        tmem_wait_ld();
+                        float gv = bf16_round(__uint_as_float(g));
+                        float uv = bf16_round(__uint_as_float(u));
+                        float y;
+                        if constexpr (kGlu == 2) {
+                            gv = fminf(gv, p.limit);
+                            uv = fminf(fmaxf(uv, -p.limit), p.limit);
+                            y = (gv / (1.f + expf(-gv))) * uv;
+                        } else {
+                            y = gv / (1.f + __expf(-gv)) * uv;
+                        }
+                        if constexpr (kFirst) {
+                            y = y * weight_of(c);
+                        }
+                        return bf16_round(y);
+                    };
+                    if constexpr (kW4) {
+                        // A 128-column block's amax a route: the warps' maxima
+                        // met in shared memory; the GLU taken again to land.
+                        for (int c = 0; c < x.rows; ++c) {
+                            const u32 m = warp_max_u32(__float_as_uint(fabsf(glu_of(c))));
+                            if (lane == 0) wmax[q * kBN + c] = __uint_as_float(m);
+                        }
+                        wg_sync(wg);
+                        for (int c = 0; c < x.rows; ++c) {
+                            const float v = glu_of(c);
+                            const float amax = fmaxf(fmaxf(wmax[c], wmax[kBN + c]),
+                                                     fmaxf(wmax[2 * kBN + c], wmax[3 * kBN + c]));
+                            const int e = e4m3_block_exp(amax);
+                            const float inv = __uint_as_float(static_cast<unsigned>(127 - e) << 23);
+                            const float sv = fminf(fmaxf(v * inv, -448.f), 448.f);
+                            const unsigned short code = static_cast<unsigned short>(
+                                __nv_cvt_float2_to_fp8x2(make_float2(sv, 0.f), __NV_SATFINITE, __NV_E4M3));
+                            p.hpool[(p0 + c) * I + col] = static_cast<u8>(code & 0xFF);
+                            if (i == 0) {
+                                p.hpool_sf[atom_offset(static_cast<int>(p0 + c), x.j, I / 128)] =
+                                    static_cast<u8>(e + 127);
+                            }
+                        }
+                    } else {
+                        bf16* hp = reinterpret_cast<bf16*>(p.hpool);
+                        for (int c = 0; c < x.rows; ++c) hp[(p0 + c) * I + col] = f32_to_bf16(glu_of(c));
+                    }
+                    tc_fence_before();
+                    __syncwarp();
+                    if (lane == 0) bar_arrive(&tempty[acc]);
                     fence_proxy_global();
                     wg_sync(wg);
                     if (i == 0) or_release(&hready[x.b], 1u << x.j);
                 } else {
-                    for (int c0 = 0; c0 < kBN; c0 += 32) {
-                        u32 d[32];
-                        tmem_ld32(base + c0, d);
+                    for (int c = 0; c < x.rows; ++c) {
+                        u32 d;
+                        tmem_ld1(base + c, d);
                         tmem_wait_ld();
-                        if (c0 + 32 == kBN) {
-                            tc_fence_before();
-                            __syncwarp();
-                            if (lane == 0) bar_arrive(&tempty[acc]);
-                        }
-                        const int col = 128 * x.j + i;
-#pragma unroll
-                        for (int c = 0; c < 32; ++c) {
-                            if (c0 + c >= x.rows) continue;
-                            const long long r = __shfl_sync(0xffffffffu, r_lane[c0 / 32], c);
-                            p.routed[r * H + col] = f32_to_bf16(__uint_as_float(d[c]));
-                        }
+                        const long long r = route_of(c);
+                        p.routed[r * H + col] = f32_to_bf16(__uint_as_float(d));
                     }
+                    tc_fence_before();
+                    __syncwarp();
+                    if (lane == 0) bar_arrive(&tempty[acc]);
                     wg_sync(wg);
                     if (i == 0) add_release(&done[x.j], static_cast<u32>(x.rows));
                 }
