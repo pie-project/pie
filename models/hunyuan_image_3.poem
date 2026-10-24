@@ -136,7 +136,10 @@ def layout(id, deploy):
             router = weight([d.experts, hidden]),
             experts_gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
             experts_down = weight([d.experts, hidden, iw], experts).rows(),
-            shared_gate_up = weight([2 * sw, hidden], banks).packed([sw, sw]),
+            shared = struct(
+                gate = weight([sw, hidden], banks).columns(),
+                up = weight([sw, hidden], banks).columns(),
+            ),
             shared_down = weight([hidden, sw], banks).rows(),
         )
 
@@ -330,7 +333,10 @@ def read(m, reads):
 
         inter = d.moe_inter
         hidden = d.hidden
-        reads.read_expr(w.shared_gate_up, swap_halves(src(at("mlp.shared_mlp.gate_and_up_proj.weight")), d.shared_inter))
+        # The release stores the shared expert's up rows, then its gate rows.
+        shared = src(at("mlp.shared_mlp.gate_and_up_proj.weight"))
+        reads.read_expr(w.shared.gate, shared.slice(0, d.shared_inter, d.shared_inter))
+        reads.read_expr(w.shared.up, shared.slice(0, 0, d.shared_inter))
         reads.read(w.shared_down, at("mlp.shared_mlp.down_proj.weight"))
 
         held = stored(at("mlp.experts.0.down_proj.weight"))
@@ -459,10 +465,8 @@ def moe(x, w, m):
 
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, w.experts_gate_up, routes, d.top_k), gating.swiglu(), d.moe_inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, w.experts_down, routes, d.top_k), weights)
-    shared = ops.linear.matmul(
-        ops.linear.glu(ops.linear.matmul(x, w.shared_gate_up), gating.swiglu(), d.shared_inter),
-        w.shared_down,
-    )
+    gate, up = ops.linear.matmul(x, w.shared.gate), ops.linear.matmul(x, w.shared.up)
+    shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.shared_down)
     return ops.elemwise.residual_add(shared, routed)
 
 def canvas_rows(arm, m):
