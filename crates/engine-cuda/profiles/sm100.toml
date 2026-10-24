@@ -103,9 +103,10 @@ moe.routes_sized = true
 # round up to 128 tokens; past them its one block a multiprocessor costs waves.
 moe.gather_ahead_until = 128
 moe.w4a8_fused_from = 512
-# A decode's routed MLP up to 2048 routes in one persistent launch, the
-# mega-MoE (DeepSeek-V4's W4A8 experts, bf16 banks).
-moe.mega_until = 2048
+# A routed MLP up to 4608 routes in one persistent launch, the mega-MoE
+# (DeepSeek-V4's W4A8 experts, bf16 banks): past 768 V4-Flash tokens the
+# fused grouped GEMMs stream faster.
+moe.mega_until = 4608
 # bf16 banks from 64 routes: a narrower fire streams them faster apart.
 moe.mega_bf16_from = 64
 # The fused qkv write a warp a head below 256 rows.

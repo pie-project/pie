@@ -279,6 +279,12 @@ fn mega_moe_rate() {
     }
 }
 
+/// B200's tuning, the mega-MoE taking every fire it can.
+const WIDE: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
+    moe_mega_until: 65_536,
+    ..SM100
+};
+
 /// The routed MLP's banks as the mega-MoE reads them.
 fn mlp_of(s: Shape, w: &W4a8, f: &Fire) -> moe::RoutedMlp {
     let (e, h, i) = (s.experts, s.hidden, s.inter);
@@ -329,13 +335,15 @@ fn the_w4a8_mega_moe_answers_the_composition_apart() {
                 experts: 32,
                 ..V4_FLASH
             },
-            &[1usize, 3, 8, 33, 100][..],
+            // 400 tokens: 2400 routes, laid out in global memory.
+            &[1usize, 3, 8, 33, 100, 400][..],
         ),
-        (narrow, &[2, 40][..]),
+        (narrow, &[2, 40, 300][..]),
     ] {
         let mut b = Bench::new(0x3e9a ^ s.inter as u64);
         let w = w4a8(&mut b, s, true);
-        let ctx = b.ctx().with_tuning(SM100);
+        // Every width the kernel takes, B200's span of it aside.
+        let ctx = b.ctx().with_tuning(WIDE);
         for &tokens in widths {
             let mut f = fire_of(&mut b, s, tokens, 0x51 + tokens as u64);
             let mut a = apart_of(&mut b, s, tokens);
@@ -428,7 +436,8 @@ fn the_bf16_mega_moe_answers_the_composition_apart() {
         ..SM100
     });
     for first in [false, true] {
-        for tokens in [1usize, 5, 40] {
+        // 600 tokens: 2400 routes, laid out in global memory.
+        for tokens in [1usize, 5, 40, 600] {
             let what = format!("{tokens} tokens, weights first {first}");
             let mut f = fire_of(&mut b, s, tokens, 0x77 + tokens as u64);
             let mut a = apart_of(&mut b, s, tokens);
@@ -629,6 +638,64 @@ fn mega_moe_chain_rate() {
         let speedup = apart_us / mega;
         eprintln!(
             "v4-flash chained {tokens} tokens: apart {apart_us:.1} us, mega {mega:.1} us ({speedup:.2}x)"
+        );
+    }
+}
+
+/// The mega-MoE's rate at DeepSeek-V4-Flash's prefill widths, against the
+/// path the engine runs there (the fused routed MLP from
+/// `kernel.moe.w4a8_fused_from` tokens, the four apart below it), both
+/// chained after the same programmatic producer. `PIE_TOKENS` a comma list.
+#[test]
+#[ignore = "a rate bench: cargo test ... -- --ignored mega_moe_prefill_rate --nocapture"]
+fn mega_moe_prefill_rate() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let s = V4_FLASH;
+    let widths: Vec<usize> = std::env::var("PIE_TOKENS")
+        .unwrap_or_else(|_| "256,384,512,1024,2048,4096,8192".to_string())
+        .split(',')
+        .map(|v| v.trim().parse().expect("a count"))
+        .collect();
+    let mut b = Bench::new(0x4f1a);
+    let w = w4a8(&mut b, s, false);
+    let pdl = kernels_cuda::tuning::Tuning { pdl: true, ..WIDE };
+    let ctx = b.ctx().with_tuning(pdl);
+    for tokens in widths {
+        let mut f = fire_of(&mut b, s, tokens, tokens as u64);
+        let mut a = apart_of(&mut b, s, tokens);
+        let lead = b.zeros(tokens * s.hidden * 2);
+        let x = f.x;
+        let fmt = Format::E4m3 { gran: 128 };
+        let pred = || {
+            act_quant::read_back(&ctx, "test", fmt, Source::rows(x, None), lead).expect("reads");
+        };
+        let alone = timed(&b, &ctx, 5, pred);
+        let m = mlp_of(s, &w, &f);
+        let mut fused_y = b.out(tokens, s.hidden);
+        let mut fused = false;
+        let today = timed(&b, &ctx, 5, || {
+            pred();
+            fused = moe::experts_weighted_first(&ctx, m, f.shared, &mut fused_y).expect("fires");
+            if !fused {
+                apart(&ctx, s, &w, &mut f, &mut a);
+            }
+        }) - alone;
+        let mut y = b.out(tokens, s.hidden);
+        let fold = moe::Fold::First(Some(f.shared));
+        let mega = timed(&b, &ctx, 5, || {
+            pred();
+            assert!(
+                moe::mega(&ctx, m, fold, &mut y).expect("fires"),
+                "takes the fire"
+            );
+        }) - alone;
+        let path = if fused { "fused" } else { "apart" };
+        let speedup = today / mega;
+        eprintln!(
+            "v4-flash prefill {tokens} tokens: {path} {today:.1} us, mega {mega:.1} us ({speedup:.2}x)"
         );
     }
 }

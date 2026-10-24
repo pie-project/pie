@@ -9,8 +9,9 @@
 // codebase's primitives:
 //
 //   - The routes are laid out by expert in every CTA alike
-//     (`linear/moe/mega.cuh`), blocks of kBN routes an expert, and the CTAs
-//     claim the tasks from one count.
+//     (`linear/moe/mega.cuh`), blocks of kBN routes an expert, or for a
+//     wide fire read where `moe_route_order_scan` laid them in global
+//     memory; the CTAs claim the tasks from one count.
 //   - The MMA is swapped: the weight's 128 rows on M, a block's routes on N,
 //     both K-major from shared memory. A gate-up tile reads 128 gate rows and
 //     the 128 up rows `inter` on into two accumulators, so a thread holds a
@@ -54,6 +55,9 @@ struct Params {
     bf16* routed;           // [tokens * top][hidden]: each route's down row
     u32* sync;              // ws_words() words, zero at rest
     const u32* win;         // the live window (tokens, first token), or null
+    const i32* order;       // a wide fire's layout (`moe_route_order_scan`'s), or null
+    const i32* offsets;
+    const i32* work;
     int tokens, top, experts, hidden, inter;
     float limit;            // the GLU's clamp (SwiGLU-clamp)
 };
@@ -193,7 +197,11 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
         const int tl = p.win != nullptr ? static_cast<int>(__ldg(&p.win[0])) : p.tokens;
         // The ring is free until the roles start: its first bytes hold the
         // layout's scratch.
-        lay_out<kBN>(R, p.routes, t0, tl, K, p.experts, reinterpret_cast<unsigned short*>(smem));
+        if (p.order != nullptr) {
+            lay_out_global(R, p.order, p.offsets, p.work, t0, tl, K, p.experts);
+        } else {
+            lay_out<kBN>(R, p.routes, t0, tl, K, p.experts, reinterpret_cast<unsigned short*>(smem));
+        }
     }
     tc_fence_before();
     __syncthreads();
@@ -486,15 +494,14 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             const int qw = warp - 3;
             int k = 0;
             for (int b = static_cast<int>(blockIdx.x); b < blocks; b += G) {
-                const int e = R.block_expert[b];
-                const int m = b - R.bstart[e];
+                int e, m;
+                block_of(R, b, e, m);
                 const int rows = min(R.count[e] - m * kBN, kBN);
                 for (int item = 0; item < rows * static_cast<int>(chunks); ++item, ++k) {
                     if (k % kHelpers != qw) continue;
                     const int n = item / static_cast<int>(chunks);
                     const int c0 = (item - n * static_cast<int>(chunks)) * (kChunk / 128);
-                    const int r = R.sorted[R.start[e] + m * kBN + n];
-                    const bf16* src = p.x + (route0 + r) / K * H;
+                    const bf16* src = p.x + static_cast<long long>(route_at(R, R.start[e] + m * kBN + n)) / K * H;
                     const long long prow = static_cast<long long>(b) * kPoolStride + n;
                     const int half = lane / 16, sub = lane % 16;
                     uint4 w[4];
@@ -565,7 +572,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
 #pragma unroll
                 for (int h = 0; h < kBN / 32; ++h) {
                     const int c = 32 * h + lane;
-                    r_lane[h] = c < x.rows ? route0 + R.sorted[x.s0 + c] : 0;
+                    r_lane[h] = c < x.rows ? route_at(R, x.s0 + c) : 0;
                     w_lane[h] = kFirst && !x.l2 && c < x.rows ? __ldg(&p.weights[r_lane[h]]) : 1.f;
                 }
                 // Column c's own of a lane's two (a dynamic index stays in

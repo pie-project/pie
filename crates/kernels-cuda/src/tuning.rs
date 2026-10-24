@@ -182,7 +182,7 @@ pub struct SsmKdaStepFused;
 /// the gate-up product, GLU, down product and fold in one persistent
 /// launch); none (0) but where a chip's profile says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.mega_until", constant(range(0..=2048)), default = 0, tune = search)]
+#[decision(id = "kernel.moe.mega_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMegaUntil(pub u32);
 
 /// The fewest routes a bf16 routed MLP runs as the mega-MoE (up to
