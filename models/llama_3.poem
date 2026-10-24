@@ -9,6 +9,11 @@ load("//pie/codec.poem", "mapped")
 load("//lib/adapters.poem", "banks")
 
 LLAMA = template("llama")
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v, the gate and the up by their heads and channels, the
+# output and down projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
 
 def llama(id, layers, mini = False):
@@ -94,14 +99,14 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            q = weight([q_width, hidden], proj).columns(heads = d.q_heads),
-            k = weight([kv_width, hidden], proj).columns(heads = d.kv_heads),
-            v = weight([kv_width, hidden], proj).columns(heads = d.kv_heads),
-            o = weight([hidden, q_width], proj).rows(),
+            q = weight([q_width, hidden], proj),
+            k = weight([kv_width, hidden], proj),
+            v = weight([kv_width, hidden], proj),
+            o = weight([hidden, q_width], proj),
             mlp_norm = weight([hidden]),
-            gate = weight([d.inter, hidden], proj).columns(),
-            up = weight([d.inter, hidden], proj).columns(),
-            down = weight([hidden, d.inter], proj).rows(),
+            gate = weight([d.inter, hidden], proj),
+            up = weight([d.inter, hidden], proj),
+            down = weight([hidden, d.inter], proj),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -127,7 +132,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table).columns(),
+        head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )

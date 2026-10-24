@@ -115,6 +115,11 @@ fn inferred_cuts_agree_with_the_stated_ones() {
             }
         }
         for (param, inferred) in trace.params.iter().zip(cuts) {
+            // A cut the package leaves to the compiler has nothing to agree
+            // with.
+            if param.shard == Shard::Inferred {
+                continue;
+            }
             tally.params += 1;
             if param.shard == inferred {
                 tally.agree += 1;
