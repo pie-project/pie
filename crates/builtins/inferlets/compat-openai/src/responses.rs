@@ -484,7 +484,7 @@ impl Stream {
                 self.event("response.reasoning_text.delta", json!({"item_id": id, "output_index": self.index, "content_index": 0, "delta": delta}));
             }
             Event::ReasoningEnd => self.close(),
-            Event::Logprobs(_) => {}
+            Event::Logprobs(_) | Event::PromptLogprobs(_) => {}
             Event::Text(delta) => {
                 self.ensure(Item::Message);
                 self.text.push_str(&delta);
