@@ -124,7 +124,8 @@ def layout(id, deploy):
             mlp = struct(
                 routed = False,
                 inter = di,
-                gate_up = weight([2 * di, hidden], weights).packed([di, di]),
+                gate = weight([di, hidden], weights).columns(),
+                up = weight([di, hidden], weights).columns(),
                 down = weight([hidden, di], weights).rows(),
             )
         else:
@@ -261,12 +262,14 @@ def huggingface(m, reads):
             reads.read(at.sinks, n("self_attn.attention_sink_bias"))
         f = w.mlp
         if not f.routed:
-            legs = [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]
-            if kept(f.gate_up):
-                kept_legs(reads, f.gate_up, legs)
+            legs = [(f.gate, n("mlp.gate_proj.weight")), (f.up, n("mlp.up_proj.weight"))]
+            if kept(f.gate):
+                for leg, name in legs:
+                    kept_legs(reads, leg, [name])
                 kept_legs(reads, f.down, [n("mlp.down_proj.weight")])
                 continue
-            reads.push(tensor(f.gate_up.name, concat(0, [readable(reads, f.gate_up, leg) for leg in legs]), encoding(f.gate_up.dtype)))
+            for leg, name in legs:
+                reads.push(tensor(leg.name, readable(reads, leg, name), encoding(leg.dtype)))
             reads.read(f.down, n("mlp.down_proj.weight"))
             continue
         reads.read(f.router, n("mlp.gate.weight"))
@@ -424,7 +427,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        act = ops.linear.glu(gate, gating.swiglu(), up = up)
         return ops.linear.matmul(act, f.down)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),

@@ -245,7 +245,9 @@ def layout(id, deploy):
         else:
             attn_banks = struct(
                 shared = False,
-                qkv = weight([q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, row_heads, row_heads]),
+                q = weight([q_w, hidden], proj).columns(heads = d.q_heads),
+                k = weight([kv_w, hidden], proj).columns(heads = row_heads),
+                v = weight([kv_w, hidden], proj).columns(heads = row_heads),
                 k_norm = norm("k_norm", head_dim),
                 k_norm_eps = d.norm_eps,
             )
@@ -375,14 +377,17 @@ def layout(id, deploy):
                 kv = "kv.mtp",
                 banks = struct(
                     shared = False,
-                    qkv = weight([q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w], heads = [d.q_heads, glob.kv_heads, glob.kv_heads]),
+                    q = weight([q_w, hidden], w).columns(heads = d.q_heads),
+                    k = weight([kv_w, hidden], w).columns(heads = glob.kv_heads),
+                    v = weight([kv_w, hidden], w).columns(heads = glob.kv_heads),
                     k_norm = anorm("k_norm", hd),
                     k_norm_eps = d.norm_eps,
                 ),
                 reading = GLOBAL,
             ),
             o_proj = weight([hidden, q_w], w).rows(),
-            gate_up = weight([2 * iw, hidden], w).packed([iw, iw]),
+            gate = weight([iw, hidden], w).columns(),
+            up = weight([iw, hidden], w).columns(),
             inter = iw,
             down = weight([hidden, iw], w).rows(),
             norm_eps = d.norm_eps,
@@ -418,7 +423,8 @@ def layout(id, deploy):
                 post_attn_norm = norm("post_attn_norm", ah),
                 pre_ffw_norm = norm("pre_ffw_norm", ah),
                 post_ffw_norm = norm("post_ffw_norm", ah),
-                gate_up = weight([2 * iw, ah], w).packed([iw, iw]),
+                gate = weight([iw, ah], w).columns(),
+                up = weight([iw, ah], w).columns(),
                 inter = iw,
                 down = weight([ah, iw], w),
                 scalar = norm("scalar", 1),
@@ -463,7 +469,8 @@ def layout(id, deploy):
             taps = SELF_COND_TAPS,
             pre_norm = weight([hidden]),
             norm_eps = d.norm_eps,
-            gate_up = weight([2 * iw, hidden], sw).packed([iw, iw]),
+            gate = weight([iw, hidden], sw).columns(),
+            up = weight([iw, hidden], sw).columns(),
             inter = iw,
             down = weight([hidden, iw], sw).rows(),
         )
@@ -596,7 +603,9 @@ def safetensors(m, reads, layout):
             reads.read(banks.k_norm, n("self_attn.k_norm.weight"))
             k = n("self_attn.k_proj.weight")
             v = n("self_attn.v_proj.weight")
-            reads.read_concat(banks.qkv, [n("self_attn.q_proj.weight"), k, v if has(v) else k])
+            reads.read(banks.q, n("self_attn.q_proj.weight"))
+            reads.read(banks.k, k)
+            reads.read(banks.v, v if has(v) else k)
         else:
             reads.read(banks.q_proj, n("self_attn.q_proj.weight"))
         reads.read(w.o_proj, n("self_attn.o_proj.weight"))
@@ -694,10 +703,8 @@ def safetensors(m, reads, layout):
     if m.self_cond != None:
         sc = m.self_cond
         reads.read(sc.pre_norm, at("self_conditioning.pre_norm.weight"))
-        reads.read_concat(sc.gate_up, [
-            at("self_conditioning.gate_proj.weight"),
-            at("self_conditioning.up_proj.weight"),
-        ])
+        reads.read(sc.gate, at("self_conditioning.gate_proj.weight"))
+        reads.read(sc.up, at("self_conditioning.up_proj.weight"))
         reads.read(sc.down, at("self_conditioning.down_proj.weight"))
 
     if m.draft != None:
@@ -715,13 +722,12 @@ def safetensors(m, reads, layout):
             (a.o_proj, n("self_attn.o_proj.weight")),
         ]:
             reads.read(weight_, name)
-        reads.read_concat(a.attn.banks.qkv, [
-            n("self_attn.q_proj.weight"),
-            n("self_attn.k_proj.weight"),
-            n("self_attn.v_proj.weight"),
-        ])
+        reads.read(a.attn.banks.q, n("self_attn.q_proj.weight"))
+        reads.read(a.attn.banks.k, n("self_attn.k_proj.weight"))
+        reads.read(a.attn.banks.v, n("self_attn.v_proj.weight"))
         reads.read(a.attn.banks.k_norm, n("self_attn.k_norm.weight"))
-        reads.read_concat(a.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(a.gate, n("mlp.gate_proj.weight"))
+        reads.read(a.up, n("mlp.up_proj.weight"))
         reads.read(a.down, n("mlp.down_proj.weight"))
 
     if m.assistant != None:
@@ -750,7 +756,8 @@ def safetensors(m, reads, layout):
                 (w.down, n("mlp.down_proj.weight")),
             ]:
                 reads.read(weight_, name)
-            reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            reads.read(w.gate, n("mlp.gate_proj.weight"))
+            reads.read(w.up, n("mlp.up_proj.weight"))
 
     if m.dflash != None:
         bind_aux(m.dflash, reads, lambda name: src(name).bias(-1.0))
@@ -777,7 +784,9 @@ def gguf(m, reads):
         banks = w.attn.banks
         if not banks.shared:
             reads.read(banks.k_norm, blk("attn_k_norm.weight"))
-            reads.read_concat(banks.qkv, [blk("attn_q.weight"), blk("attn_k.weight"), blk("attn_v.weight")])
+            reads.read(banks.q, blk("attn_q.weight"))
+            reads.read(banks.k, blk("attn_k.weight"))
+            reads.read(banks.v, blk("attn_v.weight"))
         else:
             reads.read(banks.q_proj, blk("attn_q.weight"))
         reads.read(w.o_proj, blk("attn_output.weight"))
@@ -866,7 +875,8 @@ def forward(m, inputs):
             m.vocab,
         ) * root
         normed = ops.elemwise.rmsnorm(soft, sc.pre_norm, sc.norm_eps)
-        act = ops.linear.glu(ops.linear.matmul(normed, sc.gate_up), gating.geglu_tanh(), sc.inter)
+        gate, up = ops.linear.matmul(normed, sc.gate), ops.linear.matmul(normed, sc.up)
+        act = ops.linear.glu(gate, gating.geglu_tanh(), up = up)
         signal = ops.linear.matmul(act, sc.down)
         den = ops.elemwise.rmsnorm_no_scale(ops.elemwise.residual_add(den, signal), m.hidden, sc.norm_eps)
         y = merge([den, enc])
@@ -911,7 +921,7 @@ def forward(m, inputs):
         if at.banks.shared:
             q = q_only(normed, positions, m, at, d, at.banks.q_proj)
         else:
-            q = qkv_unfused(normed, positions, inputs, m, at, d, kv_heads, at.banks.qkv,
+            q = qkv_unfused(normed, positions, inputs, m, at, d, kv_heads, at.banks,
                             at.banks.k_norm, at.banks.k_norm_eps, pages)
         seam.at(seam.ATTN_Q, [q])
 
@@ -1026,13 +1036,14 @@ def eagle_draft(m, inputs, x, logits, root):
     at = a.attn
     hd = m.glob.head_dim
     pages = inputs.kv(at.kv)
-    q = qkv_unfused(normed, inputs.positions(), inputs, m, at, hd, m.glob.kv_heads, at.banks.qkv,
+    q = qkv_unfused(normed, inputs.positions(), inputs, m, at, hd, m.glob.kv_heads, at.banks,
                     at.banks.k_norm, at.banks.k_norm_eps, pages)
     o = ops.attn.prefill(q, plan_draft, pages, None, hd, m.glob.kv_heads, at.sm_scale)
     o = ops.linear.matmul(o, a.o_proj)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, a.post_attn_norm, a.norm_eps), dy)
     mlp_in = ops.elemwise.rmsnorm(dy, a.pre_ffw_norm, a.norm_eps)
-    act = ops.linear.glu(ops.linear.matmul(mlp_in, a.gate_up), gating.geglu_tanh(), a.inter)
+    gate, up = ops.linear.matmul(mlp_in, a.gate), ops.linear.matmul(mlp_in, a.up)
+    act = ops.linear.glu(gate, gating.geglu_tanh(), up = up)
     f = ops.linear.matmul(act, a.down)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, a.post_ffw_norm, a.norm_eps), dy)
 
@@ -1063,7 +1074,8 @@ def assistant_draft(m, inputs, positions, x, logits, root):
         o = ops.linear.matmul(o, w.o_proj)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, a.norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, a.norm_eps)
-        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.geglu_tanh(), w.inter)
+        gate, up = ops.linear.matmul(mlp_in, w.gate), ops.linear.matmul(mlp_in, w.up)
+        act = ops.linear.glu(gate, gating.geglu_tanh(), up = up)
         f = ops.linear.matmul(act, w.down)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
         y = ops.elemwise.scale(w.scalar, y)
@@ -1107,10 +1119,10 @@ def tower(inputs, t):
         pooled = ops.elemwise.standardize(pooled, t.std.bias, t.std.scale)
     return ops.linear.matmul(pooled, t.projection)
 
-def qkv_unfused(x, pos, inputs, m, at, d, kv_heads, qkv, k_norm, k_norm_eps, pages):
+def qkv_unfused(x, pos, inputs, m, at, d, kv_heads, banks, k_norm, k_norm_eps, pages):
     write_page = inputs.write_page(at.kv)
     write_offset = inputs.write_offset(at.kv)
-    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, qkv), m.q_heads * d, kv_heads * d)
+    q, k, v = ops.linear.matmul(x, banks.q), ops.linear.matmul(x, banks.k), ops.linear.matmul(x, banks.v)
     v = ops.elemwise.rmsnorm_no_scale(v, d, at.q_norm_eps)
     q = ops.elemwise.rmsnorm_per_head(q, at.q_norm, d, at.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head(k, k_norm, d, k_norm_eps)

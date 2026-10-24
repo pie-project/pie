@@ -165,7 +165,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], weights).packed([iw, iw]),
+                gate = weight([iw, hidden], weights).columns(),
+                up = weight([iw, hidden], weights).columns(),
                 down = weight([hidden, iw], weights).rows(),
                 inter = iw,
             )
@@ -179,7 +180,8 @@ def layout(id, deploy):
                 gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
                 down = weight([d.experts, hidden, iw], experts).rows(),
                 shared = struct(
-                    gate_up = weight([2 * sw, hidden], weights).packed([sw, sw]),
+                    gate = weight([sw, hidden], weights).columns(),
+                    up = weight([sw, hidden], weights).columns(),
                     down = weight([hidden, sw], weights).rows(),
                     inter = sw,
                 ),
@@ -250,7 +252,8 @@ def huggingface(m, reads):
         read_attention(reads, layer.attn, at)
         f = layer.mlp
         if not f.routed:
-            reads.read_concat(f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
+            reads.read(f.gate, at("mlp.gate_proj.weight"))
+            reads.read(f.up, at("mlp.up_proj.weight"))
             reads.read(f.down, at("mlp.down_proj.weight"))
             continue
         reads.read(f.router, at("mlp.gate.weight"))
@@ -265,10 +268,8 @@ def huggingface(m, reads):
             src(leaf(e, "down_proj")).transmute([1, m.hidden, -1], held)
             for e in range(f.experts)
         ]))
-        reads.read_concat(f.shared.gate_up, [
-            at("mlp.shared_experts.gate_proj.weight"),
-            at("mlp.shared_experts.up_proj.weight"),
-        ])
+        reads.read(f.shared.gate, at("mlp.shared_experts.gate_proj.weight"))
+        reads.read(f.shared.up, at("mlp.shared_experts.up_proj.weight"))
         reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
 
 # The forward of Dots3 NOTE: latent attention over the keys the indexer
@@ -350,10 +351,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
-            f.down,
-        )
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.down)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
         f.experts,
@@ -365,10 +364,8 @@ def mlp(x, f):
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     s = f.shared
-    shared = ops.linear.matmul(
-        ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter),
-        s.down,
-    )
+    gate, up = ops.linear.matmul(x, s.gate), ops.linear.matmul(x, s.up)
+    shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), s.down)
     return ops.elemwise.residual_add(shared, routed)
 
 def index_select(x, q_a, inputs, ix):

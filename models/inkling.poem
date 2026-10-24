@@ -108,7 +108,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], w).packed([iw, iw]),
+                gate = weight([iw, hidden], w).columns(),
+                up = weight([iw, hidden], w).columns(),
                 inter = iw,
                 down = weight([hidden, iw], w).rows(),
                 scale = vec("mlp_scale", 1),
@@ -229,10 +230,8 @@ def huggingface(m, reads):
         f = w.mlp
         if not f.routed:
             w13 = src(n("mlp.w13_dn.weight"))
-            reads.read_expr(f.gate_up, concat(0, [
-                w13.stride(0, 0, f.inter, 2),
-                w13.stride(0, 1, f.inter, 2),
-            ]))
+            reads.read_expr(f.gate, w13.stride(0, 0, f.inter, 2))
+            reads.read_expr(f.up, w13.stride(0, 1, f.inter, 2))
             reads.read(f.down, n("mlp.w2_md.weight"))
             reads.read(f.scale, n("mlp.global_scale"))
             continue
@@ -349,7 +348,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        act = ops.linear.glu(gate, gating.swiglu(), up = up)
         return ops.elemwise.scale(f.scale, ops.linear.matmul(act, f.down))
     fan = f.top_k + f.sink
     routes, weights = ops.linear.moe_route(

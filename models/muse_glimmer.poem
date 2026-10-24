@@ -61,7 +61,9 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             full = l % d.full_every == d.full_every - 1,
-            qkv = weight([q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            q = weight([q_w, hidden], proj).columns(heads = d.q_heads),
+            k = weight([kv_w, hidden], proj).columns(heads = d.kv_heads),
+            v = weight([kv_w, hidden], proj).columns(heads = d.kv_heads),
             gate = weight([q_w, hidden], proj).columns(),
             o_proj = weight([hidden, q_w], proj).rows(),
             kv = "kv.{}".format(l),
@@ -73,7 +75,10 @@ def layout(id, deploy):
             pre_ffw_norm_eps = d.norm_eps,
             post_ffw_norm = norm("post_ffw_norm"),
             post_ffw_norm_eps = d.post_norm_eps,
-            gate_up = weight([2 * iw, hidden], proj).packed([iw, iw]),
+            mlp = struct(
+                gate = weight([iw, hidden], proj).columns(),
+                up = weight([iw, hidden], proj).columns(),
+            ),
             inter = iw,
             down = weight([hidden, iw], proj).rows(),
             lora_a = lora_a,
@@ -133,10 +138,13 @@ def rows(layout):
         (n("post_attention_layernorm.weight"), "layers.{l}.post_attn_norm"),
         (n("pre_feedforward_layernorm.weight"), "layers.{l}.pre_ffw_norm"),
         (n("post_feedforward_layernorm.weight"), "layers.{l}.post_ffw_norm"),
-        ([n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")], "layers.{l}.qkv"),
+        (n("self_attn.q_proj.weight"), "layers.{l}.q"),
+        (n("self_attn.k_proj.weight"), "layers.{l}.k"),
+        (n("self_attn.v_proj.weight"), "layers.{l}.v"),
         (n("self_attn.gate_proj.weight"), "layers.{l}.gate"),
         (n("self_attn.o_proj.weight"), "layers.{l}.o_proj"),
-        ([n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], "layers.{l}.gate_up"),
+        (n("mlp.gate_proj.weight"), "layers.{l}.mlp.gate"),
+        (n("mlp.up_proj.weight"), "layers.{l}.mlp.up"),
         (n("mlp.down_proj.weight"), "layers.{l}.down"),
     ]
 
@@ -170,7 +178,7 @@ def forward(m, inputs):
         normed = ops.elemwise.rmsnorm_plus_one(y, w.attn_norm, w.attn_norm_eps)
         pages = inputs.kv(w.kv)
 
-        q, k, v = ops.gather.split_qkv(ops.linear.matmul(normed, w.qkv), m.q_heads * d, m.kv_heads * d)
+        q, k, v = ops.linear.matmul(normed, w.q), ops.linear.matmul(normed, w.k), ops.linear.matmul(normed, w.v)
         q = ops.elemwise.rmsnorm_no_scale(q, d, m.norm_eps)
         k = ops.elemwise.rmsnorm_no_scale(k, d, m.norm_eps)
         if not w.full:
@@ -193,7 +201,8 @@ def forward(m, inputs):
             y,
         )
         mlp_in = ops.elemwise.rmsnorm_plus_one(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
-        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.swiglu(), w.inter)
+        gate, up = ops.linear.matmul(mlp_in, w.mlp.gate), ops.linear.matmul(mlp_in, w.mlp.up)
+        act = ops.linear.glu(gate, gating.swiglu(), up = up)
         f = ops.linear.matmul(act, w.down)
         return ops.elemwise.residual_add(
             ops.elemwise.rmsnorm_plus_one(f, w.post_ffw_norm, w.post_ffw_norm_eps),
