@@ -40,6 +40,9 @@ pub struct Join {
 pub struct Lowering {
     pub joins: Vec<Join>,
     pub tiled: Vec<String>,
+    /// The params the deployment's trace reads, by name, where known: a
+    /// layout weight none of them is (or is a plane of) is not stored.
+    pub read: Option<Vec<String>>,
 }
 
 impl Join {

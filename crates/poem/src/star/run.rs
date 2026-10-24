@@ -428,6 +428,9 @@ impl Package {
                 }
             })?;
         }
+        if let Some(read) = &lowering.read {
+            crate::import::prune(&mut contract, read);
+        }
         Ok(contract)
     }
 

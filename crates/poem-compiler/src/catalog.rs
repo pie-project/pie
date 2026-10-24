@@ -144,8 +144,10 @@ pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
 #[must_use]
 pub fn lowering_of(trace: &Trace) -> poem::Lowering {
     let joins = crate::pack::joins(trace);
+    let lowered = crate::tile::tile(crate::pack::pack(trace.clone()));
     let tiled = crate::tile::tiled(&crate::pack::pack(trace.clone()));
-    poem::Lowering { joins, tiled }
+    let read = Some(lowered.params.iter().map(|p| p.name.clone()).collect());
+    poem::Lowering { joins, tiled, read }
 }
 
 /// The rank counts [`Catalog::splits`] tries.

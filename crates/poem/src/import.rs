@@ -316,6 +316,66 @@ pub fn own_contract(
     Ok(b.build())
 }
 
+/// `contract` without the weights `read` (the params a trace reads, by
+/// name) holds none of: a public tensor neither a param nor a plane of one,
+/// and the internal ones only those read.
+pub fn prune(contract: &mut ModelContract, read: &[String]) {
+    let read: std::collections::BTreeSet<&str> = read.iter().map(String::as_str).collect();
+    let held = |name: &str| {
+        read.contains(name)
+            || name
+                .rsplit_once('.')
+                .is_some_and(|(stem, _)| read.contains(stem))
+    };
+    let mut keep: Vec<bool> = contract
+        .tensors
+        .iter()
+        .map(|t| t.visibility != checkpoint::types::Visibility::Public || held(&t.name))
+        .collect();
+    // An internal tensor stays only where a kept one reads it.
+    let at: std::collections::BTreeMap<&str, usize> = contract
+        .tensors
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.as_str(), i))
+        .collect();
+    let mut needed = vec![false; contract.tensors.len()];
+    for i in (0..contract.tensors.len()).rev() {
+        let public = contract.tensors[i].visibility == checkpoint::types::Visibility::Public;
+        if !(keep[i] && (public || needed[i])) {
+            continue;
+        }
+        let mut outs = Vec::new();
+        outs_of(&contract.tensors[i].expr, &mut outs);
+        for name in outs {
+            if let Some(&j) = at.get(name.as_str()) {
+                needed[j] = true;
+            }
+        }
+    }
+    for (i, t) in contract.tensors.iter().enumerate() {
+        if t.visibility != checkpoint::types::Visibility::Public {
+            keep[i] = needed[i];
+        }
+    }
+    let mut i = 0;
+    contract.tensors.retain(|_| {
+        i += 1;
+        keep[i - 1]
+    });
+}
+
+fn outs_of(expr: &Expr, into: &mut Vec<String>) {
+    if let Expr::Out(name) = expr {
+        into.push(name.clone());
+        return;
+    }
+    let _ = expr.clone().map_children(|child| {
+        outs_of(&child, into);
+        Ok(child)
+    });
+}
+
 /// One static input scale for legs joined into `of`, each stating its own
 /// (`names`, one f32 each): the first leg's where they agree, else the
 /// largest, under which no leg's activations overflow (as vLLM fuses them).
