@@ -201,6 +201,7 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         residency: engine_cuda::experts::Plan::default(),
         deferred_tier: false,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
 }

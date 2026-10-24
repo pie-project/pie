@@ -573,11 +573,14 @@ impl Shell {
             boot.checkpoint,
             boot.residency.clone(),
             device.stream(),
-            checkpoint::plan::StorageTarget::for_backend(
-                checkpoint::types::BackendKind::Cuda,
-                boot.world.rank,
-                boot.world.size,
-            ),
+            checkpoint::plan::StorageTarget {
+                ep_rank: boot.expert.rank,
+                ..checkpoint::plan::StorageTarget::for_backend(
+                    checkpoint::types::BackendKind::Cuda,
+                    boot.world.rank,
+                    boot.world.size,
+                )
+            },
             decode_dense,
             boot.deferred_tier,
         )?;

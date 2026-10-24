@@ -90,6 +90,7 @@ fn walk(
         runahead: engine::runahead::Runahead::F1,
         residency: Plan::default(),
         world: World::default(),
+        expert: World::default(),
         comm: core::ptr::null_mut(),
     })
     .expect("the shell loads");

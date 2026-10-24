@@ -2,97 +2,23 @@
 #![allow(unsafe_code)]
 
 //! Two expert-parallel ranks on one device stand in for a pair of peers:
-//! each holds half of every MoE layer's experts, dispatches its tokens to
+//! each reads its half of every MoE layer's experts from the one checkpoint, dispatches its tokens to
 //! the rank holding their routes and combines the outputs back. Each rank's
 //! logits are the logits one rank holding every expert answers for the same
 //! prompt, whether the other rank fires its own prompt in the step or idles
 //! through it serving the first rank's routes.
-
-use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::ep::{EpRank, wire};
 use engine_cuda::{Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_ir::{ParamSource, Trace};
+use poem_ir::Trace;
 
-const MICRO: &str = "qwen3-a3b-micro";
+use crate::micro::{MICRO, RANKS, Scratch, close, prompt, write_checkpoint};
+
 const CEILING: u32 = 256;
 const PAGE: u32 = 16;
-const RANKS: u32 = 2;
-
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// A plane's values, by its name: the same for one rank's whole bank and
-/// a rank's slots cut from it.
-fn values(name: &str, count: usize) -> Vec<u16> {
-    let norm = name.ends_with("norm");
-    let mut seed = fnv(name);
-    (0..count)
-        .map(|_| {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let unit = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
-            let value = if norm { 1.0 + 0.05 * unit } else { 0.08 * unit };
-            (value.to_bits() >> 16) as u16
-        })
-        .collect()
-}
-
-/// `trace`'s planes; a bank an expert-parallel rank holds part of is cut
-/// to the experts `rank`'s slots hold under the uniform placement
-/// (`held[p] = p % experts`), from the whole bank's values.
-fn write_checkpoint(path: &Path, trace: &Trace, rank: u32) {
-    let mut writer = ztensor::Writer::create(path).expect("the checkpoint opens");
-    let mut planes: Vec<_> = trace
-        .params
-        .iter()
-        .filter(|param| param.source == ParamSource::Checkpoint)
-        .collect();
-    planes.sort_by(|a, b| a.name.cmp(&b.name));
-    for param in planes {
-        assert_eq!(param.dtype, Dtype::Bf16, "`{}` is not bf16", param.name);
-        let count: usize = param.shape.iter().product::<u64>() as usize;
-        let plane: Vec<u16> = match param.experts {
-            None => values(&param.name, count),
-            Some(slots) => {
-                let per = count / slots.slots as usize;
-                let whole = values(&param.name, per * slots.experts as usize);
-                (0..slots.slots)
-                    .flat_map(|s| {
-                        let e = ((rank * slots.slots + s) % slots.experts) as usize;
-                        whole[e * per..(e + 1) * per].to_vec()
-                    })
-                    .collect()
-            }
-        };
-        let bytes: Vec<u8> = plane.iter().flat_map(|v| v.to_le_bytes()).collect();
-        writer
-            .add(
-                param.name.as_str(),
-                param.shape.clone(),
-                ztensor::Leaf::BF16,
-                &bytes,
-            )
-            .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
-    }
-    writer.finish().expect("the checkpoint closes");
-}
 
 struct Loaded {
     shell: Shell,
@@ -124,10 +50,12 @@ struct Carried<T>(T);
 // SAFETY: as `Loaded`'s.
 unsafe impl<T> Send for Carried<T> {}
 
-/// A rank's load up to its bodies, and the directory its checkpoint is in.
+/// A load of `trace` from `whole`'s checkpoint as `expert`'s rank, up to
+/// its bodies, and the directory the checkpoint is in.
 fn stage(
     trace: &Trace,
-    rank: u32,
+    whole: &Trace,
+    expert: engine_cuda::World,
     tag: &str,
     graphs: bool,
 ) -> (engine_cuda::serve::Staged, Scratch) {
@@ -135,7 +63,7 @@ fn stage(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the scratch directory");
     let container = dir.join("micro.zt");
-    write_checkpoint(&container, trace, rank);
+    write_checkpoint(&container, whole);
     let source = ztensor::Source::open(&container).expect("the fixture opens");
     let contract: ModelContract =
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
@@ -165,6 +93,7 @@ fn stage(
         residency: engine_cuda::experts::Plan::default(),
         deferred_tier: false,
         world: engine_cuda::World::default(),
+        expert,
         comm: core::ptr::null_mut(),
     })
     .expect("the micro loads");
@@ -172,7 +101,7 @@ fn stage(
 }
 
 fn load(trace: &Trace, tag: &str, graphs: bool) -> Loaded {
-    let (staged, dir) = stage(trace, 0, tag, graphs);
+    let (staged, dir) = stage(trace, trace, engine_cuda::World::default(), tag, graphs);
     Loaded {
         shell: staged.finish().expect("the micro arms"),
         _dir: dir,
@@ -191,9 +120,18 @@ fn arm(staged: Carried<(engine_cuda::serve::Staged, Scratch)>) -> Carried<Loaded
 
 /// The group's ranks, wired between staging and arming: arming fires the
 /// collectives, so every rank arms at once.
-fn group(lowered: &Trace, graphs: bool) -> Vec<Loaded> {
+fn group(lowered: &Trace, whole: &Trace, graphs: bool) -> Vec<Loaded> {
     let mut staged: Vec<_> = (0..RANKS)
-        .map(|r| stage(lowered, r, &format!("rank{r}-{graphs}"), graphs))
+        .map(|rank| {
+            let expert = engine_cuda::World { rank, size: RANKS };
+            stage(
+                lowered,
+                whole,
+                expert,
+                &format!("rank{rank}-{graphs}"),
+                graphs,
+            )
+        })
         .collect();
     let shape = staged[0]
         .0
@@ -215,32 +153,6 @@ fn group(lowered: &Trace, graphs: bool) -> Vec<Loaded> {
             .collect();
         armed.into_iter().map(|h| h.join().unwrap().0).collect()
     })
-}
-
-fn prompt(len: u32, seed: u32) -> Vec<u32> {
-    (0..len).map(|t| (t * 7 + 11 + seed * 131) % 2048).collect()
-}
-
-fn close(got: &[f32], want: &[f32], what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: the vocabularies differ");
-    let spread = want.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-        - want.iter().copied().fold(f32::INFINITY, f32::min);
-    let worst = got
-        .iter()
-        .zip(want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        spread > 1e-3,
-        "{what}: the logits are a rectangle nothing wrote"
-    );
-    // The experts' products see other row counts on two ranks (every rank's
-    // received rows, not one rank's own), so a kernel of another tiling
-    // rounds the last bf16 place: 0.0625 of a spread of 8 is one ulp there.
-    assert!(
-        worst <= 0.015 * spread,
-        "{what}: worst gap {worst} over a spread of {spread}"
-    );
 }
 
 #[test]
@@ -289,7 +201,7 @@ fn check(graphs: bool) {
         .unwrap();
     drop(one);
 
-    let mut ranks = group(&lowered, graphs);
+    let mut ranks = group(&lowered, &whole, graphs);
     for loaded in &mut ranks {
         loaded.shell.open(0).unwrap();
         loaded.shell.open(1).unwrap();
