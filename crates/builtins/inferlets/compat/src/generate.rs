@@ -37,9 +37,8 @@ use crate::prompt::Prompt;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sampling {
     /// Draft with the model's block drafter where it pays (greedy, or
-    /// sampled under `speculative_sampled`; alone, or beside other requests
-    /// under the runtime's `verify_budget`); on unless the request turns it
-    /// off.
+    /// sampled under `speculative_sampled`; alone); on unless the request
+    /// turns it off.
     pub speculative: bool,
     /// Draft above temperature zero too, verifying by speculative
     /// sampling's acceptance rule (temperature alone, no truncation). Off
@@ -552,10 +551,8 @@ pub async fn generate(
         && !prompt.is_empty()
         && images.is_empty()
         // Beside other requests the run-ahead decode below batches with
-        // theirs, and drafting would cost all of them, unless the runtime
-        // shares a verify budget: then the rows it grants are the ones the
-        // batch carries for nearly nothing.
-        && (Pipeline::live() == 0 || Pipeline::verify_budgeted())
+        // theirs; drafting would cost all of them.
+        && Pipeline::live() == 0
         && let Some(draft) = model::draft_block()
         && draft.proposals_from <= 1
         && (2..=16).contains(&draft.rows)
