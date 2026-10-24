@@ -16,6 +16,7 @@ fn check(code: rt::cudaError, call: &str) {
 }
 
 pub struct Gpu {
+    ordinal: i32,
     stream: rt::cudaStream_t,
     slabs: Slabs,
     device: Vec<*mut c_void>,
@@ -23,13 +24,26 @@ pub struct Gpu {
     cublas: blas::cublasHandle_t,
 }
 
-/// One granule mapped at the front of a two-granule reservation: the
-/// granule after it is reserved but never mapped, so a read past the
-/// mapped end faults instead of landing on a neighbour's bytes.
+/// A mapping this `Gpu` made: `mapped` bytes at the front of a `reserved`
+/// reservation. An edge maps one granule of two, so a read past the mapped
+/// end faults instead of landing on a neighbour's bytes; a shared mapping
+/// maps all it reserves.
 struct Edge {
     base: u64,
-    granule: usize,
+    mapped: usize,
+    reserved: usize,
     handle: u64,
+}
+
+/// The devices this process sees.
+pub fn device_count() -> i32 {
+    let mut count = 0;
+    // SAFETY: `count` is a local out-pointer.
+    check(
+        unsafe { rt::cudaGetDeviceCount(&raw mut count) },
+        "cudaGetDeviceCount",
+    );
+    count
 }
 
 pub fn arm_cache() {
@@ -41,12 +55,19 @@ pub fn arm_cache() {
 
 impl Gpu {
     pub fn open() -> Self {
+        Self::open_on(0)
+    }
+
+    /// A `Gpu` on device `ordinal`. Every call on it binds this thread to
+    /// that device first, so `Gpu`s on several devices share a thread; a
+    /// fire on its [`Gpu::ctx`] goes to the device last bound.
+    pub fn open_on(ordinal: i32) -> Self {
         arm_cache();
         // SAFETY: every out-pointer is a local; the handle is bound to the
         // stream just created, and both, with the slabs attached to it, live
         // in the `Gpu` until its `Drop` synchronizes and frees them.
         unsafe {
-            check(rt::cudaSetDevice(0), "cudaSetDevice");
+            check(rt::cudaSetDevice(ordinal), "cudaSetDevice");
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();
             check(rt::cudaStreamCreate(&raw mut stream), "cudaStreamCreate");
             let mut cublas: blas::cublasHandle_t = core::ptr::null_mut();
@@ -63,6 +84,7 @@ impl Gpu {
             let slabs = Slabs::open();
             slabs.attach(stream.cast());
             Self {
+                ordinal,
                 stream,
                 slabs,
                 device: Vec::new(),
@@ -70,6 +92,16 @@ impl Gpu {
                 cublas,
             }
         }
+    }
+
+    pub fn ordinal(&self) -> i32 {
+        self.ordinal
+    }
+
+    /// Binds this thread to the `Gpu`'s device.
+    pub fn bind(&self) {
+        // SAFETY: an ordinal `open_on` already bound once.
+        check(unsafe { rt::cudaSetDevice(self.ordinal) }, "cudaSetDevice");
     }
 
     pub fn ctx(&self) -> Ctx {
@@ -97,6 +129,7 @@ impl Gpu {
     }
 
     pub fn zeros(&mut self, bytes: usize) -> u64 {
+        self.bind();
         let _legacy = legacy();
         // SAFETY: `at` is a local out-pointer, and the memset covers exactly
         // the `bytes.max(1)` just allocated; `Drop` frees it.
@@ -154,7 +187,7 @@ impl Gpu {
             let mut prop: dr::CUmemAllocationProp = core::mem::zeroed();
             prop.type_ = dr::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
             prop.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = 0;
+            prop.location.id = self.ordinal;
             let mut granule: usize = 0;
             drv(
                 dr::cuMemGetAllocationGranularity(
@@ -181,7 +214,7 @@ impl Gpu {
             drv(dr::cuMemMap(base, granule, 0, handle, 0), "cuMemMap");
             let mut desc: dr::CUmemAccessDesc = core::mem::zeroed();
             desc.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-            desc.location.id = 0;
+            desc.location.id = self.ordinal;
             desc.flags = dr::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             drv(
                 dr::cuMemSetAccess(base, granule, &raw const desc, 1),
@@ -189,10 +222,12 @@ impl Gpu {
             );
             self.edges.push(Edge {
                 base,
-                granule,
+                mapped: granule,
+                reserved: 2 * granule,
                 handle,
             });
             let at = base + (granule - bytes) as u64;
+            self.bind();
             let _legacy = legacy();
             check(
                 rt::cudaMemset(base as *mut c_void, 0, granule),
@@ -215,6 +250,7 @@ impl Gpu {
 
     pub fn down<T: Copy + Default>(&self, at: u64, count: usize) -> Vec<T> {
         let mut out = vec![T::default(); count];
+        self.bind();
         let _legacy = legacy();
         // SAFETY: `out` holds `count` elements and the copy is synchronous;
         // `at` is an allocation of this `Gpu` at least that long, which
@@ -233,6 +269,86 @@ impl Gpu {
         out
     }
 
+    /// `bytes` of zeros on this device that every device in `readers` loads
+    /// and stores, as the engine's EP buffers are (`elastic::shared`): one
+    /// mapping whose access is granted to each reader, without turning on
+    /// peer access for the whole device.
+    pub fn shared(&mut self, bytes: usize, readers: &[i32]) -> u64 {
+        use kernels_cuda::cudarc::driver::sys as dr;
+        let drv = |code: dr::CUresult, call: &str| {
+            assert_eq!(
+                code,
+                dr::CUresult::CUDA_SUCCESS,
+                "`{call}` answered {code:?}"
+            );
+        };
+        let mut readers = readers.to_vec();
+        readers.push(self.ordinal);
+        readers.sort_unstable();
+        readers.dedup();
+        // SAFETY: the driver structs are plain C data, valid zeroed. Every
+        // out-pointer is a local; the mapping covers the whole reservation,
+        // which the memset fills. `Drop` unmaps and frees each piece.
+        unsafe {
+            let mut prop: dr::CUmemAllocationProp = core::mem::zeroed();
+            prop.type_ = dr::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = self.ordinal;
+            let mut granule: usize = 0;
+            drv(
+                dr::cuMemGetAllocationGranularity(
+                    &raw mut granule,
+                    &raw const prop,
+                    dr::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                ),
+                "cuMemGetAllocationGranularity",
+            );
+            let size = bytes.max(1).next_multiple_of(granule);
+            let mut handle: dr::CUmemGenericAllocationHandle = 0;
+            drv(
+                dr::cuMemCreate(&raw mut handle, size, &raw const prop, 0),
+                "cuMemCreate",
+            );
+            let mut base: dr::CUdeviceptr = 0;
+            drv(
+                dr::cuMemAddressReserve(&raw mut base, size, granule, 0, 0),
+                "cuMemAddressReserve",
+            );
+            drv(dr::cuMemMap(base, size, 0, handle, 0), "cuMemMap");
+            let descs: Vec<dr::CUmemAccessDesc> = readers
+                .iter()
+                .map(|&d| {
+                    let mut desc: dr::CUmemAccessDesc = core::mem::zeroed();
+                    desc.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+                    desc.location.id = d;
+                    desc.flags = dr::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                    desc
+                })
+                .collect();
+            drv(
+                dr::cuMemSetAccess(base, size, descs.as_ptr(), descs.len()),
+                "cuMemSetAccess",
+            );
+            self.edges.push(Edge {
+                base,
+                mapped: size,
+                reserved: size,
+                handle,
+            });
+            self.bind();
+            let _legacy = legacy();
+            check(rt::cudaMemset(base as *mut c_void, 0, size), "cudaMemset");
+            base
+        }
+    }
+
+    /// `values` in a [`Gpu::shared`] mapping `readers` reach.
+    pub fn up_shared<T: Copy>(&mut self, values: &[T], readers: &[i32]) -> u64 {
+        let at = self.shared(core::mem::size_of_val(values), readers);
+        host::upload_to(at, values);
+        at
+    }
+
     pub fn sync(&self) {
         // SAFETY: the stream `open` created, live until `Drop`.
         unsafe {
@@ -246,6 +362,7 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        self.bind();
         let _legacy = legacy();
         // SAFETY: the stream is drained first, so nothing still reads the
         // memory; each allocation, mapping, the handle and the stream were
@@ -257,9 +374,9 @@ impl Drop for Gpu {
             }
             for edge in self.edges.drain(..) {
                 use kernels_cuda::cudarc::driver::sys as dr;
-                let _ = dr::cuMemUnmap(edge.base, edge.granule);
+                let _ = dr::cuMemUnmap(edge.base, edge.mapped);
                 let _ = dr::cuMemRelease(edge.handle);
-                let _ = dr::cuMemAddressFree(edge.base, 2 * edge.granule);
+                let _ = dr::cuMemAddressFree(edge.base, edge.reserved);
             }
             blas::cublasDestroy_v2(self.cublas);
             rt::cudaStreamDestroy(self.stream);
