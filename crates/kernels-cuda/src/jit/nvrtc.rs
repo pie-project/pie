@@ -411,14 +411,161 @@ mod tests {
         present
     }
 
-    /// Every unit under `kernels/` lowers with no instantiation asked of it:
-    /// its text parses and its non-template code compiles. A template's body
-    /// is only checked where something instantiates it.
+    /// What the arch-tier units are held to past their non-template code:
+    /// nothing but a B200 or an H100 compiles them at run time, where a unit
+    /// that will not compile declines to the portable path in silence, and
+    /// NVRTC checks a template's body only where something instantiates it.
+    /// Each names at least every `__global__` of its unit, as the launches
+    /// spell them.
+    const INSTANTIATED: &[(&str, &[&str])] = &[
+        (
+            "linear/gemm_sm100.cu",
+            &[
+                "::pie::linear::tc5_gemm<0, 1, 1, 0, 0, 128, 4, 0, 1, 0, 0, 0, 0>",
+                "::pie::linear::tc5_finalize",
+                "::pie::linear::tc5_finalize_routed",
+            ],
+        ),
+        (
+            "attn/prefill_sm100.cu",
+            &[
+                "::pie::attn::fmha::tc5_fmha_prefill<128, 128, 3, 128>",
+                "::pie::attn::fmha::tc5_fmha_prefill<256, 64, 3, 256>",
+                "::pie::attn::fmha::tc5_fmha_prefill_wide<512, 128, 0, 2, 3>",
+                "::pie::attn::fmha::tc5_fmha_prefill_wide<256, 128, 0, 2, 5>",
+            ],
+        ),
+        (
+            "attn/compressed/prefill_sm100.cu",
+            &[
+                "::pie::attn::compressed::sm100::sparse<true>",
+                "::pie::attn::compressed::sm100::sparse<false>",
+                "::pie::attn::compressed::sm100::sparse<true, 1, 1>",
+                "::pie::attn::compressed::sm100::stage_pages<1>",
+            ],
+        ),
+        (
+            "attn/index/logits_sm100.cu",
+            &[
+                "::pie::attn::index::index_logits_tc5<32>",
+                "::pie::attn::index::index_logits_tc5<64>",
+                "::pie::attn::index::index_select_rows<true>",
+                "::pie::attn::index::index_select_rows<false>",
+            ],
+        ),
+        (
+            "attn/index/logits_fp4_sm100.cu",
+            &["::pie::attn::index::index_logits_fp4<64>"],
+        ),
+        (
+            "attn/mla/sparse_sm100.cu",
+            &[
+                "::pie::attn::mla::mla_sparse<64, false>",
+                "::pie::attn::mla::mla_sparse<64, true>",
+                "::pie::attn::mla::mla_sparse_fold",
+                "::pie::attn::mla::mla_sparse_e4<64>",
+            ],
+        ),
+        (
+            "ssm/gdn_chunk_sm100.cu",
+            &["::pie::ssm::sm100::gdn_chunked"],
+        ),
+        (
+            "linear/moe/select_fp4_sm100.cu",
+            &["::pie::linear::moe_select_mxfp4_cvt<2, 1, 2, 4, 3, 1>"],
+        ),
+        (
+            "linear/moe/route_sm100.cu",
+            &["::pie::linear::moe_gate_tc5<1, 64, 2, 2, 0, true>"],
+        ),
+        (
+            "linear/moe/select_sm90.cu",
+            &[
+                "::pie::linear::moe_select_fp8a8_wgmma<64>",
+                "::pie::linear::moe_select_bf16_wgmma<16, 1>",
+                "::pie::linear::moe_select_bf16_wgmma<32, 2>",
+                "::pie::linear::moe_select_fp4_wgmma<1, false, 3>",
+                "::pie::linear::moe_select_bf16_wsgemm<4, 1>",
+            ],
+        ),
+        (
+            "linear/w8a16_sm90.cu",
+            &["::pie::linear::fp8_w8a16_wgmma<128, 3>"],
+        ),
+        (
+            "linear/act_quant.cu",
+            &["::pie::linear::act_quant_nvfp4<0, false>"],
+        ),
+    ];
+
+    /// The `__global__` functions `text` defines, by name.
+    fn globals(text: &str) -> Vec<&str> {
+        let mut names = Vec::new();
+        for (at, _) in text.match_indices("__global__") {
+            let line = text[..at].rsplit('\n').next().unwrap_or("");
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = &text[at + "__global__".len()..];
+            loop {
+                rest = rest.trim_start();
+                let word = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if word == 0 {
+                    break;
+                }
+                let (name, after) = rest.split_at(word);
+                if !after.trim_start().starts_with('(') {
+                    rest = after;
+                    continue;
+                }
+                if name != "__launch_bounds__" {
+                    names.push(name);
+                    break;
+                }
+                let mut depth = 0;
+                let close = after
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        depth += i32::from(c == '(') - i32::from(c == ')');
+                        c == ')' && depth == 0
+                    })
+                    .map_or(after.len(), |(i, _)| i + 1);
+                rest = &after[close..];
+            }
+        }
+        names
+    }
+
+    /// The plain target a unit's tier names, by its file's suffix: the
+    /// arch-specific twin's chip for `_sm100` and `_sm90`, sm_80 (the
+    /// oldest a unit is compiled for) for `_sm80` and the generic units.
+    fn tier(file: &str) -> &'static str {
+        if file.contains("_sm100") {
+            "sm_100"
+        } else if file.contains("_sm90") {
+            "sm_90"
+        } else {
+            "sm_80"
+        }
+    }
+
+    /// Every unit under `kernels/` compiles for each target it is
+    /// registered for, as `cache::load` would compile it there: its
+    /// options, its headers, its NVRTC floor and the target
+    /// [`Root::target`] picks for its tier's chip. A unit with no
+    /// instantiation asked of it is checked for its text and non-template
+    /// code; each in [`INSTANTIATED`] is lowered as its launch names it.
     #[test]
     fn every_unit_lowers() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         if !nvrtc_is_here() {
             return;
         }
+        let nvrtc = version().expect("libnvrtc answers its version");
         // A unit another unit includes is a header: it compiles as part of
         // its includers, under their options, not on its own.
         let included: std::collections::BTreeSet<&str> = crate::source::LIBRARY
@@ -427,6 +574,7 @@ mod tests {
             .filter_map(|line| line.strip_prefix("#include \"")?.split('"').next())
             .collect();
         let mut failed = Vec::new();
+        let mut jobs: Vec<(Root, String, Option<&str>)> = Vec::new();
         for header in crate::source::LIBRARY {
             if included.contains(header.name) {
                 continue;
@@ -434,20 +582,72 @@ mod tests {
             let Some(root) = Root::of(header.name) else {
                 continue;
             };
-            let arch = if root.specific { "sm_100a" } else { "sm_90" };
-            let built = compile_text(&Job {
-                name: root.name,
-                source: root.text.to_owned(),
-                arch,
-                options: root.options,
-                headers: root.header_set(),
-                floor: Toolchain::ANY,
-                wanted: &[],
-            });
-            if let Err(why) = built {
-                failed.push(format!("{} at {arch}: {why}", header.name));
+            let wanted = INSTANTIATED
+                .iter()
+                .find(|(file, _)| *file == header.name)
+                .map_or(&[][..], |(_, wanted)| *wanted);
+            if root.specific {
+                for name in globals(root.text) {
+                    let named = |w: &&str| {
+                        w.contains(&format!("::{name}<")) || w.ends_with(&format!("::{name}"))
+                    };
+                    if !wanted.iter().any(named) {
+                        failed.push(format!(
+                            "{}: `{name}` is instantiated nowhere in INSTANTIATED",
+                            header.name
+                        ));
+                    }
+                }
+            }
+            let mut plains = vec![tier(header.name)];
+            if root.tcgen05_twin {
+                plains.push("sm_100");
+            }
+            for plain in plains {
+                let Some(arch) = root.target(plain, Features::of(plain, nvrtc).tcgen05) else {
+                    failed.push(format!(
+                        "{}: {plain} has no arch-specific twin",
+                        header.name
+                    ));
+                    continue;
+                };
+                jobs.push((root, arch.clone(), None));
+                jobs.extend(wanted.iter().map(|&w| (root, arch.clone(), Some(w))));
             }
         }
+        let next = AtomicUsize::new(0);
+        let refused = Mutex::new(Vec::new());
+        let workers = std::thread::available_parallelism().map_or(8, usize::from);
+        std::thread::scope(|scope| {
+            for _ in 0..workers.min(jobs.len()) {
+                scope.spawn(|| {
+                    while let Some((root, arch, wanted)) =
+                        jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        let wanted: Vec<String> = wanted.iter().map(|&w| w.to_owned()).collect();
+                        let built = compile_text(&Job {
+                            name: root.name,
+                            source: root.text.to_owned(),
+                            arch,
+                            options: root.options,
+                            headers: root.header_set(),
+                            floor: root.floor,
+                            wanted: &wanted,
+                        });
+                        if let Err(why) = built {
+                            let what = wanted.first().map_or("", String::as_str);
+                            refused
+                                .lock()
+                                .expect("a worker panicked")
+                                .push(format!("{} {what} at {arch}: {why}", root.file));
+                        }
+                    }
+                });
+            }
+        });
+        let mut refused = refused.into_inner().expect("a worker panicked");
+        refused.sort();
+        failed.extend(refused);
         assert!(failed.is_empty(), "{}", failed.join("\n\n"));
     }
 
