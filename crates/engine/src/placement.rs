@@ -110,6 +110,10 @@ impl Placement {
         let mut weight = next.weights(loads);
         let peak = |w: &[f64]| w.iter().copied().fold(0.0, f64::max);
         let start = peak(&weight);
+        // No peak falls below the mean: one within the gain of it stays.
+        if start - mean <= limits.gain * mean {
+            return self.clone();
+        }
         let (mut best, mut kept) = (start, None);
 
         // Whether ranks' loads `a`, busiest first, sit lower than `b`'s.
@@ -149,6 +153,9 @@ impl Placement {
                             + la * (f64::from(na) / (ka - 1.0) - f64::from(ca) / ka)
                             + lb * (f64::from(nb) / (kb + 1.0) - f64::from(cb) / kb);
                     }
+                    if peak(&scratch) > pick[0] + near {
+                        continue;
+                    }
                     sorted(&scratch, &mut trial);
                     if lower(&trial, &pick) {
                         core::mem::swap(&mut pick, &mut trial);
@@ -159,24 +166,46 @@ impl Placement {
 
             // Two experts traded between ranks, neither landing beside a
             // replica of itself: only where it lowers the loads further than
-            // any retarget, which rewrites one slot to its two.
+            // any retarget, which rewrites one slot to its two. Trading `a`
+            // on `r` for `b` on `s` shifts `share(b) - share(a)` from `s` to
+            // `r`, and the pair's busier rank is lowest for the shift nearest
+            // half their gap: for each `a`, the nearest `b` either side.
             if budget >= 2 {
                 let share = |e: usize| load(e) / f64::from(replicas[e].max(1));
-                for p in 0..ranks * slots {
-                    let (a, r) = (next.held[p] as usize, p / slots);
-                    for q in (r + 1) * slots..ranks * slots {
-                        let (b, s) = (next.held[q] as usize, q / slots);
-                        if count[a * ranks + s] > 0 || count[b * ranks + r] > 0 {
-                            continue;
-                        }
-                        scratch.copy_from_slice(&weight);
-                        let shift = share(b) - share(a);
-                        scratch[r] += shift;
-                        scratch[s] -= shift;
-                        sorted(&scratch, &mut trial);
-                        if lower(&trial, &pick) {
-                            core::mem::swap(&mut pick, &mut trial);
-                            edit = Some((p, b as u32, Some(q)));
+                let mut theirs: Vec<(f64, usize)> = Vec::with_capacity(slots);
+                for r in 0..ranks {
+                    for s in r + 1..ranks {
+                        theirs.clear();
+                        theirs.extend(
+                            (s * slots..(s + 1) * slots).map(|q| (share(next.held[q] as usize), q)),
+                        );
+                        theirs.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+                        let half = (weight[s] - weight[r]) / 2.0;
+                        for p in r * slots..(r + 1) * slots {
+                            let a = next.held[p] as usize;
+                            if count[a * ranks + s] > 0 {
+                                continue;
+                            }
+                            let fits = |&&(_, q): &&(f64, usize)| {
+                                count[next.held[q] as usize * ranks + r] == 0
+                            };
+                            let at = theirs.partition_point(|x| x.0 < share(a) + half);
+                            let below = theirs[..at].iter().rev().find(fits);
+                            let above = theirs[at..].iter().find(fits);
+                            for &(theirs_share, q) in below.into_iter().chain(above) {
+                                scratch.copy_from_slice(&weight);
+                                let shift = theirs_share - share(a);
+                                scratch[r] += shift;
+                                scratch[s] -= shift;
+                                if peak(&scratch) > pick[0] + near {
+                                    continue;
+                                }
+                                sorted(&scratch, &mut trial);
+                                if lower(&trial, &pick) {
+                                    core::mem::swap(&mut pick, &mut trial);
+                                    edit = Some((p, next.held[q], Some(q)));
+                                }
+                            }
                         }
                     }
                 }
