@@ -633,6 +633,7 @@ mod tests {
             req_id: ReqId(req),
             session: SessionId(1),
             tenant: TenantId("t".into()),
+            user: "u".into(),
             priority: Priority::Normal,
             blobs: Vec::new(),
             message: ClientMessage::LaunchProcess {
