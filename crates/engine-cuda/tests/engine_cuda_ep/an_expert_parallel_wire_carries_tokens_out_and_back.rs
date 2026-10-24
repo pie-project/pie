@@ -1,16 +1,18 @@
 #![cfg(feature = "cuda")]
 #![allow(unsafe_code)]
 
-//! Two ranks on one device stand in for a pair of peers, as the peer
-//! collectives' test does: the wire's landings and returns are the mapped
-//! buffers peers would reach. A token dispatched out and combined back,
-//! with each expert answering its row as it landed, comes back as it left.
+//! Rank `r` on device `r % count`, as the peer collectives' test places
+//! them: the wire's landings and returns are the buffers mapped into every
+//! peer. A token dispatched out and combined back, with each expert
+//! answering its row as it landed, comes back as it left.
 
 use engine_cuda::device::{Buffer, Context};
 use engine_cuda::ep::{Widest, wire};
 use kernels_cuda::collective::{Placement, Tokens, combine, dispatch};
 use kernels_cuda::{Ctx, Tensor};
 use poem_ir::Dtype;
+
+use crate::micro::{ordinals, ranks};
 
 fn down<T: Copy + Default>(at: u64, count: usize) -> Vec<T> {
     use kernels_cuda::cudarc::runtime::sys as rt;
@@ -45,7 +47,9 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let (world, tokens, width, top_k, experts) = (2u32, 24u32, 128u32, 4u32, 8u32);
+    let world = ranks();
+    let ordinals = ordinals(world);
+    let (tokens, width, top_k, experts) = (24u32, 128u32, 4u32, 8u32);
     let row_bytes = u64::from(width) * 2;
     let widest = Widest {
         tokens: 32,
@@ -53,9 +57,9 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
         out_bytes: row_bytes,
         top_k,
     };
-    let wires = wire(&[0, 0], widest).expect("one device reaches itself");
-    let devices: Vec<Context> = (0..world)
-        .map(|_| Context::bind(0, None).unwrap())
+    let wires = wire(&ordinals, widest).expect("every rank reaches every other");
+    let devices: Vec<Context> = (ordinals.iter())
+        .map(|&ordinal| Context::bind(ordinal, None).unwrap())
         .collect();
     // SAFETY: each context's stream is live for the test.
     let ctxs: Vec<Ctx> = devices
@@ -65,9 +69,14 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
 
     let slots = experts / world;
     let table: Vec<i32> = (0..experts as i32).flat_map(|e| [1, e]).collect();
-    let table = up(&table);
-    let place = Placement {
-        table: table.ptr(),
+    let tables: Vec<Buffer> = (devices.iter())
+        .map(|device| {
+            device.bind_thread().unwrap();
+            up(&table)
+        })
+        .collect();
+    let place = |rank: usize| Placement {
+        table: tables[rank].ptr(),
         stride: 2,
         experts,
         slots,
@@ -89,6 +98,7 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
         .collect();
     let held: Vec<(Buffer, Buffer, Buffer)> = (0..world as usize)
         .map(|r| {
+            devices[r].bind_thread().unwrap();
             let counts = Buffer::zeroed(slots as usize * 4).unwrap();
             (up(&xs[r]), up(&routes[r]), counts)
         })
@@ -98,6 +108,7 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
         .map(|w| w.landing(tokens, top_k, width, Dtype::Bf16, false))
         .collect();
     for (r, ctx) in ctxs.iter().enumerate() {
+        devices[r].bind_thread().unwrap();
         let (x, rt, counts) = &held[r];
         let mut counts = Tensor::new(counts.ptr(), 1, slots, Dtype::I32);
         let toks = Tokens {
@@ -106,15 +117,18 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
             weights: None,
             step: tokens,
         };
-        dispatch(ctx, &wires[r].ep, place, toks, &landing, &mut counts).unwrap();
+        dispatch(ctx, &wires[r].ep, place(r), toks, &landing, &mut counts).unwrap();
     }
-    devices.iter().for_each(|d| d.synchronize().unwrap());
+    devices.iter().for_each(|d| {
+        d.bind_thread().unwrap();
+        d.synchronize().unwrap();
+    });
 
     // Each expert answers the row it was handed.
     let cap = (world * tokens) as usize;
-    let ys: Vec<Buffer> = landing
-        .iter()
-        .map(|l| {
+    let ys: Vec<Buffer> = (landing.iter().zip(&devices))
+        .map(|(l, device)| {
+            device.bind_thread().unwrap();
             let rows: Vec<u16> = down(l.rows.ptr, cap * width as usize);
             let local: Vec<i32> = down(l.local.ptr, cap * top_k as usize);
             let y: Vec<u16> = (0..cap * top_k as usize)
@@ -132,10 +146,14 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
         .map(|w| w.routed(tokens, top_k, width, Dtype::Bf16))
         .collect();
     for (r, ctx) in ctxs.iter().enumerate() {
+        devices[r].bind_thread().unwrap();
         let y = Tensor::new(ys[r].ptr(), (cap as u32) * top_k, width, Dtype::Bf16);
         combine(ctx, &wires[r].ep, &landing[r], y, &routed).unwrap();
     }
-    devices.iter().for_each(|d| d.synchronize().unwrap());
+    devices.iter().for_each(|d| {
+        d.bind_thread().unwrap();
+        d.synchronize().unwrap();
+    });
 
     for r in 0..world as usize {
         let got: Vec<u16> = down(routed[r].ptr, (tokens * top_k * width) as usize);

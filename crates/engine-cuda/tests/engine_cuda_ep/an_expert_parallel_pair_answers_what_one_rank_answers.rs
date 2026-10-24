@@ -1,12 +1,12 @@
 #![cfg(feature = "cuda")]
 #![allow(unsafe_code)]
 
-//! Two expert-parallel ranks on one device stand in for a pair of peers:
-//! each reads its half of every MoE layer's experts from the one checkpoint, dispatches its tokens to
-//! the rank holding their routes and combines the outputs back. Each rank's
-//! logits are the logits one rank holding every expert answers for the same
-//! prompt, whether the other rank fires its own prompt in the step or idles
-//! through it serving the first rank's routes.
+//! An expert-parallel group, rank `r` on device `r % count`: each reads its
+//! part of every MoE layer's experts from the one checkpoint, dispatches
+//! its tokens to the ranks holding their routes and combines the outputs
+//! back. Each rank's logits are the logits one rank holding every expert
+//! answers for the same prompt, whether the other ranks fire their own
+//! prompts in the step or idle through it serving the first rank's routes.
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::ep::{EpRank, wire};
@@ -15,13 +15,14 @@ use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::Trace;
 
-use crate::micro::{MICRO, RANKS, Scratch, close, prompt, write_checkpoint};
+use crate::micro::{KV, MICRO, SHARE, Scratch, close, ordinals, prompt, ranks, write_checkpoint};
 
 const CEILING: u32 = 256;
 const PAGE: u32 = 16;
 
 struct Loaded {
     shell: Shell,
+    ordinal: i32,
     _dir: Scratch,
 }
 
@@ -33,13 +34,13 @@ unsafe impl Send for Loaded {}
 impl Loaded {
     /// One lane's logits, fired at the group's `bucket` on its own thread.
     fn fire_at(&mut self, bucket: u32, lane: Lane<'_>) -> Vec<Vec<f32>> {
-        engine_cuda::device::ctx::bind_thread(0).unwrap();
+        engine_cuda::device::ctx::bind_thread(self.ordinal).unwrap();
         self.shell.at_bucket(bucket);
         self.shell.fire(&[lane]).unwrap()
     }
 
     fn idle(&mut self, bucket: u32) {
-        engine_cuda::device::ctx::bind_thread(0).unwrap();
+        engine_cuda::device::ctx::bind_thread(self.ordinal).unwrap();
         self.shell.fire_idle(bucket).unwrap();
     }
 }
@@ -50,12 +51,13 @@ struct Carried<T>(T);
 // SAFETY: as `Loaded`'s.
 unsafe impl<T> Send for Carried<T> {}
 
-/// A load of `trace` from `whole`'s checkpoint as `expert`'s rank, up to
-/// its bodies, and the directory the checkpoint is in.
+/// A load of `trace` from `whole`'s checkpoint as `expert`'s rank on device
+/// `ordinal`, up to its bodies, and the directory the checkpoint is in.
 fn stage(
     trace: &Trace,
     whole: &Trace,
     expert: engine_cuda::World,
+    ordinal: i32,
     tag: &str,
     graphs: bool,
 ) -> (engine_cuda::serve::Staged, Scratch) {
@@ -71,6 +73,7 @@ fn stage(
     drop(source);
     let graphs = if graphs { "on" } else { "off" };
     let chip = engine_cuda::chip::profile(&format!("[engine]\ngraphs = \"{graphs}\"\n"));
+    engine_cuda::device::ctx::bind_thread(ordinal).unwrap();
     let staged = Shell::stage(engine_cuda::Boot {
         trace: trace.clone(),
         contract: &contract,
@@ -81,9 +84,9 @@ fn stage(
         page_size: PAGE,
         context: CEILING,
         slots: 2,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
+        kv_budget: Some(KV),
+        memory_share: SHARE,
+        ordinal,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
             ..engine_cuda::Knobs::default()
@@ -100,37 +103,37 @@ fn stage(
     (staged, Scratch(dir))
 }
 
-fn load(trace: &Trace, tag: &str, graphs: bool) -> Loaded {
-    let (staged, dir) = stage(trace, trace, engine_cuda::World::default(), tag, graphs);
+fn load(trace: &Trace, ordinal: i32, tag: &str, graphs: bool) -> Loaded {
+    let world = engine_cuda::World::default();
+    let (staged, dir) = stage(trace, trace, world, ordinal, tag, graphs);
     Loaded {
         shell: staged.finish().expect("the micro arms"),
+        ordinal,
         _dir: dir,
     }
 }
 
 /// A staged rank armed on the thread that will have driven it.
-fn arm(staged: Carried<(engine_cuda::serve::Staged, Scratch)>) -> Carried<Loaded> {
+fn arm(staged: Carried<(engine_cuda::serve::Staged, Scratch)>, ordinal: i32) -> Carried<Loaded> {
     let Carried((staged, dir)) = staged;
-    engine_cuda::device::ctx::bind_thread(0).unwrap();
+    engine_cuda::device::ctx::bind_thread(ordinal).unwrap();
     Carried(Loaded {
         shell: staged.finish().expect("the rank arms"),
+        ordinal,
         _dir: dir,
     })
 }
 
 /// The group's ranks, wired between staging and arming: arming fires the
 /// collectives, so every rank arms at once.
-fn group(lowered: &Trace, whole: &Trace, graphs: bool) -> Vec<Loaded> {
-    let mut staged: Vec<_> = (0..RANKS)
+fn group(lowered: &Trace, whole: &Trace, ordinals: &[i32], graphs: bool) -> Vec<Loaded> {
+    let size = ordinals.len() as u32;
+    let mut staged: Vec<_> = (0..size)
         .map(|rank| {
-            let expert = engine_cuda::World { rank, size: RANKS };
-            stage(
-                lowered,
-                whole,
-                expert,
-                &format!("rank{rank}-{graphs}"),
-                graphs,
-            )
+            let expert = engine_cuda::World { rank, size };
+            let ordinal = ordinals[rank as usize];
+            let tag = format!("rank{rank}-{graphs}");
+            stage(lowered, whole, expert, ordinal, &tag, graphs)
         })
         .collect();
     let shape = staged[0]
@@ -138,21 +141,30 @@ fn group(lowered: &Trace, whole: &Trace, graphs: bool) -> Vec<Loaded> {
         .shell
         .ep_shape()
         .expect("the lowered micro dispatches");
-    let wires = wire(&[0, 0], shape.widest).expect("one device reaches itself");
+    let wires = wire(ordinals, shape.widest).expect("every rank reaches every other");
     for (r, (staged, _)) in staged.iter_mut().enumerate() {
+        engine_cuda::device::ctx::bind_thread(ordinals[r]).unwrap();
         let ep = EpRank::new(wires.clone(), r as u32, &shape.layers).expect("the placement");
         staged.shell.join_ep(ep).expect("the seats");
     }
     std::thread::scope(|scope| {
-        let armed: Vec<_> = staged
-            .into_iter()
-            .map(|staged| {
+        let armed: Vec<_> = (staged.into_iter().zip(ordinals))
+            .map(|(staged, &ordinal)| {
                 let staged = Carried(staged);
-                scope.spawn(move || arm(staged))
+                scope.spawn(move || arm(staged, ordinal))
             })
             .collect();
         armed.into_iter().map(|h| h.join().unwrap().0).collect()
     })
+}
+
+/// A lane of `tokens` at `slot`, its word read off their count.
+fn lane(word: impl Fn(usize) -> u64, slot: u32, tokens: &[u32]) -> Lane<'_> {
+    Lane {
+        slot,
+        word: word(tokens.len()),
+        tokens,
+    }
 }
 
 #[test]
@@ -168,84 +180,74 @@ fn an_expert_parallel_pair_answers_what_one_rank_answers() {
 
 /// Eager walks, or captured bodies armed on every rank at once.
 fn check(graphs: bool) {
+    let size = ranks();
+    let ordinals = ordinals(size);
     let whole = poem_compiler::catalog::trace_of(MICRO, Dtype::Bf16, Dtype::Bf16, Platform::Cuda);
     let lowered =
-        poem_compiler::expert::lower(whole.clone(), RANKS, 0).expect("the micro's MoE lowers");
+        poem_compiler::expert::lower(whole.clone(), size, 0).expect("the micro's MoE lowers");
     assert!(
         lowered.params.iter().any(|p| p.experts.is_some()),
         "the lowered micro holds part of a bank"
     );
 
-    let (a, b) = (prompt(37, 1), prompt(52, 2));
-    let word = |len: u32| whole.facts.word(&Request::new(len, false));
+    let prompts: Vec<Vec<u32>> = (0..size).map(|r| prompt(37 + 15 * r, r + 1)).collect();
+    let word = |len: usize| whole.facts.word(&Request::new(len as u32, false));
+    let lane = |slot, tokens| lane(word, slot, tokens);
 
-    // One rank holding every expert.
-    let mut one = load(&whole, &format!("one-{graphs}"), graphs);
-    one.shell.open(0).unwrap();
-    one.shell.open(1).unwrap();
-    let want_a = one
-        .shell
-        .fire(&[Lane {
-            slot: 0,
-            word: word(37),
-            tokens: &a,
-        }])
-        .unwrap();
-    let want_b = one
-        .shell
-        .fire(&[Lane {
-            slot: 1,
-            word: word(52),
-            tokens: &b,
-        }])
-        .unwrap();
-    drop(one);
+    // One rank holding every expert, on each rank's device: the group's
+    // kernels are loaded and tuned on every device before its ranks spin.
+    let mut want = Vec::new();
+    for &ordinal in ordinals.iter().take(engine_cuda::device::ctx::count()) {
+        let tag = format!("one-{graphs}-{ordinal}");
+        let mut one = load(&whole, ordinal, &tag, graphs);
+        want = (prompts.iter())
+            .map(|p| {
+                one.shell.open(0).unwrap();
+                one.shell.fire(&[lane(0, p)]).unwrap().remove(0)
+            })
+            .collect();
+    }
 
-    let mut ranks = group(&lowered, &whole, graphs);
+    let mut ranks = group(&lowered, &whole, &ordinals, graphs);
     for loaded in &mut ranks {
+        engine_cuda::device::ctx::bind_thread(loaded.ordinal).unwrap();
         loaded.shell.open(0).unwrap();
         loaded.shell.open(1).unwrap();
     }
+    let widest = prompts.iter().map(Vec::len).max().unwrap_or(0) as u32;
     let bucket = ranks[0]
         .shell
-        .bucket_for(52)
-        .expect("a bucket holds both prompts");
+        .bucket_for(widest)
+        .expect("a bucket holds every prompt");
 
-    // Both ranks bring a prompt to the step.
-    let [r0, r1] = &mut ranks[..] else {
-        unreachable!()
-    };
-    let lane = |slot, len, tokens| Lane {
-        slot,
-        word: word(len),
-        tokens,
-    };
-    let (got_a, got_b) = std::thread::scope(|scope| {
-        let first = scope.spawn(|| r0.fire_at(bucket, lane(0, 37, &a)));
-        let second = scope.spawn(|| r1.fire_at(bucket, lane(0, 52, &b)));
-        (first.join().unwrap(), second.join().unwrap())
+    // Every rank brings a prompt to the step.
+    let got: Vec<Vec<Vec<f32>>> = std::thread::scope(|scope| {
+        let fired: Vec<_> = (ranks.iter_mut().zip(&prompts))
+            .map(|(rank, p)| scope.spawn(move || rank.fire_at(bucket, lane(0, p))))
+            .collect();
+        fired.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    close(
-        &got_a[0],
-        &want_a[0],
-        &format!("rank 0's prompt beside rank 1's (graphs {graphs})"),
-    );
-    close(
-        &got_b[0],
-        &want_b[0],
-        &format!("rank 1's prompt beside rank 0's (graphs {graphs})"),
-    );
+    for (r, (got, want)) in got.iter().zip(&want).enumerate() {
+        close(
+            &got[0],
+            want,
+            &format!("rank {r}'s prompt beside the others' (graphs {graphs})"),
+        );
+    }
 
-    // Rank 1 idles through rank 0's step, serving its routes.
+    // The other ranks idle through rank 0's step, serving its routes.
+    let (first, rest) = ranks.split_first_mut().expect("a group has ranks");
     let got = std::thread::scope(|scope| {
-        let first = scope.spawn(|| r0.fire_at(bucket, lane(1, 37, &a)));
-        let idle = scope.spawn(|| r1.idle(bucket));
-        idle.join().unwrap();
-        first.join().unwrap()
+        let idle: Vec<_> = (rest.iter_mut())
+            .map(|rank| scope.spawn(move || rank.idle(bucket)))
+            .collect();
+        let got = first.fire_at(bucket, lane(1, &prompts[0]));
+        idle.into_iter().for_each(|h| h.join().unwrap());
+        got
     });
     close(
         &got[0],
-        &want_a[0],
-        &format!("rank 0's prompt with rank 1 idle (graphs {graphs})"),
+        &want[0],
+        &format!("rank 0's prompt with the others idle (graphs {graphs})"),
     );
 }
