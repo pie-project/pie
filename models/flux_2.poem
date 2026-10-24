@@ -156,7 +156,8 @@ def encoder(c, layers, banks, sharded = False):
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
-            gate_up = weight([2 * inter, hidden], banks).packed([inter, inter]),
+            gate = weight([inter, hidden], banks).columns(),
+            up = weight([inter, hidden], banks).columns(),
             down = rows(weight([hidden, inter], banks)),
             kv = "te.kv.{}".format(l),
         )
@@ -215,7 +216,9 @@ DIMS = {
 def attn(d, banks):
     dim = d.dim
     return struct(
-        qkv = weight([3 * dim, dim], banks).packed([dim, dim, dim]),
+        q = weight([dim, dim], banks).columns(),
+        k = weight([dim, dim], banks).columns(),
+        v = weight([dim, dim], banks).columns(),
         q_norm = weight([HEAD_DIM]),
         k_norm = weight([HEAD_DIM]),
         out = weight([dim, dim], banks),
@@ -526,7 +529,8 @@ def te_read(reads, te, prefix):
         reads.read(w.q_norm, n("self_attn.q_norm.weight"))
         reads.read(w.k_norm, n("self_attn.k_norm.weight"))
         reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.gate, n("mlp.gate_proj.weight"))
+        reads.read(w.up, n("mlp.up_proj.weight"))
         reads.read(w.down, n("mlp.down_proj.weight"))
 
 DIFFUSERS = "a diffusers pipeline (`dit.`/`te.`/`vae.` prefixes)"
@@ -597,7 +601,8 @@ def dit(reads, m, dim, prefix):
 
 def read_attn(reads, a, stem, qkv, norms, out):
     n = lambda s: "{}.attn.{}.weight".format(stem, s)
-    reads.read_concat(a.qkv, [n(s) for s in qkv])
+    for leg, s in zip([a.q, a.k, a.v], qkv):
+        reads.read(leg, n(s))
     reads.read(a.q_norm, n(norms[0]))
     reads.read(a.k_norm, n(norms[1]))
     reads.read(a.out, n(out))
@@ -778,10 +783,8 @@ def qwen3_encode(arm, te, tap = None):
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        f = ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), te.inter),
-            w.down,
-        )
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
         y = ops.elemwise.residual_add(f, y)
         if tap != None:
             tap(l, y)
@@ -865,7 +868,7 @@ def denoise(arm, m):
 
     def heads(x, attn, mods, lanes, positions):
         h = norm_modulate(x, mods.scale_shift, lanes, NORM_EPS)
-        q, k, v = ops.gather.split_qkv(ops.linear.matmul(h, attn.qkv), dim, dim)
+        q, k, v = ops.linear.matmul(h, attn.q), ops.linear.matmul(h, attn.k), ops.linear.matmul(h, attn.v)
         return (turn(q, attn.q_norm, positions, hd), turn(k, attn.k_norm, positions, hd), v)
 
     def ff_sublayer(x, ff, mods, lanes):
