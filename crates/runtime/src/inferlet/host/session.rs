@@ -11,8 +11,8 @@ use wasmtime_wasi::WasiView;
 /// Runs `wait` with the process marked idle: a process waiting on its client
 /// is the one whose KV the planner may move off the device first.
 async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output = T>) -> T {
-    let planner = crate::planner::planner();
-    if let Some(planner) = planner {
+    let planner = crate::planner::planner_of(pid);
+    if let Some(planner) = &planner {
         planner.set_idle(pid, true);
     }
     let out = wait.await;

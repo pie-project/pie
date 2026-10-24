@@ -466,14 +466,18 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     }
 
-    crate::planner::init_planner(
-        arena_model_idx,
-        0,
-        crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
-            crate::planner::RegistryPool::new(arena_model_idx, 0, kv_swap_capable),
-        ))
-        .seated_first(seated_first),
-    );
+    // A planner for each engine: each holds its own kv pages, and a process
+    // runs on one of them.
+    for engine in 0..engines.len().max(1) {
+        crate::planner::init_planner(
+            arena_model_idx,
+            engine,
+            crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
+                crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable),
+            ))
+            .seated_first(seated_first),
+        );
+    }
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((name, component)) = &config.policy {

@@ -53,10 +53,11 @@ impl WorkingSet {
 }
 
 fn new_kv(ctx: &mut ProcessCtx) -> Result<u32> {
-    let stores = store_registry::get(0, 0);
+    let engine = crate::planner::engine_of(ctx.id());
+    let stores = store_registry::get(0, engine);
     let id =
         store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.create_working_set());
-    let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
+    let ws = KvWorkingSet::new(0, engine, id, stores.kv_page_size);
     ctx.register_kv_working_set(&ws);
     Ok(ctx.ctx().table.push(ws)?.rep())
 }
@@ -67,10 +68,11 @@ fn new_rs(ctx: &mut ProcessCtx) -> Result<u32> {
         state_size: caps.state_size,
         buffer_page_tokens: caps.buffer_page_size,
     };
-    let stores = store_registry::get(0, 0);
+    let engine = crate::planner::engine_of(ctx.id());
+    let stores = store_registry::get(0, engine);
     let id = stores.rs.lock().unwrap().create_working_set(geom);
-    let ws = RsWorkingSet::new(0, 0, id, geom);
-    ctx.register_rs_working_set(0, 0, id);
+    let ws = RsWorkingSet::new(0, engine, id, geom);
+    ctx.register_rs_working_set(0, engine, id);
     Ok(ctx.ctx().table.push(ws)?.rep())
 }
 

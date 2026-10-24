@@ -1869,11 +1869,12 @@ impl ProcessCtx {
     }
 
     fn mint_scratch_working_set(&mut self) -> Anyhow<u32> {
-        let stores = crate::store::registry::get(0, 0);
+        let engine = crate::planner::engine_of(self.id());
+        let stores = crate::store::registry::get(0, engine);
         let id = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.create_working_set()
         });
-        let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
+        let ws = KvWorkingSet::new(0, engine, id, stores.kv_page_size);
         self.register_kv_working_set(&ws);
         Ok(self.ctx().table.push(ws)?.rep())
     }
