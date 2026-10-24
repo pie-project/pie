@@ -205,6 +205,34 @@ impl Placement {
             .collect()
     }
 
+    /// The table a dispatch reads: `experts` rows of `stride` i32s, row `e`
+    /// its replica count then its physical slots ascending, the rest zero.
+    /// `stride` is fixed at load ([`Placement::stride_for`]), so a rebalance
+    /// rewrites the table's contents in place.
+    #[must_use]
+    pub fn table(&self, stride: u32) -> Vec<i32> {
+        let stride = stride as usize;
+        let mut out = vec![0i32; self.experts as usize * stride];
+        for (p, &e) in self.held.iter().enumerate() {
+            let row = &mut out[e as usize * stride..(e as usize + 1) * stride];
+            let count = row[0] as usize;
+            if 1 + count < stride {
+                row[1 + count] = p as i32;
+                row[0] += 1;
+            }
+        }
+        out
+    }
+
+    /// A table row's width for a group where an expert holds at most
+    /// `places` slots: the count and that many slots, at least two. The most
+    /// any expert can hold is every slot past the other experts' one each,
+    /// `ranks * slots - experts + 1`.
+    #[must_use]
+    pub const fn stride_for(places: u32) -> u32 {
+        if places + 1 < 2 { 2 } else { places + 1 }
+    }
+
     /// How many slots hold each logical expert.
     #[must_use]
     pub fn replicas(&self) -> Vec<u32> {
@@ -466,6 +494,18 @@ mod tests {
         let moves = p.moves(&next);
         assert_eq!(moves.iter().filter(|m| m.to == SPARE).count(), 1);
         assert_eq!(apply(&p, &moves), next.held);
+    }
+
+    #[test]
+    fn the_table_lists_each_experts_slots() {
+        let p = Placement::uniform(3, 2, 2).unwrap();
+        assert_eq!(p.held, [0, 1, 2, 0]);
+        assert_eq!(
+            p.table(Placement::stride_for(2)),
+            [2, 0, 3, 1, 1, 0, 1, 2, 0]
+        );
+        let p = Placement::uniform(4, 2, 2).unwrap();
+        assert_eq!(p.table(2), [1, 0, 1, 1, 1, 2, 1, 3]);
     }
 
     #[test]
