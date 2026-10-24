@@ -164,6 +164,11 @@ pub fn compile_axes(
         streams,
         fold_refused: unit::fold_refused(&units),
         expert: expert::held(trace),
+        chains: if profile.synth_regions {
+            fuse::chain::chains(trace)
+        } else {
+            Vec::new()
+        },
         units,
         units_of,
         patches,

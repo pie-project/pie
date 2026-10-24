@@ -51,6 +51,14 @@ pub struct Branches;
 #[decision(id = "compiler.dag_streams", flag, default = false, tune = engine)]
 pub struct DagStreams;
 
+/// Whether the compiler forms each chain of elementwise and row ops into a
+/// region lowered to eta (`fuse::chain`), for kernels-* to generate one
+/// kernel for. Off unless a chip's profile turns it on; nothing consumes
+/// the regions yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.synth_regions", flag, default = false, tune = engine)]
+pub struct SynthRegions;
+
 /// The widest fire, in rows, that runs `compiler.dag_streams`' schedule on
 /// the side streams; wider fires walk every region on the main stream
 /// (each launch fills the card alone). 0: every fire.
@@ -95,6 +103,7 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
         .add::<Branches>()
         .add::<DagStreams>()
         .add::<DagStreamsUntil>()
+        .add::<SynthRegions>()
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 
@@ -116,6 +125,7 @@ impl DeviceProfile {
             branches: profile.on::<Branches>(&profile::Anywhere),
             dag_streams: profile.on::<DagStreams>(&profile::Anywhere),
             dag_streams_until: profile.get::<DagStreamsUntil>().0,
+            synth_regions: profile.on::<SynthRegions>(&profile::Anywhere),
 
             family_us: FamilyCosts {
                 attn: us(profile.get::<AttnUs>().0),

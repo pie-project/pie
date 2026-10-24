@@ -197,6 +197,10 @@ pub struct DeviceProfile {
     /// side streams (0: every fire).
     pub dag_streams_until: u32,
 
+    /// Whether chains of elementwise and row ops are formed into regions
+    /// lowered to eta (`fuse::chain`, `compiler.synth_regions`).
+    pub synth_regions: bool,
+
     pub family_us: FamilyCosts,
 
     pub exclusive: Vec<String>,
@@ -303,6 +307,7 @@ impl Default for DeviceProfile {
             branches: false,
             dag_streams: false,
             dag_streams_until: 0,
+            synth_regions: false,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),
