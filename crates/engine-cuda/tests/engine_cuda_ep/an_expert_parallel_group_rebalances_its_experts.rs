@@ -5,12 +5,12 @@
 //! move between the ranks, their planes copied slot to slot and every
 //! rank's table rewritten, and each rank still answers what one engine
 //! holding every expert answers, with no slot past the experts and with a
-//! replica slot a rank. The window a rebalance read holds its step's rows.
+//! replica slot a rank. The first step's boundary drops the loads arming
+//! left instead, so no expert moves on rows the group never served.
 
 use engine::Engine;
 use engine_cuda::DeviceBoot;
 use poem::{Dtype, Platform, Request};
-use poem_ir::{Collective, Operation};
 
 use crate::micro::{MICRO, RANKS, answer, checkpoint, close, contract_for, prompt, request, step};
 
@@ -78,6 +78,13 @@ fn check(replicas: u32) {
                 &want[r],
                 &format!("rank {r}'s prompt, round {round}, {replicas} replicas"),
             );
+            if (round, r) == (0, 0) {
+                assert_eq!(
+                    rank.moved_experts(),
+                    0,
+                    "the first step rebalanced on arming's rows ({replicas} replicas)"
+                );
+            }
         }
     }
     let moved = ranks[0].moved_experts();
@@ -86,23 +93,5 @@ fn check(replicas: u32) {
         "the router's skew moved no expert ({replicas} replicas)"
     );
     eprintln!("{moved} slot copies across the rounds, {replicas} replicas");
-    // The last rebalance read one step's loads: rank 0's prompt's routes.
-    let top_k = (lowered.nodes.iter())
-        .find_map(|node| match node.op {
-            Operation::Collective(Collective::Dispatch { top_k, .. }) => Some(top_k),
-            _ => None,
-        })
-        .expect("the micro dispatches");
-    let balance = ranks[1].expert_balance();
-    assert!(!balance.is_empty(), "the rebalances read the loads");
-    for b in balance {
-        assert_eq!(b.steps, 1, "layer {}: one step a window", b.layer);
-        assert_eq!(
-            b.rows(),
-            prompts[0].len() as u64 * u64::from(top_k),
-            "layer {}: the step's routes",
-            b.layer
-        );
-    }
     drop(dir);
 }
