@@ -312,10 +312,15 @@ fn input_scale(src: &ztensor::Source, names: &[String], of: &str) -> Result<Expr
         })?;
         Ok(f32::from_le_bytes(word))
     };
-    let values = names
+    // A checkpoint of headers alone (a plan's dry run) holds no values: its
+    // legs' first scale stands, as an import that cannot compare them reads.
+    let Ok(values) = names
         .iter()
         .map(|n| value(n))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return Ok(Expr::src(names[0].clone()));
+    };
     if values.iter().all(|v| v.to_bits() == values[0].to_bits()) {
         return Ok(Expr::src(names[0].clone()));
     }
