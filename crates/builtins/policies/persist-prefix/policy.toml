@@ -1,0 +1,16 @@
+# Keeps on its worker's persistent disk tier (`disk_kv_persistent`) the
+# prefix a process asked for: its system turn under `persist-system`, or its
+# first `persist-prefix-tokens`. A level-triggered replication table at tier
+# `disk`, re-enacted until each such prefix is there.
+plane = "cluster"
+subscribe = ["copied", "dropped", "worker-removed", "prop-changed"]
+grants = ["replication"]
+uses = ["state.replicate", "kv.persist"]
+
+[props.persist-system]
+type = "boolean"
+doc = "Keep the system turn on disk, as long as the inferlet counts it (`system-tokens`; the compat routes set it)."
+
+[props.persist-prefix-tokens]
+type = "int"
+doc = "Keep this many leading tokens on disk."

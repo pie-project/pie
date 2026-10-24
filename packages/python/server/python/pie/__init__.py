@@ -6,11 +6,9 @@ of `@pie-project/server`.
     from pie.config import Config, ServerConfig, ModelConfig, EngineConfig
 
     cfg = Config(
-        server=ServerConfig(port=0),  # 0: a free port; see server.url
-        model=ModelConfig(
-            hf_repo="Qwen/Qwen3.5-0.8B",
-            engine=EngineConfig(type="cuda_native", device=["cuda:0"]),
-        ),
+        server=ServerConfig(listen="127.0.0.1:0"),  # port 0: a free one; see server.url
+        model=ModelConfig(source="Qwen/Qwen3.5-0.8B"),
+        engine=EngineConfig(type="cuda", device=["cuda:0"]),
     )
 
     async def main():

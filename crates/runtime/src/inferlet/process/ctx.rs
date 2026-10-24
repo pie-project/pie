@@ -261,6 +261,13 @@ impl ProcessCtx {
     }
 
     pub(crate) fn set_props(&mut self, props: client_api::Props) {
+        let tokens = client_api::props::persist_tokens(&props);
+        let owner = crate::policy::schedule::plex_id(self.id());
+        for stores in crate::store::registry::all_for_model(0) {
+            crate::store::registry::with_kv_lock(&stores.kv, "persist-hint", |kv| {
+                kv.set_persist_hint(owner, tokens);
+            });
+        }
         self.props = props;
     }
 

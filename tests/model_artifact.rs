@@ -169,7 +169,7 @@ fn an_import_that_will_prepare_refuses_a_source_no_deployment_claims() {
     let global = pie::args::GlobalArgs {
         config: None,
         log_level: "info".into(),
-        metrics_addr: None,
+        metrics_listen: None,
     };
     // `Answer` states an outcome for the CLI to render and carries no `Debug`,
     // so the Ok arm is named rather than unwrapped through one.

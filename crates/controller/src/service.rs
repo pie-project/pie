@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use controller_api::{
     Ack, Control, ControlRequest, ControlResponse, GatewayInfo, Neighbors, RoutingTable,
-    ScaleEntry, ScaleStatus, WorkerInfo, WorkerStatus,
+    ScaleStatus, WorkerInfo, WorkerStatus,
 };
 use ids::{GatewayId, NodeId, WorkerId};
 
@@ -47,17 +47,60 @@ impl Control for ControlServer {
         self.handle.watch_gateway_poll(since).await
     }
 
-    async fn desire_scale(
+    async fn scale_status(self, _: tarpc::context::Context) -> Vec<ScaleStatus> {
+        self.handle.scale_status().await
+    }
+
+    async fn report_state(
+        self,
+        _: tarpc::context::Context,
+        worker: WorkerId,
+        report: controller_api::StateReport,
+    ) {
+        self.handle.report_state(worker, report);
+    }
+
+    async fn forget_state(self, _: tarpc::context::Context, worker: WorkerId) {
+        self.handle.forget_state(worker);
+    }
+
+    async fn locate(
+        self,
+        _: tarpc::context::Context,
+        asker: WorkerId,
+        keys: Vec<controller_api::Key>,
+    ) -> Vec<(WorkerId, String, u32)> {
+        self.handle.locate(asker, &keys)
+    }
+
+    async fn link(self, _: tarpc::context::Context, worker: WorkerId) -> Option<String> {
+        self.handle.link(worker)
+    }
+
+    async fn watch_directory(
+        self,
+        _: tarpc::context::Context,
+        since: u64,
+    ) -> controller_api::DirectoryView {
+        self.handle.watch_directory_poll(since).await
+    }
+
+    async fn cluster_events(
         self,
         _: tarpc::context::Context,
         gateway: GatewayId,
-        entries: Vec<ScaleEntry>,
+        events: Vec<controller_api::ProcessEvent>,
     ) {
-        self.handle.desire_scale(gateway, entries).await;
+        self.handle.cluster_events(gateway, events);
     }
 
-    async fn scale_status(self, _: tarpc::context::Context) -> Vec<ScaleStatus> {
-        self.handle.scale_status().await
+    async fn watch_decisions(
+        self,
+        _: tarpc::context::Context,
+        gateway: GatewayId,
+        since: u64,
+    ) -> controller_api::GatewayDecisions {
+        self.handle.watch_decisions_poll(gateway, since).await
     }
 }
 

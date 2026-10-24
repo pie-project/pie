@@ -18,6 +18,7 @@ members = [
     "drain-migrate",
     "relocate",
     "pool-replicate",
+    "persist-prefix",
     "retain-all",
     "replicate",
     "disaggregate",

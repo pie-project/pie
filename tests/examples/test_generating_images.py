@@ -34,7 +34,7 @@ drive here and is reported as a skip, not a failure:
         --config ~/.pie/config.t2i-client.toml \\
         --model-dir ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/
 
-**GIVE THIS RUN ITS OWN CONFIG FILE**, with its own `[server] port` and
+**GIVE THIS RUN ITS OWN CONFIG FILE**, with its own `[server] listen` and
 `[engine] max_model_len = 32768`. A shared config another process repoints at
 a different artifact mid-run is indistinguishable from a numerics regression:
 the run still succeeds and hands back a plausible latent for the wrong model.
@@ -143,9 +143,9 @@ def served_artifact(config: str) -> Path:
     same file the run claims are made about."""
     for line in Path(resolve(config)).read_text().splitlines():
         stripped = line.strip()
-        if stripped.startswith("model") and "=" in stripped and ".zt" in stripped:
+        if stripped.startswith("source") and "=" in stripped and ".zt" in stripped:
             return Path(stripped.split("=", 1)[1].strip().strip('"').strip("'"))
-    raise FileNotFoundError(f"{config} has no `[model] model` naming a `.zt`")
+    raise FileNotFoundError(f"{config} has no `[model] source` naming a `.zt`")
 
 
 # ---------------------------------------------------------------------------

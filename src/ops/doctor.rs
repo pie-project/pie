@@ -213,13 +213,13 @@ fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
         format!("{} parses", crate::ui::short_path(path)),
         Status::Pass,
     )];
-    let flavor = worker::backend::flavor::resolve(worker.model.engine.kind, &worker.model.name);
+    let flavor = worker::backend::flavor::resolve(worker.engine.kind, &worker.model.name);
     let overrides = worker.model.overrides().ok();
     let want = worker::weights::Want {
         backend: flavor.as_ref().ok().map(|flavor| flavor.as_str()),
         overrides: overrides.as_ref(),
     };
-    match worker::weights::resolve(&worker.model.model, want, &crate::paths::pie_home()) {
+    match worker::weights::resolve(&worker.model.source, want, &crate::paths::pie_home()) {
         Ok(resolved) => out.push((
             "weights".into(),
             match resolved {
@@ -235,7 +235,7 @@ fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
         )),
         Err(error) => out.push(("weights".into(), format!("{error}"), Status::Fail)),
     }
-    let kind = worker.model.engine.kind.as_str();
+    let kind = worker.engine.kind.as_str();
     let compiled = worker::backend::flavor::compiled_embedded()
         .iter()
         .find(|(name, _)| *name == kind)
@@ -265,7 +265,7 @@ const KNOWN_ENGINES: &str = "cuda, metal, vulkan, wgpu, xla, cerebras";
 
 fn absent_because(name: &str) -> String {
     match name {
-        "cuda_native" => "not compiled — build with `--features cuda`".to_string(),
+        "cuda" => "not compiled — build with `--features cuda`".to_string(),
         "metal" if cfg!(target_vendor = "apple") => {
             "not compiled — build with `--features metal`".to_string()
         }
@@ -492,10 +492,10 @@ fn configured_engine(config_path: &Path) -> Option<String> {
 
 fn nvidia_probe_applies(named_engine: Option<&str>) -> bool {
     match named_engine {
-        Some(kind) => kind == "cuda_native" || kind == "cuda",
+        Some(kind) => kind == "cuda",
         None => worker::backend::flavor::compiled_embedded()
             .iter()
-            .any(|(name, on)| *name == "cuda_native" && *on),
+            .any(|(name, on)| *name == "cuda" && *on),
     }
 }
 

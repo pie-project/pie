@@ -39,30 +39,6 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
 
     let handle = gateway::run(cfg).await?;
-    // SIGHUP swaps the cluster policies for the file's `[server] policies`;
-    // nothing else in it is read again.
-    let policies = handle.policies();
-    ctx.on_hangup(move |config| {
-        let policies = policies.clone();
-        async move {
-            let Some(policies) = policies else {
-                tracing::warn!("no cluster policies to reload: this gateway started with none");
-                return;
-            };
-            let specs = match gateway::Config::parse(&config) {
-                Ok(config) => config.policies,
-                Err(e) => {
-                    tracing::error!(
-                        "SIGHUP: the config does not parse, so the policies stand: {e:#}"
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = gateway::reload_policies(&policies, &specs).await {
-                tracing::error!("SIGHUP: {e:#}");
-            }
-        }
-    });
     Ok(ctx
         .run_until_signal(async move { handle.shutdown().await })
         .await)

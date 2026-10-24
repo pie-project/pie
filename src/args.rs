@@ -11,7 +11,7 @@ pub struct GlobalArgs {
     #[arg(long, value_name = "LEVEL", default_value = "info")]
     pub log_level: String,
     #[arg(long, value_name = "ADDR")]
-    pub metrics_addr: Option<String>,
+    pub metrics_listen: Option<String>,
 }
 
 /// Where the config path came from.
@@ -82,12 +82,12 @@ mod tests {
             "/tmp/x.toml",
             "--log-level",
             "debug",
-            "--metrics-addr",
+            "--metrics-listen",
             "0.0.0.0:9",
         ])
         .unwrap();
         assert_eq!(cli.global.config.as_deref(), Some("/tmp/x.toml"));
         assert_eq!(cli.global.log_level, "debug");
-        assert_eq!(cli.global.metrics_addr.as_deref(), Some("0.0.0.0:9"));
+        assert_eq!(cli.global.metrics_listen.as_deref(), Some("0.0.0.0:9"));
     }
 }

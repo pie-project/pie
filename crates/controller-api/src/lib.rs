@@ -174,6 +174,187 @@ pub struct ScaleStatus {
     pub free: u32,
 }
 
+/// What a worker holds, as it tells the controller's directory: the sealed
+/// pages it gained and lost by key since its last report (all of them when
+/// `full`), the runs it keeps whole from token 0 (gained in full, lost by
+/// their last key), and where it serves its pages' bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StateReport {
+    pub peer: Option<String>,
+    /// Where this worker's peer link listens: other workers send it passes
+    /// there.
+    #[serde(default)]
+    pub link: Option<String>,
+    pub added: Vec<[u8; 32]>,
+    pub removed: Vec<[u8; 32]>,
+    pub full: bool,
+    pub runs_added: Vec<Vec<[u8; 32]>>,
+    pub runs_removed: Vec<[u8; 32]>,
+    /// A pool: it loads no model and keeps what it is sent.
+    pub pool: bool,
+    /// What the worker policy published for the cluster plane, as
+    /// `(subject, name, JSON value)`; all of it, whenever any changes.
+    pub published: Option<Vec<(String, String, String)>>,
+    /// Pages the persistent disk tier gained and lost a copy of since the
+    /// last report (all of it when `full`).
+    #[serde(default)]
+    pub disk_added: Vec<[u8; 32]>,
+    #[serde(default)]
+    pub disk_removed: Vec<[u8; 32]>,
+    /// The runs whose owner asked a prefix of them kept on disk: each run's
+    /// last key and the tokens asked; all of it, whenever any changes.
+    #[serde(default)]
+    pub persist_hints: Option<Vec<([u8; 32], u64)>>,
+    /// The tokens one kv page holds, and whether the disk tier is kept
+    /// across runs; sent with a full report.
+    #[serde(default)]
+    pub disk_tier: Option<(u32, bool)>,
+}
+
+/// A sealed page's key.
+pub type Key = [u8; 32];
+
+/// A run some worker keeps whole, by its last key: the workers (pools among
+/// them) that hold every page of it, those whose persistent disk tier does,
+/// and the most leading tokens of it some owner asked kept on disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupView {
+    pub keys: Vec<Key>,
+    pub sites: Vec<WorkerId>,
+    pub disk_sites: Vec<WorkerId>,
+    pub persist_tokens: Option<u64>,
+}
+
+/// The controller's directory as the gateways read it: what each worker
+/// holds, as of `epoch`. Soft state: rebuilt from the workers' reports.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryView {
+    pub epoch: u64,
+    pub groups: Vec<(Key, GroupView)>,
+    pub pools: Vec<WorkerId>,
+    /// Where each worker serves its pages' bytes.
+    pub peers: Vec<(WorkerId, String)>,
+    /// What each worker's policy published about the worker itself, as
+    /// `(name, JSON value)`.
+    pub published: Vec<(WorkerId, Vec<(String, String)>)>,
+    /// Each worker's kv page in tokens, and whether its disk tier is kept.
+    pub disk_tiers: Vec<(WorkerId, (u32, bool))>,
+    /// The pages each worker's persistent disk tier keeps a copy of.
+    pub disk: Vec<(WorkerId, Vec<Key>)>,
+}
+
+/// How a process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Props as JSON text by name: this crate takes no `client-api`.
+pub type JsonProps = Vec<(String, String)>;
+
+/// What a gateway tells the cluster policy about its processes, in order. A
+/// process is `req`, the gateway's own id for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessEvent {
+    /// A launch at the gate: `seq` counts this gateway's arrivals. The
+    /// prompt travels as the blocks its text hashes to, not as text.
+    Arrived {
+        req: u64,
+        seq: u64,
+        tenant: String,
+        session: Option<String>,
+        props: JsonProps,
+        prompt: Option<Vec<u64>>,
+    },
+    Dispatched {
+        req: u64,
+        worker: WorkerId,
+    },
+    Counted {
+        req: u64,
+        prompt: u64,
+        generated: u64,
+    },
+    /// A running process moved to `worker`, or (none) could not.
+    Moved {
+        req: u64,
+        worker: Option<WorkerId>,
+        why: String,
+    },
+    Exited {
+        req: u64,
+        outcome: Outcome,
+    },
+    /// `<tenant>/<session>`'s props changed: `null` removes one.
+    SessionProps {
+        id: String,
+        changes: JsonProps,
+    },
+    SessionClosed {
+        id: String,
+    },
+    /// The workers linked to this gateway now.
+    Workers(Vec<WorkerId>),
+}
+
+/// Where the cluster policy puts a process.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlacementView {
+    pub worker: Option<WorkerId>,
+    /// Passed on with the process: the worker plane reads `cluster/<name>`.
+    pub props: JsonProps,
+    /// Workers its passes may run on, best first.
+    pub executors: Vec<WorkerId>,
+}
+
+/// A copy of a group a worker is to take, carried by one gateway: workers
+/// dial gateways, not the controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicateOrder {
+    pub group: String,
+    pub worker: WorkerId,
+    pub keys: Vec<Key>,
+    /// Where a worker that holds it serves its pages; none for a copy the
+    /// worker makes from its own (`disk`).
+    pub from: String,
+    pub retention: i64,
+    pub disk: bool,
+    /// The table that wants it, for the log.
+    pub table: String,
+}
+
+/// The order launches leave a gateway's gate in: each process's key (one
+/// not named is 0), and the key below which a process is held.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleView {
+    pub keys: Vec<(u64, i64)>,
+    pub floor: Option<i64>,
+}
+
+/// The cluster policy's decisions about one gateway's processes,
+/// level-triggered, as of `epoch`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GatewayDecisions {
+    pub epoch: u64,
+    /// Cluster policies run: the gateway tells them of its processes.
+    pub active: bool,
+    /// How long a launch waits for the programs to hear it, in ms.
+    pub gate_ms: u64,
+    /// The highest arrival `seq` every program has heard, its decisions
+    /// drained; `u64::MAX` with no program to hear it.
+    pub heard: u64,
+    /// The gate's order. None: arrival order.
+    pub schedule: Option<ScheduleView>,
+    pub placements: Vec<(u64, PlacementView)>,
+    /// Processes to end, with the reason: refused at the gate, cancelled
+    /// once admitted.
+    pub terminated: Vec<(u64, String)>,
+    /// For the gateway that carries worker calls: the copies to ask for.
+    pub replicate: Vec<ReplicateOrder>,
+}
+
 #[tarpc::service]
 pub trait Control {
     async fn register_worker(info: WorkerInfo) -> WorkerId;
@@ -188,14 +369,35 @@ pub trait Control {
 
     async fn watch_gateway(since: u64) -> RoutingTable;
 
-    /// The scale table a cluster policy installed: level-triggered, the
-    /// whole table each time; a shape it does not name keeps what it has.
-    /// Taken only from `gateway` while it is the author
-    /// ([`RoutingTable::author`]); from any other, ignored.
-    async fn desire_scale(gateway: GatewayId, entries: Vec<ScaleEntry>);
-
     /// Each shape the scale table names, desired against current.
     async fn scale_status() -> Vec<ScaleStatus>;
+
+    /// What `worker` holds, gained and lost since its last report: the
+    /// directory's one input. A pool's comes through the gateway it links to.
+    async fn report_state(worker: WorkerId, report: StateReport);
+
+    /// `worker` holds nothing any more: its link to the gateway that relayed
+    /// its reports went.
+    async fn forget_state(worker: WorkerId);
+
+    /// The workers other than `asker`, reachable by their peers, that hold a
+    /// run of `keys` from the first: id, address and run length, longest
+    /// first.
+    async fn locate(asker: WorkerId, keys: Vec<Key>) -> Vec<(WorkerId, String, u32)>;
+
+    /// Where `worker`'s peer link listens.
+    async fn link(worker: WorkerId) -> Option<String>;
+
+    /// The directory once its epoch is past `since`; long-polled.
+    async fn watch_directory(since: u64) -> DirectoryView;
+
+    /// What happened to `gateway`'s processes, in order: the cluster
+    /// policy's input. A gateway sends one batch at a time.
+    async fn cluster_events(gateway: GatewayId, events: Vec<ProcessEvent>);
+
+    /// The cluster policy's decisions about `gateway`'s processes once their
+    /// epoch is past `since`; long-polled.
+    async fn watch_decisions(gateway: GatewayId, since: u64) -> GatewayDecisions;
 }
 
 #[cfg(test)]
@@ -234,7 +436,7 @@ mod tests {
                 addr: "10.0.0.4:7000".into(),
                 role: Role::Decode,
                 model: "llama3-8b".into(),
-                engine: "cuda_native".into(),
+                engine: "cuda".into(),
                 health: Health::Healthy,
                 coarse_load: WorkerStatus {
                     kv_pressure_bucket: 42,

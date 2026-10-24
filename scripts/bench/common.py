@@ -527,7 +527,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         help="Extra [model.engine.options] entries, handed straight to the "
              "engine's own options struct (deny_unknown_fields still rules). "
              "Values parse as TOML scalars: true/false, ints, floats, else "
-             "strings. Repeatable. pie cuda_native only; other engines "
+             "strings. Repeatable. pie cuda only; other engines "
              "ignore it.",
     )
     p.add_argument("--max-model-len", type=int, default=2048)

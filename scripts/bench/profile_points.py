@@ -240,7 +240,7 @@ def main() -> None:
     r.add_argument("--inferlet-dir", default=str(ROOT / "examples" / "text-completion-bench"))
     r.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
     r.add_argument("--engine-option", action="append", default=[])
-    r.add_argument("--precision", default=None, help="pie: [model] precision, e.g. bf16+nvfp4a4")
+    r.add_argument("--precision", default=None, help="pie: [model] weight_precision, e.g. bf16+nvfp4a4")
     r.add_argument("--kv", default=None, help="pie: [model] kv, e.g. e4m3 (DeepSeek-V4's fp8 rows)")
     r.add_argument("--extra", default="", help="further vLLM engine flags, one shell-quoted string")
     q = sub.add_parser("report")

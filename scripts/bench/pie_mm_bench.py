@@ -2,7 +2,7 @@
 """Pie multimodal (image) latency/throughput benchmark.
 
 The Pie-side counterpart to `vllm_mm_bench.py`. Starts the embedded server with
-the `cuda_native` engine, installs the `image-qa-bench` inferlet, and drives it
+the `cuda` engine, installs the `image-qa-bench` inferlet, and drives it
 with a fixed local image + question per request. The inferlet returns exact
 prompt and output token counts (prompt = text tokens + image soft-token rows),
 so the accounting matches vLLM's.
@@ -93,8 +93,7 @@ def build_config(args: argparse.Namespace, port: int):
     }
     cfg = Config(
         server=ServerConfig(
-            host="127.0.0.1",
-            port=port,
+            listen=f"127.0.0.1:{port}",
             verbose=True,
         ),
         telemetry=TelemetryConfig(),
@@ -108,17 +107,15 @@ def build_config(args: argparse.Namespace, port: int):
         ),
         model=ModelConfig(
             name="default",
-            hf_repo=args.model,
+            source=args.model,
             device_memory_share=args.gpu_mem_util,
-            engine=EngineConfig(
-                type=args.engine,
-                device=device,
-                tensor_parallel_size=args.tp_size,
-                activation_dtype=args.activation_dtype,
-                # Stated once for every engine now, so it is a common
-                # `[engine]` key rather than one of the backend's options.
-                options=engine_options,
-            ),
+        ),
+        engine=EngineConfig(
+            type=args.engine,
+            device=device,
+            tensor_parallel_size=args.tp_size,
+            activation_dtype=args.activation_dtype,
+            options=engine_options,
         ),
     )
     config_blob = {
@@ -275,7 +272,7 @@ def main() -> None:
                         help="Path to a built image-qa-bench inferlet project.")
         sp.add_argument("--question",
                         default="What is in this image? Answer in one sentence.")
-        sp.add_argument("--engine", default="cuda_native")
+        sp.add_argument("--engine", default="cuda")
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--activation-dtype", default="bfloat16")
         sp.add_argument("--endowment-pages", type=int, default=64,

@@ -27,7 +27,7 @@ await server.shutdown();
 `Server.start` resolves once the model is loaded and the server is
 listening, with every registered language component installed; `config` is
 the file `pie serve --config` reads, minus the model, as an object. A bare
-`Server.start(config)` with `model.model` inside, as an object or TOML text,
+`Server.start(config)` with `model.source` inside, as an object or TOML text,
 is accepted too. Under Node, `server.httpUrl` is where the HTTP routes live.
 A handle garbage-collected without `shutdown()` still stops the engine.
 

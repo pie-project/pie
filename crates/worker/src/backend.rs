@@ -13,7 +13,7 @@ use crate::config;
 #[cfg(feature = "cerebras")]
 use crate::config::CerebrasEngineOptions;
 #[cfg(any(feature = "engine-cuda", test))]
-use crate::config::CudaNativeEngineOptions;
+use crate::config::CudaEngineOptions;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 use crate::config::MetalEngineOptions;
 #[cfg(feature = "vulkan")]
@@ -26,7 +26,7 @@ use crate::config::XlaEngineOptions;
 #[derive(Clone)]
 pub enum EngineOptions {
     #[cfg(feature = "engine-cuda")]
-    CudaNative(CudaNativeEngineOptions),
+    Cuda(CudaEngineOptions),
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal(MetalEngineOptions),
     #[cfg(feature = "vulkan")]
@@ -43,7 +43,7 @@ impl EngineOptions {
     pub fn flavor(&self) -> Flavor {
         match self {
             #[cfg(feature = "engine-cuda")]
-            EngineOptions::CudaNative(_) => Flavor::Cuda,
+            EngineOptions::Cuda(_) => Flavor::Cuda,
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             EngineOptions::Metal(_) => Flavor::Metal,
             #[cfg(feature = "vulkan")]
@@ -69,18 +69,103 @@ impl EngineOptions {
 
 pub use engine::Capabilities as EngineCapabilities;
 
+/// An engine's own fire ceilings, where `[engine]` states none: the most
+/// lanes and tokens one fire carries.
+#[cfg_attr(
+    not(any(
+        feature = "vulkan",
+        feature = "wgpu",
+        feature = "xla",
+        feature = "cerebras",
+        all(feature = "metal", target_vendor = "apple")
+    )),
+    allow(dead_code, reason = "only the shells without a planner take them")
+)]
+#[derive(Clone, Copy)]
+struct Fire {
+    lanes: u32,
+    tokens: u32,
+}
+
+#[cfg_attr(
+    not(any(
+        feature = "vulkan",
+        feature = "wgpu",
+        feature = "xla",
+        feature = "cerebras",
+        all(feature = "metal", target_vendor = "apple")
+    )),
+    allow(dead_code, reason = "only the shells without a planner take them")
+)]
+impl Fire {
+    /// The stated ceilings, else these.
+    fn or(self, lanes: Option<u32>, tokens: Option<u32>) -> (u32, u32) {
+        (
+            lanes.unwrap_or(self.lanes).max(1),
+            tokens.unwrap_or(self.tokens).max(1),
+        )
+    }
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+const METAL_FIRE: Fire = Fire {
+    lanes: 512,
+    tokens: 10240,
+};
+/// The Metal shell has no planner to derive a page from.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+const METAL_PAGE_SIZE: u32 = 32;
+#[cfg(feature = "vulkan")]
+const VULKAN_FIRE: Fire = Fire {
+    lanes: 512,
+    tokens: 10240,
+};
+#[cfg(feature = "wgpu")]
+const WGPU_FIRE: Fire = Fire {
+    lanes: 512,
+    tokens: 10240,
+};
+#[cfg(feature = "xla")]
+const XLA_FIRE: Fire = Fire {
+    lanes: 64,
+    tokens: 2048,
+};
+#[cfg(feature = "cerebras")]
+const CEREBRAS_FIRE: Fire = Fire {
+    lanes: 4,
+    tokens: 64,
+};
+
+/// The index in a device name (`vulkan:1`, `tpu:0`), for a shell that drives
+/// one device; its family must be one of `families`.
+#[cfg_attr(
+    not(any(feature = "vulkan", feature = "wgpu", feature = "xla")),
+    allow(dead_code, reason = "only the one-device shells read an index")
+)]
+fn device_index(devices: &[String], families: &[&str]) -> Result<u32> {
+    let [device] = devices else {
+        anyhow::bail!(
+            "[engine] device: this engine drives one device, named as `{}:<n>`; got {devices:?}",
+            families[0]
+        );
+    };
+    let (family, index) = device.split_once(':').unwrap_or((device.as_str(), "0"));
+    anyhow::ensure!(
+        families.contains(&family),
+        "[engine] device {device:?}: this engine's devices are named `{}:<n>`",
+        families.join(":<n>`, `")
+    );
+    index
+        .parse()
+        .map_err(|_| anyhow!("[engine] device {device:?}: {index:?} is not a device number"))
+}
+
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     for (key, value) in [
         ("max_forward_tokens", opts.max_forward_tokens),
         ("max_forward_requests", opts.max_forward_requests),
         ("kv_page_size", opts.kv_page_size),
-    ] {
-        if value == 0 {
-            anyhow::bail!("[engine] {key} must be > 0");
-        }
-    }
-    for (key, value) in [
         ("max_model_len", opts.max_model_len),
         ("max_state_slots", opts.max_state_slots),
     ] {
@@ -93,7 +178,7 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
 
 #[cfg(any(feature = "engine-cuda", test))]
 fn cuda_budgets(
-    opts: &CudaNativeEngineOptions,
+    opts: &CudaEngineOptions,
     adapter_seats: u32,
     patch_ceilings: (Option<u32>, Option<u32>),
     voxel_ceilings: (Option<u32>, Option<u32>),
@@ -130,7 +215,7 @@ fn cuda_budgets(
 
 #[cfg(feature = "engine-cuda")]
 fn device_boot(
-    opts: &CudaNativeEngineOptions,
+    opts: &CudaEngineOptions,
     home: &Path,
     cache_dir: &Path,
     adapter_dir: Option<&Path>,
@@ -183,7 +268,7 @@ fn land(
     platform: poem_ir::Platform,
     frames_in_flight: u8,
     overrides: &runtime::engine::load::Overrides,
-) -> Result<(engine::Loaded, String)> {
+) -> Result<(engine::Loaded, String, Option<PathBuf>)> {
     let mut request = runtime::engine::load::request(
         overrides,
         snapshot_dir,
@@ -204,8 +289,9 @@ fn land(
         }
     }
     let deployment = request.trace.name.clone();
+    let disk_kv_dir = request.residency.disk_kv_dir.clone();
     let loaded = backend.load(request).map_err(anyhow::Error::from)?;
-    Ok((loaded, deployment))
+    Ok((loaded, deployment, disk_kv_dir))
 }
 
 fn register_operator_adapters(
@@ -295,10 +381,8 @@ pub(crate) fn create_engine_backend_group(
             irrefutable_let_patterns,
             reason = "`EngineOptions` has one variant in a CUDA-only build"
         )]
-        let EngineOptions::CudaNative(opts) = rank_options else {
-            return Err(anyhow!(
-                "cuda group creation requires cuda-native rank options"
-            ));
+        let EngineOptions::Cuda(opts) = rank_options else {
+            return Err(anyhow!("cuda group creation requires cuda rank options"));
         };
         let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
         if opts.verbose {
@@ -322,10 +406,10 @@ pub(crate) fn create_engine_backend_group(
         irrefutable_let_patterns,
         reason = "`EngineOptions` has one variant in a CUDA-only build"
     )]
-    let EngineOptions::CudaNative(opts) = &rank_options[0] else {
+    let EngineOptions::Cuda(opts) = &rank_options[0] else {
         unreachable!("validated cuda options above");
     };
-    let (loaded, deployment) = land(
+    let (loaded, deployment, disk_kv_dir) = land(
         &mut backend,
         snapshot_dir,
         cache_dir,
@@ -348,6 +432,7 @@ pub(crate) fn create_engine_backend_group(
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
+        disk_kv_dir,
         backend,
     })
 }
@@ -395,7 +480,7 @@ pub(crate) fn create_engine_backend(
         )))]
         _ => unreachable!("`EngineOptions` has no variants in this build"),
         #[cfg(feature = "engine-cuda")]
-        EngineOptions::CudaNative(opts) => {
+        EngineOptions::Cuda(opts) => {
             let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
@@ -437,15 +522,17 @@ pub(crate) fn create_engine_backend(
                 || runtime::engine::backend::open::metal(boot_doc.as_bytes()),
                 Ok,
             )?;
-            let page_size = opts.kv_page_size.max(1);
+            let page_size = opts.kv_page_size.unwrap_or(METAL_PAGE_SIZE).max(1);
             let max_context = opts
                 .max_model_len
                 .unwrap_or_else(|| engine::Budgets::default().max_context);
+            let (max_lanes, max_tokens) =
+                METAL_FIRE.or(opts.max_forward_requests, opts.max_forward_tokens);
             (
                 backend,
                 engine::Budgets {
-                    max_lanes: opts.max_forward_requests.max(1),
-                    max_tokens: opts.max_forward_tokens.max(1),
+                    max_lanes,
+                    max_tokens,
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size,
@@ -482,11 +569,13 @@ pub(crate) fn create_engine_backend(
                 Ok,
             )?;
             let defaults = engine::Budgets::default();
+            let (max_lanes, max_tokens) =
+                VULKAN_FIRE.or(opts.max_forward_requests, opts.max_forward_tokens);
             (
                 backend,
                 engine::Budgets {
-                    max_lanes: opts.max_forward_requests.max(1),
-                    max_tokens: opts.max_forward_tokens.max(1),
+                    max_lanes,
+                    max_tokens,
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
@@ -532,11 +621,13 @@ pub(crate) fn create_engine_backend(
                 Ok,
             )?;
             let defaults = engine::Budgets::default();
+            let (max_lanes, max_tokens) =
+                WGPU_FIRE.or(opts.max_forward_requests, opts.max_forward_tokens);
             (
                 backend,
                 engine::Budgets {
-                    max_lanes: opts.max_forward_requests.max(1),
-                    max_tokens: opts.max_forward_tokens.max(1),
+                    max_lanes,
+                    max_tokens,
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
@@ -570,11 +661,13 @@ pub(crate) fn create_engine_backend(
                 Ok,
             )?;
             let defaults = engine::Budgets::default();
+            let (max_lanes, max_tokens) =
+                XLA_FIRE.or(opts.max_forward_requests, opts.max_forward_tokens);
             (
                 backend,
                 engine::Budgets {
-                    max_lanes: opts.max_forward_requests.max(1),
-                    max_tokens: opts.max_forward_tokens.max(1),
+                    max_lanes,
+                    max_tokens,
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
@@ -607,11 +700,13 @@ pub(crate) fn create_engine_backend(
             }
             let backend = runtime::engine::backend::open::cerebras(boot_doc.as_bytes())?;
             let defaults = engine::Budgets::default();
+            let (max_lanes, max_tokens) =
+                CEREBRAS_FIRE.or(opts.max_forward_requests, opts.max_forward_tokens);
             (
                 backend,
                 engine::Budgets {
-                    max_lanes: opts.max_forward_requests.max(1),
-                    max_tokens: opts.max_forward_tokens.max(1),
+                    max_lanes,
+                    max_tokens,
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
@@ -638,7 +733,7 @@ pub(crate) fn create_engine_backend(
             reason = "`EngineOptions` has no variants in this build"
         )
     )]
-    let (loaded, deployment) = land(
+    let (loaded, deployment, disk_kv_dir) = land(
         &mut backend,
         snapshot_dir,
         cache_dir,
@@ -656,6 +751,7 @@ pub(crate) fn create_engine_backend(
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
+        disk_kv_dir,
         backend,
     })
 }
@@ -672,7 +768,7 @@ mod tests {
     }
 
     fn the_voxel_ceilings_a_deployment_states_reach_the_budget() {
-        let opts = CudaNativeEngineOptions::default();
+        let opts = CudaEngineOptions::default();
         let derived = cuda_budgets(&opts, 0, (None, None), (None, None), None);
         assert_eq!(derived.max_voxels, None, "unstated derives a ladder");
         assert_eq!(derived.max_clips, None);
@@ -687,7 +783,7 @@ mod tests {
     }
 
     fn the_pool_budget_seats_by_state_slots_not_pages() {
-        let mut opts = CudaNativeEngineOptions {
+        let mut opts = CudaEngineOptions {
             kv_page_size: Some(16),
             ..Default::default()
         };
@@ -740,6 +836,8 @@ pub struct GroupEngine {
     pub caps: EngineCapabilities,
     pub facts: engine::LoadFacts,
     pub snapshot_dir: PathBuf,
+    /// Where the disk tier's slot files are, when it has one.
+    pub disk_kv_dir: Option<PathBuf>,
     pub backend: runtime::engine::EngineBox,
 }
 
@@ -760,7 +858,7 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
     let num_groups = world_size / tp_degree;
     if num_groups > 1 {
         anyhow::bail!(
-            "model.engine.device lists {world_size} devices with \
+            "[engine] device lists {world_size} devices with \
              tensor_parallel_size = {tp_degree}, which asks for \
              {num_groups} data-parallel replicas in one engine. A worker \
              serves one replica: run {num_groups} workers, each with \
@@ -782,73 +880,68 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
                   every path that produces one diverges"
     )
 )]
-pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<EngineOptions> {
+pub(crate) fn build_options(e: &config::EngineConfig, flavor: Flavor) -> Result<EngineOptions> {
     match flavor {
         #[cfg(feature = "engine-cuda")]
         Flavor::Cuda => {
-            let mut c: CudaNativeEngineOptions = m
-                .engine
+            let mut c: CudaEngineOptions = e
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
-            let device = m.engine.device.first().ok_or_else(|| {
-                anyhow!(
-                    "model {:?}: cuda_native requires at least one device",
-                    m.name
-                )
-            })?;
+                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let device = e
+                .device
+                .first()
+                .ok_or_else(|| anyhow!("[engine] cuda requires at least one device"))?;
             c.device = device.clone();
-            Ok(EngineOptions::CudaNative(c))
+            Ok(EngineOptions::Cuda(c))
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Flavor::Metal => {
-            let p: MetalEngineOptions = m
-                .engine
+            let p: MetalEngineOptions = e
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+                .map_err(|why| anyhow!("[engine] options: {why}"))?;
             Ok(EngineOptions::Metal(p))
         }
         #[cfg(feature = "vulkan")]
         Flavor::Vulkan => {
-            let v: VulkanEngineOptions = m
-                .engine
+            let mut v: VulkanEngineOptions = e
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            v.device_index = device_index(&e.device, &["vulkan"])?;
             Ok(EngineOptions::Vulkan(v))
         }
         #[cfg(feature = "wgpu")]
         Flavor::Wgpu => {
-            let w: WgpuEngineOptions = m
-                .engine
+            let mut w: WgpuEngineOptions = e
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            w.adapter_index = device_index(&e.device, &["wgpu"])?;
             Ok(EngineOptions::Wgpu(w))
         }
         #[cfg(feature = "xla")]
         Flavor::Xla => {
-            let x: XlaEngineOptions = m
-                .engine
+            let mut x: XlaEngineOptions = e
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            x.device_index = device_index(&e.device, &["tpu", "xla"])?;
             Ok(EngineOptions::Xla(x))
         }
         #[cfg(feature = "cerebras")]
         Flavor::Cerebras => {
-            let c: CerebrasEngineOptions = m
-                .engine
+            let c: CerebrasEngineOptions = e
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+                .map_err(|why| anyhow!("[engine] options: {why}"))?;
             Ok(EngineOptions::Cerebras(c))
         }
     }

@@ -7,11 +7,15 @@ Anthropic / Gemini HTTP routes.
 
 ```python
 import asyncio
-from pie.config import Config, ModelConfig, ServerConfig
+from pie.config import Config, EngineConfig, ModelConfig, ServerConfig
 from pie.server import Server
 
 async def main():
-    cfg = Config(server=ServerConfig(port=0), model=ModelConfig(hf_repo="Qwen/Qwen3.5-0.8B"))
+    cfg = Config(
+        server=ServerConfig(listen="127.0.0.1:0"),  # port 0: a free one
+        model=ModelConfig(source="Qwen/Qwen3.5-0.8B"),
+        engine=EngineConfig(type="cuda", device=["cuda:0"]),
+    )
     async with Server(cfg) as server:          # resolves once the model is loaded
         client = await server.connect()        # a PieClient over ws
         print(server.http_url)                 # the OpenAI / Anthropic / Gemini routes

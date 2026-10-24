@@ -27,8 +27,8 @@ pub enum Command {
         id: WorkerId,
         status: WorkerStatus,
     },
+    /// The cluster policies' scale table, whole.
     DesireScale {
-        gateway: GatewayId,
         entries: Vec<ScaleEntry>,
     },
     ScaleStatus {
@@ -97,7 +97,7 @@ impl Actor {
                     let _ = reply.send(ack);
                 }
                 Command::ReportWorker { id, status } => self.report_worker(id, status),
-                Command::DesireScale { gateway, entries } => self.desire_scale(gateway, entries),
+                Command::DesireScale { entries } => self.desire_scale(entries),
                 Command::ScaleStatus { reply } => {
                     let _ = reply.send(self.actuator.status(&self.cluster.workers));
                 }
@@ -136,12 +136,8 @@ impl Actor {
         id
     }
 
-    /// A scale table, taken only from the author gateway.
-    fn desire_scale(&mut self, gateway: GatewayId, entries: Vec<ScaleEntry>) {
-        if self.cluster.author() != Some(gateway) {
-            tracing::debug!(%gateway, author = ?self.cluster.author(), "a scale table from a gateway that is not the author; ignored");
-            return;
-        }
+    /// The cluster policies' scale table, from the host that runs them.
+    fn desire_scale(&mut self, entries: Vec<ScaleEntry>) {
         self.actuator.desire(entries);
         self.actuator.converge(&self.cluster.workers);
     }
@@ -199,7 +195,7 @@ mod tests {
     fn table(workers: u32) -> Vec<ScaleEntry> {
         vec![ScaleEntry {
             model: Some("m".into()),
-            engine: "cuda_native".into(),
+            engine: "cuda".into(),
             workers,
         }]
     }
@@ -236,20 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn a_scale_table_is_taken_only_from_the_author() {
+    fn the_last_scale_table_is_the_one_converged_on() {
         let (mut actor, _routing) = actor();
-        let a = actor.register_gateway("a".into(), None);
-        let b = actor.register_gateway("b".into(), None);
-        actor.desire_scale(b, table(3));
-        assert!(desired(&actor).is_empty(), "not the author: ignored");
-        actor.desire_scale(a, table(2));
+        actor.desire_scale(table(2));
         assert_eq!(desired(&actor), [2]);
-        actor.desire_scale(b, table(5));
-        assert_eq!(desired(&actor), [2], "the last table is the author's");
-
-        // The author goes; the next one's table is taken from then on.
-        actor.cluster.gateways.remove(&a);
-        actor.desire_scale(b, table(5));
+        actor.desire_scale(table(5));
         assert_eq!(desired(&actor), [5]);
     }
 }

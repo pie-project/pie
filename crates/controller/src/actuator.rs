@@ -476,7 +476,7 @@ mod tests {
     fn slot(model: &str) -> Slot {
         Slot {
             model: Some(model.into()),
-            engine: "cuda_native".into(),
+            engine: "cuda".into(),
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -499,7 +499,7 @@ mod tests {
     fn entry(model: &str, workers: u32) -> ScaleEntry {
         ScaleEntry {
             model: Some(model.into()),
-            engine: "cuda_native".into(),
+            engine: "cuda".into(),
             workers,
         }
     }
@@ -508,7 +508,7 @@ mod tests {
         Worker {
             role: Role::Decode,
             model: model.into(),
-            engine: "cuda_native".into(),
+            engine: "cuda".into(),
             addr: String::new(),
             launch,
             pid: None,
@@ -607,11 +607,7 @@ mod tests {
         let status = actuator.status(&workers);
         assert_eq!(status.len(), 1, "only the named shape is reported");
         assert_eq!((status[0].launching, status[0].free), (1, 0));
-        assert!(
-            actuator
-                .short
-                .contains(&(Some("m".into()), "cuda_native".into()))
-        );
+        assert!(actuator.short.contains(&(Some("m".into()), "cuda".into())));
         assert!(
             actuator.launched[1].is_none(),
             "n is not named: nothing launched for it"
@@ -685,7 +681,7 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let shape = (Some("m".to_string()), "cuda_native".to_string());
+        let shape = (Some("m".to_string()), "cuda".to_string());
         actuator.stop(&shape, 1, &workers);
         assert!(
             actuator.launched[0].as_ref().is_some_and(|l| !l.stopping),
@@ -803,7 +799,7 @@ mod tests {
         older.load.draining = true;
         workers.insert(WorkerId(1), older);
         workers.insert(WorkerId(2), worker("m", Some(launched[1].clone())));
-        let shape = (Some("m".to_string()), "cuda_native".to_string());
+        let shape = (Some("m".to_string()), "cuda".to_string());
         actuator.stop(&shape, 1, &workers);
         assert!(actuator.launched[0].as_ref().is_some_and(|l| l.stopping));
         assert!(actuator.launched[1].as_ref().is_some_and(|l| !l.stopping));

@@ -129,6 +129,8 @@ pub struct EngineConfig {
     pub cpu_pages: usize,
     pub cpu_window_pages: u32,
     pub disk_pages: u32,
+    /// The disk tier is kept for the next run (`disk_kv_persistent`).
+    pub disk_kept: Option<KeptDisk>,
     pub kv_copy: ::engine::caps::KvCopyDomains,
     pub backend_kind: String,
     pub rs_cache_required: bool,
@@ -164,6 +166,14 @@ pub struct EngineConfig {
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
     pub engine_backend: crate::engine::EngineBox,
+}
+
+/// A disk tier kept across runs: where its journal is, and whether the
+/// engine found its slot files as the last run left them.
+#[derive(Debug, Clone)]
+pub struct KeptDisk {
+    pub journal: PathBuf,
+    pub kept: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +392,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
+    let arena_disk_kept: Vec<Option<KeptDisk>> =
+        engine_configs.iter().map(|d| d.disk_kept.clone()).collect();
     let arena_state: Vec<crate::store::registry::StatePool> = engine_configs
         .iter()
         .map(|d| crate::store::registry::StatePool {
@@ -443,6 +455,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_state,
         &arena_max_context,
     );
+    for (d, kept) in arena_disk_kept.iter().enumerate() {
+        let Some(kept) = kept else { continue };
+        let stores = crate::store::registry::get(arena_model_idx, d);
+        let taken = crate::store::registry::with_kv_lock(&stores.kv, "keep-disk", |kv| {
+            kv.keep_disk(&kept.journal, kept.kept)
+        });
+        if let Err(error) = taken {
+            tracing::warn!(%error, journal = %kept.journal.display(), "disk kv tier not kept");
+        }
+    }
 
     crate::planner::init_planner(
         arena_model_idx,

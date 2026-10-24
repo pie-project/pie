@@ -382,6 +382,8 @@ impl Engine for Group {
             pools.host_state_slots = tiers.host_state_slots;
             pools.host_buffer_pages = tiers.host_buffer_pages;
             pools.disk_kv_pages = tiers.disk_kv_pages;
+            pools.disk_kv_persistent = tiers.disk_kv_persistent;
+            pools.disk_kv_kept = tiers.disk_kv_kept;
             loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
             loaded.caps.kv_copy.host_to_device &= tiers.host_kv_pages > 0;
         }

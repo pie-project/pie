@@ -21,6 +21,32 @@ pub fn init_planner(model: usize, engine: usize, planner: ResidencyPlanner) {
         .insert((model, engine), planner);
 }
 
+/// Persists the sealed run `keys` (from token 0) on the disk tier of the
+/// engine that holds most of it, as far as it is held there on the device:
+/// the pages stay where they are, and a restart takes the copies back. They
+/// are kept under the cluster `retention` key: swap takes the lowest first.
+/// Answers the pages persisted.
+pub async fn persist_run(
+    keys: Vec<crate::store::kv::hash::Hash256>,
+    retention: i64,
+) -> Result<usize, String> {
+    let stores = crate::store::registry::all_for_model(0);
+    let engine = stores
+        .iter()
+        .enumerate()
+        .map(|(engine, stores)| {
+            let held = crate::store::registry::with_kv_lock(&stores.kv, "persist", |kv| {
+                kv.cached_run_any_tier(&keys).len()
+            });
+            (held, engine)
+        })
+        .max()
+        .filter(|&(held, _)| held > 0)
+        .map(|(_, engine)| engine)
+        .ok_or("the run is not held here")?;
+    super::exec::persist(0, engine, keys, retention).await
+}
+
 pub fn planner_for(model: usize, engine: usize) -> Option<Arc<ResidencyPlanner>> {
     if model == 0 && engine == 0 {
         return PRIMARY.get().cloned();

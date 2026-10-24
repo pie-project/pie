@@ -68,7 +68,7 @@ fn runtime_config(
     model: runtime::bootstrap::ModelConfig,
 ) -> Result<runtime::bootstrap::Config> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = match user.runtime.policy.as_deref() {
+    let policy = match user.runtime.worker_policy.as_deref() {
         Some(spec) => Some((spec.to_string(), builtins::policy_component(spec)?)),
         None => None,
     };
@@ -76,15 +76,15 @@ fn runtime_config(
     #[cfg(target_arch = "wasm32")]
     let policy = None;
     Ok(runtime::bootstrap::Config {
-        host: user.server.host.clone(),
-        port: user.server.port,
+        host: user.server.listen.ip().to_string(),
+        port: user.server.listen.port(),
         cache_dir: home.join("inferlets"),
         builtin_programs,
         verbose: user.server.verbose,
         log_dir: Some(home.join("logs")),
         telemetry: runtime::bootstrap::TelemetryConfig {
-            enabled: user.telemetry.enabled,
-            endpoint: user.telemetry.endpoint.clone(),
+            enabled: user.telemetry.endpoint.is_some(),
+            endpoint: user.telemetry.endpoint.clone().unwrap_or_default(),
             service_name: user.telemetry.service_name.clone(),
         },
         runtime: runtime::bootstrap::RuntimeConfig {
@@ -94,7 +94,7 @@ fn runtime_config(
             wasm_warm_memory_mb: user.sandbox.warm_memory.as_mib() as usize,
             wasm_warm_slots: user.sandbox.warm_slots,
             allow_fs: user.sandbox.allow_fs,
-            fs_scratch_dir: user.sandbox.fs_scratch_dir.clone(),
+            fs_scratch_dir: user.sandbox.scratch_dir.clone(),
             allow_network: user.sandbox.allow_network,
             network_allowed_hosts: user.sandbox.network_allowed_hosts.clone(),
             max_upload_mb: user.server.max_upload.as_mib() as usize,
@@ -140,8 +140,10 @@ fn build_model(
     let engines = engines
         .groups
         .into_iter()
-        .map(|g| {
+        .enumerate()
+        .map(|(group, g)| {
             let backend_kind = g.backend.kind().to_string();
+            let disk_kept = kept_disk(m, group, &g);
             runtime::bootstrap::EngineConfig {
                 total_pages: g.caps.pools.kv_pages as usize,
                 window_pages: g.caps.pools.window_pages,
@@ -149,6 +151,7 @@ fn build_model(
                 cpu_pages: g.caps.pools.host_kv_pages as usize,
                 cpu_window_pages: g.caps.pools.host_window_pages,
                 disk_pages: g.caps.pools.disk_kv_pages,
+                disk_kept,
                 kv_copy: g.caps.kv_copy,
                 backend_kind,
                 rs_cache_required: g.caps.pools.state_slots != 0,
@@ -197,4 +200,30 @@ fn build_model(
         engines,
         scheduler: scheduler(runtime),
     })
+}
+
+/// The disk tier `g` keeps for the next run, its journal beside its slot
+/// files, when `disk_kv_persistent` asked for one and the engine kept it.
+fn kept_disk(
+    m: &config::ModelConfig,
+    group: usize,
+    g: &crate::backend::GroupEngine,
+) -> Option<runtime::bootstrap::KeptDisk> {
+    let pools = &g.caps.pools;
+    match (&g.disk_kv_dir, pools.disk_kv_persistent) {
+        (Some(dir), true) => Some(runtime::bootstrap::KeptDisk {
+            journal: dir.join(format!("g{group}.journal")),
+            kept: pools.disk_kv_kept,
+        }),
+        _ => {
+            if m.disk_kv_persistent {
+                tracing::warn!(
+                    engine = %g.backend.kind(),
+                    disk_pages = pools.disk_kv_pages,
+                    "disk_kv_persistent: this engine keeps no disk tier across runs; it is scratch"
+                );
+            }
+            None
+        }
+    }
 }

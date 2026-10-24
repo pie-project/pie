@@ -42,24 +42,20 @@ const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit 
 # prints all of them with their current values and what they mean.
 
 [server]
-host = "127.0.0.1"          # loopback. Exposing the port is an edit here.
-port = 8080
+listen = "127.0.0.1:8080"   # loopback. Exposing the port is an edit here.
 verbose = false
-telemetry = false
-# otlp_endpoint   = "http://localhost:4317"
-# service_name    = "pie"
 # worker_threads  = 16        # derived from visible CPUs, capped at 64
 # max_upload      = "256MiB"
-# policies        = []        # cluster policies: built-in names or .wasm paths,
-#                             # no two granted the same write (`publish`
-#                             # excepted: each writes under its own name)
-#                             # SIGHUP reloads this and `[runtime] policy`
+
+# [telemetry]
+# endpoint     = "http://localhost:4317"  # an OTLP collector; omit to export none
+# service_name = "pie"
 
 "#;
 
 const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
-model = "Qwen/Qwen3.5-0.8B"
+source = "Qwen/Qwen3.5-0.8B"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/cache/weights
 # weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
                                  # is what the engine computes in, so that is
@@ -70,6 +66,11 @@ model = "Qwen/Qwen3.5-0.8B"
 # device_memory_share  = 0.90
 # device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
 # device_weight_budget = "18GiB"  # omit for uncapped
+# Suspended kv goes to the host, then the disk.
+# host_kv_budget       = "32GiB"
+# disk_kv_budget       = "200GiB"  # "0B" turns the disk tier off
+# disk_kv_dir          = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
+# disk_kv_persistent   = false    # keep the disk tier as cache for the next run
 "#;
 
 const TAIL: &str = r#"
@@ -81,7 +82,7 @@ const TAIL: &str = r#"
 # frame_size               = 2     # guest contract: the submit depth is
 # frame_dispatch_depth     = 2     # derived from it, not a key of its own
 # max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
-# policy                   = "noop"  # a PLEX worker policy: built-in name or .wasm path
+# worker_policy            = "noop"  # a PLEX worker policy: built-in name or .wasm path
 
 [sandbox]
 # The box an inferlet runs in: its walls, and its size.
@@ -89,14 +90,20 @@ allow_fs = false
 allow_network = true
 network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
                                # in the host stack and bypasses this list
-# fs_scratch_dir  = "/tmp/pie"
+# scratch_dir     = "/tmp/pie"
 # max_memory      = "4GiB"
 # max_instances   = 1000
 # warm_memory     = "0B"
 # warm_slots      = 100
 
 # [cluster]
-# Distributed serving only. A single-node config omits this section entirely.
+# cluster_policies = []        # cluster policies: built-in names or .wasm paths,
+#                              # no two granted the same write (`publish`
+#                              # excepted: each writes under its own name).
+#                              # SIGHUP reloads this and `[runtime] worker_policy`.
+#                              # Single-node only: a distributed controller
+#                              # states its own.
+# Distributed serving only:
 # controller = "tcp://10.0.0.1:9102"
 # role = "decode"                # or "prefill": takes peers' passes, no client turns
 # gateways = ["tcp://10.0.0.2:8081"]
@@ -120,13 +127,13 @@ const CUDA_ENGINE_BLOCK: &str = r#"
 # Which keys are valid here depends on `type`: the common ones below, plus
 # whatever the named engine accepts. A key it does not know is a parse error
 # naming the engine that rejected it.
-type = "cuda_native"
+type = "cuda"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 # kv_page_size    = 32      # omit: the engine derives one
-# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256,
-#                           # or what the chip profile states (B200: two a lane)
+# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for
+#                           # what the chip profile states (256 where it states none)
 # max_model_len   = 32768   # the most tokens one sequence may hold; omit for
 #                           # the context the model's config.json declares,
 #                           # shortened where one sequence at it would take
@@ -143,8 +150,7 @@ const METAL_ENGINE_BLOCK: &str = r#"
 type = "metal"
 device = ["metal:0"]
 activation_dtype = "bfloat16"
-kv_page_size = 32           # used as given: this engine has no planner to
-                            # derive one
+# kv_page_size         = 32     # omit for the engine's own
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_model_len        = 8192   # omit to keep the engine's KV-ring ceiling;
@@ -159,9 +165,8 @@ const VULKAN_ENGINE_BLOCK: &str = r#"
 # whatever the named engine accepts. `tensor_parallel_size` is not among them
 # for this engine — the Vulkan shell serves one device.
 type = "vulkan"
-device = ["vulkan:0"]
+device = ["vulkan:0"]       # vkEnumeratePhysicalDevices order; 0 is the first
 activation_dtype = "bfloat16"
-device_index = 0            # vkEnumeratePhysicalDevices order; 0 is the first
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
@@ -176,9 +181,8 @@ const WGPU_ENGINE_BLOCK: &str = r#"
 # whatever the named engine accepts. `tensor_parallel_size` is not among them
 # for this engine — the wgpu shell serves one adapter.
 type = "wgpu"
-device = ["wgpu:0"]
+device = ["wgpu:0"]         # enumeration order among the reachable adapters
 activation_dtype = "bfloat16"
-adapter_index = 0           # enumeration order among the reachable adapters
 # backends = "vulkan"           # omit for every backend this build carries
 # power_preference     = "high-performance"  # or "low-power", "none"
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
@@ -194,11 +198,10 @@ const XLA_ENGINE_BLOCK: &str = r#"
 # Which keys are valid here depends on `type`: the common ones below, plus
 # whatever the named engine accepts. The xla shell drives one PJRT device.
 type = "xla"
-device = ["tpu:0"]
+device = ["tpu:0"]          # which of the plugin's addressable devices
 activation_dtype = "bfloat16"
-device_index = 0            # which of the plugin's addressable devices
 # plugin               = "/path/to/libtpu.so"  # omit: PIE_XLA_PLUGIN, TPU_LIBRARY_PATH, libtpu.so
-# max_forward_tokens   = 2048
+# max_forward_tokens   = 2048   # omit for the engine's own
 # max_forward_requests = 64
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
 "#;
@@ -215,7 +218,7 @@ activation_dtype = "bfloat16"
 target = "wse3"             # the wafer generation: "wse2" or "wse3"
 num_threads = 16            # host threads for the simulator and staging
 # cmaddr               = "10.0.0.1:9000"  # omit to run the fabric simulator
-# max_forward_tokens   = 64
+# max_forward_tokens   = 64     # omit for the engine's own
 # max_forward_requests = 4
 # max_state_slots      = 4      # recurrent-state seats (hybrid models)
 "#;
@@ -270,7 +273,7 @@ mod tests {
     fn it_names_the_engine_this_binary_actually_has() {
         let expected: Option<&str> = match flavor::default_flavor() {
             #[cfg(feature = "engine-cuda")]
-            Some(flavor::Flavor::Cuda) => Some("cuda_native"),
+            Some(flavor::Flavor::Cuda) => Some("cuda"),
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Some(flavor::Flavor::Metal) => Some("metal"),
             #[cfg(feature = "vulkan")]

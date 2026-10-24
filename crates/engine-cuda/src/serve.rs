@@ -372,27 +372,49 @@ impl Shell {
         self.pools.host_window_pages()
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
+    /// Seats this rank's disk tier; `persistent` keeps its slot file for the
+    /// next run. Answers the pages it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
+        persistent: bool,
         world: crate::World,
     ) -> Result<u32> {
         let ranks = u64::from(world.size.max(1));
+        let keep =
+            persistent.then(|| format!("{} rank {}/{}", self.trace().name, world.rank, ranks));
+        let keep = keep.as_deref();
         match (budget, dir) {
             (Some(0), _) | (_, None) => {}
-            (Some(bytes), Some(dir)) => self.pools.seat_disk(dir, world.rank, bytes / ranks)?,
+            (Some(bytes), Some(dir)) => {
+                self.pools.seat_disk(dir, world.rank, bytes / ranks, keep)?;
+            }
             (None, Some(dir)) => {
+                // What kept files take already is theirs again, so a restart
+                // sizes the tier as the run that wrote it did.
+                let kept: u64 = if persistent {
+                    (0..ranks)
+                        .map(|rank| engine::disk::kept_bytes(dir, &format!("r{rank}.kv")))
+                        .sum()
+                } else {
+                    0
+                };
+                let free = engine::disk::free_space(dir).saturating_add(kept);
                 let host = u64::from(self.pools.host_pages()) * self.pools.paged_page_bytes();
-                let bytes = host
-                    .saturating_mul(4)
-                    .min(engine::disk::free_space(dir) / 4 / ranks);
-                if self.pools.seat_disk(dir, world.rank, bytes).is_err() {
+                let bytes = host.saturating_mul(4).min(free / 4 / ranks);
+                if self.pools.seat_disk(dir, world.rank, bytes, keep).is_err() {
                     self.pools.unseat_disk();
                 }
             }
         }
         Ok(self.pools.disk_pages())
+    }
+
+    /// The disk tier is kept, and holds what the last run left.
+    #[must_use]
+    pub fn disk_kv_kept(&self) -> bool {
+        self.pools.disk_kept()
     }
 
     pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {

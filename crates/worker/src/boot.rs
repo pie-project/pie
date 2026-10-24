@@ -24,13 +24,14 @@ pub(crate) fn load_model_engines(
 ) -> Result<LoadedModelEngines> {
     let (engine_groups, metadata) = {
         let m = &user_cfg.model;
-        let flavor = crate::backend::flavor::resolve(m.engine.kind, &m.name)?;
+        let e = &user_cfg.engine;
+        let flavor = crate::backend::flavor::resolve(e.kind, &m.name)?;
 
-        let world_size = m.engine.device.len();
-        let tp_degree = if m.engine.tensor_parallel_size == 0 {
+        let world_size = e.device.len();
+        let tp_degree = if e.tensor_parallel_size == 0 {
             world_size
         } else {
-            m.engine.tensor_parallel_size as usize
+            e.tensor_parallel_size as usize
         };
         let topology = crate::backend::calculate_topology(world_size, tp_degree)
             .with_context(|| format!("model {:?} topology", m.name))?;
@@ -42,16 +43,16 @@ pub(crate) fn load_model_engines(
                 Flavor::Cuda => {}
                 _ => anyhow::bail!(
                     "model {:?}: tensor_parallel_size={tp_degree} is only \
-                     supported for cuda_native",
+                     supported for cuda",
                     m.name,
                 ),
             }
         }
 
-        let mut embedded_base_opts = crate::backend::build_options(m, flavor)?;
+        let mut embedded_base_opts = crate::backend::build_options(e, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
         let resolved_model = weights::resolve(
-            &m.model,
+            &m.source,
             weights::Want {
                 backend: Some(flavor.as_str()),
                 overrides: Some(&m.overrides()?),
@@ -75,7 +76,7 @@ pub(crate) fn load_model_engines(
             // configuration asks for NIXL (a build without it refuses that).
             residency.kv_export = user_cfg.offload.transfer == crate::config::OffloadTransfer::Nixl;
             group_engines.push(create_engine_group(
-                m,
+                user_cfg,
                 residency,
                 group_idx,
                 group,
@@ -116,7 +117,7 @@ pub(crate) fn load_model_engines(
 
 /// What a boot runs the model on.
 pub enum Engine {
-    /// The one `[model.engine]` names, opened here.
+    /// The one `[engine]` names, opened here.
     Configured,
     /// One the host opened itself, such as the browser's WebGPU device.
     Opened(runtime::engine::EngineBox),
@@ -241,7 +242,7 @@ fn load_without_engine(
         backend: None,
         overrides: Some(&m.overrides()?),
     };
-    let resolved = weights::resolve(&m.model, want, home)
+    let resolved = weights::resolve(&m.source, want, home)
         .with_context(|| format!("resolving the model for {:?}", m.name))?;
     let artifact = resolved.path().to_path_buf();
     let metadata = resolved
@@ -291,7 +292,7 @@ fn artifact_name(path: &Path) -> String {
     )
 )]
 fn create_engine_group(
-    m: &config::ModelConfig,
+    cfg: &config::Config,
     residency: engine::Residency,
     group_idx: usize,
     group: &[usize],
@@ -303,10 +304,11 @@ fn create_engine_group(
     frames_in_flight: u8,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
+    let m = &cfg.model;
     #[cfg(feature = "engine-cuda")]
     {
         if flavor == Flavor::Cuda && tp_degree > 1 {
-            let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
+            let rank_opts = cuda_rank_options(cfg, group_idx, group, base_opts)?;
             return crate::backend::create_engine_backend_group(
                 &rank_opts,
                 snapshot_dir,
@@ -338,7 +340,7 @@ fn create_engine_group(
             m.name,
         )
     })?;
-    let device = group_engine(m, group_idx, first_engine_idx)?;
+    let device = group_engine(&cfg.engine, group_idx, first_engine_idx)?;
     let opts = embedded_opts_for_device(base_opts, device);
 
     crate::backend::create_engine_backend(
@@ -365,10 +367,10 @@ fn embedded_opts_for_device(base_opts: &EngineOptions, device: String) -> Engine
     #[allow(unreachable_patterns)]
     match base_opts {
         #[cfg(feature = "engine-cuda")]
-        EngineOptions::CudaNative(opts) => {
+        EngineOptions::Cuda(opts) => {
             let mut opts = opts.clone();
             opts.device = device;
-            EngineOptions::CudaNative(opts)
+            EngineOptions::Cuda(opts)
         }
         other => other.clone(),
     }
@@ -380,7 +382,7 @@ fn apply_embedded_verbose(options: &mut EngineOptions, verbose: bool) {
         irrefutable_let_patterns,
         reason = "`EngineOptions` has one variant in a CUDA-only build"
     )]
-    if let EngineOptions::CudaNative(opts) = options {
+    if let EngineOptions::Cuda(opts) = options {
         opts.verbose = verbose;
     }
 
@@ -390,23 +392,23 @@ fn apply_embedded_verbose(options: &mut EngineOptions, verbose: bool) {
 
 #[cfg(feature = "engine-cuda")]
 fn cuda_rank_options(
-    m: &config::ModelConfig,
+    cfg: &config::Config,
     group_idx: usize,
     group: &[usize],
     base_opts: &EngineOptions,
 ) -> Result<Vec<EngineOptions>> {
     let mut rank_opts = Vec::with_capacity(group.len());
     for &rank_engine_idx in group {
-        let rank_engine = group_engine(m, group_idx, rank_engine_idx)?;
+        let rank_engine = group_engine(&cfg.engine, group_idx, rank_engine_idx)?;
         #[allow(
             unreachable_patterns,
             reason = "`EngineOptions` has one variant in a CUDA-only build"
         )]
         match base_opts {
-            EngineOptions::CudaNative(opts) => {
+            EngineOptions::Cuda(opts) => {
                 let mut o = opts.clone();
                 o.device = rank_engine;
-                rank_opts.push(EngineOptions::CudaNative(o));
+                rank_opts.push(EngineOptions::Cuda(o));
             }
             _ => unreachable!("flavor checked before building cuda rank options"),
         }
@@ -414,17 +416,12 @@ fn cuda_rank_options(
     Ok(rank_opts)
 }
 
-fn group_engine(m: &config::ModelConfig, group_idx: usize, engine_idx: usize) -> Result<String> {
-    m.engine
-        .device
-        .get(engine_idx)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "model {:?}: group {group_idx} references device index {} but only {} devices configured",
-                m.name,
-                engine_idx,
-                m.engine.device.len(),
-            )
-        })
+fn group_engine(e: &config::EngineConfig, group_idx: usize, engine_idx: usize) -> Result<String> {
+    e.device.get(engine_idx).cloned().ok_or_else(|| {
+        anyhow!(
+            "[engine] group {group_idx} references device index {} but only {} devices configured",
+            engine_idx,
+            e.device.len(),
+        )
+    })
 }

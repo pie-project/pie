@@ -57,7 +57,7 @@ it is inherent to contrastive decoding.
 
 ```bash
 cargo build --release --target wasm32-wasip3
-python tests/examples/run_all.py --engine cuda_native --model <model-path>
+python tests/examples/run_all.py --engine cuda --model <model-path>
 ```
 
 The suite includes an **identity control**: at `alpha = 0.0` the rule provably

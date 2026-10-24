@@ -1189,3 +1189,367 @@ fn an_answer_goes_before_an_older_prompt() {
     assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 1);
     assert_eq!(on_device(&mut store, &other), 2, "the older prompt stays");
 }
+
+#[test]
+/// A kept disk tier's journal gives its pages back on the next run as cache
+/// on disk, found where a pass looks; pages that follow on from nothing
+/// held are given up, and so is every page an entry drops.
+fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
+    use super::hash::{chain_slots, page_hash};
+    use super::journal::{Header, Journal, PageRecord};
+    let domain = h(51);
+    let pages_of = |tokens: &[u32]| -> Vec<Vec<Option<Hash256>>> {
+        chain_slots(&domain, None, 0, tokens)
+            .chunks(4)
+            .map(|page| page.iter().map(|h| Some(*h)).collect())
+            .collect()
+    };
+    let run: Vec<u32> = (100..112).collect();
+    let mut branch = run[..8].to_vec();
+    branch.extend(200..204);
+    let (run_tokens, branch_tokens) = (pages_of(&run), pages_of(&branch));
+    let keys: Vec<Hash256> = run_tokens.iter().map(|page| page_hash(page)).collect();
+    let branch_keys: Vec<Hash256> = branch_tokens.iter().map(|page| page_hash(page)).collect();
+    let record = |tokens: &[Vec<Option<Hash256>>], keys: &[Hash256], i: usize| PageRecord {
+        page: keys[i],
+        parent: i.checked_sub(1).map(|p| keys[p]),
+        tokens: tokens[i].clone(),
+        retention: 0,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g0.journal");
+    let header = Header {
+        domain: KvStore::new_with_swap(8, 0, 8, domain).domain,
+        page_size: 4,
+        slots: 8,
+    };
+    {
+        let (mut journal, _) = Journal::open(&path, header, true).unwrap();
+        for (slot, i) in [(5, 0), (2, 1), (7, 2)] {
+            journal.put(slot, &record(&run_tokens, &keys, i)).unwrap();
+        }
+        journal
+            .put(0, &record(&branch_tokens, &branch_keys, 2))
+            .unwrap();
+        let orphan = PageRecord {
+            parent: Some(h(99)),
+            ..record(&run_tokens, &keys, 1)
+        };
+        journal
+            .put(
+                3,
+                &PageRecord {
+                    page: h(98),
+                    ..orphan
+                },
+            )
+            .unwrap();
+        let short = PageRecord {
+            page: h(97),
+            parent: None,
+            tokens: vec![None],
+            retention: 0,
+        };
+        journal.put(4, &short).unwrap();
+        journal.sync().unwrap();
+    }
+
+    let store_for = || {
+        let mut store = KvStore::new_with_swap(8, 0, 8, domain);
+        store.set_page_size(4);
+        store.set_keeps(true);
+        store
+    };
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 4);
+    let found = store.cached_run_any_tier(&keys);
+    assert_eq!(found.len(), 3, "the whole run is found");
+    assert_eq!(store.below_device(&found), 3, "all of it on disk");
+    assert_eq!(
+        store.cached_run_any_tier(&branch_keys).len(),
+        3,
+        "and its branch"
+    );
+    assert_eq!(
+        store.disk_pool.available(),
+        4,
+        "the orphan's and the short page's slots are free again"
+    );
+    store.drop_entries_off_device();
+    assert_eq!(
+        store.cached_run_any_tier(&keys).len(),
+        3,
+        "what is kept on disk is no off-device leftover"
+    );
+    drop(store);
+
+    // The next run takes the same back: the orphans were given up.
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 4);
+    assert_eq!(store.disk_pool.available(), 4);
+    assert_eq!(
+        store.disk_swap_available(),
+        8,
+        "swap may take every copy's slot"
+    );
+    store.yield_disk(8);
+    assert_eq!(store.disk_pool.available(), 8, "every slot given back");
+    assert_eq!(store.persisted_pages(), 0);
+    drop(store);
+    let mut store = store_for();
+    assert_eq!(
+        store.keep_disk(&path, true).unwrap(),
+        0,
+        "copies given up are given up in the journal"
+    );
+    drop(store);
+
+    // Slot files the engine took afresh hold nothing a journal names.
+    {
+        let (mut journal, _) = Journal::open(&path, header, true).unwrap();
+        journal.put(5, &record(&run_tokens, &keys, 0)).unwrap();
+    }
+    assert_eq!(store_for().keep_disk(&path, false).unwrap(), 0);
+}
+
+#[test]
+/// A run persisted from the device keeps its pages there; when the device
+/// wants their room they settle on their copies with nothing copied, a hit
+/// brings them back with the copies kept, a restart finds them, and swap
+/// takes their slots when it must.
+fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
+    use super::hash::{chain_slots, page_hash};
+    let seed = h(52);
+    let tokens: Vec<Vec<Option<Hash256>>> =
+        chain_slots(&seed, None, 0, &(300..312).collect::<Vec<_>>())
+            .chunks(4)
+            .map(|page| page.iter().map(|h| Some(*h)).collect())
+            .collect();
+    let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g0.journal");
+    let store_for = || {
+        let mut store = KvStore::new_with_swap(8, 0, 8, seed);
+        store.set_page_size(4);
+        store.set_keeps(true);
+        store
+    };
+
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 0);
+    let gpu = store.pool.try_alloc_n(3).unwrap();
+    assert!(store.import_cached_at(
+        &[],
+        tokens.clone(),
+        keys.clone(),
+        gpu.into_iter().map(KvPageBacking::Resident).collect(),
+    ));
+
+    let txn = store
+        .prepare_persist(&keys, 0)
+        .expect("three pages to copy");
+    assert_eq!(txn.copy_plan().0.len(), 3);
+    assert!(
+        store.prepare_persist(&keys, 0).is_none(),
+        "pages in a copy are copied once"
+    );
+    assert_eq!(store.commit_persist(txn), 3);
+    assert_eq!(store.persisted_pages(), 3);
+    assert_eq!(store.disk_pool.available(), 5);
+    assert!(store.prepare_persist(&keys, 0).is_none(), "copied already");
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!(store.below_device(&run), 0, "the pages stay on the device");
+
+    let epoch = store.current_epoch();
+    assert_eq!(store.reclaim_cache(epoch, Steps::default()), 3);
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!(run.len(), 3, "the entry stays");
+    assert_eq!(store.below_device(&run), 3, "settled on its copies");
+    assert_eq!(store.disk_pool.available(), 5, "with nothing copied");
+    assert_eq!(
+        store.reclaim_cache(epoch, Steps::default()),
+        0,
+        "what is on disk alone frees no device page"
+    );
+
+    let mut granted = store.pool.try_alloc_n(3).unwrap();
+    let txn = store
+        .prepare_promote(&run, &mut granted)
+        .unwrap()
+        .expect("a promotion");
+    let pin = store.commit_promote(txn).unwrap();
+    store.release_reader(pin);
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!(store.below_device(&run), 0, "a hit brings it back");
+    assert_eq!(store.persisted_pages(), 3, "and keeps its copies");
+    assert_eq!(store.disk_pool.available(), 5);
+    drop(store);
+
+    let mut store = store_for();
+    assert_eq!(
+        store.keep_disk(&path, true).unwrap(),
+        3,
+        "a restart finds it"
+    );
+    assert_eq!(store.make_swap_room(8), 8, "swap wins");
+    assert_eq!(store.persisted_pages(), 0);
+    drop(store);
+    assert_eq!(store_for().keep_disk(&path, true).unwrap(), 0);
+}
+
+#[test]
+/// An owner's ask to keep a prefix on disk goes out with the runs it left,
+/// a prefix persisted is a run of its own, and the ask goes with the last
+/// of its owner's entries.
+fn a_persist_hint_rides_its_owner_s_runs_and_a_persisted_prefix_is_a_run() {
+    use super::hash::{chain_slots, page_hash};
+    let seed = h(53);
+    let tokens: Vec<Vec<Option<Hash256>>> =
+        chain_slots(&seed, None, 0, &(400..412).collect::<Vec<_>>())
+            .chunks(4)
+            .map(|page| page.iter().map(|h| Some(*h)).collect())
+            .collect();
+    let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = KvStore::new_with_swap(8, 0, 8, seed);
+    store.set_page_size(4);
+    store.set_keeps(true);
+    store
+        .keep_disk(&dir.path().join("g0.journal"), true)
+        .unwrap();
+    let gpu = store.pool.try_alloc_n(3).unwrap();
+    assert!(store.import_cached_at(
+        &[],
+        tokens,
+        keys.clone(),
+        gpu.into_iter().map(KvPageBacking::Resident).collect(),
+    ));
+    let owner = ProcessId::from_u128(7);
+    for entry in store.cache.values_mut() {
+        entry.owner = Some(owner);
+    }
+    store.owners.insert(owner, store.cache.len());
+
+    assert!(store.persist_hints().is_empty());
+    store.set_persist_hint(owner, Some(8));
+    assert_eq!(store.persist_hints(), vec![(keys[2], 8)]);
+
+    let txn = store
+        .prepare_persist(&keys[..2], 0)
+        .expect("two pages to copy");
+    assert_eq!(store.commit_persist(txn), 2);
+    let mut runs = store.cached_runs();
+    runs.sort_by_key(Vec::len);
+    assert_eq!(
+        runs,
+        vec![keys[..2].to_vec(), keys.clone()],
+        "the prefix is a run"
+    );
+    let mut persisted = store.persisted_keys();
+    persisted.sort_unstable();
+    let mut expected = keys[..2].to_vec();
+    expected.sort_unstable();
+    assert_eq!(persisted, expected);
+
+    let ids: Vec<u64> = store.cache.keys().copied().collect();
+    let epoch = store.current_epoch();
+    store.drop_entries(ids, crate::policy::By::Host, epoch);
+    assert!(
+        store.hints.is_empty(),
+        "the ask goes with its owner's last entry"
+    );
+    assert_eq!(
+        store.persisted_pages(),
+        0,
+        "and the copies with their pages"
+    );
+}
+
+#[test]
+/// Swap takes the copies kept under the lowest cluster retention key first;
+/// a run asked again under a higher key keeps it, across a restart too.
+fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
+    use super::hash::{chain_slots, page_hash};
+    let seed = h(54);
+    let run_of = |first: u32| {
+        let tokens: Vec<Vec<Option<Hash256>>> =
+            chain_slots(&seed, None, 0, &(first..first + 8).collect::<Vec<_>>())
+                .chunks(4)
+                .map(|page| page.iter().map(|h| Some(*h)).collect())
+                .collect();
+        let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+        (tokens, keys)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g0.journal");
+    let store_for = || {
+        let mut store = KvStore::new_with_swap(8, 0, 4, seed);
+        store.set_page_size(4);
+        store.set_keeps(true);
+        store
+    };
+    let (low, high) = (run_of(500), run_of(600));
+    let mut store = store_for();
+    store.keep_disk(&path, true).unwrap();
+    for ((tokens, keys), key) in [(&low, 1), (&high, 9)] {
+        let gpu = store.pool.try_alloc_n(2).unwrap();
+        assert!(store.import_cached_at(
+            &[],
+            tokens.clone(),
+            keys.clone(),
+            gpu.into_iter().map(KvPageBacking::Resident).collect(),
+        ));
+        let txn = store.prepare_persist(keys, key).expect("two pages");
+        assert_eq!(store.commit_persist(txn), 2);
+    }
+    assert_eq!(store.disk_pool.available(), 0);
+    assert_eq!(store.make_swap_room(2), 2);
+    assert_eq!(store.persisted_pages(), 2);
+    let kept: HashSet<Hash256> = store.persisted_keys().into_iter().collect();
+    assert!(
+        high.1.iter().all(|key| kept.contains(key)),
+        "the higher key's copies stay"
+    );
+
+    // Asked again under a higher key, the low run keeps it: persisted anew
+    // where its copies went, and raised where they stayed.
+    let txn = store.prepare_persist(&low.1, 20).expect("its copies went");
+    assert_eq!(store.commit_persist(txn), 2);
+    assert!(
+        store.prepare_persist(&high.1, 30).is_none(),
+        "copied already"
+    );
+    drop(store);
+
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 4);
+    let retention = |keys: &[Hash256]| {
+        let persisted = store.persisted.as_ref().unwrap();
+        keys.iter()
+            .map(|key| persisted.retention[&persisted.by_key[key]])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(retention(&low.1), [20, 20]);
+    assert_eq!(retention(&high.1), [30, 30], "raised in the journal");
+}
+
+#[test]
+/// A process that maps in a run another left, and asks a prefix of it kept
+/// on disk, has that ask go out once it is gone.
+fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
+    let mut store = KvStore::new(16, h(54));
+    let tokens: Vec<u32> = (0..64).map(|t| 600 + t).collect();
+    sealed_and_gone(&mut store, &tokens, ProcessId::from_u128(1));
+
+    let asker = ProcessId::from_u128(2);
+    let ws = store.create_working_set();
+    store.set_owner(ws, asker).unwrap();
+    store.set_persist_hint(asker, Some(32));
+    store.reserve(ws, 4).unwrap();
+    let keys = keys_ahead(&store, ws, 0, &tokens);
+    let run = store.cached_run(&keys);
+    assert_eq!(store.attach_run(ws, &run, 4, 16).unwrap(), 4);
+    store.release_working_set(ws, store.current_epoch());
+    assert_eq!(store.persist_hints(), vec![(keys[3], 32)]);
+}

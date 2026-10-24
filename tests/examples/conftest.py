@@ -43,7 +43,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser = argparse.ArgumentParser(description=description)
     parser.addoption = parser.add_argument  # convenience alias
     # A store name, a HuggingFace repo id, or a path to a `.zt` artifact --
-    # whatever `[model] model` accepts, since that is where this lands.
+    # whatever `[model] source` accepts, since that is where this lands.
     #
     # THE DEFAULT DOES NOT BOOT THE SHADER BACKENDS. `Qwen/Qwen3-0.6B` is an
     # unquantised release, and `metal`, `vulkan` and `wgpu` all load through
@@ -55,7 +55,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # rather than reporting thirty-nine failures. The CUDA engines take the
     # unquantised release as it is, which is why this default is what it is.
     parser.add_argument("--model", default=parser_default_model(), help="HuggingFace model ID")
-    # WHAT TO LEAVE OFF (`[model] off`). A vision artifact serves its tower by
+    # WHAT TO LEAVE OFF (`[model] skip_parts`). A vision artifact serves its tower by
     # default; a suite that wants the text trunk alone (a one-unit load keeps
     # the fold up) leaves `vision` off.
     parser.add_argument("--off", default=None,
@@ -94,7 +94,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # not degrade or fall back -- `Server(cfg)` raises before the first
     # inferlet runs:
     #
-    #     unknown variant `dev`, expected one of `cuda_native`, `metal`,
+    #     unknown variant `dev`, expected one of `cuda`, `metal`,
     #     `vulkan`, `wgpu`
     #
     # It offered nine for a while, five of which were the pre-rewrite Python
@@ -110,27 +110,16 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # build that did not select the named backend fails at boot saying so,
     # which is a better answer than a choice list that pretends the option
     # does not exist.
-    parser.add_argument("--engine", default="cuda_native",
-                        choices=["cuda_native", "metal", "vulkan", "wgpu"],
-                        help="Embedded engine: 'cuda_native', 'metal', 'vulkan' or 'wgpu'")
+    parser.add_argument("--engine", default="cuda",
+                        choices=["cuda", "metal", "vulkan", "wgpu"],
+                        help="Embedded engine: 'cuda', 'metal', 'vulkan' or 'wgpu'")
     parser.add_argument("--cpu-mem-gb", type=int, default=0,
                         help="Pinned host KV pool size in GiB. 0 = swap disabled. "
-                             "Only cuda_native serves a host swap pool.")
+                             "Only cuda serves a host swap pool.")
     parser.add_argument("--spec-ngram", action="store_true",
                         help="Enable engine-supplied NGRAM speculative-decoding drafts.")
     parser.add_argument("--spec-num-drafts", type=int, default=4,
                         help="Number of NGRAM draft tokens proposed per iteration.")
-    # **THE RECORDING POLICY, AS A HARNESS KNOB** (`[engine] graphs`).
-    #
-    # A suite whose plan bakes a CONDITIONAL region cannot be served by the
-    # cuda shell's recorded path — `cudaGraphSetConditional` wants an rdc +
-    # cudadevrt link stage this crate does not have — and the MTP draft head is
-    # the catalog's one conditional (`poem-compiler`'s
-    # `which_deployments_get_a_conditional`: "the MTP head and nothing else"). Eager
-    # is slow and correct, so a gate about a draft head can ask for it and say
-    # in its own header that it did.
-    parser.add_argument("--graphs", default=None, choices=["on", "off", "shaped"],
-                        help="engine graph-recording policy ([engine] graphs)")
     parser.add_argument("--output-dir", default=None,
                         help="If set, write each test's captured inferlet output to "
                              "<dir>/<test-name>.txt (one file per test, multiple "
@@ -312,7 +301,7 @@ def parser_default_model() -> str:
 
 
 def _served_model_from_local_config() -> str | None:
-    """`[model] model` of the pie config a local server
+    """`[model] source` of the pie config a local server
     was started from, or `None` when there is no such file."""
     import os
     import tomllib
@@ -324,7 +313,7 @@ def _served_model_from_local_config() -> str | None:
     except (OSError, tomllib.TOMLDecodeError):
         return None
     model = config.get("model", {})
-    name = model.get("model") if isinstance(model, dict) else None
+    name = model.get("source") if isinstance(model, dict) else None
     return name if isinstance(name, str) and name else None
 
 
@@ -381,13 +370,11 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
 
     # Build the [model.engine.options] subsection content.
     engine_subsection: dict = {}
-    if args.cpu_mem_gb > 0 and args.engine == "cuda_native":
+    if args.cpu_mem_gb > 0 and args.engine == "cuda":
         engine_subsection["cpu_mem_budget_in_gb"] = args.cpu_mem_gb
     if args.spec_ngram:
         engine_subsection["spec_ngram_enabled"] = True
         engine_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
-    if args.graphs is not None:
-        engine_subsection["graphs"] = args.graphs
     for entry in args.engine_option:
         key, _, value = entry.partition("=")
         typed: object = value
@@ -400,22 +387,20 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         engine_subsection[key.strip()] = typed
 
     cfg = Config(
-        server=ServerConfig(port=0),
+        server=ServerConfig(listen="127.0.0.1:0"),
         telemetry=TelemetryConfig(),
         model=ModelConfig(
             name="default",
-            hf_repo=args.model,
-            off=[p for p in (args.off or "").split(",") if p],
+            source=args.model,
+            skip_parts=[p for p in (args.off or "").split(",") if p],
             drafter=args.drafter,
             device_weight_budget=args.device_weight_budget,
             device_kv_budget=args.device_kv_budget,
-            # `kv_pages` retired from the schema (6d3189654): the worker
-            # refuses the key by name, so the flag is not forwarded.
-            engine=EngineConfig(
-                type=args.engine,
-                device=device,
-                options=engine_subsection,
-            ),
+        ),
+        engine=EngineConfig(
+            type=args.engine,
+            device=device,
+            options=engine_subsection,
         ),
     )
     async with Server(cfg) as server:

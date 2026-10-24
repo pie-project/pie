@@ -23,10 +23,11 @@ use worker_api::Request;
 
 use crate::admission::AdmissionDecision;
 use crate::blob::{BlobStore, GatewayOriginStore};
-use crate::policy::wit::{By, Outcome};
+use crate::policy::By;
 use crate::route::RoutingHandle;
 use crate::session::{AdmitReject, DispatchFail, Sessions, TurnRouter};
 use crate::worker::WorkerRegistry;
+use controller_api::Outcome;
 
 pub use crate::controller::GatewayControl;
 
@@ -39,11 +40,6 @@ pub struct Config {
     pub worker_listen: SocketAddr,
     #[serde(default = "default_controller")]
     pub controller: String,
-    /// The cluster policies: each a built-in policy's name or a component
-    /// path, no two granted the same write; none keeps the gateway's own
-    /// order.
-    #[serde(default)]
-    pub policies: Vec<String>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -62,7 +58,6 @@ impl Default for Config {
             listen: default_listen(),
             worker_listen: default_worker_listen(),
             controller: default_controller(),
-            policies: Vec::new(),
         }
     }
 }
@@ -81,20 +76,21 @@ pub struct GatewayState {
     pub routing: RoutingHandle,
     pub workers: WorkerRegistry,
     pub blobs: Arc<dyn BlobStore>,
-    pub router: Option<Arc<policy::Cluster>>,
+    pub router: Arc<policy::Cluster>,
 }
 
 struct RouteBackend {
     routing: RoutingHandle,
     workers: WorkerRegistry,
     located: Mutex<Located>,
-    router: Option<Arc<policy::Cluster>>,
+    router: Arc<policy::Cluster>,
 }
 
 impl RouteBackend {
+    /// The cluster policies, for a launch while any run.
     fn router_for(&self, req: &Request) -> Option<&policy::Cluster> {
         let launch = matches!(req.message, client_api::ClientMessage::LaunchProcess { .. });
-        self.router.as_deref().filter(|_| launch)
+        Some(self.router.as_ref()).filter(|router| launch && router.active())
     }
 }
 
@@ -246,7 +242,6 @@ impl Gateway {
         let worker_task = self._worker_task;
         let listener = self.listener;
         let app = self.app;
-        let policies = self.state.router.clone();
         let serve_shutdown = shutdown.clone();
         let serve_task = tokio::spawn(async move {
             let graceful = async move { serve_shutdown.notified().await };
@@ -260,7 +255,6 @@ impl Gateway {
         GatewayHandle {
             listen_addr,
             worker_addr,
-            policies,
             shutdown,
             serve_task,
             worker_task,
@@ -271,7 +265,6 @@ impl Gateway {
 pub struct GatewayHandle {
     pub listen_addr: SocketAddr,
     pub worker_addr: SocketAddr,
-    policies: Option<Arc<policy::Cluster>>,
     shutdown: Arc<Notify>,
     serve_task: tokio::task::JoinHandle<()>,
     worker_task: tokio::task::JoinHandle<()>,
@@ -281,13 +274,6 @@ pub struct GatewayHandle {
 pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl GatewayHandle {
-    /// The running cluster policies, which [`reload_policies`] swaps; none
-    /// on a gateway that started without any.
-    #[must_use]
-    pub fn policies(&self) -> Option<Arc<policy::Cluster>> {
-        self.policies.clone()
-    }
-
     /// Stops taking connections and lets open streams finish, for up to
     /// [`SHUTDOWN_GRACE`]: a stream that does not end in that time is cut.
     pub async fn shutdown(mut self) {
@@ -304,74 +290,44 @@ impl GatewayHandle {
     }
 }
 
-/// The components `specs` names, each a built-in policy's name or a file.
-fn policy_components(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
-    specs
-        .iter()
-        .map(|spec| Ok((spec.clone(), builtins::policy_component(spec)?.into_owned())))
-        .collect()
-}
-
-/// Swaps the cluster policies `policies` runs for those `specs` names (a
-/// SIGHUP's `[server] policies`): the new set loads whole or the old one
-/// runs on ([`policy::Cluster::reload`]).
-pub async fn reload_policies(policies: &policy::Cluster, specs: &[String]) -> Result<()> {
-    policies
-        .reload(policy_components(specs)?)
-        .await
-        .context("reload the cluster policies")
-}
-
 pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gateway> {
     let routing_rx = control.routing_watch();
 
-    let workers = WorkerRegistry::new();
+    let sink: Arc<dyn controller::DirectorySink> = Arc::new(control.clone());
+    let workers = WorkerRegistry::with_directory(Some(sink), control.directory_watch());
     let routing = RoutingHandle::new(routing_rx, workers.connected_watch());
-    // This gateway's id, once registered: with the routing table's author,
-    // whether it enacts the cluster-wide tables.
+    // This gateway's id, once registered: the cluster policies name its
+    // processes by it.
     let (me, me_rx) = watch::channel(None);
-    let authorship = routing.table_watch();
-    let router = if config.policies.is_empty() {
-        None
-    } else {
-        let programs = policy_components(&config.policies)?;
-        let (router, cancelled, moves) = policy::Cluster::start(
-            programs,
-            routing.table_watch(),
-            me_rx,
-            workers.connected_watch(),
-            workers.clone(),
-        )
-        .context("load the cluster policies")?;
-        Some((router, cancelled, moves))
-    };
-    let policy_router = router.as_ref().map(|(router, _, _)| router.clone());
-    let scale = policy_router.as_ref().map(|router| router.scale_watch());
+    let (router, mut cancelled, mut moves) = policy::Cluster::start(
+        control.clone(),
+        me_rx,
+        workers.connected_watch(),
+        workers.clone(),
+    );
     let sessions = Sessions::new(Arc::new(RouteBackend {
         routing: routing.clone(),
         workers: workers.clone(),
         located: Mutex::default(),
-        router: policy_router.clone(),
+        router: router.clone(),
     }));
-    if let Some((_, mut cancelled, mut moves)) = router {
-        let cancelling = sessions.clone();
-        tokio::spawn(async move {
-            while let Some(req) = cancelled.recv().await {
-                cancelling.terminate(req).await;
-            }
-        });
-        let moving = sessions.clone();
-        tokio::spawn(async move {
-            while let Some((req, target)) = moves.recv().await {
-                let moving = moving.clone();
-                tokio::spawn(async move {
-                    if !moving.migrate(req, target).await {
-                        tracing::debug!(%req, %target, "a turn did not move: it ended, has sent output, or is already there");
-                    }
-                });
-            }
-        });
-    }
+    let cancelling = sessions.clone();
+    tokio::spawn(async move {
+        while let Some(req) = cancelled.recv().await {
+            cancelling.terminate(req).await;
+        }
+    });
+    let moving = sessions.clone();
+    tokio::spawn(async move {
+        while let Some((req, target)) = moves.recv().await {
+            let moving = moving.clone();
+            tokio::spawn(async move {
+                if !moving.migrate(req, target).await {
+                    tracing::debug!(%req, %target, "a turn did not move: it ended, has sent output, or is already there");
+                }
+            });
+        }
+    });
     let blobs: Arc<dyn BlobStore> =
         Arc::new(GatewayOriginStore::new(format!("http://{}", config.listen)));
     let state = GatewayState {
@@ -379,7 +335,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         routing,
         workers: workers.clone(),
         blobs: blobs.clone(),
-        router: policy_router,
+        router,
     };
 
     let worker_server = worker::serve(config.worker_listen, sessions, workers)
@@ -397,9 +353,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         .await
         .context("register gateway with controller")?;
     tracing::info!(%gateway_id, %worker_addr, "gateway registered with controller");
-    tokio::spawn(controller::heartbeat_loop(
-        control, gateway_id, info, scale, me, authorship,
-    ));
+    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info, me));
 
     let app = Router::new()
         .merge(ingress::router(state.clone()))

@@ -213,6 +213,8 @@ impl Program {
         if edges.is_empty() {
             return Ok(Commit::default());
         }
+        // What it subscribes to, so what it is called with.
+        tracing::debug!(policy = self.name(), ?edges, "cluster policy edges");
         if edges.iter().any(|edge| matches!(edge, Edge::Timer)) {
             self.alarm = None;
         }

@@ -61,8 +61,7 @@ impl Server {
                     "a gateway serves the configured engine"
                 );
                 let mut config = config;
-                config.server.host = listen.ip().to_string();
-                config.server.port = listen.port();
+                config.server.listen = listen;
                 let controller = controller::Config::parse("")?;
                 let gateway = gateway::Config::parse("")?;
                 let handle = runtime.block_on(crate::standalone::run_standalone(
@@ -102,16 +101,10 @@ impl Server {
     }
 
     /// Boots `config` the way `pie serve` does: the gateway at its
-    /// `[server] host:port`.
+    /// `[server] listen`.
     #[cfg(feature = "standalone")]
     pub fn serve(config: Config, home: &Path) -> Result<Server> {
-        let host: std::net::IpAddr = config.server.host.parse().map_err(|_| {
-            anyhow!(
-                "[server] host {:?} is not an IP address",
-                config.server.host
-            )
-        })?;
-        let listen = SocketAddr::new(host, config.server.port);
+        let listen = config.server.listen;
         Server::start(config, home, Engine::Configured, Some(listen))
     }
 

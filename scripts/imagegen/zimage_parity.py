@@ -35,10 +35,10 @@ Two modes, one per row:
     python zimage_parity.py compare --out /tmp/zimage-parity
     python zimage_parity.py all     --out /tmp/zimage-parity [--turbo]
 
-`run` needs the config's `[model] model` to be the row's artifact (`pie model
+`run` needs the config's `[model] source` to be the row's artifact (`pie model
 import <golden dir> --deployment z-image-mini-bf16-kv-bf16`, or the Z-Image-Turbo
 snapshot under `--deployment z-image-turbo-bf16-kv-bf16`), and — for a case too large
-for argv — `[sandbox] allow_fs = true` with `fs_scratch_dir` equal to `--out`,
+for argv — `[sandbox] allow_fs = true` with `scratch_dir` equal to `--out`,
 since the case is then read as `/scratch/<name>` inside the sandbox.
 
 Nothing here imports torch EXCEPT `decode`, the last command: turning two
@@ -523,7 +523,7 @@ def main() -> int:
                     help="stop the trajectory after N steps and diff against sched.xN")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/zimage-parity"))
     ap.add_argument("--config", default=None,
-                    help="the serving config; its `[model] model` must be the row's artifact")
+                    help="the serving config; its `[model] source` must be the row's artifact")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true",
                     help="pass the case as a scratch file even when it fits argv")

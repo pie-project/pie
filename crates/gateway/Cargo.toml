@@ -14,7 +14,6 @@ crate-type = ["rlib"]
 
 
 [dependencies]
-builtins = { path = "../builtins" }
 ids = { path = "../ids" }
 controller-api = { path = "../controller-api" }
 worker-api = { path = "../worker-api" }
@@ -38,21 +37,10 @@ bytes = "1"
 blake3 = "1"
 anyhow = "1"
 tracing = "0.1"
-thiserror = "2.0.19"
-wasmparser = "0.259"
-wasmtime = { version = "49.0.2", default-features = false, features = [
-    "runtime",
-    "std",
-    "anyhow",
-    "cranelift",
-    "component-model",
-    "component-model-async",
-    "async",
-] }
-wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p3"] }
 
 [dev-dependencies]
 builtins = { path = "../builtins", features = ["test-policies"] }
+controller = { path = "../controller" }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 

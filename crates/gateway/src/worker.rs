@@ -48,24 +48,41 @@ pub struct WorkerRegistry {
 struct RegistryInner {
     clients: RwLock<HashMap<WorkerId, WorkerControlClient>>,
     connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
-    directory: crate::directory::Directory,
+    /// Where reports from the workers that link only here (pools) go: the
+    /// controller's directory. None: no controller, and they go nowhere.
+    sink: Option<Arc<dyn crate::controller::DirectorySink>>,
+    directory: watch::Receiver<controller_api::DirectoryView>,
+    /// The workers whose reports came through this gateway.
+    relayed: std::sync::Mutex<HashSet<WorkerId>>,
 }
 
 impl WorkerRegistry {
+    /// A registry that reads an empty directory and passes no report on.
     pub fn new() -> Self {
+        Self::with_directory(None, watch::channel(Default::default()).1)
+    }
+
+    /// A registry that reads the controller's directory from `directory`
+    /// and passes the reports of workers that link only here to `sink`.
+    pub(crate) fn with_directory(
+        sink: Option<Arc<dyn crate::controller::DirectorySink>>,
+        directory: watch::Receiver<controller_api::DirectoryView>,
+    ) -> Self {
         let (connected_tx, _rx) = watch::channel(Arc::new(HashSet::new()));
         Self {
             inner: Arc::new(RegistryInner {
                 clients: RwLock::new(HashMap::new()),
                 connected_tx,
-                directory: crate::directory::Directory::default(),
+                sink,
+                directory,
+                relayed: Default::default(),
             }),
         }
     }
 
-    /// Which connected worker holds which sealed page.
-    pub fn directory(&self) -> &crate::directory::Directory {
-        &self.inner.directory
+    /// Which worker holds which sealed page, as the controller last said.
+    pub fn directory(&self) -> crate::directory::Directory {
+        self.inner.directory.borrow().clone().into()
     }
 
     pub fn connected_watch(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
@@ -112,7 +129,17 @@ impl WorkerRegistry {
     }
 
     fn remove(&self, id: WorkerId) {
-        self.inner.directory.forget(id);
+        // A worker that reports to the controller itself is the controller's
+        // to forget; one whose reports came through here goes with its link.
+        if self.inner.relayed.lock().unwrap().remove(&id)
+            && let Some(sink) = self.inner.sink.clone()
+        {
+            tokio::spawn(async move {
+                if let Err(error) = sink.forget_state(id).await {
+                    tracing::warn!(worker = %id, error = %format!("{error:#}"), "the controller did not hear a pool go");
+                }
+            });
+        }
         let mut clients = self.inner.clients.write().unwrap();
         clients.remove(&id);
         Self::publish(&self.inner.connected_tx, &clients);
@@ -254,55 +281,18 @@ impl GatewayInbound for InboundServer {
         worker_id: WorkerId,
         report: worker_api::StateReport,
     ) {
-        let quiet = !report.full
-            && report.added.is_empty()
-            && report.removed.is_empty()
-            && report.runs_added.is_empty()
-            && report.runs_removed.is_empty();
-        // Workers report each second whether or not anything changed.
-        if !quiet {
-            tracing::debug!(
-                worker = %worker_id,
-                added = report.added.len(),
-                removed = report.removed.len(),
-                runs = report.runs_added.len(),
-                full = report.full,
-                "state report"
-            );
+        // Only a worker that links to no controller (a pool) reports here.
+        self.registry
+            .inner
+            .relayed
+            .lock()
+            .unwrap()
+            .insert(worker_id);
+        let Some(sink) = self.registry.inner.sink.clone() else {
+            return;
+        };
+        if let Err(error) = sink.report_state(worker_id, report).await {
+            tracing::debug!(worker = %worker_id, error = %format!("{error:#}"), "a pool's report not passed on");
         }
-        let directory = self.registry.directory();
-        if let Some(link) = report.link {
-            directory.report_link(worker_id, link);
-        }
-        directory.report(
-            worker_id,
-            report.peer,
-            report.added,
-            report.removed,
-            report.full,
-        );
-        directory.report_runs(
-            worker_id,
-            report.runs_added,
-            report.runs_removed,
-            report.full,
-            report.pool,
-        );
-        if let Some(published) = report.published {
-            directory.report_published(worker_id, published);
-        }
-    }
-
-    async fn link(self, _: tarpc::context::Context, worker: WorkerId) -> Option<String> {
-        self.registry.directory().link(worker)
-    }
-
-    async fn locate(
-        self,
-        _: tarpc::context::Context,
-        worker_id: WorkerId,
-        keys: Vec<[u8; 32]>,
-    ) -> Vec<(WorkerId, String, u32)> {
-        self.registry.directory().holders(worker_id, &keys)
     }
 }

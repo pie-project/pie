@@ -74,7 +74,7 @@ impl Settings {
         let mut model = toml::Table::new();
         model.insert("name".into(), "default".into());
         model.insert(
-            "model".into(),
+            "source".into(),
             artifact
                 .to_str()
                 .ok_or_else(|| anyhow!("{} is not UTF-8", artifact.display()))?
@@ -83,15 +83,15 @@ impl Settings {
         let mut engine = toml::Table::new();
         engine.insert("type".into(), kind.as_str().into());
         let device = match kind {
-            EngineKind::CudaNative => "cuda:0".to_string(),
+            EngineKind::Cuda => "cuda:0".to_string(),
             kind => format!("{}:0", kind.as_str()),
         };
         engine.insert("device".into(), device.into());
-        model.insert("engine".into(), engine.into());
         document.insert("model".into(), model.into());
+        document.insert("engine".into(), engine.into());
         let mut config = Config::parse(&document.to_string())?;
 
-        config.model.engine.options = self.engine_options(kind, home);
+        config.engine.options = self.engine_options(kind, home);
         config.model.device_kv_budget = self.device_kv_budget;
         config.model.device_memory_share = self.device_memory_share;
         if self.max_voxels.is_some() {
@@ -112,7 +112,7 @@ impl Settings {
         sandbox.warm_memory = ByteSize::default();
         sandbox.warm_slots = 0;
         sandbox.allow_fs = false;
-        sandbox.fs_scratch_dir = home.join("scratch");
+        sandbox.scratch_dir = home.join("scratch");
         sandbox.allow_network = false;
         sandbox.network_allowed_hosts.clear();
         Ok(config)
@@ -154,7 +154,7 @@ fn native_kind() -> EngineKind {
     if cfg!(all(feature = "metal", target_vendor = "apple")) {
         EngineKind::Metal
     } else if cfg!(feature = "engine-cuda") {
-        EngineKind::CudaNative
+        EngineKind::Cuda
     } else if cfg!(feature = "vulkan") {
         EngineKind::Vulkan
     } else {

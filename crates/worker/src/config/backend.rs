@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use super::units::ByteSize;
+use units::ByteSize;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CudaNativeEngineOptions {
+pub struct CudaEngineOptions {
     pub kv_page_size: Option<u32>,
     pub max_state_slots: Option<u32>,
     pub max_model_len: Option<u32>,
@@ -21,12 +21,12 @@ pub struct CudaNativeEngineOptions {
     pub nccl_transport: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetalEngineOptions {
-    pub kv_page_size: u32,
-    pub max_forward_tokens: u32,
-    pub max_forward_requests: u32,
+    pub kv_page_size: Option<u32>,
+    pub max_forward_tokens: Option<u32>,
+    pub max_forward_requests: Option<u32>,
     pub max_model_len: Option<u32>,
     pub max_state_slots: Option<u32>,
     pub diagnostics: Option<String>,
@@ -36,69 +36,51 @@ pub struct MetalEngineOptions {
     pub verbose: bool,
 }
 
-impl Default for MetalEngineOptions {
-    fn default() -> Self {
-        Self {
-            kv_page_size: 32,
-            max_forward_tokens: 10240,
-            max_forward_requests: 512,
-            max_model_len: None,
-            max_state_slots: None,
-            diagnostics: None,
-            device: "metal:0".to_string(),
-            verbose: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VulkanEngineOptions {
+    /// Which physical device, in `vkEnumeratePhysicalDevices` order: the
+    /// number in `[engine] device` (`vulkan:1`).
+    #[serde(skip)]
     pub device_index: u32,
-    pub max_forward_tokens: u32,
-    pub max_forward_requests: u32,
+    pub max_forward_tokens: Option<u32>,
+    pub max_forward_requests: Option<u32>,
     pub max_model_len: Option<u32>,
     pub max_state_slots: Option<u32>,
     pub validation: bool,
     pub pipeline_cache: Option<PathBuf>,
 }
 
-impl Default for VulkanEngineOptions {
-    fn default() -> Self {
-        Self {
-            device_index: 0,
-            max_forward_tokens: 10240,
-            max_forward_requests: 512,
-            max_model_len: None,
-            max_state_slots: None,
-            validation: false,
-            pipeline_cache: None,
-        }
+impl VulkanEngineOptions {
+    pub(super) fn validate(&self) -> Result<()> {
+        limits_are_positive(self.max_forward_tokens, self.max_forward_requests)
     }
 }
 
-impl VulkanEngineOptions {
-    pub(super) fn validate(&self) -> Result<()> {
-        ensure!(
-            self.max_forward_tokens > 0,
-            "engine.max_forward_tokens must be > 0"
-        );
-        ensure!(
-            self.max_forward_requests > 0,
-            "engine.max_forward_requests must be > 0"
-        );
-        Ok(())
-    }
+/// A stated fire ceiling of zero admits nothing.
+fn limits_are_positive(tokens: Option<u32>, requests: Option<u32>) -> Result<()> {
+    ensure!(
+        tokens != Some(0),
+        "engine.max_forward_tokens must be > 0; omit it for the engine's own"
+    );
+    ensure!(
+        requests != Some(0),
+        "engine.max_forward_requests must be > 0; omit it for the engine's own"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WgpuEngineOptions {
+    /// Which adapter, in enumeration order among the reachable ones: the
+    /// number in `[engine] device` (`wgpu:1`).
+    #[serde(skip)]
     pub adapter_index: u32,
     pub backends: Option<String>,
     pub power_preference: String,
-    pub max_forward_tokens: u32,
-    pub max_forward_requests: u32,
+    pub max_forward_tokens: Option<u32>,
+    pub max_forward_requests: Option<u32>,
     pub max_model_len: Option<u32>,
     pub max_state_slots: Option<u32>,
     pub pipeline_cache: Option<PathBuf>,
@@ -111,8 +93,8 @@ impl Default for WgpuEngineOptions {
             adapter_index: 0,
             backends: None,
             power_preference: "high-performance".to_string(),
-            max_forward_tokens: 10240,
-            max_forward_requests: 512,
+            max_forward_tokens: None,
+            max_forward_requests: None,
             max_model_len: None,
             max_state_slots: None,
             pipeline_cache: None,
@@ -132,14 +114,7 @@ impl WgpuEngineOptions {
              \"low-power\", \"none\"; got {:?}",
             self.power_preference
         );
-        ensure!(
-            self.max_forward_tokens > 0,
-            "engine.max_forward_tokens must be > 0"
-        );
-        ensure!(
-            self.max_forward_requests > 0,
-            "engine.max_forward_requests must be > 0"
-        );
+        limits_are_positive(self.max_forward_tokens, self.max_forward_requests)?;
         if let Some(memory) = self.device_memory {
             ensure!(
                 memory.as_bytes() > 0,
@@ -152,19 +127,20 @@ impl WgpuEngineOptions {
 }
 
 /// The XLA engine: a PJRT plugin (libtpu on a TPU host) driving one device.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct XlaEngineOptions {
     /// The PJRT plugin to load. Omit to find one: `PIE_XLA_PLUGIN`, then
     /// `TPU_LIBRARY_PATH`, then `libtpu.so` on the loader's path.
     pub plugin: Option<PathBuf>,
-    /// Which of the plugin's addressable devices this engine drives.
+    /// Which of the plugin's addressable devices this engine drives: the
+    /// number in `[engine] device` (`tpu:1`).
+    #[serde(skip)]
     pub device_index: u32,
-    /// The kv pool, in pages. Omit for the engine's own default.
-    /// The most tokens one fire carries.
-    pub max_forward_tokens: u32,
-    /// The most requests one fire carries.
-    pub max_forward_requests: u32,
+    /// The most tokens one fire carries. Omit for the engine's own.
+    pub max_forward_tokens: Option<u32>,
+    /// The most requests one fire carries. Omit for the engine's own.
+    pub max_forward_requests: Option<u32>,
     /// Recurrent-state seats (hybrid models).
     pub max_state_slots: Option<u32>,
     /// The longest sequence (prompt + output) one lane holds, in tokens.
@@ -175,31 +151,9 @@ pub struct XlaEngineOptions {
     pub prewarm: bool,
 }
 
-impl Default for XlaEngineOptions {
-    fn default() -> Self {
-        Self {
-            plugin: None,
-            device_index: 0,
-            max_forward_tokens: 2048,
-            max_forward_requests: 64,
-            max_state_slots: None,
-            max_model_len: None,
-            prewarm: false,
-        }
-    }
-}
-
 impl XlaEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
-        ensure!(
-            self.max_forward_tokens > 0,
-            "engine.max_forward_tokens must be > 0"
-        );
-        ensure!(
-            self.max_forward_requests > 0,
-            "engine.max_forward_requests must be > 0"
-        );
-        Ok(())
+        limits_are_positive(self.max_forward_tokens, self.max_forward_requests)
     }
 }
 
@@ -215,10 +169,10 @@ pub struct CerebrasEngineOptions {
     pub cmaddr: Option<String>,
     /// Host threads the simulator and the host-side staging use.
     pub num_threads: u32,
-    /// The most tokens one fire carries.
-    pub max_forward_tokens: u32,
-    /// The most requests one fire carries.
-    pub max_forward_requests: u32,
+    /// The most tokens one fire carries. Omit for the engine's own.
+    pub max_forward_tokens: Option<u32>,
+    /// The most requests one fire carries. Omit for the engine's own.
+    pub max_forward_requests: Option<u32>,
     /// Recurrent-state seats (hybrid models).
     pub max_state_slots: Option<u32>,
     /// The longest sequence (prompt + output) one lane holds, in tokens.
@@ -234,8 +188,8 @@ impl Default for CerebrasEngineOptions {
             target: "wse3".to_string(),
             cmaddr: None,
             num_threads: 16,
-            max_forward_tokens: 64,
-            max_forward_requests: 4,
+            max_forward_tokens: None,
+            max_forward_requests: None,
             max_state_slots: None,
             max_model_len: None,
             prewarm: false,
@@ -251,19 +205,11 @@ impl CerebrasEngineOptions {
             self.target
         );
         ensure!(self.num_threads > 0, "engine.num_threads must be > 0");
-        ensure!(
-            self.max_forward_tokens > 0,
-            "engine.max_forward_tokens must be > 0"
-        );
-        ensure!(
-            self.max_forward_requests > 0,
-            "engine.max_forward_requests must be > 0"
-        );
-        Ok(())
+        limits_are_positive(self.max_forward_tokens, self.max_forward_requests)
     }
 }
 
-impl CudaNativeEngineOptions {
+impl CudaEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
         if let Some(size) = self.kv_page_size {
             ensure!(

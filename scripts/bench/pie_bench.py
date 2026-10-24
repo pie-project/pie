@@ -78,7 +78,7 @@ PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
 # Metal's engine takes these two unconditionally: its planner has no lattice
 # to collapse, so a value is always wanted. The CUDA engine documents the
 # opposite -- "Omit to let the memory planner choose ... A guess here is worse
-# than absence" (`crates/worker/src/config.rs`) -- so cuda_native forwards them only
+# than absence" (`crates/worker/src/config.rs`) -- so cuda forwards them only
 # when the caller moved them off these defaults.
 PIE_MAX_FORWARD_TOKENS_DEFAULT = 10240
 PIE_MAX_FORWARD_REQUESTS_DEFAULT = 512
@@ -253,7 +253,7 @@ def build_config(args: argparse.Namespace):
         args.device = ",".join(f"cuda:{i}" for i in range(args.tp_size))
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     engine_options: dict[str, Any]
-    if args.engine == "cuda_native":
+    if args.engine == "cuda":
         engine_options = {}
         # Eight `engine_options` writes STOOD HERE (`memory_profile`,
         # `kv_cache_dtype`, `runtime_quant`, `mxfp4_moe`,
@@ -473,8 +473,7 @@ def build_config(args: argparse.Namespace):
     resolved_model = resolve_local_model(args.model)
     cfg = Config(
         server=ServerConfig(
-            host="127.0.0.1",
-            port=0,
+            listen="127.0.0.1:0",
             verbose=True,
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
@@ -515,22 +514,22 @@ def build_config(args: argparse.Namespace):
         ),
         model=ModelConfig(
             name="default",
-            hf_repo=resolved_model,
+            source=resolved_model,
             # `[model] device_weight_budget` / `host_weight_budget`: the
             # residency lever (what stays on the device, what streams). Metal
             # derives them from the working set when unset.
             device_weight_budget=getattr(args, "device_weight_budget", None),
             host_weight_budget=getattr(args, "host_weight_budget", None),
             device_kv_budget=getattr(args, "device_kv_budget", None),
-            precision=getattr(args, "precision", None),
-            kv=getattr(args, "kv", None),
+            weight_precision=getattr(args, "precision", None),
+            kv_dtype=getattr(args, "kv", None),
             device_memory_share=args.gpu_mem_util,
-            engine=EngineConfig(
-                type=args.engine,
-                device=device,
-                tensor_parallel_size=args.tp_size,
-                options=engine_options,
-            )
+        ),
+        engine=EngineConfig(
+            type=args.engine,
+            device=device,
+            tensor_parallel_size=args.tp_size,
+            options=engine_options,
         ),
     )
     config_blob = {
@@ -1504,8 +1503,8 @@ def build_parser() -> argparse.ArgumentParser:
         # `metal` is back: its engine is wired into `pie serve` again (P5), and
         # `EMBEDDED_CLI_ENGINES` above has named it the whole time. `vulkan`
         # and `wgpu` are still absent because no build of pie hosts them.
-        sp.add_argument("--engine", default="cuda_native",
-                        choices=["cuda_native", "metal", "vllm", "sglang",
+        sp.add_argument("--engine", default="cuda",
+                        choices=["cuda", "metal", "vllm", "sglang",
                                  "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
@@ -1513,11 +1512,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--cpu-mem-budget", type=int, default=0)
         sp.add_argument(
             "--kv-pages", type=int, default=2048,
-            help="DEAD for cuda_native: never reaches engine_options, so it "
+            help="DEAD for cuda: never reaches engine_options, so it "
                  "silently does nothing. Use --device-kv-budget to cap KV.",
         )
         sp.add_argument("--precision", default=None,
-                        help="[model] precision, e.g. bf16+nvfp4a4")
+                        help="[model] weight_precision, e.g. bf16+nvfp4a4")
         sp.add_argument("--kv", default=None,
                         help="[model] kv, e.g. e4m3 (DeepSeek-V4's fp8 rows)")
         sp.add_argument(
@@ -1531,7 +1530,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--swap-pool-size",
             type=int,
             default=0,
-            help="Host-side swap pages (cuda_native engine option). Must be "
+            help="Host-side swap pages (cuda engine option). Must be "
                  ">0 to arm the suspend/restore rung; 0 leaves the residency "
                  "planner with pool-only reclaim.",
         )

@@ -246,7 +246,7 @@ fn discover(snapshot_dir: &Path) -> Result<Discovered, Error> {
         return Err(Error::Checkpoint(format!(
             "{} holds {} serving artifacts and this load names none of them: {}. \
              Two artifacts of one model is what the naming is for — a different \
-             backend, degree or precision — so `[model] model` has to name the \
+             backend, degree or precision — so `[model] source` has to name the \
              file rather than the directory.",
             snapshot_dir.display(),
             specialized.len(),

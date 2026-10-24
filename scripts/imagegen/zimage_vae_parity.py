@@ -13,7 +13,7 @@ sent to the client as a PNG that `pie run -o DIR` writes to disk.
     # 1. the case the inferlet reads (the golden latent, as JSON)
     python zimage_vae_parity.py case    --out /tmp/zimage-vae
 
-    # 2. run it (the config's `[model] model` is the imported artifact)
+    # 2. run it (the config's `[model] source` is the imported artifact)
     python zimage_vae_parity.py run     --out /tmp/zimage-vae \
         --config ~/.pie/config.zimage-vae.toml
 
@@ -285,7 +285,7 @@ def main() -> int:
     ap.add_argument("stage", choices=["case", "run", "compare", "all"])
     ap.add_argument("--out", default="/tmp/zimage-vae", help="working directory")
     ap.add_argument("--golden", default=DEFAULT_GOLDEN, help="the reference dump")
-    ap.add_argument("--config", default=None, help="pie config (its `[model] model` is the artifact)")
+    ap.add_argument("--config", default=None, help="pie config (its `[model] source` is the artifact)")
     ap.add_argument("--pie", default=None, help="the pie binary")
     ap.add_argument("--png", default="zimage-vae.png",
                     help="send the pixels to the client under this name; empty to skip")

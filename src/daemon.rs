@@ -19,7 +19,7 @@ pub struct BootSpec {
     pub name: &'static str,
     pub version: &'static str,
     pub default_config_filename: &'static str,
-    pub default_metrics_addr: Option<&'static str>,
+    pub default_metrics_listen: Option<&'static str>,
 }
 
 impl BootSpec {
@@ -28,7 +28,7 @@ impl BootSpec {
             name,
             version: "0.0.0",
             default_config_filename: "config.toml",
-            default_metrics_addr: None,
+            default_metrics_listen: None,
         }
     }
 
@@ -42,27 +42,27 @@ impl BootSpec {
         self
     }
 
-    fn default_metrics_addr(mut self, addr: &'static str) -> Self {
-        self.default_metrics_addr = Some(addr);
+    fn default_metrics_listen(mut self, addr: &'static str) -> Self {
+        self.default_metrics_listen = Some(addr);
         self
     }
 
     pub fn worker() -> Self {
         Self::new("worker")
             .default_config_filename("worker.toml")
-            .default_metrics_addr("127.0.0.1:9100")
+            .default_metrics_listen("127.0.0.1:9100")
     }
 
     pub fn gateway() -> Self {
         Self::new("gateway")
             .default_config_filename("gateway.toml")
-            .default_metrics_addr("127.0.0.1:9101")
+            .default_metrics_listen("127.0.0.1:9101")
     }
 
     pub fn controller() -> Self {
         Self::new("controller")
             .default_config_filename("controller.toml")
-            .default_metrics_addr("127.0.0.1:9102")
+            .default_metrics_listen("127.0.0.1:9102")
     }
 
     pub fn pie() -> Self {
@@ -148,14 +148,17 @@ pub fn init(spec: BootSpec, global: GlobalArgs) -> Result<Ctx> {
     let config = read_config(&spec, &global)?;
     let (path, _) = config_path_or(&global, spec.default_config_filename);
 
-    let metrics_addr: Option<SocketAddr> =
-        match global.metrics_addr.as_deref().or(spec.default_metrics_addr) {
-            Some(s) => Some(
-                s.parse()
-                    .with_context(|| format!("parsing metrics address {s:?}"))?,
-            ),
-            None => None,
-        };
+    let metrics_addr: Option<SocketAddr> = match global
+        .metrics_listen
+        .as_deref()
+        .or(spec.default_metrics_listen)
+    {
+        Some(s) => Some(
+            s.parse()
+                .with_context(|| format!("parsing metrics address {s:?}"))?,
+        ),
+        None => None,
+    };
 
     if let Some(addr) = metrics_addr {
         spawn_metrics(addr, Instant::now(), spec.name, spec.version)?;
@@ -302,11 +305,11 @@ mod tests {
     fn each_role_names_its_config_and_metrics() {
         assert_eq!(BootSpec::worker().name, "worker");
         assert_eq!(BootSpec::worker().default_config_filename, "worker.toml");
-        assert!(BootSpec::worker().default_metrics_addr.is_some());
+        assert!(BootSpec::worker().default_metrics_listen.is_some());
         assert_eq!(BootSpec::gateway().name, "gateway");
         assert_eq!(BootSpec::controller().name, "controller");
         assert_eq!(BootSpec::pie().name, "pie");
-        assert!(BootSpec::pie().default_metrics_addr.is_none());
+        assert!(BootSpec::pie().default_metrics_listen.is_none());
         assert_eq!(BootSpec::gateway().version("1.2.3").version, "1.2.3");
     }
 
@@ -318,7 +321,7 @@ mod tests {
         let present = GlobalArgs {
             config: Some(path.to_string_lossy().into_owned()),
             log_level: "info".into(),
-            metrics_addr: None,
+            metrics_listen: None,
         };
         assert_eq!(read_config(&spec, &present).unwrap(), "key = 1\n");
         std::fs::remove_file(&path).ok();
@@ -326,7 +329,7 @@ mod tests {
         let missing = GlobalArgs {
             config: Some("/nonexistent/pie-daemon-missing.toml".into()),
             log_level: "info".into(),
-            metrics_addr: None,
+            metrics_listen: None,
         };
         assert!(read_config(&spec, &missing).is_err());
     }

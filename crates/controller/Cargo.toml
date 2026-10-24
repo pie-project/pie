@@ -14,6 +14,7 @@ crate-type = ["rlib"]
 
 
 [dependencies]
+units = { path = "../units" }
 controller-api = { path = "../controller-api" }
 ids = { path = "../ids" }
 tarpc = { version = "0.38", features = [
@@ -28,10 +29,28 @@ futures = "0.3"
 tracing = "0.1"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+builtins = { path = "../builtins" }
+client-api = { package = "pie-client-api", path = "../client-api" }
+serde_json = "1"
+thiserror = "2.0.19"
+wasmparser = "0.259"
+wasmtime = { version = "49.0.2", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "cranelift",
+    "component-model",
+    "component-model-async",
+    "async",
+] }
+wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p3"] }
 toml = "1.1"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
+
+[dev-dependencies]
+builtins = { path = "../builtins", features = ["test-policies"] }
 
 [lints]
 workspace = true

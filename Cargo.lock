@@ -839,16 +839,24 @@ name = "controller"
 version = "0.5.4"
 dependencies = [
  "anyhow",
+ "builtins",
  "controller-api",
  "futures",
  "ids",
+ "pie-client-api",
  "rustix",
  "serde",
+ "serde_json",
  "tarpc",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "toml",
  "tracing",
+ "units",
+ "wasmparser 0.259.0",
+ "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]
@@ -2358,6 +2366,7 @@ dependencies = [
  "blake3",
  "builtins",
  "bytes",
+ "controller",
  "controller-api",
  "futures",
  "ids",
@@ -2366,14 +2375,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tarpc",
- "thiserror 2.0.21",
  "tokio",
  "toml",
  "tower",
  "tracing",
- "wasmparser 0.259.0",
- "wasmtime",
- "wasmtime-wasi",
  "worker-api",
 ]
 
@@ -6884,6 +6889,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
 
 [[package]]
+name = "units"
+version = "0.5.4"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8277,6 +8289,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transport",
+ "units",
  "worker-api",
  "ztensor",
 ]

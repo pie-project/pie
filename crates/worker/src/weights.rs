@@ -327,7 +327,7 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
     };
     bail!(
         "{} holds {} artifacts of one model{asked}. Name the one to serve in \
-         `[model] model` — {candidates} — or state `[model] precision` or \
+         `[model] source` — {candidates} — or state `[model] weight_precision` or \
          `[model] drafter` to pick between artifacts of one backend.",
         dir.display(),
         named.len(),
@@ -643,7 +643,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(why.contains("[model] precision"), "{why}");
+        assert!(why.contains("[model] weight_precision"), "{why}");
     }
 
     fn artifact(dir: &Path, config: &[u8], whole_tokenizer: bool) -> Model {

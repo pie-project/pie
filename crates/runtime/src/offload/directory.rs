@@ -74,3 +74,38 @@ pub fn cached_runs() -> Vec<Vec<Hash256>> {
     }
     runs
 }
+
+/// Every page this worker's persistent disk tier keeps a copy of, by key.
+pub fn persisted_keys() -> HashSet<Hash256> {
+    let mut keys = HashSet::new();
+    for stores in crate::store::registry::all_for_model(0) {
+        keys.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
+            kv.persisted_keys()
+        }));
+    }
+    keys
+}
+
+/// The runs whose owner asked a prefix of them kept on disk: each run's last
+/// key, and the tokens asked.
+pub fn persist_hints() -> Vec<(Hash256, u64)> {
+    let mut hints = Vec::new();
+    for stores in crate::store::registry::all_for_model(0) {
+        hints.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
+            kv.persist_hints()
+        }));
+    }
+    hints.sort_unstable();
+    hints
+}
+
+/// The tokens one kv page holds, and whether the disk tier is kept across
+/// runs; none without a model.
+pub fn disk_tier() -> Option<(u32, bool)> {
+    let stores = crate::store::registry::all_for_model(0);
+    let page_size = stores.first()?.kv_page_size;
+    let persistent = stores
+        .iter()
+        .any(|stores| with_kv_lock(&stores.kv, "offload-report", |kv| kv.disk_persistent()));
+    Some((page_size, persistent))
+}

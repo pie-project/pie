@@ -16,7 +16,7 @@ doc = "How many workers of the shape the cluster should run; a negative count as
 
 [props.scale-engine]
 type = "text"
-doc = "The shape's engine kind, as a worker's config spells it (`cuda_native`)."
+doc = "The shape's engine kind, as a worker's config spells it (`cuda`)."
 
 [props.scale-model]
 type = "text"

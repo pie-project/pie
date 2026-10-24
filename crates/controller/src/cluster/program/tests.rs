@@ -1,6 +1,6 @@
 use super::*;
-use crate::policy::ManifestError;
-use crate::policy::wit::Dispatch;
+use crate::cluster::ManifestError;
+use crate::cluster::wit::Dispatch;
 
 #[derive(Default, Clone)]
 struct Fake {
@@ -45,7 +45,7 @@ impl Plane for Fake {
     }
 
     fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
-        let (Subject::Process(id) | Subject::Worker(id)) = of else {
+        let (Subject::Process(id) | Subject::Worker(id) | Subject::Group(id)) = of else {
             return None;
         };
         self.attrs
@@ -150,6 +150,38 @@ fn retain_all_retains_every_group_above_key_0() {
     let retention = commit.state.retention.expect("a retention table");
     assert_eq!((retention.key("g1"), retention.key("g2")), (1, 1));
     assert_eq!(retention.keys.len(), 2);
+}
+
+#[test]
+fn persist_prefix_keeps_the_asked_prefix_on_disk_where_the_group_is() {
+    let mut program = load("persist-prefix").unwrap();
+    let plane = Fake {
+        groups: vec!["asked".into(), "not".into()],
+        ..Fake::default()
+    }
+    .attr("asked", "persist-tokens", Value::Int(40))
+    .attr("asked", "sites", Value::Json(r#"["1","7"]"#.into()))
+    .attr("not", "sites", Value::Json(r#"["1"]"#.into()));
+    let copied = Edge::Copied(types::Residency {
+        group: "asked".into(),
+        site: types::Site {
+            worker: "1".into(),
+            tier: types::Tier::Host,
+        },
+    });
+    let commit = program.react(Box::new(plane), vec![copied], 0).unwrap();
+    let replication = commit.state.replication.expect("a replication table");
+    assert_eq!(replication.len(), 1, "only the group that asked");
+    let entry = &replication[0];
+    assert_eq!((entry.group.as_str(), entry.upto), ("asked", Some(40)));
+    assert_eq!(
+        entry
+            .at
+            .iter()
+            .map(|site| (site.worker.as_str(), site.tier))
+            .collect::<Vec<_>>(),
+        [("1", types::Tier::Disk), ("7", types::Tier::Disk)]
+    );
 }
 
 #[test]
