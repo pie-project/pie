@@ -39,7 +39,7 @@ TAPS3 = 9
 
 def conv_weights(c_out, c_in, taps):
     return struct(
-        w = weight([c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], dtype.bf16),
         bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,

@@ -28,6 +28,9 @@ sdpa.mla_dense_short = true
 # A prefill's pooled index scored on tcgen05 and ranked by radix select.
 sdpa.index_tc5 = true
 sdpa.index_radix = true
+# V4.1's FP4 index keys scored as they are on the block-scaled MMA, at any
+# row count.
+sdpa.index_fp4_tc5 = true
 # The hyper-connection pre-mix norm emits the next fp8 GEMM's operand.
 elemwise.norm_emit = true
 # Routed bf16 selects on the tcgen05 grouped GEMM.
@@ -100,6 +103,11 @@ moe.routes_sized = true
 # round up to 128 tokens; past them its one block a multiprocessor costs waves.
 moe.gather_ahead_until = 128
 moe.w4a8_fused_from = 512
+# A decode's routed MLP up to 2048 routes in one persistent launch, the
+# mega-MoE (DeepSeek-V4's W4A8 experts, bf16 banks).
+moe.mega_until = 2048
+# bf16 banks from 64 routes: a narrower fire streams them faster apart.
+moe.mega_bf16_from = 64
 # The fused qkv write a warp a head below 256 rows.
 attn.qkv_rows_from = 256
 # KDA: chunked prefill on the tensor cores, a fused decode step.

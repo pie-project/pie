@@ -178,6 +178,19 @@ pub struct SsmKdaStepFused;
 /// weighted sum with (its GLU landing the down leg's e4m3 operand from the
 /// gate-up epilogue); never (65 536 past any fire) but where a chip's
 /// profile says (B200's).
+/// The most routes a routed MLP runs as the mega-MoE (`linear::moe::mega`:
+/// the gate-up product, GLU, down product and fold in one persistent
+/// launch); none (0) but where a chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mega_until", constant(range(0..=2048)), default = 0, tune = search)]
+pub struct MoeMegaUntil(pub u32);
+
+/// The fewest routes a bf16 routed MLP runs as the mega-MoE (up to
+/// `kernel.moe.mega_until`): fewer stream their banks faster apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mega_bf16_from", constant(range(0..=2048)), default = 0, tune = search)]
+pub struct MoeMegaBf16From(pub u32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.w4a8_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a8FusedFrom(pub u32);
@@ -409,6 +422,15 @@ pub struct SdpaIndexMma;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.index_tc5", flag, default = false, tune = search)]
 pub struct SdpaIndexTc5;
+
+/// Whether a pooled index over FP4 keys (DeepSeek-V4.1's, its queries read
+/// at FP4) scores them on tcgen05's block-scaled MMA as they are
+/// (`attn/index/logits_fp4_sm100.cu`: e2m1 against e2m1, a key a lane, a
+/// decode's keys split over the multiprocessors), then ranks in a launch of
+/// its own; off, the keys are widened to bf16 for the other scorers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_fp4_tc5", flag, default = false, tune = search)]
+pub struct SdpaIndexFp4Tc5;
 
 /// Whether a prefill's hyper-connection pre-mix norm lands its row's e4m3
 /// 1x128 operand beside it, for the fp8 GEMMs that read it next, in place of
@@ -820,6 +842,8 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmBiasEpilogue>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
+        .add::<MoeMegaUntil>()
+        .add::<MoeMegaBf16From>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
@@ -856,6 +880,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
+        .add::<SdpaIndexFp4Tc5>()
         .add::<ElemwiseNormEmit>()
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
@@ -956,6 +981,8 @@ tuning! {
     gemm_bias_epilogue: bool = false, on GemmBiasEpilogue;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
+    moe_mega_until: u32 = 0, get MoeMegaUntil;
+    moe_mega_bf16_from: u32 = 0, get MoeMegaBf16From;
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
@@ -992,6 +1019,7 @@ tuning! {
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
+    index_fp4_tc5: bool = false, on SdpaIndexFp4Tc5;
     norm_emit: bool = false, on ElemwiseNormEmit;
     index_radix: bool = false, on SdpaIndexRadix;
     pool_mma: bool = false, on SdpaPoolMma;

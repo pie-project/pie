@@ -165,4 +165,32 @@ __device__ __forceinline__ void select_top_radix(const float* __restrict__ frow,
     for (int n = written + tid; n < topk; n += kBlock) srow[n] = -1;
 }
 
+// DeepSeek-V4.1's FP4 index keys: a position's 128 dims as e2m1 pairs (64
+// bytes, the lower dim in the low nibble) under one ue8m0 exponent a 32 (4
+// bytes), a page of `ps` positions its `ps` data rows then its `ps` scale
+// rows. The reference's `fp4_act_quant(k, 32, ue8m0)`: the exponent
+// 2^ceil(log2(amax / 6)), amax floored at 6 * 2^-126, the codes e2m1 of
+// x / 2^e. Its queries are read alike.
+namespace index_fp4 {
+
+constexpr int kD = 128;
+constexpr int kData = kD / 2;
+constexpr int kScale = kD / 32;
+constexpr int kRow = kData + kScale;
+
+// The biased exponent of 2^ceil(log2(amax * (1/6))), as the reference's
+// `fast_round_scale` takes it off the product's bits.
+__device__ __forceinline__ int e8m0_ceil6(float amax) {
+    const unsigned bits = __float_as_uint(fmaxf(amax, 6.f * 1.1754943508222875e-38f) * (1.f / 6.f));
+    return static_cast<int>((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u ? 1 : 0);
+}
+
+__device__ __forceinline__ float pow2_of(int e) {
+    return e != 0 ? __uint_as_float(static_cast<unsigned>(e) << 23) : __uint_as_float(0x00400000u);
+}
+
+}
+
+// namespace index_fp4
+
 }

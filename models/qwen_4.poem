@@ -102,7 +102,10 @@ def routed(n, hidden, m, experts, proj, gate):
         router = weight([m.experts, hidden], gate),
         gate_up = weight([m.experts, 2 * m.inter, hidden], experts).bank([m.inter, m.inter]),
         down = weight([m.experts, hidden, m.inter], experts).rows(),
-        shared_gate_up = weight([2 * m.shared_inter, hidden], proj).packed([m.shared_inter, m.shared_inter]),
+        shared = struct(
+            gate = weight([m.shared_inter, hidden], proj).columns(),
+            up = weight([m.shared_inter, hidden], proj).columns(),
+        ),
         shared_down = weight([hidden, m.shared_inter], proj).rows(),
         shared_gate = weight([1, hidden], gate),
         experts = m.experts,
@@ -617,7 +620,8 @@ def read_routed(reads, f, n, layout):
     else:
         reads.read(f.gate_up, n("mlp.experts.gate_up_proj"))
         reads.read(f.down, n("mlp.experts.down_proj"))
-    reads.read_concat(f.shared_gate_up, [n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")])
+    reads.read(f.shared.gate, n("mlp.shared_expert.gate_proj.weight"))
+    reads.read(f.shared.up, n("mlp.shared_expert.up_proj.weight"))
     reads.read(f.shared_down, n("mlp.shared_expert.down_proj.weight"))
     reads.read(f.shared_gate, n("mlp.shared_expert_gate.weight"))
 
@@ -797,10 +801,8 @@ def moe(x, f):
 
     hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, experts, f.top_k), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, experts, f.top_k), weights)
-    shared = ops.linear.matmul(
-        ops.linear.glu(ops.linear.matmul(x, f.shared_gate_up), gating.swiglu(), f.shared_inter),
-        f.shared_down,
-    )
+    gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
+    shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.shared_down)
     return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
 
 MROPE_SECTIONS = [11, 11, 10]

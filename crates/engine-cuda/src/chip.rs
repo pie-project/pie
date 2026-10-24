@@ -519,6 +519,7 @@ mod tests {
                 assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.index_fp4_tc5, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.mla_sparse, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
                     tuning.compressed_prefill_from,
@@ -579,6 +580,8 @@ mod tests {
                         gemv_narrow: false,
                         mla_naive: false,
                         moe_tc5: defaults.moe_tc5,
+                        moe_mega_until: defaults.moe_mega_until,
+                        moe_mega_bf16_from: defaults.moe_mega_bf16_from,
                         ssm_gdn_fused_scan: false,
                         ssm_gdn_tc5: false,
                         rows_vec: false,
@@ -637,6 +640,7 @@ mod tests {
                         mxfp4_cvt_ksplit_until: 0,
                         hc_mma: false,
                         index_tc5: false,
+                        index_fp4_tc5: false,
                         norm_emit: false,
                         qkv_rows_from: defaults.qkv_rows_from,
                         q_norm_rope_warp: false,
@@ -883,6 +887,7 @@ mod tests {
         assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
         assert_eq!(b200.moe_gather_ahead_until, 128);
         assert_eq!(b200.moe_w4a8_fused_from, 512);
+        assert_eq!((b200.moe_mega_until, b200.moe_mega_bf16_from), (2048, 64));
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);
         assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));

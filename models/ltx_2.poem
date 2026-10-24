@@ -210,7 +210,7 @@ def connector(prefix, text_in, dim, heads, layers, caption, banks):
 def vae_conv(c_out, c_in, banks):
     taps = 27
     return struct(
-        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], banks),
         bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,

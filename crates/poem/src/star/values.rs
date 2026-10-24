@@ -141,13 +141,6 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         crate::star::forward::dsl("bank", || WeightValue(this.0.clone().bank(segments.items)))
     }
 
-    /// A conv's weight, its taps major and `c_in` inputs minor.
-    fn conv_taps_major(this: &WeightValue, c_in: u32, taps: u32) -> anyhow::Result<WeightValue> {
-        crate::star::forward::dsl("conv_taps_major", || {
-            WeightValue(this.0.clone().conv_taps_major(c_in, taps))
-        })
-    }
-
     /// The weight is cut along its rows between ranks; `heads` are the
     /// heads its rows hold.
     fn columns(

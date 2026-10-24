@@ -155,7 +155,7 @@ def text_encoder(banks):
 def conv_weights(name, c_out, c_in, k, plane, banks, front = None):
     taps = k[0] * k[1] * k[2]
     return struct(
-        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], banks),
         bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,

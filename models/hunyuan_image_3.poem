@@ -78,7 +78,7 @@ DIMS = {
 def conv_weights(c_out, c_in, k, banks):
     taps = k[0] * k[1] * k[2]
     return struct(
-        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], banks),
         bias = weight([c_out], dtype.f32),
         k = k,
     )

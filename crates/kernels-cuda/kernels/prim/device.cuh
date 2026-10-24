@@ -49,6 +49,22 @@ __device__ __forceinline__ unsigned int pack_bf16x2(float lo, float hi) {
     return r;
 }
 
+// a * b + c a lane of each pair, each rounded once: one packed f32x2 FMA
+// where the chip has it (sm_100 up), else two.
+__device__ __forceinline__ float2 fma2(float2 a, float2 b, float2 c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    unsigned long long d;
+    asm("{\n\t.reg .b64 a, b, c;\n\t"
+        "mov.b64 a, {%1, %2};\n\tmov.b64 b, {%3, %4};\n\tmov.b64 c, {%5, %6};\n\t"
+        "fma.rn.f32x2 %0, a, b, c;\n\t}"
+        : "=l"(d)
+        : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y), "f"(c.x), "f"(c.y));
+    return make_float2(__uint_as_float(static_cast<unsigned>(d)), __uint_as_float(static_cast<unsigned>(d >> 32)));
+#else
+    return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+
 __device__ __forceinline__ unsigned short bf16_as_u16(bf16 v) { return v.raw; }
 __device__ __forceinline__ bf16 u16_as_bf16(unsigned short v) { return bf16{v}; }
 __device__ __forceinline__ unsigned int bf16x2_as_u32(bf16 lo, bf16 hi) {

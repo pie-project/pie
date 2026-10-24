@@ -171,15 +171,65 @@ pub(crate) fn ranked_tc5(
         ),
         &[ArgValue::of(&map), ArgValue::of(&map8), bytes],
     )?;
+    select(ctx, bytes, selection)?;
+    Ok(true)
+}
+
+/// The rows a scorer landed in `scores` ranked a block a row
+/// (`index_select_rows`), as [`ranked_tc5`] ranks its own.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_rows(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    keys: &KvPool,
+    heads: i32,
+    top_k: i32,
+    ratio: i32,
+    score_stride: i32,
+    scores: u64,
+    num_requests: i32,
+    selection: &mut Tensor,
+) -> Result<(), Error> {
+    let params = Tc5Params {
+        q: q.data.ptr,
+        w: 0,
+        qo_indptr: q.indptr.ptr,
+        page_indices: keys.page_indices.ptr,
+        page_indptr: keys.page_indptr.ptr,
+        last_page_lens: keys.last_page_lens.ptr,
+        scores,
+        turn_pos: 0,
+        win: match ctx.stage() {
+            ArgValue::Ptr(at) => at,
+            _ => 0,
+        },
+        requests: num_requests,
+        heads,
+        page_size: keys.page_size,
+        score_stride,
+        top_k,
+        ratio,
+        per: 0,
+        rows: stated("attn.index_topk", selection.rows)?,
+        turn_dim: 0,
+        turn_theta: 0.0,
+        turn_factor: 1.0,
+        turn_low: 0.0,
+        turn_high: 0.0,
+        sub: 0,
+    };
+    select(ctx, ArgValue::of(&params), selection)
+}
+
+fn select(ctx: &Ctx, params: ArgValue<'_>, selection: &mut Tensor) -> Result<(), Error> {
     let radix = ctx.tuning().index_radix;
     ctx.fire(
-        OP,
+        "attn.index_topk",
         Fire::at(kernel(
             LOGITS_SM100,
             &format!("::pie::attn::index::index_select_rows<{radix}>"),
         ))
         .apply(Launch::grid([selection.rows, 1, 1], [K_BLOCK, 1, 1])),
-        &[bytes, selection.arg()],
-    )?;
-    Ok(true)
+        &[params, selection.arg()],
+    )
 }
