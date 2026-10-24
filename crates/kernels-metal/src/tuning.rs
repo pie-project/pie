@@ -27,6 +27,8 @@ pub enum Qmm {
     /// 8 rows, a whole number of its column tiles.
     #[partial]
     Mpp,
+    /// Up to 8 rows of 4-bit, 64-group banks whose operands are fed to the
+    /// tensor-op multiply in registers, laid as Apple10 lays them.
     #[partial]
     Staged,
     /// Up to 8 rows of 4-bit, 64-group banks on the simdgroup-matrix MMA,
@@ -90,6 +92,14 @@ pub fn fill(rows: u32, n: u32, cores: u32) -> i64 {
 }
 
 impl Qmm {
+    /// Whether this kernel answers right on a GPU of `family`: the staged
+    /// tile fills its operands in Apple10's register layout, which earlier
+    /// families with the same tensor ops lay otherwise.
+    #[must_use]
+    pub fn runs_on(&self, family: u32) -> bool {
+        !matches!(self, Qmm::Staged) || family >= 10
+    }
+
     fn fits_shape(&self, at: &QmmAt) -> bool {
         match self {
             Qmm::Mpp => {
