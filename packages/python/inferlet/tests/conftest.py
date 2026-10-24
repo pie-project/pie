@@ -116,7 +116,6 @@ def _make_model() -> types.ModuleType:
 class BlockDrafterStub:
     rows: int
     mask_token: int
-    bidirectional: bool
     proposals_from: int
 
 

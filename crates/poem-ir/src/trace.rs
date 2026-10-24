@@ -188,7 +188,6 @@ pub struct Trace {
 pub struct BlockDrafter {
     pub rows: u32,
     pub mask_token: u32,
-    pub bidirectional: bool,
     #[serde(default = "one")]
     pub proposals_from: u32,
 }

@@ -166,7 +166,6 @@ fn build_model(
                 mtp_depth: g.caps.profile.mtp_depth,
                 draft_block: g.caps.profile.draft_block,
                 draft_mask_token: g.caps.profile.draft_mask_token,
-                draft_bidirectional: g.caps.profile.draft_bidirectional,
                 draft_proposals_from: g.caps.profile.draft_proposals_from,
                 has_value_head: g.caps.profile.has_value_head,
                 has_kv_envelopes: false,

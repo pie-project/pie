@@ -45,20 +45,19 @@ fn the_block_drafters_state_their_facts_every_case() {
 }
 
 fn every_drafter_text_states_its_block() {
-    let drafter = |rows, mask_token, bidirectional, proposals_from| BlockDrafter {
+    let drafter = |rows, mask_token, proposals_from| BlockDrafter {
         rows,
         mask_token,
-        bidirectional,
         proposals_from,
     };
     let table = [
-        ("qwen36-27b-dflash-", drafter(16, 248_070, true, 1)),
-        ("qwen36-35b-a3b-dflash-", drafter(16, 248_077, true, 1)),
-        ("qwen38-27b-dflash2-", drafter(8, 248_070, true, 1)),
-        ("qwen36-35b-a3b-dflash2-", drafter(8, 248_077, true, 1)),
-        ("qwen38-27b-dspark-", drafter(15, 248_200, true, 0)),
-        ("gemma4-26b-a4b-dflash-", drafter(16, 4, true, 1)),
-        ("gptoss-20b-dflash-", drafter(8, 200_000, true, 1)),
+        ("qwen36-27b-dflash-", drafter(16, 248_070, 1)),
+        ("qwen36-35b-a3b-dflash-", drafter(16, 248_077, 1)),
+        ("qwen38-27b-dflash2-", drafter(8, 248_070, 1)),
+        ("qwen36-35b-a3b-dflash2-", drafter(8, 248_077, 1)),
+        ("qwen38-27b-dspark-", drafter(15, 248_200, 0)),
+        ("gemma4-26b-a4b-dflash-", drafter(16, 4, 1)),
+        ("gptoss-20b-dflash-", drafter(8, 200_000, 1)),
     ];
     for (prefix, want) in table {
         for platform in PLATFORMS {

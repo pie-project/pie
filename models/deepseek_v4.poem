@@ -1571,7 +1571,6 @@ def dspark_readout(m, inputs, logits, ends):
         logits,
         rows = ds.block,
         mask_token = ds.noise,
-        bidirectional = False,
         proposals_from = 0,
     )
     read = lambda x: ops.gather.gather_rows(x, inputs.readout_rows()).on(drafting)

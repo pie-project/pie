@@ -211,17 +211,6 @@ def caches(d, c, space):
         plane = a.kv_heads * a.head_dim
         c.kv(space, a.kv, [plane, plane], a.head_dim, heads = True)
 
-def attends_both_ways(d):
-    """Whether a block attends every row before it and every row of its
-    block: one with no window, or any block of a head that reads its block
-    both ways."""
-    if d.bidirectional:
-        return True
-    for b in d.blocks:
-        if b.window == None:
-            return True
-    return False
-
 def block_rows(d):
     """The rows of a drafted block."""
     return fact.block_draft()
@@ -308,7 +297,6 @@ def plant_readout(d, logits, inputs, read, block_draft):
         logits,
         rows = d.block,
         mask_token = d.mask_token,
-        bidirectional = attends_both_ways(d),
         proposals_from = d.proposals_from,
     )
     dlogits = logits.on(block_draft)

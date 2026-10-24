@@ -366,7 +366,6 @@ pub struct EtaCaps {
     pub mtp_depth: u32,
     pub draft_block: u32,
     pub draft_mask_token: u32,
-    pub draft_bidirectional: bool,
     pub draft_proposals_from: u32,
     pub has_value_head: bool,
     pub has_kv_envelopes: bool,
