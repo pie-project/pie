@@ -441,3 +441,121 @@ impl Pass {
         self.trace.nodes = nodes;
     }
 }
+
+/// What a rank with no tokens of its own runs while the others step: each
+/// lowered layer's dispatch (sending nothing), the experts it holds over the
+/// rows the others send it, and the combine that sends them back, in layer
+/// order and nothing else. The dispatch reads its tokens and routes as
+/// [`RuntimeInput::Idle`] rows: no row of them is live. `None` where `lowered`
+/// dispatches nothing, or where its experts read a value only the rest of
+/// the model makes.
+#[must_use]
+pub fn idle(lowered: &Trace) -> Option<Trace> {
+    let mut kept = BTreeSet::new();
+    let mut held = BTreeSet::new();
+    let mut ins = Vec::new();
+    let mut outs = Vec::new();
+    for (at, node) in lowered.nodes.iter().enumerate() {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        let take = match &node.op {
+            Operation::Collective(Collective::Dispatch { .. }) => true,
+            Operation::Collective(Collective::Combine { y, .. }) => held.contains(y),
+            _ => ins.iter().any(|v| held.contains(v)),
+        };
+        if !take {
+            continue;
+        }
+        kept.insert(at);
+        outs.clear();
+        node.op.outputs(&mut outs);
+        if !matches!(node.op, Operation::Collective(Collective::Combine { .. })) {
+            held.extend(outs.iter().copied());
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+
+    // Every value the kept nodes read is made by one of them, a weight, or a
+    // dispatch's own tokens, routes and weights.
+    let mut idle_rows = BTreeSet::new();
+    for &at in &kept {
+        ins.clear();
+        lowered.nodes[at].op.inputs(&mut ins);
+        let dispatch = matches!(
+            lowered.nodes[at].op,
+            Operation::Collective(Collective::Dispatch { .. })
+        );
+        for v in &ins {
+            match lowered.values[v.0 as usize].def {
+                _ if dispatch => {
+                    idle_rows.insert(*v);
+                }
+                Def::Weight(_) => {}
+                Def::Op(i) if kept.contains(&(i as usize)) => {}
+                _ => return None,
+            }
+        }
+    }
+
+    let mut used = BTreeSet::new();
+    for &at in &kept {
+        lowered.nodes[at].op.inputs(&mut ins);
+        lowered.nodes[at].op.outputs(&mut ins);
+        used.extend(ins.drain(..));
+    }
+    let mut params = Vec::new();
+    let mut param_of = BTreeMap::new();
+    let mut value_of = BTreeMap::new();
+    let mut values = Vec::new();
+    let mut landed = BTreeMap::new();
+    for (n, &at) in kept.iter().enumerate() {
+        landed.insert(at as u32, n as u32);
+    }
+    for &v in &used {
+        let decl = &lowered.values[v.0 as usize];
+        let def = if idle_rows.contains(&v) {
+            Def::Input(poem_ir::RuntimeInput::Idle)
+        } else {
+            match &decl.def {
+                Def::Weight(p) => {
+                    let next = params.len() as u32;
+                    let p = *param_of.entry(*p).or_insert_with(|| {
+                        params.push(lowered.params[*p as usize].clone());
+                        next
+                    });
+                    Def::Weight(p)
+                }
+                Def::Op(i) => Def::Op(landed[i]),
+                other => other.clone(),
+            }
+        };
+        value_of.insert(v, ValueId(values.len() as u32));
+        values.push(ValueDecl {
+            def,
+            ty: decl.ty.clone(),
+        });
+    }
+    let nodes = kept
+        .iter()
+        .map(|&at| {
+            let node = &lowered.nodes[at];
+            Node {
+                op: crate::tree::remap(&node.op, &|v| value_of[&v]),
+                ..node.clone()
+            }
+        })
+        .collect();
+    Some(Trace {
+        name: format!("{}.idle", lowered.name),
+        platform: lowered.platform,
+        params,
+        caches: Vec::new(),
+        values,
+        nodes,
+        seams: Vec::new(),
+        drafter: None,
+        facts: lowered.facts.clone(),
+    })
+}

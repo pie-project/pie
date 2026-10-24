@@ -1638,6 +1638,9 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::Grid) => self.fire.grid.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's clip grid, which no lane of it submitted")
             }),
+            Def::Input(RuntimeInput::Idle) => panic!(
+                "value {at} is an idle expert-parallel rank's row, which only an idle fire binds"
+            ),
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
                 self.fire.token_grid.unwrap_or_else(|| {
                     panic!(

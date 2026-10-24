@@ -208,6 +208,10 @@ pub enum RuntimeInput {
     Grid,
     Voxels { port: u8, channels: u32 },
     TokenGrid { p: [u32; 3] },
+    /// Rows no live row reads: an idle expert-parallel rank's tokens and
+    /// routes, which its dispatch sends none of. An engine binds any buffer
+    /// of the value's size.
+    Idle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

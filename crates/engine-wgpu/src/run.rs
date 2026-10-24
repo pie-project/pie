@@ -519,6 +519,9 @@ impl<'c> Run<'c> {
             ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
             Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
             Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Idle) => panic!(
+                "value {at} is an idle expert-parallel rank's row, which only an idle fire binds"
+            ),
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
                 self.voxel_seat(at).token_grid.unwrap_or_else(|| {
                     panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
