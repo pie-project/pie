@@ -1491,7 +1491,7 @@ impl FrameShell for Shell {
             self.armed_body = bodied.then(|| key.clone());
         }
 
-        let carve_rows = if bodied {
+        let carve_rows = if bodied || !self.compiled.expert.is_empty() {
             composition.bucket().max(composition.rows())
         } else {
             composition.rows()

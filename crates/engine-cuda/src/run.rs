@@ -585,6 +585,9 @@ pub struct Run<'c> {
     /// The fire's taps, told of each node's layer as it is enqueued.
     tapping: Option<&'c crate::tap::Tapping>,
 
+    /// The values an expert region makes, by id (`CompiledModel::expert`).
+    expert: &'c [bool],
+
     /// Rows this walk quantized for the FP8 products, by value, staged
     /// window and context, with the region and hold they sit in: their codes
     /// and scales, for the later products of the same rows.
@@ -680,6 +683,7 @@ impl<'c> Run<'c> {
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
             tapping: None,
+            expert: &[],
             #[cfg(feature = "rocm")]
             fp8_rows: Vec::new(),
             #[cfg(feature = "rocm")]
@@ -764,6 +768,12 @@ impl<'c> Run<'c> {
     #[must_use]
     pub fn tapping(mut self, tapping: Option<&'c crate::tap::Tapping>) -> Self {
         self.tapping = tapping;
+        self
+    }
+
+    #[must_use]
+    pub fn expert(mut self, held: &'c [bool]) -> Self {
+        self.expert = held;
         self
     }
 
@@ -1358,6 +1368,9 @@ impl<'c> Run<'c> {
 
     fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
+        if self.expert.get(at).copied().unwrap_or(false) {
+            return self.received(at, handle);
+        }
         if self.window().gathered.is_some() {
             return self.compacted(id, handle);
         }
@@ -1425,6 +1438,27 @@ impl<'c> Run<'c> {
         Tensor::new(
             handle.ptr + u64::from(skip) * stride,
             keep.min(handle.rows.saturating_sub(skip)),
+            handle.width,
+            handle.dtype,
+        )
+    }
+
+    /// An expert region's value: the rows this rank received, every rank's
+    /// tokens at the step's bucket from the first, whatever this rank's own
+    /// window or walk. Its arena slot is carved at the bucket for it.
+    fn received(&self, at: usize, handle: Tensor) -> Tensor {
+        let Ty::Tensor { shape, .. } = &self.values[at].ty else {
+            return handle;
+        };
+        let times = match shape.first() {
+            Some(Dim::TokensTimes(k)) => *k,
+            Some(Dim::Tokens) => 1,
+            _ => return handle,
+        };
+        let bucket = self.ceilings.pad_on(poem_ir::RowAxis::Tokens).bucket;
+        Tensor::new(
+            handle.ptr,
+            (bucket * times).min(handle.rows),
             handle.width,
             handle.dtype,
         )

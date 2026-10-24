@@ -524,7 +524,10 @@ impl FireCtx<'_> {
             }
         }
 
-        let carve_rows = if p.bodied {
+        // Under expert parallelism the received rows are every rank's, at
+        // the bucket: every fire carves for them.
+        let received = !self.compiled.expert.is_empty();
+        let carve_rows = if p.bodied || received {
             u64::from(p.composition.bucket()).max(u64::from(rows))
         } else {
             u64::from(rows)
@@ -773,7 +776,7 @@ impl FireCtx<'_> {
             });
         let armed = kernels_cuda::Pad {
             rows: p.composition.rows(),
-            bucket: if self.pad {
+            bucket: if self.pad || !self.compiled.expert.is_empty() {
                 p.composition.bucket()
             } else {
                 p.composition.rows()
@@ -829,7 +832,8 @@ impl FireCtx<'_> {
         .ceilings(ceilings)
         .decoded_tiles(self.decoded_tiles)
         .unread(self.unread)
-        .tapping(self.tapping);
+        .tapping(self.tapping)
+        .expert(&self.compiled.expert);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
