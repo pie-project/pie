@@ -52,12 +52,10 @@ struct Params {
     u8* hpool;              // [pool rows][inter]
     u8* hpool_sf;           // W4A8
     bf16* routed;           // [tokens * top][hidden]: each route's down row
-    float* partials;        // split: [split][tokens * top][2][inter], each share's sums
     u32* sync;              // ws_words() words, zero at rest
     const u32* win;         // the live window (tokens, first token), or null
     int tokens, top, experts, hidden, inter;
     float limit;            // the GLU's clamp (SwiGLU-clamp)
-    int split;              // a gate-up tile's shares of K
 };
 
 constexpr u32 kTileA = 128 * 128;  // a 128-row, 128-byte box
@@ -145,7 +143,6 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     int* task_slot = reinterpret_cast<int*>(task_empty + kSlots);
     u32* tmem_slot = reinterpret_cast<u32*>(task_slot + kSlots);
     u32* flag = tmem_slot + 1;
-    u32* wg_flag = flag + 1;  // an epilogue warpgroup's own, two
     float* wmax_all = reinterpret_cast<float*>(smem + kOffTail + 256);
     Routing& R = *reinterpret_cast<Routing*>(smem + kOffTail + 256 + 2 * 4 * 4 * kBN);
 
@@ -196,8 +193,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     const u32 tmem = *tmem_slot;
     const int blocks = R.bstart[p.experts];
     const int live_routes = R.start[p.experts];
-    const int split = p.split;
-    const int tasks = blocks * (j1 * split + j2);
+    const int tasks = blocks * (j1 + j2);
     const long long route0 = static_cast<long long>(R.t0) * K;
     const u32 chunks = static_cast<u32>(H / kChunk);
     u32* xready = p.sync + ws_xready();
@@ -230,12 +226,10 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                     ++ended;
                     continue;
                 }
-                const Task x = task_of<kBN>(R, t, blocks, j1, j2, split);
+                const Task x = task_of<kBN>(R, t, blocks, j1, j2);
                 const int nk = x.l2 ? I / (2 * kBoxK) : H / kBoxK;
-                const int kb0 = x.l2 ? 0 : x.part * nk / split;
-                const int kb1 = x.l2 ? nk : (x.part + 1) * nk / split;
                 const int row = x.l2 ? x.e * H + 128 * x.j : x.e * 2 * I + 128 * x.j;
-                for (int kb = kb0; kb < kb1; ++kb) {
+                for (int kb = 0; kb < nk; ++kb) {
                     bar_wait(&empty[s], ph ^ 1);
                     bar_arrive_expect_tx(&full[s], kTxA);
                     unsigned char* a = smem + s * kStageA;
@@ -272,17 +266,15 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                 const int t = claimed(n);
                 bar_arrive(&task_empty[n % kSlots]);
                 if (t < 0) break;
-                const Task x = task_of<kBN>(R, t, blocks, j1, j2, split);
+                const Task x = task_of<kBN>(R, t, blocks, j1, j2);
                 const int nk = x.l2 ? I / (2 * kBoxK) : H / kBoxK;
-                const int kb0 = x.l2 ? 0 : x.part * nk / split;
-                const int kb1 = x.l2 ? nk : (x.part + 1) * nk / split;
                 const int p0 = x.b * kPoolStride;
                 if (!x.l2) {
                     wait_count(&xready[x.b], static_cast<u32>(x.rows) * chunks);
                     fence_proxy_global();
                 }
                 u32 have = 0;
-                for (int kb = kb0; kb < kb1; ++kb) {
+                for (int kb = 0; kb < nk; ++kb) {
                     if (x.l2) {
                         // A down step's K: the gate-up tiles 2 kb and 2 kb + 1
                         // (W4A8), or tile kb (bf16).
@@ -329,10 +321,8 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             __syncwarp();
             if (lane == 0) bar_arrive(&task_empty[n % kSlots]);
             if (t < 0) break;
-            const Task x = task_of<kBN>(R, t, blocks, j1, j2, split);
+            const Task x = task_of<kBN>(R, t, blocks, j1, j2);
             const int nk = x.l2 ? I / (2 * kBoxK) : H / kBoxK;
-            const int kb0 = x.l2 ? 0 : x.part * nk / split;
-            const int kb1 = x.l2 ? nk : (x.part + 1) * nk / split;
             const u32 acc = static_cast<u32>(it) % 2;
             bar_wait(&tempty[acc], ((static_cast<u32>(it) / 2) & 1) ^ 1);
             tc_fence_after();
@@ -340,7 +330,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             // The block's rows from their own half of the atom (the MMA faults
             // on scales at an odd quarter).
             const u32 quarter = static_cast<u32>((x.b * kPoolStride) % 128) / 32;
-            for (int kb = kb0; kb < kb1; ++kb) {
+            for (int kb = 0; kb < nk; ++kb) {
                 bar_wait(&full[s], ph);
                 tc_fence_after();
                 __syncwarp();
@@ -360,7 +350,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                         for (u32 j = 0; j < 8; ++j) {
                             const u64 a = da + (j / 4) * (kTileA >> 4) + 2 * (j % 4);
                             const u64 b = db + (j / 4) * ((kBN * 128) >> 4) + 2 * (j % 4);
-                            const bool more = kb > kb0 || j > 0;
+                            const bool more = kb > 0 || j > 0;
                             if constexpr (kW4) {
                                 // The weights' scale column kb * 8 + j (atom
                                 // j / 4), the rows' kb * 2 + j / 4.
@@ -378,7 +368,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                             const u64 da = sdesc_sw128(ta + h * kTileA);
 #pragma unroll
                             for (u32 j = 0; j < 4; ++j) {
-                                const bool more = kb > kb0 || j > 0;
+                                const bool more = kb > 0 || j > 0;
                                 if constexpr (kW4) {
                                     // The gate's (h 0) or up's atom, column j;
                                     // the rows' column kb.
@@ -486,7 +476,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                 __syncwarp();
                 if (lane == 0) bar_arrive(&task_empty[n % kSlots]);
                 if (t < 0) break;
-                const Task x = task_of<kBN>(R, t, blocks, j1, j2, split);
+                const Task x = task_of<kBN>(R, t, blocks, j1, j2);
                 const u32 acc = static_cast<u32>(wg);
                 bar_wait(&tfull[acc], (static_cast<u32>(n) / 2) & 1);
                 tc_fence_after();
@@ -522,58 +512,15 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                 // The live columns alone, a TMEM column at a time: a loop
                 // unrolled over every column runs past the instruction cache.
                 if (!x.l2) {
-                    // A share of a split tile lands its sums; the last share in
-                    // sums them all, in share order, and lands the GLU.
-                    const long long cap = static_cast<long long>(p.tokens) * K;
-                    auto share = [&](int part, int c) {
-                        return p.partials + ((part * cap) + x.s0 + c) * 2 * I + col;
-                    };
-                    if (split > 1) {
-                        for (int c = 0; c < x.rows; ++c) {
-                            u32 g, u;
-                            tmem_ld1(base + c, g);
-                            tmem_ld1(base + kBN + c, u);
-                            tmem_wait_ld();
-                            float* at = share(x.part, c);
-                            at[0] = __uint_as_float(g);
-                            at[I] = __uint_as_float(u);
-                        }
-                        tc_fence_before();
-                        __syncwarp();
-                        if (lane == 0) bar_arrive(&tempty[acc]);
-                        wg_sync(wg);
-                        if (i == 0) {
-                            wg_flag[wg] = add_acq_rel(&p.sync[ws_parts() + x.b * j1 + x.j], 1u);
-                        }
-                        wg_sync(wg);
-                        const bool last = wg_flag[wg] == static_cast<u32>(split - 1);
-                        wg_sync(wg);
-                        if (!last) continue;
-                        if (i == 0) p.sync[ws_parts() + x.b * j1 + x.j] = 0;
-                        fence_acquire();
-                    }
                     // Column c's GLU, the gate-up product read as the apart
                     // select lands it, in bf16.
                     auto glu_of = [&](int c) {
-                        float gs, us;
-                        if (split > 1) {
-                            gs = 0.f;
-                            us = 0.f;
-                            for (int part = 0; part < split; ++part) {
-                                const float* at = share(part, c);
-                                gs += __ldcg(at);
-                                us += __ldcg(at + I);
-                            }
-                        } else {
-                            u32 g, u;
-                            tmem_ld1(base + c, g);
-                            tmem_ld1(base + kBN + c, u);
-                            tmem_wait_ld();
-                            gs = __uint_as_float(g);
-                            us = __uint_as_float(u);
-                        }
-                        float gv = bf16_round(gs);
-                        float uv = bf16_round(us);
+                        u32 g, u;
+                        tmem_ld1(base + c, g);
+                        tmem_ld1(base + kBN + c, u);
+                        tmem_wait_ld();
+                        float gv = bf16_round(__uint_as_float(g));
+                        float uv = bf16_round(__uint_as_float(u));
                         float y;
                         if constexpr (kGlu == 2) {
                             gv = fminf(gv, p.limit);
@@ -614,11 +561,9 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                         bf16* hp = reinterpret_cast<bf16*>(p.hpool);
                         for (int c = 0; c < x.rows; ++c) hp[(p0 + c) * I + col] = f32_to_bf16(glu_of(c));
                     }
-                    if (split == 1) {
-                        tc_fence_before();
-                        __syncwarp();
-                        if (lane == 0) bar_arrive(&tempty[acc]);
-                    }
+                    tc_fence_before();
+                    __syncwarp();
+                    if (lane == 0) bar_arrive(&tempty[acc]);
                     fence_proxy_global();
                     wg_sync(wg);
                     if (i == 0) or_release(&hready[x.b], 1u << x.j);

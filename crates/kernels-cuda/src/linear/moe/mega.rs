@@ -22,7 +22,6 @@ const POOL_X_SF: &str = "linear.moe_mega_x_atoms";
 const POOL_H: &str = "linear.moe_mega_h";
 const POOL_H_SF: &str = "linear.moe_mega_h_atoms";
 const ROUTED: &str = "linear.moe_mega_routed";
-const PARTIALS: &str = "linear.moe_mega_partials";
 const SYNC: &str = "linear.moe_mega_sync";
 
 /// `pie::linear::mega::Params`, field for field.
@@ -40,7 +39,6 @@ struct Params {
     hpool: u64,
     hpool_sf: u64,
     routed: u64,
-    partials: u64,
     sync: u64,
     win: u64,
     tokens: i32,
@@ -49,7 +47,6 @@ struct Params {
     hidden: i32,
     inter: i32,
     limit: f32,
-    split: i32,
 }
 
 /// `pie::linear::mega` bounds: experts, routes a fire, 128-column output
@@ -59,10 +56,7 @@ const MAX_ROUTES: u32 = 2048;
 const MAX_COL_TILES: u32 = 64;
 const MAX_GLU_TILES: u32 = 32;
 /// `pie::linear::mega::ws_words`: the flags, zero at rest.
-/// `pie::linear::mega::kMaxSplitTiles`: a split fire's gate-up tiles.
-const MAX_SPLIT_TILES: u32 = 8192;
-const SYNC_WORDS: usize =
-    2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 2 + MAX_SPLIT_TILES as usize;
+const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 2;
 /// `pie::linear::mega::kChunk`: the columns a quantizer pass reads.
 const CHUNK: u32 = 1024;
 /// `pie::linear::mega::kPoolStride`: a block's pool rows 64 apart.
@@ -271,7 +265,9 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         Glu::Swiglu if !w4 => (1, f32::INFINITY),
         _ => return Ok(false),
     };
-    if w4 && !first {
+    // A W4A8 fire's weights first; a bf16 one from `kernel.moe.mega_bf16_from`
+    // routes, a narrower one streaming its banks faster apart.
+    if (w4 && !first) || (!w4 && count < ctx.tuning().moe_mega_bf16_from) {
         return Ok(false);
     }
     let Some(sms) = ctx.multiprocessors() else {
@@ -297,24 +293,6 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         (0, 0)
     };
     let routed = ctx.scratch_stream(OP, ROUTED, count as usize * hidden as usize * 2)? as u64;
-    // A decode's few gate-up tiles split K, each share on its own SM, so the
-    // first product's tiles fill the card (`kernel.moe.mega_split`, the most
-    // shares a tile): as many shares as bring the tiles its expert count
-    // makes at most to the SMs.
-    let tiles = experts.min(count) * (inter / 128);
-    let mut split = 1u32;
-    while split < ctx.tuning().moe_mega_split
-        && tiles * split < sms
-        && count * (inter / 128) <= MAX_SPLIT_TILES
-    {
-        split *= 2;
-    }
-    let partials = if split > 1 {
-        let bytes = split as usize * count as usize * 2 * inter as usize * 4;
-        ctx.scratch_stream(OP, PARTIALS, bytes)? as u64
-    } else {
-        0
-    };
     let sync = ctx.scratch_stream_zeroed(OP, SYNC, SYNC_WORDS * 4)? as u64;
     let map_up = operand_map(
         up_codes.ptr,
@@ -354,7 +332,6 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         hpool,
         hpool_sf,
         routed,
-        partials,
         sync,
         win,
         tokens: int(tokens)?,
@@ -363,7 +340,6 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         hidden: int(hidden)?,
         inter: int(inter)?,
         limit,
-        split: int(split)?,
     };
     let kind = u32::from(w4);
     let first = u32::from(first);

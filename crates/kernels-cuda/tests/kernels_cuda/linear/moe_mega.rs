@@ -422,7 +422,11 @@ fn the_bf16_mega_moe_answers_the_composition_apart() {
     let mut b = Bench::new(0xbf16);
     let up = bf16_bank(&mut b, s.experts, 2 * s.inter, s.hidden);
     let down = bf16_bank(&mut b, s.experts, s.hidden, s.inter);
-    let ctx = b.ctx().with_tuning(SM100);
+    // Every width the kernel takes, B200's floor for bf16 banks aside.
+    let ctx = b.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        moe_mega_bf16_from: 0,
+        ..SM100
+    });
     for first in [false, true] {
         for tokens in [1usize, 5, 40] {
             let what = format!("{tokens} tokens, weights first {first}");

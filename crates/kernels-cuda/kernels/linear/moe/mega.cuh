@@ -12,8 +12,7 @@
 // laid so.
 //
 // The tasks: first the gate-up tiles (`L1`: a block's 128 intermediate
-// columns, their gate rows and their up rows; a decode's few in shares of
-// K, the last share in summing them), then the down tiles (`L2`: a
+// columns, their gate rows and their up rows), then the down tiles (`L2`: a
 // block's 128 output columns). A CTA claims the next task from a global
 // count as its ring frees: a gate-up task waits on nothing but its rows'
 // quantization, and a down task (claimed only once every gate-up task is) on
@@ -48,22 +47,12 @@ __host__ __device__ constexpr int ws_hready() { return kMaxRoutes; }
 __host__ __device__ constexpr int ws_done() { return 2 * kMaxRoutes; }
 __host__ __device__ constexpr int ws_finish() { return 2 * kMaxRoutes + kMaxColTiles; }
 __host__ __device__ constexpr int ws_next() { return ws_finish() + 1; }
-// A split gate-up tile's parts landed: its last part zeroes the count as it
-// sums them. A split fire's blocks' tiles, kMaxSplitTiles at most.
-constexpr int kMaxSplitTiles = 8192;
-__host__ __device__ constexpr int ws_parts() { return ws_next() + 1; }
-__host__ __device__ constexpr int ws_words() { return ws_parts() + kMaxSplitTiles; }
+__host__ __device__ constexpr int ws_words() { return ws_next() + 1; }
 
 // ---- cross-CTA flags ---------------------------------------------------------
 
 __device__ __forceinline__ void add_release(u32* p, u32 v) {
     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
-
-__device__ __forceinline__ u32 add_acq_rel(u32* p, u32 v) {
-    u32 old;
-    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
-    return old;
 }
 
 __device__ __forceinline__ void or_release(u32* p, u32 v) {
@@ -230,22 +219,19 @@ struct Task {
     int l2;    // 0 a gate-up tile, 1 a down tile
     int b;     // the block
     int j;     // its 128-column tile
-    int part;  // a gate-up tile's share of K (of the fire's `split`)
     int e;     // the block's expert
     int rows;  // its live rows
     int s0;    // its first sorted route
 };
 
-// Task `t` of `blocks * (j1 * split + j2)`: the gate-up tiles (j1 a block,
-// each in `split` shares of K, adjacent), then the down tiles (j2 a block).
+// Task `t` of `blocks * (j1 + j2)`: the gate-up tiles (j1 a block), then
+// the down tiles (j2 a block).
 template <int kBN>
-__device__ __forceinline__ Task task_of(const Routing& R, int t, int blocks, int j1, int j2,
-                                        int split) {
+__device__ __forceinline__ Task task_of(const Routing& R, int t, int blocks, int j1, int j2) {
     Task x;
-    const int n1 = blocks * j1 * split;
+    const int n1 = blocks * j1;
     x.l2 = t >= n1 ? 1 : 0;
-    const int u = x.l2 ? t - n1 : t / split;
-    x.part = x.l2 ? 0 : t - u * split;
+    const int u = x.l2 ? t - n1 : t;
     const int per = x.l2 ? j2 : j1;
     x.b = u / per;
     x.j = u - x.b * per;
