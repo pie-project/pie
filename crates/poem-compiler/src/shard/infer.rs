@@ -14,7 +14,10 @@
 //! vocab-split head gathers) puts its weights back whole, and the trace is
 //! read again until nothing changes. Where a share meets the partial sums of
 //! another, the product that contracted the other's share is the one put
-//! back whole, so a low-rank pair cuts its wide half by its columns.
+//! back whole, so a low-rank pair cuts its wide half by its columns. A
+//! product whose weight the model states whole reads the share before it
+//! gathered instead, where one gather puts the share back in order: the
+//! column cut is kept, and the projection after it runs whole on every rank.
 //!
 //! A packed product's segments are where the ops that read its share take
 //! it apart, and a segment's heads are what an op reading it `head_dim`
@@ -113,9 +116,9 @@ pub fn resolve(trace: &mut Trace) -> Vec<(String, Shard)> {
 /// param's cut over its logical shape.
 fn inferred(trace: &Trace, pinned: BTreeSet<usize>) -> (Vec<Shard>, Vec<Shard>) {
     let reading = Reading::of(trace);
-    let mut whole = pinned;
+    let mut whole = pinned.clone();
     loop {
-        let mut walk = Walk::new(&reading, &whole);
+        let mut walk = Walk::new(&reading, &whole, &pinned);
         walk.run();
         let rejected = std::mem::take(&mut walk.rejected);
         if rejected.is_subset(&whole) {
@@ -241,6 +244,8 @@ enum Cut {
 struct Walk<'r, 't> {
     reading: &'r Reading<'t>,
     whole: &'r BTreeSet<usize>,
+    /// The params the model states whole.
+    pinned: &'r BTreeSet<usize>,
     held: Vec<Option<Held>>,
     cuts: Vec<Option<Cut>>,
     /// Where the ops that read a column cut's share take it apart.
@@ -253,11 +258,16 @@ struct Walk<'r, 't> {
 }
 
 impl<'r, 't> Walk<'r, 't> {
-    fn new(reading: &'r Reading<'t>, whole: &'r BTreeSet<usize>) -> Walk<'r, 't> {
+    fn new(
+        reading: &'r Reading<'t>,
+        whole: &'r BTreeSet<usize>,
+        pinned: &'r BTreeSet<usize>,
+    ) -> Walk<'r, 't> {
         let trace = reading.trace;
         Walk {
             reading,
             whole,
+            pinned,
             held: vec![None; trace.values.len()],
             cuts: vec![None; trace.params.len()],
             bounds: BTreeMap::new(),
@@ -366,6 +376,21 @@ impl<'r, 't> Walk<'r, 't> {
         {
             self.reject(&origins);
         }
+    }
+
+    /// Whether `v`, a share, is gathered where it is wanted whole: a share
+    /// of one column cut's run, as wide as each segment of it, which a
+    /// gather puts back in order.
+    fn gathers(&self, v: ValueId) -> bool {
+        let Some(Held::Split(os)) = &self.held[v.0 as usize] else {
+            return false;
+        };
+        let [o] = os.iter().copied().collect::<Vec<_>>()[..] else {
+            return false;
+        };
+        let (segments, _) = self.segments(o.param, o.lo, o.hi);
+        self.width(v)
+            .is_some_and(|w| segments.iter().all(|s| *s == w))
     }
 
     /// A value an op reads whole: a share's cuts put back, a weight kept
@@ -481,6 +506,10 @@ impl<'r, 't> Walk<'r, 't> {
                     Held::Split(origins) => {
                         if self.decide(p, Cut::Row(input)) {
                             Held::Partial(origins)
+                        } else if self.pinned.contains(&p) && self.gathers(a) {
+                            // A weight the model states whole reads its
+                            // share gathered.
+                            Held::Whole
                         } else {
                             self.reject(&origins)
                         }
