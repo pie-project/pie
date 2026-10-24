@@ -26,8 +26,8 @@ TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"v
 def qwen(id, layers, vocab = 248320, template = CHATML, tokenizer = TOKENIZER, **kwargs):
     return model(id, template = template, tokenizer = tokenizer, arch = "qwen3_5", layers = layers, vocab = vocab, **kwargs)
 
-def fixture(id):
-    return model(id, mini = True, template = CHATML, tokenizer = TOKENIZER)
+def fixture(id, **kwargs):
+    return model(id, mini = True, template = CHATML, tokenizer = TOKENIZER, **kwargs)
 
 MODELS = [
     qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], layers = 64),
@@ -52,7 +52,8 @@ MODELS = [
     qwen("qwen36-35b-a3b-mini", mini = True, layers = 5),
     qwen("qwen36-35b-a3b-mini64", mini = True, layers = 5),
     fixture("qwen36-27b-bonsai"),
-    fixture("qwen3-a3b-micro"),
+    # Served end to end (`scripts/tiny_qwen3_moe.py`): an inferlet reads its depth and vocabulary.
+    fixture("qwen3-a3b-micro", layers = 4, vocab = 2048),
     fixture("qwen3-a3b-uncached-bank"),
     fixture("qwen3-micro-text"),
     fixture("qwen3-micro-text-rotated"),

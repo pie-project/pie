@@ -1585,6 +1585,7 @@ fn yields<'a>(
         | Expr::Stride { src, .. }
         | Expr::Gather { src, .. }
         | Expr::Shard { src, .. }
+        | Expr::Experts { src, .. }
         | Expr::Select { src, .. }
         | Expr::Scale { src, .. }
         | Expr::Unary { src, .. }
