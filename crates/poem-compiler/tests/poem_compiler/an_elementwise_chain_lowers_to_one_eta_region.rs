@@ -57,7 +57,7 @@ fn a_residual_add_and_its_norm_form_one_region() {
     });
     let formed = chains(&t);
     let chain = the_one(&formed);
-    assert_eq!(chain.nodes, 0..2);
+    assert_eq!(chain.nodes, [0, 1]);
     let shared: Vec<bool> = chain.ins.iter().map(|input| input.shared).collect();
     assert_eq!(
         shared,
@@ -148,6 +148,59 @@ fn the_fused_residual_norm_lowers_as_its_two_ops_do() {
     );
 }
 
+/// An op between a chain's ops that neither reads what the chain computes
+/// nor writes what it reads runs before the region, which lands where the
+/// chain's last op was.
+#[test]
+fn a_chain_runs_past_an_op_it_does_not_touch() {
+    let t = trace(|p| {
+        let h = elemwise::residual_add(&p.rows("x", WIDTH), &p.rows("y", WIDTH));
+        let side = linear::matmul(&p.rows("z", WIDTH), &p.weight("side", [WIDTH, WIDTH]));
+        let n = elemwise::rmsnorm(&h, &p.weight("w", [WIDTH]), EPS);
+        let _ = linear::matmul(&n, &p.weight("out", [WIDTH, WIDTH]));
+        read_later(p, &side);
+    });
+    let formed = chains(&t);
+    assert_eq!(the_one(&formed).nodes, [0, 2]);
+    let (folded, _) = fold(t);
+    assert!(matches!(folded.nodes[0].op, Operation::Linear(_)), "the matmul runs first");
+    assert!(matches!(
+        folded.nodes[1].op,
+        Operation::Fused(Fused::Region { .. })
+    ));
+}
+
+/// A layer's scale, a weight of one element, is a scalar parameter: Gemma's
+/// norm, residual add and scale form one region.
+#[test]
+fn a_one_element_scale_is_a_scalar_parameter() {
+    let t = trace(|p| {
+        let n = elemwise::rmsnorm(&p.rows("x", WIDTH), &p.weight("w", [WIDTH]), EPS);
+        let h = elemwise::residual_add(&n, &p.rows("y", WIDTH));
+        let scaled = elemwise::scale(&p.weight("s", [1]), &h);
+        read_later(p, &scaled);
+    });
+    let formed = chains(&t);
+    let chain = the_one(&formed);
+    assert_eq!(chain.nodes, [0, 1, 2]);
+    let ones: Vec<bool> = chain.ins.iter().map(|input| input.one).collect();
+    assert_eq!(ones, [false, false, false, true], "x, w, y and the scale");
+    assert!(chain.region.params[3].dims.is_empty(), "the scale is a scalar");
+    let (x, w, y) = (row(1), row(2), row(3));
+    let out = chain
+        .region
+        .eval(&[
+            Value::F32(x),
+            Value::F32(w),
+            Value::F32(y.clone()),
+            Value::F32(vec![0.5]),
+        ])
+        .expect("the region runs");
+    assert_eq!(out.len(), 1, "only the scaled stream leaves");
+    let body = chain.region.body().expect("the stream core covers it");
+    assert!(body.source.contains("f.one(3)"), "{}", body.source);
+}
+
 #[test]
 fn a_lone_op_keeps_its_hand_kernel() {
     let t = trace(|p| drop(elemwise::silu(&p.rows("x", WIDTH))));
@@ -164,7 +217,7 @@ fn a_value_read_past_the_chain_leaves_it() {
     });
     let formed = chains(&t);
     let chain = the_one(&formed);
-    assert_eq!(chain.nodes, 0..3, "the matmuls end the chain");
+    assert_eq!(chain.nodes, [0, 1, 2], "the matmuls end the chain");
     let leaving: Vec<poem_ir::ValueId> = chain.outs.iter().map(|out| out.value).collect();
     // The stream (a matmul reads it) and the activation leave; the normed
     // row only the activation reads stays in the registers.
@@ -183,7 +236,7 @@ fn an_op_no_region_lowers_ends_the_chain() {
     });
     let formed = chains(&t);
     let spans: Vec<_> = formed.iter().map(|chain| chain.nodes.clone()).collect();
-    assert_eq!(spans, [0..2, 3..5], "erf's gelu has no eta form");
+    assert_eq!(spans, [vec![0, 1], vec![3, 4]], "erf's gelu has no eta form");
 }
 
 fn qwen3() -> Trace {
@@ -252,7 +305,7 @@ fn a_residual_add_and_the_next_layers_norm_form_one_region() {
     let crossing = chains(&t)
         .iter()
         .filter(|chain| {
-            t.nodes[chain.nodes.start as usize].layer != t.nodes[chain.nodes.end as usize - 1].layer
+            t.nodes[chain.nodes[0] as usize].layer != t.nodes[*chain.nodes.last().expect("ops") as usize].layer
         })
         .count();
     assert!(crossing > 0, "a layer's stream is normed by the next");
@@ -347,10 +400,14 @@ fn every_catalog_chain_has_a_body() {
         for chain in chains(&t) {
             formed += 1;
             ops += chain.nodes.len();
-            if chain.nodes.start < after || chain.nodes.end as usize > t.nodes.len() {
+            let ordered = chain.nodes.windows(2).all(|pair| pair[0] < pair[1]);
+            if chain.nodes[0] < after
+                || !ordered
+                || *chain.nodes.last().expect("ops") as usize >= t.nodes.len()
+            {
                 wrong.push(format!("{}: {:?} is out of order", row.name, chain.nodes));
             }
-            after = chain.nodes.end;
+            after = chain.nodes[0] + 1;
             if let Err(why) = chain.region.body() {
                 wrong.push(format!(
                     "{}: {:?} has no body: {why:?}",

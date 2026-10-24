@@ -4,13 +4,16 @@
 //! kernels-* `synth` builds one kernel for.
 //!
 //! **Forming** is conservative, as the fuse rules are: a chain is a run of
-//! consecutive ops, each one this module lowers, each reading a value an
-//! earlier op of the run computes, all under one guard and over rows of one
-//! width (a run may cross a layer's end, as a layer's last residual add and
-//! the next layer's input norm do, and lands in its last op's layer, as a
-//! fuse rule's match does); at most [`MAX_CHAIN`] ops, and at least two (a
-//! lone op keeps its hand kernel). Nothing is searched, so no unplanned
-//! combination forms.
+//! ops, each one this module lowers, each reading a value an earlier op of
+//! the run computes, all under one guard and over rows of one width (a run
+//! may cross a layer's end, as a layer's last residual add and the next
+//! layer's input norm do); at most [`MAX_CHAIN`] ops, and at least two (a
+//! lone op keeps its hand kernel). The run's ops need not be consecutive:
+//! the ops between them run before it, and none reads what the run computes
+//! or writes what it reads, so the region lands where the run's last op was,
+//! in its layer, as a fuse rule's match does. Of the run from an op, the
+//! longest part the row frame holds is the chain. Nothing else is searched,
+//! so no unplanned combination forms.
 //!
 //! **Lowering** turns each op into the eta math it states, in f32. A value
 //! the run reads but does not compute is a parameter; a value it computes
@@ -32,7 +35,6 @@
 //! default).
 
 use std::collections::BTreeMap;
-use std::ops::Range;
 
 use eta_compiler::plan::{Dimension, SymbolicType};
 use eta_compiler::region::{Body, Region};
@@ -53,8 +55,9 @@ const GELU_CUBIC: f32 = 0.044_715;
 /// A chain of ops lowered to one region.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chain {
-    /// The trace's ops the region replaces, in order.
-    pub nodes: Range<u32>,
+    /// The trace's ops the region replaces, in order; the ops between them
+    /// run before the region, where its last op was.
+    pub nodes: Vec<u32>,
     /// `ins[k]` is the region's parameter `k`.
     pub ins: Vec<In>,
     /// `outs[k]` is the region's result `k`.
@@ -69,6 +72,9 @@ pub struct In {
     pub dtype: Dtype,
     /// One row every row reads (a norm's weight), not one a row.
     pub shared: bool,
+    /// One element every row reads (a layer's scale, a weight of one
+    /// element): a scalar parameter.
+    pub one: bool,
 }
 
 /// A value a chain writes, a row a row in its own dtype: the kernels' `Out`.
@@ -94,7 +100,7 @@ pub struct Synth {
 #[must_use]
 pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Synth>) {
     let mut bodies = BTreeMap::new();
-    let mut folded: Vec<(Range<u32>, Fused)> = Vec::new();
+    let mut folded: Vec<(Vec<u32>, Fused)> = Vec::new();
     for chain in chains(&trace) {
         let Ok(body) = chain.region.body() else {
             continue;
@@ -137,7 +143,8 @@ pub const FRAME_PLANES: usize = 5;
 /// Whether the row frame a region's body runs in (`row_frame` in
 /// kernels-cuda's `elemwise/frame.cuh`) holds `chain`: every row it reads
 /// and writes bf16, the width a whole number of eight-wide runs within one
-/// block's registers, at most [`FRAME_PLANES`] planes each way. A chain the
+/// block's registers, at most [`FRAME_PLANES`] planes each way (a scalar
+/// parameter, one element, holds none). A chain the
 /// frame does not hold is never folded, so an engine never meets a region
 /// it cannot launch.
 #[must_use]
@@ -153,7 +160,10 @@ pub fn frames(trace: &Trace, chain: &Chain, width: u32) -> bool {
     };
     width % 8 == 0
         && width <= FRAME_BLOCK * FRAME_PER * 8
-        && planes_fit(chain.ins.len() + chain.outs.len(), width)
+        && planes_fit(
+            chain.ins.iter().filter(|input| !input.one).count() + chain.outs.len(),
+            width,
+        )
         && chain.ins.iter().all(|input| bf16(input.value))
         && chain.outs.iter().all(|out| bf16(out.value))
 }
@@ -166,49 +176,68 @@ fn planes_fit(planes: usize, width: u32) -> bool {
     planes * per <= FRAME_PLANES * FRAME_PER as usize
 }
 
-/// `trace` with each run's ops replaced by its op, landed where the run
-/// began, under the run's guard and in the layer of its last op that has
-/// one (a fuse rule's match lands so too); the runs are in order and apart.
-fn replace(mut trace: Trace, runs: Vec<(Range<u32>, Fused)>) -> Trace {
+/// `trace` with each run's ops replaced by its op, landed where the run's
+/// last op was, under the run's guard and in the layer of its last op that
+/// has one (a fuse rule's match lands so too); the runs are apart.
+fn replace(mut trace: Trace, runs: Vec<(Vec<u32>, Fused)>) -> Trace {
+    // Each node's run, and the run each run's last node lands.
+    let mut run_of: Vec<Option<usize>> = vec![None; trace.nodes.len()];
+    for (r, (nodes, _)) in runs.iter().enumerate() {
+        for &n in nodes {
+            run_of[n as usize] = Some(r);
+        }
+    }
+    let lasts: Vec<u32> = runs
+        .iter()
+        .map(|(nodes, _)| *nodes.last().expect("a run holds ops"))
+        .collect();
     let layers: Vec<Option<u32>> = runs
         .iter()
-        .map(|(run, _)| {
-            trace.nodes[run.start as usize..run.end as usize]
+        .map(|(nodes, _)| {
+            nodes
                 .iter()
                 .rev()
-                .find_map(|node| node.layer)
+                .find_map(|&n| trace.nodes[n as usize].layer)
         })
         .collect();
-    let mut layers = layers.into_iter();
-    let mut landed = Vec::with_capacity(trace.nodes.len());
-    let mut nodes = Vec::with_capacity(trace.nodes.len());
-    let mut runs = runs.into_iter().peekable();
-    let mut inside: Option<(u32, u32)> = None;
-    for (at, node) in (0u32..).zip(std::mem::take(&mut trace.nodes)) {
-        if let Some((end, to)) = inside {
-            if at < end {
-                landed.push(to);
-                continue;
+    // Where each node lands: a run's ops all where its last lands.
+    let mut at_of: Vec<u32> = vec![0; trace.nodes.len()];
+    let mut landed_at = vec![0u32; runs.len()];
+    let mut next = 0u32;
+    for (n, run) in run_of.iter().enumerate() {
+        match run {
+            Some(r) if lasts[*r] as usize != n => {}
+            Some(r) => {
+                landed_at[*r] = next;
+                next += 1;
             }
-            inside = None;
+            None => {
+                at_of[n] = next;
+                next += 1;
+            }
         }
-        let here = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
-        landed.push(here);
-        if runs.peek().is_some_and(|(run, _)| run.start == at) {
-            let (run, op) = runs.next().expect("peeked");
-            inside = Some((run.end, here));
-            nodes.push(Node {
-                op: Operation::Fused(op),
+    }
+    for (n, run) in run_of.iter().enumerate() {
+        if let Some(r) = run {
+            at_of[n] = landed_at[*r];
+        }
+    }
+    let mut ops: Vec<Option<Fused>> = runs.into_iter().map(|(_, op)| Some(op)).collect();
+    let mut nodes = Vec::with_capacity(next as usize);
+    for (n, node) in std::mem::take(&mut trace.nodes).into_iter().enumerate() {
+        match run_of[n] {
+            None => nodes.push(node),
+            Some(r) if lasts[r] as usize == n => nodes.push(Node {
+                op: Operation::Fused(ops[r].take().expect("a run lands once")),
                 guard: node.guard,
-                layer: layers.next().expect("a layer a run"),
-            });
-        } else {
-            nodes.push(node);
+                layer: layers[r],
+            }),
+            Some(_) => {}
         }
     }
     for decl in &mut trace.values {
         if let Def::Op(i) = &mut decl.def
-            && let Some(&to) = landed.get(*i as usize)
+            && let Some(&to) = at_of.get(*i as usize)
         {
             *i = to;
         }
@@ -217,32 +246,108 @@ fn replace(mut trace: Trace, runs: Vec<(Range<u32>, Fused)>) -> Trace {
     trace
 }
 
-/// Every chain of `trace`, in order; ops outside them run as they are.
+/// How far past a chain's first op its run is looked for.
+const REACH: u32 = 64;
+
+/// Every chain of `trace` the row frame holds, by its first op; ops outside
+/// them run as they are.
 #[must_use]
 pub fn chains(trace: &Trace) -> Vec<Chain> {
     let escapes = Escapes::of(trace);
     let mut out = Vec::new();
-    let mut at = 0u32;
     let count = u32::try_from(trace.nodes.len()).unwrap_or(u32::MAX);
-    while at < count {
+    let mut taken = vec![false; trace.nodes.len()];
+    for at in 0..count {
+        if taken[at as usize] {
+            continue;
+        }
         let Some(row) = row_of(trace, at) else {
-            at += 1;
             continue;
         };
-        let mut end = at + 1;
-        while end < count && ((end - at) as usize) < MAX_CHAIN && joins(trace, at..end, end, row) {
-            end += 1;
+        // The run from `at`: each op that joins it, up to the first op that
+        // reads what it computes and does not join it.
+        let mut run = vec![at];
+        let mut next = at + 1;
+        while next < count && next <= at + REACH && run.len() < MAX_CHAIN {
+            if !taken[next as usize] && joins(trace, &run, next, row) {
+                run.push(next);
+            } else if reads_from(trace, &run, next) {
+                break;
+            }
+            next += 1;
         }
-        if end - at >= 2
-            && let Some(chain) = lower(trace, at..end, &escapes)
-        {
+        if let Some(chain) = held(trace, &run, &escapes) {
+            for &n in &chain.nodes {
+                taken[n as usize] = true;
+            }
             out.push(chain);
-            at = end;
-        } else {
-            at += 1;
         }
     }
     out
+}
+
+/// The longest part of `run` (the latest of the longest, so a chain that
+/// ends in a norm keeps it, as the rules' matches do) that is a chain the
+/// row frame holds: its ops lower, the ops between them keep their order,
+/// and the frame takes its region.
+fn held(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
+    for len in (2..=run.len()).rev() {
+        for from in (0..=run.len() - len).rev() {
+            let part = &run[from..from + len];
+            if !keeps_order(trace, part) {
+                continue;
+            }
+            let Some(chain) = lower(trace, part, escapes) else {
+                continue;
+            };
+            let framed = chain.region.body().is_ok()
+                && matches!(chain.region.width(), Ok(Some(w)) if frames(trace, &chain, w));
+            if framed {
+                return Some(chain);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `node` reads a value an op of `run` computes.
+fn reads_from(trace: &Trace, run: &[u32], node: u32) -> bool {
+    let mut ins = Vec::new();
+    trace.nodes[node as usize].op.inputs(&mut ins);
+    ins.iter()
+        .any(|v| matches!(trace.values[v.0 as usize].def, Def::Op(by) if run.contains(&by)))
+}
+
+/// Whether the ops between the first and the last of `run` keep their
+/// order once the run lands where its last op was: none reads what the run
+/// computes or a cache it reads, and none writes in place what it reads.
+fn keeps_order(trace: &Trace, run: &[u32]) -> bool {
+    let (Some(&first), Some(&last)) = (run.first(), run.last()) else {
+        return false;
+    };
+    let mut read = Vec::new();
+    let mut written = Vec::new();
+    for &n in run {
+        let op = &trace.nodes[n as usize].op;
+        op.inputs(&mut read);
+        op.outputs(&mut written);
+    }
+    let caches: Vec<ValueId> = read
+        .iter()
+        .copied()
+        .filter(|v| matches!(trace.values[v.0 as usize].def, Def::Cache(_)))
+        .collect();
+    let (mut ids, mut aliases) = (Vec::new(), Vec::new());
+    (first + 1..last).filter(|n| !run.contains(n)).all(|n| {
+        let op = &trace.nodes[n as usize].op;
+        ids.clear();
+        op.inputs(&mut ids);
+        aliases.clear();
+        op.aliases(&mut aliases);
+        ids.iter()
+            .all(|v| !written.contains(v) && !caches.contains(v))
+            && aliases.iter().all(|(_, into)| !read.contains(into))
+    })
 }
 
 /// The rows a lowerable op runs over: their leading dim and width.
@@ -259,21 +364,38 @@ fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
     if !lowers(op) {
         return None;
     }
-    let mut ids = Vec::new();
-    op.inputs(&mut ids);
-    op.outputs(&mut ids);
+    // A device scale is its first element: a region reads one of a weight
+    // of one element, and no other.
+    if let Operation::Elemwise(Elemwise::Act { s: Some(s), .. }) = op
+        && !matches!(form(trace, *s), Some(Form::One))
+    {
+        return None;
+    }
+    // The rows are its outputs'; an input may be rows of another axis (a
+    // readout's rows read beside the tokens'), row k read for row k, as
+    // the op's own kernel reads it.
+    let (mut ins, mut outs) = (Vec::new(), Vec::new());
+    op.inputs(&mut ins);
+    op.outputs(&mut outs);
     let mut rows: Option<Rows> = None;
     let mut width: Option<u64> = None;
-    for v in ids {
+    for (v, output) in ins
+        .into_iter()
+        .map(|v| (v, false))
+        .chain(outs.into_iter().map(|v| (v, true)))
+    {
         let (dim, w) = match form(trace, v)? {
             Form::Rows { dim, width } => (Some(dim), width),
             Form::Shared { width } => (None, width),
+            Form::One => continue,
         };
         if width.is_some_and(|held| held != w) {
             return None;
         }
         width = Some(w);
-        if let Some(dim) = dim {
+        if let Some(dim) = dim
+            && output
+        {
             match rows {
                 Some(held) if held.dim != dim => return None,
                 _ => rows = Some(Rows { dim, width: w }),
@@ -287,19 +409,13 @@ fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
 /// rows, under the run's guard, and reads what the run computes. Its layer
 /// may be the next one's: a layer's last residual add and the next layer's
 /// input norm are one chain, as they are one fused op by a rule.
-fn joins(trace: &Trace, run: Range<u32>, node: u32, row: Rows) -> bool {
+fn joins(trace: &Trace, run: &[u32], node: u32, row: Rows) -> bool {
     if row_of(trace, node) != Some(row) {
         return false;
     }
-    let first = &trace.nodes[run.start as usize];
+    let first = &trace.nodes[run[0] as usize];
     let next = &trace.nodes[node as usize];
-    if next.guard != first.guard {
-        return false;
-    }
-    let mut ins = Vec::new();
-    next.op.inputs(&mut ins);
-    ins.iter()
-        .any(|v| matches!(trace.values[v.0 as usize].def, Def::Op(by) if run.contains(&by)))
+    next.guard == first.guard && reads_from(trace, run, node)
 }
 
 /// How a value a chain touches is laid out.
@@ -308,6 +424,8 @@ enum Form {
     Rows { dim: Dim, width: u64 },
     /// One row of `width` every row reads: a weight.
     Shared { width: u64 },
+    /// One element every row reads: a weight of one element.
+    One,
 }
 
 fn form(trace: &Trace, v: ValueId) -> Option<Form> {
@@ -323,6 +441,7 @@ fn form(trace: &Trace, v: ValueId) -> Option<Form> {
         return None;
     }
     match (shape.as_slice(), &decl.def) {
+        ([Dim::Const(1)], Def::Weight(_)) => Some(Form::One),
         ([Dim::Const(width)], Def::Weight(_)) => Some(Form::Shared { width: *width }),
         ([dim, Dim::Const(width)], _) if !matches!(dim, Dim::Const(_)) => Some(Form::Rows {
             dim: *dim,
@@ -350,9 +469,7 @@ fn lowers(op: &Operation) -> bool {
             Elemwise::Binary { .. } => true,
             Elemwise::Rmsnorm { axis, .. } => *axis == NormAxis::Row,
             Elemwise::Layernorm { .. } => true,
-            Elemwise::Act { s, act, .. } => {
-                s.is_none() && !matches!(act, ActFn::Gelu { tanh: false })
-            }
+            Elemwise::Act { act, .. } => !matches!(act, ActFn::Gelu { tanh: false }),
             Elemwise::Softcap { .. } => true,
             Elemwise::GateSigmoidMul { heads, .. } => heads.is_none(),
             Elemwise::Clamp { bounds, .. } => matches!(bounds, Bounds::Fixed { .. }),
@@ -398,15 +515,15 @@ impl Escapes {
 
     /// Whether `v`, computed inside `run`, may be read past it. A value
     /// nothing reads is the trace's to keep, so it leaves too.
-    fn leaves(&self, v: ValueId, run: &Range<u32>) -> bool {
+    fn leaves(&self, v: ValueId, run: &[u32]) -> bool {
         let readers = &self.readers[v.0 as usize];
         self.held[v.0 as usize] || readers.is_empty() || readers.iter().any(|r| !run.contains(r))
     }
 }
 
 /// The region `run` lowers to, or `None` where an op of it does not lower.
-fn lower(trace: &Trace, run: Range<u32>, escapes: &Escapes) -> Option<Chain> {
-    let row = row_of(trace, run.start)?;
+fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
+    let row = row_of(trace, run[0])?;
     let width = u32::try_from(row.width).ok()?;
 
     // Parameters: what the run reads and does not compute, in first-read
@@ -414,7 +531,7 @@ fn lower(trace: &Trace, run: Range<u32>, escapes: &Escapes) -> Option<Chain> {
     let mut computed: Vec<ValueId> = Vec::new();
     let mut ins: Vec<In> = Vec::new();
     let mut ids = Vec::new();
-    for node in run.clone() {
+    for &node in run {
         let op = &trace.nodes[node as usize].op;
         ids.clear();
         op.inputs(&mut ids);
@@ -424,6 +541,7 @@ fn lower(trace: &Trace, run: Range<u32>, escapes: &Escapes) -> Option<Chain> {
                     value: v,
                     dtype: dtype_of(trace, v),
                     shared: matches!(form(trace, v)?, Form::Shared { .. }),
+                    one: matches!(form(trace, v)?, Form::One),
                 });
             }
         }
@@ -441,13 +559,13 @@ fn lower(trace: &Trace, run: Range<u32>, escapes: &Escapes) -> Option<Chain> {
     for (k, input) in (0u32..).zip(&ins) {
         b.of.insert(input.value, k);
     }
-    for node in run.clone() {
+    for &node in run {
         b.node(&trace.nodes[node as usize].op)?;
     }
 
     let outs: Vec<Out> = computed
         .iter()
-        .filter(|&&v| escapes.leaves(v, &run))
+        .filter(|&&v| escapes.leaves(v, run))
         .map(|&v| Out {
             value: v,
             dtype: dtype_of(trace, v),
@@ -476,15 +594,28 @@ fn lower(trace: &Trace, run: Range<u32>, escapes: &Escapes) -> Option<Chain> {
         dtype: eta_ir::Dtype::F32,
         dims: vec![Dimension::Static(width)],
     };
+    let one_type = SymbolicType {
+        dtype: eta_ir::Dtype::F32,
+        dims: Vec::new(),
+    };
     let region = Region {
-        params: vec![row_type; ins.len()],
+        params: ins
+            .iter()
+            .map(|input| {
+                if input.one {
+                    one_type.clone()
+                } else {
+                    row_type.clone()
+                }
+            })
+            .collect(),
         ops: b.ops,
         results,
         rounds,
     };
     region.types().ok()?;
     Some(Chain {
-        nodes: run,
+        nodes: run.to_vec(),
         ins,
         outs,
         region,
@@ -652,7 +783,7 @@ impl Builder {
                 self.set(*y, out);
             }
             Elemwise::Act {
-                s: None,
+                s,
                 x,
                 act,
                 scale,
@@ -662,6 +793,11 @@ impl Builder {
                 if let Some(k) = scale {
                     let k = self.konst(*k);
                     t = self.push(Op::Mul(t, k));
+                }
+                // a device scalar's first element: a weight of one element
+                // the region reads as a scalar parameter
+                if let Some(s) = s {
+                    t = self.push(Op::Mul(t, self.get(*s)?));
                 }
                 let out = match act {
                     ActFn::Identity => t,
