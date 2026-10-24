@@ -33,14 +33,6 @@ impl Shell {
         self.device.ctx().tuning()
     }
 
-    /// Each token bucket's serving fires on the device, under
-    /// `fire-timing`: every one the device has passed.
-    pub fn fire_times(
-        &mut self,
-    ) -> Result<Option<&std::collections::BTreeMap<u32, super::timing::FireTime>>> {
-        self.fire_timer.as_mut().map(|t| t.times()).transpose()
-    }
-
     #[must_use]
     pub fn budget(&self) -> &Budget {
         &self.budget

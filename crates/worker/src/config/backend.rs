@@ -24,9 +24,6 @@ pub struct CudaEngineOptions {
     /// `expert_load_window` steps.
     pub expert_rebalance_steps: Option<u32>,
     pub expert_load_window: Option<u32>,
-    /// Every this many steps (0: never) an expert-parallel group prints
-    /// each MoE layer's balance: rows a rank and a logical expert.
-    pub expert_balance_steps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -956,9 +956,6 @@ impl Shell {
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
             decoded_tiles: Vec::new(),
             arming: false,
-            fire_timer: (boot.knobs.diagnostics.fire_timing)
-                .then(super::timing::FireTimer::new)
-                .transpose()?,
             armed_body: None,
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
