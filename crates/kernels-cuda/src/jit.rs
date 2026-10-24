@@ -23,7 +23,7 @@ pub mod nvrtc;
 mod root;
 
 pub use abi::{Arg, ArgValue};
-pub use ctx::{Ctx, Fire, Launch, Pad, Slabs, kernels_strict, strict_kernels};
+pub use ctx::{Ctx, Fire, Launch, Pad, Slabs, count_fires, fires, kernels_strict, strict_kernels};
 pub(crate) use kernel::generated;
 pub use kernel::{Kernel, kernel};
 pub use root::{Features, Root, Toolchain, specific_of};

@@ -38,6 +38,8 @@ mod a_declined_mega_moe_answers_what_its_legs_answer;
 mod a_dit_plan_loads_at_a_sixty_four_k_row_ceiling;
 mod a_double_block_fires_two_streams_through_the_engine;
 mod a_family_is_read_against_its_reference;
+#[cfg(feature = "cuda")]
+mod a_fired_router_and_mega_moe_answer_what_their_legs_answer;
 mod a_fitted_pool_is_pledged_what_it_declared;
 mod a_four_rank_group_fires_a_sharded_plan;
 mod a_fragmented_window_gets_a_view_per_run;
