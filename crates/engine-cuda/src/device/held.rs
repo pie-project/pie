@@ -55,6 +55,17 @@ pub fn retire_stream(ordinal: i32, stream: *mut core::ffi::c_void, destroy: impl
     destroy();
 }
 
+/// The device `ptr`, an allocation of device memory, lives on.
+fn device_of(ptr: u64) -> Option<i32> {
+    // SAFETY: a zeroed attribute record the call fills.
+    let mut attrs: rt::cudaPointerAttributes = unsafe { core::mem::zeroed() };
+    // SAFETY: `attrs` is a live local the call writes; `ptr` is only looked up.
+    let code =
+        unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, ptr as *const core::ffi::c_void) };
+    (code == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeDevice)
+        .then_some(attrs.device)
+}
+
 pub(crate) fn current_device() -> Option<i32> {
     let mut device = 0i32;
     // SAFETY: writes one int.
@@ -273,7 +284,7 @@ pub(crate) mod recycle {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{Fence, current_device};
+    use super::{Fence, current_device, device_of};
     use crate::device::rt;
     use crate::error::Result;
 
@@ -329,10 +340,11 @@ pub(crate) mod recycle {
 
     /// Keeps `ptr` for its size behind a fence on its device's compute
     /// streams, or frees it when the budget is spent or the fence will not
-    /// record.
+    /// record. Its device is the one it was made on, whichever this thread
+    /// has bound: a group's leader drops every rank's buffers.
     pub(crate) fn release(ptr: u64, bytes: usize) {
         if HELD.load(Ordering::Relaxed) + bytes <= BUDGET
-            && let Some(device) = current_device()
+            && let Some(device) = device_of(ptr)
             && let Some(fence) = Fence::record(device)
         {
             HELD.fetch_add(bytes, Ordering::Relaxed);
