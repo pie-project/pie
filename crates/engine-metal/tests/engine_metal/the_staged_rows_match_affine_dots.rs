@@ -6,6 +6,20 @@ use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
+/// The device, where it is an Apple10 GPU: the staged tile fills its
+/// operands in that family's register layout and runs nowhere else.
+fn apple10() -> Option<Context> {
+    let device = Context::bind().ok()?;
+    if device.family() < 10 {
+        eprintln!(
+            "skipped: the staged tile runs on Apple10, this GPU is Apple{}",
+            device.family()
+        );
+        return None;
+    }
+    Some(device)
+}
+
 fn noise(at: u64) -> u8 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
     x ^= x >> 33;
@@ -20,7 +34,7 @@ fn bf16(v: f32) -> [u8; 2] {
 
 #[test]
 fn every_staged_row_answers_an_affine_reference() {
-    let Ok(device) = Context::bind() else {
+    let Some(device) = apple10() else {
         return;
     };
     let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"staged\", \"qmv\"]", false);
@@ -162,7 +176,7 @@ fn every_staged_row_answers_an_affine_reference() {
 
 #[test]
 fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
-    let Ok(device) = Context::bind() else {
+    let Some(device) = apple10() else {
         return;
     };
     let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"staged\", \"qmv\"]", false);
@@ -263,7 +277,7 @@ fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
 
 #[test]
 fn the_coop_segments_are_their_matmuls() {
-    let Ok(device) = Context::bind() else {
+    let Some(device) = apple10() else {
         return;
     };
     let handles = Handles::new();

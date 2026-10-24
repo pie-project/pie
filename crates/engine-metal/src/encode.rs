@@ -505,15 +505,8 @@ impl Sink<'_> {
         pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
         fire: Fire,
     ) -> Result<(), Error> {
-        let group = if fire.group == [0, 0, 0] {
-            crate::device::ctx::threadgroup(pipeline, fire.lanes)
-        } else {
-            MTLSize {
-                width: fire.group[0].max(1) as usize,
-                height: fire.group[1].max(1) as usize,
-                depth: fire.group[2].max(1) as usize,
-            }
-        };
+        let group = crate::device::ctx::group_of(pipeline, fire)
+            .map_err(|fault| Sink::refuse(fire, fault))?;
         if let Some(indirect) = fire.indirect {
             let binding = self.handles.get(indirect.buf).ok_or_else(|| {
                 Sink::refuse(
