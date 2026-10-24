@@ -124,17 +124,22 @@ impl Budget {
     /// The tokens a round of `width` rows emits on average: the anchor's,
     /// and each proposal's survival.
     pub fn expected(&self, confidence: &[f32], width: u32) -> f64 {
+        1.0 + self.survival(confidence, width).iter().sum::<f64>()
+    }
+
+    /// The chance a round of `width` rows keeps each of its proposals and
+    /// every one before it: what a lane bids for the runtime's verify rows.
+    pub fn survival(&self, confidence: &[f32], width: u32) -> Vec<f64> {
         let mut survival = 1.0;
-        let mut total = 1.0;
-        for (j, &c) in confidence
+        confidence
             .iter()
             .take(width.saturating_sub(1) as usize)
             .enumerate()
-        {
-            survival *= self.accept(j, c);
-            total += survival;
-        }
-        total
+            .map(|(j, &c)| {
+                survival *= self.accept(j, c);
+                survival
+            })
+            .collect()
     }
 
     /// Whether this round verifies every row.
