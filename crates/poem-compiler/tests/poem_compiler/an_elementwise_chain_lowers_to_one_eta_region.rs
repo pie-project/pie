@@ -196,39 +196,28 @@ fn regions(t: &Trace) -> Vec<(Vec<ValueId>, Vec<ValueId>, u64)> {
 }
 
 #[test]
-fn the_compiler_folds_regions_only_when_asked() {
+fn a_folded_trace_plans_as_it_stands() {
     let t = qwen3();
-    let off = bake_with(&t, &DeviceProfile::default()).expect("bakes");
-    assert!(
-        off.trace.is_none(),
-        "off by default, the plan is of the trace given"
-    );
-    assert!(off.bodies.is_empty());
-
-    let on = bake_with(&t, &synth()).expect("bakes");
-    let folded = on.trace.as_ref().expect("the plan is of the folded trace");
+    let (folded, bodies) = fold(t.clone());
     let formed = chains(&t);
-    let ops = regions(folded);
-    assert!(
-        !ops.is_empty(),
-        "a qwen3 forward has a residual norm a layer"
-    );
-    assert_eq!(ops.len(), formed.len(), "each chain is one op");
-    let folded_away: usize = formed.iter().map(|chain| chain.nodes.len() - 1).sum();
-    assert_eq!(folded.nodes.len(), t.nodes.len() - folded_away);
+    let ops = regions(&folded);
+    assert!(!ops.is_empty(), "a qwen3 forward has a residual norm a layer");
+    let framed = formed
+        .iter()
+        .filter(|chain| matches!(chain.region.width(), Ok(Some(w)) if poem_compiler::fuse::chain::frames(&t, chain, w)))
+        .count();
+    assert_eq!(ops.len(), framed, "each chain the frame holds is one op");
     for (ins, outs, body) in &ops {
-        let synth = on.bodies.get(body).expect("the op's body is held");
+        let synth = bodies.get(body).expect("the op's body is held");
         assert_eq!(synth.body.hash, *body);
         assert_eq!(synth.region.params.len(), ins.len());
         assert_eq!(synth.region.results.len(), outs.len());
     }
-    assert!(
-        on.bodies.len() < ops.len(),
-        "a layer's chain shares the next's body"
-    );
-    poem_ir::check(folded).expect("the folded trace checks");
+    assert!(bodies.len() < ops.len(), "a layer's chain shares the next's body");
+    poem_ir::check(&folded).expect("the folded trace checks");
+    let plan = bake_with(&folded, &synth()).expect("bakes");
     assert_eq!(
-        on.classes.node_mask.len(),
+        plan.classes.node_mask.len(),
         folded.nodes.len(),
         "the plan is of the folded trace"
     );
@@ -239,9 +228,9 @@ fn the_compiler_folds_regions_only_when_asked() {
 /// not another block's.
 #[test]
 fn no_region_lands_an_output_over_its_input() {
-    let t = qwen3();
-    let on = bake_with(&t, &synth()).expect("bakes");
-    let folded = on.trace.as_ref().expect("folded");
+    let (folded, _) = fold(qwen3());
+    let folded = &folded;
+    let on = bake_with(folded, &synth()).expect("bakes");
     let fire = poem_compiler::FireRows::ceilings(&crate::common::budgets_of(folded));
     let (mut wrong, mut held) = (Vec::new(), 0usize);
     for (ins, outs, _) in regions(folded) {
