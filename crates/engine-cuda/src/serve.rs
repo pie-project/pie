@@ -10,6 +10,7 @@ mod prepare;
 mod segments;
 mod settle;
 mod stats;
+pub mod timing;
 
 pub use arming::{Armed, Kind, Seal};
 pub use boot::{Boot, DEFAULT_BODIES_MEGABYTES, Golden, Graphs, Knobs, Recording};
@@ -111,6 +112,8 @@ pub struct Shell {
     bodies_mem: usize,
     decoded_tiles: Vec<u64>,
     arming: bool,
+    /// `fire-timing`: each serving fire's span on the device.
+    fire_timer: Option<timing::FireTimer>,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
@@ -256,19 +259,21 @@ impl Shell {
     /// the rows the other ranks send, and the combines.
     pub fn fire_idle(&mut self, bucket: u32) -> Result<()> {
         self.at_bucket(bucket);
-        let prepared = FrameShell::prepare(
-            self,
-            StepView {
-                lanes: &[],
-                attachments: &[],
-                media: &[],
-                voxels: &[],
-            },
-            None,
-        )?;
-        let enqueued = FrameShell::enqueue(self, prepared)?;
-        FrameShell::settle(self, enqueued)?;
-        Ok(())
+        diag::guarded(|| {
+            let prepared = FrameShell::prepare(
+                self,
+                StepView {
+                    lanes: &[],
+                    attachments: &[],
+                    media: &[],
+                    voxels: &[],
+                },
+                None,
+            )?;
+            let enqueued = FrameShell::enqueue(self, prepared)?;
+            FrameShell::settle(self, enqueued)?;
+            Ok(())
+        })
     }
 
     /// What the trace dispatches, for wiring the group.

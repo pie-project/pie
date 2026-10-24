@@ -315,6 +315,32 @@ impl Event {
         }
     }
 
+    /// Microseconds on the device from `begin` to this event, both timing
+    /// events the device has passed.
+    pub fn since(&self, begin: &Event) -> Result<f64> {
+        #[cfg(feature = "device")]
+        {
+            let mut ms = 0f32;
+            // SAFETY: both handles are live and this crate created them.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaEventElapsedTime",
+                    crate::device::rt::cudaEventElapsedTime(
+                        &raw mut ms,
+                        begin.raw.cast(),
+                        self.raw.cast(),
+                    ),
+                )?;
+            }
+            Ok(f64::from(ms) * 1e3)
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            let _ = begin;
+            Err(Fault::Runtimeless)
+        }
+    }
+
     pub fn settle(&self) -> Result<()> {
         #[cfg(feature = "device")]
         {
