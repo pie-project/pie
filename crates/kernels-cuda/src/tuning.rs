@@ -653,6 +653,21 @@ pub struct ElemwiseHcTile;
 #[decision(id = "kernel.elemwise.hc_mma", flag, default = false, tune = search)]
 pub struct ElemwiseHcMma;
 
+/// The most rows a hyper-connection seam (a sublayer's fold and the next
+/// sublayer's whole pre-mix) lands in one tcgen05 launch at
+/// (`elemwise/hc_sm100.cu`); more run the fold and the pre-mix apart. 0
+/// (never) but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.hc_mega_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct ElemwiseHcMegaUntil(pub u32);
+
+/// The fewest rows the seam lands in one launch at: below them a decode's
+/// fold and pre-mix as their own launches run as fast (their programmatic
+/// overlap hides the latencies the seam's split reduction cannot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.hc_mega_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct ElemwiseHcMegaFrom(pub u32);
+
 /// Whether the chunked causal conv's 16-byte row-tiled form runs four
 /// channels a thread under a 64-register bound (the same sums in the same
 /// order); off, eight a thread as before.
@@ -822,6 +837,8 @@ pub fn register(registry: &mut Registry) {
         .add::<ElemwiseNormFoldBlock>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
+        .add::<ElemwiseHcMegaUntil>()
+        .add::<ElemwiseHcMegaFrom>()
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
         .add::<SsmGdnStepBlocks>()
@@ -961,6 +978,8 @@ tuning! {
     norm_fold_block: u32 = 0, get ElemwiseNormFoldBlock;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
+    hc_mega_until: u32 = 0, get ElemwiseHcMegaUntil;
+    hc_mega_from: u32 = 0, get ElemwiseHcMegaFrom;
     ssm_conv_vec4: bool = false, on SsmConvVec4;
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
     ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
