@@ -46,6 +46,7 @@ flags! {
     ResidualAddRmsnorm = "fuse.residual_add_rmsnorm" => "fused.residual_add_rmsnorm",
     MatmulSwigluMatmul = "fuse.matmul_swiglu_matmul" => "fused.matmul_swiglu_matmul",
     MatmulGlu = "fuse.matmul_glu" => "fused.matmul_glu",
+    MoeMega = "fuse.moe_mega" => "fused.moe_mega",
     MoeExperts = "fuse.moe_experts" => "fused.moe_experts",
     MoeSelectGlu = "fuse.moe_select_glu" => "fused.moe_select_glu",
     MatmulSoftcap = "fuse.matmul_softcap" => "fused.matmul_softcap",

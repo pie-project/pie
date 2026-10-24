@@ -60,6 +60,7 @@ pub fn all() -> Vec<Rule> {
         residual_add_rmsnorm(),
         matmul_swiglu_matmul(),
         matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
+        moe_mega(),
         moe_experts(),
         moe_select_glu(),
         matmul_softcap(),
@@ -1024,6 +1025,89 @@ pub fn matmul_swiglu_matmul() -> Rule {
             packed: m.value("packed"),
             h: m.value("h"),
             y: m.value("y"),
+        }
+    })
+}
+
+/// A routed MLP the mega-MoE lands in one launch: a gate-up select over a
+/// packed bank (gate rows then up rows per expert), its SwiGLU, the down
+/// select on the same routes and the fold, nothing between. Its forms are
+/// the ones the kernel takes: DeepSeek-V4's W4A8 banks, the route weights
+/// scaling the clamped GLU's rows and the routes summed with the shared row
+/// added; and dense banks under the weighted sum (clamped or not), or the
+/// weights first under a clamp, the shared row added. A fire it declines
+/// still runs as its legs.
+#[must_use]
+pub fn moe_mega() -> Rule {
+    let mut alternatives = Vec::new();
+    // (W4A8 banks, the weights first, a clamp)
+    let forms = [
+        (true, true, true),
+        (false, false, false),
+        (false, false, true),
+        (false, true, true),
+    ];
+    for (w4a8, first, clamped) in forms {
+        alternatives.push(template(move |p| {
+            let x = p.rows("x", W);
+            let routes = p.value(
+                "routes",
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(W)],
+                    dtype: Dtype::I32,
+                },
+            );
+            let weights = p.value(
+                "weights",
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(W)],
+                    dtype: Dtype::F32,
+                },
+            );
+            let top_k = p.u32("top_k");
+            let select_of = |x: &poem::Value, bank: &'static str| {
+                if w4a8 {
+                    linear::select::quantized(
+                        x,
+                        &p.weight_at(bank, [W, W, W], W4A8),
+                        &routes,
+                        top_k,
+                    )
+                } else {
+                    linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k)
+                }
+            };
+            let packed = select_of(&x, "bank");
+            p.name("packed", &packed);
+            let hidden = linear::glu(
+                &packed,
+                GluAct::Swiglu,
+                Some(p.u32("intermediate")),
+                None,
+                first.then_some(&weights),
+                clamped.then(|| p.f32("limit")),
+            );
+            p.name("hidden", &hidden);
+            let routed = select_of(&hidden, "down");
+            p.name("routed", &routed);
+            let y = if first {
+                linear::moe_sum_add(&routed, &p.rows("shared", W))
+            } else {
+                linear::moe_weighted_sum(&routed, &weights)
+            };
+            p.export("y", &y);
+        }));
+    }
+    Rule::new("fused.moe_mega", alternatives, |m| {
+        let linear_op = |name| match m.op(name) {
+            Operation::Linear(op) => Box::new(op.clone()),
+            other => panic!("`{name}` is computed by {other:?}, not a linear op"),
+        };
+        Fused::MoeMega {
+            select: linear_op("packed"),
+            glu: linear_op("hidden"),
+            down: linear_op("routed"),
+            sum: linear_op("y"),
         }
     })
 }
