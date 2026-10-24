@@ -479,10 +479,10 @@ impl Group {
                     .ok_or("a rank is in no expert-parallel group")?,
             );
         }
-        let stream = views[0].1;
+        let streams: Vec<_> = views.iter().map(|&(_, stream)| stream).collect();
         let mut ranks: Vec<&mut crate::ep::EpRank> = views.into_iter().map(|(ep, _)| ep).collect();
         rebalancer
-            .run(due, &mut ranks, &self.ordinals, stream)
+            .run(due, &mut ranks, &self.ordinals, &streams)
             .map(|_| ())
             .map_err(|f| format!("the expert rebalance failed: {f}"))
     }

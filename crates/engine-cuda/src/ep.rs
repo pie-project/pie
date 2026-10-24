@@ -312,11 +312,13 @@ fn carve(_: i32, _: &[i32], _: &[u64; PARTS]) -> Result<[u64; PARTS]> {
 pub mod rebalance;
 
 /// One MoE layer's placement on a rank's device: the table its dispatches
-/// read and the loads they add each local slot's rows to.
+/// read, and where in the rank's loads they add each local slot's rows.
 struct Layer {
     place: kernels_cuda::collective::Placement,
     table: crate::device::Buffer,
-    loads: crate::device::Buffer,
+    /// The byte offset of the layer's `slots` u32 counters in
+    /// [`EpRank::loads`].
+    at: usize,
 }
 
 /// One plane of a routed bank on a rank: its `slots` slots, slot `s` the
@@ -339,6 +341,10 @@ pub struct EpRank {
     pub wires: Vec<Wire>,
     pub rank: u32,
     layers: std::collections::BTreeMap<u32, Layer>,
+    /// Every layer's loads, one span, so a rebalance reads them in one copy
+    /// into `mirror` and zeroes them in one memset.
+    loads: crate::device::Buffer,
+    mirror: crate::device::Pinned,
     banks: Banks,
     seats: Seats,
     seats_forked: Seats,
@@ -349,7 +355,15 @@ impl EpRank {
     /// dispatches, its table sized for any later rebalance.
     pub fn new(wires: Vec<Wire>, rank: u32, layers: &[(u32, u32, u32)]) -> Result<EpRank> {
         let ranks = wires.len() as u32;
+        let mut spans = std::collections::BTreeMap::new();
+        for &(layer, _, slots) in layers {
+            spans.entry(layer).or_insert(slots as usize * 4);
+        }
+        let bytes = spans.values().sum::<usize>();
+        let loads = crate::device::Buffer::zeroed(bytes)?;
+        let mirror = crate::device::Pinned::mapped(bytes)?;
         let mut held = std::collections::BTreeMap::new();
+        let mut at = 0;
         for &(layer, experts, slots) in layers {
             if held.contains_key(&layer) {
                 continue;
@@ -362,27 +376,22 @@ impl EpRank {
                 .collect();
             let mut table = crate::device::Buffer::zeroed(bytes.len())?;
             table.write(0, &bytes)?;
-            let loads = crate::device::Buffer::zeroed(slots as usize * 4)?;
             let place = kernels_cuda::collective::Placement {
                 table: table.ptr(),
                 stride,
                 experts,
                 slots,
-                loads: loads.ptr(),
+                loads: loads.ptr() + at as u64,
             };
-            held.insert(
-                layer,
-                Layer {
-                    place,
-                    table,
-                    loads,
-                },
-            );
+            held.insert(layer, Layer { place, table, at });
+            at += slots as usize * 4;
         }
         Ok(EpRank {
             wires,
             rank,
             layers: held,
+            loads,
+            mirror,
             banks: Banks::new(),
             seats: Seats::default(),
             seats_forked: Seats::default(),
@@ -415,23 +424,29 @@ impl EpRank {
         })
     }
 
-    /// Each layer's rows per local slot since the last read, which it
-    /// zeroes. The rank's dispatches must have finished.
-    pub fn take_loads(&mut self) -> Result<std::collections::BTreeMap<u32, Vec<u32>>> {
-        let mut out = std::collections::BTreeMap::new();
-        for (&l, layer) in &mut self.layers {
-            let mut bytes = vec![0u8; layer.loads.bytes()];
-            layer.loads.read(0, &mut bytes)?;
-            layer.loads.zero_span(0, bytes.len())?;
-            let loads = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| u32::from_le_bytes(*c))
-                .collect();
-            out.insert(l, loads);
-        }
-        Ok(out)
+    /// Enqueues on `stream` (of this rank's device) the copy of every
+    /// layer's loads into the host mirror, then their zeroing. The rank's
+    /// dispatches must have finished; [`EpRank::taken_loads`] reads the
+    /// mirror once `stream` has.
+    pub fn take_loads(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        let bytes = self.loads.bytes();
+        crate::device::alloc::copy_any(stream, self.mirror.host() as u64, self.loads.ptr(), bytes)?;
+        self.loads.zero_span_on(stream, 0, bytes)
+    }
+
+    /// Each layer's rows per local slot as the last [`EpRank::take_loads`]
+    /// left them in the mirror.
+    #[must_use]
+    pub fn taken_loads(&self) -> std::collections::BTreeMap<u32, Vec<u32>> {
+        (self.layers.iter())
+            .map(|(&l, layer)| {
+                let bytes = self.mirror.read(layer.at, layer.place.slots as usize * 4);
+                let loads = (bytes.as_chunks::<4>().0.iter())
+                    .map(|c| u32::from_le_bytes(*c))
+                    .collect();
+                (l, loads)
+            })
+            .collect()
     }
 
     /// Rewrites `layer`'s table in place: a captured body reads it where it
