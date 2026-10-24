@@ -7,7 +7,7 @@
 //! r % devices: real peers over the link, and past two ranks real and
 //! virtual peers in one group.
 
-use crate::common::{Gpu, device_count};
+use crate::common::{Alone, Gpu, device_count};
 use dtype::Dtype::{Bf16, F32, I32};
 use kernels_cuda::Tensor;
 use kernels_cuda::collective::{
@@ -188,11 +188,11 @@ fn ep_of(held: &[Held], rank: usize) -> Ep {
     }
 }
 
-// The ranks' launches meet on the device: a legacy-stream call from a test
-// running beside them, landing between two ranks' launches, would wait on
-// the first rank's spin while holding back the second's. They run alone.
+// The ranks' launches meet on the device: a call that waits on it from a
+// test running beside them, landing between two ranks' launches, would wait
+// on the first rank's spin while holding back the second's. Every check
+// holds the devices alone (`open_ranks`).
 fn fire_dispatch(c: &Case, gpus: &[Gpu], held: &[Held]) {
-    let _alone = crate::common::capturing();
     let landing: Vec<_> = held.iter().map(|h| h.landing).collect();
     let ctxs: Vec<_> = gpus.iter().map(Gpu::ctx).collect();
     for (r, ctx) in ctxs.iter().enumerate() {
@@ -215,7 +215,6 @@ fn fire_dispatch(c: &Case, gpus: &[Gpu], held: &[Held]) {
 }
 
 fn fire_combine(gpus: &[Gpu], held: &[Held]) {
-    let _alone = crate::common::capturing();
     let routed: Vec<_> = held.iter().map(|h| h.routed).collect();
     let ctxs: Vec<_> = gpus.iter().map(Gpu::ctx).collect();
     for (r, ctx) in ctxs.iter().enumerate() {
@@ -236,8 +235,10 @@ fn check(c: &Case) {
     check_on(c, 1);
 }
 
-/// The group's ranks, rank r on device r % `devices`.
-fn open_ranks(world: usize, devices: i32) -> (Vec<Gpu>, Vec<i32>) {
+/// The group's ranks, rank r on device r % `devices`, with the devices to
+/// themselves until the first of the three is dropped (it is the last).
+fn open_ranks(world: usize, devices: i32) -> (Alone, Vec<Gpu>, Vec<i32>) {
+    let alone = crate::common::alone();
     let gpus: Vec<_> = (0..world)
         .map(|r| Gpu::open_on(r as i32 % devices))
         .collect();
@@ -250,13 +251,13 @@ fn open_ranks(world: usize, devices: i32) -> (Vec<Gpu>, Vec<i32>) {
         g.bind();
         kernels_cuda::collective::load_ep().expect("the EP kernels load");
     }
-    (gpus, readers)
+    (alone, gpus, readers)
 }
 
 fn check_on(c: &Case, devices: i32) {
     let (world, t, k, h, w) = (c.world, c.tokens, c.top_k, c.width, c.out_width);
     let (slots, cap) = (c.slots(), world * t);
-    let (mut gpus, readers) = open_ranks(world, devices);
+    let (_alone, mut gpus, readers) = open_ranks(world, devices);
     let signals: Vec<_> = gpus
         .iter_mut()
         .map(|g| g.shared(EP_SIGNAL_BYTES as usize, &readers))
@@ -537,7 +538,7 @@ fn peer_rate() {
                 window: None,
                 short: None,
             };
-            let (mut gpus, readers) = open_ranks(c.world, devices);
+            let (_alone, mut gpus, readers) = open_ranks(c.world, devices);
             let signals: Vec<_> = gpus
                 .iter_mut()
                 .map(|g| g.shared(EP_SIGNAL_BYTES as usize, &readers))
@@ -573,7 +574,7 @@ fn peer_rate() {
                         crate::common::captured(&ctxs[r], || (0..reps).for_each(|_| fire(r)))
                     })
                     .collect();
-                let _alone = crate::common::capturing();
+                let _capture = crate::common::capturing();
                 let replay = || {
                     for (r, g) in gpus.iter().enumerate() {
                         g.bind();
