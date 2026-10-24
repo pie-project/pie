@@ -27,6 +27,9 @@ struct Case {
     weights: bool,
     /// `[live, first]`: the armed window, or every token live.
     window: Option<[u32; 2]>,
+    /// `x`'s rows when fewer than the step's tokens (an eager walk's live
+    /// rows under a step at its bucket), with no window armed.
+    short: Option<usize>,
 }
 
 /// One rank's inputs for a round.
@@ -52,6 +55,9 @@ impl Case {
     }
 
     fn live(&self, t: usize) -> bool {
+        if let Some(rows) = self.short {
+            return t < rows;
+        }
         self.window
             .is_none_or(|[live, first]| t >= first as usize && t < (first + live) as usize)
     }
@@ -132,7 +138,21 @@ fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64) -> Held {
         slots: slots as u32,
     };
     Held {
-        tokens: Tokens { x, routes, weights },
+        tokens: Tokens {
+            x: Tensor {
+                rows: c.short.map_or(x.rows, |r| r as u32),
+                ..x
+            },
+            routes: Tensor {
+                rows: c.short.map_or(routes.rows, |r| r as u32),
+                ..routes
+            },
+            weights: weights.map(|w| Tensor {
+                rows: c.short.map_or(w.rows, |r| r as u32),
+                ..w
+            }),
+            step: t as u32,
+        },
         landing,
         counts,
         routed,
@@ -154,7 +174,7 @@ fn ep_of(held: &[Held], rank: usize) -> Ep {
         world: held.len() as u32,
         signals,
         scratch: held[rank].scratch,
-        scratch_tokens: held[rank].tokens.x.rows,
+        scratch_tokens: held[rank].tokens.step,
     }
 }
 
@@ -331,6 +351,7 @@ fn every_rank_lands_its_routes_rows_in_rank_then_token_order() {
         extra: 0,
         weights: true,
         window: None,
+        short: None,
     };
     for world in [1, 2, 4, 8] {
         check(&Case { world, ..base });
@@ -338,7 +359,7 @@ fn every_rank_lands_its_routes_rows_in_rank_then_token_order() {
 }
 
 #[test]
-fn replicas_and_a_window_keep_the_rows_where_the_host_puts_them() {
+fn replicas_a_window_and_short_rows_keep_the_rows_where_the_host_puts_them() {
     let base = Case {
         world: 4,
         tokens: 37,
@@ -349,10 +370,15 @@ fn replicas_and_a_window_keep_the_rows_where_the_host_puts_them() {
         extra: 8,
         weights: false,
         window: None,
+        short: None,
     };
     check(&base);
     check(&Case {
         window: Some([20, 5]),
+        ..base
+    });
+    check(&Case {
+        short: Some(30),
         ..base
     });
     check(&Case {
@@ -374,5 +400,6 @@ fn a_fire_past_one_count_block_scans_across_its_chunks() {
         extra: 0,
         weights: true,
         window: None,
+        short: None,
     });
 }

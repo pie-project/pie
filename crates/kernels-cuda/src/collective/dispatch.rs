@@ -73,13 +73,17 @@ pub struct Landing {
     pub origin: Tensor,
 }
 
-/// This rank's tokens: `[T, H]` rows, their routes (`[T, top_k]` i32 logical
-/// experts) and, where the experts consume them, the routes' weights.
+/// This rank's tokens: rows, their routes (`[rows, top_k]` i32 logical
+/// experts) and, where the experts consume them, the routes' weights; and
+/// `step`, the tokens every rank of the step agrees on (its bucket), at
+/// least `x`'s rows. Under an armed window the window says which are live;
+/// otherwise `x`'s rows are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tokens {
     pub x: Tensor,
     pub routes: Tensor,
     pub weights: Option<Tensor>,
+    pub step: u32,
 }
 
 /// `pie::collective::DispatchParams`, field for field.
@@ -102,6 +106,7 @@ struct Params {
     rank: i32,
     ranks: i32,
     tokens: i32,
+    live: i32,
     packs: i32,
     top_k: i32,
     experts: i32,
@@ -117,12 +122,20 @@ pub fn dispatch(
     ctx: &Ctx,
     ep: &Ep,
     place: Placement,
-    Tokens { x, routes, weights }: Tokens,
+    Tokens {
+        x,
+        routes,
+        weights,
+        step,
+    }: Tokens,
     landing: &[Landing],
     counts: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "collective.dispatch";
-    let (world, tokens, top_k) = (ep.world, x.rows, routes.width);
+    let (world, tokens, top_k) = (ep.world, step, routes.width);
+    if x.rows > step {
+        return Err(refuse(OP, "more rows than the step's tokens"));
+    }
     if !(1..=EP_MAX_RANKS).contains(&world) || ep.rank >= world || landing.len() != world as usize {
         return Err(refuse(
             OP,
@@ -133,11 +146,11 @@ pub fn dispatch(
     if !aligned16(x.ptr) || !row.is_multiple_of(16) || row == 0 {
         return Err(refuse(OP, "a token row is whole 16-byte packs"));
     }
-    if routes.dtype != Dtype::I32 || routes.rows != tokens || !(1..=32).contains(&top_k) {
-        return Err(refuse(OP, "the routes are i32 [tokens, 1..=32]"));
+    if routes.dtype != Dtype::I32 || routes.rows != x.rows || !(1..=32).contains(&top_k) {
+        return Err(refuse(OP, "the routes are i32 [rows, 1..=32]"));
     }
-    if weights.is_some_and(|w| w.dtype != Dtype::F32 || w.rows != tokens || w.width != top_k) {
-        return Err(refuse(OP, "the weights are f32 [tokens, top_k]"));
+    if weights.is_some_and(|w| w.dtype != Dtype::F32 || w.rows != x.rows || w.width != top_k) {
+        return Err(refuse(OP, "the weights are f32 [rows, top_k]"));
     }
     if place.slots == 0 || place.stride < 2 {
         return Err(refuse(
@@ -209,6 +222,7 @@ pub fn dispatch(
         rank: ep.rank as i32,
         ranks: world as i32,
         tokens: tokens as i32,
+        live: x.rows as i32,
         packs: (row / 16) as i32,
         top_k: top_k as i32,
         experts: place.experts as i32,

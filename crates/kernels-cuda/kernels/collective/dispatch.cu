@@ -46,8 +46,8 @@ struct DispatchParams {
     const int4* x;
     const i32* routes;
     const float* weights;
-    // The live window (`win[0]` tokens from token `win[1]`), or null: every
-    // token is live.
+    // The live window (`win[0]` tokens from token `win[1]`), or null: the
+    // first `live` tokens are.
     const u32* win;
     // `[experts][stride]`: a replica count, then that many physical slots
     // (rank * slots + local slot).
@@ -63,7 +63,10 @@ struct DispatchParams {
     peer::Signals* self;
     i32 rank;
     i32 ranks;
+    // The step's tokens, every rank's: rows are `ranks * tokens` and an
+    // origin `rank * tokens + t`. `x` holds at least the live ones.
     i32 tokens;
+    i32 live;
     i32 packs;
     i32 top_k;
     i32 experts;
@@ -76,7 +79,7 @@ __device__ __forceinline__ Inbox* inbox(peer::Signals* s) {
 }
 
 __device__ __forceinline__ bool live(const DispatchParams& p, int t) {
-    if (p.win == nullptr) return true;
+    if (p.win == nullptr) return t < p.live;
     const int at = t - static_cast<int>(p.win[1]);
     return at >= 0 && at < static_cast<int>(p.win[0]);
 }

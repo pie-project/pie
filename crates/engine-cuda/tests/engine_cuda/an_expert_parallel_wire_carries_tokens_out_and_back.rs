@@ -102,6 +102,7 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
             x: Tensor::new(x.ptr(), tokens, width, Dtype::Bf16),
             routes: Tensor::new(rt.ptr(), tokens, top_k, Dtype::I32),
             weights: None,
+            step: tokens,
         };
         dispatch(ctx, &wires[r].ep, place, toks, &landing, &mut counts).unwrap();
     }
