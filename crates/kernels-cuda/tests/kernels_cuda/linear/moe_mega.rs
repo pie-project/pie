@@ -699,3 +699,208 @@ fn mega_moe_prefill_rate() {
         );
     }
 }
+
+/// A kernel holding a CTA a multiprocessor (200 KiB of shared memory each,
+/// too much beside it for a mega-MoE CTA), sleeping out `ns` nanoseconds.
+const HOG: &str = r#"
+extern "C" __global__ void hog(unsigned long long ns) {
+    extern __shared__ unsigned char held[];
+    held[threadIdx.x] = 0;
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do {
+        __nanosleep(1000);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    } while (t - t0 < ns);
+}
+"#;
+const HOG_SMEM: u32 = 200 * 1024;
+
+/// The hog compiled and loaded: its module and function.
+#[allow(unsafe_code)]
+fn hog_kernel() -> (
+    kernels_cuda::cudarc::driver::sys::CUmodule,
+    kernels_cuda::cudarc::driver::sys::CUfunction,
+) {
+    use kernels_cuda::cudarc::driver::sys as dr;
+    let opts = kernels_cuda::cudarc::nvrtc::CompileOptions {
+        arch: Some("compute_100"),
+        ..Default::default()
+    };
+    let ptx = kernels_cuda::cudarc::nvrtc::compile_ptx_with_opts(HOG, opts).expect("compiles");
+    let text = std::ffi::CString::new(ptx.to_src()).expect("ptx text");
+    // SAFETY: the out-pointers are locals; the module image is the
+    // NUL-terminated PTX just compiled.
+    unsafe {
+        let mut module: dr::CUmodule = core::ptr::null_mut();
+        let code = dr::cuModuleLoadData(&raw mut module, text.as_ptr().cast());
+        assert_eq!(code, dr::CUresult::CUDA_SUCCESS, "loads");
+        let mut f: dr::CUfunction = core::ptr::null_mut();
+        let code = dr::cuModuleGetFunction(&raw mut f, module, c"hog".as_ptr());
+        assert_eq!(code, dr::CUresult::CUDA_SUCCESS, "finds the hog");
+        let attr = dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+        let code = dr::cuFuncSetAttribute(f, attr, HOG_SMEM as i32);
+        assert_eq!(code, dr::CUresult::CUDA_SUCCESS, "takes its shared memory");
+        (module, f)
+    }
+}
+
+/// The mega-MoE's launch, cooperative and a programmatic dependent in one
+/// config, as the driver takes it on this card: a grid a CTA a
+/// multiprocessor at a mega-MoE CTA's shared memory launches, and one that
+/// cannot all be resident at once is refused rather than seated in waves.
+#[test]
+#[allow(unsafe_code)]
+fn a_cooperative_programmatic_launch_seats_its_grid_whole_or_not_at_all() {
+    use kernels_cuda::cudarc::driver::sys as dr;
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let b = Bench::new(1);
+    let ctx = b.ctx();
+    let sms = ctx.multiprocessors().expect("a device");
+    let (module, hog) = hog_kernel();
+    let launch = |grid: u32| {
+        let mut ns: u64 = 1000;
+        let mut args = [(&raw mut ns).cast::<core::ffi::c_void>()];
+        // SAFETY: plain C data, valid zeroed; the attributes and the one
+        // argument are locals outliving the call on the test's live stream.
+        unsafe {
+            let mut attrs: [dr::CUlaunchAttribute; 2] = core::mem::zeroed();
+            attrs[0].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+            attrs[0].value.cooperative = 1;
+            attrs[1].id =
+                dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+            attrs[1].value.programmaticStreamSerializationAllowed = 1;
+            let config = dr::CUlaunchConfig {
+                gridDimX: grid,
+                gridDimY: 1,
+                gridDimZ: 1,
+                blockDimX: 32,
+                blockDimY: 1,
+                blockDimZ: 1,
+                sharedMemBytes: HOG_SMEM,
+                hStream: ctx.stream().cast(),
+                attrs: attrs.as_mut_ptr(),
+                numAttrs: 2,
+            };
+            dr::cuLaunchKernelEx(
+                &raw const config,
+                hog,
+                args.as_mut_ptr(),
+                core::ptr::null_mut(),
+            )
+        }
+    };
+    assert_eq!(
+        launch(sms),
+        dr::CUresult::CUDA_SUCCESS,
+        "a grid the card seats at once launches"
+    );
+    assert_eq!(
+        launch(sms + 1),
+        dr::CUresult::CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE,
+        "a grid the card cannot seat at once is refused"
+    );
+    b.sync();
+    // SAFETY: the module is this test's, its launches drained above.
+    unsafe {
+        dr::cuModuleUnload(module);
+    }
+}
+
+/// A mega-MoE fire beside a long kernel on another stream holding most SMs
+/// lands (its cooperative launch seated once they free), bit for bit what
+/// it lands alone.
+#[test]
+#[allow(unsafe_code)]
+fn the_mega_moe_lands_beside_another_streams_long_kernel() {
+    use kernels_cuda::cudarc::driver::sys as dr;
+    use kernels_cuda::cudarc::runtime::sys as rt;
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let s = Shape {
+        experts: 32,
+        ..V4_FLASH
+    };
+    let mut b = Bench::new(0x6a11);
+    let w = w4a8(&mut b, s, true);
+    let tuning = kernels_cuda::tuning::Tuning { pdl: true, ..SM100 };
+    let ctx = b.ctx().with_tuning(tuning);
+    let (module, hog) = hog_kernel();
+    // A decode (its fold in the down epilogue) and a wider fire (folded at
+    // the end), the hog leaving 8 SMs free.
+    let held = ctx.multiprocessors().expect("a device") - 8;
+    for tokens in [3usize, 40] {
+        let f = fire_of(&mut b, s, tokens, 0x5150 + tokens as u64);
+        let m = mlp_of(s, &w, &f);
+        let fold = moe::Fold::First(Some(f.shared));
+        let mut alone = b.out(tokens, s.hidden);
+        assert!(
+            moe::mega(&ctx, m, fold, &mut alone).expect("fires"),
+            "takes the fire"
+        );
+        let want = b.read(alone.ptr, tokens * s.hidden);
+        let mut y = b.out(tokens, s.hidden);
+        b.sync();
+        // SAFETY: every out-pointer is a local; the stream and events live
+        // to the end of the block, and the hog's one argument outlives its
+        // launch on that stream.
+        unsafe {
+            let mut side: rt::cudaStream_t = core::ptr::null_mut();
+            rt::cudaStreamCreateWithFlags(&raw mut side, rt::cudaStreamNonBlocking);
+            let mut done: rt::cudaEvent_t = core::ptr::null_mut();
+            rt::cudaEventCreate(&raw mut done);
+            let mut ns: u64 = 300_000_000;
+            let mut args = [(&raw mut ns).cast::<core::ffi::c_void>()];
+            let code = dr::cuLaunchKernel(
+                hog,
+                held,
+                1,
+                1,
+                32,
+                1,
+                1,
+                HOG_SMEM,
+                side.cast(),
+                args.as_mut_ptr(),
+                core::ptr::null_mut(),
+            );
+            assert_eq!(code, dr::CUresult::CUDA_SUCCESS, "the hog launches");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                moe::mega(&ctx, m, fold, &mut y).expect("fires"),
+                "takes the fire"
+            );
+            rt::cudaEventRecord(done, ctx.stream().cast());
+            let start = std::time::Instant::now();
+            while rt::cudaEventQuery(done) == rt::cudaError::cudaErrorNotReady {
+                let late = start.elapsed() > std::time::Duration::from_secs(10);
+                assert!(
+                    !late,
+                    "{tokens} tokens: the fire never lands beside the hog"
+                );
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            rt::cudaStreamSynchronize(side);
+            rt::cudaEventDestroy(done);
+            rt::cudaStreamDestroy(side);
+        }
+        let got = b.read(y.ptr, tokens * s.hidden);
+        let same = got
+            .iter()
+            .zip(&want)
+            .all(|(g, w)| g.to_bits() == w.to_bits());
+        assert!(
+            same,
+            "{tokens} tokens: the fire beside the hog lands what it lands alone"
+        );
+    }
+    // SAFETY: the module is this test's, its launches drained above.
+    unsafe {
+        dr::cuModuleUnload(module);
+    }
+}

@@ -19,6 +19,11 @@
 // the gate-up tiles that land the K it reads, so every gate-up task
 // finishes and no wait closes a cycle.
 //
+// The launch is cooperative, its grid seated whole; and no CTA waits on
+// work a given CTA owns besides: the tasks, the quantizer's blocks and a
+// wide fold's items are all claimed from counts, so whichever CTAs run first
+// do every one of them.
+//
 // Between them, global flags (zero at rest, the last CTA out zeroing them):
 // a block's quantized row chunks (`xready`, a count), its intermediate
 // tiles (`hready`, a bit a tile), an output column tile's routes landed
@@ -47,7 +52,10 @@ __host__ __device__ constexpr int ws_hready() { return kMaxRoutes; }
 __host__ __device__ constexpr int ws_done() { return 2 * kMaxRoutes; }
 __host__ __device__ constexpr int ws_finish() { return 2 * kMaxRoutes + kMaxColTiles; }
 __host__ __device__ constexpr int ws_next() { return ws_finish() + 1; }
-__host__ __device__ constexpr int ws_words() { return ws_next() + 1; }
+// The quantizer's blocks claimed, and a wide fold's items.
+__host__ __device__ constexpr int ws_qnext() { return ws_finish() + 2; }
+__host__ __device__ constexpr int ws_fnext() { return ws_finish() + 3; }
+__host__ __device__ constexpr int ws_words() { return ws_finish() + 4; }
 
 // ---- cross-CTA flags ---------------------------------------------------------
 
@@ -96,6 +104,9 @@ __device__ __forceinline__ u32 wait_bits(const u32* p, u32 need) {
     fence_acquire();
     return v;
 }
+
+// Warps 3-11's own barrier, sharing a claimed block's quantization.
+__device__ __forceinline__ void helpers_sync() { asm volatile("bar.sync 4, 288;" ::: "memory"); }
 
 // An epilogue warpgroup's own barrier (its four warps), 1 or 2.
 __device__ __forceinline__ void wg_sync(int wg) {

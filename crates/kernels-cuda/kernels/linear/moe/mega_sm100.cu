@@ -487,13 +487,18 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             bar_wait(&tempty[l % 2], (static_cast<u32>(l) / 2) & 1);
         }
     } else {
-        // Warps 3-11 first quantize (or copy) the routes' rows of this CTA's
-        // blocks into the activation pool, a 1024-column chunk a warp at a
-        // time.
+        // Warps 3-11 first quantize (or copy) the routes' rows into the
+        // activation pool, a block claimed at a time by the CTA, a 1024-column
+        // chunk a warp at a time.
         {
             const int qw = warp - 3;
             int k = 0;
-            for (int b = static_cast<int>(blockIdx.x); b < blocks; b += G) {
+            for (;;) {
+                if (warp == 3 && lane == 0) *flag = atomicAdd(&p.sync[ws_qnext()], 1u);
+                helpers_sync();
+                const int b = static_cast<int>(*flag);
+                helpers_sync();
+                if (b >= blocks) break;
                 int e, m;
                 block_of(R, b, e, m);
                 const int rows = min(R.count[e] - m * kBN, kBN);
@@ -679,9 +684,13 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
         // The fold of a wide fire's tiles, spread over the CTAs once each
         // tile's routes have landed (a narrow fire's ran in the down epilogue).
         if (R.tokens > kFoldInline) {
-            const int fw = warp - 3;
             const int items = R.tokens * j2;
-            for (int item = static_cast<int>(blockIdx.x) + G * fw; item < items; item += kHelpers * G) {
+            for (;;) {
+                // An item a warp at a time, claimed.
+                u32 got = 0;
+                if (lane == 0) got = atomicAdd(&p.sync[ws_fnext()], 1u);
+                const int item = static_cast<int>(__shfl_sync(0xffffffffu, got, 0));
+                if (item >= items) break;
                 const int t = item / j2, j = item - t * j2;
                 fold(t, j, true);
                 __syncwarp();
@@ -708,6 +717,8 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
         for (int j = static_cast<int>(threadIdx.x); j < j2; j += kThreads) done[j] = 0;
         if (threadIdx.x == 0) {
             p.sync[ws_next()] = 0;
+            p.sync[ws_qnext()] = 0;
+            p.sync[ws_fnext()] = 0;
             p.sync[ws_finish()] = 0;
         }
     }

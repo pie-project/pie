@@ -64,7 +64,7 @@ const MAX_BLOCKS: u32 = 2048;
 const MAX_COL_TILES: u32 = 64;
 const MAX_GLU_TILES: u32 = 32;
 /// `pie::linear::mega::ws_words`: the flags, zero at rest.
-const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 2;
+const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 4;
 /// `pie::linear::mega::kChunk`: the columns a quantizer pass reads.
 const CHUNK: u32 = 1024;
 /// `pie::linear::mega::kPoolStride`: a block's pool rows 64 apart.
@@ -374,18 +374,14 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
     };
     let kind = u32::from(w4);
     let first = u32::from(first);
-    // As a programmatic dependent (`kernel.pdl`) its set-up overlaps the
-    // producer's tail. Every wait across CTAs comes after the producer is
-    // done and its CTAs gone, so the grid is resident without a cooperative
-    // launch, which the driver would not overlap; without PDL it launches
-    // cooperatively.
-    let pdl = ctx.tuning().pdl;
-    let launch = Launch::grid([sms, 1, 1], [THREADS, 1, 1]).smem(smem);
-    let launch = if pdl {
-        launch.programmatic(true)
-    } else {
-        launch.cooperative()
-    };
+    // A cooperative launch: the driver seats the whole grid at once or
+    // refuses it, so the CTAs that wait on each other's flags are all
+    // resident whatever else holds the card. As a programmatic dependent
+    // (`kernel.pdl`) too, in the same launch.
+    let launch = Launch::grid([sms, 1, 1], [THREADS, 1, 1])
+        .smem(smem)
+        .cooperative()
+        .programmatic(ctx.tuning().pdl);
     ctx.fire(
         OP,
         Fire::at(kernel(
