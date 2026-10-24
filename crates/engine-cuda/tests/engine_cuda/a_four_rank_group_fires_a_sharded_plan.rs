@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_close, bf};
 use checkpoint::contract::ModelContract;
 use engine::Engine;
-use engine::channel::ChannelRegistration;
+use engine::channel::{ChannelId, ChannelRegistration};
 use engine::fire::{
     Attachment, Boundary, FrameSubmission, Lane, PortFeed, PortKind, Readout, Step,
 };
@@ -272,7 +272,7 @@ fn four_ranks_land_what_one_rank_lands() {
             })
             .expect("the program registers on every rank");
         let mut channel = |host_role: HostRole| {
-            let id = next_channel;
+            let id = ChannelId(next_channel);
             next_channel += 1;
             group
                 .register_channel(&ChannelRegistration {

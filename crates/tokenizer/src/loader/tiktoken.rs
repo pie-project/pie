@@ -205,6 +205,7 @@ fn parse_config(data: &[u8], label: &str) -> Result<(TiktokenTokenizerConfig, Ti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Specials;
 
     #[test]
     fn kimi_loader_matches_split_and_special_token_contract() {
@@ -251,7 +252,7 @@ mod tests {
         .unwrap();
 
         let tokenizer = from_file(&model_path).unwrap();
-        assert_eq!(tokenizer.get_split_regex(), KIMI_TIKTOKEN_REGEX);
+        assert_eq!(tokenizer.split_regex(), Some(KIMI_TIKTOKEN_REGEX));
         assert_eq!(
             tokenizer.vocab_size(),
             (base_vocab_size + KIMI_RESERVED_SPECIAL_TOKENS) as usize
@@ -272,11 +273,17 @@ mod tests {
             vec![base_vocab_size, 257, b'4' as u32, base_vocab_size + 1]
         );
         assert_eq!(
-            tokenizer.decode(&[base_vocab_size, b'h' as u32, base_vocab_size + 1], false),
+            tokenizer.decode(
+                &[base_vocab_size, b'h' as u32, base_vocab_size + 1],
+                Specials::Keep
+            ),
             "<|im_user|>h<|tool|>"
         );
         assert_eq!(
-            tokenizer.decode(&[base_vocab_size, b'h' as u32, base_vocab_size + 1], true),
+            tokenizer.decode(
+                &[base_vocab_size, b'h' as u32, base_vocab_size + 1],
+                Specials::Skip
+            ),
             "h<|tool|>"
         );
     }

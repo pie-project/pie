@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{ArgValue, Ctx, Fire, Launch};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel};
 
 const FILE: &str = "runtime/channel.cu";
 
@@ -213,7 +213,7 @@ pub fn gather_words(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::runtime::channel::gather_words")
+        Fire::at(kernel(FILE, "::pie::runtime::channel::gather_words"))
             .apply(Launch::grid([run_count, 1, 1], [GATHER_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(runs),
@@ -235,7 +235,7 @@ pub fn pull_validate(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::runtime::channel::pull_validate")
+        Fire::at(kernel(FILE, "::pie::runtime::channel::pull_validate"))
             .apply(Launch::grid([lane_count, 1, 1], [PULL_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(tickets),
@@ -252,7 +252,7 @@ pub fn commit_bump(ctx: &Ctx, lanes: DevicePtr, lane_count: u32) -> Result<(), E
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::runtime::channel::commit_bump")
+        Fire::at(kernel(FILE, "::pie::runtime::channel::commit_bump"))
             .apply(Launch::grid([lane_count, 1, 1], [BUMP_BLOCK, 1, 1])),
         &[ArgValue::Ptr(lanes), ArgValue::U32(lane_count)],
     )
@@ -270,7 +270,7 @@ pub fn scatter_publish(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::runtime::channel::scatter_publish")
+        Fire::at(kernel(FILE, "::pie::runtime::channel::scatter_publish"))
             .apply(Launch::grid([lane_count, 1, 1], [PULL_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(tickets),
@@ -292,7 +292,7 @@ pub fn settle(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::runtime::channel::settle")
+        Fire::at(kernel(FILE, "::pie::runtime::channel::settle"))
             .apply(Launch::grid([lane_count, 1, 1], [SETTLE_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(tickets),
@@ -315,7 +315,7 @@ pub fn mask_from_commit(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::runtime::channel::mask_from_commit")
+        Fire::at(kernel(FILE, "::pie::runtime::channel::mask_from_commit"))
             .apply(Launch::grid([lane_count, 1, 1], [MASK_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(commits),

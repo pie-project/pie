@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -224,7 +224,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
     if !config.skip_tracing {
-        init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
+        init_tracing(config.log_dir.as_deref(), config.verbose, &config.telemetry)?;
     }
     let wasm_engine = init_wasmtime(&config.runtime);
 
@@ -715,7 +715,7 @@ fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConf
 
 #[cfg(target_arch = "wasm32")]
 fn init_tracing(
-    _log_dir: &Option<PathBuf>,
+    _log_dir: Option<&Path>,
     _verbose: bool,
     _telemetry_config: &TelemetryConfig,
 ) -> Result<()> {
@@ -724,7 +724,7 @@ fn init_tracing(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn init_tracing(
-    log_dir: &Option<PathBuf>,
+    log_dir: Option<&Path>,
     verbose: bool,
     telemetry_config: &TelemetryConfig,
 ) -> Result<()> {

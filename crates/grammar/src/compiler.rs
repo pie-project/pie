@@ -140,7 +140,7 @@ impl GrammarCompiler {
         if let Some(compiled) = self
             .cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("cache lock poisoned")
             .get(&key)
             .cloned()
         {
@@ -149,10 +149,7 @@ impl GrammarCompiler {
 
         let compiled = build_compiled()?;
 
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = self.cache.lock().expect("cache lock poisoned");
         if let Some(existing) = cache.get(&key) {
             return Ok(existing.clone());
         }

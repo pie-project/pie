@@ -6,7 +6,7 @@
 use crate::attn::kv;
 use crate::attn::plan::{DecodePlan, PrefillPlan};
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, refuse};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 pub const FILE: &str = "attn/paged.hip";
@@ -243,10 +243,10 @@ pub fn decode(
         // whose columns split over its wavefronts keeps more blocks a CU
         // (and their reads) in flight.
         (
-            symbol(&format!(
+            format!(
                 "::pie::attn::paged_decode_cols<{}, {group}, {hnd}, {fp8}>",
                 shape.head_dim
-            )),
+            ),
             256,
         )
     } else if group <= 16 && shape.head_dim.is_multiple_of(32) {
@@ -265,26 +265,26 @@ pub fn decode(
             8
         };
         (
-            symbol(&format!(
+            format!(
                 "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}, {pvm}, {fp8}>",
                 shape.head_dim,
                 shape.head_dim < 512
-            )),
+            ),
             64 * waves,
         )
     } else {
         let waves = decode_waves(group, shape.head_dim);
         (
-            symbol(&format!(
+            format!(
                 "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}, {fp8}>",
                 shape.head_dim
-            )),
+            ),
             64 * waves,
         )
     };
     ctx.fire(
         op,
-        Fire::at(FILE, entry).apply(Launch::grid(
+        Fire::at(kernel(FILE, &entry)).apply(Launch::grid(
             [info.padded_batch_size as u32, shape.num_kv_heads, 1],
             [threads, 1, 1],
         )),
@@ -447,28 +447,28 @@ fn prefill_walk(
                 "the selected prefill walks causal 128- or 256-wide heads of bf16 pages only",
             ));
         }
-        let entry = symbol(&format!(
+        let entry = format!(
             "::pie::attn::paged_prefill_selected<{}, {hnd}>",
             shape.head_dim
-        ));
+        );
         ctx.fire(
             op,
-            Fire::at(FILE, entry).apply(launch),
+            Fire::at(kernel(FILE, &entry)).apply(launch),
             &[ArgValue::of(&args), ArgValue::of(&sel)],
         )?;
     } else {
-        let kernel = if matches!(shape.head_dim, 128 | 256) {
+        let family = if matches!(shape.head_dim, 128 | 256) {
             "paged_prefill"
         } else {
             "paged_prefill_wide"
         };
-        let entry = symbol(&format!(
-            "::pie::attn::{kernel}<{}, {hnd}, {causal}, {fp8}>",
+        let entry = format!(
+            "::pie::attn::{family}<{}, {hnd}, {causal}, {fp8}>",
             shape.head_dim
-        ));
+        );
         ctx.fire(
             op,
-            Fire::at(FILE, entry).apply(launch),
+            Fire::at(kernel(FILE, &entry)).apply(launch),
             &[ArgValue::of(&args)],
         )?;
     }
@@ -488,10 +488,10 @@ fn merge(ctx: &Ctx, op: &'static str, parts: &Partials) -> Result<(), Error> {
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::attn::merge_partials<{}>", parts.head_dim)),
-        )
+            &format!("::pie::attn::merge_partials<{}>", parts.head_dim),
+        ))
         .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(parts.parts),

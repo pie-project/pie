@@ -27,16 +27,15 @@ pub struct Kimi3 {
 }
 
 impl Kimi3 {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self {
-            open: special(&tokenizer, OPEN),
-            close: special(&tokenizer, CLOSE),
-            sep: special(&tokenizer, SEP),
-            end_of_msg: special(&tokenizer, END_OF_MSG),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        Ok(Self {
+            open: special(&tokenizer, OPEN)?,
+            close: special(&tokenizer, CLOSE)?,
+            sep: special(&tokenizer, SEP)?,
+            end_of_msg: special(&tokenizer, END_OF_MSG)?,
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn open_tag(&self, tag: &str, attrs: &[(&str, &str)]) -> Vec<u32> {

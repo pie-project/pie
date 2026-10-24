@@ -64,15 +64,12 @@ impl Device {
         let client = open_client(plugin).map_err(|e| Fault::NoDevice {
             detail: e.to_string(),
         })?;
-        let device = *client
-            .devices()
-            .get(ordinal)
-            .ok_or_else(|| Fault::NoDevice {
-                detail: format!(
-                    "device {ordinal} asked of a client that addresses {}",
-                    client.devices().len()
-                ),
-            })?;
+        let device = client.device(ordinal).ok_or_else(|| Fault::NoDevice {
+            detail: format!(
+                "device {ordinal} asked of a client that addresses {}",
+                client.device_count()
+            ),
+        })?;
         let kind = client.device_kind(device).unwrap_or_default();
         let stats = client.memory_stats(device).ok();
         let limit = stats
@@ -112,11 +109,7 @@ impl Device {
         };
         let kind = client
             .as_ref()
-            .and_then(|c| {
-                c.devices()
-                    .get(ordinal)
-                    .and_then(|d| c.device_kind(*d).ok())
-            })
+            .and_then(|c| c.device(ordinal).and_then(|d| c.device_kind(d).ok()))
             // Without a client, the v6e the defaults were measured on.
             .unwrap_or_else(|| "TPU v6 lite".to_string());
         Ok(Device {
@@ -143,10 +136,7 @@ impl Device {
     #[must_use]
     pub fn dry_texts(&self) -> Vec<String> {
         self.dry.as_ref().map_or_else(Vec::new, |texts| {
-            texts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+            texts.lock().expect("texts lock poisoned").clone()
         })
     }
 
@@ -182,8 +172,8 @@ impl Device {
         self.held
     }
 
-    fn device(&self) -> Result<pjrt::Device> {
-        Ok(self.client()?.devices()[self.ordinal])
+    fn device(&self) -> Result<pjrt::Device<'_>> {
+        self.client()?.device(self.ordinal).ok_or(Fault::Deviceless)
     }
 
     /// Lands `bytes` as a `[rows, width]` array of `dtype` (packed dtypes as
@@ -222,12 +212,7 @@ impl Device {
     /// The compiled form of `text`, from the cache or freshly built.
     pub fn program(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
         }
         if let Some(dir) = &self.dump {
@@ -238,7 +223,7 @@ impl Device {
         if let Some(texts) = &self.dry {
             texts
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("texts lock poisoned")
                 .push(text.to_string());
             let exe = match &self.client {
                 None => None,
@@ -254,7 +239,7 @@ impl Device {
             });
             self.cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("cache lock poisoned")
                 .insert(key, Arc::clone(&program));
             return Ok(program);
         }
@@ -313,17 +298,14 @@ impl Device {
         });
         self.cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("cache lock poisoned")
             .insert(key, Arc::clone(&program));
         Ok(program)
     }
 
     #[must_use]
     pub fn compiled(&self) -> usize {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.cache.lock().expect("cache lock poisoned").len()
     }
 
     /// Runs `program` over `args` (in its parameter order); returns its

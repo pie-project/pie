@@ -24,14 +24,5 @@ blake3 = "1.8"
 [dev-dependencies]
 tempfile = "3"
 
-# The workspace lints, with unsafe_code at deny rather than forbid: starlark
-# 0.14's `ProvidesStaticType` derive emits an `unsafe impl`, allowed in
-# `star` alone.
-[lints.rust]
-unsafe_code = "deny"
-missing_docs = "allow"
-
-[lints.clippy]
-todo = "deny"
-unimplemented = "deny"
-dbg_macro = "deny"
+[lints]
+workspace = true

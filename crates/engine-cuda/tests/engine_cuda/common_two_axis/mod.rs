@@ -14,6 +14,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
+use engine::{ChannelId, InstanceId, ProgramId};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -405,7 +406,7 @@ impl Rig {
     }
 
     #[must_use]
-    pub fn vae_lane(&self, slot: u32, channel: u64) -> Lane {
+    pub fn vae_lane(&self, slot: u32, channel: ChannelId) -> Lane {
         Lane {
             slot,
             word: self.word(Some("vae")),
@@ -427,9 +428,9 @@ impl Rig {
         &self,
         slot: u32,
         rows: u32,
-        latent: u64,
-        timestep: u64,
-        positions: u64,
+        latent: ChannelId,
+        timestep: ChannelId,
+        positions: ChannelId,
     ) -> Lane {
         Lane {
             slot,
@@ -459,7 +460,7 @@ impl Rig {
         }
     }
 
-    pub fn register(&mut self, container: TraceContainer, salt: u64) -> u64 {
+    pub fn register(&mut self, container: TraceContainer, salt: u64) -> ProgramId {
         let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
@@ -478,8 +479,8 @@ impl Rig {
             .expect("the program registers")
     }
 
-    pub fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> u64 {
-        let id = self.next_channel;
+    pub fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> ChannelId {
+        let id = ChannelId(self.next_channel);
         self.next_channel += 1;
         self.engine
             .register_channel(&ChannelRegistration {
@@ -496,7 +497,7 @@ impl Rig {
         id
     }
 
-    pub fn bind(&mut self, program: u64, channels: Vec<u64>, rows: u32) -> u64 {
+    pub fn bind(&mut self, program: ProgramId, channels: Vec<ChannelId>, rows: u32) -> InstanceId {
         self.engine
             .bind_instance(&InstanceBinding {
                 program,
@@ -515,7 +516,7 @@ impl Rig {
             .id
     }
 
-    pub fn publish(&mut self, instance: u64, dense: u32, values: &[f32]) {
+    pub fn publish(&mut self, instance: InstanceId, dense: u32, values: &[f32]) {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let accepted = self
             .engine
@@ -524,7 +525,7 @@ impl Rig {
         assert!(accepted, "the ring had room");
     }
 
-    pub fn take(&mut self, instance: u64, dense: u32) -> Vec<f32> {
+    pub fn take(&mut self, instance: InstanceId, dense: u32) -> Vec<f32> {
         let bytes = self
             .engine
             .take_channel(instance, dense)
@@ -540,7 +541,7 @@ impl Rig {
 }
 
 #[must_use]
-pub fn attach(lane: u32, instance: u64) -> Attachment {
+pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
     Attachment {
         lane,
         instance,

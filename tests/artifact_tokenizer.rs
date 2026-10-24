@@ -9,6 +9,7 @@
 //! and reader would land.
 
 use std::collections::HashMap;
+use tokenizer::Specials;
 
 use checkpoint::file::meta;
 use checkpoint::file::read;
@@ -91,7 +92,10 @@ fn a_tokenizer_survives_the_artifact() {
     for text in ["abc", "a b c", "cab", ""] {
         let ids = original.encode(text);
         assert_eq!(rebuilt.encode(text), ids, "encoding {text:?}");
-        assert_eq!(rebuilt.decode(&ids, false), original.decode(&ids, false));
+        assert_eq!(
+            rebuilt.decode(&ids, Specials::Keep),
+            original.decode(&ids, Specials::Keep)
+        );
     }
 
     // The weight is still a weight, and the tokenizer objects are still not.

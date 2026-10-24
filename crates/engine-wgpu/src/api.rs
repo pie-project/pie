@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -66,8 +67,8 @@ pub struct Wgpu {
     contract_for: ContractFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
-    next_fire: FireId,
-    next_frame: FrameId,
+    next_fire: u64,
+    next_frame: u64,
 
     sink: Option<engine::CompletionSink>,
 
@@ -118,11 +119,6 @@ impl Wgpu {
     #[must_use]
     pub fn contract_for(&self) -> ContractFor {
         self.contract_for
-    }
-
-    #[must_use]
-    pub fn shell(&self) -> Option<&Shell> {
-        self.shell.as_ref()
     }
 
     pub fn shell_mut(&mut self) -> Option<&mut Shell> {
@@ -568,13 +564,13 @@ impl Engine for Wgpu {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
-        let id = self.next_frame;
+        let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
 
         self.pending = None;
 
         let mut steps = Vec::with_capacity(frame.steps.len());
-        tracing::debug!(frame = id, steps = frame.steps.len(), "wgpu submit");
+        tracing::debug!(frame = id.0, steps = frame.steps.len(), "wgpu submit");
         let mut pending = Vec::with_capacity(frame.steps.len());
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
@@ -924,7 +920,7 @@ impl Wgpu {
             })
             .collect();
 
-        let id = self.next_fire;
+        let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];
@@ -1116,6 +1112,3 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
         })
         .collect()
 }
-
-unsafe impl Send for Wgpu {}
-unsafe impl Sync for Wgpu {}

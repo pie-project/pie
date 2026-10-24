@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::kernel;
 use crate::ssm::kda_chunk::kda_chunked_mma;
 
 const KDA: &str = "ssm/kda.cu";
@@ -124,7 +125,11 @@ impl Kda {
             // A warp a head where the row is whole heads (a decode's row over
             // the card), else a block a plane.
             if self.head_dim > 0 && self.width.is_multiple_of(self.head_dim) {
-                Fire::at(KDA, "::pie::ssm::kda_qkv_prep_heads<::pie::bf16, 128>").apply(
+                Fire::at(kernel(
+                    KDA,
+                    "::pie::ssm::kda_qkv_prep_heads<::pie::bf16, 128>",
+                ))
+                .apply(
                     Launch::grid(
                         [
                             self.n,
@@ -136,7 +141,7 @@ impl Kda {
                     .programmatic(ctx.tuning().pdl),
                 )
             } else {
-                Fire::at(KDA, "::pie::ssm::kda_qkv_prep<::pie::bf16, 128>")
+                Fire::at(kernel(KDA, "::pie::ssm::kda_qkv_prep<::pie::bf16, 128>"))
                     .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1]))
             },
             &[
@@ -152,12 +157,12 @@ impl Kda {
         )?;
         // A row a block, four channels a thread.
         let gates = if self.head_dim.is_multiple_of(4) {
-            Fire::at(KDA, "::pie::ssm::kda_gate_beta_rows<::pie::bf16>").apply(
+            Fire::at(kernel(KDA, "::pie::ssm::kda_gate_beta_rows<::pie::bf16>")).apply(
                 Launch::grid([self.n, self.width.div_ceil(1024), 1], [256, 1, 1])
                     .programmatic(ctx.tuning().pdl),
             )
         } else {
-            Fire::at(KDA, "::pie::ssm::kda_gate_beta<::pie::bf16>").apply(Launch::grid(
+            Fire::at(kernel(KDA, "::pie::ssm::kda_gate_beta<::pie::bf16>")).apply(Launch::grid(
                 [self.n, self.heads, 1],
                 [self.head_dim.clamp(WARP, PREP_BLOCK), 1, 1],
             ))
@@ -221,13 +226,13 @@ pub fn kda(
             .min(shape.head_dim.max(1));
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 KDA,
-                symbol(&format!(
+                &format!(
                     "::pie::ssm::kda_step_fused<::pie::bf16, {}>",
                     shape.head_dim / WARP
-                )),
-            )
+                ),
+            ))
             .apply(
                 Launch::grid([shape.n, shape.heads, splits], [STEP_BLOCK, 1, 1])
                     .smem(kda_shmem(shape.head_dim) + shape.head_dim * FLOAT),
@@ -256,7 +261,7 @@ pub fn kda(
     let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
     ctx.fire(
         OP,
-        Fire::at(KDA, "::pie::ssm::kda_step").apply(
+        Fire::at(kernel(KDA, "::pie::ssm::kda_step")).apply(
             Launch::grid(
                 [
                     shape.n,
@@ -350,7 +355,7 @@ pub fn kda_chunked(
     let work = shape.work(ctx, OP, state, lanes)?;
     ctx.fire(
         OP,
-        Fire::at(KDA, "::pie::ssm::kda_chunked").apply(
+        Fire::at(kernel(KDA, "::pie::ssm::kda_chunked")).apply(
             Launch::grid(
                 [lanes, shape.heads, 1],
                 [shape.head_dim.min(PREFILL_MAX_WARPS) * WARP, 1, 1],

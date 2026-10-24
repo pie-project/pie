@@ -7,7 +7,7 @@
 
 use crate::attn::compressed::decode::Rows;
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel};
 use crate::linear::gemm_sm100::supported;
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
@@ -395,17 +395,17 @@ fn sparse(
         };
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 PREFILL_SM100,
-                symbol(&match quantized {
+                &match quantized {
                     Some((wf, pf)) => format!(
                         "::pie::attn::compressed::sm100::sparse<{selected}, {}, {}>",
                         wf.code(),
                         pf.code()
                     ),
                     None => format!("::pie::attn::compressed::sm100::sparse<{selected}>"),
-                }),
-            )
+                },
+            ))
             .apply(
                 Launch::grid(
                     [rows.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
@@ -495,13 +495,13 @@ fn stage(
     if pages > 0 {
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 PREFILL_SM100,
-                symbol(&format!(
+                &format!(
                     "::pie::attn::compressed::sm100::stage_pages<{}>",
                     fmt.code()
-                )),
-            )
+                ),
+            ))
             .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
             &[
                 pool.keys.arg(),

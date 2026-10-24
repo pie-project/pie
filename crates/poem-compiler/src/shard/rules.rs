@@ -99,7 +99,7 @@ const KV_HEADS: &str = "kv_heads";
 fn heads(name: &str) -> Option<Heads> {
     Some(match name {
         "elemwise.act" | "elemwise.rope_axes" | "gather.rows" | "gather.pack_rows"
-        | "gather.unpack_rows" | "linear.gelu_tanh" => Heads::of(&["x"], &[]),
+        | "gather.unpack_rows" | "linear.gelu_tanh" | "linear.relu2" => Heads::of(&["x"], &[]),
         "elemwise.gate_sigmoid_mul" | "elemwise.rmsnorm_gated" => Heads::of(&["x", "gate"], &[]),
         "elemwise.rmsnorm_gated_by" => Heads::of(&["x", "gate"], &["heads"]),
         // q, and k where the rotation turns one.
@@ -125,6 +125,9 @@ fn heads(name: &str) -> Option<Heads> {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
         "ssm.gdn_gates" => Heads::of(&["ba"], &[]),
+        "ssm.mamba2" | "ssm.mamba2_chunked" => {
+            Heads::of(&["xbc", "dt", "z"], &["heads", "groups"]).cache(Cache::Split)
+        }
         "ssm.gated_delta" | "ssm.gated_delta_chunked" => {
             Heads::of(&["qkv", "z", "gates"], &["k_heads", "v_heads"]).cache(Cache::Split)
         }
@@ -167,13 +170,10 @@ fn rule(op: &Operation) -> Rule {
             input: 1,
         };
     }
-    // A plain lookup reads the rows each rank holds of a row-split table; a
-    // weighted or concatenated one reads its table whole.
-    if let Operation::Gather(Gather::Embed {
-        weights, concat, ..
-    }) = op
-    {
-        return if weights.is_none() && !concat {
+    // A plain or concatenated lookup reads the rows each rank holds of a
+    // row-split table; a weighted one reads its table whole.
+    if let Operation::Gather(Gather::Embed { weights, .. }) = op {
+        return if weights.is_none() {
             Rule::Lookup { table: "table" }
         } else {
             Rule::Whole

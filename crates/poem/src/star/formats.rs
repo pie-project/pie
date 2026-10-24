@@ -294,8 +294,8 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         ))
     }
 
-    /// The values put through `op`: "neg_ln" (`ln(-x)`), "sqrt", "rsqrt" or
-    /// "sigmoid".
+    /// The values put through `op`: "neg_ln" (`ln(-x)`), "sqrt", "rsqrt",
+    /// "sigmoid", "square" or "recip" (`1 / x`).
     fn unary(this: &ExprValue, #[starlark(require = pos)] op: &str) -> anyhow::Result<ExprValue> {
         use checkpoint::contract::UnaryOp;
         let op = match op {
@@ -304,8 +304,11 @@ fn expr_methods(builder: &mut MethodsBuilder) {
             "rsqrt" => UnaryOp::Rsqrt,
             "sigmoid" => UnaryOp::Sigmoid,
             "square" => UnaryOp::Square,
+            "recip" => UnaryOp::Recip,
             other => {
-                anyhow::bail!("a unary op is neg_ln, sqrt, rsqrt, sigmoid or square, not {other:?}")
+                anyhow::bail!(
+                    "a unary op is neg_ln, sqrt, rsqrt, sigmoid, square or recip, not {other:?}"
+                )
             }
         };
         Ok(ExprValue(this.0.clone().unary(op)))

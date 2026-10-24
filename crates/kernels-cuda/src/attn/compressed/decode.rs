@@ -18,7 +18,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, refuse, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, kernel, refuse};
 use crate::tensor::{KvPool, Tensor};
 const DECODE: &str = "attn/compressed/decode.cu";
 
@@ -391,12 +391,10 @@ pub fn decode(
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             DECODE,
-            symbol(&format!(
-                "::pie::attn::compressed::decode<{HEAD_DIM}, {sink_ty}, {ranks}, {wf}, {pf}>"
-            )),
-        )
+            &format!("::pie::attn::compressed::decode<{HEAD_DIM}, {sink_ty}, {ranks}, {wf}, {pf}>"),
+        ))
         .apply(launch),
         &[
             q.arg(),

@@ -70,6 +70,15 @@ mod tests {
         }
     }
 
+    /// Registers `handle` with `reg`'s local backend.
+    #[allow(unsafe_code)]
+    fn local(reg: &Registry, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
+        // SAFETY: these handles name made-up addresses that only
+        // `FakeCopier` ever sees, and it records them without touching
+        // memory, so no region needs to be allocated.
+        unsafe { reg.register(owner, handle, BackendKind::Local) }
+    }
+
     #[derive(Clone, Default)]
     struct FakeCopier {
         calls: Arc<Mutex<Vec<(u64, u64, u64)>>>,
@@ -92,11 +101,8 @@ mod tests {
 
     fn local_recv_acknowledges_colocated_peer() {
         let reg = Registry::local_only(Box::<FakeCopier>::default());
-        let decode = reg
-            .register(WorkerId(2), handle(0x9000, 8), BackendKind::Local)
-            .unwrap();
-        reg.register(WorkerId(1), handle(0x1000, 8), BackendKind::Local)
-            .unwrap();
+        let decode = local(&reg, WorkerId(2), handle(0x9000, 8)).unwrap();
+        local(&reg, WorkerId(1), handle(0x1000, 8)).unwrap();
 
         let id = reg
             .recv(&decode, &PageSet::new(vec![0]), WorkerId(1))
@@ -108,11 +114,8 @@ mod tests {
         let copier = FakeCopier::default();
         let calls = copier.calls.clone();
         let reg = Registry::local_only(Box::new(copier));
-        let source = reg
-            .register(WorkerId(1), multi_handle(0x1000, 8), BackendKind::Local)
-            .unwrap();
-        reg.register(WorkerId(2), multi_handle(0x9000, 8), BackendKind::Local)
-            .unwrap();
+        let source = local(&reg, WorkerId(1), multi_handle(0x1000, 8)).unwrap();
+        local(&reg, WorkerId(2), multi_handle(0x9000, 8)).unwrap();
         let id = reg
             .send_mapped(
                 &source,
@@ -133,9 +136,7 @@ mod tests {
 
     fn send_to_unregistered_peer_is_unknown_peer() {
         let reg = Registry::local_only(Box::<FakeCopier>::default());
-        let prefill = reg
-            .register(WorkerId(1), handle(0x1000, 8), BackendKind::Local)
-            .unwrap();
+        let prefill = local(&reg, WorkerId(1), handle(0x1000, 8)).unwrap();
         let err = reg
             .send(&prefill, &PageSet::new(vec![0]), WorkerId(99))
             .unwrap_err();

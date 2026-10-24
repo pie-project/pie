@@ -98,7 +98,7 @@ impl WakerTable {
     fn slot(&self, index: u32) -> Option<&'static Slot> {
         self.slots
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("slots lock poisoned")
             .get(index as usize)
             .copied()
     }
@@ -126,10 +126,10 @@ impl WakerTable {
 
     pub fn alloc(&self) -> WakerSlotId {
         loop {
-            let reused = self.free.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let reused = self.free.lock().expect("lock poisoned").pop();
             if let Some(index) = reused {
                 let slot = self.slot(index).expect("freelist index in range");
-                let state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                let state = slot.state.lock().expect("lock poisoned");
                 if state.retired || state.generation == 0 {
                     continue;
                 }
@@ -139,7 +139,7 @@ impl WakerTable {
                 return slot_id(state.generation, index);
             }
 
-            let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
+            let mut slots = self.slots.write().expect("slots lock poisoned");
             let index = u32::try_from(slots.len()).expect("waker slot index space exhausted");
             let slot: &'static Slot = Box::leak(Box::new(Slot::new()));
             slots.push(slot);
@@ -154,7 +154,7 @@ impl WakerTable {
         };
 
         let (waker, recycle) = {
-            let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = slot.state.lock().expect("lock poisoned");
             if !Self::is_live(&state, generation) {
                 return;
             }
@@ -178,10 +178,7 @@ impl WakerTable {
             waker.wake();
         }
         if recycle {
-            self.free
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(index);
+            self.free.lock().expect("lock poisoned").push(index);
         }
     }
 
@@ -196,7 +193,7 @@ impl WakerTable {
         let waker = waker.clone();
 
         let replaced = {
-            let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = slot.state.lock().expect("lock poisoned");
             if !Self::is_live(&state, generation) {
                 return false;
             }
@@ -213,7 +210,7 @@ impl WakerTable {
             return;
         };
         let removed = {
-            let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = slot.state.lock().expect("lock poisoned");
             if !Self::is_live(&state, generation) {
                 return;
             }
@@ -247,7 +244,7 @@ impl WakerTable {
         };
 
         let (outcome, waker) = {
-            let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = slot.state.lock().expect("lock poisoned");
             if !Self::is_live(&state, generation) {
                 (WakeOutcome::Stale, None)
             } else {
@@ -278,7 +275,7 @@ impl WakerTable {
     pub fn published(&self, id: WakerSlotId) -> Option<u64> {
         let (generation, index) = split_id(id);
         let slot = self.slot(index)?;
-        let state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = slot.state.lock().expect("lock poisoned");
         Self::is_live(&state, generation).then_some(state.published_epoch)
     }
 
@@ -291,7 +288,7 @@ impl WakerTable {
         };
 
         let (outcome, waker) = {
-            let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = slot.state.lock().expect("lock poisoned");
             if !Self::is_live(&state, generation) {
                 (WakeOutcome::Stale, None)
             } else {

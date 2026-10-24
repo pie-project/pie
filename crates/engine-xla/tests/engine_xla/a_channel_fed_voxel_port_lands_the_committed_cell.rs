@@ -10,6 +10,7 @@ use common_dit::{
     C_IN, C_OUT, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, carrier, condition,
     conv_reference, matmul, modulation, two_axis,
 };
+use engine::channel::ChannelId;
 use engine::fire::{Lane, LaneStream, PortFeed, PortKind, Readout, ReadoutSeam, StepVoxels};
 use eta_ir::container::HostRole;
 use eta_ir::types::Shape;
@@ -20,7 +21,7 @@ const fn voxels() -> u32 {
     CLIP[0] * CLIP[1] * CLIP[2]
 }
 
-fn vae_lane(rig: &Rig, slot: u32, channel: Option<u64>) -> Lane {
+fn vae_lane(rig: &Rig, slot: u32, channel: Option<ChannelId>) -> Lane {
     Lane {
         slot,
         word: rig.word(Some("vae")),

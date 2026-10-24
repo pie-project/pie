@@ -8,7 +8,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::linear::dequant::DECODED_WEIGHT;
 use crate::linear::gemm;
@@ -69,10 +69,10 @@ pub fn e4m3_values(
         .map_err(|_| refuse(op, "the quantizer's threads do not fit a 32-bit extent"))?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::act_quant_e4m3_values<{gran}>")),
-        )
+            &format!("::pie::linear::act_quant_e4m3_values<{gran}>"),
+        ))
         .apply(Launch::flat(threads, BLOCK)),
         &[
             x.arg(),
@@ -163,10 +163,10 @@ pub fn fp8b128_decode_into(
         .map_err(|_| refuse(op, "the decode's threads do not fit a 32-bit extent"))?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::fp8b128_decode<{side}>")),
-        )
+            &format!("::pie::linear::fp8b128_decode<{side}>"),
+        ))
         .apply(Launch::flat(threads, BLOCK)),
         &[
             codes.arg(),
@@ -216,10 +216,10 @@ pub fn matmul_fp8b128(
         nonzero(op, "the projection's rows", n)?;
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 FILE,
-                symbol(&format!("::pie::linear::fp8b128_gemv<{}, {side}>", 4)),
-            )
+                &format!("::pie::linear::fp8b128_gemv<{}, {side}>", 4),
+            ))
             .apply(Launch::flat(threads, BLOCK)),
             &[
                 q.arg(),
@@ -359,12 +359,10 @@ fn quantize_codes_into(
         .map_err(|_| refuse(op, "the quantizer's threads do not fit a 32-bit extent"))?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             "linear/fp8.hip",
-            symbol(&format!(
-                "::pie::linear::act_quant_e4m3_codes<{gran}, {pow2}>"
-            )),
-        )
+            &format!("::pie::linear::act_quant_e4m3_codes<{gran}, {pow2}>"),
+        ))
         .apply(Launch::flat(threads, BLOCK)),
         &[
             x.arg(),
@@ -583,8 +581,11 @@ pub fn matmul_fp8b32_lanes(
         .map_err(|_| refuse(op, "the quantizer's threads do not fit a 32-bit extent"))?;
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", "::pie::linear::act_quant_e4m3_e8m0")
-            .apply(Launch::flat(threads, BLOCK)),
+        Fire::at(kernel(
+            "linear/fp8.hip",
+            "::pie::linear::act_quant_e4m3_e8m0",
+        ))
+        .apply(Launch::flat(threads, BLOCK)),
         &[
             act.arg(),
             q.arg(),
@@ -644,12 +645,9 @@ fn fire_fp8_dense(
     let part = fp8_partials(ctx, op, splits, act.rows, n)?;
     ctx.fire(
         op,
-        Fire::at(
-            "linear/fp8.hip",
-            symbol(&format!(
+        Fire::at(kernel("linear/fp8.hip", &format!(
                 "::pie::linear::dense_fp8_mfma<::pie::i32({mt}), ::pie::i32({nb}), ::pie::i32({sb}), ::pie::i32({fr})>"
-            )),
-        )
+            )))
         .apply(Launch::grid([tiles.div_ceil(8) * 8 * items * splits, 1, 1], [BLOCK, 1, 1])),
         &[
             q.arg(),
@@ -675,7 +673,7 @@ fn fire_fp8_dense(
         u32::try_from((u64::from(act.rows) * u64::from(n)).div_ceil(256).min(4096)).unwrap_or(4096);
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", "::pie::linear::fp8_mfma_finalize")
+        Fire::at(kernel("linear/fp8.hip", "::pie::linear::fp8_mfma_finalize"))
             .apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
         &[
             part,
@@ -824,13 +822,10 @@ fn fire_fp8_tiles(
     } = t;
     ctx.fire(
         op,
-        Fire::at(
-            "linear/fp8.hip",
-            symbol(&format!(
+        Fire::at(kernel("linear/fp8.hip", &format!(
                 "::pie::linear::dense_fp8_tiles<::pie::i32({sb}), ::pie::i32({nb}), ::pie::i32({wn}), ::pie::i32({wm}), \
                  ::pie::i32({ns}), ::pie::i32({ms}), ::pie::i32({occ}), ::pie::i32({fr})>"
-            )),
-        )
+            )))
         .apply(Launch::grid([live, 1, 1], [64 * wn * wm, 1, 1])),
         &[
             q.arg(),
@@ -906,7 +901,7 @@ pub fn e4m3fn_shuffle(
     let grid = u32::try_from(chunks.div_ceil(u64::from(BLOCK)).min(16384)).unwrap_or(16384);
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", "::pie::linear::e4m3fn_shuffle")
+        Fire::at(kernel("linear/fp8.hip", "::pie::linear::e4m3fn_shuffle"))
             .apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(src),

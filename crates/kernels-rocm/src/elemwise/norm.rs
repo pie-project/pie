@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use crate::voxels::{flat_elements, lanes_of};
@@ -98,12 +98,10 @@ fn rms_row(
         let plus = template == OFFSET_BANK;
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 NORM_UNIT,
-                symbol(&format!(
-                    "::pie::elemwise::rmsnorm_lanes<{t}, {lph}, {plus}>"
-                )),
-            )
+                &format!("::pie::elemwise::rmsnorm_lanes<{t}, {lph}, {plus}>"),
+            ))
             .apply(lanes),
             &[
                 x.arg(),
@@ -118,10 +116,10 @@ fn rms_row(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             NORM_UNIT,
-            symbol(&format!("::pie::elemwise::{template}<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::{template}<{t}, 256>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -219,12 +217,10 @@ pub fn rmsnorm_no_scale(
     if let Some((lph, lanes, total)) = head_lanes(OP, y, head_dim, &[x.ptr, y.ptr])? {
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 NORM_UNIT,
-                symbol(&format!(
-                    "::pie::elemwise::rmsnorm_lanes<{t}, {lph}, false>"
-                )),
-            )
+                &format!("::pie::elemwise::rmsnorm_lanes<{t}, {lph}, false>"),
+            ))
             .apply(lanes),
             &[
                 x.arg(),
@@ -239,10 +235,10 @@ pub fn rmsnorm_no_scale(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM_UNIT,
-            symbol(&format!("::pie::elemwise::rmsnorm_no_scale<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::rmsnorm_no_scale<{t}, 256>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -291,12 +287,10 @@ pub fn rmsnorm_gated(
     )? {
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 NORM_UNIT,
-                symbol(&format!(
-                    "::pie::elemwise::rmsnorm_gated_f32_lanes<{t}, {lph}>"
-                )),
-            )
+                &format!("::pie::elemwise::rmsnorm_gated_f32_lanes<{t}, {lph}>"),
+            ))
             .apply(lanes),
             &[
                 x.arg(),
@@ -313,10 +307,10 @@ pub fn rmsnorm_gated(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM_UNIT,
-            symbol(&format!("::pie::elemwise::rmsnorm_gated_f32_in<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::rmsnorm_gated_f32_in<{t}, 256>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -376,12 +370,10 @@ pub(crate) fn rmsnorm_grouped(
     let launch = rows_per_head(op, y.rows, y.width, group)?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             NORM_UNIT,
-            symbol(&format!(
-                "::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"
-            )),
-        )
+            &format!("::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -427,10 +419,10 @@ pub fn rmsnorm_gated_by(
     let d = x.width / heads;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "elemwise/norm.hip",
-            symbol(&format!("::pie::elemwise::rmsnorm_gated_by<{t}>")),
-        )
+            &format!("::pie::elemwise::rmsnorm_gated_by<{t}>"),
+        ))
         .apply(Launch::grid(
             [y.rows, heads, 1],
             // Whole wavefronts: the block's sum reduces wave by wave.
@@ -482,10 +474,10 @@ pub fn standardize(ctx: &Ctx, bias: Tensor, scale: Tensor, out: &mut Tensor) -> 
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM_UNIT,
-            symbol(&format!("::pie::elemwise::standardize<{t}>")),
-        )
+            &format!("::pie::elemwise::standardize<{t}>"),
+        ))
         .apply(route_rows(out.rows, out.width)),
         &[out.arg(), bias.arg(), scale.arg(), width.arg()],
     )
@@ -510,10 +502,10 @@ pub fn layernorm_no_scale(ctx: &Ctx, x: Tensor, eps: f32, y: &mut Tensor) -> Res
     let rows = nonzero(OP, "rows", y.rows)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             LAYERNORM_UNIT,
-            symbol(&format!("::pie::elemwise::layernorm_no_scale<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::layernorm_no_scale<{t}, 256>"),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[x.arg(), y.arg(), hidden.arg(), eps.arg(), ctx.stage()],
     )
@@ -533,10 +525,10 @@ pub fn layernorm(
     let rows = nonzero(OP, "rows", y.rows)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             LAYERNORM_UNIT,
-            symbol(&format!("::pie::elemwise::layernorm<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::layernorm<{t}, 256>"),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
@@ -618,7 +610,7 @@ pub fn group_norm(
 
     ctx.fire(
         OP,
-        Fire::at(NORM_UNIT, "::pie::elemwise::group_norm_stats<1024>").apply(Launch::grid(
+        Fire::at(kernel(NORM_UNIT, "::pie::elemwise::group_norm_stats<1024>")).apply(Launch::grid(
             [splits.unsigned_abs(), lanes.unsigned_abs(), 1],
             [STATS_BLOCK, 1, 1],
         )),
@@ -633,7 +625,7 @@ pub fn group_norm(
     )?;
     ctx.fire(
         OP,
-        Fire::at(NORM_UNIT, "::pie::elemwise::group_norm_finalize").apply(Launch::grid(
+        Fire::at(kernel(NORM_UNIT, "::pie::elemwise::group_norm_finalize")).apply(Launch::grid(
             [groups.unsigned_abs(), lanes.unsigned_abs(), 1],
             [FINALIZE_BLOCK, 1, 1],
         )),
@@ -648,14 +640,14 @@ pub fn group_norm(
     let (blocks, total) = flat_elements(OP, x, APPLY_BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM_UNIT,
             if silu {
                 "::pie::elemwise::group_norm_apply<true>"
             } else {
                 "::pie::elemwise::group_norm_apply<false>"
             },
-        )
+        ))
         .apply(Launch::grid([blocks, 1, 1], [APPLY_BLOCK, 1, 1])),
         &[
             x.arg(),

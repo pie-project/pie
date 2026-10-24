@@ -138,9 +138,7 @@ impl Landing {
             tracing::warn!(seq, arm, failed, %why, "landing: the step faulted");
         }
         let parked = {
-            let mut post = mailbox
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut post = mailbox.lock().expect("mailbox lock poisoned");
             post.landed.push(Landed {
                 seq,
                 arm,
@@ -228,10 +226,7 @@ impl Worker {
 
     #[cfg(feature = "wgpu")]
     fn runner(&self, at: usize) -> crate::device::host::channel::Sender<Runnable> {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.inner.lock().expect("lock poisoned");
         while state.runners.len() <= at {
             let (tx, rx) = crate::device::host::channel::unbounded::<Runnable>();
             crate::device::host::thread::spawn(
@@ -249,10 +244,7 @@ impl Worker {
     }
     fn land(&self, landing: Landing) {
         let inline = {
-            let mut state = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.inner.lock().expect("lock poisoned");
             if state.queued == 0 && landing.guests.is_none() {
                 Some(landing)
             } else {
@@ -278,11 +270,7 @@ impl Worker {
             while let Ok(mut landing) = rx.recv() {
                 let fault = landing.run_guests(&worker);
                 landing.finish(fault);
-                worker
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .queued -= 1;
+                worker.inner.lock().expect("lock poisoned").queued -= 1;
             }
         })
         .expect("spawn the landing worker");

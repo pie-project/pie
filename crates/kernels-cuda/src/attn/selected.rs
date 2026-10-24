@@ -3,7 +3,7 @@ use dtype::Dtype;
 
 use crate::attn::kv;
 use crate::attn::mla::decode::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const SELECTED_SM80: &str = "attn/selected_sm80.cu";
@@ -166,12 +166,10 @@ fn selected(
         .smem(tile_smem_bytes(dim));
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 SELECTED_SM80,
-                symbol(&format!(
-                    "::pie::attn::selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"
-                )),
-            )
+                &format!("::pie::attn::selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"),
+            ))
             .apply(launch),
             &[
                 q.data.arg(),
@@ -205,12 +203,10 @@ fn selected(
         .smem(mma_smem_bytes(dim));
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 SELECTED_SM80,
-                symbol(&format!(
-                    "::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"
-                )),
-            )
+                &format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"),
+            ))
             .apply(launch),
             &[
                 q.data.arg(),
@@ -248,7 +244,7 @@ fn selected(
     .smem(smem_bytes(head_dim));
     ctx.fire(
         op,
-        Fire::at(FILE, ENTRY).apply(launch),
+        Fire::at(kernel(FILE, ENTRY)).apply(launch),
         &[
             q.data.arg(),
             pool.keys.arg(),

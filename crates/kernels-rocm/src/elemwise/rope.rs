@@ -3,7 +3,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -91,10 +91,10 @@ pub fn full(
     let per_block = heads_per_block(half);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ROPE_UNIT,
             "::pie::elemwise::rope_full<::pie::false_type::value, false>",
-        )
+        ))
         .apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
@@ -221,7 +221,7 @@ pub fn partial_last(
     }
     ctx.fire(
         OP,
-        Fire::at(ROPE_UNIT, "::pie::elemwise::rope_partial_last")
+        Fire::at(kernel(ROPE_UNIT, "::pie::elemwise::rope_partial_last"))
             .apply(Launch::per_row(q.rows, ROTATE_BLOCK).smem(8 * (rotary_dim / 2))),
         &[
             q.arg(),
@@ -300,7 +300,7 @@ pub fn yarn(
     let per_block = heads_per_block(half);
     ctx.fire(
         OP,
-        Fire::at(ROPE_UNIT, "::pie::elemwise::rope_yarn").apply(rotate_launch(
+        Fire::at(kernel(ROPE_UNIT, "::pie::elemwise::rope_yarn")).apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -343,8 +343,11 @@ fn rope_partial(
     let pairs = cache_pairs(rotary_dim / 2);
     ctx.fire(
         op,
-        Fire::at(ROPE_UNIT, "::pie::elemwise::rope_partial<::pie::bf16>")
-            .apply(Launch::per_row(q.rows, ROTATE_BLOCK).smem(pairs * 2 * 4)),
+        Fire::at(kernel(
+            ROPE_UNIT,
+            "::pie::elemwise::rope_partial<::pie::bf16>",
+        ))
+        .apply(Launch::per_row(q.rows, ROTATE_BLOCK).smem(pairs * 2 * 4)),
         &[
             q.arg(),
             k.arg(),
@@ -538,13 +541,10 @@ fn fire_axes(
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ROPE_AXES_UNIT,
-            symbol(&format!(
-                "::pie::elemwise::rope_axes<{t}, {}>",
-                form.stamp()
-            )),
-        )
+            &format!("::pie::elemwise::rope_axes<{t}, {}>", form.stamp()),
+        ))
         .apply(Launch::per_row(rows, ROTATE_BLOCK)),
         &[
             x.arg(),
@@ -724,7 +724,7 @@ fn fire_mrope(
     let rows = nonzero(OP, "rows", q.rows)?;
     ctx.fire(
         OP,
-        Fire::at(ROPE_MROPE_UNIT, entry).apply(Launch::per_row(rows, ROTATE_BLOCK)),
+        Fire::at(kernel(ROPE_MROPE_UNIT, entry)).apply(Launch::per_row(rows, ROTATE_BLOCK)),
         &[
             q.arg(),
             k.arg(),

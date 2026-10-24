@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use engine::program::InstanceId;
 use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
 
@@ -393,7 +394,7 @@ pub fn bf16_bits(value: f32) -> u16 {
 #[derive(Debug, Clone, Copy)]
 pub enum Source<'a> {
     Own {
-        instance: u64,
+        instance: InstanceId,
         planes: &'a [AdapterPlane<'a>],
     },
     Shared {
@@ -411,7 +412,7 @@ pub struct Binding {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Key {
-    Instance(u64),
+    Instance(InstanceId),
     Shared(crate::blob::Stamp),
 }
 
@@ -660,22 +661,30 @@ mod tests {
 
     fn the_residency_pins_releases_and_refuses_by_name() {
         let mut slots = Slots::new(2);
-        let first = slots.acquire(Key::Instance(1)).expect("a free slot");
+        let first = slots
+            .acquire(Key::Instance(InstanceId(1)))
+            .expect("a free slot");
         assert!(first.fresh);
-        let second = slots.acquire(Key::Instance(2)).expect("the other one");
+        let second = slots
+            .acquire(Key::Instance(InstanceId(2)))
+            .expect("the other one");
         assert_ne!(first.slot, second.slot, "two instances are two slots");
         let why = slots
-            .acquire(Key::Instance(3))
+            .acquire(Key::Instance(InstanceId(3)))
             .expect_err("both are pinned");
         assert!(why.to_string().contains('2'), "names the capacity: {why}");
-        let again = slots.acquire(Key::Instance(1)).expect("its own slot");
+        let again = slots
+            .acquire(Key::Instance(InstanceId(1)))
+            .expect("its own slot");
         assert_eq!(again.slot, first.slot);
         assert!(!again.fresh, "a held key does not re-land");
-        slots.release(&Key::Instance(1));
+        slots.release(&Key::Instance(InstanceId(1)));
         assert_eq!(slots.live(), 2, "the second hold keeps it pinned");
-        slots.release(&Key::Instance(1));
+        slots.release(&Key::Instance(InstanceId(1)));
         assert_eq!(slots.live(), 1, "the last release frees it");
-        let reused = slots.acquire(Key::Instance(3)).expect("the freed slot");
+        let reused = slots
+            .acquire(Key::Instance(InstanceId(3)))
+            .expect("the freed slot");
         assert_eq!(reused.slot, first.slot, "the lowest free slot is taken");
     }
 
@@ -699,7 +708,9 @@ mod tests {
         assert_eq!(third.slot, first.slot);
         assert_eq!(slots.live(), 1, "three binds, one resident identity");
 
-        let private = slots.acquire(Key::Instance(77)).expect("the other slot");
+        let private = slots
+            .acquire(Key::Instance(InstanceId(77)))
+            .expect("the other slot");
         assert_ne!(private.slot, first.slot);
         assert!(private.fresh);
 
@@ -722,10 +733,14 @@ mod tests {
 
     fn an_abandoned_acquire_leaves_the_slot_free() {
         let mut slots = Slots::new(1);
-        let grant = slots.acquire(Key::Instance(7)).expect("the only slot");
-        slots.abandon(&Key::Instance(7));
+        let grant = slots
+            .acquire(Key::Instance(InstanceId(7)))
+            .expect("the only slot");
+        slots.abandon(&Key::Instance(InstanceId(7)));
         assert_eq!(slots.live(), 0);
-        let after = slots.acquire(Key::Instance(8)).expect("it is free again");
+        let after = slots
+            .acquire(Key::Instance(InstanceId(8)))
+            .expect("it is free again");
         assert_eq!(after.slot, grant.slot);
     }
 }

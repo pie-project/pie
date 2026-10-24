@@ -2,7 +2,7 @@
 //! with a rocBLAS handle, buffers in bf16 / f32, and the host rounding the
 //! device does. A test calls `Gpu::open()` and returns early on `None`, so
 //! a machine with no HIP device passes vacuously.
-
+#![allow(unsafe_code)]
 #![allow(dead_code)]
 
 use dtype::Dtype;

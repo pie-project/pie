@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use serde_json::{Map, Value};
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -48,16 +49,15 @@ pub struct MiniMax {
 }
 
 impl MiniMax {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
         // Every marker is spelled into text, so only its presence is checked.
-        let _ = specials(&tokenizer, MARKERS);
-        Self {
-            think_open: special(&tokenizer, THINK_OPEN),
-            think_close: special(&tokenizer, THINK_CLOSE),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+        let _ = specials(&tokenizer, MARKERS)?;
+        Ok(Self {
+            think_open: special(&tokenizer, THINK_OPEN)?,
+            think_close: special(&tokenizer, THINK_CLOSE)?,
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn encode(&self, text: &str) -> Vec<u32> {
@@ -271,7 +271,7 @@ impl Instruct for MiniMax {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(MiniMaxToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

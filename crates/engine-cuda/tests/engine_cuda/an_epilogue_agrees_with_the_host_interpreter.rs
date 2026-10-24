@@ -1,4 +1,4 @@
-use engine::ProgramRegistration;
+use engine::{ChannelId, ProgramRegistration};
 use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::Plane;
 use engine_cuda::program::compile::Disk;
@@ -203,7 +203,7 @@ fn device_outputs(
     let wire_seeds: Vec<(u32, Vec<u8>)> =
         seeds.iter().map(|(c, v)| (*c, v.to_le_bytes())).collect();
     let count = bound.container.channels.len();
-    let ids: Vec<u64> = (1..=count as u64).collect();
+    let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
     let instance = plane
         .bind(
             program,

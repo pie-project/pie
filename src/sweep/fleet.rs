@@ -44,23 +44,28 @@ impl FleetRun {
 async fn run_one(addr: &str, program: &str, input: &str) -> Result<Vec<i64>, String> {
     let client = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "pie-sweep")
         .await
-        .map_err(|e| format!("connect ws://{addr}/v1/ws: {e}"))?;
+        .map_err(|e| format!("connect ws://{addr}/v1/ws: {}", chain(e)))?;
     client
-        .authenticate("pie-sweep", &None)
+        .authenticate("pie-sweep", None)
         .await
-        .map_err(|e| format!("authenticate: {e}"))?;
+        .map_err(|e| format!("authenticate: {}", chain(e)))?;
     let mut process = client
         .launch_process(program.to_string(), input.to_string(), true)
         .await
-        .map_err(|e| format!("launch {program}: {e}"))?;
+        .map_err(|e| format!("launch {program}: {}", chain(e)))?;
     let returned = process
         .wait_for_return()
         .await
-        .map_err(|e| format!("{program} returned an error: {e}"))?;
+        .map_err(|e| format!("{program} returned an error: {}", chain(e)))?;
     parse_tokens(&returned).ok_or_else(|| {
         let head: String = returned.chars().take(200).collect();
         format!("{program} returned no tokens: {head}")
     })
+}
+
+/// `e` with its source chain, as `anyhow`'s `{:#}` prints it.
+fn chain(e: client::Error) -> String {
+    format!("{:#}", anyhow::Error::from(e))
 }
 
 fn parse_tokens(json: &str) -> Option<Vec<i64>> {

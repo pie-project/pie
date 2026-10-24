@@ -69,7 +69,18 @@ pub struct PeerConn {
 pub trait Backend {
     fn kind(&self) -> BackendKind;
 
-    fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle>;
+    /// Registers `handle`'s regions under `owner`; transfers then read and
+    /// write them at their `base`/`len`, peers' included, and nothing
+    /// deregisters them.
+    ///
+    /// # Safety
+    ///
+    /// Every region of `handle` must stay allocated for as long as this
+    /// backend lives, and must not be accessed in ways that race a transfer
+    /// into or out of it (a peer's read or write included) while one may be
+    /// in flight.
+    #[allow(unsafe_code)]
+    unsafe fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle>;
 
     fn send_mapped(
         &self,

@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel, refuse};
 
 const SKINNY: &str = "linear/skinny.cu";
 
@@ -97,7 +97,7 @@ pub fn skinny_bf16(
     ];
     ctx.fire(
         "linear.skinny",
-        Fire::at(SKINNY, entrypoint).apply(
+        Fire::at(kernel(SKINNY, entrypoint)).apply(
             Launch::grid(
                 [(n / cols(epilogue) as i32) as u32, 1, 1],
                 [32 * WARPS, 1, 1],

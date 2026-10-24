@@ -87,8 +87,10 @@ jobs:
       - name: free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build python3-yaml
+      # slangc: a workspace build compiles kernels-slang's modules.
       - uses: ./.github/actions/toolchain
         with:
+          features: vulkan,wgpu
           cache-key: ${{ runner.os }}-verify-o1
       - uses: taiki-e/install-action@nextest
       # `--all-targets` so benches and `tests/*.rs` that stopped compiling

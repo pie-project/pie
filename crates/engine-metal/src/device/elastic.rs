@@ -53,6 +53,7 @@
 //! fault, not a leak -- so the destructor checks the mapping timeline is
 //! past the last remap, and leaks rather than frees if that check fails.
 //! See `Fence`.
+#![allow(unsafe_code)]
 
 use std::sync::{Arc, Mutex};
 
@@ -426,9 +427,7 @@ impl Arena {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.state.lock().expect("state lock poisoned")
     }
 }
 
@@ -768,9 +767,7 @@ impl Drop for Elastic {
         let Some(state) = self.owner.upgrade() else {
             return;
         };
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state.lock().expect("state lock poisoned");
         state.budget.reserved = state.budget.reserved.saturating_sub(self.committed);
         state.budget.committed = state.budget.committed.saturating_sub(self.committed);
     }
@@ -936,9 +933,7 @@ fn grow(buffer: &mut Elastic, bytes: u64) -> Result<Option<(u64, u64)>> {
                 Err(error) => {
                     // Un-charge only what has not been mapped. The tiles that
                     // did land are real and still owed for.
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut state = state.lock().expect("state lock poisoned");
                     state.budget.reserved = state
                         .budget
                         .reserved
@@ -961,9 +956,7 @@ fn grow(buffer: &mut Elastic, bytes: u64) -> Result<Option<(u64, u64)>> {
         chunk.mapped += grow;
         buffer.committed += grow;
 
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state.lock().expect("state lock poisoned");
         state.budget.committed += grow;
         state.budget.high_water = state.budget.high_water.max(state.budget.committed);
     }
@@ -1134,9 +1127,7 @@ fn shrink(buffer: &mut Elastic, bytes: u64) -> (bool, Vec<Chunk>) {
     }
 
     if let Some(state) = buffer.owner.upgrade() {
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = state.lock().expect("state lock poisoned");
         state.budget.committed = state.budget.committed.saturating_sub(released);
         state.budget.reserved = state.budget.reserved.saturating_sub(released);
     }

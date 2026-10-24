@@ -3,6 +3,7 @@
 //! tensors, its layers' banks cut for the split, which layer's weights are
 //! staged, and its program, compiled off the serving thread. All sites
 //! share one hand-off and one status flag.
+#![allow(unsafe_code)]
 
 use crate::chip::{AneMlp, AneProjections};
 use std::collections::BTreeMap;

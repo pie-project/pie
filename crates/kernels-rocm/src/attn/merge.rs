@@ -5,7 +5,7 @@ use crate::attn::elementwise;
 use crate::attn::lse_plane;
 use crate::attn::per_head_elementwise;
 use crate::attn::row_heads;
-use crate::jit::{Arg, Ctx, Fire, count, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, count, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 pub fn sink(
@@ -34,10 +34,10 @@ pub fn sink(
     let (vec, launch) = per_head_elementwise(o.rows, heads, head_dim);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "attn/attention.hip",
-            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}, {vec}>")),
-        )
+            &format!("::pie::attn::sink_rescale<{t}, {s}, {vec}>"),
+        ))
         .apply(launch),
         &[
             o.arg(),
@@ -76,10 +76,10 @@ pub fn merge_lse(
     let head_dim = count(OP, "the head width this merge states", head_dim)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "attn/attention.hip",
-            symbol(&format!("::pie::attn::merge_lse_combine<{t}, {vec}>")),
-        )
+            &format!("::pie::attn::merge_lse_combine<{t}, {vec}>"),
+        ))
         .apply(launch),
         &[
             o1.arg(),
@@ -111,10 +111,10 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     nonzero(OP, "the element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "attn/attention.hip",
-            symbol(&format!("::pie::attn::logit_softcap<{t}>")),
-        )
+            &format!("::pie::attn::logit_softcap<{t}>"),
+        ))
         .apply(elementwise(lanes)),
         &[x.arg(), cap.arg(), n.arg()],
     )

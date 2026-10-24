@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 fn container_has_attention_stages(container: &eta_ir::container::TraceContainer) -> bool {
     use eta_ir::registry::Stage;
     container
@@ -3026,7 +3027,7 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
         publishes: usize,
     }
     struct DeviceRingUse {
-        global_id: u64,
+        global_id: ::engine::ChannelId,
         capacity: u64,
         pressure: u64,
     }
@@ -3986,7 +3987,8 @@ pub(crate) mod lifecycle_tests {
         if failed {
             completion.reject("test callback failure");
         } else {
-            // The completion owns this terminal cell for the entire write.
+            // SAFETY: `completion` is borrowed for the whole call and owns this
+            // terminal cell, so the pointer is live; `publish` is an atomic store.
             unsafe {
                 (*completion.terminal_cell_ptr().0)
                     .publish(crate::engine::completion::TERMINAL_OUTCOME_SUCCESS);

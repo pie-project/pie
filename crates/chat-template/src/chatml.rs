@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -51,12 +52,11 @@ pub struct ChatMLInstruct {
 }
 
 impl ChatMLInstruct {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>, config: ChatML) -> Self {
-        let stop_ids = specials(&tokenizer, &config.stop_tokens);
+    pub fn try_new(tokenizer: Arc<Tokenizer>, config: ChatML) -> Result<Self, String> {
+        let stop_ids = specials(&tokenizer, &config.stop_tokens)?;
 
-        let im_start = special(&tokenizer, "<|im_start|>");
-        let im_end = special(&tokenizer, "<|im_end|>");
+        let im_start = special(&tokenizer, "<|im_start|>")?;
+        let im_end = special(&tokenizer, "<|im_end|>")?;
         let newline = tokenizer.encode("\n");
 
         let header = |role: &str| -> Vec<u32> {
@@ -81,13 +81,13 @@ impl ChatMLInstruct {
         let mut quiet_header = header("assistant");
         if config.thinking {
             let gap = tokenizer.encode("\n\n");
-            quiet_header.push(special(&tokenizer, THINK_OPEN));
+            quiet_header.push(special(&tokenizer, THINK_OPEN)?);
             quiet_header.extend(&gap);
-            quiet_header.push(special(&tokenizer, THINK_CLOSE));
+            quiet_header.push(special(&tokenizer, THINK_CLOSE)?);
             quiet_header.extend(&gap);
         }
 
-        Self {
+        Ok(Self {
             system_prefix: header("system"),
             user_prefix: header("user"),
             assistant_prefix: header("assistant"),
@@ -95,13 +95,13 @@ impl ChatMLInstruct {
             quiet_header,
             turn_suffix,
             stop_ids,
-            think_open: vec![special(&tokenizer, THINK_OPEN)],
-            think_close: special(&tokenizer, THINK_CLOSE),
+            think_open: vec![special(&tokenizer, THINK_OPEN)?],
+            think_close: special(&tokenizer, THINK_CLOSE)?,
             tool_response_prefix,
             tool_response_suffix,
             tokenizer,
             config,
-        }
+        })
     }
 
     fn turn(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
@@ -431,7 +431,7 @@ impl Instruct for ChatMLInstruct {
             return Box::new(NoopToolDecoder);
         }
         Box::new(ChatMLToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
             xml: self.config.xml_tools,

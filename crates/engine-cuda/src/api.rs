@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -58,8 +59,8 @@ pub struct Cuda {
     contract_for: ContractFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
-    next_fire: FireId,
-    next_frame: FrameId,
+    next_fire: u64,
+    next_frame: u64,
     channels: BTreeMap<ChannelId, Arc<crate::program::Endpoint>>,
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
@@ -135,7 +136,9 @@ impl Cuda {
         })
     }
 
-    pub fn channel_predictions(&mut self) -> EngineResult<Vec<(u64, Vec<crate::program::Cursor>)>> {
+    pub fn channel_predictions(
+        &mut self,
+    ) -> EngineResult<Vec<(InstanceId, Vec<crate::program::Cursor>)>> {
         Ok(self.loaded_mut()?.channel_predictions())
     }
 
@@ -145,7 +148,7 @@ impl Cuda {
             .map_err(fault)?
             .ok_or(Error::Closed {
                 what: "instance",
-                id,
+                id: id.0,
             })
     }
 
@@ -748,7 +751,7 @@ impl Engine for Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
-        let id = self.next_frame;
+        let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
 
@@ -1110,7 +1113,7 @@ impl Cuda {
         at: engine::StepDone,
         announce: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
-        let id = self.next_fire;
+        let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let done = self
@@ -1413,11 +1416,12 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
     out
 }
 
-// SAFETY: `Shell` holds raw device handles inline, none of which is `Send`
-// to the compiler. Sound because every verb takes `&mut self`, so exactly
-// one thread touches a shell at a time.
+// SAFETY: `Shell` holds raw device handles and `Cell`s inline, none of
+// which the compiler lets cross threads. The handles name driver objects that
+// any thread may use once it binds the context, and every verb that touches
+// the device, the stream or a `Cell` takes `&mut self` (and `bind_thread`
+// binds the context first), so one thread drives a shell at a time.
 unsafe impl Send for Cuda {}
-unsafe impl Sync for Cuda {}
 
 #[cfg(test)]
 mod tests {

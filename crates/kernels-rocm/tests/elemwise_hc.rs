@@ -66,6 +66,7 @@ struct Mixed {
 }
 
 /// mHC's gates of every row, as `hc_gates` takes them.
+#[allow(clippy::too_many_arguments)]
 fn host_gates(
     s: Shape,
     mixes: &[f32],

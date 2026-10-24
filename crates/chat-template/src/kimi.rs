@@ -19,31 +19,30 @@ pub struct Kimi {
 }
 
 impl Kimi {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        let stop_ids = specials(&tokenizer, STOP_TOKENS);
-        let im_middle = special(&tokenizer, "<|im_middle|>");
-        let im_end = special(&tokenizer, "<|im_end|>");
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        let stop_ids = specials(&tokenizer, STOP_TOKENS)?;
+        let im_middle = special(&tokenizer, "<|im_middle|>")?;
+        let im_end = special(&tokenizer, "<|im_end|>")?;
 
-        let header = |marker: &str, role: &str| -> Vec<u32> {
-            let mut tokens = vec![special(&tokenizer, marker)];
+        let header = |marker: &str, role: &str| -> Result<Vec<u32>, String> {
+            let mut tokens = vec![special(&tokenizer, marker)?];
             tokens.extend(tokenizer.encode(role));
             tokens.push(im_middle);
-            tokens
+            Ok(tokens)
         };
 
-        let mut generation_header = header("<|im_assistant|>", "assistant");
+        let mut generation_header = header("<|im_assistant|>", "assistant")?;
         generation_header.extend(tokenizer.encode("<think></think>"));
 
-        Self {
-            system_prefix: header("<|im_system|>", "system"),
-            user_prefix: header("<|im_user|>", "user"),
-            assistant_prefix: header("<|im_assistant|>", "assistant"),
+        Ok(Self {
+            system_prefix: header("<|im_system|>", "system")?,
+            user_prefix: header("<|im_user|>", "user")?,
+            assistant_prefix: header("<|im_assistant|>", "assistant")?,
             turn_suffix: vec![im_end],
             generation_header,
             stop_ids,
             tokenizer,
-        }
+        })
     }
 
     fn turn(&self, prefix: &[u32], msg: &str) -> Vec<u32> {

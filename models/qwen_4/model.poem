@@ -429,7 +429,8 @@ def build(mix, kv, rope, d, hashes, draft, vision):
         shards = shards,
         # Read only by the n-gram gather, a few rows a token: a card whose
         # profile says so serves it from pinned host memory.
-        table = weight("ple.table", [padded, hidden // heads], mix.table).packed([padded // shards] * shards).host(),
+        # one band a rank: the n-gram gather offsets an id by its rank's first row
+        table = weight("ple.table", [padded, hidden // heads], mix.table).packed([padded]).host(),
         key_proj = weight("ple.key_proj", [sh, hidden], proj),
         value_proj = weight("ple.value_proj", [hidden, hidden], proj),
         norm_key = weight("ple.norm_key", [sh], dense),

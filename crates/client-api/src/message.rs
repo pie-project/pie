@@ -104,6 +104,23 @@ impl ClientMessage {
             ClientMessage::SignalProcess { .. } | ClientMessage::TransferFile { .. } => None,
         }
     }
+
+    /// The request's correlation id to stamp, for the messages that carry one.
+    pub fn corr_id_mut(&mut self) -> Option<&mut u32> {
+        match self {
+            ClientMessage::AuthIdentify { corr_id, .. }
+            | ClientMessage::AuthProve { corr_id, .. }
+            | ClientMessage::CheckProgram { corr_id, .. }
+            | ClientMessage::Query { corr_id, .. }
+            | ClientMessage::AddProgram { corr_id, .. }
+            | ClientMessage::LaunchProcess { corr_id, .. }
+            | ClientMessage::AttachProcess { corr_id, .. }
+            | ClientMessage::TerminateProcess { corr_id, .. }
+            | ClientMessage::ListProcesses { corr_id }
+            | ClientMessage::Ping { corr_id } => Some(corr_id),
+            ClientMessage::SignalProcess { .. } | ClientMessage::TransferFile { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,6 +9,7 @@ pub mod run;
 
 use std::collections::BTreeMap;
 
+use engine::program::ProgramId;
 use eta_compiler::codegen::launch::LaunchPackage;
 
 pub use lower::Refused;
@@ -27,8 +28,8 @@ pub struct Compiled {
 
 #[derive(Debug, Default)]
 pub struct Forms {
-    compiled: BTreeMap<u64, Compiled>,
-    refused: BTreeMap<u64, Refused>,
+    compiled: BTreeMap<ProgramId, Compiled>,
+    refused: BTreeMap<ProgramId, Refused>,
 }
 
 /// Whether every stage of `package` lowers (for one lane, every intrinsic
@@ -62,7 +63,7 @@ pub fn admits(package: &LaunchPackage) -> Result<u32, Refused> {
 }
 
 impl Forms {
-    pub fn admit(&mut self, program: u64, package: &LaunchPackage) -> bool {
+    pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
         match admits(package) {
             Ok(cols) => {
                 let key = *blake3::hash(format!("{package:?}").as_bytes()).as_bytes();
@@ -84,7 +85,7 @@ impl Forms {
     }
 
     #[must_use]
-    pub fn get(&self, program: u64) -> Option<&Compiled> {
+    pub fn get(&self, program: ProgramId) -> Option<&Compiled> {
         self.compiled.get(&program)
     }
 
@@ -92,7 +93,7 @@ impl Forms {
     /// stage too big for the PE at the current spread (`why`): the next
     /// spread every stage lowers at, or none, when the program loses its
     /// device form and runs in the interpreter from now on.
-    pub fn widen(&mut self, program: u64, package: &LaunchPackage, why: &str) -> Option<u32> {
+    pub fn widen(&mut self, program: ProgramId, package: &LaunchPackage, why: &str) -> Option<u32> {
         let current = self.compiled.get(&program)?.cols;
         // A quarter wider at least: a spread one PE wider rarely links
         // where this one did not, and each try is a compile.
@@ -115,17 +116,17 @@ impl Forms {
 
     /// Takes `program`'s device form away: it runs in the interpreter from
     /// now on, `why` on record.
-    pub fn demote(&mut self, program: u64, why: String) {
+    pub fn demote(&mut self, program: ProgramId, why: String) {
         self.compiled.remove(&program);
         self.refused.insert(program, Refused(why));
     }
 
     #[must_use]
-    pub fn refusal(&self, program: u64) -> Option<&Refused> {
+    pub fn refusal(&self, program: ProgramId) -> Option<&Refused> {
         self.refused.get(&program)
     }
 
-    pub fn forget(&mut self, program: u64) {
+    pub fn forget(&mut self, program: ProgramId) {
         self.compiled.remove(&program);
         self.refused.remove(&program);
     }

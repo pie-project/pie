@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -81,10 +81,10 @@ pub(super) fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32, pdl: bool)
     }
     let per = experts.div_ceil(32).next_power_of_two();
     Some(
-        Fire::at(
+        Fire::at(kernel(
             ROUTE,
-            symbol(&format!("::pie::linear::moe_topk_softmax_lane<{t}, {per}>")),
-        )
+            &format!("::pie::linear::moe_topk_softmax_lane<{t}, {per}>"),
+        ))
         .apply(Launch::grid([rows.max(1), 1, 1], [32, 1, 1]).programmatic(pdl)),
     )
 }
@@ -118,10 +118,10 @@ pub fn topk_softmax(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ROUTE,
-            symbol(&format!("::pie::linear::moe_topk_softmax<{t}>")),
-        )
+            &format!("::pie::linear::moe_topk_softmax<{t}>"),
+        ))
         .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
@@ -176,10 +176,10 @@ pub fn topk_softmax_scaled(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ROUTE,
-            symbol(&format!("::pie::linear::moe_topk_softmax_scaled<{t}>")),
-        )
+            &format!("::pie::linear::moe_topk_softmax_scaled<{t}>"),
+        ))
         .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
@@ -217,12 +217,10 @@ pub(super) fn ranked_router(
     let per = experts.div_ceil(WARP).next_power_of_two();
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             ROUTE,
-            symbol(&format!(
-                "::pie::linear::moe_topk_ranked<{t}, {softplus}, {per}>"
-            )),
-        )
+            &format!("::pie::linear::moe_topk_ranked<{t}, {softplus}, {per}>"),
+        ))
         .apply(
             Launch::grid([logits.rows.div_ceil(ROWS), 1, 1], [WARP * ROWS, 1, 1])
                 .programmatic(ctx.tuning().pdl),
@@ -325,10 +323,10 @@ pub fn topk_sigmoid_sink(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ROUTE,
-            symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")),
-        )
+            &format!("::pie::linear::moe_topk_sigmoid_sink<{t}>"),
+        ))
         .apply(rms(logits.rows)),
         &[
             logits.arg(),
@@ -496,9 +494,9 @@ pub(super) fn route_order_sliced(
     ctx.fire(
         op,
         if scan {
-            Fire::at(ROUTE, symbol("::pie::linear::moe_route_order_scan"))
+            Fire::at(kernel(ROUTE, "::pie::linear::moe_route_order_scan"))
         } else {
-            Fire::at(ROUTE, symbol("::pie::linear::moe_route_order"))
+            Fire::at(kernel(ROUTE, "::pie::linear::moe_route_order"))
         }
         .apply(
             Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1])
@@ -579,7 +577,8 @@ pub fn hash_route(
     let experts = nonzero(OP, "the expert count the logits span", logits.width)?;
     ctx.fire(
         OP,
-        Fire::at(ROUTE, "::pie::linear::hash_route_gather").apply(Launch::flat(rows, BLOCK)),
+        Fire::at(kernel(ROUTE, "::pie::linear::hash_route_gather"))
+            .apply(Launch::flat(rows, BLOCK)),
         &[
             ids.arg(),
             tid2eid.arg(),
@@ -611,7 +610,7 @@ pub fn group_routes(ctx: &Ctx, groups: u32, routes: &mut Tensor) -> Result<(), E
     })?;
     ctx.fire(
         OP,
-        Fire::at(ROUTE, "::pie::linear::group_routes").apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(kernel(ROUTE, "::pie::linear::group_routes")).apply(Launch::flat(lanes, BLOCK)),
         &[
             routes.arg(),
             stated(OP, rows)?.arg(),

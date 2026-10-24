@@ -5,7 +5,7 @@
 //! host interpreter draws, over rows a trained model's and a random mini's
 //! next-token distributions span and bf16 logits' runs of equal values.
 
-use engine::ProgramRegistration;
+use engine::{ChannelId, ProgramRegistration};
 use engine_cuda::device::Context;
 use engine_cuda::program::Plane;
 use engine_cuda::program::compile::Disk;
@@ -175,7 +175,7 @@ fn draw_all(rank: bool, cases: &[(&str, Vec<f32>, f32, [u32; 2])]) -> (usize, us
         .register(&context, &registration)
         .expect("the sampler compiles");
     let count = bound.container.channels.len();
-    let ids: Vec<u64> = (1..=count as u64).collect();
+    let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
     let (mut agree, mut total) = (0, 0);
     for (what, logits, knob, state) in cases {
         let knob = if rank {

@@ -238,16 +238,16 @@ struct PortFeedPlan {
     voxel: bool,
     at: u64,
     bytes: u64,
-    channel: u64,
+    channel: engine::ChannelId,
     dtype: Dtype,
-    instance: u64,
+    instance: engine::InstanceId,
     lane: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attached {
     pub lane: u32,
-    pub instance: u64,
+    pub instance: engine::InstanceId,
     pub at: Boundary,
 }
 
@@ -1502,53 +1502,56 @@ impl Shell {
     pub fn register_program(
         &mut self,
         registration: &engine::program::ProgramRegistration,
-    ) -> Result<u64> {
+    ) -> Result<engine::ProgramId> {
         self.programs.register(&self.device, registration)
     }
 
     pub fn bind_program(
         &mut self,
-        program_id: u64,
+        program_id: engine::ProgramId,
         seeds: &[(u32, Vec<u8>)],
         extents: eta_exec::Extents,
         geometry: eta_ir::registry::GeometryClass,
-        channels: &[u64],
-    ) -> Result<u64> {
+        channels: &[engine::ChannelId],
+    ) -> Result<engine::InstanceId> {
         self.programs
             .bind(&self.device, program_id, seeds, extents, geometry, channels)
     }
 
     pub fn register_shared_channel(
         &mut self,
-        id: u64,
+        id: engine::ChannelId,
         shape: crate::program::ChannelShape,
     ) -> Result<()> {
         self.programs.register_channel(&self.device, id, shape)
     }
 
-    pub fn close_shared_channel(&mut self, id: u64) -> bool {
+    pub fn close_shared_channel(&mut self, id: engine::ChannelId) -> bool {
         self.programs.close_channel(id)
     }
 
-    pub fn program_ready(&mut self, instance_id: u64) -> Result<Option<crate::program::Blocked>> {
+    pub fn program_ready(
+        &mut self,
+        instance_id: engine::InstanceId,
+    ) -> Result<Option<crate::program::Blocked>> {
         self.fence_instances(&[instance_id])?;
         self.programs.ready(instance_id)
     }
 
     pub fn program_instance(
         &mut self,
-        instance_id: u64,
+        instance_id: engine::InstanceId,
     ) -> Result<Option<&mut crate::program::Session>> {
         self.fence_instances(&[instance_id])?;
         Ok(self.programs.instance_mut(instance_id))
     }
 
-    pub fn close_program_instance(&mut self, instance_id: u64) -> Result<()> {
+    pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.fence_instances(&[instance_id])?;
         self.programs.close_instance(instance_id)
     }
 
-    pub fn fire_program(&mut self, instance_id: u64) -> Result<crate::Fired> {
+    pub fn fire_program(&mut self, instance_id: engine::InstanceId) -> Result<crate::Fired> {
         self.fence_instances(&[instance_id])?;
         self.programs.fire(&self.device, instance_id)
     }
@@ -1562,7 +1565,10 @@ impl Shell {
         self.weights.seats()
     }
 
-    pub fn program_adapter_sink(&self, program_id: u64) -> Result<Option<crate::adapter::Sink>> {
+    pub fn program_adapter_sink(
+        &self,
+        program_id: engine::ProgramId,
+    ) -> Result<Option<crate::adapter::Sink>> {
         let program = self.programs.program(program_id).ok_or_else(|| {
             Fault::program(
                 "serve::shell",
@@ -2058,7 +2064,7 @@ impl Shell {
         width: u64,
         draft: Option<(u64, u64)>,
         drafts: Option<(u64, u64)>,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<engine::InstanceId>> {
         if prepared.attachments.is_empty() {
             return Ok(Vec::new());
         }
@@ -2108,7 +2114,7 @@ impl Shell {
         first_row: &[u32],
         lane_rows: &[u32],
         fire_lane: &[u32],
-        owed: &mut Vec<u64>,
+        owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
         let mut staged = Vec::with_capacity(prepared.attachments.len());
         for attached in prepared
@@ -2324,7 +2330,7 @@ impl Shell {
         Ok(())
     }
 
-    fn fence_instances(&mut self, instances: &[u64]) -> Result<()> {
+    fn fence_instances(&mut self, instances: &[engine::InstanceId]) -> Result<()> {
         if instances.is_empty() {
             return Ok(());
         }
@@ -2351,7 +2357,7 @@ impl Shell {
             return Ok(());
         }
 
-        let instances: Vec<u64> = attachments.iter().map(|a| a.instance).collect();
+        let instances: Vec<engine::InstanceId> = attachments.iter().map(|a| a.instance).collect();
         self.fence_instances(&instances)?;
 
         for (index, attached) in attachments.iter().enumerate() {
@@ -2537,7 +2543,8 @@ impl Shell {
         let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         if !attachments.is_empty() {
-            let instances: Vec<u64> = attachments.iter().map(|a| a.instance).collect();
+            let instances: Vec<engine::InstanceId> =
+                attachments.iter().map(|a| a.instance).collect();
             self.fence_instances(&instances)?;
             for attached in attachments {
                 let Some(envelope) = self.programs.envelope(attached.instance)? else {
@@ -3271,7 +3278,7 @@ impl Shell {
         let taps = self.self_cond_taps as usize;
         let mut self_cond_rows = vec![0i32; rows as usize * taps];
         let mut self_cond_weights = vec![0f32; rows as usize * taps];
-        let mut self_cond_feeds: Vec<(u64, u64, u64, u64)> = Vec::new();
+        let mut self_cond_feeds: Vec<(u64, u64, engine::ChannelId, engine::ChannelId)> = Vec::new();
         if taps > 0 {
             for row in composition.lanes() {
                 let Some(sc) = lanes[row.source as usize].self_cond else {
@@ -4311,7 +4318,7 @@ pub struct Clips<'a> {
 
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
-    self_cond_feeds: Vec<(u64, u64, u64, u64)>,
+    self_cond_feeds: Vec<(u64, u64, engine::ChannelId, engine::ChannelId)>,
     port_feeds: Vec<PortFeedPlan>,
     merge_lands: Vec<MergeLand>,
     attachments: &'a [Attached],
@@ -4343,7 +4350,7 @@ pub struct Enqueued<'a> {
     arm: usize,
     lanes: usize,
     launches: u32,
-    attached: Vec<u64>,
+    attached: Vec<engine::InstanceId>,
     step: PhantomData<&'a ()>,
 }
 
@@ -4384,7 +4391,7 @@ struct Flight {
     arm: usize,
     lanes: usize,
     pending: Pending,
-    attached: Vec<u64>,
+    attached: Vec<engine::InstanceId>,
 }
 
 impl engine::frame::Shell for Shell {
@@ -4738,7 +4745,7 @@ fn bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-fn refused(fired: &crate::Fired, instance: u64) -> Fault {
+fn refused(fired: &crate::Fired, instance: engine::InstanceId) -> Fault {
     match fired {
         crate::Fired::Committed => Fault::program(
             "serve::epilogue",

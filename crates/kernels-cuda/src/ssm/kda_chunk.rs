@@ -1,6 +1,7 @@
 //! KDA in sixteen-token chunks on the tensor cores (`ssm/kda_chunk_sm80.cu`).
 
 use super::*;
+use crate::jit::kernel;
 use crate::ssm::kda::Kda;
 use crate::ssm::kda::KdaGates;
 
@@ -50,7 +51,7 @@ pub(crate) fn kda_chunked_mma(
     )?;
     ctx.fire(
         op,
-        Fire::at(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_prep").apply(
+        Fire::at(kernel(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_prep")).apply(
             Launch::grid([heads.div_ceil(TASKS), slots, 1], [TASKS * 2 * WARP, 1, 1])
                 .smem(TASKS * TASK_SMEM),
         ),
@@ -79,7 +80,7 @@ pub(crate) fn kda_chunked_mma(
     )?;
     ctx.fire(
         op,
-        Fire::at(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_scan")
+        Fire::at(kernel(KDA_CHUNK_SM80, "::pie::ssm::kda_chunk_scan"))
             .apply(Launch::grid([lanes * heads * 2, 1, 1], [128, 1, 1]).smem(3 * STAGE + 64)),
         &[
             ArgValue::Ptr(gl),

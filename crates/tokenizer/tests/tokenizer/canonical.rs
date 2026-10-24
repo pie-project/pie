@@ -1,7 +1,7 @@
 use crate::common::{MergeFormat, TEXTS, byte_level_json, gemma_json};
 use serde_json::json;
-use tokenizer::Tokenizer;
 use tokenizer::canonical::{CanonicalTokenizer, VERSION};
+use tokenizer::{Specials, Tokenizer};
 
 fn load(json: &serde_json::Value) -> Tokenizer {
     let bytes = serde_json::to_vec(json).unwrap();
@@ -32,11 +32,11 @@ fn assert_round_trips(original: &Tokenizer, what: &str) -> CanonicalTokenizer {
     for text in TEXTS {
         let expected = original.encode(text);
         assert_eq!(rebuilt.encode(text), expected, "{what}: encoding {text:?}");
-        for skip in [false, true] {
+        for specials in [Specials::Keep, Specials::Skip] {
             assert_eq!(
-                rebuilt.decode(&expected, skip),
-                original.decode(&expected, skip),
-                "{what}: decoding {text:?} (skip_special={skip})"
+                rebuilt.decode(&expected, specials),
+                original.decode(&expected, specials),
+                "{what}: decoding {text:?} ({specials:?})"
             );
         }
     }

@@ -18,7 +18,7 @@ use kernels_rocm::gather::{embed_concat, embed_concat_mlxu4, embed_mlx_affine};
 use kernels_rocm::gather::{grid_taps, pixels};
 use kernels_rocm::gather::{merge_rows, pool_rows};
 use kernels_rocm::linear::moe::GroupSeat;
-use kernels_rocm::{ArgValue, Ctx, Fire, Launch, Tensor, gather, sampling};
+use kernels_rocm::{ArgValue, Ctx, Fire, Launch, Tensor, gather, kernel, sampling};
 
 /// bf16 values as the bytes of a u8 plane [rows, 2·width].
 fn bf16_bytes(gpu: &Gpu, v: &[f32], rows: u32, width: u32) -> Tensor {
@@ -231,8 +231,11 @@ fn embed_scale_add_and_shards() {
     let y = gpu.zeros(rows, hidden, Dtype::Bf16);
     ctx.fire(
         "test.embed_vocab_shard",
-        Fire::at("gather/rows.hip", "::pie::layout::embed_vocab_shard")
-            .apply(Launch::grid([rows, 1, 1], [256, 1, 1])),
+        Fire::at(kernel(
+            "gather/rows.hip",
+            "::pie::layout::embed_vocab_shard",
+        ))
+        .apply(Launch::grid([rows, 1, 1], [256, 1, 1])),
         &[
             id_t.arg(),
             band.arg(),
@@ -264,8 +267,11 @@ fn embed_scale_add_and_shards() {
     let total = rows * (world * shard) as u32;
     ctx.fire(
         "test.gather_width_concat",
-        Fire::at("gather/rows.hip", "::pie::layout::gather_width_concat")
-            .apply(Launch::flat(total, 256)),
+        Fire::at(kernel(
+            "gather/rows.hip",
+            "::pie::layout::gather_width_concat",
+        ))
+        .apply(Launch::flat(total, 256)),
         &[
             src.arg(),
             dst.arg(),
@@ -799,12 +805,15 @@ fn envelope_update_appended() {
         let fire = || {
             ctx.fire(
                 "test.envelope",
-                Fire::at("attn/kv_envelope.hip", "::pie::layout::update_appended")
-                    // Two slots past the four touched pages do nothing.
-                    .apply(Launch::grid(
-                        [6, kv_heads as u32, 1],
-                        [head_dim as u32, 1, 1],
-                    )),
+                Fire::at(kernel(
+                    "attn/kv_envelope.hip",
+                    "::pie::layout::update_appended",
+                ))
+                // Two slots past the four touched pages do nothing.
+                .apply(Launch::grid(
+                    [6, kv_heads as u32, 1],
+                    [head_dim as u32, 1, 1],
+                )),
                 &[
                     keys.arg(),
                     qo_indptr.arg(),

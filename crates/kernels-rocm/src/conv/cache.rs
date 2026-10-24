@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse};
 use crate::tensor::Tensor;
 use crate::voxels::{flat_elements, lanes_of};
 use dtype::Dtype;
@@ -59,7 +59,7 @@ pub fn cache_gather(
         check(OP, slab, slot_ids, grid, *cache, frames)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::conv::cache_gather<::pie::bf16>")
+        Fire::at(kernel(FILE, "::pie::conv::cache_gather<::pie::bf16>"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             slab.arg(),
@@ -92,7 +92,7 @@ pub fn cache_store(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::conv::cache_store<::pie::bf16>")
+        Fire::at(kernel(FILE, "::pie::conv::cache_store<::pie::bf16>"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             x.arg(),

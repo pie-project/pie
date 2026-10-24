@@ -1,6 +1,7 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel, refuse};
 use crate::tensor::Tensor;
 
 const FILE: &str = "collective/all_reduce.cu";
@@ -50,7 +51,7 @@ impl Peers {
     pub fn answer(&self, ctx: &Ctx, status: u64) -> Result<(), Error> {
         ctx.fire(
             "collective.peers_answer",
-            Fire::at(FILE, "::pie::collective::peers_answer")
+            Fire::at(kernel(FILE, "::pie::collective::peers_answer"))
                 .apply(Launch::grid([1, 1, 1], [1, 1, 1])),
             &[
                 ArgValue::Ptr(self.stages),
@@ -81,7 +82,7 @@ impl Peers {
             let packs = bytes / 16;
             ctx.fire(
                 op,
-                Fire::at(FILE, entry).apply(Self::launch(packs)),
+                Fire::at(kernel(FILE, entry)).apply(Self::launch(packs)),
                 &[
                     ArgValue::Ptr(self.stages),
                     ArgValue::Ptr(self.signals),
@@ -114,7 +115,8 @@ impl Peers {
             copy(ctx, op, self.stage, x.ptr + first * row, rows * row)?;
             ctx.fire(
                 op,
-                Fire::at(FILE, entry).apply(Self::launch(rows * row / 16 * u64::from(self.world))),
+                Fire::at(kernel(FILE, entry))
+                    .apply(Self::launch(rows * row / 16 * u64::from(self.world))),
                 &[
                     ArgValue::Ptr(self.stages),
                     ArgValue::Ptr(self.signals),
@@ -136,6 +138,10 @@ fn copy(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(
     {
         use cudarc::runtime::sys as rt;
 
+        // SAFETY: the stream is `ctx`'s, live by `Ctx::on`'s contract. The
+        // callers bound `bytes` by the peer stage's `stage_bytes`, so `dst`
+        // stays inside the stage `Ctx::with_peers` vouched for; `src` is a
+        // range of the caller's tensor.
         let code = unsafe {
             rt::cudaMemcpyAsync(
                 dst as usize as *mut core::ffi::c_void,
@@ -180,6 +186,9 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
         let Some((send, count)) = message(*buf) else {
             return Ok(());
         };
+        // SAFETY: `comm` is the live communicator `Ctx::with_comm` vouched
+        // for and the stream is `ctx`'s. The reduce is in place over the
+        // `count` elements of `buf`, a device allocation the caller owns.
         let code = unsafe {
             nccl::ncclAllReduce(
                 send,
@@ -212,8 +221,8 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         return peers.all_gather(ctx, OP, &x, y);
     }
     let comm = ctx.comm(OP)?;
-    debug_assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
-    debug_assert!(
+    assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
+    assert!(
         x.elements() > 0 && y.elements().is_multiple_of(x.elements()),
         "the gathered rectangle is a whole number of shards"
     );
@@ -228,6 +237,10 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         };
 
         if x.rows <= 1 {
+            // SAFETY: `comm` and the stream are `ctx`'s, live by its
+            // contracts. NCCL reads `count` elements of `x` and writes
+            // `count * world` into `y`; that `y` is that large is the
+            // caller's to keep beyond the assertion above, which holds it to whole shards.
             let code = unsafe {
                 nccl::ncclAllGather(
                     send,
@@ -250,6 +263,9 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let bytes = usize::try_from(y.elements().saturating_mul(y.dtype.bytes_ceil()))
             .map_err(|_| refuse(OP, "the gathered rectangle does not fit this address space"))?;
         let stage = ctx.scratch(OP, "all_gather_stage", bytes)?;
+        // SAFETY: `comm` and the stream are `ctx`'s. `stage` is a slab of
+        // `y.elements()` elements, which is `count * world` by the
+        // division above; `send` is `x`'s `count` elements.
         let code = unsafe {
             nccl::ncclAllGather(send, stage, count, dtype, comm.cast(), ctx.stream().cast())
         };
@@ -270,8 +286,11 @@ pub fn grouped<R>(op: &'static str, body: impl FnOnce() -> Result<R, Error>) -> 
     {
         use cudarc::nccl::sys as nccl;
 
+        // SAFETY: takes no arguments; it opens a group on this thread that
+        // the `ncclGroupEnd` below closes whatever `body` returns.
         answered(op, "ncclGroupStart", unsafe { nccl::ncclGroupStart() })?;
         let ran = body();
+        // SAFETY: closes the group opened above, on the same thread.
         let ended = answered(op, "ncclGroupEnd", unsafe { nccl::ncclGroupEnd() });
         let out = ran?;
         ended?;
@@ -300,8 +319,8 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
             ),
         ));
     }
-    debug_assert_eq!(x.dtype, y.dtype, "a reduction does not change the dtype");
-    debug_assert!(
+    assert_eq!(x.dtype, y.dtype, "a reduction does not change the dtype");
+    assert!(
         y.elements() > 0 && x.elements().is_multiple_of(y.elements()),
         "the reduced rectangle is a whole number of shards"
     );
@@ -314,6 +333,10 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
         let Some((recv, count)) = message(*y) else {
             return Ok(());
         };
+        // SAFETY: `comm` and the stream are `ctx`'s. NCCL writes `count`
+        // elements of `y` and reads `count * world` of `x`; that `x` holds
+        // that many is the caller's to keep beyond the assertion above,
+        // which holds it to whole shards.
         let code = unsafe {
             nccl::ncclReduceScatter(
                 x.ptr as usize as *const core::ffi::c_void,

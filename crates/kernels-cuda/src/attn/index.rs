@@ -3,7 +3,7 @@ use dtype::Dtype;
 
 use crate::attn::kv;
 use crate::attn::mla;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 #[cfg(feature = "cuda")]
 use logits::{TC5_FROM, ranked_tc5};
@@ -77,14 +77,17 @@ pub fn layernorm_rope(
         OP,
         // A warp a row where the profile says (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(
+            Fire::at(kernel(
                 INDEX,
                 "::pie::attn::index::index_knorm_rope_warp<::pie::bf16>",
-            )
+            ))
             .apply(Launch::per_row(k.rows, 32))
         } else {
-            Fire::at(INDEX, "::pie::attn::index::index_knorm_rope<::pie::bf16>")
-                .apply(Launch::per_row(k.rows, K_BLOCK))
+            Fire::at(kernel(
+                INDEX,
+                "::pie::attn::index::index_knorm_rope<::pie::bf16>",
+            ))
+            .apply(Launch::per_row(k.rows, K_BLOCK))
         },
         &[
             k.arg(),
@@ -120,11 +123,17 @@ pub fn rope(
         // A thread a (head, pair) where the profile says
         // (`kernel.elemwise.rows_vec`).
         if ctx.tuning().rows_vec {
-            Fire::at(INDEX, "::pie::attn::index::index_q_rope_pairs<::pie::bf16>")
-                .apply(Launch::per_row(q.rows, K_BLOCK))
+            Fire::at(kernel(
+                INDEX,
+                "::pie::attn::index::index_q_rope_pairs<::pie::bf16>",
+            ))
+            .apply(Launch::per_row(q.rows, K_BLOCK))
         } else {
-            Fire::at(INDEX, "::pie::attn::index::index_q_rope<::pie::bf16>")
-                .apply(Launch::per_row(q.rows, q_rope_block(n_heads)))
+            Fire::at(kernel(
+                INDEX,
+                "::pie::attn::index::index_q_rope<::pie::bf16>",
+            ))
+            .apply(Launch::per_row(q.rows, q_rope_block(n_heads)))
         },
         &[
             q.arg(),
@@ -177,7 +186,7 @@ pub fn store_fp4(
     let div = crate::attn::compressed::pool::packing(OP, keys, i64::from(FP4_ROW))?;
     ctx.fire(
         OP,
-        Fire::at(INDEX, "::pie::attn::index::index_store_fp4")
+        Fire::at(kernel(INDEX, "::pie::attn::index::index_store_fp4"))
             .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             entries.arg(),
@@ -208,7 +217,8 @@ fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTen
         let lanes = u32::try_from(runs).map_err(|_| refuse(op, "the queries overflow a launch"))?;
         ctx.fire(
             op,
-            Fire::at(INDEX, "::pie::attn::index::index_q_fp4").apply(Launch::flat(lanes, 256)),
+            Fire::at(kernel(INDEX, "::pie::attn::index::index_q_fp4"))
+                .apply(Launch::flat(lanes, 256)),
             &[
                 q.data.arg(),
                 ArgValue::Ptr(out),
@@ -241,7 +251,7 @@ fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error
     if pages > 0 {
         ctx.fire(
             op,
-            Fire::at(INDEX, "::pie::attn::index::index_stage_fp4")
+            Fire::at(kernel(INDEX, "::pie::attn::index::index_stage_fp4"))
                 .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
             &[
                 keys.keys.arg(),
@@ -398,7 +408,7 @@ pub fn topk_tokens(
     let num_requests = kv::lanes_of(OP, q.indptr)?;
     ctx.fire(
         OP,
-        Fire::at(INDEX, "::pie::attn::index::index_pool_tokens")
+        Fire::at(kernel(INDEX, "::pie::attn::index::index_pool_tokens"))
             .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             ArgValue::Ptr(blocks_at),
@@ -614,7 +624,7 @@ fn ranked(
     };
     ctx.fire(
         OP,
-        Fire::at(INDEX, symbol(&entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
+        Fire::at(kernel(INDEX, &entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
         &[
             q.data.arg(),
             ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),
@@ -727,10 +737,10 @@ pub fn topk_block_max(
 
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             INDEX,
             "::pie::attn::index::index_topk_block_max<::pie::bf16>",
-        )
+        ))
         .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             q.data.arg(),

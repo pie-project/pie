@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const GLU: &str = "linear/glu.cu";
@@ -76,7 +76,7 @@ pub fn swiglu(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>"))).apply(launch),
+        Fire::at(kernel(FILE, &format!("::pie::linear::{entry}<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),
@@ -100,7 +100,7 @@ pub fn swiglu_clamp(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
         OP,
-        Fire::at(GLU, symbol(&format!("::pie::linear::swiglu_clamp<{t}>")))
+        Fire::at(kernel(GLU, &format!("::pie::linear::swiglu_clamp<{t}>")))
             .apply(launch.programmatic(ctx.tuning().pdl)),
         &[
             packed.arg(),
@@ -127,10 +127,10 @@ pub fn swiglu_clamp_alpha(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             GLU,
-            symbol(&format!("::pie::linear::swiglu_clamp_alpha<{t}>")),
-        )
+            &format!("::pie::linear::swiglu_clamp_alpha<{t}>"),
+        ))
         .apply(launch),
         &[
             packed.arg(),
@@ -183,12 +183,10 @@ fn swiglu_clamp_lanes(
     let absent = crate::jit::ArgValue::ABSENT;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             GLU,
-            symbol(&format!(
-                "::pie::linear::swiglu_clamp_lanes<{t}, {packed}, {routed}>"
-            )),
-        )
+            &format!("::pie::linear::swiglu_clamp_lanes<{t}, {packed}, {routed}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             gate.arg(),
@@ -281,7 +279,8 @@ pub fn swiglu_clamp_routed_e4m3(
     }
     ctx.fire(
         OP,
-        Fire::at(GLU, "::pie::linear::swiglu_clamp_routed_e4m3").apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(kernel(GLU, "::pie::linear::swiglu_clamp_routed_e4m3"))
+            .apply(Launch::flat(lanes, BLOCK)),
         &[
             packed.arg(),
             weights.arg(),
@@ -339,7 +338,7 @@ pub fn geglu_tanh(
     nonzero(OP, "the activation's element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(GLU, symbol(&format!("::pie::linear::geglu_tanh<{t}>")))
+        Fire::at(kernel(GLU, &format!("::pie::linear::geglu_tanh<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             gate.arg(),
@@ -384,7 +383,7 @@ fn act(
     nonzero(op, "the activation's element count", lanes)?;
     ctx.fire(
         op,
-        Fire::at(GLU, symbol(&format!("::pie::linear::act<{t}, {relu2}>")))
+        Fire::at(kernel(GLU, &format!("::pie::linear::act<{t}, {relu2}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
@@ -422,7 +421,7 @@ pub fn geglu_tanh_packed(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>"))).apply(launch),
+        Fire::at(kernel(FILE, &format!("::pie::linear::{entry}<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),
@@ -450,7 +449,7 @@ pub fn situ(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
         OP,
-        Fire::at(GLU, symbol(&format!("::pie::linear::situ<{t}>"))).apply(launch),
+        Fire::at(kernel(GLU, &format!("::pie::linear::situ<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),

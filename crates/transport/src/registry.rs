@@ -74,13 +74,21 @@ impl Registry {
         out
     }
 
-    pub fn register(
+    /// Registers `handle` with the `backend` backend ([`Backend::register`]).
+    ///
+    /// # Safety
+    ///
+    /// As for [`Backend::register`], for as long as this registry lives.
+    #[allow(unsafe_code)]
+    pub unsafe fn register(
         &self,
         owner: WorkerId,
         handle: KvHandle,
         backend: BackendKind,
     ) -> Result<RegisteredHandle> {
-        self.backend(backend)?.register(owner, handle)
+        // SAFETY: the backend lives as long as this registry, and the caller
+        // keeps `handle`'s regions alive and unraced that long.
+        unsafe { self.backend(backend)?.register(owner, handle) }
     }
 
     pub fn connect(&self, backend: BackendKind, peer: &crate::core::PeerConn) -> Result<()> {

@@ -5,7 +5,7 @@ use crate::error::Error;
 
 use super::rms;
 use crate::attn::kv::lanes_of;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
 const PREP: &str = "attn/mla/prep.cu";
@@ -36,10 +36,10 @@ pub(crate) fn split_kv_a_norm(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             PREP,
-            crate::jit::symbol(&format!("::pie::attn::mla::mla_latents<{t}, 256>")),
-        )
+            &format!("::pie::attn::mla::mla_latents<{t}, 256>"),
+        ))
         .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl)),
         &[
             kv_a.arg(),
@@ -79,10 +79,10 @@ pub fn split_q_b(
             .map_err(|_| refuse(OP, format!("{runs} runs overflow a launch")))?;
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 PREP,
-                crate::jit::symbol(&format!("::pie::attn::mla::mla_split_q_b_vec8<{t}>")),
-            )
+                &format!("::pie::attn::mla::mla_split_q_b_vec8<{t}>"),
+            ))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
             &[
                 q_b.arg(),
@@ -105,10 +105,10 @@ pub fn split_q_b(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             PREP,
-            crate::jit::symbol(&format!("::pie::attn::mla::mla_split_q_b<{t}>")),
-        )
+            &format!("::pie::attn::mla::mla_split_q_b<{t}>"),
+        ))
         .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
         &[
             q_b.arg(),
@@ -149,7 +149,8 @@ pub(crate) fn write_mla_fp8_rows(
     let num_requests = lanes_of(op, indptr)?;
     ctx.fire(
         op,
-        Fire::at(PREP, "::pie::attn::mla::mla_kv_append_fp8").apply(Launch::per_row(ckv.rows, 160)),
+        Fire::at(kernel(PREP, "::pie::attn::mla::mla_kv_append_fp8"))
+            .apply(Launch::per_row(ckv.rows, 160)),
         &[
             ckv.arg(),
             kpe.arg(),
@@ -184,7 +185,7 @@ pub(crate) fn write_mla_to_pages(
     let num_requests = lanes_of(op, indptr)?;
     ctx.fire(
         op,
-        Fire::at(PREP, "::pie::attn::mla::mla_kv_append")
+        Fire::at(kernel(PREP, "::pie::attn::mla::mla_kv_append"))
             .apply(Launch::per_row(ckv.rows, MLA_WRITE_BLOCK)),
         &[
             ckv.arg(),

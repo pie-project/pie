@@ -60,3 +60,6 @@ wgpu = [
     "kernels-slang/wgsl",
     "kernels-slang/probe",
 ]
+
+[lints]
+workspace = true

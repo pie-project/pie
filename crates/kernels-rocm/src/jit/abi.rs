@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 #[cfg(feature = "rocm")]
 use core::ffi::c_void;
 

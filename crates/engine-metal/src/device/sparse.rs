@@ -21,6 +21,7 @@
 //!
 //! Absent on a device without `MTLGPUFamilyMetal4` — [`Sparse::open`]
 //! answers `None` and the pool stays a fixed allocation.
+#![allow(unsafe_code)]
 
 use std::sync::{Arc, Mutex};
 
@@ -62,6 +63,8 @@ pub struct Sparse {
 // made on it (queue operations, event reads and waits, residency edits), and
 // the only mutable state is behind a `Mutex`.
 unsafe impl Send for Sparse {}
+// SAFETY: as `Send`: `&Sparse` reaches only those thread-safe calls and the
+// `Mutex`-guarded ticks.
 unsafe impl Sync for Sparse {}
 
 impl std::fmt::Debug for Sparse {
@@ -138,9 +141,7 @@ impl Sparse {
     }
 
     fn ticks(&self) -> std::sync::MutexGuard<'_, Ticks> {
-        self.ticks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.ticks.lock().expect("ticks lock poisoned")
     }
 
     /// Queue one remap of `tiles` tiles of `buffer` from `first_tile`,

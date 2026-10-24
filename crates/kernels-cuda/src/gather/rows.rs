@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -53,8 +53,11 @@ pub(crate) fn gather_width_concat(
         .map_err(|_| refuse(OP, format!("{total} lanes do not fit a 32-bit grid")))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::gather::gather_width_concat<::pie::bf16>")
-            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(
+            FILE,
+            "::pie::gather::gather_width_concat<::pie::bf16>",
+        ))
+        .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(src),
             y.arg(),
@@ -97,7 +100,7 @@ pub fn split_qkv_padded(
     let out8 = (heads[0] + 2 * heads[1]) * head_dim / 8;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::gather::split_qkv_padded_vec8").apply(Launch::grid(
+        Fire::at(kernel(FILE, "::pie::gather::split_qkv_padded_vec8")).apply(Launch::grid(
             [q.rows, out8.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -151,10 +154,10 @@ pub fn split_qkv(
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::gather::{entry}<::pie::bf16>")),
-        )
+            &format!("::pie::gather::{entry}<::pie::bf16>"),
+        ))
         .apply(Launch::grid(
             [q.rows, width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
@@ -203,8 +206,11 @@ pub fn split_q_gate(
             .map_err(|_| refuse(OP, format!("{total} runs overflow a grid")))?;
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::gather::split_q_gate_vec8<::pie::bf16>")
-                .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
+            Fire::at(kernel(
+                FILE,
+                "::pie::gather::split_q_gate_vec8<::pie::bf16>",
+            ))
+            .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
             &[
                 packed.arg(),
                 q.arg(),
@@ -219,7 +225,7 @@ pub fn split_q_gate(
     let block = if head_dim < 128 { 64 } else { 128 };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::gather::split_q_gate<::pie::bf16>")
+        Fire::at(kernel(FILE, "::pie::gather::split_q_gate<::pie::bf16>"))
             .apply(Launch::grid([q.rows, heads, 1], [block, 1, 1])),
         &[
             packed.arg(),
@@ -276,7 +282,7 @@ pub fn split_rows(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entrypoint)).apply(launch),
+        Fire::at(kernel(FILE, &entrypoint)).apply(launch),
         &[
             x.arg(),
             left.arg(),
@@ -322,7 +328,7 @@ pub fn select(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::gather::select<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::select<{t}>")))
             .apply(route_rows(y.rows, width)),
         &[
             table.arg(),
@@ -395,7 +401,7 @@ fn move_rows(
     let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::gather::{entry}<{unit}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::{entry}<{unit}>")))
             .apply(route_rows(rows, per_row)),
         &[
             args[0].arg(),
@@ -484,7 +490,7 @@ fn permute_rows(
     let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::gather::{entry}<{unit}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::{entry}<{unit}>")))
             .apply(route_rows(rows, per_row)),
         &[
             x.arg(),
@@ -534,7 +540,8 @@ pub fn concat_cols(ctx: &Ctx, xs: &[Tensor], y: &mut Tensor) -> Result<(), Error
         if threads > 0 {
             ctx.fire(
                 OP,
-                Fire::at(FILE, "::pie::gather::concat_cols").apply(Launch::flat(threads, BLOCK)),
+                Fire::at(kernel(FILE, "::pie::gather::concat_cols"))
+                    .apply(Launch::flat(threads, BLOCK)),
                 &[
                     x.arg(),
                     y.arg(),
@@ -609,10 +616,10 @@ pub fn scatter_live_rows(
         .min(MAX_BLOCK);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::gather::scatter_live_rows<{unit}>")),
-        )
+            &format!("::pie::gather::scatter_live_rows<{unit}>"),
+        ))
         .apply(Launch::per_row(rows, threads)),
         &[src.arg(), y.arg(), routes.arg(), units.arg(), ctx.stage()],
     )
@@ -646,7 +653,7 @@ pub fn pool_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), 
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::gather::pool_rows<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::pool_rows<{t}>")))
             .apply(Launch::per_row(out, BLOCK)),
         &[x.arg(), y.arg(), width.arg(), stated(OP, block)?.arg()],
     )
@@ -688,7 +695,7 @@ pub fn merge_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(),
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::gather::merge_rows<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::merge_rows<{t}>")))
             .apply(Launch::per_row(out, BLOCK)),
         &[
             x.arg(),

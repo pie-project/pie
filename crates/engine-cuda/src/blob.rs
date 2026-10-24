@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
 use crate::AdapterPlane;
@@ -325,7 +325,7 @@ impl Blobs {
     }
 
     pub fn open(&self, at: &Path, path: &str) -> Result<Arc<Blob>> {
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.lock().expect("held lock poisoned");
         loop {
             let seen = match held.get(at) {
                 Some(Cell::Held(weak)) => Some(weak.upgrade()),
@@ -339,17 +339,14 @@ impl Blobs {
                     break;
                 }
                 None => {
-                    held = self
-                        .ready
-                        .wait(held)
-                        .unwrap_or_else(PoisonError::into_inner);
+                    held = self.ready.wait(held).expect("ready lock poisoned");
                 }
             }
         }
         drop(held);
         self.loads.fetch_add(1, Ordering::Relaxed);
         let read = std::fs::read(at);
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.held.lock().expect("held lock poisoned");
         let out = match read {
             Ok(bytes) => {
                 let blob = Arc::new(Blob {
@@ -393,7 +390,7 @@ pub struct Stamp {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
     Shared(Stamp),
-    Own(u64),
+    Own(engine::InstanceId),
 }
 
 fn stat(at: &Path, file: &str, name: &str) -> Result<(String, u64, u128)> {
@@ -532,7 +529,7 @@ pub enum Source<'a> {
         name: &'a str,
     },
     Own {
-        instance: u64,
+        instance: engine::InstanceId,
         planes: &'a [AdapterPlane<'a>],
     },
 }

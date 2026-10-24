@@ -69,3 +69,6 @@ tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 tempfile = "3"
+
+[lints]
+workspace = true

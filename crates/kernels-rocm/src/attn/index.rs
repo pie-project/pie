@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/index.hip";
@@ -80,7 +80,8 @@ pub fn layernorm_rope(
     let rope_dim = stated(OP, rope_dim)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_knorm_rope").apply(Launch::per_row(k.rows, K_BLOCK)),
+        Fire::at(kernel(FILE, "::pie::attn::index_knorm_rope"))
+            .apply(Launch::per_row(k.rows, K_BLOCK)),
         &[
             k.arg(),
             weight.arg(),
@@ -112,7 +113,7 @@ pub fn rope(
     let rope_dim = stated(OP, rope_dim)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_q_rope")
+        Fire::at(kernel(FILE, "::pie::attn::index_q_rope"))
             .apply(Launch::per_row(q.rows, q_rope_block(n_heads))),
         &[
             q.arg(),
@@ -257,12 +258,10 @@ pub fn topk(
     let launch = Launch::grid([score_blocks, rows, 1], [SCORE_KEYS, 1, 1]);
     if mfma && lists.count == 0 {
         // A prefill's rows, SCORE_ROWS a block over the same keys.
-        let entry = symbol(&format!(
-            "::pie::attn::index_score_rows<{head_dim}, {tiles}, {SCORE_ROWS}>"
-        ));
+        let entry = format!("::pie::attn::index_score_rows<{head_dim}, {tiles}, {SCORE_ROWS}>");
         ctx.fire(
             OP,
-            Fire::at(FILE, entry).apply(Launch::grid(
+            Fire::at(kernel(FILE, &entry)).apply(Launch::grid(
                 [score_blocks.min(SCORE_LANES), rows.div_ceil(SCORE_ROWS), 1],
                 [SCORE_KEYS, 1, 1],
             )),
@@ -286,12 +285,10 @@ pub fn topk(
             ],
         )?;
     } else if mfma {
-        let entry = symbol(&format!(
-            "::pie::attn::index_score_paged<{head_dim}, {tiles}>"
-        ));
+        let entry = format!("::pie::attn::index_score_paged<{head_dim}, {tiles}>");
         ctx.fire(
             OP,
-            Fire::at(FILE, entry).apply(launch),
+            Fire::at(kernel(FILE, &entry)).apply(launch),
             &[
                 q.data.arg(),
                 weights,
@@ -315,7 +312,7 @@ pub fn topk(
     } else {
         ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::attn::index_score_any").apply(launch),
+            Fire::at(kernel(FILE, "::pie::attn::index_score_any")).apply(launch),
             &[
                 q.data.arg(),
                 weights,
@@ -342,7 +339,7 @@ pub fn topk(
         args.extend([top_k.arg(), ratio.arg(), ctx.stage()]);
         ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::attn::index_topk_bound")
+            Fire::at(kernel(FILE, "::pie::attn::index_topk_bound"))
                 .apply(Launch::grid([rows, 1, 1], [SELECT_BLOCK, 1, 1])),
             &args,
         )?;
@@ -351,7 +348,7 @@ pub fn topk(
         args.extend([top_k.arg(), ratio.arg(), ctx.stage()]);
         ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::attn::index_topk_collect").apply(Launch::grid(
+            Fire::at(kernel(FILE, "::pie::attn::index_topk_collect")).apply(Launch::grid(
                 [max_keys.div_ceil(COLLECT_KEYS), rows, 1],
                 [256, 1, 1],
             )),
@@ -363,7 +360,7 @@ pub fn topk(
     args.extend([top_k.arg(), ratio.arg(), ArgValue::of(&lists), ctx.stage()]);
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_topk_select")
+        Fire::at(kernel(FILE, "::pie::attn::index_topk_select"))
             .apply(Launch::grid([rows, 1, 1], [SELECT_BLOCK, 1, 1])),
         &args,
     )
@@ -438,7 +435,7 @@ pub fn topk_tokens(
     let num_requests = kv::lanes_of(OP, q.indptr)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_pool_tokens")
+        Fire::at(kernel(FILE, "::pie::attn::index_pool_tokens"))
             .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             ArgValue::Ptr(blocks_at),
@@ -536,7 +533,7 @@ pub fn topk_block_max(
     )?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_topk_block_max")
+        Fire::at(kernel(FILE, "::pie::attn::index_topk_block_max"))
             .apply(Launch::per_row(selection.rows, 256)),
         &[
             q.data.arg(),

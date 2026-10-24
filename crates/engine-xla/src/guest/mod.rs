@@ -9,6 +9,7 @@ pub mod run;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use engine::program::ProgramId;
 use eta_compiler::codegen::launch::LaunchPackage;
 
 pub use lower::Refused;
@@ -63,8 +64,8 @@ pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
 
 #[derive(Debug, Default)]
 pub struct Forms {
-    compiled: BTreeMap<u64, Arc<Compiled>>,
-    refused: BTreeMap<u64, Refused>,
+    compiled: BTreeMap<ProgramId, Arc<Compiled>>,
+    refused: BTreeMap<ProgramId, Refused>,
 }
 
 /// Whether every stage of `package` lowers.
@@ -90,7 +91,7 @@ pub fn admits(package: &LaunchPackage) -> Result<(), Refused> {
 }
 
 impl Forms {
-    pub fn admit(&mut self, program: u64, package: &LaunchPackage) -> bool {
+    pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
         match admits(package) {
             Ok(()) => {
                 let key = *blake3::hash(format!("{package:?}").as_bytes()).as_bytes();
@@ -112,16 +113,16 @@ impl Forms {
     }
 
     #[must_use]
-    pub fn get(&self, program: u64) -> Option<&Arc<Compiled>> {
+    pub fn get(&self, program: ProgramId) -> Option<&Arc<Compiled>> {
         self.compiled.get(&program)
     }
 
     #[must_use]
-    pub fn refusal(&self, program: u64) -> Option<&Refused> {
+    pub fn refusal(&self, program: ProgramId) -> Option<&Refused> {
         self.refused.get(&program)
     }
 
-    pub fn forget(&mut self, program: u64) {
+    pub fn forget(&mut self, program: ProgramId) {
         self.compiled.remove(&program);
         self.refused.remove(&program);
     }

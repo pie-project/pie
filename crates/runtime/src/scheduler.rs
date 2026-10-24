@@ -322,7 +322,7 @@ pub(crate) fn nudge(engine_idx: usize) {
 pub fn submit_async_with_kv_copy(
     request: crate::engine::FireRequest,
     engine_idx: usize,
-    instance_id: u64,
+    instance_id: ::engine::InstanceId,
     pipeline_id: Option<ProcessId>,
     completion: crate::engine::WorkItemCompletion,
     copy_src: Vec<u32>,
@@ -350,7 +350,7 @@ pub fn submit_async_with_kv_copy(
 pub fn submit_prebuilt_async_with_kv_copy(
     request: crate::engine::FireRequest,
     engine_idx: usize,
-    instance_id: u64,
+    instance_id: ::engine::InstanceId,
     completion: crate::engine::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
@@ -376,7 +376,7 @@ pub fn submit_prebuilt_async_with_kv_copy(
 pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     handle: &worker::SchedulerHandle,
     request: crate::engine::FireRequest,
-    instance_id: u64,
+    instance_id: ::engine::InstanceId,
     process_id: ProcessId,
     pipeline_id: ProcessId,
     completion: crate::engine::WorkItemCompletion,

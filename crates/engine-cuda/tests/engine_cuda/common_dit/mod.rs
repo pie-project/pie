@@ -13,6 +13,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
+use engine::{ChannelId, InstanceId, ProgramId};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -408,11 +409,11 @@ pub fn epilogue(rows: u32) -> TraceContainer {
 }
 
 pub struct LaneHandles {
-    pub instance: u64,
-    pub latent: u64,
-    pub timestep: u64,
-    pub positions: u64,
-    pub out: u64,
+    pub instance: InstanceId,
+    pub latent: ChannelId,
+    pub timestep: ChannelId,
+    pub positions: ChannelId,
+    pub out: ChannelId,
     pub rows: u32,
 }
 
@@ -420,7 +421,7 @@ pub struct Rig {
     pub engine: engine_cuda::Cuda,
     pub loaded: Loaded,
     pub facts: poem_ir::Facts,
-    pub programs: BTreeMap<u32, u64>,
+    pub programs: BTreeMap<u32, ProgramId>,
     next_channel: u64,
     _dir: tempfile::TempDir,
 }
@@ -493,7 +494,7 @@ impl Rig {
         &self.loaded.caps.profile
     }
 
-    fn program(&mut self, rows: u32) -> u64 {
+    fn program(&mut self, rows: u32) -> ProgramId {
         if let Some(id) = self.programs.get(&rows) {
             return *id;
         }
@@ -502,7 +503,7 @@ impl Rig {
         id
     }
 
-    pub fn register(&mut self, container: TraceContainer, salt: u64) -> u64 {
+    pub fn register(&mut self, container: TraceContainer, salt: u64) -> ProgramId {
         let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
@@ -521,8 +522,8 @@ impl Rig {
             .expect("the program registers")
     }
 
-    fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> u64 {
-        let id = self.next_channel;
+    fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> ChannelId {
+        let id = ChannelId(self.next_channel);
         self.next_channel += 1;
         self.engine
             .register_channel(&ChannelRegistration {
@@ -544,7 +545,7 @@ impl Rig {
         self.lane_of(program, rows, WIDTH)
     }
 
-    pub fn lane_of(&mut self, program: u64, rows: u32, width: u32) -> LaneHandles {
+    pub fn lane_of(&mut self, program: ProgramId, rows: u32, width: u32) -> LaneHandles {
         let latent = self.channel(vec![rows, WIDTH], HostRole::Writer);
         let timestep = self.channel(vec![1, 1], HostRole::Writer);
         let positions = self.channel(vec![rows, 2], HostRole::Writer);
@@ -575,7 +576,7 @@ impl Rig {
         }
     }
 
-    pub fn publish(&mut self, instance: u64, dense: u32, values: &[f32]) {
+    pub fn publish(&mut self, instance: InstanceId, dense: u32, values: &[f32]) {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let accepted = self
             .engine
@@ -584,7 +585,7 @@ impl Rig {
         assert!(accepted, "the ring had room");
     }
 
-    pub fn take(&mut self, instance: u64, dense: u32) -> Vec<f32> {
+    pub fn take(&mut self, instance: InstanceId, dense: u32) -> Vec<f32> {
         let bytes = self
             .engine
             .take_channel(instance, dense)

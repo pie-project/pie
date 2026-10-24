@@ -4,7 +4,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, stated};
 use crate::linear::affine::extent;
 use crate::tensor::Tensor;
 
@@ -35,7 +35,7 @@ pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Erro
     let lanes = nonzero(OP, "the cast's element count", extent(OP, n)?)?;
     ctx.fire(
         OP,
-        Fire::at(CAST, symbol(&format!("::pie::linear::cast_f32_to<{t}>")))
+        Fire::at(kernel(CAST, &format!("::pie::linear::cast_f32_to<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[src.arg(), dst.arg(), n.arg()],
     )
@@ -48,7 +48,7 @@ pub fn scale_rows(ctx: &Ctx, l: Tensor, buf: &mut Tensor) -> Result<(), Error> {
     let width = stated(OP, nonzero(OP, "width", buf.width)?)?;
     ctx.fire(
         OP,
-        Fire::at(CAST, symbol(&format!("::pie::linear::scale_rows<{t}>")))
+        Fire::at(kernel(CAST, &format!("::pie::linear::scale_rows<{t}>")))
             .apply(route_rows(buf.rows, buf.width)),
         &[buf.arg(), l.arg(), width.arg()],
     )

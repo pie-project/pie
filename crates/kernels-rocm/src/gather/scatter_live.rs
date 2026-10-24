@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "gather/scatter_live.hip";
@@ -61,10 +61,10 @@ pub fn scatter_live_rows(
         .min(MAX_BLOCK);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::layout::scatter_live_rows<{unit}>")),
-        )
+            &format!("::pie::layout::scatter_live_rows<{unit}>"),
+        ))
         .apply(Launch::per_row(rows, threads)),
         &[src.arg(), y.arg(), routes.arg(), units.arg(), ctx.stage()],
     )

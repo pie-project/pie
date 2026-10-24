@@ -217,8 +217,8 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(4);
         let d = b.op(x, 4, fact(0));
-        let p = b.op(x, 4, Guard::not(fact(0)));
-        let m = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 4);
+        let p = b.op(x, 4, !fact(0));
+        let m = b.merge(&[(d, fact(0)), (p, !fact(0))], 4);
         let plan = b.prepare_over(m, Guard::Always);
         let o = b.decode(m, plan, Guard::Always);
         b.out(o);

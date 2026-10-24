@@ -1,4 +1,4 @@
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 use engine::Engine;
@@ -139,13 +139,13 @@ struct EngineRegistration {
     backend: Option<EngineBox>,
 }
 
-fn registry() -> &'static RwLock<Vec<Option<EngineRegistration>>> {
-    static REGISTRY: OnceLock<RwLock<Vec<Option<EngineRegistration>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+fn registry() -> &'static Mutex<Vec<Option<EngineRegistration>>> {
+    static REGISTRY: OnceLock<Mutex<Vec<Option<EngineRegistration>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 pub fn register_engine_backend(mut spec: EngineSpec, backend: EngineBox) -> usize {
-    let mut engines = registry().write().unwrap();
+    let mut engines = registry().lock().unwrap();
     let id = engines.len();
     spec.device_domain = backend
         .device_facts()
@@ -159,7 +159,7 @@ pub fn register_engine_backend(mut spec: EngineSpec, backend: EngineBox) -> usiz
 
 pub fn get_spec(engine_id: usize) -> Result<EngineSpec> {
     registry()
-        .read()
+        .lock()
         .unwrap()
         .get(engine_id)
         .and_then(|d| d.as_ref().map(|r| r.spec.clone()))
@@ -167,7 +167,7 @@ pub fn get_spec(engine_id: usize) -> Result<EngineSpec> {
 }
 
 pub fn take_engine_backend(engine_id: usize) -> Result<EngineBox> {
-    let mut engines = registry().write().unwrap();
+    let mut engines = registry().lock().unwrap();
     let Some(Some(engine)) = engines.get_mut(engine_id) else {
         return Err(anyhow!("unknown engine {engine_id}"));
     };
@@ -178,7 +178,7 @@ pub fn take_engine_backend(engine_id: usize) -> Result<EngineBox> {
 }
 
 pub fn unregister_engine(engine_id: usize) -> Result<()> {
-    let mut engines = registry().write().unwrap();
+    let mut engines = registry().lock().unwrap();
     let Some(slot) = engines.get_mut(engine_id) else {
         return Err(anyhow!("unknown engine {engine_id}"));
     };

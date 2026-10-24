@@ -244,7 +244,7 @@ impl<'a> Seated<'a> {
 pub struct Attached {
     pub lane: u32,
 
-    pub instance: u64,
+    pub instance: engine::InstanceId,
 
     pub at: Boundary,
 }
@@ -2902,13 +2902,15 @@ impl Shell {
             self.device.frame()?
         });
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
-        let sink = Encoded::Live(Sink::new(
-            &self.device,
-            frame.as_ref().expect("the walk opened a frame"),
-            &self.pipelines,
-            &self.handles,
-        ));
+        // The sink borrows the frame, which leaves in `Walked`, so it ends
+        // with this block.
         {
+            let sink = Encoded::Live(Sink::new(
+                &self.device,
+                frame.as_ref().expect("the walk opened a frame"),
+                &self.pipelines,
+                &self.handles,
+            ));
             let mut run = Run::new(
                 &sink,
                 &self.handles,
@@ -2940,7 +2942,6 @@ impl Shell {
             )?;
         }
 
-        let Encoded::Live(_) = sink;
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
             .sum();

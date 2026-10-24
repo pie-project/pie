@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+use poem_compiler::arena::{LiveSlot, Peak};
 use poem_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
 
 use crate::arena::Arena;
@@ -249,7 +251,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 regions.join(" ")
             );
         }
-        let (at, slots) = compiled.arena.peak();
+        let Peak { at, slots } = compiled.arena.peak();
         eprintln!(
             "[arm-trace] budget: max_tokens {} max_lanes {} buckets {:?}",
             boot.budget.max_tokens, boot.budget.max_lanes, boot.budget.buckets
@@ -264,9 +266,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             compiled.arena.bytes >> 20,
             compiled.arena.live_bound() >> 20,
             slots.len(),
-            slots.iter().map(|(_, _, _, bytes)| *bytes).sum::<u64>() >> 20
+            slots.iter().map(|slot| slot.bytes).sum::<u64>() >> 20
         );
-        for (value, span, offset, bytes) in slots.iter().take(16) {
+        for LiveSlot {
+            value,
+            span,
+            offset,
+            bytes,
+        } in slots.iter().take(16)
+        {
             let what = match &boot.trace.values[value.0 as usize].def {
                 poem_ir::Def::Op(node) => {
                     poem_ir::Operands::name(&boot.trace.nodes[*node as usize].op).to_string()

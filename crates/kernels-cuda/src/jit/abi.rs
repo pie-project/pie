@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 #[cfg(feature = "cuda")]
 use core::ffi::c_void;
 
@@ -50,6 +51,18 @@ impl<'a> ArgValue<'a> {
             Self::Usize(_) => "a usize",
             Self::Bool(_) => "a bool",
             Self::Bytes(_) => "a by-value aggregate",
+        }
+    }
+
+    /// The bytes the kernel's parameter for this argument must take: a
+    /// scalar's natural width, an aggregate's own size.
+    #[must_use]
+    pub const fn width(self) -> usize {
+        match self {
+            Self::Ptr(_) | Self::I64(_) | Self::Usize(_) => 8,
+            Self::I32(_) | Self::U32(_) | Self::F32(_) => 4,
+            Self::Bool(_) => 1,
+            Self::Bytes(Aggregate { len, .. }) => len,
         }
     }
 

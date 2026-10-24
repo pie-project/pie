@@ -98,7 +98,7 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   const uint column = position.x * 32 * NF + simd * 8 * NF + fm;
   const ulong words = ulong(stride) / 8, groups = ulong(stride) / 64;
   const device uint2 *w0 = reinterpret_cast<const device uint2 *>(weights + ulong(column) * words) + c;
-  const ulong apart = 8 * words / 2; // uint2s between the two fragments
+  const uint apart = uint(8 * words / 2), g8 = uint(8 * groups); // uint2s, scales between the two fragments
   const device bfloat *s0 = scales + ulong(column) * groups, *b0 = biases + ulong(column) * groups;
   const device vec<bfloat, 16> *xt =
       reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
@@ -119,9 +119,9 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   for (int u = 0; u < U; ++u)
 #pragma unroll
     for (int f = 0; f < NF; ++f) {
-      q[u][f] = w0[f * apart + ulong(first + u) * 4];
-      qs[u][f] = float(s0[8 * f * groups + first + u]);
-      qb[u][f] = float(b0[8 * f * groups + first + u]);
+      q[u][f] = w0[f * apart + uint(first + u) * 4];
+      qs[u][f] = float(s0[f * g8 + uint(first + u)]);
+      qb[u][f] = float(b0[f * g8 + uint(first + u)]);
     }
   for (int h0 = first; h0 < last; h0 += U) {
     uint2 cw[U][NF];
@@ -138,15 +138,15 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
       for (int u = 0; u < U; ++u)
 #pragma unroll
         for (int f = 0; f < NF; ++f) {
-          q[u][f] = w0[f * apart + ulong(h0 + U + u) * 4];
-          qs[u][f] = float(s0[8 * f * groups + h0 + U + u]);
-          qb[u][f] = float(b0[8 * f * groups + h0 + U + u]);
+          q[u][f] = w0[f * apart + uint(h0 + U + u) * 4];
+          qs[u][f] = float(s0[f * g8 + uint(h0 + U + u)]);
+          qb[u][f] = float(b0[f * g8 + uint(h0 + U + u)]);
         }
     }
 #pragma unroll
     for (int u = 0; u < U; ++u) {
       const int h = h0 + u;
-      const vec<bfloat, 16> x = xt[ulong(h) * 32];
+      const vec<bfloat, 16> x = xt[uint(h) * 32];
       // One chain per 64 codes (one scale and bias).
       float2 d[NF];
 #pragma unroll
@@ -161,8 +161,8 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
           for (int f = 0; f < NF; ++f)
             mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
         }
-      const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
-                        *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
+      const float2 sm = *reinterpret_cast<const device float2 *>(sums + uint(h) * 16 + fn) +
+                        *reinterpret_cast<const device float2 *>(sums + uint(h) * 16 + 8 + fn);
 #pragma unroll
       for (int f = 0; f < NF; ++f) {
         acc[f] = fma(d[f], ck[u][f].x, acc[f]);
@@ -297,7 +297,7 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
   const uint wcolumn = uint(offsets[s]) + column;
   const ulong words = ulong(stride) / 8, groups = ulong(stride) / 64;
   const device uint2 *wp = reinterpret_cast<const device uint2 *>(weights + ulong(wcolumn) * words) + c;
-  const ulong apart = 8 * words / 2; // uint2s between the two fragments
+  const uint apart = uint(8 * words / 2), g8 = uint(8 * groups); // uint2s, scales between the two fragments
   const device bfloat *sp = scales + ulong(wcolumn) * groups, *bp = biases + ulong(wcolumn) * groups;
   const device vec<bfloat, 16> *xt =
       reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
@@ -316,9 +316,9 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
   for (int u = 0; u < U; ++u)
 #pragma unroll
     for (int f = 0; f < NF; ++f) {
-      q[u][f] = wp[f * apart + ulong(first + u) * 4];
-      qs[u][f] = float(sp[8 * f * groups + first + u]);
-      qb[u][f] = float(bp[8 * f * groups + first + u]);
+      q[u][f] = wp[f * apart + uint(first + u) * 4];
+      qs[u][f] = float(sp[f * g8 + uint(first + u)]);
+      qb[u][f] = float(bp[f * g8 + uint(first + u)]);
     }
   for (int h0 = first; h0 < last; h0 += U) {
     uint2 cw[U][NF];
@@ -335,15 +335,15 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
       for (int u = 0; u < U; ++u)
 #pragma unroll
         for (int f = 0; f < NF; ++f) {
-          q[u][f] = wp[f * apart + ulong(h0 + U + u) * 4];
-          qs[u][f] = float(sp[8 * f * groups + h0 + U + u]);
-          qb[u][f] = float(bp[8 * f * groups + h0 + U + u]);
+          q[u][f] = wp[f * apart + uint(h0 + U + u) * 4];
+          qs[u][f] = float(sp[f * g8 + uint(h0 + U + u)]);
+          qb[u][f] = float(bp[f * g8 + uint(h0 + U + u)]);
         }
     }
 #pragma unroll
     for (int u = 0; u < U; ++u) {
       const int h = h0 + u;
-      const vec<bfloat, 16> x = xt[ulong(h) * 32];
+      const vec<bfloat, 16> x = xt[uint(h) * 32];
       float2 d[NF];
 #pragma unroll
       for (int f = 0; f < NF; ++f)
@@ -357,8 +357,8 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
           for (int f = 0; f < NF; ++f)
             mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
         }
-      const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
-                        *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
+      const float2 sm = *reinterpret_cast<const device float2 *>(sums + uint(h) * 16 + fn) +
+                        *reinterpret_cast<const device float2 *>(sums + uint(h) * 16 + 8 + fn);
 #pragma unroll
       for (int f = 0; f < NF; ++f) {
         acc[f] = fma(d[f], ck[u][f].x, acc[f]);

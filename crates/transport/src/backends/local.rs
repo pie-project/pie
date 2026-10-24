@@ -85,7 +85,8 @@ impl Backend for LocalBackend {
         BackendKind::Local
     }
 
-    fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
+    #[allow(unsafe_code)]
+    unsafe fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
         self.peers.lock().unwrap().insert(owner.0, handle.clone());
         Ok(RegisteredHandle {
             backend: BackendKind::Local,

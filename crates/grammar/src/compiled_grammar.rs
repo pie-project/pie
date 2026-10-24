@@ -213,7 +213,7 @@ impl CompiledGrammar {
         let mut cache = self
             .bitmask_cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("bitmask cache lock poisoned");
         if let Some(cached) = cache.get(key) {
             bitmask.copy_from_slice(cached);
             true
@@ -226,7 +226,7 @@ impl CompiledGrammar {
         let mut cache = self
             .bitmask_cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("bitmask cache lock poisoned");
         cache.put(key.to_vec(), bitmask.to_vec());
     }
 }

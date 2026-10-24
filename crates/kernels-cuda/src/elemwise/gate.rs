@@ -1,6 +1,8 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
+};
 use crate::tensor::Tensor;
 
 const GATE: &str = "elemwise/gate.cu";
@@ -27,7 +29,7 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
     {
         return ctx.fire(
             OP,
-            Fire::at(GATE, "::pie::elemwise::gate_sigmoid_mul_vec8")
+            Fire::at(kernel(GATE, "::pie::elemwise::gate_sigmoid_mul_vec8"))
                 .apply(Launch::flat(lanes / 8, BLOCK)),
             &[
                 x.arg(),
@@ -41,8 +43,11 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
     }
     ctx.fire(
         OP,
-        Fire::at(GATE, "::pie::elemwise::gate_sigmoid_mul<::pie::bf16>")
-            .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(kernel(
+            GATE,
+            "::pie::elemwise::gate_sigmoid_mul<::pie::bf16>",
+        ))
+        .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
             gate.arg(),
@@ -88,8 +93,11 @@ pub fn sigmoid_mul_heads(
     }
     ctx.fire(
         OP,
-        Fire::at(GATE, "::pie::elemwise::gate_sigmoid_mul_heads<::pie::bf16>")
-            .apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(kernel(
+            GATE,
+            "::pie::elemwise::gate_sigmoid_mul_heads<::pie::bf16>",
+        ))
+        .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
             gate.arg(),

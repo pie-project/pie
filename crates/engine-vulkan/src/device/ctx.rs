@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ffi::{CStr, c_char};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,14 +25,16 @@ fn entry() -> std::result::Result<ash::Entry, String> {
     static ENTRY: std::sync::OnceLock<std::result::Result<ash::Entry, String>> =
         std::sync::OnceLock::new();
     ENTRY
+        // SAFETY: this loads the system Vulkan loader, whose initializers are
+        // trusted as any linked system library's; the `OnceLock` loads it
+        // once and keeps it loaded for the life of the process.
         .get_or_init(|| unsafe { ash::Entry::load() }.map_err(|e| e.to_string()))
         .clone()
 }
 
 fn instance_gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GATE.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    GATE.lock().expect("gate lock poisoned")
 }
 
 #[must_use]
@@ -42,20 +45,28 @@ pub fn present() -> bool {
     let _gate = instance_gate();
     let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
     let info = vk::InstanceCreateInfo::default().application_info(&app);
-    let Ok(instance) = (unsafe { entry.create_instance(&info, None) }) else {
-        return false;
-    };
-    let found = unsafe { instance.enumerate_physical_devices() }
-        .map(|devices| {
-            devices.iter().any(|&physical| {
-                unsafe { instance.get_physical_device_queue_family_properties(physical) }
-                    .iter()
-                    .any(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+    // SAFETY: `info` and `app` outlive the call, and the gate serializes
+    // instance creation and destruction across the process. The instance is
+    // used only here, its physical devices come from it, and it is destroyed
+    // once, after its last use, with no child objects made.
+    unsafe {
+        let Ok(instance) = entry.create_instance(&info, None) else {
+            return false;
+        };
+        let found = instance
+            .enumerate_physical_devices()
+            .map(|devices| {
+                devices.iter().any(|&physical| {
+                    instance
+                        .get_physical_device_queue_family_properties(physical)
+                        .iter()
+                        .any(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                })
             })
-        })
-        .unwrap_or(false);
-    unsafe { instance.destroy_instance(None) };
-    found
+            .unwrap_or(false);
+        instance.destroy_instance(None);
+        found
+    }
 }
 
 pub(crate) const STAGING_BYTES: u64 = 256 << 20;
@@ -129,6 +140,9 @@ impl Core {
         }
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        // SAFETY: `physical` belongs to `instance`, the budget struct is
+        // chained only when the device enabled `VK_EXT_memory_budget`, and
+        // both structs outlive the call.
         unsafe {
             self.instance
                 .get_physical_device_memory_properties2(self.physical, &mut props);
@@ -157,6 +171,11 @@ impl Core {
         record: impl FnOnce(&ash::Device, vk::CommandBuffer),
     ) -> Result<()> {
         let d = &self.device;
+        // SAFETY: a `&Transfer` exists only through the guard of
+        // `self.transfer`, so the caller holds that lock and no one else
+        // touches its command buffer or fence. The previous use waited on the
+        // fence, so the buffer is not pending when it is begun again; `record`
+        // only records into it, and the queue is used under its own lock.
         unsafe {
             d.begin_command_buffer(
                 transfer.cmd,
@@ -172,10 +191,7 @@ impl Core {
             let bufs = [transfer.cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             {
-                let queue = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let queue = self.queue.lock().expect("queue lock poisoned");
                 d.queue_submit(*queue, &submits, transfer.fence)
                     .map_err(|e| self.fault("vkQueueSubmit", e))?;
             }
@@ -200,11 +216,13 @@ impl Core {
         if let Some(fence) = self
             .spare_fences
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("spare fences lock poisoned")
             .pop()
         {
             return Ok(fence);
         }
+        // SAFETY: `self.device` is live while `self` is; a default fence info
+        // creates an unsignaled fence.
         unsafe {
             self.device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
@@ -216,9 +234,13 @@ impl Core {
         let mut spare = self
             .spare_fences
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("spare fences lock poisoned");
+        // SAFETY: the only caller, `Inner`'s drop, returns its fence after
+        // waiting on it, so no queue submission still names it; nothing else
+        // holds the handle once it is returned.
         if spare.len() >= SPARE_FENCES || unsafe { self.device.reset_fences(&[fence]) }.is_err() {
             drop(spare);
+            // SAFETY: as above, the fence is ours and no longer in use.
             unsafe { self.device.destroy_fence(fence, None) };
             return;
         }
@@ -226,15 +248,9 @@ impl Core {
     }
 
     pub(crate) fn thread_pool(&self) -> Result<vk::CommandPool> {
-        let mut pools = self
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self.pools.lock().expect("pools lock poisoned");
         if let Some(&pool) = pools.get(&std::thread::current().id()) {
-            let mut orphans = self
-                .orphans
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut orphans = self.orphans.lock().expect("orphans lock poisoned");
             let mut freed = Vec::new();
             orphans.retain(|&(owner, cmd)| {
                 let mine = owner == pool;
@@ -244,10 +260,15 @@ impl Core {
                 !mine
             });
             if !freed.is_empty() {
+                // SAFETY: `pool` is this thread's own pool, so it is not used
+                // concurrently, and each orphan was allocated from it by a
+                // frame whose drop already waited out its submission.
                 unsafe { self.device.free_command_buffers(pool, &freed) };
             }
             return Ok(pool);
         }
+        // SAFETY: `self.device` is live and `family` is the queue family it
+        // was created with.
         let pool = unsafe {
             self.device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -264,28 +285,25 @@ impl Core {
 
 impl Drop for Core {
     fn drop(&mut self) {
+        // SAFETY: this is the last `Arc<Core>`, so every slab, frame, cache and
+        // pipeline that held one is gone; `device_wait_idle` retires any work
+        // still queued. Children are destroyed before the device and the
+        // device before its instance, under the instance gate.
         unsafe {
             let _ = self.device.device_wait_idle();
             {
-                let transfer = self
-                    .transfer
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let transfer = self.transfer.get_mut().expect("transfer lock poisoned");
                 transfer.staging = None;
                 self.device.destroy_fence(transfer.fence, None);
             }
             for fence in std::mem::take(
                 self.spare_fences
                     .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    .expect("spare fences lock poisoned"),
             ) {
                 self.device.destroy_fence(fence, None);
             }
-            let pools = std::mem::take(
-                self.pools
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
+            let pools = std::mem::take(self.pools.get_mut().expect("pools lock poisoned"));
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
             }
@@ -308,6 +326,8 @@ unsafe extern "system" fn on_validation(
     if data.is_null() {
         return vk::FALSE;
     }
+    // SAFETY: `data` is non-null and the validation layer keeps it, and its
+    // message string, valid for the duration of this callback.
     let message = unsafe { (*data).message_as_c_str() }
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -347,6 +367,8 @@ impl PipelineCache {
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
             .unwrap_or_default();
+        // SAFETY: `core.device` is live; any bytes are acceptable initial
+        // data, as the driver validates the header and ignores a stale cache.
         let make = |bytes: &[u8]| unsafe {
             core.device.create_pipeline_cache(
                 &vk::PipelineCacheCreateInfo::default().initial_data(bytes),
@@ -386,7 +408,7 @@ impl PipelineCache {
             && self
                 .written
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("written lock poisoned")
                 .elapsed()
                 >= PIPELINE_CACHE_SETTLE;
         if due && let Err(fault) = self.persist() {
@@ -398,13 +420,13 @@ impl PipelineCache {
         if !self.changed.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        *self
-            .written
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+        *self.written.lock().expect("written lock poisoned") = std::time::Instant::now();
         let Some(path) = &self.path else {
             return Ok(());
         };
+        // SAFETY: `self.cache` is a live cache of `self.core.device`; reading
+        // its data may race pipeline builds that use it, which Vulkan allows,
+        // as `vkGetPipelineCacheData` does not need it externally synchronized.
         let bytes = unsafe { self.core.device.get_pipeline_cache_data(self.cache) }
             .map_err(|e| self.core.fault("vkGetPipelineCacheData", e))?;
         let io = |call: &'static str| {
@@ -426,18 +448,30 @@ impl PipelineCache {
 impl Drop for PipelineCache {
     fn drop(&mut self) {
         let _ = self.persist();
+        // SAFETY: this is the last `Arc<PipelineCache>`, so no build is using
+        // the cache; pipelines made from it do not depend on it.
         unsafe { self.core.device.destroy_pipeline_cache(self.cache, None) };
     }
 }
 
 /// The staging buffer holds the `Core` that holds it; left in place, that
 /// cycle leaks the device after every load until `vkCreateDevice` fails.
+///
+/// The queue is first drained: a shell drops its pipelines, descriptor
+/// layouts and guest sessions after its context, and frames still in flight
+/// (whose watchers outlive the shell) may use them.
 impl Drop for Context {
     fn drop(&mut self) {
+        {
+            let queue = self.core.queue.lock().expect("queue lock poisoned");
+            // SAFETY: the queue is this device's, and its lock is the external
+            // sync `vkQueueWaitIdle` needs.
+            let _ = unsafe { self.core.device.queue_wait_idle(*queue) };
+        }
         self.core
             .transfer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("transfer lock poisoned")
             .staging = None;
     }
 }
@@ -467,6 +501,7 @@ impl Context {
         let app = vk::ApplicationInfo::default()
             .application_name(c"pie")
             .api_version(vk::API_VERSION_1_3);
+        // SAFETY: a global query of the loaded entry, with no handles.
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
         let validation = c"VK_LAYER_KHRONOS_validation";
         let validated = boot.validation
@@ -483,6 +518,7 @@ impl Context {
             enabled_exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
         let instance_exts =
+            // SAFETY: a global query of the loaded entry, with no handles.
             unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
         let props2 = has_extension(
             &instance_exts,
@@ -492,6 +528,8 @@ impl Context {
             .application_info(&app)
             .enabled_layer_names(&enabled_layers)
             .enabled_extension_names(&enabled_exts);
+        // SAFETY: `info` names only layers and extensions found above, its
+        // borrowed names and `app` outlive the call, and the gate is held.
         let instance =
             unsafe { entry.create_instance(&info, None) }.map_err(|e| Fault::NoDevice {
                 detail: format!("vkCreateInstance: {e}"),
@@ -508,6 +546,9 @@ impl Context {
                         | vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
                 )
                 .pfn_user_callback(Some(on_validation));
+            // SAFETY: `debug_utils` is enabled on `instance` whenever
+            // `validated`, and `on_validation` matches the callback ABI and
+            // reads only what the layer passes it.
             unsafe { debug.create_debug_utils_messenger(&create, None) }
                 .ok()
                 .map(|m| (debug, m))
@@ -517,6 +558,9 @@ impl Context {
         match Self::finish(entry, instance, messenger, boot, share, props2) {
             Ok(context) => Ok(context),
             Err((fault, Some((instance, messenger)))) => {
+                // SAFETY: `finish` hands the instance back only when it made no
+                // device from it, so the messenger and then the instance are
+                // its last objects; the gate is still held.
                 unsafe {
                     if let Some((debug, m)) = messenger {
                         debug.destroy_debug_utils_messenger(m, None);
@@ -547,6 +591,10 @@ impl Context {
                 return Err(($fault, Some((instance, messenger))))
             };
         }
+        // In this function every query takes a `physical` enumerated from
+        // `instance`, which lives until the end of it, and every chained
+        // output struct is a local that outlives its call.
+        // SAFETY: `instance` is live.
         let physicals = match unsafe { instance.enumerate_physical_devices() } {
             Ok(p) => p,
             Err(e) => bail!(Fault::NoDevice {
@@ -556,8 +604,10 @@ impl Context {
 
         let mut candidates: Vec<(u32, usize, vk::PhysicalDevice, u32, String)> = Vec::new();
         for (ordinal, &physical) in physicals.iter().enumerate() {
+            // SAFETY: `physical` was enumerated from the live `instance`.
             let props = unsafe { instance.get_physical_device_properties(physical) };
             let families =
+                // SAFETY: as above.
                 unsafe { instance.get_physical_device_queue_family_properties(physical) };
             let Some(family) = pick_family(&families) else {
                 continue;
@@ -587,6 +637,7 @@ impl Context {
             });
         };
         let name = name.clone();
+        // SAFETY: `physical` was enumerated from the live `instance`.
         let props = unsafe { instance.get_physical_device_properties(physical) };
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
         let mut sizes = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
@@ -596,6 +647,8 @@ impl Context {
             if sized {
                 p2 = p2.push_next(&mut sizes);
             }
+            // SAFETY: the chain holds the 1.1 subgroup struct and, only on a
+            // 1.3 device, the size-control struct; both outlive the call.
             unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
         }
         // The narrowest subgroup a pipeline may be compiled at: a driver
@@ -606,6 +659,7 @@ impl Context {
         } else {
             subgroup.subgroup_size.max(1)
         };
+        // SAFETY: `physical` was enumerated from the live `instance`.
         let device_exts =
             unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let memory_budget = has_extension(&device_exts, ash::ext::memory_budget::NAME);
@@ -613,6 +667,8 @@ impl Context {
 
         let coopmat_shape = coopmat_ext && {
             let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+            // SAFETY: the device advertises `VK_KHR_cooperative_matrix`, so the
+            // loaded query exists for `physical`, which `instance` owns.
             unsafe { cm.get_physical_device_cooperative_matrix_properties(physical) }
                 .map(|props| {
                     props.iter().any(|p| {
@@ -629,8 +685,10 @@ impl Context {
                 .unwrap_or(false)
         };
 
-        let cores = kernels_slang::cores::shader_cores(&device_exts, &mut |p2| unsafe {
-            instance.get_physical_device_properties2(physical, p2);
+        let cores = kernels_slang::cores::shader_cores(&device_exts, &mut |p2| {
+            // SAFETY: `shader_cores` chains only structs of extensions it found
+            // in `device_exts`, live for the call; `physical` is `instance`'s.
+            unsafe { instance.get_physical_device_properties2(physical, p2) };
         });
 
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
@@ -648,8 +706,11 @@ impl Context {
             if coopmat_ext {
                 query = query.push_next(&mut fcm);
             }
+            // SAFETY: the 1.3 and coopmat structs are chained only when the
+            // device reports 1.3 or the extension; all outlive the call.
             unsafe { instance.get_physical_device_features2(physical, &mut query) };
         }
+        // SAFETY: `physical` was enumerated from the live `instance`.
         let core = unsafe { instance.get_physical_device_features(physical) };
         // Pin every pipeline to 32 lanes where the driver allows it (AMD
         // RDNA defaults to 64, Intel varies 8 to 32).
@@ -734,13 +795,18 @@ impl Context {
             .queue_create_infos(&queues)
             .enabled_extension_names(&exts)
             .push_next(&mut enable);
+        // SAFETY: every feature enabled was reported supported above, every
+        // extension named was found in `device_exts`, `family` is a family
+        // of `physical`, and all borrowed create structs outlive the call.
         let device = match unsafe { instance.create_device(physical, &create, None) } {
             Ok(d) => d,
             Err(e) => bail!(Fault::NoDevice {
                 detail: format!("vkCreateDevice on {name}: {e}"),
             }),
         };
+        // SAFETY: queue 0 of `family` was requested in `create`.
         let queue = unsafe { device.get_device_queue(family, 0) };
+        // SAFETY: `device` is live and `family` is the one it was made with.
         let pool = match unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -751,6 +817,8 @@ impl Context {
         } {
             Ok(p) => p,
             Err(e) => {
+                // SAFETY: the device has no child objects yet and is not used
+                // after this.
                 unsafe { device.destroy_device(None) };
                 bail!(Fault::Vulkan {
                     what: "vkCreateCommandPool",
@@ -758,6 +826,9 @@ impl Context {
                 });
             }
         };
+        // SAFETY: `pool` is this new device's pool, used by no other thread
+        // yet. On failure only the pool exists as a child, and it is destroyed
+        // before the device, neither used again.
         let transfer = unsafe {
             let cmd = device
                 .allocate_command_buffers(
@@ -784,6 +855,7 @@ impl Context {
                 }
             }
         };
+        // SAFETY: `physical` was enumerated from the live `instance`.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let device_local: u64 = memory.memory_heaps[..memory.memory_heap_count as usize]
             .iter()
@@ -943,6 +1015,8 @@ impl Context {
         let core = &self.core;
         let d = &core.device;
         let pool = core.thread_pool()?;
+        // SAFETY: `pool` is this thread's own pool, which no other thread
+        // allocates from or frees into, so its external sync holds.
         let cmd = unsafe {
             d.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -953,6 +1027,9 @@ impl Context {
         }
         .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
         let fence = core.lend_fence()?;
+        // SAFETY: `cmd` was just allocated on this thread and is in the
+        // initial state, so it may be begun; the barrier below records into it
+        // while it is still only this function's.
         unsafe {
             let flags = if one_time {
                 vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
@@ -964,6 +1041,8 @@ impl Context {
         .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
         // Frames run ahead of one another on the queue: each waits for every
         // write submitted before it.
+        // SAFETY: `cmd` is recording and owned here; a global memory barrier
+        // across all stages is valid on any queue.
         unsafe {
             let all = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -979,6 +1058,8 @@ impl Context {
             );
         }
         let timing = if crate::encode::profiling() && core.limits.timestamp_period > 0.0 {
+            // SAFETY: `d` is live; a nonzero `timestampPeriod` means the
+            // device supports timestamp queries.
             let pool = unsafe {
                 d.create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
@@ -988,6 +1069,8 @@ impl Context {
                 )
             }
             .map_err(|e| core.fault("vkCreateQueryPool", e))?;
+            // SAFETY: `cmd` is recording outside a render pass, and the range is
+            // exactly the pool's `TIMED_DISPATCHES * 2` queries.
             unsafe { d.cmd_reset_query_pool(cmd, pool, 0, TIMED_DISPATCHES * 2) };
             Some(Timing {
                 pool,
@@ -1066,31 +1149,27 @@ pub(crate) const TIMED_DISPATCHES: u32 = 8192;
 impl Drop for Inner {
     fn drop(&mut self) {
         let d = &self.core.device;
+        // SAFETY: this is the last `Arc<Inner>`, so nothing else records into
+        // `cmd` or allocates from its descriptor pools. A submitted frame is
+        // waited on first, so the pools, queries and buffer are no longer in
+        // use (a wait that times out after two minutes is taken as a lost
+        // device). The command buffer is freed only on the thread whose pool
+        // it came from, and otherwise left to that thread as an orphan.
         unsafe {
             if self.submitted.load(Ordering::Acquire) {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
             }
-            for pool in self
-                .pools
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .drain(..)
-            {
+            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
                 d.destroy_descriptor_pool(pool, None);
             }
-            if let Some(timing) = self
-                .timing
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
+            if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
             let owned = self
                 .core
                 .pools
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("pools lock poisoned")
                 .get(&std::thread::current().id())
                 == Some(&self.cmd_pool);
             if owned {
@@ -1099,7 +1178,7 @@ impl Drop for Inner {
                 self.core
                     .orphans
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect("orphans lock poisoned")
                     .push((self.cmd_pool, self.cmd));
             }
         }
@@ -1217,7 +1296,7 @@ impl Frame {
         self.inner
             .keep
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("keep lock poisoned")
             .push(Arc::clone(slab));
     }
 
@@ -1230,26 +1309,20 @@ impl Frame {
         let d = &core.device;
         let key = layout.as_raw();
         {
-            let mut spare = self
-                .inner
-                .spare
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut spare = self.inner.spare.lock().expect("spare lock poisoned");
             if let Some(set) = spare.get_mut(&key).and_then(Vec::pop) {
                 return Ok(set);
             }
         }
         let layouts = [layout; SETS_PER_BATCH];
-        let mut pools = self
-            .inner
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self.inner.pools.lock().expect("pools lock poisoned");
         let mut got: Option<Vec<vk::DescriptorSet>> = None;
         if let Some(&pool) = pools.last() {
             let info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
                 .set_layouts(&layouts);
+            // SAFETY: the `pools` lock is held, which is the external sync
+            // the descriptor pool needs; `layout` is a live layout of `d`.
             got = unsafe { d.allocate_descriptor_sets(&info) }.ok();
         }
         let mut sets = match got {
@@ -1258,6 +1331,7 @@ impl Frame {
                 let sizes = [vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_BUFFER)
                     .descriptor_count(BUFFERS_PER_POOL)];
+                // SAFETY: `d` is live and the create info is complete.
                 let pool = unsafe {
                     d.create_descriptor_pool(
                         &vk::DescriptorPoolCreateInfo::default()
@@ -1271,6 +1345,7 @@ impl Frame {
                 let info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
                     .set_layouts(&layouts);
+                // SAFETY: as above, under the `pools` lock, from the fresh pool.
                 unsafe { d.allocate_descriptor_sets(&info) }
                     .map_err(|e| core.fault("vkAllocateDescriptorSets", e))?
             }
@@ -1281,7 +1356,7 @@ impl Frame {
             self.inner
                 .spare
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("spare lock poisoned")
                 .entry(key)
                 .or_default()
                 .extend(sets);
@@ -1327,6 +1402,10 @@ impl Frame {
         let (read_back, source, into) = (into.is_host(), source.slab(), into.slab());
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd;
+        // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`.
+        // Both slabs are live buffers of this device and every region was
+        // checked to lie inside them; the frame retains both below until its
+        // fence signals.
         unsafe {
             let before = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
@@ -1375,6 +1454,11 @@ impl Frame {
         let into = into.slab();
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd;
+        // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
+        // the slab is live and retained below, and `span` bounds the fill. The
+        // rounding of `len` to 4 stays inside the slab (a multiple of 4 long)
+        // only for a 4-aligned `at`, which `vkCmdFillBuffer` requires and
+        // callers keep, but which is not checked here.
         unsafe {
             let before = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
@@ -1416,23 +1500,31 @@ impl Frame {
         let core = &self.inner.core;
         let d = &core.device;
         let cmd = self.inner.cmd;
+        // In `flush`, `Frame` is not `Sync`, so `&self` here is the only
+        // thread using this frame's `cmd` and fence, and the frame is open:
+        // every method that ends it consumes the frame.
+        // SAFETY: `cmd` is recording, so it may be ended.
         unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
         {
             let bufs = [cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-            let queue = core
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = core.queue.lock().expect("queue lock poisoned");
+            // SAFETY: `cmd` is executable, the fence is unsignaled (reset after
+            // each wait) and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
         }
+        // SAFETY: the fence is this frame's own, just submitted.
         unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
             .map_err(|e| core.fault("vkWaitForFences", e))?;
+        // SAFETY: the wait returned success, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }
             .map_err(|e| core.fault("vkResetFences", e))?;
+        // SAFETY: the work is complete, so `cmd` is not pending; its pool was
+        // made with `RESET_COMMAND_BUFFER`.
         unsafe { d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
             .map_err(|e| core.fault("vkResetCommandBuffer", e))?;
+        // SAFETY: `cmd` was just reset to the initial state.
         unsafe {
             d.begin_command_buffer(
                 cmd,
@@ -1451,6 +1543,8 @@ impl Frame {
         }
         self.open = false;
         let core = &self.inner.core;
+        // SAFETY: `open` was set, so `cmd` is recording; `&mut self` is its
+        // only user.
         unsafe { core.device.end_command_buffer(self.inner.cmd) }
             .map_err(|e| core.fault("vkEndCommandBuffer", e))
     }
@@ -1460,10 +1554,9 @@ impl Frame {
         let core = &self.inner.core;
         let bufs = [self.inner.cmd];
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-        let queue = core
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue = core.queue.lock().expect("queue lock poisoned");
+        // SAFETY: `cmd` was just ended and never submitted, the fence is the
+        // frame's own unsignaled one, and the queue is held under its lock.
         unsafe { core.device.queue_submit(*queue, &submits, self.inner.fence) }
             .map_err(|e| core.fault("vkQueueSubmit", e))?;
         self.inner.submitted.store(true, Ordering::Release);
@@ -1523,6 +1616,8 @@ impl Drop for Frame {
     fn drop(&mut self) {
         if self.open {
             self.open = false;
+            // SAFETY: an open frame's `cmd` is recording and only this frame
+            // records into it.
             unsafe {
                 let _ = self.inner.core.device.end_command_buffer(self.inner.cmd);
             }
@@ -1547,20 +1642,29 @@ impl Kept {
     ) -> Result<Pending> {
         let core = &self.inner.core;
         let d = &core.device;
+        // In `replay`, the kept `cmd` is executable, ended by `into_kept`; its
+        // one caller keeps only frames opened by `frame_kept`, so it was
+        // recorded without `ONE_TIME_SUBMIT` (`into_kept` does not check
+        // this). It also relies on one replay at a
+        // time per `Kept`: `Kept` is `Sync` and nothing here stops two threads
+        // from submitting the same buffer and fence at once; the serve loop
+        // replays from one thread only.
         if self.inner.submitted.load(Ordering::Acquire) {
+            // SAFETY: the fence is this kept frame's own.
             unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
                 .map_err(|e| core.fault("vkWaitForFences", e))?;
         }
+        // SAFETY: any previous submission has signaled (waited above), so no
+        // pending submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }
             .map_err(|e| core.fault("vkResetFences", e))?;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         {
             let bufs = [self.inner.cmd];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
-            let queue = core
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = core.queue.lock().expect("queue lock poisoned");
+            // SAFETY: `cmd` is executable and no longer pending, the fence is
+            // unsignaled, and the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
         }
@@ -1596,12 +1700,16 @@ impl std::fmt::Debug for Pending {
 impl Pending {
     #[must_use]
     pub fn landed(&self) -> bool {
+        // SAFETY: the fence lives as long as `inner`, which `self` holds;
+        // querying a fence needs no external sync.
         unsafe { self.inner.core.device.get_fence_status(self.inner.fence) }.unwrap_or(true)
     }
 
     pub fn wait(&self) -> Result<()> {
         let core = &self.inner.core;
         let at = crate::encode::profiling().then(std::time::Instant::now);
+        // SAFETY: the fence lives as long as `inner`, which `self` holds;
+        // waiting needs no external sync, so concurrent waiters are fine.
         unsafe {
             core.device
                 .wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS)
@@ -1617,10 +1725,7 @@ impl Pending {
 
 impl Inner {
     fn harvest_timing(&self) {
-        let mut slot = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = self.timing.lock().expect("timing lock poisoned");
         let Some(timing) = slot.as_mut() else {
             return;
         };
@@ -1630,6 +1735,9 @@ impl Inner {
         timing.harvested = true;
         let n = timing.names.len() as u32;
         let mut ticks = vec![0u64; (n * 2) as usize];
+        // SAFETY: the caller waited on the fence, so every written query is
+        // available; `n * 2` queries fit the pool (`names` stops at
+        // `capacity`), and `ticks` holds one u64 for each with `TYPE_64`.
         let ok = unsafe {
             self.core.device.get_query_pool_results(
                 timing.pool,

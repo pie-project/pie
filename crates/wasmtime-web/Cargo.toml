@@ -26,10 +26,5 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 [dev-dependencies]
 wasmtime = { version = "49.0.2", default-features = false, features = ["cranelift", "wat"] }
 
-[lints.rust]
-unsafe_code = "deny"
-
-[lints.clippy]
-todo = "deny"
-unimplemented = "deny"
-dbg_macro = "deny"
+[lints]
+workspace = true

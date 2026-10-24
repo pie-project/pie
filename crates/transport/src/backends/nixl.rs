@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 mod ffi;
 pub mod objects;
 
@@ -11,7 +12,20 @@ use crate::core::{
 };
 use crate::error::{Result, TransportError};
 use engine::{KvHandle, MemoryDomain};
-use ffi::*;
+use ffi::{
+    nixl_capi_agent_t, nixl_capi_backend_t, nixl_capi_create_agent, nixl_capi_create_backend,
+    nixl_capi_create_reg_dlist, nixl_capi_create_xfer_dlist, nixl_capi_create_xfer_req,
+    nixl_capi_destroy_agent, nixl_capi_destroy_backend, nixl_capi_destroy_reg_dlist,
+    nixl_capi_destroy_xfer_dlist, nixl_capi_destroy_xfer_req, nixl_capi_get_local_md,
+    nixl_capi_get_plugin_params, nixl_capi_get_xfer_status, nixl_capi_load_remote_md,
+    nixl_capi_mem_list_t, nixl_capi_mem_type_t, nixl_capi_mem_type_t_NIXL_CAPI_MEM_DRAM,
+    nixl_capi_mem_type_t_NIXL_CAPI_MEM_VRAM, nixl_capi_params_t, nixl_capi_post_xfer_req,
+    nixl_capi_reg_dlist_add_desc, nixl_capi_reg_dlist_t, nixl_capi_register_mem,
+    nixl_capi_release_xfer_req, nixl_capi_status_t, nixl_capi_status_t_NIXL_CAPI_IN_PROG,
+    nixl_capi_status_t_NIXL_CAPI_SUCCESS, nixl_capi_xfer_dlist_add_desc, nixl_capi_xfer_dlist_t,
+    nixl_capi_xfer_op_t, nixl_capi_xfer_op_t_NIXL_CAPI_XFER_OP_READ,
+    nixl_capi_xfer_op_t_NIXL_CAPI_XFER_OP_WRITE, nixl_capi_xfer_req_t,
+};
 
 const OK: nixl_capi_status_t = nixl_capi_status_t_NIXL_CAPI_SUCCESS;
 const INPROG: nixl_capi_status_t = nixl_capi_status_t_NIXL_CAPI_IN_PROG;
@@ -67,10 +81,12 @@ pub struct NixlBackend {
     inner: Mutex<Inner>,
 }
 
-// SAFETY: every NIXL call goes through `inner`'s mutex, so the agent is never
-// touched concurrently (NIXL is not thread-safe). The raw handles are only
-// dereferenced by NIXL itself under that lock.
+// SAFETY: the raw handles are NIXL heap objects with no tie to the thread
+// that made them, only dereferenced by NIXL itself, and only under `inner`'s
+// mutex (or `&mut self` in `Drop`); moving the backend moves sole ownership.
 unsafe impl Send for NixlBackend {}
+// SAFETY: `&NixlBackend` reaches the agent only through `inner`'s mutex, so
+// NIXL (which is not thread-safe) never sees two calls at once.
 unsafe impl Sync for NixlBackend {}
 
 impl NixlBackend {
@@ -78,34 +94,39 @@ impl NixlBackend {
         let name = CString::new(agent_name)
             .map_err(|_| TransportError::Transfer("agent name contains a nul byte".into()))?;
         let ucx = CString::new("UCX").expect("UCX literal");
-        unsafe {
-            let mut agent: nixl_capi_agent_t = ptr::null_mut();
-            let st = nixl_capi_create_agent(name.as_ptr(), &mut agent);
-            if st != OK {
-                return Err(err("create_agent", st));
-            }
-            let mut mems: nixl_capi_mem_list_t = ptr::null_mut();
-            let mut params: nixl_capi_params_t = ptr::null_mut();
-            let st = nixl_capi_get_plugin_params(agent, ucx.as_ptr(), &mut mems, &mut params);
-            if st != OK {
-                return Err(err("get_plugin_params(UCX)", st));
-            }
-            let mut backend: nixl_capi_backend_t = ptr::null_mut();
-            let st = nixl_capi_create_backend(agent, ucx.as_ptr(), params, &mut backend);
-            if st != OK {
-                return Err(err("create_backend(UCX)", st));
-            }
-            Ok(Self {
-                inner: Mutex::new(Inner {
-                    agent,
-                    backend,
-                    locals: HashMap::new(),
-                    remotes: HashMap::new(),
-                    reqs: HashMap::new(),
-                    next_id: 0,
-                }),
-            })
+        let mut agent: nixl_capi_agent_t = ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated and outlives the call; `agent` is a
+        // live out-parameter.
+        let st = unsafe { nixl_capi_create_agent(name.as_ptr(), &mut agent) };
+        if st != OK {
+            return Err(err("create_agent", st));
         }
+        let mut mems: nixl_capi_mem_list_t = ptr::null_mut();
+        let mut params: nixl_capi_params_t = ptr::null_mut();
+        // SAFETY: `agent` was just created; `ucx` is NUL-terminated; `mems`
+        // and `params` are live out-parameters.
+        let st =
+            unsafe { nixl_capi_get_plugin_params(agent, ucx.as_ptr(), &mut mems, &mut params) };
+        if st != OK {
+            return Err(err("get_plugin_params(UCX)", st));
+        }
+        let mut backend: nixl_capi_backend_t = ptr::null_mut();
+        // SAFETY: `agent` is live and `params` is the list NIXL just handed
+        // back for this plugin; `backend` is a live out-parameter.
+        let st = unsafe { nixl_capi_create_backend(agent, ucx.as_ptr(), params, &mut backend) };
+        if st != OK {
+            return Err(err("create_backend(UCX)", st));
+        }
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                agent,
+                backend,
+                locals: HashMap::new(),
+                remotes: HashMap::new(),
+                reqs: HashMap::new(),
+                next_id: 0,
+            }),
+        })
     }
 
     fn xfer(
@@ -132,18 +153,23 @@ impl NixlBackend {
             return Err(TransportError::LayoutMismatch);
         }
         let (locals, remotes) = runs(local_pages, remote_pages);
-        unsafe {
-            let local_dl = build_xfer_dlist(local.handle(), &locals)?;
-            let remote_dl = match build_xfer_dlist(&remote_handle, &remotes) {
-                Ok(dl) => dl,
-                Err(e) => {
-                    nixl_capi_destroy_xfer_dlist(local_dl);
-                    return Err(e);
-                }
-            };
+        let local_dl = build_xfer_dlist(local.handle(), &locals)?;
+        let remote_dl = match build_xfer_dlist(&remote_handle, &remotes) {
+            Ok(dl) => dl,
+            Err(e) => {
+                // SAFETY: `local_dl` was built above and is destroyed once.
+                unsafe { nixl_capi_destroy_xfer_dlist(local_dl) };
+                return Err(e);
+            }
+        };
 
-            let mut req: nixl_capi_xfer_req_t = ptr::null_mut();
-            let st = nixl_capi_create_xfer_req(
+        let mut req: nixl_capi_xfer_req_t = ptr::null_mut();
+        // SAFETY: `g.agent` is live while `self` is and is used under its
+        // lock; both lists were just built; `rname` is the NUL-terminated name
+        // `connect` copied; `req` is a live out-parameter. NIXL checks each
+        // descriptor against the memory registered on its side.
+        let st = unsafe {
+            nixl_capi_create_xfer_req(
                 g.agent,
                 op,
                 local_dl,
@@ -151,31 +177,39 @@ impl NixlBackend {
                 rname.as_ptr(),
                 &mut req,
                 ptr::null_mut(),
-            );
+            )
+        };
+        // SAFETY: the request copied the lists; each is destroyed once, here.
+        unsafe {
             nixl_capi_destroy_xfer_dlist(local_dl);
             nixl_capi_destroy_xfer_dlist(remote_dl);
-            if st != OK {
-                return Err(err("create_xfer_req", st));
-            }
+        }
+        if st != OK {
+            return Err(err("create_xfer_req", st));
+        }
 
-            let st = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
-            if st != OK && st != INPROG {
+        // SAFETY: `req` was just created on `g.agent`; no notification is sent.
+        let st = unsafe { nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut()) };
+        if st != OK && st != INPROG {
+            // SAFETY: `req` failed to post, so nothing is in flight; it is
+            // released and destroyed once, and never recorded.
+            unsafe {
                 nixl_capi_release_xfer_req(g.agent, req);
                 nixl_capi_destroy_xfer_req(req);
-                return Err(err("post_xfer_req", st));
             }
-
-            let id = g.next_id;
-            g.next_id += 1;
-            g.reqs.insert(
-                id,
-                Request {
-                    handle: req,
-                    released: false,
-                },
-            );
-            Ok(TransferId(id))
+            return Err(err("post_xfer_req", st));
         }
+
+        let id = g.next_id;
+        g.next_id += 1;
+        g.reqs.insert(
+            id,
+            Request {
+                handle: req,
+                released: false,
+            },
+        );
+        Ok(TransferId(id))
     }
 }
 
@@ -204,37 +238,52 @@ fn runs(local: &PageSet, remote: &PageSet) -> (Runs, Runs) {
     (locals, remotes)
 }
 
-unsafe fn build_xfer_dlist(
-    handle: &KvHandle,
-    runs: &[(u32, u32)],
-) -> Result<nixl_capi_xfer_dlist_t> {
+/// The transfer list naming `runs` of every region of `handle`, each run
+/// checked to lie inside its region. The list only records addresses: no
+/// memory is touched until a request built from it is posted, and NIXL
+/// checks each descriptor against registered memory then, so this asks
+/// nothing of its caller. The caller owns the list and destroys it.
+fn build_xfer_dlist(handle: &KvHandle, runs: &[(u32, u32)]) -> Result<nixl_capi_xfer_dlist_t> {
     let first = handle
         .regions
         .first()
         .ok_or(TransportError::Unsupported("handle has no KV region"))?;
     let (kind, _) = segment(first.domain)?;
     let mut dl: nixl_capi_xfer_dlist_t = ptr::null_mut();
+    // SAFETY: `dl` is a live out-parameter.
     let st = unsafe { nixl_capi_create_xfer_dlist(kind, &mut dl) };
     if st != OK {
         return Err(err("create_xfer_dlist", st));
     }
+    let discard = |dl| {
+        // SAFETY: `dl` was created above, is not returned, and is destroyed
+        // once, on the way out.
+        unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+    };
     for region in &handle.regions {
         let device = match segment(region.domain) {
             Ok((other, device)) if other == kind && region.page_stride != 0 => device,
             _ => {
-                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+                discard(dl);
                 return Err(TransportError::LayoutMismatch);
             }
         };
         for &(page, count) in runs {
-            let offset = u64::from(page) * region.page_stride;
-            let len = u64::from(count) * region.page_stride;
-            if offset + len > region.len {
-                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+            // Checked: a peer's page numbers must not wrap past the bound.
+            let inside = u64::from(page)
+                .checked_mul(region.page_stride)
+                .zip(u64::from(count).checked_mul(region.page_stride))
+                .filter(|&(offset, len)| {
+                    offset.checked_add(len).is_some_and(|end| end <= region.len)
+                });
+            let Some((offset, len)) = inside else {
+                discard(dl);
                 return Err(TransportError::PageOutOfBounds {
                     page: page + count - 1,
                 });
-            }
+            };
+            // SAFETY: `dl` is the live list created above; a descriptor is
+            // plain data, read by NIXL only when a request is built from it.
             let st = unsafe {
                 nixl_capi_xfer_dlist_add_desc(
                     dl,
@@ -244,7 +293,7 @@ unsafe fn build_xfer_dlist(
                 )
             };
             if st != OK {
-                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+                discard(dl);
                 return Err(err("xfer_dlist_add_desc", st));
             }
         }
@@ -257,33 +306,41 @@ impl Backend for NixlBackend {
         BackendKind::Nixl
     }
 
-    fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
+    unsafe fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
         let mut g = self.inner.lock().unwrap();
         for region in &handle.regions {
             let (kind, device) = segment(region.domain)?;
-            unsafe {
-                let mut dl: nixl_capi_reg_dlist_t = ptr::null_mut();
-                let st = nixl_capi_create_reg_dlist(kind, &mut dl);
-                if st != OK {
-                    return Err(err("create_reg_dlist", st));
-                }
-                let st = nixl_capi_reg_dlist_add_desc(
+            let mut dl: nixl_capi_reg_dlist_t = ptr::null_mut();
+            // SAFETY: `dl` is a live out-parameter.
+            let st = unsafe { nixl_capi_create_reg_dlist(kind, &mut dl) };
+            if st != OK {
+                return Err(err("create_reg_dlist", st));
+            }
+            // SAFETY: `dl` was just created; the descriptor carries no
+            // metadata (null, 0), and its range is plain data here.
+            let st = unsafe {
+                nixl_capi_reg_dlist_add_desc(
                     dl,
                     region.base as usize,
                     region.len as usize,
                     device,
                     ptr::null(),
                     0,
-                );
-                if st != OK {
-                    nixl_capi_destroy_reg_dlist(dl);
-                    return Err(err("reg_dlist_add_desc", st));
-                }
-                let st = nixl_capi_register_mem(g.agent, dl, ptr::null_mut());
-                nixl_capi_destroy_reg_dlist(dl);
-                if st != OK {
-                    return Err(err("register_mem", st));
-                }
+                )
+            };
+            if st != OK {
+                // SAFETY: `dl` is live and destroyed once, here.
+                unsafe { nixl_capi_destroy_reg_dlist(dl) };
+                return Err(err("reg_dlist_add_desc", st));
+            }
+            // SAFETY: `g.agent` is live and used under its lock, and `dl` was
+            // just built. The region stays allocated and unraced for the
+            // agent's life, as `register`'s caller promised.
+            let st = unsafe { nixl_capi_register_mem(g.agent, dl, ptr::null_mut()) };
+            // SAFETY: registering copied the list; `dl` is destroyed once.
+            unsafe { nixl_capi_destroy_reg_dlist(dl) };
+            if st != OK {
+                return Err(err("register_mem", st));
             }
         }
         g.locals.insert(owner.0, handle.clone());
@@ -321,6 +378,8 @@ impl Backend for NixlBackend {
             .get(&id.0)
             .ok_or(TransportError::UnknownTransfer { id: id.0 })?;
         if request.released {
+            // SAFETY: an earlier poll released `request` and its destroy
+            // failed, so it is live, finished, and still ours to destroy.
             let status = unsafe { nixl_capi_destroy_xfer_req(request.handle) };
             if status != OK {
                 return Err(err("destroy_xfer_req", status));
@@ -328,14 +387,20 @@ impl Backend for NixlBackend {
             g.reqs.remove(&id.0);
             return Ok(Completion::Done);
         }
+        // SAFETY: `request.handle` is a live, unreleased request posted on
+        // `g.agent`, used under its lock.
         let st = unsafe { nixl_capi_get_xfer_status(g.agent, request.handle) };
         match st {
             s if s == OK => {
+                // SAFETY: the request is live and unreleased, and no longer in
+                // flight (its status is final); it is marked released below.
                 let status = unsafe { nixl_capi_release_xfer_req(g.agent, request.handle) };
                 if status != OK {
                     return Err(err("release_xfer_req", status));
                 }
                 g.reqs.get_mut(&id.0).expect("request remains").released = true;
+                // SAFETY: released just above; destroyed once, as its entry is
+                // removed on success.
                 let status = unsafe { nixl_capi_destroy_xfer_req(request.handle) };
                 if status != OK {
                     return Err(err("destroy_xfer_req", status));
@@ -345,11 +410,15 @@ impl Backend for NixlBackend {
             }
             s if s == INPROG => Ok(Completion::Pending),
             other => {
+                // SAFETY: the request is live and unreleased, and no longer in
+                // flight (its status is final); it is marked released below.
                 let status = unsafe { nixl_capi_release_xfer_req(g.agent, request.handle) };
                 if status != OK {
                     return Err(err("release_xfer_req", status));
                 }
                 g.reqs.get_mut(&id.0).expect("request remains").released = true;
+                // SAFETY: released just above; destroyed once, as its entry is
+                // removed on success.
                 let status = unsafe { nixl_capi_destroy_xfer_req(request.handle) };
                 if status != OK {
                     return Err(err("destroy_xfer_req", status));
@@ -363,18 +432,23 @@ impl Backend for NixlBackend {
     fn connect(&self, peer: &PeerConn) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         let mut rname: *mut c_char = ptr::null_mut();
-        let agent = unsafe {
-            let st = nixl_capi_load_remote_md(
+        // SAFETY: `g.agent` is live and used under its lock; the metadata is
+        // `peer.metadata.len()` readable bytes; `rname` is a live
+        // out-parameter.
+        let st = unsafe {
+            nixl_capi_load_remote_md(
                 g.agent,
                 peer.metadata.as_ptr() as *const c_void,
                 peer.metadata.len(),
                 &mut rname,
-            );
-            if st != OK {
-                return Err(err("load_remote_md", st));
-            }
-            CStr::from_ptr(rname).to_owned()
+            )
         };
+        if st != OK {
+            return Err(err("load_remote_md", st));
+        }
+        // SAFETY: on success NIXL hands back the peer's agent name as a
+        // NUL-terminated string, which is copied here.
+        let agent = unsafe { CStr::from_ptr(rname) }.to_owned();
         g.remotes.insert(
             peer.worker.0,
             Remote {
@@ -387,34 +461,41 @@ impl Backend for NixlBackend {
 
     fn local_metadata(&self) -> Result<Vec<u8>> {
         let g = self.inner.lock().unwrap();
-        unsafe {
-            let mut data: *mut c_void = ptr::null_mut();
-            let mut len: usize = 0;
-            let st = nixl_capi_get_local_md(g.agent, &mut data, &mut len);
-            if st != OK {
-                return Err(err("get_local_md", st));
-            }
-            Ok(std::slice::from_raw_parts(data as *const u8, len).to_vec())
+        let mut data: *mut c_void = ptr::null_mut();
+        let mut len: usize = 0;
+        // SAFETY: `g.agent` is live and used under its lock; `data` and `len`
+        // are live out-parameters.
+        let st = unsafe { nixl_capi_get_local_md(g.agent, &mut data, &mut len) };
+        if st != OK {
+            return Err(err("get_local_md", st));
         }
+        // SAFETY: on success `data` is a buffer of `len` initialised bytes
+        // that NIXL allocated for this call; it is copied out here.
+        Ok(unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec())
     }
 }
 
 impl Drop for NixlBackend {
     fn drop(&mut self) {
         let g = self.inner.get_mut().unwrap();
-        unsafe {
-            for (_, request) in g.reqs.drain() {
-                if !request.released {
-                    let _ = nixl_capi_release_xfer_req(g.agent, request.handle);
-                }
-                let _ = nixl_capi_destroy_xfer_req(request.handle);
+        for (_, request) in g.reqs.drain() {
+            if !request.released {
+                // SAFETY: a live request of this agent not yet released;
+                // releasing it stops whatever is still in flight.
+                let _ = unsafe { nixl_capi_release_xfer_req(g.agent, request.handle) };
             }
-            if !g.backend.is_null() {
-                nixl_capi_destroy_backend(g.backend);
-            }
-            if !g.agent.is_null() {
-                nixl_capi_destroy_agent(g.agent);
-            }
+            // SAFETY: released, now or by an earlier poll; drained, so
+            // destroyed once.
+            let _ = unsafe { nixl_capi_destroy_xfer_req(request.handle) };
+        }
+        if !g.backend.is_null() {
+            // SAFETY: the backend `new` created, destroyed once, after every
+            // request that used it.
+            unsafe { nixl_capi_destroy_backend(g.backend) };
+        }
+        if !g.agent.is_null() {
+            // SAFETY: the agent `new` created, destroyed once and last.
+            unsafe { nixl_capi_destroy_agent(g.agent) };
         }
     }
 }
@@ -465,9 +546,12 @@ mod tests {
         );
         let ours_at = (ours.as_mut_ptr(), ours.len());
         let theirs_at = (theirs.as_mut_ptr(), theirs.len());
-        let mine = a.register(WorkerId(1), host(ours_at.0, ours_at.1)).unwrap();
-        b.register(WorkerId(2), host(theirs_at.0, theirs_at.1))
-            .unwrap();
+        // SAFETY: `ours` and `theirs` are declared before `a` and `b`, so
+        // they outlive both agents, and neither is touched until the read
+        // below has completed.
+        let mine = unsafe { a.register(WorkerId(1), host(ours_at.0, ours_at.1)) }.unwrap();
+        // SAFETY: as above.
+        unsafe { b.register(WorkerId(2), host(theirs_at.0, theirs_at.1)) }.unwrap();
         a.connect(&PeerConn {
             worker: WorkerId(2),
             handle: host(theirs_at.0, theirs_at.1),

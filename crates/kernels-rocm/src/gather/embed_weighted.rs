@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "gather/embed_weighted.hip";
@@ -75,7 +75,7 @@ pub fn embed_weighted(
         .min(MAX_BLOCK);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::embed_weighted<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::embed_weighted<{t}>")))
             .apply(Launch::per_row(rows, threads)),
         &[
             ids.arg(),

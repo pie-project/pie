@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::borrow::Cow;
 use std::ffi::c_void;
 

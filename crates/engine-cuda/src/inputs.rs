@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_cuda::Tensor;
 use kernels_cuda::attn::plan::{
     Device, Toggles, Workspace, prefill_graph_padding, prefill_partial_rows,

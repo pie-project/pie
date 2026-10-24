@@ -2,6 +2,7 @@
 //! does: e4m3 made canonical for the FP8 matrix core (it reads e4m3fnuz),
 //! and fp8b32 / fp8b128 projections and mxfp4 expert banks put in the
 //! matrix core's order where they lie.
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 

@@ -2,7 +2,7 @@
 
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel};
 use crate::tensor::{KvPool, Tensor};
 
 const KV_ENVELOPE: &str = "attn/kv_envelope.cu";
@@ -28,7 +28,11 @@ pub(crate) fn envelope_update_appended(
 
     ctx.fire(
         op,
-        Fire::at(KV_ENVELOPE, "::pie::attn::update_appended<::pie::bf16>").apply(Launch::grid(
+        Fire::at(kernel(
+            KV_ENVELOPE,
+            "::pie::attn::update_appended<::pie::bf16>",
+        ))
+        .apply(Launch::grid(
             [max_touched.unsigned_abs(), kv_heads.unsigned_abs(), 1],
             [threads_for(head_dim), 1, 1],
         )),

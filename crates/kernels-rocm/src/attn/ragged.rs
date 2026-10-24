@@ -1,6 +1,6 @@
 use crate::attn::kv;
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -259,13 +259,13 @@ pub fn ragged(
 
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             RAGGED,
-            symbol(&format!(
+            &format!(
                 "::pie::attn::ragged<{stamp}, {WAVES}, {}>",
                 operands.arm as u32
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [rows.unsigned_abs().div_ceil(TILE), num_q_heads, 1],
             [BLOCK, 1, 1],
