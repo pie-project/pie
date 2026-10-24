@@ -149,8 +149,8 @@ pub fn one_arm(id: &str, decode: bool) -> Package {
         .files()
         .map(|(file, source)| (file.to_string(), source.to_string()))
         .collect();
-    for (file, source) in &mut files {
-        if file == "forward.poem" {
+    for (_, source) in &mut files {
+        if source.contains("def forward(m, inputs):") {
             *source = source
                 .replace("def caches(m, c):", "def every_cache(m, c):")
                 .replace("def forward(m, inputs):", "def every_reading(m, inputs):")

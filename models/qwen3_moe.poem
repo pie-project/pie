@@ -1,0 +1,266 @@
+# Qwen 3 MoE (Qwen/Qwen3-30B-A3B, -235B-A22B, their 2507 releases, and
+# Qwen3-Coder-480B-A35B / -30B-A3B): full attention in every layer, its q and
+# k RMS-normed per head, and a routed MLP of softmax-picked experts with no
+# shared expert. As released (bf16), as Qwen releases it in FP8 (128-square
+# blocks), as NVIDIA's modelopt exports it in NVFP4, and miniatures that read
+# the first layers and experts of the whole models' checkpoints at full width.
+# The original releases rotate at theta 1e6 and the 2507 ones at their own,
+# so each is its own model. Qwen3-Coder-30B-A3B's configuration is the
+# 30B-A3B-2507's, so an import reads it as that unless told `--deployment
+# qwen3-coder-30b-a3b-...`.
+
+load("//pie/codec.poem", "mapped")
+load("//lib/adapters.poem", "banks")
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+# Qwen3-Coder: no thinking block, its calls XML.
+CODER = template("qwen3_coder")
+TOKENIZER = tokenizer(markers = [QWEN_STOP, ["<|im_start|>"]])
+
+def qwen3(id, layers, mini = False, spoken = CHATML):
+    return model(id, mini = mini, template = spoken, tokenizer = TOKENIZER, arch = "qwen3_moe", layers = layers, vocab = 151936)
+
+MODELS = [
+    qwen3("qwen3-30b-a3b", layers = 48),
+    qwen3("qwen3-30b-a3b-2507", layers = 48),
+    qwen3("qwen3-30b-a3b-mini", layers = 4, mini = True),
+    qwen3("qwen3-235b-a22b", layers = 94),
+    qwen3("qwen3-235b-a22b-2507", layers = 94),
+    qwen3("qwen3-235b-a22b-2507-mini", layers = 4, mini = True),
+    qwen3("qwen3-coder-480b-a35b", layers = 62, spoken = CODER),
+    qwen3("qwen3-coder-480b-a35b-mini", layers = 4, mini = True, spoken = CODER),
+    qwen3("qwen3-coder-30b-a3b", layers = 48, spoken = CODER),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+F8 = dtype.e4m3tile128a8
+NV4 = dtype.nvfp4a4
+NV4W = dtype.nvfp4
+
+def rows(id, mini = False):
+    """A model's rows: as released, Qwen's FP8, quantized to u4 at import,
+    and modelopt's NVFP4 (projections against bf16 activations, experts
+    against NVFP4 ones, or bf16 where no GEMM quantizes them)."""
+    out = [
+        deployment(id, weights = BF, kv = BF),
+        deployment(id, weights = F8, kv = BF),
+        deployment(id, weights = F8, kv = dtype.e4m3),
+        deployment(id, weights = [NV4W, NV4], kv = BF),
+        deployment(id, weights = [NV4W, NV4], kv = dtype.e4m3),
+        deployment(id, weights = [NV4W, NV4W], kv = BF),
+    ]
+    if not mini:
+        out.append(deployment(id, weights = U4, kv = BF))
+    return out
+
+DEPLOYMENTS = (
+    rows("qwen3-30b-a3b") +
+    rows("qwen3-30b-a3b-2507") +
+    rows("qwen3-30b-a3b-mini", mini = True) +
+    rows("qwen3-235b-a22b") +
+    rows("qwen3-235b-a22b-2507") +
+    rows("qwen3-235b-a22b-2507-mini", mini = True) +
+    rows("qwen3-coder-480b-a35b") +
+    rows("qwen3-coder-480b-a35b-mini", mini = True) +
+    rows("qwen3-coder-30b-a3b")
+)
+
+# The weights of Qwen 3 MoE: per layer an RMS norm, q, k and v packed into
+# one projection with per-head q and k norms, the output projection, an RMS
+# norm, the router and the routed experts' banks (gate and up packed); the
+# token embedding, a final norm and the head. The deployment's first dtype
+# stores the projections, its second (or the first) the expert banks; the
+# norms, the router, the embedding and the head stay bf16 under a release's
+# FP8 or NVFP4. Each layer also has the LoRA banks the host registers.
+
+def dims(hidden, layers, q_heads, kv_heads, experts, inter, theta):
+    return struct(
+        hidden = hidden,
+        layers = layers,
+        q_heads = q_heads,
+        kv_heads = kv_heads,
+        head_dim = 128,
+        experts = experts,
+        top_k = 8,
+        inter = inter,
+        vocab = 151936,
+        theta = theta,
+        norm_eps = 1e-6,
+    )
+
+A3B = dict(hidden = 2048, q_heads = 32, kv_heads = 4, inter = 768)
+A22B = dict(hidden = 4096, q_heads = 64, kv_heads = 4, inter = 1536)
+A35B = dict(hidden = 6144, q_heads = 96, kv_heads = 8, inter = 2560)
+
+DIMS = {
+    "qwen3-30b-a3b": dims(layers = 48, experts = 128, theta = 1000000.0, **A3B),
+    "qwen3-30b-a3b-2507": dims(layers = 48, experts = 128, theta = 10000000.0, **A3B),
+    "qwen3-30b-a3b-mini": dims(layers = 4, experts = 16, theta = 1000000.0, **A3B),
+    "qwen3-235b-a22b": dims(layers = 94, experts = 128, theta = 1000000.0, **A22B),
+    "qwen3-235b-a22b-2507": dims(layers = 94, experts = 128, theta = 5000000.0, **A22B),
+    "qwen3-235b-a22b-2507-mini": dims(layers = 4, experts = 16, theta = 5000000.0, **A22B),
+    "qwen3-coder-30b-a3b": dims(layers = 48, experts = 128, theta = 10000000.0, **A3B),
+    "qwen3-coder-480b-a35b": dims(layers = 62, experts = 160, theta = 10000000.0, **A35B),
+    "qwen3-coder-480b-a35b-mini": dims(layers = 4, experts = 16, theta = 10000000.0, **A35B),
+}
+
+# A release whose planes a deployment keeps as released, its tables bf16.
+RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4, dtype.nvfp4a4]
+
+def layout(id, deploy):
+    r = roles(deploy, "proj", "experts")
+    proj, experts = r.proj, r.experts
+    if deploy.drafter != None or deploy.parts:
+        fail("{} ships no drafter and no parts".format(id))
+    table = dtype.bf16 if proj in RELEASED else proj
+    dense = compute(table)
+    d = DIMS[id]
+    hidden, hd = d.hidden, d.head_dim
+    q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
+
+    def layer(l):
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        return struct(
+            attn_norm = weight([hidden]),
+            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            o = weight([hidden, q_width], proj).rows(),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            router = weight([d.experts, hidden]),
+            gate_up = weight([d.experts, 2 * d.inter, hidden], experts).bank([d.inter, d.inter]),
+            down = weight([d.experts, hidden, d.inter], experts).rows(),
+            kv = "kv.{}".format(l),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        q_width = q_width,
+        kv_width = kv_width,
+        experts = d.experts,
+        top_k = d.top_k,
+        inter = d.inter,
+        theta = d.theta,
+        eps = d.norm_eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden], table),
+        head = weight([d.vocab, hidden], table).columns(),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+    )
+
+# How a Qwen 3 MoE checkpoint is read: transformers' safetensors under
+# `model.`, each expert apart, as released (bf16), as Qwen releases it in FP8
+# (e4m3 codes beside 128-square block factors), or as modelopt exports it in
+# NVFP4 (codes, e4m3 scales a 16, a tensor scale and an input scale a leg);
+# recognized by its per-head q norm and its first expert, and checked against
+# its config.
+
+def configured(m):
+    return [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("head_dim", m.head_dim),
+        config("num_hidden_layers", len(m.layers)),
+        config("moe_intermediate_size", m.inter),
+        config("num_experts", m.experts),
+        config("num_experts_per_tok", m.top_k),
+        config("rms_norm_eps", m.eps),
+        config("rope_theta", m.theta),
+    ]
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.q_norm.weight") and has("model.layers.0.mlp.experts.0.down_proj.weight"),
+        read = lambda reads: mapped(reads, m, TRANSFORMERS),
+        states = configured(m),
+    )]
+
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.weight",
+        "model.layers.{l}.self_attn.k_proj.weight",
+        "model.layers.{l}.self_attn.v_proj.weight",
+    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    ("model.layers.{l}.mlp.gate.weight", "layers.{l}.router"),
+    (["model.layers.{l}.mlp.experts.{e}.gate_proj.weight", "model.layers.{l}.mlp.experts.{e}.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.experts.{e}.down_proj.weight", "layers.{l}.down"),
+]
+
+# The forward of Qwen 3 MoE: pre-norm layers of full grouped-query attention,
+# its q and k RMS-normed per head and rotated in full (neox halves), and a
+# routed MLP: the router's softmax picks `top_k` experts, their weights
+# renormalized over the pick. A row with an adapter adds its LoRA correction
+# to the attention's output.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    for w in m.layers:
+        c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
+
+def forward(m, inputs):
+    positions = inputs.positions()
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
+        o = attention(x, inputs, m, positions, w)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
+        return ops.elemwise.residual_add(moe(x, m, w), y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def moe(x, m, w):
+    """`m.top_k` of `m.experts`, weighted by the router's softmax over them."""
+    experts, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, w.router),
+        m.experts,
+        m.top_k,
+        routing.softmax(),
+    )
+
+    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, w.gate_up, experts, m.top_k), gating.swiglu(), m.inter)
+    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, w.down, experts, m.top_k), weights)
+
+def attention(x, inputs, m, positions, w):
+    pages = inputs.kv(w.kv)
+    d = m.head_dim
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    seam.at(seam.ATTN_QV, [q, v])
+    q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
+    k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
+    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k)
+    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+    seam.at(seam.ATTN_Q, [q])
+
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, w.o)

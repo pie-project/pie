@@ -1,0 +1,626 @@
+# Tencent Hy4-preview, with its multi-token draft head or without, and its
+# six-layer, sixteen-expert miniature.
+
+load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
+load("//lib/adapters.poem", "banks")
+
+HY = template("hy", thinking = True)
+TOKENIZER = tokenizer(
+    markers = [
+        ["<｜hy_end:opensource｜>"],
+        [
+            "<｜hy_start:opensource｜>",
+            "<｜hy_middle:opensource｜>",
+            "<｜reasoning_mode:opensource｜>",
+            "<think:opensource>",
+            "</think:opensource>",
+            "<tool_calls:opensource>",
+            "</tool_calls:opensource>",
+            "<tool_call:opensource>",
+            "</tool_call:opensource>",
+            "<arg_key:opensource>",
+            "</arg_key:opensource>",
+            "<arg_value:opensource>",
+            "</arg_value:opensource>",
+            "<tool_response:opensource>",
+            "</tool_response:opensource>",
+        ],
+    ],
+)
+
+MODELS = [
+    model("hy4-preview", template = HY, tokenizer = TOKENIZER, drafters = ["mtp"], arch = "hy_v4", layers = 78, vocab = 120832),
+    model("hy4-mini", mini = True, template = HY, tokenizer = TOKENIZER, arch = "hy_v4", layers = 6, vocab = 120832),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+U2 = dtype.u2g64
+
+# Hy4-preview-FP8 as it ships (modelopt's MXFP8, whatever its name says):
+# projections and experts e4m3 under one e8m0 exponent a 1x32 block of each
+# row, against e4m3 activations in 1x32 blocks (W8A8; W8A16 where there are
+# no tcgen05 GEMMs); the tables, gates and latent up-projection bf16.
+MX8 = dtype.mxfp8a8g32
+
+DEPLOYMENTS = [
+    deployment("hy4-preview", weights = MX8, kv = BF),
+    deployment("hy4-preview", weights = [MX8, MX8, MX8], kv = BF, drafter = "mtp"),
+    deployment("hy4-preview", weights = [U4, U2], kv = BF),
+    deployment("hy4-preview", weights = [U4, U2, U4], kv = BF, drafter = "mtp"),
+    deployment("hy4-preview", weights = BF, kv = BF),
+    deployment("hy4-mini", weights = BF, kv = BF),
+    deployment("hy4-mini", weights = [U4, U4], kv = BF),
+    # The latent rows as vLLM's standard fp8 rows, read by B200's sparse pass.
+    deployment("hy4-preview", weights = [U4, U2], kv = dtype.e4m3),
+    deployment("hy4-mini", weights = BF, kv = dtype.e4m3),
+    deployment("hy4-mini", weights = MX8, kv = BF),
+]
+
+# The weights of Hy4-preview: gated latent attention with a sink per head
+# over the keys a lightning indexer picks (own or the last ranking's), a dense
+# first layer then routed experts, four hyper-connected residual streams, and
+# an optional MTP draft head.
+
+def hyper(streams, norm_eps, gate_eps, alpha):
+    """The streams' shape and the constants their gates are computed with."""
+    return struct(streams = streams, norm_eps = norm_eps, gate_eps = gate_eps, alpha = alpha)
+
+def mix(n, name, streams, hidden):
+    """A sublayer's mix `name` over `streams` streams `hidden` wide: the pre
+    and post logits a projection of the normed streams scores, scaled and
+    biased; no combine."""
+    width = 2 * streams
+    return struct(
+        scale = weight([2], dtype.f32),
+        base = weight([width], dtype.f32),
+        dynamic = weight([width, streams * hidden], dtype.f32),
+    )
+
+def head(prefix, streams, hidden):
+    """The trunk's collapse of its streams into one row."""
+    return struct(
+        scale = weight([1], dtype.f32),
+        base = weight([streams], dtype.f32),
+        dynamic = weight([streams, streams * hidden], dtype.f32),
+    )
+
+def attention(n, d, hidden, weights, norms, eps, kv, sink, indexer, kept = None):
+    """The gated latent attention named by `n`, its projections in `weights`
+    and its norms in `norms`, caching under `kv`, its sink logits at `sink`;
+    `indexer` ranks its keys, or with none it reads the last ranking. Its
+    latent up-projection and gate are at `kept`, or `weights`."""
+    kept = kept or weights
+    qk_head_dim = d.qk_nope_head_dim + d.qk_rope_head_dim
+    v_width = d.heads * d.v_head_dim
+    return struct(
+        heads = d.heads,
+        kv_lora_rank = d.kv_lora_rank,
+        qk_nope_head_dim = d.qk_nope_head_dim,
+        qk_rope_head_dim = d.qk_rope_head_dim,
+        v_head_dim = d.v_head_dim,
+        theta = d.theta,
+        sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
+        q_a_proj = weight([d.q_lora_rank, hidden], weights),
+        q_a_norm = weight([d.q_lora_rank]),
+        q_a_norm_eps = eps,
+        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights).columns(),
+        kv_a_proj = weight([d.kv_lora_rank + d.qk_rope_head_dim, hidden], weights),
+        kv_a_norm = weight([d.kv_lora_rank]),
+        kv_a_norm_eps = eps,
+        kv_b_proj = weight([d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
+            kept,
+        ).columns(),
+        gate = weight([v_width, hidden], kept).columns(),
+        sink = weight([d.heads], dtype.f32).columns(),
+        o_proj = weight([hidden, v_width], weights).rows(),
+        kv = kv,
+        indexer = indexer,
+    )
+
+def preview(layers = 78, experts = 256, index_top_k = 2048):
+    return struct(
+        hidden = 6144,
+        layers = layers,
+        dense_layers = 1,
+        mla = struct(
+            heads = 64,
+            q_lora_rank = 2048,
+            kv_lora_rank = 512,
+            qk_nope_head_dim = 192,
+            qk_rope_head_dim = 64,
+            v_head_dim = 256,
+            theta = 10000000.0,
+        ),
+        index_heads = 32,
+        index_head_dim = 128,
+        index_top_k = index_top_k,
+        index_norm_eps = 1e-6,
+        streams = 4,
+        gate_eps = 1e-6,
+        alpha = 2.0,
+        dense_inter = 18432,
+        moe = struct(
+            experts = experts,
+            top_k = min(8, experts),
+            inter = 2048,
+            shared_inter = 2048,
+            renorm = True,
+            scaling = 2.827,
+        ),
+        swiglu_limit = 10.0,
+        vocab = 120832,
+        norm_eps = 1e-5,
+    )
+
+DIMS = {
+    "hy4-preview": preview(),
+    # The first six layers with the first sixteen routed experts: the dense
+    # layer, the ranking layers 0, 1 and 5 and the reading layers 2-4; its
+    # indexer keeps sixteen keys, so the ranking is read at probe lengths.
+    "hy4-mini": preview(layers = 6, experts = 16, index_top_k = 16),
+}
+
+def ranks(l):
+    """Whether layer `l` ranks its own keys ("full") or reads the last
+    ranking ("shared"): the first, then every fourth from the second."""
+    return l == 0 or (l - 1) % 4 == 0
+
+def layout(id, deploy):
+    if deploy.drafter == "mtp":
+        if len(deploy.weights) != 3:
+            fail("{} with its draft head stores its weights, experts and draft experts at a dtype each, not {}".format(id, deploy.weights))
+        weights, experts, draft = deploy.weights
+    elif len(deploy.weights) == 1:
+        weights, experts = deploy.weights[0], deploy.weights[0]
+        draft = None
+    else:
+        if len(deploy.weights) != 2:
+            fail("{} stores its weights and its experts at one dtype or a dtype each, not {}".format(id, deploy.weights))
+        weights, experts = deploy.weights
+        draft = None
+    d = DIMS[id]
+    # The FP8 release as it ships (modelopt's MXFP8): projections and experts
+    # e4m3 under one e8m0 a 1x32 block of each row, against e4m3 activations
+    # in 1x32 blocks; what it keeps bf16 (tables, gate, the indexer's weights)
+    # and the latent's up-projection (the absorbs read it as bf16) at bf16.
+    proj = weights
+    if weights == dtype.mxfp8a8g32:
+        weights = dtype.bf16
+    dense = compute(weights)
+    hidden = d.hidden
+    streams = d.streams
+    a = d.mla
+    index_width = d.index_heads * d.index_head_dim
+
+    def mla_at(prefix, kv, keys, sink):
+        n = lambda s: "{}.{}".format(prefix, s)
+        indexer = None
+        if keys != None:
+            indexer = struct(
+                heads = d.index_heads,
+                head_dim = d.index_head_dim,
+                top_k = d.index_top_k,
+                rope_dim = a.qk_rope_head_dim,
+                theta = a.theta,
+                wq_b = weight([index_width, a.q_lora_rank], proj),
+                wk = weight([d.index_head_dim, hidden], proj),
+                weights_proj = weight([d.index_heads, hidden], weights),
+                k_norm = weight([d.index_head_dim]),
+                k_norm_bias = weight([d.index_head_dim]),
+                k_norm_eps = d.index_norm_eps,
+                keys = keys,
+            )
+        return attention(n, a, hidden, proj, dense, d.norm_eps, kv, sink, indexer, kept = weights)
+
+    def routed_at(prefix, banks_dtype):
+        n = lambda s: "{}.{}".format(prefix, s)
+        m = d.moe
+        iw = m.inter
+        sw = m.shared_inter
+        return struct(
+            routed = True,
+            router = weight([m.experts, hidden]),
+            bias = weight([m.experts], dtype.f32),
+            gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
+            down = weight([m.experts, hidden, iw], banks_dtype).rows(),
+            shared = struct(
+                gate_up = weight([2 * sw, hidden], proj).packed([sw, sw]),
+                down = weight([hidden, sw], proj).rows(),
+                inter = sw,
+            ),
+            experts = m.experts,
+            top_k = m.top_k,
+            inter = iw,
+            limit = d.swiglu_limit,
+            renorm = m.renorm,
+            scaling = m.scaling,
+        )
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        norm = lambda s: weight([hidden])
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        keys = "index.{}".format(l) if ranks(l) else None
+        if l < d.dense_layers:
+            iw = d.dense_inter
+            mlp = struct(
+                routed = False,
+                gate_up = weight([2 * iw, hidden], proj).packed([iw, iw]),
+                down = weight([hidden, iw], proj).rows(),
+                inter = iw,
+            )
+        else:
+            mlp = routed_at("layer.{}".format(l), experts)
+        return struct(
+            attn_mix = mix(n, "attn_hc", streams, hidden),
+            attn_norm = norm("attn_norm"),
+            attn_norm_eps = d.norm_eps,
+            attn = mla_at("layer.{}".format(l), "kv.{}".format(l), keys, n("sink")),
+            mlp_mix = mix(n, "ffn_hc", streams, hidden),
+            mlp_norm = norm("mlp_norm"),
+            mlp_norm_eps = d.norm_eps,
+            mlp = mlp,
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    mtp = None
+    if draft != None:
+        mtp = struct(
+            enorm = weight([hidden]),
+            hnorm = weight([hidden]),
+            e_proj = weight([hidden, hidden]),
+            h_proj = weight([hidden, hidden]),
+            attn_norm = weight([hidden]),
+            attn = mla_at("mtp", "kv.mtp", "index.mtp", "mtp.sink"),
+            mlp_norm = weight([hidden]),
+            mlp = routed_at("mtp", draft),
+            norm = weight([hidden]),
+            norm_eps = d.norm_eps,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = a.heads,
+        kv_lora_rank = a.kv_lora_rank,
+        kv = deploy.kv,
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha),
+        embed = weight([d.vocab, hidden], weights),
+        head = weight([d.vocab, hidden], weights),
+        hc_head = head("hc_head", streams, hidden),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+        mtp = mtp,
+    )
+
+# How a Hy4-preview checkpoint is laid out: transformers' names, the routed
+# bank stacked on dim 0, the MTP head as `model.mtp_layers.0`. The checkpoint
+# turns its rope dims in interleaved pairs: the reader moves each pair's
+# halves apart so the attention turns them as halves, and moves the indexer's
+# rope dims (the last of each head) first, where its kernels turn them.
+# Hy4-preview-FP8 (modelopt's MXFP8) stores its projections and experts e4m3
+# beside `*.weight_scale` (`*_scale` beside a stacked bank), one e8m0 a 1x32
+# block of each row; a row gather takes each row's exponents with it.
+
+def halved(width):
+    """The interleaved pairs of a `width`-wide rope part, as halves."""
+    return [2 * i for i in range(width // 2)] + [2 * i + 1 for i in range(width // 2)]
+
+def q_b_rows(a):
+    """`q_b_proj`'s rows with each head's rope part as halves."""
+    per = a.qk_nope_head_dim + a.qk_rope_head_dim
+    rows = []
+    for h in range(a.heads):
+        base = h * per
+        rows += [base + i for i in range(a.qk_nope_head_dim)]
+        rows += [base + a.qk_nope_head_dim + j for j in halved(a.qk_rope_head_dim)]
+    return rows
+
+def kv_a_rows(a):
+    """`kv_a_proj_with_mqa`'s rows with the rope part as halves."""
+    return list(range(a.kv_lora_rank)) + [a.kv_lora_rank + j for j in halved(a.qk_rope_head_dim)]
+
+def rope_first(heads, head_dim, rope_dim):
+    """An indexer projection's rows with each head's rope dims first."""
+    rows = []
+    for h in range(heads):
+        base = h * head_dim
+        rows += [base + head_dim - rope_dim + i for i in range(rope_dim)]
+        rows += [base + i for i in range(head_dim - rope_dim)]
+    return rows
+
+def formats(m):
+    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+
+def huggingface(m, reads):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    reads.read(m.hc_head.dynamic, "model.hc_head.hc_head_fn")
+    reads.read(m.hc_head.scale, "model.hc_head.hc_head_scale")
+    reads.read(m.hc_head.base, "model.hc_head.hc_head_base")
+    for l, layer in enumerate(m.layers):
+        at = lambda tail: "model.layers.{}.{}".format(l, tail)
+        for x, hc in [(layer.attn_mix, "hc_attn_layer"), (layer.mlp_mix, "hc_mlp_layer")]:
+            reads.read(x.dynamic, at(hc + ".hc_pre.hc_fn"))
+            reads.read(x.scale, at(hc + ".hc_pre.hc_scale"))
+            reads.read(x.base, at(hc + ".hc_pre.hc_base"))
+        reads.read(layer.attn_norm, at("input_layernorm.weight"))
+        reads.read(layer.mlp_norm, at("post_attention_layernorm.weight"))
+        read_attention(reads, layer.attn, at)
+        f = layer.mlp
+        if f.routed:
+            moe(reads, f, at)
+        else:
+            read_weight(
+                reads,
+                f.gate_up,
+                [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")],
+                quantized = "read",
+            )
+            read_weight(reads, f.down, [at("mlp.down_proj.weight")], quantized = "read")
+
+    mtp = m.mtp
+    if mtp == None:
+        return
+    at = lambda tail: "model.mtp_layers.0." + tail
+    reads.read(mtp.enorm, at("enorm.weight"))
+    reads.read(mtp.hnorm, at("hnorm.weight"))
+    reads.read_expr(mtp.e_proj, src(at("eh_proj.weight")).slice(1, 0, m.hidden))
+    reads.read_expr(mtp.h_proj, src(at("eh_proj.weight")).slice(1, m.hidden, m.hidden))
+    reads.read(mtp.attn_norm, at("input_layernorm.weight"))
+    reads.read(mtp.mlp_norm, at("post_attention_layernorm.weight"))
+    reads.read(mtp.norm, at("final_layernorm.weight"))
+    read_attention(reads, mtp.attn, at)
+    moe(reads, mtp.mlp, at)
+
+def read_attention(reads, a, at):
+    read_weight(reads, a.q_a_proj, [at("self_attn.q_a_proj.weight")], quantized = "read")
+    reads.read(a.q_a_norm, at("self_attn.q_a_layernorm.weight"))
+    read_weight(reads, a.q_b_proj, [at("self_attn.q_b_proj.weight")], rows = q_b_rows(a), quantized = "read")
+    read_weight(
+        reads,
+        a.kv_a_proj,
+        [at("self_attn.kv_a_proj_with_mqa.weight")],
+        rows = kv_a_rows(a),
+        quantized = "read",
+    )
+    reads.read(a.kv_a_norm, at("self_attn.kv_a_layernorm.weight"))
+    read_weight(reads, a.kv_b_proj, at("self_attn.kv_b_proj.weight"), quantized = "widen")
+    reads.read(a.gate, at("self_attn.linear_gate.weight"))
+    read_weight(reads, a.o_proj, [at("self_attn.o_proj.weight")], quantized = "read")
+    reads.read(a.sink, at("self_attn.learnable_sink_param"))
+    ix = a.indexer
+    if ix == None:
+        return
+    one = rope_first(1, ix.head_dim, ix.rope_dim)
+    read_weight(
+        reads,
+        ix.wq_b,
+        [at("self_attn.indexer.wq_b.weight")],
+        rows = rope_first(ix.heads, ix.head_dim, ix.rope_dim),
+        quantized = "read",
+    )
+    read_weight(reads, ix.wk, [at("self_attn.indexer.wk.weight")], rows = one, quantized = "read")
+    reads.read(ix.weights_proj, at("self_attn.indexer.weights_proj.weight"))
+    reads.read_expr(ix.k_norm, src(at("self_attn.indexer.k_norm.weight")).gather(0, one))
+    reads.read_expr(ix.k_norm_bias, src(at("self_attn.indexer.k_norm.bias")).gather(0, one))
+
+def moe(reads, f, at):
+    reads.read(f.router, at("mlp.gate.weight"))
+    reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
+    for w, name in [(f.gate_up, at("mlp.experts.gate_up_proj")), (f.down, at("mlp.experts.down_proj"))]:
+        if kept(w):
+            stacked_bank(reads, w, name)
+        else:
+            reads.read(w, name)
+    read_weight(reads, f.shared.gate_up, [
+        at("mlp.shared_experts.gate_proj.weight"),
+        at("mlp.shared_experts.up_proj.weight"),
+    ], quantized = "read")
+    read_weight(reads, f.shared.down, [at("mlp.shared_experts.down_proj.weight")], quantized = "read")
+
+# The forward of Hy4-preview: sublayers gated out of and folded back into
+# four hyper-connected streams; latent attention over the keys the last
+# ranking layer picked, sink-rescaled and gated; and the MTP draft head.
+
+def gate(streams, mix, hy):
+    """The sublayer input `mix` reads out of `streams`, and the post and
+    (identity) combine mixes its output is folded back with."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    return ops.elemwise.hc_gates_independent(
+        ops.elemwise.hc_project(normed, mix.dynamic, hy.streams),
+        streams,
+        mix.scale,
+        mix.base,
+        hy.streams,
+        hy.gate_eps,
+        hy.alpha,
+    )
+
+def collapse(streams, head, hy):
+    """The streams collapsed into one row through the mix `head`."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
+    return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
+
+# An e4m3 kv deployment keeps the latent rows as vLLM's standard fp8 rows, as
+# GLM-5's does: the 512 latent and 64 rotated dims e4m3 under one scale of 1,
+# 576 bytes a position in a u8 plane, read by the tcgen05 sparse pass alone.
+# The index keys stay at bf16.
+FP8_ROW = 576
+
+def fp8_rows(m):
+    return m.kv == dtype.e4m3
+
+def cache(c, space, a, fp8 = False):
+    """`a`'s latent rows in the kv `space`."""
+    if fp8:
+        if a.kv_lora_rank != 512 or a.qk_rope_head_dim != 64:
+            fail("fp8 latent rows hold 512 latent and 64 rotated dims, and this attention's are {} and {}".format(a.kv_lora_rank, a.qk_rope_head_dim))
+        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim)
+        return
+    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+
+def run_attention(x, inputs, positions, a, selection, whole = False):
+    """Latent attention of the rows `x` over the keys `a`'s indexer ranks,
+    or with none the `selection` the last ranking layer left: the attention
+    and the selection it read."""
+    pages = inputs.kv(a.kv)
+    write_page = inputs.write_page(a.kv)
+    write_offset = inputs.write_offset(a.kv)
+
+    q_a = ops.linear.matmul(x, a.q_a_proj)
+    q_a = ops.elemwise.rmsnorm(q_a, a.q_a_norm, a.q_a_norm_eps)
+    q_b = ops.linear.matmul(q_a, a.q_b_proj)
+    kv_a = ops.linear.matmul(x, a.kv_a_proj)
+    seam.at(seam.ATTN_QV, [q_b, kv_a])
+
+    if a.indexer != None:
+        selection = index_select(x, q_a, inputs, positions, a.indexer)
+    elif selection == None:
+        fail("a layer reading the last ranking follows no layer that ranked")
+
+    kv_c, k_pe = ops.attn.mla_latents_rope(
+        kv_a,
+        positions,
+        a.kv_a_norm,
+        a.kv_a_norm_eps,
+        a.kv_lora_rank,
+        a.qk_rope_head_dim,
+        a.theta,
+    )
+    ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
+
+    q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
+    q_pe = ops.elemwise.rope(q_pe, positions, a.qk_rope_head_dim, a.theta, rotary.partial(a.qk_rope_head_dim))
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    seam.at(seam.ATTN_Q, [q])
+
+    # The picked keys, the sinks folded in once over both kinds of lane.
+    scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
+                                 selection = selection, sinks = a.sink, whole = whole)
+
+    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o_proj), selection
+
+def index_select(x, q_a, inputs, positions, ix):
+    """The keys each row reads: the indexer's keys appended, its queries
+    scored against every cached key, the top `ix.top_k` kept. The checkpoint
+    turns the last `rope_dim` of each head; the reader moves them first."""
+    keys = inputs.kv(ix.keys)
+    k = ops.attn.index_layernorm_rope(
+        ops.linear.matmul(x, ix.wk),
+        positions,
+        ix.k_norm,
+        ix.k_norm_eps,
+        ix.k_norm_bias,
+        ix.rope_dim,
+        ix.theta,
+    )
+    ops.attn.index_kv_append(k, keys, inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
+    q = ops.attn.index_rope(
+        ops.linear.matmul(q_a, ix.wq_b),
+        positions,
+        ix.heads,
+        ix.head_dim,
+        ix.rope_dim,
+        ix.theta,
+    )
+    weights = ops.linear.matmul(x, ix.weights_proj)
+    return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)
+
+def mlp(x, f):
+    if not f.routed:
+        return ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
+            f.down,
+        )
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.sigmoid(renormalize = f.renorm, scaling = f.scaling),
+        bias = f.bias,
+    )
+
+    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter, limit = f.limit)
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
+    s = f.shared
+    act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter)
+    return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
+
+def caches(m, c):
+    fp8 = fp8_rows(m)
+    kv = c.kv_space(dtype.u8 if fp8 else m.kv)
+    index = c.kv_space(dtype.bf16 if fp8 else m.kv)
+    for w in m.layers:
+        cache(c, kv, w.attn, fp8)
+        if w.attn.indexer != None:
+            c.kv(index, w.attn.indexer.keys, [w.attn.indexer.head_dim], w.attn.indexer.head_dim)
+    if m.mtp != None:
+        a = m.mtp.attn
+        cache(c, kv, a, fp8)
+        c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
+
+def forward(m, inputs):
+    hy = m.hyper
+    positions = inputs.positions()
+    streams = ops.elemwise.hc_expand(ops.gather.embed(inputs.tokens(), m.embed, m.vocab), hy.streams)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, carried):
+        streams, selection = carried
+        x, post_mix, comb_mix = gate(streams, w.attn_mix, hy)
+        x = ops.elemwise.rmsnorm(x, w.attn_norm, w.attn_norm_eps)
+        o, selection = run_attention(x, inputs, positions, w.attn, selection)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
+
+        x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)
+        x = ops.elemwise.rmsnorm(x, w.mlp_norm, w.mlp_norm_eps)
+        streams = ops.elemwise.hc_fold(mlp(x, w.mlp), streams, post_mix, comb_mix)
+        return streams, selection
+
+    streams, _ = inputs.fold_layers(m.layers, (streams, None), block)
+
+    y = collapse(streams, m.hc_head, hy)
+    y = ops.gather.gather_rows(y, inputs.readout_rows())
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    logits = ops.linear.lm_head(x, m.head)
+
+    if m.mtp != None:
+        draft(m, inputs, x, positions, logits)
+    return logits
+
+def draft(m, inputs, hidden, positions, logits):
+    """The MTP head's drafted token, from the trunk's last normed rows
+    `hidden` and the token its logits pick: one plain residual layer, no
+    streams."""
+    mtp = m.mtp
+    drafted = inputs.on(fact.drafts())
+    hidden = hidden.on(fact.drafts())
+    positions = positions.on(fact.drafts())
+    token = ops.sampling.argmax([logits.on(fact.drafts())])
+
+    e = ops.gather.embed(token, m.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+    h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
+    fused = ops.elemwise.residual_add(
+        ops.linear.matmul(e, mtp.e_proj),
+        ops.linear.matmul(h, mtp.h_proj),
+    )
+    x = ops.elemwise.rmsnorm(fused, mtp.attn_norm, mtp.norm_eps)
+    o, _ = run_attention(x, drafted, positions, mtp.attn, None, whole = True)
+    r = ops.elemwise.residual_add(o, fused)
+    x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
+    r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
+    proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
+    seam.at(seam.MTP, [proposal])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])

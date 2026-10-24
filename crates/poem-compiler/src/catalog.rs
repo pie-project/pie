@@ -353,23 +353,20 @@ impl Catalog {
         package.import(id, &one_rank(w, kv), src, platform)
     }
 
-    /// The package of `id` with `source` appended to `file`, whose `function` is
-    /// renamed `whole_<function>`: a part of a model traced or read alone.
-    pub fn replacing(
-        &self,
-        id: &str,
-        file: &str,
-        function: &str,
-        source: &str,
-    ) -> Result<Package, String> {
+    /// The package of `id` with its `function` renamed `whole_<function>` and
+    /// `source` appended beside it: a part of a model traced or read alone.
+    pub fn replacing(&self, id: &str, function: &str, source: &str) -> Result<Package, String> {
         let package = self
             .package_of(id)
             .ok_or_else(|| format!("no package holds `{id}`"))?;
         let stated = format!("def {function}(");
+        if !package.files().any(|(_, text)| text.contains(&stated)) {
+            return Err(format!("`{id}`'s package defines no `{function}`"));
+        }
         let files: Vec<(String, String)> = package
             .files()
             .map(|(name, text)| {
-                let text = if name == file {
+                let text = if text.contains(&stated) {
                     text.replace(&stated, &format!("def whole_{function}(")) + "\n" + source
                 } else {
                     text.to_string()
@@ -410,7 +407,15 @@ impl Tree {
             let dir = dir
                 .map_err(|why| io(&format!("read {root:?}"), why))?
                 .path();
-            // A package is a directory of `.poem` files, `lib/` excepted.
+            // A package is a `.poem` file, or a directory of them, `lib/`
+            // excepted.
+            if let Some(name) = one_file(&dir) {
+                let text = std::fs::read_to_string(&dir)
+                    .map_err(|why| io(&format!("read {dir:?}"), why))?;
+                let file = format!("{name}.poem");
+                packages.push((name, vec![(file, text)]));
+                continue;
+            }
             if !is_package(&dir) {
                 continue;
             }
@@ -439,6 +444,12 @@ impl Tree {
             packages.push((name, files));
         }
         packages.sort();
+        if let Some(twice) = packages.windows(2).find(|p| p[0].0 == p[1].0) {
+            return Err(Refused(format!(
+                "both `{0}.poem` and `{0}/` are the package `{0}`; keep one",
+                twice[0].0
+            )));
+        }
         Ok(Tree { packages, library })
     }
 }
@@ -553,12 +564,21 @@ pub fn import_of(
     repository().import_of(id, w, kv, src, platform)
 }
 
-pub fn replacing(id: &str, file: &str, function: &str, source: &str) -> Result<Package, String> {
-    repository().replacing(id, file, function, source)
+pub fn replacing(id: &str, function: &str, source: &str) -> Result<Package, String> {
+    repository().replacing(id, function, source)
 }
 
 pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static str, Unmatched> {
     repository().identify(src, platform)
+}
+
+/// The package `path` is by itself: a `.poem` file beside the packages,
+/// named for its stem.
+fn one_file(path: &Path) -> Option<String> {
+    if !path.is_file() || path.extension().is_none_or(|ext| ext != "poem") {
+        return None;
+    }
+    path.file_stem()?.to_str().map(str::to_string)
 }
 
 /// Whether `dir` is a package: a directory, not the libraries', holding a

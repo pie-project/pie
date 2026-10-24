@@ -1,0 +1,348 @@
+# MiniMax-M3, its language model, and a six-layer, eight-expert miniature
+# of it: three dense layers and three sparse.
+
+load("//pie/codec.poem", "bank", "kept", "nvfp4_packed_bank", read_weight = "weight")
+
+MINIMAX = template("minimax")
+TOKENIZER = tokenizer(markers = [["[e~[", "]~b]", "]~!b[", "]<]minimax[>[", "<mm:think>", "</mm:think>"]])
+
+def m3(id, **kwargs):
+    return model(id, template = MINIMAX, tokenizer = TOKENIZER, arch = "minimax_m3_vl", vocab = 200064, **kwargs)
+
+MODELS = [
+    m3("minimax-m3", layers = 60),
+    m3("minimax-m3-mini", mini = True, layers = 6),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+
+# MiniMax-M3-MXFP8 as it ships: every projection and expert e4m3 under one
+# e8m0 exponent a 1x32 block of each row, against e4m3 activations in 1x32
+# blocks (W8A8; W8A16 where there are no tcgen05 GEMMs).
+MX8 = dtype.mxfp8a8g32
+
+DEPLOYMENTS = [
+    deployment("minimax-m3", weights = MX8, kv = BF),
+    # MiniMax-M3.1-Flash: MXFP8 projections, compressed-tensors NVFP4 experts
+    deployment("minimax-m3", weights = [MX8, dtype.nvfp4a4], kv = BF),
+    deployment("minimax-m3", weights = U4, kv = BF),
+    deployment("minimax-m3", weights = BF, kv = BF),
+    deployment("minimax-m3-mini", weights = BF, kv = BF),
+    deployment("minimax-m3-mini", weights = U4, kv = BF),
+    deployment("minimax-m3-mini", weights = MX8, kv = BF),
+]
+
+# The weights of MiniMax-M3's language model: GQA with plus-one q/k norms and
+# a partial NeoX rope; three dense layers, then layers reading only the blocks
+# their indexer picks per kv head, with routed experts and one shared. Every
+# MLP is a clamped SwiGLU-OAI.
+
+def dims(layers = 60, experts = 128):
+    return struct(
+        hidden = 6144,
+        layers = layers,
+        dense_layers = 3,
+        q_heads = 64,
+        kv_heads = 4,
+        head_dim = 128,
+        rotary_dim = 64,
+        theta = 5000000.0,
+        dense_inter = 12288,
+        experts = experts,
+        top_k = 4,
+        inter = 3072,
+        shared_inter = 3072,
+        routed_scaling = 2.0,
+        swiglu_limit = 7.0,
+        swiglu_alpha = 1.702,
+        indexer = struct(heads = 4, head_dim = 128, block = 128, top_k = 16),
+        vocab = 200064,
+        norm_eps = 1e-6,
+    )
+
+DIMS = {
+    "minimax-m3": dims(),
+    "minimax-m3-mini": dims(layers = 6, experts = 8),
+}
+
+NV4 = dtype.nvfp4a4
+
+def mix_of(w):
+    """Where each kind of weight lands at deployment weights `w`: whole at
+    bf16; at u4g64 the routed experts at four bits and the rest of the
+    projections at eight; at mxfp8a8g32 the MXFP8 release as it ships, every
+    projection (the indexer's too) and expert MXFP8 against e4m3 in 1x32
+    blocks, the tables bf16."""
+    if w == dtype.u4g64:
+        return struct(embed = dtype.u8g64, head = dtype.u8g64, proj = dtype.u8g64, experts = dtype.u4g64, index = None)
+    if w == MX8:
+        return struct(embed = dtype.bf16, head = dtype.bf16, proj = MX8, experts = MX8, index = MX8)
+    if w == [MX8, NV4]:
+        # MiniMax-M3.1-Flash as it ships: the MXFP8 release's projections, its experts NVFP4 against NVFP4 activations
+        return struct(embed = dtype.bf16, head = dtype.bf16, proj = MX8, experts = NV4, index = MX8)
+    return struct(embed = w, head = w, proj = w, experts = w, index = None)
+
+def attention(n, d, proj, dense, kv):
+    """The attention named by `n`, its projections at `proj`, caching in `kv`."""
+    hd = d.head_dim
+    return struct(
+        rotary_dim = d.rotary_dim,
+        theta = d.theta,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        q_proj = weight([d.q_heads * hd, d.hidden], proj).columns(),
+        k_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
+        v_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
+        o_proj = weight([d.hidden, d.q_heads * hd], proj).rows(),
+        q_norm = weight([hd]),
+        k_norm = weight([hd]),
+        norm_eps = d.norm_eps,
+        kv = kv,
+    )
+
+def indexer(n, d, dense, keys, proj = None):
+    """The block indexer named by `n`: `heads` queries, one per kv head, and
+    one key a token, cached in `keys`; its projections at `proj`, or `dense`."""
+    ix = d.indexer
+    proj = proj or dense
+    return struct(
+        heads = ix.heads,
+        head_dim = ix.head_dim,
+        block = ix.block,
+        top_k = ix.top_k,
+        norm_eps = d.norm_eps,
+        q_proj = weight([ix.heads * ix.head_dim, d.hidden], proj),
+        k_proj = weight([ix.head_dim, d.hidden], proj),
+        q_norm = weight([ix.head_dim]),
+        k_norm = weight([ix.head_dim]),
+        keys = keys,
+    )
+
+def mlp(d, inter, proj):
+    """A clamped SwiGLU-OAI MLP `inter` wide, its gate and up packed."""
+    return struct(
+        gate_up = weight([2 * inter, d.hidden], proj).packed([inter, inter]),
+        down = weight([d.hidden, inter], proj).rows(),
+        inter = inter,
+        limit = d.swiglu_limit,
+        alpha = d.swiglu_alpha,
+    )
+
+def routed(n, d, mix, dense):
+    """`d.top_k` of `d.experts` experts, sigmoid-routed with a correction
+    bias, beside the one shared expert."""
+    return struct(
+        router = weight([d.experts, d.hidden]),
+        bias = weight([d.experts], dtype.f32),
+        gate_up = weight([d.experts, 2 * d.inter, d.hidden], mix.experts).bank([d.inter, d.inter]),
+        down = weight([d.experts, d.hidden, d.inter], mix.experts).rows(),
+        shared = mlp(d, d.shared_inter, mix.proj),
+        experts = d.experts,
+        top_k = d.top_k,
+        inter = d.inter,
+        routed_scaling = d.routed_scaling,
+        limit = d.swiglu_limit,
+        alpha = d.swiglu_alpha,
+    )
+
+def layout(id, deploy):
+    mixed = deploy.weights == [MX8, NV4]
+    if not mixed and (len(deploy.weights) != 1 or deploy.weights[0] not in [dtype.bf16, dtype.u4g64, MX8]) or deploy.parts or deploy.drafter != None:
+        fail("{} does not ship {}".format(id, deploy))
+    d = DIMS[id]
+    mix = mix_of(deploy.weights if mixed else deploy.weights[0])
+    dense = compute(mix.proj)
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        sparse = l >= d.dense_layers
+        return struct(
+            attn_norm = weight([d.hidden]),
+            attn = attention(n, d, mix.proj, dense, "kv.{}".format(l)),
+            indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if sparse else None,
+            mlp_norm = weight([d.hidden]),
+            mlp = routed(n, d, mix, dense) if sparse else None,
+            dense = None if sparse else mlp(d, d.dense_inter, mix.proj),
+        )
+
+    return struct(
+        hidden = d.hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = d.head_dim,
+        norm_eps = d.norm_eps,
+        kv = deploy.kv,
+        embed = weight([d.vocab, d.hidden], mix.embed),
+        head = weight([d.vocab, d.hidden], mix.head),
+        final_norm = weight([d.hidden]),
+        layers = [layer(l) for l in range(d.layers)],
+    )
+
+# How a MiniMax-M3 checkpoint is laid out: the language model under
+# `language_model.`, each routed expert its own `w1`/`w3`/`w2` planes, the
+# vision tower beside it unread. The MXFP8 release stores every projection
+# e4m3 beside `*.weight_scale_inv` (one e8m0 a 1x32 block of each row).
+
+def lifted(w):
+    """`w`'s shape, its cut axis left for the stack to fill."""
+    dims = list(w.shape)
+    dims[w.cut_axis] = -1
+    return dims
+
+def expert_bank(reads, w, names):
+    """The planes `names`, stacked on the leading axis, read as the bank `w`."""
+    read = logical(stored(names[0]))
+    reads.read_expr(w, concat(0, [src(n) for n in names]).transmute(lifted(w), raw(read)))
+
+def at(l, leaf):
+    return "language_model.model.layers.{}.{}".format(l, leaf)
+
+def formats(m):
+    return [format(
+        "huggingface",
+        recognizes = lambda c: has("language_model.model.embed_tokens.weight"),
+        read = lambda reads: read(m, reads),
+    )]
+
+def read(m, reads):
+    reads.read(m.embed, "language_model.model.embed_tokens.weight")
+    reads.read(m.final_norm, "language_model.model.norm.weight")
+    reads.read(m.head, "language_model.lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: at(l, leaf)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        a = w.attn
+        for p, name in [
+            (a.q_proj, "q_proj"),
+            (a.k_proj, "k_proj"),
+            (a.v_proj, "v_proj"),
+            (a.o_proj, "o_proj"),
+            (a.q_norm, "q_norm"),
+            (a.k_norm, "k_norm"),
+        ]:
+            read_weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "read")
+        ix = w.indexer
+        if ix != None:
+            for p, name in [
+                (ix.q_proj, "index_q_proj"),
+                (ix.k_proj, "index_k_proj"),
+                (ix.q_norm, "index_q_norm"),
+                (ix.k_norm, "index_k_norm"),
+            ]:
+                read_weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "read")
+        if w.dense != None:
+            read_mlp(reads, w.dense, lambda leaf: n("mlp." + leaf))
+            continue
+        f = w.mlp
+        moe = lambda leaf: n("block_sparse_moe." + leaf)
+        reads.read(f.router, moe("gate.weight"))
+        reads.read(f.bias, moe("e_score_correction_bias"))
+        leg = lambda e, w: moe("experts.{}.{}.weight".format(e, w))
+        if f.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
+            # MiniMax-M3.1-Flash: its experts compressed-tensors NVFP4 beside MXFP8 projections
+            nvfp4_packed_bank(reads, f.gate_up, [[moe("experts.{}.w1".format(e)), moe("experts.{}.w3".format(e))] for e in range(f.experts)])
+            nvfp4_packed_bank(reads, f.down, [[moe("experts.{}.w2".format(e))] for e in range(f.experts)])
+        elif kept(f.gate_up):
+            bank(reads, f.gate_up, [[leg(e, "w1"), leg(e, "w3")] for e in range(f.experts)])
+            bank(reads, f.down, [[leg(e, "w2")] for e in range(f.experts)])
+        else:
+            gate_up = []
+            for e in range(f.experts):
+                gate_up += [leg(e, "w1"), leg(e, "w3")]
+            expert_bank(reads, f.gate_up, gate_up)
+            expert_bank(reads, f.down, [leg(e, "w2") for e in range(f.experts)])
+        read_mlp(reads, f.shared, lambda leaf: moe("shared_experts." + leaf))
+
+def read_mlp(reads, f, n):
+    read_weight(reads, f.gate_up, [n("gate_proj.weight"), n("up_proj.weight")], quantized = "read")
+    read_weight(reads, f.down, [n("down_proj.weight")], quantized = "read")
+
+# The forward of MiniMax-M3: pre-norm layers of GQA attention and a clamped
+# SwiGLU-OAI MLP. A sparse layer's indexer ranks the 128-key blocks a row sees
+# by their best key, for each kv head on its own, and that head's queries read
+# its sixteen blocks, the row's own among them; a dense layer's read every key.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
+        if w.indexer != None:
+            # One raw indexer key a token, bf16 at any kv, as the
+            # indexer's kernels read them.
+            index = c.kv_space(dtype.bf16)
+            c.kv(index, w.indexer.keys, [w.indexer.head_dim], w.indexer.head_dim)
+
+def forward(m, inputs):
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+
+    def block(l, w, y):
+        x = ops.elemwise.rmsnorm_plus_one(y, w.attn_norm, m.norm_eps)
+        o = attn_mixer(x, inputs, m, w.attn, w.indexer)
+        y = ops.elemwise.residual_add(o, y)
+        x = ops.elemwise.rmsnorm_plus_one(y, w.mlp_norm, m.norm_eps)
+        f = moe(x, w.mlp) if w.mlp != None else swiglu_oai(x, w.dense)
+        return ops.elemwise.residual_add(f, y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm_plus_one(y, m.final_norm, m.norm_eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def swiglu_oai(x, f):
+    act = ops.linear.glu(
+        ops.linear.matmul(x, f.gate_up),
+        gating.swiglu_alpha(f.alpha),
+        f.inter,
+        limit = f.limit,
+    )
+    return ops.linear.matmul(act, f.down)
+
+def moe(x, f):
+    """The routed experts, scaled, beside the shared expert."""
+    experts, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.sigmoid(renormalize = True, scaling = f.routed_scaling),
+        bias = f.bias,
+    )
+
+    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, experts, f.top_k), gating.swiglu_alpha(f.alpha), f.inter, limit = f.limit)
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, experts, f.top_k), weights)
+    return ops.elemwise.residual_add(swiglu_oai(x, f.shared), routed)
+
+def select_blocks(x, inputs, a, ix):
+    """Each row's blocks, `ix.top_k` for each kv head."""
+    keys = inputs.kv(ix.keys)
+    positions = inputs.positions()
+    q = ops.linear.matmul(x, ix.q_proj)
+    k = ops.linear.matmul(x, ix.k_proj)
+    q = ops.elemwise.rmsnorm_per_head_plus_one(q, ix.q_norm, ix.head_dim, ix.norm_eps)
+    k = ops.elemwise.rmsnorm_per_head_plus_one(k, ix.k_norm, ix.head_dim, ix.norm_eps)
+    q, k = ops.elemwise.rope(q, positions, ix.head_dim, a.theta, rotary.partial(a.rotary_dim), k = k)
+    ops.attn.index_kv_append(k, keys, inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
+    return ops.attn.index_topk(q, None, keys, ix.heads, ix.head_dim, ix.top_k, ix.block, score = "block_max")
+
+def attn_mixer(x, inputs, m, a, ix):
+    pages = inputs.kv(a.kv)
+    d = m.head_dim
+    q = ops.linear.matmul(x, a.q_proj)
+    k = ops.linear.matmul(x, a.k_proj)
+    v = ops.linear.matmul(x, a.v_proj)
+    seam.at(seam.ATTN_QV, [q, v])
+    q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.norm_eps)
+    k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.norm_eps)
+    q, k = ops.elemwise.rope(q, inputs.positions(), d, a.theta, rotary.partial(a.rotary_dim), k = k)
+    ops.attn.kv_append(k, v, pages, inputs.write_page(a.kv), inputs.write_offset(a.kv))
+    seam.at(seam.ATTN_Q, [q])
+
+    # Each lane by its kind; on a sparse layer decode and prefill lanes read
+    # the key blocks the indexer picked, one pick a head.
+    selection = select_blocks(x, inputs, a, ix) if ix != None else None
+    o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True, scores = True,
+                        selection = selection, ratio = ix.block if ix != None else None, per_head = True)
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o_proj)

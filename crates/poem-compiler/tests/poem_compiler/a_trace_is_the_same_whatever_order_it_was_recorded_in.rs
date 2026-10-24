@@ -8,7 +8,7 @@ use poem_ir::{Dtype, Platform, canon};
 const ID: &str = "llama31-8b";
 
 fn traced(forward: &str) -> poem_ir::Trace {
-    replacing(ID, "forward.poem", "forward", forward)
+    replacing(ID, "forward", forward)
         .unwrap_or_else(|why| panic!("{why}"))
         .trace(ID, &one_rank(Dtype::Bf16, Dtype::Bf16), ID, Platform::Cuda)
         .unwrap_or_else(|why| panic!("{why:#}"))

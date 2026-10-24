@@ -1,0 +1,341 @@
+# GLM-4.5, 4.6 and 4.7 (zai-org/GLM-4.5, -4.5-Air, -4.6, -4.7): grouped-query
+# attention with biased q, k and v, half its head rotated, its q and k
+# RMS-normed per head (not the Air's); dense first layers, then routed experts
+# picked by a biased sigmoid beside a shared expert. As released (bf16), as
+# NVIDIA's modelopt exports them in NVFP4, quantized to u4 at import, and
+# miniatures that read the first layers and experts of the whole models'
+# checkpoints at full width.
+# 4.5 and 4.6 are spoken through one template, 4.7 through its own; 4.6's
+# configuration is 4.7's, so an import reads either as 4.7 unless told
+# `--deployment glm46-…`.
+
+load("//pie/codec.poem", "mapped")
+load("//lib/adapters.poem", "banks")
+
+GLM45 = template("glm45")
+GLM47 = template("glm47")
+TOKENIZER = tokenizer(markers = [["<|user|>", "<|observation|>", "<|endoftext|>"], ["[gMASK]", "<sop>", "<|system|>", "<|assistant|>", "<think>", "</think>"]])
+
+def glm(id, layers, spoken, mini = False):
+    return model(id, mini = mini, template = spoken, tokenizer = TOKENIZER, arch = "glm4_moe", layers = layers, vocab = 151552)
+
+MODELS = [
+    glm("glm45", layers = 92, spoken = GLM45),
+    glm("glm45-air", layers = 46, spoken = GLM45),
+    glm("glm45-air-mini", layers = 4, spoken = GLM45, mini = True),
+    glm("glm46", layers = 92, spoken = GLM45),
+    glm("glm47", layers = 92, spoken = GLM47),
+    glm("glm47-mini", layers = 5, spoken = GLM47, mini = True),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+# Z.ai's FP8 releases (a scale a row) are read by the formats, and wait on
+# a per-channel bank product that keeps their codes as stored before a row
+# deploys them at `e4m3g128a8`.
+NV4 = dtype.nvfp4a4
+NV4W = dtype.nvfp4
+
+def rows(id, mini = False):
+    """A model's rows: as released; modelopt's NVFP4 (attention bf16, the routed experts
+    against NVFP4 activations or bf16 ones, the dense and shared MLPs against
+    bf16 ones); and quantized to u4 at import."""
+    out = [
+        deployment(id, weights = BF, kv = BF),
+        deployment(id, weights = [BF, NV4, NV4W], kv = BF),
+        deployment(id, weights = [BF, NV4, NV4W], kv = dtype.e4m3),
+        deployment(id, weights = [BF, NV4W, NV4W], kv = BF),
+    ]
+    if not mini:
+        out.append(deployment(id, weights = U4, kv = BF))
+    return out
+
+DEPLOYMENTS = (
+    rows("glm47") +
+    rows("glm47-mini", mini = True) +
+    rows("glm46") +
+    rows("glm45") +
+    rows("glm45-air") +
+    rows("glm45-air-mini", mini = True)
+)
+
+# The weights of GLM-4.5 / 4.6 / 4.7: per layer an RMS norm, q, k and v
+# packed into one biased projection (per-head q and k norms where the model
+# has them), the output projection and an RMS norm; then a SwiGLU MLP on the
+# first layers, routed experts (gate and up packed) behind a router and its
+# score bias beside a shared expert on the rest. The token embedding, a final
+# norm and the head. The deployment's first dtype stores the projections and
+# the shared and dense MLPs, its second (or the first) the routed banks; the
+# norms, biases, router, embedding and head stay bf16 under the FP8 release.
+# Each layer also has the LoRA banks the host registers.
+
+def dims(hidden, layers, experts, inter, dense_layers, dense_inter, qk_norm, scaling, max_position):
+    return struct(
+        hidden = hidden,
+        layers = layers,
+        q_heads = 96,
+        kv_heads = 8,
+        head_dim = 128,
+        rotary_dim = 64,
+        qk_norm = qk_norm,
+        experts = experts,
+        top_k = 8,
+        inter = inter,
+        shared_inter = inter,
+        dense_layers = dense_layers,
+        dense_inter = dense_inter,
+        scaling = scaling,
+        vocab = 151552,
+        theta = 1000000.0,
+        norm_eps = 1e-5,
+        max_position = max_position,
+    )
+
+def big(layers = 92, experts = 160, max_position = 202752):
+    return dims(hidden = 5120, layers = layers, experts = experts, inter = 1536, dense_layers = 3, dense_inter = 12288, qk_norm = True, scaling = 2.5, max_position = max_position)
+
+def air(layers = 46, experts = 128):
+    return dims(hidden = 4096, layers = layers, experts = experts, inter = 1408, dense_layers = 1, dense_inter = 10944, qk_norm = False, scaling = 1.0, max_position = 131072)
+
+# 4.5 states a 128K context, 4.6 and 4.7 one of 198K; 4.6's and 4.7's
+# configurations are otherwise the same.
+DIMS = {
+    "glm45": big(max_position = 131072),
+    "glm45-air": air(),
+    "glm45-air-mini": air(layers = 4, experts = 16),
+    "glm46": big(),
+    "glm47": big(),
+    # Three dense layers and two routed ones.
+    "glm47-mini": big(layers = 5, experts = 16),
+}
+
+# A release whose planes a deployment keeps as released, its tables bf16.
+RELEASED = [dtype.e4m3tile128a8, dtype.e4m3g128a8, dtype.nvfp4, dtype.nvfp4a4]
+
+def layout(id, deploy):
+    ws = deploy.weights
+    if len(ws) == 1:
+        proj, experts, mlp_w = ws[0], ws[0], ws[0]
+    elif len(ws) == 2:
+        proj, experts = ws
+        mlp_w = proj
+    elif len(ws) == 3:
+        proj, experts, mlp_w = ws
+    else:
+        fail("{} stores its weights at one dtype, or its attention, experts and MLPs at a dtype each; not {}".format(id, ws))
+    if deploy.drafter != None or deploy.parts:
+        fail("{} ships no drafter and no parts".format(id))
+    table = dtype.bf16 if proj in RELEASED else proj
+    dense = compute(table)
+    d = DIMS[id]
+    hidden, hd = d.hidden, d.head_dim
+    q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
+    heads = [d.q_heads, d.kv_heads, d.kv_heads]
+
+    def mlp(l):
+        if l < d.dense_layers:
+            iw = d.dense_inter
+            # The Air's dense MLP is 10944 wide, not a whole number of 128s:
+            # its down projection, stored a scale a row, is widened to bf16.
+            down_w = dtype.bf16 if mlp_w == dtype.e4m3g128a8 and iw % 128 != 0 else mlp_w
+            return struct(
+                routed = False,
+                gate_up = weight([2 * iw, hidden], mlp_w).packed([iw, iw]),
+                down = weight([hidden, iw], down_w).rows(),
+                inter = iw,
+            )
+        iw, sw = d.inter, d.shared_inter
+        return struct(
+            routed = True,
+            router = weight([d.experts, hidden]),
+            bias = weight([d.experts], dtype.f32),
+            gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+            down = weight([d.experts, hidden, iw], experts).rows(),
+            shared = struct(
+                gate_up = weight([2 * sw, hidden], mlp_w).packed([sw, sw]),
+                down = weight([hidden, sw], mlp_w).rows(),
+                inter = sw,
+            ),
+            experts = d.experts,
+            top_k = d.top_k,
+            inter = iw,
+            scaling = d.scaling,
+        )
+
+    def layer(l):
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        return struct(
+            attn_norm = weight([hidden]),
+            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = heads),
+            qkv_bias = weight([q_width + 2 * kv_width]).packed([q_width, kv_width, kv_width], heads = heads),
+            o = weight([hidden, q_width], proj).rows(),
+            q_norm = weight([hd]) if d.qk_norm else None,
+            k_norm = weight([hd]) if d.qk_norm else None,
+            mlp_norm = weight([hidden]),
+            mlp = mlp(l),
+            kv = "kv.{}".format(l),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        rotary_dim = d.rotary_dim,
+        q_width = q_width,
+        kv_width = kv_width,
+        experts = d.experts,
+        theta = d.theta,
+        max_position = d.max_position,
+        eps = d.norm_eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden], table),
+        head = weight([d.vocab, hidden], table).columns(),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+    )
+
+# How a GLM-4.5 / 4.6 / 4.7 checkpoint is read: transformers' safetensors
+# under `model.`, each expert apart, as released (bf16), as Z.ai releases it
+# in FP8 (compressed-tensors: e4m3 codes and a scale a row; biases, norms,
+# router and score bias unquantized) or as modelopt exports it in NVFP4
+# (attention bf16; every MLP's legs codes, e4m3 scales a 16, a tensor and an
+# input scale); recognized by its biased q and its router's score bias, and
+# checked against its config. The draft layer stored after the last is not
+# read.
+
+def configured(m):
+    return [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("head_dim", m.head_dim),
+        config("num_hidden_layers", len(m.layers)),
+        config("n_routed_experts", m.experts),
+        config("partial_rotary_factor", 0.5),
+        config("rms_norm_eps", m.eps),
+        config("rope_theta", m.theta),
+        config("max_position_embeddings", m.max_position),
+    ]
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.q_proj.bias") and has("model.layers.{}.mlp.gate.e_score_correction_bias".format(len(m.layers) - 1)),
+        read = lambda reads: mapped(reads, m, TRANSFORMERS, quantized = "widen"),
+        states = configured(m),
+    )]
+
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.weight",
+        "model.layers.{l}.self_attn.k_proj.weight",
+        "model.layers.{l}.self_attn.v_proj.weight",
+    ], "layers.{l}.qkv"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.bias",
+        "model.layers.{l}.self_attn.k_proj.bias",
+        "model.layers.{l}.self_attn.v_proj.bias",
+    ], "layers.{l}.qkv_bias"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    # A dense layer's MLP; a routed one's router, shared expert and banks.
+    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.mlp.gate_up"),
+    ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.mlp.down"),
+    ("model.layers.{l}.mlp.gate.weight", "layers.{l}.mlp.router"),
+    ("model.layers.{l}.mlp.gate.e_score_correction_bias", "layers.{l}.mlp.bias"),
+    ([
+        "model.layers.{l}.mlp.shared_experts.gate_proj.weight",
+        "model.layers.{l}.mlp.shared_experts.up_proj.weight",
+    ], "layers.{l}.mlp.shared.gate_up"),
+    ("model.layers.{l}.mlp.shared_experts.down_proj.weight", "layers.{l}.mlp.shared.down"),
+    ([
+        "model.layers.{l}.mlp.experts.{e}.gate_proj.weight",
+        "model.layers.{l}.mlp.experts.{e}.up_proj.weight",
+    ], "layers.{l}.mlp.gate_up"),
+    ("model.layers.{l}.mlp.experts.{e}.down_proj.weight", "layers.{l}.mlp.down"),
+]
+
+# The forward of GLM-4.5 / 4.6 / 4.7: pre-norm layers of grouped-query
+# attention, q, k and v biased, q and k RMS-normed per head where the model
+# has the norms, and the first half of each head rotated (neox halves); then
+# a SwiGLU MLP on the first layers, and on the rest the shared expert plus
+# the routed experts a biased sigmoid picks, their weights renormalized and
+# scaled. A row with an adapter adds its LoRA correction to the attention's
+# output.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    for w in m.layers:
+        c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
+
+def forward(m, inputs):
+    positions = inputs.positions()
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
+        o = attention(x, inputs, m, positions, w)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
+        return ops.elemwise.residual_add(mlp(x, w.mlp), y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def mlp(x, f):
+    if not f.routed:
+        return ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
+            f.down,
+        )
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.sigmoid(renormalize = True, scaling = f.scaling),
+        bias = f.bias,
+    )
+
+    act = ops.linear.glu(ops.linear.matmul(x, f.shared.gate_up), gating.swiglu(), f.shared.inter)
+    shared = ops.linear.matmul(act, f.shared.down)
+    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
+    return ops.elemwise.residual_add(shared, routed)
+
+def attention(x, inputs, m, positions, w):
+    pages = inputs.kv(w.kv)
+    d = m.head_dim
+    q, k, v = ops.gather.split_qkv(
+        ops.elemwise.add_bias(w.qkv_bias, ops.linear.matmul(x, w.qkv)),
+        m.q_width,
+        m.kv_width,
+    )
+    seam.at(seam.ATTN_QV, [q, v])
+    if w.q_norm != None:
+        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
+        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
+    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.partial(m.rotary_dim), k = k)
+    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+    seam.at(seam.ATTN_Q, [q])
+
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, w.o)

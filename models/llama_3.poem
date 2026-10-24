@@ -1,0 +1,229 @@
+# Llama 3.1 and 3.3 (meta-llama/Llama-3.1-8B-Instruct, Llama-3.3-70B-Instruct):
+# full grouped-query attention in every layer over llama3-scaled rope, and a
+# SwiGLU MLP; as released (bf16), as NVIDIA's modelopt exports them (FP8 a
+# tensor, run as 128-square blocks against e4m3 activations; NVFP4), and the
+# 70B's four-layer miniature, which reads the first four layers of the whole
+# model's checkpoint at its full width.
+
+load("//pie/codec.poem", "mapped")
+load("//lib/adapters.poem", "banks")
+
+LLAMA = template("llama")
+TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
+
+def llama(id, layers, mini = False):
+    return model(id, mini = mini, template = LLAMA, tokenizer = TOKENIZER, arch = "llama", layers = layers, vocab = 128256)
+
+MODELS = [
+    llama("llama31-8b", layers = 32),
+    llama("llama33-70b", layers = 80),
+    llama("llama33-70b-mini-l4", layers = 4, mini = True),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+F8 = dtype.e4m3tile128a8
+NV4W = dtype.nvfp4
+E4M3 = dtype.e4m3
+
+DEPLOYMENTS = [
+    deployment("llama31-8b", weights = BF, kv = BF),
+    deployment("llama31-8b", weights = BF, kv = E4M3),
+    # modelopt's FP8 export (`nvidia/Llama-3.1-8B-Instruct-FP8`), its one
+    # scale a projection as every 128-square block's factor, against e4m3
+    # activations, with the e4m3 cache vLLM serves it with.
+    deployment("llama31-8b", weights = F8, kv = E4M3),
+    deployment("llama31-8b", weights = F8, kv = BF),
+    # modelopt's NVFP4 export against bf16 activations.
+    deployment("llama31-8b", weights = NV4W, kv = E4M3),
+    deployment("llama31-8b", weights = U4, kv = BF),
+    deployment("llama33-70b", weights = BF, kv = BF),
+    deployment("llama33-70b", weights = F8, kv = E4M3),
+    deployment("llama33-70b", weights = NV4W, kv = E4M3),
+    deployment("llama33-70b", weights = U4, kv = BF),
+    deployment("llama33-70b-mini-l4", weights = BF, kv = BF),
+    deployment("llama33-70b-mini-l4", weights = F8, kv = E4M3),
+]
+
+# The weights of Llama 3.1 / 3.3: per layer an RMS norm, q, k and v packed
+# into one projection and the output projection, an RMS norm and a SwiGLU MLP;
+# the token embedding, a final norm and the head. The projections are stored
+# at the deployment's one dtype; the norms, the embedding and the head stay
+# bf16 under a release's FP8 or NVFP4 (modelopt leaves the head bf16), or take
+# the projections' u4 where the deployment quantizes a bf16 release. Each
+# layer also has the LoRA banks the host registers.
+
+def dims(hidden, layers, q_heads, inter):
+    return struct(
+        hidden = hidden,
+        layers = layers,
+        q_heads = q_heads,
+        kv_heads = 8,
+        inter = inter,
+        head_dim = 128,
+        vocab = 128256,
+        theta = 500000.0,
+        # rope_scaling: rope_type "llama3".
+        rope_factor = 8.0,
+        rope_low_freq_factor = 1.0,
+        rope_high_freq_factor = 4.0,
+        rope_original_max_position = 8192,
+        norm_eps = 1e-5,
+    )
+
+DIMS = {
+    "llama31-8b": dims(hidden = 4096, layers = 32, q_heads = 32, inter = 14336),
+    "llama33-70b": dims(hidden = 8192, layers = 80, q_heads = 64, inter = 28672),
+    "llama33-70b-mini-l4": dims(hidden = 8192, layers = 4, q_heads = 64, inter = 28672),
+}
+
+# A release whose projections a deployment keeps as released, its tables bf16.
+RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4]
+
+def layout(id, deploy):
+    if deploy.drafter != None or deploy.parts:
+        fail("{} ships no drafter and no parts".format(id))
+    proj = roles(deploy, "proj", exact = True).proj
+    table = dtype.bf16 if proj in RELEASED else proj
+    dense = compute(table)
+    d = DIMS[id]
+    hidden, hd = d.hidden, d.head_dim
+    q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
+
+    def layer(l):
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        return struct(
+            attn_norm = weight([hidden]),
+            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            o = weight([hidden, q_width], proj).rows(),
+            mlp_norm = weight([hidden]),
+            gate_up = weight([2 * d.inter, hidden], proj).packed([d.inter, d.inter]),
+            down = weight([hidden, d.inter], proj).rows(),
+            kv = "kv.{}".format(l),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        q_width = q_width,
+        kv_width = kv_width,
+        inter = d.inter,
+        theta = d.theta,
+        rope = struct(
+            factor = d.rope_factor,
+            low_freq_factor = d.rope_low_freq_factor,
+            high_freq_factor = d.rope_high_freq_factor,
+            original_max_position = d.rope_original_max_position,
+        ),
+        eps = d.norm_eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden], table),
+        head = weight([d.vocab, hidden], table).columns(),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+    )
+
+# How a Llama 3.1 / 3.3 checkpoint is read: transformers' safetensors under
+# `model.`, as released (bf16) or as modelopt exports it (FP8 e4m3 codes
+# under one scale a projection, read as 128-square block factors; NVFP4),
+# checked against its config.
+
+def configured(m):
+    return [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("num_hidden_layers", len(m.layers)),
+        config("intermediate_size", m.inter),
+        config("rms_norm_eps", m.eps),
+        config("rope_theta", m.theta),
+        config("rope_scaling.factor", m.rope.factor),
+        config("rope_scaling.low_freq_factor", m.rope.low_freq_factor),
+        config("rope_scaling.high_freq_factor", m.rope.high_freq_factor),
+        config("rope_scaling.original_max_position_embeddings", m.rope.original_max_position),
+    ]
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("model.embed_tokens.weight") and has("model.layers.0.self_attn.q_proj.weight") and not has("model.layers.0.self_attn.q_norm.weight"),
+        read = lambda reads: mapped(reads, m, TRANSFORMERS),
+        states = configured(m),
+    )]
+
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.weight",
+        "model.layers.{l}.self_attn.k_proj.weight",
+        "model.layers.{l}.self_attn.v_proj.weight",
+    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.down"),
+]
+
+# The forward of Llama 3.1 / 3.3: pre-norm layers of full grouped-query
+# attention, q and k rotated in full (neox halves) at llama3-scaled
+# frequencies, and a SwiGLU MLP. A row with an adapter adds its LoRA
+# correction to the attention's output.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    for w in m.layers:
+        c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
+
+def forward(m, inputs):
+    positions = inputs.positions()
+    scaling = rope_scaling({
+        "rope_type": "llama3",
+        "factor": m.rope.factor,
+        "low_freq_factor": m.rope.low_freq_factor,
+        "high_freq_factor": m.rope.high_freq_factor,
+        "original_max_position_embeddings": m.rope.original_max_position,
+    })
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
+        o = attention(x, inputs, m, positions, scaling, w)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), m.inter),
+            w.down,
+        )
+        return ops.elemwise.residual_add(f, y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def attention(x, inputs, m, positions, scaling, w):
+    pages = inputs.kv(w.kv)
+    d = m.head_dim
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    seam.at(seam.ATTN_QV, [q, v])
+    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
+    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+    seam.at(seam.ATTN_Q, [q])
+
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, w.o)
