@@ -50,6 +50,7 @@ flags! {
     MoeSelectGlu = "fuse.moe_select_glu" => "fused.moe_select_glu",
     MatmulSoftcap = "fuse.matmul_softcap" => "fused.matmul_softcap",
     MatmulBias = "fuse.matmul_bias" => "fused.matmul_bias",
+    MatmulMoeRoute = "fuse.matmul_moe_route" => "fused.matmul_moe_route",
     MatmulSplitRows = "fuse.matmul_split_rows" => "fused.matmul_split_rows",
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "fused.gated_residual_norm_modulate",
     NormModulate = "fuse.norm_modulate" => "fused.norm_modulate",

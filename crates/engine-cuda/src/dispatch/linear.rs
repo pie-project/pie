@@ -260,6 +260,87 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            Fused::MatmulMoeRoute {
+                act,
+                w,
+                bias,
+                scale,
+                hint,
+                experts,
+                top_k,
+                score,
+                logits,
+                routes,
+                weights,
+            } => {
+                // One launch lands the routes and weights from the product's
+                // sums, the logits never written; where it declines (not a
+                // tcgen05 chip, a router past what it stages), the two run
+                // apart over the logits.
+                if self.tensor(*act).dtype == Dtype::Bf16 && self.dense_weight(*w) {
+                    let gate = match *score {
+                        poem_ir::RouteScore::Softmax => Some(linear::moe::GateScore::Softmax {
+                            gain: scale.map(|s| self.tensor(s)),
+                        }),
+                        poem_ir::RouteScore::Sigmoid {
+                            renormalize,
+                            scaling,
+                        } => Some(linear::moe::GateScore::Sigmoid {
+                            bias: bias.map(|b| self.tensor(b)),
+                            renormalize,
+                            scaling,
+                        }),
+                        poem_ir::RouteScore::SqrtSoftplus {
+                            renormalize,
+                            scaling,
+                        } => bias.map(|b| linear::moe::GateScore::SqrtSoftplus {
+                            bias: self.tensor(b),
+                            renormalize,
+                            scaling,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(score) = gate
+                        && linear::moe::gate(
+                            self.ctx(),
+                            self.tensor(*act),
+                            self.tensor(*w),
+                            linear::moe::Gate {
+                                experts: *experts,
+                                top_k: *top_k,
+                                logits: self.tensor(*logits).dtype,
+                                score,
+                            },
+                            &mut self.tensor(*routes),
+                            &mut self.tensor(*weights),
+                        )?
+                    {
+                        return Ok(());
+                    }
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *logits,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
+                })?;
+                self.linear(&Linear::MoeRoute {
+                    ids: None,
+                    table: None,
+                    logits: *logits,
+                    bias: *bias,
+                    scale: *scale,
+                    hint: *hint,
+                    experts: *experts,
+                    top_k: *top_k,
+                    score: *score,
+                    routes: *routes,
+                    weights: *weights,
+                })
+            }
             Fused::MatmulSplitRows {
                 act,
                 w,

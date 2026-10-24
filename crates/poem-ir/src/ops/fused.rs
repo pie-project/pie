@@ -4,7 +4,7 @@ use crate::Op;
 use crate::operands::Part;
 use crate::ops::attn::Attn;
 use crate::ops::elemwise::{Elemwise, ModulateForm, Turn, Yarn};
-use crate::ops::linear::{GluAct, Linear};
+use crate::ops::linear::{GluAct, Linear, RouteScore};
 use crate::value::ValueId;
 
 /// The norm a [`Fused::RmsnormResidualAdd`] also lands over its last row:
@@ -405,6 +405,32 @@ pub enum Fused {
         y: ValueId,
         #[output(alias = y)]
         y_out: ValueId,
+    },
+    /// A router's product (a `Matmul` into `logits`) and the top-k it feeds
+    /// (a `MoeRoute` of `experts` under `score`, `bias`, `scale` and `hint`
+    /// as it states them): a backend may land the routes and weights
+    /// straight from the product's sums, or run the two. `logits` is still
+    /// an output, read by nothing else.
+    MatmulMoeRoute {
+        #[input]
+        act: ValueId,
+        #[input]
+        w: ValueId,
+        #[input]
+        bias: Option<ValueId>,
+        #[input]
+        scale: Option<ValueId>,
+        #[input]
+        hint: Option<ValueId>,
+        experts: u32,
+        top_k: u32,
+        score: RouteScore,
+        #[output]
+        logits: ValueId,
+        #[output(I32)]
+        routes: ValueId,
+        #[output(F32)]
+        weights: ValueId,
     },
     /// A projection whose rows are cut at `width` straight after: a backend
     /// may land each side from its own slice of the weight, or run the

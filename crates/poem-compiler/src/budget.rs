@@ -243,6 +243,7 @@ impl FamilyCosts {
                 | poem_ir::Fused::MatmulSwigluMatmul { .. }
                 | poem_ir::Fused::MatmulSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. }
+                | poem_ir::Fused::MatmulMoeRoute { .. }
                 | poem_ir::Fused::MatmulSplitRows { .. }
                 | poem_ir::Fused::MoeSelectGlu { .. }
                 | poem_ir::Fused::MoeExperts { .. } => self.linear,
