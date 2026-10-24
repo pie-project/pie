@@ -175,74 +175,7 @@ fn every_moe_row_dispatches_every_layer() {
             "`{}`: every MoE layer dispatches",
             row.name
         );
-        let idle = poem_compiler::expert::idle(&trace)
-            .unwrap_or_else(|| panic!("`{}` has an idle program", row.name));
-        poem_ir::check::check(&idle)
-            .unwrap_or_else(|faults| panic!("`{}` idle: {faults:?}", row.name));
     }
     assert!(moe > 0, "the catalog lists MoE rows");
 }
 
-/// An idle rank runs each layer's dispatch, its experts and its combine,
-/// and nothing else: no attention, no cache, no route.
-#[test]
-fn an_idle_rank_runs_only_the_experts_it_holds() {
-    let catalog = poem_compiler::catalog::repository();
-    for row in ROWS {
-        let lowered = catalog
-            .parse(&format!("{row}-ep{EP}"))
-            .expect("parses")
-            .try_trace(Platform::Cuda)
-            .expect("lowers");
-        let idle = poem_compiler::expert::idle(&lowered)
-            .unwrap_or_else(|| panic!("`{row}-ep{EP}` has an idle program"));
-        poem_ir::check::check(&idle).unwrap_or_else(|faults| panic!("`{row}` idle: {faults:?}"));
-        assert!(idle.caches.is_empty() && idle.seams.is_empty());
-        let count =
-            |t: &Trace, f: &dyn Fn(&Operation) -> bool| t.nodes.iter().filter(|n| f(&n.op)).count();
-        let dispatch =
-            |op: &Operation| matches!(op, Operation::Collective(Collective::Dispatch { .. }));
-        let combine =
-            |op: &Operation| matches!(op, Operation::Collective(Collective::Combine { .. }));
-        assert_eq!(
-            count(&idle, &dispatch),
-            count(&lowered, &dispatch),
-            "`{row}`"
-        );
-        assert_eq!(count(&idle, &combine), count(&lowered, &combine), "`{row}`");
-        // The collectives in the order the lowered trace runs them.
-        let order = |t: &Trace| -> Vec<u32> {
-            t.nodes
-                .iter()
-                .filter_map(|n| match &n.op {
-                    Operation::Collective(Collective::Dispatch { layer, .. }) => Some(*layer),
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(order(&idle), order(&lowered), "`{row}`");
-        for node in &idle.nodes {
-            assert!(
-                matches!(
-                    node.op,
-                    Operation::Collective(_)
-                        | Operation::Linear(Linear::MoeSelect { .. } | Linear::Glu { .. })
-                        | Operation::Elemwise(_)
-                ),
-                "`{row}` idle runs {}",
-                node.op.name()
-            );
-        }
-        let idle_inputs = idle
-            .values
-            .iter()
-            .filter(|v| v.def == Def::Input(poem_ir::RuntimeInput::Idle))
-            .count();
-        assert!(
-            idle_inputs >= 2 * count(&idle, &dispatch),
-            "`{row}`: tokens and routes are idle rows"
-        );
-    }
-    let dense = poem_compiler::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16").expect("listed");
-    assert!(poem_compiler::expert::idle(&dense.trace(Platform::Cuda)).is_none());
-}

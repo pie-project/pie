@@ -424,7 +424,6 @@ impl<'c> Run<'c> {
             Def::Input(
                 which @ (RuntimeInput::Grid
                 | RuntimeInput::TokenGrid { .. }
-                | RuntimeInput::Idle
                 | RuntimeInput::Voxels { .. }
                 | RuntimeInput::RowPermutation { .. }
                 | RuntimeInput::Latents { .. }

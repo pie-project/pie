@@ -1552,9 +1552,6 @@ impl<'c> Run<'c> {
                 self.packing(at, *select).permutation
             }
             Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
-            Def::Input(RuntimeInput::Idle) => panic!(
-                "value {at} is an idle expert-parallel rank's row, which only an idle fire binds"
-            ),
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
                 self.voxel_seat(at).token_grid.unwrap_or_else(|| {
                     panic!(
