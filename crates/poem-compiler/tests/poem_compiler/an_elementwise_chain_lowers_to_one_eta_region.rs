@@ -265,8 +265,8 @@ fn no_region_lands_an_output_over_its_input() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Every catalog deployment, on CUDA, folded: each chain one op, and the
-/// trace still checks.
+/// Every catalog deployment, on CUDA, folded: each chain the row frame holds
+/// one op, and the trace still checks.
 #[test]
 fn every_folded_catalog_trace_checks() {
     let mut wrong: Vec<String> = Vec::new();
@@ -274,7 +274,14 @@ fn every_folded_catalog_trace_checks() {
         let t = row.trace(poem::Platform::Cuda);
         let (folded, bodies) = fold(t.clone());
         let ops = regions(&folded);
-        if ops.len() != chains(&t).len() {
+        let framed = chains(&t)
+            .into_iter()
+            .filter(|chain| {
+                chain.region.body().is_ok()
+                    && matches!(chain.region.width(), Ok(Some(w)) if poem_compiler::fuse::chain::frames(&t, chain, w))
+            })
+            .count();
+        if ops.len() != framed {
             wrong.push(format!("{}: a chain is not folded", row.name));
         }
         if ops.iter().any(|(_, _, body)| !bodies.contains_key(body)) {

@@ -98,6 +98,9 @@ pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Synth>) {
         let Ok(Some(width)) = chain.region.width() else {
             continue;
         };
+        if !frames(&trace, &chain, width) {
+            continue;
+        }
         folded.push((
             chain.nodes.clone(),
             Fused::Region {
@@ -116,6 +119,47 @@ pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Synth>) {
         return (trace, bodies);
     }
     (super::search::compact(replace(trace, folded)), bodies)
+}
+
+/// The widest row the frame holds in registers: a block of
+/// [`FRAME_BLOCK`] threads, [`FRAME_PER`] eight-wide runs a thread.
+pub const FRAME_BLOCK: u32 = 256;
+pub const FRAME_PER: u32 = 4;
+/// The planes a frame holds at most, read and written together, at its
+/// widest: each plane is [`FRAME_PER`] sixteen-byte runs a thread, and past
+/// five at the widest the row no longer stays in registers.
+pub const FRAME_PLANES: usize = 5;
+
+/// Whether the row frame a region's body runs in (`row_frame` in
+/// kernels-cuda's `elemwise/frame.cuh`) holds `chain`: every row it reads
+/// and writes bf16, the width a whole number of eight-wide runs within one
+/// block's registers, at most [`FRAME_PLANES`] planes each way. A chain the
+/// frame does not hold is never folded, so an engine never meets a region
+/// it cannot launch.
+#[must_use]
+pub fn frames(trace: &Trace, chain: &Chain, width: u32) -> bool {
+    let bf16 = |v: poem_ir::ValueId| {
+        matches!(
+            &trace.values[v.0 as usize].ty,
+            poem_ir::Ty::Tensor {
+                dtype: poem_ir::Dtype::Bf16,
+                ..
+            }
+        )
+    };
+    width % 8 == 0
+        && width <= FRAME_BLOCK * FRAME_PER * 8
+        && planes_fit(chain.ins.len() + chain.outs.len(), width)
+        && chain.ins.iter().all(|input| bf16(input.value))
+        && chain.outs.iter().all(|out| bf16(out.value))
+}
+
+/// Whether `planes` rows of `width` stay in a frame's registers: as many
+/// planes as [`FRAME_PLANES`] at the widest, more as the row narrows (the
+/// runs a thread holds scale with the width).
+fn planes_fit(planes: usize, width: u32) -> bool {
+    let per = width.div_ceil(FRAME_BLOCK * 8).max(1) as usize;
+    planes * per <= FRAME_PLANES * FRAME_PER as usize
 }
 
 /// `trace` with each run's ops replaced by its op, landed where the run
