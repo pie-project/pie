@@ -7,14 +7,14 @@
 //! asserts the per-width usage matches the fork's own counts from the reference
 //! oracle (`wiki/quantize-coding/bonsai-oracle.md` §6):
 //!
-//! * `prism.hadamard.signs.5120` × **130** — the residual-stream sites: the
+//! * `bonsai.hidden` (5120 wide) × **130** — the residual-stream sites: the
 //!   mixer input on all 64 blocks (`in_qkvz` / `attn_q`+`attn_k`), the FFN
 //!   `gate`+`up` input on all 64, the output head, and the token-embedding
 //!   inverse (1 signed pass) = 64 + 64 + 1 + 1.
-//! * `prism.hadamard.signs.6144` × **64** — `ssm_out` on the 48 GDN blocks plus
+//! * `bonsai.ssm` (6144 wide) × **64** — `ssm_out` on the 48 GDN blocks plus
 //!   `attn_output` (o-proj) on the 16 full-attention blocks (both have input
 //!   width `v_heads·v_dim` = `q_heads·head_dim` = 6144).
-//! * `prism.hadamard.signs.17408` × **64** — the FFN `down` input on all 64.
+//! * `bonsai.ffn_down` (17408 wide) × **64** — the FFN `down` input on all 64.
 //!
 //! Total signed = 258, matching the fork's 258 sign-multiply / H-matmul nodes.
 //! pie adds 2 EXTRA plain (unsigned) Hadamards: the token-embedding inverse is
@@ -30,22 +30,20 @@ use poem::{Def, Dtype, Elemwise, Linear, Operation, Platform, Trace, ValueId};
 use poem_compiler::catalog::trace_of;
 
 /// The width of the sign bank a Hadamard node references, or `None` for a plain
-/// (unsigned) Hadamard. Resolves the `signs` value to its registered param name
-/// `prism.hadamard.signs.<W>` and returns `<W>`.
+/// (unsigned) Hadamard: its param, one of the layout's `bonsai` sign banks, is
+/// `[1, W]`.
 fn signed_width(trace: &Trace, signs: Option<ValueId>) -> Option<u32> {
     let s = signs?;
     let Def::Weight(at) = trace.values[s.0 as usize].def else {
         panic!("a Hadamard's sign diagonal is a parameter bank, not a live value");
     };
-    let name = &trace.params[at as usize].name;
-    let width = name
-        .strip_prefix("prism.hadamard.signs.")
-        .unwrap_or_else(|| {
-            panic!("a rotated site reads `{name}`, not a `prism.hadamard.signs.<W>`")
-        })
-        .parse()
-        .unwrap_or_else(|_| panic!("`{name}` does not end in a width"));
-    Some(width)
+    let param = &trace.params[at as usize];
+    assert!(
+        param.name.starts_with("bonsai."),
+        "a rotated site reads `{}`, not one of the `bonsai` sign banks",
+        param.name
+    );
+    Some(u32::try_from(param.shape[1]).expect("a sign width fits u32"))
 }
 
 /// `(total hadamards, signed hadamards, per-width signed counts as (5120, 6144, 17408))`.
@@ -176,7 +174,7 @@ fn the_bonsai_flag_declares_three_width_keyed_sign_banks() {
         trace
             .params
             .iter()
-            .filter(|p| p.name.starts_with("prism.hadamard.signs."))
+            .filter(|p| p.name.starts_with("bonsai."))
             .cloned()
             .collect()
     };
@@ -197,7 +195,7 @@ fn the_bonsai_flag_declares_three_width_keyed_sign_banks() {
     for width in [5120u64, 6144, 17408] {
         let w = banks
             .iter()
-            .find(|w| w.name == format!("prism.hadamard.signs.{width}"))
+            .find(|w| w.shape == vec![1, width])
             .unwrap_or_else(|| panic!("no {width}-wide sign diagonal in {banks:?}"));
         assert_eq!(w.shape, vec![1, width]);
         // Declared in the activation compute dtype (bf16 for the Ptq1_0 serve),

@@ -131,8 +131,10 @@ impl Package {
             .heap()
             .access_owned_frozen_value(&self.required("layout")?);
         let heap = module.heap();
-        eval.eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[])
-            .map_err(error)
+        let m = eval
+            .eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[])
+            .map_err(error)?;
+        Ok(crate::star::paths::named(heap, m))
     }
 
     /// What `id`'s deployment `deploy` states of itself as a generative

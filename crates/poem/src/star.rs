@@ -13,10 +13,12 @@ mod manifest;
 mod ops;
 mod ops_by_hand;
 mod package;
+mod paths;
 mod run;
 mod values;
 
 pub use manifest::{Manifest, Model, Published, Template, Tokenizer, dtype_of, precision_of};
 pub use package::Package;
+pub use paths::renamed;
 pub use run::{Deploy, ImageSpec};
 pub use values::{precision_word, word};

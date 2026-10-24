@@ -18,6 +18,12 @@ entry once; a name a file only `load()`s is not its definition. `lib/`
 holds the helpers every package may load, as `//lib/…`; what a library
 defines is never a package's entry.
 
+A weight is named by where it sits in the struct `layout` returns:
+`layers.3.q` is the `q` of the fourth of `layers`, `head` the field `head`.
+That name is its parameter in the trace, its tensor in an artifact and what
+the host finds an adapter bank by (`layers.{l}.lora_a`). A weight reached
+at two paths is one weight, named by the first.
+
 How a release stores its quantized weights is the importer's, not a
 package's: `//pie/codec.poem`, which ships with pie, reads block FP8,
 per-channel FP8, MXFP8 and NVFP4 as the release stores them. A package's

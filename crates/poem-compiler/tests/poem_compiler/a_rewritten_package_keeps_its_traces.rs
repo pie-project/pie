@@ -28,7 +28,8 @@ fn a_rewritten_package_keeps_its_traces() {
     for deployment in all.filter(|d| packages.iter().any(|p| p == d.package.name())) {
         for platform in [Platform::Cuda, Platform::Metal] {
             let file = dir.join(format!("{}.{platform:?}.json", deployment.name));
-            let trace = match deployment.try_trace(platform) {
+            let (traced, renames) = poem::star::renamed(|| deployment.try_trace(platform));
+            let trace = match traced {
                 Ok(trace) => trace,
                 // A deployment its platform refuses has no trace to keep; one
                 // that traced before and does not now has changed.
@@ -42,8 +43,24 @@ fn a_rewritten_package_keeps_its_traces() {
                 Err(_) => continue,
             };
             if file.exists() {
-                let before: Trace = serde_json::from_slice(&std::fs::read(&file).expect("read"))
-                    .expect("a recorded trace");
+                let mut before: Trace =
+                    serde_json::from_slice(&std::fs::read(&file).expect("read"))
+                        .expect("a recorded trace");
+                // A weight now named by its path is the one recorded under
+                // its stated name, its planes beside it; the longest stated
+                // name a param's begins with is its weight's.
+                let mut renames = renames.clone();
+                renames.sort_by_key(|(stated, _)| std::cmp::Reverse(stated.len()));
+                for param in &mut before.params {
+                    for (stated, path) in &renames {
+                        if let Some(plane) = param.name.strip_prefix(stated.as_str())
+                            && (plane.is_empty() || plane.starts_with('.'))
+                        {
+                            param.name = format!("{path}{plane}");
+                            break;
+                        }
+                    }
+                }
                 match canon::difference(&before, &trace) {
                     None => held += 1,
                     Some(why) => differ.push(format!("{} on {platform:?}: {why}", deployment.name)),

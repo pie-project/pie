@@ -45,8 +45,12 @@ fn a_rewritten_format_keeps_its_contracts() {
         };
         let checkpoint = dir.file_name().expect("a name").to_string_lossy().to_string();
         let mut lines = Vec::new();
+        let mut renames: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
         for deployment in deployments().filter(|d| d.deploy.tp == 1) {
-            let said = match deployment.contract(&src, Platform::Cuda) {
+            let (read, renamed) = poem::star::renamed(|| deployment.contract(&src, Platform::Cuda));
+            renames.insert(deployment.name.clone(), renamed);
+            let said = match read {
                 Ok(contract) => match checkpoint::plan::compile(&metadata, &contract, target.clone()) {
                     Ok(_) => serde_json::to_string(&contract).expect("a contract serializes"),
                     Err(why) => format!("refused: no plan: {why}"),
@@ -77,9 +81,9 @@ fn a_rewritten_format_keeps_its_contracts() {
                 std::fs::write(&file, &now).expect("records");
                 recorded += 1;
             }
-            Ok(then) if shown(&then) == shown(&now) => held += 1,
+            Ok(then) if shown(&renaming(&then, &renames)) == shown(&renaming(&now, &Default::default())) => held += 1,
             Ok(then) => {
-                let (then, now) = (shown(&then), shown(&now));
+                let (then, now) = (shown(&renaming(&then, &renames)), shown(&renaming(&now, &Default::default())));
                 let (then, now): (Vec<&str>, Vec<&str>) =
                     (then.lines().collect(), now.lines().collect());
                 let moved: Vec<&str> = now
@@ -94,4 +98,52 @@ fn a_rewritten_format_keeps_its_contracts() {
     }
     println!("recorded {recorded}, held {held}, differ {}", differ.len());
     assert!(differ.is_empty(), "contracts moved:\n{}", differ.join("\n"));
+}
+
+/// The recorded `text` with each weight stated under a name now named by its
+/// path (`renames`): its tensors, the planes beside them and what reads them.
+fn renaming(
+    text: &str,
+    renames: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+) -> String {
+    fn walk(v: &mut serde_json::Value, key: Option<&str>, rename: &dyn Fn(&str) -> Option<String>) {
+        match v {
+            serde_json::Value::String(s) if matches!(key, Some("name" | "Out" | "of" | "zero_points")) => {
+                if let Some(new) = rename(s) {
+                    *s = new;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, key, rename);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (k, item) in fields.iter_mut() {
+                    walk(item, Some(k.as_str()), rename);
+                }
+            }
+            _ => {}
+        }
+    }
+    text.lines()
+        .map(|line| match line.split_once('\t') {
+            Some((deployment, json)) if json.starts_with('{') => {
+                let mut ours: Vec<&(String, String)> =
+                    renames.get(deployment).into_iter().flatten().collect();
+                ours.sort_by_key(|(stated, _)| std::cmp::Reverse(stated.len()));
+                let rename = |name: &str| -> Option<String> {
+                    ours.iter().find_map(|(stated, path)| {
+                        let plane = name.strip_prefix(stated.as_str())?;
+                        (plane.is_empty() || plane.starts_with('.')).then(|| format!("{path}{plane}"))
+                    })
+                };
+                let mut v: serde_json::Value = serde_json::from_str(json).expect("a recorded contract");
+                walk(&mut v, None, &rename);
+                format!("{deployment}\t{}", serde_json::to_string(&v).expect("serializes"))
+            }
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
