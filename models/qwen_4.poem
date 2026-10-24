@@ -131,6 +131,7 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = MERGE, mrope = True,
         prefix = "<|vision_start|>", placeholder = "<|image_pad|>", suffix = "<|vision_end|>",
+        frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
     ))
 
 def tower(size, out, dt):
