@@ -93,14 +93,14 @@ fn the_contract_reads_a_kv_head_once_per_group() {
             .clone()
     };
     // The one k and one v head each read by a group of two.
-    let src = || Expr::src(JOINED);
+    let kv = || Expr::src(JOINED);
     assert_eq!(
         read(JOINED),
         Expr::concat(
             0,
             vec![
-                src().slice(0, 0, 2 * 256).shard_among(0, 2),
-                src().slice(0, 2 * 256, 2 * 256).shard_among(0, 2),
+                kv().slice(0, 0, 2 * 256).shard_among(0, 2),
+                kv().slice(0, 2 * 256, 2 * 256).shard_among(0, 2),
             ]
         ),
     );
