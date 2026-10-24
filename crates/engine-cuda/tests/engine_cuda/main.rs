@@ -70,7 +70,6 @@ mod every_catalog_deployment_dispatches;
 mod every_diagnostic_is_a_word_the_boot_states;
 mod masked_axis;
 mod no_shell_reads_the_environment;
-mod peer_collectives_answer_what_every_rank_holds;
 mod routed_experts_stream;
 mod the_flux_2_vae_answers_the_reference;
 mod the_ltx_2_vae_answers_the_reference;

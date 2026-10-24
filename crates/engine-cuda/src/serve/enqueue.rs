@@ -196,6 +196,7 @@ impl Shell {
             device: &self.device,
             trace: &self.trace,
             compiled: &self.compiled,
+            ep: self.ep.as_ref(),
             weights: &self.weights,
             arena: &self.arena,
             pools: &mut self.pools,
@@ -258,6 +259,7 @@ struct FireCtx<'a> {
     device: &'a Context,
     trace: &'a Trace,
     compiled: &'a CompiledModel,
+    ep: Option<&'a crate::ep::EpRank>,
     weights: &'a Weights,
     arena: &'a Arena,
     pools: &'a mut Pools,
@@ -524,7 +526,10 @@ impl FireCtx<'_> {
             }
         }
 
-        let carve_rows = if p.bodied {
+        // Under expert parallelism the received rows are every rank's, at
+        // the bucket: every fire carves for them.
+        let received = !self.compiled.expert.is_empty();
+        let carve_rows = if p.bodied || received {
             u64::from(p.composition.bucket()).max(u64::from(rows))
         } else {
             u64::from(rows)
@@ -564,11 +569,11 @@ impl FireCtx<'_> {
             let until = self.compiled.streams.forked_until;
             until == 0 || p.composition.bucket() <= until
         };
-        let map = match &self.compiled.arena_forked {
-            Some(forked) if forks => forked,
-            _ => &self.compiled.arena,
+        let (map, forked) = match &self.compiled.arena_forked {
+            Some(forked) if forks => (forked, true),
+            _ => (&self.compiled.arena, false),
         };
-        let slots = self.arena.slots(
+        let mut slots = self.arena.slots(
             map,
             poem_compiler::FireRows {
                 tokens: carve_rows,
@@ -580,6 +585,10 @@ impl FireCtx<'_> {
                 readouts: p.readout_rows.len() as u64,
             },
         );
+        if let Some(ep) = self.ep {
+            ep.seats(forked)
+                .seat(ep.wire(), p.composition.bucket(), &mut slots);
+        }
         for land in &p.merge_lands {
             let Some(column) = slots.0[land.merge.0 as usize] else {
                 return Err(Fault::Unbound {
@@ -773,7 +782,7 @@ impl FireCtx<'_> {
             });
         let armed = kernels_cuda::Pad {
             rows: p.composition.rows(),
-            bucket: if self.pad {
+            bucket: if self.pad || !self.compiled.expert.is_empty() {
                 p.composition.bucket()
             } else {
                 p.composition.rows()
@@ -829,7 +838,9 @@ impl FireCtx<'_> {
         .ceilings(ceilings)
         .decoded_tiles(self.decoded_tiles)
         .unread(self.unread)
-        .tapping(self.tapping);
+        .tapping(self.tapping)
+        .expert(&self.compiled.expert)
+        .ep(self.ep);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }

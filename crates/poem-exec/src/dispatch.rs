@@ -41,6 +41,9 @@ pub trait DispatchConv {
 }
 
 pub trait DispatchProbe {
+    /// Before `node` dispatches.
+    fn enter(&mut self, _node: &Node) {}
+
     fn probe(&mut self, _node: &Node) {}
 }
 
@@ -57,6 +60,7 @@ pub trait Dispatch:
     + DispatchProbe
 {
     fn exec(&mut self, node: &Node) -> Result<(), KernelError> {
+        self.enter(node);
         let outcome = match &node.op {
             Operation::Attn(op) => DispatchAttn::dispatch(self, op),
             Operation::Linear(op) => DispatchLinear::dispatch(self, op),

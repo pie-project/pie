@@ -585,6 +585,16 @@ pub struct Run<'c> {
     /// The fire's taps, told of each node's layer as it is enqueued.
     tapping: Option<&'c crate::tap::Tapping>,
 
+    /// The values an expert region makes, by id (`CompiledModel::expert`).
+    expert: &'c [bool],
+
+    /// This rank's expert-parallel group, where the trace dispatches.
+    ep: Option<&'c crate::ep::EpRank>,
+
+    /// The node launching works on the received rows (an expert region's,
+    /// past its dispatch): its kernels see no window of this rank's.
+    received: Cell<bool>,
+
     /// Rows this walk quantized for the FP8 products, by value, staged
     /// window and context, with the region and hold they sit in: their codes
     /// and scales, for the later products of the same rows.
@@ -680,6 +690,9 @@ impl<'c> Run<'c> {
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
             tapping: None,
+            expert: &[],
+            ep: None,
+            received: Cell::new(false),
             #[cfg(feature = "rocm")]
             fp8_rows: Vec::new(),
             #[cfg(feature = "rocm")]
@@ -765,6 +778,47 @@ impl<'c> Run<'c> {
     pub fn tapping(mut self, tapping: Option<&'c crate::tap::Tapping>) -> Self {
         self.tapping = tapping;
         self
+    }
+
+    #[must_use]
+    pub fn expert(mut self, held: &'c [bool]) -> Self {
+        self.expert = held;
+        self
+    }
+
+    #[must_use]
+    pub fn ep(mut self, ep: Option<&'c crate::ep::EpRank>) -> Self {
+        self.ep = ep;
+        self
+    }
+
+    /// Notes whether `node` works on the received rows: it makes an expert
+    /// region's value and is not the dispatch that receives them (which
+    /// reads this rank's own live tokens).
+    pub(crate) fn enter(&self, node: &poem_ir::Node) {
+        use poem_ir::Operands;
+        if self.expert.is_empty() {
+            return;
+        }
+        let dispatch = matches!(
+            node.op,
+            poem_ir::Operation::Collective(poem_ir::Collective::Dispatch { .. })
+        );
+        let mut outs = Vec::new();
+        node.op.outputs(&mut outs);
+        let held = outs
+            .iter()
+            .any(|v| self.expert.get(v.0 as usize).copied().unwrap_or(false));
+        self.received.set(held && !dispatch);
+    }
+
+    pub(crate) fn ep_rank(&self) -> Option<&'c crate::ep::EpRank> {
+        self.ep
+    }
+
+    /// The step's token bucket, every rank's under expert parallelism.
+    pub(crate) fn bucket(&self) -> u32 {
+        self.ceilings.pad_on(poem_ir::RowAxis::Tokens).bucket
     }
 
     /// The walk has enqueued `node`.
@@ -1213,8 +1267,15 @@ impl<'c> Run<'c> {
                 n => self.side.get(n as usize - 1).copied().unwrap_or(self.ctx),
             },
         };
-        ctx.arm(self.here());
-        ctx.arm_stage(self.live_at());
+        // The received rows are every rank's, padding marked -1: neither
+        // this rank's window nor its pad says which are live.
+        if self.received.get() {
+            ctx.arm(Pad::default());
+            ctx.arm_stage(0);
+        } else {
+            ctx.arm(self.here());
+            ctx.arm_stage(self.live_at());
+        }
         let region = self.place.region.get();
         ctx.arm_region(region);
         ctx.arm_lane(self.place.lane.get());
@@ -1257,10 +1318,17 @@ impl<'c> Run<'c> {
         self.standing().lanes(self.windows, self.window().span())
     }
 
-    pub(crate) fn plane_fan(&self, plane_rows: u32) -> u32 {
-        let tokens = self
-            .carve_rows()
-            .unwrap_or_else(|| self.window().span().rows);
+    /// How many rows of `plane` (a value laid over token rows, a run of
+    /// them per token) one token takes. An expert region's value is laid
+    /// over every rank's tokens at the bucket.
+    pub(crate) fn plane_fan(&self, plane: ValueId) -> u32 {
+        let plane_rows = self.tensor(plane).rows;
+        let tokens = if self.expert.get(plane.0 as usize).copied().unwrap_or(false) {
+            self.bucket() * self.ep_rank().map_or(1, |ep| ep.wires.len() as u32)
+        } else {
+            self.carve_rows()
+                .unwrap_or_else(|| self.window().span().rows)
+        };
         if tokens == 0 {
             return 1;
         }
@@ -1358,6 +1426,9 @@ impl<'c> Run<'c> {
 
     fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
+        if self.expert.get(at).copied().unwrap_or(false) {
+            return self.received(at, handle);
+        }
         if self.window().gathered.is_some() {
             return self.compacted(id, handle);
         }
@@ -1425,6 +1496,27 @@ impl<'c> Run<'c> {
         Tensor::new(
             handle.ptr + u64::from(skip) * stride,
             keep.min(handle.rows.saturating_sub(skip)),
+            handle.width,
+            handle.dtype,
+        )
+    }
+
+    /// An expert region's value: the rows this rank received, every rank's
+    /// tokens at the step's bucket from the first, whatever this rank's own
+    /// window or walk. Its arena slot is carved at the bucket for it.
+    fn received(&self, at: usize, handle: Tensor) -> Tensor {
+        let Ty::Tensor { shape, .. } = &self.values[at].ty else {
+            return handle;
+        };
+        let times = match shape.first() {
+            Some(Dim::TokensTimes(k)) => *k,
+            Some(Dim::Tokens) => 1,
+            _ => return handle,
+        };
+        let bucket = self.ceilings.pad_on(poem_ir::RowAxis::Tokens).bucket;
+        Tensor::new(
+            handle.ptr,
+            (bucket * times).min(handle.rows),
             handle.width,
             handle.dtype,
         )

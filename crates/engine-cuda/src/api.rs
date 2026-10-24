@@ -49,7 +49,7 @@ pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
 }
 
-struct PendingStep {
+pub(crate) struct PendingStep {
     readout: Vec<Readout>,
     settled: crate::serve::Settled,
 }
@@ -67,7 +67,15 @@ pub struct Cuda {
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
     replay: Option<crate::replay::Replay>,
+    /// This rank's place in its expert-parallel group (`size` 1 outside
+    /// one): which experts' planes its banks load.
+    expert: World,
+    /// Run between a load's staging and its arming: an expert-parallel
+    /// group wires its ranks there, since arming fires their collectives.
+    before_arming: Option<BeforeArming>,
 }
+
+pub(crate) type BeforeArming = Box<dyn FnMut(&mut Shell) -> std::result::Result<(), String> + Send>;
 
 impl Cuda {
     #[must_use]
@@ -86,7 +94,19 @@ impl Cuda {
             pending: None,
             adapters: BTreeMap::new(),
             replay: None,
+            expert: World::default(),
+            before_arming: None,
         }
+    }
+
+    pub(crate) fn before_arming(&mut self, hook: BeforeArming) {
+        self.before_arming = Some(hook);
+    }
+
+    /// Places this engine at `rank` of an expert-parallel group of `size`,
+    /// before it loads.
+    pub(crate) fn set_expert_rank(&mut self, rank: u32, size: u32) {
+        self.expert = World { rank, size };
     }
 
     #[must_use]
@@ -186,6 +206,61 @@ impl Cuda {
             self.boot.world.rank,
             self.boot.world.size,
         )
+    }
+
+    /// A frame an expert-parallel rank brings to its group: validated, its
+    /// id minted, and the token bucket each of its steps needs. A step the
+    /// replay would split fires twice, which the group's other ranks would
+    /// not match: refused.
+    pub(crate) fn lockstep_frame(
+        &mut self,
+        frame: &FrameSubmission,
+    ) -> EngineResult<(FrameId, Vec<u32>)> {
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::Serves::NONE, engine::Serves::of),
+        )?;
+        if let Some(replay) = self.replay
+            && frame.steps.iter().any(|step| replay.split(step).is_some())
+        {
+            return Err(Error::Unsupported {
+                verb: "an encoder replay split under expert parallelism",
+                engine: "cuda",
+            });
+        }
+        let shell = self.loaded_mut()?;
+        let buckets = frame
+            .steps
+            .iter()
+            .map(|step| shell.bucket_for(step.rows()))
+            .collect::<Option<Vec<u32>>>()
+            .ok_or_else(|| Error::Invalid("a step wider than the widest bucket".into()))?;
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+        self.pending = None;
+        Ok((id, buckets))
+    }
+
+    /// Fires `step` at its group's `bucket`.
+    pub(crate) fn fire_step_at(
+        &mut self,
+        step: &Step,
+        at: engine::StepDone,
+        bucket: u32,
+    ) -> EngineResult<(FireTicket, PendingStep)> {
+        self.loaded_mut()?.at_bucket(bucket);
+        self.fire_step(step, at, true)
+    }
+
+    /// Fires a step with no lanes at the group's `bucket`.
+    pub(crate) fn fire_idle(&mut self, bucket: u32) -> EngineResult<()> {
+        self.loaded_mut()?.fire_idle(bucket).map_err(fault)
+    }
+
+    /// The steps of frame `id` its group fired, to settle as a frame.
+    pub(crate) fn adopt(&mut self, id: FrameId, settled: Vec<PendingStep>) {
+        self.pending = Some((id, settled));
     }
 
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
@@ -515,6 +590,20 @@ impl Engine for Cuda {
             frames_in_flight,
         } = request;
 
+        // A rank of an expert-parallel group of `size` holds part of a bank
+        // only in a trace lowered for that many ranks.
+        let size = self.expert.size;
+        if size > 1
+            && !trace
+                .params
+                .iter()
+                .any(|param| param.experts.is_some_and(|slots| slots.ep == size))
+        {
+            return Err(Error::Load(format!(
+                "this engine is a rank of an expert-parallel group of {size}, and its trace \
+                 holds no bank lowered for {size} ranks: load the deployment's `-ep{size}` trace"
+            )));
+        }
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
                 "the cuda shell lands a checkpoint or nothing runs; \
@@ -557,7 +646,7 @@ impl Engine for Cuda {
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);
         let budget = bake_budgets(&budgets, &trace);
-        let mut shell = Shell::load(Boot {
+        let mut staged = Shell::stage(Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
@@ -587,6 +676,10 @@ impl Engine for Cuda {
                 .map_or(core::ptr::null(), Arc::as_ptr),
         })
         .map_err(fault)?;
+        if let Some(hook) = self.before_arming.as_mut() {
+            hook(&mut staged.shell).map_err(Error::Load)?;
+        }
+        let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         let host_kv_pages = shell

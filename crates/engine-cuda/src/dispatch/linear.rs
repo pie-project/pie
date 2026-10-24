@@ -473,7 +473,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu(
                     self.ctx(),
                     self.tensor(*packed),
@@ -492,7 +492,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp(
                     self.ctx(),
                     self.tensor(*packed),
@@ -512,7 +512,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_alpha(
                     self.ctx(),
                     self.tensor(*packed),
@@ -533,7 +533,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_split_routed(
                     self.ctx(),
                     self.tensor(*gate),
@@ -554,7 +554,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 // Read back through e4m3 here, for the W4A8 select that
                 // would read it back.
                 #[cfg(feature = "cuda")]
@@ -603,7 +603,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_split(
                     self.ctx(),
                     self.tensor(*gate),
@@ -623,7 +623,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::geglu_tanh(
                     self.ctx(),
                     self.tensor(*gate),
@@ -633,11 +633,11 @@ impl Run<'_> {
                 )
             }
             Linear::GeluTanh { x, y } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
             Linear::Relu2 { x, y } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
             Linear::Glu {
@@ -650,7 +650,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::geglu_tanh_packed(
                     self.ctx(),
                     self.tensor(*packed),
@@ -669,7 +669,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Situ { beta, up_cap, .. },
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::situ(
                     self.ctx(),
                     self.tensor(*packed),

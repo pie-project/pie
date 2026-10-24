@@ -5,6 +5,7 @@ pub mod diag;
 mod enqueue;
 mod lanes;
 mod load;
+pub use load::Staged;
 mod prepare;
 mod segments;
 mod settle;
@@ -53,6 +54,12 @@ pub struct Shell {
     accounting: crate::store::Accounting,
     trace: Trace,
     compiled: CompiledModel,
+    /// This rank's part of an expert-parallel group, once the group wires
+    /// it after every rank has loaded.
+    ep: Option<crate::ep::EpRank>,
+    /// The token bucket the next fire composes at, where its group agreed
+    /// one: taken by that fire.
+    forced_bucket: Option<u32>,
     budget: Budget,
     patch_seat: Option<crate::inputs::PatchSeat>,
     mrope_seat: bool,
@@ -142,6 +149,96 @@ pub(crate) struct KvReport {
 }
 
 impl Shell {
+    /// Joins this rank to its expert-parallel group.
+    /// Joins an expert-parallel group as `ep`, its dispatch and combine
+    /// outputs seated on the rank's fixed buffers; refuses a trace that
+    /// reads one after its peers may write it again.
+    pub fn join_ep(&mut self, mut ep: crate::ep::EpRank) -> std::result::Result<(), String> {
+        ep.seat(
+            &self.trace,
+            &self.compiled.arena,
+            self.compiled.arena_forked.as_ref(),
+        )?;
+        self.ep = Some(ep);
+        Ok(())
+    }
+
+    /// The token bucket a fire of `rows` rows composes at, or `None` past
+    /// the widest.
+    #[must_use]
+    pub fn bucket_for(&self, rows: u32) -> Option<u32> {
+        let top = self.budget.buckets.last().copied()?;
+        (rows <= top).then(|| poem_exec::fire::rung_of(&self.budget.buckets, rows))
+    }
+
+    /// The next fire composes at token bucket `bucket`, the one its
+    /// expert-parallel group agreed for the step.
+    pub fn at_bucket(&mut self, bucket: u32) {
+        self.forced_bucket = Some(bucket);
+    }
+
+    /// An expert-parallel rank's step with no lanes of its own, at the
+    /// group's `bucket`: the walk runs only the dispatches, the experts over
+    /// the rows the other ranks send, and the combines.
+    pub fn fire_idle(&mut self, bucket: u32) -> Result<()> {
+        self.at_bucket(bucket);
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes: &[],
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        FrameShell::settle(self, enqueued)?;
+        Ok(())
+    }
+
+    /// What the trace dispatches, for wiring the group.
+    #[must_use]
+    pub fn ep_shape(&self) -> Option<crate::ep::Shape> {
+        use poem_ir::{Collective, Operation, Ty};
+        let width_bytes = |v: poem_ir::ValueId| match &self.trace.values[v.0 as usize].ty {
+            Ty::Tensor { shape, dtype } => shape.last().and_then(|d| match d {
+                poem_ir::Dim::Const(n) => Some(*n * dtype.bytes_ceil()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let mut layers = Vec::new();
+        let mut widest = crate::ep::Widest {
+            tokens: self.budget.max_tokens,
+            row_bytes: 0,
+            out_bytes: 0,
+            top_k: 0,
+        };
+        for node in &self.trace.nodes {
+            match &node.op {
+                Operation::Collective(Collective::Dispatch {
+                    x,
+                    experts,
+                    slots,
+                    top_k,
+                    layer,
+                    ..
+                }) => {
+                    layers.push((*layer, *experts, *slots));
+                    widest.row_bytes = widest.row_bytes.max(width_bytes(*x)?);
+                    widest.top_k = widest.top_k.max(*top_k);
+                }
+                Operation::Collective(Collective::Combine { y, top_k, .. }) => {
+                    widest.out_bytes = widest.out_bytes.max(width_bytes(*y)?);
+                    widest.top_k = widest.top_k.max(*top_k);
+                }
+                _ => {}
+            }
+        }
+        (!layers.is_empty()).then_some(crate::ep::Shape { layers, widest })
+    }
+
     /// Whether a lane may ask this load for a tap: it reads its layers out
     /// as they go, and someone is told what it read.
     #[must_use]

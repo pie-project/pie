@@ -30,6 +30,7 @@ fn values(bytes: &[u8]) -> Vec<f32> {
 /// out. One message spans more than one stage, so the chunking is exercised.
 #[test]
 fn peer_collectives_answer_what_every_rank_holds() {
+    let _alone = crate::alone();
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
         return;

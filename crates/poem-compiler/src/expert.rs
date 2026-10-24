@@ -455,3 +455,32 @@ impl Pass {
         self.trace.nodes = nodes;
     }
 }
+
+/// Which values an expert region makes, by id: every Dispatch output and
+/// what is computed from one up to its Combine (whose output is the
+/// model's again). They are the received rows' values, `ep * tokens` rows
+/// on any rank whatever its own tokens. Empty where nothing dispatches.
+#[must_use]
+pub fn held(trace: &Trace) -> Vec<bool> {
+    let mut held = vec![false; trace.values.len()];
+    let (mut ins, mut outs) = (Vec::new(), Vec::new());
+    let mut any = false;
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        let inside = match &node.op {
+            Operation::Collective(Collective::Dispatch { .. }) => true,
+            Operation::Collective(Collective::Combine { .. }) => false,
+            _ => ins.iter().any(|v| held[v.0 as usize]),
+        };
+        if inside {
+            any = true;
+            outs.clear();
+            node.op.outputs(&mut outs);
+            for v in &outs {
+                held[v.0 as usize] = true;
+            }
+        }
+    }
+    if any { held } else { Vec::new() }
+}

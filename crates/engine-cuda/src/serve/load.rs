@@ -510,6 +510,14 @@ fn score_heads(trace: &poem_ir::Trace, exports: &Exports) -> u32 {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        Self::stage(boot)?.finish()
+    }
+
+    /// A load up to its bodies: weights, arena, inputs and cache rows down,
+    /// nothing fired. [`Staged::finish`] arms the bodies; an expert-parallel
+    /// group wires its ranks between the two, since arming fires their
+    /// collectives.
+    pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
         let Baked {
             mut device,
@@ -892,6 +900,8 @@ impl Shell {
             accounting,
             trace: boot.trace,
             compiled,
+            ep: None,
+            forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
             patch_seat,
@@ -1070,25 +1080,7 @@ impl Shell {
                     .join("/"),
             );
         }
-        let footprint = |shell: &Shell| Footprint {
-            total: device_total,
-            before: device_total.saturating_sub(free_before),
-            weights: shell.weights.bytes(),
-            arena: shell.arena.bytes(),
-            inputs: shell.inputs.bytes(),
-            buffers: shell.buffer_bytes(),
-            readout: shell.readout_rows.bytes() as u64,
-            scores: shell
-                .scores
-                .as_ref()
-                .map_or(0, crate::scores::Scores::bytes),
-            cache_rows: shell.pools.committed_bytes(),
-            bodies: shell.cache.body_stats().census.bytes as u64,
-            scratch: kernels_cuda::jit::Slabs::census()
-                .iter()
-                .map(|(_, bytes)| *bytes as u64)
-                .sum(),
-        };
+        let footprint = |shell: &Shell| footprint(shell, device_total, free_before);
         let bodies = if shell.records_bodies() {
             shell.bodies_mem as u64
         } else {
@@ -1139,16 +1131,48 @@ impl Shell {
             );
             shell.held.truncate(fitted.slots as usize);
         }
-        if boot.knobs.diagnostics.arm_trace {
+        Ok(Staged {
+            shell,
+            held_for_fires,
+            rank: boot.world.rank,
+            arm_trace: boot.knobs.diagnostics.arm_trace,
+            device_total,
+            free_before,
+        })
+    }
+}
+
+/// A shell whose load stopped short of arming its bodies ([`Shell::stage`]).
+pub struct Staged {
+    pub shell: Shell,
+    held_for_fires: u64,
+    rank: u32,
+    arm_trace: bool,
+    device_total: u64,
+    free_before: u64,
+}
+
+impl Staged {
+    /// Arms the bodies and fits the cache rows to what the card has left.
+    pub fn finish(self) -> Result<Shell> {
+        let Staged {
+            mut shell,
+            held_for_fires,
+            rank,
+            arm_trace,
+            device_total,
+            free_before,
+        } = self;
+        if arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         shell.arm_bodies()?;
-        let resident = footprint(&shell);
+        let resident = footprint(&shell, device_total, free_before);
         let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
-        if boot.knobs.diagnostics.arm_trace {
+        if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
                  context) of the {} MiB the card hands out for them ({resident})",
@@ -1158,7 +1182,7 @@ impl Shell {
                 fitted.room >> 20,
             );
         }
-        if boot.world.rank != 0 {
+        if rank != 0 {
             shell.programs.set_shadow(true);
         }
         // Only a warm fire waits on the device, and a load whose bodies were
@@ -1177,6 +1201,28 @@ impl Shell {
             )
         })?;
         Ok(shell)
+    }
+}
+
+fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
+    Footprint {
+        total: device_total,
+        before: device_total.saturating_sub(free_before),
+        weights: shell.weights.bytes(),
+        arena: shell.arena.bytes(),
+        inputs: shell.inputs.bytes(),
+        buffers: shell.buffer_bytes(),
+        readout: shell.readout_rows.bytes() as u64,
+        scores: shell
+            .scores
+            .as_ref()
+            .map_or(0, crate::scores::Scores::bytes),
+        cache_rows: shell.pools.committed_bytes(),
+        bodies: shell.cache.body_stats().census.bytes as u64,
+        scratch: kernels_cuda::jit::Slabs::census()
+            .iter()
+            .map(|(_, bytes)| *bytes as u64)
+            .sum(),
     }
 }
 
