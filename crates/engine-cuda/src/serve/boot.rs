@@ -74,6 +74,10 @@ pub struct Knobs {
     /// the last `expert_load_window` steps (none: as many as it waits).
     pub expert_rebalance_steps: Option<u32>,
     pub expert_load_window: Option<u32>,
+    /// An expert-parallel group's balance report: every this many steps
+    /// (none or 0, never) it reads its loads and prints each MoE layer's
+    /// `[expert-balance]` since the last read.
+    pub expert_balance_steps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

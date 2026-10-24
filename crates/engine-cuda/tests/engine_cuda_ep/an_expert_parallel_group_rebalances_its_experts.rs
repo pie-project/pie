@@ -1,15 +1,16 @@
 #![cfg(feature = "cuda")]
 
-//! An expert-parallel group that rebalances before every step, over the
-//! last step's loads: the experts its random router favours move between
-//! the ranks, their planes copied slot to slot and every rank's table
-//! rewritten, and each rank still answers what one engine holding every
-//! expert answers, with no slot past the experts and with a replica slot
-//! a rank.
+//! An expert-parallel group that rebalances before every step but the
+//! first, over the last step's loads: the experts its random router favours
+//! move between the ranks, their planes copied slot to slot and every
+//! rank's table rewritten, and each rank still answers what one engine
+//! holding every expert answers, with no slot past the experts and with a
+//! replica slot a rank. The window a rebalance read holds its step's rows.
 
 use engine::Engine;
 use engine_cuda::DeviceBoot;
 use poem::{Dtype, Platform, Request};
+use poem_ir::{Collective, Operation};
 
 use crate::micro::{MICRO, RANKS, answer, checkpoint, close, contract_for, prompt, request, step};
 
@@ -85,5 +86,23 @@ fn check(replicas: u32) {
         "the router's skew moved no expert ({replicas} replicas)"
     );
     eprintln!("{moved} slot copies across the rounds, {replicas} replicas");
+    // The last rebalance read one step's loads: rank 0's prompt's routes.
+    let top_k = (lowered.nodes.iter())
+        .find_map(|node| match node.op {
+            Operation::Collective(Collective::Dispatch { top_k, .. }) => Some(top_k),
+            _ => None,
+        })
+        .expect("the micro dispatches");
+    let balance = ranks[1].expert_balance();
+    assert!(!balance.is_empty(), "the rebalances read the loads");
+    for b in balance {
+        assert_eq!(b.steps, 1, "layer {}: one step a window", b.layer);
+        assert_eq!(
+            b.rows(),
+            prompts[0].len() as u64 * u64::from(top_k),
+            "layer {}: the step's routes",
+            b.layer
+        );
+    }
     drop(dir);
 }

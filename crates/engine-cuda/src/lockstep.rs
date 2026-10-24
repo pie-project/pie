@@ -192,6 +192,21 @@ impl<F, R> Rendezvous<F, R> {
         self.changed.notify_all();
     }
 
+    /// Runs `verb` between two steps: once every formed step has finished,
+    /// and before the next forms.
+    pub fn between<T>(&self, verb: impl FnOnce() -> T) -> Result<T, String> {
+        let mut s = self.lock();
+        loop {
+            if let Some(why) = &s.poisoned {
+                return Err(why.clone());
+            }
+            if s.fired == s.open {
+                return Ok(verb());
+            }
+            s = self.changed.wait(s).expect("lockstep state lock poisoned");
+        }
+    }
+
     /// The group stops: every waiting and later arrival answers `why`.
     pub fn poison(&self, why: &str) {
         let mut s = self.lock();
@@ -220,7 +235,7 @@ struct Group {
     wired: Mutex<(usize, Option<Result<(), String>>)>,
     wired_cv: Condvar,
     firing: Firing,
-    rebalancer: Option<Mutex<crate::ep::rebalance::Rebalancer>>,
+    rebalancer: Mutex<crate::ep::rebalance::Rebalancer>,
 }
 
 /// What a rank's thread fires: its frame's step, or an idle step.
@@ -406,9 +421,9 @@ impl Group {
     }
 
     /// Fires `formed` on every rank at once, each on its own thread, the
-    /// group rebalanced first when it is due.
+    /// group's loads read (and its experts rebalanced) first when it is due.
     fn fire(&self, formed: Formed<(Step, engine::StepDone)>) -> Vec<Option<Fired>> {
-        if let Some(why) = self.rebalance().err() {
+        if let Some(why) = self.boundary().err() {
             self.poison(&why);
             let refused = |_| Some(Err(Error::Device(why.clone())));
             return (0..self.ranks.len()).map(refused).collect();
@@ -449,18 +464,34 @@ impl Group {
 }
 
 impl Group {
-    /// Rebalances the group's experts when it is due, before the step's
-    /// launches: every rank's work finished first, the leader's thread
-    /// running the copies on rank 0's device. A failure leaves the planes
-    /// and the tables apart, so the group stops.
-    fn rebalance(&self) -> Result<(), String> {
-        let Some(rebalancer) = &self.rebalancer else {
+    /// Does what the boundary before a step is due, before its launches:
+    /// the loads arming left dropped before the first, read (and the
+    /// experts rebalanced on them) at the knobs' periods. A failure leaves
+    /// the planes and the tables apart, so the group stops.
+    fn boundary(&self) -> Result<(), String> {
+        let mut rebalancer = self
+            .rebalancer
+            .lock()
+            .expect("lockstep rebalance lock poisoned");
+        let Some(due) = rebalancer.due() else {
             return Ok(());
         };
-        let mut rebalancer = rebalancer.lock().expect("lockstep rebalance lock poisoned");
-        if !rebalancer.due() {
-            return Ok(());
-        }
+        self.quiesced(|ranks, stream| rebalancer.run(due, ranks, stream))
+            .map(|_| ())
+            .map_err(|why| format!("the expert loads' boundary failed: {why}"))
+    }
+
+    /// Runs `verb` over every rank's expert-parallel state, every rank's
+    /// work finished first, this thread bound to rank 0's device and
+    /// handed its compute stream. Only between two steps: a rank synced
+    /// while a peer has not launched its part of a step waits forever.
+    fn quiesced<T>(
+        &self,
+        verb: impl FnOnce(
+            &mut [&mut crate::ep::EpRank],
+            *mut core::ffi::c_void,
+        ) -> crate::error::Result<T>,
+    ) -> Result<T, String> {
         let mut cudas: Vec<_> = self
             .ranks
             .iter()
@@ -480,10 +511,7 @@ impl Group {
         crate::device::ctx::bind_thread(self.ordinals[0]).map_err(|f| f.to_string())?;
         let stream = views[0].1;
         let mut ranks: Vec<&mut crate::ep::EpRank> = views.into_iter().map(|(ep, _)| ep).collect();
-        rebalancer
-            .run(&mut ranks, stream)
-            .map(|_| ())
-            .map_err(|f| format!("the expert rebalance failed: {f}"))
+        verb(&mut ranks, stream).map_err(|f| f.to_string())
     }
 }
 
@@ -515,6 +543,7 @@ pub fn open_lockstep(
             window: knobs.expert_load_window.unwrap_or(every).max(every),
         }
     });
+    let report = knobs.expert_balance_steps.unwrap_or(0);
     let mut ranks = Vec::with_capacity(size);
     for (rank, boot) in boots.into_iter().enumerate() {
         let mut cuda = crate::boot::open(boot, contract_for)?;
@@ -522,7 +551,7 @@ pub fn open_lockstep(
         ranks.push(Arc::new(Mutex::new(cuda)));
     }
     let firing = Firing::start(&ranks, &ordinals)?;
-    let rebalancer = rebalance.map(|knob| Mutex::new(crate::ep::rebalance::Rebalancer::new(knob)));
+    let rebalancer = Mutex::new(crate::ep::rebalance::Rebalancer::new(rebalance, report));
     let group = Arc::new(Group {
         ranks,
         ordinals,
@@ -565,9 +594,52 @@ impl Rank {
     /// The slot copies the group's rebalances made since load.
     #[must_use]
     pub fn moved_experts(&self) -> u64 {
-        self.group.rebalancer.as_ref().map_or(0, |r| {
-            r.lock().expect("lockstep rebalance lock poisoned").moved()
+        self.rebalancer().moved()
+    }
+
+    /// Each MoE layer's balance over the window the group's last read of
+    /// its loads closed (a rebalance, a report, or
+    /// [`Rank::read_expert_balance`]); empty before the first.
+    #[must_use]
+    pub fn expert_balance(&self) -> Vec<crate::ep::rebalance::LayerBalance> {
+        self.rebalancer().balance().to_vec()
+    }
+
+    /// Reads the group's loads now, between two steps (it waits for the
+    /// one firing): each layer's balance since the last read.
+    pub fn read_expert_balance(&self) -> EngineResult<Vec<crate::ep::rebalance::LayerBalance>> {
+        let group = &self.group;
+        let read = group.steps.between(|| {
+            let mut rebalancer = self.rebalancer();
+            group.quiesced(|ranks, _| rebalancer.read(ranks).map(<[_]>::to_vec))
+        });
+        match read {
+            Ok(Ok(balance)) => Ok(balance),
+            Ok(Err(why)) | Err(why) => Err(Error::Device(format!(
+                "the expert balance read failed: {why}"
+            ))),
+        }
+    }
+
+    /// This rank's fires on its device by token bucket, its own steps and
+    /// its idle ones, under `fire-timing` (none without it). Waits for
+    /// nothing: a fire the device has not passed is not in it yet.
+    pub fn fire_times(
+        &self,
+    ) -> EngineResult<Option<std::collections::BTreeMap<u32, crate::serve::timing::FireTime>>> {
+        self.with(|cuda| {
+            let shell = cuda
+                .shell_mut()
+                .ok_or_else(|| Error::Load("this rank has no model loaded".into()))?;
+            let times = shell
+                .fire_times()
+                .map_err(|f| Error::Device(f.to_string()))?;
+            Ok(times.cloned())
         })
+    }
+
+    fn rebalancer(&self) -> MutexGuard<'_, crate::ep::rebalance::Rebalancer> {
+        (self.group.rebalancer.lock()).expect("lockstep rebalance lock poisoned")
     }
 
     fn cuda(&self) -> EngineResult<std::sync::MutexGuard<'_, Cuda>> {
@@ -777,6 +849,7 @@ impl Engine for Rank {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering::SeqCst;
     use std::thread;
 
     fn lead_or_join(r: &Rendezvous<u32, u32>, rank: usize, frame: u32, bucket: u32) -> u32 {
@@ -898,6 +971,34 @@ mod tests {
             let want: Vec<u32> = (0..200).map(|i| (rank as u32) * 1_000 + i).collect();
             assert_eq!(got, want, "rank {rank}'s frames");
         }
+    }
+
+    /// Work between two steps waits for the formed step to finish.
+    #[test]
+    fn between_waits_for_the_step_firing() {
+        let r = Arc::new(Rendezvous::<u32, u32>::new(2, Duration::from_millis(5)));
+        let Part::Lead(formed) = r
+            .arrive(
+                0,
+                Arrival {
+                    frame: 1,
+                    bucket: 8,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("the first arrival leads");
+        };
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let between = {
+            let (r, ran) = (Arc::clone(&r), Arc::clone(&ran));
+            thread::spawn(move || r.between(|| ran.store(true, SeqCst)))
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(!ran.load(SeqCst), "it ran while the step fired");
+        r.finish(formed.step, vec![None, None]);
+        between.join().unwrap().expect("not poisoned");
+        assert!(ran.load(SeqCst));
     }
 
     /// A step forms while the one before it fires, but closes only after:
